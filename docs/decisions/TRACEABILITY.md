@@ -12,6 +12,16 @@ no row reaches production with Status "⛔ not-built" for the decisions below �
 fails. New hard-invariant decisions added to [DECISIONS.md](DECISIONS.md) must add a row here before
 the PR merges.
 
+**Status legend:** `✅ green` — tagged test exists and passes in CI. `🟡 unit-green` — the Layer-1
+unit slice is built and passing, but the named Component/E2E layers (their consumers) are not yet
+built. `⛔ not-built` — no tagged test yet. A multi-layer row is only fully `✅` when **all** its
+named layers pass; the release gate (D68) is the Layer-3 conformance suite, not the unit slice alone.
+
+**Build progress:** the `sqlglot` column-provenance extractor (`src/data_agent/sqlparse/provenance.py`,
+Phase-0 first brick, D52/D62) is built and passing 39 Layer-1 tests; it satisfies the unit slices
+below. Its consumers — the MCP live-scope gate (D57), the replayed-trail filter (D44), and scratch
+enforcement at the MCP (D64) — are **not yet built**, so those rows stay `🟡 unit-green`.
+
 See [docs/11-testing.md](../11-testing.md) for the four-layer test pyramid definition and the full
 Layer 3 scenario list. See [docs/decisions/DECISIONS.md](DECISIONS.md) for the rationale behind each
 decision cited here.
@@ -24,7 +34,7 @@ decision cited here.
 |---|---|---|---|---|---|
 | **D5** | `session_id`/JWT/scope are injected by code — the model never sees or supplies them; it cannot forge or escalate scope | Unit | `D5-scope-never-model-visible` | — | ⛔ not-built |
 | **D44** | Every stored tool result carries a column-provenance set; on scope narrowing, trail entries whose provenance ⊄ current scope are dropped before context assembly — never replayed | Unit + Component | `D44-provenance-drop-on-scope-narrow` | **Mid-session scope narrowing** | ⛔ not-built |
-| **D44** | SQL parse failure → provenance unknown → entry dropped from replay (fail-closed, never assumed in-scope) | Unit | `D44-parse-fail-drops-entry` | — | ⛔ not-built |
+| **D44** | SQL parse failure → provenance unknown → entry dropped from replay (fail-closed, never assumed in-scope) | Unit | `D44-parse-fail-drops-entry` | — | 🟡 unit-green |
 | **D45** | A pause checkpoint is persisted before yielding; any runtime instance can resume at `awaiting_node` after a restart; completed DAG nodes never re-run; `consumed` CAS flag prevents double-entry | Component + E2E | `D45-pause-resume-survives-restart` | **Pause/resume durability** | ⛔ not-built |
 | **D46** | Results are preview-only in model context (≤N rows + `truncated` flag + `row_count`); full results persist to Couchbase and appear in UI; preview never causes the model to mistake a truncated set for a complete answer | Unit | `D46-preview-truncated-flag-present` | — | ⛔ not-built |
 | **D47** | The raw agent loop never runs past its per-turn budget (iterations/tokens/wall-clock) without pausing via `askUser`; "continue" grants exactly one fresh budget window, not unlimited continuation | E2E | `D47-budget-cap-triggers-pause` | **Budget-cap pause** | ⛔ not-built |
@@ -32,13 +42,13 @@ decision cited here.
 | **D48** | Two blueprints with materially different semantics (gross vs net, period filter present vs absent) produce different `canonical_key` values | Unit | `D48-different-semantics-different-key` | — | ⛔ not-built |
 | **D48** | SQL parse failure during dedup → skip the hard key, fall through to soft embedding layer (fail-soft — never a wrong merge) | Unit | `D48-parse-fail-falls-to-soft` | — | ⛔ not-built |
 | **D50** | Scope-filter (D44) runs before history compaction (D46); the prose summary is derived only from in-scope entries and is never persisted as an artifact | Unit | `D50-filter-before-compact-order` | — | ⛔ not-built |
-| **D52** | `sqlglot` extracts the qualified `(table, column)` USES set from a query, including columns referenced only in derived expressions (e.g. `AVG(gross_pay)` yields `payroll_fact.gross_pay`) | Unit | `D52-derived-column-in-uses-set` | — | ⛔ not-built |
-| **D52** | `sqlglot` parse failure behavior is per-consumer: D57-consumer → fail-closed reject; D48-consumer → fail-soft skip-hard-key; D35-consumer → fail-to-review; none silently proceeds | Unit | `D52-per-consumer-fail-behavior` | — | ⛔ not-built |
+| **D52** | `sqlglot` extracts the qualified `(table, column)` USES set from a query, including columns referenced only in derived expressions (e.g. `AVG(gross_pay)` yields `payroll_fact.gross_pay`) | Unit | `D52-derived-column-in-uses-set` | — | ✅ green |
+| **D52** | `sqlglot` parse failure behavior is per-consumer: D57-consumer → fail-closed reject; D48-consumer → fail-soft skip-hard-key; D35-consumer → fail-to-review; none silently proceeds | Unit | `D52-per-consumer-fail-behavior` | — | 🟡 unit-green |
 | **D53** | A table with no catalog entry is served structural-only by `getTableSchema` (not an error); it is ineligible for blueprint promotion | Component | `D53-uncatalogued-table-structural-only` | — | ⛔ not-built |
 | **D53** | A `schema_edit` candidate opens a branch + YAML patch PR with CI (schema lint + `explainQuery` dry-run); it is never auto-committed to the catalog | Component | `D53-schema-edit-opens-pr-not-auto-commit` | — | ⛔ not-built |
 | **D56** | Every `runBlueprint` response passes the deterministic grain-integrity check before being returned; a wrong-grain result (fan-out double-count) is caught and falls back to the raw loop — never returned to the user | Unit + E2E | `D56-wrong-grain-falls-back` | **No-silent verification** | ⛔ not-built |
 | **D56** | The LLM verification gate runs on every blueprint response; the user is never asked to verify; SQL is visible but verification is the agent's job | E2E | `D56-verify-gate-always-runs` | **No-silent verification** | ⛔ not-built |
-| **D57** | On every `runQuery`, the MCP parses the SQL, extracts referenced columns, and rejects the query if referenced columns ⊄ injected scope; derived aggregates over forbidden columns are caught (`AVG(gross_pay)` with no payroll scope → rejected) | Unit + Component | `D57-derived-agg-over-forbidden-rejected` | **Scope denial** | ⛔ not-built |
+| **D57** | On every `runQuery`, the MCP parses the SQL, extracts referenced columns, and rejects the query if referenced columns ⊄ injected scope; derived aggregates over forbidden columns are caught (`AVG(gross_pay)` with no payroll scope → rejected) | Unit + Component | `D57-derived-agg-over-forbidden-rejected` | **Scope denial** | 🟡 unit-green |
 | **D57** | An out-of-scope blueprint is not surfaced in thin cards (retrieval pre-filter); the existence of a restricted report is not leaked to the user | Component + E2E | `D57-out-of-scope-blueprint-not-surfaced` | **Scope denial** | ⛔ not-built |
 | **D58** | A `global_knowledge` candidate is not returned by `searchKnowledge` until a human approves it in the review inbox; approve → immediately retrievable | Component + E2E | `D58a-knowledge-not-retrievable-before-approval` | **Knowledge human-gate** | ⛔ not-built |
 | **D58** | `LEARNING_ENABLED=false` halts the write router and promotion scheduler without a deploy; reads (`searchKnowledge`, `searchBlueprints`) continue unaffected | Component + E2E | `D58c-learning-kill-switch-halts-writes` | **Correction → learning** | ⛔ not-built |
@@ -47,10 +57,10 @@ decision cited here.
 | **D59** | `requires_approval` fires before the node runs and may reference only upstream/completed outputs; a reference to the gated node's own un-computed output is rejected | Unit | `D59b-approval-upstream-only-reference` | — | ⛔ not-built |
 | **D61** | Step-level progress events stream to the UI throughout a turn (context assembly, blueprint pick, each DAG node, D56 verify gate); the first progress event arrives before the final answer | E2E | `D61-progress-events-stream` | **Ask → fast path** | ⛔ not-built |
 | **D61** | Progress event labels contain step/shape only — no cell values, no bound slot values, no JWT content | E2E | `D61-progress-pii-safe` | **Observability + PII** | ⛔ not-built |
-| **D63** | When `sqlglot` cannot parse a live `runQuery` well enough to extract referenced columns, the MCP rejects the query and alerts — it never runs an unverifiable query against the warehouse | Unit + E2E | `D63-parse-fail-rejects-not-runs` | **Parser fail-closed** | ⛔ not-built |
+| **D63** | When `sqlglot` cannot parse a live `runQuery` well enough to extract referenced columns, the MCP rejects the query and alerts — it never runs an unverifiable query against the warehouse | Unit + E2E | `D63-parse-fail-rejects-not-runs` | **Parser fail-closed** | 🟡 unit-green |
 | **D63** | The `system.query_log.columns` oracle correctly identifies cases where parser-extracted columns differ from engine-reported columns, enabling the false-reject rate to be measured and driven down | Component | `D63-query-log-oracle-diff` | — | ⛔ not-built |
-| **D64** | Scratch tables named outside `scratch.s_<session_id>_*` are rejected by the MCP on every `runQuery`; a cross-session scratch reference (session A referencing session B's table) is always rejected | Unit + Component | `D64-scratch-cross-session-rejected` | — | ⛔ not-built |
-| **D64** | An unparseable scratch table reference is fail-closed: rejected, never run unchecked | Unit | `D64-scratch-parse-fail-closed` | — | ⛔ not-built |
+| **D64** | Scratch tables named outside `scratch.s_<session_id>_*` are rejected by the MCP on every `runQuery`; a cross-session scratch reference (session A referencing session B's table) is always rejected | Unit + Component | `D64-scratch-cross-session-rejected` | — | 🟡 unit-green |
+| **D64** | An unparseable scratch table reference is fail-closed: rejected, never run unchecked | Unit | `D64-scratch-parse-fail-closed` | — | ✅ green |
 | **D25** | Per-turn Phoenix spans contain no JWT, no raw scope token, no cell values, no bound slot values; shape/count/latency only | E2E | `D25-spans-pii-redacted` | **Observability + PII** | ⛔ not-built |
 | **D25** | The leakage gate emits a `GUARDRAIL` span in Phoenix when a candidate is flagged | Component | `D25-leakage-gate-guardrail-span` | **Observability + PII** | ⛔ not-built |
 | **D34** | The blueprint extractor parameterizes only real SQL that ran and was accepted (from the `runQuery` trail) — it never synthesizes fresh SQL; a session with no acceptance signal produces no blueprint candidate | Component | `D34-no-synthesis-only-accepted-sql` | **Correction → learning** | ⛔ not-built |
@@ -101,8 +111,9 @@ the Layer 1 test suite. They extend the existing D57/D63/D64 rows in the matrix 
 
 | Decision | Invariant | Test layer | Test slug | Conformance scenario | Status |
 |---|---|---|---|---|---|
-| **D69 / OQ-1** | Lambda-body columns ARE in the USES set; if `sqlglot` cannot prove the lambda body was walked, `ProvenanceExtractionError` is raised — no silent skip | Unit | `D57-lambda-body-failclosed` | — | ⛔ not-built |
-| **D69 / OQ-2** | `SELECT *` expands to ALL catalog columns of referenced tables; any out-of-scope expanded column → reject; table not in catalog → fail-closed | Unit | `D57-star-expand-reject-out-of-scope` | — | ⛔ not-built |
-| **D69 / OQ-3** | Canonical USES pair is `(database.table, column)` three-part; scope vector uses same granularity; extractor resolves three-part SQL references without stripping the database prefix | Unit | `D69-uses-pair-fully-qualified` | — | ⛔ not-built |
-| **D69 / OQ-4** | Scratch table columns are NOT column-scope-checked; `qualify_columns` is not run for scratch tables; session-ID name-match (D64) is the sole gate | Unit | `D69-scratch-column-no-scope-check` | — | ⛔ not-built |
-| **D69 / OQ-5** | `extract_column_provenance` is never called on EXPLAIN queries; the caller enforces this precondition before invoking the extractor | Unit (caller precondition test) | `D69-explain-caller-precondition` | — | ⛔ not-built |
+| **D69 / OQ-1** | Lambda-body columns ARE in the USES set; if `sqlglot` cannot prove the lambda body was walked, `ProvenanceExtractionError` is raised — no silent skip | Unit | `D57-lambda-body-failclosed` | — | ✅ green |
+| **D69 / OQ-2** | `SELECT *` expands to ALL catalog columns of referenced tables; any out-of-scope expanded column → reject; table not in catalog → fail-closed | Unit | `D57-star-expand-reject-out-of-scope` | — | ✅ green |
+| **D69 / OQ-3** | Canonical USES pair is `(database.table, column)` three-part; scope vector uses same granularity; extractor resolves three-part SQL references without stripping the database prefix | Unit | `D69-uses-pair-fully-qualified` | — | ✅ green |
+| **D69 / OQ-4** | Scratch table columns are NOT column-scope-checked; `qualify_columns` is not run for scratch tables; session-ID name-match (D64) is the sole gate | Unit | `D69-scratch-column-no-scope-check` | — | ✅ green |
+| **D69 / OQ-5** | `extract_column_provenance` is never called on EXPLAIN queries; the caller enforces this precondition before invoking the extractor | Unit (caller precondition test) | `D69-explain-caller-precondition` | — | ✅ green |
+| **D70** | Identifier matching is case-sensitive + exact; a table/column reference unresolvable against the catalog → `ProvenanceExtractionError` (no case-insensitive fallback, no silent skip); scratch columns are the documented exception (D69/OQ-4) | Unit | `D70-case-mismatch-fails-closed` | — | ✅ green |

@@ -613,3 +613,23 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   internal EXPLAIN handler would obscure the caller contract and create dead code.
 
   Cross-references: D44, D52, D57, D62, D63, D64.
+
+- **D70 (locked, 2026-06-30).** **Identifier matching is case-sensitive and exact; any unresolvable
+  reference fails closed (extends D69; surfaced by the provenance-extractor security review).**
+  Identifier resolution against the Semantic Catalog is **case-sensitive and exact for both tables
+  and columns** — matching ClickHouse's own identifier semantics (`amount` and `Amount` are genuinely
+  different identifiers). A table or column reference that cannot be **exactly** resolved against the
+  catalog → **fail-closed** (`ProvenanceExtractionError`); there is **no case-insensitive fallback**
+  and **no silent skip**. Rationale: the review found that (a) a case-insensitive table fallback plus
+  (b) `qualify_columns` leaving case-mismatched columns unattributed combined to make
+  `SELECT amount FROM payroll` (lowercase, catalog `Amount`) return an **empty USES set** that passes
+  any scope check — a silent under-extraction, i.e. exactly the leak the extractor exists to prevent.
+  The scope enforcer must **not** rely on ClickHouse rejecting the bad-case query downstream — that
+  inverts the D57/D63 defense-in-depth. Enforcement: the extractor runs sqlglot's **validating**
+  qualify so an unresolvable column **raises** rather than getting empty attribution, and the
+  case-insensitive table fallback is removed (exact match only). Scratch tables remain the documented
+  exception (D69/OQ-4): their columns are session-gated, not catalog-resolved, so validating-qualify
+  is **not** applied to scratch column references. Also tightens the D69/OQ-1 lambda rule: the
+  coverage check is **structural** (assert sqlglot produced a `Lambda` node with a non-None body and
+  a non-empty parameter list) rather than relying on the same `find_all` traversal it is trying to
+  verify (which was tautological in the failure case). Cross-references: D57, D62, D63, D64, D69.

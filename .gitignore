@@ -1,1 +1,12 @@
 .claude/
+
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+*.pyo
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
