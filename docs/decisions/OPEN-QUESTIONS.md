@@ -75,6 +75,59 @@ sub-detail: the SQL-AST canonicalization rules (alias/ordering normalization dep
 - Golden-input capture: where golden results are stored and refreshed.
 - neo4j graph schema (node labels, edge types, indexes) — to be specified.
 
+## Semantic Catalog (`databaseSchemaDocs/`) — from the catalog gap review
+
+The curated half of `getTableSchema`. A review of the first-pass YAMLs fixed a set of gaps in-file;
+the items below are the **code-side dependencies** those fixes now assume, plus **data-layer gaps**
+the catalog can only document.
+
+### New catalog fields that need consuming code (introduced by the review)
+- **`grain_verifiable: false`** — set on tables with no exposed unique key (`payroll`, `accrual_events`,
+  `performance_discussions`, which now use `grain: []`). The **D43 catalog-vs-warehouse conformance
+  probe must SKIP** these tables (not run `COUNT(*) == COUNT(DISTINCT grain)` against an empty/absent
+  key and crash). Per-blueprint result-grain checks (D56) still apply to those blueprints' own grain.
+- **`resolve_via` on a rule** — a filter rule over a client-defined code column declares
+  `predicate: "FieldId IN ({field_codes})"` + `resolve_via: "resolveValues(FieldId, <concept>)"`
+  (see PAF `*_change_fields`). The **runtime must resolve the concept → code set and bind the param
+  before executing** the predicate (D10: never string-interpolated). No mechanism exists for this yet.
+- **`sensitive: true` on a column** — added to known PII columns. Intended as the **catalog source of
+  truth for the column-scope / governance layer**; needs that layer to actually consume it (today
+  scope/masking are maintained out-of-band).
+
+### `measures` schema (decision: minimal reconciliation)
+Authored shape is `{ column, agg, defined_over }` (measure name may be conceptual). `agg` normalized to
+`sum | count | count_distinct | avg | min | max`. **Decision: `defined_over` stays best-effort prose**
+carrying both scope filter and aggregation grain — the de-fan check reads it best-effort, not as a
+structured grain. (Full structured split of scope-vs-grain was considered and deferred.) AUTHORING_NOTES
+updated; the [04](../04-blueprints.md) example still shows the old `{agg, defined_over}` form — align it.
+
+### Tenancy (decision: RLS, recorded)
+The warehouse is multi-tenant but isolation is **ClickHouse row-level security** (a custom `client_code`
+setting from the JWT, applied by the MCP) — **not** the agent. The agent never sees/filters `ClientCode`
+and its view is single-tenant. Catalog consequence (now enforced): grain/joins use **within-tenant keys
+only**; `ClientCode` is never in `grain`/`primary_key` nor a join predicate.
+
+### Data-layer gaps the catalog can only document (need warehouse / business action)
+- **No supervisor foreign key** — org hierarchy is exposed only as `…SupervisorEmployeeName` strings;
+  "who reports to X" / span-of-control is best-effort name-matching until a `SupervisorEmployeeCode`
+  exists. (`supervisor` ambiguity documents the limitation.)
+- **Requisition island** — no `RequisitionId` on `applicant_tracking_application`; application↔requisition
+  funnel analysis (apps/req, fill rate, time-to-fill) is impossible without an external mapping.
+- **String-typed dates/numerics** — candidate dates, `RequisitionOpenPositions`, `MonitoringPeriodDays`,
+  `ExceptionPointTotal` are `String`. Safe-cast recipes (`…OrNull`) added, but proper typing is the fix.
+- **Unconfirmed `terminated` rule** — the employee `rehired_not_terminated` guard rests on an explicit
+  "ASSUMPTION to confirm" (rehire signalled by `MostRecentHireDate` advancing past `TerminationDate`);
+  needs business sign-off.
+- **Missing table doc** — `weekly_booked_sales_reps_only` is a declared join target with no catalog YAML;
+  `getTableSchema` on it fails until authored.
+- **Soft department joins** — `DistributedDepartmentCode`/`AccrualEventDepartmentCode → employee.DepartmentCode`
+  are label-based, client-defined, low/medium confidence; not reliable FKs.
+
+### `resolveValues` accept-vs-clarify threshold (extends D66, see Retrieval below)
+Beyond the deferred per-(client,column) index, there is **no defined confidence threshold** for when a
+ranked `resolveValues` match is auto-used vs. routed to `askUser` — risk of silently filtering on a
+plausible-but-wrong code.
+
 ## Retrieval ([03](../03-context-and-retrieval.md))
 - Reranker model + threshold; recall `k` vs. final top-3.
 - Shared embedding model choice.

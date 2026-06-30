@@ -73,8 +73,8 @@ employee_info:
 payroll_fact:
   grain: [ employee_code, pay_period, pay_component ]   # one row per component, per period, per emp
   temporal: { period_col: pay_period, semantics: per_period }
-  measures:
-    gross_pay: { agg: sum, defined_over: pay_component } # an emp's period pay = SUM over components
+  measures:                                              # shape: { column, agg, defined_over }
+    gross_pay: { column: amount, agg: sum, defined_over: "per (employee_code, pay_period); SUM over pay_component — the de-fan axis" }
 ```
 
 #### `temporal` — the dimensions model (D65, revises D40)
