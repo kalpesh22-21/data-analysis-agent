@@ -1,0 +1,206 @@
+database: dbpcm_warehouse
+table: payroll
+region: workforce_payroll
+description: Payroll register line-item table. Contains paycheck components such as earnings, deductions, taxes, benefits, employer taxes, and net-pay distributions. Not one row per paycheck.
+
+grain: []
+grain_verifiable: false   # no exposed unique key — the D43 COUNT(*)==COUNT(DISTINCT grain) conformance probe does not apply
+grain_note: >
+  Payroll register LINE ITEMS — one row per pay component, not one row per paycheck. No exposed
+  unique row id (TransactionNumber is NOT unique). Multiple rows share the same EmployeeCode + PayDate.
+  Logical analysis grains for GROUP BY: a "paycheck" = EmployeeCode + PayDate (often + pay-period
+  dates); an employee's period earnings = SUM(Amount) WHERE RegisterType='EARN' grouped to
+  EmployeeCode + period. Blueprints must declare their own result grain; this base table is unverifiable.
+
+temporal:
+  # Dual-temporal (D65): a coverage PERIOD (a date range, no key column) + a payment EVENT date.
+  dimensions:
+    - name: pay_period
+      role: period
+      range: { start_col: PayPeriodStartDate, end_col: PayPeriodEndDate }
+    - name: pay_event
+      role: event
+      date_col: PayDate
+  default_pin: pay_period       # coverage period is the default; the pay_timing ambiguity redirects to pay_event (PayDate) on intent
+  # Gate (D65): any blueprint over this table must constrain at least one dimension
+  # (a period range / a PayDate window) — never aggregate across the full 2013–2026 span unpinned.
+
+primary_key: []
+primary_key_note: No reliable unique primary key is exposed. Do not treat TransactionNumber as unique.
+
+# Tenancy: isolation is enforced below the agent by ClickHouse row-level security (client_code from
+# the JWT, applied by the MCP). The agent never filters ClientCode and sees one tenant — joins need no
+# tenant predicate and grain is the within-tenant key. See AUTHORING_NOTES Tenancy.
+join_keys:
+  - { column: EmployeeCode, joins: employee.EmployeeCode, cardinality: N:1 }
+  - { column: DistributedDepartmentCode, joins: employee.DepartmentCode, cardinality: many_to_reference, confidence: medium }
+
+columns:
+  ClientCode:
+    type: Nullable(String)
+    description: Client/company code.
+
+  EmployeeCode:
+    type: String
+    description: Employee identifier; canonical join key to employee.
+
+  RegisterType:
+    type: String
+    values:
+      EARN: earnings
+      EETAX: employee_tax
+      DDUCT: deductions
+      NETPAYDIST: net_pay_distribution
+      EEBEN: employee_benefits
+      ERTAX: employer_tax
+    description: Main payroll register category for the line item.
+
+  Amount:
+    type: Nullable(Decimal(18, 6))
+    unit: USD
+    description: Monetary amount for the payroll line. Meaning depends on RegisterType.
+
+  TypeHours:
+    type: Nullable(Decimal(18, 6))
+    unit: hours
+    description: Hours associated with the payroll type code when applicable.
+
+  TypeCode:
+    type: Nullable(String)
+    client_defined: true
+    description: Payroll code within the register type (an earning, deduction, tax, benefit, or distribution code). CLIENT-DEFINED — resolve concepts to codes via resolveValues(TypeCode, <concept>), do not hardcode.
+
+  TypeCodeDescription:
+    type: Nullable(String)
+    client_defined: true
+    description: Human-readable description for TypeCode.
+
+  ProfileCode:
+    type: Nullable(String)
+    client_defined: true
+    description: Payroll profile/benefit eligibility profile code when applicable. CLIENT-DEFINED — resolve via resolveValues(ProfileCode, <concept>).
+
+  DistributedDepartmentCode:
+    type: Nullable(String)
+    client_defined: true
+    description: Department or labor-distribution code charged on the payroll item. CLIENT-DEFINED — resolve via resolveValues(DistributedDepartmentCode, <concept>).
+
+  distributedDepartmentDescription:
+    type: Nullable(String)
+    description: Human-readable distributed department label for the payroll item.
+
+  TypeRate:
+    type: Nullable(Decimal(18, 6))
+    unit: USD_per_hour
+    description: Rate associated with the type code when applicable.
+
+  PayDate:
+    type: DateTime64(6)
+    description: Check/payment date; use when the question is about when payroll was issued.
+
+  PayPeriodStartDate:
+    type: DateTime64(6)
+    description: Start date of the pay period covered by the line item.
+
+  PayPeriodEndDate:
+    type: DateTime64(6)
+    description: End date of the pay period covered by the line item.
+
+  TransactionNumber:
+    type: Nullable(String)
+    description: Transaction reference number. Not unique in observed data.
+
+measures:
+  # Amount's meaning depends on RegisterType, so every monetary measure is SCOPED to its register
+  # filter in defined_over (AUTHORING_NOTES rule). A correct per-employee/period figure also requires
+  # pinning a temporal dimension (gate) and summing line items up to the result grain (de-fan) — see
+  # grain_note. Never SUM(Amount) across RegisterType values (mixes earnings, taxes, deductions, net).
+  gross_earnings:
+    column: Amount
+    agg: sum
+    defined_over: "RegisterType = 'EARN'; summed over line items within (EmployeeCode, pay period)"
+  employee_tax_withheld:
+    column: Amount
+    agg: sum
+    defined_over: "RegisterType = 'EETAX'; summed over line items within (EmployeeCode, pay period)"
+  employee_deductions:
+    column: Amount
+    agg: sum
+    defined_over: "RegisterType = 'DDUCT'; summed over line items within (EmployeeCode, pay period)"
+  net_pay_distributed:
+    column: Amount
+    agg: sum
+    defined_over: "RegisterType = 'NETPAYDIST'; summed over line items within (EmployeeCode, pay period)"
+  employer_tax:
+    column: Amount
+    agg: sum
+    defined_over: "RegisterType = 'ERTAX'; summed over line items within (EmployeeCode, pay period)"
+  employee_benefits:
+    column: Amount
+    agg: sum
+    defined_over: "RegisterType = 'EEBEN'; summed over line items within (EmployeeCode, pay period)"
+  paid_hours:
+    column: TypeHours
+    agg: sum
+    defined_over: "hours-bearing rows (usually RegisterType = 'EARN', narrowed by TypeCode via resolveValues); see 'hours worked' ambiguity for paid/worked/PTO/overtime disambiguation"
+
+rules:
+  - id: gross_earnings
+    predicate: "RegisterType = 'EARN'"
+    applies_when: gross earnings or payroll earnings questions
+    description: Use earnings rows for gross compensation analysis.
+
+  - id: employee_deductions
+    predicate: "RegisterType = 'DDUCT'"
+    applies_when: deductions or expense-reimbursement-style deduction questions
+    description: Use deduction rows, then narrow by TypeCode as needed.
+
+  - id: employee_taxes
+    predicate: "RegisterType = 'EETAX'"
+    applies_when: employee tax withholding questions
+    description: Taxes withheld from employee pay.
+
+  - id: employer_taxes
+    predicate: "RegisterType = 'ERTAX'"
+    applies_when: employer payroll tax questions
+    description: Employer-paid payroll tax rows.
+
+  - id: net_pay_distribution
+    predicate: "RegisterType = 'NETPAYDIST'"
+    applies_when: take-home pay distribution questions
+    description: How net pay was distributed, such as direct deposit or check.
+
+ambiguities:
+  - term: pay_timing
+    resolves_to: [ PayDate, "PayPeriodStartDate / PayPeriodEndDate (coverage period)" ]
+    default: pay_period_coverage
+    clarify_if: >
+      timing is ambiguous between the check/issue date (PayDate — use for "when paid/issued") and the
+      work period covered (PayPeriodStartDate/EndDate — use for "period worked/covered"). Default pins
+      the coverage period (temporal default_pin: pay_period); redirect to PayDate when intent is the
+      payment event.
+
+  - term: payroll
+    resolves_to: [ "line items across all RegisterType values" ]
+    default: all_register_types
+    clarify_if: user needs only gross earnings, net pay, taxes, deductions, benefits, or employer cost
+
+  - term: paycheck
+    resolves_to: [ "group payroll line items by EmployeeCode + PayDate, and often pay-period dates" ]
+    default: grouped_line_items
+    clarify_if: exact check identity is required, because no unique paycheck id is exposed
+
+  - term: wages or earnings
+    resolves_to: [ "SUM(Amount) WHERE RegisterType = 'EARN'" ]
+    default: gross_earnings
+    clarify_if: user means net pay, taxable wages, employer payroll cost, or the planned AnnualSalary / Rate1 from the employee table (planned vs actually-paid — see employee.yaml 'salary' ambiguity)
+
+  - term: hours worked
+    resolves_to: [ "SUM(TypeHours), usually filtered to earnings/hour-related TypeCode rows" ]
+    default: TypeHours
+    clarify_if: user needs paid hours, worked hours, PTO hours, overtime hours, or all hours
+
+  - term: department
+    resolves_to: [ DistributedDepartmentCode, distributedDepartmentDescription ]
+    default: payroll_distributed_department
+    clarify_if: user means current employee department from employee.Department

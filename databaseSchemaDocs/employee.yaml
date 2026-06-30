@@ -1,0 +1,156 @@
+database: dbpcm_warehouse
+table: employee
+description: Current-state employee record, one row per employee. Reflects current employee attributes, not historical snapshots.
+
+grain: [ EmployeeCode ]   # agent view is single-tenant via ClickHouse RLS (client_code from JWT); EmployeeCode is unique within that view
+temporal:
+  # Current-state snapshot, no temporal dimension → no pin required (D65; was semantics: as_of_now).
+  dimensions: []
+  default_pin: null
+
+primary_key: [ EmployeeCode ]
+
+# Tenancy: the warehouse is multi-tenant, but isolation is enforced BELOW the agent by ClickHouse
+# row-level security (a custom client_code setting inferred from the JWT, applied by the MCP). The
+# agent never sees, supplies, or filters ClientCode and its query view is always a single tenant — so
+# joins need NO tenant predicate and grain is the within-tenant key. See AUTHORING_NOTES Tenancy.
+join_keys:
+  - { column: EmployeeCode, joins: payroll.EmployeeCode, cardinality: 1:N }
+  - { column: EmployeeCode, joins: weekly_booked_sales_reps_only.EmployeeCode, cardinality: 1:N }  # TODO: weekly_booked_sales_reps_only has no catalog YAML yet — getTableSchema(weekly_booked_sales_reps_only) will fail until authored
+  - { column: EmployeeCode, joins: accrual_events.EmployeeCode, cardinality: 1:N }
+  - { column: EmployeeCode, joins: performance_discussions.EmployeeCode, cardinality: 1:N }
+  - { column: EmployeeCode, joins: personnel_action_form_changes.EmployeeCode, cardinality: 1:N }
+  - { column: EmployeeCode, joins: applicant_tracking_application.EmployeeCode, cardinality: 1:N }
+
+columns:
+  ClientCode: { type: Nullable(String), description: Client/company code. }
+  EmployeeCode: { type: String, description: Stable unique employee identifier; canonical employee join key. }
+  Department: { type: Nullable(String), client_defined: true, description: Current department label (CLIENT-DEFINED; resolve via resolveValues(Department, <concept>))., synonyms: [ dept, team ] }
+  Position: { type: Nullable(String), client_defined: true, description: Current position; preferred field for identifying/filtering managers (CLIENT-DEFINED; resolve via resolveValues(Position, <concept>)). }
+  EmployeeName: { type: Nullable(String), description: Default employee display name. }
+  EmployeeStatus:
+    type: Nullable(String)
+    values: { A: active, D: deceased, I: inactive, N: not_hired, P: pre_hire, R: retired, T: terminated, V: on_leave }
+    observed_values: [ A, D, I, N, T, V ]
+    description: Current employee status code.
+  DepartmentCode: { type: Nullable(String), client_defined: true, description: Formal department code used in company maintenance/labor allocation context (CLIENT-DEFINED; resolve via resolveValues(DepartmentCode, <concept>)). }
+  LivesInState: { type: Nullable(String), description: Residence state for assigned tax profile. }
+  WorksInState: { type: Nullable(String), description: Work state for assigned tax profile. }
+  SUIState: { type: Nullable(String), description: State unemployment insurance agency state for assigned tax profile. }
+  TerminationDate: { type: Nullable(DateTime64(6)), description: Current or latest termination date. }
+  OldTerminationDate: { type: Nullable(DateTime64(6)), description: Prior termination date before rehire. }
+  FirstName: { type: Nullable(String), description: Employee first name. }
+  MiddleName: { type: Nullable(String), description: Employee middle name. }
+  LastName: { type: Nullable(String), description: Employee last name. }
+  Nickname: { type: Nullable(String), description: Employee nickname or preferred informal name. }
+  HireDate: { type: Nullable(DateTime64(6)), description: Original hire date. }
+  MostRecentHireDate: { type: Nullable(DateTime64(6)), description: Latest hire date; default field for generic hire-date questions. }
+  LeaveAbsenceStart: { type: Nullable(DateTime64(6)), description: Leave-of-absence start date. }
+  LeaveAbsenceEnd: { type: Nullable(DateTime64(6)), description: Leave-of-absence end date. }
+  PrimarySupervisorEmployeeName: { type: Nullable(String), description: Current primary supervisor name. }
+  SecondarySupervisorEmployeeName: { type: Nullable(String), description: Current secondary supervisor name. }
+  TertiarySupervisorEmployeeName: { type: Nullable(String), description: Current tertiary supervisor name. }
+  QuaternarySupervisorEmployeeName: { type: Nullable(String), description: Current quaternary supervisor name. }
+  CountryCode: { type: Nullable(String), description: Two-character residence country code. }
+  TermReason: { type: Nullable(String), client_defined: true, description: Termination reason code; CLIENT-DEFINED, requires lookup before interpreting — resolve via resolveValues(TermReason, <concept>). }
+  FullTimeToPartTimeDate: { type: Nullable(DateTime64(6)), description: Date employee moved from full-time to part-time. }
+  LastCheckDate: { type: Nullable(DateTime64(6)), description: Last pay date/check date. }
+  PositionFamilyName: { type: Nullable(String), client_defined: true, description: Broader position family classification (CLIENT-DEFINED; resolve via resolveValues(PositionFamilyName, <concept>)). }
+  AccrualProfileDesc: { type: Nullable(String), client_defined: true, description: Human-readable accrual profile description (CLIENT-DEFINED; resolve via resolveValues(AccrualProfileDesc, <concept>)). }
+  BusinessTitlePositionSeat: { type: Nullable(String), description: Assigned business title for current position seat. }
+  PositionLevel: { type: Nullable(Int32), description: Numeric org level; requires company mapping for semantic interpretation. }
+  PrimaryAddressLine1: { type: Nullable(String), description: Primary residence address line 1. }
+  PrimaryAddressLine2: { type: Nullable(String), description: Primary residence address line 2. }
+  PrimaryCityMunicipality: { type: Nullable(String), description: Primary residence city/municipality. }
+  PrimaryState: { type: Nullable(String), description: Primary residence state. }
+  PrimaryZipCode: { type: Nullable(String), description: Primary residence ZIP/postal code. }
+  RehireDate: { type: Nullable(DateTime64(6)), description: Most recent rehire date when applicable. }
+  LastPositionChangeDate: { type: Nullable(DateTime64(6)), description: Most recent position-change date. }
+  LastWorkedDate: { type: Nullable(DateTime64(6)), description: Last day worked. }
+  PositionTitlePositionInfo: { type: Nullable(String), description: Formal title from position management. }
+  PayTypeDescription:
+    type: Nullable(String)
+    observed_values: [ Commission Only, None, Salary ]
+    description: Pay type description.
+  WorkLocationDescription: { type: Nullable(String), client_defined: true, description: Human-readable work location name (CLIENT-DEFINED; resolve via resolveValues(WorkLocationDescription, <concept>)). }
+  WorkLocationAddress: { type: Nullable(String), description: Work location street address. }
+  WorkLocationCity: { type: Nullable(String), description: Work location city. }
+  WorkLocationState: { type: Nullable(String), description: Work location state. }
+  WorkLocationZip: { type: Nullable(String), description: Work location ZIP/postal code. }
+  WorkLocationCountry: { type: Nullable(String), description: Work location country. }
+  sales_sl_gradution: { type: Nullable(String), description: Internal sales training graduation date field; spelling preserved from source. }
+  sales_sl_start_date: { type: Nullable(String), description: Internal sales training start date field. }
+  AnnualSalary: { type: Nullable(Decimal(18, 6)), unit: USD, description: Annual salary amount when applicable; not actual payroll paid. }
+  EmploymentType:
+    type: Nullable(String)
+    values: { W2: employee, "1099": contractor }
+    observed_values: [ W2, "1099" ]
+    description: Worker classification.
+  Rate1: { type: Nullable(Decimal(18, 6)), unit: USD, description: Base hourly/rate-1 pay rate when applicable. }
+
+rules:
+  - id: active_employee
+    predicate: "EmployeeStatus = 'A'"
+    applies_when: user asks for active/current active employees
+    description: Restrict to active employees.
+
+  - id: exclude_not_hired_default
+    predicate: "EmployeeStatus != 'N' OR EmployeeStatus IS NULL"
+    applies_when: default for employee-based analysis when no explicit status filter (e.g. active_employee) is applied
+    description: Exclude not-hired (pre-hire) records by default because they were never actually hired. Headcount uses active_employee instead, which already excludes 'N' — do not stack both defaults.
+
+  - id: rehired_not_terminated
+    predicate: "TerminationDate IS NULL OR MostRecentHireDate IS NULL OR MostRecentHireDate < TerminationDate"
+    applies_when: termination-status evaluation — compose as `EmployeeStatus = 'T' AND <this guard>`
+    description: >
+      Rehire guard for the `terminated` resolution: excludes anyone rehired on/after their
+      TerminationDate (MostRecentHireDate >= TerminationDate ⇒ not currently terminated).
+      ASSUMPTION to confirm: rehire is signalled by MostRecentHireDate advancing past TerminationDate.
+
+ambiguities:
+  - term: headcount
+    resolves_to: [ "COUNT(DISTINCT EmployeeCode) with EmployeeStatus = 'A'" ]
+    default: active_only
+    clarify_if: user asks for all employees, historical employees, terminated employees, or including not-hired records
+
+  - term: hire_date
+    resolves_to: [ MostRecentHireDate ]
+    default: most_recent_hire
+    clarify_if: user asks for original hire date or rehire-specific analysis
+
+  - term: terminated
+    resolves_to: [ "EmployeeStatus = 'T' with rehire check using MostRecentHireDate vs TerminationDate" ]
+    default: current_termination_state
+    clarify_if: user asks for termination events regardless of rehire
+
+  - term: manager
+    resolves_to: [ Position ]
+    default: position_based
+    clarify_if: user needs an exact business-defined manager population
+
+  - term: supervisor
+    resolves_to:
+      - PrimarySupervisorEmployeeName
+      - SecondarySupervisorEmployeeName
+      - TertiarySupervisorEmployeeName
+      - QuaternarySupervisorEmployeeName
+    default: primary_supervisor_name_best_effort
+    clarify_if: >
+      DATA LIMITATION — org hierarchy is exposed ONLY as supervisor NAME strings; there is no
+      SupervisorEmployeeCode and no reliable self-join key. "Who reports to X", span-of-control, and
+      org rollups must match Primary…Quaternary SupervisorEmployeeName against employee names, which is
+      non-unique and breaks on duplicate/changed names. Treat name matching as best-effort, not a
+      foreign key; confirm the supervisor identity and prefer asking which supervisor tier is meant.
+
+  - term: salary
+    resolves_to:
+      - AnnualSalary                                                    # planned annual (employee) — NOT actually paid
+      - Rate1                                                           # base rate (employee)
+      - "payroll gross earnings = SUM(Amount) WHERE RegisterType = 'EARN'"   # actually paid (payroll, per period)
+      - "payroll net pay = SUM(Amount) WHERE RegisterType = 'NETPAYDIST'"    # take-home (payroll, per period)
+    default: planned_annual_salary
+    clarify_if: >
+      "salary" / "pay" / "compensation" is ambiguous across tables and meanings — planned AnnualSalary
+      (employee, not actually paid) vs base Rate1 vs actually-paid gross earnings (payroll EARN) vs
+      take-home net pay (payroll NETPAYDIST). Clarify planned-vs-actual and gross-vs-net; payroll
+      figures additionally require a pinned pay period (temporal gate).

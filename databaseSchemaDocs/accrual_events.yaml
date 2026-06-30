@@ -1,0 +1,195 @@
+database: dbpcm_warehouse
+table: accrual_events
+description: Employee accrual-event log for time-off requests and related accrual activity. Event-level records, not an accrual-balance table.
+
+grain: []
+grain_verifiable: false   # no exposed unique key — the D43 COUNT(*)==COUNT(DISTINCT grain) conformance probe does not apply
+grain_note: >
+  Event-level accrual log. No reliable exposed row id; do NOT assume uniqueness by EmployeeCode,
+  RequestDate, EarnCode, or Status. Granularity is ONE ROW PER DAY of a request (see RequestDate),
+  so SUM(Hours) over a RequestDate range is exact. Logical analysis grain: one accrual event/day row.
+
+temporal:
+  dimensions:
+    - name: requested_for_date
+      role: event
+      date_col: RequestDate
+    - name: submission_event
+      role: event
+      date_col: DateAdded
+  default_pin: requested_for_date
+
+primary_key: []
+primary_key_note: No reliable unique primary key is exposed.
+
+join_keys:
+  - { column: EmployeeCode, joins: employee.EmployeeCode, cardinality: N:1 }
+  - { column: AccrualEventDepartmentCode, joins: employee.DepartmentCode, cardinality: many_to_reference, confidence: low }
+
+columns:
+  ClientCode:
+    type: Nullable(String)
+    description: Client/company code.
+
+  EmployeeCode:
+    type: String
+    description: Employee identifier; canonical join key to employee.
+
+  RequestDate:
+    type: Nullable(DateTime64(6))
+    description: >
+      The single day the time off / accrual event is for. Granularity is ONE ROW PER DAY — a
+      multi-day request creates one row per day — so SUM(Hours) over a RequestDate range is exact
+      (no hidden multi-day spans). Use for when the leave/event occurs.
+
+  Hours:
+    type: Nullable(Decimal(18, 6))
+    unit: hours
+    description: Hours attached to the accrual event. Do not assume these are approved/taken hours without filtering Status.
+
+  EarnCode:
+    type: Nullable(String)
+    client_defined: true
+    description: Accrual earning code. CLIENT-DEFINED and drifts over time — resolve concepts to codes via resolveValues(EarnCode, <concept>), do not hardcode. Interpret with EarnDescription and the requested period.
+
+  EarnDescription:
+    type: Nullable(String)
+    client_defined: true
+    description: Human-readable description for EarnCode. Use with EarnCode; either field can be null or historically inconsistent.
+
+  Status:
+    type: Nullable(String)
+    values:
+      Approved: approved_request
+      Requested: submitted_or_pending_request
+      Denied: denied_request
+      Removed: removed_or_withdrawn_request
+      Calendar Only: calendar_tracking_event
+    observed_values: [ Approved, Requested, Denied, Removed, Calendar Only ]
+    description: Approval/workflow state of the accrual event.
+
+  Reason:
+    type: Nullable(String)
+    description: Reason provided for the accrual event.
+
+  EventType:
+    type: Nullable(String)
+    values:
+      Time Off Request: time_off_request
+      Payout Request: payout_request
+    observed_values: [ Time Off Request ]
+    description: Accrual event category. Current accessible rows show time-off requests.
+
+  DateAdded:
+    type: Nullable(DateTime64(6))
+    description: Date/time the record was added or submitted in the system. Use for request-submission timing.
+
+  Comments:
+    type: Nullable(String)
+    description: Workflow context field; may include Gone automated approval/denial context.
+
+  GoneReason:
+    type: Nullable(String)
+    description: Workflow or supervisor context field. Do not treat as a canonical policy label without inspection.
+
+  AccrualEventDepartmentCode:
+    type: Nullable(String)
+    description: Department or labor-allocation code selected for the accrual event when present.
+
+measures:
+  approved_time_off_hours:
+    column: Hours
+    agg: sum
+    defined_over: "Status = 'Approved' AND EventType = 'Time Off Request' plus the relevant EarnCode/EarnDescription category filter"
+
+  request_count:
+    column: "*"
+    agg: count
+    defined_over: "rows after temporal, Status, EventType, employee, and EarnCode/EarnDescription filters"
+
+rules:
+  - id: approved_events
+    predicate: "Status = 'Approved'"
+    applies_when: measuring approved or taken time off
+    description: Restrict to approved accrual events.
+
+  - id: requested_events
+    predicate: "Status = 'Requested'"
+    applies_when: measuring pending/submitted request workflow
+    description: Restrict to requested accrual events.
+
+  - id: denied_events
+    predicate: "Status = 'Denied'"
+    applies_when: measuring denied requests
+    description: Restrict to denied accrual events.
+
+  - id: removed_events
+    predicate: "Status = 'Removed'"
+    applies_when: measuring removed, withdrawn, or cancelled requests
+    description: Restrict to removed accrual events.
+
+  - id: calendar_only_events
+    predicate: "Status = 'Calendar Only'"
+    applies_when: measuring calendar-only tracking entries
+    description: Restrict to calendar-only entries; do not treat as standard approved paid time off by default.
+
+  - id: time_off_request_events
+    predicate: "EventType = 'Time Off Request'"
+    applies_when: time-off request analysis
+    description: Restrict to time-off request rows.
+
+  - id: payout_request_events
+    predicate: "EventType = 'Payout Request'"
+    applies_when: payout request analysis
+    description: Restrict to payout request rows if present.
+
+  - id: has_hours
+    predicate: "Hours IS NOT NULL"
+    applies_when: aggregating hours
+    description: Keep rows with an hours value.
+
+ambiguities:
+  - term: time_off_taken
+    resolves_to: [ "SUM(Hours) with Status = 'Approved' and EventType = 'Time Off Request'" ]
+    default: approved_time_off_hours
+    clarify_if: user asks for requested, denied, removed, calendar-only, pending, or all request activity
+
+  - term: request_date
+    resolves_to: [ RequestDate ]
+    default: requested_for_date
+    clarify_if: user means when the employee submitted/entered the request
+
+  - term: submitted_date
+    resolves_to: [ DateAdded ]
+    default: submission_event
+    clarify_if: user means the date the time off was for
+
+  - term: PTO
+    resolves_to: [ "resolveValues(EarnCode, 'PTO / vacation / personal day / floating holiday') → filter EarnCode IN result; SUM(Hours) with approved_events" ]
+    default: approved_pto_vacation_style
+    clarify_if: user wants sick leave, bereavement, unpaid leave, FMLA/family leave, jury duty, holidays, all leave categories, or non-approved statuses
+
+  - term: sick_time
+    resolves_to: [ "resolveValues(EarnCode, 'sick leave / sick time') → filter EarnCode IN result; SUM(Hours) with approved_events" ]
+    default: approved_sick_hours
+    clarify_if: user wants PTO/vacation, family leave, COVID leave treated separately, or all leave categories
+
+  - term: leave
+    resolves_to: [ "resolveValues(EarnCode, 'unpaid leave / LOA / FMLA / USERRA / family leave') → filter EarnCode IN result; SUM(Hours) with approved_events" ]
+    default: approved_leave_hours
+    clarify_if: user means all paid time off, only unpaid leave, only FMLA, or all request statuses
+
+  - term: bereavement
+    resolves_to: [ "resolveValues(EarnCode, 'bereavement') → filter EarnCode IN result; SUM(Hours) with approved_events" ]
+    default: approved_bereavement_hours
+    clarify_if: user wants bereavement plus broader family leave or all leave categories
+
+  - term: jury_duty
+    resolves_to: [ "resolveValues(EarnCode, 'jury duty') → filter EarnCode IN result; SUM(Hours) with approved_events" ]
+    default: approved_jury_duty_hours
+    clarify_if: user wants all civic-duty or leave categories
+
+  - term: request_volume
+    resolves_to: [ "COUNT(*) grouped by Status, usually with EventType = 'Time Off Request'" ]
+    default: status_scoped_request_count
+    clarify_if: user wants only approved/taken hours instead of workflow volume

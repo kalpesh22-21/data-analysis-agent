@@ -1,0 +1,221 @@
+database: dbpcm_warehouse
+table: personnel_action_form_changes
+description: Personnel Action Form workflow/change-log table. Each row records one proposed or approved field change within a personnel action transaction; one transaction can contain multiple changed fields.
+
+grain: [ PafTransactionId, FieldId ]   # within-tenant field-change grain; ClientCode is RLS-enforced below the agent (see AUTHORING_NOTES Tenancy)
+grain_note: Logical field-change grain. PafTransactionId identifies the personnel action transaction, but it is not row-unique because one transaction can span multiple field changes.
+
+temporal:
+  dimensions:
+    - name: paf_effective_date
+      role: as_of
+      effective_col: PafEffectiveDate
+    - name: created_event
+      role: event
+      date_col: CreatedDate
+    - name: modified_event
+      role: event
+      date_col: ModifiedDate
+    - name: manager_signoff_event
+      role: event
+      date_col: ManagerSignDate
+  default_pin: paf_effective_date
+
+primary_key: []
+primary_key_note: No reliable row-level primary key is exposed. Use PafTransactionId for transaction-level grouping, not row uniqueness.
+
+join_keys:
+  - { column: EmployeeCode, joins: employee.EmployeeCode, cardinality: N:1 }
+
+columns:
+  ClientCode:
+    type: Nullable(String)
+    description: Client/company code.
+
+  PafTransactionId:
+    type: Int32
+    description: Personnel action transaction id. Group by this when analyzing one personnel action rather than individual changed fields.
+
+  EmployeeCode:
+    type: Nullable(String)
+    description: Employee identifier for the employee affected by the personnel action.
+
+  EmployeeName:
+    type: Nullable(String)
+    description: Employee display name captured on the PAF row.
+
+  PafEffectiveDate:
+    type: Nullable(DateTime64(6))
+    description: Business-effective date for the proposed or approved change. Can be future dated.
+
+  PafEffectiveDateTime:
+    type: Nullable(DateTime64(6))
+    description: More exact effective timestamp. Use when ordering same-day personnel actions matters.
+
+  PafStatus:
+    type: Nullable(String)
+    values:
+      Draft: draft_not_submitted
+      Pending: submitted_in_progress
+      Approval: in_approval_workflow
+      Final Approval: approved_or_authorized
+      Denied: rejected
+    description: Workflow state of the PAF transaction. Not the employee's employment status.
+
+  PafComments:
+    type: Nullable(String)
+    description: Comments associated with the PAF transaction.
+
+  ForwardTo:
+    type: Nullable(String)
+    description: Next approver, recipient, or workflow destination.
+
+  CreatedBy:
+    type: Nullable(String)
+    description: User who created the PAF.
+
+  ModifiedBy:
+    type: Nullable(String)
+    description: User who last modified the PAF.
+
+  CreatedDate:
+    type: Nullable(DateTime64(6))
+    description: Timestamp when the PAF was created or initiated.
+
+  ModifiedDate:
+    type: Nullable(DateTime64(6))
+    description: Timestamp when the PAF was last modified.
+
+  ManagerSignDate:
+    type: Nullable(DateTime64(6))
+    description: Manager signoff timestamp when applicable.
+
+  FieldId:
+    type: Nullable(String)
+    client_defined: true
+    description: Identifier for the specific field being changed. CLIENT-DEFINED code space — resolve concepts to FieldId sets via resolveValues(FieldId, <concept>), never hardcode.
+
+  FieldLabel:
+    type: Nullable(String)
+    client_defined: true
+    description: Human-readable label for the field being changed. Use with FieldId. CLIENT-DEFINED labels.
+
+  OldValue:
+    type: Nullable(String)
+    description: Prior value captured by the PAF row.
+
+  ProposedValue:
+    type: Nullable(String)
+    description: Proposed new value captured by the PAF row.
+
+measures:
+  changed_field_rows:
+    column: "*"
+    agg: count
+    defined_over: "rows after temporal, status, employee, and field filters"
+
+  personnel_actions:
+    column: PafTransactionId
+    agg: count_distinct
+    defined_over: "distinct PafTransactionId after temporal, status, employee, and field filters"
+
+rules:
+  - id: final_approval
+    predicate: "PafStatus = 'Final Approval'"
+    applies_when: approved or authorized PAF changes
+    description: Restrict to PAFs in final approval status.
+
+  - id: pending_or_in_approval
+    predicate: "PafStatus IN ('Pending', 'Approval')"
+    applies_when: pending or in-progress workflow questions
+    description: Restrict to submitted PAFs still moving through workflow.
+
+  - id: draft_paf
+    predicate: "PafStatus = 'Draft'"
+    applies_when: draft personnel action questions
+    description: Restrict to draft PAFs.
+
+  - id: denied_paf
+    predicate: "PafStatus = 'Denied'"
+    applies_when: rejected personnel action questions
+    description: Restrict to denied PAFs.
+
+  - id: approved_and_effective
+    predicate: "PafStatus = 'Final Approval' AND coalesce(PafEffectiveDateTime, PafEffectiveDate) <= now64(6)"
+    applies_when: approved changes that should already be effective by date
+    description: Restrict to final-approved PAFs whose effective timestamp/date has passed.
+
+  - id: future_effective
+    predicate: "coalesce(PafEffectiveDateTime, PafEffectiveDate) > now64(6)"
+    applies_when: future-dated personnel action questions
+    description: Restrict to PAF rows with a future effective date or timestamp.
+
+  - id: employee_status_change_fields
+    predicate: "FieldId IN ({field_codes})"            # bound param; never string-interpolated (D10)
+    resolve_via: "resolveValues(FieldId, 'employee status')"
+    applies_when: employee-status change questions
+    description: Restrict to PAF rows that change employee status. FieldId codes are CLIENT-DEFINED — runtime resolves the concept to a code set via resolve_via and binds it as a parameter; not a literal SQL predicate on its own.
+
+  - id: termination_change_fields
+    predicate: "FieldId IN ({field_codes})"            # bound param; never string-interpolated (D10)
+    resolve_via: "resolveValues(FieldId, 'termination date / last date worked / termination type / termination reason / rehire eligibility')"
+    applies_when: termination or rehire eligibility questions from PAF
+    description: Restrict to PAF rows related to termination details. FieldId codes are CLIENT-DEFINED — runtime resolves the concept to a code set via resolve_via and binds it; not a literal SQL predicate on its own.
+
+  - id: compensation_change_fields
+    predicate: "FieldId IN ({field_codes})"            # bound param; never string-interpolated (D10)
+    resolve_via: "resolveValues(FieldId, 'pay rate / annualized estimate / pay class / pay basis / pay type / pay frequency / processing schedule')"
+    applies_when: compensation or payroll setup change questions
+    description: Restrict to PAF rows related to compensation or payroll setup. FieldId codes are CLIENT-DEFINED — runtime resolves via resolve_via and binds; not a literal SQL predicate on its own.
+
+  - id: org_change_fields
+    predicate: "FieldId IN ({field_codes})"            # bound param; never string-interpolated (D10)
+    resolve_via: "resolveValues(FieldId, 'department / supervisor / title / position / work location')"
+    applies_when: department, supervisor, title, position, or work-location change questions
+    description: Restrict to PAF rows related to organization or position changes. FieldId codes are CLIENT-DEFINED — runtime resolves via resolve_via and binds; not a literal SQL predicate on its own.
+
+ambiguities:
+  - term: personnel_action
+    resolves_to: [ "COUNT(DISTINCT PafTransactionId)" ]
+    default: transaction_count
+    clarify_if: user asks for changed fields, field updates, or raw rows
+
+  - term: field_change
+    resolves_to: [ "COUNT(*) at the PAF row level" ]
+    default: changed_field_rows
+    clarify_if: user means whole personnel actions rather than individual changed fields
+
+  - term: approved_change
+    resolves_to: [ "PafStatus = 'Final Approval'" ]
+    default: final_approval
+    clarify_if: user needs only changes already effective as of today or also future-dated approvals
+
+  - term: current_employee_state
+    resolves_to: [ "employee table current-state columns" ]
+    default: employee_table_current_state
+    clarify_if: user wants proposed, pending, denied, historical, or future-dated PAF changes
+
+  - term: effective_date
+    resolves_to: [ PafEffectiveDate ]
+    default: paf_effective_date
+    clarify_if: same-day ordering or exact timestamp matters
+
+  - term: exact_effective_time
+    resolves_to: [ PafEffectiveDateTime ]
+    default: paf_effective_datetime
+    clarify_if: user only needs date-level grouping
+
+  - term: created_date
+    resolves_to: [ CreatedDate ]
+    default: created_event
+    clarify_if: user means effective date, modified date, or manager signoff date
+
+  - term: pending_changes
+    resolves_to: [ "PafStatus IN ('Pending', 'Approval')" ]
+    default: pending_or_in_approval
+    clarify_if: user wants drafts included or only final-approved future changes
+
+  - term: termination
+    resolves_to: [ "PAF rows whose FieldId/FieldLabel indicate termination-related fields" ]
+    default: termination_change_fields
+    clarify_if: user asks who is currently terminated, which should be resolved against employee.EmployeeStatus with rehire logic

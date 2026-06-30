@@ -1,0 +1,57 @@
+database: dbpcm_warehouse
+table: candidate_employment_history
+description: Candidate-provided prior employment history linked to an ATS application. Not verified internal employment history and not directly linked to EmployeeCode or CandidateId.
+
+grain: [ EmploymentId ]
+
+temporal:
+  dimensions: []
+  default_pin: null
+
+primary_key: [ EmploymentId ]
+
+join_keys:
+  - { column: ApplicationId, joins: applicant_tracking_application.ApplicationId, cardinality: N:1 }
+
+columns:
+  ClientCode: { type: Nullable(String), description: Client/company code. }
+  EmploymentId: { type: Nullable(Int32), description: Unique employment-history row identifier. }
+  ApplicationId: { type: Nullable(Int32), description: Application identifier; join through applicant_tracking_application. }
+  EmployerName: { type: Nullable(String), description: Candidate-provided employer name. }
+  EmployerStreetAddress: { type: Nullable(String), sensitive: true, description: Sensitive candidate-provided employer street address. }
+  EmployerCity: { type: Nullable(String), description: Employer city. }
+  EmployerState: { type: Nullable(String), description: Employer state. }
+  EmployerZipCode: { type: Nullable(String), description: Employer ZIP/postal code. }
+  EmployerCountry: { type: Nullable(String), description: Employer country. }
+  EmployerPhone: { type: Nullable(String), sensitive: true, description: Sensitive employer phone number. }
+  PreviousJobTitle: { type: Nullable(String), description: Candidate-provided previous job title. }
+  PreviousJobDuties: { type: Nullable(String), description: Candidate-provided previous job duties. }
+  PreviousSupervisor: { type: Nullable(String), description: Candidate-provided previous supervisor. }
+  ReasonLeft: { type: Nullable(String), description: Candidate-provided reason for leaving. }
+  CanContactEmployer:
+    type: Nullable(String)
+    observed_values: [ Yes, No ]
+    description: Whether the candidate says the employer may be contacted.
+  CurrentEmployer:
+    type: Nullable(String)
+    observed_values: [ Yes, No ]
+    description: Whether the candidate marked this as their current employer.
+  EmploymentStartDate: { type: Nullable(String), description: Candidate-provided employment start date; stored as String. }
+  EmploymentEndDate: { type: Nullable(String), description: Candidate-provided employment end date; stored as String. }
+
+measures:
+  employment_history_entries: { column: "*", agg: count, defined_over: "employment-history rows after application/candidate filters" }
+
+rules:
+  - { id: current_employer_rows, predicate: "CurrentEmployer = 'Yes'", applies_when: current prior-employer analysis, description: Restrict to rows marked as current employer. }
+  - { id: former_employer_rows, predicate: "CurrentEmployer = 'No'", applies_when: former-employer analysis, description: Restrict to rows not marked as current employer. }
+  - { id: can_contact_employer, predicate: "CanContactEmployer = 'Yes'", applies_when: employer-contact-permission analysis, description: Restrict to rows where employer contact is allowed. }
+  - { id: cannot_contact_employer, predicate: "CanContactEmployer = 'No'", applies_when: contact-restricted employer analysis, description: Restrict to rows where employer contact is not allowed. }
+  - { id: has_employment_start, predicate: "EmploymentStartDate IS NOT NULL", applies_when: employment-date analysis, description: Restrict to rows with a start date value. }
+  - { id: has_employment_end, predicate: "EmploymentEndDate IS NOT NULL", applies_when: employment-date analysis, description: Restrict to rows with an end date value. }
+
+ambiguities:
+  - { term: employee_work_history, resolves_to: [ "join employee -> applicant_tracking_application by EmployeeCode, pick the application with MAX(ApplicationDate) for that employee, then candidate_employment_history on its ApplicationId" ], default: latest_application_by_ApplicationDate, clarify_if: user wants all ATS work history across every application, or a specific application }
+  - { term: candidate_work_history, resolves_to: [ "candidate_employment_history rows joined through ApplicationId" ], default: application_linked_employment_rows, clarify_if: candidate has multiple applications and user does not specify which one }
+  - { term: current_employer, resolves_to: [ "CurrentEmployer = 'Yes' in candidate-provided work history" ], default: current_employer_rows, clarify_if: user means current Paycom employment status from employee table }
+  - { term: employment_dates, resolves_to: [ EmploymentStartDate, EmploymentEndDate ], default: candidate_provided_string_dates, clarify_if: "candidate-entered String dates with NO guaranteed format — parse via parseDateTimeBestEffortOrNull(...) (nulls unparseable values rather than erroring); chronological sorting/filtering is best-effort and may silently drop rows. Confirm before relying on date math." }

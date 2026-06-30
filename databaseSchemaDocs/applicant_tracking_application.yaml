@@ -1,0 +1,113 @@
+database: dbpcm_warehouse
+table: applicant_tracking_application
+description: Applicant Tracking application table. One row per candidate application, not one row per candidate. Use for application pipeline, status, offer workflow, source attribution, and hired-employee ATS linkage.
+
+grain: [ ApplicationId ]
+
+temporal:
+  dimensions:
+    - { name: application_event, role: event, date_col: ApplicationDate }
+    - { name: disposition_event, role: event, date_col: DispositionDate }
+    - { name: offer_sent_event, role: event, date_col: OfferLetterSentDate }
+    - { name: offer_response_event, role: event, date_col: OfferLetterAcceptedRejectedDate }
+    - { name: offer_created_event, role: event, date_col: OfferLetterCreatedOnDate }
+    - { name: offer_approval_event, role: event, date_col: OfferLetterApprovalDate }
+  default_pin: application_event
+
+primary_key: [ ApplicationId ]
+
+join_keys:
+  - { column: ApplicationId, joins: candidate_education.ApplicationId, cardinality: 1:N }
+  - { column: ApplicationId, joins: candidate_employment_history.ApplicationId, cardinality: 1:N }
+  - { column: EmployeeCode, joins: employee.EmployeeCode, cardinality: N:1 }
+
+columns:
+  ClientCode: { type: Nullable(String), description: Client/company code. }
+  ApplicationId: { type: Int32, description: Unique application identifier. }
+  ReferralSource: { type: Nullable(String), client_defined: true, description: Referral source named on the application (CLIENT-DEFINED; resolve via resolveValues(ReferralSource, <concept>)). }
+  ApplicationDate: { type: DateTime64(6), description: Date/time the application was started. }
+  Disposition: { type: Nullable(String), client_defined: true, description: Application outcome or disposition label (CLIENT-DEFINED; resolve via resolveValues(Disposition, <concept>)). }
+  DispositionDate: { type: Nullable(DateTime64(6)), description: Date/time the disposition last changed. }
+  WorkFlowGroupName: { type: Nullable(String), client_defined: true, description: Hiring workflow group (CLIENT-DEFINED; resolve via resolveValues(WorkFlowGroupName, <concept>)). }
+  CandidateId: { type: Nullable(Int32), description: Stable candidate identifier across applications. }
+  ApplicationSource: { type: Nullable(String), client_defined: true, description: Source channel for the application (CLIENT-DEFINED; resolve via resolveValues(ApplicationSource, <concept>)). }
+  ApplicantFirstName: { type: Nullable(String), description: Applicant first name. }
+  ApplicantLastName: { type: Nullable(String), description: Applicant last name. }
+  ApplicantPreferredFirstName: { type: Nullable(String), description: Applicant preferred first name. }
+  ApplicantPreferredLastName: { type: Nullable(String), description: Applicant preferred last name. }
+  ApplicantPrimaryPhone: { type: Nullable(String), sensitive: true, description: Sensitive applicant phone number. }
+  ApplicantSecondaryPhone: { type: Nullable(String), sensitive: true, description: Sensitive applicant secondary phone number. }
+  ApplicantEmailAddress: { type: Nullable(String), sensitive: true, description: Sensitive applicant email address. }
+  ApplicantBirthDate: { type: Nullable(DateTime64(6)), sensitive: true, description: Sensitive applicant birth date. }
+  ApplicantFullStreetAddress: { type: Nullable(String), sensitive: true, description: Sensitive applicant full street address. }
+  ApplicantStreetAddress1: { type: Nullable(String), sensitive: true, description: Sensitive applicant address line 1. }
+  ApplicantStreetAddress2: { type: Nullable(String), sensitive: true, description: Sensitive applicant address line 2. }
+  ApplicantCity: { type: Nullable(String), description: Applicant city. }
+  ApplicantState: { type: Nullable(String), description: Applicant state. }
+  ApplicantZipCode: { type: Nullable(String), description: Applicant ZIP/postal code. }
+  ApplicantCounty: { type: Nullable(String), description: Applicant county. }
+  ApplicationStatusEnum:
+    type: Nullable(String)
+    observed_values: [ Hired, Offered, Active, Rejected, Knocked Out, Unknown Status, Declined Offer ]
+    description: Current application status.
+  ApplicationType:
+    type: Nullable(String)
+    observed_values: [ Internal, External, Past Employee ]
+    description: Application category.
+  CompleteIncomplete:
+    type: Nullable(String)
+    observed_values: [ Complete, Incomplete ]
+    description: Whether the application is complete.
+  OfferLetterAcceptedRejectedDate: { type: Nullable(DateTime64(6)), description: Offer accepted/rejected timestamp. }
+  OfferLetterStatusEnum:
+    type: Nullable(String)
+    observed_values: [ Approved, Not Sent, No Offer Letter, Offer Approval Pending, Offer Expired, Offer Incomplete, Offer Rejected, Offer Sent, Offer Signed ]
+    description: Offer-letter workflow status.
+  OfferLetterSentDate: { type: Nullable(DateTime64(6)), description: Offer-letter sent timestamp. }
+  ApprovalStep: { type: Nullable(String), description: Approval workflow step. }
+  WorkFlowStep: { type: Nullable(String), description: Current workflow step. }
+  OfferLetterCreatedOnDate: { type: Nullable(DateTime64(6)), description: Offer-letter creation timestamp. }
+  OfferLetterApprovalDate: { type: Nullable(DateTime64(6)), description: Offer-letter approval timestamp. }
+  OfferVersion: { type: Nullable(String), description: Offer version. }
+  ApplicationJobWageStart: { type: Nullable(Decimal(18, 6)), unit: USD, description: Lower bound of application job wage range. }
+  ApplicationJobWageEnd: { type: Nullable(Decimal(18, 6)), unit: USD, description: Upper bound of application job wage range. }
+  HiringProcessStep: { type: Nullable(String), description: Hiring process step. }
+  UserAssignedToStep: { type: Nullable(String), description: User assigned to the current workflow step. }
+  DaysInOfferStatus: { type: Nullable(Int32), unit: days, description: Aging in current offer status. }
+  HoursInOfferStatus: { type: Nullable(Int32), unit: hours, description: Aging in current offer status. }
+  DaysInHiringStep: { type: Nullable(Int32), unit: days, description: Aging in current hiring step. }
+  HoursInHiringStep: { type: Nullable(Int32), unit: hours, description: Aging in current hiring step. }
+  MinutesInHiringStep: { type: Nullable(Int32), unit: minutes, description: Aging in current hiring step. }
+  HoursInNewHireQueue: { type: Nullable(Int32), unit: hours, description: Time in new-hire queue. }
+  DaysInNewHireQueue: { type: Nullable(Int32), unit: days, description: Time in new-hire queue. }
+  TotalOnboardingHours: { type: Nullable(Int32), unit: hours, description: Total onboarding hours. }
+  ApplicationPositionSeatCode: { type: Nullable(String), description: Position seat code captured on the application. }
+  ApplicationPositionSeatDescription: { type: Nullable(String), description: Position seat description captured on the application. }
+  EmployeeCode: { type: Nullable(String), description: Employee identifier when the application links to a hired/current employee. }
+
+measures:
+  application_count: { column: "*", agg: count, defined_over: "applications after temporal and status filters" }
+  candidate_count: { column: CandidateId, agg: count_distinct, defined_over: "applications with CandidateId after temporal and status filters" }
+  hired_application_count: { column: ApplicationId, agg: count_distinct, defined_over: "ApplicationStatusEnum = 'Hired'" }
+
+rules:
+  - { id: complete_applications, predicate: "CompleteIncomplete = 'Complete'", applies_when: completed application analysis, description: Restrict to completed applications. }
+  - { id: hired_applications, predicate: "ApplicationStatusEnum = 'Hired'", applies_when: hired application or conversion analysis, description: Restrict to applications marked hired. }
+  - { id: active_applications, predicate: "ApplicationStatusEnum = 'Active'", applies_when: active pipeline analysis, description: Restrict to active applications. }
+  - { id: rejected_applications, predicate: "ApplicationStatusEnum IN ('Rejected', 'Knocked Out')", applies_when: rejection analysis, description: Restrict to rejected/knocked-out applications. }
+  - { id: offered_applications, predicate: "ApplicationStatusEnum = 'Offered'", applies_when: offer-stage pipeline analysis, description: Restrict to offered applications. }
+  - { id: declined_offer_applications, predicate: "ApplicationStatusEnum = 'Declined Offer'", applies_when: declined-offer analysis, description: Restrict to declined-offer applications. }
+  - { id: external_applications, predicate: "ApplicationType = 'External'", applies_when: external applicant analysis, description: Restrict to external applications. }
+  - { id: internal_applications, predicate: "ApplicationType = 'Internal'", applies_when: internal applicant analysis, description: Restrict to internal applications. }
+  - { id: past_employee_applications, predicate: "ApplicationType = 'Past Employee'", applies_when: rehire/past-employee applicant analysis, description: Restrict to past-employee applications. }
+  - { id: offer_signed, predicate: "OfferLetterStatusEnum = 'Offer Signed'", applies_when: accepted/signed offer analysis, description: Restrict to signed offers. }
+  - { id: has_employee_link, predicate: "EmployeeCode IS NOT NULL", applies_when: hired-employee ATS linkage, description: Restrict to applications linked to an employee record. }
+
+ambiguities:
+  - { term: applicant_count, resolves_to: [ "COUNT(DISTINCT CandidateId)" ], default: candidate_count, clarify_if: user means application count rather than unique candidates }
+  - { term: application_count, resolves_to: [ "COUNT(*) or COUNT(DISTINCT ApplicationId)" ], default: application_count, clarify_if: user means unique candidates }
+  - { term: hire, resolves_to: [ "ApplicationStatusEnum = 'Hired'" ], default: hired_applications, clarify_if: user wants offer signed, employee-linked records, or current employee state }
+  - { term: submitted_application, resolves_to: [ "CompleteIncomplete = 'Complete'" ], default: complete_applications, clarify_if: user means started applications regardless of completion }
+  - { term: current_employee_state, resolves_to: [ employee ], default: employee_table_current_state, clarify_if: user wants ATS application state instead }
+  - { term: requisition_join, resolves_to: [ "no direct RequisitionId is exposed on applicant_tracking_application" ], default: unavailable_without_mapping, clarify_if: user asks for application-to-requisition conversion without a supplied mapping }
+

@@ -1,0 +1,81 @@
+database: dbpcm_warehouse
+table: applicant_tracking_requisition
+description: Applicant Tracking requisition table. One row per job requisition; use for job opening metadata, requisition status, posting windows, open positions, hires, recruiter, and hiring-manager context.
+
+grain: [ RequisitionId ]
+
+temporal:
+  dimensions:
+    - { name: posting_period, role: period, range: { start_col: RequisitionPostingStartDate, end_col: RequisitionPostingEndDate } }
+    - { name: filled_event, role: event, date_col: RequisitionPostingFilledDate }
+  default_pin: posting_period
+
+primary_key: [ RequisitionId ]
+
+# DATA LIMITATION: no foreign key links requisitions to applications, hires, or employees — there is
+# no RequisitionId on applicant_tracking_application. So application→requisition funnel analysis (apps
+# per req, fill rate, time-to-fill spanning posting→hire) is NOT possible without an external mapping.
+# RequisitionNumberOfHires is the only in-table hire signal. See the application_link ambiguity below.
+join_keys: []
+
+columns:
+  ClientCode: { type: Nullable(String), description: Client/company code. }
+  RequisitionId: { type: Int32, description: Unique requisition identifier. }
+  RequisitionStatusEnum:
+    type: Nullable(String)
+    observed_values: [ Posted, Denied, Draft, Filled, Closed ]
+    description: Current requisition workflow/status.
+  RequisitionPositionTitle: { type: Nullable(String), client_defined: true, description: Internal position title (CLIENT-DEFINED; resolve via resolveValues(RequisitionPositionTitle, <concept>)). }
+  RequisitionPositionCode: { type: Nullable(String), description: Position code. }
+  RequisitionPositionSeatCodes: { type: Nullable(String), description: Position seat codes associated with the requisition. }
+  RequisitionPositionSeatTitles: { type: Nullable(String), description: Position seat titles associated with the requisition. }
+  RequisitionJobTitle: { type: Nullable(String), client_defined: true, description: Job title (CLIENT-DEFINED; resolve via resolveValues(RequisitionJobTitle, <concept>)). }
+  RequisitionPublishedJobTitle: { type: Nullable(String), client_defined: true, description: Published job title shown externally (CLIENT-DEFINED; resolve via resolveValues(RequisitionPublishedJobTitle, <concept>)). }
+  RequisitionPositionType:
+    type: Nullable(String)
+    observed_values: [ Contractor, Full Time, Internship ]
+    description: Position type for the requisition.
+  RequisitionPostingStartDate: { type: Nullable(DateTime64(6)), description: Posting start date. }
+  RequisitionPostingEndDate: { type: Nullable(DateTime64(6)), description: Posting end date. }
+  RequisitionPostingFilledDate: { type: Nullable(DateTime64(6)), description: Date/time requisition was filled. }
+  RequisitionPositionLevelEnum:
+    type: Nullable(String)
+    observed_values: [ Entry, Experienced, Management, Senior ]
+    description: Position level.
+  RequisitionDepartmentCode: { type: Nullable(String), client_defined: true, description: Department code for the requisition (CLIENT-DEFINED; resolve via resolveValues(RequisitionDepartmentCode, <concept>)). }
+  RequisitionDepartmentDescription: { type: Nullable(String), client_defined: true, description: Department description for the requisition (CLIENT-DEFINED; resolve via resolveValues(RequisitionDepartmentDescription, <concept>)). }
+  RequisitionOpenPositions: { type: Nullable(String), description: "Remaining open positions; stored as String. Cast with toInt32OrNull(RequisitionOpenPositions) before numeric use — nulls non-numeric values rather than erroring." }
+  RequisitionNumberOfHires: { type: Nullable(Int32), description: Number of hires recorded against the requisition. }
+  RequisitionLocation: { type: Nullable(String), client_defined: true, description: Requisition location (CLIENT-DEFINED; resolve via resolveValues(RequisitionLocation, <concept>)). }
+  RequestTypeEnum:
+    type: Nullable(String)
+    observed_values: [ Seasonal, Replacement, Additional, Evergreen ]
+    description: Type of requisition request.
+  RequestReason: { type: Nullable(String), description: Reason for the requisition request. }
+  PrimaryRecruiter: { type: Nullable(String), description: Primary recruiter assigned to the requisition. }
+  HiringManagerUsername: { type: Nullable(String), description: Hiring manager username. }
+
+measures:
+  requisition_count: { column: RequisitionId, agg: count_distinct, defined_over: "requisitions after temporal and status filters" }
+  requisition_hires: { column: RequisitionNumberOfHires, agg: sum, defined_over: "requisitions after temporal and status filters" }
+
+rules:
+  - { id: posted_requisitions, predicate: "RequisitionStatusEnum = 'Posted'", applies_when: open/posted requisition analysis, description: Restrict to posted requisitions. }
+  - { id: filled_requisitions, predicate: "RequisitionStatusEnum = 'Filled'", applies_when: filled requisition analysis, description: Restrict to filled requisitions. }
+  - { id: closed_requisitions, predicate: "RequisitionStatusEnum = 'Closed'", applies_when: closed requisition analysis, description: Restrict to closed requisitions. }
+  - { id: draft_requisitions, predicate: "RequisitionStatusEnum = 'Draft'", applies_when: draft requisition analysis, description: Restrict to draft requisitions. }
+  - { id: denied_requisitions, predicate: "RequisitionStatusEnum = 'Denied'", applies_when: denied requisition analysis, description: Restrict to denied requisitions. }
+  - { id: active_postings, predicate: "RequisitionStatusEnum = 'Posted' AND (RequisitionPostingEndDate IS NULL OR RequisitionPostingEndDate >= now64(6))", applies_when: currently active posting analysis, description: Restrict to posted requisitions whose posting end date has not passed. }
+  - { id: requisitions_with_hires, predicate: "RequisitionNumberOfHires > 0", applies_when: requisitions with recorded hires, description: Restrict to requisitions with at least one hire. }
+  - { id: full_time_requisitions, predicate: "RequisitionPositionType = 'Full Time'", applies_when: full-time requisition analysis, description: Restrict to full-time requisitions. }
+  - { id: contractor_requisitions, predicate: "RequisitionPositionType = 'Contractor'", applies_when: contractor requisition analysis, description: Restrict to contractor requisitions. }
+  - { id: internship_requisitions, predicate: "RequisitionPositionType = 'Internship'", applies_when: internship requisition analysis, description: Restrict to internship requisitions. }
+
+ambiguities:
+  - { term: open_requisition, resolves_to: [ "RequisitionStatusEnum = 'Posted'" ], default: posted_requisitions, clarify_if: user means active by posting date, open positions > 0, or not filled/closed }
+  - { term: active_posting, resolves_to: [ "RequisitionStatusEnum = 'Posted' and posting end date has not passed" ], default: active_postings, clarify_if: user only means status Posted }
+  - { term: job_title, resolves_to: [ RequisitionPublishedJobTitle, RequisitionJobTitle, RequisitionPositionTitle ], default: RequisitionPublishedJobTitle, clarify_if: user wants internal title or position title }
+  - { term: open_positions, resolves_to: [ "cast RequisitionOpenPositions before numeric use" ], default: requisition_open_positions_string_cast, clarify_if: field contains non-numeric values or user needs exact requisition capacity logic }
+  - { term: hires, resolves_to: [ RequisitionNumberOfHires ], default: requisition_hires, clarify_if: user wants hired applications from the application table }
+  - { term: application_link, resolves_to: [ "no RequisitionId is exposed on applicant_tracking_application; requisitions cannot be joined to applications/hires without an external mapping" ], default: unavailable_without_mapping, clarify_if: user asks for applications per requisition, requisition fill rate, or time-to-fill spanning the application table }
+

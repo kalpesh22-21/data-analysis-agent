@@ -1,0 +1,119 @@
+database: dbpcm_warehouse
+table: performance_discussions
+description: Performance discussion workflow and form-detail table. Use for writeups, coaching or disciplinary discussions, workflow state, acknowledgments, monitoring periods, uploaded-document filenames, and field-level discussion responses.
+
+grain: []
+grain_verifiable: false   # no exposed unique key — the D43 COUNT(*)==COUNT(DISTINCT grain) conformance probe does not apply
+grain_note: >
+  Field-response-level rows. No reliable row-level natural key is exposed. Use DiscussionId for
+  discussion-level grouping (COUNT(DISTINCT DiscussionId)); multiple rows exist per DiscussionId
+  because field-level responses repeat. Logical analysis grain: one field-response row.
+
+temporal:
+  dimensions:
+    - { name: creation_event, role: event, date_col: CreationDate }
+    - { name: last_action_event, role: event, date_col: LastActionDate }
+    - { name: resolved_event, role: event, date_col: ResolvedDate }
+    - { name: employee_acknowledgment_event, role: event, date_col: EmployeeAcknowledgmentDate }
+    - { name: manager_approval_event, role: event, date_col: ManagerApprovalDate }
+    - { name: monitoring_end_event, role: event, date_col: MonitoringPeriodEndDate }
+  default_pin: creation_event
+
+primary_key: []
+primary_key_note: DiscussionId is the discussion-level identifier, but it is not row-unique.
+
+join_keys:
+  - { column: EmployeeCode, joins: employee.EmployeeCode, cardinality: N:1 }
+
+columns:
+  ClientCode: { type: Nullable(String), description: Client/company code. }
+  EmployeeCode: { type: String, description: Employee identifier; canonical join key to employee. }
+  DiscussionId: { type: Nullable(Int32), description: Discussion/form/workflow identifier. Group by this for discussion-level analysis. }
+  ApprovalNotes: { type: Nullable(String), sensitive: true, description: Approval or resolution notes. Sensitive workflow text. }
+  Approver: { type: Nullable(String), description: User who approved or resolved the discussion. }
+  CreatedBy: { type: Nullable(String), description: User who created the discussion. }
+  CreationDate: { type: Nullable(DateTime64(6)), description: Discussion creation timestamp. }
+  DiscussionNotes: { type: Nullable(String), sensitive: true, description: Discussion notes. Sensitive workflow text. }
+  DiscussionNotesUpdatedBy: { type: Nullable(String), description: User who last updated discussion notes. }
+  DiscussionReason: { type: Nullable(String), description: Reason for the discussion. }
+  DiscussionState:
+    type: Nullable(String)
+    values:
+      Draft: draft_not_submitted
+      Creator: with_creator
+      Employee Approval: awaiting_employee_approval
+      Eligibility Review: eligibility_review_stage
+      Accrual Review: accrual_review_stage
+      Human Resources: hr_review_stage
+      Final Approval: in_final_approval
+      Resolved: resolved_closed
+      Archived: archived
+    observed_values: [ Draft, Creator, Resolved, Archived, Final Approval, Employee Approval ]
+    description: Current workflow state of the discussion.
+  DiscussionTemplate: { type: Nullable(String), client_defined: true, description: Form/template used for the discussion (CLIENT-DEFINED; resolve via resolveValues(DiscussionTemplate, <concept>)). }
+  DiscussionType:
+    type: Nullable(String)
+    client_defined: true
+    observed_values: [ Verbal, 1 on 1, Manager Updates, Green Kudos, Exit Interview, Stay Interviews, Talent Acquisition, CRR Manager Shadow, New Hire Check In, Final Incident Summary - Involuntary Separation, Memo Of Conversation - Verbal, Corrective Action Form - Misconduct, Sales Performance Documentation, Corrective Action Form - Performance, Memo Of Conversation - Performance, Paycom Offboarding Interview, Corrective Action Form - Behavior, Performance Improvement Plan ]
+    description: Type/category of discussion. CLIENT-DEFINED (client-configured form types) — resolve concepts via resolveValues(DiscussionType, <concept>); observed_values is illustrative, not authoritative per client.
+  DocumentUploads: { type: Nullable(String), description: Uploaded document filenames only; not document contents. }
+  DocumentUploadsUpdatedBy: { type: Nullable(String), description: User who updated uploaded document metadata. }
+  EmployeeAcknowledgment:
+    type: Nullable(String)
+    observed_values: [ Declined, Acknowledgment, Individual Development Plan (initiator) ]
+    description: Employee acknowledgment state/text.
+  EmployeeAcknowledgmentDate: { type: Nullable(DateTime64(6)), description: Timestamp when employee acknowledged the discussion. }
+  EmployeeSignature: { type: Nullable(String), description: Employee signature or acknowledgment text. }
+  ExceptionPointThreshold: { type: Nullable(String), description: Exception-point threshold tier associated with the discussion. }
+  ExceptionPointTotal: { type: Nullable(String), description: "Employee exception-point total at discussion creation time; stored as String. Cast with toFloat64OrNull(ExceptionPointTotal) before numeric use — nulls non-numeric values rather than erroring." }
+  FieldAnswer: { type: Nullable(String), sensitive: true, description: Field-level answer captured on the discussion form. Sensitive form text. }
+  FieldCompletedBy: { type: Nullable(String), description: User or employee who completed the field-level answer. }
+  FieldDescription: { type: Nullable(String), description: Field-level prompt/description on the discussion form. }
+  LastActionDate: { type: Nullable(DateTime64(6)), description: Timestamp of most recent workflow action. }
+  LastModifiedBy: { type: Nullable(String), description: User who last modified the discussion. }
+  ManagerAcknowledgment:
+    type: Nullable(String)
+    observed_values: [ Acknowledgment, Declined, Individual Development Plan (initiator), Individual Development Plan (leader), Overridden ]
+    description: Manager acknowledgment state/text.
+  ManagerApprovalDate: { type: Nullable(DateTime64(6)), description: Timestamp when manager approved or resolved the discussion. }
+  ManagerSignature: { type: Nullable(String), description: Manager signature identifier or text. }
+  MonitoringPeriodDays: { type: Nullable(String), unit: days, description: "Monitoring-period length; stored as String. Cast with toInt32OrNull(MonitoringPeriodDays) before numeric use — nulls non-numeric values rather than erroring." }
+  MonitoringPeriodEndDate: { type: Nullable(DateTime64(6)), description: Monitoring-period end timestamp. }
+  ResolvedDate: { type: Nullable(DateTime64(6)), description: Resolution timestamp when discussion is resolved. }
+  SendBackNotes: { type: Nullable(String), sensitive: true, description: Notes entered when the discussion was sent back. Sensitive workflow text. }
+  WaitingOn: { type: Nullable(String), description: Current pending owner, approver, employee, group, or relationship. }
+
+measures:
+  discussion_count: { column: DiscussionId, agg: count_distinct, defined_over: "discussion rows after temporal, workflow-state, employee, and type filters" }
+  field_response_rows: { column: "*", agg: count, defined_over: "field-level rows after temporal, workflow-state, employee, and type filters" }
+
+rules:
+  - { id: resolved_discussions, predicate: "DiscussionState = 'Resolved'", applies_when: resolved discussion analysis, description: Restrict to resolved discussions. }
+  - { id: archived_discussions, predicate: "DiscussionState = 'Archived'", applies_when: archived discussion analysis, description: Restrict to archived discussions. }
+  - { id: final_approval_discussions, predicate: "DiscussionState = 'Final Approval'", applies_when: final approval workflow analysis, description: Restrict to discussions in final approval. }
+  - { id: employee_approval_discussions, predicate: "DiscussionState = 'Employee Approval'", applies_when: employee approval or acknowledgment workflow analysis, description: Restrict to discussions awaiting employee approval. }
+  - { id: draft_discussions, predicate: "DiscussionState = 'Draft'", applies_when: draft discussion analysis, description: Restrict to draft discussions. }
+  - { id: creator_discussions, predicate: "DiscussionState = 'Creator'", applies_when: creator workflow queue analysis, description: Restrict to discussions in creator workflow state. }
+  - { id: open_discussions, predicate: "DiscussionState IS NOT NULL AND DiscussionState NOT IN ('Resolved', 'Archived')", applies_when: open or in-flight discussion analysis, description: Restrict to discussions not resolved or archived. }
+  - { id: has_waiting_on, predicate: "WaitingOn IS NOT NULL AND WaitingOn != ''", applies_when: pending-owner workflow analysis, description: Restrict to discussions with a WaitingOn value. }
+  - { id: employee_acknowledged, predicate: "EmployeeAcknowledgment = 'Acknowledgment' OR EmployeeAcknowledgmentDate IS NOT NULL", applies_when: employee acknowledgment analysis, description: Restrict to discussions with employee acknowledgment evidence. }
+  - { id: employee_declined_acknowledgment, predicate: "EmployeeAcknowledgment = 'Declined'", applies_when: declined employee acknowledgment analysis, description: Restrict to employee-declined acknowledgment rows. }
+  - { id: manager_acknowledged, predicate: "ManagerAcknowledgment = 'Acknowledgment' OR ManagerApprovalDate IS NOT NULL", applies_when: manager acknowledgment or approval analysis, description: Restrict to discussions with manager acknowledgment/approval evidence. }
+  - { id: manager_declined_acknowledgment, predicate: "ManagerAcknowledgment = 'Declined'", applies_when: declined manager acknowledgment analysis, description: Restrict to manager-declined acknowledgment rows. }
+  - { id: active_monitoring_period, predicate: "MonitoringPeriodEndDate IS NOT NULL AND MonitoringPeriodEndDate >= now64(6)", applies_when: active monitoring-period analysis, description: Restrict to discussions whose monitoring end date has not passed. }
+  - { id: has_document_uploads, predicate: "DocumentUploads IS NOT NULL AND DocumentUploads != ''", applies_when: uploaded-document filename analysis, description: Restrict to rows with uploaded document filenames. }
+  - { id: has_exception_points, predicate: "ExceptionPointTotal IS NOT NULL OR ExceptionPointThreshold IS NOT NULL", applies_when: exception-point-triggered discussion analysis, description: Restrict to discussions with exception-point fields populated. }
+  - { id: corrective_action_discussions, predicate: "DiscussionType IN ('Corrective Action Form - Misconduct', 'Corrective Action Form - Performance', 'Corrective Action Form - Behavior')", applies_when: corrective action analysis, description: Restrict to corrective action discussion types. }
+  - { id: performance_improvement_plan_discussions, predicate: "DiscussionType = 'Performance Improvement Plan'", applies_when: PIP analysis, description: Restrict to performance improvement plan discussions. }
+  - { id: field_level_rows, predicate: "FieldDescription IS NOT NULL OR FieldAnswer IS NOT NULL", applies_when: form field response analysis, description: Restrict to rows with field-level form detail. }
+
+ambiguities:
+  - { term: discussion_count, resolves_to: [ "COUNT(DISTINCT DiscussionId)" ], default: discussion_count, clarify_if: user asks for field-level rows or form answers }
+  - { term: row_count, resolves_to: [ "COUNT(*) at field-response row grain" ], default: field_response_rows, clarify_if: user means distinct discussions }
+  - { term: writeup, resolves_to: [ DiscussionId ], default: discussion_level_grouping, clarify_if: user means corrective action only, PIP only, or all performance discussions }
+  - { term: open_discussion, resolves_to: [ "DiscussionState NOT IN ('Resolved', 'Archived')" ], default: open_discussions, clarify_if: user wants only a specific workflow state such as Employee Approval or Final Approval }
+  - { term: resolved, resolves_to: [ "DiscussionState = 'Resolved'", ResolvedDate ], default: resolved_discussions, clarify_if: user means manager-approved, final-approved, or archived }
+  - { term: acknowledgment, resolves_to: [ EmployeeAcknowledgment, EmployeeAcknowledgmentDate, ManagerAcknowledgment, ManagerApprovalDate ], default: employee_and_manager_acknowledgment_fields, clarify_if: user wants only employee acknowledgment or only manager acknowledgment }
+  - { term: monitoring_period, resolves_to: [ MonitoringPeriodDays, MonitoringPeriodEndDate ], default: monitoring_period_fields, clarify_if: user wants active monitoring periods only }
+  - { term: uploaded_documents, resolves_to: [ DocumentUploads ], default: uploaded_filenames_only, clarify_if: user expects document contents, which are not stored in this table }
+  - { term: current_employee_state, resolves_to: [ employee ], default: employee_table_current_state, clarify_if: user wants discussion workflow state instead }
