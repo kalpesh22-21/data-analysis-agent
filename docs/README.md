@@ -25,6 +25,7 @@ fundamentals of OpenAI's in-house data agent but adapted for a **curated** wareh
 
 - [decisions/DECISIONS.md](decisions/DECISIONS.md) — locked decisions, dated, with rationale.
 - [decisions/OPEN-QUESTIONS.md](decisions/OPEN-QUESTIONS.md) — forks still open.
+- [decisions/TRACEABILITY.md](decisions/TRACEABILITY.md) — decision → invariant → test matrix; the enforcement registry. A decision is not done until its tagged test is green in CI.
 
 ## Conventions
 

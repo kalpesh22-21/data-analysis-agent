@@ -8,6 +8,11 @@ pyramid, where the top layer is a **spec-conformance suite**: a full stack in Do
 the real UI by **Playwright (MCP)**, asserting the observable behaviors *and* the
 security/correctness invariants the spec promises.
 
+The **enforcement registry** — mapping each hard-invariant decision to its invariant statement, test
+layer, stable test slug, and conformance scenario — lives in
+[decisions/TRACEABILITY.md](decisions/TRACEABILITY.md). CI fails if any hard-invariant decision has
+no green tagged test.
+
 ## Layers
 
 ```

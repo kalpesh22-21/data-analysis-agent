@@ -513,6 +513,40 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   path in [06](../06-security-and-governance.md). Resolves the parse-failure half of review risk #8;
   the eight review risks are now all dispositioned.
 
+## Delivery / sequencing
+- **D68 (locked, 2026-06-30).** **Three-phase delivery with a red-burndown conformance harness from day one.**
+
+  ### Phase definitions and exit criteria
+
+  **Phase 0 — Walking skeleton (raw-loop alpha).**
+  Scope: `sqlglot` parser (D52/D62) → ClickHouse MCP data plane (D1/D57/D63/D64) → Couchbase session store (D22/D44/D45) → raw agent loop with injected scope (D5) + minimal UI with progress streaming (D61) + Phoenix tracing (D23/D24/D25). Scope-enforced, transparent, **raw-loop-only** SQL agent. No blueprints, no knowledge plane reads, no learning loop.
+  - **First brick:** the `sqlglot` parser is built and TDD'd first — it is the shared dependency of five consumers (D57 live scope, D44 provenance, D48 dedup, D35 template rewrite, D64 scratch isolation) and is pure logic with no infrastructure prerequisite. Nothing else starts until its unit test suite (Layer 1) is green.
+  - **Exit criteria:** all Phase-0 conformance scenarios green (scope denial, mid-session scope narrowing, parser fail-closed, observability + PII, pause/resume durability, budget-cap pause); Layer 1 + Layer 2 MCP + session-store tests passing in CI; Phoenix traces reachable and PII-clean on a real turn.
+
+  **Phase 1 — Blueprints + D56 verify gate (the launchable product).**
+  Scope: knowledge plane reads (`searchBlueprints`, `getBlueprint`, `runBlueprint`, `searchKnowledge`), the full D56 verification gate, composite blueprints (D59), retrieval pipeline (D7/D8), grain declaration (D37a/D40/D65), `resolveValues` (D66/D67), D53 catalog CI, review inbox UI, and all remaining Layer 3 conformance scenarios. Runs alongside **Track B** (see below).
+  - **Track B (parallel) — learning-loop write router:** D26–D31 write router stages, D58 leakage gate (human pre-gate for `global_knowledge`; sampled detection for blueprints), D48 hard-dedup with single-writer-per-key, D51 provenance/audit store, `LEARNING_ENABLED=false` kill-switch (D58c), review-inbox ingestion, D53 `schema_edit` PR bot. Track B is fully offline/decoupled from the request path and has no Phase-0 prerequisites beyond the session store and Redis.
+  - **Exit criteria (gates first release):** ALL Layer 3 spec-conformance scenarios green (the full ~13-scenario suite from [11-testing.md](../11-testing.md) §Layer 3) + Layers 1–2 green for every shipped module. This is the full-conformance gate — there is no "ship request path, learn later" escape hatch (see tension note below).
+
+  **Phase 2 — Drift defense fast-follow (committed, not open backlog).**
+  Scope: D43 three-probe drift attestation (result grain-integrity scheduler, catalog-vs-warehouse conformance probe, rule-semantics currency check) + `silent_eligible` freshness predicate + D37b static authoring grain gate. Supersedes D12's unconditional silent path. Adds authoring-time and periodic defense on top of the Phase 1 runtime gate (D56) — defense in depth, not a silent-path toggle.
+  - **Exit criteria:** drift probe tests green in CI; `drift_status` correctly stamps and demotes blueprints; static authoring gate rejects wrong-grain blueprints before storage.
+
+  ### Full-conformance gate commitment
+  The full Layer 3 spec-conformance suite (all ~13 scenarios in [11-testing.md](../11-testing.md) §Layer 3) **must be green to gate the first release** — not just a security subset. Rationale: three of the 13 scenarios directly exercise the learning loop (`correction→learning`, `knowledge human-gate`, `LEARNING_ENABLED=false`), so "ship request path, learn later" would leave those scenarios permanently red and the release blocked. The learning loop is not Phase-2 cleanup — it is a Phase-1 parallel track with its own exit criterion.
+
+  ### Parallel learning-loop commitment
+  Track B (the offline learning-loop write router) runs concurrently with Phase 1's request-path work. It is fully decoupled from the live request path (D1: data plane vs. knowledge plane; D26: two processes) and can be built, tested with real stores (Layer 2: learning loop vs. neo4j/Redis), and wired without blocking or blocking the Phase-1 request-path work. The shared enabling components (Couchbase session store, Redis Streams D30, neo4j) are all Phase-0 or early Phase-1 deliverables that Track B can consume as they land.
+
+  ### Accepted tension + red-burndown mitigation
+  Tension: "full conformance gates release" + "learning loop in parallel" means Track B must be substantially complete before the first release, even though it is logically a background/offline concern. There is no ship-first-learn-later escape.
+  Mitigation: stand up the full Layer 3 conformance harness (Docker stack + Playwright MCP + all ~13 scenarios) in **Phase 0 as a red burndown** — every scenario is written as a failing test from day one; each feature delivery flips its scenario green; the burndown chart is the shared definition of launch-ready and the alignment artifact for the whole team. This makes the tension visible and tracked rather than discovered late.
+
+  ### sqlglot as Phase-0 first brick
+  `sqlglot` (D62) is chosen over any other parser start point because it is: (a) pure Python logic with zero infrastructure dependency; (b) the shared substrate for five hard-invariant consumers (D57 scope enforcement, D44 provenance/replay, D48 canonical dedup key, D35 template rewrite, D64 scratch isolation); (c) TDD-able immediately with adversarial inputs; and (d) a parse failure in any of those consumers produces a security or correctness consequence (fail-closed / fail-soft / fail-to-review per D52), so getting the fail-behavior tests green first means every later consumer inherits a tested safety net.
+
+  Cross-references: D1, D5, D7, D8, D13, D22, D23, D24, D25, D26–D31, D35, D37, D40, D42, D43, D44, D45, D46, D47, D48, D51, D52, D53, D56, D57, D58, D59, D61, D62, D63, D64, D65, D66, D67.
+
 ## Testing
 - **D64 (locked, 2026-06-30).** **Four-layer test strategy with an automated spec-conformance suite.**
   Because nearly every locked decision is a **hard invariant** (D56 no-silent, D57 scope enforcement,
@@ -533,3 +567,49 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   `system.query_log.columns` oracle runs as a parser-accuracy job tracking the D63 false-reject rate.
   **Sequencing:** Layer-1/2 units can be built per-module as code lands; Layers 3–4 need the runtime +
   UI to exist (Phase-0 build). Adds [11-testing.md](../11-testing.md) as a chapter.
+
+- **D69 (locked, 2026-06-30).** **Column-provenance extraction contract — five edge-case rules
+  (resolves OQ-1..OQ-5 from test-plans/column-provenance-extraction.md).**
+
+  **(OQ-1) Lambda / higher-order bodies.** Columns referenced inside lambda bodies (e.g.
+  `arrayMap(x -> x * Amount, ...)`) ARE part of the USES set. If `sqlglot` (D62) cannot prove it
+  walked the lambda body — e.g. `Amount` is absent from the extracted set even though the lambda
+  body references it — the extractor MUST raise `ProvenanceExtractionError`. No silent skip is
+  permitted. Rationale: identical to D63's general fail-closed rule — a silently skipped lambda
+  body is an under-extraction, and under-extraction is a security gap. The implementer must verify
+  sqlglot's lambda-walk behavior empirically; if it silently drops body columns, pre-normalize or
+  treat any lambda-bearing query as a parse failure until coverage is confirmed.
+
+  **(OQ-2) `SELECT *` expansion.** `SELECT *` is expanded to ALL columns of each referenced table
+  via the catalog schema. The query passes only if every expanded column ∈ scope; if any expanded
+  column is out of scope the query is rejected. If a referenced table is not in the catalog schema
+  (columns cannot be enumerated) → fail-closed / reject. Rationale: scope is column-level (D57);
+  the engine does NOT strip columns (role-pushdown option 2b was rejected), so any weaker check
+  (e.g. representative or ID-column-only) would under-gate and could leak columns such as
+  `gross_pay`. Expanding via the catalog preserves "referenced columns ⊄ scope ⇒ reject" (D57)
+  intact for the star case.
+
+  **(OQ-3) Canonical USES pair shape.** The canonical USES pair is FULLY-QUALIFIED:
+  `(database.table, column)` — a three-part granularity. Scope expressions and comparisons are
+  at the same three-part granularity. Rationale: disambiguates warehouse vs. scratch (D64) vs.
+  cross-database references; prevents bare-name namespace collisions where two databases share a
+  table name. The catalog schema dict fed to `qualify_columns` must therefore key tables at
+  `database.table` granularity, and the scope vector injected by D5 must express allowed columns
+  as `database.table.column` triples.
+
+  **(OQ-4) Scratch table column qualification.** Scratch tables (`scratch.s_<sessionId>_<file>`,
+  D64) are NOT column-scope-checked — they are session-gated only via the D64 `s_<sessionId>_*`
+  name-match. Column references against scratch tables are accepted without catalog qualification
+  (scratch tables are not in the Semantic Catalog; their schema is user-supplied at upload time).
+  The session-ID boundary is the gate for scratch; column scope enforcement applies only to
+  warehouse tables. This is consistent with D64's statement that scratch isolation is a session
+  boundary, stacked with but orthogonal to the column boundary.
+
+  **(OQ-5) EXPLAIN queries.** `extract_column_provenance` is NEVER called on EXPLAIN queries.
+  This is a **caller precondition**: the MCP (and any other D52 consumer) must strip or gate
+  EXPLAIN statements before invoking the extractor. The precondition is documented and enforced
+  at the call site; the extractor does not need to handle EXPLAIN internally. Rationale: EXPLAIN
+  is a distinct code path (`explainQuery` tool) and is not a `runQuery` target; adding an
+  internal EXPLAIN handler would obscure the caller contract and create dead code.
+
+  Cross-references: D44, D52, D57, D62, D63, D64.
