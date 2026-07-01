@@ -53,13 +53,20 @@ def translate_tool_spec(tool: MCPToolSpec) -> dict[str, Any]:
     }
 
 
-async def fetch_function_schemas(mcp_client: MCPClient) -> list[dict[str, Any]]:
+async def fetch_function_schemas(
+    mcp_client: MCPClient, *, jwt: str, session_id: str
+) -> list[dict[str, Any]]:
     """Fetch `list_tools()` from *mcp_client*, translate, and append `askUser`.
 
-    No caching here — see `ToolSchemaCache` for the cached/TTL'd variant used
-    at runtime startup.
+    *jwt*/*session_id* are required because the live MCP authenticates every
+    request, including `tools/list` — but the tool catalogue itself is
+    scope-INDEPENDENT (D5-safe: no credential ever appears in the returned
+    schemas, only in the outbound transport headers `list_tools` attaches).
+
+    No caching here — see `ToolSchemaCache` for the cached variant used at
+    runtime.
     """
-    tools = await mcp_client.list_tools()
+    tools = await mcp_client.list_tools(jwt=jwt, session_id=session_id)
     schemas = [translate_tool_spec(tool) for tool in tools]
     schemas.append(ASK_USER_TOOL_SCHEMA)
     return schemas
@@ -71,13 +78,30 @@ class ToolSchemaCache:
     Startup dependency (design §11 sub-decision C): the first `get_schemas()`
     call requires the MCP to be reachable. Pass B's composition root decides
     the local-dev fallback behavior (e.g. cache-on-disk) — out of scope here.
+
+    Lazy-per-turn-with-cache (2026-07-01 fix): `get_schemas` takes the
+    CURRENT turn's `jwt`/`session_id` because the live MCP requires them on
+    every request, including `tools/list` — there is no anonymous/startup-time
+    introspection call available. But the tool catalogue itself never varies
+    by scope (every principal sees the same 6 tools; only per-call *results*
+    are scope-filtered by the MCP), so the cache is still keyed on nothing but
+    "has a fetch ever succeeded": the FIRST successful `get_schemas()` call —
+    made with whichever turn's credentials happens to trigger it — populates
+    `self._cache` for every subsequent call, turn, session, and column scope,
+    until an explicit `force_reload=True`. Credentials are used ONLY to
+    authenticate that one fetch; they are never retained or reflected in the
+    cached schemas (D5).
     """
 
     def __init__(self, mcp_client: MCPClient) -> None:
         self._mcp_client = mcp_client
         self._cache: list[dict[str, Any]] | None = None
 
-    async def get_schemas(self, *, force_reload: bool = False) -> list[dict[str, Any]]:
+    async def get_schemas(
+        self, *, jwt: str, session_id: str, force_reload: bool = False
+    ) -> list[dict[str, Any]]:
         if self._cache is None or force_reload:
-            self._cache = await fetch_function_schemas(self._mcp_client)
+            self._cache = await fetch_function_schemas(
+                self._mcp_client, jwt=jwt, session_id=session_id
+            )
         return self._cache

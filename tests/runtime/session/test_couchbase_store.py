@@ -35,10 +35,18 @@ async def test_create_and_load_session_round_trips(settings: RuntimeSettings) ->
 
 
 async def test_real_cas_race(settings: RuntimeSettings) -> None:
-    """Confirms real Couchbase CAS semantics reject a losing concurrent resume."""
+    """D45 exactly-once against real Couchbase: two concurrent resumes over one
+    checkpoint — EXACTLY ONE wins, the loser is rejected. The loser may raise
+    either `CASMismatchError` (they truly interleaved and the stale CAS was
+    caught) or `AlreadyConsumedError` (the winner committed first, so the loser
+    re-read an already-consumed checkpoint). Both outcomes preserve exactly-once;
+    the invariant under test is "one winner, one rejection", not the exact type.
+    """
+    import asyncio
+
     from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
     from data_agent.runtime.session.models import PauseCheckpoint
-    from data_agent.runtime.session.store import CASMismatchError
+    from data_agent.runtime.session.store import AlreadyConsumedError, CASMismatchError
 
     store = CouchbaseSessionStore(settings)
     checkpoint = PauseCheckpoint(
@@ -52,6 +60,13 @@ async def test_real_cas_race(settings: RuntimeSettings) -> None:
     _, cas_a = await store.get_session_with_cas("layer2-sess-2")
     _, cas_b = await store.get_session_with_cas("layer2-sess-2")
 
-    await store.resume_checkpoint("layer2-sess-2", cas_a, "Sales")
-    with pytest.raises(CASMismatchError):
-        await store.resume_checkpoint("layer2-sess-2", cas_b, "Engineering")
+    results = await asyncio.gather(
+        store.resume_checkpoint("layer2-sess-2", cas_a, "Sales"),
+        store.resume_checkpoint("layer2-sess-2", cas_b, "Engineering"),
+        return_exceptions=True,
+    )
+    successes = [r for r in results if not isinstance(r, Exception)]
+    failures = [r for r in results if isinstance(r, Exception)]
+    assert len(successes) == 1, f"exactly one resume must win; got {results!r}"
+    assert len(failures) == 1, f"exactly one resume must be rejected; got {results!r}"
+    assert isinstance(failures[0], (AlreadyConsumedError, CASMismatchError)), failures[0]

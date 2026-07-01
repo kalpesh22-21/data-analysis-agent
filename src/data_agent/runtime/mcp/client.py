@@ -64,6 +64,16 @@ class MCPClient(Protocol):
         """
         ...
 
-    async def list_tools(self) -> list[MCPToolSpec]:
-        """Return the live MCP's tool catalogue (for `mcp/tool_schema.py` to translate)."""
+    async def list_tools(self, *, jwt: str, session_id: str) -> list[MCPToolSpec]:
+        """Return the live MCP's tool catalogue (for `mcp/tool_schema.py` to translate).
+
+        The live MCP requires a valid Bearer JWT on EVERY request, including
+        `tools/list` (no anonymous introspection) — so *jwt*/*session_id* are
+        threaded through here exactly like `call_tool`, even though the
+        resulting tool catalogue itself is scope-INDEPENDENT (every caller
+        sees the same 6 tools regardless of column scope; only per-call
+        results are scope-filtered). Callers that want to avoid repeating
+        this fetch on every turn should cache the result — see
+        `mcp/tool_schema.py::ToolSchemaCache`.
+        """
         ...

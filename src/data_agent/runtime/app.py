@@ -204,6 +204,16 @@ def create_app(
     # `loop_paused_ask_user`'s `question` payload specifically).
     _tracing_observer = tracing.guardrail_observer(tracer)
 
+    async def _tools_provider(credentials: RuntimeCredentials) -> list[dict[str, Any]]:
+        # The live MCP authenticates tools/list too (no anonymous
+        # introspection) — thread this turn's credentials through, but the
+        # catalogue itself is scope-independent and cached by
+        # ToolSchemaCache after the first successful fetch (see its
+        # docstring).
+        return await tool_schema_cache.get_schemas(
+            jwt=credentials.jwt, session_id=credentials.session_id
+        )
+
     def _build_agent_loop(observer: ToolObserver) -> AgentLoop:
         dispatcher = ToolDispatcher(
             mcp_client,
@@ -217,7 +227,7 @@ def create_app(
             tool_dispatcher=dispatcher,
             context_assembler=context_assembler,
             session_store=session_store,
-            tools_provider=tool_schema_cache.get_schemas,
+            tools_provider=_tools_provider,
             max_loop_iterations=settings.max_loop_iterations,
             max_wall_clock_seconds=settings.max_wall_clock_seconds,
             max_budget_windows=settings.max_budget_windows,

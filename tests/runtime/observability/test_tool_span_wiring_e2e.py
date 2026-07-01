@@ -152,7 +152,7 @@ async def test_ask_user_question_never_appears_in_any_span_attribute() -> None:
         tool_dispatcher=dispatcher,
         context_assembler=assembler,
         session_store=store,
-        tools_provider=lambda: _tools_provider(),
+        tools_provider=_tools_provider,
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
         max_budget_windows=3,
@@ -174,7 +174,7 @@ async def test_ask_user_question_never_appears_in_any_span_attribute() -> None:
             assert PII_QUESTION not in str(value)
 
 
-async def _tools_provider() -> list[dict]:
+async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
     return [
         {
             "type": "function",

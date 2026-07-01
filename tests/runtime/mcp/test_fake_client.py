@@ -51,5 +51,13 @@ async def test_calls_are_recorded_with_credentials() -> None:
 async def test_list_tools_returns_configured_specs() -> None:
     specs = [MCPToolSpec(name="listDatabases", description="d", input_schema={"type": "object"})]
     client = FakeMCPClient(tools=specs)
-    result = await client.list_tools()
+    result = await client.list_tools(jwt="tok", session_id="s1")
     assert result == specs
+
+
+async def test_list_tools_records_credentials() -> None:
+    client = FakeMCPClient(tools=[])
+    await client.list_tools(jwt="secret-jwt", session_id="sess-9")
+    assert len(client.list_tools_calls) == 1
+    assert client.list_tools_calls[0].jwt == "secret-jwt"
+    assert client.list_tools_calls[0].session_id == "sess-9"

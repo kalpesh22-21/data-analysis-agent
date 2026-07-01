@@ -44,7 +44,7 @@ TOOLS_SCHEMA = [
 ]
 
 
-async def _tools_provider() -> list[dict]:
+async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
     return list(TOOLS_SCHEMA)
 
 

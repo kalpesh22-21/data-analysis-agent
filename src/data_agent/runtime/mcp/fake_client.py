@@ -10,6 +10,12 @@ Every call is recorded in `self.calls` (tool_name, args, jwt, session_id) so
 tests can assert the credential-injection boundary (D5): the JWT/session_id
 DID reach this transport boundary, even though they never appear in any
 `ToolResult`/`TrailEntry`/model-facing structure produced downstream.
+
+`list_tools` also requires `jwt`/`session_id` keyword arguments (mirroring
+the real MCP, which authenticates every request including `tools/list`) —
+each call is recorded in `self.list_tools_calls`, but the returned tool
+catalogue itself never varies by credentials (it is scope-independent, like
+the real MCP's).
 """
 
 from __future__ import annotations
@@ -28,6 +34,12 @@ class RecordedCall:
     session_id: str
 
 
+@dataclass(frozen=True)
+class RecordedListToolsCall:
+    jwt: str
+    session_id: str
+
+
 class FakeMCPClient:
     """Layer-1 `MCPClient` double with scripted, ordered responses per tool."""
 
@@ -39,6 +51,7 @@ class FakeMCPClient:
         self._scripted: dict[str, list[Any]] = {k: list(v) for k, v in (scripted or {}).items()}
         self._tools = list(tools) if tools is not None else []
         self.calls: list[RecordedCall] = []
+        self.list_tools_calls: list[RecordedListToolsCall] = []
 
     async def call_tool(
         self,
@@ -61,5 +74,6 @@ class FakeMCPClient:
             raise response
         return response
 
-    async def list_tools(self) -> list[MCPToolSpec]:
+    async def list_tools(self, *, jwt: str, session_id: str) -> list[MCPToolSpec]:
+        self.list_tools_calls.append(RecordedListToolsCall(jwt=jwt, session_id=session_id))
         return list(self._tools)

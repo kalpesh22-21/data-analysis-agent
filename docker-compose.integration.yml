@@ -1,0 +1,107 @@
+# Layer-2 integration stack: real ClickHouse (seeded HR warehouse) + token IdP + the
+# D83-enabled ClickHouse MCP. Lets the skip-guarded runtime integration tests run against
+# real infra instead of fakes. DEV/TEST only (plain HTTP, ephemeral token-signing key).
+#
+# Usage:
+#   docker compose -f docker-compose.integration.yml up -d --build
+#   MCP_TEST_URL=http://localhost:18090/mcp uv run pytest tests/integration -v
+#   docker compose -f docker-compose.integration.yml down -v
+#
+# The token/mcp images are BUILT from the clickhouse-api repo (../clickhouse-api).
+name: data-agent-l2
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: l2-ch
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    environment:
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"
+    volumes:
+      # HR warehouse seed (this repo owns the Semantic Catalog it matches).
+      - ./docker/clickhouse-init:/docker-entrypoint-initdb.d:ro
+      # Register the SQL_ custom-settings prefix so the MCP's SQL_tenant setting is accepted.
+      - /Users/kalpeshmulye/Development/clickhouse-api/docker/clickhouse-config/custom-settings.xml:/etc/clickhouse-server/config.d/custom-settings.xml:ro
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--host", "localhost", "--query", "SELECT 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  token:
+    build:
+      context: /Users/kalpeshmulye/Development/clickhouse-api
+      dockerfile: Dockerfile
+    container_name: l2-token
+    environment:
+      MODE: "token"
+      TOKEN_ISSUER: "http://token:8000/"
+      TOKEN_AUDIENCE: "clickhouse-api"
+      TOKEN_TTL_SECONDS: "3600"
+      TOKEN_ISSUER_API_KEY: "issuer-key-abc123"
+      TOKEN_DEV_MODE: "true"
+      APP_PORT: "8000"
+      LOG_LEVEL: "INFO"
+    ports:
+      - "19000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  mcp:
+    build:
+      context: /Users/kalpeshmulye/Development/clickhouse-api
+      dockerfile: Dockerfile
+    container_name: l2-mcp
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      token: { condition: service_healthy }
+    environment:
+      MODE: "mcp"
+      MCP_TRANSPORT: "http"
+      MCP_PORT: "8000"
+      MCP_PATH: "/mcp"
+      CLICKHOUSE_HOST: "clickhouse"
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_SECURE: "false"
+      CLICKHOUSE_USER: "default"
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DATABASE: "dbpcm_warehouse"
+      OIDC_JWKS_URL: "http://token:8000/.well-known/jwks.json"
+      OIDC_ISSUER: "http://token:8000/"
+      OIDC_AUDIENCE: "clickhouse-api"
+      API_KEY: "test-key-abc123"
+      ALLOWED_DATABASES: "*"
+      LOG_LEVEL: "INFO"
+    ports:
+      - "18090:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # Session store (D22/D44/D45). Cluster/bucket/collection init is done out-of-band
+  # by scripts/couchbase-init.sh after the node reports healthy (Couchbase init is
+  # not fully declarative in the base image).
+  couchbase:
+    image: couchbase/server:7.6.5
+    container_name: l2-cb
+    ports:
+      - "8091:8091"   # admin/REST
+      - "8093:8093"   # query
+      - "11210:11210" # KV
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8091/pools"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s

@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Data Agent — Phase 0</title>
+<style>
+  :root {
+    --color-bg: #0f1117;
+    --color-surface: #171a23;
+    --color-surface-2: #1f2330;
+    --color-border: #2a2f3d;
+    --color-text: #e6e8ee;
+    --color-text-dim: #9aa1b2;
+    --color-accent: #5b8cff;
+    --color-accent-text: #ffffff;
+    --color-error-bg: #3a1c1c;
+    --color-error-border: #b33a3a;
+    --color-error-text: #ffb4b4;
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --radius: 8px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--color-bg);
+    color: var(--color-text);
+    display: flex;
+    justify-content: center;
+    padding: var(--space-5);
+  }
+
+  main {
+    width: 100%;
+    max-width: 720px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  h1 {
+    font-size: 1.25rem;
+    margin: 0;
+  }
+
+  .session-line {
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+  }
+
+  form#message-form {
+    display: flex;
+    gap: var(--space-2);
+  }
+
+  input[type="text"] {
+    flex: 1;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    color: var(--color-text);
+    padding: var(--space-3);
+    font-size: 1rem;
+  }
+
+  input[type="text"]:focus {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  button {
+    background: var(--color-accent);
+    color: var(--color-accent-text);
+    border: none;
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
+    font-size: 1rem;
+    cursor: pointer;
+  }
+
+  button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  button:focus-visible,
+  input:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  section {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-4);
+  }
+
+  section h2 {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-dim);
+    margin: 0 0 var(--space-3) 0;
+  }
+
+  #progress-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    max-height: 220px;
+    overflow-y: auto;
+  }
+
+  #progress-list:empty::after {
+    content: "No activity yet.";
+    color: var(--color-text-dim);
+    font-size: 0.9rem;
+  }
+
+  .progress-item {
+    background: var(--color-surface-2);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+    font-size: 0.9rem;
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+
+  .progress-item .step {
+    color: var(--color-text);
+  }
+
+  .progress-item .shape {
+    color: var(--color-text-dim);
+    font-size: 0.8rem;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  #answer {
+    white-space: pre-wrap;
+    line-height: 1.5;
+  }
+
+  #answer:empty::after {
+    content: "No answer yet.";
+    color: var(--color-text-dim);
+  }
+
+  #status {
+    font-size: 0.85rem;
+    color: var(--color-text-dim);
+    margin-top: var(--space-2);
+  }
+
+  #ask-user[hidden] {
+    display: none;
+  }
+
+  #ask-user-question {
+    margin: 0 0 var(--space-3) 0;
+    font-weight: 600;
+  }
+
+  .chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
+  }
+
+  .chip {
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
+    border-radius: 999px;
+    padding: var(--space-2) var(--space-4);
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+
+  .chip:hover,
+  .chip:focus-visible {
+    border-color: var(--color-accent);
+  }
+
+  #ask-user-freetext {
+    display: flex;
+    gap: var(--space-2);
+  }
+
+  #error-banner[hidden] {
+    display: none;
+  }
+
+  #error-banner {
+    background: var(--color-error-bg);
+    border: 1px solid var(--color-error-border);
+    color: var(--color-error-text);
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
+  }
+
+  #error-banner .error-code {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-weight: 600;
+    margin-right: var(--space-2);
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Data Agent — Phase 0</h1>
+    <p class="session-line">Session: <span id="session-line">connecting…</span></p>
+  </header>
+
+  <div id="error-banner" data-testid="error-banner" role="alert" hidden>
+    <span class="error-code" data-testid="error-code"></span>
+    <span data-testid="error-message"></span>
+  </div>
+
+  <form id="message-form" aria-label="Send a message to the agent">
+    <label for="message-input" class="sr-only">Message</label>
+    <input
+      type="text"
+      id="message-input"
+      data-testid="message-input"
+      placeholder="Ask a question about the HR data…"
+      autocomplete="off"
+    />
+    <button type="submit" id="send-button" data-testid="send-button">Send</button>
+  </form>
+
+  <section aria-labelledby="progress-heading">
+    <h2 id="progress-heading">Progress</h2>
+    <ul id="progress-list" data-testid="progress-list" aria-live="polite"></ul>
+  </section>
+
+  <section id="ask-user" data-testid="ask-user" aria-labelledby="ask-user-question" hidden>
+    <h2 id="ask-user-heading">Agent needs input</h2>
+    <p id="ask-user-question" data-testid="ask-user-question"></p>
+    <div class="chip-row" id="ask-user-options"></div>
+    <div id="ask-user-freetext">
+      <label for="ask-user-input" class="sr-only">Your answer</label>
+      <input type="text" id="ask-user-input" data-testid="ask-user-input" placeholder="Type your answer…" />
+      <button type="button" id="ask-user-submit" data-testid="ask-user-submit">Submit</button>
+    </div>
+  </section>
+
+  <section aria-labelledby="answer-heading">
+    <h2 id="answer-heading">Answer</h2>
+    <div id="answer" data-testid="answer" aria-live="polite"></div>
+    <!-- TODO: SQL/results need a richer result payload from the runtime SSE (follow-up) -->
+    <div id="status" data-testid="status"></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  var sessionId = null;
+
+  var els = {
+    sessionLine: document.getElementById("session-line"),
+    form: document.getElementById("message-form"),
+    input: document.getElementById("message-input"),
+    sendButton: document.getElementById("send-button"),
+    progressList: document.getElementById("progress-list"),
+    answer: document.getElementById("answer"),
+    status: document.getElementById("status"),
+    askUser: document.getElementById("ask-user"),
+    askUserQuestion: document.getElementById("ask-user-question"),
+    askUserOptions: document.getElementById("ask-user-options"),
+    askUserInput: document.getElementById("ask-user-input"),
+    askUserSubmit: document.getElementById("ask-user-submit"),
+    errorBanner: document.getElementById("error-banner"),
+    errorCode: document.getElementById("error-code"),
+    errorMessage: document.getElementById("error-message"),
+  };
+
+  function clearError() {
+    els.errorBanner.hidden = true;
+    els.errorCode.textContent = "";
+    els.errorMessage.textContent = "";
+  }
+
+  function showError(code, message) {
+    els.errorBanner.hidden = false;
+    els.errorCode.textContent = code || "ERROR";
+    els.errorMessage.textContent = message || "Something went wrong.";
+  }
+
+  function addProgressItem(step, shape) {
+    var li = document.createElement("li");
+    li.className = "progress-item";
+    li.setAttribute("data-testid", "progress-item");
+
+    var stepSpan = document.createElement("span");
+    stepSpan.className = "step";
+    stepSpan.textContent = step;
+    li.appendChild(stepSpan);
+
+    var shapeKeys = shape ? Object.keys(shape) : [];
+    if (shapeKeys.length > 0) {
+      var shapeSpan = document.createElement("span");
+      shapeSpan.className = "shape";
+      shapeSpan.textContent = JSON.stringify(shape);
+      li.appendChild(shapeSpan);
+    }
+
+    els.progressList.appendChild(li);
+    els.progressList.scrollTop = els.progressList.scrollHeight;
+  }
+
+  function setStatus(data) {
+    if (!data) {
+      els.status.textContent = "";
+      return;
+    }
+    els.status.textContent =
+      "status: " + data.status + " · tool_calls_made: " + data.tool_calls_made;
+  }
+
+  function setAnswer(text) {
+    els.answer.textContent = text || "";
+  }
+
+  function hideAskUser() {
+    els.askUser.hidden = true;
+    els.askUserQuestion.textContent = "";
+    els.askUserOptions.innerHTML = "";
+    els.askUserInput.value = "";
+  }
+
+  function showAskUser(pendingQuestion) {
+    els.askUserQuestion.textContent = pendingQuestion.question || "";
+    els.askUserOptions.innerHTML = "";
+
+    var options = pendingQuestion.options || [];
+    options.forEach(function (option) {
+      var chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip";
+      chip.setAttribute("data-testid", "ask-user-option");
+      chip.setAttribute("data-option", option);
+      chip.textContent = option;
+      chip.addEventListener("click", function () {
+        submitAnswer(option);
+      });
+      els.askUserOptions.appendChild(chip);
+    });
+
+    els.askUser.hidden = false;
+    if (options.length === 0) {
+      els.askUserInput.focus();
+    }
+  }
+
+  function setBusy(isBusy) {
+    els.sendButton.disabled = isBusy;
+    els.input.disabled = isBusy;
+  }
+
+  function setAskUserBusy(isBusy) {
+    els.askUserSubmit.disabled = isBusy;
+    els.askUserInput.disabled = isBusy;
+    var chips = els.askUserOptions.querySelectorAll(".chip");
+    chips.forEach(function (chip) {
+      chip.disabled = isBusy;
+    });
+  }
+
+  /**
+   * Read a fetch Response body as a stream of SSE frames (`event:`/`data:`
+   * blocks separated by a blank line) and invoke `onEvent(eventName, data)`
+   * for each one as it arrives. EventSource can't POST, hence this manual
+   * fetch + reader parse (per the runtime's SSE contract).
+   */
+  function consumeSSE(response, onEvent) {
+    var reader = response.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = "";
+
+    function processBuffer() {
+      var frames = buffer.split("\n\n");
+      buffer = frames.pop(); // last element may be incomplete — keep it
+      frames.forEach(function (frame) {
+        if (!frame.trim()) return;
+        var eventName = "message";
+        var dataLines = [];
+        frame.split("\n").forEach(function (line) {
+          if (line.startsWith("event:")) {
+            eventName = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trim());
+          }
+        });
+        var data = null;
+        if (dataLines.length > 0) {
+          try {
+            data = JSON.parse(dataLines.join("\n"));
+          } catch (err) {
+            data = null;
+          }
+        }
+        onEvent(eventName, data);
+      });
+    }
+
+    function pump() {
+      return reader.read().then(function (result) {
+        if (result.done) {
+          buffer += decoder.decode();
+          if (buffer.trim()) processBuffer();
+          return;
+        }
+        buffer += decoder.decode(result.value, { stream: true });
+        processBuffer();
+        return pump();
+      });
+    }
+
+    return pump();
+  }
+
+  function handleSSEEvent(eventName, data) {
+    if (eventName === "progress" && data) {
+      addProgressItem(data.step, data.shape);
+    } else if (eventName === "result" && data) {
+      setStatus(data);
+      setAnswer(data.assistant_text);
+      if (data.pending_question) {
+        showAskUser(data.pending_question);
+      } else {
+        hideAskUser();
+      }
+    } else if (eventName === "error" && data) {
+      showError(data.code, data.message);
+    }
+  }
+
+  function runTurn(url, body) {
+    clearError();
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(function (response) {
+      if (!response.ok) {
+        return response.text().then(function (text) {
+          var message = text || response.statusText;
+          try {
+            var parsed = JSON.parse(text);
+            if (parsed && parsed.detail) message = parsed.detail;
+          } catch (err) {
+            // not JSON — show the raw text as-is
+          }
+          showError("HTTP_" + response.status, message);
+        });
+      }
+      return consumeSSE(response, handleSSEEvent);
+    });
+  }
+
+  function sendMessage(message) {
+    if (!sessionId) {
+      showError("NO_SESSION", "Session not ready yet — try again in a moment.");
+      return;
+    }
+    setBusy(true);
+    hideAskUser();
+    runTurn("/api/turn", { session_id: sessionId, message: message }).finally(function () {
+      setBusy(false);
+    });
+  }
+
+  function submitAnswer(answer) {
+    if (!answer || !answer.trim()) return;
+    setAskUserBusy(true);
+    runTurn("/api/turn/resume", { session_id: sessionId, answer: answer }).finally(function () {
+      setAskUserBusy(false);
+    });
+  }
+
+  els.form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var message = els.input.value.trim();
+    if (!message) return;
+    els.input.value = "";
+    sendMessage(message);
+  });
+
+  els.askUserSubmit.addEventListener("click", function () {
+    var answer = els.askUserInput.value.trim();
+    submitAnswer(answer);
+    els.askUserInput.value = "";
+  });
+
+  els.askUserInput.addEventListener("keydown", function (event) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      els.askUserSubmit.click();
+    }
+  });
+
+  // Bootstrap: mint a session_id (and, server-side only, a JWT — D82/D5) on load.
+  fetch("/api/session", { method: "POST" })
+    .then(function (response) {
+      if (!response.ok) throw new Error("session request failed: " + response.status);
+      return response.json();
+    })
+    .then(function (data) {
+      sessionId = data.session_id;
+      els.sessionLine.textContent = sessionId;
+    })
+    .catch(function (err) {
+      els.sessionLine.textContent = "failed to start session";
+      showError("SESSION_INIT_FAILED", String(err));
+    });
+})();
+</script>
+</body>
+</html>

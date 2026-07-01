@@ -9,9 +9,25 @@ from __future__ import annotations
 
 import os
 
+import httpx
 import pytest
 
 from data_agent.runtime.mcp.real_client import RealMCPClient, _parse_tool_error_text
+
+_TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
+_TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
+
+
+async def _mint(column_scope: list[str] | None = None) -> str:
+    """Mint a JWT from the live token IdP (allow-all when *column_scope* is None/[])."""
+    async with httpx.AsyncClient() as http_client:
+        response = await http_client.post(
+            _TOKEN_SERVICE_URL,
+            headers={"Authorization": f"Bearer {_TOKEN_ISSUER_API_KEY}"},
+            json={"user_name": "alice", "column_scope": column_scope or []},
+        )
+        response.raise_for_status()
+        return response.json()["access_token"]
 
 # ---------------------------------------------------------------------------
 # Layer 1 — pure parsing logic, no infra
@@ -33,6 +49,15 @@ from data_agent.runtime.mcp.real_client import RealMCPClient, _parse_tool_error_
         ),
         ("An internal error occurred.", None, "An internal error occurred."),
         ("", None, ""),
+        (
+            # Real captured text from the live MCP: FastMCP prepends
+            # "Error executing tool <name>: " ahead of the domain ToolError's
+            # own "[{CODE}] message" — the code must still be found (FIX 2).
+            "Error executing tool runQuery: [COLUMN_SCOPE_VIOLATION] This query "
+            "references columns outside your permitted scope.",
+            "COLUMN_SCOPE_VIOLATION",
+            "This query references columns outside your permitted scope.",
+        ),
     ],
 )
 def test_parse_tool_error_text(raw_text: str, expected_code: str | None, expected_message: str) -> None:
@@ -54,6 +79,7 @@ pytestmark_live = pytest.mark.skipif(
 @pytestmark_live
 async def test_list_tools_against_live_mcp() -> None:
     client = RealMCPClient(os.environ["MCP_TEST_URL"])
-    tools = await client.list_tools()
+    jwt = await _mint()
+    tools = await client.list_tools(jwt=jwt, session_id="sess-real-client-test")
     names = {t.name for t in tools}
     assert {"listDatabases", "listTables", "getTableSchema", "sampleRows", "runQuery", "explainQuery"} <= names

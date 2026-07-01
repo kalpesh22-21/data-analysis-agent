@@ -98,7 +98,7 @@ def test_translate_passes_input_schema_verbatim() -> None:
 
 async def test_fetch_function_schemas_includes_all_6_plus_ask_user() -> None:
     client = FakeMCPClient(tools=_FAKE_TOOLS)
-    schemas = await fetch_function_schemas(client)
+    schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")
     names = {s["name"] for s in schemas}
     assert names == {
         "listDatabases",
@@ -116,7 +116,7 @@ async def test_fetch_function_schemas_includes_all_6_plus_ask_user() -> None:
 async def test_no_credential_params_leak_in_any_schema() -> None:
     """D5: no schema (MCP-derived or askUser) may declare session_id/jwt/scope."""
     client = FakeMCPClient(tools=_FAKE_TOOLS)
-    schemas = await fetch_function_schemas(client)
+    schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")
     blob = json.dumps(schemas).lower()
     for forbidden in ("session_id", "jwt", "column_scope", "\"scope\""):
         assert forbidden not in blob, f"credential-shaped parameter leaked: {forbidden}"
@@ -126,14 +126,19 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
     client = FakeMCPClient(tools=_FAKE_TOOLS)
     cache = ToolSchemaCache(client)
 
-    first = await cache.get_schemas()
+    first = await cache.get_schemas(jwt="tok", session_id="s1")
     assert len(first) == 7
 
     # Mutate the underlying client's tool list; without force_reload the cache
     # must not reflect the change.
     client._tools = []  # deliberate white-box test of cache staleness
-    second = await cache.get_schemas()
+    second = await cache.get_schemas(jwt="tok", session_id="s1")
     assert second == first
 
-    reloaded = await cache.get_schemas(force_reload=True)
+    # Different credentials do not bust the cache either (D5: catalogue is
+    # scope-independent; the fetch is only re-triggered by force_reload).
+    third = await cache.get_schemas(jwt="other-tok", session_id="s2")
+    assert third == first
+
+    reloaded = await cache.get_schemas(jwt="tok", session_id="s1", force_reload=True)
     assert reloaded == [ASK_USER_TOOL_SCHEMA]

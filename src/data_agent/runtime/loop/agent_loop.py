@@ -81,7 +81,7 @@ from data_agent.runtime.session.store import SessionStore
 
 from .budget_guard import new_budget_window
 
-ToolsProvider = Callable[[], Awaitable[list[dict[str, Any]]]]
+ToolsProvider = Callable[[RuntimeCredentials], Awaitable[list[dict[str, Any]]]]
 
 TurnStatus = Literal[
     "done", "paused_ask_user", "paused_budget_cap", "stopped_hard_ceiling"
@@ -330,7 +330,13 @@ class AgentLoop:
         turn_index: int,
         model_client: ModelClient,
     ) -> TurnOutcome:
-        tools = await self._tools_provider()
+        # The live MCP authenticates every request, including tools/list, so
+        # the tools_provider seam is called WITH this turn's credentials on
+        # every window (2026-07-01 fix) — it is expected to cache the fetched
+        # catalogue itself (see mcp/tool_schema.py::ToolSchemaCache) since the
+        # catalogue is scope-independent; this is not a live MCP round-trip
+        # on every call in practice, just a credentialed one the first time.
+        tools = await self._tools_provider(credentials)
         guard = new_budget_window(
             max_iterations=self._max_loop_iterations,
             max_wall_clock_seconds=self._max_wall_clock_seconds,
