@@ -18,13 +18,20 @@ built. `⛔ not-built` — no tagged test yet. A multi-layer row is only fully `
 named layers pass; the release gate (D68) is the Layer-3 conformance suite, not the unit slice alone.
 
 **Build progress:** the `sqlglot` column-provenance extractor (`src/data_agent/sqlparse/provenance.py`,
-Phase-0 first brick, D52/D62) is built and passing 39 Layer-1 tests; it satisfies the unit slices
-below. Its consumers — the MCP live-scope gate (D57), the replayed-trail filter (D44), and scratch
-enforcement at the MCP (D64) — are **not yet built**, so those rows stay `🟡 unit-green`. Per D75,
-the Component consumer for **D57/D63/D64** is the **`clickhouse-api` extension** (the existing MCP
-service, adopted and extended); the provenance extractor will be delivered into `clickhouse-api`
-via **copy-in** (D79a). **D44's** Component consumer is different — it is the **agent runtime's** replayed-trail
-filter, also not yet built (not part of the `clickhouse-api` extension). No status changes until these ship.
+Phase-0 first brick, D52/D62) is built and passing Layer-1 tests. The **`clickhouse-api` MCP
+extension** (D57/D63/D64 enforcement) is built + pushed (Session 5). The **Phase-0 agent runtime**
+(`src/data_agent/runtime/`, Session 6) is now built and **Layer-1-green + reviewed** (296 tests): it
+supplies the **agent-runtime** consumers of **D5** (credential injection / model-invisibility),
+**D44** (replayed-trail *and* conversational-message scope re-filter — the 2026-07-01 clarification,
+turn-scoped & status-gated), **D46/D50** (preview-only + filter-before-compact), **D47/D55** (budget
+caps), and **D45** (pause/resume CAS, via the in-memory fake at Layer 1). **Honest caveat:** these are
+proven at **Layer 1 with fakes** and have passed adversarial review — they are **not** yet
+conformance-proven. The D68 release gate is **Layer-3** (Docker + Playwright), and the Component
+layers (real Couchbase for D44/D45; real MCP↔ClickHouse for D57/D64) are **not yet built**, so the
+rows below move only to `🟡 unit-green`, never `✅ green`, on the strength of this session. A
+runtime-surfaced gap to carry forward: the `clickhouse-api` MCP column-scopes only `runQuery`, **not
+`sampleRows`/`getTableSchema`** — the runtime now covers this defensively (D44 drop), but the MCP
+boundary does not yet enforce it.
 
 See [docs/11-testing.md](../11-testing.md) for the four-layer test pyramid definition and the full
 Layer 3 scenario list. See [docs/decisions/DECISIONS.md](DECISIONS.md) for the rationale behind each
@@ -36,16 +43,16 @@ decision cited here.
 
 | Decision | Invariant | Test layer | Test slug | Conformance scenario | Status |
 |---|---|---|---|---|---|
-| **D5** | `session_id`/JWT/scope are injected by code — the model never sees or supplies them; it cannot forge or escalate scope | Unit | `D5-scope-never-model-visible` | — | ⛔ not-built |
-| **D44** | Every stored tool result carries a column-provenance set; on scope narrowing, trail entries whose provenance ⊄ current scope are dropped before context assembly — never replayed | Unit + Component | `D44-provenance-drop-on-scope-narrow` | **Mid-session scope narrowing** | ⛔ not-built |
+| **D5** | `session_id`/JWT/scope are injected by code — the model never sees or supplies them; it cannot forge or escalate scope | Unit | `D5-scope-never-model-visible` | — | 🟡 unit-green |
+| **D44** | Every stored tool result carries a column-provenance set; on scope narrowing, trail entries whose provenance ⊄ current scope are dropped before context assembly — never replayed | Unit + Component | `D44-provenance-drop-on-scope-narrow` | **Mid-session scope narrowing** | 🟡 unit-green |
 | **D44** | SQL parse failure → provenance unknown → entry dropped from replay (fail-closed, never assumed in-scope) | Unit | `D44-parse-fail-drops-entry` | — | 🟡 unit-green |
-| **D45** | A pause checkpoint is persisted before yielding; any runtime instance can resume at `awaiting_node` after a restart; completed DAG nodes never re-run; `consumed` CAS flag prevents double-entry | Component + E2E | `D45-pause-resume-survives-restart` | **Pause/resume durability** | ⛔ not-built |
-| **D46** | Results are preview-only in model context (≤N rows + `truncated` flag + `row_count`); full results persist to Couchbase and appear in UI; preview never causes the model to mistake a truncated set for a complete answer | Unit | `D46-preview-truncated-flag-present` | — | ⛔ not-built |
-| **D47** | The raw agent loop never runs past its per-turn budget (iterations/tokens/wall-clock) without pausing via `askUser`; "continue" grants exactly one fresh budget window, not unlimited continuation | E2E | `D47-budget-cap-triggers-pause` | **Budget-cap pause** | ⛔ not-built |
+| **D45** | A pause checkpoint is persisted before yielding; any runtime instance can resume at `awaiting_node` after a restart; completed DAG nodes never re-run; `consumed` CAS flag prevents double-entry | Component + E2E | `D45-pause-resume-survives-restart` | **Pause/resume durability** | 🟡 unit-green |
+| **D46** | Results are preview-only in model context (≤N rows + `truncated` flag + `row_count`); full results persist to Couchbase and appear in UI; preview never causes the model to mistake a truncated set for a complete answer | Unit | `D46-preview-truncated-flag-present` | — | 🟡 unit-green |
+| **D47** | The raw agent loop never runs past its per-turn budget (iterations/tokens/wall-clock) without pausing via `askUser`; "continue" grants exactly one fresh budget window, not unlimited continuation | E2E | `D47-budget-cap-triggers-pause` | **Budget-cap pause** | 🟡 unit-green |
 | **D48** | Two blueprints with identical SQL semantics (same `resolves`, `uses_rules`, normalized AST) produce the same `canonical_key`; concurrent writes result in one create + one `hit_count` increment, never a duplicate | Unit + Component | `D48-same-semantics-same-key` | — | ⛔ not-built |
 | **D48** | Two blueprints with materially different semantics (gross vs net, period filter present vs absent) produce different `canonical_key` values | Unit | `D48-different-semantics-different-key` | — | ⛔ not-built |
 | **D48** | SQL parse failure during dedup → skip the hard key, fall through to soft embedding layer (fail-soft — never a wrong merge) | Unit | `D48-parse-fail-falls-to-soft` | — | ⛔ not-built |
-| **D50** | Scope-filter (D44) runs before history compaction (D46); the prose summary is derived only from in-scope entries and is never persisted as an artifact | Unit | `D50-filter-before-compact-order` | — | ⛔ not-built |
+| **D50** | Scope-filter (D44) runs before history compaction (D46); the prose summary is derived only from in-scope entries and is never persisted as an artifact | Unit | `D50-filter-before-compact-order` | — | 🟡 unit-green |
 | **D52** | `sqlglot` extracts the qualified `(table, column)` USES set from a query, including columns referenced only in derived expressions (e.g. `AVG(gross_pay)` yields `payroll_fact.gross_pay`) | Unit | `D52-derived-column-in-uses-set` | — | ✅ green |
 | **D52** | `sqlglot` parse failure behavior is per-consumer: D57-consumer → fail-closed reject; D48-consumer → fail-soft skip-hard-key; D35-consumer → fail-to-review; none silently proceeds | Unit | `D52-per-consumer-fail-behavior` | — | 🟡 unit-green |
 | **D53** | A table with no catalog entry is served structural-only (not an error); it is ineligible for blueprint promotion. Graceful degradation is **runtime-side per D78** — the runtime overlays nothing; the MCP returns normal introspection (test at the runtime component layer, not the MCP) | Component | `D53-uncatalogued-table-structural-only` | — | ⛔ not-built |

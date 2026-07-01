@@ -18,13 +18,30 @@ invariant→test status board.
   Extractor delivered **copy-in** (D79a); interim `system.columns` catalog. 755+ tests green.
 - ✅ `token_service` mints **column-scoped** tokens the MCP validates end-to-end (D79/D82); the UI
   mints its JWT server-side on login, defaulting to all-column access for now (D82).
+- ✅ **The Phase-0 agent runtime is BUILT (strict Phase 0, Layer-1 green).** `src/data_agent/runtime/`:
+  OpenAI raw loop (Responses primary / Chat fallback, D71), 6-MCP-tool + `askUser` dispatch with D5
+  credential injection, minimal non-retrieval context assembly (D44/D46/D50), Couchbase session store
+  (D22/D44/D45, CAS-guarded), progress streaming (D61) + Phoenix/OTel spans with PII redaction
+  (D23/D24/D25), budget caps (D47/D55). **296 tests pass / 3 Layer-2 skipped, ruff clean.** Reviewed
+  (2 review rounds): 5 blockers + a self-introduced current-turn PII-leak regression found and fixed;
+  all closed and independently re-verified. `getTableSchema` is introspection-only (no overlay).
 
-**Next brick:** **agent-runtime work** (the pieces D77/D78 moved out of the MCP, plus the Phase-0 loop):
-- Runtime `resolveValues` composite over `runQuery` (D77).
-- Runtime `getTableSchema` catalog overlay (`introspection ⨝ catalog YAML`, D78) + `catalog_sha` stamping.
-- The Phase-0 raw agent loop + context assembly + Couchbase session store + progress streaming.
+**Next brick:** **Phase 1** (per D68) — **D77 `resolveValues`** (runtime composite over `runQuery`) and
+**D78 `getTableSchema` catalog overlay** (`introspection ⨝ catalog YAML`) + `catalog_sha` stamping;
+then the retrieval pipeline, blueprints, the D56 verify gate, and the learning-loop Track B. Before
+"Phase-0 done" can be *claimed*, the D68 exit criteria still need **Layer-2** (real Couchbase/MCP +
+Phoenix on a live turn) and the **Layer-3** Docker+Playwright conformance scenarios — the runtime code
+is Layer-1-proven and reviewed, not yet conformance-proven against live infra.
 
 **Open follow-ups carried forward:**
+- **clickhouse-api MCP does NOT column-scope `sampleRows`/`getTableSchema`** (only `runQuery`, via the
+  D57 SQL parse). Real enforcement gap once per-user entitlements replace the D82 interim allow-all.
+  The Phase-0 runtime now covers it **defensively** (D44 drops out-of-scope tool results before the
+  model sees them), but the MCP boundary itself should enforce it — surfaced by the runtime security review.
+- Phase-0 runtime **Layer-2** (containerized Couchbase/MCP, Phoenix) + **Layer-3** conformance are not
+  yet built (need live infra + the UI); the runtime DI seams (fakes) are in place for them.
+- Phase-0 runtime provisional tunables (`RuntimeSettings`): budget caps (15 iter / 60s / 3 windows),
+  `SESSION_TTL`=7d, N=20 preview rows, history budget 20% — all set to defaults pending real traffic.
 - Production IdP (Entra) must stamp the `column_scope` claim; wire per-user entitlements to replace the
   **D82 interim all-access** default (OPEN-QUESTIONS §Security/infra).
 - Replace the interim `system.columns` catalog in `clickhouse-api` with the **D78 runtime catalog** source.
@@ -36,6 +53,42 @@ invariant→test status board.
 - 6 coverage gaps accepted into backlog (see TRACEABILITY.md §Coverage gaps) — Phase-2 test additions.
 
 ---
+
+## 2026-07-01 — Session 6: Phase-0 agent runtime BUILT (strict Phase 0, Layer-1 green + reviewed)
+
+### Scope decision this session
+- User chose **strict Phase 0** for the runtime: raw loop + context assembly + Couchbase + progress
+  streaming only. **D77 `resolveValues` and D78 `getTableSchema` overlay stay Phase 1** (declined to
+  pull forward). `getTableSchema` ships **introspection-only**. Provider = **OpenAI** (D71), not Claude.
+
+### Shipped artifacts
+| Area | Path | Agent |
+|---|---|---|
+| Phase-0 runtime design doc (module layout, interfaces, Couchbase doc model, span/redaction map, test seams, deps, build order, OQs) | `docs/decisions/phase0-runtime-design.md` | `planner` |
+| Runtime **Pass A** (below-the-loop): config, credentials, session store (+CAS) & models, MCP client + fake + tool-schema translation, provenance capture, tool dispatcher + denial mapping, D44/D46/D50 context assembly | `src/data_agent/runtime/{config,auth,session,mcp,provenance,dispatch,context}` | `backend-developer` |
+| Runtime **Pass B**: OpenAI Responses/Chat client, agent loop + budget guard, observability (tracing/redaction/progress), JWKS auth, LLM summarizer, `app.py` composition root (SSE `/turn` + `/turn/resume`) | `src/data_agent/runtime/{model,loop,observability,context/llm_summarizer.py,auth/jwt_verify.py,app.py}` | `backend-developer` |
+| Adversarial Layer-1 test hardening (D5 injection, D44 narrowing, fail-closed, budget termination, CAS, redaction, denial, fallback) | `tests/runtime/**` | `qa` |
+| Two review rounds + fixes (5 blockers + 1 self-introduced regression) | `src/data_agent/runtime/**`, docs | `reviewer` + `backend-developer` |
+| D44 clarification (extends to conversational messages, turn-scoped & status-gated) | `docs/decisions/DECISIONS.md` (D44), `phase0-runtime-design.md` §5.1–§5.2 | `backend-developer` |
+
+### Review findings fixed (all closed, independently re-verified)
+- **[CRITICAL] D44 leaked via conversational history** — assistant prose replayed unfiltered; fixed by
+  tagging assistant messages with their turn's tool-result provenance-union and filtering like the trail.
+- **[HIGH]** Couchbase writes not CAS-guarded (lost updates); shared OpenAI fallback state across
+  concurrent turns; transport exceptions leaked raw `str(exc)` to the user + uncounted; TOOL spans never
+  emitted so D25 redaction was dead on the live path (+ askUser question leaked into spans).
+- **[CRITICAL, self-introduced during a fix]** the turn-scoped error-visibility fix exempted *all*
+  current-turn entries from the scope check → a successful out-of-scope `sampleRows` leaked PII rows to
+  the model. Caught by the re-review, reproduced e2e, fixed by **status-gating** the exemption
+  (`status != "ok"` only; successful entries always scope-checked). Orchestrator independently
+  confirmed the repro test fails without the guard and passes with it.
+- Plus hardening: event-loop-blocking summarizer, uncapped tool-calls-per-response, denial message fed
+  back for self-correction, `X-Session-Id` validation, `app.py` generic-SSE-error (no raw `str(exc)`).
+
+### Verification status
+- `uv run pytest` → **296 passed, 3 skipped** (Layer-2 Couchbase/MCP guarded); `uv run ruff check` → clean.
+- **Layer-1 + reviewed only.** Layer-2/3 conformance (live infra + UI) NOT yet run — Phase-0 *conformance*
+  per D68 is not yet claimable; the code is complete, reviewed, and unit-proven.
 
 ## 2026-07-01 — Session 5: clickhouse-api enforcement BUILT; D79–D82 locked
 

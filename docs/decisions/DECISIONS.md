@@ -335,6 +335,20 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   whole doc auto-expires, no partial value-purge. **Constraint:** `SESSION_TTL` must exceed the
   learning-loop completion window. Accepted trade-off: PII cell-values dwell the full TTL.
   `SESSION_TTL` value is an open parameter. Resolves review items C and D.
+  **2026-07-01 Phase-0 clarification:** the replayed-trail scope filter (D44) extends to
+  conversational assistant messages, tagged with their turn's tool-result provenance-union; user
+  messages carry no warehouse data and are always retained; undetermined ⇒ dropped fail-closed. See
+  [phase0-runtime-design.md §5.1](phase0-runtime-design.md#51-message-provenance-filter-2026-07-01-d44-clarification).
+  **2026-07-01 turn-scoped continuity fix (STATUS-GATED):** D44's strict provenance drop applies to
+  REPLAY of PRIOR turns, PLUS any current-turn entry that actually SUCCEEDED (`status == "ok"`) — only
+  a current-turn **denied/errored** entry is exempt, because (and only because) it carries no result
+  rows (`ToolResult.result_preview`/`result_full` are `None` for any non-`"ok"` status), so the model
+  can see its own current-turn tool errors and self-correct (§3.4) without any leak. A successful
+  current-turn `sampleRows`/`getTableSchema`/`runQuery` result is never exempt — its provenance is
+  checked against `column_scope` exactly as any prior-turn entry's is, because those tools' result rows
+  ARE data-bearing and (for `sampleRows`/`getTableSchema`) are not themselves column-scoped by the MCP
+  (D80(b) only column-scopes `runQuery`). Cross-turn D44 is unchanged. See
+  [phase0-runtime-design.md §5.2](phase0-runtime-design.md#52-turn-scoped-continuity-refinement-2026-07-01-correctness-fix).
 - **D45 (locked, 2026-06-30).** **In-flight turns are durable across restarts via a pause checkpoint;
   active compute relies on idempotent re-run.** On an `askUser`/approval pause the runtime persists a
   **pause checkpoint** to the session doc (pending prompt, partial trail, and mid-DAG `blueprint_id`
