@@ -1,5 +1,9 @@
 .claude/
 
+# Secrets — never commit
+.env
+.env.*
+
 # Python
 .venv/
 __pycache__/
