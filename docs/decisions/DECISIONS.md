@@ -397,6 +397,28 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   Cross-references: [D1](#architecture), [D42](#semantic-catalog), [D53](#blueprint-dedup--resolvers),
   [D57](#blueprint-silent-path-safety), [D75](#clickhouse-mcp--adoption-decision), [D77](#client-defined-value-resolution).
 
+- **D79 (locked, 2026-06-30).** **clickhouse-api extension mechanics: extractor delivery + scope transport.**
+  Resolves the two D75 sub-questions (previously in [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md) §Security/infra).
+  - **(a) Extractor delivery = copy-in.** The Phase-0 provenance extractor is copied into
+    `clickhouse-api` (`app/sqlparse/`) rather than shared via package or submodule. The **spec repo
+    (`data-analysis-agent`) is authoritative**; any change to the extractor or its D69/D70 contract is
+    mirrored into `clickhouse-api` in the **same sprint** (optionally enforced by a CI file-diff check).
+    Rationale: the D69/D70 contract is new and will churn; copy-in avoids release ceremony while it
+    stabilizes. **Promote to a shared internal library once the contract holds for one release** — a
+    cheap one-way door deferred until it pays for itself.
+  - **(b) Scope transport = signed JWT claims.** `column_scope` (a set of `database.table.column`
+    triples, D69/OQ-3) and `session_id` travel as **claims in the runtime-signed JWT** that
+    `clickhouse-api` already validates — read alongside the existing tenant claim; threaded through the
+    existing `Principal`/ContextVar into `runQuery`. Signed by the issuer ⇒ unforgeable; the model never
+    holds the token (D5). This is the **tenant-level → column-level** shift flagged in D75.
+    **Caveat (not a blocker):** a very large scope can exceed HTTP header size — if it bites, send a
+    signed **scope *reference*** (a short id resolved server-side), not the inline list. **Fallback**
+    (only if a runtime cannot mint custom claims — not our case): a short-lived HMAC-signed `X-Scope`
+    header. Enforcement stays at the MCP boundary (D57); stdio transport skips enforcement (local-trust).
+  Cross-references: [D5](#tools), [D52](#blueprint-dedup--resolvers), [D57](#blueprint-silent-path-safety),
+  [D62](#blueprint-silent-path-safety), [D63](#blueprint-silent-path-safety), [D64](#security--infra),
+  [D69](#testing), [D70](#testing), [D75](#clickhouse-mcp--adoption-decision).
+
 ## Blueprint silent-path safety
 - **D43 (locked, 2026-06-30).** **Silent-eligibility is a freshness-bounded attestation, not the
   permanent `validated` status.** "Semantic drift" decomposes into **three concrete probes** run by

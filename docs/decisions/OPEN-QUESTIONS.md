@@ -147,25 +147,16 @@ decision, not an MCP concern.
 
 ## Security / infra ([06](../06-security-and-governance.md), [09](../09-infrastructure.md))
 
-### D75 — clickhouse-api extension: two open sub-questions
+### D75 — clickhouse-api extension: two sub-questions — **RESOLVED by D79**
 
-1. **Provenance extractor packaging.** The Phase-0 extractor
-   (`src/data_agent/sqlparse/provenance.py`, this repo) must be delivered into `clickhouse-api` (the
-   enforcement site, per D75). Three options: (a) **copy-in** — paste the module directly into
-   `clickhouse-api`; simple, creates divergence risk over time; (b) **shared library** — publish the
-   `sqlparse` package (e.g. to an internal PyPI); clean boundary, adds release/versioning overhead;
-   (c) **git submodule / path import** — reference this repo from `clickhouse-api`. Decision affects
-   every future change to the extractor (D69/D70 contract changes must propagate). Not resolved; pick
-   before the D75 extension sprint starts.
+1. ~~**Provenance extractor packaging.**~~ **RESOLVED by D79(a): copy-in** (spec repo authoritative,
+   mirror same-sprint; promote to shared library once the D69/D70 contract stabilizes).
 
-2. **Column-scope model mismatch.** `clickhouse-api`'s current `Principal` model is
-   **tenant/realm-wide** — it injects a per-tenant ClickHouse setting but has no concept of
-   per-column scope. D57 requires **per-request column scope** (a set of `database.table.column`
-   triples, D69/OQ-3) injected into every `runQuery`. Adding this means: (a) extending the `Principal`
-   / auth middleware to carry and validate a column-scope claim, and (b) adding `scope` + `session_id`
-   as injected parameters on `runQuery` (D5). This is a conceptual shift in the service's auth model —
-   tenant-level → column-level per request. Review impact on existing JWT claims structure before
-   designing the extension.
+2. ~~**Column-scope model mismatch / transport.**~~ **RESOLVED by D79(b): signed JWT claims** —
+   `column_scope` + `session_id` ride the runtime-signed JWT, threaded through the existing
+   `Principal`/ContextVar into `runQuery` (the tenant-level → column-level shift). Remaining sub-detail:
+   the large-scope-vs-header-size mitigation (inline list vs. a signed scope *reference*) — decided only
+   if it bites.
 
 ### Other security / infra items
 
