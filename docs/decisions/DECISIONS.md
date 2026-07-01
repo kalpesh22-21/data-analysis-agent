@@ -739,15 +739,21 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
 ## Delivery / sequencing
 - **D68 (locked, 2026-06-30).** **Three-phase delivery with a red-burndown conformance harness from day one.**
 
+  **Amended 2026-07-01 (post D71/D75/D77/D78/D79–D82):** phase *structure* unchanged; the Phase-0/Phase-1
+  scope lines below now name the OpenAI model provider (D71), the delivered `clickhouse-api` MCP (D75),
+  the auth/token path (D79/D81/D82), and the custom embedding/reranker API (D71). `resolveValues` (D77)
+  and the `getTableSchema` catalog overlay (D78) stay **Phase 1**. The **skills/lifecycle-hooks mechanism
+  (D72–D74) is deliberately out of all phases** — it ships dormant and is wired only on explicit go-ahead.
+
   ### Phase definitions and exit criteria
 
   **Phase 0 — Walking skeleton (raw-loop alpha).**
-  Scope: `sqlglot` parser (D52/D62) → ClickHouse MCP data plane (D1/D57/D63/D64) → Couchbase session store (D22/D44/D45) → raw agent loop with injected scope (D5) + minimal UI with progress streaming (D61) + Phoenix tracing (D23/D24/D25). Scope-enforced, transparent, **raw-loop-only** SQL agent. No blueprints, no knowledge plane reads, no learning loop.
+  Scope: `sqlglot` parser (D52/D62) → the **delivered `clickhouse-api` MCP data plane** (adopt+extend, D75; D1/D57/D63/D64) → Couchbase session store (D22/D44/D45) → raw agent loop driven by the **OpenAI model** (Responses API primary / Chat Completions fallback, D71) with **minimal, non-retrieval context assembly** (schema + conversation; the embed→recall→rerank pipeline is Phase 1). **Auth path:** the UI mints its JWT server-side on login (D82), the backend forwards it as a Bearer token + the `X-Session-Id` header (D81/D79), the MCP validates and injects scope (D5). `getTableSchema` is **introspection-only** in Phase 0 (the D78 catalog overlay is Phase 1). Plus minimal UI with progress streaming (D61) + Phoenix tracing (D23/D24/D25). Scope-enforced, transparent, **raw-loop-only** SQL agent. No blueprints, no knowledge plane reads, no learning loop.
   - **First brick:** the `sqlglot` parser is built and TDD'd first — it is the shared dependency of five consumers (D57 live scope, D44 provenance, D48 dedup, D35 template rewrite, D64 scratch isolation) and is pure logic with no infrastructure prerequisite. Nothing else starts until its unit test suite (Layer 1) is green.
   - **Exit criteria:** all Phase-0 conformance scenarios green (scope denial, mid-session scope narrowing, parser fail-closed, observability + PII, pause/resume durability, budget-cap pause); Layer 1 + Layer 2 MCP + session-store tests passing in CI; Phoenix traces reachable and PII-clean on a real turn.
 
   **Phase 1 — Blueprints + D56 verify gate (the launchable product).**
-  Scope: knowledge plane reads (`searchBlueprints`, `getBlueprint`, `runBlueprint`, `searchKnowledge`), the full D56 verification gate, composite blueprints (D59), retrieval pipeline (D7/D8), grain declaration (D37a/D40/D65), `resolveValues` (D66/D67 — runtime composite, D77), D53 catalog CI + catalog overlay in the runtime (D78), review inbox UI, and all remaining Layer 3 conformance scenarios. Runs alongside **Track B** (see below).
+  Scope: knowledge plane reads (`searchBlueprints`, `getBlueprint`, `runBlueprint`, `searchKnowledge`), the full D56 verification gate, composite blueprints (D59), **retrieval pipeline (D7/D8) on the custom (non-OpenAI) embedding + reranker API (D71)**, grain declaration (D37a/D40/D65), `resolveValues` (D66/D67 — runtime composite, D77), D53 catalog CI + the runtime `getTableSchema` catalog overlay (D78), review inbox UI, and all remaining Layer 3 conformance scenarios. Runs alongside **Track B** (see below).
   - **Track B (parallel) — learning-loop write router:** D26–D31 write router stages, D58 leakage gate (human pre-gate for `global_knowledge`; sampled detection for blueprints), D48 hard-dedup with single-writer-per-key, D51 provenance/audit store, `LEARNING_ENABLED=false` kill-switch (D58c), review-inbox ingestion, D53 `schema_edit` PR bot. Track B is fully offline/decoupled from the request path and has no Phase-0 prerequisites beyond the session store and Redis.
   - **Exit criteria (gates first release):** ALL Layer 3 spec-conformance scenarios green (the full ~13-scenario suite from [11-testing.md](../11-testing.md) §Layer 3) + Layers 1–2 green for every shipped module. This is the full-conformance gate — there is no "ship request path, learn later" escape hatch (see tension note below).
 
