@@ -24,28 +24,51 @@ invariant→test status board.
   (D22/D44/D45, CAS-guarded), progress streaming (D61) + Phoenix/OTel spans with PII redaction
   (D23/D24/D25), budget caps (D47/D55). **296 tests pass / 3 Layer-2 skipped, ruff clean.** Reviewed
   (2 review rounds): 5 blockers + a self-introduced current-turn PII-leak regression found and fixed;
-  all closed and independently re-verified. `getTableSchema` is introspection-only (no overlay).
+  all closed and independently re-verified. Committed `6820677`.
+- ✅ **D83/D84 — catalog overlay + column-scope enforcement in the `clickhouse-api` MCP** (Session 7),
+  committed (`7a901ed` data-agent docs+loader; `b55b4de` clickhouse-api). `getTableSchema` merges
+  introspection+catalog then scope-filters; `sampleRows` rejects out-of-scope. Reviewed — 3 metadata
+  fail-opens found + fixed fail-closed.
+- ✅ **Layer-2 validated against REAL infra** (Session 8, `206a29b`): 10 integration tests prove D57+D83
+  scope enforcement vs real ClickHouse; Couchbase round-trip + D45 exactly-once CAS vs real Couchbase;
+  2 integration bugs found+fixed (`list_tools` no-auth → 401; FastMCP-wrapped error-code parse).
+- ✅ **Minimal UI** (Session 8, `206a29b`/`fbc224e`): FastAPI BFF (JWT server-side, D82) + vanilla SSE
+  console; a browser Send-button bug found+fixed via Layer-3.
+- ✅ **Layer-3 conformance** (Session 8, `fbc224e`): **5/6 Phase-0 scenarios green** via Playwright over
+  the real UI (progress streaming D61, clarify/resume, scope denial D57, parser fail-closed D63,
+  budget-cap D47), deterministic via scripted doubles.
+- ✅ **LIVE end-to-end turn PROVEN**: real OpenAI (D71) → real MCP → real ClickHouse → **correct answer
+  ("2" Sales employees)**, 4 tool calls, progress stream PII-clean. The D68 "real turn" criterion, met.
 
-**Next brick:** **Phase 1** (per D68) — **D77 `resolveValues`** (runtime composite over `runQuery`).
-**D78's `getTableSchema` catalog overlay is no longer a runtime item** — D83 (2026-07-01) relocates the
-overlay + scope-filter permanently to the `clickhouse-api` MCP (see Session 7 below); the runtime's own
-Phase-1 `getTableSchema` work shrinks to a passthrough of an already-overlaid, already-scope-filtered
-MCP response, and `catalog_sha` stamping is likewise MCP-side (D84) for the MCP's own copy. Runtime
-Phase-1 work otherwise continues with the retrieval pipeline, blueprints, the D56 verify gate, and the
-learning-loop Track B. Before "Phase-0 done" can be *claimed*, the D68 exit criteria still need
-**Layer-2** (real Couchbase/MCP + Phoenix on a live turn) and the **Layer-3** Docker+Playwright
-conformance scenarios — the runtime code is Layer-1-proven and reviewed, not yet conformance-proven
-against live infra.
+**Next brick:** **Phase 1** (per D68) — **D77 `resolveValues`** (runtime composite over `runQuery`),
+the retrieval pipeline (embed→recall→rerank on the custom non-OpenAI API, D71), blueprints
+(`searchBlueprints`/`getBlueprint`/`runBlueprint` + neo4j), the **D56 verify gate**, the knowledge plane
+(`searchKnowledge`), and the offline **Track B** learning loop. The runtime's Phase-1 `getTableSchema`
+is just a passthrough of the now-MCP-side overlay (D83/D84). **Phase 0 is substantially complete and
+validated end-to-end** (live turn works); the honest remaining Phase-0 gap is the **3 deferred Layer-3
+scenarios** — mid-session scope narrowing (needs BFF per-turn scope switching), observability+PII span
+inspection (needs a Phoenix collector in the stack — the progress channel is already PII-clean), and
+pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tested). See
+`tests/e2e/README.md`.
 
 **Open follow-ups carried forward:**
-- **clickhouse-api MCP now column-scopes `getTableSchema`/`sampleRows`** (D83) — built on branch
-  `feat/scope-enforcement`, unit-green, **not yet committed** (see Session 7). Layer-2 integration tests
-  against a live containerized ClickHouse for the new scope enforcement have **not yet been run**. The
-  Phase-0 runtime's **defensive** D44 check (drops out-of-scope tool results before the model sees them)
-  stays in place as redundant-but-harmless belt-and-suspenders (OQ-4, mcp-overlay-design.md) now that the
-  MCP boundary itself enforces this too, rather than covering a genuine gap.
-- Phase-0 runtime **Layer-2** (containerized Couchbase/MCP, Phoenix) + **Layer-3** conformance are not
-  yet built (need live infra + the UI); the runtime DI seams (fakes) are in place for them.
+- **NOTHING IS PUSHED (user deferred the push).** data-analysis-agent branch
+  `phase0/provenance-extractor` has 4 commits (`6820677`→`7a901ed`→`206a29b`→`fbc224e`) — **this repo
+  has NO git remote configured yet** (add an `origin` before push/PR). clickhouse-api
+  `feat/scope-enforcement` (origin `kalpesh22-21/click-house-openapi`) has `b55b4de` (D83/D84) +
+  `143f0c1` "Stale changes" (unrelated branch WIP — settings/oauth/helm/diagnose_token, not ours)
+  ahead of origin, unpushed.
+- **How to re-up the Layer-2 stack next session:** `docker compose -f docker-compose.integration.yml
+  up -d --wait`, then `bash scripts/couchbase-init.sh`. Run: MCP/ClickHouse integration →
+  `MCP_TEST_URL=http://localhost:18090/mcp uv run pytest tests/integration`; Couchbase →
+  `RUN_COUCHBASE_TESTS=1 COUCHBASE_CONNECTION_STRING=couchbase://localhost COUCHBASE_USERNAME=admin
+  COUCHBASE_PASSWORD=password uv run pytest tests/runtime/session/test_couchbase_store.py`; Layer-3 →
+  `RUN_E2E=1 uv run pytest tests/e2e` (needs a browser + `l2-token` up). Live UI/turn: run the real
+  runtime `uv run uvicorn data_agent.runtime.app:create_app --factory --port 8000` (with the l2 env +
+  the `.env` OpenAI key) + `scripts/run_ui.sh`.
+- **3 deferred Layer-3 scenarios** (see Next brick + `tests/e2e/README.md`) — the remaining Phase-0 gap.
+- `pytest-playwright` is a dev dep; the live OpenAI key is in a **gitignored `.env`** (`OPENAI_API_KEY`).
+  The runtime's **defensive** D44 check stays as belt-and-suspenders now the MCP enforces scope too (OQ-4).
 - Phase-0 runtime provisional tunables (`RuntimeSettings`): budget caps (15 iter / 60s / 3 windows),
   `SESSION_TTL`=7d, N=20 preview rows, history budget 20% — all set to defaults pending real traffic.
 - Production IdP (Entra) must stamp the `column_scope` claim; wire per-user entitlements to replace the
@@ -63,6 +86,35 @@ against live infra.
 - 6 coverage gaps accepted into backlog (see TRACEABILITY.md §Coverage gaps) — Phase-2 test additions.
 
 ---
+
+## 2026-07-01 — Session 8: Phase-0 VALIDATED against real infra — Layer-2 + UI + Layer-3 + live turn
+
+Took the Layer-1-green Phase-0 build and proved it end-to-end against real infrastructure. **No pushes**
+(user deferred). Committed on `phase0/provenance-extractor`: `206a29b` (Layer-2 + UI + 2 fixes),
+`fbc224e` (Layer-3 + UI browser-fix).
+
+### Shipped
+| Area | Path / commit | Agent |
+|---|---|---|
+| Layer-2 harness: `docker-compose.integration.yml` (real ClickHouse + seeded `dbpcm_warehouse` HR + token IdP + D83 MCP + Couchbase) + `docker/clickhouse-init/hr-warehouse.sql` + `scripts/couchbase-init.sh` | `206a29b` | orchestrator + `backend-developer` |
+| Layer-2 MCP integration suite (10 tests): D57 + D83 scope enforcement vs **real ClickHouse**, read-only, overlay, `catalog_sha` | `tests/integration/` `206a29b` | `backend-developer` |
+| Couchbase session-store Layer-2: round-trip + D45 exactly-once CAS vs **real Couchbase** | `tests/runtime/session/test_couchbase_store.py` `206a29b` | orchestrator |
+| **2 integration bugs found+fixed** (hidden by fakes): `RealMCPClient.list_tools()` sent no JWT → 401 (credentials threaded through list_tools→tool_schema→loop); FastMCP wraps errors as `Error executing tool X: [CODE]` → parser `.match()`→`.search()` | `src/data_agent/runtime/mcp/*`, `loop/agent_loop.py`, `app.py` `206a29b` | `backend-developer` |
+| Minimal UI: FastAPI BFF (`ui/server.py`, mints JWT server-side D82, proxies SSE) + vanilla console (`ui/static/index.html`) + scripted-model launcher (`scripts/run_ui_runtime.py`) | `206a29b`/`fbc224e` | `frontend-developer` + `qa` |
+| Layer-3 conformance (5/6): Playwright over the real UI — progress/clarify/scope-denial/parser-fail-closed/budget-cap | `tests/e2e/` `fbc224e` | `qa` |
+| UI browser-bug fix (Send button dead in a real browser: error spans lacked `id`) | `ui/static/index.html` `fbc224e` | `qa` |
+| Reviews: Layer-2+UI+fixes (APPROVE, 3 suggestions folded incl. `.search()` regex tightening) | — | `reviewer` |
+
+### Live turn (the capstone)
+Ran the **real** runtime (`create_app()` → real OpenAI D71 + `RealMCPClient` @ l2 MCP + real Couchbase +
+JWKS via `l2-token`) and asked *"How many employees are in the Sales department?"* → the model
+autonomously ran `listDatabases`→`listTables`→`getTableSchema`→`runQuery` against **real ClickHouse** →
+answered **"2"** (correct; Alice + Carol in the seed). Progress stream PII-clean (shape only). Verified.
+
+### Honest status
+Phase 0 substantially complete + validated. Remaining: **3 deferred Layer-3 scenarios** (mid-session
+narrowing, observability+PII/Phoenix, restart-durability — documented in `tests/e2e/README.md` with
+server-side/unit coverage noted), and **nothing pushed** (data-agent has no remote configured yet).
 
 ## 2026-07-01 — Session 7: D83/D84 — getTableSchema overlay + scope-filter relocated to clickhouse-api
 
