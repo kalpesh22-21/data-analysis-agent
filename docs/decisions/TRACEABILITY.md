@@ -68,6 +68,14 @@ decision cited here.
 | **D45** | A crash during active (non-paused) compute results in a clean re-run of the whole turn — not a partial or corrupted state — because the data path is read-only and idempotent | Component | `D45-crash-rerun-idempotent` | — | ⛔ not-built |
 | **D49** | Slot resolvers are deterministic code — no LLM call occurs inside `runBlueprint`; multi-match or fuzzy NL slot values route to `askUser`, never to an LLM guess | Unit | `D49-resolver-no-llm-multi-match-asks-user` | **Ask → clarify** | ⛔ not-built |
 
+| **D72** | Hook failures (unhandled exceptions) are logged as `GUARDRAIL` spans and treated as `continue`; a buggy hook never drops a live turn | Unit | `D72-hook-exception-continues-turn` | — | ⛔ not-built |
+| **D72** | H1 ON_REQUEST_RECEIVED veto → turn is aborted cleanly (before it starts); veto from H7/H9 → graceful denial / fallback (turn continues) | Unit + E2E | `D72-hook-veto-correct-action` | — | ⛔ not-built |
+| **D72** | H15–H17 (learning-loop hooks) are read-only; a hook at these points that attempts a write is rejected by the runtime | Unit | `D72-learning-hook-readonly` | — | ⛔ not-built |
+| **D73** | A skill never receives the raw JWT, raw scope token, or raw session_id; `HookContext` carries only hashed/id forms (D5 parity) | Unit | `D73-skill-no-raw-credentials` | — | ⛔ not-built |
+| **D73** | A skill-triggered tool call has credentials injected by the runtime at dispatch; the skill cannot supply its own scope | Unit + Component | `D73-skill-tool-call-scope-injected` | — | ⛔ not-built |
+| **D73** | A skill that exceeds `max_latency_ms` is terminated; a `GUARDRAIL` span is emitted; the turn continues | Unit | `D73-skill-timeout-guardrail` | — | ⛔ not-built |
+| **D74** | Skill execution emits a `CHAIN` span; veto/reject/fallback emits a `GUARDRAIL` span; no cell values or slot values appear in span attributes | E2E | `D74-skill-spans-pii-safe` | **Observability + PII** | ⛔ not-built |
+
 ---
 
 ## Coverage gaps — ACCEPTED into backlog (2026-06-30)

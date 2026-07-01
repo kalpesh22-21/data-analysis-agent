@@ -259,10 +259,28 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   request path and the offline learning loop. Span kinds map ~1:1 to components (AGENT/LLM/TOOL/
   RETRIEVER/EMBEDDING/RERANKER/CHAIN/GUARDRAIL).
 - **D24.** **Self-hosted** Phoenix inside the trust boundary — HR PII must not reach a SaaS endpoint.
-  Auto-instrument the Anthropic SDK; manual spans for custom runtime + learning loop.
+  Auto-instrument the OpenAI SDK (agent LLM only — D71) via the OpenInference OpenAI instrumentor;
+  manual spans for custom runtime + learning loop. The **embedding and reranker are a custom API
+  called via a plain HTTP `POST`** (not any SDK — D71), so those calls require **manual `EMBEDDING` /
+  `RERANKER` spans** — auto-instrumentation does not cover them.
 - **D25.** Traces grouped by `session.id`. **Never log JWT/scope token** (log a scope id/hash only);
   **mask result rows + bound slot values** via OpenInference hide flags + a custom redactor. Log
   shape (counts/columns/latency), not content. Leakage gate emits a `GUARDRAIL` span.
+
+## Model provider
+- **D71 (locked, 2026-06-30).** **Agent LLM is OpenAI; Responses API (`/v1/responses`) is primary,
+  Chat Completions (`/v1/chat/completions`) is fallback.** This supersedes any prior Anthropic/Claude
+  assumption. Rationale for two endpoints: the Responses API is the intended surface for agentic
+  tool-use loops (native tool-call semantics, future streaming improvements); Chat Completions is the
+  fallback for availability gaps or features not yet on the Responses API. **This is NOT a pluggable
+  provider layer** — there is one model provider (OpenAI) and two endpoint modes; the runtime switches
+  between them, not between vendors. **The OpenAI switch applies to the agent LLM only.** The
+  **embedding and reranker models are NOT OpenAI** — they are a **separate custom API called via a
+  simple HTTP `POST` request** (not the OpenAI SDK, not an auto-instrumented client). Because these
+  calls are plain HTTP, they produce **manual `EMBEDDING` / `RERANKER` spans** — the OpenInference
+  OpenAI auto-instrumentor covers only the agent LLM's Responses/Chat Completions SDK calls. The
+  custom embedding/reranker endpoint + specific model ids are TBD (see [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md)
+  §Retrieval). Consistent with D2 (one capable LLM per request) and D23/D24 (observability).
 
 ## External data
 - **D19.** External CSV/xlsx joins via a **session-scoped ClickHouse scratch schema** (not DuckDB).
@@ -512,6 +530,44 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   constructs); do **not** relax to fail-open. The user-facing rejection reuses the §Graceful-denial
   path in [06](../06-security-and-governance.md). Resolves the parse-failure half of review risk #8;
   the eight review risks are now all dispositioned.
+
+## Extensibility
+- **D72 (locked, 2026-06-30).** **Lifecycle hook points are named, typed, and have fixed contracts;
+  they are NOT arbitrary intercept points.** Seventeen named hook points span the request lifecycle
+  (H1–H14) and the offline learning loop (H15–H17). Each hook declares: what it reads (a redacted
+  shape/count view — never raw cell values, never the JWT/scope/session_id per D5), what it may
+  mutate (only: context fragment injection at H3, thin-card reordering at H4, veto at H1/H7/H9,
+  fallback at H9, structured non-PII annotation at H13), and whether it can veto/abort. Hooks at
+  H15–H17 (learning loop) are **read-only** — no mutation — to prevent a hook from corrupting the
+  D1 two-plane split. Hook failures (unhandled exceptions) are logged as `GUARDRAIL` spans (D23)
+  and treated as `continue`; a buggy hook never drops a live turn. H1 failures abort the turn
+  (safe: the turn has not started). See [12-extensibility.md](../12-extensibility.md) §1 for the
+  full hook-point table and contracts.
+
+- **D73 (locked, 2026-06-30).** **Skills are first-party, manifest-registered capabilities invoked
+  by the runtime — the model never participates in skill selection.** A skill is a distinct extension
+  axis from tools (D4, fixed 11) and blueprints (D9–D13, learned query DAGs): tools are the model's
+  action vocabulary; blueprints are learned fast-path query patterns; a skill is a pre-approved
+  runtime capability (formatting, cross-system lookup, specialized analysis, document generation)
+  that may orchestrate tool calls while staying within the D5 injection boundary. Skills are
+  registered at startup via a YAML manifest (`name`, `version`, `description`, `when_to_use`,
+  `capability` ∈ a closed enum, `triggers.intent_patterns`, `triggers.blueprint_ids`, `hook_points`,
+  `entry_point`, `max_latency_ms`). The runtime selects skills by matching turn intent against
+  `intent_patterns` (or `blueprint_ids` on fast-path completion) at the registered hook point;
+  selection is deterministic, runtime-only. **Security boundary:** a skill receives `session_id_hash`
+  and `scope_id` (hashes, not the raw token — D5), never the JWT; any tool call a skill dispatches
+  has credentials injected by the runtime at dispatch (same as model-initiated calls). **Budget
+  boundary:** skill wall-clock and tool-call iterations count against the turn's D47 budget; a skill
+  exceeding `max_latency_ms` is terminated and logged as a `GUARDRAIL` span. Launch trust model:
+  first-party only, in-process, no sandboxing (see OPEN-QUESTIONS). See
+  [12-extensibility.md](../12-extensibility.md) §2–3.
+
+- **D74 (locked, 2026-06-30).** **Hooks and skills reuse existing span kinds; no new span kind is
+  introduced.** Hook execution → `CHAIN`; veto/reject/fallback → `GUARDRAIL`; unhandled exception →
+  `GUARDRAIL`. A skill-triggered tool call → `TOOL` (child of the skill's `CHAIN` span). PII posture
+  is identical to D25: no cell values, no bound slot values, no JWT, no raw scope token in any
+  span attribute; `slot_names` (not values) are permitted. See [12-extensibility.md](../12-extensibility.md)
+  §4.
 
 ## Delivery / sequencing
 - **D68 (locked, 2026-06-30).** **Three-phase delivery with a red-burndown conformance harness from day one.**

@@ -19,9 +19,12 @@ request path and the offline learning loop.
 
 - **Self-hosted Phoenix** (container) inside our trust boundary. HR data is sensitive — traces must
   not leave to a SaaS endpoint. OTLP over gRPC/HTTP to the in-cluster collector.
-- **Auto-instrument** the Anthropic SDK (the agent model is Claude) via the OpenInference Anthropic
-  instrumentor; **manual spans** for our custom runtime (context assembly, tool dispatch, blueprint
-  executor, learning loop).
+- **Auto-instrument** the OpenAI SDK (the agent model is OpenAI — Responses API primary, Chat
+  Completions fallback; D71) via the OpenInference OpenAI instrumentor; **manual spans** for our
+  custom runtime (context assembly, tool dispatch, blueprint executor, learning loop). **The
+  embedding and reranker are a separate custom API (not OpenAI) called via a plain HTTP `POST`, so
+  those calls produce manual `EMBEDDING` / `RERANKER` spans** — the auto-instrumentor does not cover
+  them (it covers only the agent LLM's SDK calls).
 - Separate Phoenix **projects** for `request-path` vs. `learning-loop`.
 
 ## Span boundaries double as UI progress events (D61)

@@ -129,8 +129,10 @@ ranked `resolveValues` match is auto-used vs. routed to `askUser` — risk of si
 plausible-but-wrong code.
 
 ## Retrieval ([03](../03-context-and-retrieval.md))
-- Reranker model + threshold; recall `k` vs. final top-3.
-- Shared embedding model choice.
+- Reranker model + threshold; recall `k` vs. final top-3. The reranker is a **custom API (not OpenAI)** (D71) called via a **simple HTTP `POST`** with a manual `RERANKER` span (D24); endpoint + model id TBD.
+- Shared embedding model choice — a **custom API (not OpenAI)** (D71); endpoint + specific model id TBD.
+  Called via a **simple HTTP `POST`** with a manual `EMBEDDING` span (D24); shared across question +
+  blueprint intent + knowledge.
 - **`resolveValues` (D66):** ranking signals (semantic + synonyms + frequency) weighting; the
   deferred **per-(client,column) index** (currently live `DISTINCT` each call); temporal label-drift
   handling via the `period?` arg.
@@ -167,6 +169,21 @@ plausible-but-wrong code.
 - Redactor implementation + attribute allow-list.
 - Online eval judges (live vs. batch) and the canary eval set.
 - Trace sampling rate (100% vs. sampled) given PII + volume.
+
+## Extensibility ([12](../12-extensibility.md))
+- **Sandboxing model for skills.** Launch is first-party in-process (no sandbox). If third-party
+  skills are introduced: what boundary (subprocess, WASM, gVisor)? What review process?
+- **Skill versioning and compatibility.** When `HookContext` payload evolves, how are older skills
+  gated? Is there a `min_schema_version` startup check, or is the contract additive-only?
+- **Permission model for `capability` enum.** Who approves new capability tags, and how is the
+  capability ↔ hook-point whitelist extended?
+- **Skill testing conventions.** Should the Layer 3 `docker-compose` stack include a fixture skill
+  to exercise the dispatch path end-to-end?
+- **Skill ordering at the same hook point.** Sequential-in-registration-order is simple but
+  file-system-order-dependent. Should the manifest have an explicit `priority` field?
+- **Skill failure and D47 budget interaction.** When a skill is terminated for exceeding
+  `max_latency_ms`, is the remaining turn budget reduced by the consumed wall-clock, or reset?
+  (Working answer: reduced, consistent with D47.)
 
 ## Whole-system
 - Full component diagram polish.

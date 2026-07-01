@@ -125,5 +125,5 @@ This is defense-in-depth, not the security boundary: the hard gate remains the i
 
 **Status:** Locked
 **Open questions:**
-- Reranker model/threshold and `k` for recall vs. top-3 final — tune empirically.
-- Embedding model choice (shared across question + blueprint intent + knowledge).
+- Reranker model/threshold and `k` for recall vs. top-3 final — tune empirically. The reranker is a **custom API (not OpenAI)** called via a **simple HTTP `POST`** with a manual `RERANKER` span (D71/D24).
+- Embedding model choice — a **custom API (not OpenAI)** (D71); endpoint + specific model id TBD; shared across question + blueprint intent + knowledge. Called via a **simple HTTP `POST`** with a manual `EMBEDDING` span (D71/D24).

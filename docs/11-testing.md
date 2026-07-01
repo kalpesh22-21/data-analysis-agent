@@ -92,7 +92,7 @@ couchbase · redis · phoenix · agent-runtime · ui · privileged-ingestion sid
 
 ### Determinism of the LLM in e2e
 
-The agent uses a real LLM (Claude), so e2e must not assert exact NL. Two modes:
+The agent uses a real LLM (OpenAI — D71), so e2e must not assert exact NL. Two modes:
 - **CI (deterministic):** record/replay LLM interactions (cassette-style) + assert on **structural/behavioral invariants** (SQL shape, chips present, scope denied, span emitted), never exact prose.
 - **Nightly (live):** run the same suite against the live model to catch drift; grade with the Layer-4 result-set/LLM-judge harness rather than string equality.
 

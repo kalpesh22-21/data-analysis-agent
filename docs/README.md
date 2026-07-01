@@ -20,6 +20,7 @@ fundamentals of OpenAI's in-house data agent but adapted for a **curated** wareh
 | 09 | [Infrastructure](09-infrastructure.md) | Stores, session management |
 | 10 | [Observability](10-observability.md) | Arize Phoenix + OTel tracing, evals, PII redaction (cross-cutting) |
 | 11 | [Testing](11-testing.md) | Four-layer pyramid; Docker + Playwright(MCP) spec-conformance suite |
+| 12 | [Extensibility](12-extensibility.md) | Skills & lifecycle hooks: hook points, skill manifests, interface contracts, invariant constraints |
 
 ## Decision record
 

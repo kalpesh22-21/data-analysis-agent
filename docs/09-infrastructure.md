@@ -121,7 +121,7 @@ rejected — the **scratch session-isolation boundary** (D64,
 
 ## Retrieval infra
 
-- Shared embedding model across question / blueprint intent / knowledge.
+- Shared embedding model across question / blueprint intent / knowledge, plus the cross-encoder reranker below: both are a **custom API (not OpenAI)** — D71; endpoint + specific model ids TBD. Each is called via a **simple HTTP `POST`** (not any SDK), so each call produces a **manual `EMBEDDING` / `RERANKER` span** (D24).
 - **Both vector corpora (blueprint intent + global knowledge) live in neo4j** (D60) — one engine for
   graph traversal + vector recall; no separate vector store.
 - Vector recall → **cross-encoder reranker** → top-3 thin cards (blueprints) and reranked knowledge.
@@ -195,9 +195,9 @@ accumulating over weeks and human approvals over days — that is **state** on c
 
 ---
 
-**Status:** Partial (topology Locked; concrete tech for vector index/embeddings/reranker TBD)
+**Status:** Partial (topology Locked; concrete tech for embeddings/reranker TBD)
 **Open questions:**
 - ~~Vector index choice (native neo4j vector vs. external)~~ — **RESOLVED by D60: neo4j-native**,
-  hosting both blueprint intent + global-knowledge vectors. Embedding-model choice still TBD.
-- Reranker hosting.
+  hosting both blueprint intent + global-knowledge vectors. Embedding + reranker are a **custom API (not OpenAI)** (D71) via simple HTTP `POST`; endpoint + model ids TBD.
+- Reranker hosting (custom API — D71).
 - Couchbase document model for the session trail.
