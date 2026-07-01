@@ -400,7 +400,8 @@ specified separately.
 **Open questions:**
 - **Grain ownership (correctness — proposed D37):** no grain contract today, so a wrong-grain
   blueprint (e.g. `AVG(gross_pay)` over a 1:N `payroll_fact` join, no period filter) passes every
-  gate and runs silently. Declare grain in `getTableSchema` YAML + static fan-out gate at authoring +
+  **authoring-time** gate — though the runtime **D56 verify gate catches it at execution** (catching it
+  statically at authoring is the proposed-D37 deliverable). Declare grain in `getTableSchema` YAML + static fan-out gate at authoring +
   a temporal slot type. See [decisions](decisions/DECISIONS.md) D37 and [open questions](decisions/OPEN-QUESTIONS.md).
 - **Rule-semantics drift (proposed D38):** `uses_rules` pins rules by name only; a definition change
   mutates citing blueprints silently. Version rules; re-flag dependents.
@@ -415,8 +416,8 @@ specified separately.
 - **`skip`/`skip_remaining` semantics** in a parallel-converge graph (skip-node vs skip-dependents;
   "remaining" by what order), and **mid-DAG runtime failure** handling — still open.
 - Concrete `slot_bindings` payload shape and per-`type` binding rules (incl. list/`IN` and enum slots).
-- Inline-vs-scratch size threshold for intermediates.
+- ~~Inline-vs-scratch size threshold for intermediates.~~ **RESOLVED by D59a:** shape-based — scalars → typed params; all tables → session scratch. No threshold.
 - Output-signature definition: which invariants to capture/check, and the input-sampling strategy.
-- **Golden replay on a mutable warehouse:** retro pay / backdated PAFs make frozen goldens prove SQL
-  *stability* not *correctness vs. current data* (D36 scopes replay to regression) — needs a
-  semantic-drift canary.
+- ~~**Golden replay on a mutable warehouse**~~ — **RESOLVED by D43:** the semantic-drift canary is
+  specified as three probes (grain-integrity, catalog-conformance, rule-currency), scheduled in Phase 2;
+  D36 scopes replay to regression. Remaining: `DRIFT_TTL` + probe cadence.

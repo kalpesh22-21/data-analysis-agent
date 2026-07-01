@@ -23,7 +23,7 @@ below. Its consumers — the MCP live-scope gate (D57), the replayed-trail filte
 enforcement at the MCP (D64) — are **not yet built**, so those rows stay `🟡 unit-green`. Per D75,
 the Component consumer for **D57/D63/D64** is the **`clickhouse-api` extension** (the existing MCP
 service, adopted and extended); the provenance extractor will be delivered into `clickhouse-api`
-(packaging TBD). **D44's** Component consumer is different — it is the **agent runtime's** replayed-trail
+via **copy-in** (D79a). **D44's** Component consumer is different — it is the **agent runtime's** replayed-trail
 filter, also not yet built (not part of the `clickhouse-api` extension). No status changes until these ship.
 
 See [docs/11-testing.md](../11-testing.md) for the four-layer test pyramid definition and the full

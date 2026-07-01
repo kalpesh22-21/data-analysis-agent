@@ -28,7 +28,7 @@ The same injection applies to `runQuery` calls made **inside** `runBlueprint`.
 | `runQuery` | `sql, limit(1–10000?)` | Read-only `SELECT/WITH/SHOW/DESCRIBE`. Enforces read-only, time limits, row caps. INSERT/UPDATE/DELETE/DDL/table functions blocked. |
 | `explainQuery` | `sql` | `EXPLAIN` to validate SQL / inspect plan without executing. |
 
-These 6 tools are provided by the existing `clickhouse-api` service (adopted + extended, D75). The MCP returns introspection only; the semantic-catalog overlay (D42) is applied by the **agent runtime** (D78) — it is no longer an `clickhouse-api` extension item. After D77 + D78, the remaining `clickhouse-api` extension scope is enforcement-only: D57 column-scope + D63 fail-closed + D64 scratch isolation + D5 scope injection. The MCP data plane is exactly 6 read tools — consistent with D4.
+These 6 tools are provided by the existing `clickhouse-api` service (adopted + extended, D75). The MCP returns introspection only; the semantic-catalog overlay (D42) is applied by the **agent runtime** (D78) — it is no longer a `clickhouse-api` extension item. After D77 + D78, the remaining `clickhouse-api` extension scope is enforcement-only: D57 column-scope + D63 fail-closed + D64 scratch isolation + D5 scope injection. The MCP data plane is exactly 6 read tools — consistent with D4.
 
 ## Runtime composite tools
 

@@ -69,9 +69,11 @@ sub-detail: the SQL-AST canonicalization rules (alias/ordering normalization dep
   *stability* not *correctness vs. current data*). The "semantic-drift canary" is now specified as
   **three concrete probes** (result grain-integrity, catalog-vs-warehouse conformance, rule-semantics
   currency) gating a **freshness-bounded silent-eligibility** predicate; scope is incorrectness-not-
-  change (honors D36). **Phase-2 deliverable** — Phase 1 ships silent-on-validation as an accepted
-  time-boxed risk. Remaining sub-detail: `DRIFT_TTL` value + probe sampling/scheduling cadence.
-- Inline-vs-scratch size threshold for intermediates.
+  change (honors D36). **Phasing (per D56):** Phase 1's D56 verify gate runs probe #1 (grain-integrity)
+  on **every** result at runtime — so there is no unverified return; probes #2 (catalog-conformance)
+  and #3 (rule-currency) are the **Phase-2 scheduled** additions (accepted time-boxed drift risk until
+  then). Remaining sub-detail: `DRIFT_TTL` value + probe sampling/scheduling cadence.
+- ~~Inline-vs-scratch size threshold for intermediates.~~ **RESOLVED by D59a:** shape-based, not size-based — scalars → typed params; all tables (small or large) → session scratch. No threshold.
 - Golden-input capture: where golden results are stored and refreshed.
 - neo4j graph schema (node labels, edge types, indexes) — to be specified.
 
@@ -152,11 +154,11 @@ decision, not an MCP concern.
 1. ~~**Provenance extractor packaging.**~~ **RESOLVED by D79(a): copy-in** (spec repo authoritative,
    mirror same-sprint; promote to shared library once the D69/D70 contract stabilizes).
 
-2. ~~**Column-scope model mismatch / transport.**~~ **RESOLVED by D79(b): signed JWT claims** —
-   `column_scope` + `session_id` ride the runtime-signed JWT, threaded through the existing
-   `Principal`/ContextVar into `runQuery` (the tenant-level → column-level shift). Remaining sub-detail:
-   the large-scope-vs-header-size mitigation (inline list vs. a signed scope *reference*) — decided only
-   if it bites.
+2. ~~**Column-scope model mismatch / transport.**~~ **RESOLVED by D79(b) + D81:** `column_scope` is a
+   signed **JWT claim** (D79b); `session_id` travels as an unsigned **`X-Session-Id` header** (D81,
+   amends D79b) — both threaded through the existing `Principal`/ContextVar into `runQuery` (the
+   tenant-level → column-level shift). Remaining sub-detail: the large-scope-vs-header-size mitigation
+   (inline `column_scope` list vs. a signed scope *reference*) — decided only if it bites.
 
 ### Other security / infra items
 

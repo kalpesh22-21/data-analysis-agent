@@ -121,8 +121,10 @@ extracted ─(leakage pass)─▶ candidate ─┬─ golden-replay passes (sche
 - **Drift attestation (D43):** the scheduler also runs the **three drift probes** (result
   grain-integrity, catalog-vs-warehouse conformance, rule-semantics currency) and stamps
   `drift_status` + `last_drift_check_at`. **Silent-eligibility** is `validated AND drift_status=clean
-  AND fresh` — see [04-blueprints.md](04-blueprints.md) §Drift attestation. **Phased:** Phase 1
-  ships `validated→silent` unconditionally (accepted time-boxed risk); Phase 2 enforces the predicate.
+  AND fresh` — see [04-blueprints.md](04-blueprints.md) §Drift attestation. **Phased (per D56):** the
+  D56 verify gate runs grain-integrity on **every** result in Phase 1 (no unverified silent return);
+  the full freshness predicate (catalog-conformance + rule-currency probes) is **Phase 2** — accepted
+  time-boxed drift risk until then.
 - **Negative signals demote:** a corrected blueprint output, a failed golden replay, or a
   `drift_status=suspect` probe drops trust.
 

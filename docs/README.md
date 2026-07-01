@@ -10,7 +10,7 @@ fundamentals of OpenAI's in-house data agent but adapted for a **curated** wareh
 |---|-----|----------------|
 | 00 | [Overview](00-overview.md) | Problem, OpenAI lineage, where we differ, goals |
 | 01 | [Architecture](01-architecture.md) | Two-plane model, components, request lifecycle |
-| 02 | [Tools & API](02-tools-and-api.md) | The 11-tool inventory, contracts, injected vs model-visible args |
+| 02 | [Tools & API](02-tools-and-api.md) | The 12-tool inventory, contracts, injected vs model-visible args |
 | 03 | [Context & Retrieval](03-context-and-retrieval.md) | Retrieval pipeline, reranker, progressive disclosure |
 | 04 | [Blueprints](04-blueprints.md) | DAG model, execution, lifecycle, scope edges |
 | 05 | [Memory & Learning](05-memory-and-learning.md) | Memory-layer mapping + the end-of-session write router |

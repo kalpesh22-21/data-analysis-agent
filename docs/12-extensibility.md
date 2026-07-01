@@ -17,7 +17,7 @@ The agent already has three extension axes. Skills and hooks are a **fourth** â€
 
 | Axis | What it is | Who adds it | Interaction with model |
 |---|---|---|---|
-| **Tool (D4)** | Fixed 11-tool inventory; data plane + knowledge plane tools; model calls them by name | Core runtime, never extended by skills | Model emits a tool call; runtime dispatches |
+| **Tool (D4)** | Fixed 12-tool inventory (6 MCP + `resolveValues` runtime composite + 4 knowledge + `askUser`); model calls them by name | Core runtime, never extended by skills | Model emits a tool call; runtime dispatches |
 | **Blueprint (D9â€“D13)** | Learned, parameterized query DAG stored in neo4j; arrives via the learning loop | Learning loop (offline) | Model selects and invokes via `runBlueprint` |
 | **Skill (D73)** | Reusable capability registered at startup; selected by the runtime based on intent matching | First-party developers | Model is unaware; runtime selects + invokes |
 | **Lifecycle hook (D72)** | Code that runs at a named point in the request or learning-loop lifecycle | First-party developers | Observes / may redirect; model never sees it |

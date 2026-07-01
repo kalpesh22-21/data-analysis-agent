@@ -45,8 +45,9 @@ On upload, the UI runs a **column-mapping step** — which uploaded column is `E
 ## Reuse for blueprint intermediates
 
 The same scratch schema materializes **large blueprint intermediates** (see
-[04-blueprints.md](04-blueprints.md) §Pass intermediates). Small scalars/tables inline as CTE/`VALUES`;
-large tables land in scratch. One mechanism for both.
+[04-blueprints.md](04-blueprints.md) §Pass intermediates). Scalars bind as typed ClickHouse
+server-side parameters; tables (small or large) materialize to the scratch schema and are `JOIN`ed —
+shape-based, replacing D11's size-based inline-vs-scratch split (D59a). One mechanism for both.
 
 ## Governance guardrails
 

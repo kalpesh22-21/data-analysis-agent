@@ -9,39 +9,52 @@ invariant→test status board.
 
 ## ▶ RESUME HERE (next session)
 
-**Where we are:** Phase 0 (walking skeleton, per **D68**). The first brick — the `sqlglot`
-column-provenance extractor — is **built, reviewed, fixed, and green**. Nothing else in the runtime
-exists yet.
+**Where we are:** Phase 0 (walking skeleton, per **D68**).
+- ✅ The `sqlglot` column-provenance extractor — built, reviewed, green.
+- ✅ The **`clickhouse-api` MCP enforcement is built, tested, committed, and pushed** (branch
+  `feat/scope-enforcement` on `kalpesh22-21/click-house-openapi`): D57 column-scope + D63 fail-closed
+  + D64 scratch isolation; `column_scope` via a signed **JWT claim** (D79b), `session_id` via the
+  **`X-Session-Id` header** (D81), empty scope = allow-all (D80), **MCP-only** enforcement (D80).
+  Extractor delivered **copy-in** (D79a); interim `system.columns` catalog. 755+ tests green.
+- ✅ `token_service` mints **column-scoped** tokens the MCP validates end-to-end (D79/D82); the UI
+  mints its JWT server-side on login, defaulting to all-column access for now (D82).
 
-**Next brick:** **extend the existing `clickhouse-api` service** (D75) — NOT build a new MCP from
-scratch. The extension adds the missing enforcement pieces to `clickhouse-api`:
-- D57/D62/D63 — wire `sqlglot` column-scope enforcement + fail-closed policy.
-- D64 — scratch `s_<session_id>_*` isolation (same parse, same fail-closed posture).
-- D5 — add `scope` + `session_id` parameters to `runQuery` (injected, not model-visible).
-- ~~D66 — implement the `resolveValues` tool (the 7th data-plane tool).~~ **Removed (D77,
-  2026-06-30):** `resolveValues` is now a runtime composite over `runQuery`, not an MCP addition.
-  Its implementation belongs in the agent runtime, not `clickhouse-api`.
-- ~~D42 — merge the semantic-catalog overlay into `getTableSchema`.~~ **Removed (D78,
-  2026-06-30):** the `introspection ⨝ catalog overlay` join moves to the agent runtime. The MCP
-  returns introspection only; `clickhouse-api` extension scope is now enforcement-only
-  (D57/D63/D64/D5).
-- Deliver the Phase-0 provenance extractor **into** `clickhouse-api` (packaging TBD — see
-  OPEN-QUESTIONS.md §Security/infra D75).
-
-Building this extension turns the `🟡 unit-green` rows (D57 live scope, D63 fail-closed, D64 scratch)
-toward `✅` by adding their Component layer. It needs a **containerized ClickHouse** for Layer-2
-tests (read-only enforcement, scope-by-parse; catalog overlay test now lives in the runtime layer, D78).
-The Component layer now lives in `clickhouse-api`, not a new service.
+**Next brick:** **agent-runtime work** (the pieces D77/D78 moved out of the MCP, plus the Phase-0 loop):
+- Runtime `resolveValues` composite over `runQuery` (D77).
+- Runtime `getTableSchema` catalog overlay (`introspection ⨝ catalog YAML`, D78) + `catalog_sha` stamping.
+- The Phase-0 raw agent loop + context assembly + Couchbase session store + progress streaming.
 
 **Open follow-ups carried forward:**
-- The lambda fail-closed has a structural check (D70); the secondary body-walk cross-check still uses
-  `find_all` — fine as belt-and-suspenders, but the **D62 `system.query_log.columns` oracle** (a
-  Layer-2 job) is the real long-term validation of parser coverage. Not built yet.
-- Local dev venv is Python 3.14; CI pins 3.12 (the `requires-python` floor). Consider a CI matrix
-  (3.12 + 3.14) later.
+- Production IdP (Entra) must stamp the `column_scope` claim; wire per-user entitlements to replace the
+  **D82 interim all-access** default (OPEN-QUESTIONS §Security/infra).
+- Replace the interim `system.columns` catalog in `clickhouse-api` with the **D78 runtime catalog** source.
+- **Layer-2 / integration tests** against a live containerized ClickHouse (scope denial, scratch, fail-closed).
+- **`X-Session-Id` HMAC-bind-to-`sub`** hardening before the scratch-upload feature ships (D81).
+- The **D62 `system.query_log.columns` oracle** (Layer-2 job) — measure the sqlglot false-reject rate
+  before enabling enforcement in prod; also the D70 secondary body-walk still uses `find_all` (belt-and-suspenders).
+- Local dev venv is Python 3.14; CI pins 3.12 — consider a CI matrix (3.12 + 3.14) later.
 - 6 coverage gaps accepted into backlog (see TRACEABILITY.md §Coverage gaps) — Phase-2 test additions.
 
 ---
+
+## 2026-07-01 — Session 5: clickhouse-api enforcement BUILT; D79–D82 locked
+
+### Decisions locked this session
+- **D79** — extractor delivery = **copy-in**; scope transport = signed JWT claim (session_id later moved to a header by D81).
+- **D80** — **MCP-only** enforcement (REST is a trusted unscoped surface); empty `column_scope` = **allow-all** (D63/D64 still fire).
+- **D81** — `session_id` travels via the **`X-Session-Id` header**, not a JWT claim; `column_scope` stays a JWT claim.
+- **D82** — the UI mints its JWT server-side on login; **interim** default is all-column access; future = managed IdP (Entra).
+
+### Shipped artifacts
+| Area | Path / branch | Agent |
+|---|---|---|
+| Column-scope + fail-closed + scratch enforcement, extractor copy-in, sqlglot dep, JWT-claim + `X-Session-Id` wiring, interim catalog | `clickhouse-api` branch `feat/scope-enforcement` (pushed) | `backend-developer` |
+| `token_service` mints column-scoped tokens; mint→validate round-trip test | `clickhouse-api/app/token_service.py` | `backend-developer` |
+| D79–D82 recorded; D79–D82 relocated under `## ClickHouse MCP — adoption decision`; full-doc consistency audit + fixes | `docs/decisions/*`, chapters 02/04/05/06/07/08/README | `planner` + `reviewer` |
+
+### Notes
+- `clickhouse-api` enforcement is **built, tested (755+ green), and pushed** — no PR opened yet (per user).
+- Security review found **no fail-open** on the MCP path; interim gaps documented (REST unscoped, `X-Session-Id` unsigned, `system.columns` interim catalog).
 
 ## 2026-06-30 — Session 4: D78 — getTableSchema catalog overlay moves to agent runtime
 
