@@ -6,7 +6,7 @@
 |---|---|
 | **ClickHouse** | HR data warehouse (flattened views: employee info, payroll, time & attendance; join on `employee_code`). Exposed read-only via the MCP. |
 | **ClickHouse scratch schema** | Session-scoped, TTL'd tables for external uploads + large blueprint intermediates. Written via a privileged side-channel, read via normal MCP. |
-| **Semantic Catalog** | **Git-backed YAML** (one file per table + a `rules.yaml`), deployed with the runtime (D53/D78). The curated semantic layer: entities, grain, per-measure `{agg, defined_over}`, `temporal`, rule definitions, ambiguities, synonyms, enum values, `sensitive`/`client_defined` flags. The **runtime** merges this with live MCP introspection (`introspection ⨝ catalog overlay`, D78) before handing schema to the model. Single source of truth blueprints inherit. See §Semantic Catalog. |
+| **Semantic Catalog** | **Git-backed YAML** (one file per table + a `rules.yaml`), deployed to **both** the runtime and the MCP (D53, amended D84 — D78's runtime-only deploy is reversed). The curated semantic layer: entities, grain, per-measure `{agg, defined_over}`, `temporal`, rule definitions, ambiguities, synonyms, enum values, `sensitive`/`client_defined` flags. The **MCP** merges this with live introspection (`introspection ⨝ catalog overlay`, D83 reverses D78) and scope-filters the result before handing schema to the model. Single source of truth blueprints inherit. See §Semantic Catalog. |
 | **neo4j** | Blueprint DAG store: nodes for blueprints/steps, `USES` edges to tables/columns (transitive scope filtering), `composes` graph + blueprint-to-blueprint/rule traversal. **Also hosts the global-knowledge vector index** (D60) — both blueprint intent embeddings **and** knowledge embeddings live here; the standalone vector store is removed. |
 | ~~Vector index + RAG~~ | **Folded into neo4j (D60).** Global knowledge (institutional knowledge + lessons), entity-agnostic, served via `searchKnowledge` — now a neo4j-native vector index. |
 | **User knowledge store** | Per-user preferences and entity defaults (entity-bearing OK). |
@@ -15,9 +15,9 @@
 
 ## Semantic Catalog (git-backed YAML)
 
-The curated semantic layer that grounds correctness for **all** users. The MCP's `getTableSchema` returns live introspection only; the **runtime** applies the `introspection ⨝ catalog overlay` join (D78) before presenting schema to the model. Because it grounds every user's answers, it is the
+The curated semantic layer that grounds correctness for **all** users. The **MCP**'s `getTableSchema` applies the `introspection ⨝ catalog overlay` join and scope-filters the result (D83 reverses D78, which had put this join in the runtime) before presenting schema to the model. Because it grounds every user's answers, it is the
 single most correctness-critical artifact in the system, so it lives where versioning, diff,
-rollback, audit, and human review come for free: **git**. The catalog deploys with the runtime (not the MCP service) — see §Deploy-coupled load below.
+rollback, audit, and human review come for free: **git**. The catalog now deploys to **both** the runtime and the MCP service (D84 amends D53) — see §Deploy-coupled load below.
 
 ```
 catalog/
@@ -27,7 +27,7 @@ catalog/
   rules.yaml              # rule DEFINITIONS: active_employee, settled_pay_only, latest_period, …
 ```
 
-- **Deploy-coupled load (D53; clarified by D78).** The catalog is **baked into the runtime deploy artifact** (not the MCP service); a merged PR goes live on the next runtime deploy/restart. So **catalog SHA ≡ runtime deploy SHA** — fully reproducible, and "the catalog version a blueprint validated against" is simply the runtime deploy version. The runtime reads the catalog at startup and performs the overlay join before serving schema to the model (D78). The warehouse is curated and rarely mutates, so gating catalog edits on deploy cadence is acceptable (edits are human-reviewed and batched with releases anyway). The learning loop / drift jobs read the catalog at the currently-deployed SHA.
+- **Deploy-coupled load (D53; clarified by D78, D78 reversed and superseded by D84).** The catalog is now **baked into both the runtime and the MCP deploy artifacts** (D84 amends D53's original single-artifact framing, and D78's brief "runtime-only, not the MCP service" clarification no longer holds); a merged PR goes live on each service's next deploy/restart. Because there are now two deploy artifacts, `catalog_sha` is redefined (D84) as the **catalog subtree's own git SHA**, not either service's deploy SHA — this is what makes cross-service version-skew observable, rather than assuming the two always deploy in lockstep. "The catalog version a blueprint validated against" is that catalog SHA. The **MCP** reads the catalog and performs the overlay + scope-filter join before serving schema to the model (D83); the runtime's own copy remains available for the query-provenance/D62 uses `build_sqlglot_schema()` already had, and continues to be exposed as `catalog_sha` from its own git log. The warehouse is curated and rarely mutates, so gating catalog edits on deploy cadence is acceptable (edits are human-reviewed and batched with releases anyway). The learning loop / drift jobs read the catalog at the currently-deployed SHA.
 - **Version = git commit SHA (= deploy SHA).** Stamped into blueprint `USES`-edge validation and
   golden replays, so a blueprint always validates against a known catalog version.
 - **Write path = the schema-edit review inbox, via a bot-authored PR (D53).** Learning-loop
@@ -37,10 +37,10 @@ catalog/
   gate. One mechanism for the catalog write path and the review queue. (A blueprint paired with a
   `schema_edit(add_rule)` via `depends_on` stays blocked until that PR merges **and** ships in a
   deploy.)
-- **Catalog ↔ ClickHouse mismatch (D53; graceful degradation now runtime-side per D78).** The MCP always returns introspection; the runtime applies the overlay. So:
-  - *Table in ClickHouse, no catalog entry* → runtime returns **structural-only** (no grain/rules/semantics);
+- **Catalog ↔ ClickHouse mismatch (D53; graceful degradation is MCP-side again per D83, reversing D78's runtime-side arrangement).** The MCP performs the overlay and, when there's no catalog entry, the graceful-degradation path itself. So:
+  - *Table in ClickHouse, no catalog entry* → MCP returns **structural-only** (no grain/rules/semantics);
     **usable in the raw loop** (flagged "uncatalogued") but **not blueprint-eligible** (no grain to
-    gate). Graceful degradation handled by the runtime, not the MCP.
+    gate). Graceful degradation handled by the MCP, not the runtime.
   - *Catalog entry, warehouse diverged* → caught by the **D43 catalog-vs-warehouse conformance probe**;
     resolution flows back as a `schema_edit` PR. No new mechanism — reuses the drift attestation.
 - **Drift propagation.** A catalog SHA bump triggers the schema-drift maintenance job
@@ -186,7 +186,7 @@ The ClickHouse MCP data plane is the **existing `clickhouse-api` service** (Fast
 JWT/OIDC auth at `app/auth_jwt.py` + `app/principal.py`) — **adopted and extended**, not built from
 scratch (D75). It already provides the 6 core data tools and read-only enforcement + tenant/row-level
 isolation. The remaining extension pieces — D57/D62/D63 column-scope enforcement, D64 scratch isolation, D5
-scope/session_id injection, and the Phase-0 provenance extractor — are added to `clickhouse-api` by extension. **D66 `resolveValues` (moved to runtime by D77) and D42 catalog overlay (moved to runtime by D78) are no longer `clickhouse-api` extension items.** After D77 + D78, the clickhouse-api extension scope is enforcement-only.
+scope/session_id injection, and the Phase-0 provenance extractor — are added to `clickhouse-api` by extension. **D66 `resolveValues` (moved to runtime by D77) is no longer a `clickhouse-api` extension item; D42 catalog overlay (moved to runtime by D78) has moved back (D83 reverses D78) and is once again a `clickhouse-api` extension item.** After D77 + D83, the clickhouse-api extension scope is enforcement **plus** the D83 catalog overlay/scope-filter (`getTableSchema`) and scope-reject (`sampleRows`).
 
 ## Boundaries recap
 

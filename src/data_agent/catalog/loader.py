@@ -61,25 +61,33 @@ def _extract_columns(raw_columns: dict[str, Any]) -> dict[str, str]:
     return result
 
 
-def load_catalog_from_dir(schema_dir: Path | str) -> dict[str, dict[str, str]]:
-    """Load all *.yaml files in `schema_dir` and return the sqlglot schema dict.
+def _resolve_schema_dir(schema_dir: Path | str | None) -> Path:
+    """Resolve the databaseSchemaDocs/ directory, defaulting relative to this file.
 
-    Returns:
-        {
-          "database.table": {"ColumnName": "type_string", ...},
-          ...
-        }
+    If `schema_dir` is None, resolves to repo root / databaseSchemaDocs (this file
+    lives at src/data_agent/catalog/loader.py, so repo root is 3 levels up). Pass
+    an explicit path in tests or when the layout differs.
+    """
+    if schema_dir is None:
+        repo_root = Path(__file__).parent.parent.parent.parent
+        return repo_root / "databaseSchemaDocs"
+    return Path(schema_dir)
+
+
+def _load_raw_table_entries(schema_dir: Path | str) -> dict[str, dict[str, Any]]:
+    """Parse every *.yaml file in `schema_dir` once and return the raw per-table dict.
+
+    Returns {"database.table": <raw parsed YAML dict, with `database` normalized
+    to the resolved value>, ...}. This is the single-parse source both
+    `load_catalog_from_dir()` (the {col: type} projection) and
+    `load_semantic_catalog()` (the full overlay structure) build from, so the two
+    views can't drift by parsing the YAML independently with different field lists.
 
     Only files with a top-level `table` and `columns` key are included.  Files
     like AUTHORING_NOTES.md and rules-only YAMLs are silently skipped.
-
-    NOTE: measure/rule entries that appear inside the `columns` block in some
-    YAMLs (e.g. `measures` as a sibling dict key accidentally inside columns) are
-    naturally excluded because we iterate `raw_columns` which is the `columns`
-    mapping only.
     """
     schema_dir = Path(schema_dir)
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, dict[str, Any]] = {}
 
     for yaml_path in sorted(schema_dir.glob("*.yaml")):
         with yaml_path.open(encoding="utf-8") as fh:
@@ -98,12 +106,34 @@ def load_catalog_from_dir(schema_dir: Path | str) -> dict[str, dict[str, str]]:
         database = raw.get("database", DEFAULT_DATABASE)
         qualified_key = f"{database}.{table_name}"
 
-        columns = _extract_columns(raw_columns)
-        # Exclude entries that are not column definitions (e.g. measure sub-keys
-        # that sneak in if the YAML author put them in the wrong block — defensive).
-        result[qualified_key] = columns
+        entry = dict(raw)
+        entry["database"] = database
+        result[qualified_key] = entry
 
     return result
+
+
+def load_catalog_from_dir(schema_dir: Path | str) -> dict[str, dict[str, str]]:
+    """Load all *.yaml files in `schema_dir` and return the sqlglot schema dict.
+
+    Returns:
+        {
+          "database.table": {"ColumnName": "type_string", ...},
+          ...
+        }
+
+    Only files with a top-level `table` and `columns` key are included.  Files
+    like AUTHORING_NOTES.md and rules-only YAMLs are silently skipped.
+
+    NOTE: measure/rule entries that appear inside the `columns` block in some
+    YAMLs (e.g. `measures` as a sibling dict key accidentally inside columns) are
+    naturally excluded because we iterate `raw_columns` which is the `columns`
+    mapping only.
+    """
+    raw_entries = _load_raw_table_entries(schema_dir)
+    return {
+        qualified_key: _extract_columns(entry["columns"]) for qualified_key, entry in raw_entries.items()
+    }
 
 
 def build_sqlglot_schema(schema_dir: Path | str | None = None) -> dict[str, dict[str, str]]:
@@ -115,13 +145,35 @@ def build_sqlglot_schema(schema_dir: Path | str | None = None) -> dict[str, dict
 
     This is the production entry point used by the MCP and the provenance extractor.
     """
-    if schema_dir is None:
-        # Resolve relative to this file: src/data_agent/catalog/loader.py
-        # -> repo root is 3 levels up
-        repo_root = Path(__file__).parent.parent.parent.parent
-        schema_dir = repo_root / "databaseSchemaDocs"
+    return load_catalog_from_dir(_resolve_schema_dir(schema_dir))
 
-    return load_catalog_from_dir(schema_dir)
+
+def load_semantic_catalog(schema_dir: Path | str | None = None) -> dict[str, dict[str, Any]]:
+    """Return {"database.table": <full parsed semantic entry>, ...} — one entry per table YAML.
+
+    A superset of `build_sqlglot_schema()`: includes every catalog field (`grain`,
+    `temporal`, `primary_key`, `primary_key_note`, `join_keys`, `measures`, `rules`,
+    `ambiguities`, `description`, and the full per-column block — `type`,
+    `description`, `unit`, `client_defined`, `sensitive`, `values`,
+    `observed_values`, `synonyms` — not just `{col: type}`), for the getTableSchema
+    MCP overlay (D83/D84).
+
+    Keying, database-fallback, and file-skip rules are identical to
+    `build_sqlglot_schema()` (same `_load_raw_table_entries()` parse) so the two
+    views stay aligned: keys are "{database}.{table}" using the YAML's `database`
+    field or DEFAULT_DATABASE when omitted; files without a top-level `table` +
+    `columns` block are skipped.
+
+    Column/table name casing is preserved exactly as authored (D70) — nothing is
+    lowercased. The returned structure is a faithful, JSON-serializable parse of
+    the YAML: whatever fields a table's YAML declares (e.g. `measures` on
+    payroll.yaml, absent on employee.yaml) are present as-is; nothing is padded
+    with defaults the source file didn't declare.
+
+    If `schema_dir` is None, resolves to databaseSchemaDocs/ the same way
+    `build_sqlglot_schema()` does.
+    """
+    return _load_raw_table_entries(_resolve_schema_dir(schema_dir))
 
 
 def is_scratch_table(database: str, table: str, session_id: str) -> bool:

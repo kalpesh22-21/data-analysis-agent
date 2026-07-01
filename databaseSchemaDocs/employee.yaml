@@ -80,13 +80,13 @@ columns:
   WorkLocationCountry: { type: Nullable(String), description: Work location country. }
   sales_sl_gradution: { type: Nullable(String), description: Internal sales training graduation date field; spelling preserved from source. }
   sales_sl_start_date: { type: Nullable(String), description: Internal sales training start date field. }
-  AnnualSalary: { type: Nullable(Decimal(18, 6)), unit: USD, description: Annual salary amount when applicable; not actual payroll paid. }
+  AnnualSalary: { type: "Nullable(Decimal(18, 6))", unit: USD, description: Annual salary amount when applicable; not actual payroll paid. }
   EmploymentType:
     type: Nullable(String)
     values: { W2: employee, "1099": contractor }
     observed_values: [ W2, "1099" ]
     description: Worker classification.
-  Rate1: { type: Nullable(Decimal(18, 6)), unit: USD, description: Base hourly/rate-1 pay rate when applicable. }
+  Rate1: { type: "Nullable(Decimal(18, 6))", unit: USD, description: Base hourly/rate-1 pay rate when applicable. }
 
 rules:
   - id: active_employee

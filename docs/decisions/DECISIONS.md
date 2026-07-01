@@ -232,15 +232,21 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   gaps are the likely failure source and the fail behaviors keep a gap from becoming a leak or a bad
   merge. Resolves new-unknown N3.
 
-- **D53 (locked, 2026-06-30; deploy location clarified by D78).** **Semantic Catalog operations.** (a) **Deploy-coupled load:** catalog
-  baked into the **runtime** deploy artifact (not the MCP service — see D78), merged PR live on next deploy ⇒ **catalog SHA ≡ runtime deploy SHA** (fully
-  reproducible; catalog-edit latency = deploy cadence, acceptable for a rarely-mutating curated
-  store). (b) **Bot-authored PRs:** `schema_edit` candidates open a branch + YAML patch + PR with CI
-  (schema lint + `explainQuery` dry-run); human merge = the D18 gate. (c) **Mismatch handling:**
-  table-without-catalog-entry → structural-only schema (the **runtime** overlays nothing; the MCP
-  returns normal introspection — see D78), raw-loop-usable but not
+- **D53 (locked, 2026-06-30; deploy location clarified by D78, further amended by D84 — 2026-07-01).**
+  **Semantic Catalog operations.** (a) **Deploy-coupled load:** catalog
+  baked into the **runtime** deploy artifact ~~(not the MCP service — see D78)~~ **and, per D84, now
+  also into the MCP's deploy artifact** — merged PR live on next deploy of either/both services.
+  ~~⇒ **catalog SHA ≡ runtime deploy SHA**~~ **→ D84 redefines `catalog_sha` as the catalog subtree's
+  own git SHA, independent of either service's deploy SHA**, once two services carry the catalog
+  (fully reproducible per-artifact still holds; catalog-edit latency = deploy cadence, acceptable for
+  a rarely-mutating curated store). (b) **Bot-authored PRs:** `schema_edit` candidates open a branch +
+  YAML patch + PR with CI (schema lint + `explainQuery` dry-run); human merge = the D18 gate. (c)
+  **Mismatch handling:** table-without-catalog-entry → structural-only schema — **per D83 this is now
+  the MCP's responsibility again** (the MCP overlays nothing and returns normal introspection;
+  see D78 for the interim runtime-side arrangement this reverses), raw-loop-usable but not
   blueprint-eligible; catalog-diverged-from-warehouse → caught by the **D43 conformance probe** →
-  `schema_edit` PR (no new mechanism). Resolves new-unknown N5.
+  `schema_edit` PR (no new mechanism). Resolves new-unknown N5. See [D84](#semantic-catalog) for the
+  full two-artifact amendment.
 
 - **D54 (locked, 2026-06-30).** **Preview-only results (D46) come with a push-computation-into-SQL
   norm + explicit truncation signal.** The preview carries `row_count` + a `truncated` flag so the
@@ -383,14 +389,15 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   and the D44 replayed-trail boundary. Resolves architectural-review finding #2.
 
 ## Semantic catalog
-- **D42 (locked, 2026-06-30; overlay location amended by D78).** The **Semantic Catalog** is a first-class component, stored as
+- **D42 (locked, 2026-06-30; overlay location amended by D78, D78 reversed by D83).** The **Semantic Catalog** is a first-class component, stored as
   **git-backed YAML** (one file per table + `rules.yaml`). It is the curated semantic layer
   (entities, grain, per-measure `{agg, defined_over}`, `temporal`, rule definitions, ambiguities,
   synonyms, enums). The structural half of `getTableSchema` is live ClickHouse introspection;
-  **D78 clarifies that the `introspection ⨝ catalog overlay` join happens in the agent runtime,
-  not the MCP** — the MCP returns introspection only. Consequences: (a) **catalog version = git
-  commit SHA**, stamped into `USES`-edge validation + golden replays (the catalog ships with the
-  runtime deploy per D53/D78); (b) the learning-loop
+  **D78 clarified (2026-06-30) that the `introspection ⨝ catalog overlay` join happens in the agent
+  runtime, not the MCP** — **D83 (2026-07-01) reverses this**: the join is back in the ClickHouse MCP.
+  Consequences (as amended by D83/D84): (a) **catalog version = git
+  commit SHA**, stamped into `USES`-edge validation + golden replays (the catalog now ships with
+  **both** the runtime and MCP deploys — see D84 for the two-artifact SHA reconciliation); (b) the learning-loop
   `schema_edit` review inbox emits a **PR**, and human merge **is** the D18 never-auto-commit gate
   (one mechanism for write path + review queue); (c) a catalog SHA bump triggers the schema-drift
   maintenance job (re-validate `USES` edges + grain gate + golden replay, demote breakage), and per
@@ -398,18 +405,111 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   `rules.yaml`, enforced two ways** — deterministic AST injection in blueprints vs. model-written SQL
   in the raw loop (governance note in [06-security-and-governance.md](../06-security-and-governance.md)),
   and rules are a correctness convention, never an access boundary. Resolves review item A
-  (catalog had no storage home). See [D78](#semantic-catalog) for the overlay-location decision.
+  (catalog had no storage home). See [D83](#semantic-catalog) for the current overlay-location decision
+  (supersedes the D78 pointer previously here).
 
-- **D78 (locked, 2026-06-30).** **The `getTableSchema` semantic-catalog overlay moves to the agent runtime.** The ClickHouse MCP's `getTableSchema` returns **live introspection only** (columns/types/engine/comments). The **runtime** performs the `introspection ⨝ catalog YAML overlay` join — merging in grain, per-measure `{agg, defined_over}`, `temporal`, rule definitions, ambiguities, synonyms, enum values, and `sensitive`/`client_defined` flags — before handing the enriched schema to the model. **Amends D42** (overlay location moves; catalog content/format unchanged). **Clarifies D53**: the catalog deploys with the **runtime**, not the MCP service; D53's "catalog SHA ≡ deploy SHA" idea holds but SHA ≡ runtime deploy SHA. Graceful-degradation path (table without catalog entry → structural-only) now happens runtime-side: the MCP always returns whatever introspection it can; the runtime overlays nothing if no catalog entry exists.
+- **D78 (locked, 2026-06-30 — REVERSED by D83, 2026-07-01; kept verbatim below for history).** ~~The `getTableSchema` semantic-catalog overlay moves to the agent runtime.~~ The ClickHouse MCP's `getTableSchema` returns **live introspection only** (columns/types/engine/comments). The **runtime** performs the `introspection ⨝ catalog YAML overlay` join — merging in grain, per-measure `{agg, defined_over}`, `temporal`, rule definitions, ambiguities, synonyms, enum values, and `sensitive`/`client_defined` flags — before handing the enriched schema to the model. **Amends D42** (overlay location moves; catalog content/format unchanged). **Clarifies D53**: the catalog deploys with the **runtime**, not the MCP service; D53's "catalog SHA ≡ deploy SHA" idea holds but SHA ≡ runtime deploy SHA. Graceful-degradation path (table without catalog entry → structural-only) now happens runtime-side: the MCP always returns whatever introspection it can; the runtime overlays nothing if no catalog entry exists.
 
-  **Rationale (terse):**
+  **Rationale (terse, as originally argued — see D83 for why this is now reversed):**
   - Keeps the ClickHouse MCP a pure, thin data plane — introspection is a warehouse fact; the curated semantic layer is a runtime/knowledge concern.
   - The catalog is git-backed YAML that already versions/deploys with the runtime; the runtime is the natural owner of the overlay + `catalog_sha` stamping.
   - Consistent with D77 (enrichment/composition happens runtime-side) and the two-plane split (D1).
   - Removes the last non-enforcement piece from the clickhouse-api extension scope — after D77 + D78, clickhouse-api's remaining delta is enforcement-only: D57 column-scope + D63 fail-closed + D64 scratch + D5 scope injection.
 
   Cross-references: [D1](#architecture), [D42](#semantic-catalog), [D53](#blueprint-dedup--resolvers),
-  [D57](#blueprint-silent-path-safety), [D75](#clickhouse-mcp--adoption-decision), [D77](#client-defined-value-resolution).
+  [D57](#blueprint-silent-path-safety), [D75](#clickhouse-mcp--adoption-decision), [D77](#client-defined-value-resolution),
+  [D83](#semantic-catalog).
+
+- **D83 (locked, 2026-07-01 — REVERSES D78; amends D42).** **The `getTableSchema` semantic-catalog
+  overlay moves back into the ClickHouse MCP (`clickhouse-api`), restoring the D42/D75 arrangement
+  D78 had undone.** The MCP's `getTableSchema` now performs **introspection ⨝ catalog YAML overlay**
+  itself, merging in grain, per-measure `{agg, defined_over}`, `temporal`, rule definitions,
+  ambiguities, synonyms, enum values, and `sensitive`/`client_defined` flags — **then scope-filters**
+  the merged result against the caller's `column_scope` (D5/D80) before returning it. The agent
+  runtime no longer performs this join; it receives an already-overlaid, already-scope-filtered
+  schema. See [mcp-overlay-design.md](mcp-overlay-design.md) for the full design (merge/filter
+  ordering, response shape, uncatalogued-table path, richer catalog loader).
+
+  **What changes vs. D78:**
+  - `getTableSchema` (MCP) response shape reverts to `introspection ⨝ catalog`, now **additionally
+    scope-filtered** — a capability neither the original D42 arrangement nor D78 had, since D78's
+    scope-filtering gap (`getTableSchema`/`sampleRows` were never column-scope-checked — only
+    `runQuery` was, per D57) is closed as part of this reversal.
+  - `sampleRows` (MCP) gains column-scope enforcement for the first time (reject-if-`table's
+    columns ⊄ scope`, consistent with `runQuery`'s D57 treatment) — see [mcp-overlay-design.md](mcp-overlay-design.md)
+    §2. This was an open follow-up flagged in [WORKLOG.md](../WORKLOG.md) ("clickhouse-api MCP does
+    NOT column-scope `sampleRows`/`getTableSchema`") independent of the overlay question; this
+    reversal is the natural place to close it since both tools are touched anyway.
+  - The MCP needs a **richer catalog loader** than its current interim `system.columns`-derived
+    `{col: type}` catalog (`app/catalog.py` in `clickhouse-api`) — it must load the **full** YAML
+    semantic fields, not just types. See [mcp-overlay-design.md](mcp-overlay-design.md) §3.
+  - The runtime's D44 replayed-trail provenance filter and D50 context-assembly ordering are
+    **unaffected** — they operate on `runQuery`/`sampleRows` result provenance, not on the
+    `getTableSchema` response shape, and stay in place as defense-in-depth (see Open Question 4 in
+    [mcp-overlay-design.md](mcp-overlay-design.md)).
+
+  **Why reversed (vs. D78's stated rationale):**
+  - D78's rationale rested on "MCP stays a thin data plane; overlay is a runtime/knowledge concern."
+    In practice the MCP **already** must load a catalog-shaped schema to do D57 column-scope
+    enforcement (`get_catalog_schema()` in `clickhouse-api/app/catalog.py`, feeding
+    `extract_column_provenance`) — so the MCP is not, in fact, catalog-free today. Extending that
+    existing catalog dependency to carry the full semantic YAML (not just `{col: type}`) is a smaller
+    delta than maintaining **two** divergent catalog loaders (the runtime's richer one for the
+    overlay, the MCP's thin one for scope) that must stay in lockstep.
+  - Scope-filtering `getTableSchema`/`sampleRows` **requires** column-level knowledge at the MCP
+    regardless of where the overlay lives (D57's parser + catalog schema already live there) — since
+    the MCP must scope-filter *some* form of the schema response anyway, doing the overlay there too
+    avoids a "merge in the runtime, then filter again in the runtime using MCP-supplied scope" split
+    that duplicates the scope-check logic in two places.
+  - Consolidates the **security-relevant** part of `getTableSchema` (which columns/semantics a given
+    caller may see) at the single enforcement boundary (D57's MCP boundary), rather than trusting the
+    runtime to apply scope-filtering correctly on a runtime-side overlay — matches the existing
+    posture that the MCP, not the runtime, is the hard boundary for column-level access (D57).
+  - Accepted trade-off (see [mcp-overlay-design.md](mcp-overlay-design.md) Open Question 1): the
+    catalog must now be deployed to/readable by **two** services (MCP and runtime — the runtime still
+    needs it for D44/D57 provenance extraction and D14 blueprint scope pre-filtering), reintroducing a
+    two-artifact sync/version-skew question that D78 had collapsed to one. D84 addresses this.
+
+  Cross-references: [D1](#architecture), [D42](#semantic-catalog), [D53](#blueprint-dedup--resolvers),
+  [D57](#blueprint-silent-path-safety), [D75](#clickhouse-mcp--adoption-decision),
+  [D77](#client-defined-value-resolution), [D78](#semantic-catalog), [D80](#clickhouse-mcp--adoption-decision),
+  [D84](#semantic-catalog).
+
+- **D84 (locked, 2026-07-01 — amends D53).** **The Semantic Catalog now deploys to (and is readable
+  by) *two* services — the ClickHouse MCP and the agent runtime — not the runtime alone; `catalog_sha`
+  is redefined as the catalog's own git-subtree version, independent of either service's deploy SHA.**
+
+  - **Why two services need it now:** D83 moves the `getTableSchema` overlay to the MCP, so the MCP
+    needs the full semantic YAML. The **runtime still needs it too** — for D44 replayed-trail
+    provenance filtering, D14 blueprint `USES`-scope pre-filtering, D37/D40/D65 grain declarations
+    consumed by the (future) blueprint grain gate, and D67 rule definitions. Neither service can drop
+    it.
+  - **`catalog_sha` redefinition.** D53 defined `catalog_sha ≡ runtime deploy SHA` (single artifact,
+    single deploy). With two artifacts, "the runtime deploy SHA" is no longer a well-defined stand-in
+    for "the catalog version a blueprint validated against." **`catalog_sha` is now the git commit SHA
+    of the last commit touching `databaseSchemaDocs/**`** (a subtree SHA, computable independent of
+    which service(s) have redeployed) — **not** either service's overall application deploy SHA. Both
+    the MCP and the runtime **stamp and expose their currently-loaded `catalog_sha`** (e.g. a
+    `/health` or `/version` field) so a **mismatch between the two is directly observable** — this is
+    the version-skew detector D78's single-artifact model didn't need and D83 reintroduces.
+  - **Delivery mechanism to the MCP** is an **open question, not locked here** — see
+    [mcp-overlay-design.md](mcp-overlay-design.md) Open Question 1 for the copy-in vs. shared-package
+    vs. canonical-relocation fork and the recommendation.
+  - **Drift/skew handling:** a `catalog_sha` mismatch between the live MCP and the runtime's recorded
+    blueprint `catalog_sha` is folded into the **D43 catalog-vs-warehouse conformance probe** as an
+    additional signal (not a new mechanism) — it indicates the schema a blueprint was authored/
+    validated against may differ from what `getTableSchema` currently returns to the model, which is a
+    drift risk of the same shape D43 already probes for.
+  - **Mismatch/uncatalogued-table handling (restates D53(c), now MCP-side again):** table-in-ClickHouse
+    with no catalog entry → the MCP returns **structural-only** introspection (no
+    grain/rules/ambiguities/semantics) — raw-loop-usable, not blueprint-eligible; catalog entry
+    diverged from live warehouse → still caught by the D43 conformance probe → `schema_edit` PR. No new
+    mechanism beyond relocating the "who returns structural-only" responsibility from the runtime
+    (D78) back to the MCP.
+
+  Cross-references: [D42](#semantic-catalog), [D43](#blueprint-silent-path-safety),
+  [D44](#security--infra), [D53](#blueprint-dedup--resolvers), [D57](#blueprint-silent-path-safety),
+  [D75](#clickhouse-mcp--adoption-decision), [D78](#semantic-catalog), [D83](#semantic-catalog).
 
 ## Blueprint silent-path safety
 - **D43 (locked, 2026-06-30).** **Silent-eligibility is a freshness-bounded attestation, not the
@@ -656,12 +756,20 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   - ~~**D66 `resolveValues`** tool — completely absent (the 7th data-plane tool).~~ **Removed from
     this list by D77:** `resolveValues` is now a runtime composite over `runQuery`, not an MCP
     addition. The MCP data plane stays at 6 tools.
-  - ~~**D42 `getTableSchema` semantic-catalog overlay**~~ — **Removed from this list by D78:** the `introspection ⨝ catalog` join moves to the agent runtime. The MCP returns introspection only; the runtime applies the overlay. This drops out of `clickhouse-api` extension scope entirely.
+  - ~~**D42 `getTableSchema` semantic-catalog overlay** — Removed from this list by D78 (the join moved to the agent runtime).~~
+    **Restored to this list by D83 (2026-07-01):** the `introspection ⨝ catalog YAML overlay` join
+    (D42) **plus scope-filtering the merged result** (D5/D80) moves back into `clickhouse-api`'s
+    `getTableSchema`. This is once again an MCP extension item — see [D83](#semantic-catalog) and
+    [mcp-overlay-design.md](mcp-overlay-design.md). Requires the MCP to load the **full** semantic
+    YAML (not just `{col: type}` — see [D84](#semantic-catalog) and the richer-loader design), and to
+    add column-scope enforcement to `sampleRows` as well (D83), which had never been scope-checked.
   - The **Phase-0 column-provenance extractor** (built in this repo under D52/D62/D68/D69/D70) is
     the component that powers column extraction (D57) and scratch-table name extraction (D64). Under D75 it must be **delivered into
     `clickhouse-api`** (the enforcement site). ~~How it is packaged — copied in, published as a shared
     library, or imported — is an open question~~ — **Resolved by D79(a): copy-in** (spec repo
     authoritative; mirror same-sprint; promote to a shared library once the D69/D70 contract stabilizes).
+    D83/D84 raise the **same delivery-mechanism question again for the catalog itself** — see
+    [mcp-overlay-design.md](mcp-overlay-design.md) Open Question 1.
 
   **Enforcement boundary:** remains **at the MCP** (consistent with D57 — "enforced at the MCP by
   parsing the SQL"), not in the agent runtime.
@@ -670,7 +778,8 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   [D52](#blueprint-dedup--resolvers), [D57](#blueprint-silent-path-safety),
   [D62](#blueprint-silent-path-safety), [D63](#blueprint-silent-path-safety),
   [D64](#security--infra), [D66](#client-defined-value-resolution), [D68](#delivery--sequencing),
-  [D69](#testing), [D70](#testing), [D77](#client-defined-value-resolution),
+  [D69](#testing), [D70](#testing), [D77](#client-defined-value-resolution), [D83](#semantic-catalog),
+  [D84](#semantic-catalog),
   [D78](#semantic-catalog).
 
 - **D79 (locked, 2026-06-30).** **clickhouse-api extension mechanics: extractor delivery + scope transport.**
@@ -759,15 +868,23 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   and the `getTableSchema` catalog overlay (D78) stay **Phase 1**. The **skills/lifecycle-hooks mechanism
   (D72–D74) is deliberately out of all phases** — it ships dormant and is wired only on explicit go-ahead.
 
+  **Further amended 2026-07-01 (post D83/D84):** the `getTableSchema` catalog overlay stays a **Phase
+  1** deliverable, but its delivery site flips from the agent runtime to `clickhouse-api` (the MCP) —
+  see D83. This does not change phase *sequencing*: Phase 0 still ships `getTableSchema` as
+  introspection-only (the MCP simply hasn't been extended with the overlay+scope-filter yet), and the
+  overlay work lands in Phase 1 as a `clickhouse-api` extension task rather than a runtime task. The
+  richer catalog loader (D84) is now needed by **both** the runtime and the MCP in Phase 1, not the
+  runtime alone.
+
   ### Phase definitions and exit criteria
 
   **Phase 0 — Walking skeleton (raw-loop alpha).**
-  Scope: `sqlglot` parser (D52/D62) → the **delivered `clickhouse-api` MCP data plane** (adopt+extend, D75; D1/D57/D63/D64) → Couchbase session store (D22/D44/D45) → raw agent loop driven by the **OpenAI model** (Responses API primary / Chat Completions fallback, D71) with **minimal, non-retrieval context assembly** (schema + conversation; the embed→recall→rerank pipeline is Phase 1). **Auth path:** the UI mints its JWT server-side on login (D82), the backend forwards it as a Bearer token + the `X-Session-Id` header (D81/D79), the MCP validates and injects scope (D5). `getTableSchema` is **introspection-only** in Phase 0 (the D78 catalog overlay is Phase 1). Plus minimal UI with progress streaming (D61) + Phoenix tracing (D23/D24/D25). Scope-enforced, transparent, **raw-loop-only** SQL agent. No blueprints, no knowledge plane reads, no learning loop.
+  Scope: `sqlglot` parser (D52/D62) → the **delivered `clickhouse-api` MCP data plane** (adopt+extend, D75; D1/D57/D63/D64) → Couchbase session store (D22/D44/D45) → raw agent loop driven by the **OpenAI model** (Responses API primary / Chat Completions fallback, D71) with **minimal, non-retrieval context assembly** (schema + conversation; the embed→recall→rerank pipeline is Phase 1). **Auth path:** the UI mints its JWT server-side on login (D82), the backend forwards it as a Bearer token + the `X-Session-Id` header (D81/D79), the MCP validates and injects scope (D5). `getTableSchema` is **introspection-only** in Phase 0 (the D83 catalog overlay + scope-filter is Phase 1, now a `clickhouse-api` task — see amendment above). Plus minimal UI with progress streaming (D61) + Phoenix tracing (D23/D24/D25). Scope-enforced, transparent, **raw-loop-only** SQL agent. No blueprints, no knowledge plane reads, no learning loop.
   - **First brick:** the `sqlglot` parser is built and TDD'd first — it is the shared dependency of five consumers (D57 live scope, D44 provenance, D48 dedup, D35 template rewrite, D64 scratch isolation) and is pure logic with no infrastructure prerequisite. Nothing else starts until its unit test suite (Layer 1) is green.
   - **Exit criteria:** all Phase-0 conformance scenarios green (scope denial, mid-session scope narrowing, parser fail-closed, observability + PII, pause/resume durability, budget-cap pause); Layer 1 + Layer 2 MCP + session-store tests passing in CI; Phoenix traces reachable and PII-clean on a real turn.
 
   **Phase 1 — Blueprints + D56 verify gate (the launchable product).**
-  Scope: knowledge plane reads (`searchBlueprints`, `getBlueprint`, `runBlueprint`, `searchKnowledge`), the full D56 verification gate, composite blueprints (D59), **retrieval pipeline (D7/D8) on the custom (non-OpenAI) embedding + reranker API (D71)**, grain declaration (D37a/D40/D65), `resolveValues` (D66/D67 — runtime composite, D77), D53 catalog CI + the runtime `getTableSchema` catalog overlay (D78), review inbox UI, and all remaining Layer 3 conformance scenarios. Runs alongside **Track B** (see below).
+  Scope: knowledge plane reads (`searchBlueprints`, `getBlueprint`, `runBlueprint`, `searchKnowledge`), the full D56 verification gate, composite blueprints (D59), **retrieval pipeline (D7/D8) on the custom (non-OpenAI) embedding + reranker API (D71)**, grain declaration (D37a/D40/D65), `resolveValues` (D66/D67 — runtime composite, D77), D53/D84 catalog CI + the **`clickhouse-api`-side** `getTableSchema` catalog overlay + scope-filter (D83; supersedes the runtime-side D78 plan), `sampleRows` column-scope enforcement (D83), review inbox UI, and all remaining Layer 3 conformance scenarios. Runs alongside **Track B** (see below).
   - **Track B (parallel) — learning-loop write router:** D26–D31 write router stages, D58 leakage gate (human pre-gate for `global_knowledge`; sampled detection for blueprints), D48 hard-dedup with single-writer-per-key, D51 provenance/audit store, `LEARNING_ENABLED=false` kill-switch (D58c), review-inbox ingestion, D53 `schema_edit` PR bot. Track B is fully offline/decoupled from the request path and has no Phase-0 prerequisites beyond the session store and Redis.
   - **Exit criteria (gates first release):** ALL Layer 3 spec-conformance scenarios green (the full ~13-scenario suite from [11-testing.md](../11-testing.md) §Layer 3) + Layers 1–2 green for every shipped module. This is the full-conformance gate — there is no "ship request path, learn later" escape hatch (see tension note below).
 

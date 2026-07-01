@@ -79,7 +79,7 @@ sub-detail: the SQL-AST canonicalization rules (alias/ordering normalization dep
 
 ## Semantic Catalog (`databaseSchemaDocs/`) — from the catalog gap review
 
-The curated semantic layer applied by the **agent runtime** (not the MCP). Per D78, the MCP's `getTableSchema` returns introspection only; the runtime performs the `introspection ⨝ catalog YAML overlay` join. A review of the first-pass YAMLs fixed a set of gaps in-file; the items below are the **code-side dependencies** those fixes now assume, plus **data-layer gaps** the catalog can only document.
+The curated semantic layer applied by the **MCP**, not the runtime. Per D83 (reverses D78), the MCP's `getTableSchema` performs the `introspection ⨝ catalog YAML overlay` join itself and scope-filters the result before returning it. A review of the first-pass YAMLs fixed a set of gaps in-file; the items below are the **code-side dependencies** those fixes now assume, plus **data-layer gaps** the catalog can only document. (The code-side dependencies below — e.g. `resolveValues`'s `resolve_via` binding — are unaffected by the D83 relocation; only the "who applies the overlay" framing sentence above changes.)
 
 ### New catalog fields that need consuming code (introduced by the review)
 - **`grain_verifiable: false`** — set on tables with no exposed unique key (`payroll`, `accrual_events`,

@@ -64,7 +64,7 @@ Split into **read** (used during a chat) and **write** (the learning loop, fully
 | **Context assembly** | Pre-loop retrieval: embed → vector recall → cross-encoder rerank → top-3 thin blueprint cards + knowledge + user memory. |
 | **ClickHouse MCP** | The read-only data plane. Implemented by the existing `clickhouse-api` service (FastAPI + MCP, JWT/OIDC auth), adopted and extended — not built from scratch (D75). |
 | **Scratch schema** | Session-scoped, TTL'd ClickHouse schema for external uploads and large blueprint intermediates. Loaded via a privileged side-channel, not an agent tool. |
-| **Semantic Catalog** | Git-backed YAML: the curated semantic layer (entities, grain, measures, `temporal`, rule definitions, ambiguities, synonyms). Applied by the **runtime** as an overlay over live MCP introspection (D78) before the model sees schema. Single source of truth for grain/rules that blueprints inherit. See [09-infrastructure.md](09-infrastructure.md). |
+| **Semantic Catalog** | Git-backed YAML: the curated semantic layer (entities, grain, measures, `temporal`, rule definitions, ambiguities, synonyms). Applied by the **MCP** as an overlay over its own introspection, then scope-filtered, before the model sees schema (D83 reverses D78's runtime-side placement). Single source of truth for grain/rules that blueprints inherit. See [09-infrastructure.md](09-infrastructure.md). |
 | **neo4j** | Blueprint DAG store, including `USES` edges to tables/columns for scope filtering. |
 | **Vector index + RAG** | Global knowledge retrieval. |
 | **Couchbase** | Session store keyed by `session_id`: messages + tool-call/result trail (thinking discarded). |

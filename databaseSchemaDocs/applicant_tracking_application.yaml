@@ -69,8 +69,8 @@ columns:
   OfferLetterCreatedOnDate: { type: Nullable(DateTime64(6)), description: Offer-letter creation timestamp. }
   OfferLetterApprovalDate: { type: Nullable(DateTime64(6)), description: Offer-letter approval timestamp. }
   OfferVersion: { type: Nullable(String), description: Offer version. }
-  ApplicationJobWageStart: { type: Nullable(Decimal(18, 6)), unit: USD, description: Lower bound of application job wage range. }
-  ApplicationJobWageEnd: { type: Nullable(Decimal(18, 6)), unit: USD, description: Upper bound of application job wage range. }
+  ApplicationJobWageStart: { type: "Nullable(Decimal(18, 6))", unit: USD, description: Lower bound of application job wage range. }
+  ApplicationJobWageEnd: { type: "Nullable(Decimal(18, 6))", unit: USD, description: Upper bound of application job wage range. }
   HiringProcessStep: { type: Nullable(String), description: Hiring process step. }
   UserAssignedToStep: { type: Nullable(String), description: User assigned to the current workflow step. }
   DaysInOfferStatus: { type: Nullable(Int32), unit: days, description: Aging in current offer status. }

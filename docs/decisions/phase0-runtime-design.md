@@ -3,9 +3,13 @@
 **Status:** Proposed (design, not yet built). Companion to [DECISIONS.md](DECISIONS.md),
 scoped strictly to **D68 Phase 0** (the raw-loop "walking skeleton" alpha).
 
-**Out of scope (explicitly, per the brief):** D77 `resolveValues`, D78 `getTableSchema` catalog
-overlay, the retrieval pipeline (D7/D8), blueprints (D9–D14, D32–D43, D56, D59), the learning loop
-(D15–D18, D26–D31, D58), skills/hooks (D72–D74). These are Phase 1/2 and are not designed here.
+**Out of scope (explicitly, per the brief):** D77 `resolveValues`; the D78 `getTableSchema` catalog
+overlay — **note: D83 (2026-07-01) permanently relocates this to the `clickhouse-api` MCP, so it is not
+merely deferred here, it is never coming to the runtime.** The runtime's `getTableSchema` stays a
+passthrough of an already-overlaid, already-scope-filtered MCP response once D83 ships (see
+[mcp-overlay-design.md](mcp-overlay-design.md)); no runtime-side overlay work is needed in Phase 1.
+Also out of scope: the retrieval pipeline (D7/D8), blueprints (D9–D14, D32–D43, D56, D59), the learning
+loop (D15–D18, D26–D31, D58), skills/hooks (D72–D74). These are Phase 1/2 and are not designed here.
 
 ## 0. Ground truth this design relies on (verified by reading code, not assumed)
 
@@ -17,7 +21,9 @@ overlay, the retrieval pipeline (D7/D8), blueprints (D9–D14, D32–D43, D56, D
   `COLUMN_SCOPE_VIOLATION`, `SCRATCH_SESSION_VIOLATION`, `PARSE_FAILED_CLOSED`,
   `DATABASE_NOT_ALLOWED`, `TABLE_NOT_FOUND`, `CLICKHOUSE_QUERY_ERROR`, `CLICKHOUSE_UNAVAILABLE`.
 - `getTableSchema(database, table)` → `{database, table, columns: [{name, type, comment}]}`
-  (`app/service.py:get_table_schema`) — **introspection only**, matching D78.
+  (`app/service.py:get_table_schema`) — **introspection only** in Phase 0 today; this stays true only
+  until the D83 MCP-side overlay + scope-filter ships (D78, which this line originally cited, is
+  reversed by D83 — see the "Out of scope" note above).
 - `runQuery` / `sampleRows` return the compact shape `{columns, rows, row_count, truncated}`.
 - `column_scope` on the JWT is a **JSON-encoded list of `"database.table.column"` strings**
   (`app/token_service.py`); `[]` (empty list → empty frozenset) = **allow-all** (D80b). This is the
