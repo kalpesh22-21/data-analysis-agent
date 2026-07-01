@@ -312,7 +312,7 @@ code-computed assertion and the LLM review; both always run.
 ### Column-scope and entity-agnostic governance ([06](06-security-and-governance.md))
 A skill may not receive or expose raw column values from out-of-scope tables (the payload redaction
 prevents this). Any tool call a skill triggers is scope-enforced by the MCP in the normal way (D57).
-A skill that triggers `resolveValues` has the `ClientCode`/scope injected by the runtime (D5/D66) —
+A skill that triggers `resolveValues` has the `ClientCode`/scope injected by the runtime (D5/D66 — implemented as a runtime composite per D77) —
 it cannot supply its own scope.
 
 ---

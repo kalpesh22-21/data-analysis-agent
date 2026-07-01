@@ -20,7 +20,11 @@ named layers pass; the release gate (D68) is the Layer-3 conformance suite, not 
 **Build progress:** the `sqlglot` column-provenance extractor (`src/data_agent/sqlparse/provenance.py`,
 Phase-0 first brick, D52/D62) is built and passing 39 Layer-1 tests; it satisfies the unit slices
 below. Its consumers — the MCP live-scope gate (D57), the replayed-trail filter (D44), and scratch
-enforcement at the MCP (D64) — are **not yet built**, so those rows stay `🟡 unit-green`.
+enforcement at the MCP (D64) — are **not yet built**, so those rows stay `🟡 unit-green`. Per D75,
+the Component consumer for **D57/D63/D64** is the **`clickhouse-api` extension** (the existing MCP
+service, adopted and extended); the provenance extractor will be delivered into `clickhouse-api`
+(packaging TBD). **D44's** Component consumer is different — it is the **agent runtime's** replayed-trail
+filter, also not yet built (not part of the `clickhouse-api` extension). No status changes until these ship.
 
 See [docs/11-testing.md](../11-testing.md) for the four-layer test pyramid definition and the full
 Layer 3 scenario list. See [docs/decisions/DECISIONS.md](DECISIONS.md) for the rationale behind each
@@ -44,7 +48,7 @@ decision cited here.
 | **D50** | Scope-filter (D44) runs before history compaction (D46); the prose summary is derived only from in-scope entries and is never persisted as an artifact | Unit | `D50-filter-before-compact-order` | — | ⛔ not-built |
 | **D52** | `sqlglot` extracts the qualified `(table, column)` USES set from a query, including columns referenced only in derived expressions (e.g. `AVG(gross_pay)` yields `payroll_fact.gross_pay`) | Unit | `D52-derived-column-in-uses-set` | — | ✅ green |
 | **D52** | `sqlglot` parse failure behavior is per-consumer: D57-consumer → fail-closed reject; D48-consumer → fail-soft skip-hard-key; D35-consumer → fail-to-review; none silently proceeds | Unit | `D52-per-consumer-fail-behavior` | — | 🟡 unit-green |
-| **D53** | A table with no catalog entry is served structural-only by `getTableSchema` (not an error); it is ineligible for blueprint promotion | Component | `D53-uncatalogued-table-structural-only` | — | ⛔ not-built |
+| **D53** | A table with no catalog entry is served structural-only (not an error); it is ineligible for blueprint promotion. Graceful degradation is **runtime-side per D78** — the runtime overlays nothing; the MCP returns normal introspection (test at the runtime component layer, not the MCP) | Component | `D53-uncatalogued-table-structural-only` | — | ⛔ not-built |
 | **D53** | A `schema_edit` candidate opens a branch + YAML patch PR with CI (schema lint + `explainQuery` dry-run); it is never auto-committed to the catalog | Component | `D53-schema-edit-opens-pr-not-auto-commit` | — | ⛔ not-built |
 | **D56** | Every `runBlueprint` response passes the deterministic grain-integrity check before being returned; a wrong-grain result (fan-out double-count) is caught and falls back to the raw loop — never returned to the user | Unit + E2E | `D56-wrong-grain-falls-back` | **No-silent verification** | ⛔ not-built |
 | **D56** | The LLM verification gate runs on every blueprint response; the user is never asked to verify; SQL is visible but verification is the agent's job | E2E | `D56-verify-gate-always-runs` | **No-silent verification** | ⛔ not-built |

@@ -77,9 +77,7 @@ sub-detail: the SQL-AST canonicalization rules (alias/ordering normalization dep
 
 ## Semantic Catalog (`databaseSchemaDocs/`) — from the catalog gap review
 
-The curated half of `getTableSchema`. A review of the first-pass YAMLs fixed a set of gaps in-file;
-the items below are the **code-side dependencies** those fixes now assume, plus **data-layer gaps**
-the catalog can only document.
+The curated semantic layer applied by the **agent runtime** (not the MCP). Per D78, the MCP's `getTableSchema` returns introspection only; the runtime performs the `introspection ⨝ catalog YAML overlay` join. A review of the first-pass YAMLs fixed a set of gaps in-file; the items below are the **code-side dependencies** those fixes now assume, plus **data-layer gaps** the catalog can only document.
 
 ### New catalog fields that need consuming code (introduced by the review)
 - **`grain_verifiable: false`** — set on tables with no exposed unique key (`payroll`, `accrual_events`,
@@ -88,8 +86,11 @@ the catalog can only document.
   key and crash). Per-blueprint result-grain checks (D56) still apply to those blueprints' own grain.
 - **`resolve_via` on a rule** — a filter rule over a client-defined code column declares
   `predicate: "FieldId IN ({field_codes})"` + `resolve_via: "resolveValues(FieldId, <concept>)"`
-  (see PAF `*_change_fields`). The **runtime must resolve the concept → code set and bind the param
-  before executing** the predicate (D10: never string-interpolated). No mechanism exists for this yet.
+  (see PAF `*_change_fields`). The **runtime resolves the concept → code set via its runtime
+  `resolveValues` (D77) and binds the result as params before executing** the predicate (D10: never
+  string-interpolated). No mechanism exists for this yet. Note: because `resolveValues` is now a
+  runtime composite (D77), the resolved concept→code expansion also happens runtime-side, consistent
+  with the D5 injection boundary.
 - **`sensitive: true` on a column** — added to known PII columns. Intended as the **catalog source of
   truth for the column-scope / governance layer**; needs that layer to actually consume it (today
   scope/masking are maintained out-of-band).
@@ -123,25 +124,51 @@ only**; `ClientCode` is never in `grain`/`primary_key` nor a join predicate.
 - **Soft department joins** — `DistributedDepartmentCode`/`AccrualEventDepartmentCode → employee.DepartmentCode`
   are label-based, client-defined, low/medium confidence; not reliable FKs.
 
-### `resolveValues` accept-vs-clarify threshold (extends D66, see Retrieval below)
+### `resolveValues` accept-vs-clarify threshold (extends D66, runtime-side per D77)
 Beyond the deferred per-(client,column) index, there is **no defined confidence threshold** for when a
 ranked `resolveValues` match is auto-used vs. routed to `askUser` — risk of silently filtering on a
-plausible-but-wrong code.
+plausible-but-wrong code. As a runtime composite (D77), this threshold is a runtime implementation
+decision, not an MCP concern.
 
 ## Retrieval ([03](../03-context-and-retrieval.md))
 - Reranker model + threshold; recall `k` vs. final top-3. The reranker is a **custom API (not OpenAI)** (D71) called via a **simple HTTP `POST`** with a manual `RERANKER` span (D24); endpoint + model id TBD.
 - Shared embedding model choice — a **custom API (not OpenAI)** (D71); endpoint + specific model id TBD.
   Called via a **simple HTTP `POST`** with a manual `EMBEDDING` span (D24); shared across question +
   blueprint intent + knowledge.
-- **`resolveValues` (D66):** ranking signals (semantic + synonyms + frequency) weighting; the
-  deferred **per-(client,column) index** (currently live `DISTINCT` each call); temporal label-drift
-  handling via the `period?` arg.
+- **`resolveValues` (D66, now runtime-side per D77):** ranking signals (semantic + synonyms +
+  frequency) weighting; the deferred **per-(client,column) index** (currently live `DISTINCT` each
+  call); temporal label-drift handling via the `period?` arg. These questions now live **agent-
+  runtime-side** — the backing `runQuery` handles enforcement; ranking and caching decisions belong
+  to the runtime implementation of D77.
 - **Context-budget params (D46):** result preview row cap `N` + history token budget + when
   compaction triggers. (Mechanism resolved; values TBD.)
 - **Loop-budget caps (D47):** max iterations / tokens / wall-clock per turn. (Mechanism resolved;
   values TBD.)
 
 ## Security / infra ([06](../06-security-and-governance.md), [09](../09-infrastructure.md))
+
+### D75 — clickhouse-api extension: two open sub-questions
+
+1. **Provenance extractor packaging.** The Phase-0 extractor
+   (`src/data_agent/sqlparse/provenance.py`, this repo) must be delivered into `clickhouse-api` (the
+   enforcement site, per D75). Three options: (a) **copy-in** — paste the module directly into
+   `clickhouse-api`; simple, creates divergence risk over time; (b) **shared library** — publish the
+   `sqlparse` package (e.g. to an internal PyPI); clean boundary, adds release/versioning overhead;
+   (c) **git submodule / path import** — reference this repo from `clickhouse-api`. Decision affects
+   every future change to the extractor (D69/D70 contract changes must propagate). Not resolved; pick
+   before the D75 extension sprint starts.
+
+2. **Column-scope model mismatch.** `clickhouse-api`'s current `Principal` model is
+   **tenant/realm-wide** — it injects a per-tenant ClickHouse setting but has no concept of
+   per-column scope. D57 requires **per-request column scope** (a set of `database.table.column`
+   triples, D69/OQ-3) injected into every `runQuery`. Adding this means: (a) extending the `Principal`
+   / auth middleware to carry and validate a column-scope claim, and (b) adding `scope` + `session_id`
+   as injected parameters on `runQuery` (D5). This is a conceptual shift in the service's auth model —
+   tenant-level → column-level per request. Review impact on existing JWT claims structure before
+   designing the extension.
+
+### Other security / infra items
+
 - Scope representation passed by UI (JWT claim vs. separate object).
 - Scratch TTL duration + cleanup ownership.
 - **`SESSION_TTL` value** (D44) — must exceed the learning-loop completion window.

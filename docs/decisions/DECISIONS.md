@@ -12,7 +12,7 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
 
 ## Tools
 - **D4.** 11 agent-facing tools: 6 MCP + `searchBlueprints` + `getBlueprint` + `runBlueprint` +
-  `searchKnowledge` + `askUser`. Writes are never tools.
+  `searchKnowledge` + `askUser`. Writes are never tools. *(Count amended by D66 to 12 — `resolveValues` added as a model-facing tool; see also D77 which moves its implementation to the runtime. See [D66](#client-defined-value-resolution) and [D77](#client-defined-value-resolution).)*
 - **D5.** `session_id`, JWT, column scope are **injected by code** into every tool call — not in tool
   schemas, not in model context. Security property: model can't forge/escalate scope.
 - **D6.** `askUser` is a control-flow primitive that pauses/resumes the loop. Disciplined triggers:
@@ -116,17 +116,48 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   `as_of` dim. A ranged-`period` slot resolves to a `(start,end)` pair / "period covering date X".
 
 ## Client-defined value resolution
-- **D66 (locked, 2026-06-30).** **New data-plane tool `resolveValues(table, column, concept, period?)`
+- **D66 (locked, 2026-06-30; amended by D77).** **`resolveValues(table, column, concept, period?)`
   for client-defined / time-varying code spaces** (`EarnCode`, `TypeCode`, departments…). Static
   catalog maps can't model per-tenant, drifting enums. Returns **client-scoped** values ranked by
   semantic match to `concept` (`ClientCode`/scope **injected**, D5). **Live** each call (`DISTINCT
   (code,description)` in scope → semantic rank); **no tenant-knowledge cache for now** — ephemeral,
-  index later. 12th agent-facing tool; justified as **non-overlapping**. Integrations: (a) catalog
+  index later. Model-facing tool; justified as **non-overlapping**. Integrations: (a) catalog
   marks `client_defined` columns and points their ambiguities at the tool; (b) it's the **D41 slot
   resolver** for client-coded slots, so blueprints stay entity-agnostic — they store the *concept*
   (`EarnCode IN {pto_codes}`), resolved per-client at run time, never the codes; (c) low-confidence /
   multi-match results drive an `askUser` clarify. **Explicitly deferred:** tenant-knowledge scope
-  (global/tenant/user) — not added now.
+  (global/tenant/user) — not added now. **→ D77 moves the implementation into the agent runtime
+  (over `runQuery`); the model interface and concept/ranking behaviour are unchanged.**
+
+- **D77 (locked, 2026-06-30).** **`resolveValues` moves from a ClickHouse-MCP data-plane tool to an
+  agent-runtime composite tool implemented over `runQuery`.** The model interface is unchanged
+  (`resolveValues(table, column, concept, period?)` → `[{value, description, score, freq}]`); only
+  the implementation location moves. Under the hood the runtime:
+  1. Issues an ordinary `runQuery` (D57 column-scope enforcement and D5 `ClientCode`/tenant RLS
+     are automatic — no separate enforcement path needed in the MCP) — roughly
+     `SELECT <column>, <descriptionCol>, count() AS freq FROM <table> [WHERE <period>] GROUP BY … ORDER BY freq DESC LIMIT N`.
+  2. Ranks the returned rows in the runtime by **semantic similarity of `concept`** (the embedding
+     client in the runtime, D71) combined with `freq`, returning `[{value, description, score, freq}]`.
+
+  **Rationale:**
+  - Enforcement free and correct — the backing `runQuery` is already scope-checked (D57) and
+    tenant-isolated; no separate enforcement path is needed in the MCP.
+  - Injection-safe by construction — `concept` never touches SQL; ranking happens in the runtime
+    after the query (consistent with D10).
+  - The embedding client (D71) lives in the runtime, not duplicated into the MCP service.
+  - Keeps the ClickHouse MCP data plane pure — exactly the **6 read tools**
+    (`listDatabases`, `listTables`, `getTableSchema`, `sampleRows`, `runQuery`, `explainQuery`).
+
+  **Reconciles D4:** D4 states "6 MCP" tools; `docs/02-tools-and-api.md` had previously listed 7
+  (including `resolveValues`). With D77, `resolveValues` is a runtime composite, so the MCP data
+  plane is literally 6 tools and D4 is now internally consistent.
+
+  **Amends D66:** D66 defined `resolveValues` as a live MCP resolution tool. The concept/ranking
+  behaviour (D66 integrations a/b/c) and model interface are unchanged; only the implementation site
+  moves from the MCP service to the agent runtime.
+
+  Cross-references: [D4](#tools), [D5](#tools), [D10](#blueprints), [D57](#blueprint-silent-path-safety),
+  [D66](#client-defined-value-resolution), [D71](#model-provider), [D75](#clickhouse-mcp--adoption-decision).
 
 - **D67 (locked, 2026-06-30).** **Two rule kinds: static and resolved (dynamic).** A catalog `rule`'s
   `predicate` is either a fixed SQL boolean (**static**) or references `resolveValues(column, concept)`
@@ -201,12 +232,13 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   gaps are the likely failure source and the fail behaviors keep a gap from becoming a leak or a bad
   merge. Resolves new-unknown N3.
 
-- **D53 (locked, 2026-06-30).** **Semantic Catalog operations.** (a) **Deploy-coupled load:** catalog
-  baked into the deploy artifact, merged PR live on next deploy ⇒ **catalog SHA ≡ deploy SHA** (fully
+- **D53 (locked, 2026-06-30; deploy location clarified by D78).** **Semantic Catalog operations.** (a) **Deploy-coupled load:** catalog
+  baked into the **runtime** deploy artifact (not the MCP service — see D78), merged PR live on next deploy ⇒ **catalog SHA ≡ runtime deploy SHA** (fully
   reproducible; catalog-edit latency = deploy cadence, acceptable for a rarely-mutating curated
   store). (b) **Bot-authored PRs:** `schema_edit` candidates open a branch + YAML patch + PR with CI
   (schema lint + `explainQuery` dry-run); human merge = the D18 gate. (c) **Mismatch handling:**
-  table-without-catalog-entry → structural-only `getTableSchema`, raw-loop-usable but not
+  table-without-catalog-entry → structural-only schema (the **runtime** overlays nothing; the MCP
+  returns normal introspection — see D78), raw-loop-usable but not
   blueprint-eligible; catalog-diverged-from-warehouse → caught by the **D43 conformance probe** →
   `schema_edit` PR (no new mechanism). Resolves new-unknown N5.
 
@@ -337,12 +369,14 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   and the D44 replayed-trail boundary. Resolves architectural-review finding #2.
 
 ## Semantic catalog
-- **D42 (locked, 2026-06-30).** The **Semantic Catalog** is a first-class component, stored as
-  **git-backed YAML** (one file per table + `rules.yaml`). It is the curated half of `getTableSchema`
+- **D42 (locked, 2026-06-30; overlay location amended by D78).** The **Semantic Catalog** is a first-class component, stored as
+  **git-backed YAML** (one file per table + `rules.yaml`). It is the curated semantic layer
   (entities, grain, per-measure `{agg, defined_over}`, `temporal`, rule definitions, ambiguities,
-  synonyms, enums); the structural half stays live ClickHouse introspection, so
-  `getTableSchema = introspection ⨝ catalog overlay`. Consequences: (a) **catalog version = git
-  commit SHA**, stamped into `USES`-edge validation + golden replays; (b) the learning-loop
+  synonyms, enums). The structural half of `getTableSchema` is live ClickHouse introspection;
+  **D78 clarifies that the `introspection ⨝ catalog overlay` join happens in the agent runtime,
+  not the MCP** — the MCP returns introspection only. Consequences: (a) **catalog version = git
+  commit SHA**, stamped into `USES`-edge validation + golden replays (the catalog ships with the
+  runtime deploy per D53/D78); (b) the learning-loop
   `schema_edit` review inbox emits a **PR**, and human merge **is** the D18 never-auto-commit gate
   (one mechanism for write path + review queue); (c) a catalog SHA bump triggers the schema-drift
   maintenance job (re-validate `USES` edges + grain gate + golden replay, demote breakage), and per
@@ -350,7 +384,18 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   `rules.yaml`, enforced two ways** — deterministic AST injection in blueprints vs. model-written SQL
   in the raw loop (governance note in [06-security-and-governance.md](../06-security-and-governance.md)),
   and rules are a correctness convention, never an access boundary. Resolves review item A
-  (catalog had no storage home).
+  (catalog had no storage home). See [D78](#semantic-catalog) for the overlay-location decision.
+
+- **D78 (locked, 2026-06-30).** **The `getTableSchema` semantic-catalog overlay moves to the agent runtime.** The ClickHouse MCP's `getTableSchema` returns **live introspection only** (columns/types/engine/comments). The **runtime** performs the `introspection ⨝ catalog YAML overlay` join — merging in grain, per-measure `{agg, defined_over}`, `temporal`, rule definitions, ambiguities, synonyms, enum values, and `sensitive`/`client_defined` flags — before handing the enriched schema to the model. **Amends D42** (overlay location moves; catalog content/format unchanged). **Clarifies D53**: the catalog deploys with the **runtime**, not the MCP service; D53's "catalog SHA ≡ deploy SHA" idea holds but SHA ≡ runtime deploy SHA. Graceful-degradation path (table without catalog entry → structural-only) now happens runtime-side: the MCP always returns whatever introspection it can; the runtime overlays nothing if no catalog entry exists.
+
+  **Rationale (terse):**
+  - Keeps the ClickHouse MCP a pure, thin data plane — introspection is a warehouse fact; the curated semantic layer is a runtime/knowledge concern.
+  - The catalog is git-backed YAML that already versions/deploys with the runtime; the runtime is the natural owner of the overlay + `catalog_sha` stamping.
+  - Consistent with D77 (enrichment/composition happens runtime-side) and the two-plane split (D1).
+  - Removes the last non-enforcement piece from the clickhouse-api extension scope — after D77 + D78, clickhouse-api's remaining delta is enforcement-only: D57 column-scope + D63 fail-closed + D64 scratch + D5 scope injection.
+
+  Cross-references: [D1](#architecture), [D42](#semantic-catalog), [D53](#blueprint-dedup--resolvers),
+  [D57](#blueprint-silent-path-safety), [D75](#clickhouse-mcp--adoption-decision), [D77](#client-defined-value-resolution).
 
 ## Blueprint silent-path safety
 - **D43 (locked, 2026-06-30).** **Silent-eligibility is a freshness-bounded attestation, not the
@@ -569,6 +614,51 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   span attribute; `slot_names` (not values) are permitted. See [12-extensibility.md](../12-extensibility.md)
   §4.
 
+## ClickHouse MCP — adoption decision
+- **D75 (locked, 2026-06-30).** **Adopt the existing `clickhouse-api` service as the ClickHouse MCP
+  data plane; do not build a new MCP from scratch. Extend it with the missing enforcement pieces.**
+
+  The **`clickhouse-api` repo** is a FastAPI + MCP service with JWT/OIDC auth (tenant/row-level
+  isolation via ClickHouse row policies driven by a JWT claim).
+
+  **Already provided by `clickhouse-api` (leaves our build scope — verified by code inspection):**
+  - 6 of the 7 data-plane tools: `listDatabases`, `listTables`, `getTableSchema`, `sampleRows`,
+    `runQuery`, `explainQuery`.
+  - Read-only enforcement: SQL allowlist (SELECT/WITH/EXPLAIN/SHOW/DESCRIBE) + denylist (blocks
+    INSERT/UPDATE/DELETE/DDL/SET + external table functions url/s3/file/remote), comment-stripping,
+    string-literal masking, auto-LIMIT injection, and ClickHouse session settings `readonly=1` +
+    `max_execution_time` + `max_result_rows` + `max_rows_to_read`.
+  - JWT/OIDC auth (`app/auth_jwt.py`, `app/principal.py`) with per-tenant ClickHouse-settings injection.
+    Note: this is **tenant/row-level** isolation, distinct from the spec's **column-level** scope.
+
+  **Still missing — must be ADDED to `clickhouse-api` by extension (verified absent):**
+  - **D57 column-scope enforcement** — no per-request column scope, no SQL column extraction, no
+    reject-if-columns-⊄-scope. Any authenticated user can currently read any column.
+  - **D62 `sqlglot` parser** — not a dependency; not used anywhere in the service.
+  - **D63 fail-closed on parse failure.**
+  - **D64 scratch `scratch.s_<session_id>_*` isolation** — no `session_id` concept at the MCP.
+  - **D5 column-scope injection** — the JWT Principal carries claims but no computed `column_scope`;
+    `runQuery` has no `scope` or `session_id` parameter today.
+  - ~~**D66 `resolveValues`** tool — completely absent (the 7th data-plane tool).~~ **Removed from
+    this list by D77:** `resolveValues` is now a runtime composite over `runQuery`, not an MCP
+    addition. The MCP data plane stays at 6 tools.
+  - ~~**D42 `getTableSchema` semantic-catalog overlay**~~ — **Removed from this list by D78:** the `introspection ⨝ catalog` join moves to the agent runtime. The MCP returns introspection only; the runtime applies the overlay. This drops out of `clickhouse-api` extension scope entirely.
+  - The **Phase-0 column-provenance extractor** (built in this repo under D52/D62/D68/D69/D70) is
+    the component that powers column extraction (D57) and scratch-table name extraction (D64). Under D75 it must be **delivered into
+    `clickhouse-api`** (the enforcement site). How it is packaged — copied in, published as a shared
+    library, or imported — is an **open question** (see [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md)
+    §Security/infra — D75 packaging).
+
+  **Enforcement boundary:** remains **at the MCP** (consistent with D57 — "enforced at the MCP by
+  parsing the SQL"), not in the agent runtime.
+
+  Cross-references: [D1](#architecture), [D4](#tools), [D5](#tools), [D42](#semantic-catalog),
+  [D52](#blueprint-dedup--resolvers), [D57](#blueprint-silent-path-safety),
+  [D62](#blueprint-silent-path-safety), [D63](#blueprint-silent-path-safety),
+  [D64](#security--infra), [D66](#client-defined-value-resolution), [D68](#delivery--sequencing),
+  [D69](#testing), [D70](#testing), [D77](#client-defined-value-resolution),
+  [D78](#semantic-catalog).
+
 ## Delivery / sequencing
 - **D68 (locked, 2026-06-30).** **Three-phase delivery with a red-burndown conformance harness from day one.**
 
@@ -580,7 +670,7 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   - **Exit criteria:** all Phase-0 conformance scenarios green (scope denial, mid-session scope narrowing, parser fail-closed, observability + PII, pause/resume durability, budget-cap pause); Layer 1 + Layer 2 MCP + session-store tests passing in CI; Phoenix traces reachable and PII-clean on a real turn.
 
   **Phase 1 — Blueprints + D56 verify gate (the launchable product).**
-  Scope: knowledge plane reads (`searchBlueprints`, `getBlueprint`, `runBlueprint`, `searchKnowledge`), the full D56 verification gate, composite blueprints (D59), retrieval pipeline (D7/D8), grain declaration (D37a/D40/D65), `resolveValues` (D66/D67), D53 catalog CI, review inbox UI, and all remaining Layer 3 conformance scenarios. Runs alongside **Track B** (see below).
+  Scope: knowledge plane reads (`searchBlueprints`, `getBlueprint`, `runBlueprint`, `searchKnowledge`), the full D56 verification gate, composite blueprints (D59), retrieval pipeline (D7/D8), grain declaration (D37a/D40/D65), `resolveValues` (D66/D67 — runtime composite, D77), D53 catalog CI + catalog overlay in the runtime (D78), review inbox UI, and all remaining Layer 3 conformance scenarios. Runs alongside **Track B** (see below).
   - **Track B (parallel) — learning-loop write router:** D26–D31 write router stages, D58 leakage gate (human pre-gate for `global_knowledge`; sampled detection for blueprints), D48 hard-dedup with single-writer-per-key, D51 provenance/audit store, `LEARNING_ENABLED=false` kill-switch (D58c), review-inbox ingestion, D53 `schema_edit` PR bot. Track B is fully offline/decoupled from the request path and has no Phase-0 prerequisites beyond the session store and Redis.
   - **Exit criteria (gates first release):** ALL Layer 3 spec-conformance scenarios green (the full ~13-scenario suite from [11-testing.md](../11-testing.md) §Layer 3) + Layers 1–2 green for every shipped module. This is the full-conformance gate — there is no "ship request path, learn later" escape hatch (see tension note below).
 
@@ -601,10 +691,12 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   ### sqlglot as Phase-0 first brick
   `sqlglot` (D62) is chosen over any other parser start point because it is: (a) pure Python logic with zero infrastructure dependency; (b) the shared substrate for five hard-invariant consumers (D57 scope enforcement, D44 provenance/replay, D48 canonical dedup key, D35 template rewrite, D64 scratch isolation); (c) TDD-able immediately with adversarial inputs; and (d) a parse failure in any of those consumers produces a security or correctness consequence (fail-closed / fail-soft / fail-to-review per D52), so getting the fail-behavior tests green first means every later consumer inherits a tested safety net.
 
-  Cross-references: D1, D5, D7, D8, D13, D22, D23, D24, D25, D26–D31, D35, D37, D40, D42, D43, D44, D45, D46, D47, D48, D51, D52, D53, D56, D57, D58, D59, D61, D62, D63, D64, D65, D66, D67.
+  Cross-references: D1, D5, D7, D8, D13, D22, D23, D24, D25, D26–D31, D35, D37, D40, D42, D43, D44, D45, D46, D47, D48, D51, D52, D53, D56, D57, D58, D59, D61, D62, D63, D64, D65, D66, D67, D75, D76, D77, D78.
 
 ## Testing
-- **D64 (locked, 2026-06-30).** **Four-layer test strategy with an automated spec-conformance suite.**
+- **D76 (locked, 2026-06-30).** **Four-layer test strategy with an automated spec-conformance suite.**
+  <!-- Renumbered from a duplicate D64 (collided with the scratch-isolation D64); D64 now refers only to scratch isolation. -->
+
   Because nearly every locked decision is a **hard invariant** (D56 no-silent, D57 scope enforcement,
   D58 knowledge human-gate, D44 provenance filter, D59 injection-safe intermediates, D61 progress
   streaming, D63 fail-closed parser), tests must **prove** them, not assume them. Layers: **(1) Unit**

@@ -50,7 +50,8 @@ The deterministic primitives that guard hard boundaries. Each gets exhaustive po
 
 Run against a **real** containerized store, not the full stack:
 
-- **MCP data-plane** (vs. ClickHouse): read-only enforced (INSERT/UPDATE/DELETE/DDL/table-functions blocked), row caps + time limits, **scope rejection by SQL parse (D57)**, `getTableSchema = introspection ⨝ catalog overlay` incl. uncatalogued-table structural-only path (D53).
+- **MCP data-plane** (vs. ClickHouse): read-only enforced (INSERT/UPDATE/DELETE/DDL/table-functions blocked), row caps + time limits, **scope rejection by SQL parse (D57)**, `getTableSchema` returns **live introspection only (D78)**.
+- **Runtime catalog overlay** (vs. catalog + MCP): the runtime performs `introspection ⨝ catalog overlay` incl. the uncatalogued-table structural-only path (D53/D78) — a **runtime** component test, not an MCP one.
 - **`runBlueprint` executor** (vs. ClickHouse + neo4j): topo-sort + parallel branches; **scalar→typed param / table→scratch (D59a)**; approval gate references upstream-only (D59b); **pause checkpoint + CAS-exactly-once resume (D45)**; verification gate runs + falls back on failure (D56).
 - **Learning loop** (vs. neo4j/Redis/provenance store): each stage triage→extractor→static-validate→**leakage gate**→dedup→writers; **idempotency by `content_hash`**; **single-writer-per-`canonical_key` race (D48)**; knowledge ⇒ review inbox, **not retrievable until approved (D58a)**; `LEARNING_ENABLED=false` halts write-back (D58c).
 - **Retrieval** (vs. neo4j): embed→recall→**scope pre-filter drops out-of-scope blueprints**→rerank→top-3 thin cards; both vector corpora served from neo4j (D60).
