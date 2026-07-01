@@ -160,6 +160,13 @@ decision, not an MCP concern.
 
 ### Other security / infra items
 
+- **`X-Session-Id` forgeability (hardening, from the D81 security review).** `session_id` reaches the
+  MCP as an **unsigned** `X-Session-Id` header (D81), so scratch namespace selection rests on an
+  application-layer prefix check with no signature and no ClickHouse row policy. A JWT-authenticated
+  caller bypassing the trusted backend could target another session's scratch. Accepted for now
+  (trusted backend; scratch ephemeral; feature unbuilt). If scratch grows cross-user-sensitive data,
+  **bind `session_id` to the JWT `sub`** (HMAC prefix) or add a scratch row policy. Decide before the
+  scratch-upload feature (D19/D64) ships.
 - Scope representation passed by UI (JWT claim vs. separate object).
 - Scratch TTL duration + cleanup ownership.
 - **`SESSION_TTL` value** (D44) — must exceed the learning-loop completion window.
