@@ -9,6 +9,14 @@ are **injected by runtime code at dispatch** into every tool call. They are:
 - **Not present** in the model's context (no leakage, no token cost).
 - The model calls `runQuery(sql)`; the runtime runs `runQuery(sql, jwt, scope, session_id)`.
 
+### Token acquisition and interim scope (D82)
+
+The JWT is obtained at login: the **UI's backend** calls `token_service`'s guarded `POST /token` (or an external IdP in production) to mint a signed JWT for the session. The browser receives but does not sign tokens.
+
+**Interim posture — `column_scope: []` (D82/D80):** every token is currently minted with an **empty `column_scope`**, which D80 defines as allow-all. Per-user column entitlements are **not yet wired**, so **column-level enforcement is effectively a no-op until entitlements are populated** — this is an explicit interim, not the end state. Row-level tenant isolation (`SQL_tenant`/`user_name`) is enforced separately at the warehouse and is unaffected. The MCP parser (D57/D62) and D63 fail-closed + D64 scratch isolation **still fire** on every request even with an allow-all token, so cross-session scratch access and unparseable SQL remain blocked.
+
+`session_id` travels as an unsigned `X-Session-Id` header (D81), separate from the JWT. The backend forwards both to the MCP on every turn.
+
 ### Why this is a security property
 The model never holds the token, so it **cannot forge or escalate scope**. Enforcement is uniform —
 the same injection applies to `runQuery` calls made **inside** `runBlueprint`, so column-level access
@@ -167,5 +175,5 @@ never an agent tool.
 
 **Status:** Locked
 **Open questions:**
-- Scope representation/format passed by the UI (claim shape in JWT vs. separate scope object).
+- ~~Scope representation/format passed by the UI (claim shape in JWT vs. separate scope object).~~ **RESOLVED by D79b:** `column_scope` is a signed JWT claim (a JSON list of `database.table.column` triples).
 - Scratch TTL duration and cleanup ownership.

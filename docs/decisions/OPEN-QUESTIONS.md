@@ -160,6 +160,10 @@ decision, not an MCP concern.
 
 ### Other security / infra items
 
+- **Per-user column-entitlement source (D82, interim).** Currently every JWT is minted with `column_scope: []` (allow-all, D80/D82) — column enforcement is a no-op until entitlements are wired. Open: where does the mint step look up a user's permitted columns — IdP claims stamped at login (e.g. Entra group → scope claim) vs. a backend entitlement service / token-exchange that populates `column_scope` at mint time? Resolving this also unlocks the D82 interim: once a non-empty scope is being minted, column enforcement activates automatically (D57 is already in place).
+
+- **Planned move to a managed IdP (Microsoft Entra / Keycloak / Okta), cross-reference D79/D82.** `token_service` is an interim issuer. The production direction is to replace it with a managed identity provider (Microsoft Entra or equivalent). Because the ClickHouse MCP already validates standard OIDC JWTs via JWKS (D79) — checking `iss`/`aud` and fetching signing keys from `OIDC_JWKS_URL` — this swap is an **issuer/config change** (point `OIDC_JWKS_URL` / `OIDC_ISSUER` / `OIDC_AUDIENCE` at Entra; the IdP mints the JWT with the `column_scope` + `user_name`/tenant claims), **not an MCP code change**. Prerequisite: the chosen IdP must be able to stamp the `column_scope` claim (ties into the per-user-entitlement item above).
+
 - **`X-Session-Id` forgeability (hardening, from the D81 security review).** `session_id` reaches the
   MCP as an **unsigned** `X-Session-Id` header (D81), so scratch namespace selection rests on an
   application-layer prefix check with no signature and no ClickHouse row policy. A JWT-authenticated
@@ -167,7 +171,7 @@ decision, not an MCP concern.
   (trusted backend; scratch ephemeral; feature unbuilt). If scratch grows cross-user-sensitive data,
   **bind `session_id` to the JWT `sub`** (HMAC prefix) or add a scratch row policy. Decide before the
   scratch-upload feature (D19/D64) ships.
-- Scope representation passed by UI (JWT claim vs. separate object).
+- ~~Scope representation passed by UI (JWT claim vs. separate object).~~ **RESOLVED by D79b:** `column_scope` is a signed JWT claim.
 - Scratch TTL duration + cleanup ownership.
 - **`SESSION_TTL` value** (D44) — must exceed the learning-loop completion window.
 - **SQL parser choice** — **RESOLVED by D62: `sqlglot` (Python).** Remaining: **dialect coverage** —
