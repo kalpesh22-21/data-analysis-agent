@@ -54,7 +54,20 @@ case-insensitive substring match — see `DemoModelClient.send_turn`):
     | "bad headcount"            | runBlueprint no-silent-verify (D56): VERIFY_FAILED -> raw loop |
     | "average tenure"           | runBlueprint slot ask->clarify->resume (D49) |
     | "approve headcount"        | runBlueprint approval pause/resume (D45/D59b) |
+    | "recall payroll"           | scope-narrowing turn 2 (D44): echo iff in scope |
+    | "payroll"                  | scope-narrowing turn 1 (D44): runQuery(sql=payroll) |
     | (anything else)            | normal: getTableSchema -> final answer       |
+
+Slice-2 env toggles (all OFF by default → byte-identical to Slice 1):
+
+    | Env var                    | Effect                                        |
+    |----------------------------|-----------------------------------------------|
+    | DEMO_SESSION_STORE=couchbase | CouchbaseSessionStore (live l2-cb) for D45   |
+    | DEMO_TEST_SPANS=1          | in-memory span exporter + GET /_test/spans (D25) |
+
+(The D44 scope-narrowing BFF endpoint `POST /api/session/scope` is gated
+separately by `UI_TEST_AFFORDANCES=1` in ui/server.py — the runtime never
+sees that flag.)
 
 The four runBlueprint scenarios (D89) require the demo runtime to advertise a
 blueprint fast path, which `create_app` wires ONLY when a `RetrievalPipeline`
@@ -80,6 +93,8 @@ Run:
 
 from __future__ import annotations
 
+import json
+import os
 from typing import Any
 
 import uvicorn
@@ -125,6 +140,28 @@ _DEMO_SCHEMA_RESPONSE: dict[str, Any] = {
 # its own).
 _SCOPE_DENIAL_QUERY = f"SELECT AnnualSalary FROM {_DEMO_DATABASE}.{_DEMO_TABLE}"
 _PARSE_FAIL_QUERY = "RAW_SQL_DEMO -- ; DROP TABLE employees; --"
+
+# --------------------------------------------------------------------------
+# Mid-session scope narrowing (D44 Slice 2) — a payroll table + a turn-1 query
+# whose provenance the runtime resolves to `demo.payroll.salary`. Turn 1 runs
+# it under an allow-all scope (result kept in replay); the harness then narrows
+# the JWT scope to EXCLUDE that column via the BFF's `/api/session/scope`; turn
+# 2 asks the model to recall the figure, but `ContextAssembler`/`scope_filter`
+# has dropped the now-out-of-scope prior entry from replay, so the sentinel
+# value is no longer in the model's context and never reaches the DOM.
+#
+# The query MUST carry the SQL in the `sql` arg key (not `query`): the runtime's
+# provenance capture reads `args.get("sql")` (provenance/capture.py) — a `query`
+# key would yield UNDETERMINED provenance (dropped even under allow-all), so
+# turn 1 would never establish the in-scope baseline this scenario narrows away.
+_D44_PAYROLL_TABLE = "demo.payroll"
+_D44_PAYROLL_SALARY_COL = f"{_D44_PAYROLL_TABLE}.salary"
+_D44_PAYROLL_DEPT_COL = f"{_D44_PAYROLL_TABLE}.department"
+_D44_PAYROLL_QUERY = f"SELECT salary FROM {_D44_PAYROLL_TABLE} WHERE department = 'Sales'"
+# A distinctive sentinel the result carries; the D44 test asserts it renders in
+# turn 1 (baseline) and is ABSENT after narrowing (turn 2). Deliberately not a
+# bare digit run (a uuid4 session id could contain one by chance).
+_D44_PAYROLL_SENTINEL = "PAYROLL_FIGURE_XYZZY_770077"
 
 
 # --------------------------------------------------------------------------
@@ -522,6 +559,68 @@ class DemoModelClient:
                 )
             )
 
+        # --- Mid-session scope narrowing (D44, Slice 2) ------------------------
+        # THREE SEPARATE turns, ONE session (not same-turn resumes). Turn 1
+        # ("payroll lookup") runs a query whose provenance the runtime resolves to
+        # `demo.payroll.salary`; the sentinel value lands in the replayable trail
+        # under the (turn-1) allow-all scope. Turn 2 ("recall payroll", still wide)
+        # echoes it — positive control. The harness then narrows the JWT scope to
+        # exclude that column; turn 3 ("recall payroll", narrowed) can no longer
+        # find it because the replay filter dropped the out-of-scope prior entry.
+        #
+        # Unlike every other branch here, these route off the LATEST user message
+        # (`latest_lower`), NOT the first: across DISTINCT turns the assembled
+        # context carries turn 1's message as `user_messages[0]` forever, so a
+        # first-message route would mis-fire on every follow-up. The resume-based
+        # branches above must keep routing off the first message (their resume
+        # appends the answer as the latest message, within ONE turn); this
+        # multi-turn scenario is the one that needs the latest. "recall payroll"
+        # is checked BEFORE the turn-1 "payroll" branch (both contain "payroll").
+        latest_user_text = str(user_messages[-1].get("content") or "")
+        latest_lower = latest_user_text.lower()
+        if "recall payroll" in latest_lower:
+            context_blob = json.dumps(messages, default=str)
+            if _D44_PAYROLL_SENTINEL in context_blob:
+                return ModelTurnResult(
+                    assistant_text=(
+                        f"The payroll figure on record from the earlier lookup is "
+                        f"{_D44_PAYROLL_SENTINEL}. (Scripted demo runtime.)"
+                    )
+                )
+            return ModelTurnResult(
+                assistant_text=(
+                    "I no longer have that payroll figure available — it is outside "
+                    "your current column scope, so I dropped it from context. "
+                    "(Scripted demo runtime.)"
+                )
+            )
+
+        if "payroll" in latest_lower:
+            # Turn 1: emit the payroll query via the `sql` arg key so the runtime's
+            # provenance capture (which reads `args.get("sql")`) DETERMINES it to
+            # `demo.payroll.salary`; on the returned result, a generic final answer
+            # (the sentinel rides in the trail's result_preview, not this prose, so
+            # nothing from turn 1 lingers in the DOM's #answer past turn 2). This is
+            # the FIRST turn of the session, so `tool_messages` is empty on the
+            # first call and holds only this turn's runQuery result on the second.
+            if not tool_messages:
+                return ModelTurnResult(
+                    tool_calls=[
+                        ToolCallRequest(
+                            id="call-d44-payroll-1",
+                            name="runQuery",
+                            arguments={"sql": _D44_PAYROLL_QUERY},
+                        )
+                    ]
+                )
+            return ModelTurnResult(
+                assistant_text=(
+                    "I looked up the payroll figure for Sales and recorded it. "
+                    "Ask me to recall it and I'll report what's in scope. "
+                    "(Scripted demo runtime.)"
+                )
+            )
+
         # --- runBlueprint scenarios (D89) --------------------------------------
         # The loop intercepts `runBlueprint` via the runtime-tool registry (wired
         # once `create_app` is given a retrieval pipeline), so the double emits it
@@ -727,6 +826,16 @@ class DemoMCPClient(FakeMCPClient):
                     "PARSE_FAILED_CLOSED",
                     "[PARSE_FAILED_CLOSED] could not parse/validate the submitted SQL",
                 )
+            if _D44_PAYROLL_TABLE in sql:
+                # Mid-session scope narrowing (D44): a SUCCESSFUL query whose
+                # provenance the runtime resolves to `demo.payroll.salary`. The
+                # sentinel value rides in the result_preview; the runtime's replay
+                # filter — not this double — is what later drops it under a narrowed
+                # scope. Content-routed statelessly like every other branch.
+                self.calls.append(
+                    RecordedCall(tool_name=tool_name, args=dict(args), jwt=jwt, session_id=session_id)
+                )
+                return _rows_result(["salary"], [[_D44_PAYROLL_SENTINEL]], row_count=1)
             blueprint_result = _blueprint_run_query(sql)
             if blueprint_result is not None:
                 self.calls.append(
@@ -736,7 +845,85 @@ class DemoMCPClient(FakeMCPClient):
         return await super().call_tool(tool_name, args, jwt=jwt, session_id=session_id)
 
 
+# --------------------------------------------------------------------------
+# Slice-2 env toggles (all OFF by default → the demo path is byte-identical to
+# Slice 1). Read once here so the launcher's behavior is explicit:
+#   DEMO_SESSION_STORE=couchbase  -> CouchbaseSessionStore (live l2-cb) instead
+#                                    of InMemorySessionStore, for the ONE restart
+#                                    durability scenario (D45). Default in-memory.
+#   DEMO_TEST_SPANS=1             -> install an in-memory OTel span exporter +
+#                                    the runtime's `GET /_test/spans` route, for
+#                                    the observability/PII scenario (D25).
+# The BFF's own `UI_TEST_AFFORDANCES=1` gate (D44 scope endpoint) lives in
+# ui/server.py, not here — the runtime never sees it.
+# --------------------------------------------------------------------------
+# The live l2-cb Couchbase (docker-compose.integration.yml `couchbase` service),
+# seeded by scripts/couchbase-init.sh (bucket `agent_sessions`, collections
+# `sessions`/`session_results`, admin/password).
+_COUCHBASE_CONNECTION_STRING = "couchbase://localhost"
+_COUCHBASE_USERNAME = "admin"
+_COUCHBASE_PASSWORD = "password"
+
+
+class _LazyCouchbaseSessionStore:
+    """Construct the real `CouchbaseSessionStore` on FIRST async use (D45 launcher).
+
+    The `acouchbase` Cluster connects EAGERLY at construction and requires a
+    RUNNING event loop — but this launcher builds the app at module import
+    (`app = build_demo_app()`), before uvicorn's loop is up, so a direct
+    `CouchbaseSessionStore(settings)` there raises "Event loop is not running".
+    This thin proxy defers the real construction to the first awaited method
+    (always inside a request, where the loop is running), then delegates every
+    `SessionStore` call to it. Pure launcher scaffolding — no runtime behavior
+    is touched (the real store is used verbatim once built).
+    """
+
+    def __init__(self, settings: RuntimeSettings) -> None:
+        self._settings = settings
+        self._inner: Any = None
+
+    def _store(self) -> Any:
+        if self._inner is None:
+            from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
+
+            self._inner = CouchbaseSessionStore(self._settings)
+        return self._inner
+
+    async def create_session(self, session_id: str) -> Any:
+        return await self._store().create_session(session_id)
+
+    async def get_or_create_session(self, session_id: str) -> Any:
+        return await self._store().get_or_create_session(session_id)
+
+    async def load_trail(self, session_id: str) -> Any:
+        return await self._store().load_trail(session_id)
+
+    async def append_message(self, session_id: str, message: Any) -> None:
+        await self._store().append_message(session_id, message)
+
+    async def append_trail_entry(self, session_id: str, entry: Any) -> None:
+        await self._store().append_trail_entry(session_id, entry)
+
+    async def bump_last_activity(self, session_id: str) -> None:
+        await self._store().bump_last_activity(session_id)
+
+    async def write_full_result(
+        self, session_id: str, result_id: str, result_full: dict[str, Any]
+    ) -> str:
+        return await self._store().write_full_result(session_id, result_id, result_full)
+
+    async def write_pause_checkpoint(self, session_id: str, checkpoint: Any) -> None:
+        await self._store().write_pause_checkpoint(session_id, checkpoint)
+
+    async def get_session_with_cas(self, session_id: str) -> Any:
+        return await self._store().get_session_with_cas(session_id)
+
+    async def resume_checkpoint(self, session_id: str, cas: Any, answer: str) -> Any:
+        return await self._store().resume_checkpoint(session_id, cas, answer)
+
+
 def build_demo_app():
+    use_couchbase = os.environ.get("DEMO_SESSION_STORE") == "couchbase"
     settings = RuntimeSettings(
         jwks_url=_JWKS_URL,
         jwt_issuer=_TOKEN_ISSUER,
@@ -750,6 +937,11 @@ def build_demo_app():
         max_loop_iterations=3,
         max_wall_clock_seconds=60,
         max_budget_windows=3,
+        # Couchbase config — only consulted when DEMO_SESSION_STORE=couchbase
+        # (below); harmless defaults otherwise (InMemorySessionStore ignores it).
+        couchbase_connection_string=_COUCHBASE_CONNECTION_STRING,
+        couchbase_username=_COUCHBASE_USERNAME,
+        couchbase_password=_COUCHBASE_PASSWORD,
     )
 
     catalog = CatalogHandle(
@@ -758,6 +950,10 @@ def build_demo_app():
             # The blueprint tables (D89) — so the executor's inner runQuery
             # provenance is DETERMINED and the verified result survives D44 replay.
             **_BP_TABLE_SCHEMAS,
+            # The payroll table (D44) — catalogued so the turn-1 query's
+            # provenance resolves to `demo.payroll.salary`; narrowing the JWT
+            # scope to exclude it then drops the entry from turn-2 replay.
+            _D44_PAYROLL_TABLE: {"department": "String", "salary": "UInt64"},
         }
     )
 
@@ -802,13 +998,37 @@ def build_demo_app():
     # ToolDispatcher as production and are content-routed by DemoMCPClient.
     retrieval = build_retrieval_pipeline(settings)
 
+    # Restart durability (D45, Slice 2): the ONLY scenario that needs a real,
+    # out-of-process store — an InMemorySessionStore loses a paused checkpoint on
+    # process restart by design, so it cannot demonstrate durability. Selected via
+    # DEMO_SESSION_STORE=couchbase; every other scenario keeps the in-memory store.
+    session_store: Any
+    if use_couchbase:
+        session_store = _LazyCouchbaseSessionStore(settings)
+    else:
+        session_store = InMemorySessionStore()
+
+    # Observability + PII (D25, Slice 2): install an in-process InMemorySpanExporter
+    # + the runtime's `GET /_test/spans` route (NOT a Phoenix container) when
+    # DEMO_TEST_SPANS=1, so the Layer-3 scenario can dump the manual AGENT/TOOL/
+    # CHAIN/GUARDRAIL spans and assert them PII-clean. Off by default → no exporter,
+    # no route, byte-identical HTTP surface.
+    span_exporter = None
+    if os.environ.get("DEMO_TEST_SPANS") == "1":
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        span_exporter = InMemorySpanExporter()
+
     return create_app(
         settings=settings,
-        session_store=InMemorySessionStore(),
+        session_store=session_store,
         mcp_client=mcp_client,
         model_client=DemoModelClient(),
         catalog=catalog,
         retrieval=retrieval,
+        span_exporter=span_exporter,
     )
 
 

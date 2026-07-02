@@ -66,6 +66,23 @@ yet demo-wired), any live `resolve_via` seed (D67 Layer-1 only), and the table-i
 gated on a `clickhouse-api` scratch-write surface). Tests at slice close: **1225 passed / 44 skipped /
 0 xfailed**, ruff clean; live Layer-2 3/3.
 
+**Update (Session 14 — the D68 release gate is GREEN): the FULL Layer-3 conformance suite is
+`12/12 Playwright-green.`** The Layer-3 completion brick (Slices 1+2,
+[layer3-conformance-design.md](layer3-conformance-design.md)) turned every previously-red scenario
+green over the real UI + BFF + runtime with deterministic model/MCP/vector-index doubles: the **4
+runBlueprint scenarios** (fast-path execution, no-silent-verification D56, approval pause/resume
+D45/D59b, ask→clarify→resume D49) and the **3 remaining Phase-0 scenarios** (mid-session scope
+narrowing D44, observability + PII span inspection D25, and **pause/resume durability across a genuine
+runtime-process restart against live Couchbase** D45), joining the 5 pre-existing (D61/clarify/D57/
+D63/D47). **This satisfies the D68 release gate** (the full Layer-3 burndown), the first time it has
+been met. The conformance-scenario legs of the D44/D25/D45/D56/D49/D57/D61/D63/D47 rows below are now
+**Layer-3-green**; rows may still read `🟡` where their real-infra **Component** layer (e.g. live
+Couchbase for every D45 path, real MCP↔ClickHouse for every D57 path) is not yet built — the D68 gate
+is the conformance suite, which is green. Tests at brick close: **1355 passed / 56 skipped**, ruff
+clean; `RUN_E2E=1` → **13/13**. The three new test seams (span-exporter injection, `GET /_test/spans`,
+the env-gated scope-narrow BFF endpoint) are structurally default-off (no production path enables
+them) and the scope endpoint is monotonic-narrowing (rejects widening) — reviewer-verified.
+
 See [docs/11-testing.md](../11-testing.md) for the four-layer test pyramid definition and the full
 Layer 3 scenario list. See [docs/decisions/DECISIONS.md](DECISIONS.md) for the rationale behind each
 decision cited here.

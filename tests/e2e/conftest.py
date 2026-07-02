@@ -55,14 +55,24 @@ def running_stack() -> Iterator[None]:
     runtime_log = open(_REPO_ROOT / "tests" / "e2e" / ".runtime.stack.log", "w")
     bff_log = open(_REPO_ROOT / "tests" / "e2e" / ".bff.stack.log", "w")
 
+    # Slice-2 test affordances (all env-gated; the store stays IN-MEMORY here —
+    # only the isolated restart module opts into Couchbase). DEMO_TEST_SPANS=1
+    # installs the in-memory span exporter + `GET /_test/spans` (D25); it adds a
+    # span processor + a route but changes NO turn behavior, so the 9 pre-existing
+    # scenarios stay green. UI_TEST_AFFORDANCES=1 (BFF, below) exposes the inert
+    # `POST /api/session/scope` (D44) — never called by the other scenarios.
+    runtime_env = dict(os.environ)
+    runtime_env["DEMO_TEST_SPANS"] = "1"
     runtime_proc = subprocess.Popen(
         [sys.executable, "scripts/run_ui_runtime.py"],
         cwd=_REPO_ROOT,
+        env=runtime_env,
         stdout=runtime_log,
         stderr=subprocess.STDOUT,
     )
     bff_env = dict(os.environ)
     bff_env["RUNTIME_URL"] = _RUNTIME_URL
+    bff_env["UI_TEST_AFFORDANCES"] = "1"
     bff_env["TOKEN_SERVICE_URL"] = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
     bff_proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "ui.server:app", "--host", "0.0.0.0", "--port", "3000"],

@@ -48,6 +48,11 @@ _INDEX_HTML = _STATIC_DIR / "index.html"
 # durability/multi-replica requirement here.
 _SESSIONS: dict[str, str] = {}
 
+# Server-side-only session_id -> current column_scope (`[]` == allow-all, D80b).
+# Tracked ONLY so the test-only `/api/session/scope` affordance can enforce that
+# it narrows monotonically (never re-widens) — see `set_session_scope`.
+_SESSION_SCOPES: dict[str, list[str]] = {}
+
 app = FastAPI(title="data-agent-ui-bff")
 
 
@@ -61,6 +66,31 @@ class ResumeBody(BaseModel):
     answer: str
 
 
+class ScopeBody(BaseModel):
+    session_id: str
+    column_scope: list[str]
+
+
+async def _mint_jwt(column_scope: list[str]) -> str:
+    """Call the token service server-side to mint a JWT carrying *column_scope*
+    (D82/D5: the BFF is the ONLY holder of the token; the browser never sees
+    it). `column_scope=[]` == allow-all, matching the runtime's D80(b)/D44
+    scope semantics."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.post(
+                TOKEN_SERVICE_URL,
+                headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
+                json={"user_name": "ui-user", "column_scope": column_scope},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Token service unreachable: {exc}"
+            ) from exc
+    return response.json()["access_token"]
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(_INDEX_HTML)
@@ -69,22 +99,50 @@ async def index() -> FileResponse:
 @app.post("/api/session")
 async def create_session() -> dict[str, str]:
     session_id = str(uuid.uuid4())
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            response = await client.post(
-                TOKEN_SERVICE_URL,
-                headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
-                json={"user_name": "ui-user", "column_scope": []},
-            )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise HTTPException(
-                status_code=502, detail=f"Token service unreachable: {exc}"
-            ) from exc
-
-    jwt = response.json()["access_token"]
-    _SESSIONS[session_id] = jwt
+    _SESSIONS[session_id] = await _mint_jwt([])
+    _SESSION_SCOPES[session_id] = []
     return {"session_id": session_id}
+
+
+@app.post("/api/session/scope")
+async def set_session_scope(body: ScopeBody) -> dict[str, bool]:
+    """Test-only (D-L3-4): re-mint the session's JWT server-side with a NARROWER
+    `column_scope`, replacing the one held for `session_id`. Active ONLY when
+    `UI_TEST_AFFORDANCES=1` — otherwise 404, so the production BFF never exposes
+    it. D82/D5 stay intact: the BFF is still the sole JWT holder and the browser
+    still never receives the token; this endpoint only lets the Layer-3 harness
+    drive a mid-session scope change (D44) that a real product would drive from
+    its identity provider. The scope-narrowing itself is enforced server-side by
+    the runtime's `ContextAssembler`/`scope_filter` fail-closed replay — this
+    just supplies the narrower token.
+
+    MONOTONIC-NARROWING (S1, security): the affordance may only NARROW scope,
+    never widen it — otherwise a caller could POST `[]` (== allow-all, D80b) to
+    re-widen a narrowed session, turning this into an escalation surface once
+    Item-9 per-user scoped tokens make base sessions non-allow-all. So `[]` is
+    refused outright, and against a non-allow-all current scope the new scope
+    must be a subset of it."""
+    if os.environ.get("UI_TEST_AFFORDANCES") != "1":
+        raise HTTPException(status_code=404, detail="Not found.")
+    if body.session_id not in _SESSIONS:
+        raise HTTPException(
+            status_code=404, detail="Unknown session_id — call POST /api/session first."
+        )
+    if body.column_scope == []:
+        raise HTTPException(
+            status_code=400, detail="Test affordance narrows only; [] (allow-all) refused."
+        )
+    current = _SESSION_SCOPES.get(body.session_id, [])
+    # A non-empty current scope is an allowlist; the new scope must be ⊆ it. A
+    # current `[]` (allow-all) admits any non-empty narrowing (already checked).
+    if current and not set(body.column_scope).issubset(set(current)):
+        raise HTTPException(
+            status_code=400,
+            detail="Test affordance narrows only; new scope must be a subset of the current scope.",
+        )
+    _SESSIONS[body.session_id] = await _mint_jwt(body.column_scope)
+    _SESSION_SCOPES[body.session_id] = list(body.column_scope)
+    return {"ok": True}
 
 
 def _jwt_for_session(session_id: str) -> str:

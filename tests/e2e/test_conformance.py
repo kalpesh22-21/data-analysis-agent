@@ -22,9 +22,11 @@ Three Phase-0 conformance scenarios are intentionally NOT covered here — see
 
 from __future__ import annotations
 
+import json
 import os
 import re
 
+import httpx
 import pytest
 
 # Skip the whole module cleanly at COLLECTION if playwright isn't installed
@@ -41,7 +43,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 _BFF_URL = "http://localhost:3000"
+_RUNTIME_URL = "http://localhost:8000"
 _ASSERT_TIMEOUT_MS = 15_000
+
+# The result-cell sentinel the demo's payroll query returns (scripts/
+# run_ui_runtime.py::_D44_PAYROLL_SENTINEL). Used by BOTH the D44 scope-narrowing
+# scenario (asserts it drops from replay) and the D25 span scenario (asserts it
+# never reaches a span attribute).
+_PAYROLL_SENTINEL = "PAYROLL_FIGURE_XYZZY_770077"
 
 
 @pytest.fixture(autouse=True)
@@ -286,6 +295,130 @@ class TestRunBlueprintApprovalPauseResume:
         expect(page.get_by_test_id("answer")).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
         expect(page.get_by_test_id("status")).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
         expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+
+class TestScopeNarrowingDropsReplay:
+    """Scenario 10 — mid-session scope narrowing (D44): turn 1 surfaces a
+    payroll figure under an allow-all scope; the harness re-mints the session's
+    JWT with a NARROWER scope (excluding the payroll column) via the BFF's
+    `POST /api/session/scope`; a follow-up turn can no longer recall the figure
+    because `ContextAssembler`/`scope_filter` fail-closed drops the now-out-of-
+    scope prior entry from replay. D82/D5 intact — the browser never holds the
+    JWT; only the BFF re-mints it server-side.
+
+    Two methods, two SEPARATE browser sessions (function-scoped `page`), so the
+    baseline's sentinel-bearing assistant message never contaminates the
+    narrowed case's context:
+      - baseline (wide scope throughout) — proves the figure IS recallable, i.e.
+        the trail entry is determined, kept and rendered (guards against a
+        false-pass where an undetermined/None provenance dropped it anyway).
+      - narrowed — proves that narrowing the scope is what drops it from replay.
+    """
+
+    def test_baseline_recall_surfaces_figure_while_in_scope(self, page: Page) -> None:
+        _goto_and_wait_for_session(page)
+
+        # Turn 1 (wide scope): run the payroll lookup — provenance resolves to
+        # demo.payroll.salary; the sentinel lands in the replayable trail.
+        _send_message(page, "payroll lookup for sales")
+        expect(page.get_by_test_id("answer")).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("status")).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
+
+        # Turn 2 (still wide): the figure IS recallable while the payroll column is
+        # in scope — the entry was determined, kept, and rendered into context.
+        _send_message(page, "recall payroll figure")
+        expect(page.get_by_test_id("answer")).to_contain_text(
+            _PAYROLL_SENTINEL, timeout=_ASSERT_TIMEOUT_MS
+        )
+        expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+    def test_narrowed_scope_drops_prior_result_from_replay(self, page: Page) -> None:
+        _goto_and_wait_for_session(page)
+        session_id = page.locator("#session-line").inner_text().strip()
+
+        # Turn 1 (wide scope): the payroll lookup lands its sentinel in the trail.
+        _send_message(page, "payroll lookup for sales")
+        expect(page.get_by_test_id("answer")).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("status")).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
+
+        # Narrow the session's scope to EXCLUDE the payroll salary column (the
+        # BFF re-mints the JWT server-side; the browser never sees it).
+        response = httpx.post(
+            f"{_BFF_URL}/api/session/scope",
+            json={"session_id": session_id, "column_scope": ["demo.payroll.department"]},
+            timeout=10.0,
+        )
+        assert response.status_code == 200, response.text
+
+        # Turn 2 (narrowed): the follow-up can no longer surface the figure — the
+        # D44 replay filter dropped the out-of-scope prior entry from context.
+        _send_message(page, "recall payroll figure")
+        expect(page.get_by_test_id("answer")).to_contain_text(
+            "no longer", timeout=_ASSERT_TIMEOUT_MS
+        )
+        expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+        # The sentinel value must be ABSENT from the whole rendered page — proof
+        # the narrowed scope dropped it from replay (D44 end-to-end).
+        body_text = page.locator("body").inner_text()
+        assert _PAYROLL_SENTINEL not in body_text, (
+            f"Out-of-scope payroll figure leaked into the DOM after narrowing: {body_text!r}"
+        )
+
+
+class TestSpansEmittedPiiClean:
+    """Scenario 11 — observability + PII (D25): drive one ordinary turn, then
+    dump the emitted OTel spans via the runtime's test-only `GET /_test/spans`
+    (an in-process InMemorySpanExporter, NOT a Phoenix container). Assert at
+    least one AGENT and one TOOL span exist, and that NO span attribute value
+    carries the JWT, a raw SQL literal, or a result cell value (D25)."""
+
+    def test_spans_emitted_and_carry_no_pii(self, page: Page) -> None:
+        _goto_and_wait_for_session(page)
+
+        # Drive the payroll turn: it emits an AGENT span (the turn) + a runQuery
+        # TOOL span whose args are SQL-literal-masked, and returns a distinctive
+        # result cell sentinel — the strongest D25 probe (a result value that must
+        # NEVER reach a span attribute).
+        _send_message(page, "payroll lookup for sales")
+        expect(page.get_by_test_id("answer")).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("status")).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
+
+        response = httpx.get(f"{_RUNTIME_URL}/_test/spans", timeout=10.0)
+        assert response.status_code == 200, response.text
+        spans = response.json()["spans"]
+        assert spans, "no spans were captured"
+
+        kinds = {s["kind"] for s in spans}
+        assert "AGENT" in kinds, f"no AGENT span emitted; kinds={kinds}"
+        assert "TOOL" in kinds, f"no TOOL span emitted; kinds={kinds}"
+
+        # POSITIVE control (keeps the mask assertion below non-vacuous): a runQuery
+        # TOOL span DOES carry the SQL as a `tool.args.sql` attribute — but masked.
+        # The in-memory exporter accumulates spans across the whole session, so
+        # search for the payroll query specifically (not span[0]); if its SQL ever
+        # stopped reaching spans, this fails instead of the "no raw literal" check
+        # silently passing on an absent attribute.
+        sql_values = [
+            s["attributes"]["tool.args.sql"] for s in spans if "tool.args.sql" in s["attributes"]
+        ]
+        assert sql_values, "no span carried a tool.args.sql attribute (mask check would be vacuous)"
+        payroll_sql = [v for v in sql_values if "demo.payroll" in v]
+        assert payroll_sql, "the payroll runQuery SQL never reached a span"
+        # Every SQL that reaches a span is literal-masked — no raw WHERE literal.
+        for value in sql_values:
+            assert "'Sales'" not in value, f"SQL literal not masked in span: {value!r}"
+
+        blob = json.dumps(spans)
+        # (b) PII-clean: no result cell value, no JWT, no raw SQL string literal.
+        assert _PAYROLL_SENTINEL not in blob, (
+            "a result cell value leaked into a span attribute (D25 violation)"
+        )
+        assert "eyJ" not in blob, "a JWT leaked into a span attribute (D5/D25 violation)"
+        assert "Bearer " not in blob, "an Authorization header leaked into a span attribute"
+        # The runQuery SQL is masked (redact_tool_args): the raw WHERE literal
+        # 'Sales' must not survive into any span as a bound SQL value.
+        assert "= 'Sales'" not in blob, "an unmasked SQL literal leaked into a span attribute"
 
 
 def _any_of(substrings: list[str]) -> re.Pattern[str]:

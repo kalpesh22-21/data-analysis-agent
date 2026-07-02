@@ -1,10 +1,11 @@
 # Layer-3 conformance completion — design
 
-**Status:** Slice 1 BUILT (Session 14) — the 4 runBlueprint conformance scenarios are
-Playwright-green (9/9 e2e incl. the 5 pre-existing), via a seeded-fake retrieval pipeline injected
-into the demo launcher. Slice 2 (scope-switch BFF + in-memory span exporter + Couchbase restart —
-the 3 original Phase-0 scenarios) is next. The full D68 conformance-status traceability flip lands
-when Slice 2 completes the suite.
+**Status:** BUILT (Session 14) — **Slices 1+2 complete; the full Layer-3 conformance suite is
+12/12 Playwright-green (RUN_E2E 13/13), satisfying the D68 release gate for the first time.** Slice 1
+wired the demo launcher's retrieval pipeline + the 4 runBlueprint scenarios; Slice 2 added the 3
+original Phase-0 scenarios (mid-session scope narrowing D44, PII span inspection D25, restart
+durability against live Couchbase D45) behind default-off, monotonic-narrowing test seams. See the
+Session-14 D68-gate note in TRACEABILITY.md.
 **Branch context:** `phase0/provenance-extractor`.
 **Scope:** Turn every currently-red Layer-3 (Playwright) conformance scenario green, so the
 D68 release gate (the *full* Layer-3 burndown) is satisfiable for Phase 0. Seven red scenarios
@@ -199,7 +200,11 @@ never sets `otlp_endpoint`, so no spans are exported. Two options:
 - **(A) Real Phoenix container** in the Layer-3 stack + assert spans arrive via its query API.
 - **(B) In-process `InMemorySpanExporter`** wired by the demo launcher under a test env toggle,
   plus a **test-only `GET /_test/spans`** endpoint on the runtime that dumps the captured spans'
-  names + attribute *keys* (never values).
+  names + kinds + attributes (keys AND stringified values). Dumping the *values* is deliberate
+  and load-bearing: the D25 invariant under test is "no attribute VALUE carries a cell/JWT/SQL
+  literal", which can only be asserted by inspecting the values — a keys-only dump could not prove
+  it. Safe because the route is env-gated + test-only (registered only when the in-memory exporter
+  is injected); it is never present on the production HTTP surface.
 
 **Choose (B).** The D25 invariant under test is "**spans are emitted and carry no cell
 values/JWT/PII**" — an in-memory exporter proves exactly that, hermetically, with no extra

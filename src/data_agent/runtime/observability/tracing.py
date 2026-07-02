@@ -34,13 +34,18 @@ from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter
 from opentelemetry.trace import Span, Tracer
 
 _TRACER_NAME = "data-agent-runtime"
 
 
-def configure_tracing(*, otlp_endpoint: str, service_name: str) -> TracerProvider:
+def configure_tracing(
+    *,
+    otlp_endpoint: str,
+    service_name: str,
+    span_exporter: SpanExporter | None = None,
+) -> TracerProvider:
     """Build a `TracerProvider` exporting to *otlp_endpoint* (Phoenix), or a
     no-op provider (no span processor) when *otlp_endpoint* is empty.
 
@@ -49,12 +54,22 @@ def configure_tracing(*, otlp_endpoint: str, service_name: str) -> TracerProvide
     exactly once; keeping it out of this function makes `configure_tracing`
     safely callable multiple times in tests without triggering OTel's
     "Overriding of current TracerProvider is not allowed" warning.
+
+    *span_exporter* (test-only seam, D-L3-5): when supplied, its spans are
+    attached via a `SimpleSpanProcessor` (synchronous flush — a batched
+    processor would leave spans un-exported when a test reads them right after
+    a turn). This is the injection point the Layer-3 demo launcher uses to
+    install an `InMemorySpanExporter` and assert the D25 PII invariant over the
+    real emitted spans, with NO Phoenix container. Production leaves it `None`,
+    so this branch is inert and the provider is byte-identical to before.
     """
     resource = Resource.create({"service.name": service_name})
     provider = TracerProvider(resource=resource)
     if otlp_endpoint:
         exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
         provider.add_span_processor(BatchSpanProcessor(exporter))
+    if span_exporter is not None:
+        provider.add_span_processor(SimpleSpanProcessor(span_exporter))
     return provider
 
 

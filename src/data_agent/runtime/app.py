@@ -183,6 +183,11 @@ def create_app(
     embedding_client: EmbeddingClient | None = None,
     resolve_values: ResolveValuesComposite | None = None,
     retrieval: RetrievalPipeline | None = None,
+    # Test-only seam (D-L3-5). Kept `Any` rather than `SpanExporter | None`
+    # because the `/_test/spans` route below duck-types `get_finished_spans()`,
+    # which lives on `InMemorySpanExporter`, not the `SpanExporter` base — typing
+    # it to the base would force a cast/import at the route for no added safety.
+    span_exporter: Any = None,
 ) -> FastAPI:
     """Build the FastAPI app. All dependencies default to the real
     implementations, sourced from *settings* — pass Layer-1 fakes for any of
@@ -206,7 +211,13 @@ def create_app(
     )
 
     tracer_provider = tracing.configure_tracing(
-        otlp_endpoint=settings.otlp_endpoint, service_name=settings.otlp_service_name
+        otlp_endpoint=settings.otlp_endpoint,
+        service_name=settings.otlp_service_name,
+        # Test-only seam (D-L3-5): an injected in-memory exporter captures the
+        # manual AGENT/TOOL/CHAIN/GUARDRAIL spans this provider's tracer emits,
+        # so the Layer-3 D25 scenario can dump + assert them PII-clean without a
+        # Phoenix container. `None` in production → byte-identical provider.
+        span_exporter=span_exporter,
     )
     tracing.instrument_openai(tracer_provider)
     tracer = tracing.get_tracer(tracer_provider)
@@ -424,6 +435,33 @@ def create_app(
                 await vector_index.close()
 
     app = FastAPI(title="data-agent-runtime", lifespan=_lifespan)
+
+    # Test-only span-dump endpoint (D-L3-5), registered ONLY when a
+    # `span_exporter` is injected (the Layer-3 demo launcher's in-memory
+    # exporter). Production passes `span_exporter=None`, so this route never
+    # exists — the HTTP surface is byte-identical. It dumps each captured span's
+    # name, kind, and attributes (keys AND stringified values) so the D25
+    # scenario can assert PII-cleanliness OVER THE REAL VALUES — proving the
+    # invariant, not merely that keys look benign. Safe to expose values here:
+    # the endpoint is a test seam gated on the injected exporter, and the whole
+    # point is to inspect what actually reaches a span attribute.
+    if span_exporter is not None:
+
+        @app.get("/_test/spans")
+        async def _test_spans() -> dict[str, Any]:
+            spans = span_exporter.get_finished_spans()
+            dumped: list[dict[str, Any]] = []
+            for s in spans:
+                dumped.append(
+                    {
+                        "name": s.name,
+                        "kind": s.attributes.get(
+                            "openinference.span.kind"
+                        ),
+                        "attributes": {k: str(v) for k, v in s.attributes.items()},
+                    }
+                )
+            return {"spans": dumped, "count": len(dumped)}
 
     @app.post("/turn")
     async def turn(

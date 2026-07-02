@@ -14,3 +14,6 @@ dist/
 build/
 .pytest_cache/
 .ruff_cache/
+
+# Layer-3 e2e subprocess logs (runtime/BFF stdout captured by the fixtures)
+tests/e2e/*.log
