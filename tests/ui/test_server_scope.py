@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setenv("UI_TEST_AFFORDANCES", "1")
 
-    async def _fake_mint(column_scope: list[str], session_id: str) -> str:
+    async def _fake_mint(user_name: str, column_scope: list[str], session_id: str) -> str:
         return "fake.jwt." + ",".join(column_scope)
 
     monkeypatch.setattr(server, "_mint_jwt", _fake_mint)

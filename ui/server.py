@@ -32,9 +32,10 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from ui.entitlements import resolve_caller_identity, resolve_column_scope
 
 RUNTIME_URL = os.environ.get("RUNTIME_URL", "http://localhost:8000")
 TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
@@ -49,9 +50,17 @@ _INDEX_HTML = _STATIC_DIR / "index.html"
 _SESSIONS: dict[str, str] = {}
 
 # Server-side-only session_id -> current column_scope (`[]` == allow-all, D80b).
-# Tracked ONLY so the test-only `/api/session/scope` affordance can enforce that
-# it narrows monotonically (never re-widens) — see `set_session_scope`.
+# Tracked so the test-only `/api/session/scope` affordance can enforce that it
+# narrows monotonically (never re-widens) relative to the session's ENTITLED base
+# — see `set_session_scope`. For a restricted user this base is their entitled
+# allowlist (not allow-all), so narrowing works within it and widening beyond it
+# is rejected by the subset check.
 _SESSION_SCOPES: dict[str, list[str]] = {}
+
+# Server-side-only session_id -> resolved caller identity (auth-hardening Slice 2).
+# Tracked so the monotonic-narrow re-mint preserves the SAME identity/user_name
+# (and thus the same per-user entitlement basis + sid_hash session binding).
+_SESSION_USERS: dict[str, str] = {}
 
 app = FastAPI(title="data-agent-ui-bff")
 
@@ -71,11 +80,17 @@ class ScopeBody(BaseModel):
     column_scope: list[str]
 
 
-async def _mint_jwt(column_scope: list[str], session_id: str) -> str:
+async def _mint_jwt(user_name: str, column_scope: list[str], session_id: str) -> str:
     """Call the token service server-side to mint a JWT carrying *column_scope*
     and bound to *session_id* (D82/D5: the BFF is the ONLY holder of the token;
     the browser never sees it). `column_scope=[]` == allow-all, matching the
     runtime's D80(b)/D44 scope semantics.
+
+    *user_name* is the resolved caller identity (auth-hardening Slice 2): it is
+    stamped into the token so the warehouse's row-level tenant isolation
+    (`SQL_tenant`/`user_name`, D82) attributes the session to the right user, and
+    it is the identity whose per-user `column_scope` entitlement produced
+    *column_scope* (see `ui/entitlements.py`).
 
     *session_id* is threaded into the mint request so the token carries a
     `sid_hash` claim (auth-hardening Slice 1): the MCP then rejects any request
@@ -89,7 +104,7 @@ async def _mint_jwt(column_scope: list[str], session_id: str) -> str:
                 TOKEN_SERVICE_URL,
                 headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
                 json={
-                    "user_name": "ui-user",
+                    "user_name": user_name,
                     "column_scope": column_scope,
                     "session_id": session_id,
                 },
@@ -108,10 +123,21 @@ async def index() -> FileResponse:
 
 
 @app.post("/api/session")
-async def create_session() -> dict[str, str]:
+async def create_session(request: Request) -> dict[str, str]:
+    """Mint a fresh `session_id` and a JWT scoped to the CALLER'S per-user
+    entitlement (auth-hardening Slice 2). The identity and its `column_scope` are
+    resolved exclusively through the `ui/entitlements.py` seams — the demo
+    `ui-user` resolves to allow-all (`[]`, D80b), a restricted user to their
+    entitled allowlist. This replaces D82's hardcoded all-access mint: allow-all
+    is now the *default entitlement*, not a blanket, so a real per-user scope is
+    honored end-to-end (the MCP enforces it, D57/D80). The token is still bound to
+    `session_id` (Slice 1 sid_hash) and never leaves the BFF (D82/D5)."""
     session_id = str(uuid.uuid4())
-    _SESSIONS[session_id] = await _mint_jwt([], session_id)
-    _SESSION_SCOPES[session_id] = []
+    identity = resolve_caller_identity(request)
+    column_scope = resolve_column_scope(identity)
+    _SESSIONS[session_id] = await _mint_jwt(identity, column_scope, session_id)
+    _SESSION_SCOPES[session_id] = list(column_scope)
+    _SESSION_USERS[session_id] = identity
     return {"session_id": session_id}
 
 
@@ -129,10 +155,12 @@ async def set_session_scope(body: ScopeBody) -> dict[str, bool]:
 
     MONOTONIC-NARROWING (S1, security): the affordance may only NARROW scope,
     never widen it — otherwise a caller could POST `[]` (== allow-all, D80b) to
-    re-widen a narrowed session, turning this into an escalation surface once
-    Item-9 per-user scoped tokens make base sessions non-allow-all. So `[]` is
-    refused outright, and against a non-allow-all current scope the new scope
-    must be a subset of it."""
+    re-widen a narrowed session, turning this into an escalation surface. With
+    Item-9 per-user scoped tokens (Slice 2), the session's base is the caller's
+    ENTITLED scope (which may already be a non-allow-all allowlist), so narrowing
+    happens WITHIN that base: `[]` is refused outright, and the new scope must be a
+    subset of the current scope (transitively a subset of the entitled base) —
+    widening beyond the entitled base is therefore rejected."""
     if os.environ.get("UI_TEST_AFFORDANCES") != "1":
         raise HTTPException(status_code=404, detail="Not found.")
     if body.session_id not in _SESSIONS:
@@ -143,7 +171,13 @@ async def set_session_scope(body: ScopeBody) -> dict[str, bool]:
         raise HTTPException(
             status_code=400, detail="Test affordance narrows only; [] (allow-all) refused."
         )
-    current = _SESSION_SCOPES.get(body.session_id, [])
+    # Hard lookup (fail-closed): the session-existence check above guarantees the
+    # happy path, so a miss here means an inconsistent server state (e.g. a future
+    # _SESSIONS writer like restart-restore that forgot to seed _SESSION_SCOPES).
+    # A `.get(..., [])` default would silently treat that as allow-all and REOPEN
+    # the widen surface — the wrong failure direction for a security check — so we
+    # crash (KeyError, matching _SESSION_USERS[...] below) instead of failing open.
+    current = _SESSION_SCOPES[body.session_id]
     # A non-empty current scope is an allowlist; the new scope must be ⊆ it. A
     # current `[]` (allow-all) admits any non-empty narrowing (already checked).
     if current and not set(body.column_scope).issubset(set(current)):
@@ -151,10 +185,11 @@ async def set_session_scope(body: ScopeBody) -> dict[str, bool]:
             status_code=400,
             detail="Test affordance narrows only; new scope must be a subset of the current scope.",
         )
-    # Re-mint with the SAME session_id so the sid_hash binding stays valid across
-    # the scope narrow (auth-hardening Slice 1, invariant §6.5): only column_scope
-    # changes; the session binding and identity are preserved.
-    _SESSIONS[body.session_id] = await _mint_jwt(body.column_scope, body.session_id)
+    # Re-mint with the SAME session_id AND the SAME identity/user_name so both the
+    # sid_hash session binding (Slice 1, invariant §6.5) and the per-user identity
+    # (Slice 2) stay valid across the scope narrow: only column_scope changes.
+    user_name = _SESSION_USERS[body.session_id]
+    _SESSIONS[body.session_id] = await _mint_jwt(user_name, body.column_scope, body.session_id)
     _SESSION_SCOPES[body.session_id] = list(body.column_scope)
     return {"ok": True}
 

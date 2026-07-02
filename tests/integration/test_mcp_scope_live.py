@@ -379,3 +379,108 @@ async def test_omit_header_cannot_read_cross_session_scratch(mint: Mint) -> None
     assert tool_result["isError"] is True
     error_text = tool_result["content"][0]["text"]
     assert "SCRATCH_SESSION_VIOLATION" in error_text, error_text
+
+
+# ---------------------------------------------------------------------------
+# Per-user column_scope entitlement — BFF-minted restricted scope (auth-hardening
+# Slice 2, the (a) proof)
+#
+# THE POINT: the BFF no longer mints a blanket allow-all token (D82 interim). It
+# resolves the caller's identity → their entitled column_scope via
+# `ui/entitlements.py` and mints THAT. A restricted non-admin identity must then
+# be DENIED an out-of-scope column at the live MCP boundary (COLUMN_SCOPE_
+# VIOLATION, D57/D80) — the MCP is the enforcement point, the BFF only supplies
+# the scope.
+#
+# This exercises the REAL BFF mint path end-to-end: `ui.entitlements.
+# resolve_column_scope` produces the restricted scope and `ui.server._mint_jwt`
+# mints it against the live token IdP (the same one the BFF uses), session-bound
+# (Slice 1). Reuses the scope-denial pattern of `test_run_query_rejects_out_of_
+# scope_column` above.
+# ---------------------------------------------------------------------------
+
+
+async def _bff_mint(identity: str) -> tuple[str, str, list[str]]:
+    """Mint exactly as the BFF's `create_session` does: resolve the identity's
+    entitled scope via the entitlements seam, then mint a session-bound JWT via
+    the BFF's own `_mint_jwt` against the live token IdP. Returns
+    `(jwt, session_id, entitled_scope)`."""
+    import ui.server as bff
+    from ui.entitlements import resolve_column_scope
+
+    session_id = _session_id()
+    scope = resolve_column_scope(identity)
+    jwt = await bff._mint_jwt(identity, scope, session_id)
+    return jwt, session_id, scope
+
+
+async def test_bff_restricted_user_denied_out_of_scope_column() -> None:
+    """A BFF-minted RESTRICTED identity → an out-of-scope column query is denied
+    by the live MCP (COLUMN_SCOPE_VIOLATION). This is the Slice-2 (a) proof."""
+    jwt, session_id, scope = await _bff_mint("restricted-analyst")
+    # Sanity: the entitlement seam produced a real restriction, not allow-all.
+    assert scope and scope != []
+
+    with pytest.raises(MCPToolError) as exc_info:
+        await _client().call_tool(
+            "runQuery",
+            {"sql": f"SELECT AnnualSalary FROM {_EMPLOYEE_FQ}"},
+            jwt=jwt,
+            session_id=session_id,
+        )
+    assert exc_info.value.code == "COLUMN_SCOPE_VIOLATION"
+
+
+async def test_bff_restricted_user_allowed_in_scope_column() -> None:
+    """Positive control: the SAME BFF-minted restricted identity CAN read the
+    column it is entitled to (EmployeeCode) — the restriction is real, not a
+    blanket denial."""
+    jwt, session_id, _ = await _bff_mint("restricted-analyst")
+    result = await _client().call_tool(
+        "runQuery",
+        {"sql": f"SELECT EmployeeCode FROM {_EMPLOYEE_FQ}"},
+        jwt=jwt,
+        session_id=session_id,
+    )
+    assert result["row_count"] == 5
+
+
+async def test_bff_two_column_restricted_user_scope_boundary() -> None:
+    """A BFF-minted TWO-column restricted identity (`restricted-hr`, entitled to
+    {EmployeeCode, Department}) is allowed BOTH entitled columns but DENIED a
+    column outside its entitlement (AnnualSalary → COLUMN_SCOPE_VIOLATION)."""
+    jwt, session_id, scope = await _bff_mint("restricted-hr")
+    assert len(scope) == 2  # a genuine two-column entitlement
+
+    # Both entitled columns are readable.
+    allowed = await _client().call_tool(
+        "runQuery",
+        {"sql": f"SELECT EmployeeCode, Department FROM {_EMPLOYEE_FQ}"},
+        jwt=jwt,
+        session_id=session_id,
+    )
+    assert allowed["row_count"] == 5
+
+    # A column outside the two-column entitlement is denied.
+    with pytest.raises(MCPToolError) as exc_info:
+        await _client().call_tool(
+            "runQuery",
+            {"sql": f"SELECT AnnualSalary FROM {_EMPLOYEE_FQ}"},
+            jwt=jwt,
+            session_id=session_id,
+        )
+    assert exc_info.value.code == "COLUMN_SCOPE_VIOLATION"
+
+
+async def test_bff_demo_user_stays_allow_all() -> None:
+    """The demo `ui-user` identity keeps its allow-all entitlement — a BFF-minted
+    ui-user token reads any column (conformance-suite invariant preserved)."""
+    jwt, session_id, scope = await _bff_mint("ui-user")
+    assert scope == []  # allow-all default unchanged (D82/D80b)
+    result = await _client().call_tool(
+        "runQuery",
+        {"sql": f"SELECT AnnualSalary FROM {_EMPLOYEE_FQ}"},
+        jwt=jwt,
+        session_id=session_id,
+    )
+    assert result["row_count"] == 5

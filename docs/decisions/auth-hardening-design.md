@@ -1,12 +1,13 @@
 # Auth Hardening — Runtime-Readiness Design (Item 9)
 
-**Status:** Slice 1 BUILT (Session 14, **D92**) — the `X-Session-Id`↔`sid_hash` binding + the
+**Status:** Slices 1+2 BUILT (Session 14, **D92**) — the `X-Session-Id`↔`sid_hash` binding + the
 no-session scratch fail-closed + the reserved-claim guard are built cross-repo, reviewed, and
 live-proven against the enforcing MCP (a cross-session scratch read is rejected). One deviation from
 this doc: the omit-header vector is closed via **fix (b)** (extractor fail-closed on `scratch.*` with
 no bound session), not fix (a) (require the header), because (a) forbids the legitimate no-header
-no-session mode. Slice 2 (per-user `column_scope` entitlement mint) is next; only the literal Entra
-OIDC wiring stays deferred. Companion to [DECISIONS.md](DECISIONS.md)
+no-session mode. Slice 2 (per-user `column_scope` entitlement mint) is also built — a stub identity→scope map behind
+two `# ENTRA SEAM` functions in `ui/entitlements.py`; demo `ui-user` stays allow-all, restricted users
+are enforced live. Only the literal Entra OIDC wiring stays deferred. Companion to [DECISIONS.md](DECISIONS.md)
 (D5 / D57 / D64 / D79 / D80 / D81 / D82). Scope: build the runtime/MCP-side
 **readiness** for real per-user entitlements and session-hijack protection now;
 defer only the literal Microsoft Entra OIDC wiring. This is a *readiness brick*,

@@ -31,8 +31,10 @@ def mint_calls(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict]]:
     monkeypatch.setenv("UI_TEST_AFFORDANCES", "1")
     calls: list[dict] = []
 
-    async def _fake_mint(column_scope: list[str], session_id: str) -> str:
-        calls.append({"column_scope": list(column_scope), "session_id": session_id})
+    async def _fake_mint(user_name: str, column_scope: list[str], session_id: str) -> str:
+        calls.append(
+            {"user_name": user_name, "column_scope": list(column_scope), "session_id": session_id}
+        )
         return f"fake.jwt.{session_id}.{','.join(column_scope)}"
 
     monkeypatch.setattr(server, "_mint_jwt", _fake_mint)

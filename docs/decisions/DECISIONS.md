@@ -1095,9 +1095,18 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   column_scope/sid_hash`) in a mint request's free `claims`, and applies free claims *before* the
   computed ones, so a caller cannot shadow `sid_hash`. Adversarially reviewed + QA'd (the omit-header
   cross-session scratch read was proven to exfiltrate victim PII pre-fix, and rejected post-fix,
-  live against the enforcing MCP). **Still deferred (only this):** the literal Entra OIDC provider
-  integration; the per-user `column_scope` entitlement mint is **Slice 2** (this slice keeps the D82
-  interim all-access default). Cross-references: [D5](#tools), [D64](#security--infra),
+  live against the enforcing MCP). **Slice 2 — per-user `column_scope` entitlement mint (BUILT):** the
+  BFF resolves the caller's identity → `column_scope` through two one-function seams in
+  `ui/entitlements.py` (`resolve_caller_identity` + `resolve_column_scope` over a stub
+  `user → column_scope` map), then mints with that scope instead of a hardcoded all-access `[]`. The
+  demo `ui-user` stays allow-all (the 12 conformance scenarios are byte-identical); a restricted
+  identity mints a restricted scope that the MCP enforces (proven live: a `restricted-analyst`'s
+  out-of-entitlement `SELECT AnnualSalary` → `COLUMN_SCOPE_VIOLATION`). The Layer-3 scope-narrow
+  endpoint now narrows monotonically **within the entitled base** (subset-of-current, one-way — no
+  re-widen). An unmapped identity falls back to the D82 all-access default **with a warning** (a
+  deny-by-default TODO for Entra time). **Still deferred (only this):** the literal Entra OIDC provider
+  integration — the two `# ENTRA SEAM` function bodies in `ui/entitlements.py` are the swap point
+  (`create_session` needs no change). Cross-references: [D5](#tools), [D64](#security--infra),
   [D79](#clickhouse-mcp--adoption-decision), [D80](#clickhouse-mcp--adoption-decision),
   [D81](#clickhouse-mcp--adoption-decision), [D82](#clickhouse-mcp--adoption-decision), D90 (the
   byte-identical extractor), D68.
