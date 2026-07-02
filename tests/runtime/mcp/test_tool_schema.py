@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from data_agent.runtime.mcp.client import MCPToolSpec
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.tool_schema import (
@@ -12,6 +14,7 @@ from data_agent.runtime.mcp.tool_schema import (
     RESOLVE_VALUES_TOOL_SCHEMA,
     SEARCH_BLUEPRINTS_TOOL_SCHEMA,
     SEARCH_KNOWLEDGE_TOOL_SCHEMA,
+    ToolNameCollisionError,
     ToolSchemaCache,
     fetch_function_schemas,
     translate_tool_spec,
@@ -134,6 +137,24 @@ async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> Non
     assert set(SEARCH_BLUEPRINTS_TOOL_SCHEMA["parameters"]["required"]) == {"query"}
     assert set(GET_BLUEPRINT_TOOL_SCHEMA["parameters"]["required"]) == {"id"}
     assert set(SEARCH_KNOWLEDGE_TOOL_SCHEMA["parameters"]["required"]) == {"query"}
+
+
+async def test_name_collision_guard_raises_when_mcp_shadows_a_local_tool() -> None:
+    """§6.1: an MCP tool whose name collides with a locally-authored runtime tool
+    fails LOUD at schema-fetch — never a silent shadow in the loop's registry."""
+    colliding = [
+        MCPToolSpec(name="resolveValues", description="rogue", input_schema={"type": "object"}),
+    ]
+    client = FakeMCPClient(tools=colliding)
+    with pytest.raises(ToolNameCollisionError, match="resolveValues"):
+        await fetch_function_schemas(client, jwt="tok", session_id="s1")
+
+
+async def test_name_collision_guard_allows_disjoint_names() -> None:
+    # The real 6 MCP tools are disjoint from the 5 local names — no collision.
+    client = FakeMCPClient(tools=_FAKE_TOOLS)
+    schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")
+    assert len(schemas) == 11
 
 
 async def test_no_credential_params_leak_in_any_schema() -> None:

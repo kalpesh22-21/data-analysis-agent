@@ -1,4 +1,5 @@
-# Hand-authored blueprint seed corpus (neo4j-corpus-design §3.2).
+# Hand-authored blueprint seed corpus (neo4j-corpus-design §3.2, extended with the
+# full DAG by runblueprint-design §1.2).
 #
 # `uses` strings are BYTE-EXACT `"database.table.column"` scope keys of the HR
 # warehouse the Layer-2 ClickHouse seed (docker/clickhouse-init/hr-warehouse.sql)
@@ -6,6 +7,12 @@
 # genuinely exercised. Any format skew here silently drops the blueprint via the
 # set-subset scope pre-filter (§8 highest-risk contract), so these are curated
 # against the real `dbpcm_warehouse.<table>.<Column>` names.
+#
+# Each seed is an EXECUTABLE SINGLE-NODE blueprint (runblueprint-design §Q7 Slice
+# A): a top-level `sql_template` with `{slot}` bind sites, typed `slots`, and a
+# declared `result_grain` (D56 checks the result against it). The corpus loader's
+# write-time validation (§1.2) proves every `{slot}` is declared, each template
+# parses under ClickHouse, and the template's column footprint ⊆ `uses`.
 - id: bp-overtime-by-department
   intent: Total overtime pay by department for a given pay period
   slots_summary: department, pay_period
@@ -19,6 +26,22 @@
     - dbpcm_warehouse.payroll.PayPeriodEndDate
     - dbpcm_warehouse.employee.EmployeeCode
     - dbpcm_warehouse.employee.Department
+  resolves:
+    overtime: gross_earnings
+  slots:
+    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.Department }
+    - { name: pay_period, type: period, required: true, binds_to: dbpcm_warehouse.payroll.PayPeriodEndDate }
+  uses_rules:
+    - gross_earnings
+  result_grain: [ Department ]
+  sql_template: |
+    SELECT e.Department AS department, SUM(p.Amount) AS overtime_pay
+    FROM dbpcm_warehouse.payroll AS p
+    JOIN dbpcm_warehouse.employee AS e ON e.EmployeeCode = p.EmployeeCode
+    WHERE p.RegisterType = 'EARN'
+      AND e.Department = {department}
+      AND p.PayPeriodEndDate = {pay_period}
+    GROUP BY e.Department
 
 - id: bp-active-headcount-by-department
   intent: Active employee headcount by department
@@ -30,6 +53,16 @@
     - dbpcm_warehouse.employee.EmployeeCode
     - dbpcm_warehouse.employee.Department
     - dbpcm_warehouse.employee.EmployeeStatus
+  slots:
+    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.Department }
+  uses_rules:
+    - active_employee
+  result_grain: [ Department ]
+  sql_template: |
+    SELECT Department AS department, COUNT(DISTINCT EmployeeCode) AS headcount
+    FROM dbpcm_warehouse.employee
+    WHERE EmployeeStatus = 'A' AND Department = {department}
+    GROUP BY Department
 
 - id: bp-average-salary-by-department
   intent: Average annual salary by department
@@ -41,3 +74,15 @@
     - dbpcm_warehouse.employee.EmployeeCode
     - dbpcm_warehouse.employee.Department
     - dbpcm_warehouse.employee.AnnualSalary
+  resolves:
+    salary: AnnualSalary
+  slots:
+    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.Department }
+  result_grain: [ Department ]
+  sql_template: |
+    SELECT Department AS department,
+           AVG(AnnualSalary) AS avg_salary,
+           COUNT(DISTINCT EmployeeCode) AS headcount
+    FROM dbpcm_warehouse.employee
+    WHERE Department = {department}
+    GROUP BY Department

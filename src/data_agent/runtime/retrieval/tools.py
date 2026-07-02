@@ -200,6 +200,14 @@ def _uses_to_provenance(uses: frozenset[str]) -> frozenset[tuple[str, str]] | No
     return frozenset(tuples)
 
 
+def _put_if_present(target: dict[str, Any], key: str, value: Any) -> None:
+    """Add *key*→*value* only when the blueprint actually stored the DAG field
+    (non-None) — keeps the `getBlueprint` FOUND shape strictly additive so a
+    DAG-less D87/D88 blueprint renders byte-identically to before (§1.3)."""
+    if value is not None:
+        target[key] = value
+
+
 def _require_text(raw: Any, name: str) -> tuple[str | None, str | None]:
     """A required non-blank free-text arg (`query`/`id`). Fail-closed on
     missing/blank/non-string, naming ONLY the bad arg (no enumeration, §6)."""
@@ -351,6 +359,19 @@ class GetBlueprintTool(_ReadTool):
             "hit_count": detail.hit_count,
             "catalog_sha": detail.catalog_sha,
         }
+        # Additive full-DAG expansion (runblueprint-design §1.3) — the D8
+        # progressive-disclosure "expand" step is now complete: the model sees the
+        # typed `slots` (to fill), `resolves`, `uses_rules`, `result_grain`, and
+        # SQL. Rendered ONLY when the blueprint stored them (a DAG-less D87/D88
+        # blueprint carries `None` → the FOUND shape is byte-identical to before,
+        # keeping the extension strictly additive). The non-oracle {found:false}
+        # posture (D88(b)) above is unchanged.
+        _put_if_present(result_full, "resolves", detail.resolves)
+        _put_if_present(result_full, "slots", detail.slots)
+        _put_if_present(result_full, "uses_rules", detail.uses_rules)
+        _put_if_present(result_full, "sql_template", detail.sql_template)
+        _put_if_present(result_full, "composes", detail.composes)
+        _put_if_present(result_full, "result_grain", detail.result_grain)
         # S1: provenance is the blueprint's SCOPED uses footprint (NOT the
         # safe-empty frozenset()) — this is the same class of info getTableSchema
         # exposes (column identifiers) and, like it, must drop from D44 replay

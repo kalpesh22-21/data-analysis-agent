@@ -277,13 +277,32 @@ def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]
 
 def _assembled_to_canonical(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """`AssembledContext.messages` (Pass-A shape, `context/budget.py::render_messages`)
-    -> the canonical `ModelClient.send_turn` message shape (design §1 `model/client.py`)."""
+    -> the canonical `ModelClient.send_turn` message shape (design §1 `model/client.py`).
+
+    §6.2 defensive dedup: the OpenAI API requires every `tool_call_id` in a turn to
+    be UNIQUE with exactly one matching `tool` response. A legacy/corrupt trail (or
+    a paused-and-resumed DAG that re-appended a colliding id) would otherwise emit
+    two `tool` messages with the same id → an API 400 that aborts the turn. So we
+    drop a duplicate `tool_call_id` here (keeping the FIRST) — fail-closed toward a
+    valid (if lossy) replay, never a turn-aborting one. This matters more for the
+    `runBlueprint` brick whose resume re-enters and appends new trail entries."""
     canonical: list[dict[str, Any]] = []
+    seen_tool_call_ids: set[str] = set()
     for message in messages:
         role = message["role"]
         if role == "system":
             canonical.append({"role": "system", "content": message["content"]})
         elif role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if isinstance(tool_call_id, str) and tool_call_id in seen_tool_call_ids:
+                _logger.warning(
+                    "dropping duplicate tool_call_id %r from replay (keeping the first) "
+                    "to keep the message list API-valid",
+                    tool_call_id,
+                )
+                continue
+            if isinstance(tool_call_id, str):
+                seen_tool_call_ids.add(tool_call_id)
             canonical.extend(_tool_trail_entry_to_canonical(message))
         else:  # pragma: no cover - render_messages only ever emits system/tool
             raise ValueError(f"Unexpected assembled-context message role: {role!r}")

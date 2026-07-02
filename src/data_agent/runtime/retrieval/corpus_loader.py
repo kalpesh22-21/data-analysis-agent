@@ -21,12 +21,27 @@ the recall path.
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
+from sqlglot import exp
+from sqlglot.optimizer.qualify_columns import qualify_columns, validate_qualify_columns
+from sqlglot.optimizer.qualify_tables import qualify_tables
+from sqlglot.schema import MappingSchema
+
+from data_agent.runtime.blueprint.models import Blueprint, BlueprintParseError
+from data_agent.runtime.blueprint.template import (
+    TemplateBindError,
+    assert_read_only_select,
+    contains_star,
+    parse_template,
+    referenced_slots,
+)
+from data_agent.runtime.blueprint.when import WhenClauseError, validate_when
 
 if TYPE_CHECKING:
     from neo4j import AsyncDriver, AsyncManagedTransaction
@@ -57,6 +72,15 @@ class BlueprintSeed:
     status: str = "validated"
     drift_status: str = "clean"
     catalog_sha: str = ""
+    # --- additive full-DAG fields, the runBlueprint brick (OQ-T1, §1.2). All
+    # optional-defaulted so existing D87/D88 fixtures still load (no migration).
+    # Stored as JSON-string properties on the `:Blueprint` node; unread by recall.
+    resolves: dict[str, str] = field(default_factory=dict)
+    slots: list[dict[str, Any]] = field(default_factory=list)
+    uses_rules: list[Any] = field(default_factory=list)
+    sql_template: str | None = None
+    composes: list[dict[str, Any]] = field(default_factory=list)
+    result_grain: list[str] | dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +108,12 @@ class LoadReport:
 
 class CorpusLoadError(Exception):
     """Raised on a write-time parity violation (mixed embedding models, §3.3)."""
+
+
+# Hard cap on `composes` DAG size (FIX 3). Phase-1 blueprints are single-node or a
+# handful of scalar-converging nodes; anything beyond this is an authoring error /
+# adversarial input and is rejected LOUD (never traversed into a stack overflow).
+_MAX_COMPOSE_NODES = 64
 
 
 def load_seed_fixtures(
@@ -167,7 +197,13 @@ SET b.intent = $intent,
     b.catalog_sha = $catalog_sha,
     b.created_by = 'seed',
     b.created_at = coalesce(b.created_at, datetime()),
-    b.hit_count = coalesce(b.hit_count, 0)
+    b.hit_count = coalesce(b.hit_count, 0),
+    b.resolves_json = $resolves_json,
+    b.slots_json = $slots_json,
+    b.uses_rules_json = $uses_rules_json,
+    b.sql_template = $sql_template,
+    b.composes_json = $composes_json,
+    b.result_grain_json = $result_grain_json
 """
 
 # Reserved graph shape (§1.3): the transitive USES closure written as edges,
@@ -259,6 +295,253 @@ def _validate_blueprint_uses(bp: BlueprintSeed) -> None:
             )
 
 
+def _dag_properties(bp: BlueprintSeed) -> dict[str, Any]:
+    """Serialize the additive full-DAG fields into the neo4j string properties
+    (§1.1). Empty structures are stored as `null` so a DAG-less blueprint carries
+    no phantom `{}`/`[]` — additive and back-compatible with D87/D88 seeds."""
+    return {
+        "resolves_json": json.dumps(bp.resolves) if bp.resolves else None,
+        "slots_json": json.dumps(bp.slots) if bp.slots else None,
+        "uses_rules_json": json.dumps(bp.uses_rules) if bp.uses_rules else None,
+        "sql_template": bp.sql_template,
+        "composes_json": json.dumps(bp.composes) if bp.composes else None,
+        "result_grain_json": (
+            json.dumps(bp.result_grain) if bp.result_grain is not None else None
+        ),
+    }
+
+
+def _uses_schema(uses: list[str]) -> dict[str, dict[str, dict[str, str]]]:
+    """Build a sqlglot `{db: {table: {column: type}}}` schema from the declared
+    `uses` scope keys — the ALLOWLIST the template's tables + columns must resolve
+    against. A `db.table.column` key groups as db=all-but-last-two,
+    table=second-to-last, column=last (matching `f"{db_table}.{column}"`)."""
+    schema: dict[str, dict[str, dict[str, str]]] = {}
+    for key in uses:
+        if not isinstance(key, str):
+            continue
+        parts = key.split(".")
+        if len(parts) < 3 or not all(parts):
+            continue
+        db = ".".join(parts[:-2])
+        table = parts[-2]
+        column = parts[-1]
+        schema.setdefault(db, {}).setdefault(table, {})[column] = "TEXT"
+    return schema
+
+
+def _assert_source_tables_in_uses(
+    bp_id: str,
+    where: str,
+    qualified: exp.Expression,
+    schema_dict: dict[str, dict[str, dict[str, str]]],
+) -> None:
+    """Assert every SOURCE table (FROM/JOIN) resolves to a `(db, table)` present in
+    the uses-schema (review re-review BLOCKER — the qualified-column JOIN hole).
+
+    The column-level qualify only validates UNQUALIFIED columns against the schema —
+    a column already qualified to a source alias (`p.SSN`) is treated as resolved
+    and its SOURCE table is never checked. So a JOIN to a table absent from `uses`
+    reads arbitrary columns. This closes it at the TABLE level (qualified,
+    fully-qualified, and CROSS JOIN forms). A CTE name is the query's OWN derived
+    table (not a warehouse source) and is skipped; a table-function / db-less source
+    that is not a CTE and not in `uses` is rejected (fail-closed)."""
+    cte_names = {cte.alias for cte in qualified.find_all(exp.CTE) if cte.alias}
+    for table in qualified.find_all(exp.Table):
+        name = table.name
+        db = table.text("db")
+        if not name or (not db and name in cte_names):
+            continue  # a CTE reference (own derived table), never a warehouse source
+        if name not in schema_dict.get(db, {}):
+            qualified_name = f"{db}.{name}" if db else name
+            raise CorpusLoadError(
+                f"blueprint {bp_id}: {where} reads from source table {qualified_name!r} "
+                "which is not in the declared uses footprint"
+            )
+
+
+def _assert_template_reads_within_uses(
+    bp_id: str, where: str, tree: exp.Expression, uses: list[str]
+) -> None:
+    """§1.2(c), table-aware (review FIX 1): every table + column the template reads
+    must resolve to a `db.table.column` present in the declared `uses`.
+
+    Two-level check: (1) every SOURCE table in FROM/JOIN resolves into the
+    uses-schema (`_assert_source_tables_in_uses` — closes the JOIN-to-an-unlisted-
+    table hole where an alias-qualified `p.SSN` reads an undeclared table); (2)
+    every column qualifies against a schema built ONLY from `uses`, with
+    `expand_alias_refs=False` so an output-alias name can never mask a real
+    same-named column read (the alias-mask evasion). Any column that cannot be
+    resolved — out of `uses`, wrong table, an alias-masked read — raises `sqlglot`'s
+    `OptimizeError`, surfaced as `CorpusLoadError`.
+
+    `*` stars and dict-family functions are rejected by the caller BEFORE this runs
+    (they defeat any column-level analysis)."""
+    schema_dict = _uses_schema(uses)
+    schema = MappingSchema(schema_dict, dialect="clickhouse")
+    try:
+        qualified = qualify_tables(tree.copy(), dialect="clickhouse")
+        _assert_source_tables_in_uses(bp_id, where, qualified, schema_dict)
+        qualified = qualify_columns(
+            qualified,
+            schema=schema,
+            expand_alias_refs=False,
+            expand_stars=False,
+            infer_schema=False,
+            dialect="clickhouse",
+        )
+        validate_qualify_columns(qualified)
+    except CorpusLoadError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any qualify failure is a fail-closed scope violation
+        raise CorpusLoadError(
+            f"blueprint {bp_id}: {where} reads a column outside the declared uses "
+            f"footprint (or an unresolvable/cross-table reference): {exc}"
+        ) from exc
+
+
+def _assert_no_dict_functions(bp_id: str, where: str, tree: exp.Expression) -> None:
+    """Reject dictionary-family functions (`dictGet…`) that read a ClickHouse
+    dictionary source INVISIBLE to the column walk (review FIX 1 / reviewer dictGet
+    case) — a hidden read outside the declared `uses`."""
+    for node in tree.walk():
+        if isinstance(node, exp.Anonymous):
+            name = node.this or ""
+            if isinstance(name, str) and name.lower().startswith("dict"):
+                raise CorpusLoadError(
+                    f"blueprint {bp_id}: {where} uses a dictionary function "
+                    f"({name}) that reads a source invisible to scope analysis"
+                )
+
+
+def _validate_dag_structure(bp_id: str, blueprint: Blueprint) -> None:
+    """§1.2(d): `composes` is a DAG — every `feeds_from` reference exists and there
+    are no cycles. Raises `CorpusLoadError` on a dangling ref, a cycle, or an
+    adversarially large DAG (FIX 3: a hard node-count cap so a huge/malicious
+    composes fails LOUD with a clean error, never a stack overflow)."""
+    nodes = blueprint.composes
+    if not nodes:
+        return
+    if len(nodes) > _MAX_COMPOSE_NODES:
+        raise CorpusLoadError(
+            f"blueprint {bp_id}: composes has {len(nodes)} nodes, exceeding the "
+            f"{_MAX_COMPOSE_NODES}-node cap (a Phase-1 blueprint DAG is small; a "
+            "huge DAG is an authoring error, not a valid fast path)"
+        )
+    orders = [n.order for n in nodes]
+    if len(orders) != len(set(orders)):
+        raise CorpusLoadError(f"blueprint {bp_id}: composes has duplicate node 'order' values")
+    order_set = set(orders)
+    edges: dict[int, tuple[int, ...]] = {}
+    for node in nodes:
+        for parent in node.feeds_from:
+            if parent not in order_set:
+                raise CorpusLoadError(
+                    f"blueprint {bp_id}: node {node.order} feeds_from unknown node {parent}"
+                )
+        edges[node.order] = node.feeds_from
+    # Cycle detection via ITERATIVE DFS coloring over the feeds_from edges (FIX 3:
+    # an explicit stack instead of recursion, so a very long forward-reference
+    # chain fails with a clean CorpusLoadError rather than a RecursionError).
+    white, grey, black = 0, 1, 2
+    color = dict.fromkeys(order_set, white)
+    for start in order_set:
+        if color[start] != white:
+            continue
+        stack: list[tuple[int, bool]] = [(start, True)]
+        while stack:
+            node_order, entering = stack.pop()
+            if not entering:
+                color[node_order] = black
+                continue
+            if color[node_order] == black:
+                continue
+            color[node_order] = grey
+            stack.append((node_order, False))
+            for parent in edges.get(node_order, ()):
+                if color[parent] == grey:
+                    raise CorpusLoadError(
+                        f"blueprint {bp_id}: composes has a cycle at node {node_order}"
+                    )
+                if color[parent] == white:
+                    stack.append((parent, True))
+
+
+def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
+    """Write-time full-DAG validation (§1.2, fail-loud — mirrors
+    `_validate_blueprint_uses`). An authoring mistake FAILS the seed load rather
+    than shipping a silently-broken blueprint.
+
+    Checks: (structural) the DAG parses into typed objects; (a) every `{slot}`
+    token in a sql_template has a matching `slots` entry; (b) each sql_template
+    parses under sqlglot ClickHouse AND is a single READ-ONLY SELECT (no DDL/DML,
+    no multi-statement block — FIX 2); (c) the template's footprint ⊆ the declared
+    `uses`, enforced TABLE-AWARELY (every source table AND every column resolves
+    into the uses-schema — FIX 1) after rejecting the analysis-defeating constructs
+    (`*` stars — FIX 1a; dict-family functions); (d) `composes` is a DAG (no cycles,
+    refs exist, ≤ the node cap — FIX 3); and every `when` clause is a valid,
+    entity-AGNOSTIC predicate (D59)."""
+    try:
+        blueprint = Blueprint.parse(
+            id=bp.id,
+            intent=bp.intent,
+            resolves=bp.resolves,
+            slots=bp.slots,
+            uses_rules=bp.uses_rules,
+            sql_template=bp.sql_template,
+            composes=bp.composes,
+            result_grain=bp.result_grain,
+        )
+    except BlueprintParseError as exc:
+        raise CorpusLoadError(f"blueprint {bp.id}: malformed DAG — {exc}") from exc
+
+    slot_names = {s.name for s in blueprint.slots}
+
+    templates: list[tuple[int | None, str]] = []
+    if blueprint.sql_template:
+        templates.append((None, blueprint.sql_template))
+    templates.extend(
+        (node.order, node.sql_template) for node in blueprint.composes if node.sql_template
+    )
+
+    for order, template in templates:
+        where = "sql_template" if order is None else f"node {order} sql_template"
+        # (a) undeclared slot token.
+        unknown = referenced_slots(template) - slot_names
+        if unknown:
+            raise CorpusLoadError(
+                f"blueprint {bp.id}: {where} references undeclared slot(s) {sorted(unknown)}"
+            )
+        # (b) parses under ClickHouse dialect + is a single read-only SELECT (FIX 2).
+        try:
+            tree = parse_template(template)
+            assert_read_only_select(tree)
+        except TemplateBindError as exc:
+            raise CorpusLoadError(f"blueprint {bp.id}: {where} does not parse — {exc}") from exc
+        # (c) footprint ⊆ declared uses — table-aware (FIX 1). First reject the
+        # constructs that DEFEAT column-level analysis (a `*` names zero columns
+        # while reading everything; a dict-family function reads a hidden source),
+        # THEN qualify every source table + column against the uses allowlist.
+        if contains_star(tree):
+            raise CorpusLoadError(
+                f"blueprint {bp.id}: {where} uses `*` — a blueprint must name its "
+                "columns so its scope footprint is verifiable"
+            )
+        _assert_no_dict_functions(bp.id, where, tree)
+        _assert_template_reads_within_uses(bp.id, where, tree, bp.uses)
+
+    for node in blueprint.composes:
+        if node.when is not None:
+            try:
+                validate_when(node.when.expr)
+            except WhenClauseError as exc:
+                raise CorpusLoadError(
+                    f"blueprint {bp.id}: node {node.order} when-clause invalid — {exc}"
+                ) from exc
+
+    _validate_dag_structure(bp.id, blueprint)
+
+
 async def apply_schema(driver: AsyncDriver, *, database: str = "neo4j") -> None:
     """Create the constraints + native vector indexes (idempotent), then wait
     for every index to come ONLINE so a subsequent recall sees them (§4.2)."""
@@ -288,9 +571,11 @@ async def load_corpus(
 
     # S2: validate the highest-risk contract BEFORE any embed/write — a malformed
     # scope key fails the whole load loudly rather than silently storing a
-    # blueprint the scope filter will always drop.
+    # blueprint the scope filter will always drop. The full-DAG validation (§1.2)
+    # runs in the same pre-write pass so an authoring mistake never ships.
     for bp in blueprints:
         _validate_blueprint_uses(bp)
+        _validate_blueprint_dag(bp)
 
     # Embed offline through the SAME endpoint the online path uses (parity by
     # construction). Order-preserving: `embed` returns one vector per input.
@@ -329,6 +614,7 @@ async def load_corpus(
                     status=bp.status,
                     drift_status=bp.drift_status,
                     catalog_sha=bp.catalog_sha,
+                    **_dag_properties(bp),
                 )
                 # S1: unconditional — rewrites the edge set (delete-then-add), so
                 # a shrunk uses set leaves no phantom :USES edges.

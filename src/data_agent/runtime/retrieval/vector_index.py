@@ -13,6 +13,7 @@ corpora from a neo4j native vector index.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Protocol
@@ -226,27 +227,54 @@ _CORPUS_MAPPER = {
 }
 
 # Keyed single-blueprint fetch for `getBlueprint` (read-tools §1.2 / §4). Reads
-# ONLY the stored D87 projection fields — the full DAG (`sql_template`, typed
-# `slots`, ...) is reserved (§1.5) and not stored, so it is not selected here.
-# No parity `WHERE embedding_model` guard: this is a keyed metadata read, not a
-# vector-space recall (§1.2), so a model-mismatched vector is irrelevant.
+# the stored D87 projection PLUS the additive full-DAG JSON properties now that
+# the `runBlueprint` brick lands (runblueprint-design §1.3 / OQ-T1). The recall
+# query (`_BLUEPRINT_RECALL_QUERY`) is UNCHANGED — it selects its own explicit
+# field list, so the new properties are simply not read by recall (D87 invariant
+# preserved). No parity `WHERE embedding_model` guard: a keyed metadata read, not
+# a vector-space recall (§1.2), so a model-mismatched vector is irrelevant.
 _GET_BLUEPRINT_QUERY = """
 MATCH (b:Blueprint {id: $id})
 RETURN b.id AS id, b.intent AS intent, b.slots_summary AS slots_summary,
        b.uses AS uses, b.status AS status, b.drift_status AS drift_status,
-       b.hit_count AS hit_count, b.catalog_sha AS catalog_sha
+       b.hit_count AS hit_count, b.catalog_sha AS catalog_sha,
+       b.resolves_json AS resolves_json, b.slots_json AS slots_json,
+       b.uses_rules_json AS uses_rules_json, b.sql_template AS sql_template,
+       b.composes_json AS composes_json, b.result_grain_json AS result_grain_json
 """
 
 
+def _decode_json(raw: Any) -> Any:
+    """JSON-decode a stored `*_json` string property, tolerating null/malformed
+    (→ `None`) so a corrupt DAG field degrades to "absent" rather than crashing
+    the keyed fetch — the tool then simply omits it (additive, fail-soft)."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        _logger.warning("skipping malformed blueprint DAG JSON property", exc_info=True)
+        return None
+
+
 def map_blueprint_detail_record(record: Mapping[str, Any]) -> BlueprintDetail:
-    """Map one `getBlueprint` row → `BlueprintDetail` (read-tools §1.2).
+    """Map one `getBlueprint` row → `BlueprintDetail` (read-tools §1.2, grown with
+    the full DAG in runblueprint-design §1.3).
 
     `uses` is coerced with the SAME fail-closed `_coerce_uses` as recall so an
     undetermined/corrupt stored value becomes `None` (scope check then drops it,
     never fail-open). `hit_count` defaults to 0 on a null/non-int stored value.
+    The additive DAG fields are JSON-decoded (`_decode_json`), defaulting to `None`
+    when absent/corrupt — a blueprint with no stored DAG maps exactly as before.
     """
     raw_hits = record.get("hit_count")
     hit_count = raw_hits if isinstance(raw_hits, int) and not isinstance(raw_hits, bool) else 0
+    resolves = _decode_json(record.get("resolves_json"))
+    slots = _decode_json(record.get("slots_json"))
+    uses_rules = _decode_json(record.get("uses_rules_json"))
+    composes = _decode_json(record.get("composes_json"))
+    result_grain = _decode_json(record.get("result_grain_json"))
+    sql_template = record.get("sql_template")
     return BlueprintDetail(
         id=record["id"],
         intent=record.get("intent") or "",
@@ -256,6 +284,12 @@ def map_blueprint_detail_record(record: Mapping[str, Any]) -> BlueprintDetail:
         drift_status=record.get("drift_status") or "",
         hit_count=hit_count,
         catalog_sha=record.get("catalog_sha") or "",
+        resolves=resolves if isinstance(resolves, dict) else None,
+        slots=slots if isinstance(slots, list) else None,
+        uses_rules=uses_rules if isinstance(uses_rules, list) else None,
+        sql_template=sql_template if isinstance(sql_template, str) else None,
+        composes=composes if isinstance(composes, list) else None,
+        result_grain=result_grain if isinstance(result_grain, (list, dict)) else None,
     )
 
 

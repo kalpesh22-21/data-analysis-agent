@@ -181,6 +181,30 @@ SEARCH_KNOWLEDGE_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# The locally-authored (runtime-implemented) tool schemas, appended after the
+# live-fetched MCP tools. This tuple is the SINGLE source of truth for "these
+# names are ours" — the name-collision guard (§6.1) asserts the MCP never
+# advertises one of them.
+_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
+    ASK_USER_TOOL_SCHEMA,
+    RESOLVE_VALUES_TOOL_SCHEMA,
+    SEARCH_BLUEPRINTS_TOOL_SCHEMA,
+    GET_BLUEPRINT_TOOL_SCHEMA,
+    SEARCH_KNOWLEDGE_TOOL_SCHEMA,
+)
+_LOCAL_TOOL_NAMES: frozenset[str] = frozenset(s["name"] for s in _LOCAL_TOOL_SCHEMAS)
+
+
+class ToolNameCollisionError(RuntimeError):
+    """A locally-authored tool name collides with an MCP-advertised one (§6.1).
+
+    Raised at schema-fetch (startup), fail-closed and LOUD: were a collision
+    allowed, the model would see two schemas with the same name and the loop's
+    `runtime_tools` interception would silently SHADOW the MCP tool (or vice
+    versa) depending on dispatch order. A config/deploy error surfaced here,
+    never a silent runtime ambiguity."""
+
+
 def translate_tool_spec(tool: MCPToolSpec) -> dict[str, Any]:
     """Translate one `MCPToolSpec` into an OpenAI `type: "function"` declaration."""
     return {
@@ -205,14 +229,22 @@ async def fetch_function_schemas(
     runtime.
     """
     tools = await mcp_client.list_tools(jwt=jwt, session_id=session_id)
+    # §6.1 name-collision guard: the locally-authored tool names MUST be disjoint
+    # from the MCP-advertised names. A collision fails LOUD at startup (fail-
+    # closed) rather than becoming a silent shadow in the loop's `runtime_tools`
+    # interception — the runtime-tool registry is the source of truth for our names.
+    mcp_names = {tool.name for tool in tools}
+    collisions = mcp_names & _LOCAL_TOOL_NAMES
+    if collisions:
+        raise ToolNameCollisionError(
+            "MCP advertises tool name(s) that collide with locally-authored runtime "
+            f"tools: {sorted(collisions)}. Rename the local tool or the MCP tool — a "
+            "name collision would silently shadow one of them in the loop."
+        )
     schemas = [translate_tool_spec(tool) for tool in tools]
-    schemas.append(ASK_USER_TOOL_SCHEMA)
-    schemas.append(RESOLVE_VALUES_TOOL_SCHEMA)
-    # The three model-facing read tools (read-tools §1) — locally authored,
-    # always advertised, appended after `resolveValues` (count 8 → 11).
-    schemas.append(SEARCH_BLUEPRINTS_TOOL_SCHEMA)
-    schemas.append(GET_BLUEPRINT_TOOL_SCHEMA)
-    schemas.append(SEARCH_KNOWLEDGE_TOOL_SCHEMA)
+    # The locally-authored runtime tools (askUser + resolveValues + the three read
+    # tools), always advertised, appended after the MCP tools (count 6 → 11).
+    schemas.extend(_LOCAL_TOOL_SCHEMAS)
     return schemas
 
 

@@ -55,15 +55,20 @@ class KnowledgeHit:
 @dataclass(frozen=True)
 class BlueprintDetail:
     """The stored D87 retrieval projection of one blueprint — what `getBlueprint`
-    returns (read-tools-design §1.2). It is a STRICT subset that grows additively
-    when the full DAG (`sql_template`, typed `slots`, `resolves`, ...) is stored
-    with the `runBlueprint` brick (D87 §1.5); until then this is the honest,
-    complete set of persisted fields.
+    returns (read-tools-design §1.2), GROWN ADDITIVELY with the full DAG
+    (`sql_template`, typed `slots`, `resolves`, `uses_rules`, `composes`,
+    `result_grain`) now that the `runBlueprint` brick lands (runblueprint-design
+    §1 / OQ-T1). The additive fields default to `None`/`empty` so every existing
+    D87/D88 construction still holds — the recall projection is unchanged.
 
     `uses` is a `frozenset[str] | None` (NOT the rendered list): `None` is the
     fail-closed undetermined marker (a corrupt/absent stored `uses`), so a
     scope check via `scope_filter.is_blueprint_in_scope` DROPS it rather than
     fail-open — mirroring `Candidate.uses`. The tool renders it as a sorted list.
+
+    The full-DAG fields are carried JSON-DECODED (dicts/lists/str/None), NOT the
+    typed `runtime.blueprint` objects — retrieval stays free of blueprint typing;
+    `runtime.blueprint.models.Blueprint.parse(...)` turns them into typed objects.
     """
 
     id: str
@@ -74,6 +79,13 @@ class BlueprintDetail:
     drift_status: str
     hit_count: int
     catalog_sha: str
+    # --- additive, the runBlueprint brick (OQ-T1) — JSON-decoded, default absent ---
+    resolves: dict[str, Any] | None = None
+    slots: list[dict[str, Any]] | None = None
+    uses_rules: list[Any] | None = None
+    sql_template: str | None = None
+    composes: list[dict[str, Any]] | None = None
+    result_grain: list[str] | dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
