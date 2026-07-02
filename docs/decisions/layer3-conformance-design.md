@@ -1,6 +1,10 @@
 # Layer-3 conformance completion — design
 
-**Status:** Proposed (design only — no code in this change).
+**Status:** Slice 1 BUILT (Session 14) — the 4 runBlueprint conformance scenarios are
+Playwright-green (9/9 e2e incl. the 5 pre-existing), via a seeded-fake retrieval pipeline injected
+into the demo launcher. Slice 2 (scope-switch BFF + in-memory span exporter + Couchbase restart —
+the 3 original Phase-0 scenarios) is next. The full D68 conformance-status traceability flip lands
+when Slice 2 completes the suite.
 **Branch context:** `phase0/provenance-extractor`.
 **Scope:** Turn every currently-red Layer-3 (Playwright) conformance scenario green, so the
 D68 release gate (the *full* Layer-3 burndown) is satisfiable for Phase 0. Seven red scenarios

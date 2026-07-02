@@ -178,6 +178,116 @@ class TestBudgetCapPause:
         expect(page.get_by_test_id("status")).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
 
 
+class TestRunBlueprintFastPath:
+    """Scenario 6 — runBlueprint fast path (D89): a "headcount by department"
+    message drives a `runBlueprint` tool call; the executor runs the node query,
+    the D56 grain probe passes, and a verified answer renders."""
+
+    def test_fast_path_runs_and_renders_verified_answer(self, page: Page) -> None:
+        _goto_and_wait_for_session(page)
+        _send_message(page, "run the headcount by department blueprint")
+
+        # runBlueprint emits tool_dispatch_start/ok → progress items.
+        expect(page.get_by_test_id("progress-item").first).to_be_visible(
+            timeout=_ASSERT_TIMEOUT_MS
+        )
+        expect(page.get_by_test_id("progress-item")).not_to_have_count(
+            0, timeout=_ASSERT_TIMEOUT_MS
+        )
+
+        # Prove VERIFIED-ness, not just a non-empty answer: the scripted model
+        # returns prose on ANY runBlueprint tool result (ok or VERIFY_FAILED), so
+        # assert the progress stream shows the SUCCESSFUL dispatch — the
+        # `tool_dispatch_ok` step ("step complete: runBlueprint") is emitted ONLY on
+        # a completed runBlueprint; a VERIFY_FAILED path emits `tool_dispatch_error`
+        # (no user-facing label) and so never renders this step.
+        progress_list = page.get_by_test_id("progress-list")
+        expect(progress_list).to_contain_text(
+            "step complete: runBlueprint", timeout=_ASSERT_TIMEOUT_MS
+        )
+
+        expect(page.get_by_test_id("answer")).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("status")).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+
+class TestRunBlueprintNoSilentVerification:
+    """Scenario 7 — no-silent-verification (D56): a "bad headcount" message drives
+    a `runBlueprint` whose result fails the grain-integrity gate. The fan-out
+    result is WITHHELD; the model answers from the raw loop without ever
+    presenting the unverified numbers, and no error banner appears."""
+
+    def test_unverified_result_is_withheld_and_never_leaks(self, page: Page) -> None:
+        _goto_and_wait_for_session(page)
+        _send_message(page, "run the bad headcount blueprint")
+
+        answer = page.get_by_test_id("answer")
+        expect(answer).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
+
+        # A verify-failed blueprint is a graceful raw-loop fallback, never a crash.
+        expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+        # The withheld fan-out row + figure (the sentinels the demo double emits
+        # for the D56 negative fixture) must NEVER reach the DOM — the executor
+        # discards them on VERIFY_FAILED.
+        body_text = page.locator("body").inner_text()
+        assert "FANOUT_LEAK_ROW" not in body_text, (
+            f"Withheld fan-out row leaked into the DOM: {body_text!r}"
+        )
+        assert "987654" not in body_text, (
+            f"Withheld fan-out figure leaked into the DOM: {body_text!r}"
+        )
+
+
+class TestRunBlueprintAskClarifyResume:
+    """Scenario 8 — slot ask→clarify→resume (D49): an "average tenure" message
+    drives a `runBlueprint` with an unfilled required slot; the executor pauses
+    for the slot value. Answering it (via the free-text resume affordance)
+    resumes the blueprint to a verified answer."""
+
+    def test_slot_pause_then_resume_to_answer(self, page: Page) -> None:
+        _goto_and_wait_for_session(page)
+        _send_message(page, "show average tenure by department")
+
+        expect(page.get_by_test_id("ask-user")).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("ask-user-question")).not_to_have_text(
+            "", timeout=_ASSERT_TIMEOUT_MS
+        )
+
+        # A missing required slot pauses with no options → answer via the existing
+        # free-text resume affordance (ask-user-input + ask-user-submit).
+        page.get_by_test_id("ask-user-input").fill("Sales")
+        page.get_by_test_id("ask-user-submit").click()
+
+        expect(page.get_by_test_id("ask-user")).to_be_hidden(timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("answer")).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+
+class TestRunBlueprintApprovalPauseResume:
+    """Scenario 9 — approval pause/resume (D45/D59b): an "approve headcount"
+    message drives a multi-node `runBlueprint` DAG whose approval gate pauses the
+    turn showing approve/deny chips. Clicking approve re-enters the executor at
+    the awaiting node and completes to a verified answer."""
+
+    def test_approval_pause_then_approve_to_answer(self, page: Page) -> None:
+        _goto_and_wait_for_session(page)
+        _send_message(page, "approve headcount for sales")
+
+        expect(page.get_by_test_id("ask-user")).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+        approve_chip = page.locator('[data-testid="ask-user-option"][data-option="approve"]')
+        deny_chip = page.locator('[data-testid="ask-user-option"][data-option="deny"]')
+        expect(approve_chip).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+        expect(deny_chip).to_be_visible()
+
+        approve_chip.click()
+
+        expect(page.get_by_test_id("ask-user")).to_be_hidden(timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("answer")).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("status")).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+
 def _any_of(substrings: list[str]) -> re.Pattern[str]:
     pattern = "|".join(re.escape(s) for s in substrings)
     return re.compile(pattern, re.IGNORECASE)
