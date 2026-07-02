@@ -118,6 +118,7 @@ def test_bad_slot_type_rejected() -> None:
 def test_composes_cycle_rejected() -> None:
     bp = _seed(
         sql_template=None,
+        slots=[],  # B3(a): a composes DAG that uses no department filter declares no slot
         composes=[
             {"order": 1, "feeds_from": [2], "output": {"a": "scalar"},
              "sql_template": "SELECT Department FROM dbpcm_warehouse.employee"},
@@ -132,6 +133,7 @@ def test_composes_cycle_rejected() -> None:
 def test_composes_dangling_feeds_from_rejected() -> None:
     bp = _seed(
         sql_template=None,
+        slots=[],  # B3(a): no department filter → no declared slot
         composes=[
             {"order": 1, "feeds_from": [99], "output": {"a": "scalar"},
              "sql_template": "SELECT Department FROM dbpcm_warehouse.employee"},
@@ -144,6 +146,7 @@ def test_composes_dangling_feeds_from_rejected() -> None:
 def test_entity_valued_when_clause_rejected() -> None:
     bp = _seed(
         sql_template=None,
+        slots=[],  # B3(a): no department filter → no declared slot
         composes=[
             {"order": 1, "output": {"a": "scalar"},
              "sql_template": "SELECT Department FROM dbpcm_warehouse.employee",
@@ -309,6 +312,7 @@ def test_group_by_output_alias_rejected_constraint_pin() -> None:
 def test_group_by_real_column_accepted() -> None:
     _validate_blueprint_dag(
         _seed(
+            slots=[],  # B3(a): this template uses no {department} filter → no declared slot
             sql_template=(
                 "SELECT Department AS dept, COUNT(EmployeeCode) AS c "
                 "FROM dbpcm_warehouse.employee GROUP BY Department"
@@ -338,7 +342,7 @@ def test_deep_compose_dag_over_cap_rejected() -> None:
          "sql_template": "SELECT Department FROM dbpcm_warehouse.employee"}
         for i in range(1, 201)
     ]
-    bp = _seed(sql_template=None, composes=composes)
+    bp = _seed(sql_template=None, slots=[], composes=composes)
     with pytest.raises(CorpusLoadError, match="node cap"):
         _validate_blueprint_dag(bp)
 
@@ -346,6 +350,7 @@ def test_deep_compose_dag_over_cap_rejected() -> None:
 def test_valid_when_clause_accepted() -> None:
     bp = _seed(
         sql_template=None,
+        slots=[],  # B3(a): no department filter → no declared slot
         composes=[
             {"order": 1, "output": {"a": "scalar"},
              "sql_template": "SELECT Department FROM dbpcm_warehouse.employee",

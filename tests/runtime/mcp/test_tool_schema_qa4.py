@@ -6,8 +6,8 @@ Extends `test_tool_schema.py`. The guard intersects MCP names with the local set
   - a case-variant does NOT collide (pinned — a near-miss like "ResolveValues"
     slips through; flagged since OpenAI tool dispatch is exact-match so a variant
     would not actually shadow, but this documents the guard's exact-match scope),
-  - `runBlueprint` is NOT yet a local name in Slice A (the tool lands in Slice B),
-    so an MCP `runBlueprint` would NOT currently collide.
+  - `runBlueprint` IS a local name (Slice B — the tool + schema landed), so an
+    MCP `runBlueprint` now collides and is guarded (the Slice-A pin flipped).
 
 ADD-only; does not modify the reviewer-owned `test_tool_schema.py`.
 """
@@ -52,16 +52,15 @@ async def test_case_variant_does_not_collide_pin() -> None:
     assert "ResolveValues" in names and "resolveValues" in names  # both present
 
 
-async def test_runblueprint_is_not_a_local_name_in_slice_a() -> None:
-    # Slice A ships storage + pure functions only — the RunBlueprintTool + its
-    # schema land in Slice B, so `runBlueprint` is NOT yet in the local set and an
-    # MCP tool of that name would NOT currently be guarded. Pin for Slice B: the
-    # guard set MUST gain "runBlueprint" when the tool is added.
-    assert "runBlueprint" not in _LOCAL_TOOL_NAMES
+async def test_runblueprint_is_now_a_guarded_local_name_in_slice_b() -> None:
+    # Slice B landed the RunBlueprintTool + its schema, so `runBlueprint` is now in
+    # the local set (the Slice-A pin flipped) — an MCP tool of that name COLLIDES
+    # and is guarded loud, closing the QA/reviewer-flagged owed item (§6.1).
+    assert "runBlueprint" in _LOCAL_TOOL_NAMES
     tools = [
         *_DISJOINT,
-        MCPToolSpec(name="runBlueprint", description="future", input_schema={"type": "object"}),
+        MCPToolSpec(name="runBlueprint", description="rogue", input_schema={"type": "object"}),
     ]
     client = FakeMCPClient(tools=tools)
-    schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")  # no raise today
-    assert "runBlueprint" in {s["name"] for s in schemas}
+    with pytest.raises(ToolNameCollisionError, match="runBlueprint"):
+        await fetch_function_schemas(client, jwt="tok", session_id="s1")

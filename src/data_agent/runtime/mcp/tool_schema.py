@@ -181,6 +181,49 @@ SEARCH_KNOWLEDGE_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# `runBlueprint` (runblueprint-design §5.1) — the deterministic fast-path
+# execution tool: run one stored, validated blueprint by id with the model's
+# raw slot values. The runtime resolves/binds each slot (never the model),
+# executes through the runQuery choke point (D57/D64/D5 free), and runs the
+# D56 verify gate before returning — a missing/ambiguous slot pauses to ask the
+# user; a verify failure falls back to the raw loop. Declares NO
+# session_id/jwt/scope (D5) — scope is applied automatically by the inner
+# runQuery's RLS + column-scope enforcement.
+RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "runBlueprint",
+    "description": (
+        "Execute a stored, validated blueprint (from a getBlueprint result) by id to "
+        "answer the user's question the fast, deterministic way. Fill `slot_bindings` "
+        "with the raw values from the conversation and the user's own words (use the "
+        "blueprint's `slots` and `resolves` to know what each slot means) — the runtime "
+        "validates and binds them safely; you never write SQL or codes. If a required "
+        "slot is missing or a value is ambiguous, the run pauses to ask the user. Every "
+        "result is verified before you see it; if verification fails, answer from the raw "
+        "tools instead. The client/tenant is applied automatically — do not pass any "
+        "client identifier."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "The blueprint id to run, e.g. 'bp-average-salary-by-department'.",
+            },
+            "slot_bindings": {
+                "type": "object",
+                "description": "A flat map of {slot_name: raw_value} — the model's best "
+                "natural-language read of each slot (a string, number, boolean, or a list "
+                "for IN/enum-list slots). The runtime resolves each to a concrete, "
+                "scope-safe value. Omit a slot to leave it unfilled (a required one will "
+                "pause to ask).",
+            },
+        },
+        "required": ["id", "slot_bindings"],
+    },
+}
+
+
 # The locally-authored (runtime-implemented) tool schemas, appended after the
 # live-fetched MCP tools. This tuple is the SINGLE source of truth for "these
 # names are ours" — the name-collision guard (§6.1) asserts the MCP never
@@ -191,6 +234,7 @@ _LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     SEARCH_BLUEPRINTS_TOOL_SCHEMA,
     GET_BLUEPRINT_TOOL_SCHEMA,
     SEARCH_KNOWLEDGE_TOOL_SCHEMA,
+    RUN_BLUEPRINT_TOOL_SCHEMA,
 )
 _LOCAL_TOOL_NAMES: frozenset[str] = frozenset(s["name"] for s in _LOCAL_TOOL_SCHEMAS)
 
@@ -243,7 +287,8 @@ async def fetch_function_schemas(
         )
     schemas = [translate_tool_spec(tool) for tool in tools]
     # The locally-authored runtime tools (askUser + resolveValues + the three read
-    # tools), always advertised, appended after the MCP tools (count 6 → 11).
+    # tools + runBlueprint), always advertised, appended after the MCP tools
+    # (count 6 → 12).
     schemas.extend(_LOCAL_TOOL_SCHEMAS)
     return schemas
 

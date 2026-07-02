@@ -16,11 +16,23 @@ no loop changes beyond the §6 owed items:
   - `verify`   — the D56 deterministic grain-integrity + signature assertion as a
                  pure function (the "no silent path" teeth).
 
-The executor (`executor.py`) + the `RunBlueprintTool` (`tool.py`) land in Slice B.
+Slice B adds the execution engine + the tool:
+  - `executor` — `BlueprintExecutor`: the single-node DAG walk (fetch → resolve +
+                 bind slots → dispatch through the runQuery choke point → D56
+                 verify gate), returning a typed `ExecOutcome` union.
+  - `tool`     — `RunBlueprintTool`: the model-facing `RuntimeTool` wrapper
+                 (span + redaction + B4 guard + the §2.5 pausing-tool seam).
 """
 
 from __future__ import annotations
 
+from .executor import (
+    BlueprintExecutor,
+    ExecCompleted,
+    ExecFailed,
+    ExecOutcome,
+    ExecPaused,
+)
 from .models import (
     Blueprint,
     BlueprintParseError,
@@ -31,16 +43,23 @@ from .models import (
 )
 from .slots import AskUser, OmitSlot, SlotBinding, resolve_slot
 from .template import TemplateBindError, bind_template
+from .tool import RunBlueprintTool
 from .verify import VerifyOutcome, verify_result
 from .when import WhenClauseError, evaluate_when, validate_when
 
 __all__ = [
     "AskUser",
     "Blueprint",
+    "BlueprintExecutor",
     "BlueprintParseError",
+    "ExecCompleted",
+    "ExecFailed",
+    "ExecOutcome",
+    "ExecPaused",
     "Node",
     "OmitSlot",
     "ResultGrain",
+    "RunBlueprintTool",
     "SlotBinding",
     "SlotSpec",
     "TemplateBindError",

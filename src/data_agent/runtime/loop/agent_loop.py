@@ -89,6 +89,7 @@ from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
+    ToolPause,
     ToolResult,
 )
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
@@ -132,10 +133,14 @@ _RUNTIME_TOOL_UNAVAILABLE_CODE: dict[str, str] = {
     "searchBlueprints": "RETRIEVAL_TOOL_UNAVAILABLE",
     "getBlueprint": "RETRIEVAL_TOOL_UNAVAILABLE",
     "searchKnowledge": "RETRIEVAL_TOOL_UNAVAILABLE",
+    "runBlueprint": "RUN_BLUEPRINT_UNAVAILABLE",
 }
 _RUNTIME_TOOL_UNAVAILABLE_MESSAGE: dict[str, str] = {
     "RESOLVE_VALUES_UNAVAILABLE": "Value resolution is not available right now.",
     "RETRIEVAL_TOOL_UNAVAILABLE": "Blueprint and knowledge search is not available right now.",
+    "RUN_BLUEPRINT_UNAVAILABLE": (
+        "The blueprint fast path is not available right now — answer from the raw tools."
+    ),
 }
 
 TurnStatus = Literal[
@@ -525,6 +530,42 @@ class AgentLoop:
             result = replace(result, provenance=sanitized)
         return result
 
+    async def _pause_from_runtime_tool(
+        self,
+        *,
+        session_id: str,
+        pause: ToolPause,
+        window_count: int,
+        assistant_text: str | None,
+        tool_calls_made: int,
+    ) -> TurnOutcome:
+        """Honor a runtime tool's `ToolPause` (§2.5) — write the checkpoint (with
+        the additive `blueprint_*` mid-DAG state) and return `paused_ask_user`,
+        the same terminal contract as `askUser`. The loop owns `budget_window_count`
+        (the tool cannot know it), exactly as for the `askUser` checkpoint above."""
+        checkpoint = PauseCheckpoint(
+            reason=pause.reason,
+            pending_question=pause.pending_question,
+            awaiting="user_answer",
+            consumed=False,
+            budget_window_count=window_count,
+            blueprint_id=pause.blueprint_id,
+            slot_bindings_json=pause.slot_bindings_json,
+            completed_nodes_json=pause.completed_nodes_json,
+            awaiting_node=pause.awaiting_node,
+        )
+        await self._session_store.write_pause_checkpoint(session_id, checkpoint)
+        self._observer(
+            "loop_paused_ask_user",
+            {"question": pause.pending_question.get("question", "")},
+        )
+        return TurnOutcome(
+            status="paused_ask_user",
+            assistant_text=assistant_text,
+            pending_question=checkpoint.pending_question,
+            tool_calls_made=tool_calls_made,
+        )
+
     async def _run_loop(
         self,
         *,
@@ -647,6 +688,23 @@ class AgentLoop:
                 else:
                     tool_result = await self._tool_dispatcher.dispatch(
                         tool_call.name, tool_call.arguments, credentials
+                    )
+
+                # §2.5 pausing-runtime-tool seam: a runtime tool may signal a
+                # pause (today only `runBlueprint`, on a slot-resolution
+                # `askUser`). This GENERALIZES the terminal `askUser` branch
+                # above — the loop writes the checkpoint and returns
+                # `paused_ask_user` exactly as for `askUser`, before persisting a
+                # trail entry or counting the call (a paused tool did not
+                # complete, mirroring `askUser`). A dispatched MCP tool never
+                # sets `.pause`, so this is inert on the normal path.
+                if tool_result.pause is not None:
+                    return await self._pause_from_runtime_tool(
+                        session_id=session_id,
+                        pause=tool_result.pause,
+                        window_count=window_count,
+                        assistant_text=result.assistant_text,
+                        tool_calls_made=tool_calls_made,
                     )
                 tool_calls_made += 1
 

@@ -513,7 +513,20 @@ One `TOOL` span for `runBlueprint`; nested per-node `runQuery` spans (via the di
 context — the `resolveValues` nesting precedent). Progress events (D61): "running blueprint step 2 of 4:
 department actuals…", "verifying results…" — **step/shape only, no cell values, no bound slot values**
 (D25/D61 PII-safe). The model-authored `slot_bindings` values are **redacted** from spans/progress
-(the `concept`/`query` redaction precedent, D25 — `redact_tool_args` extended for `runBlueprint`).
+(the `concept`/`query` redaction precedent, D25 — `redact_tool_args` extended for `runBlueprint`); the
+bound node/probe SQL literals are masked by the existing `mask_sql` on the inner `runQuery` spans.
+
+**Scope of the "no slot values in progress" claim (Slice-B clarification, reviewer redaction gray-area,
+position (a)):** the claim covers **telemetry-only surfaces** — span attributes and the `blueprint_step`
+progress payloads the executor emits — which carry step/shape only and never a slot value. It does **not**
+cover a `no_match`/`multi_match` **clarification question**: that question is *inherently user-facing* (it
+asks the user to confirm THEIR OWN proposed value, e.g. "I couldn't find 'Marketing' — which did you
+mean?"), and echoing the user's own input back to them is not a leak. Such a question is delivered through
+the same `loop_paused_ask_user` path as `askUser`, whose `pending_question` is by design the user-facing
+prompt (never a warehouse *resolved/bound* value — those are what §5.5 redacts). So the precise invariant
+is: **no resolved/bound domain value and no result cell ever reaches a span or a progress payload**; a
+clarify question may echo the user's *own* proposed slot value, exactly as `askUser` does. (QA5 pins this
+as the conscious record: `test_no_match_pause_question_echoes_value_into_progress_event_flag`.)
 
 ---
 

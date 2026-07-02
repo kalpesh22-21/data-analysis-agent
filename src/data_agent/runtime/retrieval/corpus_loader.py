@@ -530,6 +530,38 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
         _assert_no_dict_functions(bp.id, where, tree)
         _assert_template_reads_within_uses(bp.id, where, tree, bp.uses)
 
+    # (e) B3(a): every declared REQUIRED slot MUST be referenced by ≥1 template —
+    # the converse of the (a) token⊆slots check. An unreferenced required slot is a
+    # DROPPED FILTER at execution (the query runs without the user's intended
+    # constraint and returns company-wide numbers that still pass the grain gate),
+    # the exact wrong-answer class D56 exists to block. Fail the seed load LOUD.
+    all_referenced: set[str] = set()
+    for _order, template in templates:
+        all_referenced |= referenced_slots(template)
+    unreferenced_required = {
+        s.name for s in blueprint.slots if s.required and s.name not in all_referenced
+    }
+    if unreferenced_required:
+        raise CorpusLoadError(
+            f"blueprint {bp.id}: required slot(s) {sorted(unreferenced_required)} are "
+            "declared but referenced by NO template — an unreferenced required slot is a "
+            "silent dropped filter (D56 wrong-answer class). Reference it or make it optional."
+        )
+
+    # (f) S1: every slot's `binds_to` MUST be within the blueprint's declared
+    # `uses` footprint — otherwise the runtime DISTINCT domain probe reads a column
+    # the blueprint never advertised (D88c footprint story false for probes) and a
+    # binds_to⊄user-scope probe silently degrades. Asserting binds_to ⊆ uses at
+    # WRITE makes an in-scope blueprint's probe provably scope-clean.
+    uses_set = set(bp.uses)
+    for slot in blueprint.slots:
+        if slot.binds_to is not None and slot.binds_to not in uses_set:
+            raise CorpusLoadError(
+                f"blueprint {bp.id}: slot {slot.name!r} binds_to {slot.binds_to!r} which is "
+                "NOT in the blueprint's declared uses — a slot's domain probe must read only "
+                "an advertised column (add it to uses or fix binds_to)."
+            )
+
     for node in blueprint.composes:
         if node.when is not None:
             try:

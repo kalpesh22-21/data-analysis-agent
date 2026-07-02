@@ -312,3 +312,146 @@ def test_read_tool_unavailable_when_retrieval_absent(monkeypatch) -> None:
     assert trail[0].status == "error"
     assert trail[0].error_code == "RETRIEVAL_TOOL_UNAVAILABLE"
     assert mcp.calls == []  # advertised-but-unwired never hits the MCP
+
+
+# ---------------------------------------------------------------------------
+# runBlueprint registry wiring (runblueprint-design §5, Slice B, reviewer B1):
+# runBlueprint is wired ONLY when retrieval is active — it shares the pipeline's
+# vector_index (getBlueprint) + the per-request dispatcher (per-node runQuery).
+# Absent retrieval it is advertised but returns RUN_BLUEPRINT_UNAVAILABLE, never
+# an MCP unknown-tool denial. Mirrors the read-tools wiring smoke tests above.
+# ---------------------------------------------------------------------------
+
+_E = "dbpcm_warehouse.employee"
+_AVG_TEMPLATE = (
+    "SELECT Department AS department, AVG(AnnualSalary) AS avg_salary, "
+    "COUNT(DISTINCT EmployeeCode) AS headcount "
+    "FROM dbpcm_warehouse.employee WHERE Department = {department} GROUP BY Department"
+)
+
+
+def _run_blueprint_app(
+    monkeypatch, model_client: ScriptedModelClient, *, with_retrieval: bool
+) -> tuple[TestClient, InMemorySessionStore, FakeMCPClient]:
+    from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
+    from data_agent.runtime.retrieval.models import BlueprintDetail
+    from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
+    from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
+    from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
+
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *args, **kwargs: frozenset())
+    mcp_client = FakeMCPClient(
+        tools=[
+            MCPToolSpec(
+                name="runQuery", description="", input_schema={"type": "object", "properties": {}}
+            )
+        ],
+        scripted={
+            "runQuery": [
+                {"columns": ["Department"], "rows": [["Sales"]], "row_count": 1, "truncated": False},
+                {"columns": ["department", "avg_salary", "headcount"], "rows": [["Sales", 60000.0, 4]], "row_count": 1, "truncated": False},
+                {"columns": ["__bp_n", "__bp_d"], "rows": [[1, 1]], "row_count": 1, "truncated": False},
+            ]
+        },
+    )
+    store = InMemorySessionStore()
+    retrieval = None
+    if with_retrieval:
+        detail = BlueprintDetail(
+            id="bp-avg",
+            intent="Average salary by department",
+            slots_summary="department",
+            uses=frozenset({f"{_E}.Department", f"{_E}.AnnualSalary", f"{_E}.EmployeeCode"}),
+            status="validated",
+            drift_status="clean",
+            hit_count=0,
+            catalog_sha="",
+            slots=[{"name": "department", "type": "string", "required": True, "binds_to": f"{_E}.Department"}],
+            sql_template=_AVG_TEMPLATE,
+            result_grain=["Department"],
+        )
+        index = FakeVectorIndex(details={"bp-avg": detail})
+        retrieval = RetrievalPipeline(
+            embedding_client=FakeEmbeddingClient({"avg salary?": [1.0, 0.0]}),
+            reranker=None,
+            vector_index=index,
+            user_memory=NullUserMemoryProvider(),
+            recall_k=30,
+            top_k_blueprints=3,
+            top_k_knowledge=3,
+        )
+    catalog = CatalogHandle(
+        {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+    )
+    app = create_app(
+        settings=RuntimeSettings(_env_file=None),
+        session_store=store,
+        mcp_client=mcp_client,
+        model_client=model_client,
+        catalog=catalog,
+        retrieval=retrieval,
+    )
+    return TestClient(app), store, mcp_client
+
+
+def test_run_blueprint_wired_when_retrieval_active_executes_verified(monkeypatch) -> None:
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="rb1",
+                        name="runBlueprint",
+                        arguments={"id": "bp-avg", "slot_bindings": {"department": "Sales"}},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="The average salary in Sales is $60,000."),
+        ]
+    )
+    client, store, mcp = _run_blueprint_app(monkeypatch, model, with_retrieval=True)
+
+    resp = client.post("/turn", json={"message": "avg salary?"}, headers=HEADERS)
+    assert resp.status_code == 200
+    assert _parse_sse(resp.text)[-1]["data"]["status"] == "done"
+
+    import anyio
+
+    trail = anyio.run(store.load_trail, SESSION_ID)
+    assert trail[0].tool_name == "runBlueprint"
+    # HANDLED by the executor through the composition root (NOT the unwired path):
+    # a verified result, not RUN_BLUEPRINT_UNAVAILABLE.
+    assert trail[0].status == "ok"
+    assert trail[0].error_code != "RUN_BLUEPRINT_UNAVAILABLE"
+    # The three inner runQuery probes went to the MCP; runBlueprint itself never did.
+    assert [c.tool_name for c in mcp.calls] == ["runQuery", "runQuery", "runQuery"]
+
+
+def test_run_blueprint_unavailable_when_retrieval_absent(monkeypatch) -> None:
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="rb1",
+                        name="runBlueprint",
+                        arguments={"id": "bp-avg", "slot_bindings": {"department": "Sales"}},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="I'll use the raw tools instead."),
+        ]
+    )
+    client, store, mcp = _run_blueprint_app(monkeypatch, model, with_retrieval=False)
+
+    resp = client.post("/turn", json={"message": "avg salary?"}, headers=HEADERS)
+    assert resp.status_code == 200
+    assert _parse_sse(resp.text)[-1]["data"]["status"] == "done"
+
+    import anyio
+
+    trail = anyio.run(store.load_trail, SESSION_ID)
+    assert trail[0].tool_name == "runBlueprint"
+    assert trail[0].status == "error"
+    assert trail[0].error_code == "RUN_BLUEPRINT_UNAVAILABLE"
+    assert mcp.calls == []  # advertised-but-unwired never hits the MCP

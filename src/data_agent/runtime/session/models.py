@@ -171,13 +171,26 @@ class TrailEntry:
 
 @dataclass(frozen=True)
 class PauseCheckpoint:
-    """`pause_checkpoint` — the D45 exactly-once resume checkpoint."""
+    """`pause_checkpoint` — the D45 exactly-once resume checkpoint.
 
-    reason: str  # "askUser" | "budget_cap"
+    The four `blueprint_*` fields are ADDITIVE (runblueprint-design §2.5, D45
+    mid-DAG durability): they default to `None` so an `askUser`/`budget_cap`
+    checkpoint is byte-identical to before. Slice B writes `blueprint_id` +
+    `slot_bindings_json` on a slot-resolution `askUser` pause (`reason=
+    "blueprint_slot"`); `completed_nodes_json`/`awaiting_node` carry the mid-DAG
+    resume state that Slice C's multi-node/approval pauses populate.
+    """
+
+    reason: str  # "askUser" | "budget_cap" | "blueprint_slot" (Slice C: approval/when_ask)
     pending_question: dict[str, Any] | None
     awaiting: str  # "user_answer"
     consumed: bool
     budget_window_count: int = 0
+    # --- additive, the runBlueprint brick (D45 mid-DAG durability, §2.5) ---
+    blueprint_id: str | None = None
+    slot_bindings_json: str | None = None  # the raw model-proposed slot_bindings (deterministic re-fill)
+    completed_nodes_json: str | None = None  # [{order, output_scalar}] — SCALAR outputs only (Slice C)
+    awaiting_node: int | None = None  # the node order to resume at (Slice C)
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -186,10 +199,15 @@ class PauseCheckpoint:
             "awaiting": self.awaiting,
             "consumed": self.consumed,
             "budget_window_count": self.budget_window_count,
+            "blueprint_id": self.blueprint_id,
+            "slot_bindings_json": self.slot_bindings_json,
+            "completed_nodes_json": self.completed_nodes_json,
+            "awaiting_node": self.awaiting_node,
         }
 
     @classmethod
     def from_doc(cls, doc: dict[str, Any]) -> PauseCheckpoint:
+        awaiting_node = doc.get("awaiting_node")
         return cls(
             reason=doc["reason"],
             pending_question=(
@@ -198,6 +216,10 @@ class PauseCheckpoint:
             awaiting=doc["awaiting"],
             consumed=bool(doc["consumed"]),
             budget_window_count=int(doc.get("budget_window_count", 0)),
+            blueprint_id=doc.get("blueprint_id"),
+            slot_bindings_json=doc.get("slot_bindings_json"),
+            completed_nodes_json=doc.get("completed_nodes_json"),
+            awaiting_node=int(awaiting_node) if awaiting_node is not None else None,
         )
 
 

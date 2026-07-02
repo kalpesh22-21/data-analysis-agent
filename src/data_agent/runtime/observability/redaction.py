@@ -94,6 +94,13 @@ def redact_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
             if bound_key in masked_period and masked_period[bound_key] is not None:
                 masked_period[bound_key] = _REDACTED_PLACEHOLDER
         redacted["period"] = masked_period
+    # `runBlueprint`'s `slot_bindings` (runblueprint-design §5.5): the model-
+    # authored slot VALUES may quote user PII / entity values and become SQL
+    # literals — fully redact every value in telemetry, keeping only the slot
+    # NAMES (structural, non-PII) so a span still shows WHICH slots were filled.
+    slot_bindings = redacted.get("slot_bindings")
+    if isinstance(slot_bindings, dict):
+        redacted["slot_bindings"] = {key: _REDACTED_PLACEHOLDER for key in slot_bindings}
     return redacted
 
 

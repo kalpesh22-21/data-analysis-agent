@@ -41,6 +41,8 @@ from pydantic import BaseModel
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.auth.jwt_verify import JWTVerificationError, verify_jwt
+from data_agent.runtime.blueprint.executor import BlueprintExecutor
+from data_agent.runtime.blueprint.tool import RunBlueprintTool
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.config import RuntimeSettings, get_runtime_settings
 from data_agent.runtime.context.assembly import ContextAssembler
@@ -364,6 +366,22 @@ def create_app(
             runtime_tools["getBlueprint"] = GetBlueprintTool(
                 vector_index=active_retrieval.vector_index,
                 preview_row_count=settings.preview_row_count,
+                observer=observer,
+                tracer=tracer,
+            )
+            # runBlueprint (runblueprint-design §5, Slice B): the deterministic
+            # fast path. Wired ONLY when retrieval is active — it reads the SAME
+            # `vector_index` (getBlueprint by id) and issues its per-node runQuery
+            # through the SAME per-request `dispatcher` (D57/D64/D5 + provenance
+            # free). Without this, the advertised schema (12 tools) would always
+            # return RUN_BLUEPRINT_UNAVAILABLE (the loop's unwired-tool path).
+            runtime_tools["runBlueprint"] = RunBlueprintTool(
+                executor=BlueprintExecutor(
+                    tool_dispatcher=dispatcher,
+                    vector_index=active_retrieval.vector_index,
+                    preview_row_count=settings.preview_row_count,
+                    observer=observer,
+                ),
                 observer=observer,
                 tracer=tracer,
             )

@@ -24,6 +24,12 @@ SLOT_TYPES: frozenset[str] = frozenset(
 NODE_KINDS: frozenset[str] = frozenset({"query", "approval"})  # D59c (`guard` cut)
 ON_VIOLATION: frozenset[str] = frozenset({"abort", "skip", "ask"})
 
+# Hard cap on declared `slots` (reviewer S3). Each `binds_to` slot can fire an
+# unbudgeted inner DISTINCT domain probe at execution, so a poisoned READ record
+# with N slots = N warehouse queries — cap it (mirrors the `composes` node cap in
+# the corpus loader). A Phase-1 blueprint has a handful of slots; 16 is generous.
+_MAX_SLOTS = 16
+
 
 class BlueprintParseError(Exception):
     """A stored blueprint DAG structure is malformed (fail-loud, §2.1)."""
@@ -248,7 +254,13 @@ class Blueprint:
             ):
                 raise BlueprintParseError("'resolves' must be an object of string→string")
             resolves_map = dict(resolves)
-        slot_specs = tuple(SlotSpec.parse(s) for s in (slots or []))
+        slots_raw = list(slots or [])
+        if len(slots_raw) > _MAX_SLOTS:
+            raise BlueprintParseError(
+                f"blueprint declares {len(slots_raw)} slots, exceeding the {_MAX_SLOTS}-slot "
+                f"cap (each binds_to slot can fire an inner probe; a Phase-1 blueprint is small)"
+            )
+        slot_specs = tuple(SlotSpec.parse(s) for s in slots_raw)
         if sql_template is not None and not isinstance(sql_template, str):
             raise BlueprintParseError("'sql_template' must be a string")
         nodes = tuple(Node.parse(n) for n in (composes or []))

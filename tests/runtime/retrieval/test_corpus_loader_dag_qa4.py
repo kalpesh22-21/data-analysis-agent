@@ -99,6 +99,7 @@ def test_subquery_select_star_should_be_rejected() -> None:
 def test_self_edge_rejected_as_cycle() -> None:
     bp = _seed(
         sql_template=None,
+        slots=[],  # B3(a): no department filter → no declared slot
         composes=[
             {
                 "order": 1,
@@ -115,6 +116,7 @@ def test_self_edge_rejected_as_cycle() -> None:
 def test_duplicate_node_order_rejected() -> None:
     bp = _seed(
         sql_template=None,
+        slots=[],  # B3(a): no department filter → no declared slot
         composes=[
             {
                 "order": 1,
@@ -145,7 +147,7 @@ def test_deep_forward_ref_chain_fails_cleanly_not_with_recursionerror() -> None:
         }
         for i in range(1, n + 1)
     ]
-    bp = _seed(sql_template=None, composes=composes)
+    bp = _seed(sql_template=None, slots=[], composes=composes)
     with pytest.raises(CorpusLoadError):
         _validate_blueprint_dag(bp)
 
@@ -153,18 +155,19 @@ def test_deep_forward_ref_chain_fails_cleanly_not_with_recursionerror() -> None:
 # -- declared-but-unreferenced slot (accepted at load — pin) ----------------
 
 
-def test_declared_but_unreferenced_slot_is_accepted_at_load() -> None:
-    # PIN (Slice B): the loader checks referenced-slots ⊆ declared-slots, but NOT
-    # the reverse — a declared slot the template never references passes load. At
-    # execution `bind_template` rejects an EXTRA binding, so an executor that fills
-    # every declared slot would raise. Flagged: load/execute contract mismatch.
+def test_declared_but_unreferenced_required_slot_is_now_rejected() -> None:
+    # PIN FLIPPED (reviewer B3(a) fix landed): a declared REQUIRED slot the template
+    # never references is now a CorpusLoadError — the load/execute contract mismatch
+    # this pin flagged in Slice A is closed. An unreferenced required slot is a
+    # silent dropped filter (the D56 wrong-answer class), so it fails LOUD at write.
     bp = _seed(
         slots=[
             {"name": "department", "type": "string"},
-            {"name": "ghost", "type": "string"},  # never referenced by the template
+            {"name": "ghost", "type": "string"},  # required (default), never referenced
         ]
     )
-    _validate_blueprint_dag(bp)  # no raise today
+    with pytest.raises(CorpusLoadError, match="ghost"):
+        _validate_blueprint_dag(bp)
 
 
 # -- result_grain columns are NOT checked against uses (pin) ----------------

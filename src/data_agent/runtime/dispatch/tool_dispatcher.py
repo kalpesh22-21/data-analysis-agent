@@ -78,8 +78,31 @@ def _default_observer(event: str, payload: dict[str, Any]) -> None:
 
 
 @dataclass(frozen=True)
+class ToolPause:
+    """A runtime tool's request to PAUSE the turn — the generalized `askUser`
+    terminal-pause seam (runblueprint-design §2.5). Carried on `ToolResult.pause`;
+    the agent loop honors it by writing a `PauseCheckpoint` and returning
+    `paused_ask_user`, exactly as for `askUser`. Only RUNTIME tools set it
+    (dispatched MCP tools never pause); the loop ignores it on any dispatched
+    result. Slice B uses it for a slot-resolution `askUser`; the `blueprint_*`
+    fields carry the D45 mid-DAG resume state Slice C populates for approvals."""
+
+    reason: str  # "blueprint_slot" (Slice C: "blueprint_approval" | "blueprint_when_ask")
+    pending_question: dict[str, Any]
+    blueprint_id: str | None = None
+    slot_bindings_json: str | None = None
+    completed_nodes_json: str | None = None
+    awaiting_node: int | None = None
+
+
+@dataclass(frozen=True)
 class ToolResult:
-    """The outcome of one dispatched tool call — never carries credentials."""
+    """The outcome of one dispatched tool call — never carries credentials.
+
+    `pause` (additive, runblueprint-design §2.5) is set ONLY by a runtime tool
+    that needs to pause the turn (`runBlueprint` on a slot-resolution `askUser`);
+    it is `None` for every dispatched MCP tool and every non-pausing runtime tool,
+    so the existing trail/budget path is unchanged."""
 
     status: Literal["ok", "denied", "error"]
     tool_name: str
@@ -89,6 +112,7 @@ class ToolResult:
     provenance: frozenset[tuple[str, str]] | None
     result_preview: ResultPreview | None
     result_full: dict[str, Any] | list[Any] | None
+    pause: ToolPause | None = None
 
 
 def _build_preview(raw_result: Any, preview_row_count: int) -> ResultPreview:
