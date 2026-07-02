@@ -286,6 +286,117 @@ def _has_select_star(ast: exp.Expression) -> bool:
     return False
 
 
+def _is_output_alias_reference(col_node: exp.Column) -> bool:
+    """Return True if an unresolved unqualified column is a provable SELECT-list alias ref.
+
+    D70 fail-closed distinction (case (C) of the step-8 unqualified branch).
+
+    After ``qualify_columns``, an unqualified column with ``col.table == ''`` and a name
+    absent from the catalog is ambiguous: it is EITHER
+
+      (a) a reference to a computed SELECT-list output alias of the enclosing query
+          (e.g. ``count() AS c ... ORDER BY c`` or ``SUM(x) AS dept_earn ... GROUP BY
+          dept_earn``) — a query-internal derived name, no new data access; safe to skip;
+      OR
+      (b) a genuinely unresolvable base-table column (e.g. a bare column absent from the
+          single source table's catalog) — an unverifiable reference that MUST fail closed.
+
+    Both leave ``col.table == ''``.  We distinguish them structurally:
+
+      1. LOCATION.  ``qualify_columns`` auto-wraps every projection in an identity Alias
+         (``NonExistentCol`` becomes ``NonExistentCol AS NonExistentCol``), so we cannot
+         rely on "is there an alias with this name".  Instead we check WHERE the column
+         node sits relative to its enclosing SELECT.  A column that IS a projection output
+         (arg_key ``expressions``) cannot be *referencing* an alias — it is the (broken)
+         output itself → not an alias reference → fail closed.  Only a column in
+         GROUP BY / ORDER BY / HAVING / WHERE (any non-projection clause) may point at a
+         declared SELECT-list alias.
+      2. DECLARATION.  The name must match an alias explicitly declared in the enclosing
+         SELECT's projection list.
+
+    Only when BOTH hold is this a legitimate alias reference (skip).  Otherwise the caller
+    fails closed.  A correlated outer-query reference that is genuinely unresolvable will
+    fail this test and fail closed — the safe direction (D63: a false-reject is safe, a
+    false-accept is the fail-open bug being fixed).
+    """
+    sel = col_node.find_ancestor(exp.Select)
+    if sel is None:
+        return False
+
+    # Find the direct child of `sel` that contains this column, and its clause (arg_key).
+    node: exp.Expression = col_node
+    while node.parent is not None and node.parent is not sel:
+        node = node.parent
+    if node.parent is not sel:
+        return False
+    if node.arg_key == "expressions":
+        # The column is itself a projection output — an unresolvable output, not a
+        # reference to some other output alias.  Fail closed.
+        return False
+
+    alias_names = {
+        proj.alias
+        for proj in sel.expressions
+        if isinstance(proj, exp.Alias) and proj.alias
+    }
+    return col_node.name in alias_names
+
+
+def _references_only_scratch_sources(col_node: exp.Column) -> bool:
+    """Return True if the column's enclosing SELECT draws ONLY from scratch tables.
+
+    Scratch tables (D69/OQ-4) are NOT in the catalog, so ``qualify_columns`` cannot
+    attribute a bare (unqualified) column to them — such a column is left with
+    ``col.table == ''`` exactly like a genuinely-unresolvable warehouse column.  We
+    must NOT fail closed on a legitimate scratch column reference.
+
+    An unqualified, unresolved column is a legitimate scratch reference ONLY when every
+    direct base-table source of its enclosing SELECT is a scratch table (db == ``scratch``).
+    If ANY direct source is a catalogued warehouse table, ``qualify_columns`` would have
+    resolved a real column against it; an unqualified column that stayed unresolved is
+    then genuinely unverifiable and must fail closed (the D70 bug).  A derived/subquery
+    source also yields fail-closed (conservative — D63: a false-reject is safe).
+
+    "Direct base-table source" = a Table node whose nearest enclosing SELECT is the same
+    SELECT that owns this column (tables inside nested subqueries belong to those
+    subqueries, not to this SELECT).
+    """
+    sel = col_node.find_ancestor(exp.Select)
+    if sel is None:
+        return False
+    direct_tables = [
+        tbl for tbl in sel.find_all(exp.Table) if tbl.find_ancestor(exp.Select) is sel
+    ]
+    if not direct_tables:
+        return False
+    for tbl in direct_tables:
+        db_node = tbl.args.get("db")
+        tbl_db = db_node.name if db_node else ""
+        if tbl_db != _SCRATCH_DB:
+            return False
+    return True
+
+
+def _bound_lambda_param_names(lambda_node: exp.Lambda) -> set[str]:
+    """Return the parameter names bound by this lambda AND all enclosing lambdas.
+
+    A lambda body may reference a parameter bound by an outer lambda (nested
+    higher-order calls), so the in-scope parameter set is the union of this lambda's
+    parameters and those of every ancestor Lambda.  These names are NOT column
+    references and must be excluded from the fail-closed lambda-body coverage check.
+    """
+    names: set[str] = set()
+    node: exp.Expression | None = lambda_node
+    while node is not None:
+        if isinstance(node, exp.Lambda):
+            for param in node.expressions:
+                param_name = param.name or ""
+                if param_name:
+                    names.add(param_name)
+        node = node.parent
+    return names
+
+
 def _check_lambda_body_coverage(
     ast: exp.Expression,
     uses: set[tuple[str, str]],
@@ -313,13 +424,18 @@ def _check_lambda_body_coverage(
     Note: ``lambda_node.expressions`` are the PARAMETER identifiers (e.g. [x], [acc, x]).
     They are not column references.  We do NOT check them for catalog membership.
 
+    FAIL-CLOSED COVERAGE (D70):
+    Every Column node in a lambda body must be accounted for.  A body column is legitimate
+    ONLY if it is (a) a lambda parameter bound by this or an enclosing lambda, or (b) a
+    resolved column already present in the extracted USES set (a real catalog or scratch
+    column that step 8 captured).  ANY other body column — a catalog column the step-8
+    walk silently dropped, or an uncatalogued / mis-cased identifier — is unverifiable and
+    MUST fail closed.  The previous implementation only examined columns that were in the
+    catalog, so an uncatalogued lambda-body column (e.g. ``arrayMap(x -> x + BadCol, ...)``
+    with ``BadCol`` absent from the catalog) was silently dropped — a D70 fail-open.
+
     If no Lambda nodes exist, this check is a no-op.
     """
-    # Collect all column names across the whole catalog for fast membership check.
-    all_catalog_columns: set[str] = set()
-    for cols in catalog_schema.values():
-        all_catalog_columns.update(cols.keys())
-
     extracted_col_names = {col_name for _, col_name in uses}
 
     for lambda_node in ast.find_all(exp.Lambda):
@@ -341,20 +457,30 @@ def _check_lambda_body_coverage(
                 "Cannot verify column coverage (D69/OQ-1, fail-closed)."
             )
 
-        # Walk the lambda body directly for Column nodes that reference catalog columns.
-        # These columns must already be in `uses` because step 8 walked the full AST
-        # (which includes lambda bodies) and qualify_columns resolved them.
-        # A missing catalog column here means the step-8 walk silently dropped it.
+        bound_params = _bound_lambda_param_names(lambda_node)
+
+        # Walk this lambda's own body for Column nodes.  Columns belonging to a nested
+        # lambda are handled when that nested lambda is visited in its own iteration.
         for col_node in body.find_all(exp.Column):
+            if col_node.find_ancestor(exp.Lambda) is not lambda_node:
+                continue
             col_name = col_node.name or ""
             if not col_name:
                 continue
-            if col_name in all_catalog_columns and col_name not in extracted_col_names:
-                raise ProvenanceExtractionError(
-                    f"Lambda body references catalog column '{col_name}' which was "
-                    "not found in the extracted USES set — the column walk missed a "
-                    "lambda body reference (D69/OQ-1, fail-closed)."
-                )
+            if col_name in bound_params:
+                # A lambda-bound parameter is not a column reference.
+                continue
+            if col_name in extracted_col_names:
+                # A resolved catalog/scratch column already captured by step 8.
+                continue
+            # Anything else is an unresolved, non-parameter column in a lambda body:
+            # either a catalog column the step-8 walk dropped, or an uncatalogued /
+            # mis-cased identifier.  Both are unverifiable — fail closed.
+            raise ProvenanceExtractionError(
+                f"Lambda body references column '{col_name}' which is neither a lambda "
+                "parameter nor present in the extracted USES set — it is an unresolvable "
+                "or silently-dropped column reference (D69/OQ-1, D70, fail-closed)."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -598,12 +724,27 @@ def extract_column_provenance(
             #   - col_name exactly in catalog AND already in uses  → case (B) → skip
             #   - col_name NOT in catalog exactly, but matches a catalog name
             #     case-insensitively                               → case-mismatch → raise
-            #   - col_name not in catalog (exact or case-fold)    → case (C) → skip
+            #   - col_name not in catalog (exact or case-fold), AND it is a provable
+            #     SELECT-list output alias referenced in GROUP BY / ORDER BY / HAVING
+            #                                                       → case (C) → skip
+            #   - col_name not in catalog (exact or case-fold), AND it is NOT such an
+            #     alias reference (e.g. a bare column absent from the single source
+            #     table's catalog, or a dropped lambda/projection column)
+            #                                                       → case (D) → raise
             #
             # The case-insensitive match check catches identifiers like `amount` when
             # the catalog has `Amount`.  qualify_columns could not resolve `amount`
             # because ClickHouse identifier matching is case-sensitive; the reference
             # is genuinely unresolvable and must fail-closed (D63, case-sensitivity contract).
+            #
+            # D70 FIX: previously the final `else` unconditionally SKIPPED any name absent
+            # from the catalog, treating it as a computed alias.  But a bare unresolvable
+            # base-table column (absent from the single source table's catalog) is
+            # indistinguishable from an alias by name alone — both leave col.table == ''.
+            # That silently DROPPED real unresolvable columns (understated USES = fail-open;
+            # the D44 replay filter then treats it as ⊆ any scope).  We now require a
+            # PROVABLE output-alias reference (see _is_output_alias_reference); anything
+            # else fails closed.
             extracted_col_names_so_far = {cn for _, cn in uses}
             if col_name in all_catalog_column_names:
                 if col_name not in extracted_col_names_so_far:
@@ -624,7 +765,23 @@ def extract_column_provenance(
                     "different casing (ClickHouse identifiers are case-sensitive). "
                     "Fail-closed (D63)."
                 )
-            # else: case (C) — computed alias name (dept_earn, total_earn, etc.) — skip.
+            elif not (
+                _is_output_alias_reference(col_node)
+                or _references_only_scratch_sources(col_node)
+            ):
+                # case (D) — genuinely unresolvable unqualified column.  It is neither a
+                # catalog column, a provable SELECT-list output alias reference, nor a
+                # bare column of a scratch-only source (uncatalogued by design, D69/OQ-4).
+                # A silent skip here understates the USES set (fail-open, D70). Fail closed.
+                raise ProvenanceExtractionError(
+                    f"Column '{col_name}' could not be attributed to any table after "
+                    "qualify_columns and is not a declared SELECT-list output alias "
+                    "referenced in GROUP BY / ORDER BY / HAVING — it is an unresolvable "
+                    "column reference (e.g. absent from the single source table's "
+                    "catalog). Fail-closed (D63, D70)."
+                )
+            # else: case (C) — provable computed alias reference (dept_earn, total_earn,
+            # c, dept, ...) referenced outside the projection list — skip.
             continue
 
         # col_table is set (possibly an alias); resolve via alias_map

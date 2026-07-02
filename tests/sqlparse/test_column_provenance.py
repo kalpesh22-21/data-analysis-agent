@@ -1085,3 +1085,116 @@ def test_prov_table_qualified_star_uncatalogued_failclosed() -> None:
     sql = "SELECT t.* FROM external_db.secret_table AS t"
     with pytest.raises(ProvenanceExtractionError):
         extract_column_provenance(sql, CATALOG_SCHEMA)
+
+
+# ---------------------------------------------------------------------------
+# PART 4 — D70 SCOPE FAIL-OPEN REGRESSION (unqualified unresolvable columns)
+# ---------------------------------------------------------------------------
+#
+# These cases pin the D70 fix: an unqualified column that qualify_columns leaves
+# with col.table == '' and that is NEITHER a catalog column NOR a provable
+# SELECT-list output alias reference is a genuinely-unresolvable column.  The
+# extractor previously SKIPPED it (understated USES = fail-open; the D44 replay
+# filter then treated the trail entry as ⊆ any scope).  It must now fail closed.
+
+
+def test_prov_unresolvable_bare_column_single_table_failclosed() -> None:
+    """D-07 · prov-unresolvable-bare-column-single-table — bare uncatalogued column fails closed.
+
+    Decision refs: D63, D70
+    Bug repro: `SELECT NonExistentCol FROM employee` — the column is absent from the
+    single source table's catalog.  qualify_columns leaves col.table == '' and the name
+    is not a SELECT-list alias reference.  Previously returned uses=∅ (the column
+    vanished).  Must now raise ProvenanceExtractionError (fail-closed).
+    """
+    sql = "SELECT NonExistentCol FROM dbpcm_warehouse.employee"
+    with pytest.raises(ProvenanceExtractionError):
+        extract_column_provenance(sql, CATALOG_SCHEMA)
+
+
+def test_prov_mixed_valid_and_unresolvable_column_failclosed() -> None:
+    """D-08 · prov-mixed-valid-and-unresolvable-column — one bad column poisons the query.
+
+    Decision refs: D63, D70
+    Bug repro: `SELECT EmployeeCode, NonExistentCol FROM employee` previously returned
+    uses={EmployeeCode} — NonExistentCol was silently dropped, an understated USES set.
+    A single unresolvable column must fail the whole extraction closed.
+    """
+    sql = "SELECT EmployeeCode, NonExistentCol FROM employee"
+    with pytest.raises(ProvenanceExtractionError):
+        extract_column_provenance(sql, CATALOG_SCHEMA)
+
+
+def test_prov_uncatalogued_lambda_body_column_failclosed() -> None:
+    """D-09 · prov-uncatalogued-lambda-body-column — uncatalogued lambda-body column fails closed.
+
+    Decision refs: D63, D69/OQ-1, D70
+    Bug repro: `arrayMap(x -> x + BadCol, [1,2]) FROM employee` where BadCol is
+    uncatalogued.  The lambda-body coverage check previously only examined columns that
+    were IN the catalog, so BadCol was never inspected → uses=∅ (fail-open).  A lambda
+    body column that is neither a bound parameter nor a captured catalog/scratch column
+    must fail closed.
+    """
+    sql = "SELECT arrayMap(x -> x + BadCol, [1, 2]) AS mapped FROM employee"
+    with pytest.raises(ProvenanceExtractionError):
+        extract_column_provenance(sql, CATALOG_SCHEMA)
+
+
+def test_prov_output_alias_reference_still_extracts() -> None:
+    """D-10 · prov-output-alias-reference — legit SELECT-list alias in GROUP BY/ORDER BY/HAVING.
+
+    Decision refs: D62, D70
+    Regression guard for the D70 fix: a computed SELECT-list output alias referenced in
+    GROUP BY / ORDER BY / HAVING is a query-internal derived name (no new data access) and
+    must still be SKIPPED, not rejected.  Only the underlying real columns are captured.
+    """
+    sql = """
+        SELECT Department AS dept, count() AS c
+        FROM employee
+        GROUP BY dept
+        HAVING c > 5
+        ORDER BY c DESC
+    """
+    result = extract_column_provenance(sql, CATALOG_SCHEMA)
+    # `dept` (alias of Department) resolves the real Department access; `c` (alias of
+    # count()) is a derived name with no column source.
+    assert result == frozenset([(_E, "Department")])
+
+
+def test_prov_lambda_bound_param_not_rejected() -> None:
+    """D-11 · prov-lambda-bound-param — a lambda parameter name is not a column reference.
+
+    Decision refs: D69/OQ-1, D70
+    Regression guard: the lambda-body coverage check must exclude the lambda's own bound
+    parameters (and those of enclosing lambdas).  A lambda whose body references only its
+    parameters must extract cleanly, not fail closed.
+    """
+    sql = """
+        SELECT arrayMap(x -> x * 2, groupArray(Amount)) AS doubled, EmployeeCode
+        FROM payroll
+        WHERE RegisterType = 'EARN'
+        GROUP BY EmployeeCode
+    """
+    result = extract_column_provenance(sql, CATALOG_SCHEMA)
+    assert (_P, "Amount") in result
+    assert (_P, "EmployeeCode") in result
+    assert (_P, "RegisterType") in result
+
+
+def test_prov_unqualified_scratch_only_column_not_rejected() -> None:
+    """D-12 · prov-unqualified-scratch-only-column — bare scratch column not fail-closed.
+
+    Decision refs: D64, D69/OQ-4, D70
+    Regression guard: a scratch table is uncatalogued by design, so qualify_columns
+    leaves its bare (unqualified) column with col.table == '' — identical in shape to a
+    genuinely-unresolvable warehouse column.  When the enclosing SELECT draws ONLY from
+    scratch sources, the bare column is a legitimate scratch reference and must NOT fail
+    closed (the D70 case-(D) fail-closed applies only when a catalogued warehouse table is
+    in scope).  Scratch columns are not scope-checked, so the USES set stays empty here.
+    """
+    sql = (
+        "SELECT hire_date_override, salary_adj "
+        "FROM scratch.s_sess_abc123_compensation"
+    )
+    result = extract_column_provenance(sql, CATALOG_SCHEMA, session_id="sess_abc123")
+    assert result == frozenset()

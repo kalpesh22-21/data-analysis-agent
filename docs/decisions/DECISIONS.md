@@ -1166,3 +1166,34 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   coverage check is **structural** (assert sqlglot produced a `Lambda` node with a non-None body and
   a non-empty parameter list) rather than relying on the same `find_all` traversal it is trying to
   verify (which was tautological in the failure case). Cross-references: D57, D62, D63, D64, D69.
+  **→ D90 closes a second instance of this same fail-open class (uncatalogued unqualified columns +
+  uncatalogued lambda-body columns), surfaced by the D62 oracle.**
+
+- **D90 (locked, 2026-07-02, Session 14 — surfaced by the D62 oracle).** **An unqualified column that
+  `qualify_columns` leaves unattributed (`col.table == ''`) and that is neither a catalog column, a
+  provable SELECT-list output-alias reference, nor a bare column of a scratch-only SELECT, is a
+  genuinely-unresolvable reference and fails closed — closing the D70 fail-open where such columns
+  (including uncatalogued lambda-body columns) were silently dropped.** D70 fixed the *case-mismatch*
+  under-extraction; the D62 false-reject oracle surfaced a **second, distinct instance of the same
+  class**: `SELECT NonExistentCol FROM employee` (a bare column against a single valid table, where
+  the column is simply **absent from the catalog** — not a case variant) was returned as
+  `EXTRACTED_OK` with an **empty/understated USES set** rather than fail-closed, because sqlglot's
+  `qualify_columns` leaves an unknown bare column unqualified and the old step-8 "case (C)" swallowed
+  every such name as a presumed computed alias. An understated USES set is a fail-open: an empty set
+  is ⊆ every scope, so the **runtime D44 replay filter** keeps a trail entry that should drop under
+  mid-session scope narrowing (replaying out-of-scope values into context). The **MCP live path is
+  backstopped** — it builds its enforcement schema from ClickHouse **introspection** (`system.columns`),
+  so a real column is always present and scope-checked; the fail-open bites only the runtime replay
+  path, which re-parses with the **curated YAML catalog** that can drift behind the warehouse.
+  **Fix:** the unqualified-unknown case fails closed (`ProvenanceExtractionError`) **unless** the name
+  is provably (a) a **declared projection alias referenced outside the projection list** (GROUP BY /
+  ORDER BY / HAVING — distinguished structurally by clause location *and* an explicit alias
+  declaration, so an identity-alias-wrapped broken projection column still raises), or (b) a bare
+  column of a SELECT whose **every base source is in the `scratch` DB** (scratch is uncatalogued by
+  design, D69/OQ-4; any catalogued source in the mix → fail closed, so a warehouse column can't be
+  smuggled as scratch). The lambda coverage check likewise fails closed on any lambda-body column that
+  is neither a bound parameter nor already in the USES set. Applied **byte-identical to both extractor
+  copies** (D79a copy-in: `data-agent` + `clickhouse-api`). Adversarially verified (reviewer +
+  QA: no fail-open reachable across alias-shadowing, scratch/warehouse smuggling, and lambda
+  param/body smuggling; no legit-query false-reject). Cross-references: D57, D62, D63, D64, D69, D70,
+  D79a, D44.
