@@ -1,5 +1,7 @@
 # Table-Intermediate DAG Execution — the F2 Scratch-Write Side-Channel + Runtime Materialize-and-Join
 
+**Status:** Slice 1 BUILT (Session 14, **D93**) — the session-scoped scratch-write side-channel (`POST /scratch/v1/materialize` + `/drop`, structurally scratch-confined, D92-bound, native-insert). Slice 2 (runtime materialize-and-join + a real table-passing seed blueprint + the underscore-free session_id sanitizer + the coordinated D64 read-gate tightening) is BUILDING next per the user's decision; Slice 3 (D55 scratch-reconnect on pause/resume) stays deferred.
+
 **Status:** Proposed (design only; nothing built this pass). Cross-repo brick, three slices proposed.
 **Brick:** the deferred **F2** boundary of the `runBlueprint` brick — a node that outputs a *table*
 which a downstream node `JOIN`s. Blocked since D89 on the absence of a scratch-*write* surface.

@@ -1111,6 +1111,42 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   [D81](#clickhouse-mcp--adoption-decision), [D82](#clickhouse-mcp--adoption-decision), D90 (the
   byte-identical extractor), D68.
 
+- **D93 (locked, 2026-07-02, Session 14 — table-intermediate Slice 1).** **The scratch-*write*
+  surface: a privileged, non-tool, session-scoped write side-channel on the MCP, confined to the
+  `scratch` database *structurally* (not merely by grant).** This unblocks table-intermediate DAGs
+  (D59a — a node produces a table that a downstream node `JOIN`s), which need a scratch table on the
+  *same* ClickHouse instance as the warehouse (cross-server JOINs are impractical). Specifics:
+  **(a) Two non-`@mcp.tool` routes** (`POST /scratch/v1/materialize` `{columns:[{name,type}], rows}`
+  → `scratch.s_<sid>_bp_<uuid>`; `POST /scratch/v1/drop`) behind the same `JWTAuthMiddleware`, so the
+  **D92** session binding applies. They are absent from `list_tools` — the model/agent can never reach
+  them; only the runtime's privileged side-channel calls them (D19 "not an agent tool"). **(b)
+  Structural scratch-only confinement:** the target database is hardcoded from server config
+  (`scratch`) and the table name is derived **solely from the D92-bound `X-Session-Id`** (never the
+  request body), so no body field can steer a write toward the warehouse or another session — this
+  holds *even without* the grant. **(c) A scratch-only server-side ClickHouse credential**
+  (`SCRATCH_CH_*`, GRANTed on `scratch.*` only) is defense-in-depth on top of (b) — a *deploy
+  invariant* (prod must set it; it falls back to the warehouse creds in dev/L2, where (b) still
+  confines). **(d) Rows are DATA:** loaded via the native bulk `client.insert(data=...)` (reusing
+  `admin_ingest`'s hardened `validate_identifier`/`validate_ch_type`/`coerce`), never
+  string-interpolated SQL — a hostile cell round-trips verbatim, never reaching `command()`. **(e)
+  Exact-structure drop authorization:** the ownership check matches `^s_<sid>_bp_[0-9a-f]{32}$`
+  (not a loose `s_<sid>_` prefix), so a session can only drop a table its own `materialize` could have
+  created — closing a `_`-boundary ambiguity independent of any session-id minting discipline. **(f)
+  Row-TTL cleanup** (a hidden `_scratch_created_at` column carries the TTL; data GCs even if a shell
+  remains); oversized input fails closed (`SCRATCH_TOO_LARGE`) before any DDL. Adversarially reviewed
+  (APPROVE) + QA'd (no warehouse-write / cross-session / rows-as-SQL bypass found across 90+ tests).
+  **Contract for the Slice-2 runtime caller:** the bound `session_id` must be **identifier-safe AND
+  underscore-free** (a raw uuid4 is rejected fail-closed; the Slice-2 sanitizer must strip hyphens to
+  hex, *not* to underscores — underscores reintroduce the boundary ambiguity). **Deferred:** Slice 2
+  = the runtime materialize-and-join (write a table-node's rows to scratch, AST-rewrite the downstream
+  `FROM`/`JOIN` to the scratch table, same-instance JOIN with the warehouse) + a real table-passing
+  seed blueprint; Slice 3 = D55 scratch-reconnect across pause/resume. Also a **coordinated cross-repo
+  follow-up** (with Slice 2): tighten the D64 read-gate `_validate_scratch_name` to exact session-id
+  extraction once session_ids are underscore-free (updating the D64 tests in both repos same-commit).
+  See [table-intermediate-design.md](table-intermediate-design.md). Cross-references:
+  [D19](#external-data), [D20](#external-data), [D59a](#blueprints--execution), [D64](#security--infra),
+  [D80](#clickhouse-mcp--adoption-decision), [D92](#clickhouse-mcp--adoption-decision), D79a, D89.
+
 ## Delivery / sequencing
 - **D68 (locked, 2026-06-30).** **Three-phase delivery with a red-burndown conformance harness from day one.**
 
