@@ -9,10 +9,16 @@ Three pieces:
     exercise the composite's degrade-to-freq-only path (design §3.2).
   - `HttpEmbeddingClient` (Layer 2/3, real): a plain `httpx.AsyncClient` POST to
     the custom embedding API (D71 — NOT the OpenAI SDK), settings-driven
-    base-URL/key/model, wrapped in a manual `EMBEDDING` span (D24). Raises
-    `EmbeddingError` on non-2xx / timeout / malformed body. Its live Layer-2
-    test is deferred until the endpoint exists (OQ-1); the request/response
-    mapping is unit-tested against a mocked transport.
+    URL/key, wrapped in a manual `EMBEDDING` span (D24). Raises `EmbeddingError`
+    on non-2xx / timeout / malformed body. The wire contract (OQ-1, now RESOLVED
+    against the user-provided mocks at ~/Development/SQL/mocks) is:
+        request  : POST <url>  {"input_text": [<text>, ...]}
+        response : a BARE JSON array `[[float, ...], ...]` (one vector per input,
+                   768-dim all-mpnet-base-v2) — NOT an OpenAI-shaped envelope.
+    The mock needs no auth; `api_key` is kept as an optional bearer header for
+    the eventual production endpoint. The request/response mapping is unit-tested
+    against a mocked transport; a live Layer-2 test runs when EMBEDDING_TEST_URL
+    is set (`tests/integration/test_embedding_api.py`).
 
 D5/D25 (load-bearing): no embedding client ever sees `RuntimeCredentials`; the
 embedding API key is its OWN secret (from `RuntimeSettings`, `.env`-backed),
@@ -84,11 +90,16 @@ class FakeEmbeddingClient:
 class HttpEmbeddingClient:
     """Real `EmbeddingClient` — POSTs to the custom embedding API (D71, design §3.1).
 
-    Request body:  `{"model": <model>, "input": [<text>, ...]}`
-    Response body: `{"embeddings": [[...], ...]}` (primary) or the OpenAI-shaped
-                   `{"data": [{"embedding": [...]}, ...]}` (fallback) — the exact
-                   custom-API contract is TBD (OQ-1), so both common shapes are
-                   accepted; anything else is a malformed body -> `EmbeddingError`.
+    Wire contract (OQ-1, resolved against the SQL-repo mocks):
+        Request body:  `{"input_text": [<text>, ...]}`
+        Response body: a BARE JSON array `[[float, ...], ...]` — one vector per
+                       input, order-preserving. Anything else (a dict, a bare
+                       scalar list, a non-list body) is a malformed body ->
+                       `EmbeddingError`.
+
+    `model` is not a request parameter (the endpoint serves a single fixed model)
+    — it is retained solely as the EMBEDDING span's `embedding.model` attribute so
+    traces stay coherent about which embedder produced the vectors (D24).
     """
 
     def __init__(
@@ -116,23 +127,14 @@ class HttpEmbeddingClient:
 
     @staticmethod
     def _parse_vectors(body: Any) -> list[Any]:
-        """Pull the raw per-input vector list out of a response body.
+        """Return the raw per-input vector list from a bare-array response body.
 
-        Raises `EmbeddingError` on any structurally-malformed body — the
-        element CONTENTS are validated separately by `_validate_vectors`.
+        Raises `EmbeddingError` on a structurally-malformed body (not a list) —
+        the element CONTENTS are validated separately by `_validate_vectors`.
         """
-        if isinstance(body, dict):
-            if isinstance(body.get("embeddings"), list):
-                return list(body["embeddings"])
-            data = body.get("data")
-            if isinstance(data, list):
-                out: list[Any] = []
-                for item in data:
-                    if not isinstance(item, dict) or "embedding" not in item:
-                        raise EmbeddingError("Malformed embedding item in 'data'.")
-                    out.append(item["embedding"])
-                return out
-        raise EmbeddingError("Malformed embedding API response body.")
+        if not isinstance(body, list):
+            raise EmbeddingError("Malformed embedding API response body (expected a JSON array).")
+        return body
 
     @staticmethod
     def _validate_vectors(vectors: list[Any]) -> list[list[float]]:
@@ -164,7 +166,12 @@ class HttpEmbeddingClient:
     async def embed(self, texts: list[str]) -> list[list[float]]:
         import httpx
 
-        payload = {"model": self._model, "input": list(texts)}
+        # Empty input -> [] with NO network call (matches the mock, which returns
+        # [] for an empty batch; also keeps the count check below trivially true).
+        if not texts:
+            return []
+
+        payload = {"input_text": list(texts)}
         try:
             async with httpx.AsyncClient(
                 timeout=self._timeout_seconds, transport=self._transport

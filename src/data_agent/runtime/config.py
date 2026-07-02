@@ -126,12 +126,30 @@ class RuntimeSettings(BaseSettings):
 
     # --- Embedding client (D71 custom API — resolveValues ranking) ---
     embedding_api_url: str = Field(
-        "", description="Custom embedding API endpoint (D71). Empty => freq-only degrade."
+        "",
+        description=(
+            "Full custom embedding API endpoint URL (D71), e.g. "
+            "http://localhost:8003/embed. Empty => freq-only degrade."
+        ),
     )
-    embedding_api_key: str = Field("", description="Embedding API key (secret).")
-    embedding_model: str = Field("", description="Embedding model id (custom API).")
+    embedding_api_key: str = Field(
+        "", description="Optional embedding API bearer key (mock needs none; prod TBD)."
+    )
+    embedding_model: str = Field(
+        "", description="Embedding model id — EMBEDDING span attribute only (not a request param)."
+    )
     embedding_timeout_seconds: float = Field(
         10.0, gt=0, description="Per-request embedding timeout (seconds)."
+    )
+
+    # --- Reranker client (D71 custom API — retrieval pipeline building block) ---
+    # Not wired into app.py yet; consumed by the upcoming retrieval brick.
+    reranker_api_url: str = Field(
+        "", description="Custom reranker API endpoint (D71). Empty => unconfigured."
+    )
+    reranker_api_key: str = Field("", description="Reranker API key (secret).")
+    reranker_timeout_seconds: float = Field(
+        10.0, gt=0, description="Per-request reranker timeout (seconds)."
     )
 
     # --- resolveValues composite (D77) ---

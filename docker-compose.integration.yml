@@ -89,6 +89,44 @@ services:
       retries: 20
       start_period: 5s
 
+  # Custom embedding + reranker APIs (D71). The Dockerfiles + mock services live in the
+  # SQL repo (/Users/kalpeshmulye/Development/SQL) and are AUTHORITATIVE for the real API
+  # contract; we build them here to run the skip-guarded Layer-2 tests against real weights.
+  # NOTE: an absolute build context (the SQL repo) is intentional for this local-dev-only
+  # compose — the images are not published and the SQL repo is a sibling checkout, not vendored.
+  # Model weights (~440 MB embedding / ~85 MB reranker) are pre-downloaded at build time, so
+  # the first build is slow (several minutes) but the first request is fast.
+  embedding-api:
+    build:
+      context: /Users/kalpeshmulye/Development/SQL
+      dockerfile: docker/Dockerfile.embedding
+    container_name: l2-embedding
+    ports:
+      - "18003:8003"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/healthz')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # Extra time for the first model load (weights pre-downloaded at build; startup
+      # still deserializes ~440 MB into memory, ~10-30s).
+      start_period: 60s
+
+  reranker-api:
+    build:
+      context: /Users/kalpeshmulye/Development/SQL
+      dockerfile: docker/Dockerfile.reranker
+    container_name: l2-reranker
+    ports:
+      - "18004:8004"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/healthz')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # Extra time for the first model load (weights pre-downloaded at build).
+      start_period: 60s
+
   # Session store (D22/D44/D45). Cluster/bucket/collection init is done out-of-band
   # by scripts/couchbase-init.sh after the node reports healthy (Couchbase init is
   # not fully declarative in the base image).

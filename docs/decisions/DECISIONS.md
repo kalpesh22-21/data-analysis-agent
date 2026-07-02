@@ -351,6 +351,12 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   OpenAI auto-instrumentor covers only the agent LLM's Responses/Chat Completions SDK calls. The
   custom embedding/reranker endpoint + specific model ids are TBD (see [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md)
   §Retrieval). Consistent with D2 (one capable LLM per request) and D23/D24 (observability).
+  **Update (Session 9b, 2026-07-01):** the request/response **contracts are now fixed** by user-provided
+  mock services (`~/Development/SQL/mocks`): `POST /embed {"input_text":[…]}` → bare `[[float,…],…]`
+  (mock: all-mpnet-base-v2, 768-dim); `POST /rerank {"query","documents"}` → `{"scores":[…]}` (caller
+  re-sorts). `HttpEmbeddingClient`/`HttpRerankerClient` are aligned and Layer-2-validated live against
+  them; production endpoint/auth + final model ids remain open. See
+  [retrieval-pipeline-design.md](retrieval-pipeline-design.md) §0.
 
 ## External data
 - **D19.** External CSV/xlsx joins via a **session-scoped ClickHouse scratch schema** (not DuckDB).

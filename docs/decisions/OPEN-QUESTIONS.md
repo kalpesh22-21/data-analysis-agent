@@ -139,10 +139,17 @@ The clarify decision stays model-side by design (`resolveValues` resolves; `askU
 runtime hint/hard threshold remains a compatible later change if traffic shows the model over-accepts.
 
 ## Retrieval ([03](../03-context-and-retrieval.md))
-- Reranker model + threshold; recall `k` vs. final top-3. The reranker is a **custom API (not OpenAI)** (D71) called via a **simple HTTP `POST`** with a manual `RERANKER` span (D24); endpoint + model id TBD.
-- Shared embedding model choice — a **custom API (not OpenAI)** (D71); endpoint + specific model id TBD.
-  Called via a **simple HTTP `POST`** with a manual `EMBEDDING` span (D24); shared across question +
-  blueprint intent + knowledge.
+- Reranker model + threshold; recall `k` vs. final top-3. The reranker is a **custom API (not OpenAI)** (D71) called via a **simple HTTP `POST`** with a manual `RERANK` span (D24).
+  **Contract resolved (Session 9b):** the user-provided mock at `~/Development/SQL/mocks/reranker_api`
+  is authoritative — `POST /rerank {"query","documents"}` → `{"scores":[...]}` (same order, higher =
+  more relevant, caller re-sorts; mock model `cross-encoder/ms-marco-MiniLM-L-6-v2`). `HttpRerankerClient`
+  ships aligned + Layer-2-validated live. **Still open:** production endpoint/auth + threshold/cutoff values.
+- Shared embedding model choice — a **custom API (not OpenAI)** (D71), called via a **simple HTTP
+  `POST`** with a manual `EMBEDDING` span (D24); shared across question + blueprint intent + knowledge.
+  **Contract resolved (Session 9b):** the mock at `~/Development/SQL/mocks/embedding_api` is
+  authoritative — `POST /embed {"input_text":[...]}` → bare `[[float,...],...]` (768-dim,
+  `all-mpnet-base-v2`, no auth). `HttpEmbeddingClient` rewritten to it + Layer-2-validated live.
+  **Still open:** production endpoint/auth + final model id.
 - **`resolveValues` (D66, now runtime-side per D77):** ranking signals (semantic + synonyms +
   frequency) weighting; the deferred **per-(client,column) index** (currently live `DISTINCT` each
   call); temporal label-drift handling via the `period?` arg. These questions now live **agent-
@@ -153,9 +160,10 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
   `top_k=10`) pending real traffic. The `period?` arg is honored only as a **concrete structured**
   `{column, start, end}` filter; deictic/relative period-domain resolution (label-drift over time,
   D41/D65) is **still open**, deferred to the D67 era. The **per-(client,column) index** remains
-  deferred (live `DISTINCT` each call). **Still open:** the custom **embedding API contract** — the
-  `HttpEmbeddingClient` assumes a request/response shape pending the real endpoint (D71); until it
-  exists, an unconfigured API degrades to freq-only (D85). **D67 `resolve_via` wiring** is still open,
+  deferred (live `DISTINCT` each call). ~~**Still open:** the custom **embedding API contract**~~
+  **resolved Session 9b** — the user-provided mock (`~/Development/SQL/mocks/embedding_api`) is the
+  authoritative contract and `HttpEmbeddingClient` is aligned + live-validated; an unconfigured API
+  still degrades to freq-only (D85). **D67 `resolve_via` wiring** is still open,
   but the composite now exposes a typed `resolve()` entry point it can call (no model round-trip).
 - **Context-budget params (D46):** result preview row cap `N` + history token budget + when
   compaction triggers. (Mechanism resolved; values TBD.)

@@ -146,6 +146,22 @@ def embedding_span(tracer: Tracer, *, model: str, input_count: int) -> Any:
     )
 
 
+def rerank_span(tracer: Tracer, *, model: str, document_count: int) -> Any:
+    """The custom reranker-API call (retrieval pipeline, D24/D71).
+
+    Mirrors `embedding_span`: the auto-instrumentor covers only the agent LLM,
+    not this custom endpoint, so `HttpRerankerClient` wraps its POST here
+    manually. Document counts + model id + latency only — the reranker QUERY
+    and the DOCUMENT text are never logged (D25).
+    """
+    return span(
+        tracer,
+        "rerank",
+        OpenInferenceSpanKindValues.RERANKER,
+        {"reranker.model": model, "reranker.document_count": document_count},
+    )
+
+
 # B5: a strict attribute ALLOWLIST — never a bare type-filter — for the
 # `AgentLoop`'s own (non-tool) `loop_*` stage-boundary observer events.
 # `loop_paused_ask_user`'s payload carries a `question` key that can quote

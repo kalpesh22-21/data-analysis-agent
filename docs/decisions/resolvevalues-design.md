@@ -44,9 +44,11 @@ D5 tenant-RLS gate as any other query.
 - **Per-`(client, column)` caching / vector index** — D66 says "no tenant-knowledge cache for now;
   index later". Each call is a live `DISTINCT` + live embed.
 - **Tenant-knowledge scope** (global / tenant / user) — D66 explicitly defers it.
-- **Real custom-embedding-API integration test** — the endpoint + model id are TBD (D71/OPEN-QUESTIONS
-  §Retrieval). Layer-1 uses a fake; the real `HttpEmbeddingClient` is wired but its live Layer-2 test is
-  deferred until the endpoint exists (OQ-1).
+- ~~**Real custom-embedding-API integration test** — the endpoint + model id are TBD (D71).~~
+  **RESOLVED (OQ-1, Session 9+):** the contract is now known from the user-provided mocks
+  (`~/Development/SQL/mocks`) and `HttpEmbeddingClient` is aligned to it; a live Layer-2 test runs
+  against the dockerized mock. See the OQ-1 as-built note in §3.1. (Production endpoint host/auth is
+  still TBD, but no longer blocks the seam.)
 - **Full D41/D65 period-domain resolution** (deictic / relative / "latest settled period" fill). This
   brick accepts only an already-concrete *structured* `period` (§2.4) and defers period-domain
   resolution to the D67 era.
@@ -294,6 +296,26 @@ class EmbeddingClient(Protocol):
   `embedding_model` from `RuntimeSettings` (§ "New RuntimeSettings"; secrets gitignored via `.env`). Wraps
   the call in a **manual `EMBEDDING` span** (D24 — the OpenInference auto-instrumentor covers only the
   agent LLM, not this custom endpoint). Raises `EmbeddingError` on non-2xx / timeout / malformed body.
+
+> **OQ-1 as-built (contract RESOLVED, Session 9+).** The D71 embedding-API contract is now known from
+> the user-provided authoritative mocks (`~/Development/SQL/mocks/embedding_api`):
+> - **Request:** `POST <embedding_api_url>` with body `{"input_text": [<text>, ...]}` — `embedding_api_url`
+>   is now the **full endpoint URL** (e.g. `http://localhost:8003/embed`), not a base.
+> - **Response:** a **bare JSON array** `[[float, ...], ...]` (768-dim `all-mpnet-base-v2`), one vector
+>   per input, order-preserving — *not* an OpenAI-shaped `{"embeddings"|"data": ...}` envelope. The
+>   old dual-shape parser was dropped; a non-list body / scalar list / count-mismatch / non-finite
+>   element all raise `EmbeddingError`.
+> - **Auth:** the mock needs **none**; `embedding_api_key` is retained as an optional bearer header for
+>   the eventual production endpoint. `embedding_model` is no longer a request param — it survives only
+>   as the `EMBEDDING` span's `embedding.model` attribute.
+> - **Validated live:** `tests/integration/test_embedding_api.py` + `test_resolve_values_live_embedding.py`
+>   (skip-guarded on `EMBEDDING_TEST_URL`) run against the dockerized mock and confirm the semantic win
+>   (cosine("paid time off", "PTO - Paid Time Off")≈0.72 > cosine(…, "OT - Overtime")≈0.24; the composite
+>   ranks PTO above a 20×-more-frequent OT). Production endpoint host/auth remains TBD.
+>
+> A sibling **`HttpRerankerClient`** (`model/reranker_client.py`, same discipline, `RERANKER` span) was
+> built alongside for the upcoming retrieval brick — `POST {"query","documents"}` → `{"scores": [...]}`.
+> It is NOT wired into the agent loop yet.
 
 ### 3.2 Degradation policy: fall back to freq-only ranking, flagged (do NOT fail the call)
 

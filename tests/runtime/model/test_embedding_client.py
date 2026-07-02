@@ -44,15 +44,17 @@ def _mock_transport(handler) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
-async def test_http_client_embeddings_shape() -> None:
+async def test_http_client_bare_array_shape() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        # Real contract: request body is {"input_text": [...]} (no model param),
+        # response is a BARE JSON array of vectors.
         body = json.loads(request.content)
-        assert body == {"model": "test-model", "input": ["hi", "there"]}
+        assert body == {"input_text": ["hi", "there"]}
         assert request.headers["Authorization"] == "Bearer secret-key"
-        return httpx.Response(200, json={"embeddings": [[0.1, 0.2], [0.3, 0.4]]})
+        return httpx.Response(200, json=[[0.1, 0.2], [0.3, 0.4]])
 
     client = HttpEmbeddingClient(
-        url="https://embeddings.example/v1/embed",
+        url="https://embeddings.example/embed",
         api_key="secret-key",
         model="test-model",
         transport=_mock_transport(handler),
@@ -61,16 +63,16 @@ async def test_http_client_embeddings_shape() -> None:
     assert vectors == [[0.1, 0.2], [0.3, 0.4]]
 
 
-async def test_http_client_openai_data_shape_fallback() -> None:
+async def test_http_client_dict_body_raises_embedding_error() -> None:
+    # An OpenAI-shaped envelope (or any dict) is NOT the contract -> malformed.
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200, json={"data": [{"embedding": [1.0, 2.0]}, {"embedding": [3.0, 4.0]}]}
-        )
+        return httpx.Response(200, json={"embeddings": [[1.0, 2.0]]})
 
     client = HttpEmbeddingClient(
         url="https://e", api_key="", model="m", transport=_mock_transport(handler)
     )
-    assert await client.embed(["a", "b"]) == [[1.0, 2.0], [3.0, 4.0]]
+    with pytest.raises(EmbeddingError):
+        await client.embed(["a"])
 
 
 async def test_http_client_non_2xx_raises_embedding_error() -> None:
@@ -84,9 +86,9 @@ async def test_http_client_non_2xx_raises_embedding_error() -> None:
         await client.embed(["x"])
 
 
-async def test_http_client_malformed_body_raises_embedding_error() -> None:
+async def test_http_client_non_list_body_raises_embedding_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"unexpected": "shape"})
+        return httpx.Response(200, json="not a list")
 
     client = HttpEmbeddingClient(
         url="https://e", api_key="k", model="m", transport=_mock_transport(handler)
@@ -97,7 +99,7 @@ async def test_http_client_malformed_body_raises_embedding_error() -> None:
 
 async def test_http_client_count_mismatch_raises() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"embeddings": [[0.1]]})  # 1 vec for 2 inputs
+        return httpx.Response(200, json=[[0.1]])  # 1 vec for 2 inputs
 
     client = HttpEmbeddingClient(
         url="https://e", api_key="k", model="m", transport=_mock_transport(handler)
@@ -110,7 +112,7 @@ async def test_http_client_nan_element_raises_embedding_error() -> None:
     # json.loads happily parses NaN; a NaN score must never reach ranking/the
     # model — the client validates finiteness and raises EmbeddingError (H2).
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b'{"embeddings": [[NaN, 0.1]]}')
+        return httpx.Response(200, content=b"[[NaN, 0.1]]")
 
     client = HttpEmbeddingClient(
         url="https://e", api_key="k", model="m", transport=_mock_transport(handler)
@@ -121,7 +123,31 @@ async def test_http_client_nan_element_raises_embedding_error() -> None:
 
 async def test_http_client_string_element_raises_embedding_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"embeddings": [["not", "numbers"]]})
+        return httpx.Response(200, json=[["not", "numbers"]])
+
+    client = HttpEmbeddingClient(
+        url="https://e", api_key="k", model="m", transport=_mock_transport(handler)
+    )
+    with pytest.raises(EmbeddingError):
+        await client.embed(["a"])
+
+
+async def test_http_client_scalar_list_body_raises_embedding_error() -> None:
+    # A bare list of scalars ([1, 2]) is not a batch of vectors -> malformed.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2])
+
+    client = HttpEmbeddingClient(
+        url="https://e", api_key="k", model="m", transport=_mock_transport(handler)
+    )
+    with pytest.raises(EmbeddingError):
+        await client.embed(["a", "b"])
+
+
+async def test_http_client_mixed_element_row_raises_embedding_error() -> None:
+    # [[1, "x"]] — a vector with a non-numeric element -> malformed.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[[1, "x"]])
 
     client = HttpEmbeddingClient(
         url="https://e", api_key="k", model="m", transport=_mock_transport(handler)

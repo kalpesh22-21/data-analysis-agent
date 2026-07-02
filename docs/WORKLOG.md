@@ -46,11 +46,27 @@ invariant→test status board.
   ranking `0.7·cosine+0.3·log-freq` top-10/LIMIT-200, embedding-failure **degrade-not-fail** (new **D85**).
   **512 pass / 18 skipped, ruff clean.** Adversarially QA'd (~128 tests) + reviewed (REQUEST CHANGES →
   fixed → APPROVE). See [decisions/resolvevalues-design.md](decisions/resolvevalues-design.md).
+- ✅ **D71 embedding + reranker contracts are now REAL and Layer-2-validated LIVE** (Session 9b). The
+  user-provided mocks at `~/Development/SQL/mocks` are the authoritative contracts: `POST /embed
+  {"input_text":[…]}` → bare `[[float,…],…]` (768-dim); `POST /rerank {"query","documents"}` →
+  `{"scores":[…]}`. `HttpEmbeddingClient` rewritten to match (hardening retained); new **unwired**
+  `HttpRerankerClient` building block; both mocks added to `docker-compose.integration.yml`
+  (`embedding-api` :18003, `reranker-api` :18004). **7/7 live Layer-2 tests green**, incl. the capstone:
+  `resolveValues` with the real embedder ranks PTO (freq 5) over OT (freq 100) for "paid time off",
+  `degraded=False`. **536 pass / 25 skipped, ruff clean.** Reviewed: APPROVE, 0 blockers.
+- ✅ **Retrieval-pipeline design DONE (not built)** —
+  [decisions/retrieval-pipeline-design.md](decisions/retrieval-pipeline-design.md): D7/D8 shape (embed
+  question → neo4j recall k=30/corpus → scope pre-filter → rerank → top-3 cards pre-injected + search
+  tools), neo4j-native vectors (D60), offline corpus embedding with model-parity constraint, three
+  degrade-not-fail paths, and a `VectorIndex` seam so the core ships **before** neo4j.
 
-**Next brick:** **Phase 1 (continued)** (per D68) — the retrieval pipeline (embed→recall→rerank on the
-custom non-OpenAI API, D71), blueprints (`searchBlueprints`/`getBlueprint`/`runBlueprint` + neo4j), the
-**D56 verify gate**, the knowledge plane (`searchKnowledge`), the **D67 `resolve_via` rule wiring** (the
-typed `resolveValues.resolve()` hook now exists), and the offline **Track B** learning loop. The
+**Next brick:** **Retrieval pipeline Slice 1** (per retrieval-pipeline-design.md §build order): the
+`runtime/retrieval/` core with `FakeVectorIndex` + the REAL embed/rerank clients — Layer-1 with fakes,
+Layer-2 vs the live mocks (18003/18004) — de-risking the whole embed→rerank→inject path with zero
+graph-store risk. Then: neo4j schema (shared prereq of blueprint reads + Track B) → blueprint read tools
+(`searchBlueprints`/`getBlueprint`/`searchKnowledge`) → `runBlueprint` + the **D56 verify gate** + the
+**D67 `resolve_via` wiring** (the typed `resolveValues.resolve()` hook exists), with the offline
+**Track B** learning loop parallel once the graph schema is fixed. The
 runtime's Phase-1 `getTableSchema` is just a passthrough of the now-MCP-side overlay (D83/D84). ~~D77
 `resolveValues`~~ **done (Session 9).** **Phase 0 is substantially complete and
 validated end-to-end** (live turn works); the honest remaining Phase-0 gap is the **3 deferred Layer-3
@@ -61,9 +77,9 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 
 **Open follow-ups carried forward:**
 - **NOTHING IS PUSHED (user deferred the push).** data-analysis-agent branch
-  `phase0/provenance-extractor` has 5 commits (`6820677`→`7a901ed`→`206a29b`→`fbc224e`→`90ad553`) —
-  **this repo has NO git remote configured yet** (add an `origin` before push/PR). **The Session-9 D77
-  `resolveValues` work + these doc updates are still UNCOMMITTED at time of writing** (committed right
+  `phase0/provenance-extractor` has 6 commits (`6820677`→…→`90ad553`→`192bf13` D77/D85) —
+  **this repo has NO git remote configured yet** (add an `origin` before push/PR). **The Session-9b
+  client-alignment work + these doc updates are UNCOMMITTED at time of writing** (committed right
   after this doc pass). clickhouse-api
   `feat/scope-enforcement` (origin `kalpesh22-21/click-house-openapi`) has `b55b4de` (D83/D84) +
   `143f0c1` "Stale changes" (unrelated branch WIP — settings/oauth/helm/diagnose_token, not ours)
@@ -82,11 +98,18 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 - Phase-0 runtime provisional tunables (`RuntimeSettings`): budget caps (15 iter / 60s / 3 windows),
   `SESSION_TTL`=7d, N=20 preview rows, history budget 20% — all set to defaults pending real traffic.
   **Session 9 adds:** `resolve_values_similarity_weight`=0.7 / `query_limit`=200 / `top_k`=10 (provisional).
-- **`resolveValues` follow-ups (D77/D85):** the **custom embedding API contract is still an OQ** — the
-  `HttpEmbeddingClient` assumes a request/response shape pending the real endpoint/model id (D71);
-  unconfigured → freq-only degrade (D85). **D67 `resolve_via` rule wiring** is still open (the typed
-  `resolveValues.resolve()` hook exists for it). Deferred by design: per-(client,column) index, deictic/
-  relative period-domain resolution (D41/D65), and a Layer-2 run over the real MCP + live embedding API.
+- **`resolveValues` follow-ups (D77/D85):** ~~the custom embedding API contract is still an OQ~~
+  **resolved Session 9b** — the `~/Development/SQL/mocks` contracts are authoritative; production
+  endpoint/auth still TBD (unconfigured → freq-only degrade, D85, unchanged). Live embed env for the
+  runtime: `EMBEDDING_API_URL=http://localhost:18003/embed`. Layer-2 test env:
+  `EMBEDDING_TEST_URL=http://localhost:18003/embed RERANKER_TEST_URL=http://localhost:18004/rerank
+  uv run pytest tests/integration/test_{embedding_api,reranker_api,resolve_values_live_embedding}.py`
+  (services: `docker compose -f docker-compose.integration.yml up -d --wait embedding-api reranker-api`).
+  **D67 `resolve_via` rule wiring** is still open (the typed `resolveValues.resolve()` hook exists for
+  it). Deferred by design: per-(client,column) index, deictic/relative period-domain resolution
+  (D41/D65), and a resolveValues Layer-2 run over the real MCP. Optional reviewer nit carried: the
+  embedding client's bool/Infinity-element rejection branches lack the direct unit cases the reranker
+  suite has (behaviour identical, symmetry only).
 - Production IdP (Entra) must stamp the `column_scope` claim; wire per-user entitlements to replace the
   **D82 interim all-access** default (OPEN-QUESTIONS §Security/infra).
 - **REVERSED by D83/D84** (was: "Replace the interim `system.columns` catalog in `clickhouse-api` with
@@ -102,6 +125,32 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 - 6 coverage gaps accepted into backlog (see TRACEABILITY.md §Coverage gaps) — Phase-2 test additions.
 
 ---
+
+## 2026-07-01 — Session 9b: D71 clients aligned to REAL contracts (user mocks) + retrieval-pipeline design
+
+Same-day continuation of Session 9. The user unblocked the D71 embedding question by providing
+authoritative mock APIs at `~/Development/SQL/mocks` ("use the mock … even for reranking"), resolving
+the resolvevalues-design OQ-1. **Uncommitted at time of writing** — committed immediately after this
+doc pass. One backend-developer run was interrupted twice by transient provider 529s; the work was
+already complete on disk and the orchestrator ran the verification gates directly.
+
+### Shipped
+| Area | Path | Agent |
+|---|---|---|
+| `HttpEmbeddingClient` rewritten to the real contract (`POST /embed {"input_text":[…]}` → bare `[[float,…],…]`); ALL hardening retained (parse+validate inside `try` → `EmbeddingError`, finite/numeric/no-bool/count checks, type-name-only error text) | `src/data_agent/runtime/model/embedding_client.py` | `backend-developer` |
+| **New `HttpRerankerClient`** (protocol + `FakeRerankerClient` + HTTP; `POST /rerank {"query","documents"}` → `{"scores":[…]}`; mirror discipline; `RERANK` span = model+count only, D25) — deliberately **UNWIRED**, a building block for the retrieval brick | `src/data_agent/runtime/model/reranker_client.py`, `observability/tracing.py` | `backend-developer` |
+| Settings: `embedding_api_url` = full endpoint; new `reranker_api_url/key/timeout_seconds` | `src/data_agent/runtime/config.py` | `backend-developer` |
+| Mock services in the Layer-2 stack: `embedding-api` (host **18003**) + `reranker-api` (host **18004**), built from the SQL repo (absolute build context, commented as local-dev-intentional) | `docker-compose.integration.yml` | `backend-developer` |
+| Env-guarded Layer-2 suites: live embed shape/768-dim/finite + semantic sanity; live rerank order + semantic sanity; **capstone**: `ResolveValuesComposite` + REAL embedder ranks PTO (freq 5) over OT (freq 100) for "paid time off", `degraded=False`, `ranking="semantic+freq"` — **7/7 green live** | `tests/integration/test_{embedding_api,reranker_api,resolve_values_live_embedding}.py` | `backend-developer` (gates re-run by orchestrator) |
+| Unit suites rewritten to the bare-array contract — every old malformed-shape invariant kept + 3 new cases; reranker suite adds bool/inf rejection | `tests/runtime/model/test_embedding_client*.py`, `test_reranker_client.py` | `backend-developer` |
+| Review: **APPROVE, 0 blockers / 0 suggestions / 2 optional nits** (bool-inf test symmetry; format drift) | — | `reviewer` |
+| **Retrieval-pipeline design (Proposed, NOT built)**: D7/D8 pipeline over the new clients; neo4j-native vectors (D60); `VectorIndex` seam (core ships pre-neo4j); 3 degrade-not-fail paths; Phase-1 dependency-ordered build plan (Slice 1 = retrieval core, no neo4j) | `docs/decisions/retrieval-pipeline-design.md` | `planner` |
+| OQ resolutions (embedding/reranker contract fixed; production endpoint/auth still open) | `docs/decisions/{OPEN-QUESTIONS,resolvevalues-design}.md` | `backend-developer` + orchestrator |
+
+### Verification status
+- `uv run pytest` → **536 passed, 25 skipped** (7 new guarded Layer-2 skips without env), ruff clean.
+- Live vs healthy containers → **7/7 passed** (embedding + reranker + semantic-beats-frequency composite).
+- `resolveValues` semantic ranking is now proven with real embeddings, not just fakes.
 
 ## 2026-07-01 — Session 9: D77 `resolveValues` — first Phase-1 brick (runtime composite over `runQuery`)
 
