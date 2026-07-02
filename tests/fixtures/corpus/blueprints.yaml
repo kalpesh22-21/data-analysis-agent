@@ -149,3 +149,49 @@
         FROM dbpcm_warehouse.employee
         GROUP BY Department
         HAVING AVG(AnnualSalary) > {company_avg}
+
+# Table-intermediate DAG (table-intermediate-design §2.2/§Q2, Slice 2). Genuinely
+# NOT scalar-converging: node 0 produces a per-EMPLOYEE earnings TABLE (many rows,
+# one per employee), which node 1 ROW-JOINs against the warehouse `employee` table
+# to aggregate by department. A scalar pass cannot carry a per-employee table, so
+# this exercises the D93 materialize-and-join path — node 0's result is
+# materialized to `scratch.s_<sid>_bp_<uuid>` and node 1's `scratch.emp_earnings`
+# FROM token is AST-rewritten to it (runtime-controlled identifier, never model
+# text). The join key is CAST to a stable type (`toString(EmployeeCode)` — matches
+# the String warehouse key) and the measure to `toFloat64` (§Q2/OQ-A). The scratch
+# columns are session-gated (excluded from `uses`, D69/OQ-4); the warehouse columns
+# stay ⊆ uses. The terminal grain (Department) is D56-verified.
+- id: bp-earnings-by-department-via-scratch-join
+  intent: Total earnings by department, materializing per-employee earnings and joining departments
+  slots_summary: department
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.payroll.EmployeeCode
+    - dbpcm_warehouse.payroll.RegisterType
+    - dbpcm_warehouse.payroll.Amount
+    - dbpcm_warehouse.employee.EmployeeCode
+    - dbpcm_warehouse.employee.Department
+  slots:
+    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.Department }
+  result_grain: [ Department ]
+  composes:
+    - order: 0
+      output: { emp_earnings: table }
+      sql_template: |
+        SELECT toString(p.EmployeeCode) AS EmployeeCode,
+               toFloat64(SUM(p.Amount)) AS earnings
+        FROM dbpcm_warehouse.payroll AS p
+        WHERE p.RegisterType = 'EARN'
+        GROUP BY p.EmployeeCode
+    - order: 1
+      feeds_from: [ 0 ]
+      consumes: { emp_earnings: "$0" }
+      output: {}
+      sql_template: |
+        SELECT e.Department AS department, SUM(x.earnings) AS total_earnings
+        FROM scratch.emp_earnings AS x
+        JOIN dbpcm_warehouse.employee AS e ON e.EmployeeCode = x.EmployeeCode
+        WHERE e.Department = {department}
+        GROUP BY e.Department

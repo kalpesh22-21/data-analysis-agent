@@ -72,7 +72,7 @@ CATALOG_SCHEMA: dict[str, dict[str, str]] = {
 
 _E = "dbpcm_warehouse.employee"
 _P = "dbpcm_warehouse.payroll"
-_SID = "sess_abc123"
+_SID = "sessabc123"
 
 
 # ===========================================================================
@@ -259,7 +259,7 @@ def test_qa_scratch_only_bare_column_extracts() -> None:
     Scratch tables are uncatalogued by design (D69/OQ-4); their columns are not scope-checked,
     so the USES set stays empty rather than failing closed.
     """
-    sql = "SELECT hire_override, salary_adj FROM scratch.s_sess_abc123_comp"
+    sql = "SELECT hire_override, salary_adj FROM scratch.s_sessabc123_comp"
     result = extract_column_provenance(sql, CATALOG_SCHEMA, session_id=_SID)
     assert result == frozenset()
 
@@ -267,13 +267,13 @@ def test_qa_scratch_only_bare_column_extracts() -> None:
 def test_qa_two_scratch_join_bare_columns_extract() -> None:
     """A JOIN of TWO scratch tables with bare columns extracts the scratch USES (no raise)."""
     sql = (
-        "SELECT k FROM scratch.s_sess_abc123_a AS a "
-        "JOIN scratch.s_sess_abc123_b AS b ON a.j = b.j"
+        "SELECT k FROM scratch.s_sessabc123_a AS a "
+        "JOIN scratch.s_sessabc123_b AS b ON a.j = b.j"
     )
     result = extract_column_provenance(sql, CATALOG_SCHEMA, session_id=_SID)
     assert result == frozenset([
-        ("scratch.s_sess_abc123_a", "j"),
-        ("scratch.s_sess_abc123_b", "j"),
+        ("scratch.s_sessabc123_a", "j"),
+        ("scratch.s_sessabc123_b", "j"),
     ])
 
 
@@ -287,7 +287,7 @@ def test_qa_scratch_join_warehouse_bare_unresolved_failclosed() -> None:
     scratch" guard.
     """
     sql = (
-        "SELECT smuggled FROM scratch.s_sess_abc123_t AS s "
+        "SELECT smuggled FROM scratch.s_sessabc123_t AS s "
         "JOIN employee AS e ON s.k = e.EmployeeCode"
     )
     with pytest.raises(ProvenanceExtractionError):
@@ -302,7 +302,7 @@ def test_qa_scratch_join_warehouse_bare_name_is_catalog_column_failclosed() -> N
     must not smuggle it in — a warehouse table is in direct scope, so fail closed.
     """
     sql = (
-        "SELECT Amount FROM scratch.s_sess_abc123_t AS s "
+        "SELECT Amount FROM scratch.s_sessabc123_t AS s "
         "JOIN employee e ON s.k = e.EmployeeCode"
     )
     with pytest.raises(ProvenanceExtractionError):
@@ -318,7 +318,7 @@ def test_qa_scratch_subquery_feeding_warehouse_outer_extracts() -> None:
     """
     sql = (
         "SELECT e.Department FROM employee e "
-        "WHERE e.EmployeeCode IN (SELECT k FROM scratch.s_sess_abc123_t)"
+        "WHERE e.EmployeeCode IN (SELECT k FROM scratch.s_sessabc123_t)"
     )
     result = extract_column_provenance(sql, CATALOG_SCHEMA, session_id=_SID)
     assert result == frozenset([

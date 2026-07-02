@@ -147,13 +147,67 @@ def _to_literal(name: str, value: Any) -> exp.Expression:
     )
 
 
-def bind_template(sql_template: str, bindings: dict[str, Any]) -> str:
+# The reserved database a table-consume placeholder lives under in a consumer
+# template (`FROM scratch.<placeholder> …`). The loader treats `scratch.*` sources
+# as session-gated (D69/OQ-4 — not required in `uses`); the executor rewrites the
+# placeholder table to the runtime-controlled materialized scratch table.
+_SCRATCH_DB = "scratch"
+
+
+def _rewrite_scratch_tables(
+    tree: exp.Expression, table_bindings: dict[str, str]
+) -> exp.Expression:
+    """Rewrite every `scratch.<placeholder>` table token to its materialized name.
+
+    *table_bindings* maps a placeholder table name (as it appears in the consumer's
+    FROM/JOIN, e.g. `earn_by_emp`) to the BARE runtime-controlled scratch table the
+    producing node materialized to (e.g. `s_<sid>_bp_<uuid>`). The replacement is
+    purely STRUCTURAL — a new `exp.Identifier` the runtime built, never model text
+    and never a result cell — so no injection surface is opened (D10/§2.2 step 3).
+    The `scratch` database and any table alias are preserved, so the consumer's
+    aliased column references (`e.earnings`) stay valid.
+
+    Fail-closed: a `scratch.<placeholder>` reference in the template with NO
+    matching binding (an intermediate that was never materialized) raises — the
+    executor never emits a query pointing at a non-existent scratch table.
+    """
+    def _replace(node: exp.Expression) -> exp.Expression:
+        if isinstance(node, exp.Table):
+            db_node = node.args.get("db")
+            db = db_node.name if db_node is not None else ""
+            if db == _SCRATCH_DB:
+                placeholder = node.name
+                if placeholder not in table_bindings:
+                    raise TemplateBindError(
+                        f"scratch table placeholder {placeholder!r} has no materialized "
+                        "binding — the upstream table intermediate was not produced"
+                    )
+                new_table = node.copy()
+                new_table.set("this", exp.to_identifier(table_bindings[placeholder]))
+                return new_table
+        return node
+
+    return tree.transform(_replace)
+
+
+def bind_template(
+    sql_template: str,
+    bindings: dict[str, Any],
+    *,
+    table_bindings: dict[str, str] | None = None,
+) -> str:
     """Return *sql_template* with every `{slot}` replaced by a typed AST literal.
 
     Fail-closed: raises `TemplateBindError` on a parse failure, an unbound slot
     (`{slot}` present, no binding), an EXTRA binding (a key the template never
     references), or an unbindable value. The slot value NEVER touches SQL as a
     string — it is a typed literal in the regenerated AST (D10/F1).
+
+    *table_bindings* (table-intermediate Slice 2): maps a `scratch.<placeholder>`
+    table token to the BARE materialized scratch table name, applied as an AST
+    identifier rewrite BEFORE the literal binding (§2.2 step 3). Table placeholders
+    are NOT `{slot}` tokens, so they are invisible to the missing/extra slot
+    checks — the two mechanisms compose cleanly.
     """
     referenced = referenced_slots(sql_template)
     provided = set(bindings)
@@ -175,6 +229,11 @@ def bind_template(sql_template: str, bindings: dict[str, Any]) -> str:
     # Rewrite `{name}` → `:name` so sqlglot parses each bind site as a
     # placeholder node (`{name}` alone parses as a ClickHouse map literal — unusable).
     tree = parse_template(sql_template)
+
+    # Rewrite table-consume placeholders (scratch.<placeholder> → the materialized
+    # scratch table) FIRST — a structural identifier swap, injection-safe.
+    if table_bindings:
+        tree = _rewrite_scratch_tables(tree, table_bindings)
 
     def _replace(node: exp.Expression) -> exp.Expression:
         if isinstance(node, exp.Placeholder):

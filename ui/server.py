@@ -131,8 +131,19 @@ async def create_session(request: Request) -> dict[str, str]:
     entitled allowlist. This replaces D82's hardcoded all-access mint: allow-all
     is now the *default entitlement*, not a blanket, so a real per-user scope is
     honored end-to-end (the MCP enforces it, D57/D80). The token is still bound to
-    `session_id` (Slice 1 sid_hash) and never leaves the BFF (D82/D5)."""
-    session_id = str(uuid.uuid4())
+    `session_id` (Slice 1 sid_hash) and never leaves the BFF (D82/D5).
+
+    SID FORMAT (table-intermediate Slice 2): the session_id is minted
+    UNDERSCORE-FREE and identifier-safe — ``s`` + a hyphen-stripped uuid4 hex
+    (``s<32hex>``, matching ``^[A-Za-z_][A-Za-z0-9_]*$`` with NO ``_``). This is
+    load-bearing for the D93 scratch namespace: scratch tables are named
+    ``s_<session_id>_bp_<hex>`` and the D64 read gate extracts the owning session
+    as the run after ``s_`` up to the next ``_``. A raw uuid4 (hyphens) is not a
+    safe SQL identifier and would be rejected at materialize; an underscore in the
+    sid would reintroduce the ``_``-boundary ambiguity the read gate now forbids.
+    Stripping the hyphens to hex (NOT converting them to ``_``) keeps the sid
+    underscore-free."""
+    session_id = "s" + uuid.uuid4().hex
     identity = resolve_caller_identity(request)
     column_scope = resolve_column_scope(identity)
     _SESSIONS[session_id] = await _mint_jwt(identity, column_scope, session_id)

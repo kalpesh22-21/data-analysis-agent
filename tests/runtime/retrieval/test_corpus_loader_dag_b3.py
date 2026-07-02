@@ -113,6 +113,7 @@ def test_all_seed_fixtures_still_validate_under_b3_s1_s3() -> None:
         "bp-average-salary-by-department",
         "bp-total-earnings-by-department",
         "bp-departments-above-company-average-salary",
+        "bp-earnings-by-department-via-scratch-join",
     }
     for bp in blueprints:
         _validate_blueprint_dag(bp)  # no raise — every required slot is referenced,

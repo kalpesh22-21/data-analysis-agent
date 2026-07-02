@@ -36,6 +36,39 @@ class RuntimeSettings(BaseSettings):
         description="Streamable-HTTP endpoint of the adopted clickhouse-api MCP.",
     )
 
+    # --- Scratch-write side-channel (table-intermediate Slice 2, D93/D90) ---
+    # The privileged NON-TOOL materialize/drop routes ride the SAME MCP host as a
+    # plain REST POST (not an MCP JSON-RPC tool). When empty, the base is derived
+    # from `mcp_url` (host root + `/scratch/v1`), so a Layer-2 deploy that sets
+    # only `MCP_URL` wires the scratch surface automatically. Set explicitly to
+    # point the runtime at a different scratch host.
+    scratch_api_url: str = Field(
+        "",
+        description="Base URL of the MCP scratch side-channel (…/scratch/v1). Empty → derived from mcp_url.",
+    )
+    scratch_enabled: bool = Field(
+        True,
+        description=(
+            "Wire the runtime ScratchClient so table-intermediate blueprints run the "
+            "materialize-and-join fast path. False → table intermediates stay UNSUPPORTED "
+            "(clean raw-loop degrade)."
+        ),
+    )
+    scratch_max_rows: int = Field(
+        10_000,
+        ge=1,
+        description=(
+            "Runtime row cap for a materializable table intermediate (OQ-C). An "
+            "intermediate over this cap fails closed to the raw loop rather than "
+            "POSTing a runaway body (the MCP re-enforces its own SCRATCH_MAX_ROWS)."
+        ),
+    )
+    scratch_max_columns: int = Field(
+        256,
+        ge=1,
+        description="Runtime column cap for a materializable table intermediate (fail-closed over-cap).",
+    )
+
     # --- OpenAI model provider (fields only — unused until Pass B, D71) ---
     openai_api_key: str = Field("", description="OpenAI API key (secret). Unused in Pass A.")
     openai_model: str = Field(
@@ -264,6 +297,21 @@ class RuntimeSettings(BaseSettings):
     def history_token_budget(self) -> int:
         """Absolute history token budget derived from the model's context window (OQ-G)."""
         return int(self.model_context_window * self.history_token_budget_ratio)
+
+    def scratch_api_base(self) -> str:
+        """Resolve the scratch side-channel base URL (…/scratch/v1), no trailing slash.
+
+        Uses `scratch_api_url` when set; otherwise derives it from `mcp_url` by
+        replacing the MCP mount path with `/scratch/v1` (the routes live on the
+        same MCP host, contract §Q6). E.g. `http://host:18090/mcp` →
+        `http://host:18090/scratch/v1`.
+        """
+        if self.scratch_api_url:
+            return self.scratch_api_url.rstrip("/")
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(self.mcp_url)
+        return urlunsplit((parts.scheme, parts.netloc, "/scratch/v1", "", "")).rstrip("/")
 
 
 @lru_cache(maxsize=1)

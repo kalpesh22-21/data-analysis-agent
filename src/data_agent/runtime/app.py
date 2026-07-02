@@ -51,6 +51,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolObse
 from data_agent.runtime.loop.agent_loop import AgentLoop, RuntimeTool, TurnOutcome
 from data_agent.runtime.mcp.client import MCPClient
 from data_agent.runtime.mcp.real_client import RealMCPClient
+from data_agent.runtime.mcp.scratch_client import ScratchClient
 from data_agent.runtime.mcp.tool_schema import ToolSchemaCache
 from data_agent.runtime.model.client import ModelClient
 from data_agent.runtime.model.embedding_client import EmbeddingClient, HttpEmbeddingClient
@@ -183,6 +184,10 @@ def create_app(
     embedding_client: EmbeddingClient | None = None,
     resolve_values: ResolveValuesComposite | None = None,
     retrieval: RetrievalPipeline | None = None,
+    # The D93 scratch-write side-channel client (table-intermediate Slice 2). When
+    # None AND `scratch_enabled`, a real `ScratchClient` is built from settings
+    # (same MCP host). Pass a `FakeScratchClient` in a smoke test.
+    scratch_client: Any = None,
     # Test-only seam (D-L3-5). Kept `Any` rather than `SpanExporter | None`
     # because the `/_test/spans` route below duck-types `get_finished_spans()`,
     # which lives on `InMemorySpanExporter`, not the `SpanExporter` base — typing
@@ -203,6 +208,10 @@ def create_app(
     settings = settings or get_runtime_settings()
     catalog = catalog or load_catalog_handle()
     mcp_client = mcp_client or RealMCPClient(settings.mcp_url)
+    # The scratch side-channel client is a singleton shared by every per-request
+    # BlueprintExecutor (it holds no per-request state — creds ride each call).
+    if scratch_client is None and settings.scratch_enabled:
+        scratch_client = ScratchClient(settings.scratch_api_base())
     session_store = session_store or CouchbaseSessionStore(settings)
     model_client = model_client or build_openai_model_client(
         api_key=settings.openai_api_key,
@@ -400,6 +409,12 @@ def create_app(
                 resolve_via_gap_threshold=settings.resolve_via_gap_threshold,
                 resolve_via_min_confidence=settings.resolve_via_min_confidence,
                 preview_row_count=settings.preview_row_count,
+                # Table-intermediate Slice 2: the materialize-and-join fast path.
+                # `None` (scratch disabled/unwired) → table intermediates stay
+                # UNSUPPORTED → raw loop (clean degrade).
+                scratch_client=scratch_client,
+                scratch_max_rows=settings.scratch_max_rows,
+                scratch_max_columns=settings.scratch_max_columns,
                 observer=observer,
             )
             runtime_tools["runBlueprint"] = RunBlueprintTool(

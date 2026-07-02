@@ -1138,11 +1138,17 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   **Contract for the Slice-2 runtime caller:** the bound `session_id` must be **identifier-safe AND
   underscore-free** (a raw uuid4 is rejected fail-closed; the Slice-2 sanitizer must strip hyphens to
   hex, *not* to underscores — underscores reintroduce the boundary ambiguity). **Deferred:** Slice 2
-  = the runtime materialize-and-join (write a table-node's rows to scratch, AST-rewrite the downstream
-  `FROM`/`JOIN` to the scratch table, same-instance JOIN with the warehouse) + a real table-passing
-  seed blueprint; Slice 3 = D55 scratch-reconnect across pause/resume. Also a **coordinated cross-repo
-  follow-up** (with Slice 2): tighten the D64 read-gate `_validate_scratch_name` to exact session-id
-  extraction once session_ids are underscore-free (updating the D64 tests in both repos same-commit).
+  = the runtime materialize-and-join (**BUILT, Slice 2**: a table-output node's rows are written to
+  scratch via the D93 endpoint, the downstream node's `FROM`/`JOIN` placeholder is AST-rewritten to the
+  returned scratch table identifier, and JOINed with the warehouse same-instance — a real table-passing
+  seed blueprint verifies live, `total_earnings==7350` from a scratch⨝warehouse JOIN; provenance stays
+  warehouse-only, a **truncated** intermediate fails closed to the raw loop, never a partial "verified"
+  answer). Slice 2 also made session_ids **underscore-free** (`s<32hex>`) and tightened the D64 read-gate
+  `_validate_scratch_name` to **exact session-id extraction** (byte-identical both repos, D64 tests
+  reconciled same-commit) — closing the `_`-boundary ambiguity; the write boundary rejects an
+  underscore-containing session_id so the invariant is structural, not a UI convention. Slice 3 = D55
+  scratch-reconnect across pause/resume remains deferred (a mid-DAG pause of a table-intermediate
+  blueprint fails clean on resume, never a wrong answer).
   See [table-intermediate-design.md](table-intermediate-design.md). Cross-references:
   [D19](#external-data), [D20](#external-data), [D59a](#blueprints--execution), [D64](#security--infra),
   [D80](#clickhouse-mcp--adoption-decision), [D92](#clickhouse-mcp--adoption-decision), D79a, D89.

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,6 +47,10 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolObserver,
     _build_preview,
     _default_observer,
+)
+from data_agent.runtime.mcp.scratch_client import (
+    ScratchClientError,
+    ScratchClientProtocol,
 )
 from data_agent.runtime.provenance.catalog_handle import SemanticCatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail, Candidate
@@ -187,6 +192,12 @@ class BlueprintExecutor:
         resolve_via_min_confidence: float = _DEFAULT_MIN_CONFIDENCE,
         query_limit: int | None = None,
         preview_row_count: int = 20,
+        # The D93 scratch-write side-channel client (table-intermediate Slice 2).
+        # `None` → a table intermediate stays UNSUPPORTED (clean raw-loop degrade,
+        # reversible: a deploy with no scratch surface simply never enables it).
+        scratch_client: ScratchClientProtocol | None = None,
+        scratch_max_rows: int = 10_000,
+        scratch_max_columns: int = 256,
         observer: ToolObserver = _default_observer,
     ) -> None:
         self._tool_dispatcher = tool_dispatcher
@@ -197,6 +208,9 @@ class BlueprintExecutor:
         self._resolve_via_min_confidence = resolve_via_min_confidence
         self._query_limit = query_limit
         self._preview_row_count = preview_row_count
+        self._scratch_client = scratch_client
+        self._scratch_max_rows = scratch_max_rows
+        self._scratch_max_columns = scratch_max_columns
         self._observer = observer
 
     async def execute(
@@ -456,15 +470,30 @@ class BlueprintExecutor:
         `awaiting_node=None`. Resume: `completed` rehydrated + `awaiting_node` set."""
         bid = blueprint.id
 
-        # 1. Topo-order + the F2 boundary: a TABLE intermediate (a node output
-        # consumed downstream) needs scratch materialization no Phase-1 MCP tool
-        # can do → UNSUPPORTED (raw loop). SCALAR-converging DAGs execute.
+        # 1. Topo-order + the F2 boundary. A TABLE intermediate (a node output
+        # consumed downstream by a table `consumes`) is now MATERIALIZED to a
+        # session-scoped scratch table via the D93 side-channel, then the consumer's
+        # JOIN is AST-rewritten to it (§2.2). This is supported ONLY when a
+        # `scratch_client` is wired; otherwise it stays UNSUPPORTED → raw loop
+        # (reversible degrade). SCALAR-converging DAGs execute unchanged.
         topo = _topo_order(blueprint.composes)
         if topo is None:
             return ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
-        if _has_table_intermediate(blueprint.composes):
-            _logger.info("blueprint %s needs a table intermediate (F2); UNSUPPORTED", bid)
+        table_consumed_orders = _table_consumed_orders(blueprint.composes)
+        if table_consumed_orders and self._scratch_client is None:
+            _logger.info(
+                "blueprint %s needs a table intermediate but no scratch_client is wired; "
+                "UNSUPPORTED (raw loop)",
+                bid,
+            )
             return ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+        # A `table`-output node consumed downstream WITHOUT a table `consumes` (a
+        # shape the loader forbids, but a poisoned/legacy record could carry) still
+        # cannot be scalar-passed → UNSUPPORTED (defense-in-depth, fail-closed).
+        if _has_table_intermediate(blueprint.composes) and not table_consumed_orders:
+            _logger.info("blueprint %s has a table intermediate with no table consume; UNSUPPORTED", bid)
+            return ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+        materialized: dict[int, str] = {}  # node order → full "scratch.s_<sid>_bp_<uuid>"
 
         provenances: list[frozenset[tuple[str, str]] | None] = []
         all_referenced = _all_referenced_slots(blueprint)
@@ -618,8 +647,16 @@ class BlueprintExecutor:
             )
             if bind_fail is not None:
                 return bind_fail
+            # Table consumes: rewrite each `scratch.<placeholder>` FROM/JOIN token to
+            # the runtime-controlled materialized scratch table (§2.2 step 3). An
+            # upstream table not yet materialized → SLOT_INVALID (fail-closed).
+            table_bindings, table_fail = _node_table_bindings(node, materialized)
+            if table_fail is not None:
+                return table_fail
             try:
-                node_sql = bind_template(node.sql_template, node_bindings)
+                node_sql = bind_template(
+                    node.sql_template, node_bindings, table_bindings=table_bindings
+                )
             except TemplateBindError:
                 _logger.warning("blueprint %s node %s bind failed", bid, node.order)
                 return ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
@@ -640,6 +677,26 @@ class BlueprintExecutor:
                 )
             provenances.append(result.provenance)
             node_sqls.append(node_sql)
+            # Table producer (§2.2 steps 1-2): a node whose table output is consumed
+            # downstream is MATERIALIZED to a session-scoped scratch table via the
+            # D93 side-channel, then the consumer's JOIN is rewritten to it. This
+            # runs INSIDE the one `runBlueprint` tool call (no extra model-facing
+            # budget). Its provenance (warehouse columns, already scope-checked at
+            # dispatch) is folded into the union above; scratch columns are excluded
+            # downstream by the MCP's D69/OQ-4 filter (§Q1/§5.3).
+            if node.order in table_consumed_orders:
+                table_name, mat_fail = await self._materialize_node(
+                    bid, node, result.result_full, credentials
+                )
+                if mat_fail is not None:
+                    return mat_fail
+                assert table_name is not None  # mat_fail is None ⇒ table_name set
+                materialized[node.order] = table_name
+                # A materialized intermediate is neither a scalar producer nor the
+                # terminal — record it (empty scalar output) and move on.
+                running[node.order] = _node_record({}, result.provenance, node_sql)
+                _record_empty_output(node, node_outputs)
+                continue
             # B1/F2: a node with a declared SCALAR output MUST return a single cell
             # (1 row, 1 column per declared scalar). >1 row (fan-out), 0 rows, a
             # NULL cell, or an extra column → fail-closed to SLOT_INVALID BEFORE the
@@ -891,6 +948,76 @@ class BlueprintExecutor:
         values = [str(row[0]) for row in rows if row and row[0] is not None]
         return values, [probe.provenance]  # append UNCONDITIONALLY (None poisons the union)
 
+    async def _materialize_node(
+        self,
+        blueprint_id: str,
+        node: Node,
+        result_full: Any,
+        credentials: RuntimeCredentials,
+    ) -> tuple[str | None, ExecFailed | None]:
+        """Materialize a table-output node's result into a session-scoped scratch
+        table via the D93 side-channel (§2.2 steps 1-2).
+
+        Returns `(full_scratch_table_name, None)` on success — the RETURNED
+        `scratch.s_<sid>_bp_<uuid>` name used VERBATIM (never reconstructed) — or
+        `(None, ExecFailed(UNSUPPORTED))` on a structural over-cap or a
+        rejected/failed materialize. Both fail closed to the raw loop: never a
+        runaway materialization, never a wrong answer.
+        """
+        columns, rows, _rc, truncated = _unpack_result(result_full)
+        if not columns:
+            _logger.info(
+                "blueprint node %s produced no columns to materialize; UNSUPPORTED", node.order
+            )
+            return None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+        # TRUNCATION guard (BLOCKER fix): the MCP's runQuery HARD-caps rows at
+        # max_response_rows (service.py `_compact_result`) regardless of any caller
+        # LIMIT, and runBlueprint passes no query_limit. A producer returning more
+        # than that cap arrives PRE-TRUNCATED (the row/column caps below never see
+        # the real size), so materializing it would build a PARTIAL scratch table
+        # and the downstream JOIN would aggregate over only the surviving rows —
+        # returning a silently under-counted "verified" answer (the exact
+        # wrong-answer class D56 exists to block). A truncated intermediate is
+        # unmaterializable → fail closed to the raw loop, BEFORE any materialize.
+        if truncated:
+            _logger.info(
+                "blueprint node %s intermediate was TRUNCATED by the runQuery row cap; "
+                "UNSUPPORTED (a partial scratch table would under-count the JOIN)",
+                node.order,
+            )
+            return None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+        # Structural guard (mirrors the D89(d) scalar guard): an oversized
+        # intermediate → raw loop, never a runaway. An EMPTY result is allowed (an
+        # empty scratch table JOINs to nothing — a legitimate "no rows" answer the
+        # terminal grain gate still validates).
+        if len(rows) > self._scratch_max_rows or len(columns) > self._scratch_max_columns:
+            _logger.info(
+                "blueprint node %s intermediate over cap (%d rows, %d cols); UNSUPPORTED",
+                node.order,
+                len(rows),
+                len(columns),
+            )
+            return None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+        typed_cols = _infer_scratch_columns(columns, rows)
+        assert self._scratch_client is not None  # gated at _execute_dag entry
+        self._observer(
+            "blueprint_step",
+            {"blueprint_id": blueprint_id, "step": "materializing", "node": node.order},
+        )
+        try:
+            table = await self._scratch_client.materialize(
+                typed_cols, rows, jwt=credentials.jwt, session_id=credentials.session_id
+            )
+        except ScratchClientError as exc:
+            # Over-cap server-side, a bad type, or any endpoint rejection → raw loop.
+            _logger.info(
+                "blueprint node %s materialize rejected (%s); UNSUPPORTED",
+                node.order,
+                exc.code,
+            )
+            return None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+        return table, None
+
     async def _verify(
         self,
         *,
@@ -1067,12 +1194,20 @@ def _union_provenance(
     """Union every inner runQuery's captured provenance (§5.3). Fail-closed: if
     ANY inner call had undetermined (`None`) provenance, the union is `None` (the
     assistant message drops from D44 replay), matching
-    `_compute_turn_provenance_union`'s posture."""
+    `_compute_turn_provenance_union`'s posture.
+
+    SCRATCH columns are EXCLUDED (D69/OQ-4, §2.2 step 4): a `scratch.*` pair is
+    session-gated, not scope-gated, and the materialized scratch table is an
+    ephemeral projection of already-scope-checked warehouse data. Dropping the
+    `scratch.` pairs here keeps the persisted footprint HONEST — exactly the real
+    warehouse columns the answer depends on (the same posture the read plane's
+    `is_provenance_in_scope` takes at check time). The `None`-poison rule is
+    unchanged: an undetermined inner call still drops the whole answer."""
     acc: set[tuple[str, str]] = set()
     for prov in provenances:
         if prov is None:
             return None
-        acc.update(prov)
+        acc.update(pair for pair in prov if not pair[0].startswith("scratch."))
     return frozenset(acc)
 
 
@@ -1129,6 +1264,83 @@ def _has_table_intermediate(nodes: tuple[Node, ...]) -> bool:
         n.order in upstream and any(kind == "table" for kind in n.output.values())
         for n in nodes
     )
+
+
+# A TABLE consume value is a bare `$N` (the WHOLE table output of node N) — the
+# table analogue of the scalar `$N.name` consume (§2.3). Table passing:
+# `consumes: {placeholder: "$N"}`, with `{placeholder}` a `scratch.<placeholder>`
+# FROM/JOIN token in the consumer's sql_template.
+_TABLE_CONSUME_REF = re.compile(r"^\$(\d+)$")
+
+
+def _table_consumed_orders(nodes: tuple[Node, ...]) -> set[int]:
+    """Every upstream node order consumed as a TABLE (`consumes: {ph: "$N"}`) — the
+    nodes that must be materialized to scratch before their consumer dispatches."""
+    orders: set[int] = set()
+    for n in nodes:
+        for ref in n.consumes.values():
+            match = _TABLE_CONSUME_REF.match(str(ref))
+            if match is not None:
+                orders.add(int(match.group(1)))
+    return orders
+
+
+def _node_table_bindings(
+    node: Node, materialized: dict[int, str]
+) -> tuple[dict[str, str], ExecFailed | None]:
+    """Map each TABLE consume `{placeholder: "$N"}` to the BARE materialized scratch
+    table name (`s_<sid>_bp_<uuid>`) for the AST JOIN rewrite (§2.2 step 3). An
+    upstream node not (yet) materialized → SLOT_INVALID (fail-closed — never a JOIN
+    against a non-existent scratch table). Scalar consumes are ignored here (they
+    are value bindings, handled by `_node_bindings`)."""
+    bindings: dict[str, str] = {}
+    for placeholder, ref in node.consumes.items():
+        match = _TABLE_CONSUME_REF.match(str(ref))
+        if match is None:
+            continue  # a scalar `$N.name` consume — not a table binding
+        order = int(match.group(1))
+        full = materialized.get(order)
+        if full is None:
+            return {}, ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
+        bindings[placeholder] = full.split(".", 1)[1] if "." in full else full
+    return bindings, None
+
+
+def _infer_ch_type(values: list[Any]) -> str:
+    """Infer the non-Nullable ClickHouse type for a column's NON-NULL cells (OQ-A).
+
+    Maps NATIVE result types: Bool → Int64 → Float64 → String. A STRING cell maps
+    to `String` (never re-parsed as a number), so an explicit `toString(...)` CAST
+    on a join key is HONORED — the scratch column stays String and matches the
+    String warehouse key, sidestepping the all-numeric-string mistyping hazard. A
+    measure CAST to `toFloat64(...)` arrives as a native float → Float64. Any mixed
+    column falls back to `String` (fail-safe: the endpoint stores it as data)."""
+    if not values:
+        return "String"  # all-NULL → the caller Nullable-wraps this
+    if all(isinstance(v, bool) for v in values):
+        return "Bool"
+    if all(isinstance(v, int) and not isinstance(v, bool) for v in values):
+        return "Int64"
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+        return "Float64"
+    return "String"
+
+
+def _infer_scratch_columns(
+    columns: list[str], rows: list[list[Any]]
+) -> list[dict[str, str]]:
+    """Infer `[{name, type}]` for a table intermediate (OQ-A default — runtime
+    inference reusing admin_ingest's Int64→Float64→String ladder, Nullable-wrapped
+    on any NULL). The endpoint RE-VALIDATES every type against its whitelist and
+    native-inserts the cells as DATA (never SQL)."""
+    typed: list[dict[str, str]] = []
+    for idx, name in enumerate(columns):
+        cells = [row[idx] for row in rows if idx < len(row)]
+        non_null = [v for v in cells if v is not None]
+        has_null = len(non_null) != len(cells)
+        base = _infer_ch_type(non_null)
+        typed.append({"name": name, "type": f"Nullable({base})" if has_null else base})
+    return typed
 
 
 def _all_referenced_slots(blueprint: Blueprint) -> set[str]:

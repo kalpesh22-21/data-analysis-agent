@@ -52,6 +52,7 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
         "bp-average-salary-by-department",
         "bp-total-earnings-by-department",
         "bp-departments-above-company-average-salary",
+        "bp-earnings-by-department-via-scratch-join",
     }
     for bp in blueprints:
         _validate_blueprint_dag(bp)  # no raise

@@ -80,6 +80,19 @@ services:
       API_KEY: "test-key-abc123"
       ALLOWED_DATABASES: "*"
       LOG_LEVEL: "INFO"
+      # D93 scratch-write side-channel (table-intermediate Slice 2). The scratch-only
+      # credential (provisioned in docker/clickhouse-init/scratch-user.sql, GRANTed on
+      # `scratch.*` ONLY — invariant #1) makes /scratch/v1/materialize + /drop live
+      # over HTTP. Distinct from CLICKHOUSE_* so the warehouse read path stays on the
+      # read-only `default` account and the write path can never touch the warehouse.
+      SCRATCH_CH_HOST: "clickhouse"
+      SCRATCH_CH_PORT: "8123"
+      SCRATCH_CH_SECURE: "false"
+      SCRATCH_CH_USER: "scratch_writer"
+      SCRATCH_CH_PASSWORD: "scratch-pass"
+      SCRATCH_DATABASE: "scratch"
+      SCRATCH_TTL_SECONDS: "3600"
+      SCRATCH_MAX_ROWS: "100000"
     ports:
       - "18090:8000"
     healthcheck:

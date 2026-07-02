@@ -121,6 +121,14 @@ _MAX_COMPOSE_NODES = 64
 # occurrence in a `when` expr — used by the Slice-C load-time validations.
 _CONSUME_REF = re.compile(r"^\$(\d+)\.([A-Za-z_][A-Za-z0-9_]*)$")
 _COUNT_REF = re.compile(r"count\(\s*\$(\d+)")
+# A TABLE consume reference (`$1`) — node 1's WHOLE table output, injected as a
+# `scratch.<placeholder>` FROM/JOIN token (table-intermediate Slice 2, §2.3).
+_TABLE_CONSUME_REF = re.compile(r"^\$(\d+)$")
+# The reserved database a table-consume placeholder lives under in a consumer
+# template. The scope-honesty gate treats `scratch.*` sources as SESSION-GATED
+# (D69/OQ-4) — not required in `uses` — while the consumer's warehouse columns
+# still must be ⊆ uses.
+_SCRATCH_DB = "scratch"
 
 
 def load_seed_fixtures(
@@ -337,6 +345,55 @@ def _uses_schema(uses: list[str]) -> dict[str, dict[str, dict[str, str]]]:
     return schema
 
 
+def _scratch_placeholder_names(sql_template: str | None) -> set[str]:
+    """The set of `scratch.<placeholder>` table names a template references in a
+    FROM/JOIN position (the table-consume bind sites, §2.3). Parsed via
+    `parse_template` so a `{slot}` template parses too. A non-parsing template →
+    empty set (the other load checks surface the parse failure)."""
+    if not sql_template:
+        return set()
+    try:
+        tree = parse_template(sql_template)
+    except TemplateBindError:
+        return set()
+    names: set[str] = set()
+    for table in tree.find_all(exp.Table):
+        if table.text("db") == _SCRATCH_DB and table.name:
+            names.add(table.name)
+    return names
+
+
+def _template_output_columns(sql_template: str | None) -> list[str]:
+    """The producing node's output column names (its SELECT-list aliases) — the
+    columns its materialized scratch table will carry, used to register the scratch
+    placeholder in the consumer's qualify schema."""
+    if not sql_template:
+        return []
+    try:
+        tree = parse_template(sql_template)
+    except TemplateBindError:
+        return []
+    return list(getattr(tree, "named_selects", []) or [])
+
+
+def _scratch_schema_for_node(
+    node: Any, outputs_by_order: dict[int, Any]
+) -> dict[str, dict[str, str]]:
+    """Build `{placeholder: {column: TEXT}}` for a consumer node's TABLE consumes,
+    sourced from each producing node's declared output columns. Lets qualify_columns
+    resolve `scratch.<placeholder>` columns while keeping warehouse columns checked
+    against `uses` (the D69/OQ-4 scope-honesty split, §2.3)."""
+    schema: dict[str, dict[str, str]] = {}
+    for placeholder, ref in node.consumes.items():
+        match = _TABLE_CONSUME_REF.match(str(ref))
+        if match is None:
+            continue
+        src = outputs_by_order.get(int(match.group(1)))
+        cols = _template_output_columns(getattr(src, "sql_template", None)) if src else []
+        schema[placeholder] = {col: "TEXT" for col in cols}
+    return schema
+
+
 def _assert_source_tables_in_uses(
     bp_id: str,
     where: str,
@@ -359,6 +416,11 @@ def _assert_source_tables_in_uses(
         db = table.text("db")
         if not name or (not db and name in cte_names):
             continue  # a CTE reference (own derived table), never a warehouse source
+        if db == _SCRATCH_DB:
+            # A table-consume placeholder (scratch.<placeholder>) is a SESSION-GATED
+            # source (D69/OQ-4), materialized at runtime from an already-scope-checked
+            # upstream node result — not part of the warehouse `uses` footprint (§2.3).
+            continue
         if name not in schema_dict.get(db, {}):
             qualified_name = f"{db}.{name}" if db else name
             raise CorpusLoadError(
@@ -368,7 +430,11 @@ def _assert_source_tables_in_uses(
 
 
 def _assert_template_reads_within_uses(
-    bp_id: str, where: str, tree: exp.Expression, uses: list[str]
+    bp_id: str,
+    where: str,
+    tree: exp.Expression,
+    uses: list[str],
+    scratch_schema: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """§1.2(c), table-aware (review FIX 1): every table + column the template reads
     must resolve to a `db.table.column` present in the declared `uses`.
@@ -385,6 +451,11 @@ def _assert_template_reads_within_uses(
     `*` stars and dict-family functions are rejected by the caller BEFORE this runs
     (they defeat any column-level analysis)."""
     schema_dict = _uses_schema(uses)
+    # Register the session-gated scratch placeholder tables (their producing node's
+    # output columns) so qualify_columns resolves `scratch.<placeholder>` columns —
+    # WITHOUT adding them to the warehouse `uses` footprint (§2.3 scope-honesty).
+    if scratch_schema:
+        schema_dict.setdefault(_SCRATCH_DB, {}).update(scratch_schema)
     schema = MappingSchema(schema_dict, dialect="clickhouse")
     try:
         qualified = qualify_tables(tree.copy(), dialect="clickhouse")
@@ -524,6 +595,7 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
         if parsed is not None:
             rule_binds.add(parsed.binds)
 
+    nodes_by_order = {n.order: n for n in blueprint.composes}
     # (node_order | None) → the extra non-slot placeholders that node may reference.
     templates: list[tuple[int | None, str, set[str]]] = []
     if blueprint.sql_template:
@@ -558,7 +630,15 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
                 "columns so its scope footprint is verifiable"
             )
         _assert_no_dict_functions(bp.id, where, tree)
-        _assert_template_reads_within_uses(bp.id, where, tree, bp.uses)
+        # A consumer node's `scratch.<placeholder>` columns are session-gated: register
+        # the producing node's output columns so qualify resolves them, while the
+        # warehouse columns are still checked ⊆ uses (§2.3 scope-honesty).
+        scratch_schema = (
+            _scratch_schema_for_node(nodes_by_order[order], nodes_by_order)
+            if order is not None and order in nodes_by_order
+            else None
+        )
+        _assert_template_reads_within_uses(bp.id, where, tree, bp.uses, scratch_schema)
 
     # (e) B3(a): every declared REQUIRED slot MUST be referenced by ≥1 template —
     # the converse of the (a) token⊆slots check. An unreferenced required slot is a
@@ -608,17 +688,45 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
                 "resolve() probe must read only an advertised column."
             )
 
-    # (h) S6b: a node's `consumes` `$P.name` MUST reference a real upstream SCALAR
-    # output — P ∈ this node's feeds_from AND name a declared `scalar` output of P.
+    # (h) S6b: a node's `consumes` MUST reference a real upstream output —
+    #   - SCALAR consume `$P.name`: P ∈ feeds_from AND `name` a declared SCALAR
+    #     output of P (bound as a typed literal into `{placeholder}`).
+    #   - TABLE consume `$P` (table-intermediate Slice 2, §2.3): P ∈ feeds_from AND
+    #     P declares a `table` output, AND the `placeholder` appears as a
+    #     `scratch.<placeholder>` FROM/JOIN token in this node's template (the AST
+    #     JOIN-rewrite site). This is the "table-consume placeholder maps to a
+    #     FROM/JOIN position" loader gate.
     # Fail LOUD at load (like feeds_from), not a generic runtime SLOT_INVALID.
     outputs_by_order = {n.order: n.output for n in blueprint.composes}
     for node in blueprint.composes:
+        scratch_refs = _scratch_placeholder_names(node.sql_template)
         for placeholder, ref in node.consumes.items():
-            match = _CONSUME_REF.match(str(ref))
+            ref_str = str(ref)
+            table_match = _TABLE_CONSUME_REF.match(ref_str)
+            if table_match is not None:
+                src_order = int(table_match.group(1))
+                if src_order not in node.feeds_from:
+                    raise CorpusLoadError(
+                        f"blueprint {bp.id}: node {node.order} consumes a table from node "
+                        f"{src_order}, which is not in its feeds_from {list(node.feeds_from)}."
+                    )
+                src_outputs = outputs_by_order.get(src_order, {})
+                if not any(kind == "table" for kind in src_outputs.values()):
+                    raise CorpusLoadError(
+                        f"blueprint {bp.id}: node {node.order} consumes table {ref_str!r} but "
+                        f"node {src_order} has no declared TABLE output."
+                    )
+                if placeholder not in scratch_refs:
+                    raise CorpusLoadError(
+                        f"blueprint {bp.id}: node {node.order} table-consume {placeholder!r} must "
+                        f"appear as a 'scratch.{placeholder}' source in a FROM/JOIN position."
+                    )
+                continue
+            match = _CONSUME_REF.match(ref_str)
             if match is None:
                 raise CorpusLoadError(
                     f"blueprint {bp.id}: node {node.order} consumes {placeholder!r} "
-                    f"from {ref!r}, which is not a '$N.name' upstream-output reference."
+                    f"from {ref!r}, which is not a '$N.name' scalar or '$N' table reference."
                 )
             src_order, out_name = int(match.group(1)), match.group(2)
             if src_order not in node.feeds_from:

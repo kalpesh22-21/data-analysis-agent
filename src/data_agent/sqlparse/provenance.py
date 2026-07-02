@@ -96,9 +96,11 @@ class ScratchSessionError(ProvenanceExtractionError):
 # ---------------------------------------------------------------------------
 
 _SCRATCH_DB = "scratch"
-# Scratch table naming pattern: s_<sessionId>_<anything> (D64)
-# We match this by checking the prefix `s_<session_id>_` directly rather than
-# using a regex, because session_id can itself contain underscores.
+# Scratch table naming pattern: s_<sessionId>_<suffix> (D64).
+# The bound session_id is an UNDERSCORE-FREE identifier-safe token (the runtime
+# sanitizer mints `s<32hex>`), so the owning session can be extracted
+# UNAMBIGUOUSLY as the run after the leading `s_` up to the NEXT `_`.  We match by
+# exact session extraction (see `_validate_scratch_name`), not a loose prefix.
 # The general validity check (must look like a scratch table at all) uses this regex:
 _SCRATCH_TABLE_GENERIC_RE = re.compile(r"^s_.+_.+$")
 
@@ -245,14 +247,27 @@ def _build_alias_map(
 
 
 def _validate_scratch_name(tbl_name: str, session_id: str | None) -> None:
-    """Validate scratch table name against session_id pattern (D64/OQ-4).
+    """Validate a scratch table name against session_id by EXACT session extraction (D64/OQ-4).
 
-    A valid own-session scratch table name must:
-      1. Match the generic scratch pattern: s_<anything>_<anything>
-      2. Start with `s_<session_id>_` (when session_id is provided)
+    A scratch table is named ``s_<session_id>_<suffix>`` (the write side mints
+    ``s_<sid>_bp_<uuid4hex>``).  Because the bound session_id is an
+    UNDERSCORE-FREE identifier-safe token (the runtime sanitizer mints
+    ``s<32hex>``), the owning session is recoverable UNAMBIGUOUSLY: it is the run
+    immediately after the leading ``s_`` up to the NEXT ``_``.  A valid
+    own-session scratch table must therefore:
+      1. start with ``s_``;
+      2. have a non-empty suffix after the extracted session (a second ``_``);
+      3. have its extracted session equal *session_id* EXACTLY.
 
-    session_id can itself contain underscores (e.g. 'sess_abc123'), so we do
-    a prefix check rather than a regex group match.
+    This TIGHTENS the former ``startswith(f"s_{session_id}_")`` prefix check.  A
+    loose prefix carried a ``_``-boundary ambiguity when a session_id itself
+    contained ``_`` (a session bound to ``a`` matched a table ``s_a_b_...`` whose
+    owner was ``a_b`` — ``s_a_b_...`` starts with ``s_a_``).  The coordinated fix
+    is a discipline + a check: session ids are minted underscore-free, so a
+    validly-produced table ``s_<sid>_<suffix>`` has exactly one extractable owner,
+    and this gate requires it to equal the injected session_id.  ``a`` can only
+    ever match a table whose extracted session is ``a``, never one owned by a
+    different session that merely shares a prefix.
 
     FAIL-CLOSED on a None session_id (D64, auth-hardening Slice 1): reaching this
     function means a ``scratch.*`` table was referenced, and a scratch reference
@@ -266,18 +281,23 @@ def _validate_scratch_name(tbl_name: str, session_id: str | None) -> None:
     the extractor at all, so this only affects scoped callers — the exact
     surface the bypass exploited.
     """
-    if session_id is None:
+    if not session_id:
+        # `None` OR an empty string: an empty sid would otherwise match `s__<suffix>`
+        # (extracted session == "" == session_id) — an ownership hole. Fail closed on
+        # any falsy sid (defense-in-depth NIT).
         raise ScratchSessionError(
             f"Scratch table '{_SCRATCH_DB}.{tbl_name}' was referenced without a "
             "bound session_id; ownership cannot be verified — rejected fail-closed "
             "(D64). A scratch reference requires a session context."
         )
 
-    expected_prefix = f"s_{session_id}_"
-    if not tbl_name.startswith(expected_prefix) or len(tbl_name) <= len(expected_prefix):
+    # Exact session extraction: s_<sid>_<suffix> with an underscore-free <sid>.
+    remainder = tbl_name[2:] if tbl_name.startswith("s_") else ""
+    extracted_session, sep, suffix = remainder.partition("_")
+    if not tbl_name.startswith("s_") or not sep or not suffix or extracted_session != session_id:
         raise ScratchSessionError(
             f"Scratch table '{_SCRATCH_DB}.{tbl_name}' does not match "
-            f"session_id '{session_id}' (expected {_SCRATCH_DB}.s_{session_id}_<file> pattern). "
+            f"session_id '{session_id}' (expected {_SCRATCH_DB}.s_{session_id}_<suffix> pattern). "
             "Cross-session or malformed scratch access rejected (D64)."
         )
 
