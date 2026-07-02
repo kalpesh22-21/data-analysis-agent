@@ -173,6 +173,34 @@ def test_render_entry_includes_static_denial_user_message_for_non_ok_status() ->
     assert tool_msg["user_message"] == "That query didn't run correctly. Let me fix it and try again."
 
 
+def test_render_entry_resolve_values_unknown_target_uses_specific_message() -> None:
+    """L5: a replayed `resolveValues` RESOLVE_VALUES_UNKNOWN_TARGET trail entry
+    renders the composite code's crafted, actionable message (from the denial
+    table), NOT the generic "Something went wrong processing that request."
+    fallback — preserving the `retryable=True` self-correction rationale even
+    though `user_message` is not persisted on `TrailEntry`."""
+    entry = TrailEntry(
+        turn_index=0,
+        tool_call_id="c1",
+        tool_name="resolveValues",
+        args={"table": "dbpcm_warehouse.accrual_events", "column": "Nope", "concept": "x"},
+        status="error",
+        error_code="RESOLVE_VALUES_UNKNOWN_TARGET",
+        provenance=None,
+        result_preview=None,
+        result_full_ref=None,
+        ts="2026-07-01T00:00:00+00:00",
+    )
+    result = compact_trail([entry], token_budget=10_000, scope_hash="h1")
+    messages = render_messages(result)
+    tool_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
+    assert tool_msg["user_message"] == (
+        "That table or column isn't available. Check the exact name with "
+        "getTableSchema and try again."
+    )
+    assert tool_msg["user_message"] != "Something went wrong processing that request."
+
+
 def test_render_entry_user_message_is_none_for_ok_status() -> None:
     entry = _entry("c1", "SELECT 1")
     result = compact_trail([entry], token_budget=10_000, scope_hash="h1")

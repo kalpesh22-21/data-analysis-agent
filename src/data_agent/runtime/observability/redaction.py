@@ -35,6 +35,14 @@ _NUMERIC_LITERAL = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w])")
 # in Phase 0 — kept as a set for forward-compatibility with future tools).
 _SQL_ARG_KEYS = frozenset({"sql"})
 
+# Tool argument keys that are FREE USER TEXT (highest PII risk) — fully replaced
+# with a placeholder in telemetry, distinct from SQL-literal masking (D77/D25,
+# resolvevalues-design §6.1). Precedent: `askUser`'s `question` is kept out of
+# spans (`tracing.guardrail_observer`); `resolveValues`'s `concept` gets the
+# same treatment.
+_FULLY_REDACTED_ARG_KEYS = frozenset({"concept"})
+_REDACTED_PLACEHOLDER = "<redacted>"
+
 
 def hash_scope(column_scope: frozenset[str]) -> str:
     """Stable hash of *column_scope* — never log the raw scope (D25)."""
@@ -69,6 +77,21 @@ def redact_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         value = redacted.get(key)
         if isinstance(value, str):
             redacted[key] = mask_sql(value)
+    for key in _FULLY_REDACTED_ARG_KEYS:
+        if key in redacted:
+            redacted[key] = _REDACTED_PLACEHOLDER
+    # `resolveValues`'s structured `period` (D77): keep `period.column` (a
+    # structural catalog identifier) but FULLY redact the `start`/`end` bounds.
+    # They are unvalidated model-supplied free text (not guaranteed SQL-shaped),
+    # so `mask_sql` would pass non-SQL-shaped values straight through (L1) — a
+    # placeholder is the safe choice.
+    period = redacted.get("period")
+    if isinstance(period, dict):
+        masked_period = dict(period)
+        for bound_key in ("start", "end"):
+            if bound_key in masked_period and masked_period[bound_key] is not None:
+                masked_period[bound_key] = _REDACTED_PLACEHOLDER
+        redacted["period"] = masked_period
     return redacted
 
 

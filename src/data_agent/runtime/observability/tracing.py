@@ -131,6 +131,21 @@ def guardrail_span(
     return span(tracer, name, OpenInferenceSpanKindValues.GUARDRAIL, attributes)
 
 
+def embedding_span(tracer: Tracer, *, model: str, input_count: int) -> Any:
+    """The custom embedding-API call (`resolveValues` ranking, D24/D71).
+
+    The auto-instrumentor covers only the agent LLM, not this custom endpoint,
+    so `HttpEmbeddingClient` wraps its POST here manually. Vector counts +
+    model id + latency only — the embedded TEXT is never logged (D25).
+    """
+    return span(
+        tracer,
+        "embedding",
+        OpenInferenceSpanKindValues.EMBEDDING,
+        {"embedding.model": model, "embedding.input_count": input_count},
+    )
+
+
 # B5: a strict attribute ALLOWLIST — never a bare type-filter — for the
 # `AgentLoop`'s own (non-tool) `loop_*` stage-boundary observer events.
 # `loop_paused_ask_user`'s payload carries a `question` key that can quote
@@ -168,6 +183,7 @@ __all__ = [
     "agent_span",
     "chain_span",
     "configure_tracing",
+    "embedding_span",
     "get_tracer",
     "guardrail_observer",
     "guardrail_span",

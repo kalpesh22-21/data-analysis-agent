@@ -40,6 +40,7 @@ from pydantic import BaseModel
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.auth.jwt_verify import JWTVerificationError, verify_jwt
+from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.config import RuntimeSettings, get_runtime_settings
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.context.llm_summarizer import build_llm_summarizer
@@ -49,6 +50,7 @@ from data_agent.runtime.mcp.client import MCPClient
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.mcp.tool_schema import ToolSchemaCache
 from data_agent.runtime.model.client import ModelClient
+from data_agent.runtime.model.embedding_client import EmbeddingClient, HttpEmbeddingClient
 from data_agent.runtime.model.openai_client import build_openai_model_client
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
@@ -166,6 +168,8 @@ def create_app(
     mcp_client: MCPClient | None = None,
     model_client: ModelClient | None = None,
     catalog: CatalogHandle | None = None,
+    embedding_client: EmbeddingClient | None = None,
+    resolve_values: ResolveValuesComposite | None = None,
 ) -> FastAPI:
     """Build the FastAPI app. All dependencies default to the real
     implementations, sourced from *settings* — pass Layer-1 fakes for any of
@@ -185,6 +189,22 @@ def create_app(
     )
     tracing.instrument_openai(tracer_provider)
     tracer = tracing.get_tracer(tracer_provider)
+
+    # D77/OQ-1: the real `HttpEmbeddingClient` is wired only when the custom
+    # embedding API is configured; otherwise the composite runs with NO
+    # embedding client and degrades to frequency-only ranking (design §3.2) —
+    # an unconfigured/unreachable embedder never breaks the tool. (Deviation
+    # from OQ-1's literal "FakeEmbeddingClient when unconfigured": a no-op
+    # absent client is more honest in production than fake hash-vector ranking;
+    # `FakeEmbeddingClient` stays a test-only double.)
+    if embedding_client is None and settings.embedding_api_url:
+        embedding_client = HttpEmbeddingClient(
+            url=settings.embedding_api_url,
+            api_key=settings.embedding_api_key,
+            model=settings.embedding_model,
+            timeout_seconds=settings.embedding_timeout_seconds,
+            tracer=tracer,
+        )
 
     tool_schema_cache = ToolSchemaCache(mcp_client)
     summarizer = build_llm_summarizer(model_client)
@@ -222,6 +242,20 @@ def create_app(
             observer=observer,
             tracer=tracer,
         )
+        # D77: the composite wraps the SAME dispatcher (so its inner runQuery
+        # shares the per-request observer/tracer and the free D5/D57/provenance
+        # path); an injected `resolve_values` (Layer-1 smoke test) overrides it.
+        composite = resolve_values or ResolveValuesComposite(
+            tool_dispatcher=dispatcher,
+            catalog=catalog,
+            embedding_client=embedding_client,
+            query_limit=settings.resolve_values_query_limit,
+            top_k=settings.resolve_values_top_k,
+            similarity_weight=settings.resolve_values_similarity_weight,
+            preview_row_count=settings.preview_row_count,
+            observer=observer,
+            tracer=tracer,
+        )
         return AgentLoop(
             model_client=model_client,
             tool_dispatcher=dispatcher,
@@ -234,6 +268,7 @@ def create_app(
             token_budget=settings.model_context_window,
             max_tool_calls_per_iteration=settings.max_tool_calls_per_iteration,
             observer=observer,
+            resolve_values=composite,
         )
 
     app = FastAPI(title="data-agent-runtime")

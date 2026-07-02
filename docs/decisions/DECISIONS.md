@@ -129,8 +129,10 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   (global/tenant/user) — not added now. **→ D77 moves the implementation into the agent runtime
   (over `runQuery`); the model interface and concept/ranking behaviour are unchanged.**
 
-- **D77 (locked, 2026-06-30).** **`resolveValues` moves from a ClickHouse-MCP data-plane tool to an
-  agent-runtime composite tool implemented over `runQuery`.** The model interface is unchanged
+- **D77 (locked, 2026-06-30; BUILT 2026-07-01, Session 9 — see
+  [resolvevalues-design.md](resolvevalues-design.md)).** **`resolveValues` moves from a ClickHouse-MCP
+  data-plane tool to an agent-runtime composite tool implemented over `runQuery`.** The model interface
+  is unchanged
   (`resolveValues(table, column, concept, period?)` → `[{value, description, score, freq}]`); only
   the implementation location moves. Under the hood the runtime:
   1. Issues an ordinary `runQuery` (D57 column-scope enforcement and D5 `ClientCode`/tenant RLS
@@ -158,6 +160,36 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
 
   Cross-references: [D4](#tools), [D5](#tools), [D10](#blueprints), [D57](#blueprint-silent-path-safety),
   [D66](#client-defined-value-resolution), [D71](#model-provider), [D75](#clickhouse-mcp--adoption-decision).
+
+  **As-built (Session 9):** the runtime issues the backing `runQuery` via the single `ToolDispatcher`
+  choke point (so D57/D5 enforcement, provenance capture, and denial mapping are reused, not
+  re-implemented), intercepting `resolveValues` in the agent loop exactly like `askUser` but returning
+  an inline result. `table`/`column`/`period.column` are fail-closed validated against the catalog
+  allowlist (D70 exact-case) and rendered as sqlglot-AST identifiers/literals — `concept` provably never
+  reaches SQL (D10), verified empirically in review. Description-column discovery is
+  convention-based **and scope-aware** (out-of-scope sibling desc column → value-only fallback). `period`
+  is an optional structured `{column, start, end}` (no bound-param surface on `runQuery`); deictic/
+  relative period resolution (D41/D65) is deferred to the D67 era. Ranking is
+  `0.7·cosine_norm + 0.3·normalized-log-freq`, top-10 of a LIMIT-200 candidate pool (provisional
+  tunables in `RuntimeSettings`). Embedding-failure behaviour is **D85**. `resolve()` is exposed as a
+  typed programmatic entry point for the (still-unwired) D67 rule expansion.
+
+- **D85 (locked, 2026-07-01, Session 9 — extends D77).** **On an embedding-client failure,
+  `resolveValues` degrades to frequency-only ranking rather than failing the tool call, and surfaces the
+  degradation to the model.** D63 fail-closed governs *enforcement* (column scope), not *ranking
+  quality* — the backing `runQuery` has already scope-checked every returned value, so every candidate is
+  provably in-scope regardless of how it is ordered. Failing the whole call on an embedding outage would
+  convert a quality degradation (worse ordering of already-safe values) into an availability outage of a
+  core Phase-1 tool. So: an embedding transport/validation failure (unreachable endpoint, non-2xx,
+  malformed/empty/non-finite vectors, or a length mismatch vs. inputs) falls back to ranking by
+  normalized log-frequency alone. **The degradation is not silent:** the tool's `result_full` is a
+  wrapper `{degraded: bool, ranking: "semantic+freq" | "freq_only", top_margin, values}` — so a
+  freq-only top score can never masquerade as a perfect semantic match — and the tool description
+  instructs the model that `freq_only` results warrant an `askUser` confirmation before filtering on a
+  guessed value (D66(c)). An *unconfigured* embedding API (no endpoint set) is the same path: no client
+  is wired and every call runs `freq_only` (a stub embedder is **test-only**, never a production
+  substitute). Cross-references: [D63](#security--infra), [D66](#client-defined-value-resolution),
+  [D71](#model-provider), [D77](#client-defined-value-resolution).
 
 - **D67 (locked, 2026-06-30).** **Two rule kinds: static and resolved (dynamic).** A catalog `rule`'s
   `predicate` is either a fixed SQL boolean (**static**) or references `resolveValues(column, concept)`

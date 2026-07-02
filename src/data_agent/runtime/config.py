@@ -124,6 +124,30 @@ class RuntimeSettings(BaseSettings):
         ),
     )
 
+    # --- Embedding client (D71 custom API — resolveValues ranking) ---
+    embedding_api_url: str = Field(
+        "", description="Custom embedding API endpoint (D71). Empty => freq-only degrade."
+    )
+    embedding_api_key: str = Field("", description="Embedding API key (secret).")
+    embedding_model: str = Field("", description="Embedding model id (custom API).")
+    embedding_timeout_seconds: float = Field(
+        10.0, gt=0, description="Per-request embedding timeout (seconds)."
+    )
+
+    # --- resolveValues composite (D77) ---
+    resolve_values_query_limit: int = Field(
+        200, ge=1, description="LIMIT N on the backing runQuery (candidate pool)."
+    )
+    resolve_values_top_k: int = Field(
+        10, ge=1, description="Max ranked values returned to the model after ranking."
+    )
+    resolve_values_similarity_weight: float = Field(
+        0.7,
+        ge=0,
+        le=1,
+        description="Weight w on cosine similarity vs. normalized log-freq in the score.",
+    )
+
     def history_token_budget(self) -> int:
         """Absolute history token budget derived from the model's context window (OQ-G)."""
         return int(self.model_context_window * self.history_token_budget_ratio)

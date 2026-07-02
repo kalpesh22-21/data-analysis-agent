@@ -39,12 +39,20 @@ invariant→test status board.
   budget-cap D47), deterministic via scripted doubles.
 - ✅ **LIVE end-to-end turn PROVEN**: real OpenAI (D71) → real MCP → real ClickHouse → **correct answer
   ("2" Sales employees)**, 4 tool calls, progress stream PII-clean. The D68 "real turn" criterion, met.
+- ✅ **D77 `resolveValues` — the first Phase-1 brick — is BUILT (Session 9, Layer-1 green).**
+  `src/data_agent/runtime/composite/` + `model/embedding_client.py`: a runtime composite over `runQuery`
+  (single-dispatcher choke point reused for D57/D5 enforcement), catalog-allowlisted + sqlglot-AST SQL
+  (`concept` provably never in SQL, D10), scope-aware description-column discovery, structured `period`,
+  ranking `0.7·cosine+0.3·log-freq` top-10/LIMIT-200, embedding-failure **degrade-not-fail** (new **D85**).
+  **512 pass / 18 skipped, ruff clean.** Adversarially QA'd (~128 tests) + reviewed (REQUEST CHANGES →
+  fixed → APPROVE). See [decisions/resolvevalues-design.md](decisions/resolvevalues-design.md).
 
-**Next brick:** **Phase 1** (per D68) — **D77 `resolveValues`** (runtime composite over `runQuery`),
-the retrieval pipeline (embed→recall→rerank on the custom non-OpenAI API, D71), blueprints
-(`searchBlueprints`/`getBlueprint`/`runBlueprint` + neo4j), the **D56 verify gate**, the knowledge plane
-(`searchKnowledge`), and the offline **Track B** learning loop. The runtime's Phase-1 `getTableSchema`
-is just a passthrough of the now-MCP-side overlay (D83/D84). **Phase 0 is substantially complete and
+**Next brick:** **Phase 1 (continued)** (per D68) — the retrieval pipeline (embed→recall→rerank on the
+custom non-OpenAI API, D71), blueprints (`searchBlueprints`/`getBlueprint`/`runBlueprint` + neo4j), the
+**D56 verify gate**, the knowledge plane (`searchKnowledge`), the **D67 `resolve_via` rule wiring** (the
+typed `resolveValues.resolve()` hook now exists), and the offline **Track B** learning loop. The
+runtime's Phase-1 `getTableSchema` is just a passthrough of the now-MCP-side overlay (D83/D84). ~~D77
+`resolveValues`~~ **done (Session 9).** **Phase 0 is substantially complete and
 validated end-to-end** (live turn works); the honest remaining Phase-0 gap is the **3 deferred Layer-3
 scenarios** — mid-session scope narrowing (needs BFF per-turn scope switching), observability+PII span
 inspection (needs a Phoenix collector in the stack — the progress channel is already PII-clean), and
@@ -53,8 +61,10 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 
 **Open follow-ups carried forward:**
 - **NOTHING IS PUSHED (user deferred the push).** data-analysis-agent branch
-  `phase0/provenance-extractor` has 4 commits (`6820677`→`7a901ed`→`206a29b`→`fbc224e`) — **this repo
-  has NO git remote configured yet** (add an `origin` before push/PR). clickhouse-api
+  `phase0/provenance-extractor` has 5 commits (`6820677`→`7a901ed`→`206a29b`→`fbc224e`→`90ad553`) —
+  **this repo has NO git remote configured yet** (add an `origin` before push/PR). **The Session-9 D77
+  `resolveValues` work + these doc updates are still UNCOMMITTED at time of writing** (committed right
+  after this doc pass). clickhouse-api
   `feat/scope-enforcement` (origin `kalpesh22-21/click-house-openapi`) has `b55b4de` (D83/D84) +
   `143f0c1` "Stale changes" (unrelated branch WIP — settings/oauth/helm/diagnose_token, not ours)
   ahead of origin, unpushed.
@@ -71,6 +81,12 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
   The runtime's **defensive** D44 check stays as belt-and-suspenders now the MCP enforces scope too (OQ-4).
 - Phase-0 runtime provisional tunables (`RuntimeSettings`): budget caps (15 iter / 60s / 3 windows),
   `SESSION_TTL`=7d, N=20 preview rows, history budget 20% — all set to defaults pending real traffic.
+  **Session 9 adds:** `resolve_values_similarity_weight`=0.7 / `query_limit`=200 / `top_k`=10 (provisional).
+- **`resolveValues` follow-ups (D77/D85):** the **custom embedding API contract is still an OQ** — the
+  `HttpEmbeddingClient` assumes a request/response shape pending the real endpoint/model id (D71);
+  unconfigured → freq-only degrade (D85). **D67 `resolve_via` rule wiring** is still open (the typed
+  `resolveValues.resolve()` hook exists for it). Deferred by design: per-(client,column) index, deictic/
+  relative period-domain resolution (D41/D65), and a Layer-2 run over the real MCP + live embedding API.
 - Production IdP (Entra) must stamp the `column_scope` claim; wire per-user entitlements to replace the
   **D82 interim all-access** default (OPEN-QUESTIONS §Security/infra).
 - **REVERSED by D83/D84** (was: "Replace the interim `system.columns` catalog in `clickhouse-api` with
@@ -86,6 +102,57 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 - 6 coverage gaps accepted into backlog (see TRACEABILITY.md §Coverage gaps) — Phase-2 test additions.
 
 ---
+
+## 2026-07-01 — Session 9: D77 `resolveValues` — first Phase-1 brick (runtime composite over `runQuery`)
+
+Built the first Phase-1 tool: `resolveValues`, a model-facing composite implemented in the agent runtime
+over the existing `runQuery` MCP tool (D77), with a new embedding client (D71) and a new
+embedding-failure-degrade decision (**D85**). Design-first, then implemented, adversarially QA'd, reviewed,
+fixed, re-approved. **No pushes** (user still deferring; repo has no remote). **Uncommitted at time of
+writing this entry** — committed immediately after the doc pass.
+
+### Shipped
+| Area | Path | Agent |
+|---|---|---|
+| Design doc (Q1–Q10, seam/injection/ranking/degrade/observability decisions, build order, OQs) | `docs/decisions/resolvevalues-design.md` | orchestrator → `planner` |
+| `ResolveValuesComposite`: fail-closed catalog-allowlist validation (D70 exact-case), sqlglot-AST SQL (`concept` never in SQL, D10), inner `runQuery` via `ToolDispatcher`, scope-aware description-column discovery, structured `period`, typed `resolve()` for D67 | `src/data_agent/runtime/composite/{__init__,resolve_values,sql_builder,ranking}.py` | `backend-developer` |
+| Embedding client: `EmbeddingClient` protocol + `FakeEmbeddingClient` (test-only) + `HttpEmbeddingClient` (settings-driven, manual `EMBEDDING` span; request contract assumed pending OQ-1) | `src/data_agent/runtime/model/embedding_client.py` | `backend-developer` |
+| Loop interception (2nd intercepted tool after `askUser`; inline result; 1 `tool_calls_made`), `RESOLVE_VALUES_TOOL_SCHEMA` (period `"type": ["object","null"]`), `concept`+period redaction, `RuntimeSettings` additions, `app.py` wiring (unconfigured embedding API → no client → freq-only degrade) | `runtime/{loop/agent_loop,mcp/tool_schema,observability/redaction,config,app}.py` | `backend-developer` |
+| ~128 adversarial Layer-1 tests (incl. 5 xfail bug repros, now regular passes); real-OTel-exporter redaction e2e | `tests/runtime/composite/*`, `test_resolve_values_{adversarial,loop_adversarial,redaction_e2e,schema_adversarial}.py`, `test_{ranking,sql_builder,embedding_client}_adversarial.py` | `qa` |
+| Reviews: first **REQUEST CHANGES** (H1–H3, M1–M2, L1–L4) → fixed → **APPROVE**; post-approval residual **L5** (denial-table entries) | — | `reviewer` + `qa` (parallel) |
+
+### Review findings (recorded honestly)
+First review returned **REQUEST CHANGES**:
+- **H1** — malformed inner-result shapes crashed the turn (no B4-parity guard). Fixed: `_safe_run_inner`
+  broad-except → clean `RESOLVE_VALUES_INTERNAL_ERROR` + `_extract_rows` guards.
+- **H2** — `HttpEmbeddingClient` element-level garbage escaped as raw exceptions, bypassing degrade. Fixed:
+  parse+validate inside `try`; vectors validated non-empty / numeric / finite.
+- **H3** — the `degraded` flag was dropped and a freq-only top score read `1.0`, masquerading as a perfect
+  semantic match. Fixed: `result_full` wrapper `{degraded, ranking, top_margin, values}`; schema explains
+  `freq_only` → `askUser`. (Motivated the new **D85**.)
+- **M1** — description-column discovery ignored `column_scope` → permanent denial when the sibling desc
+  column is out of scope. Fixed: candidates filtered via `scope_filter.is_provenance_in_scope`; value-only
+  fallback.
+- **M2** — mismatched-length vectors silently truncated in cosine. Fixed: `_validate_embed_shape` → degrade.
+- **L1–L4** — full start/end redaction; unwired composite → local `RESOLVE_VALUES_UNAVAILABLE` (never
+  dispatched); observer-event symmetry; JSON-Schema `period` typing.
+- **L5** (post-approval residual) — `RESOLVE_VALUES_*` codes added to `_DENIAL_TABLE` so replayed trail
+  entries render specific messages.
+
+Re-review **APPROVED**: injection/scope/credential paths verified empirically safe (sqlglot ClickHouse
+escaping incl. backslashes; `concept` provably never reaches SQL; D70-consistent allowlisting; M1 scope-key
+correctness by construction via `is_provenance_in_scope`).
+
+### Verification status
+**512 passed / 18 skipped, ruff clean.** All 5 xfail bug repros are now regular passes. Proven **at Layer 1
+with fakes** (`FakeEmbeddingClient`, `FakeMCPClient`) — **not** yet Layer-2 over the real MCP↔ClickHouse,
+and **no** live custom-embedding-API call (endpoint/contract still an OQ). Decisions recorded: D77 annotated
+BUILT, new **D85** (embedding-failure degrade). Traceability rows added (`🟡 unit-green`).
+
+### Honest status
+D77 done at Layer 1 + reviewed; **uncommitted** at time of writing (committed right after this doc pass).
+Carried-forward: custom embedding-API contract OQ, D67 `resolve_via` wiring, per-(client,column) index +
+period-domain resolution (deferred by design), and a Layer-2 run over real infra. Nothing pushed (no remote).
 
 ## 2026-07-01 — Session 8: Phase-0 VALIDATED against real infra — Layer-2 + UI + Layer-3 + live turn
 

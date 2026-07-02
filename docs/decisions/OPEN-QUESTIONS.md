@@ -132,6 +132,12 @@ ranked `resolveValues` match is auto-used vs. routed to `askUser` — risk of si
 plausible-but-wrong code. As a runtime composite (D77), this threshold is a runtime implementation
 decision, not an MCP concern.
 
+**Resolved for Phase 1 (Session 9, D77 build):** the runtime applies **no hard threshold** — it returns
+numeric `score`s plus a computed `top_margin` (gap between the top two), and the tool description guides
+the model to call `askUser` when scores are low/clustered or when `ranking == "freq_only"` (D85 degrade).
+The clarify decision stays model-side by design (`resolveValues` resolves; `askUser` clarifies). A soft
+runtime hint/hard threshold remains a compatible later change if traffic shows the model over-accepts.
+
 ## Retrieval ([03](../03-context-and-retrieval.md))
 - Reranker model + threshold; recall `k` vs. final top-3. The reranker is a **custom API (not OpenAI)** (D71) called via a **simple HTTP `POST`** with a manual `RERANKER` span (D24); endpoint + model id TBD.
 - Shared embedding model choice — a **custom API (not OpenAI)** (D71); endpoint + specific model id TBD.
@@ -142,6 +148,15 @@ decision, not an MCP concern.
   call); temporal label-drift handling via the `period?` arg. These questions now live **agent-
   runtime-side** — the backing `runQuery` handles enforcement; ranking and caching decisions belong
   to the runtime implementation of D77.
+  **Update (Session 9, D77 build):** ranking weights are shipped as **provisional `RuntimeSettings`
+  tunables** (`resolve_values_similarity_weight=0.7`, so `0.7·cosine + 0.3·log-freq`; `query_limit=200`,
+  `top_k=10`) pending real traffic. The `period?` arg is honored only as a **concrete structured**
+  `{column, start, end}` filter; deictic/relative period-domain resolution (label-drift over time,
+  D41/D65) is **still open**, deferred to the D67 era. The **per-(client,column) index** remains
+  deferred (live `DISTINCT` each call). **Still open:** the custom **embedding API contract** — the
+  `HttpEmbeddingClient` assumes a request/response shape pending the real endpoint (D71); until it
+  exists, an unconfigured API degrades to freq-only (D85). **D67 `resolve_via` wiring** is still open,
+  but the composite now exposes a typed `resolve()` entry point it can call (no model round-trip).
 - **Context-budget params (D46):** result preview row cap `N` + history token budget + when
   compaction triggers. (Mechanism resolved; values TBD.)
 - **Loop-budget caps (D47):** max iterations / tokens / wall-clock per turn. (Mechanism resolved;

@@ -37,6 +37,16 @@ returned to the user as-is.
 `ToolDispatcher.dispatch` (design §3.3 "askUser is intercepted upstream in
 the agent loop, never reaches this dispatcher").
 
+`resolveValues` (D77) is the SECOND intercepted tool, handled symmetrically:
+it too never reaches `ToolDispatcher.dispatch` under its own name (only the
+inner `runQuery` it issues does), but — unlike `askUser`, which pauses — it
+returns an INLINE `ToolResult` so the loop's existing TrailEntry +
+write_full_result + budget path handles it identically to a dispatched tool.
+It therefore counts as exactly ONE `tool_calls_made` (the inner runQuery does
+not double-count) and respects `max_tool_calls_per_iteration` + wall-clock like
+any other tool call. Its TrailEntry carries the inner runQuery's provenance
+(resolvevalues-design §8).
+
 Statelessness across pauses (D45): both `run()` and `resume()` rebuild the
 canonical message list from the `SessionStore` on every single model
 round-trip (`_build_canonical_messages`) rather than carrying an in-memory
@@ -72,9 +82,14 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolObserver
+from data_agent.runtime.dispatch.tool_dispatcher import (
+    ToolDispatcher,
+    ToolObserver,
+    ToolResult,
+)
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
 from data_agent.runtime.session.models import PauseCheckpoint, TrailEntry, TurnMessage
 from data_agent.runtime.session.store import SessionStore
@@ -97,6 +112,21 @@ def _now_iso() -> str:
 
 def _default_observer(event: str, payload: dict[str, Any]) -> None:
     return None
+
+
+def _resolve_values_unavailable(tool_name: str) -> ToolResult:
+    """A clean local error for a `resolveValues` call when the composite is not
+    wired (L2) — never dispatched to the MCP under its own name."""
+    return ToolResult(
+        status="error",
+        tool_name=tool_name,
+        error_code="RESOLVE_VALUES_UNAVAILABLE",
+        retryable=False,
+        user_message="Value resolution is not available right now.",
+        provenance=None,
+        result_preview=None,
+        result_full=None,
+    )
 
 
 @dataclass(frozen=True)
@@ -185,12 +215,17 @@ class AgentLoop:
         max_tool_calls_per_iteration: int = 8,
         clock: Callable[[], float] = time.monotonic,
         observer: ToolObserver = _default_observer,
+        resolve_values: ResolveValuesComposite | None = None,
     ) -> None:
         self._model_client = model_client
         self._tool_dispatcher = tool_dispatcher
         self._context_assembler = context_assembler
         self._session_store = session_store
         self._tools_provider = tools_provider
+        # D77: the `resolveValues` composite is intercepted here (never
+        # dispatched under its own name). Optional so existing Layer-1 loop
+        # tests that never exercise resolveValues need not wire it.
+        self._resolve_values = resolve_values
         self._max_loop_iterations = max_loop_iterations
         self._max_wall_clock_seconds = max_wall_clock_seconds
         self._max_budget_windows = max_budget_windows
@@ -412,9 +447,27 @@ class AgentLoop:
             # on the next round-trip if it still wants them.
             capped_tool_calls = result.tool_calls[: self._max_tool_calls_per_iteration]
             for tool_call in capped_tool_calls:
-                tool_result = await self._tool_dispatcher.dispatch(
-                    tool_call.name, tool_call.arguments, credentials
-                )
+                # D77: `resolveValues` is intercepted here (symmetric to
+                # `askUser` above) — it never reaches `dispatch` under its own
+                # name; only the inner `runQuery` it issues does. It returns the
+                # SAME `ToolResult` dataclass, so the trail/budget path below is
+                # unchanged and it counts as exactly one `tool_calls_made`.
+                if tool_call.name == "resolveValues":
+                    # L2: `resolveValues` is a runtime composite — it must NEVER
+                    # be dispatched to the MCP under its own name (there is no
+                    # such MCP tool). If the composite is not wired, return a
+                    # clean local error instead of an incoherent unknown-tool
+                    # MCP denial.
+                    if self._resolve_values is None:
+                        tool_result = _resolve_values_unavailable(tool_call.name)
+                    else:
+                        tool_result = await self._resolve_values.run(
+                            tool_call.arguments, credentials
+                        )
+                else:
+                    tool_result = await self._tool_dispatcher.dispatch(
+                        tool_call.name, tool_call.arguments, credentials
+                    )
                 tool_calls_made += 1
 
                 result_full_ref: str | None = None

@@ -34,6 +34,14 @@ and `sampleRows` (scope-reject) too — closing the gap that was here; the runti
 redundant-but-harmless belt-and-suspenders (OQ-4). That MCP work is unit-green in `clickhouse-api` but
 uncommitted + Layer-2 (live ClickHouse) not yet run.
 
+**Update (Session 9, D77/D85):** the runtime `resolveValues` composite (`src/data_agent/runtime/composite/`
++ `model/embedding_client.py`) is built, adversarially QA'd (~128 Layer-1 tests, incl. 5 xfail bug repros
+now passing), and reviewed (REQUEST CHANGES → fixed → APPROVE). The D77/D85 rows below are `🟡 unit-green`:
+injection/scope/credential/degrade paths are proven **at Layer 1 with fakes** (the `FakeEmbeddingClient`
+and `FakeMCPClient`), including a real-OTel-exporter redaction e2e. **Not yet run:** Layer-2 over the real
+`clickhouse-api` MCP↔ClickHouse for the backing `runQuery`, and any live custom-embedding-API call (the
+endpoint/contract is still an open question — see OPEN-QUESTIONS §Retrieval).
+
 See [docs/11-testing.md](../11-testing.md) for the four-layer test pyramid definition and the full
 Layer 3 scenario list. See [docs/decisions/DECISIONS.md](DECISIONS.md) for the rationale behind each
 decision cited here.
@@ -137,3 +145,11 @@ the Layer 1 test suite. They extend the existing D57/D63/D64 rows in the matrix 
 | **D69 / OQ-4** | Scratch table columns are NOT column-scope-checked; `qualify_columns` is not run for scratch tables; session-ID name-match (D64) is the sole gate | Unit | `D69-scratch-column-no-scope-check` | — | ✅ green |
 | **D69 / OQ-5** | `extract_column_provenance` is never called on EXPLAIN queries; the caller enforces this precondition before invoking the extractor | Unit (caller precondition test) | `D69-explain-caller-precondition` | — | ✅ green |
 | **D70** | Identifier matching is case-sensitive + exact; a table/column reference unresolvable against the catalog → `ProvenanceExtractionError` (no case-insensitive fallback, no silent skip); scratch columns are the documented exception (D69/OQ-4) | Unit | `D70-case-mismatch-fails-closed` | — | ✅ green |
+| **D77** | `concept` never reaches SQL — the backing `runQuery` is built from catalog-allowlisted identifiers + sqlglot literals only; `concept` is used solely for in-runtime embedding/ranking (D10). Verified empirically incl. ClickHouse-escaping of adversarial `concept`/period values | Unit | `D77-concept-never-in-sql` | — | 🟡 unit-green |
+| **D77** | Enforcement is the inner `runQuery`'s — no separate scope path in the composite; an inner `COLUMN_SCOPE_VIOLATION` (incl. an out-of-scope description or period column) passes through as a `resolveValues` denial, never bypassed | Unit | `D77-enforcement-via-inner-runquery` | **Scope denial** | 🟡 unit-green |
+| **D77** | Unknown/ambiguous `table` or `column`, or unknown `period.column`, fails closed (`RESOLVE_VALUES_UNKNOWN_TARGET`, retryable) before any query is issued; the message names only the supplied target (no catalog enumeration → no scope leak) | Unit | `D77-unknown-target-fails-closed` | — | 🟡 unit-green |
+| **D77** | A `resolveValues` trail entry carries the inner `runQuery`'s extracted provenance (the value/description/period columns) — correct D44 USES-set, no `capture.py` special-case | Unit | `D77-provenance-carried-from-inner` | — | 🟡 unit-green |
+| **D77** | `resolveValues` counts as exactly one `tool_calls_made`; the single inner `runQuery` is never double-counted against the budget | Unit | `D77-one-budget-count` | — | 🟡 unit-green |
+| **D77** | Empty in-scope result set → `status="ok"` with an empty value list (a valid "no matches" answer), never an error | Unit | `D77-empty-result-is-ok` | — | 🟡 unit-green |
+| **D77 / D25** | `concept` (and `period` start/end literals) are redacted from every span and progress payload — proven by a real-OTel-exporter e2e asserting `concept` is absent from all emitted attributes | Unit | `D77-concept-redacted-from-telemetry` | — | 🟡 unit-green |
+| **D85** | An embedding failure (unreachable / non-2xx / malformed / non-finite / length-mismatch vectors) degrades to freq-only ranking, never crashes the turn and never fails the call; `result_full.degraded`/`ranking="freq_only"` surface the state so a freq-only top score can't masquerade as a semantic match | Unit | `D85-embedding-failure-degrades-not-fails` | — | 🟡 unit-green |

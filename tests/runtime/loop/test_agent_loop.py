@@ -535,3 +535,225 @@ async def test_prior_turn_denial_is_dropped_from_next_turns_context() -> None:
     blob = json.dumps(reopened_turn_messages, default=str)
     assert "call_1" not in blob
     assert "TABLE_NOT_FOUND" not in blob
+
+
+# ---------------------------------------------------------------------------
+# D77 — resolveValues is intercepted in the loop (never dispatched under its
+# own name), returns an INLINE result, counts as exactly one tool call, and
+# persists a TrailEntry carrying the inner runQuery's provenance.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_loop(
+    *, model_client: ScriptedModelClient, mcp_client: FakeMCPClient
+) -> tuple[AgentLoop, InMemorySessionStore]:
+    from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
+    from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
+
+    catalog = CatalogHandle(
+        {_E: {"EarnCode": "Nullable(String)", "EarnDescription": "Nullable(String)"}}
+    )
+    store = InMemorySessionStore()
+    dispatcher = ToolDispatcher(mcp_client, catalog)
+    assembler = ContextAssembler(store, history_token_budget=100_000)
+    composite = ResolveValuesComposite(
+        tool_dispatcher=dispatcher,
+        catalog=catalog,
+        embedding_client=FakeEmbeddingClient(dim=2),
+    )
+    loop = AgentLoop(
+        model_client=model_client,
+        tool_dispatcher=dispatcher,
+        context_assembler=assembler,
+        session_store=store,
+        tools_provider=_tools_provider,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        resolve_values=composite,
+    )
+    return loop, store
+
+
+def _resolve_result() -> dict:
+    return {
+        "columns": ["EarnCode", "EarnDescription", "freq"],
+        "rows": [["PTO", "paid time off", 10], ["OT", "overtime", 3]],
+        "row_count": 2,
+        "truncated": False,
+    }
+
+
+async def test_resolve_values_inline_result_continues_loop_no_pause() -> None:
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="rv_1",
+                        name="resolveValues",
+                        arguments={"table": _E, "column": "EarnCode", "concept": "leave"},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="PTO is the paid-time-off code."),
+        ]
+    )
+    mcp = FakeMCPClient(scripted={"runQuery": [_resolve_result()]})
+    loop, store = _resolve_loop(model_client=model, mcp_client=mcp)
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="Which code is PTO?"
+    )
+
+    assert outcome.status == "done"  # inline result, never a pause
+    # Exactly one tool call counted — the inner runQuery is not double-counted.
+    assert outcome.tool_calls_made == 1
+    # Exactly one MCP call fired: the inner runQuery (resolveValues never
+    # reaches the MCP under its own name).
+    assert [c.tool_name for c in mcp.calls] == ["runQuery"]
+
+
+async def test_resolve_values_trail_entry_has_inner_provenance() -> None:
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="rv_1",
+                        name="resolveValues",
+                        arguments={"table": _E, "column": "EarnCode", "concept": "leave"},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="done"),
+        ]
+    )
+    mcp = FakeMCPClient(scripted={"runQuery": [_resolve_result()]})
+    loop, store = _resolve_loop(model_client=model, mcp_client=mcp)
+
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    trail = await store.load_trail(SESSION_ID)
+    assert len(trail) == 1
+    entry = trail[0]
+    assert entry.tool_name == "resolveValues"
+    assert entry.status == "ok"
+    # Provenance is the inner runQuery's — the columns the built SQL references.
+    assert entry.provenance == frozenset(
+        {(_E, "EarnCode"), (_E, "EarnDescription")}
+    )
+    assert entry.result_full_ref is not None
+
+
+async def test_resolve_values_respects_per_iteration_cap() -> None:
+    # Two resolveValues calls in one model response, cap=1 -> only one dispatched.
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="rv_1",
+                        name="resolveValues",
+                        arguments={"table": _E, "column": "EarnCode", "concept": "leave"},
+                    ),
+                    ToolCallRequest(
+                        id="rv_2",
+                        name="resolveValues",
+                        arguments={"table": _E, "column": "EarnCode", "concept": "overtime"},
+                    ),
+                ]
+            ),
+            ModelTurnResult(assistant_text="done"),
+        ]
+    )
+    mcp = FakeMCPClient(scripted={"runQuery": [_resolve_result()]})  # only ONE response
+    from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
+    from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
+
+    catalog = CatalogHandle(
+        {_E: {"EarnCode": "Nullable(String)", "EarnDescription": "Nullable(String)"}}
+    )
+    store = InMemorySessionStore()
+    dispatcher = ToolDispatcher(mcp, catalog)
+    assembler = ContextAssembler(store, history_token_budget=100_000)
+    composite = ResolveValuesComposite(
+        tool_dispatcher=dispatcher, catalog=catalog, embedding_client=FakeEmbeddingClient(dim=2)
+    )
+    loop = AgentLoop(
+        model_client=model,
+        tool_dispatcher=dispatcher,
+        context_assembler=assembler,
+        session_store=store,
+        tools_provider=_tools_provider,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        max_tool_calls_per_iteration=1,
+        resolve_values=composite,
+    )
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+    assert outcome.tool_calls_made == 1  # capped, not 2
+    assert len(mcp.calls) == 1
+
+
+async def test_resolve_values_credentials_never_in_model_payload() -> None:
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="rv_1",
+                        name="resolveValues",
+                        arguments={"table": _E, "column": "EarnCode", "concept": "leave"},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="done"),
+        ]
+    )
+    mcp = FakeMCPClient(scripted={"runQuery": [_resolve_result()]})
+    loop, store = _resolve_loop(model_client=model, mcp_client=mcp)
+
+    await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    # The inner runQuery DID receive credentials at the transport boundary.
+    assert mcp.calls[0].jwt == SECRET_JWT
+    assert mcp.calls[0].session_id == SESSION_ID
+    # No model payload ever carries them.
+    for recorded_turn in model.calls:
+        blob = json.dumps(recorded_turn.messages, default=str)
+        assert SECRET_JWT not in blob
+
+
+async def test_resolve_values_unwired_returns_local_error_never_dispatched() -> None:
+    # L2: when the composite is NOT wired, a resolveValues call must NOT be
+    # dispatched to the MCP under its own name — it returns a clean local error.
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="rv_1",
+                        name="resolveValues",
+                        arguments={"table": _E, "column": "EarnCode", "concept": "leave"},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="ok"),
+        ]
+    )
+    mcp = FakeMCPClient()  # no scripted responses — must never be called
+    loop, store = _build_loop(model_client=model, mcp_client=mcp)  # resolve_values defaults None
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.status == "done"
+    assert outcome.tool_calls_made == 1
+    assert mcp.calls == []  # resolveValues never dispatched to the MCP
+
+    trail = await store.load_trail(SESSION_ID)
+    assert trail[0].tool_name == "resolveValues"
+    assert trail[0].status == "error"
+    assert trail[0].error_code == "RESOLVE_VALUES_UNAVAILABLE"

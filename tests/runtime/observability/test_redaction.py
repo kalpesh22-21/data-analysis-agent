@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from data_agent.runtime.context.scope_filter import compute_scope_hash
@@ -63,6 +65,38 @@ def test_redact_tool_args_leaves_non_sql_tools_untouched() -> None:
     args = {"database": "dbpcm_warehouse", "table": "employee"}
     redacted = redact_tool_args("getTableSchema", args)
     assert redacted == args
+
+
+def test_redact_tool_args_resolve_values_masks_concept_keeps_identifiers() -> None:
+    args = {
+        "table": "accrual_events",
+        "column": "EarnCode",
+        "concept": "employees on maternity leave for Jane Doe",
+    }
+    redacted = redact_tool_args("resolveValues", args)
+    assert redacted["concept"] == "<redacted>"
+    assert "Jane Doe" not in json.dumps(redacted)
+    # Structural catalog identifiers are kept for debuggability.
+    assert redacted["table"] == "accrual_events"
+    assert redacted["column"] == "EarnCode"
+
+
+def test_redact_tool_args_resolve_values_masks_period_literals_keeps_column() -> None:
+    args = {
+        "table": "accrual_events",
+        "column": "EarnCode",
+        "concept": "pto",
+        "period": {"column": "RequestDate", "start": "2026-01-01", "end": "2026-03-31"},
+    }
+    redacted = redact_tool_args("resolveValues", args)
+    assert redacted["period"]["column"] == "RequestDate"  # kept
+    # L1: bounds are fully redacted (they are unvalidated free text, not
+    # guaranteed SQL-shaped), not passed through mask_sql.
+    assert redacted["period"]["start"] == "<redacted>"
+    assert redacted["period"]["end"] == "<redacted>"
+    assert "2026" not in json.dumps(redacted["period"])
+    # Original args not mutated.
+    assert args["period"]["start"] == "2026-01-01"
 
 
 def test_redactor_class_delegates_to_module_functions() -> None:

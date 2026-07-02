@@ -45,6 +45,7 @@ The deterministic primitives that guard hard boundaries. Each gets exhaustive po
 | **`when` predicate evaluator** | D32/D59 | declarative predicate semantics; entity-valued predicate ⇒ rejected as non-agnostic |
 | **History budget / compaction** | D46/D50 | filter-before-compact ordering; SQL preserved verbatim; preview-only + `truncated` flag |
 | **Leakage gate (regex/NER unit)** | D58 | entity-detection cases incl. non-Western names / word-like names (the correlated-miss tail) |
+| **`resolveValues` composite** (SQL builder / ranking / composite / loop / redaction / schema / embedding client) | D77/D85/D10/D70/D25 | **BUILT Session 9** (~128 adversarial cases). Catalog-allowlist + D70 exact-case validation; unknown/ambiguous target → fail-closed; **`concept` provably never in SQL** (sqlglot-AST, ClickHouse escaping incl. backslashes); scope-aware description-column discovery (M1); ranking `0.7·cosine+0.3·log-freq` top-10; **embedding failure ⇒ freq-only degrade, not fail** (D85: bad shapes/non-finite/length-mismatch all degrade); malformed inner result ⇒ clean `RESOLVE_VALUES_INTERNAL_ERROR` (B4-parity, no turn crash); one `tool_calls_made`; provenance carried from inner `runQuery`; **`concept`/period redacted from every span+progress payload** (real-OTel-exporter e2e); schema = 6 MCP + `askUser` + `resolveValues` |
 
 ## Layer 2 — Component / Integration (one component + its real store)
 
@@ -56,6 +57,7 @@ Run against a **real** containerized store, not the full stack:
 - **Learning loop** (vs. neo4j/Redis/provenance store): each stage triage→extractor→static-validate→**leakage gate**→dedup→writers; **idempotency by `content_hash`**; **single-writer-per-`canonical_key` race (D48)**; knowledge ⇒ review inbox, **not retrievable until approved (D58a)**; `LEARNING_ENABLED=false` halts write-back (D58c).
 - **Retrieval** (vs. neo4j): embed→recall→**scope pre-filter drops out-of-scope blueprints**→rerank→top-3 thin cards; both vector corpora served from neo4j (D60).
 - **Session store** (vs. Couchbase): `SESSION_TTL` expiry; per-result column-provenance persisted (D44); pause checkpoint CAS flag.
+- **`resolveValues` composite** (vs. real `clickhouse-api` MCP↔ClickHouse + live embedding API) — **deferred, not yet run (D77/D85):** the full flow over the real MCP (backing `runQuery` scope-enforced end-to-end), and a live call to the custom embedding API (D71) — the endpoint/contract is still an open question (OPEN-QUESTIONS §Retrieval); Layer-1 proves the degrade path with `FakeEmbeddingClient` in the meantime.
 
 ## Layer 3 — E2E spec-conformance (Docker stack + Playwright MCP)
 

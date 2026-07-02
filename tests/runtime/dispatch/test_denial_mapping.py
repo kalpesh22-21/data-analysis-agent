@@ -16,6 +16,14 @@ _ALL_SEVEN_CODES = {
     "CLICKHOUSE_UNAVAILABLE",
 }
 
+# D77 resolveValues composite codes (L5): set locally by the composite, but
+# re-derived from the denial table on replay (user_message is not persisted).
+_COMPOSITE_CODES = {
+    "RESOLVE_VALUES_UNKNOWN_TARGET",
+    "RESOLVE_VALUES_INTERNAL_ERROR",
+    "RESOLVE_VALUES_UNAVAILABLE",
+}
+
 _EXPECTED_RETRYABLE = {
     "COLUMN_SCOPE_VIOLATION": False,
     "SCRATCH_SESSION_VIOLATION": False,
@@ -24,14 +32,21 @@ _EXPECTED_RETRYABLE = {
     "TABLE_NOT_FOUND": True,
     "CLICKHOUSE_QUERY_ERROR": True,
     "CLICKHOUSE_UNAVAILABLE": False,
+    # Retryable flags MUST match what the composite itself sets so replay is
+    # consistent with the live-call semantics (composite/resolve_values.py).
+    "RESOLVE_VALUES_UNKNOWN_TARGET": True,
+    "RESOLVE_VALUES_INTERNAL_ERROR": False,
+    "RESOLVE_VALUES_UNAVAILABLE": False,
 }
 
-
-def test_all_seven_codes_are_known() -> None:
-    assert KNOWN_DENIAL_CODES == frozenset(_ALL_SEVEN_CODES)
+_ALL_KNOWN_CODES = _ALL_SEVEN_CODES | _COMPOSITE_CODES
 
 
-@pytest.mark.parametrize("code", sorted(_ALL_SEVEN_CODES))
+def test_all_known_codes_are_registered() -> None:
+    assert KNOWN_DENIAL_CODES == frozenset(_ALL_KNOWN_CODES)
+
+
+@pytest.mark.parametrize("code", sorted(_ALL_KNOWN_CODES))
 def test_classify_denial_retryability(code: str) -> None:
     info = classify_denial(code)
     assert info.code == code
@@ -39,7 +54,7 @@ def test_classify_denial_retryability(code: str) -> None:
     assert info.user_message  # non-empty, user-facing text
 
 
-@pytest.mark.parametrize("code", sorted(_ALL_SEVEN_CODES))
+@pytest.mark.parametrize("code", sorted(_ALL_KNOWN_CODES))
 def test_classify_denial_user_message_is_non_technical(code: str) -> None:
     info = classify_denial(code)
     # Never leak the raw MCP error-code string into the user-facing message.

@@ -66,6 +66,31 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         retryable=False,
         user_message="The data warehouse is temporarily unavailable.",
     ),
+    # D77 resolveValues composite codes (L5): these never come from the MCP —
+    # the composite sets them locally with a crafted, target-specific
+    # `user_message` (e.g. "No column 'X' on table 'Y' is available."). But
+    # `user_message` is NOT persisted on `TrailEntry`, so on replay
+    # `context/budget.py::_render_entry` re-derives it from `error_code` via
+    # this table. The table cannot know the specific column name, so these are
+    # generic-but-actionable and match the composite's retryable semantics.
+    "RESOLVE_VALUES_UNKNOWN_TARGET": DenialInfo(
+        code="RESOLVE_VALUES_UNKNOWN_TARGET",
+        retryable=True,
+        user_message=(
+            "That table or column isn't available. Check the exact name with "
+            "getTableSchema and try again."
+        ),
+    ),
+    "RESOLVE_VALUES_INTERNAL_ERROR": DenialInfo(
+        code="RESOLVE_VALUES_INTERNAL_ERROR",
+        retryable=False,
+        user_message="Something went wrong resolving those values. Please try again.",
+    ),
+    "RESOLVE_VALUES_UNAVAILABLE": DenialInfo(
+        code="RESOLVE_VALUES_UNAVAILABLE",
+        retryable=False,
+        user_message="Value resolution is not available right now.",
+    ),
 }
 
 KNOWN_DENIAL_CODES = frozenset(_DENIAL_TABLE)

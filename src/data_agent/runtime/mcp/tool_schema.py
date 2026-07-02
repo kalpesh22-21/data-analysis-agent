@@ -42,6 +42,65 @@ ASK_USER_TOOL_SCHEMA: dict[str, Any] = {
     },
 }
 
+# `resolveValues` (D77) is the second locally-authored tool — a runtime
+# composite (not an MCP tool), intercepted in the agent loop like `askUser` but
+# returning an inline tool result. It declares NO session_id/jwt/scope (D5) —
+# the client/tenant is applied automatically by the backing runQuery's D5 RLS +
+# D57 column-scope. See docs/decisions/resolvevalues-design.md §10.
+RESOLVE_VALUES_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "resolveValues",
+    "description": (
+        "Resolve a fuzzy business CONCEPT to the concrete, client-specific values of a "
+        "code/category column, ranked by how well each value matches the concept and how "
+        "frequently it occurs for THIS client. Use this for client-defined or time-varying "
+        "code spaces (e.g. EarnCode, TypeCode, department codes) where the exact codes differ "
+        "per client and drift over time — never hardcode such codes. Prefer this over sampleRows "
+        "when you need the values that mean a concept (e.g. 'PTO earn codes'), not a raw sample. "
+        "Each result has a `score` (0-1); if the top scores are low or clustered (no clear "
+        "winner), ask the user to confirm with askUser before filtering on a guessed value. "
+        "The result also carries a `degraded` flag and a `ranking` mode: when `ranking` is "
+        "'freq_only' (semantic matching was unavailable), the scores reflect how COMMON each "
+        "value is for this client, NOT how well it matches your concept — do not treat a high "
+        "score as a concept match; prefer askUser to confirm. When `ranking` is 'semantic+freq' "
+        "the scores blend concept similarity with frequency as normal. "
+        "The client/tenant is applied automatically — do not pass any client identifier."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "table": {
+                "type": "string",
+                "description": "Table holding the column, e.g. 'accrual_events' or "
+                "'dbpcm_warehouse.accrual_events'.",
+            },
+            "column": {
+                "type": "string",
+                "description": "The code/category column to resolve values for, e.g. 'EarnCode'.",
+            },
+            "concept": {
+                "type": "string",
+                "description": "The business concept to match, in the user's own words, e.g. "
+                "'paid time off' or 'overtime'. Free text — never a code.",
+            },
+            "period": {
+                "type": ["object", "null"],
+                "description": "Optional. Restrict to a concrete date window (helps when codes "
+                "drift over time). Omit if not needed.",
+                "properties": {
+                    "column": {
+                        "type": "string",
+                        "description": "A date/time column on the table to filter on.",
+                    },
+                    "start": {"type": "string", "description": "Inclusive start (ISO date)."},
+                    "end": {"type": "string", "description": "Inclusive end (ISO date)."},
+                },
+            },
+        },
+        "required": ["table", "column", "concept"],
+    },
+}
+
 
 def translate_tool_spec(tool: MCPToolSpec) -> dict[str, Any]:
     """Translate one `MCPToolSpec` into an OpenAI `type: "function"` declaration."""
@@ -69,6 +128,7 @@ async def fetch_function_schemas(
     tools = await mcp_client.list_tools(jwt=jwt, session_id=session_id)
     schemas = [translate_tool_spec(tool) for tool in tools]
     schemas.append(ASK_USER_TOOL_SCHEMA)
+    schemas.append(RESOLVE_VALUES_TOOL_SCHEMA)
     return schemas
 
 
