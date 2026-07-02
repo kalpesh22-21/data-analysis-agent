@@ -44,9 +44,12 @@ routes near-misses to the review inbox. Refines the proposed D39 (intent → sof
 sub-detail: the SQL-AST canonicalization rules (alias/ordering normalization depth).
 
 ### Execution semantics (track separately — not grain)
-- ~~Intermediate inlining vs. the injection boundary~~ — **RESOLVED by D59a:** scalars → typed
-  ClickHouse params; tables (small or large) → session scratch + `JOIN`. No untrusted upstream rows
-  are ever string-interpolated into SQL. Refines D11.
+- ~~Intermediate inlining vs. the injection boundary~~ — **RESOLVED by D59a; BUILT D89 for scalars:**
+  scalars → **typed sqlglot-AST literals** (reframed from "server-side params" at build — no `runQuery`
+  param surface; the D10-safe path); tables (small or large) → session scratch + `JOIN` is **DEFERRED
+  (F2, D89)** — no scratch-write surface exists yet, so a table-intermediate DAG is **rejected
+  pre-dispatch** (scalar-converging DAGs only). No untrusted upstream rows are ever string-interpolated
+  into SQL. Refines D11.
 - ~~Approval gate `show` inconsistency~~ — **RESOLVED by D59b:** `requires_approval` fires before the
   node runs and references **upstream/completed** outputs only, never the gated node's own un-computed
   output. A post-compute confirmation would be a separate node kind (not added now).
@@ -56,12 +59,14 @@ sub-detail: the SQL-AST canonicalization rules (alias/ordering normalization dep
   **pause checkpoint** on the session doc (stateless runtime, resume at `awaiting_node`). Remaining
   sub-detail: interaction with `skip_remaining` below when resuming a partially-skipped DAG.
 - **`skip` / `skip_remaining` semantics** in a parallel-converge graph: skip-node vs skip-dependents;
-  "remaining" by what order. (Still open.)
+  "remaining" by what order. (**Interim-defaulted per D89** — a `when` violation applies
+  `abort`/`skip`/`ask` at the single node; the full parallel-converge `skip_remaining` ordering
+  semantics remain open, deferred with the table-intermediate path since D33 keeps DAGs linear.)
 - ~~`guard` node_kind vs. D33 (no branching)~~ — **RESOLVED by D59c:** `guard` cut; its abort/skip
   capability folded into the `when` clause every node already supports. `node_kind ∈ {query, approval}`.
 
 ### Carried over
-- Concrete `slot_bindings` payload shape and per-`type` binding rules (incl. list/`IN` and enum slots).
+- ~~Concrete `slot_bindings` payload shape and per-`type` binding rules (incl. list/`IN` and enum slots).~~ **RESOLVED (D89):** `slot_bindings` is a **flat `{name: raw_value}` object**; the runtime resolves per-`type` (D49 pure-code resolvers) and binds as typed AST literals (list/`IN` handled via the D67 `resolve_via` IN-list-of-literals path).
 - **Period range** slots ("May vs June", "YTD") — `period_range` shape or list-typed period slot.
 - **Period dimension table** for the period resolver (vs `SELECT DISTINCT` on a large fact table).
 - Output-signature definition (which invariants to capture/check) + input-sampling strategy for replay.
@@ -78,8 +83,10 @@ sub-detail: the SQL-AST canonicalization rules (alias/ordering normalization dep
 - ~~neo4j graph schema (node labels, edge types, indexes) — to be specified.~~ **RESOLVED by D87
   (Session 11):** `:Blueprint`/`:KnowledgeChunk` + per-corpus 768-dim cosine native vector indexes;
   USES denormalized as byte-exact `db.table.column` strings + reserved `:USES`/`:OF_TABLE` edges;
-  model-parity stamp; Track-B lifecycle columns reserved. See neo4j-corpus-design.md. Still open
-  there: full-DAG (`composes`) storage when `runBlueprint` lands.
+  model-parity stamp; Track-B lifecycle columns reserved. See neo4j-corpus-design.md. ~~Still open
+  there: full-DAG (`composes`) storage when `runBlueprint` lands.~~ **RESOLVED (D89, Slice A):** the
+  full-DAG props (`resolves`/`slots`/`uses_rules`/`sql_template`/`composes`/`result_grain`) are now
+  **stored with write-time validation AND executed** by `runBlueprint` — not merely stored.
 
 ## Semantic Catalog (`databaseSchemaDocs/`) — from the catalog gap review
 
@@ -94,9 +101,11 @@ The curated semantic layer applied by the **MCP**, not the runtime. Per D83 (rev
   `predicate: "FieldId IN ({field_codes})"` + `resolve_via: "resolveValues(FieldId, <concept>)"`
   (see PAF `*_change_fields`). The **runtime resolves the concept → code set via its runtime
   `resolveValues` (D77) and binds the result as params before executing** the predicate (D10: never
-  string-interpolated). No mechanism exists for this yet. Note: because `resolveValues` is now a
-  runtime composite (D77), the resolved concept→code expansion also happens runtime-side, consistent
-  with the D5 injection boundary.
+  string-interpolated). **BUILT (Session 13, D89):** this mechanism now exists — `runBlueprint` expands
+  `resolve_via` via the typed `resolveValues.resolve()` hook and binds the code set as an **IN-list of
+  AST literals** (empty → fail-closed, degraded → raw-loop). **Still open:** no **live** `resolve_via`
+  seed yet (Layer-1 only). Note: because `resolveValues` is now a runtime composite (D77), the resolved
+  concept→code expansion also happens runtime-side, consistent with the D5 injection boundary.
 - **`sensitive: true` on a column** — added to known PII columns. Intended as the **catalog source of
   truth for the column-scope / governance layer**; needs that layer to actually consume it (today
   scope/masking are maintained out-of-band).
@@ -159,9 +168,12 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
   budget accounting for the rendered block (OQ-R8), full-DAG blueprint storage (runBlueprint era).
 - **Read tools (Session 12, D88):** `searchBlueprints`/`getBlueprint`/`searchKnowledge` are **BUILT**
   (runtime-tool registry, non-oracle scope posture, footprint-split provenance). Resolved: searchKnowledge
-  returns **chunks** for Phase 1 (OQ-R3). Newly open (**OQ-T1**, owned by the `runBlueprint` brick):
+  returns **chunks** for Phase 1 (OQ-R3). ~~Newly open (**OQ-T1**, owned by the `runBlueprint` brick):
   `getBlueprint`'s full-DAG expansion (`resolves`/typed `slots`/`uses_rules`/`sql_template`/`composes`),
-  the runtime/MCP tool-name collision guard, and duplicate-tool-call-id replay semantics (both QA-pinned).
+  the runtime/MCP tool-name collision guard, and duplicate-tool-call-id replay semantics (both QA-pinned).~~
+  **RESOLVED (Session 13, D89):** the full-DAG expansion is **stored + executed** (`getBlueprint` expands
+  additively, non-oracle preserved for DAG blueprints); the **name-collision guard** (fail-loud at
+  schema-fetch) and **duplicate-tool-call-id dedup** (keep-first, API-safe replay) both shipped in Slice A.
 - Shared embedding model choice — a **custom API (not OpenAI)** (D71), called via a **simple HTTP
   `POST`** with a manual `EMBEDDING` span (D24); shared across question + blueprint intent + knowledge.
   **Contract resolved (Session 9b):** the mock at `~/Development/SQL/mocks/embedding_api` is
@@ -181,8 +193,13 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
   deferred (live `DISTINCT` each call). ~~**Still open:** the custom **embedding API contract**~~
   **resolved Session 9b** — the user-provided mock (`~/Development/SQL/mocks/embedding_api`) is the
   authoritative contract and `HttpEmbeddingClient` is aligned + live-validated; an unconfigured API
-  still degrades to freq-only (D85). **D67 `resolve_via` wiring** is still open,
-  but the composite now exposes a typed `resolve()` entry point it can call (no model round-trip).
+  still degrades to freq-only (D85). ~~**D67 `resolve_via` wiring** is still open,
+  but the composite now exposes a typed `resolve()` entry point it can call (no model round-trip).~~
+  **RESOLVED (Session 13, D89):** `resolve_via` is **wired inside `runBlueprint`** (single- AND
+  multi-node) — a concept expands via the typed `resolveValues.resolve()` hook (no model round-trip),
+  bound as an **IN-list of literals**; empty → fail-closed, degraded → raw-loop fallback. **Still open:**
+  no **live** `resolve_via` seed yet (D67 Layer-1 only); **deictic/relative period** resolution remains
+  deferred (label-drift over time, D41/D65).
 - **Context-budget params (D46):** result preview row cap `N` + history token budget + when
   compaction triggers. (Mechanism resolved; values TBD.)
 - **Loop-budget caps (D47):** max iterations / tokens / wall-clock per turn. (Mechanism resolved;

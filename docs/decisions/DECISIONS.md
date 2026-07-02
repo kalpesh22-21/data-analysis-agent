@@ -271,7 +271,58 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   [read-tools-design.md](read-tools-design.md). Cross-references: D8 (progressive disclosure),
   D41, D44 (replay filter), D58, D77 (runtime-tool precedent), D86/D87.
 
-- **D67 (locked, 2026-06-30).** **Two rule kinds: static and resolved (dynamic).** A catalog `rule`'s
+- **D89 (locked, 2026-07-02, Session 13 — the runBlueprint brick, Slices A/B/C).**
+  **`runBlueprint(id, slot_bindings)` ships as a `RuntimeTool` that executes stored full-DAG
+  blueprints fail-closed: scope-honest at load, D56-verified on return, injection-safe at every
+  bind, and durable across a mid-DAG approval pause.** The honest boundary is **scalar-converging
+  DAGs** — table-passing intermediates are rejected pre-dispatch (F2). Specifics:
+  **(a) The scope-honesty gate (the load-bearing check, Slice A).** A blueprint's `sql_template` can
+  only read **within its declared `uses`** — enforced **table-aware** at load via `qualify_columns`
+  against a `uses`-derived schema PLUS `_assert_source_tables_in_uses` (any JOINed / subquery /
+  table-function source absent from `uses` is rejected). Closes `SELECT *`, alias-mask, table-blind
+  bare-name, `dictGet`, cross-db, and qualified-JOIN-to-unlisted-table bypasses (all reviewer/QA
+  exploits verified closed; legit in-`uses` multi-table JOINs accepted). This makes the D88(c)
+  stored `uses` footprint **honest** — a blueprint cannot read outside the set its scope filter is
+  checked against. **(b) D56 wired live — "no unverified return" (Slice B).** Every result passes the
+  D56 grain-integrity row-count probe on the **terminal** node; verify-FAIL, unmappable grain,
+  grain-probe error, or a denied probe all **WITHHOLD** the rows (`ExecFailed` carries none);
+  `grain_verifiable:false` **skips visibly** (`grain_checked:false`, reported honestly, never a
+  silent pass). The deterministic grain check is the teeth; the LLM review is an ordinary loop
+  round-trip *after* the tool returns (satisfies both D49 no-LLM-inside and D56 two-part gate).
+  **(c) Injection-safe binding, no `runQuery` param surface (F1, D59a/D10).** Slot values AND
+  scalar intermediates are bound as **typed sqlglot-AST literals** — a `{slot}`/query-result cell
+  becomes one placeholder → one escaped literal inside one `SELECT`, provably never SQL syntax; a
+  query-result cell is treated as **hostile data** on the identical D10-safe path as a slot. No
+  bound-param surface is opened on `runQuery`. **(d) Scalar-only intermediates, F2 boundary.** A
+  node's single-cell scalar output feeds a downstream node's slot; a scalar-consumed node returning
+  `!=1` row / wrong column count / NULL fails closed (`SLOT_INVALID`) **before** the consumer runs
+  (D56 only verifies the terminal, so a fanned-out intermediate must fail closed on its own).
+  **Table intermediates are rejected pre-dispatch** — no scratch-write surface exists yet (F2,
+  gated on `clickhouse-api` Track A). **(e) D45 mid-DAG approval pause/resume (Slice C).** An
+  approval node (D59b) checkpoints completed nodes' scalar outputs + per-node provenance + SQL;
+  resume re-enters at `awaiting_node`, **CAS-consumes exactly-once** (double-resume rejected),
+  survives a runtime restart (state only from the checkpoint), and the **resumed provenance union +
+  SQL span the whole DAG** (D44 replay stays **fail-closed across the pause**). The approval
+  decision is **affirmative-only** — ambiguous/negative → deny/re-pause, **never fail-open consent**.
+  Budget: **1 `tool_calls_made` per `runBlueprint`** across pause+resume, despite N inner queries.
+  **(f) D67 `resolve_via` wired (Slice C).** A `concept → value-set` expansion runs via the typed
+  `resolveValues.resolve()` hook (no model round-trip), bound as an **IN-list of literals** (never
+  interpolated); wired for single- AND multi-node; empty → fail-closed, degraded → raw-loop
+  fallback, denial passed through verbatim. **(g) D49 resolvers + askUser-clarify** — per-type slot
+  resolvers stay deterministic code; a multi-match/near-miss pauses via `askUser`. **(h) Error
+  family** `RUN_BLUEPRINT_*` + the shared `RUNTIME_TOOL_INTERNAL_ERROR` containment (D88a).
+  **Honest deferrals (NOT built this brick):** table-intermediate DAGs (needs the F2 scratch-write
+  surface); Layer-3 Playwright demo-wiring (the runBlueprint conformance scenarios are
+  Layer-1/2-proven, not yet demo-green); no live `resolve_via` seed (D67 Layer-1 only); drift probes
+  #2/#3 (Phase-2 per D43); the authoring-time static grain gate (D37b, Phase-2 — runtime D56 gate is
+  the launch teeth). Cross-references: D33 (linear DAG, no branching), D41 (slot bind mechanism),
+  D45 (pause checkpoint additive fields), D48/D49 (dedup + deterministic resolvers), D56 (verify
+  gate — now BUILT), D59a (scalar-literal passing / table passing deferred), D59b (approval nodes),
+  D67 (resolve_via — now BUILT), D87 (stored DAG schema), D88 (read-tools registry + non-oracle
+  posture + the two owed guards, now discharged), D10 (injection boundary), D5 (scope injection).
+
+- **D67 (locked, 2026-06-30; BUILT — Session 13, wired into `runBlueprint` per [D89](#blueprints)).**
+  **Two rule kinds: static and resolved (dynamic).** A catalog `rule`'s
   `predicate` is either a fixed SQL boolean (**static**) or references `resolveValues(column, concept)`
   over a `client_defined` column (**resolved**) — the runtime expands it to a concrete per-client value
   set before injection, bound as params (not string-interpolated). Resolved rules replace hardcoded
@@ -646,8 +697,10 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   unconditional silent path**. Resolves review item I; the OPEN-QUESTIONS "semantic-drift canary" is
   now a specified Phase-2 deliverable.
 
-- **D56 (locked, 2026-06-30).** **No silent path — the agent verifies every blueprint response
-  before the user sees it; the user is never asked to verify.** Supersedes D12's "execute-then-verify
+- **D56 (locked, 2026-06-30; BUILT — Session 13, the runtime grain-integrity gate wired live in
+  `runBlueprint` per [D89](#blueprints); authoring-time D37b gate stays Phase-2).** **No silent path
+  — the agent verifies every blueprint response before the user sees it; the user is never asked to
+  verify.** Supersedes D12's "execute-then-verify
   **silently**" and reframes D43 Phase 1. Every `runBlueprint` result passes a **mandatory agent-side
   verification gate** before it is returned: (a) **code-computed assertions** — the D43 probe-#1
   **grain-integrity** check (`result row count == COUNT(DISTINCT declared result-grain)`; each measure

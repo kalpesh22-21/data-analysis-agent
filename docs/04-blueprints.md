@@ -202,9 +202,12 @@ pay_period:"May 2026"}`.
    (incl. fuzzy NL like "the pay run after the holidays") → **`askUser`**, never an LLM guess.
    (Resolvers, not the model, produce final keys — so the model can't fabricate an invalid value that
    only fails at execution.)
-3. **Bind safely.** Resolved values bind as **ClickHouse server-side query parameters** — the
-   template's `{department}` carries its type from `binds_to` → `{department:String}`, executor passes
-   `param_department`. **Never string-interpolated** (the SQL-injection boundary).
+3. **Bind safely.** Resolved values bind as **typed sqlglot-AST literals** (F1 — realized without a
+   `runQuery` param surface per D89): the template's `{department}` becomes a placeholder that binds
+   to one escaped literal inside one `SELECT`, carrying its type from `binds_to`. **Never
+   string-interpolated** (the SQL-injection boundary; the same D10-safe mechanism `resolveValues`
+   proved). *(Reframed from the original "ClickHouse server-side query parameters" design at build —
+   no bound-param surface exists on `runQuery`; the AST-literal path is provably injection-safe.)*
 
 Composite blueprints fill slots **once at the blueprint level**; values propagate to whichever step's
 `sql_template` references them. (Step-to-step `consumes` is intermediate passing, not slot filling.)
@@ -230,6 +233,14 @@ effective date rather than a period key.
 
 ## Execution — `runBlueprint(id, slot_bindings)`
 
+> **Status: BUILT (D89, Session 13, Slices A/B/C).** The execution engine, the D56 verify gate, slot
+> filling, D67 `resolve_via`, and mid-DAG approval pause/resume are all built and Layer-1-green (with a
+> Layer-2 live leg green — single- and multi-node **scalar** DAGs execute end-to-end vs real neo4j +
+> ClickHouse-via-MCP). **Honest boundary:** only **scalar-converging** DAGs execute — a
+> table-intermediate DAG is **rejected pre-dispatch** (F2, deferred, gated on a `clickhouse-api`
+> scratch-write surface). Step 4's table branch below is therefore the deferred path; step 4's scalar
+> branch is what ships. See [DECISIONS.md](decisions/DECISIONS.md) D89.
+
 The model supplies slot values; **the runtime executes the DAG deterministically** (model never
 re-derives the SQL). Steps:
 
@@ -243,9 +254,14 @@ re-derives the SQL). Steps:
    upstream `output` by **shape**, never by string-interpolating it into SQL text (upstream output is
    untrusted — it ran over warehouse + scratch + possibly uploaded PII, so a "department name" cell is
    attacker-controllable text):
-   - **scalars** → bound as **typed ClickHouse server-side parameters** (carry their type; never
-     rendered as strings).
-   - **tables (small *or* large)** → write to the **session scratch schema** and `JOIN`.
+   - **scalars** → bound as **typed sqlglot-AST literals** (F1, BUILT — a single-cell upstream output
+     binds as one escaped literal, on the same D10-safe path as a slot; a scalar-consumed node
+     returning `!=1` row / wrong column count / NULL **fails closed** before the consumer runs, since
+     D56 only verifies the terminal). *(Reframed from "server-side parameters" at build per D89.)*
+   - **tables (small *or* large)** → write to the **session scratch schema** and `JOIN`. **DEFERRED
+     (F2, D89):** no scratch-write surface exists yet, so a table-intermediate DAG is **rejected
+     pre-dispatch** (scalar-converging DAGs only) — this path is gated on the `clickhouse-api` Track-A
+     surface.
    (Same scratch infra as external uploads — one mechanism.) This **refines D11** (was size-based
    "small → inline `CTE`/`VALUES`"); inlining untrusted rows as `CTE`/`VALUES` is dropped because it
    violated the D10 "never string-interpolated" boundary.
@@ -255,8 +271,12 @@ re-derives the SQL). Steps:
       resume or apply `on_deny`;
    c. for `query` nodes, executes via MCP `runQuery` (jwt/scope/session_id injected by code), captures
       typed outputs, wires `consumes` (`$1.dept_actuals` → downstream input).
-6. **Verify (mandatory gate — D56).** Every result passes an **agent-side verification gate before
-   the user sees it; the user is never asked to verify**. The gate is two parts: (a) **code-computed
+6. **Verify (mandatory gate — D56; BUILT D89).** Every result passes an **agent-side verification
+   gate before the user sees it; the user is never asked to verify**. *(This requires the blueprint to
+   **declare its `result_grain`** at the §Execution level — the deterministic check has nothing to
+   check against otherwise; a `grain_verifiable:false` blueprint skips the grain check **visibly**
+   (`grain_checked:false`), never silently. Verify-FAIL / unmappable grain / grain-probe error all
+   **withhold** the rows.)* The gate is two parts: (a) **code-computed
    assertions** — the D43 probe-#1 **grain-integrity** check (`result row count == COUNT(DISTINCT
    declared result-grain)`; each measure aggregated at its declared `{agg, defined_over}`) plus the
    `result_signature` invariants, evaluated **deterministically in code**; (b) **LLM review** of the
@@ -398,12 +418,20 @@ properties reserved) with the transitive USES set stored **denormalized as byte-
 `database.table.column` strings** for zero-traversal scope pre-filtering (D86), plus reserved
 `:Column`/`:Table` nodes and `:USES`/`:OF_TABLE` edges (written same-transaction,
 deleted-and-rewritten on re-seed, unread until the D38-era graph consumers). `:KnowledgeChunk`
-mirrors the vector/parity shape. **Full-DAG storage (`composes`, `sql_template` steps) is a reserved
-additive extension** — specified when `runBlueprint` lands.
+mirrors the vector/parity shape. **Full-DAG storage (`composes`, `sql_template`, `slots`, `resolves`,
+`uses_rules`, `result_grain` steps) is BUILT (D89, Slice A)** — the six JSON props are stored with
+write-time validation and expanded additively by `getBlueprint`, and are now **executed** by
+`runBlueprint`, not merely stored. The **scope-honesty gate** (a template can only read within its
+declared `uses`, table-aware) is enforced at load.
 
 ---
 
-**Status:** Partial (model + execution + lifecycle Locked; Slice-2 retrieval projection **Locked/built** (D87); full-DAG storage reserved)
+**Status:** BUILT — single-node + scalar-converging DAGs executable (model + execution engine + D56
+verify + slot filling + D67 `resolve_via` + mid-DAG approval pause/resume + lifecycle Locked; Slice-2
+retrieval projection **Locked/built** (D87); full-DAG storage **built + executed** (D89)). **Deferred:**
+table-intermediate DAGs (F2, rejected pre-dispatch — needs a `clickhouse-api` scratch-write surface)
+and the full **authoring-time** static grain gate (D37/D37b, Phase-2 — the runtime D56 gate is the
+launch teeth).
 **Open questions:**
 - **Grain ownership (correctness — proposed D37):** no grain contract today, so a wrong-grain
   blueprint (e.g. `AVG(gross_pay)` over a 1:N `payroll_fact` join, no period filter) passes every

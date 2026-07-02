@@ -31,7 +31,8 @@ pre-inject:
 Pre-injected blueprints are **thin** — `{id, intent, slots-summary}` only. Cheap on context budget;
 the model decides what to expand via `getBlueprint(id)`. If the 3 are off, the model reformulates
 and calls `searchBlueprints(query, k)`. *(This pull path is live as of Session 12 — the three
-read tools are built over the real corpus, D88.)*
+read tools are built over the real corpus, D88 — and step 4 (`getBlueprint` full-DAG expand →
+`runBlueprint` execute) is live as of Session 13, D89.)*
 
 ### Reranker
 A cross-encoder reranker sits between vector recall and pre-injection, for both blueprints and
@@ -41,10 +42,10 @@ spend context budget.
 ## Progressive disclosure flow
 
 1. **Thin cards** (pre-injected, ~free).
-2. Model judges fit → `getBlueprint(id)` for the full DAG (confirm intent, inspect `resolves`/`rules`/SQL).
+2. Model judges fit → `getBlueprint(id)` for the full DAG (confirm intent, inspect `resolves`/`rules`/SQL). **Live — the full-DAG expansion is stored + returned (D89, Session 13).**
 3. Model extracts slot values from the conversation.
 4. Model calls `runBlueprint(id, slot_bindings)` (fast path) **or** falls back to the raw agent loop
-   (`getTableSchema` → write SQL → `explainQuery` → `runQuery` → verify).
+   (`getTableSchema` → write SQL → `explainQuery` → `runQuery` → verify). **Live — `runBlueprint` executes the DAG, D56-verified (D89, Session 13); scalar-converging DAGs only, table-intermediate deferred F2.**
 
 ## Context assembled per turn
 

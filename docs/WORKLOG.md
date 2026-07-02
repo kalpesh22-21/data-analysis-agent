@@ -86,24 +86,42 @@ invariant→test status board.
   flags). **814 pass / 38 skipped, ruff clean; live Layer-2 5/5.**
   Design: [decisions/read-tools-design.md](decisions/read-tools-design.md).
 
-**Next brick:** **`runBlueprint` + the D56 verify gate + the D67 `resolve_via` wiring** (full-DAG
-blueprint storage/OQ-T1, slot binding via typed params D59a, the grain-integrity probe on every
-result D56, concept→value-set expansion through `resolveValues.resolve()` D67; also owed to this
-brick: the runtime/MCP tool-name collision guard + duplicate-tool-call-id replay semantics, both
-QA-pinned). Then the offline **Track B** learning loop (graph schema is ready, D87). The
-runtime's Phase-1 `getTableSchema` is just a passthrough of the now-MCP-side overlay (D83/D84). ~~D77
-`resolveValues`~~ **done (Session 9).** **Phase 0 is substantially complete and
-validated end-to-end** (live turn works); the honest remaining Phase-0 gap is the **3 deferred Layer-3
+- ✅ **`runBlueprint` brick BUILT (Session 13, new D89) across 3 slices (A/B/C)** —
+  `src/data_agent/runtime/blueprint/` executes stored full-DAG blueprints as a `RuntimeTool`,
+  fail-closed end-to-end. **Slice A** (`3218a84`): full-DAG storage (OQ-T1) + injection-safe pure
+  functions + the **load-bearing scope-honesty gate** (a template can only read within its declared
+  `uses`, table-aware — closes `SELECT *`/alias-mask/JOIN-to-unlisted/`dictGet`) + the two D88-owed
+  guards (name-collision + dup-tool-call-id). **Slice B** (`8bb1a1b`): single-node execution engine
+  + **D56 verify gate wired live** ("no unverified return") + the `RunBlueprintTool` + the pausing-
+  runtime-tool loop seam. **Slice C** (`de320d4`): multi-node scalar DAG + **D45 mid-DAG approval
+  pause/resume** (CAS-exactly-once, restart-durable, provenance union fail-closed across the pause,
+  affirmative-only consent) + **D67 `resolve_via`** wiring. Scalar intermediates bound as **typed
+  AST literals** (D59a/D10, F1 — no `runQuery` param surface); **table-intermediate DAGs rejected
+  pre-dispatch** (F2). Adversarially QA'd (+118 A / +46 B / +48 C) + reviewed each slice (2–3 rounds;
+  the 4 Slice-C fail-open blockers all fixed + re-exploited → APPROVE). **1225 pass / 44 skipped /
+  0 xfailed, ruff clean; live Layer-2 3/3** (single + multi-node scalar DAG end-to-end vs real neo4j
+  + ClickHouse-via-MCP; non-oracle NOT_FOUND). Design:
+  [decisions/runblueprint-design.md](decisions/runblueprint-design.md).
+
+**Next brick:** **Track B — the offline learning loop** (now unblocked: the graph schema is fixed
+(D87) and blueprints are executable (D89)). ~~`runBlueprint` + D56 + D67~~ **done (Session 13, D89).**
+~~D77 `resolveValues`~~ **done (Session 9).** The runtime's Phase-1 `getTableSchema` is just a
+passthrough of the now-MCP-side overlay (D83/D84). **Phase 0 is substantially complete and validated
+end-to-end** (live turn works); the honest remaining Phase-0 gaps are the **3 deferred Layer-3
 scenarios** — mid-session scope narrowing (needs BFF per-turn scope switching), observability+PII span
 inspection (needs a Phoenix collector in the stack — the progress channel is already PII-clean), and
-pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tested). See
+pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tested) — **plus the NEW
+Layer-3 `runBlueprint` conformance scenarios** (No-silent verification / Ask→clarify / Scope denial /
+Pause-resume-durability), authored + Layer-1/2-proven but **not yet demo-wired**. See
 `tests/e2e/README.md`.
 
 **Open follow-ups carried forward:**
 - **NOTHING IS PUSHED (user deferred the push).** data-analysis-agent branch
-  `phase0/provenance-extractor` has 9 commits (`6820677`→…→`9776817` D86→`50fa37f` D87) — **this repo has NO git remote configured yet** (add an `origin` before push/PR).
-  **The Session-12 read-tools work + these doc updates are UNCOMMITTED at time of writing**
-  (committed right after this doc pass; Session-11 D87 is commit `50fa37f`). clickhouse-api
+  `phase0/provenance-extractor` has **13 commits** (`6820677`→…→`fd8052d` D88→`3218a84` runBlueprint
+  Slice A→`8bb1a1b` Slice B→`de320d4` Slice C) — **this repo has NO git remote configured yet** (add
+  an `origin` before push/PR). **These Session-13 doc updates are UNCOMMITTED at time of writing**
+  (the orchestrator commits the doc pass; the 3 runBlueprint slices A/B/C are already committed).
+  clickhouse-api
   `feat/scope-enforcement` (origin `kalpesh22-21/click-house-openapi`) has `b55b4de` (D83/D84) +
   `143f0c1` "Stale changes" (unrelated branch WIP — settings/oauth/helm/diagnose_token, not ours)
   ahead of origin, unpushed.
@@ -128,9 +146,11 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
   `EMBEDDING_TEST_URL=http://localhost:18003/embed RERANKER_TEST_URL=http://localhost:18004/rerank
   uv run pytest tests/integration/test_{embedding_api,reranker_api,resolve_values_live_embedding}.py`
   (services: `docker compose -f docker-compose.integration.yml up -d --wait embedding-api reranker-api`).
-  **D67 `resolve_via` rule wiring** is still open (the typed `resolveValues.resolve()` hook exists for
-  it). Deferred by design: per-(client,column) index, deictic/relative period-domain resolution
-  (D41/D65), and a resolveValues Layer-2 run over the real MCP. Optional reviewer nit carried: the
+  ~~**D67 `resolve_via` rule wiring** is still open (the typed `resolveValues.resolve()` hook exists for
+  it).~~ **DONE (Session 13, D89)** — wired inside `runBlueprint` (single + multi-node); **still open:**
+  no **live** `resolve_via` seed (Layer-1 only). Deferred by design: per-(client,column) index,
+  deictic/relative period-domain resolution (D41/D65), and a resolveValues Layer-2 run over the real
+  MCP. Optional reviewer nit carried: the
   embedding client's bool/Infinity-element rejection branches lack the direct unit cases the reranker
   suite has (behaviour identical, symmetry only).
 - Production IdP (Entra) must stamp the `column_scope` claim; wire per-user entitlements to replace the
@@ -146,8 +166,72 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
   before enabling enforcement in prod; also the D70 secondary body-walk still uses `find_all` (belt-and-suspenders).
 - Local dev venv is Python 3.14; CI pins 3.12 — consider a CI matrix (3.12 + 3.14) later.
 - 6 coverage gaps accepted into backlog (see TRACEABILITY.md §Coverage gaps) — Phase-2 test additions.
+- **`runBlueprint` (D89) honest follow-ups carried forward:**
+  - **Table-intermediate DAGs (F2)** — deferred; a table-intermediate is rejected pre-dispatch. Needs
+    a **scratch-write surface** in `clickhouse-api` (Track A) before scalar-converge-only can be lifted.
+  - **NEW Layer-3 `runBlueprint` conformance scenarios** (No-silent verification / Ask→clarify / Scope
+    denial / Pause-resume-durability) — authored + Layer-1/2-proven, but **demo-wiring is deferred**
+    (not yet Playwright-driven through the real UI). Add to the 3 already-deferred Phase-0 scenarios.
+  - **Live `resolve_via` seed** — D67 is wired but Layer-1 only; no corpus blueprint exercises it live.
+  - **`resolveValues` Layer-2 over the real MCP** — still not run (carried from Session 9).
+  - The **authoring-time static grain gate (D37/D37b)** stays Phase-2 — the runtime D56 gate is the
+    launch teeth; wrong-grain blueprints are caught at execution, not yet at authoring.
 
 ---
+
+## 2026-07-02 — Session 13: `runBlueprint` brick BUILT (D89) — full-DAG execution across 3 slices (A/B/C)
+
+The fast-path executor lands: `runBlueprint(id, slot_bindings)` runs stored full-DAG blueprints as a
+`RuntimeTool`, fail-closed end-to-end — scope-honest at load, D56-verified on return, injection-safe at
+every bind, durable across a mid-DAG approval pause. Honest boundary: **scalar-converging DAGs only**
+(table intermediates rejected pre-dispatch, F2). Shipped as 3 committed slices; **this doc pass is
+UNCOMMITTED** (the orchestrator commits it).
+
+### Shipped
+| Area | Path | Agent |
+|---|---|---|
+| Design doc (full-DAG storage, execution engine, slot binding, D56 gate, `resolve_via`, pause/resume, slicing, the two owed guards) | `docs/decisions/runblueprint-design.md` | `planner` |
+| **Slice A** (`3218a84`) — `runtime/blueprint/` pure core (`template.py` F1 AST-literal binding, `slots.py` D49 resolvers, `when.py` whitelist evaluator, `verify.py` D56 grain-integrity, `models.py`); full-DAG storage (6 JSON props + write-validation) in `corpus_loader`/`vector_index`/`BlueprintDetail`; the **load-bearing scope-honesty gate** (`qualify_columns` + `_assert_source_tables_in_uses`); `SemanticCatalogHandle`; the two D88-owed guards (name-collision + dup-tool-call-id) | `runtime/blueprint/*`, `runtime/retrieval/corpus_loader.py`, `runtime/provenance/catalog_handle.py`, `runtime/mcp/tool_schema.py` | `backend-developer` |
+| **Slice B** (`8bb1a1b`) — single-node `BlueprintExecutor` (scope-checked fetch → slot probe → typed-literal bind → `runQuery` dispatch → D56 verify), `RunBlueprintTool` (schema 11→12, `RUN_BLUEPRINT_*` family, one redacted TOOL span), the pausing-runtime-tool loop seam + additive `PauseCheckpoint.blueprint_*` fields; D56 "no unverified return" wired live | `runtime/blueprint/{executor,tool}.py`, `runtime/loop/agent_loop.py`, `runtime/dispatch/tool_dispatcher.py`, `runtime/session/models.py`, `runtime/app.py` | `backend-developer` |
+| **Slice C** (`de320d4`) — multi-node topo DAG walk (scalar-passing, D33 no branching), scalar contract fail-closed, approval nodes + **D45 mid-DAG pause/resume** (CAS-exactly-once, restart-durable, provenance union fail-closed across the pause, affirmative-only consent), **D67 `resolve_via`** (single + multi-node), F2 table-intermediate rejection | `runtime/blueprint/{executor,rules}.py`, `runtime/loop/agent_loop.py`, `runtime/retrieval/corpus_loader.py` | `backend-developer` |
+| Adversarial QA across all slices: +118 (A) / +46 (B) / +48 (C); each slice found 2–4 xfail bug repros → fixed → promoted | `tests/runtime/blueprint/*`, `tests/runtime/retrieval/test_corpus_loader_*.py`, `tests/runtime/mcp/test_tool_schema_qa*.py` | `qa` |
+| Live Layer-2 suite (single + multi-node scalar DAG end-to-end vs real neo4j + ClickHouse-via-MCP; non-oracle NOT_FOUND) | `tests/integration/test_run_blueprint_live.py`, `tests/integration/test_blueprint_dag_live.py` | `backend-developer` |
+| Review each slice (A: APPROVE WITH FIXES → 2 rounds; B: REQUEST CHANGES → fixed → APPROVE; C: REQUEST CHANGES → fixed → APPROVE — every exploit re-run) | — | `reviewer` (parallel with `qa`) |
+
+### Review findings (recorded honestly)
+- **Slice A — the load-bearing scope-honesty gate (hardened over 2 rounds).** First fix (footprint
+  leniency + statement-kind guard) still left a **qualified-JOIN-to-unlisted-table** bypass; the second
+  round added `_assert_source_tables_in_uses` (rejects any JOINed/subquery/table-function source absent
+  from `uses`). Now closes `SELECT *`, alias-mask, table-blind bare-name, `dictGet`, cross-db, and
+  qualified-JOIN bypasses — all reviewer/QA exploits verified closed; legit in-`uses` multi-table JOINs
+  still accepted. This is what makes the D88(c) stored `uses` footprint **honest**.
+- **Slice B — 3 blockers + a V1 false-pass.** B1: the tool was advertised but unwired. B2: the
+  slot-domain probe leaked provenance fail-**open**. B3: an unreferenced slot was silently dropped →
+  a filterless "verified" wrong answer. V1: a grain-mapping false-pass (casefold collision /
+  slot-value output-name injection) — fixed to pre-bind exact/unambiguous → fail-closed. All fixed +
+  independently re-exploited → APPROVE.
+- **Slice C — 4 fail-open / wrong-answer blockers.** (1) the scalar contract was **unenforced** — a
+  fanned-out intermediate (`!=1` row) flowed downstream; now fails closed before the consumer runs.
+  (2) **provenance loss across resume** — the resumed union dropped completed nodes' provenance,
+  breaking D44 fail-closed replay across the pause; now unioned. (3) the approval gate **approved on
+  ambiguous denials** (fail-open consent); now affirmative-only. (4) a hybrid-record **B3 regression**.
+  All fixed, re-review re-ran every exploit → APPROVE.
+
+### Verification status
+- `uv run pytest` → **1225 passed / 44 skipped / 0 xfailed**, ruff clean.
+- **Live Layer-2 3/3** — single-node **and** multi-node scalar DAG verified end-to-end via real
+  MCP→ClickHouse + neo4j (live union provenance); narrow-scope non-oracle `getBlueprint` NOT_FOUND.
+- The D8 progressive-disclosure **fast path** is now fully live end-to-end (pre-injected cards →
+  `getBlueprint` expand → `runBlueprint` execute → D56-verified answer).
+
+### Honest deferrals (NOT built this brick)
+- **Table-intermediate DAGs (F2)** — rejected pre-dispatch; needs a `clickhouse-api` scratch-write
+  surface (Track A). Only scalar-converging DAGs execute.
+- **Layer-3 Playwright demo-wiring** — the 4 runBlueprint conformance scenarios are Layer-1/2-proven,
+  not yet demo-green.
+- **Live `resolve_via` seed** — D67 wired but Layer-1 only.
+- **Drift probes #2/#3** (catalog-conformance, rule-currency) — Phase-2 scheduled (D43).
+- **Authoring-time static grain gate (D37b)** — Phase-2; the runtime D56 gate is the launch teeth.
 
 ## 2026-07-01 — Session 12: Read tools BUILT (D88) — searchBlueprints / getBlueprint / searchKnowledge
 

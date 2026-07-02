@@ -45,7 +45,7 @@ the agent runtime**, not in the ClickHouse MCP service.
 |---|---|---|
 | `searchBlueprints` | `query, k` | **BUILT (Session 12, D88).** Returns reranked **thin cards** `{id, intent, slots_summary, score}` for blueprints in scope (transitive-USES pre-filter; `k` default 5, over-max clamps to 20; `degraded` flag when embed/rerank unavailable). For when the pre-injected 3 are off or intent is reformulated. |
 | `getBlueprint` | `id` | **BUILT (Session 12, D88) as the thin D87 projection** `{found, id, intent, slots_summary, uses, status, drift_status, hit_count, catalog_sha}` — the full DAG (`resolves`, typed `slots`, `uses_rules`, `composes`, `sql_template`) arrives additively with `runBlueprint`. **Non-oracle:** out-of-scope ⇒ `{found: false}`, indistinguishable from a real miss. The "expand" step in progressive disclosure. |
-| `runBlueprint` | `id, slot_bindings` | Deterministic runtime execution of the DAG (see [04-blueprints.md](04-blueprints.md)). Model supplies slot values; runtime does the rest. |
+| `runBlueprint` | `id, slot_bindings` | **BUILT (Session 13, D89).** Deterministic runtime execution of the stored full DAG (see [04-blueprints.md](04-blueprints.md)). Schema: `runBlueprint(id, slot_bindings)` where `slot_bindings` is a **flat `{name: raw_value}` object** (the model supplies raw slot values; the runtime resolves + binds them as typed AST literals, injection-safe). **Returns** a **D56-verified result**, or a **pause** (mid-DAG `askUser` — slot clarify or approval gate), or a **clarify/fallback** (raw-loop on degrade). Only **scalar-converging** DAGs execute (table-intermediate rejected pre-dispatch, F2). **Error family:** `RUN_BLUEPRINT_*` + the shared `RUNTIME_TOOL_INTERNAL_ERROR` (registry-level containment, D88a). Counts as **1** `tool_calls_made` regardless of inner node count. |
 | `searchKnowledge` | `query` | **BUILT (Session 12, D88).** RAG over global knowledge docs (institutional knowledge + lessons) — reranked chunks `{id, title, text, score}`; bypasses column scope (entity-agnostic, write-gated D58(a)). |
 
 ## Control-flow primitive
@@ -82,5 +82,5 @@ model-facing tool implemented in the runtime over `runQuery` (D77), not an MCP d
 
 **Status:** Locked
 **Open questions:**
-- Exact `slot_bindings` shape for `runBlueprint` (typed object) — finalize with blueprint schema.
+- ~~Exact `slot_bindings` shape for `runBlueprint` (typed object) — finalize with blueprint schema.~~ **RESOLVED (D89): a flat `{name: raw_value}` object** — the model supplies raw values; the runtime resolves per-type + binds as typed AST literals.
 - ~~Whether `searchKnowledge` returns chunks vs. summarized facts~~ — **chunks for Phase 1 (D88/OQ-R3)**; revisit with the Track-B knowledge store.
