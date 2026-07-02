@@ -146,19 +146,66 @@ def embedding_span(tracer: Tracer, *, model: str, input_count: int) -> Any:
     )
 
 
-def rerank_span(tracer: Tracer, *, model: str, document_count: int) -> Any:
-    """The custom reranker-API call (retrieval pipeline, D24/D71).
+def rerank_span(
+    tracer: Tracer,
+    *,
+    model: str,
+    document_count: int,
+    reranked: bool | None = None,
+) -> Any:
+    """The custom reranker-API call / the retrieval-pipeline rerank stage
+    (retrieval pipeline, D24/D71, design §3.5).
 
     Mirrors `embedding_span`: the auto-instrumentor covers only the agent LLM,
-    not this custom endpoint, so `HttpRerankerClient` wraps its POST here
-    manually. Document counts + model id + latency only — the reranker QUERY
+    not this custom endpoint. Two call sites share this helper:
+      - `HttpRerankerClient` wraps its POST here manually (transport level, no
+        `reranked` flag — it has no knowledge of pipeline-level degrade).
+      - `retrieval/pipeline.py` wraps the rerank STAGE here (design §3.5),
+        passing `reranked` — `False` on the degrade path (no reranker
+        configured / rerank error → recall order used), so the degrade is
+        visible in traces even when the reranker client was never called.
+    Document counts + model id + the `reranked` flag only — the reranker QUERY
     and the DOCUMENT text are never logged (D25).
     """
     return span(
         tracer,
         "rerank",
         OpenInferenceSpanKindValues.RERANKER,
-        {"reranker.model": model, "reranker.document_count": document_count},
+        {
+            "reranker.model": model,
+            "reranker.document_count": document_count,
+            "reranker.reranked": reranked,
+        },
+    )
+
+
+def recall_span(
+    tracer: Tracer,
+    *,
+    corpus: str,
+    recall_k: int,
+    candidate_count: int,
+    dropped_by_scope_count: int,
+) -> Any:
+    """The retrieval-pipeline vector-recall stage per corpus (design §3.5).
+
+    `CHAIN` kind. Structural counters only — corpus name (`blueprint`/
+    `knowledge`, non-PII), the recall fan-out `k`, how many candidates the
+    index returned, and how many blueprint candidates the scope pre-filter
+    dropped (D60/D44 read-path analogue). The QUESTION TEXT is never an
+    attribute (D25), nor are candidate ids/intent/chunk text (design §3.5:
+    "no query text"; intent/chunk text is not worth the redaction surface).
+    """
+    return span(
+        tracer,
+        "retrieval.recall",
+        OpenInferenceSpanKindValues.CHAIN,
+        {
+            "retrieval.corpus": corpus,
+            "retrieval.recall_k": recall_k,
+            "retrieval.candidate_count": candidate_count,
+            "retrieval.dropped_by_scope_count": dropped_by_scope_count,
+        },
     )
 
 
@@ -204,6 +251,8 @@ __all__ = [
     "guardrail_observer",
     "guardrail_span",
     "instrument_openai",
+    "recall_span",
+    "rerank_span",
     "span",
     "tool_span",
 ]

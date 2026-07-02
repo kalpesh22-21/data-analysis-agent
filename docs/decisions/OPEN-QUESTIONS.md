@@ -143,7 +143,12 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
   **Contract resolved (Session 9b):** the user-provided mock at `~/Development/SQL/mocks/reranker_api`
   is authoritative — `POST /rerank {"query","documents"}` → `{"scores":[...]}` (same order, higher =
   more relevant, caller re-sorts; mock model `cross-encoder/ms-marco-MiniLM-L-6-v2`). `HttpRerankerClient`
-  ships aligned + Layer-2-validated live. **Still open:** production endpoint/auth + threshold/cutoff values.
+  ships aligned + Layer-2-validated live. **Update (Session 10, D86):** pipeline shape settled and
+  BUILT (Slice 1) — `recall_k=30`/corpus, top-3 cards + top-3 knowledge, degrade paths, all provisional
+  `RuntimeSettings` tunables (`retrieval_*`); the pipeline is Layer-2-green against the live mocks.
+  **Still open:** production endpoint/auth, threshold/cutoff tuning under real traffic, the **neo4j
+  vector index + corpus schema (Slice-2 first task**, retrieval-pipeline-design.md), rendered-block
+  token-budget accounting (OQ-R8), and the Slice-2 trust-boundary reconfirmation (§8.1).
 - Shared embedding model choice — a **custom API (not OpenAI)** (D71), called via a **simple HTTP
   `POST`** with a manual `EMBEDDING` span (D24); shared across question + blueprint intent + knowledge.
   **Contract resolved (Session 9b):** the mock at `~/Development/SQL/mocks/embedding_api` is

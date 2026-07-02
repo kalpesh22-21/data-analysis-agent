@@ -191,6 +191,33 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   substitute). Cross-references: [D63](#security--infra), [D66](#client-defined-value-resolution),
   [D71](#model-provider), [D77](#client-defined-value-resolution).
 
+- **D86 (locked, 2026-07-01, Session 10 — retrieval pipeline Slice 1).** **The retrieval pipeline
+  (D7/D8) is built behind a `VectorIndex` seam, degrades-not-fails at every external stage, and
+  structurally sanitizes retrieved text before it enters the model context.** Three parts:
+  **(a) `VectorIndex` seam** — the pipeline depends on a `VectorIndex` protocol
+  (`recall(query_vector, kind, k)`), not on neo4j; Slice 1 ships an in-memory index (test/dev), the
+  neo4j-native index (D60) arrives as a drop-in in Slice 2. This let the embed→recall→scope-filter→
+  rerank→inject path ship and be Layer-2-proven against the real D71 clients before any graph-store
+  work. **(b) Degrade-not-fail, observably** (extends the D85 posture from `resolveValues` to
+  retrieval): `retrieve()` never raises — no/failed embedder or index → empty `RetrievedContext`
+  (pre-injection simply absent; the turn proceeds Phase-0-style); no/failed reranker or a rerank
+  score-count mismatch → recall order with `reranked=false`; a failing user-memory provider or
+  observer → skipped. **No degrade is silent:** each path emits a shape-only `retrieval.degraded`
+  span (reason attribute) + the retrieval progress event with zero counts, and logs server-side with
+  traceback. The contract is enforced defensively (broad excepts at each stage), not by client
+  conformance. **(c) Render trust boundary** — retrieved text (blueprint intent/slots, knowledge
+  chunks, memory items) is *content-trusted* (write-time leakage gate, 03 §Scope) but
+  *structure-sanitized* at render: newlines/control chars collapsed or stripped and per-item length
+  caps, so corpus text can never forge sections or inject at system privilege into the single
+  pre-injection message; blueprint candidates are additionally scope-pre-filtered (transitive USES ⊄
+  `column_scope` → dropped; `uses=None` → dropped fail-closed; empty scope = allow-all, D80
+  semantics). Slice 2 must reconfirm the trust boundary before Track-B-written content lands
+  (retrieval-pipeline-design.md §8.1). Deferred there too: rendered-block token-budget accounting
+  (OQ-R8). See [retrieval-pipeline-design.md](retrieval-pipeline-design.md). Cross-references:
+  D7/D8 (pipeline + progressive disclosure), [D60](#blueprints--learning) (neo4j-native vectors),
+  [D71](#model-provider), [D80](#security--infra) (empty-scope semantics), D85 (degrade precedent),
+  D44/D46 (context assembly), D24/D25 (spans, shape-only).
+
 - **D67 (locked, 2026-06-30).** **Two rule kinds: static and resolved (dynamic).** A catalog `rule`'s
   `predicate` is either a fixed SQL boolean (**static**) or references `resolveValues(column, concept)`
   over a `client_defined` column (**resolved**) — the runtime expands it to a concrete per-client value

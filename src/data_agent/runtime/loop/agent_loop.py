@@ -114,6 +114,15 @@ def _default_observer(event: str, payload: dict[str, Any]) -> None:
     return None
 
 
+def _first_user_question(messages: list[TurnMessage], turn_index: int) -> str | None:
+    """The first user message of *turn_index* — the turn's originating question,
+    used to re-run retrieval on a resume (design §6). `None` if absent."""
+    for message in messages:
+        if message.turn_index == turn_index and message.role == "user":
+            return message.content
+    return None
+
+
 def _resolve_values_unavailable(tool_name: str) -> ToolResult:
     """A clean local error for a `resolveValues` call when the composite is not
     wired (L2) — never dispatched to the MCP under its own name."""
@@ -251,6 +260,7 @@ class AgentLoop:
             window_count=1,
             turn_index=turn_index,
             model_client=turn_model_client,
+            question=user_message,
         )
 
     async def resume(
@@ -285,6 +295,12 @@ class AgentLoop:
         else:
             window_count = prior_window_count  # askUser resume is not a new budget grant
 
+        # Retrieval re-runs on the ORIGINAL turn's question (design §6): the
+        # first user message of this turn (an askUser answer is appended as a
+        # later user message of the SAME turn_index — the originating question
+        # is the first). `None` when it cannot be found → retrieval simply does
+        # not run on this resume (graceful).
+        question = _first_user_question(updated_doc.messages, turn_index)
         turn_model_client = self._begin_model_turn()
         return await self._run_loop(
             session_id=session_id,
@@ -292,6 +308,7 @@ class AgentLoop:
             window_count=window_count,
             turn_index=turn_index,
             model_client=turn_model_client,
+            question=question,
         )
 
     def _begin_model_turn(self) -> ModelClient:
@@ -308,7 +325,14 @@ class AgentLoop:
         return begin_turn_client(self._model_client)
 
     async def _build_canonical_messages(
-        self, session_id: str, column_scope: frozenset[str], current_turn_index: int
+        self,
+        session_id: str,
+        column_scope: frozenset[str],
+        current_turn_index: int,
+        *,
+        question: str | None,
+        user_id: str | None,
+        retrieval_memo: dict[tuple[str, str], Any],
     ) -> list[dict[str, Any]]:
         """*current_turn_index* (turn-scoped continuity, 2026-07-01): passed
         through to `ContextAssembler.assemble` so the CURRENT in-progress
@@ -319,9 +343,22 @@ class AgentLoop:
         PRIOR turn's undetermined/denied entry is still always dropped. A
         denied/errored entry never carries result rows regardless
         (`result_preview` is `None`), so this exemption leaks nothing.
+
+        *question*/*user_id*/*retrieval_memo* (Slice-1 retrieval, design §3.3):
+        threaded into `assemble` so the retrieval pipeline (when configured)
+        pre-injects thin cards + knowledge for this turn's question. The memo is
+        turn-window-local (created fresh in `_run_loop`) so retrieval embeds at
+        most ONCE per window despite the D45 per-round-trip rebuild. When no
+        retrieval pipeline is wired, these are inert (assemble short-circuits).
         """
         assembled = await self._context_assembler.assemble(
-            session_id, column_scope, current_turn_index=current_turn_index
+            session_id,
+            column_scope,
+            current_turn_index=current_turn_index,
+            user_message=question,
+            user_id=user_id,
+            retrieval_memo=retrieval_memo,
+            observer=self._observer,
         )
         canonical = _assembled_to_canonical(assembled.messages)
         doc = await self._session_store.get_or_create_session(session_id)
@@ -364,6 +401,7 @@ class AgentLoop:
         window_count: int,
         turn_index: int,
         model_client: ModelClient,
+        question: str | None = None,
     ) -> TurnOutcome:
         # The live MCP authenticates every request, including tools/list, so
         # the tools_provider seam is called WITH this turn's credentials on
@@ -380,10 +418,20 @@ class AgentLoop:
         )
         tool_calls_made = 0
         last_assistant_text: str | None = None
+        # Turn-window-local retrieval memo (design §3.3): keyed by
+        # (question, scope_hash) inside `assemble`, it makes the pipeline embed/
+        # recall at most ONCE across every round-trip of this window despite the
+        # D45 per-round-trip context rebuild. Not persisted — pure in-turn memo.
+        retrieval_memo: dict[tuple[str, str], Any] = {}
 
         while True:
             canonical_messages = await self._build_canonical_messages(
-                session_id, credentials.column_scope, turn_index
+                session_id,
+                credentials.column_scope,
+                turn_index,
+                question=question,
+                user_id=None,
+                retrieval_memo=retrieval_memo,
             )
             self._observer("loop_model_call_start", {"window": window_count})
             result = await model_client.send_turn(canonical_messages, tools)

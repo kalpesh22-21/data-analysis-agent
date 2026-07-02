@@ -56,6 +56,7 @@ from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle, load_catalog_handle
+from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 from data_agent.runtime.session.store import AlreadyConsumedError, CASMismatchError, SessionStore
 
@@ -170,10 +171,18 @@ def create_app(
     catalog: CatalogHandle | None = None,
     embedding_client: EmbeddingClient | None = None,
     resolve_values: ResolveValuesComposite | None = None,
+    retrieval: RetrievalPipeline | None = None,
 ) -> FastAPI:
     """Build the FastAPI app. All dependencies default to the real
     implementations, sourced from *settings* — pass Layer-1 fakes for any of
-    them (e.g. in a smoke test) to avoid touching real infra entirely."""
+    them (e.g. in a smoke test) to avoid touching real infra entirely.
+
+    *retrieval* (Slice-1 seam, design §12): the D7/D8 pipeline pre-injected into
+    `ContextAssembler`. Left `None` in production for Slice 1 — the pipeline's
+    real vector store is neo4j (D60), whose `Neo4jVectorIndex` lands in Slice 2,
+    so there is no store to recall from yet and retrieval stays UNWIRED
+    (byte-identical Phase-0 parity). Tests inject a pipeline (real D71 clients +
+    a seeded `FakeVectorIndex`) to exercise the whole embed→rerank→inject path."""
     settings = settings or get_runtime_settings()
     catalog = catalog or load_catalog_handle()
     mcp_client = mcp_client or RealMCPClient(settings.mcp_url)
@@ -213,6 +222,7 @@ def create_app(
         history_token_budget=settings.history_token_budget(),
         preview_row_count=settings.preview_row_count,
         summarizer=summarizer,
+        retrieval=retrieval if settings.retrieval_enabled else None,
         tracer=tracer,
     )
 

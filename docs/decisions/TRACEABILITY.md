@@ -42,6 +42,15 @@ and `FakeMCPClient`), including a real-OTel-exporter redaction e2e. **Not yet ru
 `clickhouse-api` MCP↔ClickHouse for the backing `runQuery`, and any live custom-embedding-API call (the
 endpoint/contract is still an open question — see OPEN-QUESTIONS §Retrieval).
 
+**Update (Session 9b/10, D71 contracts + D86 retrieval Slice 1):** the embedding/reranker contracts are
+now REAL (user-provided mocks, `~/Development/SQL/mocks`) and the "no live embedding call" gap above is
+closed — `HttpEmbeddingClient`/`HttpRerankerClient` and the retrieval pipeline are Layer-2-validated
+against the live mock services (18003/18004), including semantic-beats-frequency for `resolveValues`
+(so `D85-embedding-failure-degrades-not-fails` and `D77-*` ranking behaviour now have a live-embedding
+leg; statuses stay `🟡` pending the real MCP leg + production endpoint). The D86 rows below are
+`🟡 unit-green` (Layer-1 with fakes) except where noted Layer-2-proven; the neo4j index (Slice 2) and
+the D7/D8 Layer-3 conformance scenarios are not yet built.
+
 See [docs/11-testing.md](../11-testing.md) for the four-layer test pyramid definition and the full
 Layer 3 scenario list. See [docs/decisions/DECISIONS.md](DECISIONS.md) for the rationale behind each
 decision cited here.
@@ -153,3 +162,11 @@ the Layer 1 test suite. They extend the existing D57/D63/D64 rows in the matrix 
 | **D77** | Empty in-scope result set → `status="ok"` with an empty value list (a valid "no matches" answer), never an error | Unit | `D77-empty-result-is-ok` | — | 🟡 unit-green |
 | **D77 / D25** | `concept` (and `period` start/end literals) are redacted from every span and progress payload — proven by a real-OTel-exporter e2e asserting `concept` is absent from all emitted attributes | Unit | `D77-concept-redacted-from-telemetry` | — | 🟡 unit-green |
 | **D85** | An embedding failure (unreachable / non-2xx / malformed / non-finite / length-mismatch vectors) degrades to freq-only ranking, never crashes the turn and never fails the call; `result_full.degraded`/`ranking="freq_only"` surface the state so a freq-only top score can't masquerade as a semantic match | Unit | `D85-embedding-failure-degrades-not-fails` | — | 🟡 unit-green |
+| **D86** | Phase-0 parity: with retrieval unwired (`None`/disabled) — or retrieving an empty/degraded result — the assembled context is **byte-identical** to the pre-retrieval runtime, proven on a non-trivial compaction-triggering history | Unit | `D86-unwired-retrieval-byte-parity` | — | 🟡 unit-green |
+| **D86** | A blueprint candidate whose transitive USES ⊄ `column_scope` is dropped before rerank/render (exact-string `db.table.column` keys, D70 case-exact; `uses=None` dropped fail-closed even under allow-all; empty scope = allow-all, D80) | Unit | `D86-blueprint-scope-prefilter-fail-closed` | **Scope denial** | 🟡 unit-green |
+| **D86** | `retrieve()` never raises: any exception from embedder/index/reranker/user-memory/observer degrades (empty context, recall order, or skipped item respectively) and **never crashes the turn**; a rerank score-count mismatch degrades to recall order with `reranked=false`, never silently drops candidates | Unit | `D86-retrieve-never-raises-degrades` | — | 🟡 unit-green |
+| **D86** | No degrade is silent: every degrade path emits a shape-only `retrieval.degraded` span (reason attr) + the retrieval progress event with zero counts | Unit | `D86-degrade-is-observable` | — | 🟡 unit-green |
+| **D86** | Retrieved corpus text is structure-sanitized at render (newlines/control chars neutralized, per-item length caps) — hostile card/chunk text cannot forge sections or inject instructions into the pre-injection system message | Unit | `D86-render-structure-sanitized` | — | 🟡 unit-green |
+| **D86 / D25** | The user's question text appears in NO retrieval span attribute or progress payload (counts/reasons only), proven with a real OTel exporter | Unit | `D86-question-never-in-telemetry` | — | 🟡 unit-green |
+| **D86** | Exactly one embed per budget window (memo keyed on question+scope): per-round-trip context rebuilds never re-embed; a scope change busts the memo; resume re-embeds the original turn question, not the clarify answer | Unit | `D86-one-embed-per-window` | — | 🟡 unit-green |
+| **D86 / D71** | The end-to-end embed→recall→scope-filter→rerank→render path works against the **live** embedding + reranker services (semantic ordering + rerank-changes-order asserted live) | Component | `D86-pipeline-live-e2e` | — | 🟡 unit-green (Layer-2 vs mock services green; neo4j + Layer-3 pending) |

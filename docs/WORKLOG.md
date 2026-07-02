@@ -54,16 +54,21 @@ invariant→test status board.
   (`embedding-api` :18003, `reranker-api` :18004). **7/7 live Layer-2 tests green**, incl. the capstone:
   `resolveValues` with the real embedder ranks PTO (freq 5) over OT (freq 100) for "paid time off",
   `degraded=False`. **536 pass / 25 skipped, ruff clean.** Reviewed: APPROVE, 0 blockers.
-- ✅ **Retrieval-pipeline design DONE (not built)** —
-  [decisions/retrieval-pipeline-design.md](decisions/retrieval-pipeline-design.md): D7/D8 shape (embed
-  question → neo4j recall k=30/corpus → scope pre-filter → rerank → top-3 cards pre-injected + search
-  tools), neo4j-native vectors (D60), offline corpus embedding with model-parity constraint, three
-  degrade-not-fail paths, and a `VectorIndex` seam so the core ships **before** neo4j.
+- ✅ **Retrieval pipeline Slice 1 BUILT (Session 10, new D86)** — `src/data_agent/runtime/retrieval/`:
+  embed→recall→scope-prefilter→rerank→cut behind a `VectorIndex` seam (in-memory now, neo4j Slice 2,
+  D60), pre-injected as ONE structure-sanitized system message via `ContextAssembler`; degrade-not-fail
+  at every stage, observably (`retrieval.degraded` span + zero-count event); one embed per budget
+  window; **byte-identical context when unwired** (proven non-vacuously). Adversarially QA'd (+44 QA
+  tests, 3 xfail bugs found → fixed → promoted) + reviewed (REQUEST CHANGES: silent degrade, render
+  injection surface, silent candidate drop → fixed → **APPROVE**). **617 pass / 28 skipped, ruff
+  clean; live Layer-2 3/3** (semantic ordering + rerank-flips-order vs real models). Design doc:
+  [decisions/retrieval-pipeline-design.md](decisions/retrieval-pipeline-design.md) (+§8.1 trust
+  boundary, OQ-R8/R9).
 
-**Next brick:** **Retrieval pipeline Slice 1** (per retrieval-pipeline-design.md §build order): the
-`runtime/retrieval/` core with `FakeVectorIndex` + the REAL embed/rerank clients — Layer-1 with fakes,
-Layer-2 vs the live mocks (18003/18004) — de-risking the whole embed→rerank→inject path with zero
-graph-store risk. Then: neo4j schema (shared prereq of blueprint reads + Track B) → blueprint read tools
+**Next brick:** **Retrieval Slice 2** (per retrieval-pipeline-design.md §build order): the **neo4j
+corpus schema + `Neo4jVectorIndex`** (drop-in behind the `VectorIndex` seam; neo4j service into the
+integration compose; offline corpus embedding with the same-model parity constraint; reconfirm the
+§8.1 trust boundary + OQ-R8 budget accounting). Then: blueprint read tools
 (`searchBlueprints`/`getBlueprint`/`searchKnowledge`) → `runBlueprint` + the **D56 verify gate** + the
 **D67 `resolve_via` wiring** (the typed `resolveValues.resolve()` hook exists), with the offline
 **Track B** learning loop parallel once the graph schema is fixed. The
@@ -77,9 +82,9 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 
 **Open follow-ups carried forward:**
 - **NOTHING IS PUSHED (user deferred the push).** data-analysis-agent branch
-  `phase0/provenance-extractor` has 6 commits (`6820677`→…→`90ad553`→`192bf13` D77/D85) —
-  **this repo has NO git remote configured yet** (add an `origin` before push/PR). **The Session-9b
-  client-alignment work + these doc updates are UNCOMMITTED at time of writing** (committed right
+  `phase0/provenance-extractor` has 7 commits (`6820677`→…→`192bf13` D77/D85→`b95c16d` D71 clients) —
+  **this repo has NO git remote configured yet** (add an `origin` before push/PR). **The Session-10
+  retrieval-Slice-1 work + these doc updates are UNCOMMITTED at time of writing** (committed right
   after this doc pass). clickhouse-api
   `feat/scope-enforcement` (origin `kalpesh22-21/click-house-openapi`) has `b55b4de` (D83/D84) +
   `143f0c1` "Stale changes" (unrelated branch WIP — settings/oauth/helm/diagnose_token, not ours)
@@ -125,6 +130,47 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 - 6 coverage gaps accepted into backlog (see TRACEABILITY.md §Coverage gaps) — Phase-2 test additions.
 
 ---
+
+## 2026-07-01 — Session 10: Retrieval pipeline Slice 1 BUILT (D86) — embed→recall→scope-filter→rerank→inject, no neo4j
+
+Implemented Slice 1 of retrieval-pipeline-design.md: the full pipeline core behind a `VectorIndex`
+seam (in-memory index now; neo4j is Slice 2), Layer-2-proven against the live embedding/reranker
+mocks. New decision **D86** (VectorIndex seam + observable degrade-not-fail + render trust boundary).
+**Uncommitted at time of writing** — committed immediately after this doc pass.
+
+### Shipped
+| Area | Path | Agent |
+|---|---|---|
+| `retrieval/` package: frozen models, `VectorIndex` protocol + in-memory `FakeVectorIndex`, blueprint transitive-USES scope pre-filter (exact `db.table.column` keys, `uses=None` fail-closed, empty scope allow-all), `RetrievalPipeline` (embed→recall k=30/corpus→scope-filter→rerank→cut top-3), `NullUserMemoryProvider`, deterministic renderer → ONE system message | `src/data_agent/runtime/retrieval/{models,vector_index,scope_filter,pipeline,user_memory,render}.py` | `backend-developer` |
+| Integration: `ContextAssembler` optional retrieval dep (prepends the block; **byte-identical when `None`**), `AgentLoop` per-budget-window memo (one embed per window; scope change busts it; resume re-embeds the original question), `app.py` master-switch wiring (`retrieval_enabled` off → `None` → Phase-0 parity), `retrieval_*`/`neo4j_*` settings, `recall_span` + extended `rerank_span`, `retrieval_start`/`retrieval` shape-only progress events | `context/assembly.py`, `loop/agent_loop.py`, `app.py`, `config.py`, `observability/{tracing,progress}.py` | `backend-developer` |
+| Layer-1 suite (36) + Layer-2 live suite (3: semantic ordering, rerank-flips-adversarial-order, knowledge rerank) | `tests/runtime/retrieval/`, `tests/integration/test_retrieval_pipeline_live.py` | `backend-developer` |
+| Adversarial QA: +44 tests in 5 `test_*_qa.py` files (hostile render content, malformed index/reranker results, scope key/case semantics, memo/resume, config/master-switch) — found **3 real bugs** (xfail repros) | `tests/runtime/retrieval/test_{pipeline,render,scope_filter}_adversarial_qa.py`, `test_memo_resume_qa.py`, `test_config_qa.py` | `qa` |
+| Review round 1 **REQUEST CHANGES** → fixes → re-review **APPROVE** (probes re-run empirically) | — | `reviewer` (parallel with `qa`) |
+
+### Review findings (recorded honestly)
+- **H1** — embedder degrade was completely silent (no span/event/log; the D85 silent-degrade class).
+  Fixed: every degrade path emits a shape-only `retrieval.degraded` span (reason attr) + zero-count event.
+- **H2** — corpus text flowed unescaped into the **system-role** message; newlines forged sections /
+  injected at system privilege. Fixed: `_sanitize` (controls stripped, whitespace collapsed, 500-char
+  field / 2000-char chunk caps) on every interpolated field + design-doc §8.1 trust-boundary note.
+- **M1 / QA-bug-3** — rerank score-count mismatch silently dropped candidates while claiming
+  `reranked=True`. Fixed: `zip(strict=True)` → degrade to recall order, `reranked=False`.
+- **M2 / QA-bugs-1,2** — the "never raises" contract held only by client conformance; non-typed
+  embedder/reranker exceptions crashed the turn; user-memory/observer unguarded. Fixed: defensive
+  broad-except at every external stage, server-side logging, nothing model/user-facing.
+- **M3** — the byte-parity test was vacuous (compared two empty lists). Fixed: seeds 40 ok trail
+  entries at a compaction-triggering budget; reviewer verified the comparison is sensitive.
+- **M4** (rendered block not counted against the D46 budget) + **L5** (no `scratch.` exemption in the
+  candidate scope filter, by design) — explicitly deferred/recorded as OQ-R8/OQ-R9 in the design doc.
+- **L1–L3** — progress event mis-sequencing (now `retrieval_start` + completion counts), zero-duration
+  marker spans (now wrap the awaited work), `reranked` flag semantics documented.
+- Reviewer nits carried: "found matching context" label copy on a 0/0 degrade; bidi Cf chars pass
+  through render (single-line + capped, can't forge structure) — revisit with Slice-2 trust boundary.
+
+### Verification status
+- `uv run pytest` → **617 passed, 28 skipped, 0 xfailed** (3 QA bug repros promoted to passing), ruff clean.
+- Live Layer-2 vs mocks → **3/3**; Phase-0 parity proven byte-identical on a compacted non-trivial history.
+- Production remains **unwired** (`retrieval=None` until Slice 2 lands the corpus + neo4j index).
 
 ## 2026-07-01 — Session 9b: D71 clients aligned to REAL contracts (user mocks) + retrieval-pipeline design
 

@@ -469,6 +469,30 @@ No retrieval state is persisted to Couchbase — the block is re-derived, consis
   reindex-on-write is a Track B concern (blueprint/knowledge promotion).
 - **OQ-R7 neo4j graph+vector schema** (04 §Storage stub) → **must be specified as the first task of
   Slice 2**; shared prerequisite of read [B] and Track B write.
+- **OQ-R8 (M4) retrieved-block token budget** → the rendered pre-injection block is **not yet
+  counted against the D46 history token budget** (`context/budget.py`). Slice 1 partially mitigates
+  unbounded prompt growth via `render.py`'s per-field length caps (`_MAX_FIELD_CHARS=500` /
+  `_MAX_CHUNK_CHARS=2000`), but **full budget accounting** (reserve/charge the retrieved block, trim
+  under pressure) is **deferred to Slice 2** — it couples to the neo4j corpus sizing.
+- **OQ-R9 (L5) blueprint scope filter has no `scratch.` exemption — by design.** Unlike the trail
+  filter (`context/scope_filter.py`, which exempts `scratch.`-prefixed session tables per D64/D80),
+  `retrieval/scope_filter.py` applies a plain `uses ⊆ column_scope` subset check with **no scratch
+  exemption**: a **blueprint must never reference a scratch/session-scoped table** (blueprints are
+  reusable warehouse-analysis templates written offline, not session artifacts). If Slice 2's
+  authored blueprint corpus ever needs scratch USES, this is the deliberate place to revisit.
+
+### 8.1 Slice-1 trust-boundary as-built note (H2 — render sanitisation)
+
+The retrieved block is interpolated into a **system-role** message. `retrieval/render.py` now
+**structurally sanitises** every interpolated field before emitting it: whitespace controls
+(`\n\r\t\v\f`) collapse to single spaces, other C0/C1 control characters (incl. NUL) are dropped,
+and each field is length-capped (500 chars per card field, 2000 per knowledge chunk). This prevents
+retrieved TEXT from forging message STRUCTURE (fake `## System` sections / injected instructions at
+system privilege), while keeping the block deterministic (resume renders byte-identically, §6). The
+**content itself remains trusted** — it comes from the offline, leakage-gated corpus (blueprint
+intents / promoted knowledge). **Slice 2 must reconfirm this posture** when Track-B *learned* (and
+therefore less-trusted) content begins writing the corpus: at that point content-level treatment
+(not just structural sanitisation) may be required.
 
 ---
 

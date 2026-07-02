@@ -26,12 +26,27 @@ from typing import Any
 # Only these payload keys are ever allowed to flow into a progress event's
 # `shape` — an explicit allowlist, not a denylist, so a new observer event
 # added later never accidentally leaks a sensitive field by default.
-_SHAPE_ALLOWLIST = ("tool_name", "error_code", "window", "tool_calls_made", "question")
+_SHAPE_ALLOWLIST = (
+    "tool_name",
+    "error_code",
+    "window",
+    "tool_calls_made",
+    "question",
+    # Slice-1 retrieval (design §3.5): shape-only pre-injection counts — the
+    # number of blueprint thin cards / knowledge hits surfaced. Never any card
+    # text, chunk text, ids, scores, the question, or the scope (D25).
+    "blueprints",
+    "knowledge",
+)
 
 # Fine-grained observer events (from ToolDispatcher / AgentLoop) -> coarse,
 # human-readable progress step labels (design §7 "same stage boundaries...
 # coarser"). `{}`-style placeholders are filled from the allowlisted shape.
 _STEP_LABELS: dict[str, str] = {
+    # Retrieval fires TWO shape-only steps (design §3.5): a start signal while it
+    # searches, and a completion step carrying the (blueprints, knowledge) counts.
+    "retrieval_start": "searching for a matching blueprint…",
+    "retrieval": "found matching context",
     "tool_dispatch_start": "running {tool_name}…",
     "tool_dispatch_ok": "step complete: {tool_name}",
     "tool_dispatch_denied": "step denied: {tool_name}",

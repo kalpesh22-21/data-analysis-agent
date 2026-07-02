@@ -148,9 +148,44 @@ class RuntimeSettings(BaseSettings):
         "", description="Custom reranker API endpoint (D71). Empty => unconfigured."
     )
     reranker_api_key: str = Field("", description="Reranker API key (secret).")
+    reranker_model: str = Field(
+        "", description="Reranker model id — RERANKER span attribute only (not a request param)."
+    )
     reranker_timeout_seconds: float = Field(
         10.0, gt=0, description="Per-request reranker timeout (seconds)."
     )
+
+    # --- Retrieval pipeline (D7/D8, design §3.4) ---
+    # Slice-1 note: the pipeline's real vector store is neo4j (D60), whose
+    # `Neo4jVectorIndex` lands in Slice 2. Until then `app.py` leaves the
+    # pipeline UNWIRED (retrieval=None → Phase-0 parity); these tunables are
+    # consumed by the pipeline in Layer-1/Layer-2 tests (seeded fakes) and by
+    # the Slice-2 production wiring. `retrieval_enabled=False` is a hard master
+    # switch to force empty retrieval even once the store exists.
+    retrieval_enabled: bool = Field(
+        True, description="Master switch; False => empty RetrievedContext (Phase-0 parity)."
+    )
+    retrieval_recall_k: int = Field(
+        30, ge=1, description="High-recall per-corpus recall fan-out (precision restored by rerank)."
+    )
+    retrieval_top_k_blueprints: int = Field(
+        3, ge=1, description="Blueprint thin cards pre-injected (03 fixes 3)."
+    )
+    retrieval_top_k_knowledge: int = Field(
+        3, ge=1, description="Global-knowledge hits pre-injected."
+    )
+    retrieval_knowledge_min_score: float | None = Field(
+        None,
+        description=(
+            "Optional knowledge score floor; off by default (ms-marco logits are "
+            "uncalibrated — a floor drops good hits more than it catches junk, OQ-R2)."
+        ),
+    )
+    neo4j_url: str = Field(
+        "", description="neo4j bolt URL (D60). Empty => vector index unavailable (Slice 2)."
+    )
+    neo4j_username: str = Field("", description="neo4j username (secret; Slice 2).")
+    neo4j_password: str = Field("", description="neo4j password (secret; Slice 2).")
 
     # --- resolveValues composite (D77) ---
     resolve_values_query_limit: int = Field(
