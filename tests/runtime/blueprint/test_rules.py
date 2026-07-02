@@ -77,6 +77,11 @@ def _values(*vals: str) -> list[ResolvedValue]:
     return [ResolvedValue(value=v, description=None, score=0.9, freq=10) for v in vals]
 
 
+def _scored(*pairs: tuple[str, float]) -> list[ResolvedValue]:
+    """Build a ranked (value, score) list DESCENDING, as `resolveValues` returns."""
+    return [ResolvedValue(value=v, description=None, score=s, freq=10) for v, s in pairs]
+
+
 async def test_expand_clean_binding() -> None:
     hook = _Hook(ResolveOutcome(status="ok", values=_values("A", "B"), top_margin=0.5))
     out = await expand_rule(_rule(), resolve_hook=hook, credentials=None)
@@ -95,17 +100,93 @@ async def test_expand_degraded_is_fallback_not_pause() -> None:
     assert out.reason == "degraded"
 
 
-async def test_expand_low_margin_is_fallback() -> None:
-    hook = _Hook(ResolveOutcome(status="ok", values=_values("A", "B"), top_margin=0.01))
+# --- D67 concept-subset selection (margin/gap-cut + low-confidence floor) -----
+
+
+async def test_expand_earnings_gap_cut_binds_top_code_only() -> None:
+    # The load-bearing case: [EARN 0.75, DEDUCTION 0.35] — the 0.40 gap is
+    # significant (> 0.15) → bind {EARN} ONLY, never the whole domain (binding
+    # DEDUCTION too nets its deductions into an "earnings" total: the D67 bug).
+    hook = _Hook(ResolveOutcome(status="ok", values=_scored(("EARN", 0.75), ("DEDUCTION", 0.35))))
+    out = await expand_rule(_rule(), resolve_hook=hook, credentials=None)
+    assert isinstance(out, RuleBinding)
+    assert out.values == ["EARN"]
+
+
+async def test_expand_multi_code_cluster_keeps_the_cluster() -> None:
+    # A genuinely multi-code concept: the cluster VAC/SICK/PERSONAL (~0.7) is
+    # tight; the 0.45 gap before WORK 0.21 is the first significant one → bind the
+    # whole cluster, drop only the noise below the gap.
+    hook = _Hook(
+        ResolveOutcome(
+            status="ok",
+            values=_scored(("VAC", 0.71), ("SICK", 0.69), ("PERSONAL", 0.66), ("WORK", 0.21)),
+        )
+    )
+    out = await expand_rule(_rule(), resolve_hook=hook, credentials=None)
+    assert isinstance(out, RuleBinding)
+    assert out.values == ["VAC", "SICK", "PERSONAL"]
+
+
+async def test_expand_uniform_domain_binds_all_no_false_narrowing() -> None:
+    # A uniformly-relevant domain [A 0.70, B 0.69, C 0.68] has no significant gap
+    # → bind ALL. (This replaces the old top-margin fallback: a small #1-#2 gap is
+    # NOT ambiguity here, it is a real multi-code match — no false narrowing.)
+    hook = _Hook(ResolveOutcome(status="ok", values=_scored(("A", 0.70), ("B", 0.69), ("C", 0.68))))
+    out = await expand_rule(_rule(), resolve_hook=hook, credentials=None)
+    assert isinstance(out, RuleBinding)
+    assert out.values == ["A", "B", "C"]
+
+
+async def test_expand_gradual_decline_drops_sub_floor_tail() -> None:
+    # S1: a gradual decline [0.35, 0.25, 0.12] has NO significant gap (gaps 0.10,
+    # 0.13 ≤ 0.15), so the gap cut alone would bind ALL — including 0.25 and 0.12,
+    # both below the 0.3 floor. The sub-floor drop trims them → bind ONLY {A}.
+    hook = _Hook(ResolveOutcome(status="ok", values=_scored(("A", 0.35), ("B", 0.25), ("C", 0.12))))
+    out = await expand_rule(_rule(), resolve_hook=hook, credentials=None)
+    assert isinstance(out, RuleBinding)
+    assert out.values == ["A"]
+    assert out.dropped_count == 2  # B and C were sub-floor
+    assert out.selected_count == 1
+
+
+async def test_expand_sub_floor_drop_keeps_above_floor_prefix() -> None:
+    # A sub-floor value sits after two above-floor codes with no significant gap
+    # [0.45, 0.40, 0.28] (gaps 0.05, 0.12) → gap cut binds all three, the sub-floor
+    # drop removes only the 0.28 tail → bind {A, B}, drop {C}.
+    hook = _Hook(ResolveOutcome(status="ok", values=_scored(("A", 0.45), ("B", 0.40), ("C", 0.28))))
+    out = await expand_rule(_rule(), resolve_hook=hook, credentials=None)
+    assert isinstance(out, RuleBinding)
+    assert out.values == ["A", "B"]
+    assert out.dropped_count == 1
+
+
+async def test_expand_binding_carries_shape_only_telemetry() -> None:
+    # The gap-cut binding exposes shape-only selection telemetry (counts + scores,
+    # NO code strings) for tuning the cutoffs on real traffic.
+    hook = _Hook(ResolveOutcome(status="ok", values=_scored(("EARN", 0.75), ("DEDUCTION", 0.35))))
+    out = await expand_rule(_rule(), resolve_hook=hook, credentials=None)
+    assert isinstance(out, RuleBinding)
+    assert out.selected_count == 1
+    assert out.dropped_count == 1
+    assert out.top_score == 0.75
+    assert out.cut_gap == 0.40  # the significant gap at the cut boundary
+
+
+async def test_expand_low_confidence_top_is_fallback() -> None:
+    # The top code is only a weak match (0.22 < the 0.3 floor) → the concept names
+    # no code confidently → raw-loop fallback, never a guessed filter.
+    hook = _Hook(ResolveOutcome(status="ok", values=_scored(("A", 0.22), ("B", 0.05))))
     out = await expand_rule(_rule(), resolve_hook=hook, credentials=None)
     assert isinstance(out, RuleFallback)
-    assert out.reason == "degraded"
+    assert out.reason == "low_confidence"
 
 
-async def test_expand_single_value_is_not_low_margin() -> None:
-    hook = _Hook(ResolveOutcome(status="ok", values=_values("A"), top_margin=None))
+async def test_expand_single_confident_value_binds() -> None:
+    hook = _Hook(ResolveOutcome(status="ok", values=_scored(("A", 0.8))))
     out = await expand_rule(_rule(), resolve_hook=hook, credentials=None)
-    assert isinstance(out, RuleBinding)  # a single unambiguous code binds
+    assert isinstance(out, RuleBinding)  # a single confident code binds itself
+    assert out.values == ["A"]
 
 
 async def test_expand_empty_is_fallback() -> None:

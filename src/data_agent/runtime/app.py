@@ -386,6 +386,8 @@ def create_app(
                 tool_dispatcher=dispatcher,
                 vector_index=active_retrieval.vector_index,
                 resolve_values=composite,
+                resolve_via_gap_threshold=settings.resolve_via_gap_threshold,
+                resolve_via_min_confidence=settings.resolve_via_min_confidence,
                 preview_row_count=settings.preview_row_count,
                 observer=observer,
             )

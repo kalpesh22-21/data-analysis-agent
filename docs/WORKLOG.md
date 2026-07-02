@@ -103,28 +103,51 @@ invariant→test status board.
   + ClickHouse-via-MCP; non-oracle NOT_FOUND). Design:
   [decisions/runblueprint-design.md](decisions/runblueprint-design.md).
 
-**Next brick:** **Track B — the offline learning loop** (now unblocked: the graph schema is fixed
-(D87) and blueprints are executable (D89)). ~~`runBlueprint` + D56 + D67~~ **done (Session 13, D89).**
-~~D77 `resolveValues`~~ **done (Session 9).** The runtime's Phase-1 `getTableSchema` is just a
-passthrough of the now-MCP-side overlay (D83/D84). **Phase 0 is substantially complete and validated
-end-to-end** (live turn works); the honest remaining Phase-0 gaps are the **3 deferred Layer-3
-scenarios** — mid-session scope narrowing (needs BFF per-turn scope switching), observability+PII span
-inspection (needs a Phoenix collector in the stack — the progress channel is already PII-clean), and
-pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tested) — **plus the NEW
-Layer-3 `runBlueprint` conformance scenarios** (No-silent verification / Ask→clarify / Scope denial /
-Pause-resume-durability), authored + Layer-1/2-proven but **not yet demo-wired**. See
+**Where we are (Session 14):** the **deferred-items** sweep is done — D90 (extractor fail-open) and
+D91 (D67 `resolve_via` wrong-answer) are both **fixed + reviewed**; the CI matrix, the D62 oracle, the
+resolveValues Layer-2 leg, and the D67 seed leg all landed; and the next three bricks are **designed**
+(2 design docs) with the auth posture **decided**. See Session 14 below for the full journey.
+
+**DEFERRED-ITEMS status (the sweep):**
+- **Item 1 (D67 seed / resolve_via correctness):** ✅ **done** — D91 concept-subset selection (gap-cut
+  + sub-floor drop), live-proven `IN ('EARN')`→7350.
+- **Item 2 (resolveValues Layer-2 over real MCP):** ✅ **done** — `test_resolve_values_live.py` (rank +
+  scope-denial legs green).
+- **Item 3 (Layer-3 conformance completion):** 🏗 **designed → building** — `layer3-conformance-design.md`
+  (2 slices: wire demo retrieval + 4 `runBlueprint` scenarios + 3 Phase-0 scenarios).
+- **Item 4 (CI matrix):** ✅ **done** — `.github/workflows/ci.yml` tests Python 3.12 + 3.14.
+- **Item 5 (D62 query_log oracle):** ✅ **built** — `src/data_agent/sqlparse/oracle.py` + a Layer-2
+  live job; production false-reject rate still needs a prod `query_log`.
+- **Items 6 & 7:** confirmed **Phase-2** (drift probes #2/#3; authoring-time static grain gate D37b).
+- **Item 8 (F2 table-intermediate passing):** 🏗 **designed, SLICE 1 ONLY** — `table-intermediate-design.md`
+  (the `clickhouse-api` scratch-write surface; runtime table-passing gated on a real consumer).
+- **Item 9 (auth hardening):** **DECIDED → building** — restrictive `column_scope` end-to-end +
+  per-user BFF mint + `X-Session-Id` HMAC-bind; only Entra OIDC deferred. Not yet designed/built.
+
+**Next scheduled bricks, in order:** (1) **Layer-3 conformance** (Item 3, designed) → (2) **auth
+readiness** (Item 9, decided) → (3) **table-intermediate Slice 1** (Item 8, designed). **Then Track B —
+the offline learning loop** remains the **last big Phase-1 deliverable** (now unblocked: graph schema
+fixed D87, blueprints executable D89). The runtime's Phase-1 `getTableSchema` is just a passthrough of
+the now-MCP-side overlay (D83/D84).
+
+**Honest remaining Phase-0 gaps** (carried): the **3 deferred Layer-3 scenarios** — mid-session scope
+narrowing (needs BFF per-turn scope switching), observability+PII span inspection (needs a Phoenix
+collector in the stack — the progress channel is already PII-clean), and pause/resume durability across
+a runtime restart (logic is Layer-1/Couchbase-tested) — **plus the NEW Layer-3 `runBlueprint`
+conformance scenarios** (No-silent verification / Ask→clarify / Scope denial / Pause-resume-durability),
+authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's design). See
 `tests/e2e/README.md`.
 
 **Open follow-ups carried forward:**
 - **NOTHING IS PUSHED (user deferred the push).** data-analysis-agent branch
-  `phase0/provenance-extractor` has **13 commits** (`6820677`→…→`fd8052d` D88→`3218a84` runBlueprint
-  Slice A→`8bb1a1b` Slice B→`de320d4` Slice C) — **this repo has NO git remote configured yet** (add
-  an `origin` before push/PR). **These Session-13 doc updates are UNCOMMITTED at time of writing**
-  (the orchestrator commits the doc pass; the 3 runBlueprint slices A/B/C are already committed).
-  clickhouse-api
-  `feat/scope-enforcement` (origin `kalpesh22-21/click-house-openapi`) has `b55b4de` (D83/D84) +
-  `143f0c1` "Stale changes" (unrelated branch WIP — settings/oauth/helm/diagnose_token, not ours)
-  ahead of origin, unpushed.
+  `phase0/provenance-extractor` now has **15 commits** (`6820677`→…→`3218a84`/`8bb1a1b`/`de320d4`
+  runBlueprint A/B/C→ Session-13 doc pass → `1b77747` **D90** extractor fail-open) — **this repo has
+  NO git remote configured yet** (add an `origin` before push/PR). **The D91 code + this Session-14 doc
+  pass are UNCOMMITTED / about-to-be-committed at time of writing** (D90 at `1b77747` is already
+  committed with its own DECISIONS/TRACEABILITY entries). clickhouse-api `feat/scope-enforcement`
+  (origin `kalpesh22-21/click-house-openapi`) has `b55b4de` (D83/D84) + **`f8d9467`** (D90 mirror,
+  byte-identical extractor fix) + `143f0c1` "Stale changes" (unrelated branch WIP —
+  settings/oauth/helm/diagnose_token, not ours) ahead of origin, unpushed.
 - **How to re-up the Layer-2 stack next session:** `docker compose -f docker-compose.integration.yml
   up -d --wait`, then `bash scripts/couchbase-init.sh`. Run: MCP/ClickHouse integration →
   `MCP_TEST_URL=http://localhost:18090/mcp uv run pytest tests/integration`; Couchbase →
@@ -176,6 +199,85 @@ Pause-resume-durability), authored + Layer-1/2-proven but **not yet demo-wired**
   - **`resolveValues` Layer-2 over the real MCP** — still not run (carried from Session 9).
   - The **authoring-time static grain gate (D37/D37b)** stays Phase-2 — the runtime D56 gate is the
     launch teeth; wrong-grain blueprints are caught at execution, not yet at authoring.
+
+---
+
+## 2026-07-02 — Session 14: Deferred-items resolution + 2 live-testing-surfaced security/correctness fixes
+
+The "resolve the deferred items" sweep. No new brick — instead we **closed the backlog gaps** left by
+Sessions 9–13 and **teed up the next three bricks** (2 design docs + 1 auth decision). The headline is
+**two real bugs found only because we insisted on live validation** — a scope **fail-open** in the
+provenance extractor (D90) and a wrong-"verified"-answer in `resolve_via` (D91) — both fixed, reviewed,
+QA'd. **D90 is committed (`1b77747` / clickhouse-api `f8d9467`); D91 + this doc pass are
+about-to-be-committed.**
+
+### The two live-testing wins (emphasis: both were invisible to Layer-1)
+
+- **D90 — extractor uncatalogued-column fail-*open* (committed `1b77747`).** While **building the D62
+  oracle** (Item 5), replaying `system.query_log` surfaced an incidental finding: the `sqlglot`
+  provenance extractor **silently dropped** an unqualified column absent from the catalog
+  (`col.table == ''`, not a case variant) instead of failing closed — a D70-class silent-drop that
+  **understated the USES set**, so a D44 replay could fail **open** under catalog drift. `explorer`
+  investigation → `backend-developer` fix in **both repos byte-identical** (D79a copy-in discipline):
+  an uncatalogued unqualified column now **fails closed** unless it is a provable SELECT-list
+  output-alias reference (declared alias in GROUP BY/ORDER BY/HAVING) or a bare column of a scratch-only
+  SELECT; uncatalogued lambda-body columns also fail closed. `reviewer` **APPROVE**; `qa` wrote **27
+  adversarial tests** (alias masks, lambda bodies, scratch-only, case variants) — **no fail-open, no
+  false-reject**. Committed `1b77747` (data-agent) / `f8d9467` (clickhouse-api). Its DECISIONS/
+  TRACEABILITY entries landed **with** that commit — this doc pass does **not** re-add them.
+
+- **D91 — `resolve_via` bound the full ranked domain → wrong "verified" answer.** The D67 Layer-2 live
+  test (Item 1) showed an `earnings` filter binding `RegisterType IN ('EARN','DEDUCTION')` and returning
+  a confidently **wrong 7200** (true **7350**) — a wrong *value set* that still passed the D56 grain gate
+  (fan-out was correct), i.e. a correctness bug **masquerading as a verified total**. `expand_rule`
+  previously bound the **entire** ranked `resolveValues` domain (D77 ranks but does not threshold).
+  `backend-developer` fix = **concept-subset selection**: **gap-cut** (bind the top prefix up to the
+  first score gap `> resolve_via_gap_threshold` 0.15; no gap ⇒ bind all — uniform relevance) **then
+  sub-floor drop** (`< resolve_via_min_confidence` 0.3); a top score below the floor **`RuleFallback`s
+  to the raw loop** (never an unanswerable pause, per Slice-C S2). **Replaces** the prior top-`margin`
+  ambiguity fallback. Shape-only `blueprint_rule_resolved` telemetry (no raw codes, D25). Both tunables
+  provisional (`RuntimeSettings`). `reviewer` **APPROVE**. **Live-confirmed:** `IN ('EARN')` → **7350**.
+
+### Shipped (the rest of the sweep)
+
+| Area | Path | Agent |
+|---|---|---|
+| **D90** extractor fail-open fix (both repos, byte-identical) — committed | `src/data_agent/sqlparse/provenance.py` (+ clickhouse-api mirror) | `explorer` → `backend-developer` → `reviewer` → `qa` |
+| **D91** `resolve_via` concept-subset selection (gap-cut + sub-floor drop + confidence-floor→raw-loop) | `src/data_agent/runtime/blueprint/rules.py` (+ `RuntimeSettings` tunables) | `backend-developer` → `reviewer` |
+| **D62 oracle** (Item 5) — `classify_query` (EXTRACTED_OK/FAIL_CLOSED_REJECT/PARSE_ERROR) + `run_oracle` (rate + redacted rejected samples) + a Layer-2 env-guarded live job replaying `system.query_log`; **also surfaced D90** | `src/data_agent/sqlparse/oracle.py`, `tests/integration/test_provenance_oracle_live.py` | `backend-developer` |
+| **resolveValues Layer-2** (Item 2) — standalone model-facing `run()`→`ToolResult` over real MCP↔ClickHouse + real embedder (EARN 0.75 > DEDUCTION 0.35, `degraded=False`, provenance carried) **and** the scope-denial path (JWT excluding `RegisterType` → real `COLUMN_SCOPE_VIOLATION`) | `tests/integration/test_resolve_values_live.py` | `backend-developer` |
+| **CI matrix** (Item 4) — Python 3.12 + 3.14 | `.github/workflows/ci.yml` | `backend-developer` |
+| **Design doc — Layer-3 conformance completion** (Item 3; DESIGNED, not built): 2 slices — wire demo retrieval + 4 `runBlueprint` scenarios + 3 Phase-0 scenarios | `docs/decisions/layer3-conformance-design.md` | `planner` |
+| **Design doc — F2 table-passing** (Item 8; DESIGNED, **Slice 1 only** per user): the `clickhouse-api` scratch-write surface; runtime table-passing gated on a real consumer | `docs/decisions/table-intermediate-design.md` | `planner` |
+
+### Review journeys (recorded honestly)
+- **D90** — `reviewer` APPROVE; `qa` 27 adversarial tests, **no fail-open / no false-reject**; committed
+  `1b77747` (data-agent) / `f8d9467` (clickhouse-api).
+- **D91** — the fix originated as a `reviewer` **blocker on the small batch** below: reviewing the
+  resolveValues-L2 + oracle + CI batch, the reviewer flagged the D67 full-domain bind as a **seed
+  correctness blocker** → escalated into its own fix (D91) → `reviewer` **APPROVE**.
+- **resolveValues L2 + D62 oracle + CI matrix** — landed as one small `backend-developer` batch;
+  `reviewer` **APPROVE** *with* the D67-seed blocker that became **D91**.
+
+### Design decisions (DESIGNED / DECIDED, not built)
+- **Layer-3 conformance** (Item 3) and **table-intermediate Slice-1-only** (Item 8) are **design docs
+  in the tree**, not code — the next scheduled bricks (see ▶ RESUME HERE for the order).
+- **Item 9 auth-hardening readiness is DECIDED** (build restrictive `column_scope` end-to-end +
+  per-user BFF mint + `X-Session-Id` HMAC-bind; **defer only Entra OIDC**) but **NOT yet designed/built**.
+
+### Verification status
+- `uv run pytest` → **1279 passed / 48 skipped**, ruff clean (up from 1225 at Session 13 close).
+- **Live legs green:** the resolveValues Layer-2 rank + scope-denial legs; the D67/D91 `IN ('EARN')`→7350
+  margin-cut case; the D62 oracle live job (0 rejects on 12 test SELECTs — **not** a production rate).
+- **D90** re-verified across both repos (byte-identical); **27** adversarial QA tests green.
+
+### Honest deferrals / carried gaps
+- **Production false-reject rate** — the D62 oracle exists but the l2 `query_log` is only our own test
+  queries; a real number needs a prod/staging `query_log`.
+- **Live `resolve_via` seed** — D67/D91 are Layer-1 + the single margin-cut live case only; no corpus
+  blueprint exercises `resolve_via` live end-to-end yet.
+- **Items 6 & 7 stay Phase-2** (drift probes #2/#3; authoring-time static grain gate D37b).
+- **Nothing pushed** — 15 data-agent commits, still no git remote (see the carried-forward bullet above).
 
 ---
 

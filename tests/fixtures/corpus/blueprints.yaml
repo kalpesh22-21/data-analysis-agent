@@ -87,6 +87,38 @@
     WHERE Department = {department}
     GROUP BY Department
 
+# Slice-C SINGLE-NODE `resolve_via` blueprint (D67, runblueprint-design §3.4): the
+# `earnings_only` rule maps the concept "earnings" → the earnings RegisterType code
+# set via the typed `resolveValues.resolve()` hook (NO model round-trip), and the
+# executor folds the ranked codes into the `{earn_codes}` predicate as a typed AST
+# IN-list (F1/D10 — never interpolated). Value-only ranking (RegisterType has no
+# sibling description column) against the real embedder + the DISTINCT-domain freq.
+# The seed has EARN (4 rows) + DEDUCTION (1 row); "earnings" must rank EARN first.
+- id: bp-total-earnings-by-department
+  intent: Total earnings for a department, resolving the earnings register codes dynamically
+  slots_summary: department
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.payroll.EmployeeCode
+    - dbpcm_warehouse.payroll.RegisterType
+    - dbpcm_warehouse.payroll.Amount
+    - dbpcm_warehouse.employee.EmployeeCode
+    - dbpcm_warehouse.employee.Department
+  slots:
+    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.Department }
+  uses_rules:
+    - { id: earnings_only, resolve_via: "resolveValues(RegisterType, 'earnings')", table: dbpcm_warehouse.payroll, binds: earn_codes }
+  result_grain: [ Department ]
+  sql_template: |
+    SELECT e.Department AS department, SUM(p.Amount) AS total_earnings
+    FROM dbpcm_warehouse.payroll AS p
+    JOIN dbpcm_warehouse.employee AS e ON e.EmployeeCode = p.EmployeeCode
+    WHERE p.RegisterType IN {earn_codes}
+      AND e.Department = {department}
+    GROUP BY e.Department
+
 # Slice-C multi-node SCALAR-passing DAG (runblueprint-design §2.4/§Q7 Slice C):
 # node 0 computes the company-wide average as a SCALAR; node 1 consumes it as a
 # typed AST literal (F1/D10 — never interpolated) to select the departments above

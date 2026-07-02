@@ -37,6 +37,7 @@ from data_agent.runtime.blueprint.executor import (
     ExecCompleted,
     ExecFailed,
 )
+from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
@@ -60,7 +61,13 @@ _MODEL = "all-mpnet-base-v2"
 _FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "corpus"
 _AVG_ID = "bp-average-salary-by-department"
 _ABOVE_AVG_ID = "bp-departments-above-company-average-salary"
+_EARN_ID = "bp-total-earnings-by-department"
 _E = "dbpcm_warehouse.employee"
+_P = "dbpcm_warehouse.payroll"
+# The D67 concept the resolve_via rule maps to the earnings register code set. The
+# seed's DISTINCT RegisterType domain is {EARN, DEDUCTION} (value-only ranking — no
+# sibling description column). "earnings" must rank EARN above DEDUCTION.
+_EARN_CONCEPT = "earnings"
 
 
 def _auth() -> tuple[str, str]:
@@ -85,9 +92,24 @@ def _index() -> Neo4jVectorIndex:
     )
 
 
-def _executor(index: Neo4jVectorIndex) -> BlueprintExecutor:
-    dispatcher = ToolDispatcher(RealMCPClient(os.environ["MCP_TEST_URL"]), load_catalog_handle())
-    return BlueprintExecutor(tool_dispatcher=dispatcher, vector_index=index)
+def _dispatcher() -> ToolDispatcher:
+    return ToolDispatcher(RealMCPClient(os.environ["MCP_TEST_URL"]), load_catalog_handle())
+
+
+def _composite(dispatcher: ToolDispatcher) -> ResolveValuesComposite:
+    """The D67 `resolve_via` hook wired to the SAME dispatcher (so its inner
+    runQuery shares the scope-enforced path) + the REAL embedder for ranking."""
+    return ResolveValuesComposite(
+        tool_dispatcher=dispatcher, catalog=load_catalog_handle(), embedding_client=_embedder()
+    )
+
+
+def _executor(
+    index: Neo4jVectorIndex, *, resolve_values: ResolveValuesComposite | None = None
+) -> BlueprintExecutor:
+    return BlueprintExecutor(
+        tool_dispatcher=_dispatcher(), vector_index=index, resolve_values=resolve_values
+    )
 
 
 @pytest.fixture(scope="module")
@@ -188,3 +210,78 @@ async def test_narrow_scope_blueprint_is_not_found_no_data_leaks_live(
 
     assert isinstance(outcome, ExecFailed)
     assert outcome.error_code == NOT_FOUND_CODE
+
+
+async def test_single_node_resolve_via_earnings_runs_and_verifies_live(
+    seeded_dag_corpus: bool, mint: Mint
+) -> None:
+    # D67 end-to-end on real infra: the `earnings_only` rule maps the concept
+    # "earnings" → the earnings RegisterType code set via the REAL
+    # `resolveValues.resolve()` (real embedder ranks the live DISTINCT domain
+    # {EARN, DEDUCTION}, value-only), and the executor folds the ranked codes into
+    # `RegisterType IN {earn_codes}` as a typed AST IN-list (F1/D10 — never
+    # interpolated), then runs + D56-verifies the query through the live MCP ↔
+    # ClickHouse. Nothing below the executor is faked.
+    jwt = await mint()  # allow-all scope
+    creds = RuntimeCredentials(session_id="sess-bp-earn-live", jwt=jwt, column_scope=frozenset())
+    dispatcher = _dispatcher()
+    composite = _composite(dispatcher)
+
+    # (a) The concept resolves to a real code set: EARN is present AND ranked above
+    # DEDUCTION by the real embedder over the live DISTINCT RegisterType domain.
+    resolved = await composite.resolve(
+        table=_P, column="RegisterType", concept=_EARN_CONCEPT, period=None, credentials=creds
+    )
+    assert resolved.status == "ok", resolved
+    ranked = [v.value for v in resolved.values]
+    assert "EARN" in ranked, f"EARN missing from resolved code set {ranked!r}"
+    assert ranked.index("EARN") < ranked.index("DEDUCTION"), (
+        f"EARN must rank above DEDUCTION for concept {_EARN_CONCEPT!r}; got {ranked!r} "
+        f"(scores={[(v.value, round(v.score, 4)) for v in resolved.values]})"
+    )
+
+    # (b)-(d) Run the blueprint through the executor (its OWN internal resolve()
+    # call re-does the resolution) → verified result with the IN-list bind.
+    index = _index()
+    try:
+        outcome = await _executor(index, resolve_values=composite).execute(
+            blueprint_id=_EARN_ID,
+            slot_bindings={"department": "Sales"},
+            credentials=creds,
+        )
+    finally:
+        await index.close()
+
+    assert isinstance(outcome, ExecCompleted), outcome
+    rf = outcome.result_full
+    # (c) the query executed AND passed the D56 grain-integrity gate.
+    assert rf["status"] == "verified"
+    assert rf["verify"]["grain_ok"] is True
+    assert rf["verify"]["grain_checked"] is True
+    # (b) D67 concept-subset selection binds {EARN} ONLY as typed literals — the
+    # exact `IN ('EARN')` set, NOT the whole `{EARN, DEDUCTION}` domain, never the
+    # `{earn_codes}` placeholder nor interpolation. Binding DEDUCTION too nets its
+    # -150 into the "earnings" total (7200 instead of the true 7350) — the D67
+    # correctness gap this asserts is closed.
+    assert len(rf["sql"]) == 1
+    node_sql = rf["sql"][0]
+    assert "IN ('EARN')" in node_sql, node_sql
+    assert "DEDUCTION" not in node_sql, node_sql
+    assert "{earn_codes}" not in node_sql
+    # The concept NEVER reaches SQL as a value (D10) — it would only appear as a
+    # quoted string literal if interpolated (`total_earnings` alias is authored SQL).
+    assert f"'{_EARN_CONCEPT}'" not in node_sql
+    # One department (Sales) → one verified result row.
+    assert rf["row_count"] == 1
+    assert "department" in [c.lower() for c in rf["columns"]]
+    # (b') The verified TOTAL is the TRUE earnings sum: Sales = Alice (EMP001 EARN
+    # 3750) + Carol (EMP003 EARN 3600) = 7350.0. With the old full-domain bind the
+    # DEDUCTION -150 would net this to 7200 — the assertion whose absence hid the bug.
+    total_idx = [c.lower() for c in rf["columns"]].index("total_earnings")
+    total = float(rf["preview_rows"][0][total_idx])
+    assert total == 7350.0, f"expected true earnings 7350.0 (EARN only), got {total}"
+    # (d) provenance is the LIVE union across the resolveValues probe + the slot
+    # domain probe + the node query + the grain probe.
+    assert outcome.provenance is not None
+    assert (_P, "RegisterType") in outcome.provenance
+    assert (_P, "Amount") in outcome.provenance

@@ -23,9 +23,10 @@ from data_agent.runtime.blueprint.executor import (
     _approval_decision,
 )
 from data_agent.runtime.composite.ranking import ResolvedValue
-from data_agent.runtime.composite.resolve_values import ResolveOutcome
+from data_agent.runtime.composite.resolve_values import ResolveOutcome, ResolveValuesComposite
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
+from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
@@ -83,15 +84,22 @@ def _detail(
 
 
 def _executor(
-    mcp: FakeMCPClient, detail: BlueprintDetail, *, resolve_values: Any = None
+    mcp: FakeMCPClient,
+    detail: BlueprintDetail,
+    *,
+    resolve_values: Any = None,
+    observer: Any = None,
 ) -> BlueprintExecutor:
     index = FakeVectorIndex()
     index.add_detail(detail)
-    return BlueprintExecutor(
-        tool_dispatcher=ToolDispatcher(mcp, CATALOG),
-        vector_index=index,
-        resolve_values=resolve_values,
-    )
+    kwargs: dict[str, Any] = {
+        "tool_dispatcher": ToolDispatcher(mcp, CATALOG),
+        "vector_index": index,
+        "resolve_values": resolve_values,
+    }
+    if observer is not None:
+        kwargs["observer"] = observer
+    return BlueprintExecutor(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -453,12 +461,16 @@ async def test_resolve_via_expands_and_binds_as_in_list() -> None:
     hook = _FakeResolveHook(
         ResolveOutcome(
             status="ok",
+            # "active employee" GENUINELY names two codes (A and ACT both mean
+            # active) → a tight score cluster (gap 0.04 < the 0.15 threshold) → D67
+            # concept-subset selection binds BOTH. This exercises a real multi-code
+            # IN-list bind (contrast the earnings case, where a wide gap narrows).
             values=[
-                ResolvedValue(value="A", description=None, score=0.9, freq=100),
-                ResolvedValue(value="ACT", description=None, score=0.4, freq=10),
+                ResolvedValue(value="A", description=None, score=0.72, freq=100),
+                ResolvedValue(value="ACT", description=None, score=0.68, freq=10),
             ],
             provenance=frozenset({(_E, "StatusCode")}),
-            top_margin=0.5,
+            top_margin=0.04,
         )
     )
     mcp = FakeMCPClient(
@@ -485,6 +497,51 @@ async def test_resolve_via_expands_and_binds_as_in_list() -> None:
     # The resolveValues inner provenance folds into the union (§5.3).
     assert outcome.provenance is not None
     assert (_E, "StatusCode") in outcome.provenance
+
+
+async def test_resolve_via_emits_shape_only_resolution_telemetry() -> None:
+    # S2: the rule-resolution observation is SHAPE-ONLY — counts + aggregate
+    # scores for tuning, NEVER the resolved code strings (D25). Here EARN/ACT
+    # cluster (gap 0.04) → both bind, nothing dropped.
+    hook = _FakeResolveHook(
+        ResolveOutcome(
+            status="ok",
+            values=[
+                ResolvedValue(value="A", description=None, score=0.72, freq=100),
+                ResolvedValue(value="ACT", description=None, score=0.68, freq=10),
+            ],
+            provenance=frozenset({(_E, "StatusCode")}),
+        )
+    )
+    mcp = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["department", "n"], [["Sales", 3]]),
+                _rq(["__bp_n", "__bp_d"], [[1, 1]]),
+            ]
+        }
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    executor = _executor(
+        mcp, _rule_detail(), resolve_values=hook, observer=lambda e, p: events.append((e, p))
+    )
+    outcome = await executor.execute(blueprint_id="bp-dag", slot_bindings={}, credentials=_creds())
+    assert isinstance(outcome, ExecCompleted)
+
+    resolved = [p for e, p in events if e == "blueprint_rule_resolved"]
+    assert len(resolved) == 1
+    payload = resolved[0]
+    # Shape-only: exactly the counts + aggregate scores + authored rule id.
+    assert payload == {
+        "rule_id": "active_status",
+        "selected_count": 2,
+        "dropped_count": 0,
+        "top_score": 0.72,
+        "cut_gap": None,
+    }
+    # No resolved CODE string ("A"/"ACT") leaks into the telemetry payload (D25).
+    assert "A" not in payload.values()
+    assert "ACT" not in payload.values()
 
 
 async def test_resolve_via_hostile_concept_never_in_sql() -> None:
@@ -813,3 +870,127 @@ async def test_single_node_resolve_via_expands_and_executes() -> None:
     assert len(hook.calls) == 1
     assert outcome.provenance is not None
     assert (_E, "StatusCode") in outcome.provenance
+
+
+# ---------------------------------------------------------------------------
+# D67 single-node resolve_via through the REAL ResolveValuesComposite — the
+# DISTINCT-domain probe → semantic+freq ranker → typed IN-list bind, end-to-end
+# with fakes (no FakeResolveHook shortcut). Mirrors the Layer-2 live test
+# (bp-total-earnings-by-department over payroll.RegisterType EARN/DEDUCTION) so
+# the executor↔composite wiring is proven without infra. The concept "earnings"
+# must rank EARN first; the code set binds as `IN ('EARN')` — the gap-cut prefix,
+# never the whole domain (binding DEDUCTION would net its -150 into the total).
+# ---------------------------------------------------------------------------
+
+_PAYROLL = "dbpcm_warehouse.payroll"
+_EARN_CATALOG = CatalogHandle(
+    {
+        _PAYROLL: {
+            "EmployeeCode": "String",
+            "RegisterType": "String",
+            "Amount": "Nullable(Decimal(18, 6))",
+        },
+        _E: {"EmployeeCode": "String", "Department": "Nullable(String)"},
+    }
+)
+_EARN_TEMPLATE = (
+    "SELECT e.Department AS department, SUM(p.Amount) AS total_earnings "
+    "FROM dbpcm_warehouse.payroll AS p "
+    "JOIN dbpcm_warehouse.employee AS e ON e.EmployeeCode = p.EmployeeCode "
+    "WHERE p.RegisterType IN {earn_codes} AND e.Department = {department} "
+    "GROUP BY e.Department"
+)
+
+
+def _earn_detail() -> BlueprintDetail:
+    return BlueprintDetail(
+        id="bp-total-earnings-by-department",
+        intent="total earnings for a department",
+        slots_summary="department",
+        uses=frozenset(
+            {
+                f"{_PAYROLL}.EmployeeCode",
+                f"{_PAYROLL}.RegisterType",
+                f"{_PAYROLL}.Amount",
+                f"{_E}.EmployeeCode",
+                f"{_E}.Department",
+            }
+        ),
+        status="validated",
+        drift_status="clean",
+        hit_count=0,
+        catalog_sha="",
+        slots=[
+            {
+                "name": "department",
+                "type": "string",
+                "required": True,
+                "binds_to": f"{_E}.Department",
+            }
+        ],
+        uses_rules=[
+            {
+                "id": "earnings_only",
+                "resolve_via": "resolveValues(RegisterType, 'earnings')",
+                "table": _PAYROLL,
+                "binds": "earn_codes",
+            }
+        ],
+        sql_template=_EARN_TEMPLATE,
+        composes=None,
+        result_grain=["Department"],
+    )
+
+
+async def test_single_node_resolve_via_real_composite_ranks_earn_and_binds_in_list() -> None:
+    # The real composite ranks against embeddings: "earnings" ≈ EARN, far from
+    # DEDUCTION → EARN first. Freq (EARN 4, DEDUCTION 1) reinforces the same order.
+    embedder = FakeEmbeddingClient(
+        {"earnings": [1.0, 0.0], "EARN": [1.0, 0.0], "DEDUCTION": [0.0, 1.0]}, dim=2
+    )
+    mcp = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["Department"], [["Sales"], ["Engineering"], ["Finance"]]),  # dept probe
+                _rq(["RegisterType", "freq"], [["EARN", 4], ["DEDUCTION", 1]]),  # resolveValues
+                _rq(["department", "total_earnings"], [["Sales", 7350.0]]),      # node query
+                _rq(["__bp_n", "__bp_d"], [[1, 1]]),                            # grain probe
+            ]
+        }
+    )
+    dispatcher = ToolDispatcher(mcp, _EARN_CATALOG)
+    composite = ResolveValuesComposite(
+        tool_dispatcher=dispatcher, catalog=_EARN_CATALOG, embedding_client=embedder
+    )
+    index = FakeVectorIndex()
+    index.add_detail(_earn_detail())
+    executor = BlueprintExecutor(
+        tool_dispatcher=dispatcher, vector_index=index, resolve_values=composite
+    )
+
+    outcome = await executor.execute(
+        blueprint_id="bp-total-earnings-by-department",
+        slot_bindings={"department": "Sales"},
+        credentials=_creds(),
+    )
+
+    assert isinstance(outcome, ExecCompleted), outcome
+    # The composite issued the DISTINCT-domain freq probe over RegisterType.
+    assert "GROUP BY RegisterType" in mcp.calls[1].args["sql"]
+    # EARN ranked first with a large score gap to DEDUCTION → D67 concept-subset
+    # selection binds {EARN} ONLY (the gap-cut prefix), NOT the whole domain. The
+    # resolved code set binds as a typed AST IN-list literal (F1/D10), never
+    # string-interpolated; the placeholder is gone. Binding DEDUCTION too would
+    # net its -150 into the "earnings" total — the correctness gap this asserts.
+    node_sql = mcp.calls[2].args["sql"]
+    assert "IN ('EARN')" in node_sql
+    assert "DEDUCTION" not in node_sql
+    assert "{earn_codes}" not in node_sql
+    assert "'earnings'" not in node_sql  # the concept NEVER reaches SQL (D10)
+    # The D56 grain gate ran and passed on the verified single-department result.
+    assert outcome.result_full["verify"]["grain_ok"] is True
+    assert outcome.result_full["verify"]["grain_checked"] is True
+    # The resolveValues inner probe's provenance folds into the union (§5.3).
+    assert outcome.provenance is not None
+    assert (_PAYROLL, "RegisterType") in outcome.provenance
+    assert (_PAYROLL, "Amount") in outcome.provenance

@@ -50,6 +50,7 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
         "bp-overtime-by-department",
         "bp-active-headcount-by-department",
         "bp-average-salary-by-department",
+        "bp-total-earnings-by-department",
         "bp-departments-above-company-average-salary",
     }
     for bp in blueprints:

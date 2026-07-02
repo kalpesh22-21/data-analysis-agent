@@ -37,6 +37,16 @@ _SHAPE_ALLOWLIST = (
     # text, chunk text, ids, scores, the question, or the scope (D25).
     "blueprints",
     "knowledge",
+    # D67 resolve_via rule-resolution telemetry (blueprint/rules.py): shape-only
+    # selection counts + aggregate ranking scores for tuning the gap/confidence
+    # cutoffs. `rule_id` is an AUTHORED blueprint-rule id (not a resolved value);
+    # the counts/scores are aggregates — NEVER the resolved code strings (D25:
+    # resolved domain values never enter telemetry).
+    "rule_id",
+    "selected_count",
+    "dropped_count",
+    "top_score",
+    "cut_gap",
 )
 
 # Fine-grained observer events (from ToolDispatcher / AgentLoop) -> coarse,
@@ -47,6 +57,7 @@ _STEP_LABELS: dict[str, str] = {
     # searches, and a completion step carrying the (blueprints, knowledge) counts.
     "retrieval_start": "searching for a matching blueprint…",
     "retrieval": "found matching context",
+    "blueprint_rule_resolved": "resolved the filter set",
     "tool_dispatch_start": "running {tool_name}…",
     "tool_dispatch_ok": "step complete: {tool_name}",
     "tool_dispatch_denied": "step denied: {tool_name}",

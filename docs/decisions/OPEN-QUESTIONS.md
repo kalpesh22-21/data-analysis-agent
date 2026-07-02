@@ -103,8 +103,11 @@ The curated semantic layer applied by the **MCP**, not the runtime. Per D83 (rev
   `resolveValues` (D77) and binds the result as params before executing** the predicate (D10: never
   string-interpolated). **BUILT (Session 13, D89):** this mechanism now exists — `runBlueprint` expands
   `resolve_via` via the typed `resolveValues.resolve()` hook and binds the code set as an **IN-list of
-  AST literals** (empty → fail-closed, degraded → raw-loop). **Still open:** no **live** `resolve_via`
-  seed yet (Layer-1 only). Note: because `resolveValues` is now a runtime composite (D77), the resolved
+  AST literals** (empty → fail-closed, degraded → raw-loop). **REFINED (Session 14, D91):** it binds
+  only the **concept-matching subset** — gap-cut then sub-floor drop — not the full ranked domain (a
+  wrong-"verified"-answer guard; live-proven `IN ('EARN')`→7350). **Still open:** no **live**
+  `resolve_via` seed yet (Layer-1 + the single D91 margin-cut live case only). Note: because
+  `resolveValues` is now a runtime composite (D77), the resolved
   concept→code expansion also happens runtime-side, consistent with the D5 injection boundary.
 - **`sensitive: true` on a column** — added to known PII columns. Intended as the **catalog source of
   truth for the column-scope / governance layer**; needs that layer to actually consume it (today
@@ -197,9 +200,22 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
   but the composite now exposes a typed `resolve()` entry point it can call (no model round-trip).~~
   **RESOLVED (Session 13, D89):** `resolve_via` is **wired inside `runBlueprint`** (single- AND
   multi-node) — a concept expands via the typed `resolveValues.resolve()` hook (no model round-trip),
-  bound as an **IN-list of literals**; empty → fail-closed, degraded → raw-loop fallback. **Still open:**
-  no **live** `resolve_via` seed yet (D67 Layer-1 only); **deictic/relative period** resolution remains
-  deferred (label-drift over time, D41/D65).
+  bound as an **IN-list of literals**; empty → fail-closed, degraded → raw-loop fallback. ~~**Concept-
+  subset selection** (D67 "ranks but does not threshold"): the wiring bound the **entire** ranked
+  domain, so a concept could bind codes it didn't mean.~~ **RESOLVED (Session 14, D91):** `resolve_via`
+  now binds only the concept-matching subset — **gap-cut** (top prefix up to the first score gap
+  `> resolve_via_gap_threshold` 0.15; no gap ⇒ bind all) **then sub-floor drop**
+  (`< resolve_via_min_confidence` 0.3); top score below the floor → raw-loop fallback (never a pause).
+  Live-proven: an `earnings` concept binds `IN ('EARN')` → correct **7350** (was `IN ('EARN','DEDUCTION')`
+  → wrong 7200). Both cuts are provisional `RuntimeSettings` tunables. **Still open:** no **live**
+  `resolve_via` seed yet (D67/D91 Layer-1 + the single margin-cut live case only); **deictic/relative
+  period** resolution remains deferred (label-drift over time, D41/D65).
+  - ~~**`resolveValues` Layer-2 over the real MCP** — the D77 composite was Layer-1-proven with fakes;
+    a run over the real `clickhouse-api` MCP↔ClickHouse was deferred.~~ **CLOSED (Session 14):**
+    `test_resolve_values_live.py` proves the standalone model-facing `resolveValues` `run()`→`ToolResult`
+    path over real MCP↔ClickHouse + the real embedder (EARN ranked 0.75 > DEDUCTION 0.35,
+    `degraded=False`, provenance carried) **and** the scope-denial path (a JWT excluding `RegisterType`
+    → a real `COLUMN_SCOPE_VIOLATION` from the MCP).
 - **Context-budget params (D46):** result preview row cap `N` + history token budget + when
   compaction triggers. (Mechanism resolved; values TBD.)
 - **Loop-budget caps (D47):** max iterations / tokens / wall-clock per turn. (Mechanism resolved;
@@ -236,11 +252,17 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
 - **`SESSION_TTL` value** (D44) — must exceed the learning-loop completion window.
 - **SQL parser choice** — **RESOLVED by D62: `sqlglot` (Python).** Remaining: **dialect coverage** —
   how often each fail-path (closed/soft/review) actually trips, measured via the ClickHouse
-  `system.query_log.columns` ground-truth oracle on real queries.
+  `system.query_log.columns` ground-truth oracle on real queries. **Oracle BUILT (Session 14):**
+  `src/data_agent/sqlparse/oracle.py` (`classify_query` → `EXTRACTED_OK`/`FAIL_CLOSED_REJECT`/`PARSE_ERROR`;
+  `run_oracle` → rate + redacted rejected samples) + a Layer-2 env-guarded live job
+  (`test_provenance_oracle_live.py`) that replays `system.query_log`. **Still open:** a **production**
+  false-reject rate — the l2 `query_log` is only our own test queries (0 rejects on 12 SELECTs, **not**
+  a production number); the oracle is reusable against a prod/staging `query_log` for the real rate.
 - ~~Live `runQuery` parse-failure behavior~~ — **RESOLVED by D63: fail-closed + alert** (reject, never
-  run unchecked). Remaining: build the adversarial-ClickHouse-SQL test suite + the
-  `system.query_log.columns` oracle harness to **measure** the false-reject rate and drive parser
-  coverage.
+  run unchecked). Remaining: run the (now-built, Session 14) `system.query_log.columns` oracle harness
+  against a **prod/staging** `query_log` to **measure** the false-reject rate and drive parser coverage
+  (the harness itself exists — see the SQL-parser item above; it also incidentally surfaced the D90
+  extractor fail-open).
 - ~~Vector index choice (native neo4j vs. external)~~ — **RESOLVED by D60: neo4j-native**, hosting
   both blueprint intent + global-knowledge vectors. Reranker hosting + embedding-model choice still open.
 - Couchbase session document model — now must include the **per-result column-provenance set** (D44).

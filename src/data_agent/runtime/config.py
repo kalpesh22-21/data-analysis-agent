@@ -233,6 +233,33 @@ class RuntimeSettings(BaseSettings):
         le=1,
         description="Weight w on cosine similarity vs. normalized log-freq in the score.",
     )
+    # --- D67 resolve_via concept-subset selection (blueprint/rules.py) ---
+    # The dynamic `resolve_via` rule expander binds the SUBSET of ranked codes the
+    # concept actually names, not the whole domain. `earnings` must bind {EARN},
+    # never {EARN, DEDUCTION} (the latter nets deductions into an earnings total).
+    resolve_via_gap_threshold: float = Field(
+        0.15,
+        ge=0,
+        le=1,
+        description=(
+            "Significance threshold on the ranked-score gap: the expander binds "
+            "the top prefix up to the FIRST `score[i]-score[i+1] > this` gap. "
+            "0.15 sits below the ~0.3-0.4 gap a single-code concept opens (the "
+            "0.7·Δcosine term dominates) yet above intra-cluster jitter for a "
+            "genuinely multi-code concept. Provisional; tune on Phase-0 traffic."
+        ),
+    )
+    resolve_via_min_confidence: float = Field(
+        0.3,
+        ge=0,
+        le=1,
+        description=(
+            "Floor on the TOP ranked score: below it the concept confidently "
+            "matches no code, so the fast path falls back to the raw loop rather "
+            "than guessing a filter. 0.3 ≈ a weak cosine even at full freq weight. "
+            "Provisional; tune on Phase-0 traffic."
+        ),
+    )
 
     def history_token_budget(self) -> int:
         """Absolute history token budget derived from the model's context window (OQ-G)."""

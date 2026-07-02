@@ -321,13 +321,48 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   D67 (resolve_via — now BUILT), D87 (stored DAG schema), D88 (read-tools registry + non-oracle
   posture + the two owed guards, now discharged), D10 (injection boundary), D5 (scope injection).
 
-- **D67 (locked, 2026-06-30; BUILT — Session 13, wired into `runBlueprint` per [D89](#blueprints)).**
+- **D67 (locked, 2026-06-30; BUILT — Session 13, wired into `runBlueprint` per [D89](#blueprints);
+  concept-subset selection refined by [D91](#blueprints) — Session 14).**
   **Two rule kinds: static and resolved (dynamic).** A catalog `rule`'s
   `predicate` is either a fixed SQL boolean (**static**) or references `resolveValues(column, concept)`
   over a `client_defined` column (**resolved**) — the runtime expands it to a concrete per-client value
   set before injection, bound as params (not string-interpolated). Resolved rules replace hardcoded
   client-specific codes (e.g. PAF `FieldId` lists, `EarnCode`/`TypeCode` concepts). Extends D66; same
-  injection boundary as slots (D41/D5).
+  injection boundary as slots (D41/D5). **→ REFINED by D91:** D67 ranked the code domain but did not
+  *threshold* it — the initial wiring bound the **entire** ranked domain, so a `resolve_via` concept
+  bound codes it didn't mean and returned a wrong "verified" total; D91 adds the concept-subset cut.
+
+- **D91 (locked, 2026-07-02, Session 14 — refines D67, surfaced by the D67 Layer-2 live test).**
+  **A `resolve_via` rule binds only the concept-*matching* subset of the ranked code domain — gap-cut
+  then sub-floor drop — never the full domain.** The prior wiring passed the **entire** ranked
+  `resolveValues` result (D77 returns *all* in-scope codes ranked, with no concept cutoff) into the
+  IN-list, so a rule for the `earnings` concept bound `RegisterType IN ('EARN','DEDUCTION')` and
+  returned a **wrong "verified" total (7200 vs. the true 7350)** — a wrong number that still passed the
+  D56 grain gate (the fan-out was correct; the value *set* was wrong), i.e. a correctness bug that
+  masqueraded as a verified answer. The fix is a two-stage concept-subset selection applied to the
+  ranked scores before binding:
+  1. **Gap-cut (margin cut).** Bind the top prefix of the ranked codes up to the **first score gap
+     `> resolve_via_gap_threshold`** (default **0.15**). A cliff in the scores is the concept boundary
+     (relevant codes above it, unrelated below). **No significant gap ⇒ bind all** — a uniformly-
+     relevant domain (every code matches the concept) is bound whole, not truncated.
+  2. **Sub-floor drop.** From the gap-cut prefix, **drop any selected code whose score is below
+     `resolve_via_min_confidence`** (default **0.3**) — a defensive floor for a code that squeaked in
+     under the gap but is not actually a concept match.
+  3. **Confidence-floor → raw loop.** If the **top** score is itself below the floor (nothing matched
+     the concept with confidence), the rule expansion **`RuleFallback`s to the raw agent loop** — it is
+     **never an unanswerable pause** (consistent with the Slice-C S2 posture: a failed `resolve_via`
+     degrades to the raw loop, not a dead end).
+
+  Both `resolve_via_gap_threshold` and `resolve_via_min_confidence` are **provisional `RuntimeSettings`
+  tunables** pending real traffic. The expansion emits **shape-only** `blueprint_rule_resolved`
+  telemetry (`{rule_id, selected_count, dropped_count, top_score, cut_gap}` — **no raw code strings**,
+  D25). **Replaces** the prior top-`margin` ambiguity fallback (which paused instead of cutting).
+  **Live-confirmed:** the D67 earnings case now binds `RegisterType IN ('EARN')` and returns the correct
+  **7350**. Same injection boundary as before (IN-list of typed AST literals, D10/D89f — never
+  interpolated). Cross-references: [D67](#blueprints) (the rule kinds this refines),
+  [D77](#client-defined-value-resolution) (the ranked domain source), [D66](#client-defined-value-resolution)(c)
+  (accept-vs-clarify), [D56](#blueprints) (the grain gate this wrong-answer slipped past),
+  [D89](#blueprints)(f) (the `resolve_via` wiring), [D25](#observability) (shape-only telemetry).
 
 ## Context budget & loop guardrails
 - **D46 (locked, 2026-06-30).** **What is persisted ≠ what is injected.** The trail has two consumers:

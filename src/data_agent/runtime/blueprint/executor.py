@@ -54,6 +54,12 @@ from data_agent.runtime.session.models import ResultPreview
 
 from .models import Blueprint, BlueprintParseError, Node
 from .rules import (
+    _GAP_THRESHOLD as _DEFAULT_GAP_THRESHOLD,
+)
+from .rules import (
+    _MIN_CONFIDENCE as _DEFAULT_MIN_CONFIDENCE,
+)
+from .rules import (
     RuleBinding,
     RuleFallback,
     expand_rule,
@@ -173,6 +179,12 @@ class BlueprintExecutor:
         # rule cannot be expanded → UNSUPPORTED (raw-loop fallback), never a
         # silently-unfiltered query.
         resolve_values: Any = None,
+        # D67 concept-subset selection tunables (blueprint/rules.py). Canonical
+        # values are `RuntimeSettings.resolve_via_{gap_threshold,min_confidence}`;
+        # the defaults here mirror the rules-module fallbacks so a directly
+        # constructed executor (tests) behaves identically to the wired one.
+        resolve_via_gap_threshold: float = _DEFAULT_GAP_THRESHOLD,
+        resolve_via_min_confidence: float = _DEFAULT_MIN_CONFIDENCE,
         query_limit: int | None = None,
         preview_row_count: int = 20,
         observer: ToolObserver = _default_observer,
@@ -181,6 +193,8 @@ class BlueprintExecutor:
         self._vector_index = vector_index
         self._semantic_catalog = semantic_catalog  # Slice C (see above)
         self._resolve_values = resolve_values
+        self._resolve_via_gap_threshold = resolve_via_gap_threshold
+        self._resolve_via_min_confidence = resolve_via_min_confidence
         self._query_limit = query_limit
         self._preview_row_count = preview_row_count
         self._observer = observer
@@ -723,11 +737,29 @@ class BlueprintExecutor:
                 "blueprint_step", {"blueprint_id": blueprint.id, "step": "resolving_rule"}
             )
             expansion = await expand_rule(
-                rule, resolve_hook=self._resolve_values, credentials=credentials
+                rule,
+                resolve_hook=self._resolve_values,
+                credentials=credentials,
+                gap_threshold=self._resolve_via_gap_threshold,
+                min_confidence=self._resolve_via_min_confidence,
             )
             if isinstance(expansion, RuleBinding):
                 provenances.append(expansion.provenance)
                 rule_bindings[expansion.binds] = list(expansion.values)
+                # Shape-only rule-resolution telemetry (D67 tuning signal): counts
+                # + aggregate ranking scores ONLY, NEVER the resolved code strings
+                # (D25 — resolved domain values never enter telemetry). Lets us tune
+                # resolve_via_gap_threshold/min_confidence on real Phase-0 traffic.
+                self._observer(
+                    "blueprint_rule_resolved",
+                    {
+                        "rule_id": rule.rule_id,
+                        "selected_count": expansion.selected_count,
+                        "dropped_count": expansion.dropped_count,
+                        "top_score": expansion.top_score,
+                        "cut_gap": expansion.cut_gap,
+                    },
+                )
             elif isinstance(expansion, RuleFallback):
                 # degrade/empty/denied → never a silently-dropped filter → raw loop.
                 if expansion.provenance is not None:

@@ -8,8 +8,12 @@ on:
 
 jobs:
   test:
-    name: Lint + Test (Layer 1)
+    name: Lint + Test (Layer 1, py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -17,7 +21,7 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.12"
+          python-version: "${{ matrix.python-version }}"
 
       - name: Install dependencies
         run: uv sync --extra dev
