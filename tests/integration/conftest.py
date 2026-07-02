@@ -22,26 +22,39 @@ import pytest
 TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
 TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
 
-Mint = Callable[[list[str] | None], Awaitable[str]]
+Mint = Callable[..., Awaitable[str]]
 
 
 @pytest.fixture
 def mint() -> Mint:
-    """Return an async `mint(column_scope) -> jwt` helper.
+    """Return an async `mint(column_scope=None, session_id=None) -> jwt` helper.
 
     `column_scope=None` or `column_scope=[]` mints an allow-all token (D80(b):
     `[]` == allow-all, matching `RuntimeCredentials.column_scope` and
     clickhouse-api's `Principal.column_scope` exactly). A non-empty list mints
     a token scoped to exactly those fully-qualified `database.table.column`
     strings.
+
+    `session_id`, when supplied, is threaded into the mint request so the token
+    carries a `sid_hash` claim (auth-hardening Slice 1). The live MCP enforces
+    that any `X-Session-Id` header matches this claim, so a session-bound token
+    MUST be sent with the matching `session_id` (see `test_mcp_scope_live.py`).
+    Omitting it mints an unbound token (rejected by the live MCP the moment an
+    `X-Session-Id` header is present — the default `require_sid_binding=true`).
     """
 
-    async def _mint(column_scope: list[str] | None = None) -> str:
+    async def _mint(
+        column_scope: list[str] | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        body: dict = {"user_name": "alice", "column_scope": column_scope or []}
+        if session_id is not None:
+            body["session_id"] = session_id
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 TOKEN_SERVICE_URL,
                 headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
-                json={"user_name": "alice", "column_scope": column_scope or []},
+                json=body,
             )
             response.raise_for_status()
             return response.json()["access_token"]

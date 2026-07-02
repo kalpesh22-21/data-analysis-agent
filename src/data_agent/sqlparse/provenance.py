@@ -22,8 +22,11 @@ Scratch tables (D69/OQ-4):
     references are accepted without catalog qualification.  If `session_id` is
     supplied, the scratch table name is validated against `s_<session_id>_*`; a
     mismatch raises ScratchSessionError (a subclass of ProvenanceExtractionError).
-    If `session_id` is None, scratch table names are not validated (useful in unit
-    tests that only test column extraction, not session isolation).
+    If `session_id` is None while a scratch table is referenced, the reference is
+    rejected fail-closed (D64, auth-hardening Slice 1): a scratch table whose
+    owning session is unknown can never be proven to belong to the caller, so it
+    is never accepted.  (The stdio/local-trust path — `current_scope is None` —
+    skips the extractor entirely and is unaffected.)
 
 SELECT * expansion (D69/OQ-2):
     qualify_columns from sqlglot expands SELECT * into individual columns when fed
@@ -250,11 +253,25 @@ def _validate_scratch_name(tbl_name: str, session_id: str | None) -> None:
 
     session_id can itself contain underscores (e.g. 'sess_abc123'), so we do
     a prefix check rather than a regex group match.
+
+    FAIL-CLOSED on a None session_id (D64, auth-hardening Slice 1): reaching this
+    function means a ``scratch.*`` table was referenced, and a scratch reference
+    whose owning session is unknown can never be proven to belong to the caller.
+    We therefore REJECT rather than skip. This closes the omit-the-header bypass
+    (a caller dropping/emptying X-Session-Id so ``current_session_id`` is None,
+    then reading ``scratch.s_<victim>_*`` directly): the MCP binding check only
+    fires when the header is present, so the fail-closed guard here is the
+    defense that actually stops a session-less scratch read. Note the
+    session-less/local-trust path (``current_scope is None``, stdio) never runs
+    the extractor at all, so this only affects scoped callers — the exact
+    surface the bypass exploited.
     """
     if session_id is None:
-        # No session context; skip validation (useful for unit tests that don't
-        # test session isolation, only column extraction)
-        return
+        raise ScratchSessionError(
+            f"Scratch table '{_SCRATCH_DB}.{tbl_name}' was referenced without a "
+            "bound session_id; ownership cannot be verified — rejected fail-closed "
+            "(D64). A scratch reference requires a session context."
+        )
 
     expected_prefix = f"s_{session_id}_"
     if not tbl_name.startswith(expected_prefix) or len(tbl_name) <= len(expected_prefix):

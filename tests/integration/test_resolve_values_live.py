@@ -105,7 +105,7 @@ async def test_run_earnings_ranks_over_real_mcp_and_embedder(mint: Mint) -> None
     # The FULL model-facing tool path: run() -> ToolResult over the real
     # MCP↔ClickHouse (the backing DISTINCT runQuery, scope-enforced end-to-end)
     # + the real embedder ranking the live domain.
-    jwt = await mint()  # allow-all scope (D80b)
+    jwt = await mint(session_id="sess-rv-live")  # allow-all scope (D80b), session-bound
     creds = RuntimeCredentials(
         session_id="sess-rv-live", jwt=jwt, column_scope=frozenset()
     )
@@ -168,7 +168,8 @@ async def test_run_denied_when_backing_query_out_of_scope(mint: Mint) -> None:
     # so the backing runQuery selects RegisterType and the MCP denies it. The
     # denial passes through to the ToolResult verbatim (design §7).
     scope = f"{_P}.Amount"
-    jwt = await mint([scope])  # narrow scope: RegisterType is NOT permitted
+    # narrow scope: RegisterType is NOT permitted; session-bound to the creds' id
+    jwt = await mint([scope], session_id="sess-rv-live-scope")
     creds = RuntimeCredentials(
         session_id="sess-rv-live-scope", jwt=jwt, column_scope=frozenset({scope})
     )

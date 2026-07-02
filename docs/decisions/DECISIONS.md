@@ -1053,7 +1053,9 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   `(session_id, sub)` in the required prefix) so a valid prefix can't be forged for another user's
   session. Tracked in [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md) §Security/infra. Cross-references:
   [D5](#tools), [D64](#security--infra), [D79](#clickhouse-mcp--adoption-decision),
-  [D80](#clickhouse-mcp--adoption-decision).
+  [D80](#clickhouse-mcp--adoption-decision). **→ RESOLVED by D92: `X-Session-Id` is now bound to the
+  JWT via a `sid_hash` claim (the "bind `session_id` to the JWT subject" hardening this D81 note
+  called for), and a scratch reference with no bound session fails closed.**
 
 - **D82 (locked, 2026-06-30).** **On login, the UI acquires its JWT via a server-side mint; the token defaults to all-column access (interim).**
   - **Login → mint:** on successful login, the **UI's backend** calls `token_service`'s guarded `POST /token` (or an external IdP in production) to obtain a **signed JWT** on behalf of the session. The browser **receives** the JWT; it does **not** hold a signing/private key and cannot mint tokens itself.
@@ -1064,6 +1066,41 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   - **Future direction — managed IdP:** `token_service` is an interim issuer. The production direction is to replace it with a managed identity provider (Microsoft Entra / Keycloak / Okta). Because the MCP already validates standard OIDC JWTs via JWKS (D79 — checks `iss`/`aud`, fetches keys from `OIDC_JWKS_URL`), this swap is an **issuer/config change** (point `OIDC_JWKS_URL` / `OIDC_ISSUER` / `OIDC_AUDIENCE` at Entra; the IdP mints the JWT with `column_scope` + `user_name`/tenant claims), **not an MCP code change**. Prerequisite: the chosen IdP must stamp the `column_scope` claim — which ties into the per-user-entitlement open question above.
 
   Cross-references: [D5](#tools), [D57](#blueprint-silent-path-safety), [D63](#blueprint-silent-path-safety), [D64](#security--infra), [D79](#clickhouse-mcp--adoption-decision), [D80](#clickhouse-mcp--adoption-decision), [D81](#clickhouse-mcp--adoption-decision).
+
+- **D92 (locked, 2026-07-02, Session 14 — auth hardening, Slice 1).** **`X-Session-Id` is
+  cryptographically bound to the JWT via a `sid_hash` claim, and a scratch reference with no bound
+  session fails closed — closing the D81 hijack risk before scratch-write ships.** Two parts:
+  **(a) session binding.** The `token_service` stamps `sid_hash = base64url(sha256(session_id))`
+  (unpadded) as a JWT body claim whenever a `session_id` is supplied at mint. The MCP's
+  `JWTAuthMiddleware`, *after* verifying the JWT signature (JWKS, D79) and *before* any tool or the
+  D64 extractor runs, requires — when an `X-Session-Id` header is present and `require_sid_binding`
+  is on (**default true**, fail-closed) — that `sha256(header)` **constant-time-equals** the
+  `sid_hash` claim, else `403 SESSION_BINDING_MISMATCH`. No new shared secret: the JWT signature
+  already authenticates the claim, and `session_id` is a 122-bit uuid4 so the unkeyed hash is not
+  brute-forceable. This delivers the D81-noted "bind `session_id` to the JWT subject" hardening
+  (binding to `sub` is transitive — the token is minted for one identity's session). Backward-compat:
+  a **session-less** token (no `sid_hash` claim) with **no** header stays allowed (REST/stdio,
+  D80-trusted); a token *with* a `sid_hash` claim that omits or mismatches the header is rejected.
+  **(b) scratch fail-closed without a bound session (D64 hardening).** Independently, the provenance
+  extractor's `_validate_scratch_name` now **raises** `SCRATCH_SESSION_VIOLATION` on any `scratch.*`
+  reference when `session_id is None`, instead of silently skipping the owner-prefix check — closing
+  the bypass where a bound-token caller *omits* the header and references
+  `scratch.s_<victimSession>_*` directly in the SQL (proven closed across all six SQL positions:
+  direct FROM, subquery, CTE, JOIN, WHERE-IN-subquery, UNION — `find_all(exp.Table)` enumerates them
+  all). Scratch is the *only* thing `session_id` gates MCP-side, so a no-header **non-scratch** query
+  correctly still succeeds (gated by `column_scope`). Fix (b) was chosen over the alternative
+  ("require the header whenever a `sid_hash` claim is present") because the latter would forbid the
+  legitimate no-header/no-session mode. Applied **byte-identical to both extractor copies** (D79a).
+  **(c)** the `token_service` rejects reserved claim names (`sub/iss/aud/exp/nbf/iat/user_name/
+  column_scope/sid_hash`) in a mint request's free `claims`, and applies free claims *before* the
+  computed ones, so a caller cannot shadow `sid_hash`. Adversarially reviewed + QA'd (the omit-header
+  cross-session scratch read was proven to exfiltrate victim PII pre-fix, and rejected post-fix,
+  live against the enforcing MCP). **Still deferred (only this):** the literal Entra OIDC provider
+  integration; the per-user `column_scope` entitlement mint is **Slice 2** (this slice keeps the D82
+  interim all-access default). Cross-references: [D5](#tools), [D64](#security--infra),
+  [D79](#clickhouse-mcp--adoption-decision), [D80](#clickhouse-mcp--adoption-decision),
+  [D81](#clickhouse-mcp--adoption-decision), [D82](#clickhouse-mcp--adoption-decision), D90 (the
+  byte-identical extractor), D68.
 
 ## Delivery / sequencing
 - **D68 (locked, 2026-06-30).** **Three-phase delivery with a red-burndown conformance harness from day one.**

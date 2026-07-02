@@ -71,17 +71,28 @@ class ScopeBody(BaseModel):
     column_scope: list[str]
 
 
-async def _mint_jwt(column_scope: list[str]) -> str:
+async def _mint_jwt(column_scope: list[str], session_id: str) -> str:
     """Call the token service server-side to mint a JWT carrying *column_scope*
-    (D82/D5: the BFF is the ONLY holder of the token; the browser never sees
-    it). `column_scope=[]` == allow-all, matching the runtime's D80(b)/D44
-    scope semantics."""
+    and bound to *session_id* (D82/D5: the BFF is the ONLY holder of the token;
+    the browser never sees it). `column_scope=[]` == allow-all, matching the
+    runtime's D80(b)/D44 scope semantics.
+
+    *session_id* is threaded into the mint request so the token carries a
+    `sid_hash` claim (auth-hardening Slice 1): the MCP then rejects any request
+    whose `X-Session-Id` header does not hash to that claim, closing the
+    session-hijack gap. Every JWT this BFF mints is for exactly one `session_id`
+    and is sent with the matching `X-Session-Id` header, so the binding always
+    holds for BFF-minted traffic."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.post(
                 TOKEN_SERVICE_URL,
                 headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
-                json={"user_name": "ui-user", "column_scope": column_scope},
+                json={
+                    "user_name": "ui-user",
+                    "column_scope": column_scope,
+                    "session_id": session_id,
+                },
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
@@ -99,7 +110,7 @@ async def index() -> FileResponse:
 @app.post("/api/session")
 async def create_session() -> dict[str, str]:
     session_id = str(uuid.uuid4())
-    _SESSIONS[session_id] = await _mint_jwt([])
+    _SESSIONS[session_id] = await _mint_jwt([], session_id)
     _SESSION_SCOPES[session_id] = []
     return {"session_id": session_id}
 
@@ -140,7 +151,10 @@ async def set_session_scope(body: ScopeBody) -> dict[str, bool]:
             status_code=400,
             detail="Test affordance narrows only; new scope must be a subset of the current scope.",
         )
-    _SESSIONS[body.session_id] = await _mint_jwt(body.column_scope)
+    # Re-mint with the SAME session_id so the sid_hash binding stays valid across
+    # the scope narrow (auth-hardening Slice 1, invariant §6.5): only column_scope
+    # changes; the session binding and identity are preserved.
+    _SESSIONS[body.session_id] = await _mint_jwt(body.column_scope, body.session_id)
     _SESSION_SCOPES[body.session_id] = list(body.column_scope)
     return {"ok": True}
 

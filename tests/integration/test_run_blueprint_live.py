@@ -131,7 +131,7 @@ def seeded_dag_corpus() -> bool:
 async def test_single_node_blueprint_runs_and_verifies_live(
     seeded_dag_corpus: bool, mint: Mint
 ) -> None:
-    jwt = await mint()  # allow-all scope
+    jwt = await mint(session_id="sess-bp-live")  # allow-all scope, session-bound
     creds = RuntimeCredentials(session_id="sess-bp-live", jwt=jwt, column_scope=frozenset())
     index = _index()
     try:
@@ -165,7 +165,7 @@ async def test_multi_node_scalar_dag_runs_and_verifies_live(
     # literal, F1/D10 — never interpolated) to select the above-average
     # departments. No table intermediate (F2-clean). Both node queries + the D56
     # grain probe run through the live MCP ↔ ClickHouse; the result is verified.
-    jwt = await mint()  # allow-all scope
+    jwt = await mint(session_id="sess-bp-dag-live")  # allow-all scope, session-bound
     creds = RuntimeCredentials(session_id="sess-bp-dag-live", jwt=jwt, column_scope=frozenset())
     index = _index()
     try:
@@ -196,7 +196,7 @@ async def test_narrow_scope_blueprint_is_not_found_no_data_leaks_live(
     # AnnualSalary/EmployeeCode) ⊄ scope, so the FETCH scope-check returns the
     # byte-identical NOT_FOUND (the D88(b) non-oracle) — no node query runs, no
     # out-of-scope value ever leaks, and the fast path degrades to the raw loop.
-    jwt = await mint([f"{_E}.EmployeeCode"])
+    jwt = await mint([f"{_E}.EmployeeCode"], session_id="sess-bp-live-scope")
     creds = RuntimeCredentials(
         session_id="sess-bp-live-scope", jwt=jwt, column_scope=frozenset({f"{_E}.EmployeeCode"})
     )
@@ -222,7 +222,7 @@ async def test_single_node_resolve_via_earnings_runs_and_verifies_live(
     # `RegisterType IN {earn_codes}` as a typed AST IN-list (F1/D10 — never
     # interpolated), then runs + D56-verifies the query through the live MCP ↔
     # ClickHouse. Nothing below the executor is faked.
-    jwt = await mint()  # allow-all scope
+    jwt = await mint(session_id="sess-bp-earn-live")  # allow-all scope, session-bound
     creds = RuntimeCredentials(session_id="sess-bp-earn-live", jwt=jwt, column_scope=frozenset())
     dispatcher = _dispatcher()
     composite = _composite(dispatcher)
