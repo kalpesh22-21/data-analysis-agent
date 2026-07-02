@@ -39,8 +39,10 @@ _SQL_ARG_KEYS = frozenset({"sql"})
 # with a placeholder in telemetry, distinct from SQL-literal masking (D77/D25,
 # resolvevalues-design §6.1). Precedent: `askUser`'s `question` is kept out of
 # spans (`tracing.guardrail_observer`); `resolveValues`'s `concept` gets the
-# same treatment.
-_FULLY_REDACTED_ARG_KEYS = frozenset({"concept"})
+# same treatment. The read tools' `query` (searchBlueprints/searchKnowledge) is
+# model-authored free text that may quote user PII — same treatment (read-tools
+# §5); `id` (a structural blueprint id) is non-PII and kept for debuggability.
+_FULLY_REDACTED_ARG_KEYS = frozenset({"concept", "query"})
 _REDACTED_PLACEHOLDER = "<redacted>"
 
 

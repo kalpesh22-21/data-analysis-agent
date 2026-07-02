@@ -76,10 +76,21 @@ invariant→test status board.
   **719 pass / 33 skipped, ruff clean; live Layer-2 8/8** (five D87 proofs + three pipeline).
   Design: [decisions/neo4j-corpus-design.md](decisions/neo4j-corpus-design.md).
 
-**Next brick:** the **blueprint/knowledge read tools** (`searchBlueprints`/`getBlueprint`/
-`searchKnowledge` — model-facing, over the now-real corpus) → `runBlueprint` + the **D56 verify
-gate** + the **D67 `resolve_via` wiring** (the typed `resolveValues.resolve()` hook exists), with the
-offline **Track B** learning loop parallel now that the graph schema is fixed (D87). The
+- ✅ **Read tools BUILT (Session 12, new D88)** — `searchBlueprints`/`getBlueprint`/`searchKnowledge`
+  as runtime tools behind a generalized `RuntimeTool` registry (`resolveValues` migrated in; registry
+  B4-guarded + provenance-type-validated). Non-oracle `getBlueprint` (out-of-scope == not-found,
+  byte-identical); **footprint-split provenance** (FOUND getBlueprint carries its scope-checked
+  `uses` → drops from D44 replay under narrowing — a review correction to the design);
+  `searchKnowledge` scope-bypass (write-gated); `query` fully redacted; schemas 8→11.
+  Reviewed (APPROVE WITH FIXES → fixed → **APPROVE**, probes re-run) + QA'd (+56 tests, 5 pinned
+  flags). **814 pass / 38 skipped, ruff clean; live Layer-2 5/5.**
+  Design: [decisions/read-tools-design.md](decisions/read-tools-design.md).
+
+**Next brick:** **`runBlueprint` + the D56 verify gate + the D67 `resolve_via` wiring** (full-DAG
+blueprint storage/OQ-T1, slot binding via typed params D59a, the grain-integrity probe on every
+result D56, concept→value-set expansion through `resolveValues.resolve()` D67; also owed to this
+brick: the runtime/MCP tool-name collision guard + duplicate-tool-call-id replay semantics, both
+QA-pinned). Then the offline **Track B** learning loop (graph schema is ready, D87). The
 runtime's Phase-1 `getTableSchema` is just a passthrough of the now-MCP-side overlay (D83/D84). ~~D77
 `resolveValues`~~ **done (Session 9).** **Phase 0 is substantially complete and
 validated end-to-end** (live turn works); the honest remaining Phase-0 gap is the **3 deferred Layer-3
@@ -90,10 +101,9 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 
 **Open follow-ups carried forward:**
 - **NOTHING IS PUSHED (user deferred the push).** data-analysis-agent branch
-  `phase0/provenance-extractor` has 8 commits (`6820677`→…→`b95c16d` D71 clients→`9776817` D86
-  Slice 1) — **this repo has NO git remote configured yet** (add an `origin` before push/PR).
-  **The Session-11 Slice-2 work + these doc updates are UNCOMMITTED at time of writing** (committed
-  right after this doc pass). clickhouse-api
+  `phase0/provenance-extractor` has 9 commits (`6820677`→…→`9776817` D86→`50fa37f` D87) — **this repo has NO git remote configured yet** (add an `origin` before push/PR).
+  **The Session-12 read-tools work + these doc updates are UNCOMMITTED at time of writing**
+  (committed right after this doc pass; Session-11 D87 is commit `50fa37f`). clickhouse-api
   `feat/scope-enforcement` (origin `kalpesh22-21/click-house-openapi`) has `b55b4de` (D83/D84) +
   `143f0c1` "Stale changes" (unrelated branch WIP — settings/oauth/helm/diagnose_token, not ours)
   ahead of origin, unpushed.
@@ -138,6 +148,46 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 - 6 coverage gaps accepted into backlog (see TRACEABILITY.md §Coverage gaps) — Phase-2 test additions.
 
 ---
+
+## 2026-07-01 — Session 12: Read tools BUILT (D88) — searchBlueprints / getBlueprint / searchKnowledge
+
+Same-day continuation. The three model-facing read tools ship over the real corpus, behind a new
+generalized runtime-tool registry. **Uncommitted at time of writing** — committed right after this
+doc pass.
+
+### Shipped
+| Area | Path | Agent |
+|---|---|---|
+| Design doc (tool surface, registry seam, non-oracle scope posture, provenance decision, degrade/error family, test plan) | `docs/decisions/read-tools-design.md` | `planner` |
+| `retrieval/tools.py`: three tools over a `_ReadTool` base (TOOL span, `query` redaction, B4 self-guard); `BlueprintDetail`; `get_blueprint` keyed fetch on the store seam; pipeline public `search_blueprints`/`search_knowledge` sharing the pre-injection helpers (single-embed invariant kept) | `retrieval/{tools,models,vector_index,pipeline}.py` | `backend-developer` |
+| `RuntimeTool` registry in the loop (replaces per-tool branches; `resolveValues` migrated, behaviour-exact; `askUser` still the terminal pause) + registry-level B4 guard (`RUNTIME_TOOL_INTERNAL_ERROR`) + provenance-type validation (coerce → `None` fail-closed) | `loop/agent_loop.py`, `dispatch/denial_mapping.py` | `backend-developer` |
+| Schemas 8→11, `query` fully redacted, `RETRIEVAL_TOOL_*` codes, k-clamp settings, app wiring (tools registered only when the retrieval stack is active; unwired → clean local `RETRIEVAL_TOOL_UNAVAILABLE`) | `mcp/tool_schema.py`, `observability/redaction.py`, `config.py`, `app.py` | `backend-developer` |
+| Layer-1 (~30) + redaction e2e + Layer-2 live suite (semantic match, scope drop, getBlueprint round-trip + non-oracle, knowledge scope-bypass, degrade) | `tests/runtime/retrieval/test_read_tools*.py`, `tests/integration/test_read_tools_live.py` | `backend-developer` |
+| Adversarial QA: +56 tests (arg matrices, registry attacks — mixed-call ordering, cap boundary, duplicate ids, name shadowing —, non-oracle byte-identity, schema validity) — no shipped bugs, 5 pinned latent flags | `tests/runtime/retrieval/test_read_tools_qa3.py`, `tests/runtime/loop/test_read_tools_registry_qa3.py` | `qa` |
+| Review APPROVE WITH FIXES → fixes → re-review **APPROVE** (all probes re-run empirically) | — | `reviewer` (parallel with `qa`) |
+
+### Review findings (recorded honestly)
+- **S1 (the load-bearing one)** — the design's all-`frozenset()` provenance had a hole: a FOUND
+  `getBlueprint` entry would be immune to D44 replay-dropping after mid-session scope narrowing,
+  re-surfacing a now-forbidden blueprint's existence + full `uses` footprint (contradicting the 06
+  scope table + the `getTableSchema` precedent). Fixed: FOUND `getBlueprint` provenance = the
+  scope-checked `uses` (last-dot split into the D44 tuple shape; malformed → `None` fail-closed);
+  search tools stay safe-empty `frozenset()`. Design doc §3 rewritten (amendment recorded in D88(c)).
+- **S2 / QA flags 1–2** — the registry trusted handlers to self-guard; a raising tool crashed the
+  turn, a wrong-type provenance crashed the NEXT round-trip inside the D44 filter. Fixed:
+  registry-level B4 guard + provenance sanitization (fail-closed `None`).
+- Nits: dead `GET_BLUEPRINT_NOT_FOUND` code removed; model-supplied id bounded/quoted in logs;
+  `default_k` clamped to `max_k`.
+- Re-review corrections folded into docs: `_uses_to_provenance` is a last-dot split (a four-segment
+  key round-trips byte-exactly rather than coercing to `None` — consistent with the call-time check).
+- **Deferred to the `runBlueprint` brick** (QA-pinned): runtime/MCP tool-name collision guard;
+  duplicate-tool-call-id replay semantics.
+
+### Verification status
+- `uv run pytest` → **814 passed, 38 skipped**, ruff clean. **Live Layer-2 5/5** (incl. the
+  S1-touched getBlueprint round-trip: byte-exact `uses`, out-of-scope == absent).
+- The D8 progressive-disclosure **pull** path is now fully live (pre-injected cards + reformulate →
+  searchBlueprints → getBlueprint expand + searchKnowledge); fast-path execution awaits `runBlueprint`.
 
 ## 2026-07-01 — Session 11: Retrieval Slice 2 BUILT (D87) — neo4j corpus + Neo4jVectorIndex, live-proven
 

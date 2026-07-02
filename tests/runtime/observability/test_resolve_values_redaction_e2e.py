@@ -112,7 +112,7 @@ async def test_concept_absent_from_every_span_and_progress_event() -> None:
         max_wall_clock_seconds=60,
         max_budget_windows=3,
         observer=capturing_observer,
-        resolve_values=composite,
+        runtime_tools={"resolveValues": composite},
     )
 
     outcome = await loop.run(

@@ -84,7 +84,7 @@ def _loop(
         max_wall_clock_seconds=60,
         max_budget_windows=3,
         max_tool_calls_per_iteration=max_tool_calls_per_iteration,
-        resolve_values=composite,
+        runtime_tools={"resolveValues": composite},
     )
     return loop, store
 

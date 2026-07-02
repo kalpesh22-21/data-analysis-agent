@@ -30,7 +30,8 @@ pre-inject:
 ### Thin cards
 Pre-injected blueprints are **thin** — `{id, intent, slots-summary}` only. Cheap on context budget;
 the model decides what to expand via `getBlueprint(id)`. If the 3 are off, the model reformulates
-and calls `searchBlueprints(query, k)`.
+and calls `searchBlueprints(query, k)`. *(This pull path is live as of Session 12 — the three
+read tools are built over the real corpus, D88.)*
 
 ### Reranker
 A cross-encoder reranker sits between vector recall and pre-injection, for both blueprints and

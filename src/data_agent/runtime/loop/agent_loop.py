@@ -37,15 +37,16 @@ returned to the user as-is.
 `ToolDispatcher.dispatch` (design §3.3 "askUser is intercepted upstream in
 the agent loop, never reaches this dispatcher").
 
-`resolveValues` (D77) is the SECOND intercepted tool, handled symmetrically:
-it too never reaches `ToolDispatcher.dispatch` under its own name (only the
-inner `runQuery` it issues does), but — unlike `askUser`, which pauses — it
-returns an INLINE `ToolResult` so the loop's existing TrailEntry +
-write_full_result + budget path handles it identically to a dispatched tool.
-It therefore counts as exactly ONE `tool_calls_made` (the inner runQuery does
-not double-count) and respects `max_tool_calls_per_iteration` + wall-clock like
-any other tool call. Its TrailEntry carries the inner runQuery's provenance
-(resolvevalues-design §8).
+Runtime tools (`resolveValues` + the three read tools `searchBlueprints`/
+`getBlueprint`/`searchKnowledge`) are intercepted here via the `runtime_tools`
+registry (read-tools-design §2), handled symmetrically: each never reaches
+`ToolDispatcher.dispatch` under its own name (only any inner tool it issues
+does), but — unlike `askUser`, which pauses — each returns an INLINE `ToolResult`
+so the loop's existing TrailEntry + write_full_result + budget path handles it
+identically to a dispatched tool. Each therefore counts as exactly ONE
+`tool_calls_made` and respects `max_tool_calls_per_iteration` + wall-clock like
+any other tool call. An advertised-but-unwired runtime tool returns a clean
+local unavailable error, never an MCP unknown-tool denial (§6).
 
 Statelessness across pauses (D45): both `run()` and `resume()` rebuild the
 canonical message list from the `SessionStore` on every single model
@@ -74,15 +75,15 @@ thread these through from `RuntimeSettings`.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
-from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import (
@@ -97,6 +98,45 @@ from data_agent.runtime.session.store import SessionStore
 from .budget_guard import new_budget_window
 
 ToolsProvider = Callable[[RuntimeCredentials], Awaitable[list[dict[str, Any]]]]
+
+_logger = logging.getLogger(__name__)
+
+# A runtime tool that crashes or returns a contract-violating result is
+# contained at the registry seam (read-tools-design §2 hardening, prep for
+# runBlueprint): the loop returns this clean error rather than aborting the turn
+# or leaking `str(exc)`. Distinct from the tools' own `_guarded` self-protection
+# (defense in depth — both layers hold).
+RUNTIME_TOOL_INTERNAL_ERROR_CODE = "RUNTIME_TOOL_INTERNAL_ERROR"
+_RUNTIME_TOOL_INTERNAL_ERROR_MESSAGE = "That tool hit an internal error. Please try again."
+
+
+class RuntimeTool(Protocol):
+    """A model-facing tool implemented in the RUNTIME (not the MCP), intercepted
+    in the loop and returning an inline `ToolResult` — the `resolveValues` shape
+    (read-tools-design §2). `askUser` is NOT a `RuntimeTool`: it is TERMINAL (it
+    pauses, it does not return a `ToolResult`), so it stays a hardcoded branch."""
+
+    async def run(
+        self, model_args: dict[str, Any], credentials: RuntimeCredentials
+    ) -> ToolResult: ...
+
+
+# Runtime tools are ADVERTISED (their schemas are locally authored, always
+# present) but intercepted in the loop — they must NEVER be dispatched to the MCP
+# under their own name (there is no such MCP tool). When one is advertised but
+# not wired into `runtime_tools` (its backing stack is absent), the loop returns
+# a clean local unavailable error keyed here, rather than an incoherent MCP
+# unknown-tool denial (the `resolveValues` L2 precedent, generalized — §6).
+_RUNTIME_TOOL_UNAVAILABLE_CODE: dict[str, str] = {
+    "resolveValues": "RESOLVE_VALUES_UNAVAILABLE",
+    "searchBlueprints": "RETRIEVAL_TOOL_UNAVAILABLE",
+    "getBlueprint": "RETRIEVAL_TOOL_UNAVAILABLE",
+    "searchKnowledge": "RETRIEVAL_TOOL_UNAVAILABLE",
+}
+_RUNTIME_TOOL_UNAVAILABLE_MESSAGE: dict[str, str] = {
+    "RESOLVE_VALUES_UNAVAILABLE": "Value resolution is not available right now.",
+    "RETRIEVAL_TOOL_UNAVAILABLE": "Blueprint and knowledge search is not available right now.",
+}
 
 TurnStatus = Literal[
     "done", "paused_ask_user", "paused_budget_cap", "stopped_hard_ceiling"
@@ -123,19 +163,64 @@ def _first_user_question(messages: list[TurnMessage], turn_index: int) -> str | 
     return None
 
 
-def _resolve_values_unavailable(tool_name: str) -> ToolResult:
-    """A clean local error for a `resolveValues` call when the composite is not
-    wired (L2) — never dispatched to the MCP under its own name."""
+def _runtime_tool_unavailable(tool_name: str, code: str) -> ToolResult:
+    """A clean local error for an advertised-but-unwired runtime tool (§6) —
+    never dispatched to the MCP under its own name. Shared by `resolveValues`
+    and the three read tools."""
     return ToolResult(
         status="error",
         tool_name=tool_name,
-        error_code="RESOLVE_VALUES_UNAVAILABLE",
+        error_code=code,
         retryable=False,
-        user_message="Value resolution is not available right now.",
+        user_message=_RUNTIME_TOOL_UNAVAILABLE_MESSAGE.get(
+            code, "That tool is not available right now."
+        ),
         provenance=None,
         result_preview=None,
         result_full=None,
     )
+
+
+def _runtime_tool_internal_error(tool_name: str) -> ToolResult:
+    """A clean local error for a runtime tool that RAISED out of `handler.run`
+    (S2) — the turn survives, `str(exc)` is never surfaced (logged server-side)."""
+    return ToolResult(
+        status="error",
+        tool_name=tool_name,
+        error_code=RUNTIME_TOOL_INTERNAL_ERROR_CODE,
+        retryable=False,
+        user_message=_RUNTIME_TOOL_INTERNAL_ERROR_MESSAGE,
+        provenance=None,
+        result_preview=None,
+        result_full=None,
+    )
+
+
+def _sanitize_runtime_provenance(
+    provenance: Any, tool_name: str
+) -> frozenset[tuple[str, str]] | None:
+    """Validate a `RuntimeTool`'s returned `provenance` BEFORE it is persisted
+    (S2). It must be `None` or a `frozenset` of `(str, str)` tuples — the exact
+    shape `context/scope_filter.is_provenance_in_scope` unpacks. Anything else
+    (a contract violator) is coerced to `None` fail-closed (dropped from replay)
+    with a server-side warning, rather than crashing the NEXT round-trip inside
+    the D44 replay filter."""
+    if provenance is None:
+        return None
+    if isinstance(provenance, frozenset) and all(
+        isinstance(item, tuple)
+        and len(item) == 2
+        and isinstance(item[0], str)
+        and isinstance(item[1], str)
+        for item in provenance
+    ):
+        return provenance
+    _logger.warning(
+        "runtime tool %s returned malformed provenance (%s); coercing to None (fail-closed)",
+        tool_name,
+        type(provenance).__name__,
+    )
+    return None
 
 
 @dataclass(frozen=True)
@@ -224,17 +309,19 @@ class AgentLoop:
         max_tool_calls_per_iteration: int = 8,
         clock: Callable[[], float] = time.monotonic,
         observer: ToolObserver = _default_observer,
-        resolve_values: ResolveValuesComposite | None = None,
+        runtime_tools: Mapping[str, RuntimeTool] | None = None,
     ) -> None:
         self._model_client = model_client
         self._tool_dispatcher = tool_dispatcher
         self._context_assembler = context_assembler
         self._session_store = session_store
         self._tools_provider = tools_provider
-        # D77: the `resolveValues` composite is intercepted here (never
-        # dispatched under its own name). Optional so existing Layer-1 loop
-        # tests that never exercise resolveValues need not wire it.
-        self._resolve_values = resolve_values
+        # The runtime-tool registry (read-tools-design §2): model-facing tools
+        # implemented in the runtime (`resolveValues` + the three read tools),
+        # intercepted here and never dispatched to the MCP under their own name.
+        # Empty by default so Layer-1 loop tests that exercise only MCP tools
+        # need not wire any. `askUser` is NOT here — it is terminal (see below).
+        self._runtime_tools: Mapping[str, RuntimeTool] = runtime_tools or {}
         self._max_loop_iterations = max_loop_iterations
         self._max_wall_clock_seconds = max_wall_clock_seconds
         self._max_budget_windows = max_budget_windows
@@ -393,6 +480,32 @@ class AgentLoop:
             union.update(entry.provenance)
         return frozenset(union)
 
+    async def _run_runtime_tool(
+        self,
+        handler: RuntimeTool,
+        tool_name: str,
+        arguments: dict[str, Any],
+        credentials: RuntimeCredentials,
+    ) -> ToolResult:
+        """Run one registry handler with a B4-style crash guard + a returned-
+        provenance-type validation (S2), so a misbehaving runtime tool cannot
+        abort the turn or persist a replay-poisoning provenance. The three read
+        tools + `resolveValues` already self-guard; this is defense in depth and
+        the containment seam the future `runBlueprint` brick relies on."""
+        try:
+            result = await handler.run(arguments, credentials)
+        except Exception:
+            # Never propagate the raw exception (would abort the turn) or leak
+            # `str(exc)` — log server-side only, return a clean canned error.
+            _logger.exception(
+                "runtime tool %s raised (session=%s)", tool_name, credentials.session_id
+            )
+            return _runtime_tool_internal_error(tool_name)
+        sanitized = _sanitize_runtime_provenance(result.provenance, tool_name)
+        if sanitized is not result.provenance:
+            result = replace(result, provenance=sanitized)
+        return result
+
     async def _run_loop(
         self,
         *,
@@ -495,23 +608,23 @@ class AgentLoop:
             # on the next round-trip if it still wants them.
             capped_tool_calls = result.tool_calls[: self._max_tool_calls_per_iteration]
             for tool_call in capped_tool_calls:
-                # D77: `resolveValues` is intercepted here (symmetric to
-                # `askUser` above) — it never reaches `dispatch` under its own
-                # name; only the inner `runQuery` it issues does. It returns the
-                # SAME `ToolResult` dataclass, so the trail/budget path below is
-                # unchanged and it counts as exactly one `tool_calls_made`.
-                if tool_call.name == "resolveValues":
-                    # L2: `resolveValues` is a runtime composite — it must NEVER
-                    # be dispatched to the MCP under its own name (there is no
-                    # such MCP tool). If the composite is not wired, return a
-                    # clean local error instead of an incoherent unknown-tool
-                    # MCP denial.
-                    if self._resolve_values is None:
-                        tool_result = _resolve_values_unavailable(tool_call.name)
-                    else:
-                        tool_result = await self._resolve_values.run(
-                            tool_call.arguments, credentials
-                        )
+                # Runtime-tool registry (read-tools-design §2): a runtime tool
+                # (`resolveValues` + the three read tools) is intercepted here —
+                # it never reaches `dispatch` under its own name (only any inner
+                # tool it issues does). It returns the SAME `ToolResult`
+                # dataclass, so the trail/budget path below is unchanged and it
+                # counts as exactly one `tool_calls_made`. An advertised runtime
+                # tool that is not wired returns a clean local unavailable error
+                # (§6), never an incoherent MCP unknown-tool denial.
+                handler = self._runtime_tools.get(tool_call.name)
+                if handler is not None:
+                    tool_result = await self._run_runtime_tool(
+                        handler, tool_call.name, tool_call.arguments, credentials
+                    )
+                elif tool_call.name in _RUNTIME_TOOL_UNAVAILABLE_CODE:
+                    tool_result = _runtime_tool_unavailable(
+                        tool_call.name, _RUNTIME_TOOL_UNAVAILABLE_CODE[tool_call.name]
+                    )
                 else:
                     tool_result = await self._tool_dispatcher.dispatch(
                         tool_call.name, tool_call.arguments, credentials
@@ -577,4 +690,4 @@ class AgentLoop:
             # Under budget — loop back to 3a within the same window.
 
 
-__all__ = ["AgentLoop", "TurnOutcome", "ToolsProvider"]
+__all__ = ["AgentLoop", "RuntimeTool", "ToolsProvider", "TurnOutcome"]

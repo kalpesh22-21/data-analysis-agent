@@ -43,10 +43,10 @@ the agent runtime**, not in the ClickHouse MCP service.
 
 | Tool | Model args | Purpose |
 |---|---|---|
-| `searchBlueprints` | `query, k` | Returns reranked **thin cards** `{id, intent, slots-summary}` for blueprints in scope. For when the pre-injected 3 are off or intent is reformulated. |
-| `getBlueprint` | `id` | Full DAG: `resolves`, `slots`, `uses_rules`, `composes`, `sql_template`, `status`, `hit_count`. The "expand" step in progressive disclosure. |
+| `searchBlueprints` | `query, k` | **BUILT (Session 12, D88).** Returns reranked **thin cards** `{id, intent, slots_summary, score}` for blueprints in scope (transitive-USES pre-filter; `k` default 5, over-max clamps to 20; `degraded` flag when embed/rerank unavailable). For when the pre-injected 3 are off or intent is reformulated. |
+| `getBlueprint` | `id` | **BUILT (Session 12, D88) as the thin D87 projection** `{found, id, intent, slots_summary, uses, status, drift_status, hit_count, catalog_sha}` — the full DAG (`resolves`, typed `slots`, `uses_rules`, `composes`, `sql_template`) arrives additively with `runBlueprint`. **Non-oracle:** out-of-scope ⇒ `{found: false}`, indistinguishable from a real miss. The "expand" step in progressive disclosure. |
 | `runBlueprint` | `id, slot_bindings` | Deterministic runtime execution of the DAG (see [04-blueprints.md](04-blueprints.md)). Model supplies slot values; runtime does the rest. |
-| `searchKnowledge` | `query` | RAG over global knowledge docs (institutional knowledge + lessons). |
+| `searchKnowledge` | `query` | **BUILT (Session 12, D88).** RAG over global knowledge docs (institutional knowledge + lessons) — reranked chunks `{id, title, text, score}`; bypasses column scope (entity-agnostic, write-gated D58(a)). |
 
 ## Control-flow primitive
 
@@ -83,4 +83,4 @@ model-facing tool implemented in the runtime over `runQuery` (D77), not an MCP d
 **Status:** Locked
 **Open questions:**
 - Exact `slot_bindings` shape for `runBlueprint` (typed object) — finalize with blueprint schema.
-- Whether `searchKnowledge` returns chunks vs. summarized facts — finalize with knowledge store.
+- ~~Whether `searchKnowledge` returns chunks vs. summarized facts~~ — **chunks for Phase 1 (D88/OQ-R3)**; revisit with the Track-B knowledge store.

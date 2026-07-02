@@ -244,6 +244,33 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   D84 (`catalog_sha` semantics), D86 (the `VectorIndex` seam this drops into), D38 (future graph
   consumers), D41 (blueprint model).
 
+- **D88 (locked, 2026-07-01, Session 12 — read tools).** **The model-facing read tools
+  (`searchBlueprints`, `getBlueprint`, `searchKnowledge`) ship as runtime tools behind a generalized
+  registry, with a non-oracle scope posture and footprint-split provenance.** Specifics:
+  **(a) Runtime-tool registry** — a `RuntimeTool` protocol + an `AgentLoop.runtime_tools` dict
+  replaces per-tool interception branches (`resolveValues` migrated in, behaviour-identical;
+  `askUser` remains the sole hardcoded terminal/pause branch; unknown names still fall through to
+  MCP dispatch). The loop hardens the seam: a registry handler that raises is contained
+  (`RUNTIME_TOOL_INTERNAL_ERROR`, no `str(exc)`), and a returned provenance of the wrong type is
+  coerced to `None` fail-closed before the trail write. **(b) Non-oracle `getBlueprint`** — an
+  out-of-scope blueprint is **indistinguishable from a real miss** (`ok` + `{found: false}`,
+  byte-identical fields), so restricted blueprints' existence isn't leaked (06 §scope table); the
+  scope check reuses the canonical transitive-USES filter, and `getBlueprint` returns only the D87
+  stored projection until full-DAG storage lands with `runBlueprint`. **(c) Provenance split by
+  footprint (amends the brick's original all-`frozenset()` design at review)** — `searchBlueprints`
+  (thin cards) and `searchKnowledge` (entity-agnostic, write-gated) carry safe-empty `frozenset()`
+  provenance (kept in D44 replay); a **FOUND `getBlueprint`** result *is* a column footprint, so its
+  trail entry carries the scope-checked `uses` as provenance and **drops from replay under
+  mid-session scope narrowing** — the `getTableSchema` posture. **(d)** `searchKnowledge` bypasses
+  the scope filter by design (chunks are entity-agnostic and human-gated at write, D58(a)).
+  **(e)** Shared error family `RETRIEVAL_TOOL_{INVALID_ARGS,UNAVAILABLE,INTERNAL_ERROR}`; unwired
+  tools return a clean local `RETRIEVAL_TOOL_UNAVAILABLE` (never dispatched to the MCP); `k` over-max
+  clamps, `k < 1` rejects; the model-authored `query` arg is fully redacted from spans/progress
+  (D25, the `concept` precedent). Deferred to the `runBlueprint` brick: the runtime/MCP tool-name
+  collision guard and duplicate-tool-call-id replay semantics (both QA-pinned). See
+  [read-tools-design.md](read-tools-design.md). Cross-references: D8 (progressive disclosure),
+  D41, D44 (replay filter), D58, D77 (runtime-tool precedent), D86/D87.
+
 - **D67 (locked, 2026-06-30).** **Two rule kinds: static and resolved (dynamic).** A catalog `rule`'s
   `predicate` is either a fixed SQL boolean (**static**) or references `resolveValues(column, concept)`
   over a `client_defined` column (**resolved**) — the runtime expands it to a concrete per-client value

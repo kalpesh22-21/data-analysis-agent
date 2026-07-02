@@ -82,6 +82,13 @@ class RetrievalPipeline:
         self._observer = observer
         self._tracer = tracer
 
+    @property
+    def vector_index(self) -> VectorIndex:
+        """The shared store singleton — the `getBlueprint` tool's keyed-fetch
+        seam (read-tools §4). Exposed so `app.py` can wire the read tools over
+        the SAME store this pipeline recalls from (one source of retrieval truth)."""
+        return self._vector_index
+
     async def retrieve(
         self,
         *,
@@ -106,39 +113,25 @@ class RetrievalPipeline:
         self._emit_event(obs, "retrieval_start", {})
 
         # --- EMBED (degrade: no embedder / any embed failure → empty) ---
-        if self._embedding_client is None:
-            return self._degrade("embedding_unconfigured", obs)
-        try:
-            vectors = await self._embedding_client.embed([question])
-        except Exception:  # noqa: BLE001 - any embed failure degrades, never crashes
-            _logger.warning("retrieval embed failed; returning empty context", exc_info=True)
-            return self._degrade("embedding_error", obs)
-        if not vectors:  # an embedder returning nothing degrades too
-            return self._degrade("embedding_empty", obs)
-        query_vector = vectors[0]
+        query_vector, reason = await self._embed_query(question)
+        if query_vector is None:
+            return self._degrade(reason or "embedding_error", obs)
 
-        # --- RECALL (per corpus; index unavailable/empty → [] per corpus) ---
-        # The scope pre-filter (blueprints only; knowledge is entity-agnostic)
-        # runs INSIDE the recall span so its dropped-count is recorded there.
-        kept_blueprints = await self._recall_with_span(
-            query_vector, "blueprint", column_scope=column_scope
+        # --- RECALL → SCOPE-FILTER → RERANK → CUT (per corpus) ---
+        # Both corpora reuse the SAME single-corpus helpers the public
+        # `search_blueprints`/`search_knowledge` tools call, so pre-injection and
+        # the pull tools can never drift (read-tools §4). The per-corpus rerank
+        # flags are combined here into the turn-wide `reranked` (an empty corpus
+        # contributes `None`, excluded from the AND — unchanged behaviour).
+        thin_cards, bp_flag = await self._search_blueprint_corpus(
+            query_vector, question, column_scope=column_scope,
+            k=self._top_k_blueprints, recall_k=self._recall_k,
         )
-        knowledge_candidates = await self._recall_with_span(
-            query_vector, "knowledge", column_scope=None
+        knowledge_hits, kn_flag = await self._search_knowledge_corpus(
+            query_vector, question, k=self._top_k_knowledge, recall_k=self._recall_k
         )
-
-        # --- RERANK (per corpus; no reranker / rerank failure → recall order) ---
-        bp_ordered, bp_flag = await self._rerank_corpus(question, kept_blueprints)
-        kn_ordered, kn_flag = await self._rerank_corpus(question, knowledge_candidates)
         flags = [flag for flag in (bp_flag, kn_flag) if flag is not None]
         reranked = bool(flags) and all(flags)
-
-        # --- CUT ---
-        thin_cards = [self._to_thin_card(c) for c in bp_ordered[: self._top_k_blueprints]]
-        knowledge_hits = [
-            self._to_knowledge_hit(c)
-            for c in self._apply_knowledge_floor(kn_ordered)[: self._top_k_knowledge]
-        ]
 
         # --- USER MEMORY (independent of the embedder; Null in Slice 1) ---
         try:
@@ -159,17 +152,125 @@ class RetrievalPipeline:
             reranked=reranked,
         )
 
+    # ------------------------------------------------- public single-corpus (tools)
+
+    async def search_blueprints(
+        self,
+        *,
+        question: str,
+        column_scope: frozenset[str],
+        k: int,
+        observer: Observer | None = None,  # noqa: ARG002 - reserved (progress owned by the tool)
+    ) -> tuple[list[ThinCard], bool]:
+        """embed → recall(blueprint) → scope pre-filter → rerank → top-*k*
+        (read-tools §4). Returns `(cards, reranked)`; `reranked` is `False` on
+        any embedder/index degrade (empty) or the no-reranker path (recall
+        order). Never raises — the backing helpers all degrade-not-fail (D86)."""
+        query_vector, _reason = await self._embed_query(question)
+        if query_vector is None:
+            return [], False
+        recall_k = max(self._recall_k, k)
+        cards, flag = await self._search_blueprint_corpus(
+            query_vector, question, column_scope=column_scope, k=k, recall_k=recall_k
+        )
+        return cards, bool(flag)
+
+    async def search_knowledge(
+        self,
+        *,
+        question: str,
+        k: int,
+        observer: Observer | None = None,  # noqa: ARG002 - reserved (progress owned by the tool)
+    ) -> tuple[list[KnowledgeHit], bool]:
+        """embed → recall(knowledge) → (NO scope filter) → rerank → floor →
+        top-*k* (read-tools §4). Knowledge is entity-agnostic (never scope
+        filtered). Returns `(hits, reranked)`; `reranked=False` on degrade."""
+        query_vector, _reason = await self._embed_query(question)
+        if query_vector is None:
+            return [], False
+        recall_k = max(self._recall_k, k)
+        hits, flag = await self._search_knowledge_corpus(
+            query_vector, question, k=k, recall_k=recall_k
+        )
+        return hits, bool(flag)
+
+    # --------------------------------------------------- shared single-corpus impl
+
+    async def _embed_query(self, question: str) -> tuple[list[float] | None, str | None]:
+        """Embed *question* to one query vector, or `(None, reason)` on any
+        degrade (no embedder / embed failure / empty batch). Shared by
+        `retrieve` and the two public tool methods so the embed-degrade
+        discipline (D86) is authored once."""
+        if self._embedding_client is None:
+            return None, "embedding_unconfigured"
+        try:
+            vectors = await self._embedding_client.embed([question])
+        except Exception:  # noqa: BLE001 - any embed failure degrades, never crashes
+            _logger.warning("retrieval embed failed; returning empty context", exc_info=True)
+            return None, "embedding_error"
+        if not vectors:  # an embedder returning nothing degrades too
+            return None, "embedding_empty"
+        return vectors[0], None
+
+    async def _search_blueprint_corpus(
+        self,
+        query_vector: list[float],
+        question: str,
+        *,
+        column_scope: frozenset[str],
+        k: int,
+        recall_k: int,
+    ) -> tuple[list[ThinCard], bool | None]:
+        """recall(blueprint) → scope pre-filter → rerank → top-*k* → thin cards.
+        Returns the per-corpus rerank flag (`None` when the corpus was empty)."""
+        kept = await self._recall_with_span(
+            query_vector, "blueprint", column_scope=column_scope, recall_k=recall_k
+        )
+        ordered, flag = await self._rerank_corpus(question, kept)
+        cards = [self._to_thin_card(c) for c in ordered[:k]]
+        return cards, flag
+
+    async def _search_knowledge_corpus(
+        self,
+        query_vector: list[float],
+        question: str,
+        *,
+        k: int,
+        recall_k: int,
+    ) -> tuple[list[KnowledgeHit], bool | None]:
+        """recall(knowledge) → rerank → floor → top-*k* → knowledge hits.
+        No scope filter (entity-agnostic). Floor is applied BEFORE the cut,
+        exactly as pre-injection does."""
+        candidates = await self._recall_with_span(
+            query_vector, "knowledge", column_scope=None, recall_k=recall_k
+        )
+        ordered, flag = await self._rerank_corpus(question, candidates)
+        hits = [
+            self._to_knowledge_hit(c)
+            for c in self._apply_knowledge_floor(ordered)[:k]
+        ]
+        return hits, flag
+
     # ------------------------------------------------------------------ recall
 
     async def _recall_with_span(
-        self, query_vector: list[float], corpus: str, *, column_scope: frozenset[str] | None
+        self,
+        query_vector: list[float],
+        corpus: str,
+        *,
+        column_scope: frozenset[str] | None,
+        recall_k: int | None = None,
     ) -> list[Candidate]:
         """Recall one corpus inside a CHAIN span WRAPPING the awaited index call
         (L2 — real stage latency). For blueprints (*column_scope* not None) the
         USES ⊄ scope pre-filter runs inside the span so its dropped-count is
-        recorded. A per-corpus degrade returns `[]`, never raises."""
-        with self._recall_span(corpus) as span:
-            raw = await self._recall(query_vector, corpus)
+        recorded. A per-corpus degrade returns `[]`, never raises.
+
+        *recall_k* overrides the constructor `recall_k` for the recall fan-out
+        (the tools size a pool of `max(recall_k, k)`); `None` → the default."""
+        effective_recall_k = self._recall_k if recall_k is None else recall_k
+        with self._recall_span(corpus, effective_recall_k) as span:
+            raw = await self._recall(query_vector, corpus, effective_recall_k)
             if column_scope is not None:
                 kept = scope_filter.filter_blueprints_by_scope(raw, column_scope)
             else:
@@ -179,11 +280,13 @@ class RetrievalPipeline:
                 span.set_attribute("retrieval.dropped_by_scope_count", len(raw) - len(kept))
         return kept
 
-    async def _recall(self, query_vector: list[float], kind: str) -> list[Candidate]:
+    async def _recall(
+        self, query_vector: list[float], kind: str, recall_k: int
+    ) -> list[Candidate]:
         """One corpus recall — a per-corpus degrade returns `[]`, never raises."""
         try:
             return await self._vector_index.recall(
-                query_vector=query_vector, kind=kind, k=self._recall_k
+                query_vector=query_vector, kind=kind, k=recall_k
             )
         except Exception:  # noqa: BLE001 - index unavailable degrades this corpus only
             _logger.warning("vector recall failed for corpus %s; empty", kind, exc_info=True)
@@ -267,7 +370,7 @@ class RetrievalPipeline:
 
     # ---------------------------------------------------------- observability
 
-    def _recall_span(self, corpus: str) -> Any:
+    def _recall_span(self, corpus: str, recall_k: int) -> Any:
         """Open a recall CHAIN span (candidate/dropped counts filled inside), or
         a `nullcontext` yielding `None` when no tracer is wired."""
         if self._tracer is None:
@@ -277,7 +380,7 @@ class RetrievalPipeline:
         return tracing.recall_span(
             self._tracer,
             corpus=corpus,
-            recall_k=self._recall_k,
+            recall_k=recall_k,
             candidate_count=0,
             dropped_by_scope_count=0,
         )

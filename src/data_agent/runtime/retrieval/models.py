@@ -53,6 +53,30 @@ class KnowledgeHit:
 
 
 @dataclass(frozen=True)
+class BlueprintDetail:
+    """The stored D87 retrieval projection of one blueprint — what `getBlueprint`
+    returns (read-tools-design §1.2). It is a STRICT subset that grows additively
+    when the full DAG (`sql_template`, typed `slots`, `resolves`, ...) is stored
+    with the `runBlueprint` brick (D87 §1.5); until then this is the honest,
+    complete set of persisted fields.
+
+    `uses` is a `frozenset[str] | None` (NOT the rendered list): `None` is the
+    fail-closed undetermined marker (a corrupt/absent stored `uses`), so a
+    scope check via `scope_filter.is_blueprint_in_scope` DROPS it rather than
+    fail-open — mirroring `Candidate.uses`. The tool renders it as a sorted list.
+    """
+
+    id: str
+    intent: str
+    slots_summary: str
+    uses: frozenset[str] | None
+    status: str
+    drift_status: str
+    hit_count: int
+    catalog_sha: str
+
+
+@dataclass(frozen=True)
 class UserMemoryItem:
     """One user-memory pre-injection item (personal, entity-bearing OK)."""
 
@@ -86,6 +110,7 @@ class RetrievedContext:
 
 
 __all__ = [
+    "BlueprintDetail",
     "Candidate",
     "CandidateKind",
     "KnowledgeHit",

@@ -21,7 +21,7 @@ from opentelemetry import trace
 
 from data_agent.runtime.composite.ranking import cosine
 
-from .models import Candidate
+from .models import BlueprintDetail, Candidate
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -47,6 +47,17 @@ class VectorIndex(Protocol):
         """
         ...
 
+    async def get_blueprint(self, blueprint_id: str) -> BlueprintDetail | None:
+        """Keyed fetch of one blueprint's stored projection by id (read-tools
+        §1.2 / §4). NOT a vector op — a single keyed read over the same store —
+        but colocated here so `getBlueprint` needs no parallel store abstraction.
+
+        `None` on a genuine miss AND on any store failure (the real impl never
+        raises — driver/query error degrades to `None`, D86), which the tool
+        renders identically as `{found: false}` (the §3 non-oracle).
+        """
+        ...
+
 
 class FakeVectorIndex:
     """Layer-1 `VectorIndex` double — an in-memory corpus ranked by cosine.
@@ -63,14 +74,24 @@ class FakeVectorIndex:
         entries: list[tuple[Candidate, list[float]]] | None = None,
         *,
         fail: bool = False,
+        details: dict[str, BlueprintDetail] | None = None,
     ) -> None:
         self._entries: list[tuple[Candidate, list[float]]] = list(entries or [])
         self._fail = fail
+        # Keyed store for `get_blueprint` (read-tools §4) — seeded independently
+        # of the recall `entries` since a `BlueprintDetail` carries lifecycle
+        # fields (`status`/`drift_status`/`hit_count`/`catalog_sha`) a recall
+        # `Candidate` does not.
+        self._details: dict[str, BlueprintDetail] = dict(details or {})
         self.calls: list[tuple[str, int]] = []
 
     def add(self, candidate: Candidate, vector: list[float]) -> None:
         """Seed one candidate and its stored vector into the fake index."""
         self._entries.append((candidate, vector))
+
+    def add_detail(self, detail: BlueprintDetail) -> None:
+        """Seed one blueprint's keyed projection for `get_blueprint`."""
+        self._details[detail.id] = detail
 
     async def recall(
         self, *, query_vector: list[float], kind: str, k: int
@@ -87,6 +108,13 @@ class FakeVectorIndex:
         # deterministic for candidates with identical similarity.
         scored.sort(key=lambda pair: (-pair[0], pair[1].id))
         return [replace(candidate, score=sim) for sim, candidate in scored[:k]]
+
+    async def get_blueprint(self, blueprint_id: str) -> BlueprintDetail | None:
+        """Answer from the seeded details; `fail=True` degrades to `None` (the
+        store-unavailable path the tool renders as `{found: false}`)."""
+        if self._fail:
+            return None
+        return self._details.get(blueprint_id)
 
 
 # --------------------------------------------------------------------------
@@ -197,6 +225,39 @@ _CORPUS_MAPPER = {
     "knowledge": map_knowledge_record,
 }
 
+# Keyed single-blueprint fetch for `getBlueprint` (read-tools §1.2 / §4). Reads
+# ONLY the stored D87 projection fields — the full DAG (`sql_template`, typed
+# `slots`, ...) is reserved (§1.5) and not stored, so it is not selected here.
+# No parity `WHERE embedding_model` guard: this is a keyed metadata read, not a
+# vector-space recall (§1.2), so a model-mismatched vector is irrelevant.
+_GET_BLUEPRINT_QUERY = """
+MATCH (b:Blueprint {id: $id})
+RETURN b.id AS id, b.intent AS intent, b.slots_summary AS slots_summary,
+       b.uses AS uses, b.status AS status, b.drift_status AS drift_status,
+       b.hit_count AS hit_count, b.catalog_sha AS catalog_sha
+"""
+
+
+def map_blueprint_detail_record(record: Mapping[str, Any]) -> BlueprintDetail:
+    """Map one `getBlueprint` row → `BlueprintDetail` (read-tools §1.2).
+
+    `uses` is coerced with the SAME fail-closed `_coerce_uses` as recall so an
+    undetermined/corrupt stored value becomes `None` (scope check then drops it,
+    never fail-open). `hit_count` defaults to 0 on a null/non-int stored value.
+    """
+    raw_hits = record.get("hit_count")
+    hit_count = raw_hits if isinstance(raw_hits, int) and not isinstance(raw_hits, bool) else 0
+    return BlueprintDetail(
+        id=record["id"],
+        intent=record.get("intent") or "",
+        slots_summary=record.get("slots_summary") or "",
+        uses=_coerce_uses(record.get("uses")),
+        status=record.get("status") or "",
+        drift_status=record.get("drift_status") or "",
+        hit_count=hit_count,
+        catalog_sha=record.get("catalog_sha") or "",
+    )
+
 
 class Neo4jVectorIndex:
     """Real `VectorIndex` — recall from a neo4j native vector index (Slice 2).
@@ -289,6 +350,35 @@ class Neo4jVectorIndex:
             await self._flag_model_mismatch(kind)
         return candidates
 
+    async def get_blueprint(self, blueprint_id: str) -> BlueprintDetail | None:
+        """Keyed fetch of one blueprint's stored projection (read-tools §1.2).
+
+        Never raises: a missing id, unreachable neo4j, auth failure, query error
+        or timeout ALL return `None` (D86 degrade). A single MATCH through the
+        same `_run` seam recall uses, so Layer-1 drives it without a live store.
+        """
+        try:
+            records = await self._run(_GET_BLUEPRINT_QUERY, {"id": blueprint_id})
+        except Exception:  # noqa: BLE001 - any driver/query failure degrades to None
+            # Log a bounded, quoted slice of the model-supplied id (never the
+            # raw unbounded value) — it is parameterized in the query, not
+            # interpolated, so this is purely a safe log hygiene measure.
+            _logger.warning(
+                "neo4j getBlueprint failed for id %r; returning None",
+                blueprint_id[:80],
+                exc_info=True,
+            )
+            return None
+        if not records:
+            return None
+        try:
+            return map_blueprint_detail_record(records[0])
+        except Exception:  # noqa: BLE001 - a malformed row is a miss, not a crash
+            _logger.warning(
+                "skipping malformed getBlueprint row for id %r", blueprint_id[:80], exc_info=True
+            )
+            return None
+
     async def _run(
         self, query: str, parameters: dict[str, Any]
     ) -> list[dict[str, Any]]:
@@ -328,6 +418,7 @@ __all__ = [
     "FakeVectorIndex",
     "Neo4jVectorIndex",
     "VectorIndex",
+    "map_blueprint_detail_record",
     "map_blueprint_record",
     "map_knowledge_record",
 ]

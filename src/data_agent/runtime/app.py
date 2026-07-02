@@ -46,7 +46,7 @@ from data_agent.runtime.config import RuntimeSettings, get_runtime_settings
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.context.llm_summarizer import build_llm_summarizer
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolObserver
-from data_agent.runtime.loop.agent_loop import AgentLoop, TurnOutcome
+from data_agent.runtime.loop.agent_loop import AgentLoop, RuntimeTool, TurnOutcome
 from data_agent.runtime.mcp.client import MCPClient
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.mcp.tool_schema import ToolSchemaCache
@@ -59,6 +59,11 @@ from data_agent.runtime.observability.progress import ProgressEmitter, combine_o
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle, load_catalog_handle
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
+from data_agent.runtime.retrieval.tools import (
+    GetBlueprintTool,
+    SearchBlueprintsTool,
+    SearchKnowledgeTool,
+)
 from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
 from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
@@ -277,6 +282,13 @@ def create_app(
             tracer=tracer,
         )
 
+    # `retrieval_enabled=False` is a hard master switch: no pre-injection AND no
+    # read tools (they share the one pipeline/store singleton). When active, the
+    # three read tools are wired over the SAME pipeline + store; when None, they
+    # are simply absent from the registry → the loop advertises them but returns
+    # RETRIEVAL_TOOL_UNAVAILABLE (Phase-0 parity, read-tools §6).
+    active_retrieval = retrieval if settings.retrieval_enabled else None
+
     tool_schema_cache = ToolSchemaCache(mcp_client)
     summarizer = build_llm_summarizer(model_client)
     context_assembler = ContextAssembler(
@@ -284,7 +296,7 @@ def create_app(
         history_token_budget=settings.history_token_budget(),
         preview_row_count=settings.preview_row_count,
         summarizer=summarizer,
-        retrieval=retrieval if settings.retrieval_enabled else None,
+        retrieval=active_retrieval,
         tracer=tracer,
     )
 
@@ -328,6 +340,33 @@ def create_app(
             observer=observer,
             tracer=tracer,
         )
+        # The runtime-tool registry (read-tools §2): `resolveValues` is always
+        # wired; the three read tools are wired ONLY when the retrieval pipeline
+        # is active — they share the one pipeline + store singleton, and carry
+        # this request's observer/tracer for progress + the nested TOOL span.
+        runtime_tools: dict[str, RuntimeTool] = {"resolveValues": composite}
+        if active_retrieval is not None:
+            runtime_tools["searchBlueprints"] = SearchBlueprintsTool(
+                pipeline=active_retrieval,
+                default_k=settings.retrieval_search_default_k,
+                max_k=settings.retrieval_search_max_k,
+                preview_row_count=settings.preview_row_count,
+                observer=observer,
+                tracer=tracer,
+            )
+            runtime_tools["searchKnowledge"] = SearchKnowledgeTool(
+                pipeline=active_retrieval,
+                knowledge_k=settings.retrieval_search_knowledge_k,
+                preview_row_count=settings.preview_row_count,
+                observer=observer,
+                tracer=tracer,
+            )
+            runtime_tools["getBlueprint"] = GetBlueprintTool(
+                vector_index=active_retrieval.vector_index,
+                preview_row_count=settings.preview_row_count,
+                observer=observer,
+                tracer=tracer,
+            )
         return AgentLoop(
             model_client=model_client,
             tool_dispatcher=dispatcher,
@@ -340,7 +379,7 @@ def create_app(
             token_budget=settings.model_context_window,
             max_tool_calls_per_iteration=settings.max_tool_calls_per_iteration,
             observer=observer,
-            resolve_values=composite,
+            runtime_tools=runtime_tools,
         )
 
     # Close the neo4j driver pool on shutdown (design §2.4, N1: lifespan not the

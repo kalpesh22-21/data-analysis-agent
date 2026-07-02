@@ -8,7 +8,10 @@ from data_agent.runtime.mcp.client import MCPToolSpec
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.tool_schema import (
     ASK_USER_TOOL_SCHEMA,
+    GET_BLUEPRINT_TOOL_SCHEMA,
     RESOLVE_VALUES_TOOL_SCHEMA,
+    SEARCH_BLUEPRINTS_TOOL_SCHEMA,
+    SEARCH_KNOWLEDGE_TOOL_SCHEMA,
     ToolSchemaCache,
     fetch_function_schemas,
     translate_tool_spec,
@@ -97,7 +100,7 @@ def test_translate_passes_input_schema_verbatim() -> None:
         assert schema["parameters"] is tool.input_schema or schema["parameters"] == tool.input_schema
 
 
-async def test_fetch_function_schemas_includes_all_6_plus_ask_user_plus_resolve_values() -> None:
+async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> None:
     client = FakeMCPClient(tools=_FAKE_TOOLS)
     schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")
     names = {s["name"] for s in schemas}
@@ -110,12 +113,27 @@ async def test_fetch_function_schemas_includes_all_6_plus_ask_user_plus_resolve_
         "explainQuery",
         "askUser",
         "resolveValues",
+        "searchBlueprints",
+        "getBlueprint",
+        "searchKnowledge",
     }
+    assert len(schemas) == 11
     ask_user = next(s for s in schemas if s["name"] == "askUser")
     assert ask_user == ASK_USER_TOOL_SCHEMA
     resolve_values = next(s for s in schemas if s["name"] == "resolveValues")
     assert resolve_values == RESOLVE_VALUES_TOOL_SCHEMA
     assert set(resolve_values["parameters"]["required"]) == {"table", "column", "concept"}
+    # The three model-facing read tools (read-tools §1), appended verbatim.
+    assert next(s for s in schemas if s["name"] == "searchBlueprints") == (
+        SEARCH_BLUEPRINTS_TOOL_SCHEMA
+    )
+    assert next(s for s in schemas if s["name"] == "getBlueprint") == GET_BLUEPRINT_TOOL_SCHEMA
+    assert next(s for s in schemas if s["name"] == "searchKnowledge") == (
+        SEARCH_KNOWLEDGE_TOOL_SCHEMA
+    )
+    assert set(SEARCH_BLUEPRINTS_TOOL_SCHEMA["parameters"]["required"]) == {"query"}
+    assert set(GET_BLUEPRINT_TOOL_SCHEMA["parameters"]["required"]) == {"id"}
+    assert set(SEARCH_KNOWLEDGE_TOOL_SCHEMA["parameters"]["required"]) == {"query"}
 
 
 async def test_no_credential_params_leak_in_any_schema() -> None:
@@ -132,7 +150,7 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
     cache = ToolSchemaCache(client)
 
     first = await cache.get_schemas(jwt="tok", session_id="s1")
-    assert len(first) == 8
+    assert len(first) == 11
 
     # Mutate the underlying client's tool list; without force_reload the cache
     # must not reflect the change.
@@ -146,4 +164,10 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
     assert third == first
 
     reloaded = await cache.get_schemas(jwt="tok", session_id="s1", force_reload=True)
-    assert reloaded == [ASK_USER_TOOL_SCHEMA, RESOLVE_VALUES_TOOL_SCHEMA]
+    assert reloaded == [
+        ASK_USER_TOOL_SCHEMA,
+        RESOLVE_VALUES_TOOL_SCHEMA,
+        SEARCH_BLUEPRINTS_TOOL_SCHEMA,
+        GET_BLUEPRINT_TOOL_SCHEMA,
+        SEARCH_KNOWLEDGE_TOOL_SCHEMA,
+    ]

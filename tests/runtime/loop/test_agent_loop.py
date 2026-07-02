@@ -12,7 +12,7 @@ import json
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
+from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
 from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
@@ -570,7 +570,7 @@ def _resolve_loop(
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
         max_budget_windows=3,
-        resolve_values=composite,
+        runtime_tools={"resolveValues": composite},
     )
     return loop, store
 
@@ -690,7 +690,7 @@ async def test_resolve_values_respects_per_iteration_cap() -> None:
         max_wall_clock_seconds=60,
         max_budget_windows=3,
         max_tool_calls_per_iteration=1,
-        resolve_values=composite,
+        runtime_tools={"resolveValues": composite},
     )
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
@@ -757,3 +757,159 @@ async def test_resolve_values_unwired_returns_local_error_never_dispatched() -> 
     assert trail[0].tool_name == "resolveValues"
     assert trail[0].status == "error"
     assert trail[0].error_code == "RESOLVE_VALUES_UNAVAILABLE"
+
+
+# ---------------------------------------------------------------------------
+# Runtime-tool registry (read-tools-design §2): a registered RuntimeTool is
+# intercepted (inline ToolResult, one tool call, never dispatched to the MCP);
+# an advertised-but-unwired one returns a clean local unavailable error; a
+# genuinely unknown tool falls through to MCP dispatch UNCHANGED; askUser stays
+# terminal even when other runtime tools are registered.
+# ---------------------------------------------------------------------------
+
+
+class _StubRuntimeTool:
+    """A minimal RuntimeTool double — records its call and returns an inline
+    `ToolResult` with the read-tools `provenance=frozenset()` contract."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict, RuntimeCredentials]] = []
+
+    async def run(self, model_args: dict, credentials: RuntimeCredentials) -> ToolResult:
+        self.calls.append((model_args, credentials))
+        return ToolResult(
+            status="ok",
+            tool_name="searchBlueprints",
+            error_code=None,
+            retryable=None,
+            user_message=None,
+            provenance=frozenset(),
+            result_preview=None,
+            result_full={"count": 0, "degraded": False, "blueprints": []},
+        )
+
+
+def _registry_loop(
+    *,
+    model_client: ScriptedModelClient,
+    mcp_client: FakeMCPClient,
+    runtime_tools: dict,
+) -> tuple[AgentLoop, InMemorySessionStore]:
+    store = InMemorySessionStore()
+    dispatcher = ToolDispatcher(mcp_client, CATALOG)
+    assembler = ContextAssembler(store, history_token_budget=100_000)
+    loop = AgentLoop(
+        model_client=model_client,
+        tool_dispatcher=dispatcher,
+        context_assembler=assembler,
+        session_store=store,
+        tools_provider=_tools_provider,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        runtime_tools=runtime_tools,
+    )
+    return loop, store
+
+
+async def test_registered_runtime_tool_intercepted_one_call_never_dispatched() -> None:
+    handler = _StubRuntimeTool()
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="sb_1", name="searchBlueprints", arguments={"query": "overtime"})
+                ]
+            ),
+            ModelTurnResult(assistant_text="done"),
+        ]
+    )
+    mcp = FakeMCPClient()  # must never be called for searchBlueprints
+    loop, store = _registry_loop(
+        model_client=model, mcp_client=mcp, runtime_tools={"searchBlueprints": handler}
+    )
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.status == "done"
+    assert outcome.tool_calls_made == 1  # inline, exactly one
+    assert len(handler.calls) == 1  # the registry routed to the handler
+    assert mcp.calls == []  # never dispatched to the MCP under its own name
+
+    trail = await store.load_trail(SESSION_ID)
+    assert trail[0].tool_name == "searchBlueprints"
+    assert trail[0].status == "ok"
+    assert trail[0].provenance == frozenset()  # safe-empty, kept in D44 replay
+
+
+async def test_unwired_retrieval_tool_returns_unavailable_never_dispatched() -> None:
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="gb_1", name="getBlueprint", arguments={"id": "bp-x"})
+                ]
+            ),
+            ModelTurnResult(assistant_text="ok"),
+        ]
+    )
+    mcp = FakeMCPClient()
+    loop, store = _registry_loop(model_client=model, mcp_client=mcp, runtime_tools={})
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.status == "done"
+    assert outcome.tool_calls_made == 1
+    assert mcp.calls == []  # a runtime tool is NEVER dispatched to the MCP
+
+    trail = await store.load_trail(SESSION_ID)
+    assert trail[0].tool_name == "getBlueprint"
+    assert trail[0].status == "error"
+    assert trail[0].error_code == "RETRIEVAL_TOOL_UNAVAILABLE"
+
+
+async def test_unknown_tool_falls_through_to_mcp_dispatch_unchanged() -> None:
+    # A tool that is neither a registered runtime tool NOR an advertised runtime
+    # name still routes to the MCP dispatcher exactly as before the registry.
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[ToolCallRequest(id="ld_1", name="listDatabases", arguments={})]
+            ),
+            ModelTurnResult(assistant_text="done"),
+        ]
+    )
+    mcp = FakeMCPClient(scripted={"listDatabases": [["db1", "db2"]]})
+    loop, _ = _registry_loop(
+        model_client=model, mcp_client=mcp, runtime_tools={"searchBlueprints": _StubRuntimeTool()}
+    )
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.status == "done"
+    assert [c.tool_name for c in mcp.calls] == ["listDatabases"]  # dispatched to MCP
+
+
+async def test_ask_user_stays_terminal_even_with_runtime_tools_registered() -> None:
+    # askUser is NOT a RuntimeTool — the registry must not swallow it; it still
+    # pauses with a checkpoint.
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="au_1", name="askUser", arguments={"question": "Which dept?"})
+                ]
+            )
+        ]
+    )
+    mcp = FakeMCPClient()
+    loop, store = _registry_loop(
+        model_client=model, mcp_client=mcp, runtime_tools={"searchBlueprints": _StubRuntimeTool()}
+    )
+
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="q")
+
+    assert outcome.status == "paused_ask_user"
+    doc = await store.get_or_create_session(SESSION_ID)
+    assert doc.pause_checkpoint is not None
+    assert doc.pause_checkpoint.reason == "askUser"

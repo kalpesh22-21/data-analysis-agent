@@ -189,3 +189,126 @@ def test_full_ask_user_pause_then_resume_round_trip_over_http(monkeypatch) -> No
     second_events = _parse_sse(second.text)
     assert second_events[-1]["data"]["status"] == "done"
     assert second_events[-1]["data"]["assistant_text"] == "Using Sales."
+
+
+# ---------------------------------------------------------------------------
+# Read-tools registry wiring (read-tools-design §10): the three read tools are
+# wired only when a retrieval pipeline is active; absent it they are advertised
+# but return RETRIEVAL_TOOL_UNAVAILABLE (never an MCP unknown-tool denial).
+# ---------------------------------------------------------------------------
+
+
+def _read_tools_app(
+    monkeypatch, model_client: ScriptedModelClient, *, with_retrieval: bool
+) -> tuple[TestClient, InMemorySessionStore, FakeMCPClient]:
+    from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
+    from data_agent.runtime.retrieval.models import BlueprintDetail, Candidate
+    from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
+    from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
+    from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
+
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *args, **kwargs: frozenset())
+    mcp_client = FakeMCPClient(
+        tools=[
+            MCPToolSpec(
+                name="listDatabases", description="", input_schema={"type": "object", "properties": {}}
+            )
+        ],
+        scripted={},
+    )
+    store = InMemorySessionStore()
+    retrieval = None
+    if with_retrieval:
+        index = FakeVectorIndex(
+            [
+                (
+                    Candidate(
+                        id="bp-x",
+                        kind="blueprint",
+                        text="overtime rollup",
+                        uses=frozenset(),
+                        payload={"intent": "overtime rollup", "slots_summary": "dept"},
+                    ),
+                    [1.0, 0.0],
+                )
+            ],
+            details={
+                "bp-x": BlueprintDetail(
+                    id="bp-x",
+                    intent="overtime rollup",
+                    slots_summary="dept",
+                    uses=frozenset(),
+                    status="validated",
+                    drift_status="clean",
+                    hit_count=0,
+                    catalog_sha="",
+                )
+            },
+        )
+        retrieval = RetrievalPipeline(
+            embedding_client=FakeEmbeddingClient({"overtime?": [1.0, 0.0]}),
+            reranker=None,
+            vector_index=index,
+            user_memory=NullUserMemoryProvider(),
+            recall_k=30,
+            top_k_blueprints=3,
+            top_k_knowledge=3,
+        )
+    app = create_app(
+        settings=RuntimeSettings(_env_file=None),
+        session_store=store,
+        mcp_client=mcp_client,
+        model_client=model_client,
+        catalog=CatalogHandle({}),
+        retrieval=retrieval,
+    )
+    return TestClient(app), store, mcp_client
+
+
+def test_read_tool_wired_when_retrieval_active_handled_not_dispatched(monkeypatch) -> None:
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[ToolCallRequest(id="gb1", name="getBlueprint", arguments={"id": "bp-x"})]
+            ),
+            ModelTurnResult(assistant_text="Found bp-x."),
+        ]
+    )
+    client, store, mcp = _read_tools_app(monkeypatch, model, with_retrieval=True)
+
+    resp = client.post("/turn", json={"message": "overtime?"}, headers=HEADERS)
+    assert resp.status_code == 200
+    assert _parse_sse(resp.text)[-1]["data"]["status"] == "done"
+
+    import anyio
+
+    trail = anyio.run(store.load_trail, SESSION_ID)
+    assert trail[0].tool_name == "getBlueprint"
+    assert trail[0].status == "ok"
+    assert mcp.calls == []  # getBlueprint never dispatched to the MCP
+
+
+def test_read_tool_unavailable_when_retrieval_absent(monkeypatch) -> None:
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="sb1", name="searchBlueprints", arguments={"query": "overtime"})
+                ]
+            ),
+            ModelTurnResult(assistant_text="No search available."),
+        ]
+    )
+    client, store, mcp = _read_tools_app(monkeypatch, model, with_retrieval=False)
+
+    resp = client.post("/turn", json={"message": "overtime?"}, headers=HEADERS)
+    assert resp.status_code == 200
+    assert _parse_sse(resp.text)[-1]["data"]["status"] == "done"
+
+    import anyio
+
+    trail = anyio.run(store.load_trail, SESSION_ID)
+    assert trail[0].tool_name == "searchBlueprints"
+    assert trail[0].status == "error"
+    assert trail[0].error_code == "RETRIEVAL_TOOL_UNAVAILABLE"
+    assert mcp.calls == []  # advertised-but-unwired never hits the MCP

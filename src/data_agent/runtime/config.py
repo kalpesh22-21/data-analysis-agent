@@ -187,6 +187,19 @@ class RuntimeSettings(BaseSettings):
             "uncalibrated — a floor drops good hits more than it catches junk, OQ-R2)."
         ),
     )
+    # Model-facing read tools (read-tools-design §1, OQ-T3 — provisional, tune
+    # on traffic). `searchBlueprints(query, k)`: absent `k` → default; a given
+    # `k` is clamped to `[1, max_k]` (over-ask is clamped, never rejected).
+    # `searchKnowledge` has no `k` — it always cuts to `knowledge_k`.
+    retrieval_search_default_k: int = Field(
+        5, ge=1, description="searchBlueprints default card count when the model omits k."
+    )
+    retrieval_search_max_k: int = Field(
+        20, ge=1, description="searchBlueprints upper clamp on the model-supplied k."
+    )
+    retrieval_search_knowledge_k: int = Field(
+        5, ge=1, description="searchKnowledge fixed cut (a touch above the pre-inject top-3)."
+    )
     neo4j_url: str = Field(
         "",
         description=(

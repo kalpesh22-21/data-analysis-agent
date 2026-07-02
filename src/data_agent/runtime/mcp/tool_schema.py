@@ -102,6 +102,85 @@ RESOLVE_VALUES_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# The three model-facing knowledge-plane READ tools (read-tools-design §1) —
+# runtime-implemented (not MCP tools), intercepted in the agent loop like
+# `resolveValues`/`askUser` and returning an inline tool result. None declares
+# session_id/jwt/scope (D5) — this user's scope is applied automatically
+# (searchBlueprints pre-filters, getBlueprint denies-as-not-found).
+SEARCH_BLUEPRINTS_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "searchBlueprints",
+    "description": (
+        "Search the blueprint library for reusable, validated analyses that match an "
+        "intent. You are usually GIVEN the 3 most relevant blueprints as thin cards "
+        "already — call this only when those 3 miss, or once you have reformulated the "
+        "intent in your own words. It re-searches for THIS user's scope and returns more "
+        "candidate cards (id, intent, slots summary, score). Then call getBlueprint(id) to "
+        "expand the one you pick. A `degraded` flag of true means semantic ranking was "
+        "unavailable and the order is weaker — treat scores with less confidence."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The intent to search for, in your own words. Free text.",
+            },
+            "k": {
+                "type": "integer",
+                "description": "Optional. How many cards to return (clamped to a sane maximum). "
+                "Omit for a small default.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+GET_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "getBlueprint",
+    "description": (
+        "Expand one blueprint by id (from a thin card or a searchBlueprints result). "
+        "Returns the blueprint's intent, the tables/columns it reads (its `uses` "
+        "footprint), and its status (validated/drift). Full parameter and SQL detail "
+        "arrives with the ability to run it. If the blueprint does not exist or is not "
+        "available to you, this returns `found: false` — re-search with searchBlueprints."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "The blueprint id, e.g. 'bp-overtime-by-department'.",
+            },
+        },
+        "required": ["id"],
+    },
+}
+
+SEARCH_KNOWLEDGE_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "searchKnowledge",
+    "description": (
+        "RAG over global, entity-agnostic institutional knowledge and lessons — "
+        "definitions, conventions, gotchas (e.g. how overtime is defined, what a pay "
+        "period is). This is NOT client data: do not use it to look up a specific "
+        "tenant's values (use resolveValues for that). Returns the most relevant "
+        "knowledge chunks; a `degraded` flag of true means ranking was weaker."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What to look up, in your own words. Free text.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+
 def translate_tool_spec(tool: MCPToolSpec) -> dict[str, Any]:
     """Translate one `MCPToolSpec` into an OpenAI `type: "function"` declaration."""
     return {
@@ -129,6 +208,11 @@ async def fetch_function_schemas(
     schemas = [translate_tool_spec(tool) for tool in tools]
     schemas.append(ASK_USER_TOOL_SCHEMA)
     schemas.append(RESOLVE_VALUES_TOOL_SCHEMA)
+    # The three model-facing read tools (read-tools §1) — locally authored,
+    # always advertised, appended after `resolveValues` (count 8 → 11).
+    schemas.append(SEARCH_BLUEPRINTS_TOOL_SCHEMA)
+    schemas.append(GET_BLUEPRINT_TOOL_SCHEMA)
+    schemas.append(SEARCH_KNOWLEDGE_TOOL_SCHEMA)
     return schemas
 
 

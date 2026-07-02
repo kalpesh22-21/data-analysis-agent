@@ -33,7 +33,23 @@ from .catalog_handle import CatalogHandle
 
 # Tools that expose no column-level data — always recorded with empty (not
 # undetermined) provenance, and therefore never gated by the scope filter.
-_NO_PROVENANCE_TOOLS = frozenset({"listDatabases", "listTables", "explainQuery"})
+# `searchBlueprints` (thin cards, no `uses` in the result) and `searchKnowledge`
+# (entity-agnostic prose) are read-path siblings — genuinely zero-column, so
+# `frozenset()` is correct; they are intercepted in the loop and set it
+# themselves, so this is pure defense-in-depth if one were ever routed through
+# `dispatch`. `getBlueprint` is deliberately NOT here: its provenance is the
+# blueprint's `uses` FOOTPRINT (S1), so an empty default would be fail-OPEN —
+# an ever-dispatched getBlueprint falls through to the unknown-tool `None`
+# (undetermined → dropped fail-closed), which is the safe posture.
+_NO_PROVENANCE_TOOLS = frozenset(
+    {
+        "listDatabases",
+        "listTables",
+        "explainQuery",
+        "searchBlueprints",
+        "searchKnowledge",
+    }
+)
 
 # Tools whose provenance is "every column of the referenced table" (SELECT *
 # semantics) — sampleRows/getTableSchema per design §3.3.

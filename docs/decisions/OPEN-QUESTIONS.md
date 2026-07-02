@@ -157,6 +157,11 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
   **quantified** — the rendered block is hard-bounded (~2–3k tokens) independent of corpus size.
   **Still open:** production endpoint/auth, threshold/cutoff tuning under real traffic, full D46
   budget accounting for the rendered block (OQ-R8), full-DAG blueprint storage (runBlueprint era).
+- **Read tools (Session 12, D88):** `searchBlueprints`/`getBlueprint`/`searchKnowledge` are **BUILT**
+  (runtime-tool registry, non-oracle scope posture, footprint-split provenance). Resolved: searchKnowledge
+  returns **chunks** for Phase 1 (OQ-R3). Newly open (**OQ-T1**, owned by the `runBlueprint` brick):
+  `getBlueprint`'s full-DAG expansion (`resolves`/typed `slots`/`uses_rules`/`sql_template`/`composes`),
+  the runtime/MCP tool-name collision guard, and duplicate-tool-call-id replay semantics (both QA-pinned).
 - Shared embedding model choice — a **custom API (not OpenAI)** (D71), called via a **simple HTTP
   `POST`** with a manual `EMBEDDING` span (D24); shared across question + blueprint intent + knowledge.
   **Contract resolved (Session 9b):** the mock at `~/Development/SQL/mocks/embedding_api` is

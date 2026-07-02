@@ -91,6 +91,34 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         retryable=False,
         user_message="Value resolution is not available right now.",
     ),
+    # Read-tools (searchBlueprints/getBlueprint/searchKnowledge, read-tools §6):
+    # runtime tools that never come from the MCP — the tool/loop sets these
+    # locally, and on replay `context/budget.py::_render_entry` re-derives a
+    # PII-safe message from `error_code` via this table (the L5 precedent). A
+    # SHARED `RETRIEVAL_TOOL_*` family (three tools, one failure vocabulary) with
+    # the tool name riding in the span/message.
+    "RETRIEVAL_TOOL_INVALID_ARGS": DenialInfo(
+        code="RETRIEVAL_TOOL_INVALID_ARGS",
+        retryable=True,
+        user_message="That search request was malformed. Check the arguments and try again.",
+    ),
+    "RETRIEVAL_TOOL_UNAVAILABLE": DenialInfo(
+        code="RETRIEVAL_TOOL_UNAVAILABLE",
+        retryable=False,
+        user_message="Blueprint and knowledge search is not available right now.",
+    ),
+    "RETRIEVAL_TOOL_INTERNAL_ERROR": DenialInfo(
+        code="RETRIEVAL_TOOL_INTERNAL_ERROR",
+        retryable=False,
+        user_message="Blueprint/knowledge search hit an internal error. Please try again.",
+    ),
+    # Registry-seam containment (read-tools §2 hardening): a runtime tool that
+    # raised or returned a contract-violating result — set by the loop.
+    "RUNTIME_TOOL_INTERNAL_ERROR": DenialInfo(
+        code="RUNTIME_TOOL_INTERNAL_ERROR",
+        retryable=False,
+        user_message="That tool hit an internal error. Please try again.",
+    ),
 }
 
 KNOWN_DENIAL_CODES = frozenset(_DENIAL_TABLE)
