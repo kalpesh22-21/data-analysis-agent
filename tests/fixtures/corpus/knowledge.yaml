@@ -1,0 +1,31 @@
+# Hand-authored global-knowledge seed corpus (neo4j-corpus-design §3.2).
+#
+# Entity-agnostic chunks (NOT catalog-bound, no `uses`): the leakage gate
+# guarantees knowledge carries no warehouse-scoped entity data, so knowledge is
+# never scope-filtered at recall.
+- id: kn-overtime-multiplier
+  title: Overtime pay rule
+  doc_id: hr-policy-payroll
+  status: validated
+  text: >-
+    Overtime is paid at 1.5 times the base hourly rate for hours worked beyond
+    40 in a single work week. Overtime amounts are recorded separately from
+    regular pay so they can be reported per pay period.
+
+- id: kn-pay-period-definition
+  title: Pay period
+  doc_id: hr-policy-payroll
+  status: validated
+  text: >-
+    A pay period is the recurring interval over which employee time is recorded
+    and wages are calculated, ending on the pay period end date. Common pay
+    periods are weekly, bi-weekly, semi-monthly and monthly.
+
+- id: kn-register-type
+  title: Payroll register types
+  doc_id: hr-glossary
+  status: validated
+  text: >-
+    The register type classifies each payroll amount, for example regular pay,
+    overtime, bonus or deduction. Filtering by register type isolates a single
+    category of pay when aggregating amounts.

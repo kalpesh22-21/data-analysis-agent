@@ -119,6 +119,14 @@ rejected — the **scratch session-isolation boundary** (D64,
   graph traversal + vector recall; no separate vector store.
 - Vector recall → **cross-encoder reranker** → top-3 thin cards (blueprints) and reranked knowledge.
 - Scope **pre-filter** runs before rerank (drop out-of-scope blueprints).
+- **As-built (Sessions 9b–11, D86/D87):** the embedding/reranker contracts are fixed by the
+  user-provided mock services (see OPEN-QUESTIONS §Retrieval); the whole retrieval stack —
+  `RetrievalPipeline` + `Neo4jVectorIndex` + corpus loader — is built and Layer-2-proven live. The
+  **Layer-2 stack now includes `neo4j:5.26`** (native vector indexes, no plugins) alongside the
+  embedding (18003) / reranker (18004) mocks in `docker-compose.integration.yml`; seed via
+  `scripts/seed_neo4j_corpus.py`. Production activation = `NEO4J_URL`+auth, `EMBEDDING_API_URL`,
+  `EMBEDDING_MODEL` (the load-bearing parity key, D87), optional `RERANKER_API_URL`, and
+  `retrieval_enabled`; unconfigured → the runtime runs Phase-0-identical (D86).
 
 ## Queue & job orchestration
 

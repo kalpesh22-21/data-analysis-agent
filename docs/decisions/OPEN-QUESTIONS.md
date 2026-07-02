@@ -75,7 +75,11 @@ sub-detail: the SQL-AST canonicalization rules (alias/ordering normalization dep
   then). Remaining sub-detail: `DRIFT_TTL` value + probe sampling/scheduling cadence.
 - ~~Inline-vs-scratch size threshold for intermediates.~~ **RESOLVED by D59a:** shape-based, not size-based — scalars → typed params; all tables (small or large) → session scratch. No threshold.
 - Golden-input capture: where golden results are stored and refreshed.
-- neo4j graph schema (node labels, edge types, indexes) — to be specified.
+- ~~neo4j graph schema (node labels, edge types, indexes) — to be specified.~~ **RESOLVED by D87
+  (Session 11):** `:Blueprint`/`:KnowledgeChunk` + per-corpus 768-dim cosine native vector indexes;
+  USES denormalized as byte-exact `db.table.column` strings + reserved `:USES`/`:OF_TABLE` edges;
+  model-parity stamp; Track-B lifecycle columns reserved. See neo4j-corpus-design.md. Still open
+  there: full-DAG (`composes`) storage when `runBlueprint` lands.
 
 ## Semantic Catalog (`databaseSchemaDocs/`) — from the catalog gap review
 
@@ -146,9 +150,13 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
   ships aligned + Layer-2-validated live. **Update (Session 10, D86):** pipeline shape settled and
   BUILT (Slice 1) — `recall_k=30`/corpus, top-3 cards + top-3 knowledge, degrade paths, all provisional
   `RuntimeSettings` tunables (`retrieval_*`); the pipeline is Layer-2-green against the live mocks.
-  **Still open:** production endpoint/auth, threshold/cutoff tuning under real traffic, the **neo4j
-  vector index + corpus schema (Slice-2 first task**, retrieval-pipeline-design.md), rendered-block
-  token-budget accounting (OQ-R8), and the Slice-2 trust-boundary reconfirmation (§8.1).
+  **Update (Session 11, D87):** the ~~neo4j vector index + corpus schema~~ is **BUILT and
+  Layer-2-proven live** (`Neo4jVectorIndex` + corpus loader + seeded neo4j:5.26 in the l2 stack; the
+  five conformance proofs green); the §8.1 trust boundary was **reconfirmed** (corpus still
+  hand-seeded/trusted; content-level treatment triggers with Track B); **OQ-R8** re-deferred but now
+  **quantified** — the rendered block is hard-bounded (~2–3k tokens) independent of corpus size.
+  **Still open:** production endpoint/auth, threshold/cutoff tuning under real traffic, full D46
+  budget accounting for the rendered block (OQ-R8), full-DAG blueprint storage (runBlueprint era).
 - Shared embedding model choice — a **custom API (not OpenAI)** (D71), called via a **simple HTTP
   `POST`** with a manual `EMBEDDING` span (D24); shared across question + blueprint intent + knowledge.
   **Contract resolved (Session 9b):** the mock at `~/Development/SQL/mocks/embedding_api` is

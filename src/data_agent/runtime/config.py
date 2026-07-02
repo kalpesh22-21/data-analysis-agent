@@ -136,7 +136,14 @@ class RuntimeSettings(BaseSettings):
         "", description="Optional embedding API bearer key (mock needs none; prod TBD)."
     )
     embedding_model: str = Field(
-        "", description="Embedding model id — EMBEDDING span attribute only (not a request param)."
+        "all-mpnet-base-v2",
+        description=(
+            "Embedding model id. It is BOTH the EMBEDDING span attribute AND the "
+            "load-bearing read-path parity key (D60/D86): `Neo4jVectorIndex` "
+            "recall filters `WHERE embedding_model = <this>`, so it MUST match the "
+            "id stamped on the corpus at seed time (scripts/seed_neo4j_corpus.py "
+            "defaults to the same value) or recall returns an empty corpus."
+        ),
     )
     embedding_timeout_seconds: float = Field(
         10.0, gt=0, description="Per-request embedding timeout (seconds)."
@@ -156,12 +163,11 @@ class RuntimeSettings(BaseSettings):
     )
 
     # --- Retrieval pipeline (D7/D8, design §3.4) ---
-    # Slice-1 note: the pipeline's real vector store is neo4j (D60), whose
-    # `Neo4jVectorIndex` lands in Slice 2. Until then `app.py` leaves the
-    # pipeline UNWIRED (retrieval=None → Phase-0 parity); these tunables are
-    # consumed by the pipeline in Layer-1/Layer-2 tests (seeded fakes) and by
-    # the Slice-2 production wiring. `retrieval_enabled=False` is a hard master
-    # switch to force empty retrieval even once the store exists.
+    # Slice-2 note: the pipeline's real vector store is neo4j (D60). `app.py`
+    # now wires `Neo4jVectorIndex` + `RetrievalPipeline` when `neo4j_url` AND an
+    # embedder are configured; absent either it leaves retrieval=None (Phase-0
+    # parity). `retrieval_enabled=False` is a hard master switch to force empty
+    # retrieval even once the store exists.
     retrieval_enabled: bool = Field(
         True, description="Master switch; False => empty RetrievedContext (Phase-0 parity)."
     )
@@ -182,10 +188,24 @@ class RuntimeSettings(BaseSettings):
         ),
     )
     neo4j_url: str = Field(
-        "", description="neo4j bolt URL (D60). Empty => vector index unavailable (Slice 2)."
+        "",
+        description=(
+            "neo4j bolt URL (D60). Empty => vector index unavailable => retrieval "
+            "stays unwired (Phase-0 parity). Wired in Slice 2 when set alongside "
+            "an embedder."
+        ),
     )
-    neo4j_username: str = Field("", description="neo4j username (secret; Slice 2).")
-    neo4j_password: str = Field("", description="neo4j password (secret; Slice 2).")
+    neo4j_username: str = Field("", description="neo4j username (secret).")
+    neo4j_password: str = Field("", description="neo4j password (secret).")
+    neo4j_timeout_seconds: float = Field(
+        10.0,
+        gt=0,
+        description=(
+            "neo4j connection-acquisition + per-query timeout (seconds); a "
+            "recall exceeding it degrades to empty (D86), matching the "
+            "embedding/reranker timeout convention."
+        ),
+    )
 
     # --- resolveValues composite (D77) ---
     resolve_values_query_limit: int = Field(

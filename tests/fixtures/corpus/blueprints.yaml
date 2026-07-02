@@ -1,0 +1,43 @@
+# Hand-authored blueprint seed corpus (neo4j-corpus-design §3.2).
+#
+# `uses` strings are BYTE-EXACT `"database.table.column"` scope keys of the HR
+# warehouse the Layer-2 ClickHouse seed (docker/clickhouse-init/hr-warehouse.sql)
+# + the Semantic Catalog describe — so scope filtering against a real scope is
+# genuinely exercised. Any format skew here silently drops the blueprint via the
+# set-subset scope pre-filter (§8 highest-risk contract), so these are curated
+# against the real `dbpcm_warehouse.<table>.<Column>` names.
+- id: bp-overtime-by-department
+  intent: Total overtime pay by department for a given pay period
+  slots_summary: department, pay_period
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.payroll.EmployeeCode
+    - dbpcm_warehouse.payroll.RegisterType
+    - dbpcm_warehouse.payroll.Amount
+    - dbpcm_warehouse.payroll.PayPeriodEndDate
+    - dbpcm_warehouse.employee.EmployeeCode
+    - dbpcm_warehouse.employee.Department
+
+- id: bp-active-headcount-by-department
+  intent: Active employee headcount by department
+  slots_summary: department
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.employee.EmployeeCode
+    - dbpcm_warehouse.employee.Department
+    - dbpcm_warehouse.employee.EmployeeStatus
+
+- id: bp-average-salary-by-department
+  intent: Average annual salary by department
+  slots_summary: department
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.employee.EmployeeCode
+    - dbpcm_warehouse.employee.Department
+    - dbpcm_warehouse.employee.AnnualSalary

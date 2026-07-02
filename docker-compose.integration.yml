@@ -127,6 +127,26 @@ services:
       # Extra time for the first model load (weights pre-downloaded at build).
       start_period: 60s
 
+  # neo4j retrieval corpus (D60/D86, neo4j-corpus-design §4.1). LTS with native
+  # vector indexes GA (no APOC/GDS plugin needed — native vector search is core).
+  # Community edition, single default `neo4j` database. DEV/TEST only (ephemeral
+  # password). The Layer-2 test session owns schema + seed via the loader.
+  neo4j:
+    image: neo4j:5.26
+    container_name: l2-neo4j
+    environment:
+      NEO4J_AUTH: "neo4j/testpassword"
+      NEO4J_server_memory_pagecache_size: "512M"
+    ports:
+      - "7474:7474"   # http/browser
+      - "7687:7687"   # bolt
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
   # Session store (D22/D44/D45). Cluster/bucket/collection init is done out-of-band
   # by scripts/couchbase-init.sh after the node reports healthy (Couchbase init is
   # not fully declarative in the base image).

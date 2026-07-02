@@ -65,13 +65,21 @@ invariant→test status board.
   [decisions/retrieval-pipeline-design.md](decisions/retrieval-pipeline-design.md) (+§8.1 trust
   boundary, OQ-R8/R9).
 
-**Next brick:** **Retrieval Slice 2** (per retrieval-pipeline-design.md §build order): the **neo4j
-corpus schema + `Neo4jVectorIndex`** (drop-in behind the `VectorIndex` seam; neo4j service into the
-integration compose; offline corpus embedding with the same-model parity constraint; reconfirm the
-§8.1 trust boundary + OQ-R8 budget accounting). Then: blueprint read tools
-(`searchBlueprints`/`getBlueprint`/`searchKnowledge`) → `runBlueprint` + the **D56 verify gate** + the
-**D67 `resolve_via` wiring** (the typed `resolveValues.resolve()` hook exists), with the offline
-**Track B** learning loop parallel once the graph schema is fixed. The
+- ✅ **Retrieval Slice 2 BUILT (Session 11, new D87)** — the neo4j corpus is real: `Neo4jVectorIndex`
+  (async driver, per-corpus 768-dim cosine native vector indexes, parity `WHERE`, never-raises,
+  per-row malformed-record skip, fail-closed `uses` coercion), `corpus_loader` + seed script
+  (MERGE-by-id idempotent, write-time `uses` validation, atomic in-txn model-parity refusal,
+  edge rewrite on re-seed), `neo4j:5.26` in the l2 stack, app wiring gated on
+  `retrieval_enabled`+store+embedder. **Retrieval is now production-activatable via env.**
+  Reviewed (REQUEST CHANGES: 2 blockers — a `uses` fail-open + a silently-retrieval-dead default
+  config — → fixed → **APPROVE**, fixes live-re-proven) + QA'd (+65 tests, 8 pinned flags).
+  **719 pass / 33 skipped, ruff clean; live Layer-2 8/8** (five D87 proofs + three pipeline).
+  Design: [decisions/neo4j-corpus-design.md](decisions/neo4j-corpus-design.md).
+
+**Next brick:** the **blueprint/knowledge read tools** (`searchBlueprints`/`getBlueprint`/
+`searchKnowledge` — model-facing, over the now-real corpus) → `runBlueprint` + the **D56 verify
+gate** + the **D67 `resolve_via` wiring** (the typed `resolveValues.resolve()` hook exists), with the
+offline **Track B** learning loop parallel now that the graph schema is fixed (D87). The
 runtime's Phase-1 `getTableSchema` is just a passthrough of the now-MCP-side overlay (D83/D84). ~~D77
 `resolveValues`~~ **done (Session 9).** **Phase 0 is substantially complete and
 validated end-to-end** (live turn works); the honest remaining Phase-0 gap is the **3 deferred Layer-3
@@ -82,10 +90,10 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 
 **Open follow-ups carried forward:**
 - **NOTHING IS PUSHED (user deferred the push).** data-analysis-agent branch
-  `phase0/provenance-extractor` has 7 commits (`6820677`→…→`192bf13` D77/D85→`b95c16d` D71 clients) —
-  **this repo has NO git remote configured yet** (add an `origin` before push/PR). **The Session-10
-  retrieval-Slice-1 work + these doc updates are UNCOMMITTED at time of writing** (committed right
-  after this doc pass). clickhouse-api
+  `phase0/provenance-extractor` has 8 commits (`6820677`→…→`b95c16d` D71 clients→`9776817` D86
+  Slice 1) — **this repo has NO git remote configured yet** (add an `origin` before push/PR).
+  **The Session-11 Slice-2 work + these doc updates are UNCOMMITTED at time of writing** (committed
+  right after this doc pass). clickhouse-api
   `feat/scope-enforcement` (origin `kalpesh22-21/click-house-openapi`) has `b55b4de` (D83/D84) +
   `143f0c1` "Stale changes" (unrelated branch WIP — settings/oauth/helm/diagnose_token, not ours)
   ahead of origin, unpushed.
@@ -130,6 +138,46 @@ pause/resume durability across a runtime restart (logic is Layer-1/Couchbase-tes
 - 6 coverage gaps accepted into backlog (see TRACEABILITY.md §Coverage gaps) — Phase-2 test additions.
 
 ---
+
+## 2026-07-01 — Session 11: Retrieval Slice 2 BUILT (D87) — neo4j corpus + Neo4jVectorIndex, live-proven
+
+Same-day continuation. The neo4j corpus schema was designed (D87), built, and dropped in behind the
+frozen D86 `VectorIndex` seam — retrieval is now activatable in production via env config.
+**Uncommitted at time of writing** — committed immediately after this doc pass.
+
+### Shipped
+| Area | Path | Agent |
+|---|---|---|
+| Design doc: graph schema (denormalized byte-exact `uses` + reserved edges, per-corpus 768-dim cosine indexes, parity stamp, Track-B lifecycle columns reserved), driver/loader/Layer-2 decisions, §8.1 trust-boundary reconfirmation, OQ-R8 quantified re-deferral | `docs/decisions/neo4j-corpus-design.md` | `planner` |
+| `Neo4jVectorIndex` (async official driver, `db.index.vector.queryNodes` per kind via fixed dicts — no interpolation, parity `WHERE`, never-raises→`[]`, per-row malformed-record skip, fail-closed `_coerce_uses`, model-mismatch span flag, `close()` via app lifespan) | `src/data_agent/runtime/retrieval/vector_index.py` | `backend-developer` |
+| Corpus loader + seed CLI: idempotent DDL, MERGE-by-id, write-time `uses` validation (≥3-part dotted strings, fail-closed), atomic in-txn model-parity refusal (empty stamp = conflict), `:USES` edge delete+rewrite per re-seed, duplicate-id refusal; hand-authored YAML fixtures byte-matching the HR-warehouse schema | `src/data_agent/runtime/retrieval/corpus_loader.py`, `scripts/seed_neo4j_corpus.py`, `tests/fixtures/corpus/*.yaml` | `backend-developer` |
+| Wiring: `retrieval_enabled` + store + embedder gate (no idle driver pool when disabled), `embedding_model` promoted to the load-bearing read-path parity key (default = corpus stamp), lifespan shutdown; `neo4j:5.26` service in the l2 compose; `neo4j==5.28.4` dep | `app.py`, `config.py`, `docker-compose.integration.yml`, `pyproject.toml` | `backend-developer` |
+| Layer-1 (26+) + wiring tests; Layer-2 live suite: the five D87 proofs (recall→Candidate byte-exact mapping, scope filter on real stored USES, full e2e real embed+neo4j+rerank, parity guard, unreachable-neo4j degrade) | `tests/runtime/retrieval/test_{neo4j_index,corpus_loader,neo4j_wiring_qa}.py`, `tests/integration/test_neo4j_vector_index_live.py` | `backend-developer` |
+| Adversarial QA: +65 tests (malformed-record matrix via the `_run` seam, exception flavors incl. the CancelledError carve-out, loader/fixture/gating attacks, fixture↔ClickHouse-DDL byte-exactness) — 8 pinned-behaviour flags | `tests/runtime/retrieval/test_*_qa2.py` | `qa` |
+| Review round 1 **REQUEST CHANGES** → fixes → re-review **APPROVE** (all probes re-run live) | — | `reviewer` (parallel with `qa`) |
+
+### Review findings (recorded honestly)
+- **B1** — null/empty stored `uses` mapped to `frozenset()` → passed **every** scope (fail-open on the
+  slice's highest-risk contract, locked in by a test). Fixed: `_coerce_uses` → undetermined/`None` →
+  dropped fail-closed; non-list / non-str / bare-string shapes likewise.
+- **B2** — `expected_model` read from a config field defaulting `""` (still described as cosmetic) →
+  a by-the-book deploy silently retrieval-dead via the parity `WHERE`. Fixed: default = corpus stamp,
+  description rewritten as load-bearing, loud wiring warning on empty.
+- **S1** — `:USES` edges drifted from the `uses` property on re-seed (live-proven phantom edges).
+  Fixed: delete+rewrite in the same txn. **S2** — loader stored garbage `uses` silently / crashed raw
+  on non-str. Fixed: write-time fail-closed validation. **S3** — parity check was TOCTOU (read outside
+  the write txn). Fixed: in-txn atomic. **S4** — `retrieval_enabled=False` still opened a driver pool.
+  Fixed: gate includes the master switch.
+- QA flags folded in: per-row malformed-record skip (one bad row no longer blanks the batch),
+  duplicate-id refusal, empty-string parity stamp = conflict. Nits: destructive-wipe comment,
+  lifespan migration. Residual nit-grade items carried: empty-`uses` seeds are stored-but-unretrievable
+  (safe direction), the in-txn parity race is narrowed not serialized (comment softening pending).
+
+### Verification status
+- `uv run pytest` → **719 passed, 33 skipped**, ruff clean.
+- **Live Layer-2 8/8** (5 D87 proofs + 3 pipeline) against real neo4j 5.26 + embedding + reranker;
+  the two blocker fixes re-proven live (null-`uses` dropped end-to-end; default-config recall works).
+- Production activation documented (NEO4J_URL + EMBEDDING_API_URL + EMBEDDING_MODEL + seed script).
 
 ## 2026-07-01 — Session 10: Retrieval pipeline Slice 1 BUILT (D86) — embed→recall→scope-filter→rerank→inject, no neo4j
 

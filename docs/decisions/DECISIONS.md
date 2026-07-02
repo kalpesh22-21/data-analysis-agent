@@ -218,6 +218,32 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   [D71](#model-provider), [D80](#security--infra) (empty-scope semantics), D85 (degrade precedent),
   D44/D46 (context assembly), D24/D25 (spans, shape-only).
 
+- **D87 (locked, 2026-07-01, Session 11 — retrieval Slice 2).** **The neo4j corpus schema: USES as a
+  denormalized property (+ reserved graph edges), per-corpus native vector indexes, and a strict-write /
+  degrade-read embedding-model parity stamp.** Specifics: `:Blueprint` and `:KnowledgeChunk` nodes each
+  carry a native **768-dim cosine** vector index and a uniqueness constraint on `id`. A blueprint's
+  transitive USES set is stored **denormalized as a `uses: list<string>` property of byte-exact
+  `"database.table.column"` scope keys** — recall reads it with zero traversal (per D60's
+  "precomputed set-subset, not live traversal"), and the runtime scope pre-filter (D86) consumes it as
+  a plain set-subset check, so **the stored key format must byte-match the JWT `column_scope` format**
+  (the slice's highest-risk contract; loader-validated fail-closed at write — every entry must be a
+  ≥3-part dotted string — and coerced fail-closed at read: a missing/empty/malformed `uses` maps to
+  *undetermined* → the blueprint is dropped, never allow-all). The same write transaction also
+  maintains reserved `:Column`/`:Table` nodes with `:USES`/`:OF_TABLE` edges (unread in Slice 2;
+  deleted-and-rewritten per blueprint on re-seed so property and edges cannot drift) for the D60/D38
+  graph capability, plus lifecycle/provenance properties (`status`, `drift_status`, `canonical_key`,
+  `hit_count`, `created_by`, `catalog_sha` per D84) seeded-but-unread so Track B needs no migration.
+  **Model parity**: every node is stamped `embedding_model`; the loader is **strict at write** (a
+  mixed-model seed is refused inside the write transaction, atomically; an empty-string stamp counts
+  as a conflicting model) and recall **degrades at read** (`WHERE node.embedding_model =
+  $expected_model`; a full-corpus mismatch sets a `retrieval.model_mismatch` span attribute). The
+  runtime's `embedding_model` setting is therefore the **load-bearing read-path parity key** (defaults
+  to the corpus stamp `all-mpnet-base-v2`); a model swap requires a full reindex. Corpus writes are
+  MERGE-by-id idempotent (duplicate fixture ids refused). See
+  [neo4j-corpus-design.md](neo4j-corpus-design.md). Cross-references: [D60](#blueprints--learning),
+  D84 (`catalog_sha` semantics), D86 (the `VectorIndex` seam this drops into), D38 (future graph
+  consumers), D41 (blueprint model).
+
 - **D67 (locked, 2026-06-30).** **Two rule kinds: static and resolved (dynamic).** A catalog `rule`'s
   `predicate` is either a fixed SQL boolean (**static**) or references `resolveValues(column, concept)`
   over a `client_defined` column (**resolved**) — the runtime expands it to a concrete per-client value

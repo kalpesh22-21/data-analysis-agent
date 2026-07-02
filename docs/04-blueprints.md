@@ -389,14 +389,21 @@ Each blueprint stores its `(tables, columns)` dependency set as `USES` edges, co
 **whole DAG** (transitive over `composes`). Used to pre-filter retrieval by user scope. Edges are
 written at blueprint-creation time and re-validated if the schema changes.
 
-## Storage (neo4j) — stub
+## Storage (neo4j) — Slice-2 retrieval projection (D87)
 
-Graph schema (node labels, edge types, indexes for intent-embedding + `USES` traversal) to be
-specified separately.
+Specified in [decisions/neo4j-corpus-design.md](decisions/neo4j-corpus-design.md) and built
+(Session 11). The Slice-2 projection: `:Blueprint` nodes (id-unique, native **768-dim cosine**
+vector index over the intent embedding, `embedding_model` parity stamp, Track-B lifecycle/provenance
+properties reserved) with the transitive USES set stored **denormalized as byte-exact
+`database.table.column` strings** for zero-traversal scope pre-filtering (D86), plus reserved
+`:Column`/`:Table` nodes and `:USES`/`:OF_TABLE` edges (written same-transaction,
+deleted-and-rewritten on re-seed, unread until the D38-era graph consumers). `:KnowledgeChunk`
+mirrors the vector/parity shape. **Full-DAG storage (`composes`, `sql_template` steps) is a reserved
+additive extension** — specified when `runBlueprint` lands.
 
 ---
 
-**Status:** Partial (model + execution + lifecycle Locked; neo4j schema Stub)
+**Status:** Partial (model + execution + lifecycle Locked; Slice-2 retrieval projection **Locked/built** (D87); full-DAG storage reserved)
 **Open questions:**
 - **Grain ownership (correctness — proposed D37):** no grain contract today, so a wrong-grain
   blueprint (e.g. `AVG(gross_pay)` over a 1:N `payroll_fact` join, no period filter) passes every

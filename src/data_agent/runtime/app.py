@@ -32,6 +32,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
@@ -52,11 +53,14 @@ from data_agent.runtime.mcp.tool_schema import ToolSchemaCache
 from data_agent.runtime.model.client import ModelClient
 from data_agent.runtime.model.embedding_client import EmbeddingClient, HttpEmbeddingClient
 from data_agent.runtime.model.openai_client import build_openai_model_client
+from data_agent.runtime.model.reranker_client import HttpRerankerClient
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle, load_catalog_handle
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
+from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
+from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
 from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 from data_agent.runtime.session.store import AlreadyConsumedError, CASMismatchError, SessionStore
 
@@ -177,12 +181,13 @@ def create_app(
     implementations, sourced from *settings* — pass Layer-1 fakes for any of
     them (e.g. in a smoke test) to avoid touching real infra entirely.
 
-    *retrieval* (Slice-1 seam, design §12): the D7/D8 pipeline pre-injected into
-    `ContextAssembler`. Left `None` in production for Slice 1 — the pipeline's
-    real vector store is neo4j (D60), whose `Neo4jVectorIndex` lands in Slice 2,
-    so there is no store to recall from yet and retrieval stays UNWIRED
-    (byte-identical Phase-0 parity). Tests inject a pipeline (real D71 clients +
-    a seeded `FakeVectorIndex`) to exercise the whole embed→rerank→inject path."""
+    *retrieval* (design §12 / neo4j-corpus-design §2.4): the D7/D8 pipeline
+    pre-injected into `ContextAssembler`. When left `None` AND `neo4j_url` + an
+    embedder are configured, a `Neo4jVectorIndex`-backed pipeline is constructed
+    here (Slice 2) and its driver is closed on app shutdown; absent either the
+    store or the embedder it stays `None` (byte-identical Phase-0 parity, D86).
+    Tests inject a pipeline (real D71 clients + a seeded `FakeVectorIndex` or a
+    live `Neo4jVectorIndex`) to exercise the whole embed→rerank→inject path."""
     settings = settings or get_runtime_settings()
     catalog = catalog or load_catalog_handle()
     mcp_client = mcp_client or RealMCPClient(settings.mcp_url)
@@ -212,6 +217,63 @@ def create_app(
             api_key=settings.embedding_api_key,
             model=settings.embedding_model,
             timeout_seconds=settings.embedding_timeout_seconds,
+            tracer=tracer,
+        )
+
+    # Slice 2 (neo4j-corpus-design §2.4): wire the neo4j-backed retrieval
+    # pipeline ONLY when BOTH a store (`neo4j_url`) and an embedder are
+    # configured AND retrieval is enabled — retrieval needs an embedder to embed
+    # the question AND a store to recall from; absent any of those it stays
+    # `None` (Phase-0 parity, D86). Gating on `retrieval_enabled` here (not only
+    # at the ContextAssembler below) means a disabled deployment opens NO driver
+    # pool (S4). An injected `retrieval` (Layer-1/2 tests) is honored as-is and
+    # never rebuilt here. The reranker is optional: absent `reranker_api_url` the
+    # pipeline degrades to recall order.
+    vector_index: Neo4jVectorIndex | None = None
+    if (
+        retrieval is None
+        and settings.retrieval_enabled
+        and settings.neo4j_url
+        and embedding_client is not None
+    ):
+        # B2: `embedding_model` is the read-path parity key — an empty value
+        # parity-filters recall on '' and yields a permanently EMPTY corpus. Warn
+        # loudly server-side rather than silently retrieve nothing.
+        if not settings.embedding_model:
+            _logger.warning(
+                "neo4j retrieval is configured but embedding_model is empty — recall "
+                "parity-filters on embedding_model='' and will return an EMPTY corpus. "
+                "Set embedding_model to match the corpus stamp "
+                "(see scripts/seed_neo4j_corpus.py)."
+            )
+        vector_index = Neo4jVectorIndex(
+            url=settings.neo4j_url,
+            auth=(settings.neo4j_username, settings.neo4j_password),
+            expected_model=settings.embedding_model,
+            timeout_seconds=settings.neo4j_timeout_seconds,
+            tracer=tracer,
+        )
+        reranker = (
+            HttpRerankerClient(
+                url=settings.reranker_api_url,
+                api_key=settings.reranker_api_key,
+                model=settings.reranker_model,
+                timeout_seconds=settings.reranker_timeout_seconds,
+                tracer=tracer,
+            )
+            if settings.reranker_api_url
+            else None
+        )
+        retrieval = RetrievalPipeline(
+            embedding_client=embedding_client,
+            reranker=reranker,
+            vector_index=vector_index,
+            user_memory=NullUserMemoryProvider(),
+            recall_k=settings.retrieval_recall_k,
+            top_k_blueprints=settings.retrieval_top_k_blueprints,
+            top_k_knowledge=settings.retrieval_top_k_knowledge,
+            knowledge_min_score=settings.retrieval_knowledge_min_score,
+            reranker_model=settings.reranker_model,
             tracer=tracer,
         )
 
@@ -281,7 +343,18 @@ def create_app(
             resolve_values=composite,
         )
 
-    app = FastAPI(title="data-agent-runtime")
+    # Close the neo4j driver pool on shutdown (design §2.4, N1: lifespan not the
+    # deprecated on_event). Only closes when this app OWNS a `Neo4jVectorIndex` —
+    # an injected `retrieval` (tests) owns its own store lifecycle.
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if vector_index is not None:
+                await vector_index.close()
+
+    app = FastAPI(title="data-agent-runtime", lifespan=_lifespan)
 
     @app.post("/turn")
     async def turn(
