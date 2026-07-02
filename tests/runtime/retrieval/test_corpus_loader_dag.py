@@ -50,13 +50,20 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
         "bp-overtime-by-department",
         "bp-active-headcount-by-department",
         "bp-average-salary-by-department",
+        "bp-departments-above-company-average-salary",
     }
     for bp in blueprints:
         _validate_blueprint_dag(bp)  # no raise
         props = _dag_properties(bp)
         # result_grain round-trips as a JSON list; sql_template stored verbatim.
         assert json.loads(props["result_grain_json"]) == ["Department"]
-        assert "{department}" in props["sql_template"]
+        # Single-node seeds carry a top-level {department}-parameterized template;
+        # the Slice-C multi-node seed stores its SQL per-node in composes instead.
+        if bp.sql_template is not None:
+            assert "{department}" in props["sql_template"]
+        else:
+            assert props["sql_template"] is None
+            assert props["composes_json"] is not None
 
 
 def test_valid_synthetic_seed_passes() -> None:
@@ -352,9 +359,119 @@ def test_valid_when_clause_accepted() -> None:
         sql_template=None,
         slots=[],  # B3(a): no department filter → no declared slot
         composes=[
-            {"order": 1, "output": {"a": "scalar"},
+            # S5: a `count(...)` threshold is valid over a TABLE-shaped output (a
+            # scalar output's row count is ≤1 by contract and is rejected).
+            {"order": 1, "output": {"a": "table"},
              "sql_template": "SELECT Department FROM dbpcm_warehouse.employee",
              "when": {"expr": "count($1) > 0", "on_violation": "skip"}},
         ],
     )
     _validate_blueprint_dag(replace(bp))  # no raise
+
+
+# -- Slice-C review: additional load-time gates ------------------------------
+
+_STATUS = "dbpcm_warehouse.employee.EmployeeStatus"
+
+
+def test_hybrid_sql_template_and_composes_rejected() -> None:
+    # B4: a blueprint with BOTH a top-level sql_template AND composes has no
+    # execution mode (the top template is dead) — reject outright.
+    bp = _seed(
+        slots=[],
+        composes=[
+            {"order": 0, "output": {}, "sql_template": "SELECT Department FROM dbpcm_warehouse.employee GROUP BY Department"},
+        ],
+        # inherits the base top-level sql_template → hybrid
+    )
+    with pytest.raises(CorpusLoadError, match="BOTH a top-level sql_template and a composes"):
+        _validate_blueprint_dag(bp)
+
+
+def test_resolve_via_rule_probing_column_outside_uses_rejected() -> None:
+    # S6a: a rule's probed column must be within the declared uses — even when the
+    # TEMPLATE footprint is clean (the rule probes a DIFFERENT table's column).
+    bp = _seed(
+        uses=["dbpcm_warehouse.employee.EmployeeCode", "dbpcm_warehouse.employee.Department"],
+        slots=[],
+        sql_template="SELECT count() AS n FROM dbpcm_warehouse.employee WHERE Department IN {codes}",
+        uses_rules=[
+            # probes payroll.RegisterType, which is NOT in uses (template is clean).
+            {"id": "s", "resolve_via": "resolveValues(RegisterType, 'earnings')", "table": "dbpcm_warehouse.payroll", "binds": "codes"}
+        ],
+        result_grain=[],
+    )
+    with pytest.raises(CorpusLoadError, match="resolve_via rule .* probes .* NOT in the declared uses"):
+        _validate_blueprint_dag(bp)
+
+
+def test_consumes_referencing_non_scalar_upstream_rejected() -> None:
+    # S6b: consumes $P.name must name a declared SCALAR output of an upstream P.
+    bp = _seed(
+        slots=[],
+        sql_template=None,
+        composes=[
+            {"order": 0, "output": {"tbl": "table"}, "sql_template": "SELECT Department FROM dbpcm_warehouse.employee GROUP BY Department"},
+            {"order": 1, "feeds_from": [0], "consumes": {"v": "$0.tbl"},
+             "sql_template": "SELECT Department FROM dbpcm_warehouse.employee WHERE Department = {v} GROUP BY Department", "output": {}},
+        ],
+    )
+    with pytest.raises(CorpusLoadError, match="no declared SCALAR output"):
+        _validate_blueprint_dag(bp)
+
+
+def test_consumes_from_non_feeds_from_node_rejected() -> None:
+    bp = _seed(
+        slots=[],
+        sql_template=None,
+        composes=[
+            {"order": 0, "output": {"v": "scalar"}, "sql_template": "SELECT count() AS v FROM dbpcm_warehouse.employee"},
+            {"order": 1, "output": {"v2": "scalar"}, "sql_template": "SELECT count() AS v2 FROM dbpcm_warehouse.employee"},
+            {"order": 2, "feeds_from": [1], "consumes": {"v": "$0.v"},  # consumes 0 but feeds_from 1
+             "sql_template": "SELECT Department FROM dbpcm_warehouse.employee WHERE Department = {v} GROUP BY Department", "output": {}},
+        ],
+    )
+    with pytest.raises(CorpusLoadError, match="not in its feeds_from"):
+        _validate_blueprint_dag(bp)
+
+
+def test_terminal_approval_node_rejected() -> None:
+    # S4: an approval gate that is a topo sink with no query gates nothing.
+    bp = _seed(
+        slots=[],
+        sql_template=None,
+        composes=[
+            {"order": 0, "output": {"v": "scalar"}, "sql_template": "SELECT count() AS v FROM dbpcm_warehouse.employee"},
+            {"order": 1, "node_kind": "approval", "feeds_from": [0], "output": {}},  # terminal approval
+        ],
+    )
+    with pytest.raises(CorpusLoadError, match="TERMINAL approval gate"):
+        _validate_blueprint_dag(bp)
+
+
+def test_non_terminal_approval_gating_a_query_is_accepted() -> None:
+    bp = _seed(
+        slots=[],
+        sql_template=None,
+        composes=[
+            {"order": 0, "output": {"v": "scalar"}, "sql_template": "SELECT count() AS v FROM dbpcm_warehouse.employee"},
+            {"order": 1, "node_kind": "approval", "feeds_from": [0], "output": {},
+             "sql_template": "SELECT Department AS department FROM dbpcm_warehouse.employee GROUP BY Department"},  # approval WITH its own query
+        ],
+    )
+    _validate_blueprint_dag(bp)  # no raise — the approval runs its own query
+
+
+def test_count_threshold_over_scalar_output_rejected() -> None:
+    # S5: count($N) over a scalar-output node is meaningless (row count ≤ 1).
+    bp = _seed(
+        slots=[],
+        sql_template=None,
+        composes=[
+            {"order": 0, "output": {"v": "scalar"}, "sql_template": "SELECT count() AS v FROM dbpcm_warehouse.employee"},
+            {"order": 1, "feeds_from": [0], "when": {"expr": "count($0) > 5", "on_violation": "skip"},
+             "sql_template": "SELECT Department AS department FROM dbpcm_warehouse.employee GROUP BY Department", "output": {}},
+        ],
+    )
+    with pytest.raises(CorpusLoadError, match="count.* to a SCALAR-output node"):
+        _validate_blueprint_dag(bp)

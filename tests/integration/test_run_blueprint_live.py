@@ -59,6 +59,7 @@ pytestmark = pytest.mark.skipif(
 _MODEL = "all-mpnet-base-v2"
 _FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "corpus"
 _AVG_ID = "bp-average-salary-by-department"
+_ABOVE_AVG_ID = "bp-departments-above-company-average-salary"
 _E = "dbpcm_warehouse.employee"
 
 
@@ -132,6 +133,38 @@ async def test_single_node_blueprint_runs_and_verifies_live(
     assert outcome.provenance is not None
     assert (_E, "Department") in outcome.provenance
     assert (_E, "AnnualSalary") in outcome.provenance
+
+
+async def test_multi_node_scalar_dag_runs_and_verifies_live(
+    seeded_dag_corpus: bool, mint: Mint
+) -> None:
+    # Slice C: a real SCALAR-passing DAG end-to-end. node 0 computes the
+    # company-wide average as a scalar; node 1 CONSUMES it (bound as a typed AST
+    # literal, F1/D10 — never interpolated) to select the above-average
+    # departments. No table intermediate (F2-clean). Both node queries + the D56
+    # grain probe run through the live MCP ↔ ClickHouse; the result is verified.
+    jwt = await mint()  # allow-all scope
+    creds = RuntimeCredentials(session_id="sess-bp-dag-live", jwt=jwt, column_scope=frozenset())
+    index = _index()
+    try:
+        outcome = await _executor(index).execute(
+            blueprint_id=_ABOVE_AVG_ID, slot_bindings={}, credentials=creds
+        )
+    finally:
+        await index.close()
+
+    assert isinstance(outcome, ExecCompleted), outcome
+    rf = outcome.result_full
+    assert rf["status"] == "verified"
+    assert rf["verify"]["grain_ok"] is True
+    assert rf["verify"]["grain_checked"] is True
+    assert "department" in [c.lower() for c in rf["columns"]]
+    # TWO per-node SQLs surfaced for transparency (D56 "SQL stays visible").
+    assert len(rf["sql"]) == 2
+    # Provenance is the LIVE union across BOTH node queries + the grain probe.
+    assert outcome.provenance is not None
+    assert (_E, "AnnualSalary") in outcome.provenance
+    assert (_E, "Department") in outcome.provenance
 
 
 async def test_narrow_scope_blueprint_is_not_found_no_data_leaks_live(

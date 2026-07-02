@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -34,6 +35,7 @@ from sqlglot.optimizer.qualify_tables import qualify_tables
 from sqlglot.schema import MappingSchema
 
 from data_agent.runtime.blueprint.models import Blueprint, BlueprintParseError
+from data_agent.runtime.blueprint.rules import parse_rule
 from data_agent.runtime.blueprint.template import (
     TemplateBindError,
     assert_read_only_select,
@@ -114,6 +116,11 @@ class CorpusLoadError(Exception):
 # handful of scalar-converging nodes; anything beyond this is an authoring error /
 # adversarial input and is rejected LOUD (never traversed into a stack overflow).
 _MAX_COMPOSE_NODES = 64
+
+# A `consumes` upstream-output reference (`$3.company_avg`) and a `count($N)`
+# occurrence in a `when` expr — used by the Slice-C load-time validations.
+_CONSUME_REF = re.compile(r"^\$(\d+)\.([A-Za-z_][A-Za-z0-9_]*)$")
+_COUNT_REF = re.compile(r"count\(\s*\$(\d+)")
 
 
 def load_seed_fixtures(
@@ -495,22 +502,45 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
     except BlueprintParseError as exc:
         raise CorpusLoadError(f"blueprint {bp.id}: malformed DAG — {exc}") from exc
 
+    # B4: a blueprint with BOTH a top-level `sql_template` AND a non-empty
+    # `composes` has no execution mode (the DAG path runs and the top template is
+    # DEAD) — a required slot living only in the dead template would be a silent
+    # dropped filter. Reject the hybrid outright (fail-loud, never ships).
+    if blueprint.sql_template and blueprint.composes:
+        raise CorpusLoadError(
+            f"blueprint {bp.id}: declares BOTH a top-level sql_template and a "
+            "composes DAG — a blueprint is EITHER single-node (sql_template) OR "
+            "multi-node (composes), never both (the top-level template would be "
+            "dead code and any slot it alone references a silent dropped filter)."
+        )
+
     slot_names = {s.name for s in blueprint.slots}
+    # Slice C: a node template placeholder may also be a `consumes` upstream-scalar
+    # binding or a `resolve_via` rule IN-list — those are NOT slots but ARE valid
+    # bind sites. Collect the rule-bind placeholder names once (blueprint-wide).
+    rule_binds: set[str] = set()
+    for raw_rule in blueprint.uses_rules:
+        parsed = parse_rule(raw_rule)
+        if parsed is not None:
+            rule_binds.add(parsed.binds)
 
-    templates: list[tuple[int | None, str]] = []
+    # (node_order | None) → the extra non-slot placeholders that node may reference.
+    templates: list[tuple[int | None, str, set[str]]] = []
     if blueprint.sql_template:
-        templates.append((None, blueprint.sql_template))
-    templates.extend(
-        (node.order, node.sql_template) for node in blueprint.composes if node.sql_template
-    )
+        templates.append((None, blueprint.sql_template, set(rule_binds)))
+    for node in blueprint.composes:
+        if node.sql_template:
+            allowed_extra = set(rule_binds) | set(node.consumes.keys())
+            templates.append((node.order, node.sql_template, allowed_extra))
 
-    for order, template in templates:
+    for order, template, allowed_extra in templates:
         where = "sql_template" if order is None else f"node {order} sql_template"
-        # (a) undeclared slot token.
-        unknown = referenced_slots(template) - slot_names
+        # (a) undeclared placeholder — must be a slot, a `consumes`, or a rule bind.
+        unknown = referenced_slots(template) - slot_names - allowed_extra
         if unknown:
             raise CorpusLoadError(
-                f"blueprint {bp.id}: {where} references undeclared slot(s) {sorted(unknown)}"
+                f"blueprint {bp.id}: {where} references undeclared slot(s) {sorted(unknown)} "
+                "(not a slot, a node 'consumes', or a resolve_via rule 'binds')"
             )
         # (b) parses under ClickHouse dialect + is a single read-only SELECT (FIX 2).
         try:
@@ -536,7 +566,7 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
     # constraint and returns company-wide numbers that still pass the grain gate),
     # the exact wrong-answer class D56 exists to block. Fail the seed load LOUD.
     all_referenced: set[str] = set()
-    for _order, template in templates:
+    for _order, template, _extra in templates:
         all_referenced |= referenced_slots(template)
     unreferenced_required = {
         s.name for s in blueprint.slots if s.required and s.name not in all_referenced
@@ -562,6 +592,64 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
                 "an advertised column (add it to uses or fix binds_to)."
             )
 
+    # (g) S6a: a `resolve_via` rule's probed column MUST be within the declared
+    # `uses` (scope-honesty for rules, matching the template footprint check) —
+    # otherwise the runtime `resolve()` reads a column the blueprint never
+    # advertised (D88c footprint false for rule probes).
+    for raw_rule in blueprint.uses_rules:
+        parsed = parse_rule(raw_rule)
+        if parsed is None:
+            continue
+        rule_col_key = f"{parsed.table}.{parsed.column}"
+        if rule_col_key not in uses_set:
+            raise CorpusLoadError(
+                f"blueprint {bp.id}: resolve_via rule {parsed.rule_id!r} probes "
+                f"{rule_col_key!r} which is NOT in the declared uses — a rule's "
+                "resolve() probe must read only an advertised column."
+            )
+
+    # (h) S6b: a node's `consumes` `$P.name` MUST reference a real upstream SCALAR
+    # output — P ∈ this node's feeds_from AND name a declared `scalar` output of P.
+    # Fail LOUD at load (like feeds_from), not a generic runtime SLOT_INVALID.
+    outputs_by_order = {n.order: n.output for n in blueprint.composes}
+    for node in blueprint.composes:
+        for placeholder, ref in node.consumes.items():
+            match = _CONSUME_REF.match(str(ref))
+            if match is None:
+                raise CorpusLoadError(
+                    f"blueprint {bp.id}: node {node.order} consumes {placeholder!r} "
+                    f"from {ref!r}, which is not a '$N.name' upstream-output reference."
+                )
+            src_order, out_name = int(match.group(1)), match.group(2)
+            if src_order not in node.feeds_from:
+                raise CorpusLoadError(
+                    f"blueprint {bp.id}: node {node.order} consumes from node "
+                    f"{src_order}, which is not in its feeds_from {list(node.feeds_from)}."
+                )
+            if outputs_by_order.get(src_order, {}).get(out_name) != "scalar":
+                raise CorpusLoadError(
+                    f"blueprint {bp.id}: node {node.order} consumes {ref!r} but node "
+                    f"{src_order} has no declared SCALAR output named {out_name!r}."
+                )
+
+    # (i) S4: a TERMINAL approval-only node (an approval gate that is a topo SINK
+    # and has no query of its own) gates nothing — on approve there is no
+    # post-approval query and the pre-pause result is not carried across the pause
+    # (scalar-only, F2), so it can only ABORT. Reject at load: an approval must
+    # gate a downstream node (or run its own query).
+    fed_from: set[int] = set()
+    for node in blueprint.composes:
+        fed_from.update(node.feeds_from)
+    for node in blueprint.composes:
+        is_approval = node.node_kind == "approval" or bool(node.requires_approval)
+        is_sink = node.order not in fed_from
+        if is_approval and is_sink and not node.sql_template:
+            raise CorpusLoadError(
+                f"blueprint {bp.id}: node {node.order} is a TERMINAL approval gate "
+                "(a sink with no query) — an approval must gate a downstream node "
+                "or run its own query; a terminal approval can only abort on approve."
+            )
+
     for node in blueprint.composes:
         if node.when is not None:
             try:
@@ -570,6 +658,21 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
                 raise CorpusLoadError(
                     f"blueprint {bp.id}: node {node.order} when-clause invalid — {exc}"
                 ) from exc
+            # (j) S5: a `count($N)` threshold over a SCALAR-output node is
+            # meaningless (a scalar node's `$N` has row_count ≤ 1 by contract, and
+            # that shape drifts to a synthetic marker across a resume). Reject it so
+            # the drift can never flip a gate. `empty($N)` is fine (shape-only).
+            for counted in _COUNT_REF.findall(node.when.expr):
+                src = int(counted)
+                if any(
+                    kind == "scalar" for kind in outputs_by_order.get(src, {}).values()
+                ):
+                    raise CorpusLoadError(
+                        f"blueprint {bp.id}: node {node.order} when-clause applies "
+                        f"count($ {src}) to a SCALAR-output node — a scalar's row "
+                        "count is ≤ 1 by contract (and drifts across resume); use a "
+                        "value comparison ($N.name) or empty($N) instead."
+                    )
 
     _validate_dag_structure(bp.id, blueprint)
 

@@ -86,3 +86,34 @@
     FROM dbpcm_warehouse.employee
     WHERE Department = {department}
     GROUP BY Department
+
+# Slice-C multi-node SCALAR-passing DAG (runblueprint-design §2.4/§Q7 Slice C):
+# node 0 computes the company-wide average as a SCALAR; node 1 consumes it as a
+# typed AST literal (F1/D10 — never interpolated) to select the departments above
+# it. No table intermediate (F2-clean); the declared result grain is Department.
+- id: bp-departments-above-company-average-salary
+  intent: Departments whose average salary exceeds the company-wide average
+  slots_summary: ""
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.employee.EmployeeCode
+    - dbpcm_warehouse.employee.Department
+    - dbpcm_warehouse.employee.AnnualSalary
+  result_grain: [ Department ]
+  composes:
+    - order: 0
+      output: { company_avg: scalar }
+      sql_template: |
+        SELECT AVG(AnnualSalary) AS company_avg
+        FROM dbpcm_warehouse.employee
+    - order: 1
+      feeds_from: [ 0 ]
+      consumes: { company_avg: "$0.company_avg" }
+      output: {}
+      sql_template: |
+        SELECT Department AS department, AVG(AnnualSalary) AS dept_avg
+        FROM dbpcm_warehouse.employee
+        GROUP BY Department
+        HAVING AVG(AnnualSalary) > {company_avg}

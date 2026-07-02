@@ -389,15 +389,18 @@ async def test_out_of_scope_blueprint_is_byte_identical_not_found() -> None:
 
 
 # ---------------------------------------------------------------------------
-# UNSUPPORTED multi-node → raw-loop fallback
+# UNSUPPORTED: a TABLE intermediate still needs scratch (F2) → raw-loop fallback.
+# (Slice C flips the old "any multi-node is UNSUPPORTED" pin — SCALAR-passing DAGs
+#  now execute; only TABLE-passing DAGs remain UNSUPPORTED, §2.4.)
 # ---------------------------------------------------------------------------
 
 
-async def test_multi_node_dag_is_unsupported() -> None:
+async def test_multi_node_table_intermediate_is_unsupported() -> None:
     detail = _detail(
         sql_template=None,
         composes=[
-            {"order": 0, "output": {"company_avg": "scalar"}, "sql_template": "SELECT AVG(AnnualSalary) FROM dbpcm_warehouse.employee"},
+            # node 0 declares a TABLE output that node 1 consumes → needs scratch.
+            {"order": 0, "output": {"dept_rows": "table"}, "sql_template": "SELECT AVG(AnnualSalary) FROM dbpcm_warehouse.employee"},
             {"order": 1, "feeds_from": [0], "sql_template": "SELECT 1"},
         ],
     )
@@ -406,7 +409,7 @@ async def test_multi_node_dag_is_unsupported() -> None:
     outcome = await executor.execute(blueprint_id=detail.id, slot_bindings={}, credentials=_creds())
     assert isinstance(outcome, ExecFailed)
     assert outcome.error_code == UNSUPPORTED_CODE
-    assert mcp.calls == []
+    assert mcp.calls == []  # rejected before any node dispatch
 
 
 # ---------------------------------------------------------------------------

@@ -159,6 +159,8 @@ class RunBlueprintTool:
                     pending_question=outcome.pending_question,
                     blueprint_id=outcome.blueprint_id,
                     slot_bindings_json=outcome.slot_bindings_json,
+                    completed_nodes_json=outcome.completed_nodes_json,
+                    awaiting_node=outcome.awaiting_node,
                 ),
             )
         if isinstance(outcome, ExecFailed):

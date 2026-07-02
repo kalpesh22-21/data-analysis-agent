@@ -334,6 +334,7 @@ class AgentLoop:
         clock: Callable[[], float] = time.monotonic,
         observer: ToolObserver = _default_observer,
         runtime_tools: Mapping[str, RuntimeTool] | None = None,
+        blueprint_executor: Any = None,
     ) -> None:
         self._model_client = model_client
         self._tool_dispatcher = tool_dispatcher
@@ -346,6 +347,11 @@ class AgentLoop:
         # Empty by default so Layer-1 loop tests that exercise only MCP tools
         # need not wire any. `askUser` is NOT here — it is terminal (see below).
         self._runtime_tools: Mapping[str, RuntimeTool] = runtime_tools or {}
+        # The `BlueprintExecutor` (Slice C, §2.5) — reached ONLY on a mid-DAG
+        # resume (`AgentLoop.resume` re-enters it at `awaiting_node`). `None` when
+        # runBlueprint is not wired; a blueprint mid-DAG checkpoint can then never
+        # exist, so the re-entry branch is inert.
+        self._blueprint_executor = blueprint_executor
         self._max_loop_iterations = max_loop_iterations
         self._max_wall_clock_seconds = max_wall_clock_seconds
         self._max_budget_windows = max_budget_windows
@@ -390,6 +396,27 @@ class AgentLoop:
 
         prior_window_count = checkpoint.budget_window_count if checkpoint else 1
         pause_reason = checkpoint.reason if checkpoint else "askUser"
+
+        # Blueprint mid-DAG resume (D45, §2.5): a checkpoint carrying a
+        # `blueprint_id` + an `awaiting_node` re-ENTERS the executor at that node
+        # with the completed SCALAR outputs rehydrated — completed nodes never
+        # re-run (the CAS-consume above is the exactly-once guarantee). A slot
+        # `askUser` pause (`awaiting_node is None`) is NOT this path — it re-runs
+        # via the model loop below, the Slice-B contract.
+        if (
+            checkpoint is not None
+            and checkpoint.blueprint_id is not None
+            and checkpoint.awaiting_node is not None
+            and self._blueprint_executor is not None
+        ):
+            return await self._resume_blueprint(
+                session_id=session_id,
+                credentials=credentials,
+                checkpoint=checkpoint,
+                answer=answer,
+                turn_index=turn_index,
+                window_count=prior_window_count,
+            )
 
         if pause_reason == "budget_cap":
             normalized = answer.strip().lower()
@@ -565,6 +592,165 @@ class AgentLoop:
             pending_question=checkpoint.pending_question,
             tool_calls_made=tool_calls_made,
         )
+
+    async def _resume_blueprint(
+        self,
+        *,
+        session_id: str,
+        credentials: RuntimeCredentials,
+        checkpoint: PauseCheckpoint,
+        answer: str,
+        turn_index: int,
+        window_count: int,
+    ) -> TurnOutcome:
+        """Re-enter the paused blueprint at `awaiting_node` (D45, §2.5). The
+        executor is stateless — everything to continue is in the checkpoint, so a
+        FRESH process resumes identically (restart-durable). The outcome maps the
+        same way `runBlueprint`'s first call does:
+
+          - `Paused` (another approval / degrade) → write a new checkpoint (with
+            the grown completed-nodes state) and return `paused_ask_user`;
+          - `Completed`/`Failed` → persist a `runBlueprint` trail entry (so replay
+            carries the result + provenance) and CONTINUE the model loop — the
+            model's next round-trip narrates / does the D56 LLM review (§4.4).
+
+        n2: the executor re-fires the (deterministic) slot/rule resolves on resume
+        for settled bindings — the design accepts this deterministic re-fill (the
+        probes are read-only + idempotent; §2.5 / Q8).
+        """
+        try:
+            slot_bindings = json.loads(checkpoint.slot_bindings_json or "{}")
+            if not isinstance(slot_bindings, dict):
+                slot_bindings = {}
+        except (TypeError, ValueError):
+            slot_bindings = {}
+
+        # n1: telemetry symmetry with a first-call runBlueprint (which emits a TOOL
+        # span). The resume path bypasses the tool, so emit the same dispatch
+        # progress events here around the executor re-entry.
+        # S3 (B4 parity): the CAS-consume already happened, so a RAISING executor
+        # (e.g. a neo4j blip on the authoritative re-fetch) must NOT abort the turn
+        # and strand the user with a consumed checkpoint — contain it exactly like
+        # `_run_runtime_tool` and continue the loop with a canned internal error.
+        self._observer("tool_dispatch_start", {"tool_name": "runBlueprint"})
+        try:
+            outcome = await self._blueprint_executor.resume(
+                blueprint_id=checkpoint.blueprint_id,
+                slot_bindings=slot_bindings,
+                completed_nodes_json=checkpoint.completed_nodes_json,
+                awaiting_node=checkpoint.awaiting_node,
+                approval_answer=answer,
+                credentials=credentials,
+            )
+            tool_result = self._blueprint_outcome_to_tool_result(outcome)
+        except Exception:
+            _logger.exception(
+                "runBlueprint resume raised (session=%s)", credentials.session_id
+            )
+            tool_result = _runtime_tool_internal_error("runBlueprint")
+        self._observer(
+            "tool_dispatch_ok" if tool_result.status == "ok" else "tool_dispatch_error",
+            {"tool_name": "runBlueprint", "error_code": tool_result.error_code},
+        )
+
+        if tool_result.pause is not None:
+            # Another mid-DAG pause — write the fresh checkpoint (grown
+            # completed-nodes state) and pause again, exactly as the first call.
+            return await self._pause_from_runtime_tool(
+                session_id=session_id,
+                pause=tool_result.pause,
+                window_count=window_count,
+                assistant_text=None,
+                tool_calls_made=0,
+            )
+
+        # Persist the completed/failed runBlueprint result as a trail entry so the
+        # continued loop (and any replay) sees it, then let the model narrate.
+        result_full_ref: str | None = None
+        if tool_result.result_full is not None:
+            result_full_ref = await self._session_store.write_full_result(
+                session_id, str(uuid.uuid4()), tool_result.result_full
+            )
+        entry = TrailEntry(
+            turn_index=turn_index,
+            tool_call_id=str(uuid.uuid4()),
+            tool_name="runBlueprint",
+            args={"id": checkpoint.blueprint_id, "resumed": True},
+            status=tool_result.status,
+            error_code=tool_result.error_code,
+            provenance=tool_result.provenance,
+            result_preview=tool_result.result_preview,
+            result_full_ref=result_full_ref,
+            ts=_now_iso(),
+        )
+        await self._session_store.append_trail_entry(session_id, entry)
+
+        question = _first_user_question(
+            (await self._session_store.get_or_create_session(session_id)).messages,
+            turn_index,
+        )
+        turn_model_client = self._begin_model_turn()
+        return await self._run_loop(
+            session_id=session_id,
+            credentials=credentials,
+            window_count=window_count,
+            turn_index=turn_index,
+            model_client=turn_model_client,
+            question=question,
+        )
+
+    def _blueprint_outcome_to_tool_result(self, outcome: Any) -> ToolResult:
+        """Map a `BlueprintExecutor` `ExecOutcome` to a `ToolResult` — the SAME
+        mapping `RunBlueprintTool._execute` uses, reused here for the resume path
+        so a mid-DAG resume produces byte-identical results to a first call."""
+        from data_agent.runtime.blueprint.executor import (
+            ExecCompleted,
+            ExecFailed,
+            ExecPaused,
+        )
+
+        if isinstance(outcome, ExecCompleted):
+            return ToolResult(
+                status="ok",
+                tool_name="runBlueprint",
+                error_code=None,
+                retryable=None,
+                user_message=None,
+                provenance=outcome.provenance,
+                result_preview=outcome.preview,
+                result_full=outcome.result_full,
+            )
+        if isinstance(outcome, ExecPaused):
+            return ToolResult(
+                status="ok",
+                tool_name="runBlueprint",
+                error_code=None,
+                retryable=None,
+                user_message=None,
+                provenance=frozenset(),
+                result_preview=None,
+                result_full=None,
+                pause=ToolPause(
+                    reason=outcome.reason,
+                    pending_question=outcome.pending_question,
+                    blueprint_id=outcome.blueprint_id,
+                    slot_bindings_json=outcome.slot_bindings_json,
+                    completed_nodes_json=outcome.completed_nodes_json,
+                    awaiting_node=outcome.awaiting_node,
+                ),
+            )
+        if isinstance(outcome, ExecFailed):
+            return ToolResult(
+                status="error",
+                tool_name="runBlueprint",
+                error_code=outcome.error_code,
+                retryable=outcome.retryable,
+                user_message=outcome.user_message,
+                provenance=outcome.provenance,
+                result_preview=None,
+                result_full=None,
+            )
+        return _runtime_tool_internal_error("runBlueprint")
 
     async def _run_loop(
         self,

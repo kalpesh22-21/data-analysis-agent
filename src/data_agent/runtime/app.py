@@ -347,6 +347,7 @@ def create_app(
         # is active — they share the one pipeline + store singleton, and carry
         # this request's observer/tracer for progress + the nested TOOL span.
         runtime_tools: dict[str, RuntimeTool] = {"resolveValues": composite}
+        blueprint_executor: BlueprintExecutor | None = None
         if active_retrieval is not None:
             runtime_tools["searchBlueprints"] = SearchBlueprintsTool(
                 pipeline=active_retrieval,
@@ -375,13 +376,21 @@ def create_app(
             # through the SAME per-request `dispatcher` (D57/D64/D5 + provenance
             # free). Without this, the advertised schema (12 tools) would always
             # return RUN_BLUEPRINT_UNAVAILABLE (the loop's unwired-tool path).
+            # Slice C: the executor also gets the `resolveValues` composite as its
+            # D67 `resolve_via` hook (`.resolve()`, no model round-trip) so a
+            # blueprint rule that expands a concept→code-set filters through the
+            # same scope-enforced path (§3.4). The SAME executor instance is handed
+            # to the loop so `AgentLoop.resume` can re-enter a paused mid-DAG
+            # blueprint at `awaiting_node` (D45, §2.5).
+            blueprint_executor = BlueprintExecutor(
+                tool_dispatcher=dispatcher,
+                vector_index=active_retrieval.vector_index,
+                resolve_values=composite,
+                preview_row_count=settings.preview_row_count,
+                observer=observer,
+            )
             runtime_tools["runBlueprint"] = RunBlueprintTool(
-                executor=BlueprintExecutor(
-                    tool_dispatcher=dispatcher,
-                    vector_index=active_retrieval.vector_index,
-                    preview_row_count=settings.preview_row_count,
-                    observer=observer,
-                ),
+                executor=blueprint_executor,
                 observer=observer,
                 tracer=tracer,
             )
@@ -398,6 +407,7 @@ def create_app(
             max_tool_calls_per_iteration=settings.max_tool_calls_per_iteration,
             observer=observer,
             runtime_tools=runtime_tools,
+            blueprint_executor=blueprint_executor,
         )
 
     # Close the neo4j driver pool on shutdown (design §2.4, N1: lifespan not the
