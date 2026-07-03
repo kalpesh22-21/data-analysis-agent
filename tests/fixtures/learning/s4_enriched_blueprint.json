@@ -1,0 +1,222 @@
+{
+  "single": {
+    "envelope": {
+      "_id": "candidate::hash-fixture::0",
+      "candidate_id": "candidate::hash-fixture::0",
+      "type": "blueprint",
+      "status": "extracted",
+      "payload": {
+        "intent": "total earnings for a department in a given year",
+        "kind": "single",
+        "resolves": {
+          "earnings": "payroll.payroll_fact.gross_pay"
+        },
+        "source_tool_call_refs": [
+          "tc1"
+        ],
+        "accepted_signal": "no_correction",
+        "parameterization": [
+          {
+            "locator": {
+              "table": "payroll.payroll_fact",
+              "column": "department",
+              "value": "0420"
+            },
+            "role": "slot",
+            "slot": {
+              "name": "department",
+              "type": "entity",
+              "binds_to": "payroll.payroll_fact.department",
+              "required": true,
+              "optional_pattern": null,
+              "enum_values": null
+            },
+            "rule_id": null,
+            "why": null
+          },
+          {
+            "locator": {
+              "table": "payroll.payroll_fact",
+              "column": "pay_period",
+              "value": "2025"
+            },
+            "role": "slot",
+            "slot": {
+              "name": "year",
+              "type": "period",
+              "binds_to": "payroll.payroll_fact.pay_period",
+              "required": true,
+              "optional_pattern": null,
+              "enum_values": null
+            },
+            "rule_id": null,
+            "why": null
+          },
+          {
+            "locator": {
+              "table": "payroll.payroll_fact",
+              "column": "record_type",
+              "value": "EARNING"
+            },
+            "role": "inline",
+            "slot": null,
+            "rule_id": null,
+            "why": "defines the metric 'earnings'"
+          },
+          {
+            "locator": {
+              "table": "payroll.payroll_fact",
+              "column": "region",
+              "value": "NA"
+            },
+            "role": "slot",
+            "slot": {
+              "name": "region",
+              "type": "entity",
+              "binds_to": "payroll.payroll_fact.region",
+              "required": false,
+              "optional_pattern": "TRUE",
+              "enum_values": null
+            },
+            "rule_id": null,
+            "why": null
+          }
+        ],
+        "composes": [],
+        "result_signature": {
+          "shape": [
+            {
+              "column": "total_earnings",
+              "type": "Float64"
+            }
+          ],
+          "grain": {
+            "columns": [],
+            "verifiable": false
+          },
+          "invariants": [
+            "single-row scalar"
+          ]
+        },
+        "notes": "reusable department-earnings report",
+        "generalization": {
+          "sql_template": "SELECT sum(gross_pay) AS total_earnings FROM payroll.payroll_fact WHERE department = :department AND toYear(pay_period) = :year AND record_type = 'EARNING' AND region = :region",
+          "uses": [
+            "payroll.payroll_fact.department",
+            "payroll.payroll_fact.gross_pay",
+            "payroll.payroll_fact.pay_period",
+            "payroll.payroll_fact.record_type",
+            "payroll.payroll_fact.region"
+          ],
+          "uses_rules": [
+            "rule.earning_record_type"
+          ],
+          "node_templates": [],
+          "result_grain": {
+            "columns": [],
+            "verifiable": false
+          },
+          "static_validation": {
+            "explain_ok": true,
+            "binds_to_subset_uses": true,
+            "dag_ok": true,
+            "read_only_select": true,
+            "outcome": "ok",
+            "reason": null
+          },
+          "canonical_ast_norm": "SELECT sum(gross_pay) AS total_earnings FROM payroll.payroll_fact WHERE department = {department: } AND toYear(pay_period) = {year: } AND record_type = 'EARNING' AND region = {region: }"
+        }
+      },
+      "provenance": {
+        "source_session": "sess-fixture",
+        "source_trace": "trace-fixture",
+        "evidence_ref": [
+          "evidence::sess-fixture::e1"
+        ],
+        "extractor_rationale": "reusable department-earnings report"
+      },
+      "entity_scan": {
+        "result": "pass",
+        "hits": [],
+        "scanned_fields": [
+          "intent",
+          "result_signature"
+        ],
+        "scanner": "regex+ner+llm"
+      },
+      "dedup": null,
+      "drift": {
+        "status": "unchecked",
+        "last_drift_check_at": null,
+        "probes": [],
+        "failed_probe": null
+      },
+      "confidence": 0.9,
+      "proposed_action": "new",
+      "depends_on": [],
+      "content_hash": "hash-fixture",
+      "created_at": "2026-07-03T20:17:45.000870+00:00"
+    },
+    "generalization": {
+      "sql_template": "SELECT sum(gross_pay) AS total_earnings FROM payroll.payroll_fact WHERE department = :department AND toYear(pay_period) = :year AND record_type = 'EARNING' AND region = :region",
+      "uses": [
+        "payroll.payroll_fact.department",
+        "payroll.payroll_fact.gross_pay",
+        "payroll.payroll_fact.pay_period",
+        "payroll.payroll_fact.record_type",
+        "payroll.payroll_fact.region"
+      ],
+      "uses_rules": [
+        "rule.earning_record_type"
+      ],
+      "node_templates": [],
+      "result_grain": {
+        "columns": [],
+        "verifiable": false
+      },
+      "static_validation": {
+        "explain_ok": true,
+        "binds_to_subset_uses": true,
+        "dag_ok": true,
+        "read_only_select": true,
+        "outcome": "ok",
+        "reason": null
+      },
+      "canonical_ast_norm": "SELECT sum(gross_pay) AS total_earnings FROM payroll.payroll_fact WHERE department = {department: } AND toYear(pay_period) = {year: } AND record_type = 'EARNING' AND region = {region: }"
+    }
+  },
+  "composite": {
+    "generalization": {
+      "sql_template": null,
+      "uses": [
+        "payroll.payroll_fact.department",
+        "payroll.payroll_fact.gross_pay",
+        "payroll.payroll_fact.pay_period"
+      ],
+      "uses_rules": [],
+      "node_templates": [
+        {
+          "order": 0,
+          "sql_template": "SELECT sum(gross_pay) AS dept_total FROM payroll.payroll_fact WHERE department = :department AND toYear(pay_period) = :year"
+        },
+        {
+          "order": 1,
+          "sql_template": "SELECT sum(gross_pay) AS company_total FROM payroll.payroll_fact WHERE toYear(pay_period) = :year"
+        }
+      ],
+      "result_grain": {
+        "columns": [],
+        "verifiable": false
+      },
+      "static_validation": {
+        "explain_ok": true,
+        "binds_to_subset_uses": true,
+        "dag_ok": true,
+        "read_only_select": true,
+        "outcome": "ok",
+        "reason": null
+      },
+      "canonical_ast_norm": "SELECT sum(gross_pay) AS dept_total FROM payroll.payroll_fact WHERE department = {department: } AND toYear(pay_period) = {year: }\nSELECT sum(gross_pay) AS company_total FROM payroll.payroll_fact WHERE toYear(pay_period) = {year: }"
+    }
+  }
+}

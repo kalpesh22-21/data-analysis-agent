@@ -1,0 +1,356 @@
+{
+  "knowledge_pre_gate": {
+    "_id": "candidate::reason-knowledge_pre_gate::0",
+    "candidate_id": "candidate::reason-knowledge_pre_gate::0",
+    "type": "global_knowledge",
+    "status": "in_review",
+    "payload": {
+      "statement": "the fiscal year starts in April"
+    },
+    "provenance": {
+      "source_session": "sess-knowledge_pre_gate",
+      "source_trace": "trace-knowledge_pre_gate",
+      "evidence_ref": [
+        "evidence::sess-knowledge_pre_gate::e1"
+      ],
+      "extractor_rationale": "routed for knowledge_pre_gate"
+    },
+    "entity_scan": {
+      "result": "pass",
+      "hits": [],
+      "scanned_fields": [
+        "intent"
+      ],
+      "scanner": "regex+ner+llm"
+    },
+    "dedup": null,
+    "drift": {
+      "status": "unchecked",
+      "last_drift_check_at": null,
+      "probes": [],
+      "failed_probe": null
+    },
+    "confidence": 0.8,
+    "proposed_action": "new",
+    "depends_on": [],
+    "content_hash": "hash-knowledge_pre_gate",
+    "created_at": "2026-07-03T20:17:45.001643+00:00"
+  },
+  "schema_edit": {
+    "_id": "candidate::reason-schema_edit::0",
+    "candidate_id": "candidate::reason-schema_edit::0",
+    "type": "schema_edit",
+    "status": "in_review",
+    "payload": {
+      "edit_kind": "add_rule",
+      "statement": "add rule: record_type='EARNING' means gross earnings"
+    },
+    "provenance": {
+      "source_session": "sess-schema_edit",
+      "source_trace": "trace-schema_edit",
+      "evidence_ref": [
+        "evidence::sess-schema_edit::e1"
+      ],
+      "extractor_rationale": "routed for schema_edit"
+    },
+    "entity_scan": {
+      "result": "pass",
+      "hits": [],
+      "scanned_fields": [
+        "intent"
+      ],
+      "scanner": "regex+ner+llm"
+    },
+    "dedup": null,
+    "drift": {
+      "status": "unchecked",
+      "last_drift_check_at": null,
+      "probes": [],
+      "failed_probe": null
+    },
+    "confidence": 0.8,
+    "proposed_action": "new",
+    "depends_on": [],
+    "content_hash": "hash-schema_edit",
+    "created_at": "2026-07-03T20:17:45.001650+00:00"
+  },
+  "leakage_near_miss": {
+    "_id": "candidate::reason-leakage_near_miss::0",
+    "candidate_id": "candidate::reason-leakage_near_miss::0",
+    "type": "blueprint",
+    "status": "in_review",
+    "payload": {
+      "intent": "reason=leakage_near_miss example"
+    },
+    "provenance": {
+      "source_session": "sess-leakage_near_miss",
+      "source_trace": "trace-leakage_near_miss",
+      "evidence_ref": [
+        "evidence::sess-leakage_near_miss::e1"
+      ],
+      "extractor_rationale": "routed for leakage_near_miss"
+    },
+    "entity_scan": {
+      "result": "quarantine",
+      "hits": [
+        {
+          "field": "intent",
+          "kind": "employee_code",
+          "span": "E12345"
+        }
+      ],
+      "scanned_fields": [
+        "intent"
+      ],
+      "scanner": "regex+ner+llm"
+    },
+    "dedup": null,
+    "drift": {
+      "status": "unchecked",
+      "last_drift_check_at": null,
+      "probes": [],
+      "failed_probe": null
+    },
+    "confidence": 0.8,
+    "proposed_action": "new",
+    "depends_on": [],
+    "content_hash": "hash-leakage_near_miss",
+    "created_at": "2026-07-03T20:17:45.001659+00:00"
+  },
+  "blueprint_sampled": {
+    "_id": "candidate::reason-blueprint_sampled::0",
+    "candidate_id": "candidate::reason-blueprint_sampled::0",
+    "type": "blueprint",
+    "status": "in_review",
+    "payload": {
+      "intent": "reason=blueprint_sampled example"
+    },
+    "provenance": {
+      "source_session": "sess-blueprint_sampled",
+      "source_trace": "trace-blueprint_sampled",
+      "evidence_ref": [
+        "evidence::sess-blueprint_sampled::e1"
+      ],
+      "extractor_rationale": "routed for blueprint_sampled"
+    },
+    "entity_scan": {
+      "result": "pass",
+      "hits": [],
+      "scanned_fields": [
+        "intent"
+      ],
+      "scanner": "regex+ner+llm"
+    },
+    "dedup": null,
+    "drift": {
+      "status": "unchecked",
+      "last_drift_check_at": null,
+      "probes": [],
+      "failed_probe": null
+    },
+    "confidence": 0.8,
+    "proposed_action": "new",
+    "depends_on": [],
+    "content_hash": "hash-blueprint_sampled",
+    "created_at": "2026-07-03T20:17:45.001663+00:00"
+  },
+  "dedup_conflict": {
+    "_id": "candidate::reason-dedup_conflict::0",
+    "candidate_id": "candidate::reason-dedup_conflict::0",
+    "type": "blueprint",
+    "status": "in_review",
+    "payload": {
+      "intent": "reason=dedup_conflict example"
+    },
+    "provenance": {
+      "source_session": "sess-dedup_conflict",
+      "source_trace": "trace-dedup_conflict",
+      "evidence_ref": [
+        "evidence::sess-dedup_conflict::e1"
+      ],
+      "extractor_rationale": "routed for dedup_conflict"
+    },
+    "entity_scan": {
+      "result": "pass",
+      "hits": [],
+      "scanned_fields": [
+        "intent"
+      ],
+      "scanner": "regex+ner+llm"
+    },
+    "dedup": {
+      "canonical_key": "sha256:conflict-key",
+      "matched_id": "blueprint::dept-earnings-year",
+      "similarity": 0.88,
+      "action": "conflict",
+      "layer": "soft"
+    },
+    "drift": {
+      "status": "unchecked",
+      "last_drift_check_at": null,
+      "probes": [],
+      "failed_probe": null
+    },
+    "confidence": 0.8,
+    "proposed_action": "new",
+    "depends_on": [],
+    "content_hash": "hash-dedup_conflict",
+    "created_at": "2026-07-03T20:17:45.001668+00:00"
+  },
+  "fail_to_review": {
+    "_id": "candidate::reason-fail_to_review::0",
+    "candidate_id": "candidate::reason-fail_to_review::0",
+    "type": "blueprint",
+    "status": "in_review",
+    "payload": {
+      "intent": "total earnings for a department in a given year",
+      "kind": "single",
+      "resolves": {
+        "earnings": "payroll.payroll_fact.gross_pay"
+      },
+      "source_tool_call_refs": [
+        "tc1"
+      ],
+      "accepted_signal": "no_correction",
+      "parameterization": [
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "department",
+            "value": "0420"
+          },
+          "role": "slot",
+          "slot": {
+            "name": "department",
+            "type": "entity",
+            "binds_to": "payroll.payroll_fact.department",
+            "required": true,
+            "optional_pattern": null,
+            "enum_values": null
+          },
+          "rule_id": null,
+          "why": null
+        },
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "pay_period",
+            "value": "2025"
+          },
+          "role": "slot",
+          "slot": {
+            "name": "year",
+            "type": "period",
+            "binds_to": "payroll.payroll_fact.pay_period",
+            "required": true,
+            "optional_pattern": null,
+            "enum_values": null
+          },
+          "rule_id": null,
+          "why": null
+        },
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "record_type",
+            "value": "EARNING"
+          },
+          "role": "inline",
+          "slot": null,
+          "rule_id": null,
+          "why": "defines the metric 'earnings'"
+        },
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "region",
+            "value": "NA"
+          },
+          "role": "slot",
+          "slot": {
+            "name": "region",
+            "type": "entity",
+            "binds_to": "payroll.payroll_fact.region",
+            "required": false,
+            "optional_pattern": "TRUE",
+            "enum_values": null
+          },
+          "rule_id": null,
+          "why": null
+        }
+      ],
+      "composes": [],
+      "result_signature": {
+        "shape": [
+          {
+            "column": "total_earnings",
+            "type": "Float64"
+          }
+        ],
+        "grain": {
+          "columns": [],
+          "verifiable": false
+        },
+        "invariants": [
+          "single-row scalar"
+        ]
+      },
+      "notes": "reusable department-earnings report",
+      "generalization": {
+        "sql_template": "SELECT sum(gross_pay) AS total_earnings FROM payroll.payroll_fact WHERE department = :department AND toYear(pay_period) = :year AND record_type = 'EARNING' AND region = :region",
+        "uses": [
+          "payroll.payroll_fact.department",
+          "payroll.payroll_fact.gross_pay",
+          "payroll.payroll_fact.pay_period",
+          "payroll.payroll_fact.record_type",
+          "payroll.payroll_fact.region"
+        ],
+        "uses_rules": [
+          "rule.earning_record_type"
+        ],
+        "node_templates": [],
+        "result_grain": {
+          "columns": [],
+          "verifiable": false
+        },
+        "static_validation": {
+          "explain_ok": true,
+          "binds_to_subset_uses": true,
+          "dag_ok": true,
+          "read_only_select": false,
+          "outcome": "fail_to_review",
+          "reason": "not_read_only_select"
+        },
+        "canonical_ast_norm": "SELECT sum(gross_pay) AS total_earnings FROM payroll.payroll_fact WHERE department = {department: } AND toYear(pay_period) = {year: } AND record_type = 'EARNING' AND region = {region: }"
+      }
+    },
+    "provenance": {
+      "source_session": "sess-fail_to_review",
+      "source_trace": "trace-fail_to_review",
+      "evidence_ref": [
+        "evidence::sess-fail_to_review::e1"
+      ],
+      "extractor_rationale": "routed for fail_to_review"
+    },
+    "entity_scan": {
+      "result": "pass",
+      "hits": [],
+      "scanned_fields": [
+        "intent"
+      ],
+      "scanner": "regex+ner+llm"
+    },
+    "dedup": null,
+    "drift": {
+      "status": "unchecked",
+      "last_drift_check_at": null,
+      "probes": [],
+      "failed_probe": null
+    },
+    "confidence": 0.8,
+    "proposed_action": "new",
+    "depends_on": [],
+    "content_hash": "hash-fail_to_review",
+    "created_at": "2026-07-03T20:17:45.001672+00:00"
+  }
+}

@@ -755,6 +755,43 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   [D29](#memory--learning), [D48](#blueprint-dedup--resolvers), [D58](#memory--learning),
   [D31](#memory--learning), [D34](#blueprint-extraction-payload).
 
+- **D102 (locked, 2026-07-03, Session 19 — Track B Wave-0 contract freeze; concretizes D28/D48/D101,
+  does not re-decide them).** **The learning-loop write-router stages S4–S9 build in PARALLEL against a
+  frozen inter-stage wire format: (a) the candidate envelope evolves by ADDITIVE typed verdict fields
+  ONLY, (b) the write-router stages plug into ONE injected `CandidateStage` pipeline seam on the
+  consumer, and (c) the S4-enriched blueprint payload (`BlueprintGeneralization`) is frozen and maps
+  1:1 onto `runtime/blueprint/models.py::Blueprint`.** The risk this closes: S4/S6/S9 all depend on the
+  sub-shape of the enriched blueprint payload (S4 writes it, S6 hashes it, S9 replays it); if that shape
+  drifts after parallel builds start, three slices need rework. So we freeze it now as Python-dataclass
+  field specs + fixtures. **(a) Additive envelope (the additivity rule).** `CandidateEnvelope` keeps its
+  frozen S3 spine (`candidate_id`/`type`/`status`/provenance/`content_hash`) and grows three typed
+  verdict fields — `entity_scan` (typed as `LeakageVerdict`, S5 WRITES; S3's preliminary
+  `{result:"pending"}` self-check dict is still representable so S3 constructs an unchanged envelope),
+  `dedup` (`DedupVerdict | None`, S6 WRITES, `None` pre-S6), `drift` (`DriftStamp`, S9 WRITES,
+  `unchecked` pre-S9) — plus typed `payload["generalization"]` (`BlueprintGeneralization`, S4 WRITES).
+  Every field DEFAULTS so a pre-stage envelope is a valid `to_doc`/`from_doc` doc (an old doc without the
+  new keys still parses). **No stage rewrites another stage's field**, and `status` is owned by EXACTLY
+  two writers — the consumer pipeline (`extracted → candidate/in_review/rejected`) and the separate S9
+  scheduler (`candidate ↔ validated/retired`, D29) — which is what makes the stages commutative enough to
+  build in parallel (each owns one field + a `status` sub-range). **(b) The `CandidateStage` seam.** A
+  single injected, ordered `tuple[CandidateStage, ...]` on the consumer (`generalize → leakage → dedup →
+  writer`); each stage lives in its OWN module and is registered ONE line at the composition root
+  (`scripts/run_learning_consumer.py`), so no two builders co-edit `consumer.py`. **The tuple defaults
+  EMPTY ⇒ current S3 behavior is behaviorally identical** (no extra puts; additive keys only — the
+  stub-fallback posture, mirroring the S3 extractor DI). The S9 promotion scheduler is NOT a stage — it is the separate cron-scanned process (D29) that
+  shares the envelope contract but not the seam. **(c) Contract A ↔ runtime `Blueprint`.** A validated
+  candidate promotes into exactly the `Blueprint` shape with no field invented at promotion time (the §1
+  mapping table). **The six OQs (hit_count home + threshold; `canonical_ast_norm` normalization recipe;
+  user_knowledge auto-commit as a `drop` stage; retraction deferred to S10; blueprint-sampled inbox rate;
+  `depends_on` gating in S9) are resolved and frozen** in the design §11. Wave-0 base ships: the additive
+  envelope fields + `to_doc`/`from_doc` round-trip, the `CandidateStage` seam, seven frozen
+  `fixtures/*.json` (§8's 7 files across 6 slices), and these decision rows — NO stage logic. See
+  [learning-loop-contracts-design.md](learning-loop-contracts-design.md). Cross-references:
+  [D28](#memory--learning), [D48](#blueprint-dedup--resolvers), [D101](#memory--learning),
+  [D29](#memory--learning), [D43](#blueprints), [D52](#blueprint-dedup--resolvers),
+  [D56](#blueprint-silent-path-safety), [D58](#memory--learning), [D87](#blueprints),
+  [D97](#memory--learning), [D98](#memory--learning).
+
 ## Observability
 - **D23.** **Arize Phoenix + OpenTelemetry** (OpenInference conventions) for tracing across the
   request path and the offline learning loop. Span kinds map ~1:1 to components (AGENT/LLM/TOOL/

@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "HR data-analysis agent — Phase 0 walking skeleton"
 requires-python = ">=3.12"
 dependencies = [
-    "sqlglot>=30.12.0,<31",
+    # Pinned to the 30.12.x line (D102/D48): the blueprint dedup `canonical_key` is
+    # a hash of sqlglot's normalized AST render; a minor bump can change that render,
+    # silently mint a different key, and degrade a dedup `increment` into a spurious
+    # `insert` (a duplicate blueprint). Bump this deliberately + re-freeze the S4
+    # `canonical_ast_norm` fixture together, never incidentally.
+    "sqlglot~=30.12.0",
     "pyyaml>=6.0",
     "openai>=1.0",
     "mcp>=1.0",

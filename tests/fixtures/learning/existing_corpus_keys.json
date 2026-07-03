@@ -1,0 +1,20 @@
+{
+  "artifacts": [
+    {
+      "id": "blueprint::dept-earnings-year",
+      "canonical_key": "sha256:existing-dept-earnings-year-0001",
+      "intent": "total earnings for a department in a given year",
+      "hit_count": 2,
+      "uses_rules": [
+        "rule.earning_record_type"
+      ]
+    },
+    {
+      "id": "blueprint::headcount-by-dept",
+      "canonical_key": "sha256:existing-headcount-by-dept-0002",
+      "intent": "headcount for a department as of a date",
+      "hit_count": 5,
+      "uses_rules": []
+    }
+  ]
+}

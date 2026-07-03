@@ -1,0 +1,36 @@
+{
+  "_id": "candidate::hash-userk::0",
+  "candidate_id": "candidate::hash-userk::0",
+  "type": "user_knowledge",
+  "status": "extracted",
+  "payload": {
+    "statement": "I usually mean the NA region when I say 'my team'",
+    "scope": "user",
+    "user_id": "user-1"
+  },
+  "provenance": {
+    "source_session": "sess-userk",
+    "source_trace": "trace-userk",
+    "evidence_ref": [
+      "evidence::sess-userk::e1"
+    ],
+    "extractor_rationale": "a durable per-user preference"
+  },
+  "entity_scan": {
+    "result": "pending",
+    "hits": [],
+    "self_check_contains_entities": false
+  },
+  "dedup": null,
+  "drift": {
+    "status": "unchecked",
+    "last_drift_check_at": null,
+    "probes": [],
+    "failed_probe": null
+  },
+  "confidence": 0.85,
+  "proposed_action": "new",
+  "depends_on": [],
+  "content_hash": "hash-userk",
+  "created_at": "2026-07-03T20:17:45.001943+00:00"
+}

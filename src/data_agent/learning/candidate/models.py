@@ -17,6 +17,7 @@ from typing import Any
 
 from ..extractor.models import ExtractedCandidate
 from ..summary.models import SessionSummary
+from .verdicts import DedupVerdict, DriftStamp
 
 
 class CandidateStatus:
@@ -53,12 +54,17 @@ class CandidateEnvelope:
     source_trace: str
     evidence_refs: tuple[str, ...]  # KV keys into learning_audit — never the quotes
     extractor_rationale: str
-    entity_scan: dict[str, Any]  # {result, hits} — "pending" pre-leakage-gate (S5 authoritative)
+    entity_scan: dict[str, Any]  # LeakageVerdict shape — "pending" pre-leakage-gate (S5 authoritative)
     confidence: float
     proposed_action: str
     depends_on: tuple[str, ...]
     content_hash: str  # idempotency key (the session content hash)
     created_at: str = field(default_factory=_now)
+    # --- additive Wave-0 verdict fields (D102). Each is stamped by exactly one
+    # downstream stage and defaults so a pre-stage envelope is a VALID doc. S3
+    # never populates these; the S3 spine above is untouched. ---
+    dedup: DedupVerdict | None = None  # S6 WRITES (Contract C); None pre-S6
+    drift: DriftStamp = field(default_factory=DriftStamp)  # S9 WRITES (Contract E); unchecked pre-S9
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -74,6 +80,8 @@ class CandidateEnvelope:
                 "extractor_rationale": self.extractor_rationale,
             },
             "entity_scan": self.entity_scan,
+            "dedup": self.dedup.to_doc() if self.dedup is not None else None,
+            "drift": self.drift.to_doc(),
             "confidence": self.confidence,
             "proposed_action": self.proposed_action,
             "depends_on": list(self.depends_on),
@@ -94,6 +102,12 @@ class CandidateEnvelope:
             evidence_refs=tuple(prov.get("evidence_ref", []) or []),
             extractor_rationale=prov.get("extractor_rationale", ""),
             entity_scan=dict(doc.get("entity_scan", {})),
+            dedup=(
+                DedupVerdict.from_doc(doc["dedup"])
+                if doc.get("dedup") is not None
+                else None
+            ),
+            drift=DriftStamp.from_doc(doc.get("drift", {}) or {}),
             confidence=float(doc.get("confidence", 0.0)),
             proposed_action=doc.get("proposed_action", "new"),
             depends_on=tuple(doc.get("depends_on", []) or []),

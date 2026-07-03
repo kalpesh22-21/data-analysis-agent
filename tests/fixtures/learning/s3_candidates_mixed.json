@@ -1,0 +1,256 @@
+{
+  "clean": {
+    "_id": "candidate::hash-clean::0",
+    "candidate_id": "candidate::hash-clean::0",
+    "type": "blueprint",
+    "status": "extracted",
+    "payload": {
+      "intent": "total earnings for a department in a given year",
+      "kind": "single",
+      "resolves": {
+        "earnings": "payroll.payroll_fact.gross_pay"
+      },
+      "source_tool_call_refs": [
+        "tc1"
+      ],
+      "accepted_signal": "no_correction",
+      "parameterization": [
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "department",
+            "value": "0420"
+          },
+          "role": "slot",
+          "slot": {
+            "name": "department",
+            "type": "entity",
+            "binds_to": "payroll.payroll_fact.department",
+            "required": true,
+            "optional_pattern": null,
+            "enum_values": null
+          },
+          "rule_id": null,
+          "why": null
+        },
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "pay_period",
+            "value": "2025"
+          },
+          "role": "slot",
+          "slot": {
+            "name": "year",
+            "type": "period",
+            "binds_to": "payroll.payroll_fact.pay_period",
+            "required": true,
+            "optional_pattern": null,
+            "enum_values": null
+          },
+          "rule_id": null,
+          "why": null
+        },
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "record_type",
+            "value": "EARNING"
+          },
+          "role": "inline",
+          "slot": null,
+          "rule_id": null,
+          "why": "defines the metric 'earnings'"
+        },
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "region",
+            "value": "NA"
+          },
+          "role": "slot",
+          "slot": {
+            "name": "region",
+            "type": "entity",
+            "binds_to": "payroll.payroll_fact.region",
+            "required": false,
+            "optional_pattern": "TRUE",
+            "enum_values": null
+          },
+          "rule_id": null,
+          "why": null
+        }
+      ],
+      "composes": [],
+      "result_signature": {
+        "shape": [
+          {
+            "column": "total_earnings",
+            "type": "Float64"
+          }
+        ],
+        "grain": {
+          "columns": [],
+          "verifiable": false
+        },
+        "invariants": [
+          "single-row scalar"
+        ]
+      },
+      "notes": "reusable department-earnings report"
+    },
+    "provenance": {
+      "source_session": "sess-fixture",
+      "source_trace": "trace-fixture",
+      "evidence_ref": [
+        "evidence::sess-fixture::e1"
+      ],
+      "extractor_rationale": "reusable department-earnings report"
+    },
+    "entity_scan": {
+      "result": "pending",
+      "hits": [],
+      "self_check_contains_entities": false
+    },
+    "dedup": null,
+    "drift": {
+      "status": "unchecked",
+      "last_drift_check_at": null,
+      "probes": [],
+      "failed_probe": null
+    },
+    "confidence": 0.9,
+    "proposed_action": "new",
+    "depends_on": [],
+    "content_hash": "hash-fixture",
+    "created_at": "2026-07-03T20:17:44.996817+00:00"
+  },
+  "leaking": {
+    "_id": "candidate::hash-leak::0",
+    "candidate_id": "candidate::hash-leak::0",
+    "type": "blueprint",
+    "status": "extracted",
+    "payload": {
+      "intent": "total earnings for employee E12345 in 2025",
+      "kind": "single",
+      "resolves": {
+        "earnings": "payroll.payroll_fact.gross_pay"
+      },
+      "source_tool_call_refs": [
+        "tc1"
+      ],
+      "accepted_signal": "no_correction",
+      "parameterization": [
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "department",
+            "value": "0420"
+          },
+          "role": "slot",
+          "slot": {
+            "name": "department",
+            "type": "entity",
+            "binds_to": "payroll.payroll_fact.department",
+            "required": true,
+            "optional_pattern": null,
+            "enum_values": null
+          },
+          "rule_id": null,
+          "why": null
+        },
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "pay_period",
+            "value": "2025"
+          },
+          "role": "slot",
+          "slot": {
+            "name": "year",
+            "type": "period",
+            "binds_to": "payroll.payroll_fact.pay_period",
+            "required": true,
+            "optional_pattern": null,
+            "enum_values": null
+          },
+          "rule_id": null,
+          "why": null
+        },
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "record_type",
+            "value": "EARNING"
+          },
+          "role": "inline",
+          "slot": null,
+          "rule_id": null,
+          "why": "defines the metric 'earnings'"
+        },
+        {
+          "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "region",
+            "value": "NA"
+          },
+          "role": "slot",
+          "slot": {
+            "name": "region",
+            "type": "entity",
+            "binds_to": "payroll.payroll_fact.region",
+            "required": false,
+            "optional_pattern": "TRUE",
+            "enum_values": null
+          },
+          "rule_id": null,
+          "why": null
+        }
+      ],
+      "composes": [],
+      "result_signature": {
+        "shape": [
+          {
+            "column": "total_earnings",
+            "type": "Float64"
+          }
+        ],
+        "grain": {
+          "columns": [],
+          "verifiable": false
+        },
+        "invariants": [
+          "single-row scalar"
+        ]
+      },
+      "notes": "reusable department-earnings report"
+    },
+    "provenance": {
+      "source_session": "sess-fixture",
+      "source_trace": "trace-fixture",
+      "evidence_ref": [
+        "evidence::sess-fixture::e1"
+      ],
+      "extractor_rationale": "reusable department-earnings report"
+    },
+    "entity_scan": {
+      "result": "pending",
+      "hits": [
+        "E12345"
+      ],
+      "self_check_contains_entities": true
+    },
+    "dedup": null,
+    "drift": {
+      "status": "unchecked",
+      "last_drift_check_at": null,
+      "probes": [],
+      "failed_probe": null
+    },
+    "confidence": 0.9,
+    "proposed_action": "new",
+    "depends_on": [],
+    "content_hash": "hash-fixture",
+    "created_at": "2026-07-03T20:17:44.996967+00:00"
+  }
+}

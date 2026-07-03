@@ -1,0 +1,37 @@
+{
+  "_id": "candidate::hash-schemaedit::0",
+  "candidate_id": "candidate::hash-schemaedit::0",
+  "type": "schema_edit",
+  "status": "extracted",
+  "payload": {
+    "edit_kind": "add_rule",
+    "target_catalog": "payroll",
+    "statement": "add rule earning_record_type: record_type='EARNING' denotes gross earnings",
+    "proposed_yaml": "rules:\n  - id: earning_record_type\n    table: payroll.payroll_fact\n    predicate: \"record_type = 'EARNING'\"\n    meaning: gross earnings\n"
+  },
+  "provenance": {
+    "source_session": "sess-schemaedit",
+    "source_trace": "trace-schemaedit",
+    "evidence_ref": [
+      "evidence::sess-schemaedit::e1"
+    ],
+    "extractor_rationale": "a missing catalog rule the blueprint depends on (D35)"
+  },
+  "entity_scan": {
+    "result": "pending",
+    "hits": [],
+    "self_check_contains_entities": false
+  },
+  "dedup": null,
+  "drift": {
+    "status": "unchecked",
+    "last_drift_check_at": null,
+    "probes": [],
+    "failed_probe": null
+  },
+  "confidence": 0.8,
+  "proposed_action": "new",
+  "depends_on": [],
+  "content_hash": "hash-schemaedit",
+  "created_at": "2026-07-03T20:17:45.002051+00:00"
+}

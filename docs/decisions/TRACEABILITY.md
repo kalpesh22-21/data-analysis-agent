@@ -328,3 +328,30 @@ no tagged tests yet.
 | **D95 / D51 / D17** | First real evidence writes: each candidate's cited quotes are snapshotted to `learning_audit`; the persisted candidate carries only `evidence_ref`(s), never the entity-bearing quote | Unit + Component | `S3-evidence-snapshot-ref-only` | — | ⛔ not-built |
 | **D101** | Candidates persisted to the dedicated `learning_candidates` store at `status=extracted`, queryable by `status`; its RBAC user is scoped to that bucket only | Unit + Component | `S3-candidate-store-provisioned` | — | ⛔ not-built |
 | **D96 / D101** | S3 consumer integration: KEEP → extract → snapshot evidence → persist candidate(s) → `learning.extract(candidate_count)` → `done`; decline → traced reason; all Slice-1/2 invariants (kill-switch, CAS, idempotency, dead-letter, D72 read-only) preserved | Unit + Component | `S3-consumer-extract-integration` | — | ⛔ not-built |
+
+## Additional tagged invariants from D102 (Track-B learning-loop Wave-0 contract freeze — additive envelope + `CandidateStage` seam, Session 19)
+
+The frozen inter-stage wire format that lets S4–S9 build in parallel (see
+[learning-loop-contracts-design.md](learning-loop-contracts-design.md) §9). **Two rows are made green by
+the Wave-0 base slice** — the additive-envelope round-trip and the empty-stage-tuple no-op safety — since
+that slice ships the envelope fields + the seam + fixtures with real Layer-1 tests. **The S4–S9 rows are
+`⛔ not-built`**: they are the contracts the parallel tracks build against (fixtures under
+`tests/fixtures/learning/`), with no stage logic in this base. Statuses move `⛔ → 🟡 unit-green` as each
+track's Layer-1 slice lands and `→ ✅ green` at the Layer-2/3 legs.
+
+| Decision | Invariant | Test layer | Test slug | Conformance scenario | Status |
+|---|---|---|---|---|---|
+| **D102** | Envelope additivity: every stage's output is a valid `to_doc`/`from_doc` round-trip with the other stages' fields absent/at-default; `entity_scan` (typed `LeakageVerdict`), `dedup`, `drift`, and `payload["generalization"]` each round-trip; a pre-Wave-0 doc without the new keys still parses | Unit | `contracts-envelope-additive` | — | 🟡 unit-green |
+| **D102** | The `CandidateStage` seam: an EMPTY `stages=()` tuple leaves S3 behavior behaviorally identical — no extra `put`, additive keys only (stub fallback); a wired fake stage that fills one field is honored and its `continue`/`route_inbox`/`drop`/`halt` control is respected (an unknown control raises) | Unit | `contracts-stage-seam-noop-safe` | — | 🟡 unit-green |
+| **D69 / D87** | S4 `uses` is byte-exact `database.table.column` scope keys and `binds_to ⊆ uses` | Unit | `S4-uses-scope-key-subset` | — | ⛔ not-built |
+| **D52 / D97** | S4 un-rewritable SQL ⇒ `static_validation.outcome=="fail_to_review"`, never auto-promote | Unit | `S4-unrewritable-fails-to-review` | — | ⛔ not-built |
+| **D89 / D102** | S4 enriched payload maps onto `Blueprint.parse` with no missing field (round-trip) | Unit | `S4-payload-maps-to-runtime-blueprint` | — | ⛔ not-built |
+| **D58 / D17** | S5 entity in `intent`/`result_signature` ⇒ `entity_scan.result ∈ {reroute,quarantine,reject}`, never `pass` | Unit | `S5-leakage-blocks-entity` | **Correction → learning** | ⛔ not-built |
+| **D17 / D58** | S5 `reroute` spawns a linked `user_knowledge` candidate + rejects the global one | Unit | `S5-reroute-to-user-knowledge` | — | ⛔ not-built |
+| **D48** | S6 identical semantics ⇒ identical `canonical_key` ⇒ `action==increment` (one create + one bump) | Unit | `S6-canonical-key-dedup` | — | ⛔ not-built |
+| **D48 / D52** | S6 unparseable template ⇒ hard key skipped, falls to soft layer, never a wrong merge | Unit | `S6-failsoft-no-wrong-merge` | — | ⛔ not-built |
+| **D58a / D18** | S7 ALL `global_knowledge` + `schema_edit` route to inbox (`in_review`), never auto-retrievable | Unit + Component | `S7-knowledge-schema-human-pregate` | **Knowledge human-gate** | ⛔ not-built |
+| **D29** | S7 reject archives as a negative signal (`status==rejected`), not a delete | Unit | `S7-reject-is-negative-signal` | — | ⛔ not-built |
+| **D98 / D29** | S9 single-session candidate stays `candidate` (replay alone never promotes) | Unit | `S9-replay-not-a-value-oracle` | — | ⛔ not-built |
+| **D43** | S9 `silent_eligible ⇔ validated AND drift.status==clean AND fresh` | Unit | `S9-silent-eligibility-predicate` | — | ⛔ not-built |
+| **D43** | S9 suspect drift probe demotes `validated→candidate` + review flag | Unit | `S9-drift-suspect-demotes` | — | ⛔ not-built |

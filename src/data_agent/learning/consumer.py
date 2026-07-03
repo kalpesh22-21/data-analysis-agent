@@ -26,6 +26,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 
 from data_agent.runtime.session.models import SessionDoc
 from data_agent.runtime.session.store import CASMismatchError, SessionStore
@@ -33,7 +34,13 @@ from data_agent.runtime.session.store import CASMismatchError, SessionStore
 from . import state_machine
 from .audit import AuditStore, InMemoryAuditStore
 from .audit.models import EvidenceSnapshot
-from .candidate import CandidateStore, InMemoryCandidateStore, build_envelope, mint_candidate_id
+from .candidate import (
+    CandidateEnvelope,
+    CandidateStore,
+    InMemoryCandidateStore,
+    build_envelope,
+    mint_candidate_id,
+)
 from .config import LearningSettings, learning_enabled
 from .extractor import ExtractedCandidate, LearningExtractor
 from .models import LearningStatus, compute_content_hash
@@ -45,6 +52,7 @@ from .observability import (
     triage_span,
 )
 from .queue import DeliveredJob, LearningQueue
+from .stage import CandidateStage, StageContext
 from .summary import SessionSummary, load_session_summary
 from .triage import TriageVerdict
 from .triage import triage as _default_triage
@@ -80,6 +88,7 @@ class LearningConsumer:
         audit: AuditStore | None = None,
         extractor: LearningExtractor | None = None,
         candidates: CandidateStore | None = None,
+        stages: tuple[CandidateStage, ...] = (),
     ) -> None:
         self._store = store
         self._queue = queue
@@ -97,6 +106,12 @@ class LearningConsumer:
         self._candidates: CandidateStore = (
             candidates if candidates is not None else InMemoryCandidateStore()
         )
+        # Wave-0 seam (D102 §7.1): the ordered write-router pipeline
+        # (generalize → leakage → dedup → writer). Defaulted EMPTY ⇒ the S3
+        # behavior is behaviorally identical (no stage runs ⇒ no extra puts,
+        # additive keys only). Builders register their stage here at the
+        # composition root; the consumer never hard-codes one.
+        self._stages = stages
 
     async def run_once(self) -> ConsumeResult:
         # Kill-switch gate FIRST (design §7): disabled ⇒ do NOT XREADGROUP or
@@ -269,6 +284,8 @@ class LearningConsumer:
                 evidence_refs=evidence_refs,
             )
             await self._candidates.put(envelope)
+            if await self._run_stages(envelope, summary, verdict) == "halt":
+                break
         decline_reasons = tuple(d.reason for d in result.declines)
         self._emit_extract(
             summary.session_id,
@@ -276,6 +293,52 @@ class LearningConsumer:
             decline_reasons=decline_reasons,
             target_hints=verdict.target_hints,
         )
+
+    async def _run_stages(
+        self,
+        envelope: CandidateEnvelope,
+        summary: SessionSummary,
+        verdict: TriageVerdict,
+    ) -> Literal["continue", "halt"]:
+        """Run the injected write-router pipeline over one freshly-`extracted`
+        envelope (D102 §7.1). Returns `"halt"` if a stage asked to stop the whole
+        extraction pipeline, else `"continue"`.
+
+        EMPTY tuple ⇒ behaviorally identical S3 behavior (no extra `put`; the
+        candidate was already persisted at `extracted`): the loop never runs. Only
+        a WIRED stage triggers the final persist of its enriched envelope. Control
+        semantics (see `stage.StageControl`): `continue` → next stage; `route_inbox`
+        → stop + persist; `drop` → stop, do NOT persist; `halt` → stop + persist,
+        then skip the remaining candidates. An UNKNOWN control string is a
+        programming error and raises (never a silent route_inbox)."""
+        if not self._stages:
+            return "continue"
+        ctx = StageContext(summary=summary, verdict=verdict)
+        env = envelope
+        persist = True
+        control: str = "continue"
+        for stage in self._stages:
+            outcome = await stage.process(env, ctx)
+            env = outcome.envelope
+            control = outcome.control
+            if control == "continue":
+                continue
+            if control in ("route_inbox", "halt"):
+                persist = True
+            elif control == "drop":
+                # The stage committed the candidate elsewhere (or discarded it);
+                # do not persist the enriched envelope here.
+                persist = False
+            else:
+                raise ValueError(
+                    f"stage {getattr(stage, 'stage_id', stage)!r} returned an "
+                    f"unknown control {control!r} (expected one of continue, "
+                    f"route_inbox, drop, halt)"
+                )
+            break
+        if persist:
+            await self._candidates.put(env)
+        return "halt" if control == "halt" else "continue"
 
     async def _snapshot_evidence(
         self, candidate: ExtractedCandidate, summary: SessionSummary

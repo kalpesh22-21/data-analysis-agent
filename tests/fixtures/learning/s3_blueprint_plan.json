@@ -1,0 +1,191 @@
+{
+  "single": {
+    "intent": "total earnings for a department in a given year",
+    "kind": "single",
+    "resolves": {
+      "earnings": "payroll.payroll_fact.gross_pay"
+    },
+    "source_tool_call_refs": [
+      "tc1"
+    ],
+    "accepted_signal": "no_correction",
+    "parameterization": [
+      {
+        "locator": {
+          "table": "payroll.payroll_fact",
+          "column": "department",
+          "value": "0420"
+        },
+        "role": "slot",
+        "slot": {
+          "name": "department",
+          "type": "entity",
+          "binds_to": "payroll.payroll_fact.department",
+          "required": true,
+          "optional_pattern": null,
+          "enum_values": null
+        },
+        "rule_id": null,
+        "why": null
+      },
+      {
+        "locator": {
+          "table": "payroll.payroll_fact",
+          "column": "pay_period",
+          "value": "2025"
+        },
+        "role": "slot",
+        "slot": {
+          "name": "year",
+          "type": "period",
+          "binds_to": "payroll.payroll_fact.pay_period",
+          "required": true,
+          "optional_pattern": null,
+          "enum_values": null
+        },
+        "rule_id": null,
+        "why": null
+      },
+      {
+        "locator": {
+          "table": "payroll.payroll_fact",
+          "column": "record_type",
+          "value": "EARNING"
+        },
+        "role": "inline",
+        "slot": null,
+        "rule_id": null,
+        "why": "defines the metric 'earnings'"
+      },
+      {
+        "locator": {
+          "table": "payroll.payroll_fact",
+          "column": "region",
+          "value": "NA"
+        },
+        "role": "slot",
+        "slot": {
+          "name": "region",
+          "type": "entity",
+          "binds_to": "payroll.payroll_fact.region",
+          "required": false,
+          "optional_pattern": "TRUE",
+          "enum_values": null
+        },
+        "rule_id": null,
+        "why": null
+      }
+    ],
+    "composes": [],
+    "result_signature": {
+      "shape": [
+        {
+          "column": "total_earnings",
+          "type": "Float64"
+        }
+      ],
+      "grain": {
+        "columns": [],
+        "verifiable": false
+      },
+      "invariants": [
+        "single-row scalar"
+      ]
+    },
+    "notes": "reusable department-earnings report"
+  },
+  "composite": {
+    "intent": "share of a department's earnings against the company total for a year",
+    "kind": "composite",
+    "resolves": {
+      "earnings": "payroll.payroll_fact.gross_pay"
+    },
+    "source_tool_call_refs": [
+      "tc1",
+      "tc2"
+    ],
+    "accepted_signal": "explicit_confirm",
+    "parameterization": [
+      {
+        "locator": {
+          "table": "payroll.payroll_fact",
+          "column": "department",
+          "value": "0420"
+        },
+        "role": "slot",
+        "slot": {
+          "name": "department",
+          "type": "entity",
+          "binds_to": "payroll.payroll_fact.department",
+          "required": true,
+          "optional_pattern": null,
+          "enum_values": null
+        },
+        "rule_id": null,
+        "why": null
+      },
+      {
+        "locator": {
+          "table": "payroll.payroll_fact",
+          "column": "pay_period",
+          "value": "2025"
+        },
+        "role": "slot",
+        "slot": {
+          "name": "year",
+          "type": "period",
+          "binds_to": "payroll.payroll_fact.pay_period",
+          "required": true,
+          "optional_pattern": null,
+          "enum_values": null
+        },
+        "rule_id": null,
+        "why": null
+      }
+    ],
+    "composes": [
+      {
+        "order": 0,
+        "node_kind": "query",
+        "step_intent": "department earnings for the year",
+        "feeds_from": [],
+        "consumes": {},
+        "output": {
+          "dept_total": "scalar"
+        },
+        "source_tool_call_ref": "tc1",
+        "when": null,
+        "requires_approval": null
+      },
+      {
+        "order": 1,
+        "node_kind": "query",
+        "step_intent": "company earnings for the year",
+        "feeds_from": [],
+        "consumes": {},
+        "output": {
+          "company_total": "scalar"
+        },
+        "source_tool_call_ref": "tc2",
+        "when": null,
+        "requires_approval": null
+      }
+    ],
+    "result_signature": {
+      "shape": [
+        {
+          "column": "share",
+          "type": "Float64"
+        }
+      ],
+      "grain": {
+        "columns": [],
+        "verifiable": false
+      },
+      "invariants": [
+        "share \u2208 [0,1]"
+      ]
+    },
+    "notes": "two-node scalar-converging DAG"
+  }
+}
