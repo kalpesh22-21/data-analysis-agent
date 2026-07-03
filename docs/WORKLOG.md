@@ -202,6 +202,63 @@ authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's
 
 ---
 
+## 2026-07-02 — Session 15: D94 — None-provenance stranding fix (last tracked follow-up; PAUSE before the learning loop)
+
+Closed the **one remaining tracked follow-up** (task #11) surfaced by the Layer-3 reviewer, then paused
+by request ahead of Track B (the offline learning loop). No new capability — a **silent-hang / diagnosis**
+fix on the raw-loop and `runBlueprint` paths. Committed `31a6064` (data-agent only; `provenance.py`
+untouched so no cross-repo sync). **Full suite 1419 passed / 66 skipped, ruff clean; `scope_filter.py`
+byte-identical.**
+
+### The bug (fail-closed, but a silent hang with zero root-cause signal)
+
+A tool result with **`status="ok"` but `provenance=None`** — produced when the runtime's independent
+`sqlglot` re-parse fails against a **skewed `CatalogHandle`** while the MCP's own parse succeeded
+(`capture.py:86/94`), or when a `runBlueprint` union is **poisoned to `None`** by one inner `runQuery`
+(`_union_provenance`) — was persisted to the trail, then **dropped on every context rebuild** by
+`filter_trail` (an `ok` entry is never current-turn-exempt, by PII-safety design; `is_provenance_in_scope`
+drops `None`). The model never saw its own result → **re-emitted the identical call** → burned to the
+budget cap, with only the generic `loop_paused_budget_cap` / `loop_hard_ceiling_stop` event as signal.
+
+### The fix (three parts; `scope_filter.py` left byte-identical)
+
+- **Sentinel injection** (`ContextAssembler.assemble`) — for a **current-turn** `ok`+`None` entry (covers
+  both `runQuery` and `runBlueprint` via one predicate), inject a **non-data-bearing** sentinel tool
+  message in the dropped entry's ordinal slot, keyed to the dangling `tool_call_id` so the OpenAI
+  assistant/tool pairing stays valid and the loop breaks: *"result withheld: provenance could not be
+  determined … Do not retry the identical call …"*. **Two-sided data contract (decided during review):**
+  the sentinel's tool-**result** content carries zero result payload; the **paired assistant call replays
+  the model's own `args`** (its own current-turn SQL — causally prior to the withheld result, so it cannot
+  contain it; and current-turn *denied* entries already replay full args via `budget._render_entry`) so the
+  model can **correlate** the marker to the exact call. Without the args it saw `runQuery({})` and could
+  re-strand — the exact hang, in multi-call turns.
+- **Telemetry event** `loop_result_withheld_provenance` (tool_name / turn_index / tool_call_id /
+  blueprint_id / reason — **no data**), deduped per `tool_call_id` per budget window via a
+  `withheld_call_ids` memo (sibling to `retrieval_memo`). Telemetry-only (no `progress.py` change).
+- **Soft seed-time skew warning** — `load_corpus(catalog=…)` logs a WARNING per blueprint whose `uses`
+  table is absent from the `CatalogHandle`; **load proceeds** (a blueprint may legitimately reference
+  tables outside a given dev snapshot). Wired into `scripts/seed_neo4j_corpus.py` via a soft catalog load.
+- **Record correction (D94):** production protection against this skew is **MCP-fails-closed +
+  both-catalogs-in-agreement**, **not** load-time catalog validation — the seed-time check is a dev-time
+  early-warning aid only.
+
+### Process
+
+planner (design + **D94** + TRACEABILITY) → backend (impl) → **reviewer** (no blockers; 1 HIGH: sentinel
+stripped `args` → lost correlation; 2 MEDIUM: Part-3 dead code, implicit discriminator) → backend (FIX 1
+args-replay, FIX 2 explicit `withheld_sentinel` flag, FIX 3 seed-script wiring, FIX 4/5 nits) → **qa** (25
+tests incl. byte-level RESULT-payload PII checks, multi-call correlation, end-to-end loop-break,
+corpus-skew) → **reviewer delta-review APPROVE**. The one judgment call — replaying the model's own SQL on
+the sentinel's assistant side — was ruled PII-sound (it's the model's own output, causally prior to the
+result, and consistent with the pre-existing denied-entry exemption) and recorded in D94.
+
+See [decisions/none-provenance-stranding-design.md](decisions/none-provenance-stranding-design.md).
+
+**⏸ PAUSED HERE by request** — Track B (offline learning loop), the last big Phase-1 deliverable, is the
+next major undertaking and has **not** been started.
+
+---
+
 ## 2026-07-02 — Session 14: Deferred-items resolution + 2 live-testing-surfaced security/correctness fixes
 
 The "resolve the deferred items" sweep. No new brick — instead we **closed the backlog gaps** left by
