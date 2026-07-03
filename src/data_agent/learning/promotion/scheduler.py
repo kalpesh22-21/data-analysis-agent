@@ -1,0 +1,335 @@
+"""promotion/scheduler.py — the S9 promotion scheduler (D29/D30, §7.2).
+
+A STANDALONE background process, NOT a `CandidateStage`. It is cron-scanned state
+(D29 "cron-scanned state, not queued"): each cycle it reads
+`learning_candidates.list_by_status(...)`, runs golden replay + the D43 drift
+probes, and advances `status` + stamps `drift` (Contract E). It shares the envelope
+contract with the write-router stages but NOT their pipeline seam (§7.2), so it
+parallelizes cleanly against the S4 fixture.
+
+Contract E state machine (the edges this scheduler owns):
+
+    candidate ─(static ok AND golden-replay pass AND deps resolved
+                AND (hit_count ≥ T OR human approval))──────────▶ validated
+    candidate ─(any guard fails / single session / dep unresolved)─▶ candidate  (hold)
+    in_review ─(human approve)──────────────────────────────────▶ validated
+    in_review ─(human reject)───────────────────────────────────▶ rejected
+    validated ─(drift probes clean)─────────────────────────────▶ validated  (drift=clean)
+    validated ─(drift suspect OR replay fails OR user correction)─▶ candidate  (demote + review flag)
+
+Load-bearing guards (D29/D98):
+  * **Replay alone NEVER promotes** (D98 layer iii): a single-session candidate
+    (`hit_count < T`, no human approval) with a GREEN replay STAYS `candidate`.
+    Replay verifies structure, not values — there is no value oracle (D17/D98).
+  * **`depends_on` guard** (§11.6): a candidate whose `depends_on` references an
+    unresolved artifact stays `candidate` — never promotes until it resolves.
+  * **Human-gated targets** (`global_knowledge`/`schema_edit`, D58a/D18): T = ∞;
+    the auto path never promotes them (they land via the S7 inbox → human
+    approve). `user_knowledge` auto-commits in its OWN writer (S8), not here.
+
+Fail-closed throughout: one bad candidate must not abort the cycle (mirrors the
+sweeper's per-item guard); the kill-switch is read FRESH every cycle (D58c).
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import UTC, datetime
+
+from ..candidate.generalization import BlueprintGeneralization
+from ..candidate.models import CandidateEnvelope, CandidateStatus
+from ..candidate.store import CandidateStore
+from ..candidate.verdicts import DriftStamp
+from ..config import learning_enabled
+from .drift import drift_from_replay, user_correction_stamp
+from .models import (
+    BLUEPRINT_TYPE,
+    HUMAN_GATED_TYPES,
+    CandidateDecision,
+    DependencyResolver,
+    HitCountReader,
+    PromotionPolicy,
+    PromotionSweep,
+    WarehouseProbe,
+)
+from .replay import ReplayOutcome, golden_replay
+
+_logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+class PromotionScheduler:
+    """The cron-scanned promotion scheduler. Stateless per cycle; every dependency
+    is injected so Layer-1 fakes and the live stack use the identical path."""
+
+    def __init__(
+        self,
+        store: CandidateStore,
+        *,
+        probe: WarehouseProbe,
+        hit_counts: HitCountReader,
+        policy: PromotionPolicy | None = None,
+        dependency_resolver: DependencyResolver | None = None,
+        clock: Callable[[], str] = _now_iso,
+    ) -> None:
+        self._store = store
+        self._probe = probe
+        self._hit_counts = hit_counts
+        self._policy = policy or PromotionPolicy()
+        self._deps = dependency_resolver
+        self._clock = clock
+
+    # -- the cron cycle -------------------------------------------------------
+
+    async def run_once(self) -> PromotionSweep:
+        """One scan: advance eligible `candidate`s, re-check every `validated`.
+
+        Kill-switch FIRST (D58c): disabled ⇒ no scan, no transition. Read uncached,
+        per cycle. A per-candidate error is logged and skipped (the whole cycle
+        never aborts on one bad candidate — sweeper parity)."""
+        if not learning_enabled():
+            return PromotionSweep(disabled=True)
+
+        # Snapshot BOTH status lists up front, before any transition writes: a
+        # candidate promoted this cycle must not be re-scanned as `validated` in
+        # the SAME cycle (it lands in the store at `validated` immediately). The
+        # next cycle re-checks it via the drift probes.
+        candidates = await self._store.list_by_status(
+            CandidateStatus.CANDIDATE, limit=self._policy.scan_limit
+        )
+        validated = await self._store.list_by_status(
+            CandidateStatus.VALIDATED, limit=self._policy.scan_limit
+        )
+
+        decisions: list[CandidateDecision] = []
+        for env in candidates:
+            decisions.append(await self._guard(self._advance_candidate, env))
+        for env in validated:
+            decisions.append(await self._guard(self._recheck_validated, env))
+
+        return PromotionSweep(decisions=tuple(decisions))
+
+    async def _guard(self, fn, env: CandidateEnvelope) -> CandidateDecision:
+        try:
+            return await fn(env)
+        except Exception:  # noqa: BLE001 - one bad candidate must not abort the cycle
+            _logger.exception(
+                "promotion scheduler failed for candidate %s; leaving it unchanged",
+                env.candidate_id,
+            )
+            return self._hold(env, "error")
+
+    # -- candidate → validated (the auto-promotion edge) ----------------------
+
+    async def _advance_candidate(self, env: CandidateEnvelope) -> CandidateDecision:
+        # Human-gated / non-blueprint targets never auto-promote here (D58a/D18):
+        # global_knowledge + schema_edit are T=∞ (S7 inbox → human approve);
+        # user_knowledge auto-commits in S8. Leave them as candidate.
+        if env.type != BLUEPRINT_TYPE:
+            reason = (
+                "human_gated_target" if env.type in HUMAN_GATED_TYPES else "not_auto_promotable"
+            )
+            return self._hold(env, reason)
+
+        # Guard 1 — static validation must be `ok` (S4 stamp; D52/D97).
+        gen = self._generalization(env)
+        if gen is None or gen.static_validation.outcome != "ok":
+            return self._hold(env, "static_not_ok")
+
+        # Guard 2 — `depends_on` unresolved ⇒ stays candidate (§11.6). Checked
+        # BEFORE the (more expensive) replay so an un-landed dependency short-circuits.
+        if not await self._deps_resolved(env):
+            return self._hold(env, "depends_on_unresolved")
+
+        # Guard 3 — golden replay must pass (structure, not values — D98).
+        replay = await golden_replay(env, probe=self._probe)
+        if not replay.passed:
+            return self._hold(env, f"replay_failed:{replay.reason}")
+
+        # Guard 4 — hit_count ≥ T OR human approval. A GREEN replay with a
+        # single-session count is NOT enough (D98 layer iii — replay never promotes
+        # on its own): the candidate STAYS candidate.
+        count = await self._read_hit_count(env)
+        if count < self._policy.blueprint_hit_threshold:
+            return self._hold(env, "below_hit_threshold")
+
+        # All guards pass → promote, stamping a fresh clean drift (the passing
+        # replay IS the live grain_integrity probe), so it is immediately
+        # silent-eligible.
+        drift = drift_from_replay(replay, now=self._clock())
+        promoted = replace(env, status=CandidateStatus.VALIDATED, drift=drift)
+        await self._store.put(promoted)
+        return CandidateDecision(
+            candidate_id=env.candidate_id,
+            type=env.type,
+            action="promote",
+            from_status=env.status,
+            to_status=CandidateStatus.VALIDATED,
+            reason=None,
+        )
+
+    # -- validated re-check (drift probes; demote on suspect/replay-fail) ------
+
+    async def _recheck_validated(self, env: CandidateEnvelope) -> CandidateDecision:
+        # Only a replayable (blueprint) artifact has a live grain_integrity probe.
+        # A non-blueprint validated artifact (knowledge) has no template to replay
+        # in Phase 1 → leave untouched (its Phase-2 probes are catalog/rule, stubbed).
+        if env.type != BLUEPRINT_TYPE:
+            return CandidateDecision(
+                env.candidate_id, env.type, "skip", env.status, env.status,
+                reason="not_replayable",
+            )
+
+        replay = await golden_replay(env, probe=self._probe)
+        drift = drift_from_replay(replay, now=self._clock())
+        if replay.passed:
+            # Clean drift → stays validated; re-stamp clean+fresh (silent-eligible).
+            refreshed = replace(env, drift=drift)
+            await self._store.put(refreshed)
+            return CandidateDecision(
+                env.candidate_id, env.type, "drift_clean", env.status, env.status,
+                reason=None,
+            )
+        # Suspect drift OR replay fail → demote to candidate + review flag. The
+        # review flag is carried by `status=candidate` + `drift.status=suspect`
+        # (naming the failed probe) — S9 owns only `status` + `drift` (D102).
+        demoted = replace(env, status=CandidateStatus.CANDIDATE, drift=drift)
+        await self._store.put(demoted)
+        return CandidateDecision(
+            env.candidate_id, env.type, "demote", env.status,
+            CandidateStatus.CANDIDATE, reason=f"drift_suspect:{drift.failed_probe}",
+        )
+
+    # -- caller-driven transitions (human review / user correction) -----------
+
+    async def apply_human_decision(
+        self, env: CandidateEnvelope, decision: str
+    ) -> CandidateDecision:
+        """Apply a human `in_review` decision (Contract D / Contract E): approve →
+        validated, reject → rejected. This is the ONE caller-driven promotion path
+        (not the cron scan); the human is the authority for the pre-gated targets
+        (global_knowledge/schema_edit, D58a/D18) and the sampled/near-miss route.
+
+        A blueprint approval STILL passes the static + replay safety guards (human
+        approval substitutes for the hit-count threshold, NOT for structural
+        integrity — D98). A non-replayable target (knowledge/schema) approves
+        directly."""
+        if decision == "reject":
+            rejected = replace(env, status=CandidateStatus.REJECTED)
+            await self._store.put(rejected)
+            return CandidateDecision(
+                env.candidate_id, env.type, "reject", env.status,
+                CandidateStatus.REJECTED, reason=None,
+            )
+        if decision != "approve":
+            return self._hold(env, f"unknown_decision:{decision}")
+
+        if env.type == BLUEPRINT_TYPE:
+            gen = self._generalization(env)
+            if gen is None or gen.static_validation.outcome != "ok":
+                return CandidateDecision(
+                    env.candidate_id, env.type, "hold", env.status, env.status,
+                    reason="approve_blocked_static_not_ok",
+                )
+            replay = await golden_replay(env, probe=self._probe)
+            if not replay.passed:
+                return CandidateDecision(
+                    env.candidate_id, env.type, "hold", env.status, env.status,
+                    reason=f"approve_blocked_replay:{replay.reason}",
+                )
+            drift = drift_from_replay(replay, now=self._clock())
+        else:
+            # Human-authoritative approval of a pre-gated non-blueprint target; no
+            # template to replay → no live drift probe (unchecked until Phase 2).
+            drift = DriftStamp()
+
+        approved = replace(env, status=CandidateStatus.VALIDATED, drift=drift)
+        await self._store.put(approved)
+        return CandidateDecision(
+            env.candidate_id, env.type, "approve", env.status,
+            CandidateStatus.VALIDATED, reason=None,
+        )
+
+    async def apply_user_correction(
+        self, env: CandidateEnvelope
+    ) -> CandidateDecision:
+        """A user correction is a NEGATIVE signal (D29/D43): demote a `validated`
+        artifact to `candidate` + review flag. Idempotent for a non-validated
+        candidate (a no-op hold)."""
+        if env.status != CandidateStatus.VALIDATED:
+            return self._hold(env, "not_validated")
+        demoted = replace(
+            env,
+            status=CandidateStatus.CANDIDATE,
+            drift=user_correction_stamp(now=self._clock()),
+        )
+        await self._store.put(demoted)
+        return CandidateDecision(
+            env.candidate_id, env.type, "demote", env.status,
+            CandidateStatus.CANDIDATE, reason="user_correction",
+        )
+
+    # -- helpers --------------------------------------------------------------
+
+    def _generalization(self, env: CandidateEnvelope) -> BlueprintGeneralization | None:
+        gen_doc = env.payload.get("generalization")
+        if not isinstance(gen_doc, dict):
+            return None
+        try:
+            return BlueprintGeneralization.from_doc(gen_doc)
+        except (KeyError, TypeError):
+            return None
+
+    async def _deps_resolved(self, env: CandidateEnvelope) -> bool:
+        """True iff every `depends_on` ref resolves (§11.6). No deps ⇒ trivially
+        resolved. Deps present but NO resolver injected ⇒ fail-closed (unresolved):
+        never promote a candidate whose dependencies cannot be verified."""
+        if not env.depends_on:
+            return True
+        if self._deps is None:
+            return False
+        for ref in env.depends_on:
+            if not await self._deps.is_resolved(ref):
+                return False
+        return True
+
+    async def _read_hit_count(self, env: CandidateEnvelope) -> int:
+        """Read `hit_count` from the LANDED corpus artifact via the injected
+        reader, keyed by the S6 `canonical_key`. No dedup verdict yet (S6 not run)
+        ⇒ no canonical_key ⇒ count 0 (cannot promote by count; human approval is
+        the alternative path)."""
+        if env.dedup is None or not env.dedup.canonical_key:
+            return 0
+        return await self._hit_counts.hit_count(env.dedup.canonical_key)
+
+    def _hold(self, env: CandidateEnvelope, reason: str) -> CandidateDecision:
+        return CandidateDecision(
+            candidate_id=env.candidate_id,
+            type=env.type,
+            action="hold",
+            from_status=env.status,
+            to_status=env.status,
+            reason=reason,
+        )
+
+    # -- the daemon loop ------------------------------------------------------
+
+    async def run_forever(self, *, sleep) -> None:
+        """Periodic loop (the entrypoint). *sleep* is injected (`asyncio.sleep`) so
+        it is unit-drivable. A transient error must not kill the daemon — log +
+        retry next interval (sweeper parity)."""
+        while True:
+            try:
+                await self.run_once()
+            except Exception:  # noqa: BLE001 - a transient store/probe error must
+                # not kill the daemon; log and retry next interval.
+                _logger.exception("promotion cycle failed; retrying next interval")
+            await sleep(self._policy.promotion_interval_seconds)
+
+
+__all__ = ["PromotionScheduler", "ReplayOutcome"]
