@@ -34,7 +34,10 @@ class _WorkCountingConsumer(LearningConsumer):
 
     work_calls = 0
 
-    async def _do_work(self, delivered: DeliveredJob) -> None:
+    async def _do_work(self, doc, delivered: DeliveredJob) -> None:
+        # Slice-2 signature: `_do_work(doc, delivered)` (design §5.1). This override
+        # keeps the Slice-1 "count the work body" behaviour for the crash-recovery
+        # invariant, ignoring the loaded doc.
         self.work_calls += 1
         return None
 

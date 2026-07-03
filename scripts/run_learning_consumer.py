@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from data_agent.learning.audit.couchbase_audit_store import CouchbaseAuditStore
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.consumer import LearningConsumer
 from data_agent.learning.observability import configure_learning_tracing, get_learning_tracer
@@ -45,7 +46,18 @@ async def _main() -> int:
 
     store = CouchbaseSessionStore(runtime_settings)
     queue = RedisStreamsLearningQueue.from_settings(learning_settings)
-    consumer = LearningConsumer(store, queue, learning_settings, tracer=tracer)
+    # S2: the audit client is composed + injected but DORMANT (no snapshot in the
+    # S2 path — §4.3); the loader/triage default to the module functions.
+    # MEDIUM-2: only build the Couchbase audit client when the learning_audit RBAC
+    # creds are actually provisioned. Constructing it with blank credentials builds a
+    # client against an unprovisioned bucket — a boot regression. When unconfigured
+    # we pass audit=None; the consumer tolerates that (in-memory dormant store).
+    if learning_settings.learning_audit_username and learning_settings.learning_audit_password:
+        audit = CouchbaseAuditStore(learning_settings)
+    else:
+        _logger.info("learning_audit unconfigured — audit client dormant (S2 writes no evidence)")
+        audit = None
+    consumer = LearningConsumer(store, queue, learning_settings, tracer=tracer, audit=audit)
 
     _logger.info(
         "learning consumer starting (group=%s, consumer=%s, batch=%s)",

@@ -86,6 +86,16 @@ class InMemorySessionStore:
         self._results.setdefault(session_id, {})[ref] = result_full
         return ref
 
+    async def read_full_result(
+        self, session_id: str, result_full_ref: str
+    ) -> dict[str, Any] | None:
+        # READ-ONLY (D72): dict lookup scoped by session_id (mirrors the fake's
+        # per-session results map). A missing/purged ref → `None`. Deep-copied so
+        # a caller mutating the returned dict cannot corrupt store state (LOW-a —
+        # parity with Couchbase's fresh-parse + `get_session_with_cas`'s deepcopy).
+        stored = self._results.get(session_id, {}).get(result_full_ref)
+        return copy.deepcopy(stored) if stored is not None else None
+
     async def write_pause_checkpoint(self, session_id: str, checkpoint: PauseCheckpoint) -> None:
         doc = await self.get_or_create_session(session_id)
         doc.pause_checkpoint = checkpoint

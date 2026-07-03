@@ -200,6 +200,20 @@ class CouchbaseSessionStore:
         await self._results.upsert(key, result_full, UpsertOptions(expiry=self._ttl))
         return key
 
+    async def read_full_result(
+        self, session_id: str, result_full_ref: str
+    ) -> dict[str, Any] | None:
+        # READ-ONLY (D72): a plain KV get of the D46 full result. A TTL-expired /
+        # purged result surfaces as `None` (the caller degrades to preview shape),
+        # never an exception. `session_id` is unused for the flat `session_results`
+        # keyspace but kept in the signature to match the in-memory fake's
+        # per-session scoping and the Protocol.
+        try:
+            result = await self._results.get(result_full_ref, GetOptions())
+        except DocumentNotFoundException:
+            return None
+        return result.content_as[dict]
+
     async def write_pause_checkpoint(self, session_id: str, checkpoint: PauseCheckpoint) -> None:
         await self._mutate_with_cas_retry(
             session_id, lambda doc: setattr(doc, "pause_checkpoint", checkpoint)

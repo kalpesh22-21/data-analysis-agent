@@ -293,3 +293,24 @@ Layer-2 legs (real Redis + real Couchbase) pass. The pre-existing D58c row above
 | **D30 / D96 / D25** | The queued message is a **reference** (session_id, couchbase_doc_id, cas, user_id, scope_ref, trace_id, session_closed_at, content_hash) — NEVER the transcript, NEVER the raw JWT or raw `column_scope` (only a scope id/hash) | Unit + Component | `D30-message-is-reference` | — | ⛔ not-built |
 | **D96** | Spine end-to-end (real Redis + real Couchbase): sweep→enqueue→consume→done leaves the doc at `done` and the stream fully ACKed (empty PEL, no leak) | Component | `D96-spine-end-to-end-live` | — | ⛔ not-built |
 | **D95** | Candidates carry only `evidence_ref`; the entity-bearing snapshot is NEVER inlined into the entity-free global stores (neo4j / knowledge vector index) — the dedicated `learning_audit` bucket is the sole home (store provisioned in Slice 2; the entity-free-global invariant is testable at write time once the extractor lands) | Unit + Component | `D95-evidence-ref-not-inlined` | — | ⛔ not-built |
+
+## Additional tagged invariants from D99/D100 (Track-B learning-loop Slice 2 — loader + triage + audit provisioning, Session 17)
+
+The load-bearing invariants of the Slice-2 SessionSummary loader, the deterministic triage gate, and
+the `learning_audit` store provisioning (see [learning-loop-slice2-design.md](learning-loop-slice2-design.md)),
+no tagged tests yet.
+
+| Decision | Invariant | Test layer | Test slug | Conformance scenario | Status |
+|---|---|---|---|---|---|
+| **D27 / D96** | The loader deterministically normalizes `SessionDoc` → `SessionSummary`: turns/tool_calls/args/status and `provenance` carried VERBATIM; `tool_call_id`/`turn_index` preserved so S3 evidence refs resolve; same doc twice → identical summary | Unit | `S2-loader-normalization` | — | ⛔ not-built |
+| **D99** | `accepted_signal` inferred from the trail: `no_correction` (clean answer, no trailing correction), `explicit_confirm` (confirmation lexicon), `None` (no answer / correction / ambiguous); `thumbs_up` never emitted in Phase 1; conservative bias (ambiguous ⇒ `None`) | Unit | `S2-accepted-signal-inference` | **Correction → learning** | ⛔ not-built |
+| **D99** | Failed→fixed SQL pairing: a `status∈{error,denied}` query paired with the next `status==ok` query is a fix; a failed query with no later success is NOT a fix (feeds `accepted_signal` + triage K2) | Unit | `S2-loader-failed-fixed-pair` | — | ⛔ not-built |
+| **D27** | askUser Q&A paired with the next user message (unanswered exchange → `answer=None`) | Unit | `S2-loader-askuser-pairing` | — | ⛔ not-built |
+| **D34** | blueprint usage `outcome` classified `accepted` vs `corrected` (a non-ok or correction-followed runBlueprint is `corrected`) | Unit | `S2-loader-blueprint-usage` | — | ⛔ not-built |
+| **D46** | The loader reads the FULL tool result via `result_full_ref` (new read-only `read_full_result`); a missing/expired result degrades to `full_result_loaded=False` + preview fallback, no crash | Unit + Component | `S2-loader-full-result-d46` | — | ⛔ not-built |
+| **D72** | The loader is READ-ONLY: the session doc + result docs are byte-identical before/after `load_session_summary`, and a full consume changes ONLY `learning_status`(+hash) | Unit + Component | `S2-loader-readonly-d72` | — | ⛔ not-built |
+| **D100** | Triage is deterministic: KEEP on any of K1 (accepted successful query) / K2 (failed→fixed) / K3 (answered askUser) / K4 (corrected blueprint); else SKIP with a reason code; nothing enqueued downstream on skip | Unit | `S2-triage-deterministic-keep-skip` | **Correction → learning** | ⛔ not-built |
+| **D95** | `learning_audit` provisioned: `mint_evidence_ref` yields unique `evidence::<session_id>::<uuid>` keys; `snapshot`→`read` round-trips an `EvidenceSnapshot`; writes carry the `LEARNING_AUDIT_TTL_SECONDS` retention floor | Unit + Component | `S2-audit-store-provisioned` | — | ⛔ not-built |
+| **D95** | RBAC boundary: `learning_audit_writer` can read/write `learning_audit` but is DENIED on `agent_sessions` (independent access boundary) | Component | `S2-audit-rbac-boundary` | — | ⛔ not-built |
+| **D95** | Build-not-wire: S2 stands up the audit client but the consumer/stub-extractor performs ZERO `snapshot` calls — the first evidence write is S3's | Unit | `S2-audit-not-wired-in-s2` | — | ⛔ not-built |
+| **D100 / D96** | Consumer integration: load→triage→skip ends the session `done` with a `learning.triage(skip)` trace; load→triage→keep hands to the stub extractor (`learning.extract(would_extract)`); all Slice-1 invariants (kill-switch, CAS, idempotency, dead-letter) preserved | Unit + Component | `S2-consumer-load-triage-integration` | — | ⛔ not-built |

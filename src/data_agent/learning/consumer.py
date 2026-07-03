@@ -23,17 +23,27 @@ transitions (+ `learning_content_hash` recorded on `done`).
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from data_agent.runtime.session.models import SessionDoc
 from data_agent.runtime.session.store import CASMismatchError, SessionStore
 
 from . import state_machine
+from .audit import AuditStore, InMemoryAuditStore
 from .config import LearningSettings, learning_enabled
 from .models import LearningStatus, compute_content_hash
-from .observability import consume_span, disabled_span
+from .observability import consume_span, disabled_span, extract_stub_span, triage_span
 from .queue import DeliveredJob, LearningQueue
+from .summary import SessionSummary, load_session_summary
+from .triage import TriageVerdict
+from .triage import triage as _default_triage
 
 _logger = logging.getLogger(__name__)
+
+# The S2 collaborators, typed for DI (all defaulted so Layer-1 fakes drop in).
+SummaryLoader = Callable[..., Awaitable[SessionSummary]]
+Triage = Callable[[SessionSummary], TriageVerdict]
 
 
 @dataclass(frozen=True)
@@ -55,11 +65,20 @@ class LearningConsumer:
         settings: LearningSettings,
         *,
         tracer=None,
+        summary_loader: SummaryLoader = load_session_summary,
+        triage: Triage = _default_triage,
+        audit: AuditStore | None = None,
     ) -> None:
         self._store = store
         self._queue = queue
         self._settings = settings
         self._tracer = tracer
+        # S2 DI (design §5.3): the loader + triage are pure/deterministic; the
+        # audit client is injected but DORMANT in S2 (§4.3 — no snapshot call in
+        # this path). Defaults let Layer-1 tests pass fakes.
+        self._summary_loader = summary_loader
+        self._triage = triage
+        self._audit: AuditStore = audit if audit is not None else InMemoryAuditStore()
 
     async def run_once(self) -> ConsumeResult:
         # Kill-switch gate FIRST (design §7): disabled ⇒ do NOT XREADGROUP or
@@ -143,9 +162,11 @@ class LearningConsumer:
             # leave the message for the owner / a later reclaim.
             return "skip"
 
-        # --- no-op work (Slice 1). Slice 2 replaces this with the D27
-        # loader → normalizer → cheap-LLM triage → grounded extractor. ---
-        await self._do_work(delivered)
+        # --- Slice-2 work: load → triage → skip/keep (§5.1). Operates on the
+        # already-loaded `doc` (keeps the fresh-hash source consistent with
+        # MEDIUM-3) and is strictly READ-ONLY (D72) — the only writes are the two
+        # lifecycle CAS transitions bracketing this call. ---
+        await self._do_work(doc, delivered)
 
         # MEDIUM-3: record a FRESHLY computed hash from the loaded doc (not the
         # stale message hash) so the Slice-2 dedup sees the true content hash.
@@ -193,9 +214,43 @@ class LearningConsumer:
         self._emit_consume(job.session_id, "dead_letter", delivered.delivery_count)
         return "dead_letter"
 
-    async def _do_work(self, _delivered: DeliveredJob) -> None:
-        """Slice-1 no-op stand-in for the Slice-2 loader/triage/extractor."""
-        return None
+    async def _do_work(self, doc: SessionDoc, delivered: DeliveredJob) -> None:
+        """Slice-2 seam (§5.1): load the `SessionSummary` (READ-ONLY, D72), run
+        the deterministic triage gate, and either SKIP (nothing enqueued
+        downstream) or hand the summary to the stub extractor seam. Either way the
+        outer `_process` CAS-marks the session `done` — "processed" == "triaged".
+        Whether keep or skip, this method performs NO session mutation."""
+        summary = await self._summary_loader(doc, self._store, job=delivered.job)
+        verdict = self._triage(summary)
+        self._emit_triage(summary.session_id, verdict)
+        if verdict.decision == "keep":
+            await self._extract_stub(summary, verdict)
+
+    async def _extract_stub(self, summary: SessionSummary, verdict: TriageVerdict) -> None:
+        """S2 stub — the CLEARLY-MARKED plug-in point S3 replaces with the grounded
+        extractor (learning-loop-extractor-design.md). Emits a `learning.extract`
+        span with `outcome=would_extract` + target hints and returns. Writes
+        NOTHING: no candidate, no evidence snapshot. `self._audit` is available but
+        intentionally UNUSED here in S2 (§4.3 — first evidence write is S3's)."""
+        self._emit_extract_stub(summary.session_id, verdict.target_hints)
+
+    def _emit_triage(self, session_id: str, verdict: TriageVerdict) -> None:
+        if self._tracer is not None:
+            with triage_span(
+                self._tracer,
+                session_id=session_id,
+                decision=verdict.decision,
+                reason=verdict.reason,
+                target_hints=verdict.target_hints,
+            ):
+                pass
+
+    def _emit_extract_stub(self, session_id: str, target_hints: tuple[str, ...]) -> None:
+        if self._tracer is not None:
+            with extract_stub_span(
+                self._tracer, session_id=session_id, target_hints=target_hints
+            ):
+                pass
 
     def _emit_consume(self, session_id: str, outcome: str, delivery_count: int) -> None:
         if self._tracer is not None:

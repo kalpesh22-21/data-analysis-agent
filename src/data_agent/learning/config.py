@@ -125,19 +125,27 @@ class LearningSettings(BaseSettings):
         200, ge=1, description="Max idle sessions scanned/claimed per sweep cycle."
     )
 
-    # --- Audit / provenance store (D95, §8) — RESERVED, UNREAD in Slice 1.
-    # Declared so the env surface is stable and the decision is locked, but the
-    # bucket + RBAC user + evidence_ref KV client are provisioned in Slice 2
-    # alongside the extractor that first writes evidence. Nothing in Slice 1
-    # reads these two fields.
+    # --- Audit / provenance store (D95, §4) — READ in Slice 2. The dedicated
+    # `learning_audit` bucket + its own `learning_audit_writer` RBAC user back the
+    # CouchbaseAuditStore. S2 provisions + tests the client but writes NO evidence
+    # (the first snapshot is S3's, §4.3).
+    learning_audit_connection_string: str = Field(
+        "couchbase://localhost",
+        description="Couchbase connection string for the learning_audit bucket (may be the same cluster).",
+    )
     learning_audit_bucket: str = Field(
-        "learning_audit",
-        description="RESERVED (Slice 2, D95): dedicated audit bucket. Unread in Slice 1.",
+        "learning_audit", description="Dedicated audit bucket (D95) — separate retention/RBAC clock."
+    )
+    learning_audit_username: str = Field(
+        "", description="RBAC user scoped to learning_audit ONLY (learning_audit_writer)."
+    )
+    learning_audit_password: str = Field(
+        "", description="Password for the learning_audit_writer RBAC user (secret)."
     )
     learning_audit_ttl_seconds: int = Field(
         7_776_000,  # 90 days
         ge=1,
-        description="RESERVED (Slice 2, D95): audit retention floor. Unread in Slice 1.",
+        description="Audit retention floor (D95): audit_TTL ≥ max_candidate_lifetime. Set fresh per write.",
     )
 
     # --- Observability (D23/D24) ---

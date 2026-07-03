@@ -682,6 +682,52 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   [D36](#blueprint-extraction-payload), [D56](#blueprint-silent-path-safety), [D29](#memory--learning),
   [D34](#blueprint-extraction-payload), [D17](#memory--learning), [D97](#memory--learning).
 
+- **D99 (locked, 2026-07-03, Session 17 — Track B Slice 2; concretizes D34 + D31, does not
+  re-decide them).** **The blueprint `accepted_signal` is INFERRED deterministically from the session
+  trail by the Slice-2 loader — the session document carries NO thumbs/rating field, so acceptance is
+  derived, not read.** D31/D34 make `accepted_signal ∈ {no_correction, thumbs_up, explicit_confirm}` a
+  mandatory field of a blueprint candidate but never say how it is obtained when there is no explicit
+  capture surface; D99 fixes the derivation as a contract (a false-positive acceptance manufactures a
+  blueprint candidate off an answer the user never accepted). **Rules (deterministic, first-match):**
+  (1) no successful answer turn (an assistant turn with ≥1 `status==ok` `runQuery`/`runBlueprint`) ⇒
+  `None`; (2) a correction event after the final answer turn ⇒ `None`; (3) a trailing user message
+  matching the `CONFIRMATION_PHRASES` lexicon (and none matching `CORRECTION_PHRASES`) ⇒
+  `explicit_confirm`; (4) a final answer with no trailing correction (including the session simply
+  going idle after the answer) ⇒ `no_correction`; (5) ambiguous ⇒ `None`. A **correction event** is a
+  trailing `CORRECTION_PHRASES` match OR a failed→fixed SQL pair the user drove a re-run on.
+  **`thumbs_up` is declared** (S2 and the S3 extractor share one `AcceptedSignal` type) **but is NEVER
+  emitted in Phase 1** — no rating capture surface exists; the loader's output range is
+  `{no_correction, explicit_confirm, None}`. **Conservative bias:** the failure modes are asymmetric —
+  a false negative costs one un-learned blueprint (recoverable via D48 recurrence), a false positive
+  pollutes the candidate/dedup store off a wrong answer — so ambiguity resolves to `None`, and triage
+  (D100) then skips the blueprint target (a correction/askUser signal can still keep the session for
+  other targets). See [learning-loop-slice2-design.md](learning-loop-slice2-design.md) §2.
+  Cross-references: [D34](#blueprint-extraction-payload), [D31](#memory--learning),
+  [D29](#memory--learning), [D100](#memory--learning), [D96](#memory--learning).
+
+- **D100 (locked, 2026-07-03, Session 17 — Track B Slice 2; refines the 05 data-flow).** **Phase-1
+  triage is a DETERMINISTIC-HEURISTICS keep/skip gate, NOT the "cheap LLM" triage sketched in
+  [05-memory-and-learning.md](../05-memory-and-learning.md) — an LLM triage stage is a named later
+  refinement layered over the KEEP set, not Phase 1.** Triage answers "is there anything worth
+  learning?" BEFORE any extractor cost (05: "most sessions teach nothing; skip them cheaply"). D100
+  makes that gate a pure function of the `SessionSummary`. **KEEP if ANY of:** K1 — an accepted,
+  successful query (`accepted_signal != None` AND ≥1 `status==ok` `runQuery`/`runBlueprint`, a
+  liftable blueprint per D34); K2 — ≥1 failed→fixed SQL pair (a fixed failure teaches a lesson /
+  `resolves` mapping); K3 — an answered `askUser` exchange (a `resolves` / user-knowledge fact); K4 —
+  a `corrected` blueprint usage (a negative signal). **SKIP** (terminal `done`, nothing enqueued
+  downstream, a `learning.triage` skip span with a reason code: `skip_no_tool_calls` /
+  `skip_all_failed` / `skip_no_acceptance` / `skip_other`) when none hold. **Why heuristics over an
+  LLM for Phase 1:** cheaper (zero tokens on the skip-majority), deterministic + Layer-1 unit-testable
+  (an LLM gate is only statistically testable and adds a flaky dependency on the hottest path), and it
+  matches the repo's "deterministic gate first, LLM only where it must classify" philosophy (D52/D97) —
+  triage is a filter, not a classifier. **Cost:** recall risk (a subtly-teachable session the
+  predicates miss is skipped silently); mitigated by permissive keep predicates + the observable
+  skip-reason telemetry, and reversible — an LLM refinement can trim false-keeps over the KEEP set
+  later without touching the transport or the S3 contract. See
+  [learning-loop-slice2-design.md](learning-loop-slice2-design.md) §3. Cross-references:
+  [D26](#memory--learning), [D27](#memory--learning), [D31](#memory--learning), [D99](#memory--learning),
+  [D96](#memory--learning).
+
 ## Observability
 - **D23.** **Arize Phoenix + OpenTelemetry** (OpenInference conventions) for tracing across the
   request path and the offline learning loop. Span kinds map ~1:1 to components (AGENT/LLM/TOOL/

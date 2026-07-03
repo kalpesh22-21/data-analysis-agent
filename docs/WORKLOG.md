@@ -202,6 +202,59 @@ authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's
 
 ---
 
+## 2026-07-03 — Session 17: Learning-loop Slice 2 (loader + triage + audit store) BUILT (D99/D100) + S3 design
+
+Two increments this session. First, wrote the **S3 grounded-extractor design** (committed `fec94d1`):
+`learning-loop-extractor-design.md` + **D97** (role classification is TOTAL over literal predicates —
+slot|rule|inline, NO hard-drop; caller-specific→optional slot; unclassifiable→fail-to-review) + **D98**
+(replay verifies STRUCTURE — grain-integrity + result_signature shape — NOT values; value-correctness is
+layered, replay is not a value oracle). Then built **Slice 2**.
+
+### Slice 2 — what shipped (new `src/data_agent/learning/{summary,triage,audit}/`)
+- **SessionSummary loader** — a pure, READ-ONLY (D72) normalizer: `SessionDoc` (+ full results via the
+  new read-only `read_full_result`, D46) → typed summary (turns, tool_calls preserving
+  tool_call_id→turn_index + provenance verbatim, blueprint_usages, askUser exchanges, failed→fixed SQL,
+  inferred `accepted_signal`).
+- **`accepted_signal` inference (D99)** — deterministic first-match, **conservative bias** (ambiguous ⇒
+  None; a false acceptance manufactures a candidate off a wrong answer); `thumbs_up` declared but never
+  emitted in Phase 1.
+- **Triage gate (D100)** — deterministic heuristics (KEEP on K1 accepted-query / K2 failed→fixed / K3
+  answered-askUser / K4 corrected-blueprint; else SKIP-with-reason), no LLM. Cheaper + testable; LLM
+  triage is a named later refinement.
+- **`learning_audit` store provisioned (D95)** — dedicated Couchbase bucket + `learning_audit_writer`
+  RBAC scoped to that bucket only (live-proven denied on `agent_sessions`), KV `AuditStore` client +
+  `evidence_ref` minting + TTL. Per "build tooling, don't wire": **S2 writes NO evidence** (client
+  dormant; first snapshot is S3's) — an executable zero-snapshot invariant.
+- Consumer's no-op `_do_work` replaced with load→triage→SKIP(done)/KEEP(stub extractor seam); all
+  Slice-1 invariants preserved (kill-switch, CAS state machine, dedup, dead-letter, D72).
+
+### The review win (again: adversarial review + independent verification beat a green suite)
+QA's first pass reported **"no bugs, all green"** — but the reviewer found **3 HIGH bugs**, and I
+**confirmed all three by reading the code** before trusting either: (1) askUser pairing used `> turn_index`
+while the real resume flow appends the answer at the **same** turn_index (agent_loop.py:451-452,
+couchbase_store.py:235) → K3 dead, clarification answers invisible; (2) bare-substring confirmation
+matching → *"I don't think that looks right"* scored `explicit_confirm` and *"yesterday"* matched *"yes"*;
+(3) correction lexicon too narrow → *"that can't be right"* earned `no_correction`→K1 candidate. **Root
+cause of the false-green: QA's own fixtures encoded the wrong askUser turn model**, so its tests asserted
+the buggy behavior. Fixed: append-order same-turn pairing; word-boundary + clause-scoped negation guard;
+broadened corrections (D99 asymmetry). Plus MEDIUM (transient full-result read retry so a blip doesn't
+dead-letter a healthy session; conditional audit-client boot). QA then **corrected its fixtures to the
+real runtime shape** + added the reviewer's exact adversarial reproductions.
+
+### Process
+explorer (recover intent) → planner (S3 design; then S2 design + D99/D100) → backend (S2) →
+**reviewer REQUEST CHANGES** (3 HIGH inference bugs) → **coordinator verified all 3 in source** → backend
+fix bundle → qa (corrected wrong-model fixtures + adversarial cases) → **reviewer delta APPROVE**. Gates:
+**1591 passed / 87 skipped, ruff clean**; L2 live audit RBAC/TTL + consumer vs real Couchbase.
+
+See [decisions/learning-loop-slice2-design.md](decisions/learning-loop-slice2-design.md) (BUILT;
+Slice-3 forward note: backward-only negation guard, deferred to D100 tuning).
+
+**Runway:** S1 ✅ S2 ✅ → **S3 grounded extractor (DESIGNED, next)** → S4 blueprint validate → S5 leakage
+gate → S6 D48 dedup → S7 writers + review inbox → S8 user store + schema-edit PR bot → S9 promotion scheduler.
+
+---
+
 ## 2026-07-02 — Session 16: Track B STARTED — learning-loop Slice 1 (infra spine) BUILT (D95/D96)
 
 Began the offline learning loop (Track B), the last big Phase-1 deliverable. The full architecture was

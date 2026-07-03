@@ -107,11 +107,55 @@ def disabled_span(tracer: Tracer, *, process: str) -> Any:
     )
 
 
+def triage_span(
+    tracer: Tracer,
+    *,
+    session_id: str,
+    decision: str,
+    reason: str,
+    target_hints: tuple[str, ...] = (),
+) -> Any:
+    """Triage verdict (Slice-2 §3.4 `learning.triage`, CHAIN). SHAPE-only attrs
+    (D25): the decision label, the K#/skip_* reason code, and the target-hint
+    labels — NEVER transcript/quote/SQL content."""
+    return span(
+        tracer,
+        "learning.triage",
+        OpenInferenceSpanKindValues.CHAIN,
+        {
+            "session.id": session_id,
+            "learning.triage.decision": decision,
+            "learning.triage.reason": reason,
+            "learning.triage.target_hints": ",".join(target_hints),
+        },
+    )
+
+
+def extract_stub_span(
+    tracer: Tracer, *, session_id: str, target_hints: tuple[str, ...] = ()
+) -> Any:
+    """The S2 stub extractor seam (§5.2 `learning.extract`, CHAIN). Emits
+    `outcome=would_extract` + hint labels only — writes nothing; S3 replaces the
+    body with the grounded extractor."""
+    return span(
+        tracer,
+        "learning.extract",
+        OpenInferenceSpanKindValues.CHAIN,
+        {
+            "session.id": session_id,
+            "learning.extract.outcome": "would_extract",
+            "learning.extract.target_hints": ",".join(target_hints),
+        },
+    )
+
+
 __all__ = [
     "configure_learning_tracing",
     "consume_span",
     "disabled_span",
     "enqueue_span",
+    "extract_stub_span",
     "get_learning_tracer",
     "sweep_span",
+    "triage_span",
 ]

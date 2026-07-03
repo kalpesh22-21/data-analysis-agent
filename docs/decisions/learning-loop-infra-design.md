@@ -456,8 +456,10 @@ legs pass. Slugs: `D58c-learning-kill-switch-halts-writes` (already a `⛔` row 
 ## 15. Forward map — Slices 2..N (one line each; NOT designed here)
 
 - **Slice 2 — Session loader + triage + audit store:** replace the no-op consumer with the D27
-  loader→normalizer (`SessionSummary`) + cheap-LLM triage; **provision `learning_audit`** (D95) and
-  the `evidence_ref` KV client (first evidence snapshots, D51).
+  loader→normalizer (`SessionSummary`) + a **deterministic-heuristics** triage gate (D100, not
+  cheap-LLM) + the D99 `accepted_signal` inference; **provision `learning_audit`** (D95) and the
+  `evidence_ref` KV client (stood up + tested; first evidence snapshots are S3's, D51). **Designed:**
+  [learning-loop-slice2-design.md](learning-loop-slice2-design.md) (Status: DESIGNED; D99, D100).
 - **Slice 3 — Grounded extractor:** RAG-grounded, structured-output extractor emitting typed
   candidate envelopes (D31), literals→slots, entity facts→user knowledge. **Designed:**
   [learning-loop-extractor-design.md](learning-loop-extractor-design.md) (Status: DESIGNED; D97 total

@@ -72,6 +72,19 @@ class SessionStore(Protocol):
         """
         ...
 
+    async def read_full_result(
+        self, session_id: str, result_full_ref: str
+    ) -> dict[str, Any] | None:
+        """Return the full (non-preview) tool result at *result_full_ref* (a
+        `result::<uuid>` key), or `None` if absent/expired.
+
+        The read-back counterpart of `write_full_result`, added for the D46 full
+        tool I/O trail (the Slice-2 learning loader needs the full result for
+        shape/inspection). READ-ONLY (D72): never mutates the session or the
+        result doc. A TTL-expired result is a tolerated `None`, not an error.
+        """
+        ...
+
     async def write_pause_checkpoint(self, session_id: str, checkpoint: PauseCheckpoint) -> None:
         """Set a new pause checkpoint (unconditional write — pause creation, not resume)."""
         ...
