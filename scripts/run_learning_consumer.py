@@ -21,11 +21,15 @@ import asyncio
 import logging
 
 from data_agent.learning.audit.couchbase_audit_store import CouchbaseAuditStore
+from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.consumer import LearningConsumer
+from data_agent.learning.extractor import ExtractorConfig, LearningExtractor
+from data_agent.learning.extractor.grounding import load_known_rule_ids
 from data_agent.learning.observability import configure_learning_tracing, get_learning_tracer
 from data_agent.learning.redis_queue import RedisStreamsLearningQueue
 from data_agent.runtime.config import get_runtime_settings
+from data_agent.runtime.model.openai_client import build_openai_model_client
 from data_agent.runtime.observability.tracing import set_global_tracer_provider
 from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 
@@ -46,18 +50,63 @@ async def _main() -> int:
 
     store = CouchbaseSessionStore(runtime_settings)
     queue = RedisStreamsLearningQueue.from_settings(learning_settings)
-    # S2: the audit client is composed + injected but DORMANT (no snapshot in the
-    # S2 path — §4.3); the loader/triage default to the module functions.
-    # MEDIUM-2: only build the Couchbase audit client when the learning_audit RBAC
-    # creds are actually provisioned. Constructing it with blank credentials builds a
-    # client against an unprovisioned bucket — a boot regression. When unconfigured
-    # we pass audit=None; the consumer tolerates that (in-memory dormant store).
-    if learning_settings.learning_audit_username and learning_settings.learning_audit_password:
+
+    # HIGH-2: (extractor, audit, candidates) are ONE unit. Real extraction writes
+    # entity-bearing evidence to `learning_audit` AND persists candidates to
+    # `learning_candidates`; running it with a NON-durable candidate store (or a
+    # missing audit store) would silently lose candidates on restart / leave
+    # dangling evidence_refs. So the extractor is enabled ONLY when the extractor
+    # model AND both durable Couchbase stores are configured. Otherwise we FALL
+    # BACK to the S2 `would_extract` stub (no extraction, NO audit writes) — the
+    # safe choice for a partially-provisioned deploy — and log it loudly.
+    extractor_ready = bool(learning_settings.learning_extractor_api_key)
+    audit_ready = bool(
+        learning_settings.learning_audit_username and learning_settings.learning_audit_password
+    )
+    candidates_ready = bool(
+        learning_settings.learning_candidates_username
+        and learning_settings.learning_candidates_password
+    )
+
+    if extractor_ready and audit_ready and candidates_ready:
         audit = CouchbaseAuditStore(learning_settings)
+        candidates = CouchbaseCandidateStore(learning_settings)
+        model_client = build_openai_model_client(
+            api_key=learning_settings.learning_extractor_api_key,
+            model=learning_settings.learning_extractor_model,
+            base_url=learning_settings.learning_extractor_base_url,
+        )
+        extractor = LearningExtractor(
+            model_client,
+            config=ExtractorConfig(
+                max_retries=learning_settings.learning_extractor_max_retries,
+                # MEDIUM-2: ground the `rule` role in the semantic catalog's rule
+                # ids (else every rule-role plan declines missing_rule). Full
+                # RAG-over-corpus dedup grounding is a documented later-slice
+                # deferral (see extractor/grounding.py).
+                known_rules=load_known_rule_ids(),
+            ),
+        )
+        _logger.info("S3 extractor ENABLED (durable audit + candidate stores wired)")
     else:
-        _logger.info("learning_audit unconfigured — audit client dormant (S2 writes no evidence)")
+        if extractor_ready:
+            _logger.warning(
+                "extractor model configured but audit_ready=%s candidates_ready=%s — "
+                "FALLING BACK to the would-extract stub (no extraction, no evidence "
+                "writes) to avoid lost candidates / dangling evidence_refs. Provision "
+                "learning_audit AND learning_candidates to enable S3 extraction.",
+                audit_ready, candidates_ready,
+            )
+        else:
+            _logger.info("extractor model unconfigured — KEEP path uses the would-extract stub")
         audit = None
-    consumer = LearningConsumer(store, queue, learning_settings, tracer=tracer, audit=audit)
+        candidates = None
+        extractor = None
+
+    consumer = LearningConsumer(
+        store, queue, learning_settings,
+        tracer=tracer, audit=audit, extractor=extractor, candidates=candidates,
+    )
 
     _logger.info(
         "learning consumer starting (group=%s, consumer=%s, batch=%s)",

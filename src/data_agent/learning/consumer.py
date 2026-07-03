@@ -25,15 +25,25 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from data_agent.runtime.session.models import SessionDoc
 from data_agent.runtime.session.store import CASMismatchError, SessionStore
 
 from . import state_machine
 from .audit import AuditStore, InMemoryAuditStore
+from .audit.models import EvidenceSnapshot
+from .candidate import CandidateStore, InMemoryCandidateStore, build_envelope, mint_candidate_id
 from .config import LearningSettings, learning_enabled
+from .extractor import ExtractedCandidate, LearningExtractor
 from .models import LearningStatus, compute_content_hash
-from .observability import consume_span, disabled_span, extract_stub_span, triage_span
+from .observability import (
+    consume_span,
+    disabled_span,
+    extract_span,
+    extract_stub_span,
+    triage_span,
+)
 from .queue import DeliveredJob, LearningQueue
 from .summary import SessionSummary, load_session_summary
 from .triage import TriageVerdict
@@ -68,17 +78,25 @@ class LearningConsumer:
         summary_loader: SummaryLoader = load_session_summary,
         triage: Triage = _default_triage,
         audit: AuditStore | None = None,
+        extractor: LearningExtractor | None = None,
+        candidates: CandidateStore | None = None,
     ) -> None:
         self._store = store
         self._queue = queue
         self._settings = settings
         self._tracer = tracer
-        # S2 DI (design §5.3): the loader + triage are pure/deterministic; the
-        # audit client is injected but DORMANT in S2 (§4.3 — no snapshot call in
-        # this path). Defaults let Layer-1 tests pass fakes.
+        # S2 DI (design §5.3): the loader + triage are pure/deterministic.
         self._summary_loader = summary_loader
         self._triage = triage
+        # S3 DI: the audit client now writes real evidence snapshots; the
+        # extractor + candidate store are injected. When `extractor is None`
+        # (e.g. unconfigured deployment, or the S2-parity tests) the KEEP path
+        # falls back to the S2 `would_extract` stub — additive, nothing breaks.
         self._audit: AuditStore = audit if audit is not None else InMemoryAuditStore()
+        self._extractor = extractor
+        self._candidates: CandidateStore = (
+            candidates if candidates is not None else InMemoryCandidateStore()
+        )
 
     async def run_once(self) -> ConsumeResult:
         # Kill-switch gate FIRST (design §7): disabled ⇒ do NOT XREADGROUP or
@@ -215,24 +233,73 @@ class LearningConsumer:
         return "dead_letter"
 
     async def _do_work(self, doc: SessionDoc, delivered: DeliveredJob) -> None:
-        """Slice-2 seam (§5.1): load the `SessionSummary` (READ-ONLY, D72), run
-        the deterministic triage gate, and either SKIP (nothing enqueued
-        downstream) or hand the summary to the stub extractor seam. Either way the
-        outer `_process` CAS-marks the session `done` — "processed" == "triaged".
-        Whether keep or skip, this method performs NO session mutation."""
+        """Slice-2/3 seam (§5.1): load the `SessionSummary` (READ-ONLY, D72), run
+        the deterministic triage gate, and on KEEP run the grounded extractor
+        (S3). Either way the outer `_process` CAS-marks the session `done` —
+        "processed" == "triaged". This method NEVER mutates the request-path
+        session (D72); the only writes are to the LEARNING plane (audit +
+        candidate stores)."""
         summary = await self._summary_loader(doc, self._store, job=delivered.job)
         verdict = self._triage(summary)
         self._emit_triage(summary.session_id, verdict)
-        if verdict.decision == "keep":
-            await self._extract_stub(summary, verdict)
+        if verdict.decision != "keep":
+            return
+        if self._extractor is None:
+            # Back-compat: no extractor wired ⇒ the S2 `would_extract` stub.
+            self._emit_extract_stub(summary.session_id, verdict.target_hints)
+            return
+        await self._run_extractor(summary, verdict)
 
-    async def _extract_stub(self, summary: SessionSummary, verdict: TriageVerdict) -> None:
-        """S2 stub — the CLEARLY-MARKED plug-in point S3 replaces with the grounded
-        extractor (learning-loop-extractor-design.md). Emits a `learning.extract`
-        span with `outcome=would_extract` + target hints and returns. Writes
-        NOTHING: no candidate, no evidence snapshot. `self._audit` is available but
-        intentionally UNUSED here in S2 (§4.3 — first evidence write is S3's)."""
-        self._emit_extract_stub(summary.session_id, verdict.target_hints)
+    async def _run_extractor(self, summary: SessionSummary, verdict: TriageVerdict) -> None:
+        """S3: extract candidates → snapshot each candidate's evidence into
+        `learning_audit` (the FIRST real evidence writes) → persist the candidate
+        envelope (carrying only `evidence_ref`s) at `status=extracted`. A candidate
+        with no evidence never reaches here (rejected at emit, D31)."""
+        result = await self._extractor.extract(summary, verdict)
+        # MEDIUM-3: drop any candidates a PRIOR attempt (redelivery before `done`)
+        # wrote for this session, so the store never holds a mixed set from two
+        # LLM runs that emitted a different count/order.
+        await self._candidates.supersede(summary.content_hash)
+        for ordinal, candidate in enumerate(result.candidates):
+            evidence_refs = await self._snapshot_evidence(candidate, summary)
+            envelope = build_envelope(
+                candidate,
+                summary,
+                candidate_id=mint_candidate_id(summary.content_hash, ordinal),
+                evidence_refs=evidence_refs,
+            )
+            await self._candidates.put(envelope)
+        decline_reasons = tuple(d.reason for d in result.declines)
+        self._emit_extract(
+            summary.session_id,
+            candidate_count=len(result.candidates),
+            decline_reasons=decline_reasons,
+            target_hints=verdict.target_hints,
+        )
+
+    async def _snapshot_evidence(
+        self, candidate: ExtractedCandidate, summary: SessionSummary
+    ) -> tuple[str, ...]:
+        """Snapshot each cited evidence quote into `learning_audit` (D51/D95) and
+        return the minted `evidence_ref`s. The entity-bearing quote lives ONLY in
+        the audit store; the candidate carries only the refs (D17)."""
+        refs: list[str] = []
+        for ev in candidate.header.evidence:
+            ref = self._audit.mint_evidence_ref(summary.session_id)
+            await self._audit.snapshot(
+                ref,
+                EvidenceSnapshot(
+                    evidence_ref=ref,
+                    session_id=summary.session_id,
+                    trace_id=summary.trace_id,
+                    turn_ref=ev.turn_ref,
+                    tool_call_ref=ev.tool_call_ref,
+                    quote=ev.quote,
+                    snapshotted_at=datetime.now(UTC).isoformat(),
+                ),
+            )
+            refs.append(ref)
+        return tuple(refs)
 
     def _emit_triage(self, session_id: str, verdict: TriageVerdict) -> None:
         if self._tracer is not None:
@@ -249,6 +316,25 @@ class LearningConsumer:
         if self._tracer is not None:
             with extract_stub_span(
                 self._tracer, session_id=session_id, target_hints=target_hints
+            ):
+                pass
+
+    def _emit_extract(
+        self,
+        session_id: str,
+        *,
+        candidate_count: int,
+        decline_reasons: tuple[str, ...],
+        target_hints: tuple[str, ...],
+    ) -> None:
+        if self._tracer is not None:
+            with extract_span(
+                self._tracer,
+                session_id=session_id,
+                candidate_count=candidate_count,
+                decline_count=len(decline_reasons),
+                decline_reasons=decline_reasons,
+                target_hints=target_hints,
             ):
                 pass
 

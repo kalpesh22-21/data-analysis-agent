@@ -135,8 +135,9 @@ def extract_stub_span(
     tracer: Tracer, *, session_id: str, target_hints: tuple[str, ...] = ()
 ) -> Any:
     """The S2 stub extractor seam (§5.2 `learning.extract`, CHAIN). Emits
-    `outcome=would_extract` + hint labels only — writes nothing; S3 replaces the
-    body with the grounded extractor."""
+    `outcome=would_extract` + hint labels only — writes nothing. Retained for the
+    consumer's back-compat path when no extractor is injected; S3 uses
+    `extract_span` below when the real extractor runs."""
     return span(
         tracer,
         "learning.extract",
@@ -149,11 +150,40 @@ def extract_stub_span(
     )
 
 
+def extract_span(
+    tracer: Tracer,
+    *,
+    session_id: str,
+    candidate_count: int,
+    decline_count: int,
+    decline_reasons: tuple[str, ...] = (),
+    target_hints: tuple[str, ...] = (),
+) -> Any:
+    """The S3 grounded-extractor outcome (`learning.extract`, CHAIN). SHAPE-only
+    (D25): candidate/decline COUNTS + decline reason codes + hint labels — NEVER
+    the candidate payload, evidence quote, or SQL. `outcome=extracted` when any
+    candidate was produced, else `declined`."""
+    return span(
+        tracer,
+        "learning.extract",
+        OpenInferenceSpanKindValues.CHAIN,
+        {
+            "session.id": session_id,
+            "learning.extract.outcome": "extracted" if candidate_count else "declined",
+            "learning.extract.candidate_count": candidate_count,
+            "learning.extract.decline_count": decline_count,
+            "learning.extract.decline_reasons": ",".join(decline_reasons),
+            "learning.extract.target_hints": ",".join(target_hints),
+        },
+    )
+
+
 __all__ = [
     "configure_learning_tracing",
     "consume_span",
     "disabled_span",
     "enqueue_span",
+    "extract_span",
     "extract_stub_span",
     "get_learning_tracer",
     "sweep_span",

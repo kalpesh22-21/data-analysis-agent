@@ -728,6 +728,33 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   [D26](#memory--learning), [D27](#memory--learning), [D31](#memory--learning), [D99](#memory--learning),
   [D96](#memory--learning).
 
+- **D101 (locked, 2026-07-03, Session 18 — Track B Slice 3; resolves the OPEN-QUESTIONS "concrete
+  inbox/candidate store" item).** **Extracted candidates are held in a dedicated, access-controlled
+  Couchbase `learning_candidates` store — a sibling to `learning_audit` (D95), DISTINCT from the
+  entity-free neo4j / vector recall stores — carrying the candidate envelope + `evidence_ref`(s) and
+  queryable by `status`; candidates are promoted INTO the recall stores only on validation (Slice 9).**
+  The extractor (D31/D34) emits a candidate at `status=extracted`; something must hold it between
+  extraction and promotion. It cannot live in the entity-free global stores (neo4j blueprints, the
+  knowledge vector index): a **pre-leakage-gate** candidate (before Slice 5's D58 gate) may be
+  **entity-bearing** in its payload, so inlining it would breach the entity-free guarantee (D17) — the
+  same reason evidence snapshots go to `learning_audit` not the global stores (D95). And it is
+  **less-trusted** (`candidate ≠ validated`, D29) until replay + recurrence/human approval, so it must
+  not be recall-visible. **Choice: a dedicated Couchbase bucket** `learning_candidates` with its OWN
+  RBAC user (`learning_candidates_writer`, scoped to that bucket ONLY — not sessions/audit/neo4j/
+  warehouse) and OWN retention clock (≥ the review-inbox dwell), mirroring the D95 audit-store posture;
+  it is KV-put by candidate id AND **N1QL-queryable by `status`** (a primary/status index — unlike the
+  KV-only audit store) so the Slice-7 review inbox and the Slice-9 promotion scheduler can enumerate
+  `status=extracted`/`in_review` candidates. The candidate carries only `evidence_ref`s (the audit KV
+  keys), never the entity-bearing evidence quotes. The candidate id is derived from the session
+  `content_hash` (+ ordinal) so a crash/redelivery re-UPSERTs rather than duplicates (best-effort until
+  the D48 `canonical_key` dedup in Slice 6). **Slice 3 provisions the bucket + RBAC + a Layer-2-tested
+  `CandidateStore` client and persists `status=extracted` candidates; nothing promotes them** (the
+  writers into neo4j/vector are Slice 7, the promotion scheduler Slice 9). See
+  [learning-loop-extractor-design.md](learning-loop-extractor-design.md). Cross-references:
+  [D95](#memory--learning), [D51](#blueprint-dedup--resolvers), [D17](#memory--learning),
+  [D29](#memory--learning), [D48](#blueprint-dedup--resolvers), [D58](#memory--learning),
+  [D31](#memory--learning), [D34](#blueprint-extraction-payload).
+
 ## Observability
 - **D23.** **Arize Phoenix + OpenTelemetry** (OpenInference conventions) for tracing across the
   request path and the offline learning loop. Span kinds map ~1:1 to components (AGENT/LLM/TOOL/

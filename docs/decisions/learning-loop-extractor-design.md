@@ -1,7 +1,17 @@
 # Learning-loop grounded extractor — Slice 3 (S3) design
 
-**Status:** DESIGNED (2026-07-02) — build-ready; no code yet. This doc CONCRETIZES an already-Locked
-contract (the `blueprint` payload, D34–D36; the shared header, D31). It does not re-decide it.
+**Status:** BUILT (2026-07-03) — the extractor + `learning_candidates` store (D101) shipped in S3.
+Layer-1 tests/learning/extractor + candidate (243 learning tests total) + Layer-2 live (candidate
+store put/get/list_by_status + RBAC + real evidence-write). Reviewed (REQUEST CHANGES → totality
+enumerator under-enumeration + partial-config candidate-loss fixed → APPROVE); full suite 1662 passed.
+This doc CONCRETIZES an already-Locked contract (the `blueprint` payload, D34–D36; the shared header,
+D31). It does not re-decide it. sql_template AST rewrite is S4 (the extractor emits the PLAN only).
+
+**S4+ forward note (non-blocking, from review):** the totality enumerator over-enumerates
+runtime-expression comparisons (`pay_period >= now() - INTERVAL 30 DAY` yields a `('pay_period','30')`
+literal), so relative-date queries systematically `totality_violation`→fail-to-review — D97's safe
+direction, but a real recall cost. Track via the `totality_violation` decline-reason telemetry; a
+future refinement treats a value side containing a non-cast function as "not a literal predicate".
 
 **Scope:** Track B, Slice 3 — the RAG-grounded, structured-output **extractor** that replaces the
 Slice-1 no-op consumer's `_do_work` (see [learning-loop-infra-design.md](learning-loop-infra-design.md)
@@ -282,11 +292,28 @@ slot **silently changes answers** while passing every structural gate.
 
 ### 4.1 Totality — one entry per literal predicate
 
-`parameterization` has **exactly one `ParamPlan` per literal predicate** in the accepted SQL (WHERE
-equality/`IN`, and constant JOIN-on predicates). The three roles are **TOTAL** over literal
-predicates: every literal is placed into exactly one of `slot | rule | inline`. There is **no fourth
-role and no "unplaced" predicate** — a predicate the extractor emits nothing for would be a silent
-dropped filter, the exact D56 wrong-answer class.
+`parameterization` has **exactly one `ParamPlan` per literal predicate** in the accepted SQL. The
+totality set (reconciled with D97's lock text "every literal predicate") is **every literal
+COMPARISON predicate — `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE` — anywhere in
+the statement: WHERE, constant JOIN-`ON`, HAVING, and derived-table/CTE sub-WHEREs at every nesting
+level.** A predicate is "literal" iff one side resolves to a single column (seen through a function
+wrapper, e.g. `toYear(col)`) and the other side is a constant, INCLUDING a function-wrapped literal
+(`toDate('2025-01-01')`), on **either** side. The three roles are **TOTAL** over these predicates:
+every one is placed into exactly one of `slot | rule | inline`. There is **no fourth role and no
+"unplaced" predicate** — a predicate the extractor emits nothing for would be a silent dropped filter,
+the exact D56 wrong-answer class. **Coverage is matched per-locator** (`table, column, value`), so
+`region='NA' OR region='EU'` needs a plan entry per predicate and same-named columns on different
+tables are distinguished. Over-enumeration is the SAFE direction (§2.3): a predicate the enumerator
+returns that the plan does not cover is a **conservative decline (fail-to-review)**, never a silent
+drop — so subquery-internal predicates being enumerated is an accepted conservative-decline class, not
+special-cased away.
+
+> **Enumerator scope note (build).** The `sql_predicates` enumerator walks the WHOLE statement (not a
+> single WHERE subtree — the prior WHERE-only walk silently missed JOIN-`ON` literals and >1-WHERE
+> queries, a confirmed D97 silent-drop class). The `rule` role is grounded in the semantic catalog's
+> `rules[*].id`; **full RAG-over-corpus dedup-grounding (proposing only what is not already
+> represented, D27) is a documented later-slice deferral** — S3 emits without corpus-dedup and Slice 6
+> catches near-duplicates.
 
 ### 4.2 The three roles
 

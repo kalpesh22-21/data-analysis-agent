@@ -148,6 +148,43 @@ class LearningSettings(BaseSettings):
         description="Audit retention floor (D95): audit_TTL ≥ max_candidate_lifetime. Set fresh per write.",
     )
 
+    # --- Candidate holding store (D101, Slice 3) — a dedicated, access-controlled
+    # bucket sibling to learning_audit; holds extracted candidate envelopes at
+    # status=extracted, queryable by status. Its own RBAC user scoped to it only.
+    learning_candidates_connection_string: str = Field(
+        "couchbase://localhost",
+        description="Couchbase connection string for the learning_candidates bucket.",
+    )
+    learning_candidates_bucket: str = Field(
+        "learning_candidates", description="Dedicated candidate-holding bucket (D101)."
+    )
+    learning_candidates_username: str = Field(
+        "", description="RBAC user scoped to learning_candidates ONLY (learning_candidates_writer)."
+    )
+    learning_candidates_password: str = Field(
+        "", description="Password for the learning_candidates_writer RBAC user (secret)."
+    )
+    learning_candidates_ttl_seconds: int = Field(
+        7_776_000,  # 90 days — a candidate must outlive the review-inbox dwell (D101/D95).
+        ge=1,
+        description="Candidate retention (≥ review-inbox dwell). Set fresh per write.",
+    )
+
+    # --- Extractor (Slice 3, D31/D34) — the LLM structured-output model + retry. ---
+    learning_extractor_model: str = Field(
+        "claude-opus-4-8",
+        description="Model id for the extractor's structured-output call (via the runtime ModelClient).",
+    )
+    learning_extractor_max_retries: int = Field(
+        2, ge=0, description="Retries on a malformed (non-tool-call) extractor response (D31)."
+    )
+    learning_extractor_api_key: str = Field(
+        "", description="API key for the extractor model client (secret). Empty ⇒ extractor dormant."
+    )
+    learning_extractor_base_url: str = Field(
+        "", description="Optional OpenAI-compatible base URL for the extractor model client."
+    )
+
     # --- Observability (D23/D24) ---
     otlp_endpoint: str = Field(
         "", description="OTLP collector endpoint (Phoenix). Empty => no-op provider."

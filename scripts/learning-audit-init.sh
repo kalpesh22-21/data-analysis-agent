@@ -25,7 +25,7 @@ done
 
 echo "[learning-audit-init] bucket-create $BUCKET (own retention/RBAC clock)..."
 $C bucket-create --cluster "$CLUSTER" -u "$U" -p "$P" \
-  --bucket "$BUCKET" --bucket-type couchbase --bucket-ramsize 256 \
+  --bucket "$BUCKET" --bucket-type couchbase --bucket-ramsize 128 \
   --wait 2>&1 | tail -2 || echo "[learning-audit-init] bucket exists (ok)"
 
 sleep 2

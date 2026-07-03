@@ -202,6 +202,63 @@ authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's
 
 ---
 
+## 2026-07-03 — Session 18: Learning-loop Slice 3 (grounded extractor + candidate store) BUILT (D101)
+
+The first LLM-in-the-loop learning component + the first real candidate. Built the **grounded
+extractor** and the **`learning_candidates` holding store (D101)**. No planner — the S3 design already
+existed (`learning-loop-extractor-design.md`); briefed the builder directly per user feedback
+([[skip-planner-small-slices]]).
+
+### What shipped (new `src/data_agent/learning/{extractor,candidate}/`)
+- **Grounded extractor** — a KEEP-triaged `SessionSummary` → a **forced structured-output** LLM call
+  (D31: one `emit_candidates` tool, retry-on-mismatch → dead-letter; free text can't produce a
+  candidate) → typed candidate envelope(s). **Lift-don't-generate (D34):** the `blueprint` payload's
+  `parameterization` is a PLAN over the literal predicates of the accepted SQL (roles slot|rule|inline,
+  D97) — **no `sql_template`** (the AST rewrite is S4). Injected `ModelClient` (scripted double in tests,
+  no real LLM). `known_rules` wired from the semantic catalog's 78 rule ids so the `rule` role is live.
+- **Deterministic validations** → `ExtractedCandidate | Decline`: evidence-mandatory (D31), accepted_signal
+  required + domain-checked (D34), **D97 totality** (every literal predicate must have a ParamPlan, matched
+  per-locator), role consistency, `unrewritable_sql`/`missing_rule` → fail-to-review. A decline completes
+  `done`; a schema-mismatch dead-letters — never a manufactured or silently-dropped candidate.
+- **First real evidence writes** → snapshot cited quotes into `learning_audit` (S2's dormant client, now
+  live), candidate carries only `evidence_ref` (D51/D17 — verified ref-only at L1 + L2).
+- **`learning_candidates` store (D101)** — dedicated access-controlled Couchbase bucket + RBAC scoped to
+  it only (denied on `agent_sessions` AND `learning_audit`), N1QL-queryable by `status`. Candidates
+  persisted at `status=extracted`; `supersede(content_hash)` before each write so redelivery can't leave
+  a stale mixed set. Promoted into the entity-free recall stores only on validation (S9). Resolves the
+  open "concrete candidate/inbox store" question.
+- Consumer's `_extract_stub` replaced with extract→snapshot→persist→trace; all prior invariants preserved.
+
+### The review win (again — and this time QA caught it too)
+Reviewer flagged the **D97 totality enumerator under-enumerating** — the exact silent-drop class this
+slice exists to blunt: it missed **JOIN-ON constant predicates** (design-required), **value-side
+function-wrapped literals** (`pay_period = toDate('2025-01-01')` — the canonical ClickHouse date idiom),
+**any query with >1 WHERE** (`find` not `find_all` — derived tables/CTEs), and HAVING. An un-enumerated
+predicate reaches S4 as an un-planned filter. **QA independently confirmed it** with its own adversarial
+fixtures (filed as strict-xfail reproductions) — a marked contrast to Slice 2, where QA's fixtures had
+encoded the bug. Fixed: whole-statement DFS over all comparison operators + JOIN-ON + HAVING + value-side
+fn-unwrap + per-locator matching (§4.1 reconciled to D97's "every literal predicate"). Plus a **HIGH
+partial-config data-loss** hole (extractor configured but candidate store not → real extraction + audit
+writes → persist to a process-local dict → lost on restart) closed by all-or-nothing config gating; and a
+stale-mixed-set redelivery hazard closed by `supersede`.
+
+### Process
+builder (direct, no planner) → **reviewer REQUEST CHANGES** (totality under-enumeration + partial-config
+loss) + **qa** (independently confirmed the enumerator bug; 15-slug matrix) → backend fix bundle → qa
+finalize (xfail→regression guards + new coverage) → **reviewer delta APPROVE**. Gates: **1662 passed / 93
+skipped, ruff clean**; L2 live candidate store + RBAC + real evidence-write vs `l2-cb`.
+
+See [decisions/learning-loop-extractor-design.md](decisions/learning-loop-extractor-design.md) (BUILT;
+S4 forward note: relative-date over-enumeration → conservative fail-to-review, track via telemetry).
+CI note: run each `*_live.py` in its own process (Couchbase C-ext segfaults when many Clusters share one
+interpreter).
+
+**Runway:** S1 ✅ S2 ✅ S3 ✅ → **S4 blueprint generalize + static-validate (AST rewrite → sql_template,
+USES/DAG, golden)** → S5 leakage gate → S6 D48 dedup → S7 writers + review inbox → S8 user store +
+schema-edit PR bot → S9 promotion scheduler.
+
+---
+
 ## 2026-07-03 — Session 17: Learning-loop Slice 2 (loader + triage + audit store) BUILT (D99/D100) + S3 design
 
 Two increments this session. First, wrote the **S3 grounded-extractor design** (committed `fec94d1`):

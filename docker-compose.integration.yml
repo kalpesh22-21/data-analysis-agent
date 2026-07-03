@@ -176,17 +176,22 @@ services:
       retries: 20
       start_period: 3s
 
-  # Session store (D22/D44/D45) + the Slice-2 learning_audit store (D95). Init is
-  # done out-of-band after the node reports healthy (Couchbase init is not fully
-  # declarative in the base image): run BOTH
-  #   scripts/couchbase-init.sh        (agent_sessions bucket + sessions/session_results)
-  #   scripts/learning-audit-init.sh   (dedicated learning_audit bucket + learning_audit_writer RBAC)
-  # The learning consumer / the Layer-2 audit tests then read the audit env:
+  # Session store (D22/D44/D45) + the Slice-2 learning_audit store (D95) + the
+  # Slice-3 learning_candidates store (D101). Init is done out-of-band after the
+  # node reports healthy (Couchbase init is not fully declarative in the base
+  # image): run ALL THREE
+  #   scripts/couchbase-init.sh            (agent_sessions bucket + sessions/session_results)
+  #   scripts/learning-audit-init.sh       (learning_audit bucket + learning_audit_writer RBAC)
+  #   scripts/learning-candidates-init.sh  (learning_candidates bucket + writer RBAC + status index)
+  # The consumer / Layer-2 tests then read the audit + candidate env:
   #   LEARNING_AUDIT_CONNECTION_STRING=couchbase://localhost
   #   LEARNING_AUDIT_BUCKET=learning_audit
-  #   LEARNING_AUDIT_USERNAME=learning_audit_writer   LEARNING_AUDIT_PASSWORD=audit-writer-pass
-  # (matching the credentials learning-audit-init.sh provisions). The single l2-cb
-  # node hosts both buckets; the audit bucket keeps its OWN retention/RBAC clock.
+  #   LEARNING_AUDIT_USERNAME=learning_audit_writer          LEARNING_AUDIT_PASSWORD=audit-writer-pass
+  #   LEARNING_CANDIDATES_CONNECTION_STRING=couchbase://localhost
+  #   LEARNING_CANDIDATES_BUCKET=learning_candidates
+  #   LEARNING_CANDIDATES_USERNAME=learning_candidates_writer LEARNING_CANDIDATES_PASSWORD=candidates-writer-pass
+  # (matching the credentials the init scripts provision). The single l2-cb node
+  # hosts all three buckets; each learning bucket keeps its OWN retention/RBAC clock.
   couchbase:
     image: couchbase/server:7.6.5
     container_name: l2-cb
