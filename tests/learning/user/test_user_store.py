@@ -1,0 +1,124 @@
+"""S8 per-user knowledge store + auto-commit stage (D17) — Layer-1.
+
+Covers: provisioning + the D95-style RBAC boundary (denied on other buckets),
+per-user scoping (no cross-user surface), auto-commit, and the `control="drop"`
+that keeps a user_knowledge candidate out of the review inbox.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from data_agent.learning.candidate.models import CandidateEnvelope
+from data_agent.learning.stage import StageContext
+from data_agent.learning.triage import TriageVerdict
+from data_agent.learning.user import (
+    InMemoryUserKnowledgeStore,
+    UserKnowledgeAccessError,
+    UserKnowledgeCommitStage,
+    UserKnowledgeRecord,
+    mint_record_id,
+)
+
+from ..extractor.helpers import make_summary
+
+_FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "learning"
+_KEEP = TriageVerdict(decision="keep", reason="K1", target_hints=("user",))
+
+
+def _user_candidate() -> CandidateEnvelope:
+    with (_FIXTURES / "s3_user_knowledge.json").open() as fh:
+        return CandidateEnvelope.from_doc(json.load(fh))
+
+
+def _ctx() -> StageContext:
+    return StageContext(summary=make_summary(), verdict=_KEEP)
+
+
+# --- RBAC boundary (D95-style) -----------------------------------------------
+
+
+async def test_store_open_bucket_denies_other_buckets():
+    store = InMemoryUserKnowledgeStore(bucket="user_knowledge")
+    # its own bucket is allowed ...
+    assert store.open_bucket("user_knowledge") is store
+    # ... every other bucket is denied (the scoped RBAC role)
+    for other in ("learning_audit", "learning_candidates", "sessions", "_default"):
+        with pytest.raises(UserKnowledgeAccessError):
+            store.open_bucket(other)
+
+
+async def test_store_reports_its_single_granted_bucket():
+    store = InMemoryUserKnowledgeStore(bucket="user_knowledge")
+    assert store.bucket() == "user_knowledge"
+
+
+# --- per-user scoping --------------------------------------------------------
+
+
+async def test_list_for_user_is_scoped_no_cross_user_surface():
+    store = InMemoryUserKnowledgeStore()
+    a = UserKnowledgeRecord.from_candidate(_user_candidate())
+    from dataclasses import replace
+
+    b_env = replace(
+        _user_candidate(),
+        candidate_id="candidate::hash-userk-b::0",
+        payload={"statement": "I mean APAC", "scope": "user", "user_id": "user-2"},
+    )
+    b = UserKnowledgeRecord.from_candidate(b_env)
+    await store.commit(a)
+    await store.commit(b)
+
+    only_user1 = await store.list_for_user("user-1")
+    assert [r.user_id for r in only_user1] == ["user-1"]
+    only_user2 = await store.list_for_user("user-2")
+    assert [r.user_id for r in only_user2] == ["user-2"]
+
+
+async def test_record_id_is_deterministic_idempotent():
+    env = _user_candidate()
+    rec = UserKnowledgeRecord.from_candidate(env)
+    assert rec.record_id == mint_record_id("user-1", env.candidate_id)
+    store = InMemoryUserKnowledgeStore()
+    await store.commit(rec)
+    await store.commit(rec)  # re-commit upserts the same key
+    assert len(store.all_records()) == 1
+
+
+# --- auto-commit + drop-control ----------------------------------------------
+
+
+async def test_commit_stage_auto_commits_and_drops():
+    store = InMemoryUserKnowledgeStore()
+    stage = UserKnowledgeCommitStage(store=store)
+    env = _user_candidate()
+    result = await stage.process(env, _ctx())
+
+    # auto-committed to the per-user store ...
+    assert store.commit_calls == 1
+    committed = await store.list_for_user("user-1")
+    assert len(committed) == 1
+    assert committed[0].statement.startswith("I usually mean the NA region")
+    # ... and dropped (never reaches the candidate holding store / inbox)
+    assert result.control == "drop"
+    assert result.envelope.status == "validated"
+
+
+async def test_commit_stage_passes_through_non_user_targets():
+    store = InMemoryUserKnowledgeStore()
+    stage = UserKnowledgeCommitStage(store=store)
+    from dataclasses import replace
+
+    bp = replace(_user_candidate(), type="blueprint")
+    result = await stage.process(bp, _ctx())
+    assert result.control == "continue"
+    assert store.commit_calls == 0
+
+
+async def test_record_round_trips_through_doc():
+    rec = UserKnowledgeRecord.from_candidate(_user_candidate())
+    assert UserKnowledgeRecord.from_doc(rec.to_doc()) == rec
