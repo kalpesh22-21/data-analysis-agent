@@ -630,6 +630,58 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   [D72](#extensibility), [D44](#context-budget--loop-guardrails), [D45](#context-budget--loop-guardrails),
   [D95](#memory--learning), D68 (Track B).
 
+- **D97 (locked, 2026-07-02, Session 16 — Track B Slice 3; concretizes D35 + D52, does not
+  re-decide them).** **Extractor role classification is TOTAL over literal predicates, has no "drop"
+  role, and an unclassifiable predicate fails-to-review.** D35 fixed the trichotomy (`slot | rule |
+  inline`) and the locked `blueprint` payload fixed "one entry per literal predicate" + the
+  `optional_pattern` mechanism; D97 commits the **safety consequences** those imply and adds the one
+  genuinely new rule. **(a) Totality as a safety property:** every literal predicate in the accepted
+  SQL gets **exactly one** `parameterization` entry in one of the three roles — there is no fourth
+  role and no unplaced predicate, so **no code path removes a predicate** (a missing entry would be a
+  silent dropped filter, the D56 wrong-answer class). **(b) No drop role:** a caller/session-specific
+  predicate (e.g. `region='NA'`) is **not deleted** — it becomes an **optional slot**
+  (`required:false` + `optional_pattern`), so the generalization is template-declared, review-visible,
+  and **caller-controlled at bind time**, never an irreversible AST deletion by the extractor. A
+  metric-DEFINING predicate (e.g. `record_type='EARNING'`) is `inline` (stays literal); a
+  catalog-resolvable predicate is `rule` (existing `rule_id`). **(c) NEW: unclassifiable ⇒
+  fail-to-review.** D52 covered the parser being unable to **rewrite** SQL; D97 adds that when the LLM
+  cannot confidently **classify** a predicate into exactly one role (ambiguous between metric-defining
+  inline and caller-specific optional-slot; or rule-shaped with no catalog rule — see the D35
+  missing-rule pairing), the candidate routes to **human review**, never auto-promotes. **Rationale:**
+  mis-classifying a metric-defining predicate as an optional slot silently changes answers (drops the
+  metric definition) while passing every structural gate — grain and shape are unchanged (see D98). No-
+  drop makes that outcome **structurally unreachable**: the worst the extractor can produce is an
+  over-narrow-but-correct-shaped template a human can loosen, never a silently-gone predicate. Bias:
+  keep the predicate, ask a human — never delete. See
+  [learning-loop-extractor-design.md](learning-loop-extractor-design.md) §4. Cross-references:
+  [D35](#blueprint-extraction-payload), [D52](#blueprint-dedup--resolvers), [D56](#blueprint-silent-path-safety),
+  [D31](#memory--learning), [D98](#memory--learning).
+
+- **D98 (locked, 2026-07-02, Session 16 — Track B Slice 3; concretizes D36 + D56, does not
+  re-decide them).** **Promotion replay verifies STRUCTURE (grain-integrity + result_signature shape),
+  NOT VALUES; value-correctness is a layered protection, not a replay oracle — stated as a first-class
+  invariant so replay is never overstated.** D36 fixed golden = entity-free signature + sampled-input
+  replay, scoped to regression not data/semantic drift; D56 fixed the grain-integrity teeth. D98 makes
+  the **honest scope** explicit and load-bearing. **The golden fixture is the entity-free
+  `result_signature`** (shape + invariants + grain), **never** the recorded scalar answer (which is
+  entity-bearing and must never enter the entity-free blueprint — D17). **Replay** samples valid slot
+  values at run time (catalog-driven, from `binds_to` domains; **no stored entity inputs**), binds +
+  runs the scope-enforced template, and asserts via `verify_result`: (a) D56 grain-integrity
+  (`row_count == COUNT(DISTINCT grain)` — the fan-out teeth) and (b) result_signature shape +
+  invariants. **What replay does NOT catch (explicit):** a **semantically-wrong-but-structurally-valid**
+  template — a dropped/mis-inlined value filter or a fan-out `JOIN` changes the **number** but not the
+  **shape or grain**, so it passes replay (replay has no trusted expected value to compare against;
+  storing one would breach D17). **Therefore value-correctness is LAYERED:** (i) no-drop role (D97 — the
+  extractor structurally can't silently remove a predicate); (ii) lift only the accepted final SQL (D34
+  — `accepted_signal` mandatory; the number was human-accepted at capture); (iii) candidate ≠ validated
+  (D29 — reaches `validated` only via replay + hit_count and/or human; a single session's candidate
+  stays `candidate`); (iv) fail-to-review for un-rewritable (D52) / unclassifiable (D97); (v)
+  sampled-input replay still rules out the fan-out class + shape drift (the regression role D36 scopes
+  it to). No future reader should treat a green replay as a proof of the returned number. See
+  [learning-loop-extractor-design.md](learning-loop-extractor-design.md) §6. Cross-references:
+  [D36](#blueprint-extraction-payload), [D56](#blueprint-silent-path-safety), [D29](#memory--learning),
+  [D34](#blueprint-extraction-payload), [D17](#memory--learning), [D97](#memory--learning).
+
 ## Observability
 - **D23.** **Arize Phoenix + OpenTelemetry** (OpenInference conventions) for tracing across the
   request path and the offline learning loop. Span kinds map ~1:1 to components (AGENT/LLM/TOOL/

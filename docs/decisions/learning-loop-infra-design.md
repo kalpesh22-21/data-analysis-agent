@@ -459,7 +459,9 @@ legs pass. Slugs: `D58c-learning-kill-switch-halts-writes` (already a `⛔` row 
   loader→normalizer (`SessionSummary`) + cheap-LLM triage; **provision `learning_audit`** (D95) and
   the `evidence_ref` KV client (first evidence snapshots, D51).
 - **Slice 3 — Grounded extractor:** RAG-grounded, structured-output extractor emitting typed
-  candidate envelopes (D31), literals→slots, entity facts→user knowledge.
+  candidate envelopes (D31), literals→slots, entity facts→user knowledge. **Designed:**
+  [learning-loop-extractor-design.md](learning-loop-extractor-design.md) (Status: DESIGNED; D97 total
+  role classification / no-drop, D98 replay-verifies-structure-not-values).
 - **Slice 4 — Generalize + static-validate (blueprints):** lift→slots, `USES`/DAG,
   `explainQuery` dry-run, golden result-signature (D34–D36).
 - **Slice 5 — Leakage gate:** regex/NER + LLM semantic scan; entity found → reroute/quarantine
