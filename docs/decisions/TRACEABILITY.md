@@ -264,3 +264,28 @@ data-bearing content under any scope, so the fix diagnoses the hang without weak
 | **D94 / D44** | A **cross-turn** `ok`+`None` entry stays dropped as history — no sentinel, no event; the exemption is current-turn-only and the status-gated non-`ok` exemption is unchanged (no regression) | Unit | `D94-cross-turn-ok-none-still-dropped` | — | ⛔ not-built |
 | **D94 / D25** | `assemble` emits `loop_result_withheld_provenance` (payload `tool_name`/`turn_index`/`tool_call_id`/`blueprint_id`/`reason` only — no SQL/columns/cells/scope/JWT), **at most once per `tool_call_id` per turn** across repeated round-trip rebuilds (turn-local memo de-dup); telemetry-only, no `progress.py` allowlist/label change | Unit | `D94-withheld-event-once-pii-safe` | — | ⛔ not-built |
 | **D94** | Seed/load skew warning: `corpus_loader.load_corpus` cross-checks each `BlueprintSeed.uses` `(db,table)` against an optional `CatalogHandle` and logs a **soft WARNING** (naming blueprint id + missing `db.table`) on skew — load still succeeds (**never** `CorpusLoadError`); with no `CatalogHandle` supplied the check is skipped silently. Prod safety is MCP-fails-closed + catalogs-in-agreement, **not** this load-time check | Unit | `D94-seed-skew-soft-warning-not-failclosed` | — | ⛔ not-built |
+
+---
+
+## Additional tagged invariants from D95/D96 (Track-B learning-loop infra spine, Slice 1, Session 16)
+
+The load-bearing invariants of the learning-loop transport + lifecycle spine (D96) and the audit-store
+lock (D95). All `⛔ not-built` — DESIGNED (see
+[learning-loop-infra-design.md](learning-loop-infra-design.md)), no tagged tests yet; they map to the
+Slice-1 build. Statuses move `⛔ → 🟡 unit-green` as the Layer-1 suite lands and `→ ✅ green` when the
+Layer-2 legs (real Redis + real Couchbase) pass. The pre-existing D58c row above
+(`D58c-learning-kill-switch-halts-writes`) is this design's kill-switch invariant — it now has a home.
+
+| Decision | Invariant | Test layer | Test slug | Conformance scenario | Status |
+|---|---|---|---|---|---|
+| **D58c / D96** | `LEARNING_ENABLED=false` (read uncached, per cycle) halts **both** the sweeper's enqueue AND the consumer's processing — no `XADD`, no `XREADGROUP`/process; work waits in the stream (no loss); toggles without a deploy | Unit + Component | `D58c-learning-kill-switch-halts-writes` | **Correction → learning** | ⛔ not-built |
+| **D58c / D96** | Reads are unaffected by the kill-switch: `searchKnowledge`/`searchBlueprints` serve with the switch off; the request path never imports `LEARNING_ENABLED` (no-import assertion) | Unit + Component | `D58c-kill-switch-reads-unaffected` | — | ⛔ not-built |
+| **D30 / D96** | Idempotency by `content_hash`: a Redis re-delivery OR a re-swept identical session processes exactly once (session already `done` with the same recorded hash → ACK + dedup_skip, no state change) | Unit + Component | `D30-idempotent-by-content-hash` | — | ⛔ not-built |
+| **D96** | `content_hash` is deterministic and canonical: identical transcript → identical hash; a new turn/tool-call → different hash; `learning_status`/timestamps/`result_full_ref`/`provenance` are excluded (do not affect the hash) | Unit | `D96-content-hash-canonical` | — | ⛔ not-built |
+| **D96 / D48** | Race-safe CAS transition = single-writer-per-session: two concurrent sweepers → exactly one `active→pending` claim (loser `CASMismatchError`, skips); two consumers → exactly one `queued→processing`; every transition asserts its expected `from` state | Unit + Component | `D96-cas-single-writer-transition` | — | ⛔ not-built |
+| **D30 / D96** | The sweeper detects close = idle: it claims **only** `active`/`pending` sessions with `last_activity < now − idle_threshold`; a fresh or resumed session (activity bumped after scan) is skipped via CAS mismatch | Unit + Component | `D30-sweeper-idle-detection` | — | ⛔ not-built |
+| **D30 / D96** | Dead-letter after `N` (=5) delivery attempts: a poison job is `XADD`ed to `learning:jobs:dead`, `XACK`ed off the work stream, and its session CAS-marked `dead_letter`; the stream is never head-of-line-blocked | Unit + Component | `D30-dead-letter-after-n` | — | ⛔ not-built |
+| **D96** | `done` is terminal: a completed job's session ends `done` with its `learning_content_hash` recorded; an unchanged `done` session is not re-enqueued | Unit + Component | `D96-done-terminal` | — | ⛔ not-built |
+| **D30 / D96 / D25** | The queued message is a **reference** (session_id, couchbase_doc_id, cas, user_id, scope_ref, trace_id, session_closed_at, content_hash) — NEVER the transcript, NEVER the raw JWT or raw `column_scope` (only a scope id/hash) | Unit + Component | `D30-message-is-reference` | — | ⛔ not-built |
+| **D96** | Spine end-to-end (real Redis + real Couchbase): sweep→enqueue→consume→done leaves the doc at `done` and the stream fully ACKed (empty PEL, no leak) | Component | `D96-spine-end-to-end-live` | — | ⛔ not-built |
+| **D95** | Candidates carry only `evidence_ref`; the entity-bearing snapshot is NEVER inlined into the entity-free global stores (neo4j / knowledge vector index) — the dedicated `learning_audit` bucket is the sole home (store provisioned in Slice 2; the entity-free-global invariant is testable at write time once the extractor lands) | Unit + Component | `D95-evidence-ref-not-inlined` | — | ⛔ not-built |

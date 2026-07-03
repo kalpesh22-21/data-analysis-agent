@@ -88,3 +88,51 @@ class SessionStore(Protocol):
             CASMismatchError: a concurrent resume already won the race.
         """
         ...
+
+    # --- Learning loop (Track-B Slice 1, D96) — additive, read-only w.r.t.
+    # request-path data: the only write is advancing the lifecycle flag. ---
+
+    async def scan_idle_sessions(
+        self,
+        *,
+        statuses: list[str],
+        last_activity_before: str,
+        limit: int,
+    ) -> list[tuple[SessionDoc, Any]]:
+        """Return `(doc, cas)` for sessions whose `learning_status` is in
+        *statuses* and whose `last_activity` is strictly older than
+        *last_activity_before* (an ISO-8601 cutoff), capped at *limit*.
+
+        The sweeper (D96 §6) uses this to detect idle sessions to claim. Each
+        returned CAS is a best-effort snapshot for the sweeper's subsequent
+        CAS-guarded `transition_learning_status`; a doc that changes between the
+        scan and the transition simply mismatches and is skipped.
+        """
+        ...
+
+    async def transition_learning_status(
+        self,
+        session_id: str,
+        expected_from: str,
+        to: str,
+        cas: Any,
+        *,
+        content_hash: str | None = None,
+        assert_from: bool = True,
+    ) -> Any:
+        """CAS-guarded `learning_status` transition (D96 single-writer-per-session).
+
+        Reads the doc under *cas*, asserts `learning_status == expected_from`
+        (unless *assert_from* is False — the `* → dead_letter` transition #5 has
+        no `from` assertion), sets `learning_status = to`, optionally records
+        *content_hash* on `learning_content_hash`, and writes back CAS-guarded.
+
+        Returns the new CAS token on success.
+
+        Raises:
+            CASMismatchError: the CAS no longer matches (a peer won the race) OR
+                *assert_from* is set and the current status is not *expected_from*
+                (the session was resumed / already advanced) — both are "skip
+                this session", so the sweeper/consumer treats them identically.
+        """
+        ...

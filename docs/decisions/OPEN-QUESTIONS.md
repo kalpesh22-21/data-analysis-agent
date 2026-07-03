@@ -7,7 +7,21 @@ Forks and details still to resolve. Grouped by area; link to the owning chapter.
 - Leakage-gate quarantine handling for near-misses.
 - Conflict-resolution UX for contradictory global knowledge.
 - Hit-count thresholds for candidate → validated.
-- **Provenance/audit store** (D51): concrete store choice + retention duration (≥ candidate lifetime).
+- ~~**Provenance/audit store** (D51): concrete store choice + retention duration (≥ candidate lifetime).~~
+  **RESOLVED by D95 (Track-B Slice 1):** a **dedicated Couchbase bucket `learning_audit`** (not the
+  session collection), KV-keyed by `evidence_ref`, access-controlled (own RBAC user), retention
+  `LEARNING_AUDIT_TTL_SECONDS` default **90 d** with the invariant `audit_TTL ≥ max_candidate_lifetime`.
+  Candidates carry only `evidence_ref`; the entity-bearing snapshot is never inlined into the
+  entity-free global stores (D17). The **decision is locked now; the store is provisioned in Slice 2**
+  (the spine writes no evidence yet). See [learning-loop-infra-design.md](learning-loop-infra-design.md) §8.
+- **Session-close definition** — **RESOLVED (idle half) by D96:** "closed" = idle past
+  `LEARNING_IDLE_THRESHOLD_SECONDS` (default 1800 s); the sweeper claims idle `active`/`pending`
+  sessions. Explicit end-of-session is an additive Slice-2+ trigger (does not change the transport).
+- **`SESSION_TTL` vs. the learning-loop completion window** — **RESOLVED by D96:** the enqueued
+  message is a **reference**, so the session doc must outlive the transport hop —
+  `SESSION_TTL > LEARNING_IDLE_THRESHOLD_SECONDS + P95(queue-dwell + processing)` (7 d ≫ 30 min +
+  seconds, comfortably held). The longer review-inbox dwell (candidate outliving `SESSION_TTL`) is
+  covered by the D51/D95 evidence snapshot, not this window.
 
 ## Blueprints ([04](../04-blueprints.md))
 
@@ -249,7 +263,10 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
   scratch-upload feature (D19/D64) ships.
 - ~~Scope representation passed by UI (JWT claim vs. separate object).~~ **RESOLVED by D79b:** `column_scope` is a signed JWT claim.
 - Scratch TTL duration + cleanup ownership.
-- **`SESSION_TTL` value** (D44) — must exceed the learning-loop completion window.
+- **`SESSION_TTL` value** (D44) — must exceed the learning-loop completion window. **Relationship
+  RESOLVED by D96** (see Learning loop above): `SESSION_TTL > LEARNING_IDLE_THRESHOLD_SECONDS +
+  P95(queue-dwell + processing)`; the current 7 d value holds it. The absolute value remains a tuning
+  question pending real traffic.
 - **SQL parser choice** — **RESOLVED by D62: `sqlglot` (Python).** Remaining: **dialect coverage** —
   how often each fail-path (closed/soft/review) actually trips, measured via the ClickHouse
   `system.query_log.columns` ground-truth oracle on real queries. **Oracle BUILT (Session 14):**

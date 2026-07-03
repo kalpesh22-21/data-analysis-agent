@@ -554,6 +554,82 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   discussion (incl. the golden-fixture entity-governance fork). Cross-target candidates link via
   `depends_on`.
 
+- **D95 (locked, 2026-07-02, Session 16 — resolves the D51 audit-store open question;
+  Track B Slice 1).** **The learning-loop provenance/audit store is a DEDICATED Couchbase bucket
+  `learning_audit` — never the existing session collection — KV-keyed by `evidence_ref`,
+  access-controlled, TTL-retained; the store is LOCKED now but PROVISIONED in Slice 2.** D51 fixed the
+  store's *posture* (in-boundary, session-store PII posture, own retention ≥ candidate lifetime, never
+  inlined into the entity-free global stores) but left the concrete technology open
+  (OPEN-QUESTIONS §Learning loop). **Choice: Couchbase, dedicated bucket.** Among the repo's existing
+  infra it is the only fit — it already provides KV-get/put-by-key + native per-document TTL +
+  in-boundary hosting, exactly the D51 shape; **neo4j and the knowledge vector index are disqualified
+  by construction** (evidence quotes are entity-bearing and D17 forbids inlining entities into the
+  entity-free global stores — the whole reason the snapshot is a *separate* store); **ClickHouse** is
+  the read-only data plane (D1) with the wrong access model/PII posture; **Redis** is the ephemeral
+  queue, not a durable retention store. A **separate bucket** (not merely a new collection in
+  `agent_sessions`) is required so the audit store has an **independent retention clock and RBAC
+  boundary**: session docs TTL at `SESSION_TTL` (7 d, D44) but a candidate's evidence must survive the
+  review-inbox dwell (days-to-weeks), so the two lifetimes cannot share a TTL. **Access control:** a
+  distinct Couchbase RBAC user scoped to `learning_audit` only (not the sessions bucket, not neo4j,
+  not the warehouse); write = the Slice-2 extractor, read = the review-inbox/audit tooling. Candidate
+  envelopes in neo4j / the vector index carry **only `evidence_ref`** (the KV key), never the
+  snapshot — global stores stay entity-free (D17), audit stays durable (D51). **Retention:**
+  `LEARNING_AUDIT_TTL_SECONDS` default **90 d** (`7776000`), an invariant floor of
+  `audit_TTL ≥ max_candidate_lifetime`. **Slice-1-vs-Slice-2:** Slice 1 writes **no** evidence (no
+  extractor to snapshot anything), so provisioning an access-controlled bucket nothing writes to is
+  premature — the DECISION is locked now (the load-bearing part, "never inline entities", must be
+  settled before any writer exists), and the bucket + RBAC user + `evidence_ref` KV client are
+  **provisioned in Slice 2** alongside the extractor. Slice 1 reserves the config fields
+  (`LEARNING_AUDIT_BUCKET`, `LEARNING_AUDIT_TTL_SECONDS`) **unread**. See
+  [learning-loop-infra-design.md](learning-loop-infra-design.md) §8. Cross-references:
+  [D17](#memory--learning), [D51](#blueprint-dedup--resolvers), [D28](#memory--learning),
+  [D44](#context-budget--loop-guardrails), [D1](#architecture), [D96](#memory--learning).
+
+- **D96 (locked, 2026-07-02, Session 16 — the Track-B Slice-1 infra spine; concretizes D30).**
+  **The offline learning loop's transport + lifecycle spine: a five-state `learning_status` machine
+  with per-transition CAS single-writer ownership, a real Redis Streams queue with dead-letter and
+  content-hash idempotency, an idle-detection sweeper bounded below `SESSION_TTL`, and a
+  runtime-read kill-switch — all seamed behind a queue port.** D30 fixed *Redis Streams + sweeper +
+  the `active→pending→queued→processing→done` flag + reference-not-transcript + idempotency-by-
+  `content_hash`*; D96 commits the concrete build. **(a) State machine** adds a terminal
+  `dead_letter` (six states); each transition is a CAS-guarded read-modify-write on the session doc
+  (reusing `get_session_with_cas`/`_cas_mutate`, D45) that asserts the expected `from` state — the CAS
+  is the **single-writer-per-session** guarantee (D48 spirit, key=`session_id`). **Ownership:**
+  `active→pending` (claim) and `pending→queued` (post-`XADD`) = **sweeper**; `queued→processing` and
+  `processing→done` (+`XACK`) = **consumer**; `*→dead_letter` = consumer/reclaimer. Splitting claim
+  from enqueue makes a sweeper crash recoverable (`pending` is a re-detectable intermediate, not a
+  leak). **(b) Redis topology:** stream `learning:jobs`, group `learning-workers`, dead-letter stream
+  `learning:jobs:dead`, delivery threshold **N=5** (`XAUTOCLAIM`/`XPENDING` over N → dead-letter +
+  session `dead_letter`). **(c) `content_hash` definition** = `sha256` over canonical JSON of
+  `{session_id, messages:[(turn_index,role,content)],
+  tool_trail:[(turn_index,tool_call_id,tool_name,args,status,error_code)]}` — deliberately EXCLUDING
+  `learning_status` (circular), all timestamps, `result_full_ref`/`result_preview`, `pause_checkpoint`,
+  `context_summary_cache`, and `provenance` (a re-parse artifact); it is exactly the transcript the
+  Slice-2 extractor mines (D46's full tool I/O trail). Idempotency is enforced at enqueue (only
+  `active`/`pending` are swept) and at consume (a re-delivered job whose session is already `done` with
+  the same recorded `learning_content_hash` → ACK + skip). **(d) Sweeper / TTL invariant:**
+  "session-close" = idle past `LEARNING_IDLE_THRESHOLD_SECONDS` (default **1800 s**), resolving the 05
+  "idle TTL value" fork for the idle half; the enqueued **reference** requires the doc to outlive the
+  transport hop, so **`SESSION_TTL > LEARNING_IDLE_THRESHOLD_SECONDS + P95(queue-dwell + processing)`**
+  (comfortably held: 7 d ≫ 30 min + seconds). The longer review-inbox dwell is covered by the D51/D95
+  snapshot, not this window. **(e) Kill-switch (D58c):** `LEARNING_ENABLED` is read **uncached, once
+  per cycle** (bypassing the `@lru_cache`d `RuntimeSettings`) so it toggles without a deploy; disabled
+  ⇒ sweeper skips the whole cycle (no enqueue) AND consumer stops `XREADGROUP`ing (work waits in the
+  stream, no loss); reads are unaffected **structurally** (only the sweeper/consumer consult the flag;
+  the request path never imports it). **(f) Port seam:** a thin `LearningQueue` Protocol
+  (`ensure_group`/`enqueue`/`consume`/`ack`/`reclaim_stale`) with a real `RedisStreamsLearningQueue`
+  (Layer-2-validated against real Redis, added to `docker-compose.integration.yml`) and an
+  `InMemoryLearningQueue` fake (Layer 1). **(g)** Both processes are separate entrypoints
+  (`scripts/run_learning_sweeper.py`, `scripts/run_learning_consumer.py`), in-boundary, traced to the
+  Phoenix `learning-loop` project (D23/D24), and read-only w.r.t. request-path data (D72 — the only
+  write is the lifecycle flag). Slice 1 ships a **no-op consumer** (marks `processing→done` + emits a
+  trace event); the loader/triage/extractor is Slice 2, but dead-letter + idempotency + kill-switch are
+  real and tested now. See [learning-loop-infra-design.md](learning-loop-infra-design.md).
+  Cross-references: [D26](#memory--learning), [D30](#memory--learning), [D31](#memory--learning),
+  [D48](#blueprint-dedup--resolvers), [D51](#blueprint-dedup--resolvers), [D58c](#memory--learning),
+  [D72](#extensibility), [D44](#context-budget--loop-guardrails), [D45](#context-budget--loop-guardrails),
+  [D95](#memory--learning), D68 (Track B).
+
 ## Observability
 - **D23.** **Arize Phoenix + OpenTelemetry** (OpenInference conventions) for tracing across the
   request path and the offline learning loop. Span kinds map ~1:1 to components (AGENT/LLM/TOOL/

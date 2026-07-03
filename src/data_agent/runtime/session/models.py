@@ -235,6 +235,11 @@ class SessionDoc:
     tool_trail: list[TrailEntry] = field(default_factory=list)
     pause_checkpoint: PauseCheckpoint | None = None
     context_summary_cache: dict[str, Any] | None = None
+    # Additive (Track-B Slice 1, D96): the idempotency key the learning sweeper
+    # records at the `pending → queued` transition and the consumer compares on
+    # re-delivery. `None` for every session that predates the learning loop and
+    # for any session not yet enqueued, so existing docs round-trip unchanged.
+    learning_content_hash: str | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -249,6 +254,7 @@ class SessionDoc:
                 self.pause_checkpoint.to_doc() if self.pause_checkpoint else None
             ),
             "context_summary_cache": self.context_summary_cache,
+            "learning_content_hash": self.learning_content_hash,
         }
 
     @classmethod
@@ -263,4 +269,5 @@ class SessionDoc:
             tool_trail=[TrailEntry.from_doc(e) for e in doc.get("tool_trail", [])],
             pause_checkpoint=PauseCheckpoint.from_doc(pc_doc) if pc_doc else None,
             context_summary_cache=doc.get("context_summary_cache"),
+            learning_content_hash=doc.get("learning_content_hash"),
         )

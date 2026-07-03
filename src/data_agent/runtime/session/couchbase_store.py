@@ -60,7 +60,13 @@ try:  # pragma: no cover - exercised only when the couchbase SDK is installed
     from acouchbase.cluster import Cluster
     from couchbase.auth import PasswordAuthenticator
     from couchbase.exceptions import CasMismatchException, DocumentNotFoundException
-    from couchbase.options import ClusterOptions, GetOptions, ReplaceOptions, UpsertOptions
+    from couchbase.options import (
+        ClusterOptions,
+        GetOptions,
+        QueryOptions,
+        ReplaceOptions,
+        UpsertOptions,
+    )
 
     COUCHBASE_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -228,3 +234,97 @@ class CouchbaseSessionStore:
                 f"CAS mismatch for session {session_id!r}: a concurrent resume already won."
             ) from exc
         return doc
+
+    # --- Learning loop (Track-B Slice 1, D96) ---
+
+    async def scan_idle_sessions(
+        self,
+        *,
+        statuses: list[str],
+        last_activity_before: str,
+        limit: int,
+    ) -> list[tuple[SessionDoc, Any]]:
+        """N1QL scan for idle sessions (design §6). `META().cas` is selected so
+        each returned CAS is usable directly by `transition_learning_status`'s
+        CAS-guarded `replace` — the sweeper claims exactly-once off that snapshot.
+        """
+        keyspace = (
+            f"`{self._settings.couchbase_bucket}`"
+            f".`{self._settings.couchbase_scope}`"
+            f".`{self._settings.couchbase_sessions_collection}`"
+        )
+        statement = (
+            "SELECT META(s).id AS _meta_id, META(s).cas AS _meta_cas, s.* "
+            f"FROM {keyspace} s "
+            "WHERE s.learning_status IN $statuses "
+            "AND s.last_activity < $cutoff "
+            "ORDER BY s.last_activity ASC "
+            "LIMIT $limit"
+        )
+        result = self._cluster.query(
+            statement,
+            QueryOptions(
+                named_parameters={
+                    "statuses": list(statuses),
+                    "cutoff": last_activity_before,
+                    "limit": int(limit),
+                }
+            ),
+        )
+        out: list[tuple[SessionDoc, Any]] = []
+        async for row in result:
+            cas = row.pop("_meta_cas")
+            row.pop("_meta_id", None)
+            out.append((SessionDoc.from_doc(row), cas))
+        return out
+
+    async def transition_learning_status(
+        self,
+        session_id: str,
+        expected_from: str,
+        to: str,
+        cas: Any,
+        *,
+        content_hash: str | None = None,
+        assert_from: bool = True,
+    ) -> Any:
+        """Single-shot CAS transition (D96 single-writer-per-session).
+
+        Mirrors `resume_checkpoint`'s CAS discipline — read fresh, assert the
+        `from` state, then `replace` under the CALLER's *cas* (the scan/read
+        snapshot). A loser (peer sweeper/consumer or a request-path write since
+        the scan) fails the `replace` with `CasMismatchException` → skip. This is
+        deliberately NOT the retrying `_mutate_with_cas_retry` path: a lost
+        transition race must be a skip, not a retry that would force the write.
+        The lifecycle flag is the ONLY field written — `last_activity` is left
+        untouched (D72 read-only: bumping it would resurrect the idle session).
+        """
+        doc, _ = await self._get_doc(session_id)
+        if doc is None:
+            raise CASMismatchError(f"No session {session_id!r} to transition.")
+        if assert_from and doc.learning_status != expected_from:
+            raise CASMismatchError(
+                f"learning_status for session {session_id!r} is "
+                f"{doc.learning_status!r}, expected {expected_from!r}."
+            )
+        doc.learning_status = to
+        if content_hash is not None:
+            doc.learning_content_hash = content_hash
+        try:
+            result = await self._sessions.replace(
+                _session_key(session_id),
+                doc.to_doc(),
+                # LOW-1: preserve the existing TTL — a learning-loop lifecycle
+                # transition must NOT re-arm the 7-day session TTL (an idle
+                # session being learned should still expire on its original
+                # clock). `preserve_expiry=True` keeps the current expiry;
+                # OMITTING expiry entirely would CLEAR the TTL (worse). If a
+                # couchbase SDK < 4.1 without `preserve_expiry` is ever used,
+                # this raises loudly at Layer 2 rather than silently mis-TTLing.
+                ReplaceOptions(cas=cas, preserve_expiry=True),
+            )
+        except CasMismatchException as exc:
+            raise CASMismatchError(
+                f"CAS mismatch for session {session_id!r}: a peer advanced learning_status."
+            ) from exc
+        return result.cas

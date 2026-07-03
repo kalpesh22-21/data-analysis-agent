@@ -21,8 +21,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from data_agent.runtime.context.scope_filter import compute_scope_hash
-
 # Mirrors clickhouse-api's app/security.py `_SINGLE_QUOTED_STRING` exactly
 # (handles both `''`-doubled and backslash-escaped quotes).
 _SINGLE_QUOTED_STRING = re.compile(r"'(?:[^'\\]|\\.|\\'|'')*'")
@@ -47,7 +45,18 @@ _REDACTED_PLACEHOLDER = "<redacted>"
 
 
 def hash_scope(column_scope: frozenset[str]) -> str:
-    """Stable hash of *column_scope* — never log the raw scope (D25)."""
+    """Stable hash of *column_scope* — never log the raw scope (D25).
+
+    `compute_scope_hash` is imported lazily (inside the function) rather than at
+    module top: the eager import created an import CYCLE
+    (`redaction → context → dispatch → redaction`) that made
+    `runtime.observability.tracing` un-importable as an entry point. Deferring it
+    to call time — telemetry is emitted only at runtime, well after the module
+    graph is built — breaks the cycle while returning byte-identical hashes, so
+    the `learning` package (and any future consumer) can reuse `tracing` without
+    depending on a fragile import order."""
+    from data_agent.runtime.context.scope_filter import compute_scope_hash
+
     return compute_scope_hash(column_scope)
 
 

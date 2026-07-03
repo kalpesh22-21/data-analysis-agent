@@ -160,6 +160,22 @@ services:
       retries: 30
       start_period: 20s
 
+  # Learning-loop transport (Track-B Slice 1, D30/D96). Redis Streams work +
+  # dead-letter streams for the sweeper/consumer. DEV/TEST only. The sweeper and
+  # consumer entrypoints read LEARNING_REDIS_URL=redis://localhost:6379/0 (host
+  # port 6379); inside the compose network the service is reachable as `l2-redis`.
+  l2-redis:
+    image: redis:7-alpine
+    container_name: l2-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
   # Session store (D22/D44/D45). Cluster/bucket/collection init is done out-of-band
   # by scripts/couchbase-init.sh after the node reports healthy (Couchbase init is
   # not fully declarative in the base image).

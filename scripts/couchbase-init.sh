@@ -37,6 +37,22 @@ for COLL in sessions session_results; do
     2>&1 | tail -1 || echo "[couchbase-init] collection $COLL exists (ok)"
 done
 
+# Indexes for the learning-loop sweeper's N1QL scan (LOW-3). A fresh production
+# cluster needs these SHIPPED — `scan_idle_sessions` does
+# `WHERE learning_status IN ... AND last_activity < ...`, which requires a GSI (a
+# primary index alone works but full-scans). Both are `IF NOT EXISTS` so re-runs
+# and clusters that already have them are no-ops. Give the collection a moment to
+# become query-addressable first.
+sleep 3
+Q="docker exec l2-cb curl -sf -u $U:$P http://127.0.0.1:8093/query/service --data-urlencode"
+KEYSPACE="\`$BUCKET\`._default.sessions"
+echo "[couchbase-init] primary index on sessions..."
+$Q "statement=CREATE PRIMARY INDEX IF NOT EXISTS ON $KEYSPACE" 2>&1 | tail -1 \
+  || echo "[couchbase-init] primary index exists (ok)"
+echo "[couchbase-init] learning GSI (learning_status, last_activity)..."
+$Q "statement=CREATE INDEX idx_sessions_learning IF NOT EXISTS ON $KEYSPACE(learning_status, last_activity)" 2>&1 | tail -1 \
+  || echo "[couchbase-init] learning GSI exists (ok)"
+
 echo "[couchbase-init] verify:"
 $C collection-manage --cluster "$CLUSTER" -u "$U" -p "$P" --bucket "$BUCKET" --list 2>&1 | tail -12
 echo "[couchbase-init] done."

@@ -124,3 +124,57 @@ class InMemorySessionStore:
         doc.last_activity = _now()
         self._bump_version(session_id)
         return copy.deepcopy(doc)
+
+    # --- Learning loop (Track-B Slice 1, D96) ---
+
+    async def scan_idle_sessions(
+        self,
+        *,
+        statuses: list[str],
+        last_activity_before: str,
+        limit: int,
+    ) -> list[tuple[SessionDoc, int]]:
+        status_set = set(statuses)
+        matches: list[tuple[SessionDoc, int]] = []
+        for session_id, doc in self._docs.items():
+            if doc.learning_status not in status_set:
+                continue
+            # ISO-8601 timestamps are lexicographically ordered for a fixed
+            # offset, matching the N1QL string comparison the real store uses.
+            if doc.last_activity >= last_activity_before:
+                continue
+            matches.append((copy.deepcopy(doc), self._versions[session_id]))
+        # Deterministic order (oldest-idle first), then cap.
+        matches.sort(key=lambda pair: pair[0].last_activity)
+        return matches[:limit]
+
+    async def transition_learning_status(
+        self,
+        session_id: str,
+        expected_from: str,
+        to: str,
+        cas: int,
+        *,
+        content_hash: str | None = None,
+        assert_from: bool = True,
+    ) -> int:
+        doc = self._docs.get(session_id)
+        if doc is None:
+            raise CASMismatchError(f"No session {session_id!r} to transition.")
+
+        current_cas = self._versions[session_id]
+        if cas != current_cas:
+            raise CASMismatchError(
+                f"CAS mismatch for session {session_id!r}: expected {cas}, found {current_cas}."
+            )
+        if assert_from and doc.learning_status != expected_from:
+            raise CASMismatchError(
+                f"learning_status for session {session_id!r} is "
+                f"{doc.learning_status!r}, expected {expected_from!r}."
+            )
+
+        doc.learning_status = to
+        if content_hash is not None:
+            doc.learning_content_hash = content_hash
+        self._bump_version(session_id)
+        return self._versions[session_id]

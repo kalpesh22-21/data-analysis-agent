@@ -202,6 +202,65 @@ authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's
 
 ---
 
+## 2026-07-02 — Session 16: Track B STARTED — learning-loop Slice 1 (infra spine) BUILT (D95/D96)
+
+Began the offline learning loop (Track B), the last big Phase-1 deliverable. The full architecture was
+already **Locked** (docs/05-memory-and-learning.md + D15–D31/D48/D51/D58/D72); this slice builds the
+**transport + lifecycle spine** — NO extractor/writers/leakage-gate/dedup/promotion yet (later slices).
+User chose the infra-complete path on all three scope forks: **infra spine first**, **real Redis Streams
+now**, **dedicated audit store**. Committed both repos? No — data-agent only (no clickhouse-api change).
+
+### What shipped (new `src/data_agent/learning/` package)
+- **Sweeper** (session-close detection): scans idle Couchbase sessions, two-step CAS claim
+  (active→pending, XADD, pending→queued) — **crash-recoverable** (a `pending` doc with no stream entry
+  is re-detected + re-enqueued idempotently).
+- **`learning_status` state machine** active→pending→queued→processing→done + `dead_letter`, every
+  transition a **CAS with from-state assert** (single-writer-per-session, D48 spirit) writing ONLY the
+  lifecycle flag (D72 read-only; `preserve_expiry=True` so it never re-arms the session TTL).
+- **Real Redis Streams queue** (`learning:jobs` / group `learning-workers` / `learning:jobs:dead`):
+  reference-not-transcript message (D30/D46), **idempotent by `content_hash`**, dead-letter after N=5 via
+  XAUTOCLAIM/XPENDING.
+- **No-op consumer** (real triage/extractor is Slice 2): idempotency check → CAS queued→processing→done
+  → XACK, reclaim/dead-letter, fresh-hash-at-done.
+- **`LEARNING_ENABLED` kill-switch (D58c)** — uncached, read fresh per cycle from **both `.env` and
+  process env**, gates sweeper AND consumer before any I/O; reads/request-path structurally unaffected.
+- Two traced entrypoints (`scripts/run_learning_{sweeper,consumer}.py`), `l2-redis` in
+  docker-compose.integration.yml, session-store `scan_idle_sessions` + `transition_learning_status`
+  (N1QL + CAS), additive `SessionDoc.learning_content_hash`.
+- **D95** — resolves the D51 audit-store open question: **dedicated access-controlled Couchbase bucket
+  `learning_audit`** (decision locked; provisioning DEFERRED to Slice 2, since the spine writes no
+  evidence). **D96** — concretizes D30 (state machine, Redis topology, content_hash definition,
+  dead-letter N=5). Also fixed a pre-existing latent circular import (`redaction.compute_scope_hash`
+  made a lazy import — behavior-preserving, verified byte-identical).
+
+### The review win (emphasis: live/adversarial review caught what unit tests couldn't)
+Reviewer found a **data-loss BLOCKER** unit tests structurally couldn't reach: `enqueue` set the dedup
+key **before** `XADD`, so a crash between them stranded the session in `queued` with zero stream messages
+(the in-memory fake's enqueue is atomic, so Layer-1 couldn't reproduce it). Fixed by **inverting to
+XADD-first, mark-second** (a set dedup key ⟹ XADD happened; absent ⟹ safe to re-XADD → benign duplicate
+absorbed by consume-side idempotency). Plus 4 MEDIUM (daemon-dies-on-blip → catch-log-continue;
+kill-switch ignored `.env`; two crash windows in the dead-letter path → "no irreversible XACK before the
+session CAS" invariant + terminal ack-skip) and LOWs (ship the N1QL index; VALID_TRANSITIONS map). QA
+added the exact crash-window regression (`test_crash_between_xadd_and_mark_is_benign_duplicate_not_strand`,
+green on fake AND real Redis).
+
+### Process
+explorer (recover the Locked design) → **user scope decisions** → planner (design + D95/D96 + TRACEABILITY)
+→ backend (spine) → **reviewer REQUEST CHANGES** (BLOCKER + 4 MEDIUM) → **qa** (98 L1 + 13 L2 live) →
+backend (fix bundle) → qa (crash-window regression + .env + dead-letter crash-safety) → **reviewer delta
+APPROVE**. Gates: **1517 passed / 79 skipped, ruff clean**; live 7 Redis + 6 Couchbase incl. a full
+sweeper→Redis→consumer round-trip on real infra.
+
+See [decisions/learning-loop-infra-design.md](decisions/learning-loop-infra-design.md) (Status: BUILT;
+Slice-2 forward notes recorded).
+
+**Forward runway (planner map, not yet built):** S2 loader/triage + provision `learning_audit` +
+first evidence snapshots → S3 grounded extractor (D34/D35) → S4 blueprint generalize/validate → S5
+leakage gate (D58) → S6 D48 dedup → S7 writers + review inbox → S8 user store + D53 schema-edit PR bot →
+S9 promotion scheduler.
+
+---
+
 ## 2026-07-02 — Session 15: D94 — None-provenance stranding fix (last tracked follow-up; PAUSE before the learning loop)
 
 Closed the **one remaining tracked follow-up** (task #11) surfaced by the Layer-3 reviewer, then paused
