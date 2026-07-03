@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from neo4j import AsyncDriver, AsyncManagedTransaction
 
     from data_agent.runtime.model.embedding_client import EmbeddingClient
+    from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 
 _logger = logging.getLogger(__name__)
 
@@ -307,6 +308,42 @@ def _validate_blueprint_uses(bp: BlueprintSeed) -> None:
             raise CorpusLoadError(
                 f"blueprint {bp.id}: uses entry {key!r} is not a "
                 "database.table.column scope key"
+            )
+
+
+def _warn_on_catalog_skew(
+    blueprints: list[BlueprintSeed], catalog: CatalogHandle
+) -> None:
+    """D94 Part 3 — log a SOFT WARNING per blueprint whose `uses` references a
+    `db.table` absent from *catalog*. Never raises: a blueprint may legitimately
+    reference tables absent from a partial/dev catalog snapshot, so this is a
+    dev-time early warning for the catalog/extractor skew, not a load precondition.
+    `uses` keys are `database.table.column` scope keys (grammar enforced by
+    `_validate_blueprint_uses`: >=3 non-empty dot-separated parts). The `db.table`
+    grouping is derived as everything-before-the-final-dot — the SAME convention as
+    `_use_edges`' `table_key` (and the scope-key construction in
+    `context/scope_filter`) — so the two parsers agree even for keys with a dotted
+    table segment. `is_catalogued(database, table)` reconstructs `f"{database}.{table}"`,
+    so splitting that grouping on its FIRST dot round-trips to the same `db.table`.
+    """
+    for bp in blueprints:
+        missing: list[str] = []
+        seen: set[str] = set()
+        for key in bp.uses:
+            db_table = key.rsplit(".", 1)[0]  # matches _use_edges' table_key
+            if db_table in seen:
+                continue
+            seen.add(db_table)
+            database, table = db_table.split(".", 1)
+            if not catalog.is_catalogued(database, table):
+                missing.append(db_table)
+        if missing:
+            _logger.warning(
+                "blueprint %s: uses %d table(s) absent from the supplied catalog: %s "
+                "(catalog/extractor skew — may strand an ok+None result at runtime)",
+                bp.id,
+                len(missing),
+                ", ".join(missing),
             )
 
 
@@ -803,11 +840,24 @@ async def load_corpus(
     model_id: str,
     database: str = "neo4j",
     ensure_schema: bool = True,
+    catalog: CatalogHandle | None = None,
 ) -> LoadReport:
     """Embed + upsert the seed corpus into neo4j (idempotent). See module docs.
 
     Raises `CorpusLoadError` on a malformed `uses` key (S2) or a write-time
     model-parity violation (§3.3).
+
+    *catalog* (D94 Part 3, optional dev-time aid): when a `CatalogHandle` is
+    supplied, every blueprint's `uses` tables are cross-checked against it and a
+    SOFT WARNING is logged per blueprint referencing an uncatalogued table (a
+    seed-time early warning for the catalog/extractor skew that otherwise strands
+    an `ok`+`None` result at runtime). Load ALWAYS proceeds — a blueprint may
+    legitimately reference tables absent from a partial/dev catalog snapshot, so
+    this never raises `CorpusLoadError` (that stays reserved for genuine
+    corpus-internal-consistency failures). Omit it (default `None`) to skip the
+    check silently — it is not a load precondition, and the real production safety
+    is MCP-fails-closed + both catalogs in agreement, not this check (D94 record
+    correction).
     """
     if ensure_schema:
         await apply_schema(driver, database=database)
@@ -819,6 +869,10 @@ async def load_corpus(
     for bp in blueprints:
         _validate_blueprint_uses(bp)
         _validate_blueprint_dag(bp)
+
+    # D94 Part 3: SOFT seed-time catalog-skew warning (optional, dev-time only).
+    if catalog is not None:
+        _warn_on_catalog_skew(blueprints, catalog)
 
     # Embed offline through the SAME endpoint the online path uses (parity by
     # construction). Order-preserving: `embed` returns one vector per input.

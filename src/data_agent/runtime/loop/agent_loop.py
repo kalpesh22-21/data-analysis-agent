@@ -261,22 +261,36 @@ def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]
             }
         ],
     }
-    tool_message = {
-        "role": "tool",
-        "tool_call_id": tool_call_id,
-        "content": json.dumps(
-            {
-                "status": entry["status"],
-                "error_code": entry.get("error_code"),
-                # S4: the static, PII-safe denial message (never raw MCP error
-                # text) so the model can see WHY a retryable call failed and
-                # self-correct — see context/budget.py::_render_entry.
-                "user_message": entry.get("user_message"),
-                "result_preview": entry.get("result_preview"),
-            },
-            default=str,
-        ),
-    }
+    # D94 Part 1: an entry flagged `withheld_sentinel` is a synthetic,
+    # non-data-bearing sentinel injected by `context/assembly.py` for a
+    # current-turn `ok`+`None` stranded result — its `content` is used verbatim as
+    # the tool result (never JSON-wrapped with a payload), filling the dangling
+    # tool_call's required slot to break the retry-until-budget-cap loop. The
+    # explicit flag (not a bare `content` key) keeps a future `_render_entry` field
+    # from ever silently rerouting a normal tool entry to verbatim rendering.
+    if entry.get("withheld_sentinel"):
+        tool_message = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": entry["content"],
+        }
+    else:
+        tool_message = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": json.dumps(
+                {
+                    "status": entry["status"],
+                    "error_code": entry.get("error_code"),
+                    # S4: the static, PII-safe denial message (never raw MCP error
+                    # text) so the model can see WHY a retryable call failed and
+                    # self-correct — see context/budget.py::_render_entry.
+                    "user_message": entry.get("user_message"),
+                    "result_preview": entry.get("result_preview"),
+                },
+                default=str,
+            ),
+        }
     return [assistant_message, tool_message]
 
 
@@ -471,6 +485,7 @@ class AgentLoop:
         question: str | None,
         user_id: str | None,
         retrieval_memo: dict[tuple[str, str], Any],
+        withheld_call_ids: set[str],
     ) -> list[dict[str, Any]]:
         """*current_turn_index* (turn-scoped continuity, 2026-07-01): passed
         through to `ContextAssembler.assemble` so the CURRENT in-progress
@@ -488,6 +503,11 @@ class AgentLoop:
         turn-window-local (created fresh in `_run_loop`) so retrieval embeds at
         most ONCE per window despite the D45 per-round-trip rebuild. When no
         retrieval pipeline is wired, these are inert (assemble short-circuits).
+
+        *withheld_call_ids* (D94 Part 2): the same turn-window-local memo pattern
+        as *retrieval_memo* — a `set[str]` created fresh in `_run_loop` so the
+        `loop_result_withheld_provenance` diagnostic fires at most ONCE per
+        stranded `tool_call_id` despite the per-round-trip rebuild.
         """
         assembled = await self._context_assembler.assemble(
             session_id,
@@ -496,6 +516,7 @@ class AgentLoop:
             user_message=question,
             user_id=user_id,
             retrieval_memo=retrieval_memo,
+            withheld_call_ids=withheld_call_ids,
             observer=self._observer,
         )
         canonical = _assembled_to_canonical(assembled.messages)
@@ -782,6 +803,10 @@ class AgentLoop:
         # recall at most ONCE across every round-trip of this window despite the
         # D45 per-round-trip context rebuild. Not persisted — pure in-turn memo.
         retrieval_memo: dict[tuple[str, str], Any] = {}
+        # D94 Part 2: turn-window-local de-dup for the withheld-provenance
+        # diagnostic — same lifecycle as `retrieval_memo` (fresh per window,
+        # not persisted) so the event fires at most once per stranded call.
+        withheld_call_ids: set[str] = set()
 
         while True:
             canonical_messages = await self._build_canonical_messages(
@@ -791,6 +816,7 @@ class AgentLoop:
                 question=question,
                 user_id=None,
                 retrieval_memo=retrieval_memo,
+                withheld_call_ids=withheld_call_ids,
             )
             self._observer("loop_model_call_start", {"window": window_count})
             result = await model_client.send_turn(canonical_messages, tools)

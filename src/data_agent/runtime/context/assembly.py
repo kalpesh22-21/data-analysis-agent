@@ -38,14 +38,28 @@ from .budget import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from opentelemetry.trace import Tracer
 
     from data_agent.runtime.retrieval.models import RetrievedContext
     from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
+    from data_agent.runtime.session.models import TrailEntry
 
     Observer = Callable[[str, dict[str, Any]], None]
+
+
+# D94 Part 1 — the exact, non-data-bearing sentinel surfaced in place of a
+# current-turn `ok`+`None` (undetermined-provenance) tool result that
+# `scope_filter.filter_trail` correctly dropped. It carries ZERO data (no
+# result_preview/result_full/column values), so it is PII-safe under ANY scope
+# including empty/narrow, and it fills the dangling `tool_call`'s required result
+# slot so the model stops re-emitting the identical call (design §2).
+_WITHHELD_PROVENANCE_SENTINEL = (
+    "result withheld: provenance could not be determined for this call, so its "
+    "result cannot be shown. Do not retry the identical call — it will be withheld "
+    "again. Try a different query or approach, or ask the user."
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +117,7 @@ class ContextAssembler:
         user_message: str | None = None,
         user_id: str | None = None,
         retrieval_memo: dict[tuple[str, str], RetrievedContext] | None = None,
+        withheld_call_ids: set[str] | None = None,
         observer: Observer | None = None,
     ) -> AssembledContext:
         """*current_turn_index* (turn-scoped continuity, 2026-07-01, optional):
@@ -125,6 +140,16 @@ class ContextAssembler:
         The memo is per-turn state owned by `AgentLoop`, never by this shared
         assembler. *observer* is the per-request progress observer, forwarded to
         the pipeline for its shape-only retrieval progress event (D61).
+
+        *withheld_call_ids* (D94 Part 2, turn-local, sibling to *retrieval_memo*):
+        a caller-owned `set[str]` of `tool_call_id`s for which the
+        `loop_result_withheld_provenance` diagnostic has already been emitted this
+        turn, so the D45 per-round-trip rebuild fires that event AT MOST ONCE per
+        stranded call rather than once per remaining budget window. Owned by
+        `AgentLoop`, reset per budget window (same lifecycle as *retrieval_memo*);
+        `None` (Layer-1 tests) simply disables the de-dup. The sentinel *injection*
+        itself (Part 1) is unconditional every round-trip — only the observer event
+        is de-duped.
         """
         scope_hash = scope_filter.compute_scope_hash(column_scope)
         span_cm = (
@@ -155,6 +180,21 @@ class ContextAssembler:
 
             messages = render_messages(  # 4. inject
                 compaction, preview_row_count=self._preview_row_count
+            )
+
+            # 4b. D94 Part 1/2 — sentinel injection for current-turn `ok`+`None`
+            # entries that `filter_trail` just dropped (undetermined provenance).
+            # A non-data-bearing tool result is injected in the dropped entry's
+            # slot to break the retry-until-budget-cap loop, and a diagnostic
+            # observer event is emitted (de-duped). Runs BEFORE retrieval
+            # pre-injection so the retrieval system block still leads `messages`.
+            self._inject_withheld_provenance_sentinels(
+                messages,
+                raw_trail=raw_trail,
+                in_scope=in_scope,
+                current_turn_index=current_turn_index,
+                withheld_call_ids=withheld_call_ids,
+                observer=observer,
             )
 
             # 0. retrieval pre-injection (design §3.3): a SEPARATE, additive
@@ -223,3 +263,126 @@ class ContextAssembler:
         if rendered is not None:
             messages.insert(0, rendered)
         return (len(retrieved.thin_cards), len(retrieved.knowledge_hits))
+
+    def _inject_withheld_provenance_sentinels(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        raw_trail: Sequence[TrailEntry],
+        in_scope: Sequence[TrailEntry],
+        current_turn_index: int | None,
+        withheld_call_ids: set[str] | None,
+        observer: Observer | None,
+    ) -> None:
+        """D94 Part 1/2 — surface a non-data-bearing sentinel for each current-turn
+        `ok`+`None` entry that `filter_trail` dropped, and emit the diagnostic event.
+
+        Stranded predicate (design §2, covers BOTH the raw `runQuery` and the
+        `runBlueprint`/`_union_provenance`→`None` paths with one condition):
+        `entry.turn_index == current_turn_index` AND `entry.status == "ok"` AND
+        `entry.provenance is None` AND the entry was dropped (not in *in_scope*).
+        Cross-turn `ok`+`None` stays dropped as history (no sentinel, no event).
+
+        The sentinel is keyed to the stranded entry's `tool_call_id` and reinserted
+        into its chronological slot (by trail order) so the assistant `tool_call` it
+        answers keeps a valid matching tool result for the OpenAI API. It carries
+        ONLY `_WITHHELD_PROVENANCE_SENTINEL` — never any field of the dropped entry's
+        data — so the fail-closed invariant holds under any scope. Injection is
+        unconditional every round-trip; the observer event is de-duped via
+        *withheld_call_ids* (once per `tool_call_id` per budget window).
+        """
+        if current_turn_index is None:
+            return
+        # `id(entry)` membership relies on `filter_trail` returning the SAME
+        # `TrailEntry` objects it was handed (it does — a filtered sub-list, no
+        # copies). The `provenance is None` conjunct is belt-and-braces: an
+        # `ok`+`None` current-turn entry can NEVER survive `filter_trail` (it is
+        # not status-exempt and `is_provenance_in_scope(None, ...)` is always
+        # False), so `id(entry) not in in_scope_ids` already holds — do not
+        # "simplify" the predicate by dropping either conjunct.
+        in_scope_ids = {id(entry) for entry in in_scope}
+        stranded = [
+            entry
+            for entry in raw_trail
+            if entry.turn_index == current_turn_index
+            and entry.status == "ok"
+            and entry.provenance is None
+            and id(entry) not in in_scope_ids
+        ]
+        if not stranded:
+            return
+
+        trail_order = {entry.tool_call_id: index for index, entry in enumerate(raw_trail)}
+        leading: list[dict[str, Any]] = []
+        tool_messages: list[dict[str, Any]] = []
+        for message in messages:
+            (tool_messages if message["role"] == "tool" else leading).append(message)
+
+        for entry in stranded:
+            tool_messages.append(_build_withheld_sentinel_message(entry))
+            self._emit_withheld_provenance_event(
+                entry, current_turn_index, withheld_call_ids, observer
+            )
+
+        # Re-sort so each sentinel occupies the ordinal slot its dropped entry
+        # would have held; survivors are already chronological, so this is stable.
+        tool_messages.sort(key=lambda m: trail_order.get(m["tool_call_id"], len(raw_trail)))
+        messages[:] = leading + tool_messages
+
+    def _emit_withheld_provenance_event(
+        self,
+        entry: TrailEntry,
+        current_turn_index: int,
+        withheld_call_ids: set[str] | None,
+        observer: Observer | None,
+    ) -> None:
+        """Emit `loop_result_withheld_provenance` (D94 Part 2) at most once per
+        `tool_call_id` per budget window. Payload is non-sensitive — NO SQL / column / cell
+        values / scope token (D25/D61 parity); `blueprint_id` is the model-supplied
+        `id` arg on the `runBlueprint` path, `None` for a raw `runQuery`."""
+        if observer is None:
+            return
+        if withheld_call_ids is not None:
+            if entry.tool_call_id in withheld_call_ids:
+                return
+            withheld_call_ids.add(entry.tool_call_id)
+        blueprint_id = entry.args.get("id") if entry.tool_name == "runBlueprint" else None
+        observer(
+            "loop_result_withheld_provenance",
+            {
+                "tool_name": entry.tool_name,
+                "turn_index": current_turn_index,
+                "tool_call_id": entry.tool_call_id,
+                "blueprint_id": blueprint_id,
+                "reason": "provenance_undetermined",
+            },
+        )
+
+
+def _build_withheld_sentinel_message(entry: TrailEntry) -> dict[str, Any]:
+    """Build the render-shape tool message carrying the D94 sentinel (Part 1).
+
+    The explicit `withheld_sentinel` flag (never set by the ordinary
+    `budget.render_messages` shape) signals
+    `loop/agent_loop.py::_tool_trail_entry_to_canonical` to use this verbatim,
+    data-free text as the tool result instead of a rendered payload — an explicit
+    marker so a future `_render_entry` field can never silently reroute a normal
+    tool entry to verbatim rendering.
+
+    `args` carries the model's OWN current-turn arguments (the SQL it just sent) so
+    the synthesized ASSISTANT-side `tool_call` correlates the withheld marker with
+    the exact call that stranded — without it the model sees `runQuery({})` and
+    cannot map "do not retry the identical call" to its SQL, re-emitting and
+    re-stranding (the exact hang D94 fixes). PII-consistent: args are the model's
+    own output, and the current-turn denied-entry exemption already replays full
+    args via `budget.py::_render_entry`. The sentinel *content* stays the fixed,
+    data-free string — no result_preview/result_full/column values.
+    """
+    return {
+        "role": "tool",
+        "tool_call_id": entry.tool_call_id,
+        "tool_name": entry.tool_name,
+        "args": dict(entry.args),
+        "withheld_sentinel": True,
+        "content": _WITHHELD_PROVENANCE_SENTINEL,
+    }

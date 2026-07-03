@@ -379,6 +379,70 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   infinite loop. The blueprint fast path is already bounded by DAG size, so this guards the raw loop.
   Cap values are tunable. Resolves review item G.
 
+- **D94 (locked, 2026-07-02, Session 15 — silent-hang fix).** **A tool result with
+  `status="ok"` but `provenance=None` is no longer silently stranded: the current-turn
+  case surfaces a non-data-bearing sentinel that breaks the retry loop, a diagnostic
+  observer event makes the hang attributable, and a seed-time skew warning pre-flags the
+  underlying catalog/extractor drift — with the record corrected on where prod safety
+  actually lives.** Root cause is a **catalog/extractor SKEW**, not a leak: the MCP call
+  succeeds (its own sqlglot parse + scope-enforcement passed, so `status` stays `"ok"`),
+  but the runtime's **independent** D44 re-parse against `CatalogHandle.schema` fails —
+  `provenance/capture.py` swallows a `ProvenanceExtractionError` (raw `runQuery`) or an
+  uncatalogued table (`sampleRows`/`getTableSchema`) to `None`, and on the `runBlueprint`
+  path `executor._union_provenance` poisons the whole union to `None` if any inner
+  `runQuery` is `None`, so `RunBlueprintTool` emits `ok`+`None`. Because `scope_filter`'s
+  current-turn exemption is **status-gated** (`status != "ok"` only — a deliberate PII
+  design: a non-`ok` entry carries no rows) and `is_provenance_in_scope` drops
+  `provenance is None` unconditionally, the `ok`+`None` entry is dropped from context
+  every round-trip; context is rebuilt from the trail each model round-trip, so the model
+  re-emits the identical call and the loop burns to `loop_paused_budget_cap` /
+  `loop_hard_ceiling_stop` — the only signals, none attributing the hang to stranded
+  provenance. **Fix, three parts.** **(1)** `ContextAssembler.assemble` (NOT
+  `scope_filter`, which stays a pure heavily-tested PII gate with no observer) detects a
+  current-turn `ok`+`None` entry just dropped by `filter_trail` and injects a synthetic
+  tool message keyed to that `tool_call_id` whose **content** is the fixed data-free string
+  *"result withheld: provenance could not be determined for this call, so its result cannot
+  be shown. Do not retry the identical call — it will be withheld again. Try a different
+  query or approach, or ask the user."* applies to **current-turn only** (cross-turn
+  `ok`+`None` stays dropped as history — the retry loop is a within-turn phenomenon), and
+  covers **both** the raw-loop and `runBlueprint` paths via one predicate. **Two-sided data
+  contract (decided at review):** the TOOL-RESULT `content` carries **no** warehouse RESULT
+  data (`result_preview`/`result_full`/columns/cells) — PII-safe under any scope incl.
+  narrow/empty — but the paired synthesized ASSISTANT `tool_call` **DOES replay the model's
+  own original `args`** (the SQL/params it authored this turn), which is **required** so the
+  model can correlate the withheld marker to the exact call it made; without the args a
+  multi-call turn renders `runQuery({})` and the model re-emits and re-strands, reopening
+  the hang. Replaying `args` is PII-safe: (i) they are the model's own current-turn output,
+  generated causally **before** the withheld result existed, so cannot contain it; (ii) the
+  runtime already replays full current-turn args for DENIED (`status!="ok"`) entries via
+  `budget.py::_render_entry`; (iii) the provenance/column-scope gate protects warehouse
+  **result data**, not model-authored query text. Two shape changes: the sentinel dict keys
+  are `{role, tool_call_id, tool_name, args, withheld_sentinel, content}`, and the
+  verbatim-render discriminator is the explicit `withheld_sentinel` flag, **not** the
+  presence of a `content` key. Rendering it as the tool result for the dangling
+  `tool_call_id` is what breaks the loop. **(2)** `assemble` emits a
+  telemetry-only observer event `loop_result_withheld_provenance` (payload:
+  `tool_name`, `turn_index`, `tool_call_id`, `blueprint_id`|`None`,
+  `reason="provenance_undetermined"` — no data), deduped at most once per `tool_call_id`
+  per turn via a turn-local memo threaded like `retrieval_memo`; no `progress.py`
+  allowlist/label change (not UI-surfaced). **(3)** the **offline** `corpus_loader.load_corpus`
+  cross-checks each `BlueprintSeed.uses` `(db,table)` against an optional `CatalogHandle`
+  and logs a **loud WARNING** (per blueprint, naming missing `db.table`) on skew — a **soft**
+  warning, **not** a hard `CorpusLoadError`, because a blueprint may legitimately reference
+  tables absent from a given dev catalog snapshot (hard-fail would block a valid corpus
+  against an incomplete dev catalog); the runtime `VectorIndex` protocol has no
+  enumerate-all hook, so the offline seed/load path — which has every blueprint's `uses`
+  and can load a `CatalogHandle` — is the only place the check can live. **Record
+  correction:** production protection against this skew is **(MCP-fails-closed) +
+  (both catalogs in agreement)** — the MCP parses and scope-enforces every `runQuery` and
+  fails closed (D57/D63), and its introspection-built schema and the runtime's
+  `CatalogHandle` YAML must agree — **NOT** load-time catalog validation. The seed-time
+  check is a **dev-time early-warning aid only**, never the prod safety mechanism. The bug
+  was fail-closed throughout (no leak); this fixes the silent hang + zero diagnosis. See
+  [none-provenance-stranding-design.md](none-provenance-stranding-design.md).
+  Cross-references: [D44](#context-budget--loop-guardrails), [D47](#context-budget--loop-guardrails),
+  [D57](#blueprint-silent-path-safety), [D63](#blueprint-silent-path-safety), D56, D61, D89.
+
 ## Blueprint dedup & resolvers
 - **D48 (locked, 2026-06-30).** **Dedup is two layers; the hard layer is race-safe by construction.**
   **Hard dedup:** a **deterministic canonical key** `hash(resolves, uses_rules, result-grain,

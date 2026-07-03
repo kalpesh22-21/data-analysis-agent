@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -32,9 +33,31 @@ from pathlib import Path
 from neo4j import AsyncGraphDatabase
 
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
+from data_agent.runtime.provenance.catalog_handle import (
+    CatalogHandle,
+    load_catalog_handle,
+)
 from data_agent.runtime.retrieval.corpus_loader import load_corpus, load_seed_fixtures
 
 _FIXTURE_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "corpus"
+_logger = logging.getLogger(__name__)
+
+
+def _try_load_catalog() -> CatalogHandle | None:
+    """Build the CatalogHandle for the D94 Part-3 seed-time skew warning, softly.
+
+    The check is a dev-time early warning, never a seed precondition: if the
+    schema dir is absent or `load_catalog_handle()` raises, log a note and return
+    `None` so `load_corpus` still proceeds (with the skew check skipped)."""
+    try:
+        return load_catalog_handle()
+    except Exception as exc:  # noqa: BLE001 - soft dev-time aid, never blocks the seed
+        _logger.warning(
+            "catalog unavailable (%s) — skipping the D94 seed-time skew check; "
+            "the corpus load proceeds unchanged",
+            exc,
+        )
+        return None
 
 
 async def _main() -> int:
@@ -56,6 +79,7 @@ async def _main() -> int:
         model=model_id,
         timeout_seconds=30.0,
     )
+    catalog = _try_load_catalog()
     driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
     try:
         report = await load_corpus(
@@ -65,6 +89,7 @@ async def _main() -> int:
             knowledge,
             model_id=model_id,
             database=database,
+            catalog=catalog,
         )
     finally:
         await driver.close()
