@@ -337,8 +337,15 @@ the Wave-0 base slice** — the additive-envelope round-trip and the empty-stage
 that slice ships the envelope fields + the seam + fixtures with real Layer-1 tests. **The S4–S9 rows are
 now `🟡 unit-green`** (Wave 1/2, Session 19): each stage's Layer-1 slice landed — built in parallel off
 the frozen fixtures under `tests/fixtures/learning/`, then seam-reconciled — with the S8 / `depends_on` /
-redaction / fail-closed-approve rows added below. Statuses move `🟡 → ✅ green` at the Layer-2/3 +
-consumer-wiring (Wave 3) legs, which are **not** yet built (all Layer-1 with fakes).
+redaction / fail-closed-approve rows added below. **Update (Session 20, Wave 3 wiring):** the
+`CandidateStage` seam is no longer only exercised by fakes — the six stages are now **wired into a running
+consumer** in the frozen order via `src/data_agent/learning/factory.py` (`build_learning_consumer` +
+`build_promotion_plane`), proven by a 16-case full-pipeline integration test with the S1 spine invariants
+preserved, and the D48 hit-count store is now **durable** (`CouchbaseBlueprintCorpus`). This closes the
+Layer-1 **consumer-wiring** leg for these rows; they stay `🟡 unit-green` because the remaining
+`🟡 → ✅ green` legs are **Layer-2/3** (real Redis/Couchbase/neo4j; a real GitHub/CI client for the S8 PR
+bot; the S9 corpus-landing writer) — the loop is production-activatable but dormant and **not** yet
+Layer-2/conformance-proven.
 
 | Decision | Invariant | Test layer | Test slug | Conformance scenario | Status |
 |---|---|---|---|---|---|
@@ -362,3 +369,21 @@ consumer-wiring (Wave 3) legs, which are **not** yet built (all Layer-1 with fak
 | **D35 / D43** | S9 depends_on guard: a candidate whose `depends_on` references an unresolved artifact (e.g. a blueprint depending on a not-yet-landed `schema_edit(add_rule)`) STAYS `candidate` — the scheduler refuses to promote even with `hit_count ≥ T` and a green replay, until every dependency resolves (contracts-design §11.6) | Unit | `depends_on-unresolved-stays-candidate` | — | 🟡 unit-green |
 | **D17 / D98** | S9 promotion boundary strips entity-bearing text (`strip_entity_bearing`/`redact_payload`): replay binds **synthetic sampled values**, never stored entity inputs, and the fixture's stored entity values (`0420`/`2025`/`NA`) NEVER appear in the promoted entity-free store | Unit | `S9-promotion-redacts-stored-entities` | — | 🟡 unit-green |
 | **D98 / D58c** | S9 fail-closed-approve: a human `in_review` **approve** still passes the static + replay safety guards (approval substitutes for the `hit_count` threshold, NOT for structural integrity) — a blueprint with no replayable template holds **fail-closed**; reject → `rejected` | Unit | `S9-approve-still-runs-safety-guards` | — | 🟡 unit-green |
+
+---
+
+## Additional tagged invariants from Wave 3 wiring (Track-B consumer wiring + durable corpus, Session 20)
+
+The load-bearing invariants of the Wave-3 composition root (`src/data_agent/learning/factory.py`) and the
+durable D48 hit-count corpus (`CouchbaseBlueprintCorpus`), see
+[learning-loop-wave3-wiring-design.md](learning-loop-wave3-wiring-design.md). All `🟡 unit-green` —
+**Layer-1 built** (the six stages wired in the frozen order with shared-singleton stores + all-or-nothing
+gating, a 16-case full-pipeline integration test, and the durable corpus's atomic increment) with the
+**Layer-2 live tests written-but-not-run** (env-guarded, skip cleanly; docker bring-up is Wave 3b-ii).
+The loop is production-activatable but **dormant** (`LEARNING_ENABLED` off, no request-path import).
+
+| Decision | Invariant | Test layer | Test slug | Conformance scenario | Status |
+|---|---|---|---|---|---|
+| **D48** | The durable blueprint corpus increments `hit_count` **atomically** via a single Couchbase `mutate_in` counter op (never a read-modify-write), so concurrent identical-semantics merges yield one create + N atomic bumps, never a lost update; the seed is **insert-wins idempotent** (a re-seed of an existing `canonical_key` never resets its count); it duck-types the S9 `HitCountReader` | Unit + Component | `wave3-corpus-atomic-hit-count` | — | 🟡 unit-green (Layer-1 built; Layer-2 live test written-but-not-run) |
+| **D102** | `build_learning_consumer` assembles the six write-router stages in the **frozen order** (`generalize→leakage→dedup→schema_edit_pr→user_commit→writer`) over shared-singleton stores under **all-or-nothing** config gating (a partial wiring config refuses to assemble); a session runs end-to-end through every wired stage AND the S1 spine invariants (kill-switch, CAS single-writer, idempotency, dead-letter) still hold with the stages in place | Unit + Component | `wave3-consumer-wiring-frozen-order` | — | 🟡 unit-green (Layer-1 built; Layer-2 not yet run) |
+| **D102 / D101** | `build_promotion_plane` pins **one** candidate store across the scheduler + inbox so the promotion cron and the review inbox never diverge; the corpus scan + the deferred warehouse probe both **degrade fail-closed** (no dead-letter, no uncaught raise) so a corpus/warehouse hiccup can never crash the consumer or fake a merge | Unit + Component | `wave3-promotion-plane-shared-store-failclosed` | — | 🟡 unit-green (Layer-1 built; Layer-2 not yet run) |

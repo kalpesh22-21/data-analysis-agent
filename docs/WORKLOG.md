@@ -103,20 +103,25 @@ invariant→test status board.
   + ClickHouse-via-MCP; non-oracle NOT_FOUND). Design:
   [decisions/runblueprint-design.md](decisions/runblueprint-design.md).
 
-- ✅ **Track B — the offline learning loop is BUILT end-to-end at Layer-1 (Sessions 16–19).**
-  `src/data_agent/learning/`: the infra spine (S1, D95/D96) → loader + triage + `learning_audit`
-  (S2, D99/D100) → grounded extractor + `learning_candidates` (S3, D101) → and now, off a **frozen
-  inter-stage contract** (Wave 0, D102), the **six downstream stages built in PARALLEL** by 4 agents in
-  git worktrees (Wave 1/2): **S4** generalize + static-validate (AST → `sql_template`), **S5** leakage
-  gate, **S6** D48 dedup, **S7** inbox + writers, **S8** user store + schema-edit PR bot, **S9** promotion
-  scheduler. Integrated via seam reconciliation — reviewer **REQUEST CHANGES** (3 cross-slice seam
-  blockers) + adversarial **QA** (7 strict-xfail repros incl. a hidden-field→global-store leak chain) →
-  delta **APPROVE WITH FIXES** → fixed (all 7 repros now green regression guards). **1813 pass / 93
-  skipped, ruff clean.** **Honest caveat: all Layer-1 with fakes — the 6 stages are NOT yet wired into
-  `consumer._do_work`, and NONE of this is Layer-2/conformance-proven.** **Next = Wave 3:** wire the
-  stages in the frozen order (`generalize→leakage→dedup→schema_edit_pr→user_commit→writer`) + resolve the
-  S5-reroute re-injection question + the Layer-2 legs (real Redis/Couchbase/neo4j, a real GitHub/CI
-  client for the S8 PR bot); S10 = retraction / D25 exposure trace. See Session 19 below.
+- ✅ **Track B — the offline learning loop is BUILT end-to-end AND WIRED THROUGH at Layer-1 (Sessions 16–20)
+  — production-ACTIVATABLE but dormant.** `src/data_agent/learning/`: the infra spine (S1, D95/D96) →
+  loader + triage + `learning_audit` (S2, D99/D100) → grounded extractor + `learning_candidates`
+  (S3, D101) → off a **frozen inter-stage contract** (Wave 0, D102) the **six downstream stages built in
+  PARALLEL** by 4 agents in git worktrees (Wave 1/2): **S4** generalize + static-validate (AST →
+  `sql_template`), **S5** leakage gate, **S6** D48 dedup, **S7** inbox + writers, **S8** user store +
+  schema-edit PR bot, **S9** promotion scheduler → **and now WIRED (Wave 3, Session 20):** a
+  composition-root `factory.py` assembles the six stages in the frozen order
+  (`generalize→leakage→dedup→schema_edit_pr→user_commit→writer`) with shared-singleton stores +
+  all-or-nothing gating (16-case full-pipeline integration test, S1 invariants preserved); the D48
+  hit-count corpus is now durable (`CouchbaseBlueprintCorpus`, atomic `mutate_in`, insert-wins seed); the
+  entrypoints (`run_learning_consumer.py` + new `run_learning_scheduler.py`) adopt the factory. Commits
+  `574785c` (3a) + `0a8a028` (3b-i), each reviewed **APPROVE**. **1841 pass / 98 skipped, ruff clean.**
+  **Honest caveat: all Layer-1 with fakes and dormant** (`LEARNING_ENABLED` off, no request-path import);
+  the loop is production-activatable but **NONE of it is Layer-2/conformance-proven** yet. **Next = Wave
+  3b-ii:** bring up docker Layer-2 (Redis/Couchbase/neo4j) + run the env-guarded live tests; wire a real
+  `WarehouseProbe`/`DependencyResolver` + a real GitHub PR client to activate auto-promotion; add the S9
+  corpus-landing writer (materialize a validated candidate into the retrieval/neo4j plane); S10 =
+  retraction / D25 exposure trace. See Sessions 20 + 19 below.
 
 **Where we are (Session 14):** the **deferred-items** sweep is done — D90 (extractor fail-open) and
 D91 (D67 `resolve_via` wrong-answer) are both **fixed + reviewed**; the CI matrix, the D62 oracle, the
@@ -141,10 +146,11 @@ resolveValues Layer-2 leg, and the D67 seed leg all landed; and the next three b
 
 **Next scheduled bricks, in order:** (1) **Layer-3 conformance** (Item 3, designed) → (2) **auth
 readiness** (Item 9, decided) → (3) **table-intermediate Slice 1** (Item 8, designed). **Track B —
-the offline learning loop** (the **last big Phase-1 deliverable**) is now **BUILT end-to-end at Layer-1
-through S9** (Sessions 16–19; see the Track-B bullet above) — its **next step is Wave-3 consumer wiring +
-the Layer-2 legs**, not a fresh start. The runtime's Phase-1 `getTableSchema` is just a passthrough of
-the now-MCP-side overlay (D83/D84).
+the offline learning loop** (the **last big Phase-1 deliverable**) is now **BUILT end-to-end AND WIRED
+THROUGH at Layer-1 (Sessions 16–20; see the Track-B bullet above) — production-activatable but dormant**;
+its **next step is Wave-3b-ii: docker Layer-2 bring-up + real probe/resolver/GitHub client + the S9
+corpus-landing writer**, not a fresh start. The runtime's Phase-1 `getTableSchema` is just a passthrough
+of the now-MCP-side overlay (D83/D84).
 
 **Honest remaining Phase-0 gaps** (carried): the **3 deferred Layer-3 scenarios** — mid-session scope
 narrowing (needs BFF per-turn scope switching), observability+PII span inspection (needs a Phoenix
@@ -215,6 +221,51 @@ authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's
   - **`resolveValues` Layer-2 over the real MCP** — still not run (carried from Session 9).
   - The **authoring-time static grain gate (D37/D37b)** stays Phase-2 — the runtime D56 gate is the
     launch teeth; wrong-grain blueprints are caught at execution, not yet at authoring.
+
+---
+
+## 2026-07-03 — Session 20: Track-B learning-loop WIRED THROUGH (Wave 3 consumer wiring + durable corpus)
+
+The six downstream stages built in parallel in Session 19 are now **assembled into a running consumer**
+behind a composition-root factory, and the blueprint corpus's D48 hit-count store is now **durable**.
+This is the step that turns the learning loop from "nine Layer-1 slices with fakes" into a
+**production-activatable, still-dormant** pipeline — the wiring is done at Layer-1; the Layer-2 bring-up
+and the real probe/resolver/GitHub legs are the remaining work. Everything stays gated OFF
+(`LEARNING_ENABLED` off; no request-path import). Two commits on `phase0/provenance-extractor`.
+
+### Wave 3a — the composition root (commit `574785c`)
+`src/data_agent/learning/factory.py`: `build_learning_consumer()` assembles the six write-router stages
+(S4–S8) in the **frozen order** `generalize → leakage → dedup → schema_edit_pr → user_commit → writer`
+with **shared-singleton stores** and **all-or-nothing config gating** (a partial wiring config refuses to
+assemble rather than run a half-wired router). `build_promotion_plane()` pins **one** candidate store
+across the scheduler + inbox so the promotion cron and the review inbox never diverge. A **16-case
+full-pipeline integration test** proves a session runs end-to-end through all wired stages and that the
+S1 spine invariants (kill-switch, CAS single-writer, idempotency, dead-letter) still hold with the stages
+in place. Dormant (no request-path import; gate off). Reviewed **APPROVE**.
+
+### Wave 3b-(i) — durable corpus + entrypoint adoption (commit `0a8a028`)
+- **`CouchbaseBlueprintCorpus`** — the durable D48 hit-count store: an **atomic `mutate_in` counter**
+  increment (D48), **insert-wins idempotent seed**, duck-typing the S9 `HitCountReader`. The soft-layer
+  corpus scan + the deferred warehouse probe both **degrade fail-closed** (no dead-letter, no uncaught
+  raise) so a corpus/warehouse hiccup can never crash the consumer or fake a merge.
+- **Entrypoints adopt the factory** — `scripts/run_learning_consumer.py` + a **new**
+  `scripts/run_learning_scheduler.py` both build via the factory; the gate is extended to require the
+  corpus + user store present. `scripts/learning-corpus-init.sh` provisions the corpus bucket.
+- An **env-guarded Layer-2 live test** for the durable corpus is written and **skips cleanly** when the
+  infra env is absent.
+- Gates: **full suite 1841 passed / 98 skipped, ruff clean repo-wide.** Reviewed **APPROVE**.
+
+Design doc: [learning-loop-wave3-wiring-design.md](decisions/learning-loop-wave3-wiring-design.md).
+
+### Honest boundary (NOT done — next = Wave 3b-ii / Layer-2)
+The loop is **production-ACTIVATABLE but dormant**. Still deferred:
+- Bring up docker (Redis / Couchbase / neo4j) + **run** the env-guarded live tests (they exist, unrun).
+- Wire a **real `WarehouseProbe` / `DependencyResolver`** + a **real GitHub PR client** to activate
+  auto-promotion (currently the corpus scan + warehouse probe degrade fail-closed; S8's PR bot still uses
+  an injected fake).
+- The **S9 corpus-landing writer** — materialize a validated candidate into the retrieval / neo4j plane.
+- Retraction / D25 exposure trace (deferred S10).
+- Nothing pushed; no git remote configured.
 
 ---
 
