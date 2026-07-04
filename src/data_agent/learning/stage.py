@@ -1,11 +1,22 @@
 """The `CandidateStage` pipeline seam (Wave-0 contract freeze, D102 §7.1).
 
-The ONE frozen injection point the write-router stages (S4 generalize → S5 leakage
-→ S6 dedup → S7 writer) plug into. The consumer runs an ordered, injected
-`tuple[CandidateStage, ...]` over each freshly-extracted (`status=extracted`)
-envelope. Each builder implements their stage in their OWN module exposing a
-`CandidateStage`; wiring is a one-line registration at the composition root
-(`scripts/run_learning_consumer.py`), so no two builders co-edit the consumer.
+The ONE frozen injection point the write-router stages plug into. The consumer runs
+an ordered, injected `tuple[CandidateStage, ...]` over each freshly-extracted
+(`status=extracted`) envelope. Each builder implements their stage in their OWN
+module exposing a `CandidateStage`; wiring is a one-line registration at the
+composition root (`scripts/run_learning_consumer.py`), so no two builders co-edit
+the consumer.
+
+**Frozen stage order (D-frozen):**
+`generalize (S4) → leakage (S5) → dedup (S6) → schema_edit_pr (S8) →
+ user_commit (S8) → writer (S7)`.
+The TARGET-SPECIFIC stages run before the terminal `writer` and handle-then-stop
+their own candidate type: `schema_edit_pr` opens the D53 PR + stamps a
+`schema_edit_review` marker + `route_inbox` (persist + stop); `user_commit`
+auto-commits the per-user fact + `drop` (stop, written elsewhere). So the terminal
+`writer` only ever routes what those stages let through (`blueprint` /
+`global_knowledge`); a `schema_edit`/`user_knowledge` reaching the writer is a
+stage-order violation the writer fail-closes (R8, `writer/routing.py`).
 
 **Empty tuple ⇒ behaviorally identical current behavior** (no extra puts; additive
 keys only — the stub fallback, mirroring the S3 extractor DI). No concrete stage

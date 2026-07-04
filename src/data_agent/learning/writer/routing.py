@@ -9,10 +9,24 @@ label can never disagree:
     envelope (the inbox projection calls this; it needs no sampling flag because a
     clean blueprint only reaches `in_review` via the sampled path).
 
+**Frozen stage order (D-frozen §7.1).** The target-specific writer stages run BEFORE
+this terminal writer and stop (persist/drop) their own type:
+`generalize → leakage → dedup → schema_edit_pr → user_commit → writer`. The
+`schema_edit_pr` stage handles every `schema_edit`, stamps a `schema_edit_review`
+marker on the payload, and returns `route_inbox` (stopping the pipeline before the
+writer). So in the correct wiring the writer NEVER sees a `schema_edit`; its
+`schema_edit` branch is a fail-closed DEFENSE-IN-DEPTH fallback (R8): a `schema_edit`
+that reaches the writer WITHOUT the PR-stage marker means the PR bot was bypassed
+(stage-order violation) — it is routed to review flagged `fail_to_review`, NEVER
+auto-landed.
+
 Routing (precedence, top wins):
 
-  1. `global_knowledge` / `schema_edit`  → ALWAYS `in_review` (human pre-gate; never
-     auto-retrievable — D58a/D18). Reasons `knowledge_pre_gate` / `schema_edit`.
+  1a. `global_knowledge`  → ALWAYS `in_review` (human pre-gate; never auto-retrievable
+      — D58a). Reason `knowledge_pre_gate`.
+  1b. `schema_edit`       → ALWAYS `in_review` (human pre-gate; D18). Reason
+      `schema_edit` when the PR bot ran (`schema_edit_review` marker present),
+      else `fail_to_review` (R8 — the PR stage was bypassed). Never auto-landed.
   2. blueprint, `static_validation.outcome == "fail_to_review"` → `in_review`,
      reason `fail_to_review` (un-rewritable, reviewed not dropped — D52/D97).
   3. blueprint, `dedup.action ∈ {conflict, merge}` (a SOFT-layer near-miss) →
@@ -65,13 +79,31 @@ def _is_leakage_near_miss(env: CandidateEnvelope) -> bool:
     return LeakageVerdict.is_settled(scan) and scan.get("result") != "pass"
 
 
+def _entity_scan_unsettled(env: CandidateEnvelope) -> bool:
+    """True iff the S5 leakage gate has NOT settled a verdict (still S3's `pending`
+    self-check). A blueprint that skipped the gate must NEVER auto-land (S4 fail-open
+    fix / §5 doc amendment) — route it to human review, fail-closed."""
+    return not LeakageVerdict.is_settled(env.entity_scan)
+
+
+def _schema_edit_pr_ran(env: CandidateEnvelope) -> bool:
+    """True iff the S8 `schema_edit_pr` stage processed this candidate (it stamps a
+    `schema_edit_review` marker on the payload; R8). A `schema_edit` reaching the
+    writer WITHOUT it is a stage-order violation → fail-closed to `fail_to_review`."""
+    return isinstance(env.payload.get("schema_edit_review"), dict)
+
+
+def _schema_edit_reason(env: CandidateEnvelope) -> str:
+    return "schema_edit" if _schema_edit_pr_ran(env) else "fail_to_review"
+
+
 def derive_inbox_reason(env: CandidateEnvelope) -> str:
     """The `InboxItem.reason` for an `in_review` envelope. Precedence matches
     `route_candidate`; a clean blueprint in `in_review` is `blueprint_sampled`."""
     if env.type == "global_knowledge":
         return "knowledge_pre_gate"
     if env.type == "schema_edit":
-        return "schema_edit"
+        return _schema_edit_reason(env)
     # blueprint (or any other target that got routed to review)
     if _static_outcome(env) == "fail_to_review":
         return "fail_to_review"
@@ -79,6 +111,8 @@ def derive_inbox_reason(env: CandidateEnvelope) -> str:
         return "dedup_conflict"
     if _is_leakage_near_miss(env):
         return "leakage_near_miss"
+    if _entity_scan_unsettled(env):
+        return "fail_to_review"
     return "blueprint_sampled"
 
 
@@ -86,6 +120,9 @@ def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> Routi
     """Decide the terminal status + control + inbox reason for one enriched
     candidate. Pure: reads only the envelope + the sampling coin flip."""
     if env.type in ("global_knowledge", "schema_edit"):
+        # Both are human pre-gated → ALWAYS in_review, NEVER auto-landed. A
+        # `schema_edit` without the PR-stage marker (R8) still fail-closes to review
+        # (reason `fail_to_review` via `derive_inbox_reason`); it can never auto-land.
         return RoutingDecision(
             CandidateStatus.IN_REVIEW, "route_inbox", derive_inbox_reason(env)
         )
@@ -98,6 +135,12 @@ def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> Routi
         if _is_leakage_near_miss(env):
             return RoutingDecision(
                 CandidateStatus.IN_REVIEW, "route_inbox", "leakage_near_miss"
+            )
+        if _entity_scan_unsettled(env):
+            # The leakage gate never settled a verdict (S5 skipped) → fail-closed to
+            # human review; a blueprint must never auto-land on an unsettled scan (S4).
+            return RoutingDecision(
+                CandidateStatus.IN_REVIEW, "route_inbox", "fail_to_review"
             )
         if sampled_for_inbox:
             return RoutingDecision(

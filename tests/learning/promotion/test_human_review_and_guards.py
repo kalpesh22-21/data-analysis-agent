@@ -91,6 +91,29 @@ async def test_human_approve_blueprint_blocked_when_replay_fails():
     assert decision.action == "hold"
 
 
+async def test_human_approve_blueprint_without_generalization_fails_closed():
+    """S3: a blueprint whose `generalization` is absent/malformed (`from_doc`→None)
+    must NOT approve directly as 'non-replayable' — that would bypass BOTH static and
+    replay (D98: human approval never substitutes for replay). It HOLDS fail-closed."""
+    from dataclasses import replace
+
+    store = InMemoryCandidateStore()
+    base = make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY)
+    # Strip the generalization → a blueprint with no replayable template.
+    env = replace(
+        base,
+        payload={k: v for k, v in base.payload.items() if k != "generalization"},
+    )
+    await store.put(env)
+    sched = _scheduler(store)
+
+    decision = await sched.apply_human_decision(env, "approve")
+
+    assert decision.action == "hold"
+    assert decision.reason == "approve_blocked_no_generalization"
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+
+
 async def test_static_not_ok_holds_candidate():
     store = InMemoryCandidateStore()
     env = make_blueprint_candidate(

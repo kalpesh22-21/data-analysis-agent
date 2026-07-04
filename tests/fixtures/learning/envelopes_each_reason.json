@@ -43,7 +43,15 @@
     "status": "in_review",
     "payload": {
       "edit_kind": "add_rule",
-      "statement": "add rule: record_type='EARNING' means gross earnings"
+      "statement": "add rule: record_type='EARNING' means gross earnings",
+      "schema_edit_review": {
+        "pr_opened": true,
+        "pr_url": "https://example.test/pr/1",
+        "pr_number": 1,
+        "branch": "learning/schema-edit/hash-schema_edit",
+        "lint_ok": true,
+        "explain_ok": true
+      }
     },
     "provenance": {
       "source_session": "sess-schema_edit",
@@ -80,7 +88,23 @@
     "type": "blueprint",
     "status": "in_review",
     "payload": {
-      "intent": "reason=leakage_near_miss example"
+      "intent": "reason=leakage_near_miss example",
+      "generalization": {
+        "sql_template": "SELECT 1 AS c",
+        "uses": [],
+        "uses_rules": [],
+        "node_templates": [],
+        "result_grain": {"columns": [], "verifiable": false},
+        "static_validation": {
+          "explain_ok": true,
+          "binds_to_subset_uses": true,
+          "dag_ok": true,
+          "read_only_select": true,
+          "outcome": "ok",
+          "reason": null
+        },
+        "canonical_ast_norm": "SELECT 1 AS c"
+      }
     },
     "provenance": {
       "source_session": "sess-leakage_near_miss",
@@ -123,7 +147,23 @@
     "type": "blueprint",
     "status": "in_review",
     "payload": {
-      "intent": "reason=blueprint_sampled example"
+      "intent": "reason=blueprint_sampled example",
+      "generalization": {
+        "sql_template": "SELECT 1 AS c",
+        "uses": [],
+        "uses_rules": [],
+        "node_templates": [],
+        "result_grain": {"columns": [], "verifiable": false},
+        "static_validation": {
+          "explain_ok": true,
+          "binds_to_subset_uses": true,
+          "dag_ok": true,
+          "read_only_select": true,
+          "outcome": "ok",
+          "reason": null
+        },
+        "canonical_ast_norm": "SELECT 1 AS c"
+      }
     },
     "provenance": {
       "source_session": "sess-blueprint_sampled",
@@ -160,7 +200,23 @@
     "type": "blueprint",
     "status": "in_review",
     "payload": {
-      "intent": "reason=dedup_conflict example"
+      "intent": "reason=dedup_conflict example",
+      "generalization": {
+        "sql_template": "SELECT 1 AS c",
+        "uses": [],
+        "uses_rules": [],
+        "node_templates": [],
+        "result_grain": {"columns": [], "verifiable": false},
+        "static_validation": {
+          "explain_ok": true,
+          "binds_to_subset_uses": true,
+          "dag_ok": true,
+          "read_only_select": true,
+          "outcome": "ok",
+          "reason": null
+        },
+        "canonical_ast_norm": "SELECT 1 AS c"
+      }
     },
     "provenance": {
       "source_session": "sess-dedup_conflict",

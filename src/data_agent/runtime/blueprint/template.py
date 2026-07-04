@@ -36,6 +36,9 @@ from sqlglot import exp
 # strict — a `{` followed by anything non-identifier is NOT treated as a slot
 # (so a stray brace fails the parse loudly rather than binding silently).
 _SLOT_TOKEN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# Public alias: the S4 generalize canonicalizer reuses this exact bind-site regex
+# (not a reimplementation) to translate `{slot}` → `:slot` before AST-normalizing.
+SLOT_TOKEN = _SLOT_TOKEN
 
 # Non-SELECT statement node kinds that must NEVER appear in a blueprint template
 # (a blueprint is a READ-ONLY query). `exp.Block` is the multi-statement wrapper
@@ -250,6 +253,7 @@ def bind_template(
 
 
 __all__ = [
+    "SLOT_TOKEN",
     "TemplateBindError",
     "assert_read_only_select",
     "bind_template",

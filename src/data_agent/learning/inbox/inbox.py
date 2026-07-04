@@ -13,11 +13,15 @@ caller-driven transitions in the write router:
     retract  → validated → retired      (a post-promotion pull-from-index; the physical
                                          index removal + D25 exposure trace are S10, §11.4)
 
-**Entity-strip on promotion (D17).** `approve` moves a candidate toward a global,
-retrievable state, so before it is stamped `validated` the entity-bearing leakage
-`span`s are stripped from `entity_scan` — the invariant "no entity span crosses into
-a global store" is enforced at this status boundary, not left to the physical
-promoter.
+**One approve implementation (R4).** `approve`/`reject` are the caller-driven
+promotion transitions. To guarantee EVERY approve enforces the same invariants (the
+D17 entity strip, the `depends_on` guard, and the static/replay guards for a
+replayable blueprint), the inbox does NOT re-implement them — it fetches + guards
+the current status (fail-loud) and DELEGATES the transition to the single
+`PromotionScheduler.apply_human_decision` implementation. A production inbox injects
+the wired scheduler; an unwired inbox builds a default one (its guards are guard
+functions of the envelope + injected collaborators, so an unwired approve of a
+non-replayable candidate still strips + validates).
 
 Transitions are guarded: `approve`/`reject` require the current status to be
 `in_review`; `retract` requires `validated`. An illegal transition raises
@@ -31,7 +35,8 @@ from dataclasses import replace
 
 from ..candidate.models import CandidateEnvelope, CandidateStatus
 from ..candidate.store import CandidateStore
-from ..candidate.verdicts import EntityHit, LeakageVerdict
+from ..promotion.models import ProbeResult
+from ..promotion.scheduler import PromotionScheduler
 from .models import InboxItem
 
 
@@ -39,29 +44,32 @@ class InboxTransitionError(Exception):
     """Raised when a human transition is requested from an illegal current status."""
 
 
-def _strip_entity_spans(env: CandidateEnvelope) -> CandidateEnvelope:
-    """Return a copy with entity-bearing leakage `span`s blanked (D17). No-op when
-    `entity_scan` is unsettled or carries no hits."""
-    scan = env.entity_scan
-    if not LeakageVerdict.is_settled(scan):
-        return env
-    verdict = LeakageVerdict.from_doc(scan)
-    if not verdict.hits:
-        return env
-    stripped = LeakageVerdict(
-        result=verdict.result,
-        hits=tuple(EntityHit(field=h.field, kind=h.kind, span="") for h in verdict.hits),
-        scanned_fields=verdict.scanned_fields,
-        scanner=verdict.scanner,
-    )
-    return replace(env, entity_scan=stripped.to_doc())
+class _NoOpProbe:
+    """A no-op warehouse probe for an UNWIRED inbox (no scheduler injected). Only
+    reached if an approve replays a blueprint template; a production inbox injects
+    the real scheduler + probe."""
+
+    async def run(self, sql: str, *, grain_columns: tuple[str, ...]) -> ProbeResult:
+        return ProbeResult(row_count=0, distinct_grain_count=None, columns=())
+
+
+class _ZeroHitCounts:
+    async def hit_count(self, canonical_key: str) -> int:
+        return 0
 
 
 class ReviewInbox:
     """The `in_review` projection over a `CandidateStore` + the human transitions."""
 
-    def __init__(self, store: CandidateStore) -> None:
+    def __init__(
+        self, store: CandidateStore, *, scheduler: PromotionScheduler | None = None
+    ) -> None:
         self._store = store
+        # The SINGLE approve/reject implementation (R4). Defaulted for an unwired
+        # inbox; production injects the wired scheduler.
+        self._scheduler = scheduler or PromotionScheduler(
+            store, probe=_NoOpProbe(), hit_counts=_ZeroHitCounts(),
+        )
 
     async def list(self, *, limit: int = 100) -> list[InboxItem]:
         """The current inbox: every `in_review` candidate as a reviewer view."""
@@ -79,19 +87,30 @@ class ReviewInbox:
         return env
 
     async def approve(self, candidate_id: str) -> CandidateEnvelope:
-        """Human approve: `in_review → validated`. Strips entity spans first (D17)."""
-        env = await self._require(candidate_id, CandidateStatus.IN_REVIEW)
-        promoted = replace(_strip_entity_spans(env), status=CandidateStatus.VALIDATED)
-        await self._store.put(promoted)
-        return promoted
+        """Human approve: `in_review → validated`. Delegates to the single
+        `apply_human_decision` path (strip + deps + static/replay guards; D17/R4).
+
+        A guard that HOLDS (e.g. an unresolved `depends_on`, a missing generalization,
+        a failed replay) leaves the candidate `in_review`. That is NOT a success — so
+        a held approve is surfaced as an `InboxTransitionError` carrying the hold
+        reason (nit: a held approve must be distinguishable from a validated one), not
+        silently returned as an unchanged envelope."""
+        await self._require(candidate_id, CandidateStatus.IN_REVIEW)
+        env = await self._store.get(candidate_id)
+        decision = await self._scheduler.apply_human_decision(env, "approve")
+        if decision.action != "approve":
+            raise InboxTransitionError(
+                f"approve held for {candidate_id}: {decision.reason}"
+            )
+        return await self._store.get(candidate_id)
 
     async def reject(self, candidate_id: str) -> CandidateEnvelope:
         """Human reject: `in_review → rejected`. A NEGATIVE signal, NOT a delete —
-        the row is retained for the S9 learner (D29)."""
-        env = await self._require(candidate_id, CandidateStatus.IN_REVIEW)
-        rejected = replace(env, status=CandidateStatus.REJECTED)
-        await self._store.put(rejected)
-        return rejected
+        the row is retained for the S9 learner (D29). Delegates to the single path."""
+        await self._require(candidate_id, CandidateStatus.IN_REVIEW)
+        env = await self._store.get(candidate_id)
+        await self._scheduler.apply_human_decision(env, "reject")
+        return await self._store.get(candidate_id)
 
     async def retract(self, candidate_id: str) -> CandidateEnvelope:
         """Retract a promoted artifact: `validated → retired` (a leak/drift pull).

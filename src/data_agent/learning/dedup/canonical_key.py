@@ -5,9 +5,12 @@ The key is the SHA-256 of the canonical JSON of EXACTLY, in this order:
     [ resolves , uses_rules , result_grain , canonical_ast_norm ]
 
 - `resolves`            — `payload.resolves` (S3), dict; canonical JSON sorts its keys.
-- `uses_rules`          — `generalization.uses_rules` (S4), sorted explicitly here.
+- `uses_rules`          — `generalization.uses_rules` (S4), a rule SET: deduplicated
+                          + sorted here (QA-Q5) so listing a rule twice cannot mint a
+                          different key.
 - `result_grain`        — `generalization.result_grain` (S4), a `{columns, verifiable}`
                           dict; a defensive cross-check, subsumed by the AST (D48 N4).
+                          `columns` is order-normalized (sorted) here (QA-Q6).
 - `canonical_ast_norm`  — `generalization.canonical_ast_norm` (S4). **OPAQUE.** S6
                           NEVER re-parses it — a minor sqlglot bump can re-render it,
                           and the whole point of the freeze is that S4 produces the
@@ -38,6 +41,18 @@ def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _normalized_grain(result_grain: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonicalize `result_grain` so semantically-identical grains hash equal
+    (QA-Q6). `columns` is a SET of grain columns — `canonical_json` sorts dict keys
+    but preserves LIST order, so two grains with the same columns in a different
+    order would otherwise mint different keys. Sort the columns array explicitly."""
+    grain = dict(result_grain)
+    columns = grain.get("columns")
+    if isinstance(columns, (list, tuple)):
+        grain["columns"] = sorted(columns)
+    return grain
+
+
 def compute_canonical_key(
     resolves: Mapping[str, Any],
     uses_rules: Iterable[str],
@@ -45,11 +60,15 @@ def compute_canonical_key(
     canonical_ast_norm: str,
 ) -> str:
     """Return the D48 `sha256:`-prefixed canonical key. Inputs/order are FROZEN
-    (Contract C §3); do not add, drop, or reorder members."""
+    (Contract C §3); do not add, drop, or reorder members.
+
+    `uses_rules` is a rule SET: it is DEDUPLICATED and sorted (QA-Q5) so a blueprint
+    that references the same catalog rule from two locators hashes equal to one that
+    lists it once. `result_grain.columns` is likewise order-normalized (QA-Q6)."""
     parts = [
         dict(resolves),
-        sorted(uses_rules),
-        dict(result_grain),
+        sorted(set(uses_rules)),
+        _normalized_grain(result_grain),
         canonical_ast_norm,
     ]
     digest = hashlib.sha256(_canonical_json(parts).encode("utf-8")).hexdigest()

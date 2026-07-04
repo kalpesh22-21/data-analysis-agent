@@ -122,6 +122,48 @@ async def test_fail_to_review_precedence_over_sampling():
     assert route_candidate(env, sampled_for_inbox=False).reason == "fail_to_review"
 
 
+async def test_unsettled_scan_blueprint_does_not_auto_land():
+    """S4: a blueprint whose `entity_scan` is UNSETTLED (S5 skipped — still S3's
+    `pending` self-check) must NOT auto-land as `candidate`. Guard 0 stops promotion,
+    but auto-landing would strand it forever and contradicts the §5 doc amendment —
+    so the writer fail-closes it to `in_review` (reason `fail_to_review`)."""
+    from data_agent.learning.candidate.verdicts import LeakageVerdict
+
+    env = _extracted(_reasons()["blueprint_sampled"])  # clean, would auto-land
+    # Reset the settled `pass` verdict back to S3's unsettled `pending` self-check.
+    unsettled = replace(env, entity_scan={"result": "pending", "hits": []})
+    assert not LeakageVerdict.is_settled(unsettled.entity_scan)
+
+    writer = WriterStage(sampler=lambda _env: False)  # never sampled ⇒ would auto-land
+    result = await writer.process(unsettled, _ctx())
+    assert result.control == "route_inbox"
+    assert result.envelope.status == CandidateStatus.IN_REVIEW
+    assert result.envelope.status != CandidateStatus.CANDIDATE
+    assert route_candidate(unsettled, sampled_for_inbox=False).reason == "fail_to_review"
+
+
+async def test_schema_edit_without_pr_marker_fails_closed_never_auto_lands():
+    """R8 stage-order guard: a `schema_edit` that reaches the terminal writer WITHOUT
+    the `schema_edit_pr` stage's `schema_edit_review` marker means the PR bot was
+    bypassed. It must fail-closed to the inbox (reason `fail_to_review`) — NEVER
+    auto-land as a `candidate`, regardless of the sampling coin."""
+    marked = _reasons()["schema_edit"]
+    assert "schema_edit_review" in marked.payload  # the PR-processed shape derives `schema_edit`
+    assert route_candidate(_extracted(marked), sampled_for_inbox=False).reason == "schema_edit"
+
+    # Strip the marker: the PR stage never ran.
+    unmarked = replace(
+        _extracted(marked),
+        payload={k: v for k, v in marked.payload.items() if k != "schema_edit_review"},
+    )
+    writer = WriterStage(sampler=lambda _env: False)  # would auto-land a clean blueprint
+    result = await writer.process(unmarked, _ctx())
+    assert result.control == "route_inbox"
+    assert result.envelope.status == CandidateStatus.IN_REVIEW
+    assert result.envelope.status != CandidateStatus.CANDIDATE  # never auto-retrievable
+    assert route_candidate(unmarked, sampled_for_inbox=False).reason == "fail_to_review"
+
+
 async def test_soft_merge_action_routes_to_inbox_as_dedup_conflict():
     """A soft-layer `merge` verdict (a mergeable variant) is never auto-appended:
     it routes to the inbox under the `dedup_conflict` reason ('soft conflict/variant')."""

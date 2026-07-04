@@ -36,10 +36,13 @@ class UserKnowledgeCommitStage:
         if env.type != "user_knowledge":
             return StageResult(envelope=env, control="continue")
 
-        record = UserKnowledgeRecord.from_candidate(env)
-        # Auto-commit scoped to the fact's own user_id (D17). The commit is the
-        # authoritative write; the enriched envelope is dropped, never persisted
-        # into the candidate holding store / inbox.
+        # Scope to the SESSION's authenticated user (ctx.summary.user_id), NEVER the
+        # LLM-supplied payload.user_id (R6/D17) — a foreign payload user_id can never
+        # write into another user's surface.
+        record = UserKnowledgeRecord.from_candidate(env, user_id=ctx.summary.user_id)
+        # Auto-commit scoped to that user_id (D17). The commit is the authoritative
+        # write; the enriched envelope is dropped, never persisted into the candidate
+        # holding store / inbox.
         await self.store.commit(record)
         committed = replace(env, status=CandidateStatus.VALIDATED)
         return StageResult(envelope=committed, control="drop")

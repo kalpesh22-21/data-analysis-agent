@@ -40,8 +40,9 @@ from datetime import UTC, datetime
 
 from ..candidate.generalization import BlueprintGeneralization
 from ..candidate.models import CandidateEnvelope, CandidateStatus
+from ..candidate.redaction import strip_entity_bearing
 from ..candidate.store import CandidateStore
-from ..candidate.verdicts import DriftStamp
+from ..candidate.verdicts import DriftStamp, LeakageVerdict
 from ..config import learning_enabled
 from .drift import drift_from_replay, user_correction_stamp
 from .models import (
@@ -61,6 +62,13 @@ _logger = logging.getLogger(__name__)
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _entity_scan_is_clean(env: CandidateEnvelope) -> bool:
+    """True iff the S5 leakage gate SETTLED a `pass` verdict (R5). An unsettled
+    (`pending`) scan or any non-`pass` result fails closed — never auto-promotable."""
+    scan = env.entity_scan
+    return LeakageVerdict.is_settled(scan) and scan.get("result") == "pass"
 
 
 class PromotionScheduler:
@@ -135,6 +143,12 @@ class PromotionScheduler:
                 "human_gated_target" if env.type in HUMAN_GATED_TYPES else "not_auto_promotable"
             )
             return self._hold(env, reason)
+
+        # Guard 0 — defense-in-depth (R5): the leakage gate must have SETTLED a
+        # `pass`. An unsettled (`pending`) or non-`pass` entity_scan must never
+        # auto-promote into a retrievable state — fail closed (D17/D58).
+        if not _entity_scan_is_clean(env):
+            return self._hold(env, "entity_scan_not_pass")
 
         # Guard 1 — static validation must be `ok` (S4 stamp; D52/D97).
         gen = self._generalization(env)
@@ -212,13 +226,21 @@ class PromotionScheduler:
     ) -> CandidateDecision:
         """Apply a human `in_review` decision (Contract D / Contract E): approve →
         validated, reject → rejected. This is the ONE caller-driven promotion path
-        (not the cron scan); the human is the authority for the pre-gated targets
-        (global_knowledge/schema_edit, D58a/D18) and the sampled/near-miss route.
+        (not the cron scan) and the SINGLE implementation of the approve transition —
+        `ReviewInbox.approve` delegates here so EVERY approve enforces the identical
+        invariants (R4): the entity strip, the current-status guard, the `depends_on`
+        guard, and (for a replayable blueprint) the static + replay guards.
 
-        A blueprint approval STILL passes the static + replay safety guards (human
-        approval substitutes for the hit-count threshold, NOT for structural
-        integrity — D98). A non-replayable target (knowledge/schema) approves
-        directly."""
+        Approve invariants, in order:
+          1. current status MUST be `in_review` (a mis-routed approve never mutates).
+          2. strip entity-bearing payload + audit spans BEFORE `validated` (D17/Q3).
+          3. `depends_on` must be resolved (§11.6/Q2) — a human cannot promote a
+             blueprint whose required schema_edit has not landed.
+          4. a REPLAYABLE blueprint (has a generalization) STILL passes static +
+             golden replay (human approval substitutes for the hit-count threshold,
+             NOT for structural integrity — D98). A non-replayable target
+             (knowledge/schema, or a blueprint with no template) approves directly.
+        """
         if decision == "reject":
             rejected = replace(env, status=CandidateStatus.REJECTED)
             await self._store.put(rejected)
@@ -229,9 +251,37 @@ class PromotionScheduler:
         if decision != "approve":
             return self._hold(env, f"unknown_decision:{decision}")
 
+        # Guard 1 — current-status guard: approve only from in_review.
+        if env.status != CandidateStatus.IN_REVIEW:
+            return CandidateDecision(
+                env.candidate_id, env.type, "hold", env.status, env.status,
+                reason="approve_not_in_review",
+            )
+
+        # Guard 2 — entity strip on the promotion boundary (D17). Done up front so no
+        # entity-bearing payload or audit span can cross into a validated state.
+        env = strip_entity_bearing(env)
+
+        # Guard 3 — depends_on must resolve (§11.6) regardless of promotion path (Q2).
+        if not await self._deps_resolved(env):
+            return CandidateDecision(
+                env.candidate_id, env.type, "hold", env.status, env.status,
+                reason="approve_blocked_depends_on_unresolved",
+            )
+
+        # Guard 4 — structural guards. A BLUEPRINT is always replayable: its
+        # `generalization` MUST parse, else static + replay cannot run and human
+        # approval would silently substitute for them (D98 forbids). Fail CLOSED on a
+        # missing/malformed generalization (S3) — only genuinely NON-blueprint targets
+        # (knowledge/schema) approve directly without a replay.
         if env.type == BLUEPRINT_TYPE:
             gen = self._generalization(env)
-            if gen is None or gen.static_validation.outcome != "ok":
+            if gen is None:
+                return CandidateDecision(
+                    env.candidate_id, env.type, "hold", env.status, env.status,
+                    reason="approve_blocked_no_generalization",
+                )
+            if gen.static_validation.outcome != "ok":
                 return CandidateDecision(
                     env.candidate_id, env.type, "hold", env.status, env.status,
                     reason="approve_blocked_static_not_ok",
@@ -244,8 +294,8 @@ class PromotionScheduler:
                 )
             drift = drift_from_replay(replay, now=self._clock())
         else:
-            # Human-authoritative approval of a pre-gated non-blueprint target; no
-            # template to replay → no live drift probe (unchecked until Phase 2).
+            # Genuinely non-replayable target (pre-gated knowledge/schema) →
+            # human-authoritative, no live drift probe (Phase 2).
             drift = DriftStamp()
 
         approved = replace(env, status=CandidateStatus.VALIDATED, drift=drift)

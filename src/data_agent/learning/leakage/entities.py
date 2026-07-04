@@ -35,10 +35,19 @@ _DETECTORS: tuple[tuple[str, re.Pattern[str]], ...] = (
     # sentence-initial "Total Earnings" can trip it, but a false positive on a
     # GLOBAL candidate routes to human review, never a silent leak.
     ("person", re.compile(r"\b[A-Z][a-z]+ [A-Z][a-z]+\b")),
-    # Known region tokens as whole words.
+    # Multi-character region tokens — case-INSENSITIVE (QA-Q4). These are
+    # unambiguous region names, so case-folding them ('emea' → hit) carries no
+    # false-positive risk while closing the lowercase-region gap.
     (
         "region",
-        re.compile(r"\b(?:EMEA|APAC|LATAM|NAWEST|NAEAST|NA|US|EU)\b"),
+        re.compile(r"\b(?:EMEA|APAC|LATAM|NAWEST|NAEAST)\b", re.IGNORECASE),
+    ),
+    # Short region tokens — case-SENSITIVE on purpose (QA-Q4 note): 'na'/'us'/'eu'
+    # are common English fragments (a lowercase-folded 'us'/'eu' would false-positive
+    # on ordinary prose), so only their upper-case region form is flagged.
+    (
+        "region",
+        re.compile(r"\b(?:NA|US|EU)\b"),
     ),
 )
 

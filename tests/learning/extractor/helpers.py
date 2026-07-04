@@ -53,9 +53,10 @@ def make_summary(
     session_id: str = "sess-1",
     trace_id: str = "trace-1",
     content_hash: str = "hash-1",
+    user_id: str = "user-1",
 ) -> SessionSummary:
     return SessionSummary(
-        session_id=session_id, user_id="user-1", scope_ref="scope-abc", trace_id=trace_id,
+        session_id=session_id, user_id=user_id, scope_ref="scope-abc", trace_id=trace_id,
         content_hash=content_hash,
         turns=(),
         tool_calls=tool_calls if tool_calls is not None else (make_tool_call(),),

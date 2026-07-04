@@ -20,15 +20,13 @@ The synthetic sample proves the template BINDS and RUNS; the injected
 `WarehouseProbe` (fake in tests, no real ClickHouse) returns the `verify_result`
 triple. A single green replay is not a correctness proof.
 
-Frozen-contract note: the S4 fixture's `generalization.sql_template` uses sqlglot
-COLON placeholders (`:department`), while the runtime binder authors BRACE tokens
-(`{department}`). We normalize colon→brace before reusing `bind_template`, so the
-one frozen template style replays through the runtime binder unchanged.
+Contract note: the S4 `generalization.sql_template` is BRACE authoring form
+(`{department}`) — the SAME shape the runtime binder authors — so it feeds straight
+into `bind_template`/`referenced_slots` with zero placeholder translation.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,10 +42,6 @@ from ..candidate.generalization import BlueprintGeneralization
 from ..candidate.models import CandidateEnvelope
 from .models import WarehouseProbe
 
-# A sqlglot colon placeholder (`:name`) that is NOT a `::` type-cast — the S4
-# template's bind-site style. Rewritten to the runtime binder's `{name}` token.
-_COLON_PLACEHOLDER = re.compile(r"(?<![:\w]):([A-Za-z_][A-Za-z0-9_]*)")
-
 
 @dataclass(frozen=True)
 class ReplayOutcome:
@@ -62,12 +56,6 @@ class ReplayOutcome:
     reason: str | None = None  # stable machine tag when not passed
 
 
-def _to_brace(template: str) -> str:
-    """Normalize S4 colon placeholders (`:name`) to the runtime binder's `{name}`
-    tokens so `bind_template` (reused verbatim) can drive the replay."""
-    return _COLON_PLACEHOLDER.sub(lambda m: "{" + m.group(1) + "}", template)
-
-
 def _pick_template(gen: BlueprintGeneralization) -> str | None:
     """The template whose result STRUCTURE the D56 gate verifies: a single
     blueprint's top-level template, or the TERMINAL node of a composite (highest
@@ -80,11 +68,44 @@ def _pick_template(gen: BlueprintGeneralization) -> str | None:
     return None
 
 
-def _sample_bindings(slot_names: set[str]) -> dict[str, Any]:
-    """Mint a SYNTHETIC value per referenced slot — never a stored entity input
-    (D17). A synthetic string binds as a typed literal (F1) and proves the template
-    binds + runs; its value is irrelevant (the probe is a structure oracle, D98)."""
-    return {name: f"__replay_sample_{name}__" for name in slot_names}
+# A fixed synthetic date for `as_of_date` slots (D17 — never a stored value).
+_SAMPLE_DATE = "2020-01-01"
+
+
+def _slot_types(payload: dict[str, Any]) -> dict[str, str]:
+    """Map each slot NAME → its declared `type` from `payload.parameterization`
+    (role=="slot"). Used to sample a TYPE-CORRECT synthetic value per slot (R7) so a
+    date/list slot does not type-error when the replay hits a real warehouse."""
+    types: dict[str, str] = {}
+    params = payload.get("parameterization")
+    if not isinstance(params, list):
+        return types
+    for entry in params:
+        if not isinstance(entry, dict):
+            continue
+        slot = entry.get("slot")
+        if isinstance(slot, dict) and isinstance(slot.get("name"), str):
+            types[slot["name"]] = slot.get("type", "")
+    return types
+
+
+def _sample_value(name: str, slot_type: str) -> Any:
+    """A SYNTHETIC value typed per the slot's declared type (R7) — never a stored
+    entity input (D17). `as_of_date` → a fixed ISO date; `list` → a one-element set
+    (so `IN {slot}` binds); every other type (string/entity/enum/period) → a
+    synthetic string token that binds as a typed literal (F1)."""
+    if slot_type == "as_of_date":
+        return _SAMPLE_DATE
+    if slot_type == "list":
+        return [f"__replay_sample_{name}__"]
+    return f"__replay_sample_{name}__"
+
+
+def _sample_bindings(slot_names: set[str], slot_types: dict[str, str]) -> dict[str, Any]:
+    """Mint a type-correct SYNTHETIC value per referenced slot — never a stored
+    entity input (D17). The value proves the template binds + runs; the probe is a
+    structure oracle, so only the TYPE (not the value) matters (D98/R7)."""
+    return {name: _sample_value(name, slot_types.get(name, "")) for name in slot_names}
 
 
 def _expected_columns(payload: dict[str, Any]) -> tuple[str, ...] | None:
@@ -122,12 +143,11 @@ async def golden_replay(
     if not template:
         return ReplayOutcome(False, None, None, (), reason="no_template")
 
-    brace_template = _to_brace(template)
-    slot_names = referenced_slots(brace_template)
-    bindings = _sample_bindings(slot_names)
+    slot_names = referenced_slots(template)
+    bindings = _sample_bindings(slot_names, _slot_types(env.payload))
     sampled = tuple(sorted(slot_names))
     try:
-        replay_sql = bind_template(brace_template, bindings)
+        replay_sql = bind_template(template, bindings)
     except TemplateBindError:
         return ReplayOutcome(False, None, None, sampled, reason="bind_failed")
 

@@ -113,23 +113,44 @@ class DedupStage:
             # Fail-soft (D52): no canonical_ast_norm ⇒ skip the hard key entirely.
             verdict = await self._soft_layer(env, hard_key="")
 
+        await self._seed_on_insert(env, verdict)
         return StageResult(replace(env, dedup=verdict), "continue")
+
+    async def _seed_on_insert(self, env: CandidateEnvelope, verdict: DedupVerdict) -> None:
+        """On a genuinely-new `insert` with a real hard key, register the corpus
+        artifact at `hit_count=1` from THIS first candidate (D48 §11.1) so the
+        count-based promotion threshold can accrue before the artifact lands. A
+        fail-soft insert (no hard key) has nothing to key on — skip it."""
+        if verdict.action != "insert" or not verdict.canonical_key:
+            return
+        gen = env.payload.get("generalization") or {}
+        await self._corpus.seed_artifact(
+            CorpusArtifact(
+                id=env.candidate_id,
+                canonical_key=verdict.canonical_key,
+                intent=(env.payload.get("intent") or "").strip(),
+                hit_count=1,
+                uses_rules=tuple(gen.get("uses_rules") or []),
+            )
+        )
 
     async def _soft_layer(self, env: CandidateEnvelope, *, hard_key: str) -> DedupVerdict:
         """Embedding near-miss adjudication on `intent`. Degrades to `insert` on an
-        empty intent, an empty corpus, or ANY embedder failure — never a wrong merge."""
-        # `insert` layer: "hard" when a real hard key was computed (uniqueness
-        # established by the AST); "soft" when the hard key was fail-soft-skipped.
-        insert_layer = "hard" if hard_key else "soft"
+        empty intent, an empty corpus, or ANY embedder failure — never a wrong merge.
+
+        The verdict's `layer` reflects which layer actually ADJUDICATED it: an
+        `insert`/`merge`/`conflict` is produced by THIS soft layer, so `layer="soft"`
+        (a hard-key `increment` is stamped `layer="hard"` by the caller). The prior
+        code mislabelled a soft-adjudicated insert as `hard` (review nit)."""
         intent = (env.payload.get("intent") or "").strip()
         artifacts = [a for a in await self._corpus.list_artifacts() if a.canonical_key != hard_key]
         if not intent or not artifacts:
-            return DedupVerdict(hard_key, None, 0.0, "insert", insert_layer)
+            return DedupVerdict(hard_key, None, 0.0, "insert", "soft")
 
         try:
             vectors = await self._embedder.embed([intent, *(a.intent for a in artifacts)])
         except Exception:  # noqa: BLE001 — any embedder failure degrades to insert (D52)
-            return DedupVerdict(hard_key, None, 0.0, "insert", insert_layer)
+            return DedupVerdict(hard_key, None, 0.0, "insert", "soft")
 
         query = vectors[0]
         best: CorpusArtifact | None = None
@@ -143,4 +164,4 @@ class DedupStage:
             return DedupVerdict(hard_key, best.id, best_sim, "merge", "soft")
         if best is not None and best_sim >= self._conflict_threshold:
             return DedupVerdict(hard_key, best.id, best_sim, "conflict", "soft")
-        return DedupVerdict(hard_key, None, best_sim, "insert", insert_layer)
+        return DedupVerdict(hard_key, None, best_sim, "insert", "soft")

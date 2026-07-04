@@ -133,8 +133,11 @@ Wave-0 fixtures carry `when: null`. A typed `when` on `NodeTemplate` (bare-strin
 
 ## 2. Contract B — Leakage verdict (S5 WRITES · S7 READS)
 
-S5 (leakage gate, `GUARDRAIL` span, D58/D17) scans `payload.intent` + `payload.result_signature`
-(blueprint) or `payload.statement` (global_knowledge) for entities. It writes the authoritative
+S5 (leakage gate, `GUARDRAIL` span, D58/D17) scans EVERY text-bearing content surface per target
+(Q1 field-coverage): blueprint = `intent` + `result_signature` + `notes` + `generalization.sql_template`
+(role=inline literals survive into the landed artifact); global_knowledge = `statement` + `structured`
++ `related_terms` + `scope`. Each leaf is handed to BOTH the regex battery AND the injected semantic
+scanner. It writes the authoritative
 `entity_scan` — the field **already exists** on the envelope, holding S3's preliminary `pending`
 self-check ([`candidate/models.py`](../../src/data_agent/learning/candidate/models.py):56). S5
 overwrites it. Freeze the shape:
@@ -154,12 +157,25 @@ class EntityHit:
     span: str                               # the offending substring (entity-bearing → audit store only if persisted)
 ```
 
-- **`pass`** → continue (blueprint auto-lands `candidate`; sampled fraction + this-was-a-near-miss →
-  inbox per D58b).
-- **`reroute`** → the fact is entity-bearing but legitimately a `user_knowledge` fact → S5 spawns a
-  linked `user_knowledge` candidate (`depends_on`) and marks this one `rejected`.
-- **`quarantine`** → suspected leak, hold for human (near-miss → inbox, D58b).
-- **`reject`** → hard entity in a global candidate → terminal `rejected`.
+**Routing authority (D-frozen amendment, 2026-07-03).** The leakage gate is the verdict WRITER, not
+the router — **S7 (the writer) is the sole routing authority**. The gate STAMPS `entity_scan` and
+returns `control="continue"` for `pass`, `quarantine`, AND `reroute` (letting the candidate flow to
+S6→S7). The ONLY terminal stop at S5 is a hard `reject` (`status=rejected`, `control="route_inbox"` =
+persist + stop). This closes the seam where a near-miss could be stranded invisible to the inbox
+(R1).
+
+- **`pass`** → `control="continue"`; the writer auto-lands the blueprint `candidate` (sampled fraction
+  + this-was-a-near-miss → inbox per D58b).
+- **`reroute`** → the fact is entity-bearing but legitimately a `user_knowledge` fact. S5 **commits it
+  directly** into the injected per-user `UserKnowledgeStore` (the SAME store S8 uses), scoped to the
+  session's authenticated `ctx.summary.user_id` (NEVER a payload-supplied id — R6). The residual global
+  candidate then flows on with `control="continue"`; the writer routes the residual near-miss to
+  `in_review`. *(General stage-spawned candidate re-injection into the pipeline is a Wave-3 concern;
+  reroute commits directly rather than spawning a linked candidate — R2.)*
+- **`quarantine`** → suspected leak; `control="continue"`. The candidate flows to the writer, which
+  routes it to `in_review` (reason `leakage_near_miss`, D58b). **There is no standalone `quarantined`
+  status** — a quarantined candidate is an `in_review` candidate (see §5).
+- **`reject`** → hard entity in a global candidate → terminal `status=rejected`, `control="route_inbox"`.
 
 **Attaches at:** `envelope.entity_scan` (existing field; no envelope schema change). **Where hits'
 `span` may live:** entity-bearing spans are **never** inlined into a global store, but the candidate
@@ -252,7 +268,8 @@ already frozen on `CandidateStatus`,
 
 ```
 extracted ──(S5 entity_scan.result == pass)──────────────▶ candidate
-extracted ──(S5 reject/quarantine)───────────────────────▶ rejected | quarantined
+extracted ──(S5 quarantine)──(flows to writer)───────────▶ in_review   (reason leakage_near_miss)
+extracted ──(S5 reject, terminal)────────────────────────▶ rejected
 candidate ──(target ∈ {global_knowledge, schema_edit}    ▶ in_review        [D58a/D18: human pre-gate]
              OR reason == fail_to_review/near-miss/conflict)
 candidate ──(golden-replay passes AND (hit_count ≥ T      ▶ validated
@@ -266,9 +283,19 @@ validated ──(schema/catalog drift makes it stale)────────▶
 * ─────────(retract: leaked artifact pulled from index)──▶ retired
 ```
 
+**Amendment (D-frozen, 2026-07-03).** `quarantine` is NOT a standalone status — a quarantined
+candidate flows through the writer to `in_review` (`extracted →(quarantine)→ in_review`), so it is
+visible to `ReviewInbox.list()` and can never be stranded (R1). The `CandidateStatus.QUARANTINED`
+symbol is retained only for backward-compatible doc round-trips; the S5→S7 path never lands a
+candidate there.
+
 **Guards on each promotion edge (D29/D98):**
-- `candidate → validated` requires `generalization.static_validation.outcome == "ok"` **AND** a
-  passing golden replay (`verify_result` green — grain-integrity + signature, D56/D98) **AND**
+- `candidate → validated` fails **CLOSED** unless the S5 leakage gate SETTLED `entity_scan.result ==
+  "pass"` (R5 defense-in-depth): an unsettled (`pending`) or non-`pass` scan can NEVER auto-promote /
+  auto-land into a retrievable state. This holds for BOTH the writer's auto-land and S9's
+  `candidate→validated` promotion.
+- `candidate → validated` further requires `generalization.static_validation.outcome == "ok"` **AND**
+  a passing golden replay (`verify_result` green — grain-integrity + signature, D56/D98) **AND**
   (`hit_count ≥ threshold` **OR** human approval). **A single session's candidate stays `candidate`**
   (D98 layer iii) — replay alone never promotes.
 - Replay verifies **structure, not values** (D98): a green replay is not a correctness proof. Do not
@@ -339,11 +366,22 @@ class StageResult:
 (`learning/generalize/`, `learning/leakage/`, `learning/dedup/`, `learning/writer/`) exposing a
 `CandidateStage`. **Wiring is a one-line list registration** at the composition root (the consumer
 factory / entrypoint), done **once** when the contracts land — builders never co-edit `consumer.py`.
-Stage order is fixed here: `generalize (S4) → leakage (S5) → dedup (S6) → writer (S7)`. A stage
-absent from the tuple is simply skipped (the current no-op).
+A stage absent from the tuple is simply skipped (the current no-op).
 
-**Ordering note:** S5 (leakage) reads only S3 fields (`intent`, `result_signature`), so it is
-order-independent of S4 and could run first; we still place it after S4 so the single frozen order
+**Frozen stage order (D-frozen amendment, 2026-07-03):**
+`generalize (S4) → leakage (S5) → dedup (S6) → schema_edit_pr (S8) → user_commit (S8) → writer (S7)`.
+The two TARGET-SPECIFIC writer stages run BEFORE the terminal `writer` and handle-then-stop their own
+candidate type so it never reaches the generic writer: `schema_edit_pr` opens the D53 PR + stamps a
+`schema_edit_review` marker on the payload + returns `control="route_inbox"` (persist + stop);
+`user_commit` auto-commits the per-user fact + returns `control="drop"` (stop, written elsewhere).
+The terminal `writer` therefore only routes `blueprint` / `global_knowledge`; a `schema_edit`
+reaching it WITHOUT the PR marker is a stage-order violation the writer fail-closes to `in_review`
+(reason `fail_to_review`, never auto-land — R8).
+
+**Ordering note:** S5 (leakage) reads S3 fields (`intent`, `result_signature`, `notes`) AND, when
+present, S4's `generalization.sql_template` (Q1 — role=inline literals must be scanned). It is placed
+after S4 so the generalization is available to scan; it degrades gracefully when absent. We keep the
+single frozen order so it
 serves every target. S8's `user_knowledge` auto-commit and `schema_edit` PR-bot are **writer-stage**
 concerns (part of the S7 writer or a sibling writer stage), also plugged via `CandidateStage`.
 
@@ -465,8 +503,13 @@ builder wires them as config knobs, not hard-coded constants.
 1. **`hit_count` home & threshold T (blocker).** `hit_count` lives on the **landed corpus artifact**
    (the neo4j blueprint node, keyed by `canonical_key`) — **NOT** on the envelope. Rationale: it is a
    cross-session aggregate that accrues over the artifact's whole life, while an envelope is one
-   session's candidate. S6 `action=increment` bumps the existing artifact's count (seeded at `1` on
-   `insert`); S9's promotion guard reads the artifact's accumulated count. Thresholds:
+   session's candidate. **Amendment (D-frozen, 2026-07-03 — R3):** the hit_count artifact exists from
+   the FIRST candidate (the candidate/dedup stage), NOT only post-landing. S6 `action=insert` SEEDS the
+   corpus artifact at `hit_count=1` (via the `BlueprintCorpus.seed_artifact` port, keyed by
+   `canonical_key`, idempotent); a subsequent hard-key hit is `action=increment` and bumps that existing
+   artifact's count. This lets the count-based promotion threshold accrue before the artifact lands
+   (else the count could never converge). S9's promotion guard reads the artifact's accumulated count.
+   Thresholds:
    `blueprint_promotion_hit_threshold = 3` *(provisional)*; **`global_knowledge` + `schema_edit` never
    auto-promote by count** (human-gated, D58a/D18 — `T = ∞`); **`user_knowledge` auto-commits** (no
    threshold, D17). Human approval is always an alternative promotion path regardless of count.

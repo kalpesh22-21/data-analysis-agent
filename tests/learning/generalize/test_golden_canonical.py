@@ -5,13 +5,11 @@ The recipe is pinned (§11.2): a drift here silently mints a different `canonica
 and degrades a D48 `increment` into a spurious `insert` — so this asserts the exact
 string for single AND composite (the `\n`-joined per-node composite rule).
 
-KNOWN FIXTURE INCONSISTENCY (reported, not silently patched): the single fixture's
-`generalization.uses_rules == ["rule.earning_record_type"]`, but its S3 input plan
-marks `record_type` as role=INLINE with `rule_id: null` and declares NO role=rule
-param — so `uses_rules` is NOT derivable as that value from the input. The COMPOSITE
-fixture proves the derivation rule (no role=rule params ⇒ `uses_rules == []`); the
-single fixture's value is an authoring error. This test asserts every OTHER field
-byte-for-byte and pins the contract-correct `uses_rules == ()` for the single case.
+The single fixture's `sql_template` is BRACE authoring form (`{department}`) — the same
+shape the runtime binder expects — and its `uses_rules == []`, derived from the S3
+plan which marks `record_type` as role=INLINE (`rule_id: null`) with NO role=rule
+param. This test pins every derivable field byte-for-byte AND the contract-correct
+`uses_rules == []` for the single case.
 """
 
 from __future__ import annotations

@@ -12,20 +12,22 @@ The gate is the WRITER of the settled verdict, so it never READS the incoming
 `entity_scan` (which is S3's un-settled `pending` sentinel — parsing it as a
 `LeakageVerdict` without `is_settled` would fail loud by design). It only writes.
 
-Verdict -> control mapping:
-  * pass       -> the candidate is entity-free; leave `status=extracted`, emit
-                  `control="continue"` so the downstream writer auto-lands it.
-  * reroute    -> an entity that is a legitimate per-user fact: spawn a linked
-                  `user_knowledge` candidate (`depends_on` this one) into the
-                  candidate store and mark THIS global one `rejected`.
-  * quarantine -> a suspected leak in a blueprint: `status=quarantined`, hold for
-                  human (S7 routes the near-miss to the inbox — not this slice).
+The gate STAMPS the verdict but is NOT the routing authority — the S7 writer is
+(the single routing seam, so a near-miss can never be stranded, D-frozen). The gate
+therefore lets `pass`, `quarantine`, AND `reroute` flow ON to S6→S7 with
+`control="continue"`, leaving `status=extracted`; only a hard `reject` terminates
+here (`status=rejected`, `control="route_inbox"` = persist + stop):
+
+  * pass       -> entity-free; `control="continue"`, writer auto-lands it.
+  * quarantine -> suspected leak in a blueprint; `control="continue"`, the writer
+                  routes it to `in_review` (reason `leakage_near_miss`).
+  * reroute    -> an entity that is a legitimate per-user fact: the fact is
+                  COMMITTED directly into the injected per-user `UserKnowledgeStore`
+                  (scoped to the session's authenticated `user_id`), and the global
+                  candidate flows on with `control="continue"` (the writer routes
+                  the residual near-miss to `in_review`).
   * reject     -> a hard entity in a global_knowledge candidate: terminal
-                  `status=rejected`.
-For every non-`pass` verdict the enriched envelope is persisted (audit posture,
-D101) and the candidate's pipeline stops — `control="route_inbox"` is purely the
-consumer's "persist + stop this candidate" signal; the STATUS field (not the
-control) determines inbox visibility, which S7 projects by `status`.
+                  `status=rejected`, `control="route_inbox"` (persist + stop).
 
 Entity-BEARING targets (`user_knowledge`) and human-gated `schema_edit` are NOT
 in the gate's remit — it passes them through untouched (`control="continue"`).
@@ -40,6 +42,8 @@ from ..candidate.models import CandidateEnvelope, CandidateStatus
 from ..candidate.store import CandidateStore
 from ..candidate.verdicts import EntityHit, LeakageVerdict
 from ..stage import StageContext, StageResult
+from ..user.models import UserKnowledgeRecord, mint_record_id
+from ..user.store import UserKnowledgeStore
 from . import entities
 from .scanner import (
     NullSemanticEntityScanner,
@@ -55,24 +59,81 @@ _GLOBAL_TYPES = frozenset({"blueprint", "global_knowledge"})
 _HARD_REJECT_TYPES = frozenset({"global_knowledge"})
 
 
+# The entity-free CONTENT surfaces per target, in scan order (QA-Q1). Every
+# text-bearing field a leak could hide in must reach BOTH scan layers — the earlier
+# gate scanned only `statement` (knowledge) / `intent` (blueprint) and starved even
+# a perfect semantic backstop of any other field. Blueprint raw-value carriers
+# (`parameterization`/`resolves`) are DELIBERATELY excluded: they hold the
+# pre-generalization slot values by design (they are templated out downstream), so
+# scanning them would false-positive on every candidate.
+_ENTITY_FREE_SURFACES: dict[str, tuple[str, ...]] = {
+    "global_knowledge": ("statement", "structured", "related_terms", "scope"),
+    # `notes` is extractor free text that lands with the artifact — an entity there
+    # with a clean `intent` must NOT slip through as `pass` (Q1 rework).
+    "blueprint": ("intent", "result_signature", "notes"),
+}
+# `result_signature` has a defined schema (D56) — scan it as ONE canonically
+# serialized field so a hit is attributed to `result_signature` (not a leaf path).
+_WHOLE_SERIALIZED_FIELDS = frozenset({"result_signature"})
+
+
+def _generalization_templates(payload: dict) -> dict[str, str]:
+    """The AST-rewritten SQL template(s) from S4's `generalization` (Q1 rework). A
+    role=inline literal (e.g. a hardcoded `region = 'EMEA'`) survives verbatim into
+    the landed global artifact, so the template string itself must be scanned. Single
+    blueprint: `generalization.sql_template`; composite (top-level template is None):
+    each `node_templates[*].sql_template`. Legit metric-defining literals (`'EARNING'`)
+    won't trip the entity regex; an entity hit is at worst a quarantine → human."""
+    gen = payload.get("generalization")
+    if not isinstance(gen, dict):
+        return {}
+    out: dict[str, str] = {}
+    top = gen.get("sql_template")
+    if isinstance(top, str) and top:
+        out["generalization.sql_template"] = top
+    nodes = gen.get("node_templates")
+    if isinstance(nodes, (list, tuple)):
+        for idx, node in enumerate(nodes):
+            if isinstance(node, dict):
+                tmpl = node.get("sql_template")
+                if isinstance(tmpl, str) and tmpl:
+                    out[f"generalization.node_templates.{idx}.sql_template"] = tmpl
+    return out
+
+
+def _collect_text(prefix: str, value: object, out: dict[str, str]) -> None:
+    """Flatten a payload value into `{dotted_field: text}` so EVERY text leaf is a
+    distinct, individually-attributable field handed to both scan layers. A nested
+    dict/list is walked into (`structured.example_employee`), so an entity buried in
+    a sub-field cannot starve the scanners (QA-Q1)."""
+    if isinstance(value, str):
+        if value:
+            out[prefix] = value
+    elif isinstance(value, dict):
+        for key, sub in value.items():
+            _collect_text(f"{prefix}.{key}", sub, out)
+    elif isinstance(value, (list, tuple)):
+        for idx, sub in enumerate(value):
+            _collect_text(f"{prefix}.{idx}", sub, out)
+
+
 def _scanned_fields(candidate_type: str, payload: dict) -> dict[str, str]:
-    """Select the entity-relevant text fields per target (design §4 / Contract B).
-    `result_signature` is serialized canonically so a nested dict is scannable."""
+    """Select EVERY entity-relevant text field per target (design §4 / Contract B,
+    QA-Q1). `result_signature` is serialized canonically as one field; all other
+    content surfaces are flattened so a leak in any leaf reaches both scan layers."""
     fields: dict[str, str] = {}
-    if candidate_type == "global_knowledge":
-        statement = payload.get("statement")
-        if isinstance(statement, str) and statement:
-            fields["statement"] = statement
-        return fields
-    # blueprint (and any other global carrying intent/result_signature)
-    intent = payload.get("intent")
-    if isinstance(intent, str) and intent:
-        fields["intent"] = intent
-    signature = payload.get("result_signature")
-    if signature is not None:
-        fields["result_signature"] = json.dumps(
-            signature, sort_keys=True, ensure_ascii=False
-        )
+    for name in _ENTITY_FREE_SURFACES.get(candidate_type, ()):
+        value = payload.get(name)
+        if value is None:
+            continue
+        if name in _WHOLE_SERIALIZED_FIELDS:
+            fields[name] = json.dumps(value, sort_keys=True, ensure_ascii=False)
+        else:
+            _collect_text(name, value, fields)
+    if candidate_type == "blueprint":
+        # Scan the AST-rewritten template(s) too — role=inline literals survive here
+        # into the landed artifact (Q1 rework).
+        fields.update(_generalization_templates(payload))
     return fields
 
 
@@ -86,12 +147,15 @@ def _primary_statement(text_by_field: dict[str, str]) -> str:
 
 @dataclass(frozen=True)
 class LeakageGateStage:
-    """The injected S5 write-router stage. `candidate_store` is used ONLY on the
-    reroute path (to persist the spawned `user_knowledge` candidate); the semantic
-    scanner defaults to the null (regex-only) scanner; the tracer is optional."""
+    """The injected S5 write-router stage. `candidate_store` is retained for the
+    stage's audit-store wiring parity; the reroute path commits the per-user fact
+    through the injected `user_store` (the SAME store S8 uses, scoped to the
+    session user). The semantic scanner defaults to the null (regex-only) scanner;
+    the tracer is optional."""
 
     candidate_store: CandidateStore
     semantic_scanner: SemanticEntityScanner = NullSemanticEntityScanner()
+    user_store: UserKnowledgeStore | None = None
     tracer: object | None = None
     stage_id: str = "leakage"
 
@@ -167,69 +231,57 @@ class LeakageGateStage:
         # without `is_settled` would fail loud by design).
         entity_scan_doc = verdict.to_doc()
 
-        if verdict.result == "pass":
-            return StageResult(
-                envelope=replace(env, entity_scan=entity_scan_doc),
-                control="continue",
-            )
-
-        if verdict.result == "reroute":
-            await self._spawn_user_knowledge(env, ctx, text_by_field)
+        # reject is the ONLY terminal stop at S5 (hard entity in a contract-
+        # entity-free target): persist + stop.
+        if verdict.result == "reject":
             rejected = replace(
                 env, entity_scan=entity_scan_doc, status=CandidateStatus.REJECTED
             )
             return StageResult(envelope=rejected, control="route_inbox")
 
-        if verdict.result == "quarantine":
-            held = replace(
-                env, entity_scan=entity_scan_doc, status=CandidateStatus.QUARANTINED
-            )
-            return StageResult(envelope=held, control="route_inbox")
+        # reroute: land the legitimate per-user fact into the per-user store NOW
+        # (the reroute path commits directly — no orphaned spawned candidate), then
+        # let the residual global candidate flow on to the writer.
+        if verdict.result == "reroute":
+            await self._commit_user_fact(env, ctx, text_by_field)
 
-        # reject (terminal)
-        rejected = replace(
-            env, entity_scan=entity_scan_doc, status=CandidateStatus.REJECTED
+        # pass / quarantine / reroute: the WRITER is the routing authority — flow on
+        # with the settled verdict stamped so S7 can route (pass → auto-land;
+        # quarantine/reroute residual → in_review near-miss).
+        return StageResult(
+            envelope=replace(env, entity_scan=entity_scan_doc),
+            control="continue",
         )
-        return StageResult(envelope=rejected, control="route_inbox")
 
-    async def _spawn_user_knowledge(
+    async def _commit_user_fact(
         self,
         env: CandidateEnvelope,
         ctx: StageContext,
         text_by_field: dict[str, str],
     ) -> None:
-        """Persist a NEW `user_knowledge` candidate carrying the entity-bearing
-        fact, linked back to the rejected global one via `depends_on`. Keyed
-        deterministically off the global id so a re-run UPSERTs (idempotent)."""
-        spawned = CandidateEnvelope(
-            candidate_id=f"{env.candidate_id}::rerouted-userk",
-            type="user_knowledge",
-            status=CandidateStatus.EXTRACTED,
-            payload={
-                "user_id": ctx.summary.user_id,
-                "fact_type": "frequent_entity",
-                "scope": "user",
-                "statement": _primary_statement(text_by_field),
-                "structured": None,
-            },
+        """Commit the entity-bearing fact into the injected per-user store, scoped
+        to the SESSION's authenticated `user_id` (`ctx.summary.user_id`, never a
+        payload-supplied id — R6). Fail-SAFE: if no user store is wired OR the session
+        user_id is empty (`job.user_id or ""` can be blank), the fact cannot be safely
+        SCOPED — this is a no-op (no unscoped `userknow::::` record) and the residual
+        near-miss is left for the human inbox (S2 refusal, mirroring
+        `UserKnowledgeRecord.from_candidate`'s non-empty guard)."""
+        user_id = ctx.summary.user_id
+        if self.user_store is None or not user_id:
+            return
+        record_id = mint_record_id(user_id, f"{env.candidate_id}::rerouted-userk")
+        record = UserKnowledgeRecord(
+            record_id=record_id,
+            user_id=user_id,
+            statement=_primary_statement(text_by_field),
+            fact_type="frequent_entity",
+            scope="user",
+            structured=None,
             source_session=env.source_session,
             source_trace=env.source_trace,
             evidence_refs=env.evidence_refs,
-            extractor_rationale=(
-                "rerouted by the S5 leakage gate: a global candidate carried a "
-                "user-specific entity, captured here as a per-user fact (D17/D58)"
-            ),
-            entity_scan={
-                "result": "pending",
-                "hits": [],
-                "self_check_contains_entities": True,
-            },
-            confidence=env.confidence,
-            proposed_action="new",
-            depends_on=(env.candidate_id,),
-            content_hash=env.content_hash,
         )
-        await self.candidate_store.put(spawned)
+        await self.user_store.commit(record)
 
 
 def _dedup_hits(hits: tuple[EntityHit, ...]) -> tuple[EntityHit, ...]:

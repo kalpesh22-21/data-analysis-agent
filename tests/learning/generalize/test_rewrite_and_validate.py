@@ -16,7 +16,7 @@ _SQL = (
 )
 
 
-def test_slot_becomes_colon_placeholder_inline_literal_kept():
+def test_slot_becomes_brace_placeholder_inline_literal_kept():
     params = [
         {"locator": {"table": "payroll.payroll_fact", "column": "department", "value": "0420"},
          "role": "slot", "slot": {"name": "department"}},
@@ -24,7 +24,7 @@ def test_slot_becomes_colon_placeholder_inline_literal_kept():
          "role": "inline"},
     ]
     template = rewrite_sql_to_template(_SQL, params, strict=True)
-    assert "department = :department" in template
+    assert "department = {department}" in template
     assert "record_type = 'EARNING'" in template  # inline literal preserved
 
 
@@ -36,7 +36,7 @@ def test_rule_role_drops_predicate_from_template():
          "role": "rule", "rule_id": "rule.earning_record_type"},
     ]
     template = rewrite_sql_to_template(_SQL, params, strict=True)
-    assert ":department" in template
+    assert "{department}" in template
     assert "record_type" not in template  # the rule predicate is dropped from the template
 
 

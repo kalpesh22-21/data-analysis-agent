@@ -61,7 +61,7 @@ async def test_store_reports_its_single_granted_bucket():
 
 async def test_list_for_user_is_scoped_no_cross_user_surface():
     store = InMemoryUserKnowledgeStore()
-    a = UserKnowledgeRecord.from_candidate(_user_candidate())
+    a = UserKnowledgeRecord.from_candidate(_user_candidate(), user_id="user-1")
     from dataclasses import replace
 
     b_env = replace(
@@ -69,7 +69,7 @@ async def test_list_for_user_is_scoped_no_cross_user_surface():
         candidate_id="candidate::hash-userk-b::0",
         payload={"statement": "I mean APAC", "scope": "user", "user_id": "user-2"},
     )
-    b = UserKnowledgeRecord.from_candidate(b_env)
+    b = UserKnowledgeRecord.from_candidate(b_env, user_id="user-2")
     await store.commit(a)
     await store.commit(b)
 
@@ -81,7 +81,7 @@ async def test_list_for_user_is_scoped_no_cross_user_surface():
 
 async def test_record_id_is_deterministic_idempotent():
     env = _user_candidate()
-    rec = UserKnowledgeRecord.from_candidate(env)
+    rec = UserKnowledgeRecord.from_candidate(env, user_id="user-1")
     assert rec.record_id == mint_record_id("user-1", env.candidate_id)
     store = InMemoryUserKnowledgeStore()
     await store.commit(rec)
@@ -120,5 +120,5 @@ async def test_commit_stage_passes_through_non_user_targets():
 
 
 async def test_record_round_trips_through_doc():
-    rec = UserKnowledgeRecord.from_candidate(_user_candidate())
+    rec = UserKnowledgeRecord.from_candidate(_user_candidate(), user_id="user-1")
     assert UserKnowledgeRecord.from_doc(rec.to_doc()) == rec

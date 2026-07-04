@@ -6,10 +6,11 @@ review UI ever touching a global store. The `reason` is re-derived from the same
 routing rules the writer used (`writer.routing.derive_inbox_reason`) so the label
 can never drift from the decision that produced it.
 
-`payload_view` is the candidate payload with entity-bearing leakage `span`s
-stripped, so a reviewer sees WHAT leaked (field + kind) without the raw value being
-re-exposed through the inbox surface (D17). `entity_scan` is the settled S5
-`LeakageVerdict`; `dedup` is the S6 verdict (what it collided with, if anything).
+`payload_view` is the candidate payload with entity-bearing leakage spans REDACTED
+(the entity value replaced), so a reviewer sees WHAT leaked (field + kind, via
+`entity_scan`) without the raw value being re-exposed through the inbox surface
+(D17/QA-Q7). `entity_scan` is the settled S5 `LeakageVerdict`; `dedup` is the S6
+verdict (what it collided with, if anything).
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..candidate.models import CandidateEnvelope
+from ..candidate.redaction import entity_free_payload_view
 from ..candidate.verdicts import DedupVerdict, LeakageVerdict
 from ..writer.routing import derive_inbox_reason
 
@@ -40,10 +42,10 @@ def _summary_of(env: CandidateEnvelope) -> str:
 
 
 def _entity_free_payload_view(env: CandidateEnvelope) -> dict[str, Any]:
-    """The payload for review with leakage `span`s stripped (D17). Only the
-    `entity_scan` view is span-bearing on the envelope surface; the payload itself
-    is copied shallowly so the source envelope is never mutated."""
-    return dict(env.payload)
+    """The payload for review with the settled leakage spans REDACTED (D17/QA-Q7).
+    Delegates to the shared redaction so the reviewer surface can never re-expose a
+    raw entity value the S5 verdict flagged. The source envelope is never mutated."""
+    return entity_free_payload_view(env)
 
 
 def _leakage_view(env: CandidateEnvelope) -> LeakageVerdict:

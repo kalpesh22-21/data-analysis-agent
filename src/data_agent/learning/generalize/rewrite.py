@@ -1,18 +1,19 @@
-"""AST rewrite: accepted SQL + S3 role classification → a `:slot` `sql_template`.
+"""AST rewrite: accepted SQL + S3 role classification → a `{slot}` `sql_template`.
 
 Deterministic, sqlglot-only (D35 — never re-emit SQL from an LLM). For each S3
 `parameterization` entry we locate the literal predicate in the parsed AST and:
 
-  * role=slot  → replace the literal with a `:slot` placeholder;
+  * role=slot  → replace the literal with a `{slot}` placeholder;
   * role=inline→ leave the literal in place (structural / metric-defining);
   * role=rule  → drop the predicate from the template and record the rule id in
                  `uses_rules` (the rule re-applies at runtime; D97 §7).
 
 The literal is rendered with the ClickHouse dialect (preserving `sum`/`toYear`
 casing) which emits a placeholder as the canonical token `{slot: }`; we then map
-`{slot: }` → `:slot` so the runtime-executable template carries the `:slot` form
-`runtime/blueprint/models.py` expects. This two-step keeps identifier casing exact
-while producing the `:slot` surface the fixtures pin.
+`{slot: }` → `{slot}` so the runtime-executable template carries the BRACE authoring
+form `runtime/blueprint/template.py` expects (a promoted blueprint is runtime-
+executable with zero placeholder translation). This two-step keeps identifier casing
+exact while producing the `{slot}` surface the fixtures pin.
 
 Un-rewritable / unparseable SQL raises `RewriteError` — the caller maps it to
 `fail_to_review` (D52/D97), never a guessed template.
@@ -101,7 +102,7 @@ def rewrite_sql_to_template(
     *,
     strict: bool = True,
 ) -> str:
-    """Rewrite `accepted_sql` into a `:slot` template per the S3 role plan.
+    """Rewrite `accepted_sql` into a `{slot}` template per the S3 role plan.
 
     `strict=True` (single blueprint): every role=slot/role=rule literal MUST be
     found — a miss raises `RewriteError`. `strict=False` (a composite node whose SQL
@@ -143,5 +144,5 @@ def rewrite_sql_to_template(
 
     rendered = ast.sql(dialect="clickhouse")
     for name in slot_names:
-        rendered = rendered.replace("{" + name + ": }", ":" + name)
+        rendered = rendered.replace("{" + name + ": }", "{" + name + "}")
     return rendered

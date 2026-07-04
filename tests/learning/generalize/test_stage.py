@@ -38,7 +38,7 @@ async def test_stage_fills_generalization_and_continues():
     assert result.control == "continue"
     gen = result.envelope.payload["generalization"]
     assert gen["static_validation"]["outcome"] == "ok"
-    assert gen["sql_template"].endswith("region = :region")
+    assert gen["sql_template"].endswith("region = {region}")
     # Additive only: every S3 field is untouched.
     for key in plan:
         assert result.envelope.payload[key] == plan[key]

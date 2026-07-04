@@ -70,13 +70,20 @@ class UserKnowledgeRecord:
         )
 
     @classmethod
-    def from_candidate(cls, env: Any) -> UserKnowledgeRecord:
-        """Project a `user_knowledge` `CandidateEnvelope` into a committable
-        record. Reads only the Locked `user_knowledge` payload fields — tolerant
-        of the fixture shape (`statement`/`scope`/`user_id`) plus the optional
-        `fact_type`/`structured`."""
+    def from_candidate(cls, env: Any, *, user_id: str) -> UserKnowledgeRecord:
+        """Project a `user_knowledge` `CandidateEnvelope` into a committable record.
+
+        The record is scoped to *user_id* — the SESSION's AUTHENTICATED user
+        (`ctx.summary.user_id`), NEVER the LLM-supplied `payload["user_id"]` (R6/D17):
+        an extractor (or a poisoned session) that emits a foreign `user_id` in the
+        payload must not be able to write into another user's surface. A blank
+        authenticated user_id is refused (fail-loud — no un-scoped commit)."""
+        if not user_id:
+            raise ValueError(
+                "user_knowledge commit requires a non-empty authenticated user_id "
+                "(the session user, not payload.user_id)"
+            )
         payload = env.payload
-        user_id = payload.get("user_id", "")
         return cls(
             record_id=mint_record_id(user_id, env.candidate_id),
             user_id=user_id,

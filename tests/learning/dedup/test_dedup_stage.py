@@ -125,6 +125,33 @@ async def test_hard_key_hit_increments_and_drops():
     assert corpus.get_sync(key).hit_count == 2
 
 
+async def test_insert_seeds_corpus_artifact_at_hit_count_one():
+    """R3 (contract §11.1): a genuinely-new `insert` SEEDS the corpus artifact at
+    hit_count=1 from THIS first candidate — so the count-based promotion threshold
+    can accrue BEFORE the artifact lands (else the count could never converge). The
+    seed is keyed by canonical_key and idempotent."""
+    env = _single_envelope()
+    key = _key_of(env)
+    corpus = InMemoryBlueprintCorpus()  # empty — nothing landed yet
+    stage = DedupStage(corpus, FakeEmbeddingClient())
+
+    first = await stage.process(env, _ctx())
+    assert first.envelope.dedup is not None and first.envelope.dedup.action == "insert"
+    # The artifact now exists at the key, seeded once at hit_count=1.
+    assert corpus.seed_calls == [key]
+    seeded = corpus.get_sync(key)
+    assert seeded is not None
+    assert seeded.hit_count == 1
+    assert seeded.canonical_key == key
+
+    # A second identical candidate now finds the seeded artifact ⇒ increment (not a
+    # re-seed): the count accrues from the candidate stage, before any landing.
+    second = await stage.process(_single_envelope(), _ctx())
+    assert second.envelope.dedup is not None and second.envelope.dedup.action == "increment"
+    assert corpus.seed_calls == [key]  # not re-seeded
+    assert corpus.get_sync(key).hit_count == 2
+
+
 async def test_seeded_existing_corpus_hard_key_hit():
     """Seeding the corpus with an artifact at the candidate's computed key makes
     the FIRST pass an increment (the existing-corpus collision path)."""

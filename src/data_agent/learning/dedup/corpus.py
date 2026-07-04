@@ -51,6 +51,14 @@ class BlueprintCorpus(Protocol):
         """The artifact with this exact hard key, or `None` (no hard-key collision)."""
         ...
 
+    async def seed_artifact(self, artifact: CorpusArtifact) -> None:
+        """Register a NEW artifact at `hit_count=1` on its FIRST sighting (D48 §11.1),
+        keyed by `canonical_key`. Called on `action="insert"` so the count-based
+        promotion threshold (T=3) can accrue from the candidate stage — the artifact
+        must exist BEFORE it lands, else the count could never converge. Idempotent:
+        a no-op if an artifact already exists at the key."""
+        ...
+
     async def increment_hit_count(self, canonical_key: str) -> None:
         """Bump the hit_count of the artifact at `canonical_key` (D48 `increment`)."""
         ...
@@ -67,11 +75,20 @@ class InMemoryBlueprintCorpus:
         self._by_key: dict[str, CorpusArtifact] = {}
         for art in artifacts or []:
             self._by_key[art.canonical_key] = art
-        # Audit trail for tests: which keys were incremented, in order.
+        # Audit trail for tests: which keys were incremented / seeded, in order.
         self.increment_calls: list[str] = []
+        self.seed_calls: list[str] = []
 
     async def get_by_canonical_key(self, canonical_key: str) -> CorpusArtifact | None:
         return self._by_key.get(canonical_key)
+
+    async def seed_artifact(self, artifact: CorpusArtifact) -> None:
+        # First sighting: register at hit_count=1. Idempotent — never clobber an
+        # already-present artifact (a concurrent seed / an existing landed row).
+        if artifact.canonical_key in self._by_key:
+            return
+        self.seed_calls.append(artifact.canonical_key)
+        self._by_key[artifact.canonical_key] = artifact
 
     async def increment_hit_count(self, canonical_key: str) -> None:
         self.increment_calls.append(canonical_key)
