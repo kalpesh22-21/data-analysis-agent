@@ -18,8 +18,6 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-import pytest
-
 from data_agent.learning.candidate.models import CandidateEnvelope
 from data_agent.learning.dedup import (
     CorpusArtifact,

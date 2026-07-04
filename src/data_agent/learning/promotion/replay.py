@@ -128,9 +128,13 @@ async def golden_replay(
     """Replay `env`'s frozen S4 template through the reused binder + D56 gate.
 
     Returns a `ReplayOutcome`; `passed=False` (with a machine `reason`) on a
-    missing generalization/template, a bind failure, or a failed D56 gate. NEVER
-    raises for an expected shape problem — the scheduler treats a non-passing
-    replay as "do not promote" / "demote", the D98 fail-closed posture."""
+    missing generalization/template, a bind failure, a failed D56 gate, OR a probe
+    failure (`reason="probe_unavailable"` — the warehouse/query service is down or,
+    today, the deferred stub probe is wired). NEVER raises: an unavailable probe is a
+    fail-closed NON-promotion, not an exception that escapes into the cron `_guard`
+    (needless traceback spam) or, worse, uncaught out of the human `approve` path.
+    The scheduler treats any non-passing replay as "do not promote" / "demote", the
+    D98 fail-closed posture."""
     gen_doc = env.payload.get("generalization")
     if not isinstance(gen_doc, dict):
         return ReplayOutcome(False, None, None, (), reason="no_generalization")
@@ -156,7 +160,13 @@ async def golden_replay(
     )
     expected_columns = _expected_columns(env.payload)
 
-    probe_result = await probe.run(replay_sql, grain_columns=grain.columns)
+    try:
+        probe_result = await probe.run(replay_sql, grain_columns=grain.columns)
+    except Exception:  # noqa: BLE001 - a probe/warehouse failure is a fail-closed non-promotion
+        # The warehouse or query service is unreachable (or the deferred stub probe
+        # is wired). Degrade to a clean non-promoting outcome so BOTH the cron scan
+        # and the human approve path hold cleanly — never an uncaught raise.
+        return ReplayOutcome(False, None, replay_sql, sampled, reason="probe_unavailable")
     verify = verify_result(
         result_grain=grain,
         row_count=probe_result.row_count,

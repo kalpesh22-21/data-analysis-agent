@@ -170,6 +170,36 @@ class LearningSettings(BaseSettings):
         description="Candidate retention (≥ review-inbox dwell). Set fresh per write.",
     )
 
+    # --- Blueprint corpus (Wave 3b-(i), D48) — the DURABLE landed-artifact store the
+    # S6 dedup hard key looks up + the S9 promotion `hit_count` reader. A dedicated,
+    # access-controlled bucket sibling to learning_candidates/learning_audit, with its
+    # OWN RBAC user scoped to it only. Holds landed blueprint artifacts keyed by
+    # `canonical_key`; `hit_count` is bumped ATOMICALLY server-side (sub-document
+    # counter), never read-modify-write (the D48 "one create + one increment"
+    # invariant). Durable by design (no TTL default — a landed artifact + its
+    # cross-session hit_count must outlive any candidate/session).
+    learning_corpus_connection_string: str = Field(
+        "couchbase://localhost",
+        description="Couchbase connection string for the learning_corpus bucket.",
+    )
+    learning_corpus_bucket: str = Field(
+        "learning_corpus", description="Dedicated landed-artifact corpus bucket (D48)."
+    )
+    learning_corpus_username: str = Field(
+        "", description="RBAC user scoped to learning_corpus ONLY (learning_corpus_writer)."
+    )
+    learning_corpus_password: str = Field(
+        "", description="Password for the learning_corpus_writer RBAC user (secret)."
+    )
+    learning_corpus_ttl_seconds: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Corpus retention (0 = no expiry — a landed artifact + its cross-session "
+            "hit_count is durable and must outlive candidates/sessions)."
+        ),
+    )
+
     # --- Extractor (Slice 3, D31/D34) — the LLM structured-output model + retry. ---
     learning_extractor_model: str = Field(
         "claude-opus-4-8",

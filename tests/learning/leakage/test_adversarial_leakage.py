@@ -20,10 +20,7 @@ import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-import pytest
-
 from data_agent.learning.candidate import InMemoryCandidateStore
-from data_agent.learning.candidate.models import CandidateEnvelope
 from data_agent.learning.candidate.verdicts import EntityHit, LeakageVerdict
 from data_agent.learning.leakage import LeakageGateStage
 from data_agent.learning.leakage.scanner import (

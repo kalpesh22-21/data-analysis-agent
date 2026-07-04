@@ -91,6 +91,33 @@ async def test_human_approve_blueprint_blocked_when_replay_fails():
     assert decision.action == "hold"
 
 
+class _RaisingProbe:
+    """A warehouse probe that RAISES (mirrors the deferred stub in
+    `run_learning_scheduler.py`, or a warehouse/query service that is down)."""
+
+    async def run(self, sql: str, *, grain_columns):
+        raise NotImplementedError("no warehouse probe wired")
+
+
+async def test_human_approve_blueprint_with_raising_probe_holds_not_raises():
+    """A probe that RAISES must degrade to a clean HOLD on the human approve path —
+    never an uncaught exception out of `apply_human_decision` (which would surface a
+    500 on a future inbox UI). `golden_replay` catches the probe failure →
+    `probe_unavailable`, so the blueprint holds fail-closed at in_review."""
+    store = InMemoryCandidateStore()
+    env = make_blueprint_candidate(
+        status=CandidateStatus.IN_REVIEW, canonical_key=KEY, grain_verifiable=True
+    )
+    await store.put(env)
+    sched = _scheduler(store, probe=_RaisingProbe())
+
+    decision = await sched.apply_human_decision(env, "approve")  # must NOT raise
+
+    assert decision.action == "hold"
+    assert decision.reason == "approve_blocked_replay:probe_unavailable"
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+
+
 async def test_human_approve_blueprint_without_generalization_fails_closed():
     """S3: a blueprint whose `generalization` is absent/malformed (`from_doc`→None)
     must NOT approve directly as 'non-replayable' — that would bypass BOTH static and

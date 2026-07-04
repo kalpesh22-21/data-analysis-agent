@@ -32,6 +32,7 @@ nothing here reads global settings and tests stay hermetic.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 
 from ..candidate.models import CandidateEnvelope
@@ -39,6 +40,8 @@ from ..candidate.verdicts import DedupVerdict
 from ..stage import StageContext, StageResult
 from .canonical_key import compute_canonical_key
 from .corpus import BlueprintCorpus, CorpusArtifact
+
+_logger = logging.getLogger(__name__)
 
 # Provisional bands (RuntimeSettings-style tunables, wired as knobs — §11).
 _DEFAULT_MERGE_THRESHOLD = 0.95
@@ -143,7 +146,21 @@ class DedupStage:
         (a hard-key `increment` is stamped `layer="hard"` by the caller). The prior
         code mislabelled a soft-adjudicated insert as `hard` (review nit)."""
         intent = (env.payload.get("intent") or "").strip()
-        artifacts = [a for a in await self._corpus.list_artifacts() if a.canonical_key != hard_key]
+        try:
+            all_artifacts = await self._corpus.list_artifacts()
+        except Exception:  # noqa: BLE001 — a corpus-listing failure degrades to insert (D52)
+            # With the DURABLE corpus, list_artifacts() is a real N1QL scan: a missing
+            # primary index, an unreachable query service, or a malformed doc must NOT
+            # escape and dead-letter the session. Degrade to `insert` (the race-safe
+            # hard-key layer already ran); a distinct message flags an unprovisioned
+            # index vs. the embedder-failure degrade below.
+            _logger.warning(
+                "dedup soft layer: corpus.list_artifacts() failed; degrading to insert "
+                "(hard-key dedup still applied). Check the learning_corpus primary index "
+                "/ query service.",
+            )
+            return DedupVerdict(hard_key, None, 0.0, "insert", "soft")
+        artifacts = [a for a in all_artifacts if a.canonical_key != hard_key]
         if not intent or not artifacts:
             return DedupVerdict(hard_key, None, 0.0, "insert", "soft")
 

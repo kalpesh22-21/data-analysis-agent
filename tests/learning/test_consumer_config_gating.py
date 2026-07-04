@@ -1,24 +1,35 @@
-"""HIGH-2 config gating — the consumer entrypoint (`scripts/run_learning_consumer.py`)
-treats (extractor model, audit store, candidate store) as ONE unit.
+"""Config gating for the consumer entrypoint (`scripts/run_learning_consumer.py`),
+now adopting the Wave-3 composition-root factory (`build_learning_consumer`).
 
-Real extraction writes entity-bearing evidence to `learning_audit` AND persists
-candidates to `learning_candidates`; running it with a missing durable store would
-silently lose candidates / leave dangling evidence_refs. So the extractor is
-enabled ONLY when the model AND both durable stores are configured; otherwise the
-KEEP path FALLS BACK to the S2 `would_extract` stub (no extraction, NO audit
-writes) and logs it loudly.
+Extraction is a UNIT (the S3 precedent, extended to the full write-router): the
+extractor model client + durable audit store + durable candidate store + durable
+blueprint corpus + durable per-user store + the catalog. Three branches, never a
+fourth (partial) one:
 
-This drives the composition root `_main()` with fakes for every heavy collaborator
-and asserts what the `LearningConsumer` is constructed with (extractor / audit /
-candidates) under each config, plus the loud warning on partial config.
+  * model client ABSENT (no extractor key) ⇒ the S2 `would_extract` stub — the
+    consumer is built with `extractor=None` and an EMPTY `stages` pipeline;
+  * ALL durable collaborators provisioned ⇒ the full six-stage write-router pipeline
+    (extractor present, `stages` = the six frozen stages);
+  * model client PRESENT but a durable collaborator's RBAC creds MISSING (a PARTIAL
+    config) ⇒ `LearningWiringError` at composition (the factory fails fast) — never a
+    half-wired pipeline that strands candidates mid-flow.
+
+This drives the real composition root `_main()` with fakes for every heavy
+collaborator, letting the REAL factory assemble the consumer (only `run_forever` is
+stubbed so the loop never blocks), and asserts what the `LearningConsumer` is built
+with under each config.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import logging
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+
+import data_agent.learning.factory as factory_module
+from data_agent.learning.factory import LearningWiringError
 
 _SCRIPT = (
     Path(__file__).resolve().parents[2] / "scripts" / "run_learning_consumer.py"
@@ -34,7 +45,9 @@ def _load_entrypoint():
     return module
 
 
-def _fake_settings(*, extractor: bool, audit: bool, candidates: bool) -> SimpleNamespace:
+def _fake_learning_settings(
+    *, extractor: bool, audit: bool, candidates: bool, corpus: bool
+) -> SimpleNamespace:
     return SimpleNamespace(
         learning_extractor_api_key="sk-test" if extractor else "",
         learning_extractor_model="gpt-x",
@@ -44,6 +57,8 @@ def _fake_settings(*, extractor: bool, audit: bool, candidates: bool) -> SimpleN
         learning_audit_password="p" if audit else "",
         learning_candidates_username="u" if candidates else "",
         learning_candidates_password="p" if candidates else "",
+        learning_corpus_username="u" if corpus else "",
+        learning_corpus_password="p" if corpus else "",
         otlp_endpoint="",
         learning_service_name="learning-loop",
         learning_consumer_group="learning-workers",
@@ -52,22 +67,28 @@ def _fake_settings(*, extractor: bool, audit: bool, candidates: bool) -> SimpleN
     )
 
 
-class _CapturingConsumer:
-    """Stand-in `LearningConsumer` that records its construction kwargs and whose
-    `run_forever` returns immediately (no real loop)."""
-
-    last_kwargs: dict = {}
-
-    def __init__(self, store, queue, settings, **kwargs):
-        type(self).last_kwargs = kwargs
-
-    async def run_forever(self, *, sleep):
-        return None
+def _fake_user_config(*, user: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        user_knowledge_username="u" if user else "",
+        user_knowledge_password="p" if user else "",
+    )
 
 
-def _patch(module, settings):
-    module.get_runtime_settings = lambda: object()
-    module.LearningSettings = lambda: settings
+def _fake_runtime_settings() -> SimpleNamespace:
+    # embedding_api_url empty ⇒ the entrypoint passes embedder=None (factory defaults
+    # to the insert-only embedder). No HttpEmbeddingClient is constructed.
+    return SimpleNamespace(
+        embedding_api_url="",
+        embedding_api_key="",
+        embedding_model="all-mpnet-base-v2",
+        embedding_timeout_seconds=10.0,
+    )
+
+
+def _patch(module, *, learning_settings, user_config, captured):
+    module.get_runtime_settings = lambda: _fake_runtime_settings()
+    module.LearningSettings = lambda: learning_settings
+    module.UserKnowledgeStoreConfig = lambda: user_config
     module.configure_learning_tracing = lambda **k: object()
     module.set_global_tracer_provider = lambda p: None
     module.get_learning_tracer = lambda p: None
@@ -75,56 +96,109 @@ def _patch(module, settings):
     module.RedisStreamsLearningQueue = SimpleNamespace(from_settings=lambda s: object())
     module.CouchbaseAuditStore = lambda *a, **k: SimpleNamespace(kind="audit")
     module.CouchbaseCandidateStore = lambda *a, **k: SimpleNamespace(kind="candidates")
+    module.CouchbaseBlueprintCorpus = lambda *a, **k: SimpleNamespace(kind="corpus")
+    module.CouchbaseUserKnowledgeStore = lambda *a, **k: SimpleNamespace(kind="user")
     module.build_openai_model_client = lambda **k: object()
-    module.LearningExtractor = lambda *a, **k: SimpleNamespace(kind="extractor")
+    module.HttpEmbeddingClient = lambda **k: SimpleNamespace(kind="embedder")
+    module.build_sqlglot_schema = lambda: {}
     module.load_known_rule_ids = lambda: frozenset({"active_employee"})
-    module.LearningConsumer = _CapturingConsumer
+
+    # Let the REAL factory assemble the consumer, but capture it and neutralize
+    # `run_forever` so the blocking loop never runs.
+    real_build = factory_module.build_learning_consumer
+
+    def _wrapped_build(*args, **kwargs):
+        consumer = real_build(*args, **kwargs)
+
+        async def _noop(*, sleep):
+            return None
+
+        consumer.run_forever = _noop
+        captured["consumer"] = consumer
+        return consumer
+
+    module.build_learning_consumer = _wrapped_build
 
 
-async def _run(settings):
+async def _run(*, learning_settings, user_config):
     module = _load_entrypoint()
-    _patch(module, settings)
-    _CapturingConsumer.last_kwargs = {}
+    captured: dict = {}
+    _patch(module, learning_settings=learning_settings, user_config=user_config, captured=captured)
     rc = await module._main()
     assert rc == 0
-    return _CapturingConsumer.last_kwargs
+    return captured["consumer"]
 
 
-async def test_all_three_configured_enables_real_extraction():
-    kwargs = await _run(_fake_settings(extractor=True, audit=True, candidates=True))
-    assert getattr(kwargs["extractor"], "kind", None) == "extractor"
-    assert getattr(kwargs["audit"], "kind", None) == "audit"
-    assert getattr(kwargs["candidates"], "kind", None) == "candidates"
+async def test_all_collaborators_provisioned_builds_full_pipeline():
+    consumer = await _run(
+        learning_settings=_fake_learning_settings(
+            extractor=True, audit=True, candidates=True, corpus=True
+        ),
+        user_config=_fake_user_config(user=True),
+    )
+    # Full write-router: the extractor is wired and all SIX frozen stages are present.
+    assert consumer._extractor is not None
+    assert len(consumer._stages) == 6
+    assert [s.stage_id for s in consumer._stages] == [
+        "generalize",
+        "leakage",
+        "dedup",
+        "schema_edit_writer",
+        "user_knowledge_writer",
+        "writer",
+    ]
+    # The durable stores are threaded through (shared singleton — same instance).
+    assert getattr(consumer._audit, "kind", None) == "audit"
+    assert getattr(consumer._candidates, "kind", None) == "candidates"
 
 
-async def test_extractor_but_no_candidate_store_falls_back_to_stub(caplog):
-    with caplog.at_level(logging.WARNING):
-        kwargs = await _run(_fake_settings(extractor=True, audit=True, candidates=False))
-    # Partial config ⇒ NO extraction unit wired at all (the safe fallback).
-    assert kwargs["extractor"] is None
-    assert kwargs["audit"] is None
-    assert kwargs["candidates"] is None
-    # A loud warning names the missing store.
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings
-    assert any("FALLING BACK" in r.getMessage() for r in warnings)
-    assert any("candidates_ready=False" in r.getMessage() for r in warnings)
+async def test_no_extractor_key_builds_stub_with_empty_pipeline():
+    consumer = await _run(
+        learning_settings=_fake_learning_settings(
+            extractor=False, audit=True, candidates=True, corpus=True
+        ),
+        user_config=_fake_user_config(user=True),
+    )
+    # No model client ⇒ the S2 would-extract stub: no extractor, EMPTY pipeline.
+    assert consumer._extractor is None
+    assert consumer._stages == ()
 
 
-async def test_extractor_but_no_audit_store_falls_back_to_stub(caplog):
-    with caplog.at_level(logging.WARNING):
-        kwargs = await _run(_fake_settings(extractor=True, audit=False, candidates=True))
-    assert kwargs["extractor"] is None
-    assert kwargs["audit"] is None
-    assert kwargs["candidates"] is None
-    assert any("audit_ready=False" in r.getMessage()
-               for r in caplog.records if r.levelno >= logging.WARNING)
+async def test_extractor_but_missing_corpus_creds_fails_fast():
+    with pytest.raises(LearningWiringError):
+        await _run(
+            learning_settings=_fake_learning_settings(
+                extractor=True, audit=True, candidates=True, corpus=False
+            ),
+            user_config=_fake_user_config(user=True),
+        )
 
 
-async def test_no_extractor_key_uses_stub_without_warning(caplog):
-    with caplog.at_level(logging.WARNING):
-        kwargs = await _run(_fake_settings(extractor=False, audit=True, candidates=True))
-    assert kwargs["extractor"] is None
-    # Not a partial-config hazard → info, not a warning.
-    assert not [r for r in caplog.records
-                if r.levelno >= logging.WARNING and "FALLING BACK" in r.getMessage()]
+async def test_extractor_but_missing_user_creds_fails_fast():
+    with pytest.raises(LearningWiringError):
+        await _run(
+            learning_settings=_fake_learning_settings(
+                extractor=True, audit=True, candidates=True, corpus=True
+            ),
+            user_config=_fake_user_config(user=False),
+        )
+
+
+async def test_extractor_but_missing_candidate_creds_fails_fast():
+    with pytest.raises(LearningWiringError):
+        await _run(
+            learning_settings=_fake_learning_settings(
+                extractor=True, audit=True, candidates=False, corpus=True
+            ),
+            user_config=_fake_user_config(user=True),
+        )
+
+
+async def test_extractor_but_missing_audit_creds_fails_fast():
+    with pytest.raises(LearningWiringError):
+        await _run(
+            learning_settings=_fake_learning_settings(
+                extractor=True, audit=False, candidates=True, corpus=True
+            ),
+            user_config=_fake_user_config(user=True),
+        )

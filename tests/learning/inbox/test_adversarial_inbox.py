@@ -15,8 +15,6 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-import pytest
-
 from data_agent.learning.candidate.memory_candidate_store import InMemoryCandidateStore
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.candidate.verdicts import EntityHit, LeakageVerdict

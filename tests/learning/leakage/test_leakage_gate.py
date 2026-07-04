@@ -15,7 +15,6 @@ from __future__ import annotations
 from data_agent.learning.candidate import InMemoryCandidateStore
 from data_agent.learning.candidate.verdicts import LeakageVerdict
 from data_agent.learning.leakage import LeakageGateStage
-
 from data_agent.learning.stage import StageContext
 from data_agent.learning.user import InMemoryUserKnowledgeStore
 

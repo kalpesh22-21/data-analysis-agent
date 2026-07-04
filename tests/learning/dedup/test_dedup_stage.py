@@ -224,6 +224,46 @@ async def test_failsoft_embedder_failure_degrades_to_insert():
     assert result.envelope.dedup.matched_id is None
 
 
+class _ListRaisingCorpus:
+    """A `BlueprintCorpus` whose soft-layer `list_artifacts()` raises (mirrors the
+    DURABLE corpus with a missing primary index / an unreachable query service / a
+    malformed doc). Hard-key lookups MISS (empty), and seed/increment succeed — only
+    the N1QL scan fails."""
+
+    def __init__(self) -> None:
+        self.seeded: list[CorpusArtifact] = []
+
+    async def get_by_canonical_key(self, canonical_key: str):
+        return None
+
+    async def seed_artifact(self, artifact: CorpusArtifact) -> None:
+        self.seeded.append(artifact)
+
+    async def increment_hit_count(self, canonical_key: str) -> None:
+        return None
+
+    async def list_artifacts(self):
+        raise RuntimeError("N1QL: no primary index on learning_corpus")
+
+
+async def test_soft_layer_list_artifacts_failure_degrades_to_insert():
+    """D52: with the DURABLE corpus, `list_artifacts()` is a fallible N1QL scan. A
+    failure must NOT escape the stage and dead-letter the session — it degrades to
+    `insert` (the race-safe hard-key layer already ran), exactly like an embedder
+    failure. Proves the corpus-scan failure is inside the degrade path."""
+    env = _single_envelope()
+    corpus = _ListRaisingCorpus()
+    stage = DedupStage(corpus, FakeEmbeddingClient())
+
+    result = await stage.process(env, _ctx())  # must NOT raise
+
+    assert result.control == "continue"  # never a job failure / dead-letter
+    assert result.envelope.dedup is not None
+    assert result.envelope.dedup.action == "insert"
+    assert result.envelope.dedup.layer == "soft"
+    assert result.envelope.dedup.matched_id is None
+
+
 # --- soft-layer near-match adjudication ---------------------------------------
 
 

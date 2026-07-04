@@ -8,8 +8,6 @@ posture. strict-xfail = real hole; passing = pinned guarantee.
 
 from __future__ import annotations
 
-import pytest
-
 from data_agent.learning.candidate import InMemoryCandidateStore
 from data_agent.learning.candidate.models import CandidateStatus
 from data_agent.learning.promotion import PromotionPolicy, PromotionScheduler
