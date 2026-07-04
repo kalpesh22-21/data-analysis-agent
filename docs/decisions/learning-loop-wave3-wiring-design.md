@@ -317,3 +317,84 @@ Two fail-soft holes the durable-corpus/scheduler wiring introduced, plus nits:
 - **Corpus landing writer.** This slice provisions the durable corpus for READ (S6 lookup) + SEED +
   INCREMENT + hit-count read; the S9 promotion "land a validated candidate as a corpus artifact"
   writer (neo4j blueprint node materialization) is its own later concern.
+
+# Wave 3b-(ii) — Layer-2 live proofs (S8 user store + full wired pipeline)
+
+**Status:** ACCEPTED (2026-07-03). Layer-2 live: the two remaining Layer-2 gaps are now proven
+against the real docker stack (l2-cb Couchbase, l2-redis Redis, l2-embedding). Closes the "Layer-2
+(written, env-guarded, NOT run here)" deferrals from Wave 3a §9 and Wave 3b-(i) §3b.6.
+
+## 3bii.1 What is now live-proven
+
+1. **The S8 per-user knowledge store** (the ONE entity-bearing target, D17) against a real
+   `user_knowledge` bucket — provisioned by the new `scripts/learning-user-init.sh` (bucket +
+   `user_knowledge_writer` RBAC scoped to that bucket ONLY + a declared reader + primary index),
+   mirroring `learning-corpus-init.sh` exactly.
+2. **The full factory-built consumer pipeline** (generalize → leakage → dedup → schema_edit_pr →
+   user_commit → writer) driving a KEEP session end-to-end through `LearningConsumer.run_once`
+   against REAL infra — real Couchbase session + candidate + audit + corpus + user_knowledge stores,
+   a real Redis jobs stream, a SCRIPTED extractor model double (deterministic, no LLM).
+
+## 3bii.2 Provisioning — `scripts/learning-user-init.sh`
+
+Creates bucket `user_knowledge` (128 MB), RBAC user `user_knowledge_writer` / `user-writer-pass`
+scoped `data_writer[user_knowledge],data_reader[user_knowledge],query_select[user_knowledge]` ONLY
+(no cross-bucket grant — the load-bearing D17 boundary), a declared `user_knowledge_reader`, and a
+primary index (`list_for_user` is a `user_id`-parameterized N1QL scan). Idempotent. Verified live:
+bucket present, both RBAC users set (writer with exactly the three scoped grants), primary index
+`#primary` online.
+
+## 3bii.3 Tests (live, skip-guarded, each RUN IN ITS OWN PYTEST PROCESS)
+
+- `tests/integration/test_learning_user_store_live.py` — **4 passed**. A `UserKnowledgeRecord`
+  round-trips (commit→get) with per-user scope/provenance/structured payload intact; two different
+  `user_id`s NEVER cross-read (`list_for_user` returns only the asked-for user's rows — the D17
+  no-cross-user-surface invariant on real N1QL); the RBAC boundary — `user_knowledge_writer` can
+  write+read its own bucket (positive control) but is DENIED a write to `learning_corpus` AND
+  `learning_candidates` (write probes, so a plain not-found can never masquerade as access).
+- `tests/integration/test_learning_pipeline_live.py` — **3 passed**. Against fully real stores +
+  queue:
+  - a clean blueprint flows extract → generalize → leakage(**pass**, settled) → dedup(**insert**,
+    corpus SEEDED at `hit_count=1` in real `learning_corpus`) → writer(auto-land **`candidate`**),
+    readable back from the real `learning_candidates` store with `payload.generalization`
+    (`static_validation.outcome == "ok"`), a settled pass `entity_scan`, and its `dedup` verdict;
+  - a SECOND identical session (a different session id ⇒ a different D96 content hash, but the SAME
+    deterministic `canonical_key`) INCREMENTS the durable corpus artifact to `hit_count=2` — the D48
+    cross-session accrual, on real infra (the hard-key server-side counter);
+  - a `global_knowledge` candidate lands **`in_review`** (the human pre-gate, D58a);
+  - a reroute (scripted semantic scanner → `user_fact`) commits a per-user fact into the real
+    `user_knowledge` store SCOPED to the session's AUTHENTICATED user (`user-42`, read back by its
+    deterministic record id — R6/D17), and the residual global flows on to `in_review` with a
+    settled `reroute` verdict.
+
+## 3bii.4 Hermeticity notes (design decisions in the live test)
+
+- **Per-run canonical keys.** The corpus is DURABLE (no TTL) and its `canonical_key` is DETERMINISTIC
+  off the blueprint's resolved table/columns/AST. Each pipeline test parameterizes the payroll table
+  with a per-run tag (`payroll.pf_<tag>`) so a leftover artifact from an interrupted prior run can
+  never turn this run's genuinely-new `insert` into a hard-key `increment`. The two-session accrual
+  test deliberately reuses ONE tag so the hard key collides and the count accrues 1 → 2.
+- **Embedder left at the insert-only default (a DELIBERATE degrade, per the run guidance).** The
+  insert/increment accrual assertions are a HARD-KEY proof; the S6 soft near-miss layer is not
+  load-bearing for them. `EMBEDDING_TEST_URL` is OPTIONAL — wiring the real l2-embedding service was
+  verified to also pass (the filtered corpus is empty in a hermetic run, so the soft layer
+  short-circuits to `insert` and `embed` is never called). Omitting it is strictly MORE robust: the
+  factory's `_InsertOnlyEmbedder` fail-softs a would-be soft comparison to `insert` (D52), so a leaked
+  same-intent artifact can never spuriously `merge`. The real embedder path is proven separately by
+  `test_embedding_api.py`. No store/pipeline/queue assertion was degraded — those are all real.
+- **Cluster hygiene.** Each real store owns its own Couchbase `Cluster` (5 per pipeline test); the
+  fixture CLOSES them all in teardown so the file never accumulates open clusters in one interpreter
+  (the C-ext segfault guard). Each `*_live.py` is still run in its OWN pytest process, per the
+  standing guidance.
+
+## 3bii.5 Run env + results (exact)
+
+- User store (own process): `RUN_COUCHBASE_TESTS=1`, `USER_KNOWLEDGE_CONNECTION_STRING=couchbase://localhost`,
+  `USER_KNOWLEDGE_USERNAME=user_knowledge_writer`, `USER_KNOWLEDGE_PASSWORD=user-writer-pass` → **4 passed**.
+- Pipeline (own process): `RUN_COUCHBASE_TESTS=1`, `COUCHBASE_CONNECTION_STRING=couchbase://localhost`,
+  `COUCHBASE_USERNAME=admin`, `COUCHBASE_PASSWORD=password`, the `LEARNING_{CANDIDATES,AUDIT,CORPUS}_*`
+  writer creds, `USER_KNOWLEDGE_*` writer creds, `LEARNING_REDIS_TEST_URL=redis://localhost:6379/0`
+  (`EMBEDDING_TEST_URL` optional) → **3 passed**.
+- Regression: `test_learning_corpus_store_live.py` re-run (own process) → **5 passed** (no
+  interference from the new corpus traffic). Non-live suite `uv run --extra dev pytest tests/learning -q`
+  → **422 passed** (unchanged — the new proofs are all env-guarded Layer-2, zero Layer-1 delta).
