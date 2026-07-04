@@ -92,6 +92,14 @@ class PromotionScheduler:
         self._deps = dependency_resolver
         self._clock = clock
 
+    @property
+    def store(self) -> CandidateStore:
+        """The candidate store this scheduler reads + CAS-writes. Exposed read-only
+        so a composition root can pin the inbox to the SAME instance (a split-brain
+        store would let the inbox read one store while this scheduler writes another
+        — stale-envelope approve)."""
+        return self._store
+
     # -- the cron cycle -------------------------------------------------------
 
     async def run_once(self) -> PromotionSweep:

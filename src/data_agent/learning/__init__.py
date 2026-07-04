@@ -23,6 +23,13 @@ from .extractor import (
     ExtractorConfig,
     LearningExtractor,
 )
+from .factory import (
+    LearningWiringError,
+    build_learning_consumer,
+    build_promotion_plane,
+    build_promotion_scheduler,
+    build_review_inbox,
+)
 from .memory_queue import InMemoryLearningQueue
 from .models import (
     SWEEPABLE_STATUSES,
@@ -61,9 +68,14 @@ __all__ = [
     "LearningSettings",
     "LearningStatus",
     "LearningSweeper",
+    "LearningWiringError",
     "SessionSummary",
     "SweepResult",
     "TriageVerdict",
+    "build_learning_consumer",
+    "build_promotion_plane",
+    "build_promotion_scheduler",
+    "build_review_inbox",
     "compute_content_hash",
     "get_learning_settings",
     "learning_enabled",
