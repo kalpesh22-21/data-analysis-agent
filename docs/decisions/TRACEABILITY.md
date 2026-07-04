@@ -335,23 +335,30 @@ The frozen inter-stage wire format that lets S4–S9 build in parallel (see
 [learning-loop-contracts-design.md](learning-loop-contracts-design.md) §9). **Two rows are made green by
 the Wave-0 base slice** — the additive-envelope round-trip and the empty-stage-tuple no-op safety — since
 that slice ships the envelope fields + the seam + fixtures with real Layer-1 tests. **The S4–S9 rows are
-`⛔ not-built`**: they are the contracts the parallel tracks build against (fixtures under
-`tests/fixtures/learning/`), with no stage logic in this base. Statuses move `⛔ → 🟡 unit-green` as each
-track's Layer-1 slice lands and `→ ✅ green` at the Layer-2/3 legs.
+now `🟡 unit-green`** (Wave 1/2, Session 19): each stage's Layer-1 slice landed — built in parallel off
+the frozen fixtures under `tests/fixtures/learning/`, then seam-reconciled — with the S8 / `depends_on` /
+redaction / fail-closed-approve rows added below. Statuses move `🟡 → ✅ green` at the Layer-2/3 +
+consumer-wiring (Wave 3) legs, which are **not** yet built (all Layer-1 with fakes).
 
 | Decision | Invariant | Test layer | Test slug | Conformance scenario | Status |
 |---|---|---|---|---|---|
 | **D102** | Envelope additivity: every stage's output is a valid `to_doc`/`from_doc` round-trip with the other stages' fields absent/at-default; `entity_scan` (typed `LeakageVerdict`), `dedup`, `drift`, and `payload["generalization"]` each round-trip; a pre-Wave-0 doc without the new keys still parses | Unit | `contracts-envelope-additive` | — | 🟡 unit-green |
 | **D102** | The `CandidateStage` seam: an EMPTY `stages=()` tuple leaves S3 behavior behaviorally identical — no extra `put`, additive keys only (stub fallback); a wired fake stage that fills one field is honored and its `continue`/`route_inbox`/`drop`/`halt` control is respected (an unknown control raises) | Unit | `contracts-stage-seam-noop-safe` | — | 🟡 unit-green |
-| **D69 / D87** | S4 `uses` is byte-exact `database.table.column` scope keys and `binds_to ⊆ uses` | Unit | `S4-uses-scope-key-subset` | — | ⛔ not-built |
-| **D52 / D97** | S4 un-rewritable SQL ⇒ `static_validation.outcome=="fail_to_review"`, never auto-promote | Unit | `S4-unrewritable-fails-to-review` | — | ⛔ not-built |
-| **D89 / D102** | S4 enriched payload maps onto `Blueprint.parse` with no missing field (round-trip) | Unit | `S4-payload-maps-to-runtime-blueprint` | — | ⛔ not-built |
-| **D58 / D17** | S5 entity in `intent`/`result_signature` ⇒ `entity_scan.result ∈ {reroute,quarantine,reject}`, never `pass` | Unit | `S5-leakage-blocks-entity` | **Correction → learning** | ⛔ not-built |
-| **D17 / D58** | S5 `reroute` spawns a linked `user_knowledge` candidate + rejects the global one | Unit | `S5-reroute-to-user-knowledge` | — | ⛔ not-built |
-| **D48** | S6 identical semantics ⇒ identical `canonical_key` ⇒ `action==increment` (one create + one bump) | Unit | `S6-canonical-key-dedup` | — | ⛔ not-built |
-| **D48 / D52** | S6 unparseable template ⇒ hard key skipped, falls to soft layer, never a wrong merge | Unit | `S6-failsoft-no-wrong-merge` | — | ⛔ not-built |
-| **D58a / D18** | S7 ALL `global_knowledge` + `schema_edit` route to inbox (`in_review`), never auto-retrievable | Unit + Component | `S7-knowledge-schema-human-pregate` | **Knowledge human-gate** | ⛔ not-built |
-| **D29** | S7 reject archives as a negative signal (`status==rejected`), not a delete | Unit | `S7-reject-is-negative-signal` | — | ⛔ not-built |
-| **D98 / D29** | S9 single-session candidate stays `candidate` (replay alone never promotes) | Unit | `S9-replay-not-a-value-oracle` | — | ⛔ not-built |
-| **D43** | S9 `silent_eligible ⇔ validated AND drift.status==clean AND fresh` | Unit | `S9-silent-eligibility-predicate` | — | ⛔ not-built |
-| **D43** | S9 suspect drift probe demotes `validated→candidate` + review flag | Unit | `S9-drift-suspect-demotes` | — | ⛔ not-built |
+| **D69 / D87** | S4 `uses` is byte-exact `database.table.column` scope keys and `binds_to ⊆ uses` | Unit | `S4-uses-scope-key-subset` | — | 🟡 unit-green |
+| **D52 / D97** | S4 un-rewritable SQL ⇒ `static_validation.outcome=="fail_to_review"`, never auto-promote | Unit | `S4-unrewritable-fails-to-review` | — | 🟡 unit-green |
+| **D89 / D102** | S4 enriched payload maps onto `Blueprint.parse` with no missing field (round-trip) | Unit | `S4-payload-maps-to-runtime-blueprint` | — | 🟡 unit-green |
+| **D58 / D17** | S5 entity in `intent`/`result_signature` ⇒ `entity_scan.result ∈ {reroute,quarantine,reject}`, never `pass` | Unit | `S5-leakage-blocks-entity` | **Correction → learning** | 🟡 unit-green |
+| **D17 / D58** | S5 `reroute` spawns a linked `user_knowledge` candidate + rejects the global one | Unit | `S5-reroute-to-user-knowledge` | — | 🟡 unit-green |
+| **D48** | S6 identical semantics ⇒ identical `canonical_key` ⇒ `action==increment` (one create + one bump) | Unit | `S6-canonical-key-dedup` | — | 🟡 unit-green |
+| **D48 / D52** | S6 unparseable template ⇒ hard key skipped, falls to soft layer, never a wrong merge | Unit | `S6-failsoft-no-wrong-merge` | — | 🟡 unit-green |
+| **D58a / D18** | S7 ALL `global_knowledge` + `schema_edit` route to inbox (`in_review`), never auto-retrievable | Unit + Component | `S7-knowledge-schema-human-pregate` | **Knowledge human-gate** | 🟡 unit-green |
+| **D29** | S7 reject archives as a negative signal (`status==rejected`), not a delete | Unit | `S7-reject-is-negative-signal` | — | 🟡 unit-green |
+| **D58a / D18** | S7 fail-closed-approve: a `schema_edit` reaching the terminal writer WITHOUT the `schema_edit_pr` stage's `schema_edit_review` marker (the PR bot was bypassed) fails closed to the inbox (`in_review`, reason `fail_to_review`) — **never** auto-lands as a `candidate`, regardless of the sampling coin (R8 stage-order guard) | Unit | `S7-schema-edit-bypass-fails-closed` | **Knowledge human-gate** | 🟡 unit-green |
+| **D17 / D95** | S8 the entity-BEARING per-user knowledge store is RBAC-scoped to ONLY its granted bucket (denied on others, D95-style) and never surfaces another user's rows (no cross-user read); auto-commit + `control="drop"` keeps a `user_knowledge` candidate out of the review inbox | Unit | `S8-user-store-rbac-boundary` | — | 🟡 unit-green |
+| **D53 / D18** | S8 a `schema_edit` candidate opens a branch + YAML-patch PR via the **injected** git/CI client (asserted — never a real GitHub call) and routes to human review (`in_review`); a failed CI gate opens no PR but still routes to review — **never** an auto-commit to the catalog either way (Layer-1 with a fake client; the real-GitHub/CI Component leg is the existing D53 row, Wave-3+) | Unit | `S8-schema-edit-opens-pr-not-auto-commit` | — | 🟡 unit-green |
+| **D98 / D29** | S9 single-session candidate stays `candidate` (replay alone never promotes) | Unit | `S9-replay-not-a-value-oracle` | — | 🟡 unit-green |
+| **D43** | S9 `silent_eligible ⇔ validated AND drift.status==clean AND fresh` | Unit | `S9-silent-eligibility-predicate` | — | 🟡 unit-green |
+| **D43** | S9 suspect drift probe demotes `validated→candidate` + review flag | Unit | `S9-drift-suspect-demotes` | — | 🟡 unit-green |
+| **D35 / D43** | S9 depends_on guard: a candidate whose `depends_on` references an unresolved artifact (e.g. a blueprint depending on a not-yet-landed `schema_edit(add_rule)`) STAYS `candidate` — the scheduler refuses to promote even with `hit_count ≥ T` and a green replay, until every dependency resolves (contracts-design §11.6) | Unit | `depends_on-unresolved-stays-candidate` | — | 🟡 unit-green |
+| **D17 / D98** | S9 promotion boundary strips entity-bearing text (`strip_entity_bearing`/`redact_payload`): replay binds **synthetic sampled values**, never stored entity inputs, and the fixture's stored entity values (`0420`/`2025`/`NA`) NEVER appear in the promoted entity-free store | Unit | `S9-promotion-redacts-stored-entities` | — | 🟡 unit-green |
+| **D98 / D58c** | S9 fail-closed-approve: a human `in_review` **approve** still passes the static + replay safety guards (approval substitutes for the `hit_count` threshold, NOT for structural integrity) — a blueprint with no replayable template holds **fail-closed**; reject → `rejected` | Unit | `S9-approve-still-runs-safety-guards` | — | 🟡 unit-green |

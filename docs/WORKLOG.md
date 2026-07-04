@@ -103,6 +103,21 @@ invariant→test status board.
   + ClickHouse-via-MCP; non-oracle NOT_FOUND). Design:
   [decisions/runblueprint-design.md](decisions/runblueprint-design.md).
 
+- ✅ **Track B — the offline learning loop is BUILT end-to-end at Layer-1 (Sessions 16–19).**
+  `src/data_agent/learning/`: the infra spine (S1, D95/D96) → loader + triage + `learning_audit`
+  (S2, D99/D100) → grounded extractor + `learning_candidates` (S3, D101) → and now, off a **frozen
+  inter-stage contract** (Wave 0, D102), the **six downstream stages built in PARALLEL** by 4 agents in
+  git worktrees (Wave 1/2): **S4** generalize + static-validate (AST → `sql_template`), **S5** leakage
+  gate, **S6** D48 dedup, **S7** inbox + writers, **S8** user store + schema-edit PR bot, **S9** promotion
+  scheduler. Integrated via seam reconciliation — reviewer **REQUEST CHANGES** (3 cross-slice seam
+  blockers) + adversarial **QA** (7 strict-xfail repros incl. a hidden-field→global-store leak chain) →
+  delta **APPROVE WITH FIXES** → fixed (all 7 repros now green regression guards). **1813 pass / 93
+  skipped, ruff clean.** **Honest caveat: all Layer-1 with fakes — the 6 stages are NOT yet wired into
+  `consumer._do_work`, and NONE of this is Layer-2/conformance-proven.** **Next = Wave 3:** wire the
+  stages in the frozen order (`generalize→leakage→dedup→schema_edit_pr→user_commit→writer`) + resolve the
+  S5-reroute re-injection question + the Layer-2 legs (real Redis/Couchbase/neo4j, a real GitHub/CI
+  client for the S8 PR bot); S10 = retraction / D25 exposure trace. See Session 19 below.
+
 **Where we are (Session 14):** the **deferred-items** sweep is done — D90 (extractor fail-open) and
 D91 (D67 `resolve_via` wrong-answer) are both **fixed + reviewed**; the CI matrix, the D62 oracle, the
 resolveValues Layer-2 leg, and the D67 seed leg all landed; and the next three bricks are **designed**
@@ -125,9 +140,10 @@ resolveValues Layer-2 leg, and the D67 seed leg all landed; and the next three b
   per-user BFF mint + `X-Session-Id` HMAC-bind; only Entra OIDC deferred. Not yet designed/built.
 
 **Next scheduled bricks, in order:** (1) **Layer-3 conformance** (Item 3, designed) → (2) **auth
-readiness** (Item 9, decided) → (3) **table-intermediate Slice 1** (Item 8, designed). **Then Track B —
-the offline learning loop** remains the **last big Phase-1 deliverable** (now unblocked: graph schema
-fixed D87, blueprints executable D89). The runtime's Phase-1 `getTableSchema` is just a passthrough of
+readiness** (Item 9, decided) → (3) **table-intermediate Slice 1** (Item 8, designed). **Track B —
+the offline learning loop** (the **last big Phase-1 deliverable**) is now **BUILT end-to-end at Layer-1
+through S9** (Sessions 16–19; see the Track-B bullet above) — its **next step is Wave-3 consumer wiring +
+the Layer-2 legs**, not a fresh start. The runtime's Phase-1 `getTableSchema` is just a passthrough of
 the now-MCP-side overlay (D83/D84).
 
 **Honest remaining Phase-0 gaps** (carried): the **3 deferred Layer-3 scenarios** — mid-session scope
@@ -199,6 +215,81 @@ authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's
   - **`resolveValues` Layer-2 over the real MCP** — still not run (carried from Session 9).
   - The **authoring-time static grain gate (D37/D37b)** stays Phase-2 — the runtime D56 gate is the
     launch teeth; wrong-grain blueprints are caught at execution, not yet at authoring.
+
+---
+
+## 2026-07-03 — Session 19: Track-B learning-loop S4–S9 BUILT in PARALLEL off a frozen contract (Wave 0/1/2, D102)
+
+The learning loop's six downstream stages — the whole path from a raw extracted candidate to a promoted,
+human-gated blueprint / knowledge entry — were built **concurrently** by four agents in git worktrees
+against a **frozen inter-stage contract**, then integrated. This is the project's first multi-agent
+parallel build. Everything is **Layer-1 with fakes**; Wave-3 consumer wiring + the Layer-2 legs are the
+next slice.
+
+### Wave 0 — contract freeze (commit `2083150`, D102)
+Froze the inter-stage typed contracts + the `CandidateStage` consumer seam + **7 fixtures** under
+`tests/fixtures/learning/`, so S4–S9 could build against a stable wire format without stepping on each
+other. Design doc [learning-loop-contracts-design.md](decisions/learning-loop-contracts-design.md)
+(ACCEPTED). Two slugs green off the base: `contracts-envelope-additive` (additive `to_doc`/`from_doc`
+round-trip; a pre-Wave-0 doc without the new keys still parses) + `contracts-stage-seam-noop-safe`
+(an empty `stages=()` tuple is behaviorally identical to S3; a wired fake stage's
+`continue`/`route_inbox`/`drop`/`halt` control is honored, an unknown control raises).
+
+### Wave 1/2 — the six stages (merges `c83600c`/`20066ce`/`c25158c`/`ed2a6ef` + S4 `c7ecfff` + reconciliation/hardening `96bbfc0`)
+Each lives in `src/data_agent/learning/<module>/` with its own design doc:
+- **S4 generalize + static-validate** (`generalize/`,
+  [s4](decisions/learning-loop-s4-generalize-design.md)) — AST rewrite of the accepted SQL →
+  `sql_template` with brace `{slot}` placeholders, transitive `uses`, `canonical_ast_norm`, a
+  `StaticValidation` pass; un-rewritable ⇒ fail-to-review. Slugs `S4-uses-scope-key-subset`,
+  `S4-unrewritable-fails-to-review`, `S4-payload-maps-to-runtime-blueprint`.
+- **S5 leakage gate** (`leakage/`, [s5](decisions/learning-loop-s5-leakage-design.md)) — scans ALL text
+  surfaces (regex + an injected semantic scanner) → pass / reroute / quarantine / reject. Slugs
+  `S5-leakage-blocks-entity`, `S5-reroute-to-user-knowledge`.
+- **S6 dedup / D48** (`dedup/`, [s6](decisions/learning-loop-s6-dedup-design.md)) — `canonical_key` hash,
+  hard + soft layers, fail-soft, `hit_count` seed. Slugs `S6-canonical-key-dedup`,
+  `S6-failsoft-no-wrong-merge`.
+- **S7 inbox + writers** (`inbox/`, `writer/`,
+  [s7](decisions/learning-loop-s7-inbox-writers-design.md)) — the writer is the **sole routing
+  authority**; inbox projection + a unified human approve. Slugs `S7-knowledge-schema-human-pregate`,
+  `S7-reject-is-negative-signal`.
+- **S8 user store + schema-edit PR bot** (`user/`, `schema_edit/`,
+  [s8](decisions/learning-loop-s8-user-schema-design.md)) — a per-user RBAC store (auto-commit) + an
+  **injected** git/CI PR bot that **never auto-commits** (opens a branch + YAML-patch PR, routes to human
+  review). New rows: `S8-user-store-rbac-boundary`, `S8-schema-edit-opens-pr-not-auto-commit`.
+- **S9 promotion scheduler** (`promotion/`, [s9](decisions/learning-loop-s9-promotion-design.md)) — a
+  **separate cron process**; golden replay (no value oracle, D98), a drift stamp (grain_integrity live;
+  catalog/rule stubbed Phase-2), a `depends_on` guard. Slugs `S9-replay-not-a-value-oracle`,
+  `S9-silent-eligibility-predicate`, `S9-drift-suspect-demotes` (+ `depends_on-unresolved-stays-candidate`).
+
+### The parallel-build → seam-reconciliation story
+The S4 anchor agent found + fixed **2 fixture defects** in the frozen base (a phantom `uses_rules`; a
+colon→brace placeholder mismatch) with `canonical_ast_norm` kept **byte-stable**. Integration then
+surfaced what parallel builds always do — cross-slice seam drift:
+- **Integration reviewer: REQUEST CHANGES** — 3 cross-slice seam blockers.
+- **Adversarial QA** — **7 strict-xfail reproductions**, including a hidden-field → global-store leak
+  exploit chain.
+- → fix bundle → **delta review: APPROVE WITH FIXES** (1 blocker + 3 fail-open seams) → fixed. All 7 QA
+  repros are now **green regression guards**.
+
+### Process
+Wave-0 base (contract freeze) → **4 parallel agents in worktrees** (S4 / S5+S8 / S6+S7 / S9) →
+integration merges → **reviewer REQUEST CHANGES** (3 seam blockers) + **adversarial QA** (7 xfail repros)
+→ fix bundle → **reviewer delta APPROVE WITH FIXES** → fixed. Gates: **1813 passed / 93 skipped, ruff
+clean.** All Layer-1 with fakes.
+
+### Honest boundary (NOT done — next = Wave 3)
+- Wiring the 6 stages into `consumer._do_work` in the frozen order
+  (`generalize → leakage → dedup → schema_edit_pr → user_commit → writer`).
+- The stage-spawned-candidate re-injection question (S5 `reroute` currently commits its linked
+  `user_knowledge` candidate directly rather than re-injecting it through the pipeline).
+- The Layer-2 legs (real Redis / Couchbase / neo4j) + a real GitHub/CI client for the S8 PR bot (the
+  existing D53 Component row stays `⛔ not-built` — the S8 test uses an injected fake).
+- Retraction / D25 exposure trace (deferred S10).
+- Nothing pushed; no git remote configured.
+
+**Runway:** S1 ✅ S2 ✅ S3 ✅ S4 ✅ S5 ✅ S6 ✅ S7 ✅ S8 ✅ S9 ✅ (all Layer-1 with fakes) → **Wave 3:
+wire the 6 stages into the consumer (frozen order) + Layer-2 legs + a real PR/CI client + the S5-reroute
+re-injection question** → S10 retraction / D25 exposure trace.
 
 ---
 
