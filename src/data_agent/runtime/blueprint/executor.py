@@ -38,7 +38,6 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-import sqlglot
 from sqlglot import exp
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
@@ -57,6 +56,11 @@ from data_agent.runtime.retrieval.models import BlueprintDetail, Candidate
 from data_agent.runtime.retrieval.scope_filter import is_blueprint_in_scope
 from data_agent.runtime.session.models import ResultPreview
 
+from .grain_probe import (
+    build_grain_probe_sql,
+    map_grain_columns,
+    unpack_grain_probe,
+)
 from .models import Blueprint, BlueprintParseError, Node
 from .rules import (
     _GAP_THRESHOLD as _DEFAULT_GAP_THRESHOLD,
@@ -82,6 +86,13 @@ from .verify import VerifyOutcome, verify_result
 from .when import WhenClauseError, evaluate_when
 
 _logger = logging.getLogger(__name__)
+
+# The D56 grain probe is built by the SHARED helper so the offline S9 replay probe
+# can never drift from this live path (grain_probe.py). Keep the module-private
+# aliases so the executor's call sites (and its tests) are byte-unchanged.
+_map_grain_columns = map_grain_columns
+_grain_probe_sql = build_grain_probe_sql
+_unpack_grain_probe = unpack_grain_probe
 
 # runBlueprint error family (§5.4). Every non-clean outcome either PAUSES (needs
 # user input) or falls back to the raw loop — never a wrong answer, never a crash.
@@ -1097,67 +1108,11 @@ def _parse_detail(detail: BlueprintDetail) -> Blueprint:
     )
 
 
-def _map_grain_columns(template_or_sql: str, grain_columns: tuple[str, ...]) -> list[str] | None:
-    """Map each DECLARED grain column to an OUTPUT column name (a template aliases
-    `Department AS department`, but the declared grain is `Department`). Parsed via
-    `parse_template` so a `{slot}` template parses too — V1: the caller passes the
-    PRE-BIND template, so an output name can never be a bound slot VALUE.
-
-    Matching is fail-closed (V1): an EXACT output-name match wins; otherwise a
-    case-insensitive match is accepted ONLY when it resolves to a SINGLE output
-    column. An ambiguous casefold COLLISION (declared "Dept" vs outputs "dept" AND
-    "DEPT") → `None` (the verify gate must not `COUNT(DISTINCT)` a GUESSED column);
-    a declared grain column with NO output match → `None` too. Either `None` makes
-    the executor pass `distinct=None` → verify.py withholds the result."""
-    try:
-        tree = parse_template(template_or_sql)
-    except TemplateBindError:
-        return None
-    outputs = list(getattr(tree, "named_selects", []) or [])
-    exact = set(outputs)
-    # casefold key → the DISTINCT output names that collapse to it (order-preserved).
-    casefold_candidates: dict[str, list[str]] = {}
-    for name in outputs:
-        bucket = casefold_candidates.setdefault(name.casefold(), [])
-        if name not in bucket:
-            bucket.append(name)
-    mapped: list[str] = []
-    for col in grain_columns:
-        if col in exact:
-            mapped.append(col)
-            continue
-        candidates = casefold_candidates.get(col.casefold(), [])
-        if len(candidates) == 1:
-            mapped.append(candidates[0])  # unambiguous case-insensitive match
-        else:
-            return None  # ambiguous collision OR no match → fail-closed
-    return mapped
-
-
 def _is_present(raw: Any) -> bool:
     """True iff *raw* is a non-absent slot value (mirrors slots._is_absent) — used
     to skip a domain probe for an absent slot (n3: a missing required slot pauses
     on presence alone and must not waste a warehouse query)."""
     return not (raw is None or (isinstance(raw, str) and raw.strip() == ""))
-
-
-def _grain_probe_sql(node_sql: str, grain_output_cols: list[str]) -> str:
-    """Build the scope-enforceable `SELECT COUNT(*), COUNT(DISTINCT <grain>) FROM
-    (<final SQL>)` probe (§4.2) — the fan-out canary. Built via the AST so the
-    inner SQL is embedded structurally, never string-spliced."""
-    inner = sqlglot.parse_one(node_sql, dialect="clickhouse")
-    assert_read_only_select(inner)  # defense-in-depth: the probe subquery is a read
-    subquery = exp.Subquery(
-        this=inner, alias=exp.TableAlias(this=exp.to_identifier("__bp_sub"))
-    )
-    count_star = exp.Count(this=exp.Star())
-    distinct = exp.Count(
-        this=exp.Distinct(expressions=[exp.column(col) for col in grain_output_cols])
-    )
-    select = exp.select(
-        exp.alias_(count_star, "__bp_n"), exp.alias_(distinct, "__bp_d")
-    ).from_(subquery)
-    return select.sql(dialect="clickhouse")
 
 
 def _unpack_result(raw: Any) -> tuple[list[str], list[list[Any]], int, bool]:
@@ -1173,19 +1128,6 @@ def _unpack_result(raw: Any) -> tuple[list[str], list[list[Any]], int, bool]:
     row_count = int(row_count) if isinstance(row_count, int) and not isinstance(row_count, bool) else len(rows)
     truncated = bool(raw.get("truncated", False))
     return columns, rows, row_count, truncated
-
-
-def _unpack_grain_probe(raw: Any) -> tuple[int | None, int | None]:
-    """Pull `(total, distinct)` from the single-row grain-probe result. Any
-    structural surprise → `(None, None)` (fail-closed at the caller)."""
-    _columns, rows, _row_count, _truncated = _unpack_result(raw)
-    if not rows or len(rows[0]) < 2:
-        return None, None
-    total, distinct = rows[0][0], rows[0][1]
-    try:
-        return int(total), int(distinct)
-    except (TypeError, ValueError):
-        return None, None
 
 
 def _union_provenance(

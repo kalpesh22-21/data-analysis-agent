@@ -116,6 +116,19 @@ class RuntimeSettings(BaseSettings):
     jwt_issuer: str = Field("", description="Expected JWT 'iss' claim.")
     jwt_audience: str = Field("", description="Expected JWT 'aud' claim.")
 
+    # --- Offline token mint for the S9 golden-replay probe (S9-activation §1.3/§4) ---
+    # The S9 promotion scheduler mints a per-blueprint JWT scoped to the blueprint's
+    # `uses` to run the golden-replay grain probe through the MCP `runQuery` choke
+    # point (D57 reuse). These are the mint credentials; empty ⇒ the scheduler keeps
+    # its fail-closed deferred probe (auto-promotion stays dormant).
+    token_service_url: str = Field(
+        "",
+        description="Full token-IdP mint endpoint (POST /token) for the offline replay JWT.",
+    )
+    token_issuer_api_key: str = Field(
+        "", description="Static issuer API key authorizing the offline POST /token mint (secret)."
+    )
+
     # --- Session / retention (D22/D44) ---
     session_ttl_seconds: int = Field(
         604_800,  # 7 days

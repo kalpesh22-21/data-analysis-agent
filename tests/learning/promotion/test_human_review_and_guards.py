@@ -95,7 +95,7 @@ class _RaisingProbe:
     """A warehouse probe that RAISES (mirrors the deferred stub in
     `run_learning_scheduler.py`, or a warehouse/query service that is down)."""
 
-    async def run(self, sql: str, *, grain_columns):
+    async def run(self, sql: str, *, grain_columns, column_scope=()):
         raise NotImplementedError("no warehouse probe wired")
 
 

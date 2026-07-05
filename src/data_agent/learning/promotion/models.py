@@ -118,9 +118,20 @@ class PromotionSweep:
 class WarehouseProbe(Protocol):
     """Runs a golden-replay SQL against the warehouse and returns the D56 probe
     triple. Injected/fake in tests — NO real ClickHouse. The probe is a STRUCTURE
-    oracle only (row/distinct/columns); it never returns the result value (D98)."""
+    oracle only (row/distinct/columns); it never returns the result value (D98).
 
-    async def run(self, sql: str, *, grain_columns: tuple[str, ...]) -> ProbeResult: ...
+    `column_scope` is the blueprint's declared `uses` footprint (D87) — the real
+    probe mints a JWT scoped to EXACTLY it (S9-design §1.3) so the replay reads only
+    within the declared footprint and the MCP's D57 teeth reject anything outside it.
+    """
+
+    async def run(
+        self,
+        sql: str,
+        *,
+        grain_columns: tuple[str, ...],
+        column_scope: tuple[str, ...],
+    ) -> ProbeResult: ...
 
 
 class HitCountReader(Protocol):

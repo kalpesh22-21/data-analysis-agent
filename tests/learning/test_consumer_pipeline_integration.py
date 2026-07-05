@@ -356,7 +356,7 @@ def test_shared_singleton_candidate_store_across_gate_and_consumer(store, queue,
 
 
 class _NoOpProbe:
-    async def run(self, sql, *, grain_columns):
+    async def run(self, sql, *, grain_columns, column_scope=()):
         from data_agent.learning.promotion.models import ProbeResult
         return ProbeResult(row_count=0, distinct_grain_count=None, columns=())
 

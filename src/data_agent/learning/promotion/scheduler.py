@@ -83,13 +83,33 @@ class PromotionScheduler:
         hit_counts: HitCountReader,
         policy: PromotionPolicy | None = None,
         dependency_resolver: DependencyResolver | None = None,
+        # S9-activation Slice 1 landing gate (S9-design §4). A blueprint becomes
+        # RECALLABLE only when it LANDS in the neo4j retrieval corpus; the landing
+        # writer is Slice 2. When `require_landing` is set (and no writer is wired,
+        # the only Slice-1 state), a blueprint that passes EVERY guard (incl. the real
+        # replay gate) HOLDS `landing_unavailable` instead of promoting — a real probe
+        # with no landing writer would validate a blueprint that never becomes
+        # recallable (the silent gap). Both default OFF so today's callers are unchanged.
+        landing_writer: None = None,
+        require_landing: bool = False,
         clock: Callable[[], str] = _now_iso,
     ) -> None:
+        # Slice 1 has no land-then-promote sequence: keying the gate on writer PRESENCE
+        # (not on a successful LAND) would let a caller passing any object get a
+        # blueprint promoted to `validated` with nothing ever landed. Refuse a non-None
+        # writer until Slice 2 replaces this gate with a real land-then-promote step.
+        if landing_writer is not None:
+            raise ValueError(
+                "landing_writer is unsupported until S9-activation Slice 2 "
+                "(no land-then-promote sequence exists yet)"
+            )
         self._store = store
         self._probe = probe
         self._hit_counts = hit_counts
         self._policy = policy or PromotionPolicy()
         self._deps = dependency_resolver
+        self._landing_writer = landing_writer
+        self._require_landing = require_landing
         self._clock = clock
 
     @property
@@ -179,6 +199,16 @@ class PromotionScheduler:
         count = await self._read_hit_count(env)
         if count < self._policy.blueprint_hit_threshold:
             return self._hold(env, "below_hit_threshold")
+
+        # Guard 5 — landing gate (S9-activation Slice 1, §4). A blueprint that passes
+        # EVERY guard above (including the now-REAL replay gate) still must not promote
+        # to `validated` until it can LAND in the neo4j retrieval corpus — otherwise it
+        # would be `validated` but never recallable (the silent gap). Until the landing
+        # writer is wired (Slice 2), HOLD `landing_unavailable`. The replay gate has
+        # already RUN and PASSED here — this slice makes that provable, keeping
+        # auto-promotion-into-retrieval dormant.
+        if self._landing_gate_blocks():
+            return self._hold(env, "landing_unavailable")
 
         # All guards pass → promote, stamping a fresh clean drift (the passing
         # replay IS the live grain_integrity probe), so it is immediately
@@ -300,6 +330,16 @@ class PromotionScheduler:
                     env.candidate_id, env.type, "hold", env.status, env.status,
                     reason=f"approve_blocked_replay:{replay.reason}",
                 )
+            # Landing gate (S9-Slice-1, §3.1/§4): a human approve of a BLUEPRINT also
+            # produces `validated`, so it too must LAND to be recallable. Until the
+            # landing writer is wired (Slice 2), a blueprint approve HOLDS at in_review
+            # with a clear reason — the replay gate has already run + passed. Non-
+            # blueprint human-gated targets (below) are unaffected.
+            if self._landing_gate_blocks():
+                return CandidateDecision(
+                    env.candidate_id, env.type, "hold", env.status, env.status,
+                    reason="approve_blocked_landing_unavailable",
+                )
             drift = drift_from_replay(replay, now=self._clock())
         else:
             # Genuinely non-replayable target (pre-gated knowledge/schema) →
@@ -342,6 +382,15 @@ class PromotionScheduler:
             return BlueprintGeneralization.from_doc(gen_doc)
         except (KeyError, TypeError):
             return None
+
+    def _landing_gate_blocks(self) -> bool:
+        """S9-activation Slice 1 (§4): a blueprint can PASS the replay gate but must
+        not promote to `validated` until it can LAND in the retrieval corpus. True ⇒
+        HOLD (`landing_unavailable`). In Slice 1 `landing_writer` is always None (the
+        constructor refuses a non-None one — there is no land-then-promote sequence
+        yet), so this reduces to `require_landing`. Default OFF — today's callers are
+        unchanged. Slice 2 replaces this presence gate with a real land-then-promote."""
+        return self._require_landing and self._landing_writer is None
 
     async def _deps_resolved(self, env: CandidateEnvelope) -> bool:
         """True iff every `depends_on` ref resolves (§11.6). No deps ⇒ trivially

@@ -90,8 +90,10 @@
     "payload": {
       "intent": "reason=leakage_near_miss example",
       "generalization": {
-        "sql_template": "SELECT 1 AS c",
-        "uses": [],
+        "sql_template": "SELECT department FROM payroll.payroll_fact",
+        "uses": [
+          "payroll.payroll_fact.department"
+        ],
         "uses_rules": [],
         "node_templates": [],
         "result_grain": {"columns": [], "verifiable": false},
@@ -149,8 +151,10 @@
     "payload": {
       "intent": "reason=blueprint_sampled example",
       "generalization": {
-        "sql_template": "SELECT 1 AS c",
-        "uses": [],
+        "sql_template": "SELECT department FROM payroll.payroll_fact",
+        "uses": [
+          "payroll.payroll_fact.department"
+        ],
         "uses_rules": [],
         "node_templates": [],
         "result_grain": {"columns": [], "verifiable": false},
@@ -202,8 +206,10 @@
     "payload": {
       "intent": "reason=dedup_conflict example",
       "generalization": {
-        "sql_template": "SELECT 1 AS c",
-        "uses": [],
+        "sql_template": "SELECT department FROM payroll.payroll_fact",
+        "uses": [
+          "payroll.payroll_fact.department"
+        ],
         "uses_rules": [],
         "node_templates": [],
         "result_grain": {"columns": [], "verifiable": false},

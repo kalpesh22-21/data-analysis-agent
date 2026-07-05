@@ -258,6 +258,8 @@ def build_promotion_plane(
     probe: WarehouseProbe,
     hit_counts: HitCountReader,
     dependency_resolver: DependencyResolver | None = None,
+    landing_writer: object | None = None,
+    require_landing: bool = False,
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
@@ -274,6 +276,8 @@ def build_promotion_plane(
         probe=probe,
         hit_counts=hit_counts,
         dependency_resolver=dependency_resolver,
+        landing_writer=landing_writer,
+        require_landing=require_landing,
         policy=policy,
         clock=clock,
     )
@@ -288,6 +292,8 @@ def build_promotion_scheduler(
     probe: WarehouseProbe,
     hit_counts: HitCountReader,
     dependency_resolver: DependencyResolver | None = None,
+    landing_writer: object | None = None,
+    require_landing: bool = False,
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
 ) -> PromotionScheduler:
@@ -303,6 +309,8 @@ def build_promotion_scheduler(
         hit_counts=hit_counts,
         policy=policy,
         dependency_resolver=dependency_resolver,
+        landing_writer=landing_writer,
+        require_landing=require_landing,
         **extra,
     )
 

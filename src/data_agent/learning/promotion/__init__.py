@@ -7,6 +7,7 @@ advances `status` + stamps `drift` (Contract E). See
 `docs/decisions/learning-loop-s9-promotion-design.md`.
 """
 
+from .dependency_resolver import CandidateStoreDependencyResolver
 from .drift import (
     CATALOG_CONFORMANCE,
     GRAIN_INTEGRITY,
@@ -30,6 +31,8 @@ from .models import (
 )
 from .replay import ReplayOutcome, golden_replay
 from .scheduler import PromotionScheduler
+from .token_minter import HttpTokenMinter, TokenMinter, TokenMintError
+from .warehouse_probe import MCPWarehouseProbe, WarehouseProbeError
 
 __all__ = [
     "BLUEPRINT_TYPE",
@@ -40,14 +43,20 @@ __all__ = [
     "RULE_CURRENCY",
     "STUBBED_PROBES",
     "CandidateDecision",
+    "CandidateStoreDependencyResolver",
     "DependencyResolver",
     "HitCountReader",
+    "HttpTokenMinter",
+    "MCPWarehouseProbe",
     "ProbeResult",
     "PromotionPolicy",
     "PromotionScheduler",
     "PromotionSweep",
     "ReplayOutcome",
+    "TokenMintError",
+    "TokenMinter",
     "WarehouseProbe",
+    "WarehouseProbeError",
     "drift_from_replay",
     "golden_replay",
     "silent_eligible",

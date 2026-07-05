@@ -49,7 +49,13 @@ class _NoOpProbe:
     reached if an approve replays a blueprint template; a production inbox injects
     the real scheduler + probe."""
 
-    async def run(self, sql: str, *, grain_columns: tuple[str, ...]) -> ProbeResult:
+    async def run(
+        self,
+        sql: str,
+        *,
+        grain_columns: tuple[str, ...],
+        column_scope: tuple[str, ...] = (),
+    ) -> ProbeResult:
         return ProbeResult(row_count=0, distinct_grain_count=None, columns=())
 
 

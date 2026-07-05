@@ -155,13 +155,26 @@ async def golden_replay(
     except TemplateBindError:
         return ReplayOutcome(False, None, None, sampled, reason="bind_failed")
 
+    # BACKSTOP (D57/D80b): the real probe mints a JWT scoped to `gen.uses`. An EMPTY
+    # `uses` would mint an ALLOW-ALL (unrestricted) token, running a model/extraction-
+    # derived replay SQL against live ClickHouse with no scope — the learning plane
+    # must NEVER do that. Short-circuit to a clean fail-closed HOLD with an honest
+    # machine reason (NOT the misleading `probe_unavailable`), BEFORE any mint/MCP call.
+    if not gen.uses:
+        return ReplayOutcome(False, None, replay_sql, sampled, reason="no_uses_scope")
+
     grain = ResultGrain(
         columns=gen.result_grain.columns, verifiable=gen.result_grain.verifiable
     )
     expected_columns = _expected_columns(env.payload)
 
     try:
-        probe_result = await probe.run(replay_sql, grain_columns=grain.columns)
+        # `column_scope=gen.uses` is the blueprint's declared footprint (D87/OQ-1) —
+        # the real probe mints a JWT scoped to EXACTLY it, so the replay reads only
+        # within the declared footprint and the MCP's D57 teeth are the backstop.
+        probe_result = await probe.run(
+            replay_sql, grain_columns=grain.columns, column_scope=gen.uses
+        )
     except Exception:  # noqa: BLE001 - a probe/warehouse failure is a fail-closed non-promotion
         # The warehouse or query service is unreachable (or the deferred stub probe
         # is wired). Degrade to a clean non-promoting outcome so BOTH the cron scan

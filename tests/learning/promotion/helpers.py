@@ -98,9 +98,19 @@ class FakeWarehouseProbe:
             columns=columns,
         )
         self.calls: list[tuple[str, tuple[str, ...]]] = []
+        # Every minted column_scope (the blueprint `uses`) handed to the probe, so a
+        # test can assert the replay was scoped to the declared footprint (S9 §1.3).
+        self.column_scopes: list[tuple[str, ...]] = []
 
-    async def run(self, sql: str, *, grain_columns: tuple[str, ...]) -> ProbeResult:
+    async def run(
+        self,
+        sql: str,
+        *,
+        grain_columns: tuple[str, ...],
+        column_scope: tuple[str, ...] = (),
+    ) -> ProbeResult:
         self.calls.append((sql, grain_columns))
+        self.column_scopes.append(tuple(column_scope))
         return self._result
 
 

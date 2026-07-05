@@ -19,22 +19,26 @@ reads — the same artifacts S6 seeds + increments).
 DORMANT + fail-closed by default:
   * The D58c kill-switch is read FRESH every cycle inside `run_once`; disabled ⇒ no
     scan, no transition.
-  * The real `WarehouseProbe` (golden-replay SQL against ClickHouse) and the
-    `DependencyResolver` (neo4j `depends_on` resolution) are DEFERRED infra with no
-    production client yet. Until they land, this entrypoint wires fail-closed stubs:
-    the probe raises (`golden_replay` catches it → a clean `probe_unavailable` hold, so
-    every blueprint HOLDS on the replay gate — NOT a raise), the resolver reports
-    unresolved (⇒ dependent candidates HOLD). The scheduler therefore runs safely but
-    AUTO-PROMOTES NO BLUEPRINT. The human `approve` path shares that replay gate for a
-    BLUEPRINT (a blueprint approve is likewise blocked `probe_unavailable`, degrading
-    cleanly, never a raise); only the human-gated targets (global_knowledge/schema_edit)
-    approve without a replay and so remain fully approvable via the S7 inbox. Wiring the
-    real probe/resolver is the follow-on that activates count-based auto-promotion (and
-    blueprint approval).
+  * S9-activation Slice 1 wires the REAL golden-replay probe + dependency resolver
+    when the write plane is configured (`MCP_URL` + `TOKEN_SERVICE_URL` +
+    `TOKEN_ISSUER_API_KEY`): the probe runs the D56 grain probe through the MCP
+    `runQuery` choke point under a per-blueprint JWT scoped to the blueprint's `uses`
+    (D57 reuse); the resolver reads the shared candidate store (`depends_on` resolved
+    ⟺ the sibling candidate is `validated`). When the write plane is NOT configured,
+    the entrypoint keeps the fail-closed DEFERRED stubs (probe raises → clean
+    `probe_unavailable` hold; resolver reports unresolved) so the scheduler runs safely
+    but auto-promotes nothing.
+  * Auto-promotion-INTO-RETRIEVAL stays GATED (Slice 1). There is no corpus-landing
+    writer yet (Slice 2), so `require_landing=True` with `landing_writer=None` makes a
+    blueprint that passes the (now real) replay gate HOLD `landing_unavailable` — a
+    real probe with no landing writer would validate a blueprint that never becomes
+    recallable (the silent gap). The human `approve` path for a BLUEPRINT holds the
+    same way; only the human-gated targets (global_knowledge/schema_edit) approve
+    without a replay and remain fully approvable via the S7 inbox.
 
-Environment: `RuntimeSettings` (COUCHBASE_*) + `LearningSettings`
-(LEARNING_CANDIDATES_*, LEARNING_CORPUS_*). Traced to the Phoenix `learning-loop`
-project.
+Environment: `RuntimeSettings` (COUCHBASE_*, MCP_URL, TOKEN_SERVICE_URL,
+TOKEN_ISSUER_API_KEY) + `LearningSettings` (LEARNING_CANDIDATES_*, LEARNING_CORPUS_*).
+Traced to the Phoenix `learning-loop` project.
 
 Usage:
     uv run python scripts/run_learning_scheduler.py
@@ -50,7 +54,12 @@ from data_agent.learning.config import LearningSettings
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
 from data_agent.learning.factory import build_promotion_plane
 from data_agent.learning.observability import configure_learning_tracing, get_learning_tracer
+from data_agent.learning.promotion.dependency_resolver import CandidateStoreDependencyResolver
 from data_agent.learning.promotion.models import ProbeResult
+from data_agent.learning.promotion.token_minter import HttpTokenMinter
+from data_agent.learning.promotion.warehouse_probe import MCPWarehouseProbe
+from data_agent.runtime.config import RuntimeSettings
+from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.observability.tracing import set_global_tracer_provider
 
 _logger = logging.getLogger(__name__)
@@ -63,7 +72,13 @@ class _DeferredWarehouseProbe:
     the replay gate (never a crash — `run_once` catches per item), so no candidate
     auto-promotes until a real probe is wired."""
 
-    async def run(self, sql: str, *, grain_columns: tuple[str, ...]) -> ProbeResult:
+    async def run(
+        self,
+        sql: str,
+        *,
+        grain_columns: tuple[str, ...],
+        column_scope: tuple[str, ...] = (),
+    ) -> ProbeResult:
         # `golden_replay` catches this and returns a clean `probe_unavailable` hold —
         # the scheduler never sees the raise (no per-candidate traceback spam), the
         # human approve path never surfaces a 500.
@@ -115,19 +130,48 @@ async def _main() -> int:
     candidate_store = CouchbaseCandidateStore(learning_settings)
     corpus = CouchbaseBlueprintCorpus(learning_settings)
 
+    # S9-activation Slice 1: wire the REAL write plane (probe + resolver) as a UNIT
+    # when the MCP + token-mint credentials are all present; otherwise keep the
+    # fail-closed deferred stubs (auto-promotes nothing). `require_landing` follows the
+    # real probe: with a real replay gate but no landing writer (Slice 2), a blueprint
+    # HOLDS `landing_unavailable` rather than validating a never-recallable artifact.
+    runtime_settings = RuntimeSettings()
+    write_plane_ready = bool(
+        runtime_settings.mcp_url
+        and runtime_settings.token_service_url
+        and runtime_settings.token_issuer_api_key
+    )
+    if write_plane_ready:
+        probe = MCPWarehouseProbe(
+            mcp_client=RealMCPClient(runtime_settings.mcp_url),
+            token_minter=HttpTokenMinter(
+                runtime_settings.token_service_url,
+                runtime_settings.token_issuer_api_key,
+            ),
+        )
+        dependency_resolver = CandidateStoreDependencyResolver(candidate_store)
+    else:
+        probe = _DeferredWarehouseProbe()
+        dependency_resolver = _DeferredDependencyResolver()
+
     # build_promotion_plane pins ONE candidate store across the scheduler + inbox.
     # The corpus is the HitCountReader (cross-session hit_count source of truth).
     scheduler, _inbox = build_promotion_plane(
         learning_settings,
         candidate_store=candidate_store,
-        probe=_DeferredWarehouseProbe(),
+        probe=probe,
         hit_counts=corpus,
-        dependency_resolver=_DeferredDependencyResolver(),
+        dependency_resolver=dependency_resolver,
+        landing_writer=None,  # Slice 2 wires the corpus-landing writer
+        require_landing=write_plane_ready,
     )
 
     _logger.info(
-        "learning promotion scheduler starting (auto-promotion DORMANT until a real "
-        "warehouse probe + dependency resolver are wired; kill-switch honored per cycle)"
+        "learning promotion scheduler starting (write_plane_ready=%s; replay gate %s, "
+        "auto-promotion-into-retrieval GATED on the Slice-2 landing writer — a blueprint "
+        "passing replay HOLDS landing_unavailable; kill-switch honored per cycle)",
+        write_plane_ready,
+        "REAL" if write_plane_ready else "deferred (probe_unavailable)",
     )
     await scheduler.run_forever(sleep=asyncio.sleep)
     return 0
