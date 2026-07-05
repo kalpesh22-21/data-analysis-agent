@@ -165,11 +165,23 @@ class LandingWriter(Protocol):
 
     `forbidden_spans` are the entity spans S5 identified, captured by the scheduler
     BEFORE `strip_entity_bearing` blanks them, so the last-gate defense can fire even
-    though a validated candidate's own `entity_scan` is blanked (§3.3)."""
+    though a validated candidate's own `entity_scan` is blanked (§3.3).
+
+    `update_status` is the RETRACTION write-back (S9-activation Slice 3, §8.6): a
+    demote / reject / user-correction stamps the landed node's `status`/`drift_status`
+    (keyed by the SAME deterministic landing id) so the recall filter excludes it, and
+    the clean validated-rescan re-asserts `validated`/`clean` (the self-heal). It is an
+    idempotent no-op when the node was never landed. It RAISES on a driver failure — the
+    scheduler catches it and FAILS OPEN (a corpus-write failure must never block the
+    store transition; the recall filter + the periodic re-assert are the backstops)."""
 
     async def land(
         self, env: CandidateEnvelope, *, forbidden_spans: tuple[str, ...] = ()
     ) -> None: ...
+
+    async def update_status(
+        self, env: CandidateEnvelope, *, status: str, drift_status: str
+    ) -> bool: ...
 
 
 __all__ = [

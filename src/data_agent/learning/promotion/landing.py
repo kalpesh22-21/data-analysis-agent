@@ -74,6 +74,20 @@ def landing_id(env: CandidateEnvelope) -> str:
     return f"bp::{env.candidate_id}"
 
 
+# S9-activation Slice 3 — the retraction write-back (design §8.6). MATCH-by-id so a
+# node that was never landed (or already removed) matches nothing → the SET runs zero
+# times → a safe no-op (idempotent). `RETURN b.id` lets the writer report whether a
+# node was actually stamped (observability; a miss is logged, never raised). The recall
+# filter (`vector_index._BLUEPRINT_RECALL_QUERY`) reads these two properties, so
+# flipping either `status` off `validated` OR `drift_status` to `suspect` makes the
+# blueprint un-recallable.
+_RETRACT_BLUEPRINT = """
+MATCH (b:Blueprint {id: $id})
+SET b.status = $status, b.drift_status = $drift_status
+RETURN b.id AS id
+"""
+
+
 def _seed_haystack(seed: BlueprintSeed) -> str:
     """Every text-bearing generalized field of the seed, concatenated for the entity
     scan. Covers the natural-language `intent`, the SQL templates, the slot/resolve/
@@ -176,6 +190,56 @@ class CorpusLandingWriter:
             env.candidate_id,
             seed.id,
         )
+
+    async def update_status(
+        self, env: CandidateEnvelope, *, status: str, drift_status: str
+    ) -> bool:
+        """Stamp the landed node's recall-eligibility (`status` + `drift_status`),
+        keyed by the SAME deterministic `landing_id` (S9-activation Slice 3, §8.6).
+
+        This is the retraction write-back the learning loop's demote/reject/user-
+        correction/retract edges use to make a demoted/broken/leaked blueprint
+        un-recallable (the recall filter reads exactly these two properties), AND the
+        per-cycle RE-ASSERT that converges a transiently-failed write-back — a demoted
+        blueprint re-stamped ineligible in the candidate scan, a still-validated one
+        re-stamped `validated`/`clean` in the clean rescan.
+
+        IDEMPOTENT + safe no-op: MATCH-by-id, so a node that was never landed (or
+        already removed) matches nothing and NO write happens — retracting a
+        never-landed / already-retracted node is harmless. Returns True iff a node was
+        actually stamped (False = no landed node), for the caller's observability log.
+
+        NO embed, NO model-parity, NO entity defense: this only mutates two lifecycle
+        scalars on an EXISTING node — it never (re)writes the intent/embedding/seed
+        payload, so none of the landing write's global-exposure gates apply. RAISES on
+        a driver/query failure; the scheduler catches it and FAILS OPEN (the store
+        transition is source-of-truth and must never be blocked by a corpus-write
+        failure — the recall filter + the periodic re-assert are the backstops)."""
+        seed_id = landing_id(env)
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(
+                _RETRACT_BLUEPRINT,
+                id=seed_id,
+                status=status,
+                drift_status=drift_status,
+            )
+            rows = await result.data()
+        stamped = bool(rows)
+        if stamped:
+            _logger.info(
+                "corpus status write-back: blueprint %s (id=%s) -> status=%s drift_status=%s",
+                env.candidate_id,
+                seed_id,
+                status,
+                drift_status,
+            )
+        else:
+            _logger.info(
+                "corpus status write-back no-op: blueprint %s not landed (id=%s)",
+                env.candidate_id,
+                seed_id,
+            )
+        return stamped
 
 
 __all__ = ["CorpusLandingWriter", "LandingEntityError", "landing_id"]

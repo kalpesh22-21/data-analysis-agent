@@ -571,6 +571,10 @@ Auto-promotion-into-retrieval is now FULLY ON when every real port is configured
 
 ### 8.6 KNOWN GAP — corpus retraction (S9-activation Slice 3, next-slice obligation)
 
+> **RESOLVED in Slice 3 (§9).** Both obligations below are now built: the demote/reject/
+> user-correction edges write the landed node back (`CorpusLandingWriter.update_status`),
+> and `recall` filters on `status`/`drift_status`. The historical gap description follows.
+
 **This slice makes a demoted/broken blueprint stay recallable.** A drift-suspect
 demotion (`_recheck_validated`) or a user-correction (`apply_user_correction`) writes
 `status = candidate` back to the Couchbase candidate store but NEVER touches the landed
@@ -588,3 +592,128 @@ is currently one-way.
 
 Until Slice 3 lands, a demoted blueprint remains recallable — a KNOWN, tracked gap, not a
 silent one. It is NOT built here (this slice is the forward WRITE path only).
+
+---
+
+## 9. Slice 3 — AS BUILT (corpus retraction — §8.6 RESOLVED)
+
+Status: BUILT (branch `phase0/provenance-extractor`). The §8.6 gap is closed: the landing
+write is no longer one-way. A demoted / rejected / user-corrected blueprint is now written
+back onto the landed neo4j node AND excluded by the recall filter, so it stops being
+recallable/runnable. Two independent backstops (the fail-closed recall filter + the
+periodic re-assert) mean a transient neo4j failure cannot leave a demoted blueprint
+recallable indefinitely.
+
+### 9.1 The node's authoritative recall-eligibility stamp
+Already present from Slice 2 (confirmed, NO change needed): `blueprint_seed_from_candidate`
+stamps `status="validated"` and `drift_status=<fresh drift.status>` on the landed
+`:Blueprint`, and `_land_and_promote` stamps the fresh clean drift BEFORE landing — so a
+freshly-landed node carries `status='validated', drift_status='clean'`. The seed loader's
+`_UPSERT_BLUEPRINT` already writes both properties; `BlueprintSeed` defaults
+(`status='validated', drift_status='clean'`) keep the hand-authored fixtures byte-identical.
+This is exactly what the recall filter keys on.
+
+### 9.2 The recall filter (fail-CLOSED backstop) — `vector_index._BLUEPRINT_RECALL_QUERY`
+Added to the blueprint recall Cypher, after the model-parity guard:
+
+```
+AND coalesce(node.status, 'validated') = 'validated'
+AND coalesce(node.drift_status, 'clean') <> 'suspect'
+```
+
+- **Seed-compat (load-bearing):** the `coalesce(...)` defaults treat an ABSENT property as
+  recallable, so a hand-authored seed node with no lifecycle stamp — or the
+  `validated`/`clean` the fixtures + loop-landed nodes carry — stays recallable. Only an
+  EXPLICIT `candidate`/`retired`/`rejected` status OR a `suspect` drift is excluded. The
+  retrieval Layer-1 (`test_neo4j_index.py`) and Layer-2 (`test_neo4j_vector_index_live.py`)
+  suites are byte-unchanged/green — the seed corpus recall is unaffected.
+- The `_KNOWLEDGE_RECALL_QUERY` is deliberately UNCHANGED — only blueprints land via the
+  loop, so retraction is a blueprint concern.
+- `getBlueprint` (`_GET_BLUEPRINT_QUERY`) is a keyed metadata read, NOT recall, and is left
+  unfiltered so incident-response / read-tools can still fetch a demoted node's projection.
+
+### 9.3 The retraction write-back (fail-OPEN) — `CorpusLandingWriter.update_status`
+`update_status(env, *, status, drift_status)` MATCHes the landed node by the SAME
+deterministic `landing_id` and SETs the two lifecycle scalars (`_RETRACT_BLUEPRINT`). It
+does NO embed / model-parity / entity-defense (it mutates only two scalars on an existing
+node, never re-writing the intent/embedding/payload). MATCH-by-id makes it an idempotent
+safe no-op for a never-landed / already-retracted node (returns `False`; a hit returns
+`True`, for the caller's observability log). It RAISES on a driver failure — the scheduler
+catches it. Added to the `LandingWriter` port Protocol; the concrete impl reuses the same
+injected driver, so the factory (`build_promotion_write_plane`) needs NO change.
+
+### 9.4 Wiring + the fail-open / convergence reconciliation — `scheduler._retract_corpus`
+The scheduler gained one fail-open helper, `_retract_corpus(env, *, status, drift_status)`,
+wired onto every status-transition edge that changes recall-eligibility:
+
+- **`_recheck_validated` demote branch** (drift-suspect / replay-fail) → node
+  `status='candidate', drift_status='suspect'`, written BEFORE the store demote (a crash
+  between leaves the node un-recallable — the safe direction).
+- **`apply_user_correction`** → node `status='candidate', drift_status='suspect'` before the
+  store demote.
+- **`apply_human_decision` reject** → node `status='rejected'` before the store reject
+  (usually a no-op — reject fires from `in_review`, never landed — but a previously-landed
+  blueprint CAN be rejected, so it is meaningful).
+- **`apply_retract` (NEW, review BLOCKER 2)** → node `status='retired'` before the store
+  retire. `ReviewInbox.retract` (the leak/drift PULL, §11.4) now DELEGATES here instead of
+  writing `RETIRED` straight to the store, so the highest-stakes human edge — pulling a
+  LEAKED blueprint from recall — actually stamps the node. Physical index removal stays S10;
+  the stamp is what closes the recall exposure NOW.
+- **`_advance_candidate` convergence re-assert (NEW, review BLOCKER 1)** — a DEMOTED
+  blueprint (`drift.status == "suspect"`, back in the `candidate` scan) re-stamps its node
+  `candidate`/`suspect` at the TOP of every cycle, BEFORE its guards run. If it re-promotes,
+  the land overwrites the stamp with `validated`/`clean`; if it holds, the stamp stands.
+- **`_recheck_validated` clean branch** → RE-ASSERTS `status='validated', drift_status='clean'`
+  on every clean rescan (the self-heal direction).
+
+**Reconciliation (why a transient neo4j failure can't leave a demoted blueprint recallable).**
+The corpus write-back is FAIL-OPEN: `_retract_corpus` swallows + LOUDLY logs every exception,
+so the authoritative store transition is never blocked by a neo4j hiccup. **The recall filter
+alone is NOT a backstop for a failed demote write-back** — its `coalesce(...)` seed-compat
+default reads an UN-stamped node as `validated`/`clean` (fail-OPEN precisely so a bare seed
+node stays recallable), so a demote whose write-back threw leaves the node recallable UNTIL it
+is stamped. Convergence therefore rests on the per-cycle RE-ASSERTS, one per direction:
+(1) a demoted blueprint re-stamps ineligible in the `_advance_candidate` candidate scan every
+cycle (BLOCKER-1 fix) — it converges to non-recallable the first cycle neo4j is reachable, and
+a blueprint that stays demoted keeps being re-stamped (it never re-lands, so it never regains a
+recallable stamp); (2) a still-validated blueprint re-stamps `validated`/`clean` in the clean
+`_recheck_validated` rescan. The recall filter is the fail-CLOSED gate the moment the node IS
+stamped; the re-asserts are what guarantee it gets stamped. Together they mean the corpus
+cannot stay permanently out of sync with the store's authoritative status.
+
+### 9.5 Tests
+- **Layer-1 (20 new):** recall-filter compat — the query carries the exact coalesce clauses,
+  knowledge query unfiltered, absent/`validated`+`clean` recallable, `candidate`/`retired`/
+  `rejected`/`suspect` excluded (`S9-recall-seed-compat`, `S9-recall-filters-ineligible`,
+  `test_recall_status_filter.py`); the demote/user-correction/reject edges stamp the node
+  back; a FAILING write-back → store demote still succeeds + logged (`S9-demote-writes-back-
+  failopen`); a failed demote write-back CONVERGES the next cycle via the candidate-scan
+  re-assert (BLOCKER 1); the inbox retract stamps the node `retired` + `apply_retract`
+  non-validated no-op (BLOCKER 2); the retract-before-store ORDERING on the demote +
+  user-correction edges; the clean rescan re-asserts (`S9-retract-self-heals`); the writer's
+  idempotent double-retract + never-landed no-op via a fake driver; the dormant
+  `landing_writer=None` no-op (`test_corpus_retraction.py`).
+- **Layer-2 (`test_learning_corpus_landing_live.py`, RUN GREEN):** land a validated blueprint
+  alongside the hand-authored seed corpus → both recallable; DEMOTE it via `update_status`
+  → the landed node is NO LONGER recalled while the hand-authored seed stays recallable
+  throughout. The retrieval Layer-2 (`test_neo4j_vector_index_live.py`) is re-run GREEN — the
+  seed corpus recall is unregressed by the new filter.
+
+### 9.6 Deviations
+- **`ReviewInbox.retract` DELEGATES to `PromotionScheduler.apply_retract`** (rather than the
+  inbox owning its own landing-writer). The inbox already holds the wired scheduler and
+  already delegates approve/reject to it (R4, one implementation), so routing retract the same
+  way keeps every corpus-write edge in the scheduler (single owner) and reuses the fail-open
+  `_retract_corpus`. An UNWIRED inbox's default scheduler has no landing writer, so retract is
+  store-only there (unchanged) — the STAMP happens only when a real writer is wired, exactly
+  like the other edges.
+- **Retraction is a METHOD on `CorpusLandingWriter`, not a sibling `CorpusRetractor`.** The
+  writer already holds the injected driver and is already the scheduler's only corpus-write
+  port; adding `update_status` there reuses the driver, gates retraction naturally on
+  `landing_writer is not None` (no writer ⇒ nothing landed ⇒ nothing to retract), and needs
+  no factory/entrypoint change. No behavior difference from a sibling class.
+- **Write-back FLIPS the stamp; it does NOT `DETACH DELETE` the node.** Keeping the node
+  (demoted) preserves its provenance (`created_by`, `source_candidate_id`) for incident
+  response and lets a genuine re-promotion re-land idempotently onto the same id. The recall
+  filter is what makes it non-recallable, so a delete would add nothing but lose the audit
+  handle.

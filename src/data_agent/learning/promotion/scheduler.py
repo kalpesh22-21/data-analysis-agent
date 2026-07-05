@@ -157,6 +157,22 @@ class PromotionScheduler:
     # -- candidate → validated (the auto-promotion edge) ----------------------
 
     async def _advance_candidate(self, env: CandidateEnvelope) -> CandidateDecision:
+        # Demote-direction CONVERGENCE re-assert (Slice 3 §9.4, review BLOCKER 1). A
+        # DEMOTED blueprint (`drift.status == "suspect"`, now back in the `candidate`
+        # scan) re-stamps its landed node ineligible EVERY cycle here — because the
+        # demote edge's write-back is fail-open (a transient neo4j failure at demote
+        # leaves the node `validated`/`clean`, i.e. still RECALLABLE, and the
+        # coalesce-default recall filter does NOT catch an un-stamped node). The
+        # clean-branch re-assert only scans `validated`, so it never revisits this
+        # now-`candidate` envelope — THIS is the re-assert that closes the loop: it is
+        # idempotent (one MATCH/SET) and converges the node to non-recallable once neo4j
+        # recovers. If this blueprint goes on to RE-PROMOTE below, the land overwrites
+        # the stamp with `validated`/`clean`, so running it up front is safe.
+        if env.type == BLUEPRINT_TYPE and env.drift.status == "suspect":
+            await self._retract_corpus(
+                env, status=env.status, drift_status="suspect"
+            )
+
         # Human-gated / non-blueprint targets never auto-promote here (D58a/D18):
         # global_knowledge + schema_edit are T=∞ (S7 inbox → human approve);
         # user_knowledge auto-commits in S8. Leave them as candidate.
@@ -246,6 +262,15 @@ class PromotionScheduler:
             # Clean drift → stays validated; re-stamp clean+fresh (silent-eligible).
             refreshed = replace(env, drift=drift)
             await self._store.put(refreshed)
+            # Slice 3 self-heal (§8.6): RE-ASSERT the landed node's recall-eligibility
+            # stamp every clean rescan. Belt-and-suspenders — a demote's write-back that
+            # transiently failed (fail-open below) leaves a stale node; the recall filter
+            # keeps it out meanwhile, and this periodic re-assert repairs the stamp once
+            # the blueprint is validated + clean again, so a transient neo4j failure can
+            # never leave the corpus permanently out of sync with the store.
+            await self._retract_corpus(
+                refreshed, status=CandidateStatus.VALIDATED, drift_status=drift.status
+            )
             return CandidateDecision(
                 env.candidate_id, env.type, "drift_clean", env.status, env.status,
                 reason=None,
@@ -254,6 +279,13 @@ class PromotionScheduler:
         # review flag is carried by `status=candidate` + `drift.status=suspect`
         # (naming the failed probe) — S9 owns only `status` + `drift` (D102).
         demoted = replace(env, status=CandidateStatus.CANDIDATE, drift=drift)
+        # Slice 3 (§8.6): write the demote back to the landed neo4j node FIRST (so a
+        # crash between here and the store write leaves the node un-recallable — the
+        # SAFE direction), then the authoritative store demote. The corpus write-back
+        # FAILS OPEN (see `_retract_corpus`): the store demote must never be blocked.
+        await self._retract_corpus(
+            demoted, status=CandidateStatus.CANDIDATE, drift_status=drift.status
+        )
         await self._store.put(demoted)
         return CandidateDecision(
             env.candidate_id, env.type, "demote", env.status,
@@ -284,6 +316,15 @@ class PromotionScheduler:
         """
         if decision == "reject":
             rejected = replace(env, status=CandidateStatus.REJECTED)
+            # Slice 3 (§8.6): retract the landed node so a reject is not recallable.
+            # A reject usually fires from `in_review` (never landed → an idempotent
+            # no-op), but a previously-landed blueprint CAN be rejected here, so the
+            # write-back is meaningful; fail-open, store reject is source-of-truth.
+            await self._retract_corpus(
+                rejected,
+                status=CandidateStatus.REJECTED,
+                drift_status=env.drift.status,
+            )
             await self._store.put(rejected)
             return CandidateDecision(
                 env.candidate_id, env.type, "reject", env.status,
@@ -382,10 +423,42 @@ class PromotionScheduler:
             status=CandidateStatus.CANDIDATE,
             drift=user_correction_stamp(now=self._clock()),
         )
+        # Slice 3 (§8.6): write the demote back to the landed node FIRST (safe
+        # direction on a crash), then the authoritative store demote. Fail-open —
+        # a corpus-write failure must never block a user correction.
+        await self._retract_corpus(
+            demoted,
+            status=CandidateStatus.CANDIDATE,
+            drift_status=demoted.drift.status,
+        )
         await self._store.put(demoted)
         return CandidateDecision(
             env.candidate_id, env.type, "demote", env.status,
             CandidateStatus.CANDIDATE, reason="user_correction",
+        )
+
+    async def apply_retract(self, env: CandidateEnvelope) -> CandidateDecision:
+        """Retract a promoted artifact `validated → retired` (the inbox leak/drift PULL,
+        §11.4) — the SINGLE implementation `ReviewInbox.retract` delegates to, so the
+        highest-stakes human edge (pulling a LEAKED blueprint from recall) enforces the
+        same corpus write-back as every other demote edge (review BLOCKER 2).
+
+        Stamps the landed node `retired` (fail-open, BEFORE the store retire so a crash
+        between leaves the node un-recallable — the safe direction), then writes
+        `retired` to the store. Idempotent for a non-validated env (a no-op hold — a
+        mis-routed retract never mutates). Physical index removal + the D25 exposure
+        trace remain S10; the STAMP here is what makes recall exclude the leaked node
+        NOW (the recall filter drops any non-`validated` status)."""
+        if env.status != CandidateStatus.VALIDATED:
+            return self._hold(env, "not_validated")
+        retired = replace(env, status=CandidateStatus.RETIRED)
+        await self._retract_corpus(
+            retired, status=CandidateStatus.RETIRED, drift_status=env.drift.status
+        )
+        await self._store.put(retired)
+        return CandidateDecision(
+            env.candidate_id, env.type, "retire", env.status,
+            CandidateStatus.RETIRED, reason=None,
         )
 
     # -- helpers --------------------------------------------------------------
@@ -466,6 +539,49 @@ class PromotionScheduler:
             landed.candidate_id, landed.type, action, from_status,
             CandidateStatus.VALIDATED, reason=None,
         )
+
+    async def _retract_corpus(
+        self, env: CandidateEnvelope, *, status: str, drift_status: str
+    ) -> None:
+        """FAIL-OPEN corpus write-back (S9-activation Slice 3, §8.6): stamp the landed
+        neo4j node's recall-eligibility (`status`/`drift_status`) via the landing
+        writer, keyed by the same deterministic landing id.
+
+        The store transition is SOURCE-OF-TRUTH and must SUCCEED even if this write-back
+        fails, so EVERY exception is swallowed and logged LOUDLY (never re-raised) — a
+        demote/reject/correction is never blocked by a neo4j hiccup. The recall filter's
+        coalesce default is fail-OPEN for an UN-stamped node (a node that never got
+        stamped still reads `validated`/`clean` ⇒ recallable), so the filter alone is NOT
+        a backstop for a FAILED demote write-back. Convergence is provided by the
+        per-cycle RE-ASSERTS instead:
+          * a DEMOTED blueprint (`drift.status == "suspect"`) re-stamps its node
+            ineligible every `_advance_candidate` cycle (the demote-direction re-assert);
+          * a still-validated blueprint's clean `_recheck_validated` re-stamps it
+            `validated`/`clean` (the self-heal direction).
+        So a transient failure at demote is retried each subsequent cycle and converges
+        the node to non-recallable once neo4j recovers.
+
+        No writer wired (the dormant Slice-1 state, `landing_writer is None`) ⇒ nothing
+        ever landed ⇒ nothing to retract ⇒ a no-op. Idempotent for a never-landed /
+        already-retracted node (the writer's MATCH-by-id matches nothing)."""
+        if self._landing_writer is None:
+            return
+        try:
+            await self._landing_writer.update_status(
+                env, status=status, drift_status=drift_status
+            )
+        except Exception:  # noqa: BLE001 - fail-OPEN: a corpus write must never block a demote
+            _logger.warning(
+                "corpus status write-back FAILED for candidate %s (status=%s, "
+                "drift_status=%s); the store transition proceeds (fail-open). This is "
+                "retried every subsequent cycle by the per-cycle re-assert (a demoted "
+                "blueprint re-stamps in the candidate scan; a validated one in the clean "
+                "rescan), converging the node to non-recallable once neo4j recovers.",
+                env.candidate_id,
+                status,
+                drift_status,
+                exc_info=True,
+            )
 
     async def _deps_resolved(self, env: CandidateEnvelope) -> bool:
         """True iff every `depends_on` ref resolves (§11.6). No deps ⇒ trivially

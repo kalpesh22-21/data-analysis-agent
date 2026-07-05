@@ -31,8 +31,6 @@ candidate).
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from ..candidate.models import CandidateEnvelope, CandidateStatus
 from ..candidate.store import CandidateStore
 from ..promotion.models import ProbeResult
@@ -120,8 +118,13 @@ class ReviewInbox:
 
     async def retract(self, candidate_id: str) -> CandidateEnvelope:
         """Retract a promoted artifact: `validated → retired` (a leak/drift pull).
-        The physical index removal + D25 exposure trace are deferred to S10 (§11.4)."""
+
+        DELEGATES to the single `apply_retract` path (like approve/reject) so the leak
+        PULL stamps the landed neo4j node `retired` (fail-open) BEFORE the store retire —
+        the recall filter then excludes it, so a leaked blueprint stops being recallable
+        immediately (S9-activation Slice 3, review BLOCKER 2). The physical index removal
+        + the D25 exposure trace remain S10 (§11.4); the STAMP is what closes the recall
+        exposure here and now."""
         env = await self._require(candidate_id, CandidateStatus.VALIDATED)
-        retired = replace(env, status=CandidateStatus.RETIRED)
-        await self._store.put(retired)
-        return retired
+        await self._scheduler.apply_retract(env)
+        return await self._store.get(candidate_id)

@@ -142,14 +142,28 @@ class FakeLandingWriter:
     idempotent re-land), and can be scripted to RAISE on the Nth call (a landing
     failure) so the scheduler HOLDS `landing_failed`."""
 
-    def __init__(self, *, fail: Exception | None = None, fail_times: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        fail: Exception | None = None,
+        fail_times: int = 0,
+        update_fail: Exception | None = None,
+        update_fail_times: int = 0,
+    ) -> None:
         self._fail = fail
         self._fail_times = fail_times
+        self._update_fail = update_fail
+        self._update_fail_times = update_fail_times
         self.landed: list[CandidateEnvelope] = []
         # Every `forbidden_spans` tuple handed to the writer (so a test can assert the
         # scheduler captured the PRE-strip entity spans, D17 last gate).
         self.forbidden_spans: list[tuple[str, ...]] = []
         self.calls = 0
+        # Every retraction write-back (S9-activation Slice 3): the (candidate, status,
+        # drift_status) the scheduler stamped, so a test can assert the demote/reject/
+        # user-correction edges + the clean-rescan re-assert wrote the node back.
+        self.status_updates: list[tuple[CandidateEnvelope, str, str]] = []
+        self.update_calls = 0
 
     async def land(
         self, env: CandidateEnvelope, *, forbidden_spans: tuple[str, ...] = ()
@@ -159,3 +173,12 @@ class FakeLandingWriter:
         if self._fail is not None and self.calls <= self._fail_times:
             raise self._fail
         self.landed.append(env)
+
+    async def update_status(
+        self, env: CandidateEnvelope, *, status: str, drift_status: str
+    ) -> bool:
+        self.update_calls += 1
+        if self._update_fail is not None and self.update_calls <= self._update_fail_times:
+            raise self._update_fail
+        self.status_updates.append((env, status, drift_status))
+        return True

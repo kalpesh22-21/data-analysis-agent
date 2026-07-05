@@ -139,10 +139,26 @@ _CORPUS_LABEL: dict[str, str] = {
 # embedded with a different model never comes back (empty → the pipeline's
 # empty-corpus degrade, D86), rather than garbage neighbours in a mismatched
 # vector space. ORDER BY score DESC keeps recall order-preserving.
+#
+# S9-activation Slice 3 — recall-eligibility filter (retraction backstop, design
+# §8.6). A blueprint is recallable ONLY while it is `status='validated'` with a
+# non-`suspect` drift. The learning loop's demote/reject/user-correction edges write
+# this stamp back onto the landed node (`CorpusLandingWriter.update_status`); this
+# `WHERE` is the FAIL-CLOSED backstop that keeps a demoted/broken blueprint out of
+# retrieval even in the window between a demotion and its write-back (or when the
+# write-back transiently failed — fail-open on the corpus write, fail-closed here).
+#
+# COMPAT (load-bearing): `coalesce(...)` treats an ABSENT property as recallable so
+# the existing hand-authored seed corpus stays byte-recallable — a seed node with no
+# `status`/`drift_status` (or `status='validated'` + `drift_status='clean'`, which is
+# what the fixtures + the loop-landed nodes carry) is unchanged. Only an EXPLICIT
+# `candidate`/`rejected`/`retired` status or a `suspect` drift is excluded.
 _BLUEPRINT_RECALL_QUERY = """
 CALL db.index.vector.queryNodes($index_name, $k, $query_vector)
 YIELD node, score
 WHERE node.embedding_model = $expected_model
+  AND coalesce(node.status, 'validated') = 'validated'
+  AND coalesce(node.drift_status, 'clean') <> 'suspect'
 RETURN node.id AS id, node.intent AS text, node.slots_summary AS slots_summary,
        node.uses AS uses, score
 ORDER BY score DESC
