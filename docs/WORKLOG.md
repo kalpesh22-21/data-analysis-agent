@@ -116,6 +116,17 @@ invariant→test status board.
   hit-count corpus is now durable (`CouchbaseBlueprintCorpus`, atomic `mutate_in`, insert-wins seed); the
   entrypoints (`run_learning_consumer.py` + new `run_learning_scheduler.py`) adopt the factory. Commits
   `574785c` (3a) + `0a8a028` (3b-i), each reviewed **APPROVE**. **1841 pass / 98 skipped, ruff clean.**
+  **The learning loop is now FUNCTIONALLY COMPLETE end-to-end (Session 21, S9-activation, 3 slices
+  `f93fd1a`/`fa30990`/`89e4694`): the promotion scheduler is REAL and the loop LEARNS AND FORGETS** — a
+  session's accepted SQL is lifted → generalized → dedup-accrued → replay-gated (real `MCPWarehouseProbe`
+  via MCP `runQuery` under a `uses`-scoped JWT, D98 never-a-value) → LANDED into the neo4j retrieval corpus
+  (recallable, `bp::{canonical_key}` idempotent MERGE) → and demoted/leaked/user-corrected blueprints are
+  RETRACTED from recall (recall filter + fail-open write-back + per-cycle re-assert). Two review-caught
+  subtle safety holes were closed: an empty-`uses` allow-all mint (Slice 1) and a provable-no-op D17 entity
+  last-gate (Slice 2); Slice 3's REQUEST CHANGES (self-heal only the safe direction + unwired retract edge)
+  both fixed. **1901 pass / 111 skipped, ruff clean; Layer-2 probe 3/3 + land+recall + retraction 7/1.**
+  Still **DORMANT** (`LEARNING_ENABLED` off; write plane activates only when neo4j+embedder+MCP+token
+  config all present) and Layer-2-proven, **not** Layer-3-conformance-proven. See Session 21 below.
   **Now Layer-2-PROVEN against real infra (Wave 3b-ii, commit `e520b33`):** docker stack up (real
   Couchbase + Redis + neo4j), `learning_user` provisioned via new `scripts/learning-user-init.sh` (all
   four buckets audit/candidates/corpus/user init'd), **39/39 learning Layer-2 tests GREEN** — the durable
@@ -124,10 +135,12 @@ invariant→test status board.
   proving **cross-session D48 `hit_count` accrual (1→2) on real Couchbase**. Non-live suite unchanged
   (422), ruff clean. So the **stores + queue + fully-wired pipeline are Layer-2-proven** — dormant still
   (`LEARNING_ENABLED` off, no request-path import). **Remaining = LAST-MILE ACTIVATION only** (NOT the
-  pipeline, which is proven): wire a real `WarehouseProbe`/`DependencyResolver` + a real GitHub PR client
-  to enable auto-promotion, and add the S9 corpus-landing writer (materialize a validated candidate into
-  the retrieval/neo4j plane); Layer-3 conformance for the loop + S10 retraction / D25 exposure trace stay
-  a separate later concern. See Sessions 20 (+cont.) + 19 below.
+  pipeline, which is proven): **the real `WarehouseProbe`/`DependencyResolver` + the S9 corpus-landing
+  writer + corpus retraction are now DONE (Session 21, S9-activation) — the promotion scheduler is REAL
+  and the loop learns + forgets**; what is left is a **real GitHub PR client** for the S8 schema-edit bot,
+  and the **production-activation checklist** (provision buckets + neo4j corpus schema + set the env).
+  Layer-3 conformance for the loop + D25 exposure trace / physical S10 index removal stay a separate later
+  concern. See Sessions 21 + 20 (+cont.) + 19 below.
 
 **Where we are (Session 14):** the **deferred-items** sweep is done — D90 (extractor fail-open) and
 D91 (D67 `resolve_via` wrong-answer) are both **fixed + reviewed**; the CI matrix, the D62 oracle, the
@@ -156,9 +169,11 @@ the offline learning loop** (the **last big Phase-1 deliverable**) is now **BUIL
 THROUGH at Layer-1 (Sessions 16–20) AND now Layer-2-PROVEN against real infra (Wave 3b-ii, `e520b33`:
 39/39 learning Layer-2 green incl. the full-pipeline-live cross-session D48 accrual proof) — see the
 Track-B bullet above — production-activatable but dormant**; its stores + queue + fully-wired pipeline
-are proven, so the **remaining step is LAST-MILE ACTIVATION only** (a real probe/resolver + GitHub PR
-client for auto-promotion + the S9 corpus-landing writer), **not** the pipeline and **not** a fresh
-start. The runtime's Phase-1 `getTableSchema` is just a passthrough
+are proven, and the **promotion scheduler is now REAL (Session 21, S9-activation): the loop LEARNS AND
+FORGETS end-to-end** (real probe/resolver + S9 corpus-landing writer + corpus retraction, all built +
+reviewed + committed). So the **remaining step is LAST-MILE ACTIVATION only** — a **real GitHub PR client**
+for the S8 schema-edit bot + the **production-activation checklist** (buckets + neo4j corpus schema + env)
+— **not** the pipeline and **not** a fresh start. The runtime's Phase-1 `getTableSchema` is just a passthrough
 of the now-MCP-side overlay (D83/D84).
 
 **Honest remaining Phase-0 gaps** (carried): the **3 deferred Layer-3 scenarios** — mid-session scope
@@ -230,6 +245,73 @@ authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's
   - **`resolveValues` Layer-2 over the real MCP** — still not run (carried from Session 9).
   - The **authoring-time static grain gate (D37/D37b)** stays Phase-2 — the runtime D56 gate is the
     launch teeth; wrong-grain blueprints are caught at execution, not yet at authoring.
+
+---
+
+## 2026-07-05 — Session 21: S9-activation — the promotion scheduler is now REAL (the loop learns AND forgets)
+
+The learning loop's promotion scheduler is **activated** across **3 reviewed + committed slices** (branch
+`phase0/provenance-extractor`). Before this arc the scheduler's write plane was three fail-closed stubs
+(a deferred warehouse probe, a deferred dependency resolver, and a MISSING corpus-landing writer), so a
+"validated" candidate never actually promoted into retrieval. **Now the loop closes end-to-end AND is
+reversible: a session's accepted SQL is lifted → generalized → dedup-accrued → replay-gated → LANDED into
+the neo4j retrieval corpus (recallable), and a demoted / leaked / user-corrected blueprint is RETRACTED
+from recall.** The loop learns and forgets. It is still **DORMANT** (`LEARNING_ENABLED` off; the write
+plane activates only when neo4j + embedder + MCP + token config are all present). Design:
+[decisions/learning-loop-s9-activation-design.md](decisions/learning-loop-s9-activation-design.md).
+
+- ✅ **Slice 1 — real probe + resolver (`f93fd1a`).** `MCPWarehouseProbe`: the golden-replay grain probe
+  now runs through MCP `runQuery` under a JWT minted for the blueprint's OWN `uses` (D57 teeth reused
+  verbatim — the offline replay travels the exact enforced path the live `runBlueprint` does). It **never
+  returns a value** (rows discarded, aggregates only, D98) and RAISES on any mint/MCP/parse failure →
+  `golden_replay` holds `probe_unavailable`. `CandidateStoreDependencyResolver` (fail-closed: missing /
+  non-`validated` / store-error ⇒ unresolved). The three grain-probe helpers were promoted verbatim into
+  a shared `runtime/blueprint/grain_probe.py`, imported by BOTH the live executor and the offline probe
+  and pinned by a **function-IDENTITY** test — the offline oracle CANNOT drift from the live one.
+  Auto-promotion stayed GATED on a landing writer (`landing_unavailable` hold). Reviewer **APPROVE WITH
+  FIXES** — **subtle safety hole #1:** an empty `uses` would have minted an **ALLOW-ALL** token (D80b);
+  the learning plane must never do that. Closed with two independent gates (`golden_replay` short-circuits
+  to a clean `no_uses_scope` HOLD before any mint/MCP call; `HttpTokenMinter` independently RAISES on an
+  empty scope) — `S9-empty-uses-refuses-allow-all` asserts ZERO mint/MCP calls. Layer-2 **3/3 live**: the
+  real grain probe returns 5 rows / 5 distinct vs `dbpcm_warehouse.employee`, and an out-of-`uses` column
+  is denied `COLUMN_SCOPE_VIOLATION` by the real D57 teeth.
+
+- ✅ **Slice 2 — the corpus-landing writer, the loop closes (`fa30990`).** On the `candidate → validated`
+  edge a validated blueprint is mapped (generalization → `BlueprintSeed`, entity-free fields ONLY),
+  embedded, and MERGE-landed into the neo4j retrieval corpus under a **deterministic id** (`bp::{canonical_key}`,
+  idempotent by construction) — so it becomes RECALLABLE. **The loop now closes end-to-end.** The order is
+  load-bearing: **land-then-status** ("not landed ⇒ not validated") — a landing failure holds `landing_failed`
+  and the candidate stays `candidate`; a crash between land and status re-lands idempotently next cycle.
+  Reviewer **APPROVE WITH FIXES** — **subtle safety hole #2:** the D17 entity last-gate was a **provable
+  no-op** because `strip_entity_bearing` blanks the very spans the tripwire re-derived; fixed by capturing
+  `redaction.entity_spans(pre_strip_env)` BEFORE the strip and passing them to `land` (the gate now fires
+  through the real scheduler path, proven by a test that regresses the strip to a no-op and STILL gets a
+  `landing_failed` hold). Plus a fresh drift stamp applied before landing (never a stale `suspect`) and a
+  `created_by='learning'` + `source_candidate_id` provenance stamp (so incident response can list/remove
+  everything the loop landed). Layer-2 land+recall live (land a validated candidate, recall it via
+  `Neo4jVectorIndex.recall`; a second land of the same canonical_key MERGEs to exactly ONE node).
+
+- ✅ **Slice 3 — corpus retraction, the loop forgets (`89e4694`).** The landing write is no longer one-way.
+  Recall now filters `coalesce(status,'validated')='validated' AND coalesce(drift_status,'clean')<>'suspect'`
+  (seed-compat: an ABSENT property stays recallable, so hand-authored fixtures are unregressed — only an
+  EXPLICIT `candidate`/`retired`/`rejected`/`suspect` is excluded). Demote / user-correction / reject /
+  leak-retract edges write back to the landed node (`update_status`, MATCH-by-id, **fail-OPEN** so a demote
+  is never blocked by a neo4j hiccup). A held-demoted (suspect) blueprint is **re-asserted every cycle** so
+  a transient neo4j failure converges to non-recallable; the inbox leak-PULL (`apply_retract`, validated →
+  retired) now stamps the node too. Reviewer **REQUEST CHANGES** — the first cut's self-heal covered only
+  the safe direction (a failed demote write-back could leave a node recallable indefinitely) AND the retract
+  edge was unwired; **both fixed** (the per-cycle candidate-scan re-assert closes the convergence gap; the
+  inbox `retract` now delegates to the scheduler's fail-open `_retract_corpus`). Layer-2 landing+retrieval
+  **7/1**: a demoted blueprint is EXCLUDED from recall while the hand-authored seed corpus stays recallable
+  throughout (unregressed).
+
+- **Gates at arc close:** full suite **1901 passed / 111 skipped, ruff clean.** The two independent
+  retraction backstops (the fail-closed recall filter + the per-cycle re-assert) mean the corpus cannot
+  stay permanently out of sync with the store's authoritative status.
+- **Honest boundary:** the learning loop is now **functionally COMPLETE** (promotion scheduler real, loop
+  learns + forgets) but **DORMANT** and **Layer-2-proven, not Layer-3-conformance-proven**. Remaining is
+  activation-only: a real GitHub PR client for the S8 schema-edit bot, and the production-activation
+  checklist (provision buckets + neo4j corpus schema + set the env). Nothing pushed; no git remote configured.
 
 ---
 
