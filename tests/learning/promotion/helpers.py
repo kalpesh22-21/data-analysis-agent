@@ -134,3 +134,28 @@ class FakeDependencyResolver:
 
     async def is_resolved(self, ref: str) -> bool:
         return ref in self._resolved
+
+
+class FakeLandingWriter:
+    """A Layer-1 `LandingWriter` double (no real neo4j). Records every landed
+    candidate envelope (so a test can assert land-BEFORE-status ordering + an
+    idempotent re-land), and can be scripted to RAISE on the Nth call (a landing
+    failure) so the scheduler HOLDS `landing_failed`."""
+
+    def __init__(self, *, fail: Exception | None = None, fail_times: int = 0) -> None:
+        self._fail = fail
+        self._fail_times = fail_times
+        self.landed: list[CandidateEnvelope] = []
+        # Every `forbidden_spans` tuple handed to the writer (so a test can assert the
+        # scheduler captured the PRE-strip entity spans, D17 last gate).
+        self.forbidden_spans: list[tuple[str, ...]] = []
+        self.calls = 0
+
+    async def land(
+        self, env: CandidateEnvelope, *, forbidden_spans: tuple[str, ...] = ()
+    ) -> None:
+        self.calls += 1
+        self.forbidden_spans.append(tuple(forbidden_spans))
+        if self._fail is not None and self.calls <= self._fail_times:
+            raise self._fail
+        self.landed.append(env)

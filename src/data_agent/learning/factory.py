@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from data_agent.runtime.session.store import SessionStore
 
@@ -64,8 +64,12 @@ from .leakage import (
     SemanticEntityScanner,
 )
 from .promotion import (
+    CandidateStoreDependencyResolver,
+    CorpusLandingWriter,
     DependencyResolver,
     HitCountReader,
+    LandingWriter,
+    MCPWarehouseProbe,
     PromotionPolicy,
     PromotionScheduler,
     WarehouseProbe,
@@ -77,6 +81,14 @@ from .schema_edit.pr_stage import SchemaEditPRStage
 from .stage import CandidateStage
 from .user import UserKnowledgeCommitStage, UserKnowledgeStore
 from .writer import WriterStage
+
+if TYPE_CHECKING:
+    from neo4j import AsyncDriver
+
+    from data_agent.runtime.mcp.client import MCPClient
+    from data_agent.runtime.model.embedding_client import EmbeddingClient
+
+    from .promotion import TokenMinter
 
 _logger = logging.getLogger(__name__)
 
@@ -258,7 +270,7 @@ def build_promotion_plane(
     probe: WarehouseProbe,
     hit_counts: HitCountReader,
     dependency_resolver: DependencyResolver | None = None,
-    landing_writer: object | None = None,
+    landing_writer: LandingWriter | None = None,
     require_landing: bool = False,
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
@@ -285,6 +297,50 @@ def build_promotion_plane(
     return scheduler, inbox
 
 
+def build_promotion_write_plane(
+    settings: LearningSettings,
+    *,
+    candidate_store: CandidateStore,
+    hit_counts: HitCountReader,
+    mcp_client: MCPClient,
+    token_minter: TokenMinter,
+    neo4j_driver: AsyncDriver,
+    embedding_client: EmbeddingClient,
+    model_id: str,
+    neo4j_database: str = "neo4j",
+    policy: PromotionPolicy | None = None,
+    clock: Callable[[], str] | None = None,
+) -> tuple[PromotionScheduler, ReviewInbox]:
+    """Assemble the FULLY-ACTIVATED S9 promotion WRITE plane (S9-activation Slice 2,
+    §4) — the scheduler + inbox with the REAL warehouse probe, dependency resolver,
+    AND corpus-landing writer, `require_landing` flipped ON.
+
+    The write plane is a UNIT (§4, mirroring the consumer factory's all-or-nothing
+    rule): the caller passes EVERY injected infra client — the MCP `runQuery`
+    transport, the offline token minter, the neo4j async driver, and the embedding
+    client — and this root wraps them into the three ports (probe / resolver / landing
+    writer). With a real writer present, `require_landing=True` no longer HOLDS
+    `landing_unavailable`; the scheduler LANDS a validated blueprint into neo4j FIRST,
+    then CAS-writes `validated` (`_land_and_promote`, §3.1). This module constructs NO
+    infra clients itself (that stays in the process entrypoint) — it only wires ports."""
+    probe = MCPWarehouseProbe(mcp_client=mcp_client, token_minter=token_minter)
+    resolver = CandidateStoreDependencyResolver(candidate_store)
+    landing_writer = CorpusLandingWriter(
+        neo4j_driver, embedding_client, model_id=model_id, database=neo4j_database
+    )
+    return build_promotion_plane(
+        settings,
+        candidate_store=candidate_store,
+        probe=probe,
+        hit_counts=hit_counts,
+        dependency_resolver=resolver,
+        landing_writer=landing_writer,
+        require_landing=True,
+        policy=policy,
+        clock=clock,
+    )
+
+
 def build_promotion_scheduler(
     settings: LearningSettings,
     *,
@@ -292,7 +348,7 @@ def build_promotion_scheduler(
     probe: WarehouseProbe,
     hit_counts: HitCountReader,
     dependency_resolver: DependencyResolver | None = None,
-    landing_writer: object | None = None,
+    landing_writer: LandingWriter | None = None,
     require_landing: bool = False,
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
@@ -384,5 +440,6 @@ __all__ = [
     "build_learning_consumer",
     "build_promotion_plane",
     "build_promotion_scheduler",
+    "build_promotion_write_plane",
     "build_review_inbox",
 ]

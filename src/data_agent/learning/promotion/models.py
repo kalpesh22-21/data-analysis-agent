@@ -23,7 +23,10 @@ ClickHouse, no real corpus store in tests.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
+
+if TYPE_CHECKING:
+    from ..candidate.models import CandidateEnvelope
 
 # Targets S9 NEVER auto-promotes by count (T = ∞ — human-gated, D58a/D18). A
 # blueprint auto-promotes at `blueprint_hit_threshold`; `user_knowledge`
@@ -151,6 +154,24 @@ class DependencyResolver(Protocol):
     async def is_resolved(self, ref: str) -> bool: ...
 
 
+class LandingWriter(Protocol):
+    """Materializes a validated candidate into the neo4j retrieval corpus so it
+    becomes RECALLABLE (S9-activation Slice 2, §3). Injected/fake in Layer-1 (no real
+    neo4j). `land` MERGE-upserts the blueprint by a deterministic id (idempotent
+    re-land) and RAISES on any failure — a model-parity violation, an entity leaking
+    into the seed (the last-gate D17 defense), or a neo4j write error — so the
+    scheduler HOLDS `landing_failed` and NEVER writes `validated` (not landed ⇒ not
+    validated, §3.1). The concrete impl is `promotion/landing.py::CorpusLandingWriter`.
+
+    `forbidden_spans` are the entity spans S5 identified, captured by the scheduler
+    BEFORE `strip_entity_bearing` blanks them, so the last-gate defense can fire even
+    though a validated candidate's own `entity_scan` is blanked (§3.3)."""
+
+    async def land(
+        self, env: CandidateEnvelope, *, forbidden_spans: tuple[str, ...] = ()
+    ) -> None: ...
+
+
 __all__ = [
     "BLUEPRINT_TYPE",
     "HUMAN_GATED_TYPES",
@@ -158,6 +179,7 @@ __all__ = [
     "DecisionAction",
     "DependencyResolver",
     "HitCountReader",
+    "LandingWriter",
     "ProbeResult",
     "PromotionPolicy",
     "PromotionSweep",

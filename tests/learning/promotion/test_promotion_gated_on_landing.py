@@ -10,14 +10,13 @@ behavior.
 
 from __future__ import annotations
 
-import pytest
-
 from data_agent.learning.candidate import InMemoryCandidateStore
 from data_agent.learning.candidate.models import CandidateStatus
 from data_agent.learning.promotion import PromotionPolicy, PromotionScheduler
 
 from .helpers import (
     FakeHitCountReader,
+    FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
 )
@@ -80,18 +79,21 @@ async def test_promotes_when_landing_not_required() -> None:
     assert sweep.decisions[0].action == "promote"
 
 
-def test_non_none_landing_writer_is_refused_until_slice_2() -> None:
-    """The Slice-1 gate keys on writer PRESENCE, not on a successful LAND (no
-    land-then-promote sequence exists yet). A caller passing any object would get a
-    `validated`-but-unrecallable blueprint — so a non-None writer FAILS LOUDLY."""
-    with pytest.raises(ValueError, match="landing_writer is unsupported"):
-        PromotionScheduler(
-            InMemoryCandidateStore(),
-            probe=FakeWarehouseProbe(),
-            hit_counts=FakeHitCountReader({KEY: 5}),
-            landing_writer=object(),  # any non-None writer
-            require_landing=True,
-        )
+async def test_real_writer_lands_then_promotes_clearing_the_gate() -> None:
+    """Slice 2: with a real (fake) landing writer present, the `landing_unavailable`
+    hold CLEARS — the blueprint LANDS then promotes to `validated` (the gate is a
+    presence check ONLY when no writer is wired)."""
+    store = InMemoryCandidateStore()
+    env = make_blueprint_candidate(status=CandidateStatus.CANDIDATE, canonical_key=KEY)
+    await store.put(env)
+    writer = FakeLandingWriter()
+    sched = _scheduler(store, probe=FakeWarehouseProbe(), require_landing=True, landing_writer=writer)
+
+    sweep = await sched.run_once()
+
+    assert writer.calls == 1
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.VALIDATED
+    assert sweep.decisions[0].action == "promote"
 
 
 async def test_human_approve_blueprint_holds_when_gated() -> None:

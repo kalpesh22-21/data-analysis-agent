@@ -446,3 +446,145 @@ end-to-end + the out-of-`uses` column denied by the real D57 scope.
   declared `ge=1, le=10000` (`clickhouse-api/app/mcp_server.py`), so `limit: 0` is
   REJECTED by request validation — it is not a "no limit" sentinel. 1 is the minimum;
   D98 is already satisfied (the single fetched row never reaches `ProbeResult`/logs).
+
+---
+
+## 8. Slice 2 — AS BUILT (landing writer + full activation)
+
+Status: BUILT (branch `phase0/provenance-extractor`). The loop's FIRST write into what
+gets RECALLED is live: on `candidate → validated` a validated blueprint LANDS into the
+neo4j retrieval corpus (becomes recallable), then its `validated` status is written.
+Auto-promotion-into-retrieval is now FULLY ON when every real port is configured.
+
+### 8.1 The candidate → `BlueprintSeed` mapping + deterministic id
+- **`generalize/mapping.py::blueprint_seed_from_candidate(env, *, id)`** — the parallel
+  projection to §3.2. It REUSES `blueprint_from_generalization` to VALIDATE + normalize
+  the structure (the same parse the executable blueprint takes), then projects the
+  generalized, entity-free fields onto a `BlueprintSeed`: `intent`←payload,
+  `uses`/`sql_template`/`uses_rules`/`result_grain`←generalization, `resolves`/`slots`/
+  `composes`←the S3 plan (via two extracted helpers `_slot_docs`/`_compose_docs` now
+  shared by BOTH `blueprint_from_generalization` and the seed map, so the landed seed
+  and the executable blueprint can never drift), `status="validated"`, `drift_status`←
+  the fresh stamp. It reads ONLY generalized fields — never `evidence`, audit spans, or
+  entity-bearing payload (D17). Raises `ValueError` on a candidate with no
+  `generalization` (fail-closed).
+- **Deterministic id (`promotion/landing.py::landing_id`)** — `f"bp::{canonical_key}"`
+  from the S6 dedup identity, so a re-promotion MERGEs the SAME neo4j node (idempotent
+  by construction — `load_corpus` MERGEs by `id`). Fallback `f"bp::{candidate_id}"` when
+  no canonical_key exists (a human-approved blueprint that never ran S6, OQ-3). Both
+  forms SHARE the `bp::` prefix; disjointness rests on the SHAPE of the suffix — a
+  `sha256:`-shaped canonical key vs. a `candidate::`-shaped candidate id — so the two
+  never collide. The fallback has a semantic-dupe window (two candidates for the same
+  canonical blueprint that never ran S6 land as two nodes); `CorpusLandingWriter.land`
+  WARNs whenever it lands under the fallback so that window is observable. A re-map of
+  the same candidate is BYTE-identical (`BlueprintSeed` frozen-dataclass equality).
+
+### 8.2 The land-then-status invariant + crash-safety
+- **`promotion/landing.py::CorpusLandingWriter`** — wraps the reused
+  `runtime/retrieval/corpus_loader.load_corpus([seed], [], model_id=…, ensure_schema=
+  False)` over an INJECTED neo4j async driver + the real `HttpEmbeddingClient` (the same
+  D71 endpoint online recall embeds against — parity by construction). `load_corpus`
+  embeds the `intent`, MERGE-upserts by the deterministic id, and enforces model-parity
+  (`check_model_parity`, first statement of the write txn → `CorpusLoadError` on a
+  mismatch). `ensure_schema=False`: the scheduler is a WRITER, not a provisioner (§3.3).
+- **Entity-strip DEFENSE (last gate, D17).** Before ANY embed/neo4j write, the writer
+  asserts no SETTLED S5 entity span leaked into the generalized seed
+  (`_assert_seed_entity_free`) — on the normal path the candidate is stripped at
+  validation (spans blanked ⇒ no-op); this is the tripwire for a bug/adversarial path
+  where an un-stripped envelope reaches the global write. A detection RAISES
+  `LandingEntityError` (never lands).
+- **`scheduler.py::_land_and_promote(env, drift, *, action)`** — the SINGLE land-then-
+  status sequence on the `→ validated` edge, shared by the auto (`_advance_candidate`)
+  and human-approve paths. Order is load-bearing: `strip_entity_bearing` (idempotent —
+  the human path already stripped at Guard 2; the auto path only CHECKED entity_scan) →
+  `landing_writer.land(env)` → CAS `status = validated`. Invariant **"not landed ⇒ not
+  validated"**: a landing failure returns a HOLD `landing_failed` and the candidate
+  stays `candidate`/`in_review` (never a half state); a crash BETWEEN land and the
+  status write leaves the candidate un-promoted and the next cycle re-lands idempotently
+  (MERGE) then writes status. The Slice-1 constructor refusal of a non-None
+  `landing_writer` is REMOVED; the param is typed `LandingWriter | None` (a new port
+  Protocol in `promotion/models.py`).
+
+### 8.3 The factory + flip-on wiring
+- **`factory.py::build_promotion_write_plane(...)`** — the fully-activated write plane as
+  a UNIT (§4): it takes the injected infra clients (MCP `runQuery` transport, token
+  minter, neo4j driver, embedding client + model id) and wraps them into the three ports
+  (`MCPWarehouseProbe` + `CandidateStoreDependencyResolver` + `CorpusLandingWriter`),
+  then delegates to `build_promotion_plane` with `require_landing=True`. It constructs NO
+  infra clients itself (that stays in the entrypoint). With a real writer present the
+  `landing_unavailable` hold CLEARS.
+- **`scripts/run_learning_scheduler.py`** — `write_plane_ready` now additionally requires
+  `neo4j_url` + `neo4j_username` + `embedding_api_url` (the landing writer's ports)
+  alongside the Slice-1 MCP/token config. When ALL are present the entrypoint builds the
+  neo4j driver + embedding client and calls `build_promotion_write_plane` (FULL
+  auto-promotion + neo4j landing ACTIVE); missing ANY port ⇒ the deferred stubs with
+  `landing_writer=None, require_landing=False` (dormant, fail-closed). The driver is
+  closed on shutdown.
+
+### 8.4 Tests
+- **Layer-1 (17 new/updated):** the mapping + deterministic id + identical re-map
+  (`S9-land-only-validated`, `test_landing_writer.py`); the entity-strip defense — an
+  entity in the seed → `LandingEntityError`, ZERO embed/neo4j calls
+  (`S9-land-entity-strip-defense`); land-then-status ordering, a crash-after-land-before-
+  status re-landing idempotently, and a landing failure holding `landing_failed` on BOTH
+  edges (`S9-land-then-status-idempotent`, `S9-landing-failure-holds`,
+  `test_land_then_status.py`); the full `candidate→validated` happy path (real replay-
+  pass + hit_count≥T + a fake landing writer ⇒ landed BEFORE the status flip). The
+  Slice-1 gated test's obsolete "non-None writer refused" case is replaced by a real-
+  writer-lands-then-promotes regression.
+- **Layer-2 (`test_learning_corpus_landing_live.py`, NEO4J_TEST_URI + EMBEDDING_TEST_URL-
+  guarded, RUN GREEN against the live l2 stack):** land a validated candidate via the
+  REAL writer then RECALL it through `Neo4jVectorIndex.recall` with byte-exact `uses`
+  (recallable end-to-end); a second land of the same canonical_key MERGEs to exactly ONE
+  `:Blueprint` node (idempotency).
+
+### 8.5 Deviations from the Slice-2 plan
+- **`LandingWriter.land` takes the ENVELOPE (+ `forbidden_spans`), not a pre-built
+  seed.** §3.1 sketched `land(seed)` with the seed built in the scheduler; the writer
+  instead owns the whole map→defense→write pipeline (`land(env, *, forbidden_spans)`),
+  keeping the mapping + the last-gate defense colocated in the one module that performs
+  the global write (a cleaner single responsibility; the scheduler stays status-only,
+  D102). No behavior change.
+- **The entity defense asserts against PRE-strip spans passed by the scheduler, not
+  spans re-derived at the writer.** The strip blanks `entity_scan` (`span=""`), so
+  re-deriving spans at the writer (as the first Slice-2 cut did) made the tripwire a
+  provable no-op on BOTH wired edges (review BLOCKER). Fixed: the scheduler captures
+  `redaction.entity_spans(pre_strip_env)` — on the auto edge before `_land_and_promote`,
+  on the human edge before Guard 2's strip — and passes them to `land`. The writer
+  RAISES `LandingEntityError` if any survives into the seed; the tripwire now fires
+  through the real scheduler path (proven by a test that regresses the strip to a no-op
+  and still gets a `landing_failed` hold). It never silently re-redacts.
+- **Fresh drift stamped BEFORE landing (review S1).** `_land_and_promote` now applies
+  the fresh `drift` to the env before the land (`replace(strip_entity_bearing(env),
+  drift=drift)`), so the landed seed's `drift_status`, the crash-retry re-land, and the
+  status write all carry the SAME fresh stamp — never the stale pre-promotion
+  `unchecked`/`suspect`.
+- **Provenance stamp (review S3).** A loop-landed node carries `created_by="learning"`
+  + `source_candidate_id` (vs. a hand-authored `created_by="seed"`), so incident
+  response can list/remove everything the loop landed. `BlueprintSeed.created_by`
+  defaults to `"seed"` and `source_candidate_id=None` (which sets no property), so
+  existing fixture nodes are byte-identical.
+- **The status write is a plain store upsert, not a CAS.** S9 assumes a SINGLE
+  promotion writer (the cron scan and the human-approve path both serialize through this
+  scheduler over the shared store, §7.2); a second concurrent writer is out of scope and
+  would need a compare-and-set. The comments were corrected from the overstated "CAS".
+
+### 8.6 KNOWN GAP — corpus retraction (S9-activation Slice 3, next-slice obligation)
+
+**This slice makes a demoted/broken blueprint stay recallable.** A drift-suspect
+demotion (`_recheck_validated`) or a user-correction (`apply_user_correction`) writes
+`status = candidate` back to the Couchbase candidate store but NEVER touches the landed
+neo4j node, and `_BLUEPRINT_RECALL_QUERY` has NO status/drift filter (it selects on the
+vector index only). So a blueprint that was demoted for drift-suspicion or corrected by a
+user REMAINS fully recallable AND runnable from the retrieval corpus — the landing write
+is currently one-way.
+
+**S9-activation Slice 3 — corpus retraction (REQUIRED follow-on):**
+- a demote / reject / user-correction MUST write back to (or remove) the landed neo4j
+  node — e.g. flip `b.status`/`b.drift_status` on the node, or DETACH DELETE it;
+- AND `recall` MUST filter on the landed `status`/`drift_status` (only
+  `status='validated'` + non-`suspect` drift is recallable) so a stale node cannot be
+  retrieved even between a demotion and its write-back.
+
+Until Slice 3 lands, a demoted blueprint remains recallable — a KNOWN, tracked gap, not a
+silent one. It is NOT built here (this slice is the forward WRITE path only).

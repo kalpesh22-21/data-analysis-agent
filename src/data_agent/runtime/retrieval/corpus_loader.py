@@ -75,6 +75,14 @@ class BlueprintSeed:
     status: str = "validated"
     drift_status: str = "clean"
     catalog_sha: str = ""
+    # Provenance (S9-activation Slice 2 review S3). `created_by` distinguishes a
+    # hand-authored seed (`"seed"`, the default so existing fixtures stay byte-
+    # identical) from a blueprint the LEARNING LOOP landed (`"learning"`), and
+    # `source_candidate_id` stamps the originating candidate — so incident response
+    # can list/remove everything the loop landed. `source_candidate_id=None` sets no
+    # neo4j property (neo4j drops a `SET x = null`), so a fixture node is unchanged.
+    created_by: str = "seed"
+    source_candidate_id: str | None = None
     # --- additive full-DAG fields, the runBlueprint brick (OQ-T1, §1.2). All
     # optional-defaulted so existing D87/D88 fixtures still load (no migration).
     # Stored as JSON-string properties on the `:Blueprint` node; unread by recall.
@@ -211,7 +219,8 @@ SET b.intent = $intent,
     b.status = $status,
     b.drift_status = $drift_status,
     b.catalog_sha = $catalog_sha,
-    b.created_by = 'seed',
+    b.created_by = $created_by,
+    b.source_candidate_id = $source_candidate_id,
     b.created_at = coalesce(b.created_at, datetime()),
     b.hit_count = coalesce(b.hit_count, 0),
     b.resolves_json = $resolves_json,
@@ -911,6 +920,8 @@ async def load_corpus(
                     status=bp.status,
                     drift_status=bp.drift_status,
                     catalog_sha=bp.catalog_sha,
+                    created_by=bp.created_by,
+                    source_candidate_id=bp.source_candidate_id,
                     **_dag_properties(bp),
                 )
                 # S1: unconditional — rewrites the edge set (delete-then-add), so

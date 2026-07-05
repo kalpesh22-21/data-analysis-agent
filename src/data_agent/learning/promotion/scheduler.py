@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 
 from ..candidate.generalization import BlueprintGeneralization
 from ..candidate.models import CandidateEnvelope, CandidateStatus
-from ..candidate.redaction import strip_entity_bearing
+from ..candidate.redaction import entity_spans, strip_entity_bearing
 from ..candidate.store import CandidateStore
 from ..candidate.verdicts import DriftStamp, LeakageVerdict
 from ..config import learning_enabled
@@ -51,6 +51,7 @@ from .models import (
     CandidateDecision,
     DependencyResolver,
     HitCountReader,
+    LandingWriter,
     PromotionPolicy,
     PromotionSweep,
     WarehouseProbe,
@@ -83,26 +84,19 @@ class PromotionScheduler:
         hit_counts: HitCountReader,
         policy: PromotionPolicy | None = None,
         dependency_resolver: DependencyResolver | None = None,
-        # S9-activation Slice 1 landing gate (S9-design §4). A blueprint becomes
-        # RECALLABLE only when it LANDS in the neo4j retrieval corpus; the landing
-        # writer is Slice 2. When `require_landing` is set (and no writer is wired,
-        # the only Slice-1 state), a blueprint that passes EVERY guard (incl. the real
-        # replay gate) HOLDS `landing_unavailable` instead of promoting — a real probe
-        # with no landing writer would validate a blueprint that never becomes
-        # recallable (the silent gap). Both default OFF so today's callers are unchanged.
-        landing_writer: None = None,
+        # S9-activation landing writer + gate (§3/§4). A blueprint becomes RECALLABLE
+        # only when it LANDS in the neo4j retrieval corpus. Slice 2 wires a REAL
+        # `landing_writer`: on the `→ validated` edge the scheduler LANDS FIRST, then
+        # CAS-writes `status = validated` (`_land_and_promote`) — "not landed ⇒ not
+        # validated" (§3.1). When `require_landing` is set but NO writer is wired
+        # (the Slice-1 dormant state), a blueprint that passes EVERY guard (incl. the
+        # real replay gate) HOLDS `landing_unavailable` instead of promoting — a real
+        # probe with no landing writer would validate a never-recallable blueprint (the
+        # silent gap). Both default OFF so today's callers are unchanged.
+        landing_writer: LandingWriter | None = None,
         require_landing: bool = False,
         clock: Callable[[], str] = _now_iso,
     ) -> None:
-        # Slice 1 has no land-then-promote sequence: keying the gate on writer PRESENCE
-        # (not on a successful LAND) would let a caller passing any object get a
-        # blueprint promoted to `validated` with nothing ever landed. Refuse a non-None
-        # writer until Slice 2 replaces this gate with a real land-then-promote step.
-        if landing_writer is not None:
-            raise ValueError(
-                "landing_writer is unsupported until S9-activation Slice 2 "
-                "(no land-then-promote sequence exists yet)"
-            )
         self._store = store
         self._probe = probe
         self._hit_counts = hit_counts
@@ -200,20 +194,29 @@ class PromotionScheduler:
         if count < self._policy.blueprint_hit_threshold:
             return self._hold(env, "below_hit_threshold")
 
-        # Guard 5 — landing gate (S9-activation Slice 1, §4). A blueprint that passes
-        # EVERY guard above (including the now-REAL replay gate) still must not promote
-        # to `validated` until it can LAND in the neo4j retrieval corpus — otherwise it
-        # would be `validated` but never recallable (the silent gap). Until the landing
-        # writer is wired (Slice 2), HOLD `landing_unavailable`. The replay gate has
-        # already RUN and PASSED here — this slice makes that provable, keeping
-        # auto-promotion-into-retrieval dormant.
+        # Guard 5 — landing gate (§3/§4). A blueprint that passes EVERY guard above
+        # (including the now-REAL replay gate) still must not promote to `validated`
+        # until it can LAND in the neo4j retrieval corpus — otherwise it would be
+        # `validated` but never recallable (the silent gap). When `require_landing` is
+        # set but no writer is wired (the dormant state), HOLD `landing_unavailable`.
         if self._landing_gate_blocks():
             return self._hold(env, "landing_unavailable")
 
         # All guards pass → promote, stamping a fresh clean drift (the passing
         # replay IS the live grain_integrity probe), so it is immediately
-        # silent-eligible.
+        # silent-eligible. With a real landing writer wired, LAND into the neo4j
+        # retrieval corpus FIRST, then CAS `validated` (§3.1); a landing failure HOLDS
+        # `landing_failed` and the candidate stays `candidate` (not landed ⇒ not
+        # validated). Without a writer (require_landing off), promote directly (today's
+        # baseline behavior — nothing to land into).
         drift = drift_from_replay(replay, now=self._clock())
+        if self._landing_writer is not None:
+            # Capture the entity spans S5 identified BEFORE the strip (D17 last gate) —
+            # `_land_and_promote` strips, which blanks `entity_scan`, so the forbidden
+            # spans must be read from the PRE-strip envelope here.
+            return await self._land_and_promote(
+                env, drift, action="promote", forbidden_spans=entity_spans(env)
+            )
         promoted = replace(env, status=CandidateStatus.VALIDATED, drift=drift)
         await self._store.put(promoted)
         return CandidateDecision(
@@ -296,6 +299,10 @@ class PromotionScheduler:
                 reason="approve_not_in_review",
             )
 
+        # Capture the entity spans S5 identified BEFORE the strip blanks them (D17 last
+        # gate) — the landing writer's tripwire needs the PRE-strip spans (§3.3).
+        forbidden_spans = entity_spans(env)
+
         # Guard 2 — entity strip on the promotion boundary (D17). Done up front so no
         # entity-bearing payload or audit span can cross into a validated state.
         env = strip_entity_bearing(env)
@@ -330,17 +337,26 @@ class PromotionScheduler:
                     env.candidate_id, env.type, "hold", env.status, env.status,
                     reason=f"approve_blocked_replay:{replay.reason}",
                 )
-            # Landing gate (S9-Slice-1, §3.1/§4): a human approve of a BLUEPRINT also
-            # produces `validated`, so it too must LAND to be recallable. Until the
-            # landing writer is wired (Slice 2), a blueprint approve HOLDS at in_review
-            # with a clear reason — the replay gate has already run + passed. Non-
-            # blueprint human-gated targets (below) are unaffected.
+            # Landing gate (§3.1/§4): a human approve of a BLUEPRINT also produces
+            # `validated`, so it too must LAND to be recallable. When `require_landing`
+            # is set but no writer is wired (dormant), a blueprint approve HOLDS at
+            # in_review with a clear reason — the replay gate has already run + passed.
+            # Non-blueprint human-gated targets (below) are unaffected.
             if self._landing_gate_blocks():
                 return CandidateDecision(
                     env.candidate_id, env.type, "hold", env.status, env.status,
                     reason="approve_blocked_landing_unavailable",
                 )
             drift = drift_from_replay(replay, now=self._clock())
+            # With a real writer wired, LAND FIRST then write `validated` (§3.1) — the
+            # SAME land-then-status invariant the auto edge uses. `env` was already
+            # stripped (Guard 2); `_land_and_promote` re-strips idempotently. The
+            # forbidden spans were captured PRE-strip above. A landing failure HOLDS
+            # `landing_failed`, leaving the candidate at `in_review`.
+            if self._landing_writer is not None:
+                return await self._land_and_promote(
+                    env, drift, action="approve", forbidden_spans=forbidden_spans
+                )
         else:
             # Genuinely non-replayable target (pre-gated knowledge/schema) →
             # human-authoritative, no live drift probe (Phase 2).
@@ -384,13 +400,72 @@ class PromotionScheduler:
             return None
 
     def _landing_gate_blocks(self) -> bool:
-        """S9-activation Slice 1 (§4): a blueprint can PASS the replay gate but must
-        not promote to `validated` until it can LAND in the retrieval corpus. True ⇒
-        HOLD (`landing_unavailable`). In Slice 1 `landing_writer` is always None (the
-        constructor refuses a non-None one — there is no land-then-promote sequence
-        yet), so this reduces to `require_landing`. Default OFF — today's callers are
-        unchanged. Slice 2 replaces this presence gate with a real land-then-promote."""
+        """§4 dormant gate: `require_landing` is set but NO landing writer is wired. A
+        blueprint can PASS the replay gate but must not promote to `validated` when
+        there is nowhere to land it (it would be `validated` yet never recallable —
+        the silent gap). True ⇒ HOLD (`landing_unavailable`). With a real writer
+        present this is False, and `_land_and_promote` runs the land-then-status
+        sequence instead. Default OFF — today's callers are unchanged."""
         return self._require_landing and self._landing_writer is None
+
+    async def _land_and_promote(
+        self,
+        env: CandidateEnvelope,
+        drift: DriftStamp,
+        *,
+        action: str,
+        forbidden_spans: tuple[str, ...],
+    ) -> CandidateDecision:
+        """The SINGLE land-then-status sequence for the `→ validated` edge (§3.1),
+        shared by the auto (`_advance_candidate`) and human-approve paths.
+
+        Order is LOAD-BEARING: land into the neo4j retrieval corpus FIRST, then write
+        `status = validated` to the candidate store. Invariant "not landed ⇒ not
+        validated":
+          * a landing failure → HOLD `landing_failed`; the candidate is NOT written
+            `validated` (it stays `candidate`/`in_review`, never a half state), so the
+            next cycle retries;
+          * a crash BETWEEN land and the status write is safe — the next cycle
+            re-lands idempotently (MERGE by the deterministic id) then writes status.
+
+        The status write is a plain store upsert, not a compare-and-set: S9 assumes a
+        SINGLE promotion writer (the cron scan and the human-approve path both serialize
+        through this scheduler over the shared store, §7.2), so no CAS is needed; a
+        second concurrent writer is out of scope (and would need one).
+
+        The fresh `drift` is stamped on the env BEFORE landing so the landed seed's
+        `drift_status`, the crash-retry re-land, and the status write all carry the SAME
+        fresh stamp (review S1 / §8.1) — never the stale pre-promotion `unchecked`/
+        `suspect` value.
+
+        The entity strip runs on THIS edge (D17, §3.3): the human path already stripped
+        (Guard 2), the auto path only CHECKED `entity_scan` was clean — so strip here
+        (idempotent) makes BOTH edges land an entity-free seed. *forbidden_spans* (the
+        spans S5 identified, captured by the caller BEFORE the strip) drive the writer's
+        last-gate defense, which RAISES if the strip regressed and let one through."""
+        from_status = env.status
+        # Stamp the fresh drift BEFORE landing so the landed seed carries it (§8.1);
+        # strip is idempotent (the human path already stripped at Guard 2).
+        landed = replace(strip_entity_bearing(env), drift=drift)
+        assert self._landing_writer is not None  # guarded by the caller
+        try:
+            await self._landing_writer.land(landed, forbidden_spans=forbidden_spans)
+        except Exception:  # noqa: BLE001 - any landing failure HOLDS; never a half state
+            _logger.warning(
+                "landing failed for candidate %s; holding (status stays %s, retried next cycle)",
+                landed.candidate_id,
+                from_status,
+                exc_info=True,
+            )
+            return CandidateDecision(
+                landed.candidate_id, landed.type, "hold", from_status, from_status,
+                reason="landing_failed",
+            )
+        await self._store.put(replace(landed, status=CandidateStatus.VALIDATED))
+        return CandidateDecision(
+            landed.candidate_id, landed.type, action, from_status,
+            CandidateStatus.VALIDATED, reason=None,
+        )
 
     async def _deps_resolved(self, env: CandidateEnvelope) -> bool:
         """True iff every `depends_on` ref resolves (§11.6). No deps ⇒ trivially

@@ -18,12 +18,14 @@ from .drift import (
     silent_eligible,
     user_correction_stamp,
 )
+from .landing import CorpusLandingWriter, LandingEntityError, landing_id
 from .models import (
     BLUEPRINT_TYPE,
     HUMAN_GATED_TYPES,
     CandidateDecision,
     DependencyResolver,
     HitCountReader,
+    LandingWriter,
     ProbeResult,
     PromotionPolicy,
     PromotionSweep,
@@ -44,9 +46,12 @@ __all__ = [
     "STUBBED_PROBES",
     "CandidateDecision",
     "CandidateStoreDependencyResolver",
+    "CorpusLandingWriter",
     "DependencyResolver",
     "HitCountReader",
     "HttpTokenMinter",
+    "LandingEntityError",
+    "LandingWriter",
     "MCPWarehouseProbe",
     "ProbeResult",
     "PromotionPolicy",
@@ -59,6 +64,7 @@ __all__ = [
     "WarehouseProbeError",
     "drift_from_replay",
     "golden_replay",
+    "landing_id",
     "silent_eligible",
     "user_correction_stamp",
 ]

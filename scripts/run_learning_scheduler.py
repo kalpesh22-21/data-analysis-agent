@@ -52,14 +52,13 @@ import logging
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
-from data_agent.learning.factory import build_promotion_plane
+from data_agent.learning.factory import build_promotion_plane, build_promotion_write_plane
 from data_agent.learning.observability import configure_learning_tracing, get_learning_tracer
-from data_agent.learning.promotion.dependency_resolver import CandidateStoreDependencyResolver
 from data_agent.learning.promotion.models import ProbeResult
 from data_agent.learning.promotion.token_minter import HttpTokenMinter
-from data_agent.learning.promotion.warehouse_probe import MCPWarehouseProbe
 from data_agent.runtime.config import RuntimeSettings
 from data_agent.runtime.mcp.real_client import RealMCPClient
+from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.observability.tracing import set_global_tracer_provider
 
 _logger = logging.getLogger(__name__)
@@ -130,50 +129,82 @@ async def _main() -> int:
     candidate_store = CouchbaseCandidateStore(learning_settings)
     corpus = CouchbaseBlueprintCorpus(learning_settings)
 
-    # S9-activation Slice 1: wire the REAL write plane (probe + resolver) as a UNIT
-    # when the MCP + token-mint credentials are all present; otherwise keep the
-    # fail-closed deferred stubs (auto-promotes nothing). `require_landing` follows the
-    # real probe: with a real replay gate but no landing writer (Slice 2), a blueprint
-    # HOLDS `landing_unavailable` rather than validating a never-recallable artifact.
+    # S9-activation Slice 2: wire the FULLY-ACTIVATED write plane (probe + resolver +
+    # corpus-landing writer) as a UNIT when EVERY real port is configured — the MCP +
+    # token-mint credentials AND the neo4j + embedding endpoints the landing writer
+    # needs. With a real writer present, `require_landing` is ON and a validated
+    # blueprint LANDS into the neo4j retrieval corpus (becomes recallable) BEFORE its
+    # `validated` status write. Missing ANY port ⇒ keep the fail-closed deferred stubs
+    # with no landing writer (auto-promotion stays dormant, fail-closed).
     runtime_settings = RuntimeSettings()
     write_plane_ready = bool(
         runtime_settings.mcp_url
         and runtime_settings.token_service_url
         and runtime_settings.token_issuer_api_key
+        and runtime_settings.neo4j_url
+        and runtime_settings.neo4j_username
+        and runtime_settings.neo4j_password
+        and runtime_settings.embedding_api_url
     )
+    neo4j_driver = None
     if write_plane_ready:
-        probe = MCPWarehouseProbe(
+        from neo4j import AsyncGraphDatabase
+
+        neo4j_driver = AsyncGraphDatabase.driver(
+            runtime_settings.neo4j_url,
+            auth=(runtime_settings.neo4j_username, runtime_settings.neo4j_password),
+            connection_timeout=runtime_settings.neo4j_timeout_seconds,
+            connection_acquisition_timeout=runtime_settings.neo4j_timeout_seconds,
+            max_transaction_retry_time=runtime_settings.neo4j_timeout_seconds,
+        )
+        # build_promotion_write_plane pins ONE candidate store across the scheduler +
+        # inbox, wraps the injected infra clients into the three write-plane ports, and
+        # flips require_landing ON with the real landing writer present.
+        scheduler, _inbox = build_promotion_write_plane(
+            learning_settings,
+            candidate_store=candidate_store,
+            hit_counts=corpus,
             mcp_client=RealMCPClient(runtime_settings.mcp_url),
             token_minter=HttpTokenMinter(
                 runtime_settings.token_service_url,
                 runtime_settings.token_issuer_api_key,
             ),
+            neo4j_driver=neo4j_driver,
+            embedding_client=HttpEmbeddingClient(
+                url=runtime_settings.embedding_api_url,
+                api_key=runtime_settings.embedding_api_key,
+                model=runtime_settings.embedding_model,
+                timeout_seconds=runtime_settings.embedding_timeout_seconds,
+            ),
+            model_id=runtime_settings.embedding_model,
         )
-        dependency_resolver = CandidateStoreDependencyResolver(candidate_store)
     else:
-        probe = _DeferredWarehouseProbe()
-        dependency_resolver = _DeferredDependencyResolver()
-
-    # build_promotion_plane pins ONE candidate store across the scheduler + inbox.
-    # The corpus is the HitCountReader (cross-session hit_count source of truth).
-    scheduler, _inbox = build_promotion_plane(
-        learning_settings,
-        candidate_store=candidate_store,
-        probe=probe,
-        hit_counts=corpus,
-        dependency_resolver=dependency_resolver,
-        landing_writer=None,  # Slice 2 wires the corpus-landing writer
-        require_landing=write_plane_ready,
-    )
+        # Dormant / fail-closed: the deferred stubs auto-promote nothing, and with no
+        # landing writer wired `require_landing=False` keeps the scheduler quiet (the
+        # deferred probe already HOLDS every blueprint on the replay gate).
+        scheduler, _inbox = build_promotion_plane(
+            learning_settings,
+            candidate_store=candidate_store,
+            probe=_DeferredWarehouseProbe(),
+            hit_counts=corpus,
+            dependency_resolver=_DeferredDependencyResolver(),
+            landing_writer=None,
+            require_landing=False,
+        )
 
     _logger.info(
-        "learning promotion scheduler starting (write_plane_ready=%s; replay gate %s, "
-        "auto-promotion-into-retrieval GATED on the Slice-2 landing writer — a blueprint "
-        "passing replay HOLDS landing_unavailable; kill-switch honored per cycle)",
+        "learning promotion scheduler starting (write_plane_ready=%s; %s; kill-switch "
+        "honored per cycle)",
         write_plane_ready,
-        "REAL" if write_plane_ready else "deferred (probe_unavailable)",
+        "FULL auto-promotion + neo4j landing ACTIVE"
+        if write_plane_ready
+        else "dormant deferred stubs (probe_unavailable, no landing)",
     )
-    await scheduler.run_forever(sleep=asyncio.sleep)
+    try:
+        await scheduler.run_forever(sleep=asyncio.sleep)
+    finally:
+        if neo4j_driver is not None:
+            await neo4j_driver.close()
     return 0
 
 

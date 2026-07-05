@@ -25,8 +25,13 @@ from .verdicts import EntityHit, LeakageVerdict
 _REDACTED = "[redacted]"
 
 
-def _entity_spans(env: CandidateEnvelope) -> tuple[str, ...]:
-    """The distinct, non-empty entity `span`s the settled S5 verdict found."""
+def entity_spans(env: CandidateEnvelope) -> tuple[str, ...]:
+    """The distinct, non-empty entity `span`s the settled S5 verdict found.
+
+    Public because the S9 landing writer's last-gate D17 defense must capture these
+    BEFORE `strip_entity_bearing` blanks them (a stripped env's spans are `""` → the
+    tripwire would be a no-op). Returns `()` for an unsettled scan or a scan with no
+    entity-bearing hits."""
     scan = env.entity_scan
     if not LeakageVerdict.is_settled(scan):
         return ()
@@ -78,7 +83,7 @@ def strip_entity_bearing(env: CandidateEnvelope) -> CandidateEnvelope:
     spans (D17) — the full strip applied before a candidate is stamped `validated`.
     The payload strip closes the gap where blanking only the audit spans left the
     raw entity in `payload.intent` for a physical promoter to read (QA-Q3)."""
-    spans = _entity_spans(env)
+    spans = entity_spans(env)
     stripped = replace(env, payload=redact_payload(env.payload, spans))
     return blank_scan_spans(stripped)
 
@@ -86,4 +91,4 @@ def strip_entity_bearing(env: CandidateEnvelope) -> CandidateEnvelope:
 def entity_free_payload_view(env: CandidateEnvelope) -> dict[str, Any]:
     """The reviewer payload view with entity spans redacted (QA-Q7) — the inbox
     surface must not re-expose the raw value even while the candidate is `in_review`."""
-    return redact_payload(env.payload, _entity_spans(env))
+    return redact_payload(env.payload, entity_spans(env))
