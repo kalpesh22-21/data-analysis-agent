@@ -1,0 +1,282 @@
+"""Persistent REAL agent-runtime server for the Phase-0 UI (`ui/`).
+
+This is the production-shaped sibling of `scripts/run_ui_runtime.py`. That
+launcher wires Layer-1 FAKES (a content-routed `DemoModelClient` + a scripted
+`DemoMCPClient`) so the UI can be driven OFFLINE with no OpenAI key and no live
+warehouse — every answer it returns is canned. THIS launcher keeps the SAME
+`create_app`-based structure, the SAME host/port (:8000), and the SAME real
+JWT-vs-l2-token verification posture, but injects the REAL components proven to
+compose in `scripts/demo_runtime_turn_traced.py`, so the UI answers REAL
+questions against real ClickHouse:
+
+    - `model_client`  -> a REAL `build_openai_model_client` (key read/stripped
+      from `.env`, model from `DEMO_MODEL` or a preflight-selected default). The
+      model is picked once at startup by a synchronous OpenAI Responses preflight
+      (like `demo_runtime_turn_traced.py`) so an account that lacks `gpt-5.5`
+      transparently falls back to the first candidate it can actually call.
+    - `mcp_client`    -> a REAL `RealMCPClient` -> the live l2-mcp
+      (`http://localhost:18090/mcp`), so getTableSchema/runQuery hit real
+      ClickHouse under the caller's JWT scope (D57/D80 enforced by the MCP).
+    - `session_store` -> the REAL `CouchbaseSessionStore` (live l2-cb bucket
+      `agent_sessions`), so sessions PERSIST across restarts and feed the
+      learning loop. Constructed lazily (the `acouchbase` cluster connects
+      eagerly and needs a running event loop, but this app is built at module
+      import before uvicorn's loop is up — see `_LazyCouchbaseSessionStore`).
+      Set `REAL_SESSION_STORE=memory` (or if the `couchbase` SDK is unimportable)
+      to fall back to the in-memory store instead.
+    - `catalog`       -> the REAL `load_catalog_handle()` (databaseSchemaDocs),
+      so provenance for real warehouse tables is DETERMINED (a result with
+      undetermined provenance is dropped by the D44 replay/scope filter).
+    - JWT             -> REAL verification against the l2-token JWKS (NOT
+      bypassed), exactly like `run_ui_runtime.py`. The BFF (`ui/server.py`) mints
+      per-user-entitlement JWTs bound to the session id.
+    - OTLP -> Phoenix : `otlp_endpoint=http://localhost:6006/v1/traces`, project
+      `data-agent-runtime`. `otlp_hide_llm_content=True` is kept (the D25
+      DEFAULT) — this is a real server, NOT the diagnostic demo, so the LLM
+      span's raw prompt/completion is NOT revealed.
+
+Loop tunables are the PRODUCTION defaults (`max_loop_iterations=15`,
+`max_wall_clock_seconds=60`, `max_budget_windows=3`) — NOT the scripted demo's
+low `max_loop_iterations=3` — so a real multi-step question completes.
+
+Retrieval (neo4j blueprint recall) is OFF by default: wiring it needs the neo4j
+corpus seeded with an `embedding_model` that matches `RuntimeSettings`
+(otherwise recall parity-filters to an empty corpus, see app.py's B2 warning),
+which is a separate step. Set `REAL_RETRIEVAL=1` to opt in (points at l2-neo4j +
+l2-embedding); leave it off for a plain real-turn server. This is a documented
+follow-on, not a blocker for the core real turn.
+
+Prerequisites (this launcher does NOT start/stop any container):
+    - `.env` with `OPENAI_API_KEY=...` at the repo root.
+    - The l2 integration stack UP: l2-mcp (:18090), l2-token (:19000),
+      l2-cb (:8091/:11210), l2-phoenix (:6006). (l2-neo4j/l2-embedding only if
+      `REAL_RETRIEVAL=1`.)
+
+Run:
+    uv run python scripts/run_ui_runtime_real.py
+    # or, via the launcher, alongside the BFF:
+    REAL=1 ./scripts/run_ui.sh
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+import openai
+import uvicorn
+
+from data_agent.runtime.app import create_app
+from data_agent.runtime.config import RuntimeSettings
+from data_agent.runtime.mcp.real_client import RealMCPClient
+from data_agent.runtime.model.openai_client import build_openai_model_client
+from data_agent.runtime.provenance.catalog_handle import load_catalog_handle
+from data_agent.runtime.session.memory_store import InMemorySessionStore
+
+_REPO = Path(__file__).resolve().parent.parent
+
+# --- The live l2 stack (docker-compose.integration.yml), already running. We
+# only READ its JWKS / call its MCP / write its Couchbase — nothing is modified.
+_TOKEN_ISSUER = "http://token:8000/"  # must match the JWT's "iss" claim
+_TOKEN_AUDIENCE = "clickhouse-api"
+_JWKS_URL = "http://localhost:19000/.well-known/jwks.json"
+_MCP_URL = os.environ.get("MCP_URL", "http://localhost:18090/mcp")
+
+# Couchbase (l2-cb): bucket `agent_sessions`, collections `sessions` /
+# `session_results`, seeded by scripts/couchbase-init.sh (admin/password).
+_COUCHBASE_CONNECTION_STRING = "couchbase://localhost"
+_COUCHBASE_USERNAME = "admin"
+_COUCHBASE_PASSWORD = "password"
+
+# OTLP -> self-hosted Phoenix (l2-phoenix); the runtime turn lands in this project.
+_PHOENIX_OTLP = os.environ.get("OTLP_ENDPOINT", "http://localhost:6006/v1/traces")
+_PHOENIX_PROJECT = "data-agent-runtime"
+
+# Optional retrieval (REAL_RETRIEVAL=1) — l2-neo4j + l2-embedding (D71 mocks).
+_NEO4J_URL = "bolt://localhost:7687"
+_NEO4J_USERNAME = "neo4j"
+_NEO4J_PASSWORD = "testpassword"
+_EMBEDDING_API_URL = "http://localhost:18003/embed"
+
+# Model preflight candidates (mirrors demo_runtime_turn_traced.py): the first
+# the account can actually call on the Responses API wins.
+_MODEL_CANDIDATES = ("gpt-5.5", "gpt-4o", "gpt-4.1", "gpt-4o-mini")
+
+
+def _load_openai_key() -> str:
+    """Read + strip the OPENAI_API_KEY from `.env` (quotes tolerated)."""
+    env_path = _REPO / ".env"
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("OPENAI_API_KEY="):
+            val = line.split("=", 1)[1].strip()
+            if (val.startswith('"') and val.endswith('"')) or (
+                val.startswith("'") and val.endswith("'")
+            ):
+                val = val[1:-1]
+            return val
+    raise SystemExit("OPENAI_API_KEY not found in .env")
+
+
+def _pick_openai_model(api_key: str) -> str:
+    """First candidate the account can call on the Responses API (sync preflight).
+
+    Run once at startup (before uvicorn's loop) so a persistent server does not
+    have to re-select per turn. `DEMO_MODEL` short-circuits the list.
+    """
+    client = openai.OpenAI(api_key=api_key)
+    candidates = (os.environ["DEMO_MODEL"],) if os.environ.get("DEMO_MODEL") else _MODEL_CANDIDATES
+    last_err: Exception | None = None
+    for model in candidates:
+        try:
+            client.responses.create(model=model, input=[{"role": "user", "content": "ping"}])
+            print(f"[run_ui_runtime_real] model preflight OK: {model!r}")
+            return model
+        except openai.NotFoundError as exc:
+            print(f"[run_ui_runtime_real] {model!r} unavailable (404) — trying next")
+            last_err = exc
+        except Exception as exc:  # noqa: BLE001 - preflight is best-effort selection
+            print(f"[run_ui_runtime_real] {model!r} errored ({type(exc).__name__}) — trying next")
+            last_err = exc
+    raise SystemExit(f"No OpenAI model candidate worked: {last_err}")
+
+
+class _LazyCouchbaseSessionStore:
+    """Construct the real `CouchbaseSessionStore` on FIRST async use.
+
+    The `acouchbase` cluster connects EAGERLY at construction and requires a
+    RUNNING event loop, but this launcher builds the app at module import
+    (`app = build_real_app()`), before uvicorn's loop is up. This thin proxy
+    defers the real construction to the first awaited method (always inside a
+    request, where the loop is running) and delegates every `SessionStore` call
+    to it verbatim. Same pattern as `run_ui_runtime.py`'s wrapper.
+    """
+
+    def __init__(self, settings: RuntimeSettings) -> None:
+        self._settings = settings
+        self._inner: Any = None
+
+    def _store(self) -> Any:
+        if self._inner is None:
+            from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
+
+            self._inner = CouchbaseSessionStore(self._settings)
+        return self._inner
+
+    async def create_session(self, session_id: str) -> Any:
+        return await self._store().create_session(session_id)
+
+    async def get_or_create_session(self, session_id: str) -> Any:
+        return await self._store().get_or_create_session(session_id)
+
+    async def load_trail(self, session_id: str) -> Any:
+        return await self._store().load_trail(session_id)
+
+    async def append_message(self, session_id: str, message: Any) -> None:
+        await self._store().append_message(session_id, message)
+
+    async def append_trail_entry(self, session_id: str, entry: Any) -> None:
+        await self._store().append_trail_entry(session_id, entry)
+
+    async def bump_last_activity(self, session_id: str) -> None:
+        await self._store().bump_last_activity(session_id)
+
+    async def write_full_result(
+        self, session_id: str, result_id: str, result_full: dict[str, Any]
+    ) -> str:
+        return await self._store().write_full_result(session_id, result_id, result_full)
+
+    async def write_pause_checkpoint(self, session_id: str, checkpoint: Any) -> None:
+        await self._store().write_pause_checkpoint(session_id, checkpoint)
+
+    async def get_session_with_cas(self, session_id: str) -> Any:
+        return await self._store().get_session_with_cas(session_id)
+
+    async def resume_checkpoint(self, session_id: str, cas: Any, answer: str) -> Any:
+        return await self._store().resume_checkpoint(session_id, cas, answer)
+
+
+def _build_session_store(settings: RuntimeSettings) -> tuple[Any, str]:
+    """Prefer the real Couchbase store; fall back to in-memory on request or if
+    the SDK is unavailable. Returns (store, human-readable choice)."""
+    if os.environ.get("REAL_SESSION_STORE") == "memory":
+        return InMemorySessionStore(), "InMemorySessionStore (REAL_SESSION_STORE=memory)"
+    try:
+        import acouchbase.cluster  # noqa: F401  (import probe only)
+    except ImportError:
+        return (
+            InMemorySessionStore(),
+            "InMemorySessionStore (couchbase SDK not importable)",
+        )
+    return _LazyCouchbaseSessionStore(settings), "CouchbaseSessionStore (l2-cb, lazy-connect)"
+
+
+def build_real_app():
+    api_key = _load_openai_key()
+    model = _pick_openai_model(api_key)
+
+    retrieval_on = os.environ.get("REAL_RETRIEVAL") == "1"
+
+    settings = RuntimeSettings(
+        _env_file=None,  # explicit wiring only — don't double-read .env
+        mcp_url=_MCP_URL,
+        openai_api_key=api_key,
+        openai_model=model,
+        openai_base_url="",
+        # Real JWT verification against the live l2-token JWKS (NOT bypassed).
+        jwks_url=_JWKS_URL,
+        jwt_issuer=_TOKEN_ISSUER,
+        jwt_audience=_TOKEN_AUDIENCE,
+        # Couchbase session store (consulted only by the lazy store below).
+        couchbase_connection_string=_COUCHBASE_CONNECTION_STRING,
+        couchbase_username=_COUCHBASE_USERNAME,
+        couchbase_password=_COUCHBASE_PASSWORD,
+        # OTLP -> Phoenix, project data-agent-runtime, D25 default posture
+        # (LLM span content HIDDEN — this is a real server, not the demo).
+        otlp_endpoint=_PHOENIX_OTLP,
+        otlp_project_name=_PHOENIX_PROJECT,
+        otlp_hide_llm_content=True,
+        # Production loop tunables (NOT the scripted demo's low caps).
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        # Retrieval / scratch: off unless REAL_RETRIEVAL=1 (documented follow-on).
+        retrieval_enabled=retrieval_on,
+        scratch_enabled=False,
+        neo4j_url=_NEO4J_URL if retrieval_on else "",
+        neo4j_username=_NEO4J_USERNAME,
+        neo4j_password=_NEO4J_PASSWORD,
+        embedding_api_url=_EMBEDDING_API_URL if retrieval_on else "",
+    )
+
+    session_store, store_choice = _build_session_store(settings)
+
+    print(f"[run_ui_runtime_real] mcp_url        = {settings.mcp_url}")
+    print(f"[run_ui_runtime_real] session_store  = {store_choice}")
+    print(f"[run_ui_runtime_real] otlp_endpoint  = {settings.otlp_endpoint} "
+          f"(project={settings.otlp_project_name}, hide_llm_content={settings.otlp_hide_llm_content})")
+    print(f"[run_ui_runtime_real] retrieval      = {'ON (neo4j)' if retrieval_on else 'OFF'}")
+    print(f"[run_ui_runtime_real] model          = {settings.openai_model}")
+
+    # REAL components — mirrors demo_runtime_turn_traced.py's proven wiring. Every
+    # dependency `create_app` would build itself from settings is built here too,
+    # explicitly, so the wiring is auditable at one glance.
+    return create_app(
+        settings=settings,
+        session_store=session_store,
+        mcp_client=RealMCPClient(settings.mcp_url),
+        model_client=build_openai_model_client(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            base_url=settings.openai_base_url,
+        ),
+        catalog=load_catalog_handle(),
+    )
+
+
+app = build_real_app()
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
