@@ -20,7 +20,12 @@ from data_agent.runtime.session.store import CASMismatchError, SessionStore
 from . import state_machine
 from .config import LearningSettings, learning_enabled
 from .models import SWEEPABLE_STATUSES, LearningJob, LearningStatus, compute_content_hash
-from .observability import disabled_span, enqueue_span, sweep_span
+from .observability import (
+    disabled_span,
+    enqueue_span,
+    inject_current_traceparent,
+    sweep_span,
+)
 from .queue import LearningQueue
 
 _logger = logging.getLogger(__name__)
@@ -85,21 +90,23 @@ class LearningSweeper:
                     claimed += 1
                 content_hash = compute_content_hash(doc)
                 # Step 2 — XADD (idempotent by content_hash), then pending → queued.
-                job = LearningJob.from_doc(doc, content_hash=content_hash, cas=cas)
-                message_id = await self._queue.enqueue(job)
+                # The enqueue span is the per-session trace ROOT: its `traceparent`
+                # is injected onto the job so the consumer/scheduler spans chain into
+                # ONE trace. No tracer wired ⇒ a plain enqueue with no traceparent.
+                #
+                # NOTE (intended, reviewer 4b): the enqueue span now closes BEFORE the
+                # pending→queued CAS (the traceparent must be injected around the XADD).
+                # So if that CAS then loses a race (CASMismatchError below), an enqueue
+                # span exists where the old order produced none. This is CORRECT — the
+                # XADD really happened (idempotent by content_hash; the consumer absorbs
+                # the duplicate) — and the `enqueued` COUNTER is still bumped only AFTER
+                # the CAS succeeds, so the sweep counters are unchanged.
+                await self._enqueue(doc, cas, content_hash)
                 await state_machine.transition(
                     self._store, doc.session_id, LearningStatus.PENDING,
                     LearningStatus.QUEUED, cas, content_hash=content_hash,
                 )
                 enqueued += 1
-                if self._tracer is not None:
-                    with enqueue_span(
-                        self._tracer,
-                        session_id=doc.session_id,
-                        content_hash=content_hash,
-                        message_id=message_id,
-                    ):
-                        pass
             except CASMismatchError:
                 # A peer sweeper claimed it, or the session was resumed — skip.
                 # A `pending` doc left un-enqueued by a crash here is re-detected
@@ -122,6 +129,28 @@ class LearningSweeper:
             ):
                 pass
         return SweepResult(scanned=scanned, claimed=claimed, enqueued=enqueued)
+
+    async def _enqueue(self, doc, cas, content_hash: str) -> str:
+        """XADD the reference envelope, returning the message id. When a tracer is
+        wired the enqueue runs INSIDE the `learning.enqueue` span (the per-session
+        trace ROOT) and injects that span's `traceparent` onto the job so the
+        consumer/scheduler spans join the SAME Phoenix trace; otherwise a plain
+        XADD with no traceparent (no-op-tracer behavior preserved)."""
+        if self._tracer is None:
+            job = LearningJob.from_doc(doc, content_hash=content_hash, cas=cas)
+            return await self._queue.enqueue(job)
+        with enqueue_span(
+            self._tracer, session_id=doc.session_id, content_hash=content_hash
+        ) as enqueue:
+            job = LearningJob.from_doc(
+                doc,
+                content_hash=content_hash,
+                cas=cas,
+                traceparent=inject_current_traceparent(),
+            )
+            message_id = await self._queue.enqueue(job)
+            enqueue.set_attribute("learning.message_id", message_id)
+            return message_id
 
     async def run_forever(self, *, sleep) -> None:
         """Periodic loop (used by the entrypoint). *sleep* is injected

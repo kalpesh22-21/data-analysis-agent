@@ -23,6 +23,9 @@ _ALLOWED_FIELDS = {
     "scope_ref",
     "trace_id",
     "session_closed_at",
+    # W3C trace-context carrier for cross-process span chaining — a SHAPE-only
+    # trace id (no transcript/secret content), same D25 posture as `trace_id`.
+    "traceparent",
 }
 # Anything transcript- or secret-bearing that must NEVER appear.
 _FORBIDDEN_FIELDS = {

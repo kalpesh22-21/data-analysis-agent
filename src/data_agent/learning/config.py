@@ -222,6 +222,19 @@ class LearningSettings(BaseSettings):
     learning_service_name: str = Field(
         "learning-loop", description="OTel service.name / Phoenix project for both processes."
     )
+    learning_trace_verbose: bool = Field(
+        False,
+        description=(
+            "D25 GATE: when FALSE (default) the learning-loop spans carry SHAPE-only "
+            "attrs (counters/labels/session.id — no transcript, SQL, question, or intent). "
+            "When TRUE the triage/consume/extract/promote spans ALSO carry human-readable "
+            "content (the user question, accepted SQL, learned intent/slots, blueprint id). "
+            "Verbose makes the `learning-loop` Phoenix project ENTITY-BEARING and MUST be "
+            "access-controlled like the audit/session store (D51 in-boundary PII posture), "
+            "NOT the shape-only D25 telemetry posture. Enable ONLY in a controlled diagnostic "
+            "environment."
+        ),
+    )
 
 
 def get_learning_settings() -> LearningSettings:

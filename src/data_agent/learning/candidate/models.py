@@ -65,9 +65,15 @@ class CandidateEnvelope:
     # never populates these; the S3 spine above is untouched. ---
     dedup: DedupVerdict | None = None  # S6 WRITES (Contract C); None pre-S6
     drift: DriftStamp = field(default_factory=DriftStamp)  # S9 WRITES (Contract E); unchecked pre-S9
+    # W3C `traceparent` of the extracting consume span (the session's learning
+    # trace). Stamped at extraction so the cron scheduler's promote/land spans
+    # CONTINUE the SAME Phoenix trace as the enqueue → consume → extract that
+    # produced this candidate. Additive, defaults None, round-trips through
+    # to_doc/from_doc; a missing value ⇒ the scheduler starts a normal root span.
+    traceparent: str | None = None
 
     def to_doc(self) -> dict[str, Any]:
-        return {
+        doc: dict[str, Any] = {
             "_id": self.candidate_id,
             "candidate_id": self.candidate_id,
             "type": self.type,
@@ -88,6 +94,11 @@ class CandidateEnvelope:
             "content_hash": self.content_hash,
             "created_at": self.created_at,
         }
+        # Additive + OPTIONAL: emit the trace-chaining carrier only when present, so a
+        # pre-existing candidate doc (no traceparent) round-trips byte-identically.
+        if self.traceparent is not None:
+            doc["traceparent"] = self.traceparent
+        return doc
 
     @classmethod
     def from_doc(cls, doc: dict[str, Any]) -> CandidateEnvelope:
@@ -113,6 +124,7 @@ class CandidateEnvelope:
             depends_on=tuple(doc.get("depends_on", []) or []),
             content_hash=doc.get("content_hash", ""),
             created_at=doc.get("created_at", _now()),
+            traceparent=doc.get("traceparent"),
         )
 
 
@@ -122,11 +134,14 @@ def build_envelope(
     *,
     candidate_id: str,
     evidence_refs: tuple[str, ...],
+    traceparent: str | None = None,
 ) -> CandidateEnvelope:
     """Assemble the persisted envelope from an `ExtractedCandidate` + the minted
     `evidence_refs` (the quotes are already snapshotted to `learning_audit`).
     `entity_scan.result` is `pending` — the Slice-5 leakage gate is authoritative
-    (D58); S3 only records the extractor's preliminary self-check."""
+    (D58); S3 only records the extractor's preliminary self-check. *traceparent* (the
+    extracting consume span's W3C context) is carried forward so the scheduler's
+    promote/land spans continue the SAME session trace."""
     header = candidate.header
     return CandidateEnvelope(
         candidate_id=candidate_id,
@@ -146,4 +161,5 @@ def build_envelope(
         proposed_action=header.proposed_action,
         depends_on=header.depends_on,
         content_hash=summary.content_hash,
+        traceparent=traceparent,
     )

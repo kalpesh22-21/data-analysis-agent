@@ -113,6 +113,14 @@ class LearningJob:
     scope_ref: str | None = None
     trace_id: str | None = None
     session_closed_at: str | None = None
+    # W3C `traceparent` of the SWEEPER's `learning.enqueue` span (the per-session
+    # trace ROOT). Injected at enqueue and extracted at consume so the consumer's
+    # `learning.consume`/`triage`/`extract` spans join the SAME Phoenix trace as the
+    # enqueue that produced them (cross-process span chaining). Distinct from
+    # `trace_id` (a bare request-path id): this is the D25-shape trace-context
+    # carrier, not a session grouping key. Optional — a job enqueued WITHOUT a tracer
+    # carries `None`, and the consumer then starts a normal root span (fail-open).
+    traceparent: str | None = None
 
     @classmethod
     def from_doc(
@@ -124,6 +132,7 @@ class LearningJob:
         user_id: str | None = None,
         scope_ref: str | None = None,
         trace_id: str | None = None,
+        traceparent: str | None = None,
     ) -> LearningJob:
         """Build the reference envelope from a `SessionDoc`. Slice 1's session
         doc carries no user/scope/trace identity, so those default to `None`;
@@ -138,6 +147,7 @@ class LearningJob:
             scope_ref=scope_ref,
             trace_id=trace_id,
             session_closed_at=doc.last_activity,
+            traceparent=traceparent,
         )
 
     # --- flat string (de)serialization for a Redis Streams entry (D30). The
@@ -151,7 +161,7 @@ class LearningJob:
             "couchbase_doc_id": self.couchbase_doc_id,
             "content_hash": self.content_hash,
         }
-        for key in ("cas", "user_id", "scope_ref", "trace_id", "session_closed_at"):
+        for key in ("cas", "user_id", "scope_ref", "trace_id", "session_closed_at", "traceparent"):
             value = getattr(self, key)
             if value is not None:
                 fields[key] = value
@@ -168,4 +178,5 @@ class LearningJob:
             scope_ref=fields.get("scope_ref"),
             trace_id=fields.get("trace_id"),
             session_closed_at=fields.get("session_closed_at"),
+            traceparent=fields.get("traceparent"),
         )

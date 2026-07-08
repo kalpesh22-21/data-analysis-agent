@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -44,7 +45,9 @@ from ..candidate.redaction import entity_spans, strip_entity_bearing
 from ..candidate.store import CandidateStore
 from ..candidate.verdicts import DriftStamp, LeakageVerdict
 from ..config import learning_enabled
+from ..observability import context_from_traceparent, land_span, promote_span
 from .drift import drift_from_replay, user_correction_stamp
+from .landing import landing_id
 from .models import (
     BLUEPRINT_TYPE,
     HUMAN_GATED_TYPES,
@@ -96,6 +99,8 @@ class PromotionScheduler:
         landing_writer: LandingWriter | None = None,
         require_landing: bool = False,
         clock: Callable[[], str] = _now_iso,
+        tracer: object | None = None,
+        trace_verbose: bool = False,
     ) -> None:
         self._store = store
         self._probe = probe
@@ -105,6 +110,13 @@ class PromotionScheduler:
         self._landing_writer = landing_writer
         self._require_landing = require_landing
         self._clock = clock
+        # Tracer seam (mirrors the consumer's): when wired, the promote/land edges
+        # emit `learning.promote`/`learning.land` spans STARTED under the candidate's
+        # propagated trace context, so a session's promotion CONTINUES its ONE trace.
+        # `trace_verbose` (D25 gate) toggles the entity-bearing attrs. No tracer ⇒
+        # nullcontext no-op (baseline behavior byte-identical).
+        self._tracer = tracer
+        self._trace_verbose = trace_verbose
 
     @property
     def store(self) -> CandidateStore:
@@ -233,8 +245,9 @@ class PromotionScheduler:
             return await self._land_and_promote(
                 env, drift, action="promote", forbidden_spans=entity_spans(env)
             )
-        promoted = replace(env, status=CandidateStatus.VALIDATED, drift=drift)
-        await self._store.put(promoted)
+        with self._promote_scope(env, "promote"):
+            promoted = replace(env, status=CandidateStatus.VALIDATED, drift=drift)
+            await self._store.put(promoted)
         return CandidateDecision(
             candidate_id=env.candidate_id,
             type=env.type,
@@ -472,6 +485,53 @@ class PromotionScheduler:
         except (KeyError, TypeError):
             return None
 
+    def _blueprint_intent(self, env: CandidateEnvelope) -> str | None:
+        """The learned blueprint intent for the verbose promote/land span (entity-
+        bearing, D25-gated). `None` for a non-blueprint / payload-less env."""
+        payload = env.payload
+        intent = payload.get("intent") if isinstance(payload, dict) else None
+        return intent if isinstance(intent, str) and intent else None
+
+    def _canonical_key(self, env: CandidateEnvelope) -> str | None:
+        return env.dedup.canonical_key if env.dedup is not None else None
+
+    def _promote_scope(self, env: CandidateEnvelope, action: str):
+        """The `learning.promote` span (session-trace continuation via the candidate's
+        traceparent) OR a `nullcontext` when no tracer is wired."""
+        if self._tracer is None:
+            return nullcontext(None)
+        # Double-gate (defense-in-depth, mirroring the consumer): pass the entity-
+        # bearing attrs ONLY when verbose is on, so the D25 gate does not rest solely
+        # on `_verbose_attrs` dropping them downstream.
+        verbose = self._trace_verbose
+        return promote_span(
+            self._tracer,
+            session_id=env.source_session,
+            candidate_id=env.candidate_id,
+            action=action,
+            context=context_from_traceparent(env.traceparent),
+            verbose=verbose,
+            blueprint_id=landing_id(env) if verbose else None,
+            blueprint_intent=self._blueprint_intent(env) if verbose else None,
+            canonical_key=self._canonical_key(env) if verbose else None,
+        )
+
+    def _land_scope(self, env: CandidateEnvelope):
+        """The `learning.land` span, nested UNDER the open promote span (so it takes
+        the ambient context, not the remote parent again). Nullcontext when untraced."""
+        if self._tracer is None:
+            return nullcontext(None)
+        verbose = self._trace_verbose  # double-gate, see `_promote_scope`
+        return land_span(
+            self._tracer,
+            session_id=env.source_session,
+            candidate_id=env.candidate_id,
+            verbose=verbose,
+            blueprint_id=landing_id(env) if verbose else None,
+            blueprint_intent=self._blueprint_intent(env) if verbose else None,
+            canonical_key=self._canonical_key(env) if verbose else None,
+        )
+
     def _landing_gate_blocks(self) -> bool:
         """§4 dormant gate: `require_landing` is set but NO landing writer is wired. A
         blueprint can PASS the replay gate but must not promote to `validated` when
@@ -521,20 +581,27 @@ class PromotionScheduler:
         # strip is idempotent (the human path already stripped at Guard 2).
         landed = replace(strip_entity_bearing(env), drift=drift)
         assert self._landing_writer is not None  # guarded by the caller
-        try:
-            await self._landing_writer.land(landed, forbidden_spans=forbidden_spans)
-        except Exception:  # noqa: BLE001 - any landing failure HOLDS; never a half state
-            _logger.warning(
-                "landing failed for candidate %s; holding (status stays %s, retried next cycle)",
-                landed.candidate_id,
-                from_status,
-                exc_info=True,
-            )
-            return CandidateDecision(
-                landed.candidate_id, landed.type, "hold", from_status, from_status,
-                reason="landing_failed",
-            )
-        await self._store.put(replace(landed, status=CandidateStatus.VALIDATED))
+        # The promote span continues the session's trace (from the candidate's
+        # traceparent), with the land span nested under it. Verbose attrs are read
+        # from the PRE-strip `env` (D25-gated intent/canonical_key); `landed` is
+        # already entity-stripped.
+        with self._promote_scope(env, action):
+            try:
+                with self._land_scope(env):
+                    await self._landing_writer.land(landed, forbidden_spans=forbidden_spans)
+            except Exception:  # noqa: BLE001 - any landing failure HOLDS; never a half state
+                _logger.warning(
+                    "landing failed for candidate %s; holding (status stays %s, "
+                    "retried next cycle)",
+                    landed.candidate_id,
+                    from_status,
+                    exc_info=True,
+                )
+                return CandidateDecision(
+                    landed.candidate_id, landed.type, "hold", from_status, from_status,
+                    reason="landing_failed",
+                )
+            await self._store.put(replace(landed, status=CandidateStatus.VALIDATED))
         return CandidateDecision(
             landed.candidate_id, landed.type, action, from_status,
             CandidateStatus.VALIDATED, reason=None,

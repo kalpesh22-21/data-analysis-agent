@@ -274,6 +274,7 @@ def build_promotion_plane(
     require_landing: bool = False,
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
+    tracer: object | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the S9 promotion plane — the scheduler + the review inbox — from ONE
     `candidate_store` instance. The inbox's `approve` reads that store and DELEGATES
@@ -281,7 +282,10 @@ def build_promotion_plane(
     store, so taking the store once here is what pins the shared singleton: a split
     (inbox on one store, scheduler on another) would read a stale envelope and
     CAS-write the wrong one. Prefer this over the two thin builders below when wiring
-    both — it makes the split impossible to express."""
+    both — it makes the split impossible to express.
+
+    *tracer* (optional) wires the scheduler's promote/land span seam; `trace_verbose`
+    is read off `settings.learning_trace_verbose` (D25 gate)."""
     scheduler = build_promotion_scheduler(
         settings,
         candidate_store=candidate_store,
@@ -292,6 +296,7 @@ def build_promotion_plane(
         require_landing=require_landing,
         policy=policy,
         clock=clock,
+        tracer=tracer,
     )
     inbox = build_review_inbox(candidate_store, scheduler=scheduler)
     return scheduler, inbox
@@ -310,6 +315,7 @@ def build_promotion_write_plane(
     neo4j_database: str = "neo4j",
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
+    tracer: object | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the FULLY-ACTIVATED S9 promotion WRITE plane (S9-activation Slice 2,
     §4) — the scheduler + inbox with the REAL warehouse probe, dependency resolver,
@@ -338,6 +344,7 @@ def build_promotion_write_plane(
         require_landing=True,
         policy=policy,
         clock=clock,
+        tracer=tracer,
     )
 
 
@@ -352,12 +359,16 @@ def build_promotion_scheduler(
     require_landing: bool = False,
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
+    tracer: object | None = None,
 ) -> PromotionScheduler:
     """Assemble the S9 promotion scheduler alone — the SEPARATE cron-scanned process
     (§7.2), NOT a consumer stage. Its warehouse probe, hit-count reader, and
     dependency resolver are injected (Layer-1 fakes = live path). Launched by its own
     entrypoint via `run_forever(sleep=asyncio.sleep)` (or `run_once` from a cron).
-    When wiring the inbox too, prefer `build_promotion_plane` (pins the shared store)."""
+    When wiring the inbox too, prefer `build_promotion_plane` (pins the shared store).
+
+    *tracer* (optional) wires the promote/land span seam; `trace_verbose` is read off
+    `settings.learning_trace_verbose` (the D25 gate)."""
     extra = {} if clock is None else {"clock": clock}
     return PromotionScheduler(
         candidate_store,
@@ -367,6 +378,8 @@ def build_promotion_scheduler(
         dependency_resolver=dependency_resolver,
         landing_writer=landing_writer,
         require_landing=require_landing,
+        tracer=tracer,
+        trace_verbose=settings.learning_trace_verbose,
         **extra,
     )
 

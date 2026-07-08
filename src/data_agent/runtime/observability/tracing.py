@@ -31,11 +31,14 @@ from typing import Any
 from openinference.instrumentation.openai import OpenAIInstrumentor
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 from opentelemetry import trace
+from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.propagate import inject
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter
 from opentelemetry.trace import Span, Tracer
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 _TRACER_NAME = "data-agent-runtime"
 
@@ -95,15 +98,72 @@ def span(
     name: str,
     kind: OpenInferenceSpanKindValues,
     attributes: dict[str, Any] | None = None,
+    *,
+    context: Context | None = None,
+    record_exception: bool = True,
 ) -> Iterator[Span]:
     """Generic span helper — sets the OpenInference span-kind attribute plus
-    whatever *attributes* the caller supplies (already redacted)."""
-    with tracer.start_as_current_span(name) as current_span:
+    whatever *attributes* the caller supplies (already redacted).
+
+    *context* is the OTel parent `Context` to start the span under (default
+    `None` ⇒ the ambient current context, so spans auto-nest as before). Passing
+    an EXPLICIT context — e.g. one rehydrated from a W3C `traceparent` extracted
+    off a cross-process message (`context_from_traceparent`) — makes this span a
+    CHILD of that remote parent, so a session's spans join ONE trace across the
+    sweeper → consumer → scheduler process boundaries.
+
+    *record_exception* forwards to `start_as_current_span`. It defaults to `True`
+    (the online-runtime behavior: a raised exception attaches an `exception` event —
+    `exception.message` + `exception.stacktrace` — to the span). Callers that WRAP
+    real work AND must stay content-free even on error (the learning-loop spans, D25)
+    MUST pass `record_exception=False`: an OpenAI SDK error embeds response bodies and
+    a landing error references the entity-bearing `forbidden_spans`, so recording it
+    would leak transcript/entity content onto the span EVEN WITH VERBOSE OFF. The span
+    status is still set on exception (`set_status_on_exception=True`), so the ERROR is
+    visible in traces — only the entity-bearing detail is withheld."""
+    with tracer.start_as_current_span(
+        name,
+        context=context,
+        record_exception=record_exception,
+        set_status_on_exception=True,
+    ) as current_span:
         current_span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, kind.value)
         for key, value in (attributes or {}).items():
             if value is not None:
                 current_span.set_attribute(key, value)
         yield current_span
+
+
+# --- W3C trace-context propagation (cross-process span chaining) --------------
+# The learning loop spans across THREE decoupled hops (sweeper → Redis stream →
+# consumer, and consumer → candidate store → cron scheduler). To make a session's
+# whole learning journey read as ONE Phoenix trace, the producer INJECTS the
+# current span's `traceparent` onto the carried message/envelope and the consumer
+# EXTRACTS it back into a parent `Context`. These two helpers wrap the standard
+# W3C `TraceContextTextMapPropagator` so callers never touch a carrier dict.
+_PROPAGATOR = TraceContextTextMapPropagator()
+
+
+def inject_current_traceparent() -> str | None:
+    """Serialize the CURRENT span's context to a W3C `traceparent` string (or
+    `None` when there is no recording span in context). Call it INSIDE the span
+    that should become the cross-process parent; the returned value rides on the
+    outgoing message/envelope and is rehydrated by `context_from_traceparent`."""
+    carrier: dict[str, str] = {}
+    inject(carrier)
+    return carrier.get("traceparent")
+
+
+def context_from_traceparent(traceparent: str | None) -> Context | None:
+    """Rehydrate a parent `Context` from a `traceparent` carried on an incoming
+    message/envelope, for `span(..., context=...)`. FAIL-OPEN: a missing or
+    malformed value ⇒ `None` (the span starts as a normal root), never a crash."""
+    if not traceparent:
+        return None
+    try:
+        return _PROPAGATOR.extract({"traceparent": traceparent})
+    except Exception:  # noqa: BLE001 - a malformed traceparent must never crash a consume/promote
+        return None
 
 
 def agent_span(
@@ -261,10 +321,12 @@ __all__ = [
     "agent_span",
     "chain_span",
     "configure_tracing",
+    "context_from_traceparent",
     "embedding_span",
     "get_tracer",
     "guardrail_observer",
     "guardrail_span",
+    "inject_current_traceparent",
     "instrument_openai",
     "recall_span",
     "rerank_span",

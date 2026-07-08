@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
@@ -43,12 +44,15 @@ from .candidate import (
 )
 from .config import LearningSettings, learning_enabled
 from .extractor import ExtractedCandidate, LearningExtractor
+from .extractor.models import BlueprintPayload
 from .models import LearningStatus, compute_content_hash
 from .observability import (
     consume_span,
+    context_from_traceparent,
     disabled_span,
     extract_span,
     extract_stub_span,
+    inject_current_traceparent,
     triage_span,
 )
 from .queue import DeliveredJob, LearningQueue
@@ -62,6 +66,62 @@ _logger = logging.getLogger(__name__)
 # The S2 collaborators, typed for DI (all defaulted so Layer-1 fakes drop in).
 SummaryLoader = Callable[..., Awaitable[SessionSummary]]
 Triage = Callable[[SessionSummary], TriageVerdict]
+
+# The verbose transcript-preview length cap (D25-gated; entity-bearing).
+_TRANSCRIPT_PREVIEW_LIMIT = 500
+
+
+def _session_question(summary: SessionSummary) -> str | None:
+    """The user's originating question (the first turn's NL). Entity-bearing —
+    only ever surfaced on a span behind the verbose gate."""
+    for turn in summary.turns:
+        if turn.user_nl:
+            return turn.user_nl
+    return None
+
+
+def _transcript_preview(summary: SessionSummary) -> str | None:
+    """A short human-readable preview of what the chat was about (user/assistant
+    lines, truncated). Entity-bearing — verbose-gated."""
+    parts: list[str] = []
+    for turn in summary.turns:
+        if turn.user_nl:
+            parts.append(f"user: {turn.user_nl}")
+        if turn.assistant_text:
+            parts.append(f"assistant: {turn.assistant_text}")
+    if not parts:
+        return None
+    return " | ".join(parts)[:_TRANSCRIPT_PREVIEW_LIMIT]
+
+
+def _accepted_sql(summary: SessionSummary) -> str | None:
+    """The accepted SQL (the last successful runQuery). Entity-bearing —
+    verbose-gated."""
+    sql: str | None = None
+    for tc in summary.tool_calls:
+        if tc.tool_name == "runQuery" and tc.status == "ok" and tc.sql:
+            sql = tc.sql
+    return sql
+
+
+def _blueprint_verbose(
+    candidate: ExtractedCandidate,
+) -> tuple[str | None, str | None, str | None]:
+    """The learned (intent, slot-plan, rationale) of a blueprint candidate for the
+    verbose extract span. `slots` renders as `name→binds_to; ...`. Entity-bearing —
+    verbose-gated."""
+    payload = candidate.payload
+    if not isinstance(payload, BlueprintPayload):
+        return None, None, candidate.header.rationale or None
+    slots = (
+        "; ".join(
+            f"{p.slot.name}→{p.slot.binds_to}"
+            for p in payload.parameterization
+            if p.role == "slot" and p.slot is not None
+        )
+        or None
+    )
+    return payload.intent or None, slots, candidate.header.rationale or None
 
 
 @dataclass(frozen=True)
@@ -173,6 +233,10 @@ class LearningConsumer:
         """Idempotent process of one delivery. Returns the outcome label
         (`done` | `dedup_skip` | `skip`)."""
         job = delivered.job
+        # Rehydrate the enqueue-propagated trace context so this consume (and the
+        # triage/extract spans nested under it) join the session's ONE trace. A
+        # missing/malformed traceparent ⇒ None ⇒ a normal root span (fail-open).
+        parent_ctx = context_from_traceparent(job.traceparent)
         doc, cas = await self._store.get_session_with_cas(job.session_id)
 
         # Idempotency (D96 §5.2): a re-delivery of an already-processed job
@@ -182,7 +246,9 @@ class LearningConsumer:
             and doc.learning_content_hash == job.content_hash
         ):
             await self._queue.ack(delivered.message_id)
-            self._emit_consume(job.session_id, "dedup_skip", delivered.delivery_count)
+            self._emit_consume(
+                job.session_id, "dedup_skip", delivered.delivery_count, context=parent_ctx
+            )
             return "dedup_skip"
 
         try:
@@ -192,37 +258,73 @@ class LearningConsumer:
             )
         except CASMismatchError:
             # A peer is handling it, or the state isn't `queued` — do NOT ack;
-            # leave the message for the owner / a later reclaim.
+            # leave the message for the owner / a later reclaim. No consume span
+            # (nothing was processed).
             return "skip"
 
-        # --- Slice-2 work: load → triage → skip/keep (§5.1). Operates on the
-        # already-loaded `doc` (keeps the fresh-hash source consistent with
-        # MEDIUM-3) and is strictly READ-ONLY (D72) — the only writes are the two
-        # lifecycle CAS transitions bracketing this call. ---
-        await self._do_work(doc, delivered)
+        # Open the consume span (session-trace continuation, under the propagated
+        # context) as the PARENT of the triage/extract spans, so a session's whole
+        # journey reads as ONE trace top-to-bottom. No tracer ⇒ nullcontext (no-op).
+        with self._consume_scope(
+            job.session_id, delivered.delivery_count, parent_ctx
+        ) as consume:
+            # --- Slice-2 work: load → triage → skip/keep (§5.1). Operates on the
+            # already-loaded `doc` (fresh-hash source consistent with MEDIUM-3) and
+            # is strictly READ-ONLY (D72) — the only writes are the two lifecycle
+            # CAS transitions bracketing this call. ---
+            summary = await self._do_work(doc, delivered)
 
-        # MEDIUM-3: record a FRESHLY computed hash from the loaded doc (not the
-        # stale message hash) so the Slice-2 dedup sees the true content hash.
-        fresh_hash = compute_content_hash(doc)
-        try:
-            await state_machine.transition(
-                self._store, job.session_id, LearningStatus.PROCESSING,
-                LearningStatus.DONE, cas, content_hash=fresh_hash,
-            )
-        except CASMismatchError:
-            # Crash/lost race before XACK is safe: the message stays in the PEL,
-            # is reclaimed, and the `done`+same-hash dedup ACKs it next time.
-            return "skip"
+            # MEDIUM-3: record a FRESHLY computed hash from the loaded doc (not the
+            # stale message hash) so the Slice-2 dedup sees the true content hash.
+            fresh_hash = compute_content_hash(doc)
+            try:
+                await state_machine.transition(
+                    self._store, job.session_id, LearningStatus.PROCESSING,
+                    LearningStatus.DONE, cas, content_hash=fresh_hash,
+                )
+            except CASMismatchError:
+                # Crash/lost race before XACK is safe: the message stays in the PEL,
+                # is reclaimed, and the `done`+same-hash dedup ACKs it next time.
+                if consume is not None:
+                    consume.set_attribute("learning.outcome", "skip")
+                return "skip"
 
-        await self._queue.ack(delivered.message_id)
-        self._emit_consume(job.session_id, "done", delivered.delivery_count)
+            await self._queue.ack(delivered.message_id)
+            self._set_verbose_consume(consume, summary)
         return "done"
+
+    def _consume_scope(self, session_id: str, delivery_count: int, parent_ctx):
+        """The consume span (default `outcome=done`, overridden to `skip` on the rare
+        DONE-CAS race) OR a `nullcontext(None)` when no tracer is wired, so the
+        no-op-tracer behavior is byte-identical."""
+        if self._tracer is None:
+            return nullcontext(None)
+        return consume_span(
+            self._tracer,
+            session_id=session_id,
+            outcome="done",
+            delivery_count=delivery_count,
+            context=parent_ctx,
+        )
+
+    def _set_verbose_consume(self, consume, summary: SessionSummary) -> None:
+        """D25-gated: attach the user question + a transcript preview to the consume
+        span ONLY when verbose is on (entity-bearing — see observability docstring)."""
+        if consume is None or not self._settings.learning_trace_verbose:
+            return
+        question = _session_question(summary)
+        if question is not None:
+            consume.set_attribute("learning.question", question)
+        preview = _transcript_preview(summary)
+        if preview is not None:
+            consume.set_attribute("learning.transcript_preview", preview)
 
     async def _handle_dead_letter(self, delivered: DeliveredJob) -> str:
         """A message past N deliveries. Ordering (MEDIUM-3/4): CAS the session to
         `dead_letter` FIRST, then `finalize_dead_letter` (XADD-dead + XACK).
         Returns `dead_letter` | `ack_terminal` | `skip`."""
         job = delivered.job
+        parent_ctx = context_from_traceparent(job.traceparent)
         doc, cas = await self._store.get_session_with_cas(job.session_id)
 
         # Already terminal (crash between a prior CAS and finalize, OR a poison
@@ -244,26 +346,30 @@ class LearningConsumer:
         # Session is terminal now; complete the queue-side move. A crash before
         # this leaves the message in the PEL → reclaimed → terminal → ack_terminal.
         await self._queue.finalize_dead_letter(delivered)
-        self._emit_consume(job.session_id, "dead_letter", delivered.delivery_count)
+        self._emit_consume(
+            job.session_id, "dead_letter", delivered.delivery_count, context=parent_ctx
+        )
         return "dead_letter"
 
-    async def _do_work(self, doc: SessionDoc, delivered: DeliveredJob) -> None:
+    async def _do_work(self, doc: SessionDoc, delivered: DeliveredJob) -> SessionSummary:
         """Slice-2/3 seam (§5.1): load the `SessionSummary` (READ-ONLY, D72), run
         the deterministic triage gate, and on KEEP run the grounded extractor
         (S3). Either way the outer `_process` CAS-marks the session `done` —
         "processed" == "triaged". This method NEVER mutates the request-path
         session (D72); the only writes are to the LEARNING plane (audit +
-        candidate stores)."""
+        candidate stores). Returns the loaded summary so `_process` can attach the
+        verbose consume attrs."""
         summary = await self._summary_loader(doc, self._store, job=delivered.job)
         verdict = self._triage(summary)
-        self._emit_triage(summary.session_id, verdict)
+        self._emit_triage(summary, verdict)
         if verdict.decision != "keep":
-            return
+            return summary
         if self._extractor is None:
             # Back-compat: no extractor wired ⇒ the S2 `would_extract` stub.
             self._emit_extract_stub(summary.session_id, verdict.target_hints)
-            return
+            return summary
         await self._run_extractor(summary, verdict)
+        return summary
 
     async def _run_extractor(self, summary: SessionSummary, verdict: TriageVerdict) -> None:
         """S3: extract candidates → snapshot each candidate's evidence into
@@ -275,6 +381,11 @@ class LearningConsumer:
         # wrote for this session, so the store never holds a mixed set from two
         # LLM runs that emitted a different count/order.
         await self._candidates.supersede(summary.content_hash)
+        # Capture the CURRENT trace context (the open consume span) as a W3C
+        # traceparent and stamp it onto each envelope, so the cron scheduler's
+        # promote/land spans continue this SAME session trace. None when no tracer.
+        traceparent = inject_current_traceparent() if self._tracer is not None else None
+        intent = slots = rationale = None
         for ordinal, candidate in enumerate(result.candidates):
             evidence_refs = await self._snapshot_evidence(candidate, summary)
             envelope = build_envelope(
@@ -282,16 +393,22 @@ class LearningConsumer:
                 summary,
                 candidate_id=mint_candidate_id(summary.content_hash, ordinal),
                 evidence_refs=evidence_refs,
+                traceparent=traceparent,
             )
             await self._candidates.put(envelope)
+            if intent is None and isinstance(candidate.payload, BlueprintPayload):
+                intent, slots, rationale = _blueprint_verbose(candidate)
             if await self._run_stages(envelope, summary, verdict) == "halt":
                 break
         decline_reasons = tuple(d.reason for d in result.declines)
         self._emit_extract(
-            summary.session_id,
+            summary,
             candidate_count=len(result.candidates),
             decline_reasons=decline_reasons,
             target_hints=verdict.target_hints,
+            intent=intent,
+            slots=slots,
+            rationale=rationale,
         )
 
     async def _run_stages(
@@ -364,16 +481,21 @@ class LearningConsumer:
             refs.append(ref)
         return tuple(refs)
 
-    def _emit_triage(self, session_id: str, verdict: TriageVerdict) -> None:
-        if self._tracer is not None:
-            with triage_span(
-                self._tracer,
-                session_id=session_id,
-                decision=verdict.decision,
-                reason=verdict.reason,
-                target_hints=verdict.target_hints,
-            ):
-                pass
+    def _emit_triage(self, summary: SessionSummary, verdict: TriageVerdict) -> None:
+        if self._tracer is None:
+            return
+        verbose = self._settings.learning_trace_verbose
+        with triage_span(
+            self._tracer,
+            session_id=summary.session_id,
+            decision=verdict.decision,
+            reason=verdict.reason,
+            target_hints=verdict.target_hints,
+            verbose=verbose,
+            question=_session_question(summary) if verbose else None,
+            transcript_preview=_transcript_preview(summary) if verbose else None,
+        ):
+            pass
 
     def _emit_extract_stub(self, session_id: str, target_hints: tuple[str, ...]) -> None:
         if self._tracer is not None:
@@ -384,30 +506,43 @@ class LearningConsumer:
 
     def _emit_extract(
         self,
-        session_id: str,
+        summary: SessionSummary,
         *,
         candidate_count: int,
         decline_reasons: tuple[str, ...],
         target_hints: tuple[str, ...],
+        intent: str | None = None,
+        slots: str | None = None,
+        rationale: str | None = None,
     ) -> None:
-        if self._tracer is not None:
-            with extract_span(
-                self._tracer,
-                session_id=session_id,
-                candidate_count=candidate_count,
-                decline_count=len(decline_reasons),
-                decline_reasons=decline_reasons,
-                target_hints=target_hints,
-            ):
-                pass
+        if self._tracer is None:
+            return
+        verbose = self._settings.learning_trace_verbose
+        with extract_span(
+            self._tracer,
+            session_id=summary.session_id,
+            candidate_count=candidate_count,
+            decline_count=len(decline_reasons),
+            decline_reasons=decline_reasons,
+            target_hints=target_hints,
+            verbose=verbose,
+            accepted_sql=_accepted_sql(summary) if verbose else None,
+            intent=intent if verbose else None,
+            slots=slots if verbose else None,
+            rationale=rationale if verbose else None,
+        ):
+            pass
 
-    def _emit_consume(self, session_id: str, outcome: str, delivery_count: int) -> None:
+    def _emit_consume(
+        self, session_id: str, outcome: str, delivery_count: int, *, context=None
+    ) -> None:
         if self._tracer is not None:
             with consume_span(
                 self._tracer,
                 session_id=session_id,
                 outcome=outcome,
                 delivery_count=delivery_count,
+                context=context,
             ):
                 pass
 

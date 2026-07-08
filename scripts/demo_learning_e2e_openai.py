@@ -8,12 +8,18 @@ seeding/sweep/consume/promote/land/recall pattern of
 
   1. a REAL OpenAI extractor (`build_openai_model_client` wrapped by the real
      `LearningExtractor` the factory builds) making the learning decision, and
-  2. Phoenix OTel tracing on every stage (sweeper, consumer, and manual spans
-     around promotion/recall), exported to the `learning-loop` Phoenix project.
+  2. Phoenix OTel tracing CHAINED into ONE trace per session — the sweeper's
+     `learning.enqueue` is the per-session ROOT; its W3C `traceparent` rides on the
+     job so `learning.consume`/`triage`/`extract` nest under it, and the same
+     traceparent carried on the candidate makes the scheduler's own `promote`/`land`
+     spans (its REAL tracer seam, not manual wrappers) continue the SAME trace.
+     Exported to the `learning-loop` Phoenix project. `LEARNING_TRACE_VERBOSE=1` is
+     set here so the spans additionally carry human-readable content (question /
+     accepted SQL / learned intent) — the entity-bearing diagnostic posture.
 
 Run (from the repo root, the l2 stack + Phoenix UP):
 
-    uv run python scripts/demo_learning_e2e_openai.py
+    LEARNING_TRACE_VERBOSE=1 DEMO_MODEL=gpt-5.5 uv run python scripts/demo_learning_e2e_openai.py
 """
 
 from __future__ import annotations
@@ -73,6 +79,10 @@ os.environ.update(
         # merges OTEL_RESOURCE_ATTRIBUTES into Resource.create(...) (service.name alone
         # lands everything in Phoenix's 'default' project).
         "OTEL_RESOURCE_ATTRIBUTES": "openinference.project.name=learning-loop",
+        # Turn the D25 verbose gate ON for this DIAGNOSTIC run so the spans carry the
+        # human-readable content (question / accepted SQL / learned intent). This makes
+        # the learning-loop Phoenix project entity-bearing — a controlled demo posture.
+        "LEARNING_TRACE_VERBOSE": "1",
     }
 )
 
@@ -95,7 +105,9 @@ from data_agent.learning.models import (  # noqa: E402
 )
 from data_agent.learning.observability import (  # noqa: E402
     configure_learning_tracing,
+    context_from_traceparent,
     get_learning_tracer,
+    learning_recall_span,
 )
 from data_agent.learning.promotion.landing import landing_id  # noqa: E402
 from data_agent.learning.promotion.models import PromotionPolicy  # noqa: E402
@@ -416,21 +428,50 @@ def _print_model_emission(result) -> None:  # noqa: ANN001
     print("=" * 70 + "\n")
 
 
-async def _confirm_phoenix() -> None:
+def _flatten(d: dict, prefix: str = "") -> dict:
+    """Flatten Phoenix's NESTED attribute JSON back to dotted OTel keys, so
+    `{"session": {"id": x}}` reads as `{"session.id": x}` (the form the code set)."""
+    out: dict = {}
+    for key, value in d.items():
+        dotted = f"{prefix}{key}"
+        if isinstance(value, dict):
+            out.update(_flatten(value, dotted + "."))
+        else:
+            out[dotted] = value
+    return out
+
+
+def _span_attrs(node) -> dict:  # noqa: ANN001
+    """Phoenix returns span attributes as a JSON string of a NESTED object (or a
+    dict on some builds). Normalize to a FLAT dotted-key dict; tolerate absence."""
+    import json as _json
+
+    raw = node.get("attributes")
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = _json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+    return _flatten(raw) if isinstance(raw, dict) else {}
+
+
+async def _confirm_phoenix(sid: str) -> None:
     query = (
         "{ projects { edges { node { name traceCount recordCount "
-        "spans(first: 200) { edges { node { name spanKind } } } } } } }"
+        "spans(first: 1000, sort: {col: startTime, dir: desc}) { edges { node { "
+        "name spanKind spanId parentId attributes context { traceId spanId } } } } "
+        "} } } }"
     )
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(_PHOENIX_GRAPHQL, json={"query": query})
         resp.raise_for_status()
         data = resp.json()
     projects = data.get("data", {}).get("projects", {}).get("edges", [])
-    target = None
-    for edge in projects:
-        if edge["node"]["name"] == "learning-loop":
-            target = edge["node"]
-            break
+    target = next(
+        (e["node"] for e in projects if e["node"]["name"] == "learning-loop"), None
+    )
     print("=" * 70)
     print(">>> PHOENIX TRACE CONFIRMATION")
     print("=" * 70)
@@ -441,14 +482,67 @@ async def _confirm_phoenix() -> None:
         print(f"  Open the Phoenix UI to inspect: {_PHOENIX_UI}")
         return
     spans = [e["node"] for e in target["spans"]["edges"]]
-    from collections import Counter
-
-    names = Counter(s["name"] for s in spans)
     print(f"  project: 'learning-loop'  traceCount={target['traceCount']} "
-          f"recordCount={target['recordCount']}")
-    print(f"  spans retrieved: {len(spans)}")
-    for name, count in sorted(names.items()):
-        print(f"    - {name}: {count}")
+          f"recordCount={target['recordCount']}  spans retrieved={len(spans)}")
+
+    # Group by traceId; find THE trace carrying this session's spans (session.id==sid).
+    def _trace_id(s):  # noqa: ANN001
+        return (s.get("context") or {}).get("traceId")
+
+    by_trace: dict[str, list] = {}
+    for s in spans:
+        by_trace.setdefault(_trace_id(s), []).append(s)
+
+    session_traces = {
+        _trace_id(s)
+        for s in spans
+        if _span_attrs(s).get("session.id") == sid
+    }
+    if not session_traces:
+        print(f"  no spans found for session.id={sid!r} yet (ingestion lag?). "
+              f"Open {_PHOENIX_UI} (project: learning-loop).")
+        return
+    print(f"\n  session {sid!r} spans span {len(session_traces)} traceId(s): "
+          f"{'ONE trace (chained ✓)' if len(session_traces) == 1 else 'MULTIPLE (NOT chained!)'}")
+
+    for tid in session_traces:
+        members = by_trace.get(tid, [])
+        print(f"\n  ── traceId {tid}  ({len(members)} spans) ──")
+        # Build the parent→children tree and print it depth-first from the roots.
+        by_span = {s["spanId"]: s for s in members}
+        children: dict[str | None, list] = {}
+        for s in members:
+            parent = s.get("parentId")
+            parent = parent if parent in by_span else None  # cross-trace/None → root
+            children.setdefault(parent, []).append(s)
+
+        def _print(node_id, depth, kids):  # noqa: ANN001
+            for s in kids.get(node_id, []):
+                indent = "    " + "  " * depth
+                print(f"{indent}└─ {s['name']} [{s.get('spanKind')}]")
+                _print(s["spanId"], depth + 1, kids)
+
+        _print(None, 0, children)
+
+        # A couple of the human-readable (verbose) attribute values, if present.
+        wanted = (
+            "learning.question",
+            "learning.accepted_sql",
+            "learning.extract.intent",
+            "learning.blueprint.intent",
+        )
+        printed_header = False
+        for s in members:
+            attrs = _span_attrs(s)
+            hits = {k: attrs[k] for k in wanted if k in attrs}
+            if not hits:
+                continue
+            if not printed_header:
+                print("    human-readable (verbose) attrs:")
+                printed_header = True
+            for k, v in hits.items():
+                print(f"      {s['name']}.{k} = {v!r}")
+
     print(f"\n  Open the Phoenix UI: {_PHOENIX_UI}  (project: learning-loop)")
     print("=" * 70)
 
@@ -548,7 +642,7 @@ async def _run() -> int:
         if stored is None:
             print("[STAGE 3] the real model produced NO auto-landable blueprint candidate — "
                   "reporting the traced run as-is (a valid real-LLM outcome).")
-            await _flush_and_confirm(provider, model, stages_done=3, extractor_real=True)
+            await _flush_and_confirm(provider, model, sid, stages_done=3, extractor_real=True)
             return 0
 
         gen = stored.payload.get("generalization")
@@ -572,7 +666,7 @@ async def _run() -> int:
             print(f"[STAGE 3] candidate did NOT auto-land as 'candidate' (status={stored.status}) — "
                   "the model's plan routed to review or failed static validation. "
                   "Reporting the traced run; skipping promotion.")
-            await _flush_and_confirm(provider, model, stages_done=3, extractor_real=True)
+            await _flush_and_confirm(provider, model, sid, stages_done=3, extractor_real=True)
             return 0
 
         ckey = stored.dedup.canonical_key
@@ -596,24 +690,22 @@ async def _run() -> int:
             embedding_client=infra.embedder,
             model_id=_MODEL,
             policy=policy,
+            tracer=tracer,  # REAL scheduler tracer seam: promote/land emit their own
+            # spans STARTED under the candidate's traceparent → the SAME session trace.
         )
-        # PromotionScheduler has no tracer seam — wrap its cycles in a manual span
-        # so promotion/landing shows up in the learning-loop Phoenix project.
         validated = None
         last_decision = None
-        with span(tracer, "learning.promote", OpenInferenceSpanKindValues.CHAIN,
-                  {"session.id": sid, "learning.candidate_id": cid}):
-            for _ in range(30):
-                promo = await scheduler.run_once()
-                if promo.disabled:
-                    raise SystemExit("scheduler disabled")
-                d = next((x for x in promo.decisions if x.candidate_id == cid), None)
-                if d is not None:
-                    last_decision = d
-                validated = await infra.candidate_store.get(cid)
-                if validated is not None and validated.status == "validated":
-                    break
-                await asyncio.sleep(0.5)
+        for _ in range(30):
+            promo = await scheduler.run_once()
+            if promo.disabled:
+                raise SystemExit("scheduler disabled")
+            d = next((x for x in promo.decisions if x.candidate_id == cid), None)
+            if d is not None:
+                last_decision = d
+            validated = await infra.candidate_store.get(cid)
+            if validated is not None and validated.status == "validated":
+                break
+            await asyncio.sleep(0.5)
         if last_decision is not None:
             print(f"[STAGE 4] scheduler decision for {cid}: action={last_decision.action} "
                   f"to_status={getattr(last_decision, 'to_status', None)} "
@@ -623,7 +715,7 @@ async def _run() -> int:
             print(f"[STAGE 4] candidate did NOT reach 'validated' "
                   f"(status={None if validated is None else validated.status}, "
                   f"decision_reason={reason}). Reporting the traced run; skipping recall.")
-            await _flush_and_confirm(provider, model, stages_done=4, extractor_real=True)
+            await _flush_and_confirm(provider, model, sid, stages_done=4, extractor_real=True)
             return 0
 
         async with infra.neo4j_driver.session() as s:
@@ -645,9 +737,11 @@ async def _run() -> int:
             expected_model=_MODEL,
             timeout_seconds=15.0,
         )
+        # Continue the SAME session trace: the recall/demote spans start under the
+        # candidate's propagated traceparent (fail-open None ⇒ a normal root span).
+        session_ctx = context_from_traceparent(validated.traceparent)
         try:
-            with span(tracer, "learning.recall", OpenInferenceSpanKindValues.RETRIEVER,
-                      {"session.id": sid}):
+            with learning_recall_span(tracer, session_id=sid, context=session_ctx):
                 recalled = await index.recall(query_vector=query_vector, kind="blueprint", k=30)
             landed = next((c for c in recalled if c.id == node_id), None)
             if landed is None:
@@ -659,7 +753,7 @@ async def _run() -> int:
 
             # BONUS — DEMOTE -> forget
             with span(tracer, "learning.demote", OpenInferenceSpanKindValues.CHAIN,
-                      {"session.id": sid, "learning.candidate_id": cid}):
+                      {"session.id": sid, "learning.candidate_id": cid}, context=session_ctx):
                 demote = await scheduler.apply_user_correction(validated)
             demoted = await infra.candidate_store.get(cid)
             after = await index.recall(query_vector=query_vector, kind="blueprint", k=30)
@@ -670,20 +764,20 @@ async def _run() -> int:
         finally:
             await index.close()
 
-        await _flush_and_confirm(provider, model, stages_done=5, extractor_real=True)
+        await _flush_and_confirm(provider, model, sid, stages_done=5, extractor_real=True)
         return 0
     finally:
         await _teardown(infra)
 
 
-async def _flush_and_confirm(provider, model, *, stages_done, extractor_real) -> None:  # noqa: ANN001
+async def _flush_and_confirm(provider, model, sid, *, stages_done, extractor_real) -> None:  # noqa: ANN001
     # Flush the BatchSpanProcessor so spans export before we query Phoenix / exit.
     provider.force_flush()
     print(f"\n[SUMMARY] OpenAI model used: {model!r} | stages completed: {stages_done}/5 | "
           f"real extractor: {extractor_real}")
-    # Give Phoenix a moment to ingest the flushed batch.
-    await asyncio.sleep(2.0)
-    await _confirm_phoenix()
+    # Give Phoenix a moment to ingest the flushed batch (indexing lag).
+    await asyncio.sleep(5.0)
+    await _confirm_phoenix(sid)
 
 
 if __name__ == "__main__":
