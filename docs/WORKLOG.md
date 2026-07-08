@@ -141,6 +141,14 @@ invariant→test status board.
   and the **production-activation checklist** (provision buckets + neo4j corpus schema + set the env).
   Layer-3 conformance for the loop + D25 exposure trace / physical S10 index removal stay a separate later
   concern. See Sessions 21 + 20 (+cont.) + 19 below.
+  **Now real-LLM-proven + observable (Session 22, commits `0181388`/`7dc2737`/`a5bf077`/`661cda2`):**
+  the ENABLED loop was driven end-to-end on real infra with `LEARNING_ENABLED=1`
+  (`test_learning_end_to_end_live.py`, 5/5), the extractor's forced-tool schema was hardened to emit valid
+  blueprints against a **real** OpenAI model (gpt-5.5), and BOTH the offline learning journey and a live
+  user turn are now visible in Phoenix (one-trace-per-session chaining + `data-agent-runtime`/`learning-loop`
+  projects; two review-caught D25 content-leaks closed — verbose-off shape-only + LLM-content hidden by
+  default). **The learning loop is now FUNCTIONALLY COMPLETE, real-LLM-proven, and observable — still
+  DORMANT by default.** Gates: **1800 passed / 3 skipped, ruff clean.** See Session 22 below.
 
 **Where we are (Session 14):** the **deferred-items** sweep is done — D90 (extractor fail-open) and
 D91 (D67 `resolve_via` wrong-answer) are both **fixed + reviewed**; the CI matrix, the D62 oracle, the
@@ -163,18 +171,25 @@ resolveValues Layer-2 leg, and the D67 seed leg all landed; and the next three b
 - **Item 9 (auth hardening):** **DECIDED → building** — restrictive `column_scope` end-to-end +
   per-user BFF mint + `X-Session-Id` HMAC-bind; only Entra OIDC deferred. Not yet designed/built.
 
-**Next scheduled bricks, in order:** (1) **Layer-3 conformance** (Item 3, designed) → (2) **auth
-readiness** (Item 9, decided) → (3) **table-intermediate Slice 1** (Item 8, designed). **Track B —
-the offline learning loop** (the **last big Phase-1 deliverable**) is now **BUILT end-to-end AND WIRED
-THROUGH at Layer-1 (Sessions 16–20) AND now Layer-2-PROVEN against real infra (Wave 3b-ii, `e520b33`:
-39/39 learning Layer-2 green incl. the full-pipeline-live cross-session D48 accrual proof) — see the
-Track-B bullet above — production-activatable but dormant**; its stores + queue + fully-wired pipeline
-are proven, and the **promotion scheduler is now REAL (Session 21, S9-activation): the loop LEARNS AND
-FORGETS end-to-end** (real probe/resolver + S9 corpus-landing writer + corpus retraction, all built +
-reviewed + committed). So the **remaining step is LAST-MILE ACTIVATION only** — a **real GitHub PR client**
-for the S8 schema-edit bot + the **production-activation checklist** (buckets + neo4j corpus schema + env)
-— **not** the pipeline and **not** a fresh start. The runtime's Phase-1 `getTableSchema` is just a passthrough
-of the now-MCP-side overlay (D83/D84).
+**NEXT FOCUS — the UI (next session starts here).** With Track B functionally complete, real-LLM-proven,
+and observable (Session 22, dormant by default), the next brick is the **UI**. The current UI is the
+**minimal Phase-0 SSE console** + a **scripted dev launcher** — `docs/08-ui.md`, `ui/` (`server.py` BFF +
+`static/` vanilla console + `entitlements.py`), and `scripts/run_ui_runtime.py`. Next session begins UI
+work from there.
+
+**Other scheduled bricks (carried, in order behind the UI):** (1) **Layer-3 conformance** (Item 3,
+designed) → (2) **auth readiness** (Item 9, decided) → (3) **table-intermediate Slice 1** (Item 8,
+designed). **Track B — the offline learning loop** (the **last big Phase-1 deliverable**) is now **BUILT
+end-to-end AND WIRED THROUGH at Layer-1 (Sessions 16–20) AND Layer-2-PROVEN against real infra (Wave
+3b-ii, `e520b33`: 39/39 learning Layer-2 green incl. the full-pipeline-live cross-session D48 accrual
+proof) AND real-LLM-proven + observable (Session 22) — see the Track-B bullet above — production-activatable
+but DORMANT**; its stores + queue + fully-wired pipeline are proven, the **promotion scheduler is REAL
+(Session 21, S9-activation): the loop LEARNS AND FORGETS end-to-end** (real probe/resolver + S9
+corpus-landing writer + corpus retraction), and the **ENABLED loop was driven end-to-end on real infra
+with a real LLM (Session 22)**. So the **only remaining step is LAST-MILE ACTIVATION** — a **real GitHub
+PR client** for the S8 schema-edit bot + the **production-activation checklist** (buckets + neo4j corpus
+schema + `OTLP_ENDPOINT` + env) — **not** the pipeline and **not** a fresh start. The runtime's Phase-1
+`getTableSchema` is just a passthrough of the now-MCP-side overlay (D83/D84).
 
 **Honest remaining Phase-0 gaps** (carried): the **3 deferred Layer-3 scenarios** — mid-session scope
 narrowing (needs BFF per-turn scope switching), observability+PII span inspection (needs a Phoenix
@@ -245,6 +260,65 @@ authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's
   - **`resolveValues` Layer-2 over the real MCP** — still not run (carried from Session 9).
   - The **authoring-time static grain gate (D37/D37b)** stays Phase-2 — the runtime D56 gate is the
     launch teeth; wrong-grain blueprints are caught at execution, not yet at authoring.
+
+---
+
+## 2026-07-08 — Session 22: the loop learns end-to-end with a REAL LLM, and is now observable in Phoenix
+
+Four reviewed + committed commits on `phase0/provenance-extractor` (nothing pushed — no git remote). This
+session did two things: it drove the learning loop **all the way through with the switch ON and a REAL
+LLM** (the first time the extractor "brain" faced a real model, not a scripted double), and it made **both
+the offline learning journey AND a live user turn visible in Phoenix** — the traces existed but weren't
+findable/chained. Two reviews each caught a **D25 content-leak** on the observability work; both closed.
+
+- ✅ **`0181388` — live END-TO-END, loop ENABLED.** `tests/integration/test_learning_end_to_end_live.py`
+  proves the operational chain on real infra with `LEARNING_ENABLED=1`: a genuine question answered vs live
+  ClickHouse → the real sweeper enqueues (Redis) → the consumer extracts + lands a candidate → `hit_count`
+  accrues to T → the real scheduler replay-gates vs live ClickHouse → lands a `:Blueprint` in real neo4j →
+  real recall surfaces it for a related question → demote excludes it (forget). 5/5 stages. The extractor
+  "brain" is scripted (deterministic) here; **all infra is real** — this is the switched-ON operational
+  proof to complement the Session-21 unit/Layer-2 arc.
+
+- ✅ **`7dc2737` — the extractor works against a REAL LLM.** Pointing the extractor at a real OpenAI model
+  (gpt-5.5) for the first time exposed that its forced-tool schema had only ever been validated by scripted
+  doubles: the blueprint payload schema wasn't wired into the tool the model actually sees (bare payload,
+  `kind` never required), no FQ `binds_to` guidance, no slot-type enum. Fixed in `extractor/schema.py`
+  (`allOf`/`if`/`then` wiring `_BLUEPRINT_PAYLOAD_SCHEMA`, slot-type enum, FQ `binds_to`), `extractor.py`
+  (system prompt), and `validation.py` (fail-closed hardening: malformed real-model payloads become
+  traceable **Declines**, not consumer dead-letter crashes). Proven library-native via
+  `scripts/demo_learning_e2e_openai.py` (5/5, real gpt-5.5 emits a valid blueprint). + a schema-completeness
+  guard test (D31).
+
+- ✅ **`a5bf077` — learning-loop Phoenix traces CHAINED + human-readable.** Was atomic per-stage spans; now
+  **one trace per session**, via a W3C `traceparent` propagated through the `LearningJob`/Redis message and
+  carried on the candidate to the scheduler (enqueue → consume → {triage, leakage, extract, promote → land,
+  recall, demote}). Human-readable content (question / extracted SQL / learned intent / slots / blueprint id)
+  is gated behind `LEARNING_TRACE_VERBOSE` (**DEFAULT OFF** = D25 preserved; ON = entity-bearing, so
+  access-control the Phoenix project). **D25 leak the review caught:** spans wrap work, so OTel's default
+  `record_exception` would attach model/entity content even verbose-OFF → every learning span now routes
+  through `_learning_span(record_exception=False)`.
+
+- ✅ **`661cda2` — NORMAL user-interaction traces now visible in Phoenix.** The online runtime emitted spans
+  but they weren't findable: `configure_tracing` set only `service.name` (Phoenix groups by
+  `openinference.project.name`, so everything fell into `default`) and the runtime launched without an OTLP
+  endpoint. Fixed: `configure_tracing` sets `project_name` **in code** (runtime → `data-agent-runtime`,
+  learning → `learning-loop`; removed the `OTEL_RESOURCE_ATTRIBUTES` env hack); `RuntimeSettings.otlp_project_name`;
+  stale "Pass A/Unused" comments corrected. Proven live via `scripts/demo_runtime_turn_traced.py` (real
+  gpt-5.5 + real MCP + real ClickHouse turn → one 27-span trace, answer "2 active employees in Sales").
+  **D25 leak the review caught:** the auto OpenAI LLM span carried the raw question + answer →
+  `otlp_hide_llm_content` (**DEFAULT TRUE**) hides all LLM input/output/prompt channels (shape/model/
+  token-count kept), opt-in reveal for debugging; + an `LLMExceptionEventScrubber` SpanProcessor drops
+  content-bearing exception EVENTS off LLM spans when hidden (the failure-path residual). Guard tests over
+  the real `OpenAIInstrumentor` + `MockTransport`, parametrized over responses + chat.
+
+- **Gates at session close:** full suite **1800 passed / 3 skipped, ruff clean.** Two Phoenix projects are
+  now populated: **`learning-loop`** (the offline learning journey) and **`data-agent-runtime`** (a live
+  turn). Each commit was reviewed and Layer-2/live-verified.
+- **Honest boundary:** the learning loop is now **functionally complete, real-LLM-proven, and observable**,
+  but still **DORMANT by default** (`LEARNING_ENABLED` off). Live/Layer-2-proven, **not**
+  Layer-3-conformance-proven. Nothing pushed (no git remote). The runtime real-turn launcher
+  (`scripts/demo_runtime_turn_traced.py`) is a **demo script** — a production deploy still needs an
+  `OTLP_ENDPOINT` + provisioned buckets/neo4j corpus schema to activate.
 
 ---
 
