@@ -33,7 +33,13 @@ questions against real ClickHouse:
     - OTLP -> Phoenix : `otlp_endpoint=http://localhost:6006/v1/traces`, project
       `data-agent-runtime`. `otlp_hide_llm_content=True` is kept (the D25
       DEFAULT) — this is a real server, NOT the diagnostic demo, so the LLM
-      span's raw prompt/completion is NOT revealed.
+      span's raw prompt/completion is NOT revealed. Set `OTLP_DISABLE_REDACTION=1`
+      to flip the master telemetry debug switch: Phoenix then shows the REAL tool
+      calls (actual SQL WITH literals + the result preview) AND the LLM Q/A, for a
+      debugging operator ONLY. It makes the Phoenix project entity-bearing, so
+      access-control this server exactly like the audit store when the flag is on.
+      Default OFF (D25 shape-only preserved). TELEMETRY-ONLY: it never weakens the
+      MCP-enforced scope/PII posture (D5/D57) — only what Phoenix records.
 
 Loop tunables are the PRODUCTION defaults (`max_loop_iterations=15`,
 `max_wall_clock_seconds=60`, `max_budget_windows=3`) — NOT the scripted demo's
@@ -68,7 +74,7 @@ import openai
 import uvicorn
 
 from data_agent.runtime.app import create_app
-from data_agent.runtime.config import RuntimeSettings
+from data_agent.runtime.config import RuntimeSettings, effective_llm_hide
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.openai_client import build_openai_model_client
 from data_agent.runtime.provenance.catalog_handle import load_catalog_handle
@@ -217,6 +223,12 @@ def build_real_app():
     model = _pick_openai_model(api_key)
 
     retrieval_on = os.environ.get("REAL_RETRIEVAL") == "1"
+    # Access-controlled TELEMETRY DEBUG switch (default OFF = D25 shape-only). When
+    # OTLP_DISABLE_REDACTION=1, Phoenix shows the REAL tool calls (actual SQL WITH
+    # literals + the result preview) AND the LLM Q/A — for a debugging operator
+    # only. It makes the Phoenix project entity-bearing, so treat this server like
+    # the audit store (access-controlled) when the flag is on.
+    disable_redaction = os.environ.get("OTLP_DISABLE_REDACTION") == "1"
 
     settings = RuntimeSettings(
         _env_file=None,  # explicit wiring only — don't double-read .env
@@ -237,6 +249,10 @@ def build_real_app():
         otlp_endpoint=_PHOENIX_OTLP,
         otlp_project_name=_PHOENIX_PROJECT,
         otlp_hide_llm_content=True,
+        # Default OFF: keep the D25 shape-only posture. OTLP_DISABLE_REDACTION=1
+        # flips the master telemetry debug switch (real SQL + values + result +
+        # LLM Q/A into Phoenix) — access-controlled debugging only.
+        otlp_disable_redaction=disable_redaction,
         # Production loop tunables (NOT the scripted demo's low caps).
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
@@ -254,8 +270,15 @@ def build_real_app():
 
     print(f"[run_ui_runtime_real] mcp_url        = {settings.mcp_url}")
     print(f"[run_ui_runtime_real] session_store  = {store_choice}")
+    # Print the EFFECTIVE hide (disable_redaction overrides otlp_hide_llm_content),
+    # never the raw setting — otherwise the banner claims hide_llm_content=True while
+    # OTLP_DISABLE_REDACTION=1 has actually revealed the LLM content.
     print(f"[run_ui_runtime_real] otlp_endpoint  = {settings.otlp_endpoint} "
-          f"(project={settings.otlp_project_name}, hide_llm_content={settings.otlp_hide_llm_content})")
+          f"(project={settings.otlp_project_name}, "
+          f"effective_llm_hide={effective_llm_hide(settings)})")
+    if settings.otlp_disable_redaction:
+        print("[run_ui_runtime_real] otlp_disable_redaction = ON — Phoenix will show "
+              "REAL tool calls (SQL+values), results, and LLM Q/A. ACCESS-CONTROL this server.")
     print(f"[run_ui_runtime_real] retrieval      = {'ON (neo4j)' if retrieval_on else 'OFF'}")
     print(f"[run_ui_runtime_real] model          = {settings.openai_model}")
 

@@ -44,7 +44,11 @@ from data_agent.runtime.auth.jwt_verify import JWTVerificationError, verify_jwt
 from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
-from data_agent.runtime.config import RuntimeSettings, get_runtime_settings
+from data_agent.runtime.config import (
+    RuntimeSettings,
+    effective_llm_hide,
+    get_runtime_settings,
+)
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.context.llm_summarizer import build_llm_summarizer
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolObserver
@@ -219,6 +223,16 @@ def create_app(
         base_url=settings.openai_base_url,
     )
 
+    # The effective LLM-content hide (config.effective_llm_hide): normally
+    # `otlp_hide_llm_content` (D25 default True), but the master TELEMETRY DEBUG
+    # switch `otlp_disable_redaction` forces the reveal — disabling redaction across
+    # the board also shows the LLM Q/A + exception events, so a debugging operator
+    # sees the whole turn. Access-controlled (makes the Phoenix project entity-
+    # bearing); default keeps content hidden. Passed identically to
+    # configure_tracing (exception scrubber) AND instrument_openai (attribute
+    # TraceConfig) so both channels agree.
+    hide_llm_content = effective_llm_hide(settings)
+
     tracer_provider = tracing.configure_tracing(
         otlp_endpoint=settings.otlp_endpoint,
         service_name=settings.otlp_service_name,
@@ -230,7 +244,7 @@ def create_app(
         # (TraceConfig masks attributes, not the `exception` EVENT the OpenAI
         # instrumentor records — which embeds the response error body). Same gate
         # as instrument_openai's hide_content below.
-        hide_llm_content=settings.otlp_hide_llm_content,
+        hide_llm_content=hide_llm_content,
         # Test-only seam (D-L3-5): an injected in-memory exporter captures the
         # manual AGENT/TOOL/CHAIN/GUARDRAIL spans this provider's tracer emits,
         # so the Layer-3 D25 scenario can dump + assert them PII-clean without a
@@ -242,9 +256,7 @@ def create_app(
     # surface — the completion embeds cell values / the query-derived answer). The
     # reveal is an explicit, access-controlled opt-in (`otlp_hide_llm_content`),
     # mirroring the learning loop's verbose gate.
-    tracing.instrument_openai(
-        tracer_provider, hide_content=settings.otlp_hide_llm_content
-    )
+    tracing.instrument_openai(tracer_provider, hide_content=hide_llm_content)
     tracer = tracing.get_tracer(tracer_provider)
 
     # D77/OQ-1: the real `HttpEmbeddingClient` is wired only when the custom
@@ -363,6 +375,11 @@ def create_app(
             preview_row_count=settings.preview_row_count,
             observer=observer,
             tracer=tracer,
+            # Access-controlled TELEMETRY DEBUG switch: when set, the TOOL span
+            # carries the REAL args + result preview (not the D25 masked shape) so
+            # a debugging operator sees the real tool call in Phoenix. Telemetry-
+            # only — the dispatched call + enforced scope are unchanged.
+            disable_redaction=settings.otlp_disable_redaction,
         )
         # D77: the composite wraps the SAME dispatcher (so its inner runQuery
         # shares the per-request observer/tracer and the free D5/D57/provenance
@@ -377,6 +394,9 @@ def create_app(
             preview_row_count=settings.preview_row_count,
             observer=observer,
             tracer=tracer,
+            # Access-controlled TELEMETRY DEBUG switch: reveals the real
+            # concept/period values on the resolveValues span. Telemetry-only.
+            disable_redaction=settings.otlp_disable_redaction,
         )
         # The runtime-tool registry (read-tools §2): `resolveValues` is always
         # wired; the three read tools are wired ONLY when the retrieval pipeline
@@ -385,6 +405,9 @@ def create_app(
         runtime_tools: dict[str, RuntimeTool] = {"resolveValues": composite}
         blueprint_executor: BlueprintExecutor | None = None
         if active_retrieval is not None:
+            # `disable_redaction` (telemetry-only debug switch) reveals the real
+            # `query` free text on these read-tool spans when set; default off
+            # keeps the D25-redacted span.
             runtime_tools["searchBlueprints"] = SearchBlueprintsTool(
                 pipeline=active_retrieval,
                 default_k=settings.retrieval_search_default_k,
@@ -392,6 +415,7 @@ def create_app(
                 preview_row_count=settings.preview_row_count,
                 observer=observer,
                 tracer=tracer,
+                disable_redaction=settings.otlp_disable_redaction,
             )
             runtime_tools["searchKnowledge"] = SearchKnowledgeTool(
                 pipeline=active_retrieval,
@@ -399,12 +423,14 @@ def create_app(
                 preview_row_count=settings.preview_row_count,
                 observer=observer,
                 tracer=tracer,
+                disable_redaction=settings.otlp_disable_redaction,
             )
             runtime_tools["getBlueprint"] = GetBlueprintTool(
                 vector_index=active_retrieval.vector_index,
                 preview_row_count=settings.preview_row_count,
                 observer=observer,
                 tracer=tracer,
+                disable_redaction=settings.otlp_disable_redaction,
             )
             # runBlueprint (runblueprint-design §5, Slice B): the deterministic
             # fast path. Wired ONLY when retrieval is active — it reads the SAME
@@ -437,6 +463,10 @@ def create_app(
                 executor=blueprint_executor,
                 observer=observer,
                 tracer=tracer,
+                # Telemetry-only debug switch: reveals the real slot_bindings
+                # values on the runBlueprint span when set; default off keeps the
+                # D25 span (slot names only). The executor still gets raw args.
+                disable_redaction=settings.otlp_disable_redaction,
             )
         return AgentLoop(
             model_client=model_client,

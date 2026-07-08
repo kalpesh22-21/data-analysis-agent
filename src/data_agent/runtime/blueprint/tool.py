@@ -35,7 +35,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     _default_observer,
 )
 from data_agent.runtime.observability import tracing
-from data_agent.runtime.observability.redaction import redact_tool_args
+from data_agent.runtime.observability.redaction import tool_span_args
 
 from .executor import (
     BlueprintExecutor,
@@ -70,10 +70,17 @@ class RunBlueprintTool:
         executor: BlueprintExecutor,
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
+        disable_redaction: bool = False,
     ) -> None:
         self._executor = executor
         self._observer = observer
         self._tracer = tracer
+        # Access-controlled TELEMETRY DEBUG switch (RuntimeSettings.
+        # otlp_disable_redaction). Default False keeps the D25 span (slot_bindings
+        # values redacted, slot NAMES kept). When True the span carries the REAL
+        # slot values — telemetry-only; `_guarded` below always gets the raw
+        # model_args, so the executor's per-node runQuery/enforcement is unaffected.
+        self._disable_redaction = disable_redaction
 
     async def run(
         self, model_args: dict[str, Any], credentials: RuntimeCredentials
@@ -85,9 +92,12 @@ class RunBlueprintTool:
             with tracing.tool_span(
                 self._tracer,
                 tool_name=TOOL_NAME,
-                args=redact_tool_args(TOOL_NAME, model_args),
+                args=tool_span_args(
+                    TOOL_NAME, model_args, disable_redaction=self._disable_redaction
+                ),
                 status="ok",
                 error_code=None,
+                reveal_complex_args=self._disable_redaction,
             ) as span:
                 result = await self._guarded(model_args, credentials)
                 span.set_attribute("tool.status", result.status)

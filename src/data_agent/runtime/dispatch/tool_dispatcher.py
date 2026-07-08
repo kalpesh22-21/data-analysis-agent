@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.mcp.client import MCPClient, MCPToolError
 from data_agent.runtime.observability import tracing
-from data_agent.runtime.observability.redaction import redact_tool_args
+from data_agent.runtime.observability.redaction import tool_span_args
 from data_agent.runtime.provenance.capture import capture_provenance
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.models import ResultPreview
@@ -160,6 +160,7 @@ class ToolDispatcher:
         preview_row_count: int = 20,
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
+        disable_redaction: bool = False,
     ) -> None:
         self._mcp_client = mcp_client
         self._catalog = catalog
@@ -171,18 +172,42 @@ class ToolDispatcher:
         # (Layer-1 tests, no Phoenix) means spans are simply never created —
         # no behavioral difference otherwise.
         self._tracer = tracer
+        # Access-controlled TELEMETRY DEBUG switch (RuntimeSettings.
+        # otlp_disable_redaction, wired by app.py). Default False keeps the D25
+        # shape-only span byte-identical. When True the TOOL span carries the REAL
+        # args (SQL WITH literals) AND the result preview — see `_emit_tool_span`.
+        # TELEMETRY-ONLY: this ONLY changes what the span records; the dispatched
+        # `call_tool` below always receives the raw `model_args` regardless (the
+        # redactor never touched the dispatch path), and no scope/PII ENFORCEMENT
+        # (D5/D57, enforced in the MCP + injected credentials) depends on it.
+        self._disable_redaction = disable_redaction
 
     def _emit_tool_span(
-        self, tool_name: str, model_args: dict[str, Any], *, status: str, error_code: str | None
+        self,
+        tool_name: str,
+        model_args: dict[str, Any],
+        *,
+        status: str,
+        error_code: str | None,
+        result_preview: ResultPreview | None = None,
     ) -> None:
         if self._tracer is None:
             return
+        # DEFAULT (D25): SQL literals masked, NO result on the span. DEBUG
+        # (self._disable_redaction): the REAL args + the result preview, so the
+        # whole tool call is visible in Phoenix. Purely a telemetry choice — the
+        # dispatched call and enforced scope are identical either way.
+        span_result = result_preview if self._disable_redaction else None
         with tracing.tool_span(
             self._tracer,
             tool_name=tool_name,
-            args=redact_tool_args(tool_name, model_args),
+            args=tool_span_args(
+                tool_name, model_args, disable_redaction=self._disable_redaction
+            ),
             status=status,
             error_code=error_code,
+            result_preview=span_result,
+            reveal_complex_args=self._disable_redaction,
         ):
             pass
 
@@ -254,7 +279,9 @@ class ToolDispatcher:
         preview = _build_preview(raw_result, self._preview_row_count)
 
         self._observer("tool_dispatch_ok", {"tool_name": tool_name})
-        self._emit_tool_span(tool_name, model_args, status="ok", error_code=None)
+        self._emit_tool_span(
+            tool_name, model_args, status="ok", error_code=None, result_preview=preview
+        )
         return ToolResult(
             status="ok",
             tool_name=tool_name,

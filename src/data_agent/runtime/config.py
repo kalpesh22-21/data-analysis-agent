@@ -131,6 +131,30 @@ class RuntimeSettings(BaseSettings):
             "+ query-derived answer land on the span), like LEARNING_TRACE_VERBOSE."
         ),
     )
+    otlp_disable_redaction: bool = Field(
+        False,
+        description=(
+            "MASTER TELEMETRY DEBUG SWITCH — default False (D25 shape-only posture "
+            "preserved byte-for-byte). When True, the runtime disables Phoenix-trace "
+            "redaction so a debugging operator sees the REAL tool calls: (1) the TOOL "
+            "span carries the REAL args (actual SQL WITH literals, real resolveValues "
+            "concept/period values) instead of the D25 masked shape; (2) the tool "
+            "RESULT preview (columns + preview rows + row_count/truncated) is attached "
+            "to the TOOL span (results NEVER hit spans in the default posture); (3) the "
+            "OpenAI LLM span shows content + exception events (the effective LLM hide is "
+            "`otlp_hide_llm_content AND NOT otlp_disable_redaction`). "
+            "TELEMETRY-ONLY: this changes ONLY what Phoenix sees — it does NOT weaken "
+            "any actual scope/PII ENFORCEMENT (D5 credential injection + D57 column-"
+            "scope live in the MCP/injected-credentials path, not in the span "
+            "redactor). Turning it on makes the Phoenix project ENTITY-BEARING (real "
+            "SQL + values + Q/A) and so MUST be access-controlled like the audit store. "
+            "NOT everything is revealed even when on: the askUser question (dropped by "
+            "the guardrail-observer allowlist), the embedding/rerank/recall text (never "
+            "an attribute), and the raw column_scope (only its hash is ever emitted) "
+            "STAY redacted — the LLM-span reveal (see otlp_hide_llm_content) partially "
+            "compensates by showing the model's Q/A."
+        ),
+    )
 
     # --- Auth (JWKS verification, D5/D79/D80/D81/D82 — fields only until Pass B) ---
     jwks_url: str = Field(
@@ -348,6 +372,28 @@ class RuntimeSettings(BaseSettings):
 
         parts = urlsplit(self.mcp_url)
         return urlunsplit((parts.scheme, parts.netloc, "/scratch/v1", "", "")).rstrip("/")
+
+
+def effective_llm_hide(settings: RuntimeSettings) -> bool:
+    """The EFFECTIVE OpenAI-LLM-content hide, resolving the two observability flags.
+
+    Content is hidden ONLY when `otlp_hide_llm_content` is True AND the master
+    telemetry debug switch `otlp_disable_redaction` is False. Disabling redaction
+    forces the reveal (so a debugging operator sees the LLM Q/A + exception events
+    alongside the real tool calls) regardless of `otlp_hide_llm_content`. Truth
+    table:
+
+        hide_llm_content  disable_redaction  -> hidden?
+        True              False              -> True   (D25 default: hidden)
+        True              True               -> False  (debug: revealed)
+        False             False              -> False  (explicit LLM reveal)
+        False             True               -> False  (debug: revealed)
+
+    `app.py` passes this single value to BOTH `configure_tracing(hide_llm_content=)`
+    (the LLMExceptionEventScrubber) and `instrument_openai(hide_content=)` (the
+    TraceConfig) so the two content channels can never disagree.
+    """
+    return settings.otlp_hide_llm_content and not settings.otlp_disable_redaction
 
 
 @lru_cache(maxsize=1)

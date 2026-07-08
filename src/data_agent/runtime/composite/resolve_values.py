@@ -50,7 +50,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
 )
 from data_agent.runtime.model.embedding_client import EmbeddingClient, EmbeddingError
 from data_agent.runtime.observability import tracing
-from data_agent.runtime.observability.redaction import redact_tool_args
+from data_agent.runtime.observability.redaction import tool_span_args
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 
 if TYPE_CHECKING:
@@ -122,6 +122,7 @@ class ResolveValuesComposite:
         preview_row_count: int = 20,
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
+        disable_redaction: bool = False,
     ) -> None:
         self._tool_dispatcher = tool_dispatcher
         self._catalog = catalog
@@ -132,6 +133,12 @@ class ResolveValuesComposite:
         self._preview_row_count = preview_row_count
         self._observer = observer
         self._tracer = tracer
+        # Access-controlled TELEMETRY DEBUG switch (RuntimeSettings.
+        # otlp_disable_redaction). Default False keeps the D25 span (concept
+        # redacted, period literals masked). When True the span carries the REAL
+        # concept/period values — telemetry-only; `_safe_run_inner` below always
+        # gets the raw model_args, so resolution/enforcement is unaffected.
+        self._disable_redaction = disable_redaction
 
     # -- model tool-call path -------------------------------------------------
 
@@ -141,7 +148,9 @@ class ResolveValuesComposite:
         """Model tool-call path: validate args, resolve, wrap as a `ToolResult`.
 
         Emits one `TOOL` span for `resolveValues` (with `concept` redacted and
-        `period` literals masked, design §6.1); the inner `runQuery` TOOL span
+        `period` literals masked, design §6.1 — UNLESS the access-controlled
+        `otlp_disable_redaction` debug switch is on, which reveals the real
+        concept/period values on the span, telemetry-only); the inner `runQuery` TOOL span
         nests inside it via the ambient OTel context. The whole pipeline is
         wrapped in a B4-parity guard (`_safe_run_inner`): an UNEXPECTED crash
         never propagates out to abort the turn or leak `str(exc)` — it degrades
@@ -153,9 +162,12 @@ class ResolveValuesComposite:
             with tracing.tool_span(
                 self._tracer,
                 tool_name=TOOL_NAME,
-                args=redact_tool_args(TOOL_NAME, model_args),
+                args=tool_span_args(
+                    TOOL_NAME, model_args, disable_redaction=self._disable_redaction
+                ),
                 status="ok",
                 error_code=None,
+                reveal_complex_args=self._disable_redaction,
             ) as span:
                 outcome = await self._safe_run_inner(model_args, credentials)
                 span.set_attribute("tool.status", outcome.status)

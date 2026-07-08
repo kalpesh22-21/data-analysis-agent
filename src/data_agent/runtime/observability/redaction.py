@@ -113,6 +113,28 @@ def redact_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def tool_span_args(
+    tool_name: str, args: dict[str, Any], *, disable_redaction: bool
+) -> dict[str, Any]:
+    """The args a TOOL span should carry — the single seam for the access-controlled
+    `RuntimeSettings.otlp_disable_redaction` master telemetry debug switch.
+
+    DEFAULT (`disable_redaction=False`, the D25 posture): the redacted,
+    telemetry-safe copy (`redact_tool_args` — SQL literals masked, `concept`/
+    `query` fully redacted, `period`/`slot_bindings` values masked).
+    DEBUG (`disable_redaction=True`): the REAL args, so a debugging operator sees
+    the actual SQL/concept/query/slot/period values on the span in Phoenix.
+
+    TELEMETRY-ONLY: this governs ONLY what a span records. Every caller passes the
+    RAW `args` to the actual tool work regardless of this flag, so flipping it
+    never changes what the tool executes or what scope the MCP enforces — it only
+    changes what Phoenix sees (which becomes entity-bearing when on, hence the
+    access-control requirement). Returns a shallow copy so the span code can never
+    mutate the caller's live args dict.
+    """
+    return dict(args) if disable_redaction else redact_tool_args(tool_name, args)
+
+
 class Redactor:
     """Bundles the redaction rules above behind one object — the seam
     `observability/tracing.py` and `observability/progress.py` depend on."""
@@ -127,4 +149,4 @@ class Redactor:
         return redact_tool_args(tool_name, args)
 
 
-__all__ = ["Redactor", "hash_scope", "mask_sql", "redact_tool_args"]
+__all__ = ["Redactor", "hash_scope", "mask_sql", "redact_tool_args", "tool_span_args"]

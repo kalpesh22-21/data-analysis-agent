@@ -7,7 +7,7 @@
 # together (configure_tracing/instrument_openai/get_tracer/span helpers).
 from . import tracing
 from .progress import ProgressEmitter, ProgressEvent, combine_observers, to_progress_event
-from .redaction import Redactor, hash_scope, mask_sql, redact_tool_args
+from .redaction import Redactor, hash_scope, mask_sql, redact_tool_args, tool_span_args
 
 __all__ = [
     "ProgressEmitter",
@@ -18,5 +18,6 @@ __all__ = [
     "mask_sql",
     "redact_tool_args",
     "to_progress_event",
+    "tool_span_args",
     "tracing",
 ]

@@ -38,7 +38,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     _default_observer,
 )
 from data_agent.runtime.observability import tracing
-from data_agent.runtime.observability.redaction import redact_tool_args
+from data_agent.runtime.observability.redaction import tool_span_args
 
 from . import scope_filter
 from .models import Candidate
@@ -77,9 +77,16 @@ class _ReadTool:
         *,
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
+        disable_redaction: bool = False,
     ) -> None:
         self._observer = observer
         self._tracer = tracer
+        # Access-controlled TELEMETRY DEBUG switch (RuntimeSettings.
+        # otlp_disable_redaction). Default False keeps the D25 span (`query`
+        # redacted, §5). When True the span carries the REAL `query` free text —
+        # telemetry-only; `_guarded` below always gets the raw model_args, so the
+        # search/scope-filter path is unaffected.
+        self._disable_redaction = disable_redaction
 
     async def run(
         self, model_args: dict[str, Any], credentials: RuntimeCredentials
@@ -91,9 +98,12 @@ class _ReadTool:
             with tracing.tool_span(
                 self._tracer,
                 tool_name=self.tool_name,
-                args=redact_tool_args(self.tool_name, model_args),
+                args=tool_span_args(
+                    self.tool_name, model_args, disable_redaction=self._disable_redaction
+                ),
                 status="ok",
                 error_code=None,
+                reveal_complex_args=self._disable_redaction,
             ) as span:
                 result = await self._guarded(model_args, credentials)
                 span.set_attribute("tool.status", result.status)
@@ -230,8 +240,9 @@ class SearchBlueprintsTool(_ReadTool):
         preview_row_count: int = 20,
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
+        disable_redaction: bool = False,
     ) -> None:
-        super().__init__(observer=observer, tracer=tracer)
+        super().__init__(observer=observer, tracer=tracer, disable_redaction=disable_redaction)
         self._pipeline = pipeline
         self._default_k = default_k
         self._max_k = max_k
@@ -281,8 +292,9 @@ class SearchKnowledgeTool(_ReadTool):
         preview_row_count: int = 20,
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
+        disable_redaction: bool = False,
     ) -> None:
-        super().__init__(observer=observer, tracer=tracer)
+        super().__init__(observer=observer, tracer=tracer, disable_redaction=disable_redaction)
         self._pipeline = pipeline
         self._knowledge_k = knowledge_k
         self._preview_row_count = preview_row_count
@@ -322,8 +334,9 @@ class GetBlueprintTool(_ReadTool):
         preview_row_count: int = 20,
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
+        disable_redaction: bool = False,
     ) -> None:
-        super().__init__(observer=observer, tracer=tracer)
+        super().__init__(observer=observer, tracer=tracer, disable_redaction=disable_redaction)
         self._vector_index = vector_index
         self._preview_row_count = preview_row_count
 

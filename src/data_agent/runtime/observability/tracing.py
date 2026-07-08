@@ -19,11 +19,20 @@ spans around every `responses.create`/`chat.completions.create` call.
 Every attribute passed through the `*_span` helpers below must already be
 redacted by the caller (`observability/redaction.py`) — this module does not
 re-redact; it only forwards `{key: value}` pairs onto the OTel span. Callers
-must never pass raw SQL/scope/JWT/result rows here.
+must never pass raw SQL/scope/JWT/result rows here IN THE DEFAULT POSTURE.
+
+The ONE exception is the access-controlled debug switch
+`RuntimeSettings.otlp_disable_redaction` (see `config.py`): when set, the
+composition root deliberately passes the caller the REAL (un-redacted) tool
+args + the tool RESULT preview into `tool_span`, so Phoenix shows the real
+tool call for debugging. That flip is TELEMETRY-ONLY (it never weakens actual
+scope/PII enforcement) but it DOES make the Phoenix project entity-bearing, so
+it must be access-controlled like the audit store.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -313,16 +322,66 @@ def chain_span(
 
 
 def tool_span(
-    tracer: Tracer, *, tool_name: str, args: dict[str, Any], status: str, error_code: str | None
+    tracer: Tracer,
+    *,
+    tool_name: str,
+    args: dict[str, Any],
+    status: str,
+    error_code: str | None,
+    result_preview: Any = None,
+    reveal_complex_args: bool = False,
 ) -> Any:
-    """Each tool call (design §7 `TOOL`) — *args* must already be
-    SQL-literal-masked (`observability/redaction.py::redact_tool_args`)."""
+    """Each tool call (design §7 `TOOL`).
+
+    DEFAULT (D25) posture: *args* must already be SQL-literal-masked by the caller
+    (`observability/redaction.py::redact_tool_args`), *result_preview* is `None`,
+    and *reveal_complex_args* is `False` — tool RESULTS never reach a span and only
+    SCALAR args are set (nested dict/list args like `period`/`slot_bindings` are
+    skipped entirely), so the online Phoenix project stays a shape/count/latency-
+    only surface.
+
+    DEBUG posture (`RuntimeSettings.otlp_disable_redaction=True`): the caller passes
+    the REAL (un-redacted) *args*, a *result_preview*, AND *reveal_complex_args=True*
+    so the WHOLE tool call — the real SQL/values, the nested dict/list args (real
+    `period` bounds, `slot_bindings` values), AND the columns + preview rows it
+    returned — is visible in Phoenix. This makes the project ENTITY-BEARING and MUST
+    be access-controlled like the audit store (see
+    `RuntimeSettings.otlp_disable_redaction`). This module does not itself redact; it
+    forwards whatever the caller supplies.
+
+    *result_preview* (when supplied — debug only) is a `ResultPreview`-shaped object
+    (`.columns`/`.row_count`/`.truncated`/`.preview_rows`); its columns/shape land as
+    scalar span attributes and the preview rows are JSON-serialized onto one
+    attribute (`tool.result.preview_rows`), since a span attribute cannot hold a
+    ragged list-of-lists.
+
+    *reveal_complex_args* (debug only) JSON-serializes each non-scalar arg value
+    (dict/list) onto `tool.args.{key}` — a span attribute cannot hold a nested dict,
+    so a scalar-only pass would drop `period`/`slot_bindings` even when the flag is
+    on. Default `False` keeps the default span byte-identical (those keys absent).
+    """
     attributes: dict[str, Any] = {"tool.name": tool_name, "tool.status": status}
     if error_code is not None:
         attributes["tool.error_code"] = error_code
     for key, value in args.items():
         if isinstance(value, str | int | float | bool):
             attributes[f"tool.args.{key}"] = value
+        elif reveal_complex_args and value is not None:
+            # DEBUG-ONLY (otlp_disable_redaction): a non-scalar arg (dict/list —
+            # e.g. resolveValues.period, runBlueprint.slot_bindings) JSON-serialized
+            # so its REAL values show. NEVER reached in the default posture (the flag
+            # is off), so the default span is byte-identical (these keys absent).
+            attributes[f"tool.args.{key}"] = json.dumps(value, default=str)
+    if result_preview is not None:
+        # DEBUG-ONLY (otlp_disable_redaction): attach the tool RESULT so the full
+        # call is visible. NEVER reached in the default D25 posture (the dispatcher
+        # passes None), so the shape-only surface is byte-identical when off.
+        attributes["tool.result.columns"] = list(result_preview.columns)
+        attributes["tool.result.row_count"] = result_preview.row_count
+        attributes["tool.result.truncated"] = result_preview.truncated
+        attributes["tool.result.preview_rows"] = json.dumps(
+            result_preview.preview_rows, default=str
+        )
     return span(tracer, f"tool.{tool_name}", OpenInferenceSpanKindValues.TOOL, attributes)
 
 
