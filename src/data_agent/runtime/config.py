@@ -69,13 +69,13 @@ class RuntimeSettings(BaseSettings):
         description="Runtime column cap for a materializable table intermediate (fail-closed over-cap).",
     )
 
-    # --- OpenAI model provider (fields only — unused until Pass B, D71) ---
-    openai_api_key: str = Field("", description="OpenAI API key (secret). Unused in Pass A.")
+    # --- OpenAI model provider (D71) ---
+    openai_api_key: str = Field("", description="OpenAI API key (secret).")
     openai_model: str = Field(
-        "gpt-4.1", description="Model name for Responses/Chat Completions. Unused in Pass A."
+        "gpt-4.1", description="Model name for Responses/Chat Completions."
     )
     openai_base_url: str = Field(
-        "", description="Optional OpenAI-compatible base URL override. Unused in Pass A."
+        "", description="Optional OpenAI-compatible base URL override."
     )
     model_context_window: int = Field(
         128_000,
@@ -101,12 +101,35 @@ class RuntimeSettings(BaseSettings):
         description="Collection name for full (non-preview) tool results, keyed by UUID.",
     )
 
-    # --- Observability (D23/D24/D25, Phoenix/OTLP — fields only until Pass B) ---
+    # --- Observability (D23/D24/D25, Phoenix/OTLP — wired in app.py) ---
+    # `app.py::create_app` calls `configure_tracing(otlp_endpoint=..., service_name=...,
+    # project_name=...)`: when `otlp_endpoint` is set the runtime exports spans to
+    # Phoenix; when empty the provider is a no-op (zero infra required). See
+    # `runtime/observability/tracing.py`.
     otlp_endpoint: str = Field(
-        "", description="OTLP collector endpoint (self-hosted Phoenix). Unused in Pass A."
+        "", description="OTLP collector endpoint (self-hosted Phoenix). Empty => no-op provider (no export)."
     )
     otlp_service_name: str = Field(
-        "data-agent-runtime", description="Service name reported in OTel spans."
+        "data-agent-runtime", description="Service name reported in OTel spans (service.name)."
+    )
+    otlp_project_name: str = Field(
+        "data-agent-runtime",
+        description=(
+            "Phoenix project the runtime's spans land in (openinference.project.name). "
+            "Phoenix groups traces by THIS attribute, not service.name — set in code so "
+            "a normal turn is findable as a named project without an env hack."
+        ),
+    )
+    otlp_hide_llm_content: bool = Field(
+        True,
+        description=(
+            "D25 (online per-turn HARD invariant): when True (default) the auto-"
+            "instrumented OpenAI LLM span carries NO raw prompt/completion — only "
+            "shape/timing/model-name/token-counts — so the runtime Phoenix project "
+            "stays content-free. Set False ONLY in a controlled, access-controlled "
+            "diagnostic environment: it makes the project entity-bearing (raw question "
+            "+ query-derived answer land on the span), like LEARNING_TRACE_VERBOSE."
+        ),
     )
 
     # --- Auth (JWKS verification, D5/D79/D80/D81/D82 — fields only until Pass B) ---

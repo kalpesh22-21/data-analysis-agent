@@ -28,6 +28,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from openinference.instrumentation import TraceConfig
 from openinference.instrumentation.openai import OpenAIInstrumentor
 from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
 from opentelemetry import trace
@@ -35,7 +36,7 @@ from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.propagate import inject
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter
 from opentelemetry.trace import Span, Tracer
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
@@ -43,10 +44,58 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 _TRACER_NAME = "data-agent-runtime"
 
 
+class LLMExceptionEventScrubber(SpanProcessor):
+    """Strip content-bearing EVENTS off the auto-instrumented OpenAI `LLM` span (D25).
+
+    `TraceConfig`/`instrument_openai(hide_content=True)` masks span ATTRIBUTES, but
+    NOT span EVENTS — and the OpenAI instrumentor calls `record_exception(exc)` on a
+    failed request, so an `openai.APIStatusError` (whose message/stacktrace embeds
+    the response error BODY, potentially content-bearing) lands on the online LLM
+    span as `exception.message` / `exception.stacktrace`, bypassing `hide_content`.
+    The learning loop closes this same class by refusing `record_exception` on its
+    OWN spans; here the instrumentor (not our code) owns the span, so we scrub the
+    events post-hoc.
+
+    `on_end` receives the ONE `ReadableSpan` snapshot `Span.end()` builds and hands
+    to every processor in turn; rebinding its `_events` to an empty tuple drops the
+    events from what the exporter later reads WITHOUT mutating the live span or its
+    shape attributes. Wired FIRST (before any `SimpleSpanProcessor`, which exports
+    synchronously in `on_end`) so the scrub always precedes export; the Batch path
+    reads events lazily at export time, so ordering there is immaterial.
+
+    Only OpenInference `LLM`-kind spans are touched (they carry no shape-relevant
+    events — only the redacted content channels + a possible `exception`); the
+    manual AGENT/TOOL/CHAIN/GUARDRAIL spans are left byte-identical (they are already
+    literal-redacted and never carry content events)."""
+
+    def on_start(
+        self, span: Span, parent_context: Context | None = None
+    ) -> None:  # pragma: no cover - no-op
+        return
+
+    def on_end(self, span: ReadableSpan) -> None:
+        attributes = span.attributes or {}
+        kind = attributes.get(SpanAttributes.OPENINFERENCE_SPAN_KIND)
+        if kind != OpenInferenceSpanKindValues.LLM.value:
+            return
+        if span.events:
+            # Rebind the exported snapshot's events → empty (drops `exception` and
+            # any other content-bearing event; LLM spans carry no shape events).
+            span._events = ()
+
+    def shutdown(self) -> None:  # pragma: no cover - no-op
+        return
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:  # pragma: no cover - no-op
+        return True
+
+
 def configure_tracing(
     *,
     otlp_endpoint: str,
     service_name: str,
+    project_name: str | None = None,
+    hide_llm_content: bool = False,
     span_exporter: SpanExporter | None = None,
 ) -> TracerProvider:
     """Build a `TracerProvider` exporting to *otlp_endpoint* (Phoenix), or a
@@ -58,6 +107,23 @@ def configure_tracing(
     safely callable multiple times in tests without triggering OTel's
     "Overriding of current TracerProvider is not allowed" warning.
 
+    *project_name* is the Phoenix PROJECT the spans land in: Phoenix groups
+    traces by the `openinference.project.name` resource attribute, NOT by
+    `service.name`. Setting only `service.name` (as this function used to)
+    dumps everything into Phoenix's catch-all `default` project, invisible as
+    a named project in the UI. We set `openinference.project.name` here, IN
+    CODE, so a caller (`app.py`, `configure_learning_tracing`) picks a stable
+    named project without an `OTEL_RESOURCE_ATTRIBUTES` env hack. Defaults to
+    *service_name* when omitted, so the project name is never empty.
+
+    *hide_llm_content* (D25): when True, install `LLMExceptionEventScrubber` as
+    the FIRST span processor so a recorded `exception` event (which the OpenAI
+    instrumentor embeds the response error body into) is stripped off the auto-
+    instrumented `LLM` span before export — closing the residual content channel
+    `TraceConfig` (attributes-only) leaves open. Pair with
+    `instrument_openai(hide_content=True)`; both are gated on the SAME
+    `otlp_hide_llm_content` setting by `app.py`.
+
     *span_exporter* (test-only seam, D-L3-5): when supplied, its spans are
     attached via a `SimpleSpanProcessor` (synchronous flush — a batched
     processor would leave spans un-exported when a test reads them right after
@@ -66,8 +132,17 @@ def configure_tracing(
     real emitted spans, with NO Phoenix container. Production leaves it `None`,
     so this branch is inert and the provider is byte-identical to before.
     """
-    resource = Resource.create({"service.name": service_name})
+    resource = Resource.create(
+        {
+            "service.name": service_name,
+            "openinference.project.name": project_name or service_name,
+        }
+    )
     provider = TracerProvider(resource=resource)
+    # FIRST (see LLMExceptionEventScrubber docstring): must precede any synchronous
+    # SimpleSpanProcessor export so the LLM `exception` event is scrubbed pre-export.
+    if hide_llm_content:
+        provider.add_span_processor(LLMExceptionEventScrubber())
     if otlp_endpoint:
         exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
         provider.add_span_processor(BatchSpanProcessor(exporter))
@@ -76,16 +151,68 @@ def configure_tracing(
     return provider
 
 
-def instrument_openai(provider: TracerProvider) -> None:
+def llm_content_trace_config(hide_content: bool) -> TraceConfig | None:
+    """The OpenInference `TraceConfig` governing the auto-instrumented OpenAI
+    `LLM` span's CONTENT capture (D25).
+
+    Returns `None` when *hide_content* is False — the library default, where the
+    `LLM` span carries the raw prompt + completion (`input.value`/`output.value`/
+    `llm.input_messages`/`llm.output_messages`). Otherwise returns a config that
+    SUPPRESSES every content channel (inputs, outputs, per-message content, and
+    prompts) while leaving the non-content shape/timing attributes intact
+    (`llm.model_name`, `llm.token_count.*`, `llm.provider`, span timing).
+
+    D25 (the ONLINE per-turn HARD invariant): unlike the manual AGENT/TOOL/CHAIN
+    spans — which already redact SQL literals / bound-slot values before setting
+    an attribute — the OpenAI auto-instrumentor (D24) captures the model's raw
+    prompt AND completion by DEFAULT, and the completion embeds cell values /
+    the query-derived answer. That is a content leak into the online Phoenix
+    project, which is a shape/count/latency-only surface. So the runtime hides
+    LLM content BY DEFAULT (`RuntimeSettings.otlp_hide_llm_content=True`) and the
+    reveal is an explicit, controlled opt-in — mirroring the learning loop's
+    verbose gate."""
+    if not hide_content:
+        return None
+    return TraceConfig(
+        hide_inputs=True,
+        hide_outputs=True,
+        hide_input_messages=True,
+        hide_output_messages=True,
+        hide_prompts=True,
+    )
+
+
+def instrument_openai(provider: TracerProvider, *, hide_content: bool = True) -> None:
     """Auto-instrument the OpenAI SDK (D24) — idempotent, best-effort.
 
     Safe to call repeatedly (e.g. across test modules importing `app.py`
     more than once): a second call is a no-op rather than raising.
+
+    FIRST-CALLER-WINS: `OpenAIInstrumentor` is a process-global singleton behind
+    the idempotency guard below, so the FIRST call's *hide_content* config wins
+    for the whole process — a later call with a DIFFERENT *hide_content* value
+    silently no-ops (its config is ignored). Production's single `create_app` is
+    unaffected; this note guards against a future in-process surprise (e.g. two
+    `create_app`s with divergent settings, or a test that instruments before the
+    app). The paired `LLMExceptionEventScrubber` (an OWN span processor, not the
+    singleton) is NOT subject to this — each provider gets its own.
+
+    *hide_content* (D25, default True): when True the emitted `LLM` span carries
+    NO raw prompt/completion — only shape/timing/model-name/token-counts — so the
+    online per-turn Phoenix project stays content-free (structure fully visible,
+    content hidden). Set False ONLY in a controlled, access-controlled diagnostic
+    environment: revealing the LLM content makes the runtime Phoenix project
+    ENTITY-BEARING (the raw question AND the query-derived answer land on the
+    span), subject to the same in-boundary PII posture + access control as the
+    session/audit stores — NOT the shape-only D25 telemetry posture. This is the
+    exact same trade-off as the learning-loop `LEARNING_TRACE_VERBOSE` gate.
     """
     instrumentor = OpenAIInstrumentor()
     if instrumentor.is_instrumented_by_opentelemetry:
         return
-    instrumentor.instrument(tracer_provider=provider)
+    instrumentor.instrument(
+        tracer_provider=provider, config=llm_content_trace_config(hide_content)
+    )
 
 
 def get_tracer(provider: TracerProvider, name: str = _TRACER_NAME) -> Tracer:
@@ -318,6 +445,7 @@ def guardrail_observer(tracer: Tracer) -> Callable[[str, dict[str, Any]], None]:
 
 
 __all__ = [
+    "LLMExceptionEventScrubber",
     "agent_span",
     "chain_span",
     "configure_tracing",
@@ -328,6 +456,7 @@ __all__ = [
     "guardrail_span",
     "inject_current_traceparent",
     "instrument_openai",
+    "llm_content_trace_config",
     "recall_span",
     "rerank_span",
     "span",

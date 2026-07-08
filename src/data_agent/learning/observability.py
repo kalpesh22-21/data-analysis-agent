@@ -93,8 +93,18 @@ def configure_learning_tracing(
     """Build the learning processes' `TracerProvider` (Phoenix `learning-loop`
     project). Delegates to the runtime `configure_tracing` so the exporter /
     no-op-provider behavior is identical; does NOT install the provider globally
-    (the entrypoint does that once)."""
-    return configure_tracing(otlp_endpoint=otlp_endpoint, service_name=service_name)
+    (the entrypoint does that once).
+
+    Passes `project_name="learning-loop"` so the spans land in the named
+    `learning-loop` Phoenix project directly from CODE — Phoenix groups by the
+    `openinference.project.name` resource attribute, so this replaces the old
+    `OTEL_RESOURCE_ATTRIBUTES=openinference.project.name=learning-loop` env hack
+    the demo launcher used to rely on."""
+    return configure_tracing(
+        otlp_endpoint=otlp_endpoint,
+        service_name=service_name,
+        project_name="learning-loop",
+    )
 
 
 def get_learning_tracer(provider: TracerProvider) -> Tracer:

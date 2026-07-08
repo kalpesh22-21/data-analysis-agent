@@ -75,10 +75,11 @@ os.environ.update(
         "NEO4J_TEST_PASSWORD": "testpassword",
         "EMBEDDING_TEST_URL": "http://localhost:18003/embed",
         "MCP_TEST_URL": "http://localhost:18090/mcp",
-        # Phoenix groups spans into a PROJECT by this resource attribute; the OTel SDK
-        # merges OTEL_RESOURCE_ATTRIBUTES into Resource.create(...) (service.name alone
-        # lands everything in Phoenix's 'default' project).
-        "OTEL_RESOURCE_ATTRIBUTES": "openinference.project.name=learning-loop",
+        # (The Phoenix project name is now set IN CODE by `configure_learning_tracing`
+        # via `configure_tracing(project_name="learning-loop")` — no
+        # OTEL_RESOURCE_ATTRIBUTES env hack is needed to land in the `learning-loop`
+        # project. Phoenix groups traces by the `openinference.project.name` resource
+        # attribute, which the code now sets directly.)
         # Turn the D25 verbose gate ON for this DIAGNOSTIC run so the spans carry the
         # human-readable content (question / accepted SQL / learned intent). This makes
         # the learning-loop Phoenix project entity-bearing — a controlled demo posture.

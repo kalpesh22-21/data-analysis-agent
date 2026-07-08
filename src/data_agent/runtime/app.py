@@ -222,13 +222,29 @@ def create_app(
     tracer_provider = tracing.configure_tracing(
         otlp_endpoint=settings.otlp_endpoint,
         service_name=settings.otlp_service_name,
+        # Phoenix groups traces by `openinference.project.name`, NOT service.name —
+        # set the runtime's named project in code so a normal turn is findable in
+        # the Phoenix UI (no OTEL_RESOURCE_ATTRIBUTES env hack).
+        project_name=settings.otlp_project_name,
+        # D25: when hiding LLM content, also install the LLMExceptionEventScrubber
+        # (TraceConfig masks attributes, not the `exception` EVENT the OpenAI
+        # instrumentor records — which embeds the response error body). Same gate
+        # as instrument_openai's hide_content below.
+        hide_llm_content=settings.otlp_hide_llm_content,
         # Test-only seam (D-L3-5): an injected in-memory exporter captures the
         # manual AGENT/TOOL/CHAIN/GUARDRAIL spans this provider's tracer emits,
         # so the Layer-3 D25 scenario can dump + assert them PII-clean without a
         # Phoenix container. `None` in production → byte-identical provider.
         span_exporter=span_exporter,
     )
-    tracing.instrument_openai(tracer_provider)
+    # D25: hide the auto-instrumented OpenAI LLM span's raw prompt/completion by
+    # default (the online per-turn Phoenix project is a shape/count/latency-only
+    # surface — the completion embeds cell values / the query-derived answer). The
+    # reveal is an explicit, access-controlled opt-in (`otlp_hide_llm_content`),
+    # mirroring the learning loop's verbose gate.
+    tracing.instrument_openai(
+        tracer_provider, hide_content=settings.otlp_hide_llm_content
+    )
     tracer = tracing.get_tracer(tracer_provider)
 
     # D77/OQ-1: the real `HttpEmbeddingClient` is wired only when the custom
