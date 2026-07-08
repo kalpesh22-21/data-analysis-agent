@@ -18,7 +18,12 @@ from data_agent.runtime.model.client import ModelClient, begin_turn_client
 from ..summary.models import SessionSummary
 from ..triage import TriageVerdict
 from .models import Decline, ExtractedCandidate, ExtractionResult
-from .schema import SchemaMismatchError, build_extractor_tool, parse_candidates
+from .schema import (
+    SLOT_TYPE_ENUM,
+    SchemaMismatchError,
+    build_extractor_tool,
+    parse_candidates,
+)
 from .validation import REASON_MALFORMED, to_candidate
 
 _logger = logging.getLogger(__name__)
@@ -28,11 +33,28 @@ _SYSTEM_PROMPT = (
     "emit zero or more typed learning candidates by calling the emit_candidates tool. "
     "Rules: (1) emit a PLAN, never SQL. (2) Every candidate MUST cite >=1 evidence "
     "quote (turn_ref + tool_call_ref) from the session; no evidence => do not emit it. "
-    "(3) For a blueprint, parameterization MUST have exactly one entry per literal "
-    "predicate of the accepted SQL, each classified slot|rule|inline (there is NO drop "
-    "role; a caller-specific predicate is an OPTIONAL slot with an optional_pattern; a "
-    "metric-defining predicate is inline; a catalog-rule-resolvable predicate is rule "
-    "with an EXISTING rule_id). (4) intent and result_signature must be ENTITY-FREE."
+    "(3) For a blueprint, the payload MUST include `kind` ('single'|'composite') and "
+    "`parameterization` with exactly one entry per literal predicate of the accepted "
+    "SQL, each classified slot|rule|inline (there is NO drop role; a caller-specific "
+    "predicate is an OPTIONAL slot with an optional_pattern; a metric-defining predicate "
+    "is inline; a catalog-rule-resolvable predicate is rule with an EXISTING rule_id). "
+    "(4) For each parameterization entry, `locator.table` is the 'database.table' and "
+    "`locator.column` is the BARE column. A slot's `binds_to` MUST be the "
+    "FULLY-QUALIFIED 'database.table.column' (= locator.table + '.' + locator.column, "
+    "e.g. 'dbpcm_warehouse.employee.Department'), NEVER a bare column, and must lie "
+    "within the columns the SQL touches; each slot MUST include `name`, `type`, "
+    "`binds_to`, and `required` (true|false). (5) A slot's `type` MUST be exactly one of: "
+    f"{', '.join(SLOT_TYPE_ENUM)}. A free-text filter value (e.g. a department name) is "
+    "'entity', NOT 'enum'; use 'enum' ONLY for a small closed set you ALSO provide in "
+    "`enum_values` (an enum slot without enum_values is invalid). (6) The aggregated "
+    "metric column (e.g. the argument "
+    "of sum(...)) is NOT a predicate — put it in `resolves` (a JSON OBJECT/map, e.g. "
+    "{'total salary': 'dbpcm_warehouse.employee.AnnualSalary'}, NEVER a list), never in "
+    "parameterization. "
+    "(7) Emit NO `result_signature` (null) for a single scalar aggregate (sum(...) with "
+    "only a WHERE filter and no GROUP BY); set it only when the SQL has a GROUP BY whose "
+    "grouped columns appear in the SELECT output. (8) intent and result_signature must "
+    "be ENTITY-FREE (no literal values)."
 )
 
 

@@ -142,6 +142,34 @@ def test_slot_needs_a_valid_type():
     assert out.reason == REASON_BAD_ROLE
 
 
+def test_slot_missing_required_field_defaults_to_required_true():
+    # A real model sometimes omits `required`; it must default to True (a required
+    # slot) rather than crash the payload build.
+    bad = param_slot("department", value="0420")
+    del bad["slot"]["required"]
+    out = _validate(blueprint_raw(parameterization=_plan_with(bad, column="department")))
+    assert isinstance(out, ExtractedCandidate)
+    dept = next(p for p in out.payload.parameterization if p.locator.column == "department")
+    assert dept.slot.required is True
+
+
+def test_enum_slot_without_enum_values_is_declined_role_inconsistent():
+    # An enum slot with no enum_values is un-landable (runtime SlotSpec.parse rejects
+    # it) — the extractor must decline it, not let it crash at landing.
+    bad = param_slot("department", slot_type="enum", value="0420")
+    out = _validate(blueprint_raw(parameterization=_plan_with(bad, column="department")))
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+    assert "enum_values" in out.detail
+
+
+def test_enum_slot_with_enum_values_is_accepted():
+    good = param_slot("department", slot_type="enum", value="0420")
+    good["slot"]["enum_values"] = ["0420", "0500"]
+    out = _validate(blueprint_raw(parameterization=_plan_with(good, column="department")))
+    assert isinstance(out, ExtractedCandidate)
+
+
 def test_optional_slot_needs_optional_pattern_no_silent_drop():
     # region as optional but WITHOUT optional_pattern → would silently drop.
     bad = param_slot("region", required=False, optional_pattern=None, value="NA")
@@ -323,3 +351,24 @@ def test_valid_accepted_signal_values_are_accepted(signal):
     # The session must also have carried acceptance (summary default no_correction).
     out = _validate(raw, summary=make_summary(accepted_signal="no_correction"))
     assert isinstance(out, ExtractedCandidate)
+
+
+# --- payload-shape robustness: a malformed model payload DECLINES, never crashes ---
+
+
+def test_resolves_as_a_list_is_coerced_not_a_crash():
+    # Real models sometimes emit `resolves` as a LIST instead of a {term: col} map.
+    # It must be tolerated (advisory field) — a valid plan still extracts.
+    raw = blueprint_raw()
+    raw["payload"]["resolves"] = [{"term": "earnings", "column": "gross_pay"}]
+    out = _validate(raw)
+    assert isinstance(out, ExtractedCandidate)
+    assert out.payload.resolves == {}  # non-dict coerced to an empty map
+
+
+def test_non_object_payload_is_declined_malformed_not_a_crash():
+    raw = blueprint_raw()
+    raw["payload"] = ["not", "an", "object"]
+    out = _validate(raw)
+    assert isinstance(out, Decline)
+    assert out.reason == "malformed_candidate"

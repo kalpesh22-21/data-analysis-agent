@@ -19,7 +19,12 @@ from typing import Any
 
 from data_agent.runtime.model.client import ModelTurnResult
 
+from .models import SLOT_TYPES
+
 EXTRACTOR_TOOL_NAME = "emit_candidates"
+
+# Sorted for a deterministic enum ordering in the emitted tool schema.
+_SLOT_TYPE_ENUM = sorted(SLOT_TYPES)
 
 
 class SchemaMismatchError(Exception):
@@ -39,9 +44,12 @@ _EVIDENCE_SCHEMA = {
 _LOCATOR_SCHEMA = {
     "type": "object",
     "properties": {
-        "table": {"type": "string"},
-        "column": {"type": "string"},
-        "value": {"type": "string"},
+        "table": {
+            "type": "string",
+            "description": "The fully-qualified 'database.table' the column belongs to.",
+        },
+        "column": {"type": "string", "description": "The BARE column name (no table prefix)."},
+        "value": {"type": "string", "description": "The literal as it appeared in the SQL."},
     },
     "required": ["table", "column", "value"],
 }
@@ -50,8 +58,24 @@ _SLOT_SCHEMA = {
     "type": "object",
     "properties": {
         "name": {"type": "string"},
-        "type": {"type": "string"},
-        "binds_to": {"type": "string"},
+        "type": {
+            "type": "string",
+            "enum": _SLOT_TYPE_ENUM,
+            "description": (
+                "Slot semantic type; MUST be exactly one of the enum values "
+                f"({', '.join(_SLOT_TYPE_ENUM)}). A named entity such as a department "
+                "is best modeled as 'entity'."
+            ),
+        },
+        "binds_to": {
+            "type": "string",
+            "description": (
+                "The FULLY-QUALIFIED 'database.table.column' this slot binds to (e.g. "
+                "'dbpcm_warehouse.employee.Department') — i.e. locator.table + '.' + "
+                "locator.column. NEVER a bare column name; it MUST lie within the "
+                "blueprint's uses (the columns the accepted SQL touches)."
+            ),
+        },
         "required": {"type": "boolean"},
         "optional_pattern": {"type": ["string", "null"]},
         "enum_values": {"type": ["array", "null"], "items": {"type": "string"}},
@@ -98,13 +122,50 @@ _RESULT_SIGNATURE_SCHEMA = {
 _BLUEPRINT_PAYLOAD_SCHEMA = {
     "type": "object",
     "properties": {
-        "intent": {"type": "string"},
-        "kind": {"type": "string", "enum": ["single", "composite"]},
-        "resolves": {"type": "object", "additionalProperties": {"type": "string"}},
+        "intent": {
+            "type": "string",
+            "description": (
+                "Natural-language, ENTITY-FREE description of what the query does "
+                "(no literal values such as 'Sales' or '2025')."
+            ),
+        },
+        "kind": {
+            "type": "string",
+            "enum": ["single", "composite"],
+            "description": "'single' for one query; 'composite' for a multi-step plan.",
+        },
+        "resolves": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": (
+                "A JSON OBJECT (map), NOT a list, of {ambiguous_term: "
+                "fully-qualified column} — e.g. {\"total salary\": "
+                "\"dbpcm_warehouse.employee.AnnualSalary\"}. The aggregated metric "
+                "column (e.g. the argument of sum(...)) is NOT a predicate — record it "
+                "here, NOT in parameterization."
+            ),
+        },
         "source_tool_call_refs": {"type": "array", "items": {"type": "string"}},
         "accepted_signal": {"type": "string"},
-        "parameterization": {"type": "array", "items": _PARAM_PLAN_SCHEMA},
-        "result_signature": {"anyOf": [_RESULT_SIGNATURE_SCHEMA, {"type": "null"}]},
+        "parameterization": {
+            "type": "array",
+            "items": _PARAM_PLAN_SCHEMA,
+            "description": (
+                "Exactly one entry per literal predicate in the WHERE / JOIN-ON clause, "
+                "each classified slot|rule|inline (no drop). Do NOT add an entry for the "
+                "aggregated metric column."
+            ),
+        },
+        "result_signature": {
+            "anyOf": [_RESULT_SIGNATURE_SCHEMA, {"type": "null"}],
+            "description": (
+                "Set ONLY when the accepted SQL has a GROUP BY whose grouped columns "
+                "appear in the SELECT output, with grain.columns equal to exactly those "
+                "grouped columns. For a single scalar aggregate (e.g. sum(...) with only "
+                "a WHERE filter and NO GROUP BY) there is no per-group output to verify — "
+                "emit null."
+            ),
+        },
         "notes": {"type": "string"},
     },
     "required": ["intent", "kind", "source_tool_call_refs", "accepted_signal", "parameterization"],
@@ -130,9 +191,25 @@ _CANDIDATE_SCHEMA = {
             "required": ["contains_entities"],
         },
         "depends_on": {"type": "array", "items": {"type": "string"}},
-        "payload": {"type": "object"},
+        "payload": {
+            "type": "object",
+            "description": (
+                "Type-specific payload. For type=='blueprint' it MUST be the blueprint "
+                "payload (required: intent, kind, source_tool_call_refs, accepted_signal, "
+                "parameterization) — see the conditional schema below."
+            ),
+        },
     },
     "required": ["type", "confidence", "evidence", "rationale", "payload"],
+    # Polymorphic payload: only a blueprint candidate's payload is fully specified
+    # (required `kind` + FQ slot `binds_to` + slot-type enum). The if/then leaves the
+    # other three candidate types' payloads as a generic object (not wrongly rejected).
+    "allOf": [
+        {
+            "if": {"properties": {"type": {"const": "blueprint"}}, "required": ["type"]},
+            "then": {"properties": {"payload": _BLUEPRINT_PAYLOAD_SCHEMA}},
+        }
+    ],
 }
 
 _PARAMETERS_SCHEMA = {
@@ -158,8 +235,10 @@ def build_extractor_tool() -> dict[str, Any]:
     }
 
 
-# For the blueprint payload schema to be reused by the prompt builder / docs.
+# For the blueprint payload schema / slot-type enum to be reused by the prompt
+# builder + docs (the system prompt states the enum verbatim).
 BLUEPRINT_PAYLOAD_SCHEMA = _BLUEPRINT_PAYLOAD_SCHEMA
+SLOT_TYPE_ENUM = _SLOT_TYPE_ENUM
 
 
 def parse_candidates(result: ModelTurnResult) -> list[dict[str, Any]]:

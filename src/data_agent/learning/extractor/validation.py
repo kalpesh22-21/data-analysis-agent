@@ -98,7 +98,11 @@ def _slot_plan(raw: dict[str, Any]) -> SlotPlan:
         name=str(raw["name"]),
         type=str(raw["type"]),
         binds_to=str(raw["binds_to"]),
-        required=bool(raw["required"]),
+        # A real model sometimes omits `required`. Default to True: a predicate that
+        # appeared in the ACCEPTED SQL is required unless the model explicitly marks
+        # it optional — the safe side of the no-drop (D97) invariant (an optional slot
+        # still needs an optional_pattern, enforced in `_validate_roles`).
+        required=bool(raw.get("required", True)),
         optional_pattern=(
             str(raw["optional_pattern"]) if raw.get("optional_pattern") is not None else None
         ),
@@ -165,6 +169,16 @@ def _validate_roles(params: list[ParamPlan], known_rules: frozenset[str]) -> Dec
         if p.role == "slot":
             if p.slot is None or p.slot.type not in SLOT_TYPES:
                 return Decline("blueprint", REASON_BAD_ROLE, f"slot {p.locator.column} invalid type")
+            # An `enum` slot MUST carry non-empty enum_values — the runtime
+            # `SlotSpec.parse` rejects an enum slot without them (un-landable). Catch
+            # it here as a traceable decline rather than a crash at landing. A
+            # free-text filter value should be typed `entity`/`string`, not `enum`.
+            if p.slot.type == "enum" and not p.slot.enum_values:
+                return Decline(
+                    "blueprint", REASON_BAD_ROLE,
+                    f"enum slot {p.slot.name} has no enum_values "
+                    "(a free-text value should be type 'entity', not 'enum')",
+                )
             # No-drop (D97): an optional slot MUST carry an optional_pattern, else
             # an absent bind silently drops the predicate.
             if not p.slot.required and not p.slot.optional_pattern:
@@ -240,11 +254,20 @@ def _validate_totality(
     return None
 
 
+def _resolves(raw_resolves: Any) -> dict[str, str]:
+    # `resolves` is a {term: column} map, but a real model sometimes emits it as a
+    # list (e.g. of {term, column} pairs). Coerce a non-dict to an empty map rather
+    # than crashing — `resolves` is advisory (not required, not totality-checked).
+    if not isinstance(raw_resolves, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw_resolves.items()}
+
+
 def _blueprint_payload(raw: dict[str, Any]) -> BlueprintPayload:
     return BlueprintPayload(
         intent=str(raw["intent"]),
         kind=str(raw["kind"]),
-        resolves={str(k): str(v) for k, v in (raw.get("resolves") or {}).items()},
+        resolves=_resolves(raw.get("resolves")),
         source_tool_call_refs=tuple(str(r) for r in (raw.get("source_tool_call_refs") or [])),
         accepted_signal=str(raw["accepted_signal"]),
         parameterization=tuple(_param_plans(raw.get("parameterization") or [])),
@@ -282,9 +305,15 @@ def to_candidate(
 
     # --- blueprint depth path ---
     payload_raw = raw.get("payload") or {}
+    # A real model can emit a field with the wrong JSON type (e.g. a list where a
+    # dict is expected). ANY shape confusion here MUST become a traceable Decline —
+    # never an uncaught exception that escapes to the consumer (which would skip the
+    # job and route it to dead-letter instead of recording a malformed_candidate).
+    if not isinstance(payload_raw, dict):
+        return Decline(ctype, REASON_MALFORMED, "blueprint payload is not an object")
     try:
         payload = _blueprint_payload(payload_raw)
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
         return Decline(ctype, REASON_MALFORMED, f"bad blueprint payload: {exc}")
 
     # Lift-not-generate (D34): acceptance mandatory, IN the D34 domain (LOW-2 —

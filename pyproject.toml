@@ -45,6 +45,9 @@ packages = ["src/data_agent"]
 testpaths = ["tests"]
 addopts = "-v"
 asyncio_mode = "auto"
+markers = [
+    "extractor_tool_schema_complete: guards that build_extractor_tool() emits the fully-specified blueprint payload (kind + slot-type enum + FQ binds_to) a real LLM needs",
+]
 
 [tool.ruff]
 src = ["src"]
