@@ -232,6 +232,114 @@
     white-space: nowrap;
     border: 0;
   }
+
+  /* --- Enriched result rendering (UI Slice 1) --- */
+  .result-panel[hidden],
+  #blueprint-chip[hidden],
+  #verified-badge[hidden],
+  #result-table-caption[hidden] {
+    display: none;
+  }
+
+  .answer-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+  }
+
+  .static-chip {
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
+    border-radius: 999px;
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.8rem;
+    cursor: default;
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    border: 1px solid var(--color-border);
+    border-radius: 999px;
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+  }
+
+  .result-panel {
+    margin-top: var(--space-3);
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+  }
+
+  .result-panel > summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--color-text-dim);
+  }
+
+  .result-panel[open] > summary {
+    margin-bottom: var(--space-3);
+  }
+
+  pre.sql-block {
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    margin: 0 0 var(--space-2) 0;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  pre.sql-block:last-child {
+    margin-bottom: 0;
+  }
+
+  .table-scroll {
+    overflow-x: auto;
+  }
+
+  table.result-grid {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.85rem;
+  }
+
+  table.result-grid th,
+  table.result-grid td {
+    border: 1px solid var(--color-border);
+    padding: var(--space-2) var(--space-3);
+    text-align: left;
+    white-space: nowrap;
+  }
+
+  table.result-grid th {
+    background: var(--color-surface);
+    color: var(--color-text-dim);
+    font-weight: 600;
+  }
+
+  .result-caption {
+    margin-top: var(--space-2);
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+  }
+
+  .prov-empty {
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+  }
 </style>
 </head>
 <body>
@@ -277,8 +385,34 @@
   <section aria-labelledby="answer-heading">
     <h2 id="answer-heading">Answer</h2>
     <div id="answer" data-testid="answer" aria-live="polite"></div>
-    <!-- TODO: SQL/results need a richer result payload from the runtime SSE (follow-up) -->
+
+    <div id="answer-meta" class="answer-meta">
+      <span id="blueprint-chip" data-testid="blueprint-chip" class="static-chip" hidden></span>
+      <span id="verified-badge" data-testid="verified-badge" class="badge" hidden></span>
+    </div>
+
     <div id="status" data-testid="status"></div>
+
+    <details id="sql-panel" data-testid="sql-panel" class="result-panel" hidden>
+      <summary>Show the query</summary>
+      <div id="sql-blocks"></div>
+    </details>
+
+    <details id="result-table" data-testid="result-table" class="result-panel" hidden>
+      <summary>Results</summary>
+      <div class="table-scroll">
+        <table class="result-grid">
+          <thead id="result-table-head"></thead>
+          <tbody id="result-table-body"></tbody>
+        </table>
+      </div>
+      <div id="result-table-caption" class="result-caption" hidden></div>
+    </details>
+
+    <details id="provenance-panel" data-testid="provenance-panel" class="result-panel" hidden>
+      <summary>Data lineage</summary>
+      <div id="provenance-chips" class="chip-row"></div>
+    </details>
   </section>
 </main>
 
@@ -304,6 +438,16 @@
     errorBanner: document.getElementById("error-banner"),
     errorCode: document.getElementById("error-code"),
     errorMessage: document.getElementById("error-message"),
+    blueprintChip: document.getElementById("blueprint-chip"),
+    verifiedBadge: document.getElementById("verified-badge"),
+    sqlPanel: document.getElementById("sql-panel"),
+    sqlBlocks: document.getElementById("sql-blocks"),
+    resultTable: document.getElementById("result-table"),
+    resultTableHead: document.getElementById("result-table-head"),
+    resultTableBody: document.getElementById("result-table-body"),
+    resultTableCaption: document.getElementById("result-table-caption"),
+    provenancePanel: document.getElementById("provenance-panel"),
+    provenanceChips: document.getElementById("provenance-chips"),
   };
 
   function clearError() {
@@ -351,6 +495,175 @@
 
   function setAnswer(text) {
     els.answer.textContent = text || "";
+  }
+
+  // --- Enriched result rendering (UI Slice 1) ---
+  // Every field is optional and possibly-null on any status; each renderer
+  // treats null/undefined/empty as "hide" so stale turns never linger and an
+  // old backend (only the 4 original keys) stays correct.
+
+  function clearNode(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  // Render a heterogeneous JSON scalar cell as plain text (never HTML — cells
+  // are the caller's own answer data but still go through textContent, §5).
+  function cellText(value) {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "object") return JSON.stringify(value);
+    return String(value);
+  }
+
+  // Field 1 — `sql: string[] | null`: one <pre> code block per statement, in
+  // order. null / [] → hide the panel.
+  function renderSql(sqlList) {
+    clearNode(els.sqlBlocks);
+    if (!Array.isArray(sqlList) || sqlList.length === 0) {
+      els.sqlPanel.hidden = true;
+      return;
+    }
+    sqlList.forEach(function (sql) {
+      var pre = document.createElement("pre");
+      pre.className = "sql-block";
+      var code = document.createElement("code");
+      code.textContent = cellText(sql);
+      pre.appendChild(code);
+      els.sqlBlocks.appendChild(pre);
+    });
+    els.sqlPanel.hidden = false;
+  }
+
+  // Field 2 — `result_table: {columns, preview_rows, row_count, truncated} | null`.
+  // Header from `columns` (may be [] → no header, raw cells only). Body from
+  // `preview_rows` (row-arrays of scalars). Truncation caption when the preview
+  // is a subset of `row_count`. null / no rows → hide.
+  function renderResultTable(table) {
+    clearNode(els.resultTableHead);
+    clearNode(els.resultTableBody);
+    var rows = table && Array.isArray(table.preview_rows) ? table.preview_rows : null;
+    if (!table || !rows || rows.length === 0) {
+      els.resultTable.hidden = true;
+      els.resultTableCaption.hidden = true;
+      els.resultTableCaption.textContent = "";
+      return;
+    }
+
+    var columns = Array.isArray(table.columns) ? table.columns : [];
+    if (columns.length > 0) {
+      var headRow = document.createElement("tr");
+      columns.forEach(function (col) {
+        var th = document.createElement("th");
+        th.setAttribute("scope", "col");
+        th.textContent = cellText(col);
+        headRow.appendChild(th);
+      });
+      els.resultTableHead.appendChild(headRow);
+    }
+
+    rows.forEach(function (row) {
+      var tr = document.createElement("tr");
+      var cells = Array.isArray(row) ? row : [row];
+      cells.forEach(function (cell) {
+        var td = document.createElement("td");
+        td.textContent = cellText(cell);
+        tr.appendChild(td);
+      });
+      els.resultTableBody.appendChild(tr);
+    });
+
+    var shown = rows.length;
+    var rowCount = typeof table.row_count === "number" ? table.row_count : shown;
+    if (table.truncated === true || shown < rowCount) {
+      els.resultTableCaption.textContent = "showing " + shown + " of " + rowCount + " rows";
+      els.resultTableCaption.hidden = false;
+    } else {
+      els.resultTableCaption.textContent = "";
+      els.resultTableCaption.hidden = true;
+    }
+
+    els.resultTable.hidden = false;
+  }
+
+  // Field 3 — `blueprint_use: {blueprint_id, slots} | null`: a single chip
+  // `Using blueprint {id} · {k}={v} · …`. null → no chip.
+  function renderBlueprintChip(blueprintUse) {
+    if (!blueprintUse || !blueprintUse.blueprint_id) {
+      els.blueprintChip.hidden = true;
+      els.blueprintChip.textContent = "";
+      return;
+    }
+    var parts = ["Using blueprint " + cellText(blueprintUse.blueprint_id)];
+    var slots = blueprintUse.slots || {};
+    Object.keys(slots).forEach(function (key) {
+      parts.push(key + "=" + cellText(slots[key]));
+    });
+    els.blueprintChip.textContent = parts.join(" · ");
+    els.blueprintChip.hidden = false;
+  }
+
+  // Field 4 — `verification: {passed, method, grain_checked} | null`: a passive
+  // "verified ✓" badge only when passed===true. null → render nothing (absence
+  // is information — never a warning). No "failed" state exists.
+  function renderVerification(verification) {
+    if (!verification || verification.passed !== true) {
+      els.verifiedBadge.hidden = true;
+      els.verifiedBadge.textContent = "";
+      els.verifiedBadge.removeAttribute("title");
+      return;
+    }
+    els.verifiedBadge.textContent = "verified ✓";
+    // grain_checked===false → grain probe was skipped; keep it subtle via title.
+    if (verification.grain_checked === false) {
+      els.verifiedBadge.setAttribute("title", "verified (grain not checked)");
+    } else {
+      els.verifiedBadge.setAttribute("title", "verified via blueprint gate");
+    }
+    els.verifiedBadge.hidden = false;
+  }
+
+  // Field 5 — `provenance: string[] | null`: sorted "database.table.column"
+  // chips. null → hide (lineage undetermined). [] → subtle "no tables read".
+  function renderProvenance(provenance) {
+    clearNode(els.provenanceChips);
+    if (provenance === null || provenance === undefined || !Array.isArray(provenance)) {
+      els.provenancePanel.hidden = true;
+      return;
+    }
+    if (provenance.length === 0) {
+      var note = document.createElement("span");
+      note.className = "prov-empty";
+      note.textContent = "no tables read";
+      els.provenanceChips.appendChild(note);
+      els.provenancePanel.hidden = false;
+      return;
+    }
+    provenance.forEach(function (entry) {
+      var chip = document.createElement("span");
+      chip.className = "static-chip";
+      chip.setAttribute("data-testid", "provenance-chip");
+      chip.textContent = cellText(entry);
+      els.provenanceChips.appendChild(chip);
+    });
+    els.provenancePanel.hidden = false;
+  }
+
+  // Render all five enriched fields from a `result` payload (each guarded).
+  function renderEnrichedResult(data) {
+    renderSql(data.sql);
+    renderResultTable(data.result_table);
+    renderBlueprintChip(data.blueprint_use);
+    renderVerification(data.verification);
+    renderProvenance(data.provenance);
+  }
+
+  // Clear all five panels — called on each new turn submission so stale data
+  // from a prior turn never lingers (mirrors the progress/answer reset).
+  function resetEnrichedResult() {
+    renderSql(null);
+    renderResultTable(null);
+    renderBlueprintChip(null);
+    renderVerification(null);
+    renderProvenance(null);
   }
 
   function hideAskUser() {
@@ -457,6 +770,7 @@
     } else if (eventName === "result" && data) {
       setStatus(data);
       setAnswer(data.assistant_text);
+      renderEnrichedResult(data);
       if (data.pending_question) {
         showAskUser(data.pending_question);
       } else {
@@ -497,6 +811,7 @@
     }
     setBusy(true);
     hideAskUser();
+    resetEnrichedResult();
     runTurn("/api/turn", { session_id: sessionId, message: message }).finally(function () {
       setBusy(false);
     });

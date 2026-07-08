@@ -93,7 +93,12 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolResult,
 )
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
-from data_agent.runtime.session.models import PauseCheckpoint, TrailEntry, TurnMessage
+from data_agent.runtime.session.models import (
+    PauseCheckpoint,
+    ResultPreview,
+    TrailEntry,
+    TurnMessage,
+)
 from data_agent.runtime.session.store import SessionStore
 
 from .budget_guard import new_budget_window
@@ -236,6 +241,16 @@ class TurnOutcome:
     assistant_text: str | None
     pending_question: dict[str, Any] | None
     tool_calls_made: int
+    # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §1):
+    # additive, nullable enrichment for the SSE `result` event — the loop
+    # populates these best-effort at every return site (never load-bearing for
+    # correctness). All default `None` so existing construction sites stay valid
+    # and an old client ignores the unknown keys (backward compatible).
+    sql: list[str] | None = None
+    result_table: ResultPreview | None = None
+    blueprint_use: dict[str, Any] | None = None
+    verification: dict[str, Any] | None = None
+    provenance: frozenset[tuple[str, str]] | None = None
 
 
 def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -442,6 +457,13 @@ class AgentLoop:
                     ),
                     pending_question=None,
                     tool_calls_made=0,
+                    # UI Slice 1: a `done` return — surface the turn's lineage from
+                    # the trail (the fail-closed source of truth). The in-loop sql/
+                    # table/blueprint accumulators are gone with the prior window, so
+                    # they stay `None` (best-effort partial, §1 nullability table).
+                    provenance=await self._compute_turn_provenance_union(
+                        session_id, turn_index
+                    ),
                 )
             window_count = prior_window_count + 1  # D55: "continue"/"refine" grants a fresh window
         else:
@@ -586,11 +608,20 @@ class AgentLoop:
         window_count: int,
         assistant_text: str | None,
         tool_calls_made: int,
+        sql: list[str] | None = None,
+        result_table: ResultPreview | None = None,
+        blueprint_use: dict[str, Any] | None = None,
+        verification: dict[str, Any] | None = None,
     ) -> TurnOutcome:
         """Honor a runtime tool's `ToolPause` (§2.5) — write the checkpoint (with
         the additive `blueprint_*` mid-DAG state) and return `paused_ask_user`,
         the same terminal contract as `askUser`. The loop owns `budget_window_count`
-        (the tool cannot know it), exactly as for the `askUser` checkpoint above."""
+        (the tool cannot know it), exactly as for the `askUser` checkpoint above.
+
+        UI Slice 1 Fix 2 (pause-path symmetry): the four enrichment accumulators are
+        threaded through best-effort so "runQuery succeeded, then runBlueprint paused
+        on a slot question" surfaces the partial SQL/table on THIS pause flavor too,
+        matching the direct `askUser` pause. Default `None` when no query succeeded."""
         checkpoint = PauseCheckpoint(
             reason=pause.reason,
             pending_question=pause.pending_question,
@@ -612,6 +643,10 @@ class AgentLoop:
             assistant_text=assistant_text,
             pending_question=checkpoint.pending_question,
             tool_calls_made=tool_calls_made,
+            sql=sql,
+            result_table=result_table,
+            blueprint_use=blueprint_use,
+            verification=verification,
         )
 
     async def _resume_blueprint(
@@ -677,6 +712,9 @@ class AgentLoop:
         if tool_result.pause is not None:
             # Another mid-DAG pause — write the fresh checkpoint (grown
             # completed-nodes state) and pause again, exactly as the first call.
+            # No enrichment seed: an `ExecPaused` result has no `result_full`, so a
+            # blueprint answer has not been produced yet (best-effort all-`None`,
+            # §1 nullability for `paused_ask_user`).
             return await self._pause_from_runtime_tool(
                 session_id=session_id,
                 pause=tool_result.pause,
@@ -684,6 +722,23 @@ class AgentLoop:
                 assistant_text=None,
                 tool_calls_made=0,
             )
+
+        # UI Slice 1 Fix 1: fold this COMPLETED blueprint result into seed
+        # enrichment so the resumed loop's FINAL `done` result event carries the
+        # same sql/result_table/blueprint_use/verification a non-paused blueprint
+        # answer would (a fresh `_run_loop` window would otherwise start empty and
+        # drop it). Raw slots ride the checkpoint's `slot_bindings`. A no-op on a
+        # non-`ok` (failed/degraded) resume → no seed, matching a raw-loop fallback.
+        seed_sql: list[str] = []
+        seed_preview, seed_blueprint_use, seed_verification = self._accumulate_enrichment(
+            "runBlueprint",
+            {"slot_bindings": slot_bindings},
+            tool_result,
+            turn_sql=seed_sql,
+            primary_preview=None,
+            blueprint_use=None,
+            verification=None,
+        )
 
         # Persist the completed/failed runBlueprint result as a trail entry so the
         # continued loop (and any replay) sees it, then let the model narrate.
@@ -718,6 +773,10 @@ class AgentLoop:
             turn_index=turn_index,
             model_client=turn_model_client,
             question=question,
+            seed_sql=seed_sql,
+            seed_preview=seed_preview,
+            seed_blueprint_use=seed_blueprint_use,
+            seed_verification=seed_verification,
         )
 
     def _blueprint_outcome_to_tool_result(self, outcome: Any) -> ToolResult:
@@ -773,6 +832,51 @@ class AgentLoop:
             )
         return _runtime_tool_internal_error("runBlueprint")
 
+    @staticmethod
+    def _accumulate_enrichment(
+        tool_name: str,
+        arguments: dict[str, Any],
+        tool_result: ToolResult,
+        *,
+        turn_sql: list[str],
+        primary_preview: ResultPreview | None,
+        blueprint_use: dict[str, Any] | None,
+        verification: dict[str, Any] | None,
+    ) -> tuple[ResultPreview | None, dict[str, Any] | None, dict[str, Any] | None]:
+        """Fold one SUCCESSFUL runQuery/runBlueprint result into the turn-window
+        enrichment accumulators (UI Slice 1, contract §3.2). `turn_sql` is mutated
+        in place (deduped, first-occurrence order); the other three are RETURNED
+        for the caller to reassign. A no-op for any non-`ok` / non-query tool call,
+        so it is safe to call unconditionally. Shared by the in-loop dispatch path
+        AND the blueprint approval-resume seed path so both produce identical
+        enrichment (Fix 1: a resumed verified answer keeps its badge + chip)."""
+        if tool_result.status != "ok":
+            return primary_preview, blueprint_use, verification
+        if tool_name == "runQuery":
+            query_sql = arguments.get("sql")
+            if query_sql and query_sql not in turn_sql:
+                turn_sql.append(query_sql)
+            return tool_result.result_preview, blueprint_use, verification
+        if tool_name == "runBlueprint":
+            rf = tool_result.result_full or {}
+            for bp_sql in rf.get("sql", []):
+                if bp_sql and bp_sql not in turn_sql:
+                    turn_sql.append(bp_sql)
+            new_blueprint_use = {
+                "blueprint_id": rf.get("blueprint_id"),
+                "slots": dict(arguments.get("slot_bindings") or {}),
+            }
+            new_verification = verification
+            if rf.get("status") == "verified":
+                new_verification = {
+                    "passed": True,
+                    "method": "blueprint_gate",
+                    # None-safe: a `verify: None` must not AttributeError.
+                    "grain_checked": bool((rf.get("verify") or {}).get("grain_checked")),
+                }
+            return tool_result.result_preview, new_blueprint_use, new_verification
+        return primary_preview, blueprint_use, verification
+
     async def _run_loop(
         self,
         *,
@@ -782,6 +886,14 @@ class AgentLoop:
         turn_index: int,
         model_client: ModelClient,
         question: str | None = None,
+        # UI Slice 1 Fix 1: seed the turn-window enrichment accumulators from a
+        # completed-before-this-window result (the blueprint approval-resume path)
+        # so the FINAL `done` result event carries the same enrichment a non-paused
+        # answer would. Default `None`/empty → byte-identical to a fresh window.
+        seed_sql: list[str] | None = None,
+        seed_preview: ResultPreview | None = None,
+        seed_blueprint_use: dict[str, Any] | None = None,
+        seed_verification: dict[str, Any] | None = None,
     ) -> TurnOutcome:
         # The live MCP authenticates every request, including tools/list, so
         # the tools_provider seam is called WITH this turn's credentials on
@@ -807,6 +919,16 @@ class AgentLoop:
         # diagnostic — same lifecycle as `retrieval_memo` (fresh per window,
         # not persisted) so the event fires at most once per stranded call.
         withheld_call_ids: set[str] = set()
+        # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §3):
+        # turn-window-local accumulators for the enriched `result` event, same
+        # lifecycle as the memos above (fresh per window, not persisted).
+        # Populated on each successful runQuery/runBlueprint entry below, read at
+        # every `TurnOutcome(...)` return site. Seeded (Fix 1) on the blueprint
+        # approval-resume path so a resumed verified answer keeps its enrichment.
+        turn_sql: list[str] = list(seed_sql) if seed_sql else []
+        primary_preview: ResultPreview | None = seed_preview
+        blueprint_use: dict[str, Any] | None = seed_blueprint_use
+        verification: dict[str, Any] | None = seed_verification
 
         while True:
             canonical_messages = await self._build_canonical_messages(
@@ -823,14 +945,16 @@ class AgentLoop:
             last_assistant_text = result.assistant_text
 
             if not result.tool_calls:
+                # B1/D44 (2026-07-01 clarification) AND UI Slice 1: the union of
+                # this turn's tool-result provenance — the tag for the final
+                # assistant message (so it is scope re-filtered on replay exactly
+                # like the trail itself) AND the enriched `result` event's lineage.
+                # Computed ONCE here (the single fail-closed source of truth; do
+                # not re-derive in-loop).
+                turn_provenance = await self._compute_turn_provenance_union(
+                    session_id, turn_index
+                )
                 if result.assistant_text:
-                    # B1/D44 (2026-07-01 clarification): tag this assistant
-                    # message with the union of this turn's tool-result
-                    # provenance so it is scope re-filtered on replay exactly
-                    # like the trail itself.
-                    provenance = await self._compute_turn_provenance_union(
-                        session_id, turn_index
-                    )
                     await self._session_store.append_message(
                         session_id,
                         TurnMessage(
@@ -838,7 +962,7 @@ class AgentLoop:
                             role="assistant",
                             content=result.assistant_text,
                             ts=_now_iso(),
-                            provenance=provenance,
+                            provenance=turn_provenance,
                         ),
                     )
                 self._observer("loop_turn_done", {"tool_calls_made": tool_calls_made})
@@ -847,6 +971,13 @@ class AgentLoop:
                     assistant_text=result.assistant_text,
                     pending_question=None,
                     tool_calls_made=tool_calls_made,
+                    # `[]` (no successful query this turn) -> `None`, so the UI
+                    # treats "no SQL panel" and "empty SQL" identically (§1 fork 1).
+                    sql=turn_sql or None,
+                    result_table=primary_preview,
+                    blueprint_use=blueprint_use,
+                    verification=verification,
+                    provenance=turn_provenance,
                 )
 
             ask_user_call = next(
@@ -869,6 +1000,13 @@ class AgentLoop:
                     assistant_text=result.assistant_text,
                     pending_question=checkpoint.pending_question,
                     tool_calls_made=tool_calls_made,
+                    # Best-effort partial (§1): whatever succeeded in an earlier
+                    # window of this turn; `provenance` stays `None` (the fail-closed
+                    # union is reused only on the `done` return).
+                    sql=turn_sql or None,
+                    result_table=primary_preview,
+                    blueprint_use=blueprint_use,
+                    verification=verification,
                 )
 
             # S3: never dispatch an unbounded number of tool calls from one
@@ -917,6 +1055,11 @@ class AgentLoop:
                         window_count=window_count,
                         assistant_text=result.assistant_text,
                         tool_calls_made=tool_calls_made,
+                        # Fix 2: surface whatever succeeded earlier in this window.
+                        sql=turn_sql or None,
+                        result_table=primary_preview,
+                        blueprint_use=blueprint_use,
+                        verification=verification,
                     )
                 tool_calls_made += 1
 
@@ -940,6 +1083,20 @@ class AgentLoop:
                 )
                 await self._session_store.append_trail_entry(session_id, entry)
 
+                # UI Slice 1 (§3.2): accumulate the enriched-result fields from
+                # this SUCCESSFUL tool call (runQuery arg SQL + preview; runBlueprint
+                # `result_full` SQL/blueprint_id/verify + preview). Shared with the
+                # blueprint approval-resume seed path via `_accumulate_enrichment`.
+                primary_preview, blueprint_use, verification = self._accumulate_enrichment(
+                    tool_call.name,
+                    tool_call.arguments,
+                    tool_result,
+                    turn_sql=turn_sql,
+                    primary_preview=primary_preview,
+                    blueprint_use=blueprint_use,
+                    verification=verification,
+                )
+
                 # S3: also check the budget INSIDE the per-tool-call loop (not
                 # only once per outer iteration) so a slow batch of capped
                 # calls that blows the wall-clock window mid-dispatch stops
@@ -957,6 +1114,12 @@ class AgentLoop:
                         assistant_text=last_assistant_text,
                         pending_question=None,
                         tool_calls_made=tool_calls_made,
+                        # Best-effort partial (§1): whatever succeeded before the
+                        # hard ceiling; `provenance` stays `None` (done-only).
+                        sql=turn_sql or None,
+                        result_table=primary_preview,
+                        blueprint_use=blueprint_use,
+                        verification=verification,
                     )
                 checkpoint = PauseCheckpoint(
                     reason="budget_cap",
@@ -975,6 +1138,12 @@ class AgentLoop:
                     assistant_text=last_assistant_text,
                     pending_question=checkpoint.pending_question,
                     tool_calls_made=tool_calls_made,
+                    # Best-effort partial (§1): whatever succeeded before the cap;
+                    # `provenance` stays `None` (done-only).
+                    sql=turn_sql or None,
+                    result_table=primary_preview,
+                    blueprint_use=blueprint_use,
+                    verification=verification,
                 )
             # Under budget — loop back to 3a within the same window.
 

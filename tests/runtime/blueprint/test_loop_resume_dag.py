@@ -157,6 +157,120 @@ async def test_approval_pause_then_restart_resume_completes() -> None:
     assert bp_entries and bp_entries[-1].status == "ok"
 
 
+async def test_approval_resume_final_outcome_carries_enrichment() -> None:
+    """UI Slice 1 Fix 1: a blueprint that pauses for approval and then RESUMES to a
+    verified answer must carry the enriched result fields on the FINAL `done`
+    outcome. The resumed loop starts a fresh window, so it seeds its enrichment
+    accumulators from the completed blueprint result — without the seed, the
+    verified ✓ badge + blueprint chip + SQL + table would silently vanish for
+    exactly the approval-gated blueprints."""
+    store = InMemorySessionStore()
+
+    run_model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                ]
+            ),
+        ]
+    )
+    run_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]})
+    loop1 = _make_loop(store, run_model, run_mcp)
+    paused = await loop1.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
+    assert paused.status == "paused_ask_user"
+
+    resume_model = ScriptedModelClient(
+        [ModelTurnResult(assistant_text="Flagged 2 departments above the average.")]
+    )
+    resume_mcp = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["department"], [["Sales"], ["Eng"]]),
+                _rq(["__bp_n", "__bp_d"], [[2, 2]]),
+            ]
+        }
+    )
+    loop2 = _make_loop(store, resume_model, resume_mcp)
+    done = await loop2.resume(session_id=SESSION_ID, credentials=_creds(), answer="approve")
+
+    assert done.status == "done"
+    # The verified-blueprint enrichment SURVIVES the approval-resume boundary.
+    assert done.blueprint_use == {"blueprint_id": _BID, "slots": {}}
+    assert done.verification == {"passed": True, "method": "blueprint_gate", "grain_checked": True}
+    assert done.sql and all(isinstance(s, str) for s in done.sql)
+    assert done.result_table is not None
+    # Lineage also survives: the runBlueprint trail entry is persisted before the
+    # loop re-enters, so the provenance union on the resumed answer is determined.
+    assert done.provenance is not None
+
+
+def _make_loop_ex(
+    store: InMemorySessionStore,
+    model: ScriptedModelClient,
+    bp_mcp: FakeMCPClient,
+    loop_mcp: FakeMCPClient,
+):
+    """Like `_make_loop` but with a SEPARATE MCP for the loop's own dispatcher
+    (the model's direct runQuery) vs. the executor's inner blueprint nodes — so a
+    runQuery can succeed in the same window a runBlueprint pauses."""
+    index = FakeVectorIndex()
+    index.add_detail(_detail())
+    executor = BlueprintExecutor(
+        tool_dispatcher=ToolDispatcher(bp_mcp, CATALOG), vector_index=index
+    )
+    tool = RunBlueprintTool(executor=executor)
+    from data_agent.runtime.loop.agent_loop import AgentLoop
+
+    return AgentLoop(
+        model_client=model,
+        tool_dispatcher=ToolDispatcher(loop_mcp, CATALOG),
+        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        session_store=store,
+        tools_provider=_tools_provider,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        runtime_tools={"runBlueprint": tool},
+        blueprint_executor=executor,
+    )
+
+
+async def test_in_loop_pause_carries_partial_enrichment_from_prior_query() -> None:
+    """UI Slice 1 Fix 2: when a runQuery succeeds and THEN a runBlueprint pauses
+    (approval) in the same window, the `paused_ask_user` outcome surfaces the
+    partial sql/result_table from the query — pause-path symmetry, so the
+    runtime-tool pause flavor matches the direct `askUser` pause. blueprint_use /
+    verification stay `None` (the blueprint did not produce an answer)."""
+    store = InMemorySessionStore()
+    query_sql = "SELECT Department FROM dbpcm_warehouse.employee"
+    loop_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["Department"], [["Sales"]])]})
+    bp_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]})  # node 0 only
+
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="q1", name="runQuery", arguments={"sql": query_sql}),
+                    ToolCallRequest(id="b1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}}),
+                ]
+            ),
+        ]
+    )
+    loop = _make_loop_ex(store, model, bp_mcp, loop_mcp)
+
+    paused = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
+
+    assert paused.status == "paused_ask_user"
+    # The prior runQuery's partial enrichment is surfaced on the runtime-tool pause.
+    assert paused.sql == [query_sql]
+    assert paused.result_table is not None
+    assert paused.result_table.columns == ["Department"]
+    # The blueprint did not complete → no chip / badge.
+    assert paused.blueprint_use is None
+    assert paused.verification is None
+
+
 async def test_double_resume_is_rejected_exactly_once() -> None:
     store = InMemorySessionStore()
     run_model = ScriptedModelClient(

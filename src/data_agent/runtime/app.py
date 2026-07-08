@@ -142,6 +142,20 @@ def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
         "assistant_text": outcome.assistant_text,
         "pending_question": outcome.pending_question,
         "tool_calls_made": outcome.tool_calls_made,
+        # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §1):
+        # 5 additive, nullable fields. `sql`/`blueprint_use`/`verification` pass
+        # through as-is; `result_table` serializes via `ResultPreview.to_doc()`;
+        # `provenance` projects the fail-closed `frozenset[(db.table, column)]`
+        # union to a sorted, deduped list of `"database.table.column"` strings.
+        "sql": outcome.sql,
+        "result_table": outcome.result_table.to_doc() if outcome.result_table else None,
+        "blueprint_use": outcome.blueprint_use,
+        "verification": outcome.verification,
+        "provenance": (
+            sorted(f"{db}.{col}" for db, col in outcome.provenance)
+            if outcome.provenance is not None
+            else None
+        ),
     }
 
 

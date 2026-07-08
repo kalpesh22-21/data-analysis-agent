@@ -86,8 +86,22 @@ def test_turn_endpoint_streams_progress_and_result(monkeypatch) -> None:
     assert response.status_code == 200
     events = _parse_sse(response.text)
     assert events[-1]["event"] == "result"
-    assert events[-1]["data"]["status"] == "done"
-    assert events[-1]["data"]["assistant_text"] == "Here is your answer."
+    data = events[-1]["data"]
+    # (a) the 4 original keys are unchanged (backward compat).
+    assert data["status"] == "done"
+    assert data["assistant_text"] == "Here is your answer."
+    assert data["pending_question"] is None
+    assert data["tool_calls_made"] == 0
+    # (b) the 5 UI Slice 1 keys are present.
+    for key in ("sql", "result_table", "blueprint_use", "verification", "provenance"):
+        assert key in data, f"missing enriched-result key {key!r}"
+    # Pure-chat turn (no tools): no SQL/table/blueprint, and a determined-empty
+    # provenance union (frozenset() -> []).
+    assert data["sql"] is None
+    assert data["result_table"] is None
+    assert data["blueprint_use"] is None
+    assert data["verification"] is None
+    assert data["provenance"] == []
 
 
 def test_turn_endpoint_missing_auth_header_returns_401(monkeypatch) -> None:
@@ -181,8 +195,14 @@ def test_full_ask_user_pause_then_resume_round_trip_over_http(monkeypatch) -> No
     first = client.post("/turn", json={"message": "Show payroll."}, headers=HEADERS)
     assert first.status_code == 200
     first_events = _parse_sse(first.text)
-    assert first_events[-1]["data"]["status"] == "paused_ask_user"
-    assert first_events[-1]["data"]["pending_question"]["question"] == "Which dept?"
+    paused = first_events[-1]["data"]
+    assert paused["status"] == "paused_ask_user"
+    assert paused["pending_question"]["question"] == "Which dept?"
+    # (e) a paused turn tolerates all-null enrichment (paused before any query
+    # ran) — the 5 keys are present but null.
+    for key in ("sql", "result_table", "blueprint_use", "verification", "provenance"):
+        assert key in paused, f"missing enriched-result key {key!r}"
+        assert paused[key] is None
 
     second = client.post("/turn/resume", json={"answer": "Sales"}, headers=HEADERS)
     assert second.status_code == 200
@@ -413,7 +433,26 @@ def test_run_blueprint_wired_when_retrieval_active_executes_verified(monkeypatch
 
     resp = client.post("/turn", json={"message": "avg salary?"}, headers=HEADERS)
     assert resp.status_code == 200
-    assert _parse_sse(resp.text)[-1]["data"]["status"] == "done"
+    data = _parse_sse(resp.text)[-1]["data"]
+    assert data["status"] == "done"
+    # (c) a blueprint scenario yields the enriched fields: non-null blueprint_use
+    # (raw model slots) + a passing blueprint-gate verification badge + the
+    # per-node SQL + the result table + lineage.
+    assert data["blueprint_use"] == {"blueprint_id": "bp-avg", "slots": {"department": "Sales"}}
+    assert data["verification"] == {
+        "passed": True,
+        "method": "blueprint_gate",
+        "grain_checked": True,
+    }
+    assert data["sql"] and all(isinstance(s, str) for s in data["sql"])
+    assert data["result_table"] is not None
+    assert set(data["result_table"].keys()) == {
+        "columns",
+        "row_count",
+        "truncated",
+        "preview_rows",
+    }
+    assert data["provenance"] is not None
 
     import anyio
 
@@ -455,3 +494,219 @@ def test_run_blueprint_unavailable_when_retrieval_absent(monkeypatch) -> None:
     assert trail[0].status == "error"
     assert trail[0].error_code == "RUN_BLUEPRINT_UNAVAILABLE"
     assert mcp.calls == []  # advertised-but-unwired never hits the MCP
+
+
+# ---------------------------------------------------------------------------
+# UI Slice 1 — enriched `/turn` `result` event
+# (docs/decisions/ui-slice1-enriched-result-contract.md). The blueprint case is
+# covered by test_run_blueprint_wired_when_retrieval_active_executes_verified
+# above (non-null blueprint_use + verification.passed); here we cover the
+# raw-loop case (a dispatched runQuery answer) and unit-test the serializer.
+# ---------------------------------------------------------------------------
+
+_RAW_SQL = "SELECT AVG(AnnualSalary) AS avg_salary FROM dbpcm_warehouse.employee WHERE Department = 'Sales'"
+
+
+def _raw_loop_app(
+    monkeypatch, model_client: ScriptedModelClient
+) -> tuple[TestClient, InMemorySessionStore, FakeMCPClient]:
+    """A minimal raw-loop app: a runQuery MCP tool + a catalog rich enough for
+    the provenance extractor to determine a non-null USES set from `_RAW_SQL`."""
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *args, **kwargs: frozenset())
+    mcp_client = FakeMCPClient(
+        tools=[
+            MCPToolSpec(
+                name="runQuery", description="", input_schema={"type": "object", "properties": {}}
+            )
+        ],
+        scripted={
+            "runQuery": [
+                {
+                    "columns": ["avg_salary"],
+                    "rows": [[60000.0]],
+                    "row_count": 1,
+                    "truncated": False,
+                }
+            ]
+        },
+    )
+    store = InMemorySessionStore()
+    catalog = CatalogHandle(
+        {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+    )
+    app = create_app(
+        settings=RuntimeSettings(_env_file=None),
+        session_store=store,
+        mcp_client=mcp_client,
+        model_client=model_client,
+        catalog=catalog,
+    )
+    return TestClient(app), store, mcp_client
+
+
+def test_raw_loop_turn_enriched_result_no_blueprint(monkeypatch) -> None:
+    """(d) A raw-loop answer (a dispatched runQuery, no blueprint) yields
+    blueprint_use==null + verification==null + non-null sql/result_table/
+    provenance."""
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[ToolCallRequest(id="q1", name="runQuery", arguments={"sql": _RAW_SQL})]
+            ),
+            ModelTurnResult(assistant_text="The average salary in Sales is $60,000."),
+        ]
+    )
+    client, store, mcp = _raw_loop_app(monkeypatch, model)
+
+    resp = client.post("/turn", json={"message": "avg salary?"}, headers=HEADERS)
+    assert resp.status_code == 200
+    data = _parse_sse(resp.text)[-1]["data"]
+
+    assert data["status"] == "done"
+    assert data["blueprint_use"] is None
+    assert data["verification"] is None
+    assert data["sql"] == [_RAW_SQL]
+    assert data["result_table"] == {
+        "columns": ["avg_salary"],
+        "row_count": 1,
+        "truncated": False,
+        "preview_rows": [[60000.0]],
+    }
+    # The scope-enforced extractor determined the USES set (sorted db.table.column).
+    assert data["provenance"] == [
+        "dbpcm_warehouse.employee.AnnualSalary",
+        "dbpcm_warehouse.employee.Department",
+    ]
+
+
+def test_outcome_to_dict_projects_provenance_and_result_preview() -> None:
+    """Unit test: `_outcome_to_dict` projects the frozenset provenance to sorted
+    `"db.table.column"` strings and a `ResultPreview` via `.to_doc()`, and passes
+    the other new fields through as-is."""
+    from data_agent.runtime.app import _outcome_to_dict
+    from data_agent.runtime.loop.agent_loop import TurnOutcome
+    from data_agent.runtime.session.models import ResultPreview
+
+    preview = ResultPreview(
+        columns=["department", "headcount"],
+        row_count=3,
+        truncated=False,
+        preview_rows=[["Engineering", 3], ["Sales", 3]],
+    )
+    outcome = TurnOutcome(
+        status="done",
+        assistant_text="ans",
+        pending_question=None,
+        tool_calls_made=1,
+        sql=["SELECT 1"],
+        result_table=preview,
+        blueprint_use={"blueprint_id": "bp", "slots": {"period": "2026-05"}},
+        verification={"passed": True, "method": "blueprint_gate", "grain_checked": True},
+        # Deliberately UNSORTED input to prove the projection sorts.
+        provenance=frozenset({("hr.employees", "id"), ("hr.employees", "department")}),
+    )
+
+    doc = _outcome_to_dict(outcome)
+
+    assert doc["status"] == "done"
+    assert doc["assistant_text"] == "ans"
+    assert doc["pending_question"] is None
+    assert doc["tool_calls_made"] == 1
+    assert doc["sql"] == ["SELECT 1"]
+    assert doc["result_table"] == preview.to_doc()
+    assert doc["blueprint_use"] == {"blueprint_id": "bp", "slots": {"period": "2026-05"}}
+    assert doc["verification"] == {"passed": True, "method": "blueprint_gate", "grain_checked": True}
+    assert doc["provenance"] == ["hr.employees.department", "hr.employees.id"]
+
+
+_MULTI_SQL_A = (
+    "SELECT AVG(AnnualSalary) AS avg_salary FROM dbpcm_warehouse.employee "
+    "WHERE Department = 'Sales'"
+)
+_MULTI_SQL_B = "SELECT COUNT(DISTINCT EmployeeCode) AS headcount FROM dbpcm_warehouse.employee"
+
+
+def test_raw_loop_multi_query_sql_list_ordered_and_deduped(monkeypatch) -> None:
+    """QA gap (contract §1 fork 1): a turn running several successful runQuery
+    statements surfaces them as a LIST in execution order, deduped preserving
+    first occurrence (a re-run of the identical string shows once). Exercises
+    the in-loop `turn_sql` accumulator's dedup branch, which no prior test hit.
+    Provenance is the fail-closed UNION across all successful queries."""
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *args, **kwargs: frozenset())
+    mcp_client = FakeMCPClient(
+        tools=[
+            MCPToolSpec(
+                name="runQuery", description="", input_schema={"type": "object", "properties": {}}
+            )
+        ],
+        scripted={
+            "runQuery": [
+                {"columns": ["avg_salary"], "rows": [[60000.0]], "row_count": 1, "truncated": False},
+                {"columns": ["headcount"], "rows": [[9]], "row_count": 1, "truncated": False},
+                # The duplicate A is still dispatched (dedup is on the SQL list,
+                # not on dispatch), so it needs its own scripted result.
+                {"columns": ["avg_salary"], "rows": [[60000.0]], "row_count": 1, "truncated": False},
+            ]
+        },
+    )
+    store = InMemorySessionStore()
+    catalog = CatalogHandle(
+        {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+    )
+    model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="q1", name="runQuery", arguments={"sql": _MULTI_SQL_A}),
+                    ToolCallRequest(id="q2", name="runQuery", arguments={"sql": _MULTI_SQL_B}),
+                    # Same string as q1 — must NOT appear twice in the list.
+                    ToolCallRequest(id="q3", name="runQuery", arguments={"sql": _MULTI_SQL_A}),
+                ]
+            ),
+            ModelTurnResult(assistant_text="Sales avg is $60,000 across 9 people."),
+        ]
+    )
+    app = create_app(
+        settings=RuntimeSettings(_env_file=None),
+        session_store=store,
+        mcp_client=mcp_client,
+        model_client=model,
+        catalog=catalog,
+    )
+    client = TestClient(app)
+
+    resp = client.post("/turn", json={"message": "avg + headcount?"}, headers=HEADERS)
+    assert resp.status_code == 200
+    data = _parse_sse(resp.text)[-1]["data"]
+
+    assert data["status"] == "done"
+    # Execution order preserved; the duplicate A is collapsed to one occurrence.
+    assert data["sql"] == [_MULTI_SQL_A, _MULTI_SQL_B]
+    # result_table is the LAST successful preview (the dup-A re-run here).
+    assert data["result_table"]["columns"] == ["avg_salary"]
+    assert data["blueprint_use"] is None
+    assert data["verification"] is None
+    # Fail-closed UNION across BOTH distinct queries' provenance (sorted).
+    assert data["provenance"] == [
+        "dbpcm_warehouse.employee.AnnualSalary",
+        "dbpcm_warehouse.employee.Department",
+        "dbpcm_warehouse.employee.EmployeeCode",
+    ]
+
+
+def test_outcome_to_dict_null_enrichment_projects_to_null() -> None:
+    """A bare `TurnOutcome` (all 5 new fields defaulting to None) serializes each
+    to JSON null — the backward-compatible / partial-turn shape."""
+    from data_agent.runtime.app import _outcome_to_dict
+    from data_agent.runtime.loop.agent_loop import TurnOutcome
+
+    doc = _outcome_to_dict(
+        TurnOutcome(
+            status="paused_ask_user",
+            assistant_text=None,
+            pending_question={"question": "q?", "options": None},
+            tool_calls_made=0,
+        )
+    )
+    for key in ("sql", "result_table", "blueprint_use", "verification", "provenance"):
+        assert doc[key] is None
