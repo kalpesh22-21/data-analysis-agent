@@ -265,6 +265,12 @@ def create_app(
         # so the Layer-3 D25 scenario can dump + assert them PII-clean without a
         # Phoenix container. `None` in production → byte-identical provider.
         span_exporter=span_exporter,
+        # Design §7 noise reduction: drop the per-turn plumbing spans
+        # (context.assembly / loop_model_call_start / loop_turn_done by default) at
+        # the exporter so Phoenix shows only the meaningful spans. Name-based +
+        # tunable via RuntimeSettings.otlp_drop_span_names ([] disables it). This
+        # only changes WHICH spans export — not what CONTENT a kept span carries.
+        drop_span_names=settings.otlp_drop_span_names,
     )
     # D25: hide the auto-instrumented OpenAI LLM span's raw prompt/completion by
     # default (the online per-turn Phoenix project is a shape/count/latency-only

@@ -19,6 +19,7 @@ from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
 from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
 
@@ -131,6 +132,24 @@ class RuntimeSettings(BaseSettings):
             "stays content-free. Set False ONLY in a controlled, access-controlled "
             "diagnostic environment: it makes the project entity-bearing (raw question "
             "+ query-derived answer land on the span), like LEARNING_TRACE_VERBOSE."
+        ),
+    )
+    otlp_drop_span_names: list[str] = Field(
+        default_factory=lambda: sorted(DEFAULT_DROP_SPAN_NAMES),
+        description=(
+            "Span NAMES dropped before export so a reviewer sees only the meaningful "
+            "spans of a turn (design §7). Applied centrally by wrapping the exporter "
+            "(runtime/observability/tracing.py::_NameFilteringSpanExporter) — never at "
+            "a span() call site. Default drops the per-turn plumbing spans "
+            "(context.assembly, loop_model_call_start, loop_turn_done) while KEEPING "
+            "agent.turn, the OpenAI Response/LLM span, every tool.<name> span, "
+            "embedding, rerank, retrieval.recall, and loop_repeated_idempotent_read_"
+            "guarded. Add the low-frequency status spans (loop_paused_ask_user, "
+            "loop_paused_budget_cap, loop_hard_ceiling_stop, "
+            "loop_result_withheld_provenance) to also drop those; set EMPTY ([]) to "
+            "disable filtering and export every span. Purely about WHICH spans export "
+            "— it does NOT change the CONTENT a kept span carries (that is the "
+            "separate otlp_hide_llm_content / otlp_disable_redaction posture)."
         ),
     )
     otlp_disable_redaction: bool = Field(

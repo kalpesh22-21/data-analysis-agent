@@ -33,7 +33,7 @@ it must be access-controlled like the audit store.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -46,11 +46,79 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.propagate import inject
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor,
+    SimpleSpanProcessor,
+    SpanExporter,
+    SpanExportResult,
+)
 from opentelemetry.trace import Span, Tracer
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 _TRACER_NAME = "data-agent-runtime"
+
+# The DEFAULT set of span NAMES dropped before export so a reviewer sees only the
+# meaningful spans of a runtime turn (design §7 noise-reduction). These are the
+# pure-plumbing spans emitted on every normal turn — NOT their meaningful
+# neighbours: `agent.turn`, the auto-instrumented OpenAI `Response`/`LLM` span,
+# every `tool.<name>` dispatch span, `embedding`, `rerank`, `retrieval.recall`,
+# and `loop_repeated_idempotent_read_guarded` all stay.
+#
+#   - `context.assembly`      — the D50 context-assembly CHAIN wrapper (plumbing).
+#   - `loop_model_call_start` — the AgentLoop "about to call the model" boundary.
+#   - `loop_turn_done`        — the AgentLoop "turn finished" boundary.
+#
+# This is only a DEFAULT: `RuntimeSettings.otlp_drop_span_names` overrides it
+# wholesale (add the low-frequency status spans `loop_paused_ask_user` /
+# `loop_paused_budget_cap` / `loop_hard_ceiling_stop` /
+# `loop_result_withheld_provenance` if an operator also wants those gone, or set
+# it EMPTY to disable filtering and export every span as before).
+#
+# RE-PARENTING NOTE (see `_NameFilteringSpanExporter`): `context.assembly` is a
+# MID-TREE span — the `embedding` / `rerank` / `retrieval.recall` KEEP spans run
+# INSIDE it (context/assembly.py runs retrieval within the `context.assembly`
+# span). Dropping it name-wise at the exporter does NOT drop those children; they
+# keep their `parent_span_id` and Phoenix re-roots such orphans directly under the
+# trace (`agent.turn`), so they render one level flatter but stay fully visible —
+# the intended, cleaner tree. The `loop_*` spans are leaves (no children), so
+# dropping them is inert for parenting.
+DEFAULT_DROP_SPAN_NAMES: frozenset[str] = frozenset(
+    {"context.assembly", "loop_model_call_start", "loop_turn_done"}
+)
+
+
+class _NameFilteringSpanExporter(SpanExporter):
+    """A `SpanExporter` decorator that DROPS spans by NAME before forwarding to a
+    real exporter — the one central, name-based place trace noise is reduced
+    (design §7). Wraps whatever exporter `configure_tracing` would otherwise use
+    (the OTLP/Phoenix exporter AND any injected in-memory test exporter), so a
+    single denylist governs BOTH paths identically.
+
+    Filtering here (at the exporter, downstream of the span processor) rather than
+    at each `span()` call site keeps the instrumentation call sites untouched and
+    makes the policy a single tunable set (`RuntimeSettings.otlp_drop_span_names`).
+    A dropped span's CHILDREN are still exported with their original
+    `parent_span_id`; a trace UI (Phoenix) renders such orphans under the trace
+    root, so dropping a mid-tree plumbing span flattens — never severs — the tree
+    (see `DEFAULT_DROP_SPAN_NAMES`' re-parenting note)."""
+
+    def __init__(self, inner: SpanExporter, drop_names: frozenset[str]) -> None:
+        self._inner = inner
+        self._drop_names = drop_names
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        kept = [span for span in spans if span.name not in self._drop_names]
+        if not kept:
+            # Nothing survived the filter — report success without a downstream
+            # call (an empty export is a no-op for every SDK exporter anyway).
+            return SpanExportResult.SUCCESS
+        return self._inner.export(kept)
+
+    def shutdown(self) -> None:
+        self._inner.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return self._inner.force_flush(timeout_millis)
 
 
 class LLMExceptionEventScrubber(SpanProcessor):
@@ -106,6 +174,7 @@ def configure_tracing(
     project_name: str | None = None,
     hide_llm_content: bool = False,
     span_exporter: SpanExporter | None = None,
+    drop_span_names: Collection[str] = (),
 ) -> TracerProvider:
     """Build a `TracerProvider` exporting to *otlp_endpoint* (Phoenix), or a
     no-op provider (no span processor) when *otlp_endpoint* is empty.
@@ -140,7 +209,25 @@ def configure_tracing(
     install an `InMemorySpanExporter` and assert the D25 PII invariant over the
     real emitted spans, with NO Phoenix container. Production leaves it `None`,
     so this branch is inert and the provider is byte-identical to before.
+
+    *drop_span_names* (design §7 noise reduction): span NAMES to DROP before
+    export, applied centrally by wrapping EVERY real exporter (the OTLP one AND an
+    injected *span_exporter*) in `_NameFilteringSpanExporter`. Empty (the default)
+    ⇒ NO wrapper is installed and the provider is byte-identical to before (so
+    every existing span-assertion test and any other consumer sees all spans);
+    `app.py` passes `RuntimeSettings.otlp_drop_span_names` (defaulting to
+    `DEFAULT_DROP_SPAN_NAMES`) so a normal deployment drops the plumbing spans.
+    Filtering is name-based and downstream of the span processor, so it never
+    touches an instrumentation call site and never orphans a kept child badly
+    (see `_NameFilteringSpanExporter` / `DEFAULT_DROP_SPAN_NAMES`).
     """
+    drop_names = frozenset(drop_span_names)
+
+    def _filtered(exporter: SpanExporter) -> SpanExporter:
+        # Wrap ONLY when there is something to drop, so the empty-denylist path
+        # stays byte-identical (same processor count, same exporter object).
+        return _NameFilteringSpanExporter(exporter, drop_names) if drop_names else exporter
+
     resource = Resource.create(
         {
             "service.name": service_name,
@@ -154,9 +241,9 @@ def configure_tracing(
         provider.add_span_processor(LLMExceptionEventScrubber())
     if otlp_endpoint:
         exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
-        provider.add_span_processor(BatchSpanProcessor(exporter))
+        provider.add_span_processor(BatchSpanProcessor(_filtered(exporter)))
     if span_exporter is not None:
-        provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+        provider.add_span_processor(SimpleSpanProcessor(_filtered(span_exporter)))
     return provider
 
 
@@ -524,6 +611,7 @@ def guardrail_observer(tracer: Tracer) -> Callable[[str, dict[str, Any]], None]:
 
 
 __all__ = [
+    "DEFAULT_DROP_SPAN_NAMES",
     "LLMExceptionEventScrubber",
     "agent_span",
     "chain_span",
