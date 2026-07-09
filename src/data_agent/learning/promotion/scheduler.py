@@ -63,6 +63,12 @@ from .replay import ReplayOutcome, golden_replay
 
 _logger = logging.getLogger(__name__)
 
+# The artifact types the learning loop LANDS into the neo4j retrieval corpus (and thus
+# must converge back out of recall on a demote): a blueprint (`:Blueprint`) and a
+# global_knowledge chunk (`:KnowledgeChunk`, UI Slice 2). `schema_edit`/`user_knowledge`
+# never land here, so a demote of them has nothing to re-stamp.
+_LANDED_TYPES: frozenset[str] = frozenset({BLUEPRINT_TYPE, "global_knowledge"})
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -170,17 +176,26 @@ class PromotionScheduler:
 
     async def _advance_candidate(self, env: CandidateEnvelope) -> CandidateDecision:
         # Demote-direction CONVERGENCE re-assert (Slice 3 §9.4, review BLOCKER 1). A
-        # DEMOTED blueprint (`drift.status == "suspect"`, now back in the `candidate`
-        # scan) re-stamps its landed node ineligible EVERY cycle here — because the
-        # demote edge's write-back is fail-open (a transient neo4j failure at demote
-        # leaves the node `validated`/`clean`, i.e. still RECALLABLE, and the
+        # DEMOTED landed artifact (`drift.status == "suspect"`, now back in the
+        # `candidate` scan) re-stamps its landed node ineligible EVERY cycle here —
+        # because the demote edge's write-back is fail-open (a transient neo4j failure at
+        # demote leaves the node `validated`/`clean`, i.e. still RECALLABLE, and the
         # coalesce-default recall filter does NOT catch an un-stamped node). The
         # clean-branch re-assert only scans `validated`, so it never revisits this
         # now-`candidate` envelope — THIS is the re-assert that closes the loop: it is
         # idempotent (one MATCH/SET) and converges the node to non-recallable once neo4j
-        # recovers. If this blueprint goes on to RE-PROMOTE below, the land overwrites
-        # the stamp with `validated`/`clean`, so running it up front is safe.
-        if env.type == BLUEPRINT_TYPE and env.drift.status == "suspect":
+        # recovers. If a blueprint goes on to RE-PROMOTE below, the land overwrites the
+        # stamp with `validated`/`clean`, so running it up front is safe.
+        #
+        # UI Slice 2 (knowledge convergence gap): global_knowledge now LANDS too, and a
+        # user-correction demote of a validated knowledge chunk (→ `candidate`, drift
+        # `suspect`) re-enters THIS scan — but it returns `hold: human_gated_target`
+        # below and `_recheck_validated` skips non-blueprints, so without this it would
+        # NEVER re-stamp and a transiently-failed write-back would leave the chunk
+        # recallable forever. `_retract_corpus`/`update_status` dispatch the Cypher by
+        # `env.type`, so this re-asserts the `:KnowledgeChunk` node too. Both landed
+        # types converge here; a never-landed type is an idempotent no-op (MATCH misses).
+        if env.type in _LANDED_TYPES and env.drift.status == "suspect":
             await self._retract_corpus(
                 env, status=env.status, drift_status="suspect"
             )
@@ -412,8 +427,26 @@ class PromotionScheduler:
                     env, drift, action="approve", forbidden_spans=forbidden_spans
                 )
         else:
-            # Genuinely non-replayable target (pre-gated knowledge/schema) →
-            # human-authoritative, no live drift probe (Phase 2).
+            # A pre-gated global_knowledge approve ALSO produces `validated`, so it too
+            # must LAND to be recallable (UI Slice 2 §1.1 row 6) — otherwise the flagship
+            # "approve → retrievable" action is a silent no-op. Route it through the SAME
+            # type-agnostic land-then-status machinery the blueprint edge uses: LAND FIRST
+            # into the neo4j retrieval corpus, THEN write `validated` (a landing failure
+            # HOLDS `landing_failed`, never a fake validate). When `require_landing` is set
+            # but no writer is wired (dormant), HOLD honestly — never a fake validate for a
+            # never-recallable chunk. `forbidden_spans` were captured PRE-strip above.
+            if env.type == "global_knowledge" and self._landing_writer is not None:
+                return await self._land_and_promote(
+                    env, DriftStamp(), action="approve", forbidden_spans=forbidden_spans
+                )
+            if env.type == "global_knowledge" and self._landing_gate_blocks():
+                return CandidateDecision(
+                    env.candidate_id, env.type, "hold", env.status, env.status,
+                    reason="approve_blocked_landing_unavailable",
+                )
+            # Genuinely non-landing target (schema_edit) or a truly dormant dev config
+            # with require_landing off → human-authoritative direct validate, no live
+            # drift probe (Phase 2). Nothing to land into (baseline behavior).
             drift = DriftStamp()
 
         approved = replace(env, status=CandidateStatus.VALIDATED, drift=drift)

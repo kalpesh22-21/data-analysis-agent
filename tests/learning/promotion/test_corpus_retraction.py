@@ -27,6 +27,7 @@ from .helpers import (
     FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
+    with_type,
 )
 
 KEY = "sha256:single-bp"
@@ -291,6 +292,41 @@ async def test_failed_demote_write_back_converges_next_cycle() -> None:
     await sched.run_once()
     assert writer.update_calls == 2  # retried
     assert [(u[1], u[2]) for u in writer.status_updates] == [("candidate", "suspect")]
+
+
+async def test_knowledge_user_correction_converges_via_candidate_scan() -> None:
+    """UI Slice 2 knowledge convergence gap: global_knowledge now LANDS, so a
+    user-correction demote of a validated chunk whose fail-open write-back TRANSIENTLY
+    fails must still converge — otherwise the chunk stays recallable forever (the
+    per-cycle re-assert was blueprint-only). Cycle 1's write-back fails; the CANDIDATE
+    scan's demote-direction re-assert (now covering landed non-blueprint types) re-stamps
+    the demoted `:KnowledgeChunk` ineligible the next cycle."""
+    store = InMemoryCandidateStore()
+    env = with_type(
+        make_blueprint_candidate(status=CandidateStatus.VALIDATED, canonical_key=KEY),
+        "global_knowledge",
+    )
+    await store.put(env)
+    # The write-back fails EXACTLY ONCE (the demote), then neo4j recovers.
+    writer = FakeLandingWriter(update_fail=RuntimeError("neo4j down"), update_fail_times=1)
+    sched = _scheduler(store, probe=FakeWarehouseProbe(), writer=writer)
+
+    # Demote via user correction; the write-back FAILS (fail-open) → store demotes,
+    # the knowledge node is left UN-stamped (still validated ⇒ recallable).
+    await sched.apply_user_correction(env)
+    demoted = await store.get(env.candidate_id)
+    assert demoted.status == CandidateStatus.CANDIDATE
+    assert demoted.drift.status == "suspect"
+    assert writer.update_calls == 1  # attempted...
+    assert writer.status_updates == []  # ...and failed → the node is NOT yet stamped
+
+    # Next cycle — the demoted knowledge chunk is now in the candidate scan; the
+    # convergence re-assert re-stamps it ineligible (candidate) → recall excludes it.
+    await sched.run_once()
+    assert writer.update_calls == 2  # retried
+    assert [(u[1], u[2]) for u in writer.status_updates] == [("candidate", "suspect")]
+    # It never auto-promotes (human-gated) — only the corpus re-stamp fires.
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.CANDIDATE
 
 
 # --- BLOCKER 2: the inbox retract (leak PULL) stamps the node retired ---------------

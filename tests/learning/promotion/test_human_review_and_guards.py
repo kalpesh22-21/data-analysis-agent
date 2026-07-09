@@ -15,6 +15,7 @@ from data_agent.learning.promotion import PromotionPolicy, PromotionScheduler
 from .helpers import (
     FakeDependencyResolver,
     FakeHitCountReader,
+    FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
     with_type,
@@ -23,13 +24,15 @@ from .helpers import (
 KEY = "sha256:single-bp"
 
 
-def _scheduler(store, *, probe=None, hits=None):
+def _scheduler(store, *, probe=None, hits=None, landing_writer=None, require_landing=False):
     return PromotionScheduler(
         store,
         probe=probe or FakeWarehouseProbe(),
         hit_counts=FakeHitCountReader(hits or {}),
         dependency_resolver=FakeDependencyResolver(),
         policy=PromotionPolicy(blueprint_hit_threshold=3),
+        landing_writer=landing_writer,
+        require_landing=require_landing,
         clock=lambda: "2026-07-03T12:00:00+00:00",
     )
 
@@ -58,7 +61,73 @@ async def test_human_reject_archives_as_rejected():
     assert decision.action == "reject"
 
 
+class _OrderCapturingWriter(FakeLandingWriter):
+    """A `FakeLandingWriter` that snapshots the store status AT the moment `land()`
+    is called, so a test can prove land happened BEFORE the `validated` write (the
+    land-then-status invariant, UI Slice 2 §1.1 row 6)."""
+
+    def __init__(self, store, candidate_id: str) -> None:
+        super().__init__()
+        self._store = store
+        self._candidate_id = candidate_id
+        self.status_at_land: str | None = None
+
+    async def land(self, env, *, forbidden_spans=()) -> None:
+        record = await self._store.get(self._candidate_id)
+        self.status_at_land = record.status if record else None
+        await super().land(env, forbidden_spans=forbidden_spans)
+
+
+async def test_human_approve_knowledge_lands_then_validates():
+    """UI Slice 2 §1.1 row 6: an approved global_knowledge candidate must LAND into the
+    retrieval corpus FIRST, THEN be stamped `validated` — otherwise "approve →
+    retrievable" is a silent no-op. Still no golden replay (no template)."""
+    store = InMemoryCandidateStore()
+    env = with_type(
+        make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY),
+        "global_knowledge",
+    )
+    await store.put(env)
+    probe = FakeWarehouseProbe()
+    writer = _OrderCapturingWriter(store, env.candidate_id)
+    sched = _scheduler(store, probe=probe, landing_writer=writer, require_landing=True)
+
+    decision = await sched.apply_human_decision(env, "approve")
+
+    assert decision.action == "approve"
+    assert probe.calls == []  # no template to replay for a knowledge target
+    # land() was called (the env reached the corpus writer)...
+    assert env.candidate_id in [e.candidate_id for e in writer.landed]
+    # ...BEFORE the store showed validated (the store was still in_review at land time).
+    assert writer.status_at_land == CandidateStatus.IN_REVIEW
+    # ...and only AFTER landing is the store `validated`.
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.VALIDATED
+
+
+async def test_human_approve_knowledge_holds_when_landing_unavailable():
+    """The no-writer sibling: with `require_landing` set but NO landing writer wired,
+    a global_knowledge approve HOLDS `approve_blocked_landing_unavailable` — it must
+    NOT fake a `validated` for a chunk that can never be recalled (UI Slice 2 §1.1)."""
+    store = InMemoryCandidateStore()
+    env = with_type(
+        make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY),
+        "global_knowledge",
+    )
+    await store.put(env)
+    sched = _scheduler(store, require_landing=True)  # NO landing_writer wired
+
+    decision = await sched.apply_human_decision(env, "approve")
+
+    assert decision.action == "hold"
+    assert decision.reason == "approve_blocked_landing_unavailable"
+    # NOT a fake validate — it stays in_review, awaiting a wired landing plane.
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+
+
 async def test_human_approve_knowledge_promotes_without_replay():
+    """Baseline dormant path: no landing writer + require_landing OFF → a
+    global_knowledge approve validates directly (nothing to land into), unchanged
+    from the pre-Slice-2 behavior."""
     store = InMemoryCandidateStore()
     env = with_type(
         make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY),

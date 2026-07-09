@@ -38,10 +38,17 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
-from data_agent.runtime.retrieval.corpus_loader import BlueprintSeed, load_corpus
+from data_agent.runtime.retrieval.corpus_loader import (
+    BlueprintSeed,
+    KnowledgeSeed,
+    load_corpus,
+)
 
 from ..candidate.models import CandidateEnvelope
-from ..generalize.mapping import blueprint_seed_from_candidate
+from ..generalize.mapping import (
+    blueprint_seed_from_candidate,
+    knowledge_seed_from_candidate,
+)
 
 if TYPE_CHECKING:
     from neo4j import AsyncDriver
@@ -57,21 +64,35 @@ class LandingEntityError(Exception):
     into the global, recallable corpus; the scheduler then HOLDS `landing_failed`."""
 
 
+# Per-type landing-id prefix (UI Slice 2 §1.1 row 4). A blueprint and a
+# global_knowledge chunk could otherwise derive the SAME suffix (a shared
+# canonical_key/candidate_id) and collide on one node label vs. the other — the
+# TYPE-DRIVEN prefix keeps the two id namespaces disjoint so each MERGEs its own node.
+_LANDING_PREFIX: dict[str, str] = {
+    "blueprint": "bp::",
+    "global_knowledge": "kn::",
+}
+
+
 def landing_id(env: CandidateEnvelope) -> str:
-    """The DETERMINISTIC neo4j node id for a landed blueprint (§3.2).
+    """The DETERMINISTIC neo4j node id for a landed artifact (§3.2).
 
     Derived from the S6 `canonical_key` (the dedup identity) so a re-promotion of the
-    same canonical blueprint MERGEs the SAME node — idempotent by construction
+    same canonical artifact MERGEs the SAME node — idempotent by construction
     (`load_corpus` MERGEs by `id`). Falls back to the `candidate_id` when no
-    canonical_key exists (a human-approved blueprint that never ran S6, OQ-3). Both
-    forms share the `bp::` prefix; disjointness rests on the SHAPE of the suffix — a
-    `sha256:`-shaped canonical key vs. a `candidate::`-shaped candidate id — so the two
-    never collide. The fallback has a semantic-dupe window (two candidates for the same
-    canonical blueprint that never ran S6 land as two nodes); the writer WARNs on it."""
+    canonical_key exists (a human-approved artifact that never ran S6, OQ-3). The
+    prefix is TYPE-DRIVEN — `bp::` for a blueprint, `kn::` for global_knowledge — so a
+    blueprint and a knowledge node can NEVER collide on a shared canonical_key/
+    candidate_id suffix (they MERGE into disjoint id namespaces). Disjointness within a
+    type rests on the SHAPE of the suffix — a `sha256:`-shaped canonical key vs. a
+    `candidate::`-shaped candidate id. The fallback has a semantic-dupe window (two
+    candidates for the same canonical artifact that never ran S6 land as two nodes);
+    the writer WARNs on it. An unknown type defaults to `bp::` (baseline, unchanged)."""
+    prefix = _LANDING_PREFIX.get(env.type, "bp::")
     key = env.dedup.canonical_key if env.dedup is not None else None
     if key:
-        return f"bp::{key}"
-    return f"bp::{env.candidate_id}"
+        return f"{prefix}{key}"
+    return f"{prefix}{env.candidate_id}"
 
 
 # S9-activation Slice 3 — the retraction write-back (design §8.6). MATCH-by-id so a
@@ -85,6 +106,18 @@ _RETRACT_BLUEPRINT = """
 MATCH (b:Blueprint {id: $id})
 SET b.status = $status, b.drift_status = $drift_status
 RETURN b.id AS id
+"""
+
+# The knowledge-side retraction sibling (UI Slice 2 §1.1 row 4). MATCH-by-id so a
+# never-landed / already-removed node matches nothing → a safe idempotent no-op. The
+# knowledge recall filter (`vector_index._KNOWLEDGE_RECALL_QUERY`) reads `status`, so
+# flipping it off `validated` makes the chunk un-recallable. `drift_status` is stamped
+# for parity (not read by knowledge recall). `RETURN k.id` reports whether a node was
+# actually stamped (observability; a miss is logged, never raised).
+_RETRACT_KNOWLEDGE = """
+MATCH (k:KnowledgeChunk {id: $id})
+SET k.status = $status, k.drift_status = $drift_status
+RETURN k.id AS id
 """
 
 
@@ -108,19 +141,34 @@ def _seed_haystack(seed: BlueprintSeed) -> str:
     )
 
 
+def _knowledge_haystack(seed: KnowledgeSeed) -> str:
+    """Every text-bearing field of a knowledge seed, concatenated for the entity scan
+    — the knowledge-side sibling of `_seed_haystack`. Covers the `text` (statement +
+    related terms + serialized `structured`) and the `title`, the full surface a global
+    knowledge write would expose."""
+    return "\n".join([seed.text, seed.title or ""])
+
+
 def _assert_seed_entity_free(
-    candidate_id: str, seed: BlueprintSeed, forbidden_spans: tuple[str, ...]
+    candidate_id: str,
+    seed: BlueprintSeed | KnowledgeSeed,
+    forbidden_spans: tuple[str, ...],
 ) -> None:
     """Last-gate D17 defense (§3.3): RAISE if any *forbidden_spans* entry appears in
-    the generalized seed. `forbidden_spans` are the entity spans S5 identified,
-    captured BEFORE `strip_entity_bearing` blanked them (`redaction.entity_spans` on
-    the PRE-strip envelope) — so this fires even though a validated candidate's own
+    the landed seed. `forbidden_spans` are the entity spans S5 identified, captured
+    BEFORE `strip_entity_bearing` blanked them (`redaction.entity_spans` on the
+    PRE-strip envelope) — so this fires even though a validated candidate's own
     `entity_scan` is blanked. On the normal path the strip already removed every span
     from the payload (⇒ nothing leaks ⇒ no-op); this is the tripwire for a strip
-    regression, letting an entity into the global recallable corpus."""
+    regression, letting an entity into the global recallable corpus. The haystack is
+    routed by seed TYPE — the generalized blueprint fields or the knowledge text/title."""
     if not forbidden_spans:
         return
-    haystack = _seed_haystack(seed)
+    haystack = (
+        _knowledge_haystack(seed)
+        if isinstance(seed, KnowledgeSeed)
+        else _seed_haystack(seed)
+    )
     leaked = sorted({span for span in forbidden_spans if span in haystack})
     if leaked:
         raise LandingEntityError(
@@ -173,20 +221,33 @@ class CorpusLandingWriter:
                 env.candidate_id,
                 seed_id,
             )
-        seed = blueprint_seed_from_candidate(env, id=seed_id)
+        # Branch on the artifact type (UI Slice 2 §1.1 row 3): a blueprint lands as a
+        # `:Blueprint` (generalized seed), a global_knowledge chunk lands as a
+        # `:KnowledgeChunk` (entity-free text seed). Each populates ONLY its own
+        # `load_corpus` list; the other stays empty.
+        blueprint_seeds: list[BlueprintSeed] = []
+        knowledge_seeds: list[KnowledgeSeed] = []
+        seed: BlueprintSeed | KnowledgeSeed
+        if env.type == "global_knowledge":
+            seed = knowledge_seed_from_candidate(env, id=seed_id)
+            knowledge_seeds = [seed]
+        else:
+            seed = blueprint_seed_from_candidate(env, id=seed_id)
+            blueprint_seeds = [seed]
         # Last gate BEFORE any embed/neo4j write: an entity in the seed → raise, no land.
         _assert_seed_entity_free(env.candidate_id, seed, forbidden_spans)
         await load_corpus(
             self._driver,
             self._embedder,
-            [seed],
-            [],
+            blueprint_seeds,
+            knowledge_seeds,
             model_id=self._model_id,
             database=self._database,
             ensure_schema=False,
         )
         _logger.info(
-            "landed blueprint %s into the neo4j retrieval corpus (id=%s)",
+            "landed %s %s into the neo4j retrieval corpus (id=%s)",
+            env.type,
             env.candidate_id,
             seed.id,
         )
@@ -216,9 +277,14 @@ class CorpusLandingWriter:
         transition is source-of-truth and must never be blocked by a corpus-write
         failure — the recall filter + the periodic re-assert are the backstops)."""
         seed_id = landing_id(env)
+        # Dispatch the retraction Cypher by artifact type (UI Slice 2 §1.1 row 4): a
+        # knowledge chunk stamps `:KnowledgeChunk`, everything else `:Blueprint`.
+        query = (
+            _RETRACT_KNOWLEDGE if env.type == "global_knowledge" else _RETRACT_BLUEPRINT
+        )
         async with self._driver.session(database=self._database) as session:
             result = await session.run(
-                _RETRACT_BLUEPRINT,
+                query,
                 id=seed_id,
                 status=status,
                 drift_status=drift_status,
@@ -227,7 +293,8 @@ class CorpusLandingWriter:
         stamped = bool(rows)
         if stamped:
             _logger.info(
-                "corpus status write-back: blueprint %s (id=%s) -> status=%s drift_status=%s",
+                "corpus status write-back: %s %s (id=%s) -> status=%s drift_status=%s",
+                env.type,
                 env.candidate_id,
                 seed_id,
                 status,
@@ -235,7 +302,8 @@ class CorpusLandingWriter:
             )
         else:
             _logger.info(
-                "corpus status write-back no-op: blueprint %s not landed (id=%s)",
+                "corpus status write-back no-op: %s %s not landed (id=%s)",
+                env.type,
                 env.candidate_id,
                 seed_id,
             )

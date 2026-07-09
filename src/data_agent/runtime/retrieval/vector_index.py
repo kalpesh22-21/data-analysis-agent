@@ -164,10 +164,20 @@ RETURN node.id AS id, node.intent AS text, node.slots_summary AS slots_summary,
 ORDER BY score DESC
 """
 
+# UI Slice 2 §1.1 row 5 — the knowledge recall-eligibility filter. A global_knowledge
+# chunk lands via the human-approve edge (`CorpusLandingWriter.land`) and can be
+# RETRACTED by `_RETRACT_KNOWLEDGE` stamping `status=retired`. Without this `WHERE`
+# clause a retracted node still recalls (a SILENT no-op), so the retraction path and
+# this filter MUST ship together. `coalesce(...,'validated')` keeps every existing
+# fixture node recallable (they carry an explicit `status='validated'`, and an absent
+# property coalesces to the same default) — the SAME COMPAT trick as the blueprint
+# query. Drift is not applicable to knowledge (only blueprints replay), so no
+# drift_status clause here.
 _KNOWLEDGE_RECALL_QUERY = """
 CALL db.index.vector.queryNodes($index_name, $k, $query_vector)
 YIELD node, score
 WHERE node.embedding_model = $expected_model
+  AND coalesce(node.status, 'validated') = 'validated'
 RETURN node.id AS id, node.text AS text, node.title AS title,
        node.doc_id AS doc_id, score
 ORDER BY score DESC

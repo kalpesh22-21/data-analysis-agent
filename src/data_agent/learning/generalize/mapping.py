@@ -20,9 +20,10 @@ from __future__ import annotations
 from typing import Any
 
 from ...runtime.blueprint.models import Blueprint
-from ...runtime.retrieval.corpus_loader import BlueprintSeed
+from ...runtime.retrieval.corpus_loader import BlueprintSeed, KnowledgeSeed
 from ..candidate.generalization import BlueprintGeneralization
 from ..candidate.models import CandidateEnvelope
+from ..leakage.gate import _collect_text
 
 
 def _slot_docs(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -126,4 +127,76 @@ def blueprint_seed_from_candidate(
     )
 
 
-__all__ = ["blueprint_from_generalization", "blueprint_seed_from_candidate"]
+def knowledge_seed_from_candidate(
+    env: CandidateEnvelope, *, id: str
+) -> KnowledgeSeed:
+    """Project an approved global-knowledge candidate onto the neo4j-corpus
+    `KnowledgeSeed` (UI Slice 2 §1.1) — the knowledge-side mirror of
+    `blueprint_seed_from_candidate`. Pure function.
+
+    Reads ONLY the entity-free knowledge surfaces the leakage gate scans
+    (`leakage/gate.py::_ENTITY_FREE_SURFACES` — `statement`, `structured`,
+    `related_terms`, `scope`): `text` ← `statement` (concatenated with
+    `related_terms` + a serialized `structured` for richer recall), `title` ←
+    `scope`, `doc_id` ← `env.candidate_id`, `id` ← the deterministic landing id,
+    plus the provenance/drift fields. NEVER reads `evidence`, audit spans, or any
+    entity-bearing payload (D17); the landing writer additionally asserts the seed is
+    entity-free before any neo4j write.
+
+    `id` is the deterministic landing id (`promotion/landing.py::landing_id`, the
+    `kn::`-prefixed form) so a re-promotion MERGEs the same node in place.
+
+    Raises `ValueError` when `statement` is empty — an empty knowledge chunk is never
+    landed (it would recall nothing meaningful and only pollute the index).
+    """
+    payload = env.payload
+    statement = payload.get("statement")
+    if not isinstance(statement, str) or not statement.strip():
+        raise ValueError(
+            f"candidate {env.candidate_id} has an empty knowledge statement; "
+            "cannot build a landing seed"
+        )
+
+    parts: list[str] = [statement.strip()]
+    # `related_terms` and `structured` are landed into the SCOPE-BYPASSED knowledge
+    # index (`searchKnowledge` applies no column-scope filter), so the seed text must
+    # contain ONLY what the S5 leakage gate + the entity strip actually cover. The gate
+    # scans string LEAF VALUES via `_collect_text` (dict KEYS and non-string scalars —
+    # numbers, bools — are never scanned, `redact_payload` never redacts them, and the
+    # last-gate defense can only check S5-identified spans). So we serialize with the
+    # SAME `_collect_text` walk and land ONLY the scanned string leaves — never a
+    # `json.dumps` of the raw blob, which would smuggle an entity in a KEY or a numeric
+    # leaf past every tripwire into the global index (D17/D58a cross-tenant leak).
+    leaves: dict[str, str] = {}
+    _collect_text("related_terms", payload.get("related_terms"), leaves)
+    _collect_text("structured", payload.get("structured"), leaves)
+    scanned = [leaves[key] for key in sorted(leaves)]
+    if scanned:
+        parts.append(" ".join(scanned))
+    text = "\n".join(parts)
+
+    scope = payload.get("scope")
+    title = scope if isinstance(scope, str) and scope.strip() else None
+
+    return KnowledgeSeed(
+        id=id,
+        text=text,
+        doc_id=env.candidate_id,
+        title=title,
+        status="validated",
+        # Drift is not applicable to knowledge recall (only blueprints replay), but
+        # the field is threaded for parity + so a retraction can stamp it.
+        drift_status=env.drift.status,
+        # Provenance (UI Slice 2): a loop-landed knowledge chunk is distinguishable
+        # from a hand-authored fixture (`created_by="seed"`) and carries its
+        # originating candidate id for incident response.
+        created_by="learning",
+        source_candidate_id=env.candidate_id,
+    )
+
+
+__all__ = [
+    "blueprint_from_generalization",
+    "blueprint_seed_from_candidate",
+    "knowledge_seed_from_candidate",
+]

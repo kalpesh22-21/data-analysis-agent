@@ -53,12 +53,16 @@ def test_blueprint_recall_query_carries_coalesce_status_filter() -> None:
     assert "node.embedding_model = $expected_model" in normalized
 
 
-def test_knowledge_recall_query_is_not_status_filtered() -> None:
-    """Retraction is a BLUEPRINT concern (only blueprints land via the loop). The
-    knowledge query is unchanged — no status/drift coalesce filter."""
+def test_knowledge_recall_query_carries_coalesce_status_filter() -> None:
+    """UI Slice 2 §1.1 row 5: global_knowledge now LANDS via the human-approve edge and
+    can be RETRACTED (`status=retired`), so the knowledge query MUST carry the same
+    fail-open status filter or a retracted chunk is a silent recall no-op. Drift is NOT
+    applicable to knowledge (only blueprints replay), so there is no drift_status clause."""
     normalized = _normalize(_KNOWLEDGE_RECALL_QUERY)
-    assert "coalesce" not in normalized
+    assert "coalesce(node.status, 'validated') = 'validated'" in normalized
     assert "drift_status" not in normalized
+    # The parity guard is still first (unchanged).
+    assert "node.embedding_model = $expected_model" in normalized
 
 
 def test_seed_compat_absent_and_validated_clean_are_recallable() -> None:

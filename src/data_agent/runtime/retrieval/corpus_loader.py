@@ -103,6 +103,17 @@ class KnowledgeSeed:
     doc_id: str
     title: str | None = None
     status: str = "validated"
+    # Provenance/drift (UI Slice 2 — mirror the blueprint side). `created_by`
+    # distinguishes a hand-authored seed (`"seed"`, the default so existing
+    # `knowledge.yaml` fixtures stay byte-identical) from a chunk the LEARNING LOOP
+    # landed (`"learning"`); `source_candidate_id` stamps the originating candidate.
+    # `drift_status` is threaded for parity + so a retraction can stamp it (knowledge
+    # recall does not read it — only blueprints replay/drift). `source_candidate_id=
+    # None` sets no neo4j property (neo4j drops a `SET x = null`), so a fixture node
+    # is unchanged.
+    drift_status: str = "clean"
+    created_by: str = "seed"
+    source_candidate_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -260,7 +271,9 @@ SET k.title = $title,
     k.embedding_model = $model,
     k.doc_id = $doc_id,
     k.status = $status,
-    k.created_by = 'seed',
+    k.drift_status = $drift_status,
+    k.created_by = $created_by,
+    k.source_candidate_id = $source_candidate_id,
     k.created_at = coalesce(k.created_at, datetime())
 """
 
@@ -939,6 +952,9 @@ async def load_corpus(
                     model=model_id,
                     doc_id=kn.doc_id,
                     status=kn.status,
+                    drift_status=kn.drift_status,
+                    created_by=kn.created_by,
+                    source_candidate_id=kn.source_candidate_id,
                 )
 
         await session.execute_write(_write)
