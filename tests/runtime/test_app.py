@@ -710,3 +710,184 @@ def test_outcome_to_dict_null_enrichment_projects_to_null() -> None:
     )
     for key in ("sql", "result_table", "blueprint_use", "verification", "provenance"):
         assert doc[key] is None
+
+
+# ---------------------------------------------------------------------------
+# UI Slice 3 — GET /session/history (read-only provenance transcript endpoint).
+# docs/decisions/ui-slice3-history-lineage-contract.md §1/§7.
+# ---------------------------------------------------------------------------
+
+import anyio  # noqa: E402
+
+from data_agent.runtime.session.models import (  # noqa: E402
+    PauseCheckpoint,
+    ResultPreview,
+    TrailEntry,
+    TurnMessage,
+)
+
+_HR_DEPT = ("hr.employees", "department")
+_HR_SALARY = ("hr.employees", "salary")
+
+
+def _history_client(monkeypatch, store: InMemorySessionStore, column_scope: frozenset) -> TestClient:
+    """A minimal app wired to a pre-seeded store, with `verify_jwt` returning a
+    fixed *column_scope* so the endpoint's D44 read-surface filter is exercised
+    end-to-end under a chosen scope."""
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **k: column_scope)
+    app = create_app(
+        settings=RuntimeSettings(_env_file=None),
+        session_store=store,
+        mcp_client=FakeMCPClient(tools=[], scripted={}),
+        model_client=ScriptedModelClient([]),
+        catalog=CatalogHandle({}),
+    )
+    return TestClient(app)
+
+
+def _seed_two_turn_store() -> InMemorySessionStore:
+    """A store with two completed turns: turn 0 (department, in a narrow scope)
+    and turn 1 (salary, out of a department-only scope)."""
+    store = InMemorySessionStore()
+
+    async def _seed() -> None:
+        await store.append_message(SESSION_ID, TurnMessage(0, "user", "headcount by dept?", "t"))
+        await store.append_trail_entry(
+            SESSION_ID,
+            TrailEntry(
+                turn_index=0,
+                tool_call_id="c0",
+                tool_name="runQuery",
+                args={"sql": "SELECT department FROM hr.employees"},
+                status="ok",
+                error_code=None,
+                provenance=frozenset({_HR_DEPT}),
+                result_preview=ResultPreview(
+                    columns=["department", "headcount"],
+                    row_count=1,
+                    truncated=False,
+                    preview_rows=[["Engineering", 3]],
+                ),
+                result_full_ref=None,
+                ts="t",
+            ),
+        )
+        await store.append_message(
+            SESSION_ID, TurnMessage(0, "assistant", "Engineering 3.", "t", frozenset({_HR_DEPT}))
+        )
+        await store.append_message(SESSION_ID, TurnMessage(1, "user", "salaries?", "t"))
+        await store.append_trail_entry(
+            SESSION_ID,
+            TrailEntry(
+                turn_index=1,
+                tool_call_id="c1",
+                tool_name="runQuery",
+                args={"sql": "SELECT salary FROM hr.employees"},
+                status="ok",
+                error_code=None,
+                provenance=frozenset({_HR_SALARY}),
+                result_preview=ResultPreview(
+                    columns=["salary"], row_count=1, truncated=False, preview_rows=[[85000]]
+                ),
+                result_full_ref=None,
+                ts="t",
+            ),
+        )
+        await store.append_message(
+            SESSION_ID, TurnMessage(1, "assistant", "Jane earns $85,000.", "t", frozenset({_HR_SALARY}))
+        )
+
+    anyio.run(_seed)
+    return store
+
+
+def test_history_missing_auth_header_returns_401(monkeypatch) -> None:
+    client = _history_client(monkeypatch, InMemorySessionStore(), frozenset())
+    resp = client.get("/session/history", headers={"X-Session-Id": SESSION_ID})
+    assert resp.status_code == 401
+
+
+def test_history_missing_session_id_header_returns_400(monkeypatch) -> None:
+    client = _history_client(monkeypatch, InMemorySessionStore(), frozenset())
+    resp = client.get("/session/history", headers={"Authorization": "Bearer x"})
+    assert resp.status_code == 400
+
+
+def test_history_unknown_session_returns_200_empty_turns(monkeypatch) -> None:
+    client = _history_client(monkeypatch, InMemorySessionStore(), frozenset())
+    resp = client.get("/session/history", headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["session_id"] == SESSION_ID
+    assert body["turns"] == []
+    assert body["pending_question"] is None
+
+
+def test_history_seeded_multi_turn_shape_allow_all(monkeypatch) -> None:
+    store = _seed_two_turn_store()
+    client = _history_client(monkeypatch, store, frozenset())  # allow-all
+    resp = client.get("/session/history", headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [t["turn_index"] for t in body["turns"]] == [0, 1]
+
+    t0 = body["turns"][0]
+    assert t0["question"] == "headcount by dept?"
+    assert t0["answer"] == "Engineering 3."
+    assert t0["provenance_union"] == ["hr.employees.department"]
+    assert len(t0["tool_calls"]) == 1
+    assert t0["tool_calls"][0]["sql"] == "SELECT department FROM hr.employees"
+    assert t0["tool_calls"][0]["provenance"] == ["hr.employees.department"]
+    assert t0["tool_calls"][0]["result_table"]["columns"] == ["department", "headcount"]
+
+    t1 = body["turns"][1]
+    assert t1["answer"] == "Jane earns $85,000."
+    assert t1["provenance_union"] == ["hr.employees.salary"]
+
+
+def test_history_narrowed_scope_withholds_out_of_scope_turn(monkeypatch) -> None:
+    """The end-to-end D44 read-surface assertion: reading the SAME seeded session
+    under a department-only scope withholds turn 1's salary answer + tool-call,
+    while turn 0 (department) survives — and turn 1's question still renders."""
+    store = _seed_two_turn_store()
+    client = _history_client(monkeypatch, store, frozenset({"hr.employees.department"}))
+    resp = client.get("/session/history", headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Both turns still render their question (user msg always survives).
+    assert [t["turn_index"] for t in body["turns"]] == [0, 1]
+    t0, t1 = body["turns"]
+    assert t0["answer"] == "Engineering 3."  # in scope
+    assert len(t0["tool_calls"]) == 1
+
+    assert t1["question"] == "salaries?"  # question survives
+    assert t1["answer"] is None  # salary answer withheld
+    assert t1["provenance_union"] is None
+    assert t1["tool_calls"] == []  # salary tool-call omitted
+
+
+def test_history_paused_session_pending_question(monkeypatch) -> None:
+    store = InMemorySessionStore()
+
+    async def _seed() -> None:
+        await store.append_message(SESSION_ID, TurnMessage(0, "user", "payroll?", "t"))
+        await store.write_pause_checkpoint(
+            SESSION_ID,
+            PauseCheckpoint(
+                reason="askUser",
+                pending_question={"question": "Which department?", "options": None},
+                awaiting="user_answer",
+                consumed=False,
+            ),
+        )
+
+    anyio.run(_seed)
+    client = _history_client(monkeypatch, store, frozenset())
+    resp = client.get("/session/history", headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    # Paused turn: question present, answer null (no assistant message yet).
+    assert body["turns"][0]["question"] == "payroll?"
+    assert body["turns"][0]["answer"] is None
+    assert body["pending_question"] == {"question": "Which department?", "options": None}

@@ -151,17 +151,50 @@
     text-overflow: ellipsis;
   }
 
-  #answer {
+  /* --- Conversation transcript (UI Slice 3) --- */
+  /* #transcript is a plain flex container; each turn is its own card
+     (.turn-block) so the answer section can repeat once per turn. */
+  #transcript {
+    background: none;
+    border: none;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  #transcript:empty::after {
+    content: "Ask a question to begin.";
+    color: var(--color-text-dim);
+    font-size: 0.9rem;
+  }
+
+  .turn-block {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-4);
+  }
+
+  .turn-question {
+    font-weight: 600;
+    margin: 0 0 var(--space-3) 0;
+    white-space: pre-wrap;
+  }
+
+  .turn-answer {
     white-space: pre-wrap;
     line-height: 1.5;
   }
 
-  #answer:empty::after {
-    content: "No answer yet.";
+  .turn-answer:empty::after {
+    /* Neutral placeholder — covers both an in-progress turn and a
+       scope-withheld / paused past turn without implying an answer is coming. */
+    content: "—";
     color: var(--color-text-dim);
   }
 
-  #status {
+  .turn-status {
     font-size: 0.85rem;
     color: var(--color-text-dim);
     margin-top: var(--space-2);
@@ -233,11 +266,11 @@
     border: 0;
   }
 
-  /* --- Enriched result rendering (UI Slice 1) --- */
+  /* --- Enriched result rendering (UI Slice 1, scoped per turn in Slice 3) --- */
   .result-panel[hidden],
-  #blueprint-chip[hidden],
-  #verified-badge[hidden],
-  #result-table-caption[hidden] {
+  .blueprint-chip[hidden],
+  .verified-badge[hidden],
+  .result-table-caption[hidden] {
     display: none;
   }
 
@@ -340,6 +373,22 @@
     font-size: 0.8rem;
     color: var(--color-text-dim);
   }
+
+  /* Per-SQL lineage breakdown (history turns only) */
+  .per-sql-item {
+    margin-bottom: var(--space-3);
+  }
+
+  .per-sql-item:last-child {
+    margin-bottom: 0;
+  }
+
+  .per-sql-name {
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    margin-bottom: var(--space-2);
+  }
 </style>
 </head>
 <body>
@@ -382,38 +431,50 @@
     </div>
   </section>
 
-  <section aria-labelledby="answer-heading">
-    <h2 id="answer-heading">Answer</h2>
-    <div id="answer" data-testid="answer" aria-live="polite"></div>
+  <section id="transcript" data-testid="transcript" aria-label="Conversation transcript"></section>
 
-    <div id="answer-meta" class="answer-meta">
-      <span id="blueprint-chip" data-testid="blueprint-chip" class="static-chip" hidden></span>
-      <span id="verified-badge" data-testid="verified-badge" class="badge" hidden></span>
-    </div>
+  <!-- One turn block, cloned per turn into #transcript. Same nodes as the old
+       singleton Answer section, but keyed by class (ids → classes) so many can
+       coexist. Queried via root.querySelector(...) by the scoped renderers. -->
+  <template id="turn-template">
+    <div class="turn-block" data-testid="turn-block">
+      <p class="turn-question" data-testid="turn-question"></p>
+      <div class="turn-answer" data-testid="answer" aria-live="polite"></div>
 
-    <div id="status" data-testid="status"></div>
-
-    <details id="sql-panel" data-testid="sql-panel" class="result-panel" hidden>
-      <summary>Show the query</summary>
-      <div id="sql-blocks"></div>
-    </details>
-
-    <details id="result-table" data-testid="result-table" class="result-panel" hidden>
-      <summary>Results</summary>
-      <div class="table-scroll">
-        <table class="result-grid">
-          <thead id="result-table-head"></thead>
-          <tbody id="result-table-body"></tbody>
-        </table>
+      <div class="answer-meta">
+        <span class="blueprint-chip static-chip" data-testid="blueprint-chip" hidden></span>
+        <span class="verified-badge badge" data-testid="verified-badge" hidden></span>
       </div>
-      <div id="result-table-caption" class="result-caption" hidden></div>
-    </details>
 
-    <details id="provenance-panel" data-testid="provenance-panel" class="result-panel" hidden>
-      <summary>Data lineage</summary>
-      <div id="provenance-chips" class="chip-row"></div>
-    </details>
-  </section>
+      <div class="turn-status" data-testid="status"></div>
+
+      <details class="sql-panel result-panel" data-testid="sql-panel" hidden>
+        <summary>Show the query</summary>
+        <div class="sql-blocks"></div>
+      </details>
+
+      <details class="result-table result-panel" data-testid="result-table" hidden>
+        <summary>Results</summary>
+        <div class="table-scroll">
+          <table class="result-grid">
+            <thead class="result-table-head"></thead>
+            <tbody class="result-table-body"></tbody>
+          </table>
+        </div>
+        <div class="result-table-caption result-caption" hidden></div>
+      </details>
+
+      <details class="provenance-panel result-panel" data-testid="provenance-panel" hidden>
+        <summary>Data lineage</summary>
+        <div class="provenance-chips chip-row"></div>
+      </details>
+
+      <details class="per-sql-panel result-panel" data-testid="per-sql-panel" hidden>
+        <summary>Per-query lineage</summary>
+        <div class="per-sql-list"></div>
+      </details>
+    </div>
+  </template>
 </main>
 
 <script>
@@ -421,6 +482,9 @@
   "use strict";
 
   var sessionId = null;
+  // The turn block awaiting a live `result` event. Set on submit (fresh block)
+  // or, after a resume-on-reload, to the rehydrated paused turn block.
+  var inProgressBlock = null;
 
   var els = {
     sessionLine: document.getElementById("session-line"),
@@ -428,8 +492,6 @@
     input: document.getElementById("message-input"),
     sendButton: document.getElementById("send-button"),
     progressList: document.getElementById("progress-list"),
-    answer: document.getElementById("answer"),
-    status: document.getElementById("status"),
     askUser: document.getElementById("ask-user"),
     askUserQuestion: document.getElementById("ask-user-question"),
     askUserOptions: document.getElementById("ask-user-options"),
@@ -438,16 +500,8 @@
     errorBanner: document.getElementById("error-banner"),
     errorCode: document.getElementById("error-code"),
     errorMessage: document.getElementById("error-message"),
-    blueprintChip: document.getElementById("blueprint-chip"),
-    verifiedBadge: document.getElementById("verified-badge"),
-    sqlPanel: document.getElementById("sql-panel"),
-    sqlBlocks: document.getElementById("sql-blocks"),
-    resultTable: document.getElementById("result-table"),
-    resultTableHead: document.getElementById("result-table-head"),
-    resultTableBody: document.getElementById("result-table-body"),
-    resultTableCaption: document.getElementById("result-table-caption"),
-    provenancePanel: document.getElementById("provenance-panel"),
-    provenanceChips: document.getElementById("provenance-chips"),
+    transcript: document.getElementById("transcript"),
+    turnTemplate: document.getElementById("turn-template"),
   };
 
   function clearError() {
@@ -484,42 +538,71 @@
     els.progressList.scrollTop = els.progressList.scrollHeight;
   }
 
-  function setStatus(data) {
-    if (!data) {
-      els.status.textContent = "";
-      return;
-    }
-    els.status.textContent =
-      "status: " + data.status + " · tool_calls_made: " + data.tool_calls_made;
+  function clearProgress() {
+    clearNode(els.progressList);
   }
 
-  function setAnswer(text) {
-    els.answer.textContent = text || "";
-  }
-
-  // --- Enriched result rendering (UI Slice 1) ---
-  // Every field is optional and possibly-null on any status; each renderer
-  // treats null/undefined/empty as "hide" so stale turns never linger and an
-  // old backend (only the 4 original keys) stays correct.
+  // --- Shared DOM helpers (carried over verbatim from Slice 1, §5.6) ---
 
   function clearNode(node) {
     while (node.firstChild) node.removeChild(node.firstChild);
   }
 
   // Render a heterogeneous JSON scalar cell as plain text (never HTML — cells
-  // are the caller's own answer data but still go through textContent, §5).
+  // are the caller's own answer data but still go through textContent, §5.6).
   function cellText(value) {
     if (value === null || value === undefined) return "";
     if (typeof value === "object") return JSON.stringify(value);
     return String(value);
   }
 
+  // --- Per-turn block lifecycle (UI Slice 3, §5.1/§5.3) ---
+
+  // Clone the turn template into a fresh block, render its question, and append
+  // it to #transcript. Returns the block root (used as the querySelector scope
+  // by every renderer below).
+  function createTurnBlock(question) {
+    var frag = els.turnTemplate.content.cloneNode(true);
+    var block = frag.querySelector(".turn-block");
+    setBlockQuestion(block, question);
+    els.transcript.appendChild(block);
+    return block;
+  }
+
+  function setBlockQuestion(block, question) {
+    block.querySelector(".turn-question").textContent = question || "";
+  }
+
+  function setBlockAnswer(block, text) {
+    block.querySelector(".turn-answer").textContent = text || "";
+  }
+
+  // Live turns carry status + tool_calls_made; history turns do not (field
+  // absent → leave the status line empty).
+  function setBlockStatus(block, data) {
+    var status = block.querySelector(".turn-status");
+    if (!data || data.status === undefined || data.status === null) {
+      status.textContent = "";
+      return;
+    }
+    status.textContent =
+      "status: " + data.status + " · tool_calls_made: " + data.tool_calls_made;
+  }
+
+  // --- Enriched result rendering (UI Slice 1 renderers, scoped to a block) ---
+  // Every field is optional and possibly-null on any status; each renderer
+  // treats null/undefined/empty as "hide" so a scope-withheld or missing field
+  // simply collapses its panel. Behavior per field is identical to Slice 1 —
+  // this is a scoping refactor: `els.*` → `root.querySelector(...)`.
+
   // Field 1 — `sql: string[] | null`: one <pre> code block per statement, in
   // order. null / [] → hide the panel.
-  function renderSql(sqlList) {
-    clearNode(els.sqlBlocks);
+  function renderSql(root, sqlList) {
+    var sqlPanel = root.querySelector(".sql-panel");
+    var sqlBlocks = root.querySelector(".sql-blocks");
+    clearNode(sqlBlocks);
     if (!Array.isArray(sqlList) || sqlList.length === 0) {
-      els.sqlPanel.hidden = true;
+      sqlPanel.hidden = true;
       return;
     }
     sqlList.forEach(function (sql) {
@@ -528,23 +611,27 @@
       var code = document.createElement("code");
       code.textContent = cellText(sql);
       pre.appendChild(code);
-      els.sqlBlocks.appendChild(pre);
+      sqlBlocks.appendChild(pre);
     });
-    els.sqlPanel.hidden = false;
+    sqlPanel.hidden = false;
   }
 
   // Field 2 — `result_table: {columns, preview_rows, row_count, truncated} | null`.
   // Header from `columns` (may be [] → no header, raw cells only). Body from
   // `preview_rows` (row-arrays of scalars). Truncation caption when the preview
   // is a subset of `row_count`. null / no rows → hide.
-  function renderResultTable(table) {
-    clearNode(els.resultTableHead);
-    clearNode(els.resultTableBody);
+  function renderResultTable(root, table) {
+    var resultTable = root.querySelector(".result-table");
+    var head = root.querySelector(".result-table-head");
+    var body = root.querySelector(".result-table-body");
+    var caption = root.querySelector(".result-table-caption");
+    clearNode(head);
+    clearNode(body);
     var rows = table && Array.isArray(table.preview_rows) ? table.preview_rows : null;
     if (!table || !rows || rows.length === 0) {
-      els.resultTable.hidden = true;
-      els.resultTableCaption.hidden = true;
-      els.resultTableCaption.textContent = "";
+      resultTable.hidden = true;
+      caption.hidden = true;
+      caption.textContent = "";
       return;
     }
 
@@ -557,7 +644,7 @@
         th.textContent = cellText(col);
         headRow.appendChild(th);
       });
-      els.resultTableHead.appendChild(headRow);
+      head.appendChild(headRow);
     }
 
     rows.forEach(function (row) {
@@ -568,28 +655,29 @@
         td.textContent = cellText(cell);
         tr.appendChild(td);
       });
-      els.resultTableBody.appendChild(tr);
+      body.appendChild(tr);
     });
 
     var shown = rows.length;
     var rowCount = typeof table.row_count === "number" ? table.row_count : shown;
     if (table.truncated === true || shown < rowCount) {
-      els.resultTableCaption.textContent = "showing " + shown + " of " + rowCount + " rows";
-      els.resultTableCaption.hidden = false;
+      caption.textContent = "showing " + shown + " of " + rowCount + " rows";
+      caption.hidden = false;
     } else {
-      els.resultTableCaption.textContent = "";
-      els.resultTableCaption.hidden = true;
+      caption.textContent = "";
+      caption.hidden = true;
     }
 
-    els.resultTable.hidden = false;
+    resultTable.hidden = false;
   }
 
   // Field 3 — `blueprint_use: {blueprint_id, slots} | null`: a single chip
   // `Using blueprint {id} · {k}={v} · …`. null → no chip.
-  function renderBlueprintChip(blueprintUse) {
+  function renderBlueprintChip(root, blueprintUse) {
+    var chip = root.querySelector(".blueprint-chip");
     if (!blueprintUse || !blueprintUse.blueprint_id) {
-      els.blueprintChip.hidden = true;
-      els.blueprintChip.textContent = "";
+      chip.hidden = true;
+      chip.textContent = "";
       return;
     }
     var parts = ["Using blueprint " + cellText(blueprintUse.blueprint_id)];
@@ -597,44 +685,47 @@
     Object.keys(slots).forEach(function (key) {
       parts.push(key + "=" + cellText(slots[key]));
     });
-    els.blueprintChip.textContent = parts.join(" · ");
-    els.blueprintChip.hidden = false;
+    chip.textContent = parts.join(" · ");
+    chip.hidden = false;
   }
 
   // Field 4 — `verification: {passed, method, grain_checked} | null`: a passive
   // "verified ✓" badge only when passed===true. null → render nothing (absence
   // is information — never a warning). No "failed" state exists.
-  function renderVerification(verification) {
+  function renderVerification(root, verification) {
+    var badge = root.querySelector(".verified-badge");
     if (!verification || verification.passed !== true) {
-      els.verifiedBadge.hidden = true;
-      els.verifiedBadge.textContent = "";
-      els.verifiedBadge.removeAttribute("title");
+      badge.hidden = true;
+      badge.textContent = "";
+      badge.removeAttribute("title");
       return;
     }
-    els.verifiedBadge.textContent = "verified ✓";
+    badge.textContent = "verified ✓";
     // grain_checked===false → grain probe was skipped; keep it subtle via title.
     if (verification.grain_checked === false) {
-      els.verifiedBadge.setAttribute("title", "verified (grain not checked)");
+      badge.setAttribute("title", "verified (grain not checked)");
     } else {
-      els.verifiedBadge.setAttribute("title", "verified via blueprint gate");
+      badge.setAttribute("title", "verified via blueprint gate");
     }
-    els.verifiedBadge.hidden = false;
+    badge.hidden = false;
   }
 
   // Field 5 — `provenance: string[] | null`: sorted "database.table.column"
   // chips. null → hide (lineage undetermined). [] → subtle "no tables read".
-  function renderProvenance(provenance) {
-    clearNode(els.provenanceChips);
+  function renderProvenance(root, provenance) {
+    var panel = root.querySelector(".provenance-panel");
+    var chips = root.querySelector(".provenance-chips");
+    clearNode(chips);
     if (provenance === null || provenance === undefined || !Array.isArray(provenance)) {
-      els.provenancePanel.hidden = true;
+      panel.hidden = true;
       return;
     }
     if (provenance.length === 0) {
       var note = document.createElement("span");
       note.className = "prov-empty";
       note.textContent = "no tables read";
-      els.provenanceChips.appendChild(note);
-      els.provenancePanel.hidden = false;
+      chips.appendChild(note);
+      panel.hidden = false;
       return;
     }
     provenance.forEach(function (entry) {
@@ -642,40 +733,167 @@
       chip.className = "static-chip";
       chip.setAttribute("data-testid", "provenance-chip");
       chip.textContent = cellText(entry);
-      els.provenanceChips.appendChild(chip);
+      chips.appendChild(chip);
     });
-    els.provenancePanel.hidden = false;
+    panel.hidden = false;
   }
 
-  // Render all five enriched fields from a `result` payload (each guarded).
-  function renderEnrichedResult(data) {
-    renderSql(data.sql);
-    renderResultTable(data.result_table);
-    renderBlueprintChip(data.blueprint_use);
-    renderVerification(data.verification);
-    renderProvenance(data.provenance);
+  // Per-SQL lineage breakdown (§5.2) — history turns only. Lists each tool call
+  // as {tool_name, sql, provenance}: name label, SQL in a <pre>, provenance as
+  // chips. Live turns pass no per-SQL data (undefined) → panel hidden.
+  function renderPerSqlBreakdown(root, toolCalls) {
+    var panel = root.querySelector(".per-sql-panel");
+    var list = root.querySelector(".per-sql-list");
+    clearNode(list);
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+      panel.hidden = true;
+      return;
+    }
+    toolCalls.forEach(function (call) {
+      if (!call) return;
+      var item = document.createElement("div");
+      item.className = "per-sql-item";
+      item.setAttribute("data-testid", "turn-tool-call");
+
+      var name = document.createElement("div");
+      name.className = "per-sql-name";
+      name.textContent = cellText(call.tool_name);
+      item.appendChild(name);
+
+      if (call.sql) {
+        var pre = document.createElement("pre");
+        pre.className = "sql-block";
+        var code = document.createElement("code");
+        code.textContent = cellText(call.sql);
+        pre.appendChild(code);
+        item.appendChild(pre);
+      }
+
+      var prov = call.provenance;
+      if (Array.isArray(prov) && prov.length > 0) {
+        var chipRow = document.createElement("div");
+        chipRow.className = "chip-row";
+        prov.forEach(function (entry) {
+          var chip = document.createElement("span");
+          chip.className = "static-chip";
+          chip.setAttribute("data-testid", "provenance-chip");
+          chip.textContent = cellText(entry);
+          chipRow.appendChild(chip);
+        });
+        item.appendChild(chipRow);
+      }
+
+      list.appendChild(item);
+    });
+    panel.hidden = false;
   }
 
-  // Clear all five panels — called on each new turn submission so stale data
-  // from a prior turn never lingers (mirrors the progress/answer reset).
-  function resetEnrichedResult() {
-    renderSql(null);
-    renderResultTable(null);
-    renderBlueprintChip(null);
-    renderVerification(null);
-    renderProvenance(null);
+  // Populate a turn block from a normalized result shape (§5.3). Used by both
+  // the live `result` event and the history rehydrate path — every field is
+  // guarded, so a missing field simply hides its panel. Does NOT touch the
+  // question (rendered at block creation) or clear prior blocks.
+  function renderTurnBlock(block, data) {
+    setBlockAnswer(block, data.assistant_text);
+    setBlockStatus(block, data);
+    renderSql(block, data.sql);
+    renderResultTable(block, data.result_table);
+    renderBlueprintChip(block, data.blueprint_use);
+    renderVerification(block, data.verification);
+    renderProvenance(block, data.provenance);
+    renderPerSqlBreakdown(block, data.tool_calls);
+  }
+
+  // --- History rehydrate (§5.4) ---
+
+  // Collect every non-null per-tool-call SQL into the array the Slice-1 `sql`
+  // panel expects (string[] | null).
+  function collectSql(toolCalls) {
+    var out = [];
+    toolCalls.forEach(function (call) {
+      if (call && call.sql) out.push(call.sql);
+    });
+    return out.length > 0 ? out : null;
+  }
+
+  // The main result table for a history turn is the last tool call that
+  // produced one (the final query's result — the answer table). Per-SQL detail
+  // for every call still shows in the breakdown panel.
+  function pickResultTable(toolCalls) {
+    var table = null;
+    toolCalls.forEach(function (call) {
+      if (call && call.result_table) table = call.result_table;
+    });
+    return table;
+  }
+
+  // Render one `/api/history` turn into a fresh block. Maps the history wire
+  // shape onto the renderTurnBlock shape: provenance_union → provenance,
+  // tool_calls → sql / result_table / per-SQL breakdown. History turns carry no
+  // blueprint_use / verification / status, so those panels stay hidden.
+  function renderHistoryTurn(turn) {
+    var block = createTurnBlock(turn.question);
+    var toolCalls = Array.isArray(turn.tool_calls) ? turn.tool_calls : [];
+    renderTurnBlock(block, {
+      assistant_text: turn.answer,
+      sql: collectSql(toolCalls),
+      result_table: pickResultTable(toolCalls),
+      provenance: turn.provenance_union,
+      tool_calls: toolCalls,
+    });
+    return block;
+  }
+
+  // Rebuild the transcript from persisted history (§5.4/§5.5). Rebuild-on-load
+  // avoids double-render: live appends only accrue within a page session.
+  // Failure is non-fatal — surface it and start with an empty transcript.
+  function renderHistory(data) {
+    clearNode(els.transcript);
+    inProgressBlock = null;
+    var turns = data && Array.isArray(data.turns) ? data.turns : [];
+    var lastBlock = null;
+    turns.forEach(function (turn) {
+      lastBlock = renderHistoryTurn(turn);
+    });
+    // Resume-after-reload (§1.4): re-open the ask-user prompt and aim the next
+    // `result` at the paused turn's block (last rendered turn). pending_question
+    // is already the {question, options} dict — pass it through exactly like the
+    // live SSE path (do NOT re-wrap it).
+    if (data && data.pending_question) {
+      showAskUser(data.pending_question);
+      inProgressBlock = lastBlock;
+    }
+  }
+
+  function rehydrateHistory() {
+    return fetch("/api/history?session_id=" + encodeURIComponent(sessionId))
+      .then(function (response) {
+        if (response.status === 404) {
+          // The BFF restarted and lost this session's JWT (_SESSIONS map). Drop
+          // the stale id, mint a fresh session, and start with an empty
+          // transcript — reload-restore degrades cleanly across a BFF restart.
+          clearSavedSession();
+          clearNode(els.transcript);
+          inProgressBlock = null;
+          return mintSession();
+        }
+        if (!response.ok) throw new Error("history request failed: " + response.status);
+        return response.json().then(renderHistory);
+      })
+      .catch(function (err) {
+        showError("HISTORY_LOAD_FAILED", String(err));
+      });
   }
 
   function hideAskUser() {
     els.askUser.hidden = true;
     els.askUserQuestion.textContent = "";
-    els.askUserOptions.innerHTML = "";
+    clearNode(els.askUserOptions);
     els.askUserInput.value = "";
   }
 
   function showAskUser(pendingQuestion) {
     els.askUserQuestion.textContent = pendingQuestion.question || "";
-    els.askUserOptions.innerHTML = "";
+    clearNode(els.askUserOptions);
 
     var options = pendingQuestion.options || [];
     options.forEach(function (option) {
@@ -768,9 +986,10 @@
     if (eventName === "progress" && data) {
       addProgressItem(data.step, data.shape);
     } else if (eventName === "result" && data) {
-      setStatus(data);
-      setAnswer(data.assistant_text);
-      renderEnrichedResult(data);
+      // Populate the in-progress turn block (no clearing — prior blocks stay).
+      if (inProgressBlock) {
+        renderTurnBlock(inProgressBlock, data);
+      }
       if (data.pending_question) {
         showAskUser(data.pending_question);
       } else {
@@ -811,7 +1030,10 @@
     }
     setBusy(true);
     hideAskUser();
-    resetEnrichedResult();
+    clearProgress();
+    // Fresh turn block, question rendered immediately, appended — prior blocks
+    // are untouched. The live `result` event fills this block (§5.3).
+    inProgressBlock = createTurnBlock(message);
     runTurn("/api/turn", { session_id: sessionId, message: message }).finally(function () {
       setBusy(false);
     });
@@ -820,6 +1042,12 @@
   function submitAnswer(answer) {
     if (!answer || !answer.trim()) return;
     setAskUserBusy(true);
+    // Resume continues the paused turn. Within a page session inProgressBlock is
+    // already the paused block; after a reload rehydrate aimed it at the paused
+    // turn. Fall back to a fresh block only if neither applies.
+    if (!inProgressBlock) {
+      inProgressBlock = createTurnBlock("");
+    }
     runTurn("/api/turn/resume", { session_id: sessionId, answer: answer }).finally(function () {
       setAskUserBusy(false);
     });
@@ -846,20 +1074,70 @@
     }
   });
 
-  // Bootstrap: mint a session_id (and, server-side only, a JWT — D82/D5) on load.
-  fetch("/api/session", { method: "POST" })
-    .then(function (response) {
-      if (!response.ok) throw new Error("session request failed: " + response.status);
-      return response.json();
-    })
-    .then(function (data) {
-      sessionId = data.session_id;
+  // --- Session persistence (§5.4) ---
+  // Persist the minted session_id across reloads so rehydrate has something to
+  // restore. The JWT stays server-side (D82/D5); only the opaque id is stored.
+  var SESSION_STORAGE_KEY = "data-agent-session";
+
+  function readSavedSession() {
+    try {
+      return sessionStorage.getItem(SESSION_STORAGE_KEY);
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function saveSession(id) {
+    try {
+      sessionStorage.setItem(SESSION_STORAGE_KEY, id);
+    } catch (err) {
+      /* storage unavailable (private mode / disabled) — degrade to per-load */
+    }
+  }
+
+  function clearSavedSession() {
+    try {
+      sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    } catch (err) {
+      /* ignore */
+    }
+  }
+
+  // Mint a fresh session_id (and, server-side only, a JWT — D82/D5) and persist
+  // it. Used on first-ever load and after a BFF restart drops a stale session.
+  function mintSession() {
+    return fetch("/api/session", { method: "POST" })
+      .then(function (response) {
+        if (!response.ok) throw new Error("session request failed: " + response.status);
+        return response.json();
+      })
+      .then(function (data) {
+        sessionId = data.session_id;
+        saveSession(sessionId);
+        els.sessionLine.textContent = sessionId;
+      });
+  }
+
+  // Bootstrap: reuse a saved session_id if present (→ rehydrate the transcript),
+  // otherwise mint a fresh one, then rehydrate.
+  function bootstrap() {
+    var saved = readSavedSession();
+    if (saved) {
+      sessionId = saved;
       els.sessionLine.textContent = sessionId;
-    })
-    .catch(function (err) {
-      els.sessionLine.textContent = "failed to start session";
-      showError("SESSION_INIT_FAILED", String(err));
-    });
+      return rehydrateHistory();
+    }
+    return mintSession()
+      .then(function () {
+        return rehydrateHistory();
+      })
+      .catch(function (err) {
+        els.sessionLine.textContent = "failed to start session";
+        showError("SESSION_INIT_FAILED", String(err));
+      });
+  }
+
+  bootstrap();
 })();
 </script>
 </body>

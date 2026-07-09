@@ -271,6 +271,28 @@ async def turn_resume(body: ResumeBody) -> StreamingResponse:
     return await _proxy_stream("/turn/resume", body.session_id, {"answer": body.answer})
 
 
+@app.get("/api/history")
+async def history(session_id: str) -> JSONResponse:
+    """UI Slice 3 (§4): JSON (non-streaming) proxy for the runtime's
+    `GET /session/history`. Mirrors `_proxy_inbox`'s server-side-token attach —
+    the browser sends only `session_id` (a query param), the JWT is looked up and
+    attached server-side (D82/D5: the browser never sees the token). The runtime's
+    status + JSON body propagate as-is so a non-2xx (401/400) reaches the browser's
+    error branch unchanged."""
+    jwt = _jwt_for_session(session_id)
+    headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            r = await client.get(f"{RUNTIME_URL}/session/history", headers=headers)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Runtime unreachable: {exc}") from exc
+    try:
+        content = r.json()
+    except ValueError:
+        content = {"detail": r.text}
+    return JSONResponse(status_code=r.status_code, content=content)
+
+
 # --- review-inbox BFF (UI Slice 2, §3) ---------------------------------------
 
 

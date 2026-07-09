@@ -36,7 +36,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
@@ -75,6 +75,7 @@ from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
 from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 from data_agent.runtime.session.store import AlreadyConsumedError, CASMismatchError, SessionStore
+from data_agent.runtime.session_history import project_history
 
 # S5: bounded-length, restricted-charset validation for the (unsigned,
 # UI-supplied) X-Session-Id header — it is used verbatim to build Couchbase
@@ -598,6 +599,31 @@ def create_app(
                 )
 
         return StreamingResponse(_stream_turn(_call, emitter), media_type="text/event-stream")
+
+    @app.get("/session/history")
+    async def session_history(
+        authorization: str | None = Header(default=None),
+        x_session_id: str | None = Header(default=None, alias="X-Session-Id"),
+    ) -> JSONResponse:
+        """UI Slice 3 (docs/decisions/ui-slice3-history-lineage-contract.md): a
+        scope-filtered, read-only projection of the persisted `SessionDoc` into a
+        `turns[]` transcript. Same `_extract_credentials` auth (401/400) as
+        `/turn`; one store read; no CAS/loop/KV de-ref and no writes beyond the
+        store's doc auto-create for an unknown (authenticated) session. The
+        two D44 filters run over THIS request's `column_scope` inside
+        `project_history` before any serialization, so a past turn's answer /
+        tool-call is fail-closed dropped if it is no longer in scope — the read
+        sibling of the live replay gate. An unknown session yields an empty doc →
+        `turns: []` (never 404)."""
+        credentials = _extract_credentials(
+            authorization=authorization, session_id=x_session_id, settings=settings
+        )
+        assert x_session_id is not None  # narrowed by _extract_credentials
+        doc = await session_store.get_or_create_session(x_session_id)
+        body = project_history(
+            doc.messages, doc.tool_trail, credentials.column_scope, doc.pause_checkpoint
+        )
+        return JSONResponse(content={"session_id": x_session_id, **body})
 
     return app
 
