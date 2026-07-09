@@ -27,13 +27,14 @@ Run:
 from __future__ import annotations
 
 import os
+import urllib.parse
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from ui.entitlements import resolve_caller_identity, resolve_column_scope
 
@@ -41,8 +42,18 @@ RUNTIME_URL = os.environ.get("RUNTIME_URL", "http://localhost:8000")
 TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
 TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
 
+# Review-inbox BFF wiring (UI Slice 2, §3). The BFF serves the inbox PAGE and proxies
+# the browser's `/api/inbox/*` DATA calls to the dedicated inbox service, holding the
+# shared REVIEWER_TOKEN server-side (exactly like TOKEN_ISSUER_API_KEY above) and
+# attaching it on the proxy hop so the browser never sees it. The whole surface is
+# gated OFF unless REVIEW_INBOX_ENABLED=1 (mirrors UI_TEST_AFFORDANCES).
+INBOX_SERVICE_URL = os.environ.get("INBOX_SERVICE_URL", "http://localhost:8100")
+REVIEWER_TOKEN = os.environ.get("REVIEWER_TOKEN", "")
+_INBOX_ACTIONS = frozenset({"approve", "reject", "retract"})
+
 _STATIC_DIR = Path(__file__).parent / "static"
 _INDEX_HTML = _STATIC_DIR / "index.html"
+_INBOX_HTML = _STATIC_DIR / "inbox.html"
 
 # Server-side-only session_id -> JWT map (D82/D5: the browser never receives
 # this). In-memory is fine for this minimal, single-process dev UI — no
@@ -258,3 +269,75 @@ async def turn(body: TurnBody) -> StreamingResponse:
 @app.post("/api/turn/resume")
 async def turn_resume(body: ResumeBody) -> StreamingResponse:
     return await _proxy_stream("/turn/resume", body.session_id, {"answer": body.answer})
+
+
+# --- review-inbox BFF (UI Slice 2, §3) ---------------------------------------
+
+
+def _require_inbox_enabled() -> None:
+    """Gate the inbox page + proxy behind `REVIEW_INBOX_ENABLED` (mirrors the
+    `UI_TEST_AFFORDANCES` 404 pattern above). Unset/≠"1" ⇒ the surface does not
+    exist — every inbox route 404s (defense in depth: the inbox service enforces the
+    same flag on its own routes)."""
+    if os.environ.get("REVIEW_INBOX_ENABLED") != "1":
+        raise HTTPException(status_code=404, detail="Not found.")
+
+
+async def _proxy_inbox(method: str, path: str) -> JSONResponse:
+    """Proxy a JSON (non-streaming) inbox request to the inbox service, attaching the
+    server-held `X-Reviewer-Token` on the hop (the browser never sees it — same
+    pattern as the TOKEN_ISSUER_API_KEY the mint uses). The service's status code +
+    JSON body are propagated as-is so a `4xx`/`5xx` (unknown id, illegal transition,
+    landing-plane `503`) reaches the browser's error branch unchanged. A JSON,
+    non-streaming sibling of `_proxy_stream`."""
+    headers = {"X-Reviewer-Token": REVIEWER_TOKEN}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.request(
+                method, f"{INBOX_SERVICE_URL}{path}", headers=headers
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Inbox service unreachable: {exc}"
+            ) from exc
+    # The service always answers JSON (success bodies AND HTTPException details), but a
+    # crash / misconfigured upstream could return HTML/plain text — don't 500 the proxy
+    # decoding it; forward the raw text as a `detail` so the browser's error branch
+    # still renders something.
+    try:
+        content = response.json()
+    except ValueError:
+        content = {"detail": response.text}
+    return JSONResponse(status_code=response.status_code, content=content)
+
+
+@app.get("/inbox")
+async def inbox_page() -> FileResponse:
+    """Serve the reviewer PAGE (mirrors `index()`). The browser's DATA calls go to
+    `/api/inbox/*` below — this route is only the HTML shell."""
+    _require_inbox_enabled()
+    return FileResponse(_INBOX_HTML)
+
+
+@app.get("/api/inbox")
+async def inbox_list() -> JSONResponse:
+    _require_inbox_enabled()
+    return await _proxy_inbox("GET", "/inbox")
+
+
+@app.get("/api/inbox/health")
+async def inbox_health() -> JSONResponse:
+    _require_inbox_enabled()
+    return await _proxy_inbox("GET", "/inbox/health")
+
+
+@app.post("/api/inbox/{candidate_id}/{action}")
+async def inbox_action(candidate_id: str, action: str) -> JSONResponse:
+    _require_inbox_enabled()
+    if action not in _INBOX_ACTIONS:
+        raise HTTPException(status_code=404, detail="Not found.")
+    # Percent-encode the decoded id before re-interpolating it into the upstream path
+    # (candidate ids carry `::` and could carry other reserved chars) so it is passed as
+    # a single, unambiguous path segment — never able to inject extra path structure.
+    safe_id = urllib.parse.quote(candidate_id, safe="")
+    return await _proxy_inbox("POST", f"/inbox/{safe_id}/{action}")

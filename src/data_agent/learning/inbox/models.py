@@ -15,11 +15,11 @@ verdict (what it collided with, if anything).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from ..candidate.models import CandidateEnvelope
-from ..candidate.redaction import entity_free_payload_view
+from ..candidate.redaction import entity_free_payload_view, entity_spans, redact_payload
 from ..candidate.verdicts import DedupVerdict, LeakageVerdict
 from ..writer.routing import derive_inbox_reason
 
@@ -34,11 +34,19 @@ InboxReason = Literal[
 
 
 def _summary_of(env: CandidateEnvelope) -> str:
-    """An entity-free one-liner: the blueprint `intent` or the knowledge
-    `statement`. Both are entity-free by the time a candidate is `in_review`
-    (blueprint intents are S5-scanned; knowledge statements are the fact text)."""
+    """An entity-free one-liner: the blueprint `intent` or the knowledge `statement`,
+    with any settled entity spans REDACTED.
+
+    A near-miss candidate can carry the entity IN its `intent` (the very value
+    `payload_view` redacts) — surfacing the RAW intent here would bypass that redaction
+    and re-leak it through the summary. So the one-liner runs through the SAME
+    `redact_payload` strip (keyed off the settled S5 spans) the payload view uses, so a
+    reviewer sees `[redacted]` wherever a value was, never the raw span (D17/QA-Q7)."""
     payload = env.payload
-    return str(payload.get("intent") or payload.get("statement") or "").strip()
+    raw = str(payload.get("intent") or payload.get("statement") or "").strip()
+    if not raw:
+        return raw
+    return redact_payload({"summary": raw}, entity_spans(env))["summary"]
 
 
 def _entity_free_payload_view(env: CandidateEnvelope) -> dict[str, Any]:
@@ -49,12 +57,20 @@ def _entity_free_payload_view(env: CandidateEnvelope) -> dict[str, Any]:
 
 
 def _leakage_view(env: CandidateEnvelope) -> LeakageVerdict:
-    """The settled S5 verdict. A pre-S5 (`pending`) self-check is not a settled
-    verdict, so it is represented as an empty `pass` view — the inbox never asserts
-    an entity finding that S5 did not settle."""
+    """The settled S5 verdict with hit `span`s BLANKED (field/kind kept) — the
+    reviewer sees WHAT leaked and WHERE, never the raw value.
+
+    An `in_review` envelope still stores the raw spans (they are only blanked at the
+    promotion boundary by `blank_scan_spans`), so projecting the verdict verbatim would
+    ship the exact entity value the payload redaction withholds (contract §2a requires
+    `span == ""`). Mirror `redaction.blank_scan_spans` here so the inbox surface is
+    span-free regardless of status. A pre-S5 (`pending`) self-check is not a settled
+    verdict → an empty `pass` view (the inbox never asserts a finding S5 did not
+    settle)."""
     scan = env.entity_scan
     if LeakageVerdict.is_settled(scan):
-        return LeakageVerdict.from_doc(scan)
+        verdict = LeakageVerdict.from_doc(scan)
+        return replace(verdict, hits=tuple(replace(h, span="") for h in verdict.hits))
     return LeakageVerdict(result="pass", scanner="unsettled")
 
 

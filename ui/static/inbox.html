@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Data Agent — Review Inbox</title>
+<style>
+  :root {
+    --color-bg: #0f1117;
+    --color-surface: #171a23;
+    --color-surface-2: #1f2330;
+    --color-border: #2a2f3d;
+    --color-text: #e6e8ee;
+    --color-text-dim: #9aa1b2;
+    --color-accent: #5b8cff;
+    --color-accent-text: #ffffff;
+    --color-error-bg: #3a1c1c;
+    --color-error-border: #b33a3a;
+    --color-error-text: #ffb4b4;
+    --color-warn-bg: #332816;
+    --color-warn-border: #a5772a;
+    --color-warn-text: #f0c987;
+    --color-danger: #b33a3a;
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --radius: 8px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--color-bg);
+    color: var(--color-text);
+    display: flex;
+    justify-content: center;
+    padding: var(--space-5);
+  }
+
+  main {
+    width: 100%;
+    max-width: 720px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  h1 {
+    font-size: 1.25rem;
+    margin: 0;
+  }
+
+  .session-line {
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+  }
+
+  button {
+    background: var(--color-accent);
+    color: var(--color-accent-text);
+    border: none;
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-4);
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+
+  button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  button:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  /* --- Banners --- */
+  #error-banner[hidden],
+  #health-banner[hidden] {
+    display: none;
+  }
+
+  #error-banner {
+    background: var(--color-error-bg);
+    border: 1px solid var(--color-error-border);
+    color: var(--color-error-text);
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
+  }
+
+  #error-banner .error-code {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-weight: 600;
+    margin-right: var(--space-2);
+  }
+
+  #health-banner {
+    background: var(--color-warn-bg);
+    border: 1px solid var(--color-warn-border);
+    color: var(--color-warn-text);
+    border-radius: var(--radius);
+    padding: var(--space-3) var(--space-4);
+    font-size: 0.9rem;
+  }
+
+  /* --- Inbox list --- */
+  #inbox-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  #inbox-empty[hidden] {
+    display: none;
+  }
+
+  #inbox-empty {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-5);
+    text-align: center;
+    color: var(--color-text-dim);
+  }
+
+  .inbox-item {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .item-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .item-reason {
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 0;
+  }
+
+  .item-type {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--color-border);
+    border-radius: 999px;
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.75rem;
+    color: var(--color-text-dim);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .item-summary {
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .item-field-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-dim);
+    margin: 0 0 var(--space-1) 0;
+  }
+
+  pre.payload-view {
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    margin: 0;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .item-evidence,
+  .item-scan,
+  .item-dedup {
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+  }
+
+  .item-evidence .refs,
+  .item-dedup .key {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    color: var(--color-text);
+    word-break: break-all;
+  }
+
+  .item-scan {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    align-items: center;
+  }
+
+  .scan-hit {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--color-warn-border);
+    color: var(--color-warn-text);
+    background: var(--color-warn-bg);
+    border-radius: 999px;
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.75rem;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .item-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    border-top: 1px solid var(--color-border);
+    padding-top: var(--space-3);
+  }
+
+  button.action-reject,
+  button.action-retract {
+    background: var(--color-surface-2);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+  }
+
+  button.confirming {
+    background: var(--color-danger);
+    color: var(--color-accent-text);
+    border-color: var(--color-danger);
+  }
+
+  button.action-cancel[hidden] {
+    display: none;
+  }
+
+  button.action-cancel {
+    background: transparent;
+    color: var(--color-text-dim);
+    border: 1px solid var(--color-border);
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Data Agent — Review Inbox</h1>
+    <p class="session-line" id="count-line" data-testid="inbox-count-line">loading…</p>
+  </header>
+
+  <div id="error-banner" data-testid="error-banner" role="alert" hidden>
+    <span id="error-code" class="error-code" data-testid="error-code"></span>
+    <span id="error-message" data-testid="error-message"></span>
+  </div>
+
+  <div id="health-banner" data-testid="inbox-health-banner" role="status" hidden></div>
+
+  <section aria-labelledby="inbox-heading">
+    <h2 id="inbox-heading" class="sr-only">Items awaiting review</h2>
+    <ul id="inbox-list" data-testid="inbox-list" aria-live="polite"></ul>
+    <div id="inbox-empty" data-testid="inbox-empty" role="status" hidden></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  // write_plane === "offline" pre-disables approve so a reviewer never clicks
+  // into a 503 (contract §5). Set by loadHealth() before the list renders.
+  var state = { offline: false };
+
+  var els = {
+    countLine: document.getElementById("count-line"),
+    errorBanner: document.getElementById("error-banner"),
+    errorCode: document.getElementById("error-code"),
+    errorMessage: document.getElementById("error-message"),
+    healthBanner: document.getElementById("health-banner"),
+    list: document.getElementById("inbox-list"),
+    empty: document.getElementById("inbox-empty"),
+  };
+
+  function clearError() {
+    els.errorBanner.hidden = true;
+    els.errorCode.textContent = "";
+    els.errorMessage.textContent = "";
+  }
+
+  function showError(code, message) {
+    els.errorBanner.hidden = false;
+    els.errorCode.textContent = code || "ERROR";
+    els.errorMessage.textContent = message || "Something went wrong.";
+  }
+
+  function clearNode(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  // Every payload_view value is already redacted server-side (D17); entity
+  // spans are the literal token "[redacted]". We render it verbatim and via
+  // textContent only — never innerHTML with server data (contract §4).
+  function stringifyPayload(view) {
+    try {
+      return JSON.stringify(view, null, 2);
+    } catch (err) {
+      return String(view);
+    }
+  }
+
+  // --- Per-item confirm / disable helpers ---------------------------------
+
+  // Reset every action button in a row back to its default (non-confirming)
+  // label and hide the cancel affordance.
+  function resetConfirm(actions) {
+    var buttons = actions.querySelectorAll("button.action-btn");
+    buttons.forEach(function (btn) {
+      btn.classList.remove("confirming");
+      btn.dataset.confirming = "0";
+      btn.textContent = btn.dataset.label;
+      btn.setAttribute("aria-pressed", "false");
+    });
+    var cancel = actions.querySelector("button.action-cancel");
+    if (cancel) cancel.hidden = true;
+  }
+
+  // Disable all controls in a row while a POST is in flight.
+  function disableActions(actions) {
+    actions.querySelectorAll("button").forEach(function (btn) {
+      btn.disabled = true;
+    });
+  }
+
+  // Re-enable controls after an error. Approve stays disabled in offline mode
+  // (write plane can't land) and retract stays disabled (list is all
+  // in_review — retract only applies to validated items, contract §4).
+  function enableActions(actions) {
+    actions.querySelectorAll("button").forEach(function (btn) {
+      var act = btn.dataset.action;
+      if (act === "approve" && state.offline) {
+        btn.disabled = true;
+      } else if (act === "retract") {
+        btn.disabled = true;
+      } else {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  // --- Action POST + error mapping ----------------------------------------
+
+  function performAction(candidateId, action, node, actions) {
+    clearError();
+    disableActions(actions);
+    fetch("/api/inbox/" + encodeURIComponent(candidateId) + "/" + action, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    })
+      .then(function (response) {
+        if (response.ok) {
+          // A validated/rejected/retired item is no longer in_review: drop it
+          // from the DOM for instant feedback, then refresh the authoritative
+          // list (which also handles the transition to the empty state).
+          node.parentNode && node.parentNode.removeChild(node);
+          loadInbox();
+          return;
+        }
+        return response.text().then(function (text) {
+          var parsed = null;
+          try {
+            parsed = JSON.parse(text);
+          } catch (err) {
+            parsed = null;
+          }
+          var reason = parsed && (parsed.reason || parsed.detail);
+          var message;
+          if (response.status === 503) {
+            message = "approve-that-lands is unavailable in this deployment";
+          } else if (response.status === 409) {
+            // hold reason / illegal-transition, surfaced verbatim (contract §2).
+            message = reason || "That transition is not allowed right now.";
+          } else {
+            message = reason || text || response.statusText;
+          }
+          showError("HTTP_" + response.status, message);
+          resetConfirm(actions);
+          enableActions(actions);
+        });
+      })
+      .catch(function (err) {
+        showError("NETWORK", String(err));
+        resetConfirm(actions);
+        enableActions(actions);
+      });
+  }
+
+  // Build one action button with a two-step confirm: the first click arms it
+  // (destructive/promotion actions require intent), the second click fires.
+  function makeActionButton(candidateId, action, label, node, actions, disabled) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "action-btn action-" + action;
+    btn.dataset.action = action;
+    btn.dataset.label = label;
+    btn.dataset.confirming = "0";
+    btn.textContent = label;
+    btn.setAttribute("data-testid", "inbox-" + action);
+    btn.setAttribute("aria-pressed", "false");
+    if (disabled) btn.disabled = true;
+
+    btn.addEventListener("click", function () {
+      if (btn.dataset.confirming === "1") {
+        performAction(candidateId, action, node, actions);
+        return;
+      }
+      // Arm this button; reset any other armed button first.
+      resetConfirm(actions);
+      btn.dataset.confirming = "1";
+      btn.classList.add("confirming");
+      btn.textContent = "Confirm " + label;
+      btn.setAttribute("aria-pressed", "true");
+      var cancel = actions.querySelector("button.action-cancel");
+      if (cancel) cancel.hidden = false;
+    });
+
+    return btn;
+  }
+
+  // --- Item rendering ------------------------------------------------------
+
+  function renderEvidence(item) {
+    var refs = Array.isArray(item.evidence_refs) ? item.evidence_refs : [];
+    var wrap = document.createElement("p");
+    wrap.className = "item-evidence";
+    wrap.setAttribute("data-testid", "inbox-evidence");
+    var count = document.createElement("span");
+    count.textContent = refs.length + " evidence ref" + (refs.length === 1 ? "" : "s");
+    wrap.appendChild(count);
+    if (refs.length > 0) {
+      var sep = document.createElement("span");
+      sep.textContent = ": ";
+      wrap.appendChild(sep);
+      var idents = document.createElement("span");
+      idents.className = "refs";
+      // Identifiers only — never quotes (contract §0 evidence decision).
+      idents.textContent = refs.join(", ");
+      wrap.appendChild(idents);
+    }
+    return wrap;
+  }
+
+  // entity_scan finding (field + kind) as a quiet attention marker. hits carry
+  // blanked spans (""), so nothing raw can re-leak — we show field/kind only.
+  function renderScan(item) {
+    var scan = item.entity_scan;
+    var hits = scan && Array.isArray(scan.hits) ? scan.hits : [];
+    if (hits.length === 0) return null;
+    var wrap = document.createElement("p");
+    wrap.className = "item-scan";
+    wrap.setAttribute("data-testid", "inbox-scan");
+    var label = document.createElement("span");
+    label.textContent = "entity scan:";
+    wrap.appendChild(label);
+    hits.forEach(function (hit) {
+      var chip = document.createElement("span");
+      chip.className = "scan-hit";
+      var field = hit && hit.field ? hit.field : "?";
+      var kind = hit && hit.kind ? hit.kind : "?";
+      chip.textContent = field + " (" + kind + ")";
+      wrap.appendChild(chip);
+    });
+    return wrap;
+  }
+
+  function renderDedup(item) {
+    var dedup = item.dedup;
+    if (!dedup || !dedup.canonical_key) return null;
+    var wrap = document.createElement("p");
+    wrap.className = "item-dedup";
+    wrap.setAttribute("data-testid", "inbox-dedup");
+    var label = document.createElement("span");
+    label.textContent = "dedup key: ";
+    wrap.appendChild(label);
+    var key = document.createElement("span");
+    key.className = "key";
+    key.textContent = dedup.canonical_key;
+    wrap.appendChild(key);
+    return wrap;
+  }
+
+  function renderItem(item) {
+    var li = document.createElement("li");
+    li.className = "inbox-item";
+    li.setAttribute("data-testid", "inbox-item");
+    li.setAttribute("data-candidate-id", item.candidate_id || "");
+
+    // Header: reason category label + type badge.
+    var header = document.createElement("div");
+    header.className = "item-header";
+    var reason = document.createElement("h3");
+    reason.className = "item-reason";
+    reason.setAttribute("data-testid", "inbox-reason");
+    reason.textContent = item.reason || "(no reason)";
+    header.appendChild(reason);
+    var type = document.createElement("span");
+    type.className = "item-type";
+    type.setAttribute("data-testid", "inbox-type");
+    type.textContent = item.type || "unknown";
+    header.appendChild(type);
+    li.appendChild(header);
+
+    // Body: summary.
+    if (item.summary) {
+      var summary = document.createElement("p");
+      summary.className = "item-summary";
+      summary.setAttribute("data-testid", "inbox-summary");
+      summary.textContent = item.summary;
+      li.appendChild(summary);
+    }
+
+    // Body: payload_view rendered verbatim (already redacted, D17).
+    var payloadLabel = document.createElement("p");
+    payloadLabel.className = "item-field-label";
+    payloadLabel.textContent = "payload";
+    li.appendChild(payloadLabel);
+    var payload = document.createElement("pre");
+    payload.className = "payload-view";
+    payload.setAttribute("data-testid", "inbox-payload-view");
+    payload.textContent = stringifyPayload(item.payload_view);
+    li.appendChild(payload);
+
+    // Evidence: count + identifiers.
+    li.appendChild(renderEvidence(item));
+
+    // Quiet attention markers.
+    var scan = renderScan(item);
+    if (scan) li.appendChild(scan);
+    var dedup = renderDedup(item);
+    if (dedup) li.appendChild(dedup);
+
+    // Actions.
+    var actions = document.createElement("div");
+    actions.className = "item-actions";
+    actions.setAttribute("data-testid", "inbox-actions");
+
+    var id = item.candidate_id;
+    // Approve is pre-disabled offline (contract §5); retract is disabled here
+    // because every listed item is in_review, not validated (contract §4).
+    actions.appendChild(
+      makeActionButton(id, "approve", "Approve", li, actions, state.offline)
+    );
+    actions.appendChild(
+      makeActionButton(id, "reject", "Reject", li, actions, false)
+    );
+    actions.appendChild(
+      makeActionButton(id, "retract", "Retract", li, actions, true)
+    );
+
+    var cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "action-cancel";
+    cancel.setAttribute("data-testid", "inbox-cancel");
+    cancel.textContent = "Cancel";
+    cancel.hidden = true;
+    cancel.addEventListener("click", function () {
+      resetConfirm(actions);
+    });
+    actions.appendChild(cancel);
+
+    li.appendChild(actions);
+    return li;
+  }
+
+  function renderList(payload) {
+    clearNode(els.list);
+    var items = payload && Array.isArray(payload.items) ? payload.items : [];
+    var count = payload && typeof payload.count === "number" ? payload.count : items.length;
+
+    els.countLine.textContent =
+      count === 1 ? "1 item awaiting review" : count + " items awaiting review";
+
+    if (items.length === 0) {
+      els.empty.textContent = "Inbox is empty — nothing awaiting review";
+      els.empty.hidden = false;
+      return;
+    }
+    els.empty.hidden = true;
+    items.forEach(function (item) {
+      els.list.appendChild(renderItem(item));
+    });
+  }
+
+  // --- Loaders -------------------------------------------------------------
+
+  function loadInbox() {
+    return fetch("/api/inbox", { headers: { Accept: "application/json" } })
+      .then(function (response) {
+        if (!response.ok) {
+          return response.text().then(function (text) {
+            showError("HTTP_" + response.status, text || response.statusText);
+          });
+        }
+        return response.json().then(renderList);
+      })
+      .catch(function (err) {
+        showError("NETWORK", String(err));
+      });
+  }
+
+  // On load, learn the write-plane health so approve is pre-disabled and a
+  // "read-only review" banner shows in offline mode (contract §5). Failure to
+  // read health is treated as offline (fail safe — never arm a doomed approve).
+  function loadHealth() {
+    return fetch("/api/inbox/health", { headers: { Accept: "application/json" } })
+      .then(function (response) {
+        if (!response.ok) throw new Error("health " + response.status);
+        return response.json();
+      })
+      .then(function (data) {
+        state.offline = data && data.write_plane === "offline";
+      })
+      .catch(function () {
+        state.offline = true;
+      })
+      .then(function () {
+        if (state.offline) {
+          els.healthBanner.textContent =
+            "read-only review — approve-that-lands unavailable";
+          els.healthBanner.hidden = false;
+        } else {
+          els.healthBanner.hidden = true;
+        }
+      });
+  }
+
+  // Bootstrap: health first (gates approve), then the list.
+  loadHealth().then(loadInbox);
+})();
+</script>
+</body>
+</html>

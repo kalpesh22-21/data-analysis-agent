@@ -24,6 +24,15 @@
 #   ./scripts/run_ui.sh            # scripted (offline, no key)
 #   REAL=1 ./scripts/run_ui.sh     # real turns against live ClickHouse
 #   (Ctrl-C stops both processes)
+#
+# Review inbox (UI Slice 2, DORMANT/OFF by default): this launcher does NOT start
+# the inbox service. To enable the reviewer surface, run it separately —
+#   REVIEW_INBOX_ENABLED=1 REVIEWER_TOKEN=<secret> \
+#     uv run python scripts/run_inbox_service.py   # on :8100
+# and start THIS BFF with the SAME flag + token (and INBOX_SERVICE_URL if not the
+# :8100 default) so it serves /inbox and proxies /api/inbox/* to that service:
+#   REVIEW_INBOX_ENABLED=1 REVIEWER_TOKEN=<secret> ./scripts/run_ui.sh
+# Unset ⇒ every /inbox + /api/inbox/* route 404s (the surface does not exist).
 
 set -euo pipefail
 
