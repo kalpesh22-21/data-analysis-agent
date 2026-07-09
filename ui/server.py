@@ -42,6 +42,20 @@ RUNTIME_URL = os.environ.get("RUNTIME_URL", "http://localhost:8000")
 TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
 TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
 
+# Upload BFF wiring (UI Slice 4, §4). The scratch upload routes live on the MCP /
+# clickhouse-api host, NOT the runtime — so they get their own base env, MCP_URL
+# (matching the runtime's own default, runtime/config.py:35). The `/scratch/v1`
+# base is DERIVED from it by swapping the path (see `_scratch_base`), the same
+# derivation the runtime does at runtime/config.py:362-374.
+MCP_URL = os.environ.get("MCP_URL", "http://localhost:18090/mcp")
+
+# Cheap front-door reject: short-circuit an obviously-oversized upload on its
+# declared `Content-Length` BEFORE buffering the body. The authoritative byte cap
+# lives downstream in clickhouse-api (§3); this is only a cost optimization, so it
+# is deliberately generous and header-only (a client can lie about Content-Length,
+# but then the downstream cap still rejects it after the buffered read).
+UPLOAD_MAX_BYTES = int(os.environ.get("UPLOAD_MAX_BYTES", str(8 * 1024 * 1024)))
+
 # Review-inbox BFF wiring (UI Slice 2, §3). The BFF serves the inbox PAGE and proxies
 # the browser's `/api/inbox/*` DATA calls to the dedicated inbox service, holding the
 # shared REVIEWER_TOKEN server-side (exactly like TOKEN_ISSUER_API_KEY above) and
@@ -363,3 +377,97 @@ async def inbox_action(candidate_id: str, action: str) -> JSONResponse:
     # a single, unambiguous path segment — never able to inject extra path structure.
     safe_id = urllib.parse.quote(candidate_id, safe="")
     return await _proxy_inbox("POST", f"/inbox/{safe_id}/{action}")
+
+
+# --- upload BFF (UI Slice 4, §4) ---------------------------------------------
+
+
+def _scratch_base() -> str:
+    """Derive the `/scratch/v1` base URL from `MCP_URL` by keeping its scheme +
+    netloc and swapping the path — the identical derivation the runtime does at
+    runtime/config.py:362-374. The scratch upload routes are custom HTTP routes on
+    the MCP host (`clickhouse-api`), NOT on `RUNTIME_URL`, so this is where the
+    upload proxy hops to. E.g. `http://localhost:18090/mcp` -> `http://localhost:18090/scratch/v1`."""
+    parts = urllib.parse.urlsplit(MCP_URL)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, "/scratch/v1", "", ""))
+
+
+async def _proxy_upload(path: str, session_id: str, request: Request) -> JSONResponse:
+    """RAW-BODY multipart passthrough to a clickhouse-api scratch route (§4).
+
+    Unlike `_proxy_stream` (JSON in / SSE out) and `_proxy_inbox` (JSON in / JSON
+    out), this proxies a `multipart/form-data` upload — but WITHOUT parsing it. The
+    BFF must not parse the form (that would pull `python-multipart` into this
+    package's deps, which the contract forbids), so it reads the raw body bytes and
+    forwards them verbatim with the browser's ORIGINAL `Content-Type` header (which
+    carries the multipart boundary the downstream parser needs). The `session_id`
+    arrives as a query param, so the BFF needs zero form parsing to know it.
+
+    The session's JWT + `X-Session-Id` are looked up and attached server-side — the
+    SAME credential pair `_proxy_stream` attaches (D82/D5: the browser holds neither
+    the token nor the session binding, only the opaque `session_id`). The upstream
+    status + JSON body propagate as-is (non-JSON -> `{"detail": text}`), so a
+    413/400/401 reaches the browser's error branch unchanged.
+    """
+    jwt = _jwt_for_session(session_id)
+    # The BFF caps the WHOLE multipart body, but the downstream cap (UPLOAD_MAX_BYTES)
+    # is on the FILE PART only — so give the BFF slack for the multipart envelope
+    # (headers + boundaries, a few hundred bytes) to avoid 413-ing a file downstream
+    # would accept. 64 KiB is generous headroom for the envelope.
+    body_cap = UPLOAD_MAX_BYTES + 65536
+    # Cheap header-only reject before reading the body (the downstream byte cap is
+    # authoritative — this only avoids ingesting an obviously-oversized upload). A
+    # missing/unparseable Content-Length just falls through to the bounded stream read.
+    content_length = request.headers.get("content-length")
+    if content_length is not None and content_length.isdigit() and int(content_length) > body_cap:
+        return JSONResponse(
+            status_code=413,
+            content={"error": "Upload exceeds the maximum allowed size.", "code": "UPLOAD_TOO_LARGE"},
+        )
+    # Bounded stream read: `request.body()` would buffer an unbounded amount for a
+    # chunked (no-Content-Length) body, so read incrementally and bail the moment we
+    # cross the cap — capping BFF memory even when the client omits Content-Length.
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > body_cap:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "Upload exceeds the maximum allowed size.", "code": "UPLOAD_TOO_LARGE"},
+            )
+        chunks.append(chunk)
+    body = b"".join(chunks)
+    headers = {
+        "Authorization": f"Bearer {jwt}",
+        "X-Session-Id": session_id,
+        "Content-Type": request.headers.get("content-type", "application/octet-stream"),
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(f"{_scratch_base()}{path}", headers=headers, content=body)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"clickhouse-api unreachable: {exc}"
+            ) from exc
+    try:
+        content = resp.json()
+    except ValueError:
+        content = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=content)
+
+
+@app.post("/api/upload/analyze")
+async def upload_analyze(session_id: str, request: Request) -> JSONResponse:
+    """Preview a CSV/XLSX upload: raw-body proxy to `POST /scratch/v1/analyze`
+    (parse + column/type/sample preview, no materialize). `session_id` is a query
+    param; the file rides in the raw multipart body."""
+    return await _proxy_upload("/analyze", session_id, request)
+
+
+@app.post("/api/upload")
+async def upload(session_id: str, request: Request) -> JSONResponse:
+    """Materialize a mapped upload: raw-body proxy to `POST /scratch/v1/upload`
+    (parse + rename + materialize the session-scoped scratch table). `session_id`
+    is a query param; the file + `mapping` field ride in the raw multipart body."""
+    return await _proxy_upload("/upload", session_id, request)

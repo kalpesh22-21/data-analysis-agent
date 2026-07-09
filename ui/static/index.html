@@ -389,6 +389,87 @@
     font-family: ui-monospace, SFMono-Regular, monospace;
     margin-bottom: var(--space-2);
   }
+
+  /* --- Upload widget (UI Slice 4) --- */
+  .upload-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  #upload-column-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+  }
+
+  #upload-column-list:empty {
+    display: none;
+  }
+
+  .upload-column-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+    font-size: 0.9rem;
+  }
+
+  .upload-col-name {
+    font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .upload-col-type {
+    color: var(--color-text-dim);
+    font-size: 0.8rem;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .upload-col-sample {
+    flex: 1;
+    color: var(--color-text-dim);
+    font-size: 0.8rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .upload-column-row select {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    color: var(--color-text);
+    padding: var(--space-1) var(--space-2);
+    font-size: 0.85rem;
+  }
+
+  #upload-confirm-button[hidden],
+  #upload-result[hidden],
+  #upload-mapping-warning[hidden] {
+    display: none;
+  }
+
+  #upload-confirm-button {
+    margin-top: var(--space-3);
+  }
+
+  #upload-result {
+    margin: var(--space-3) 0 0 0;
+    font-size: 0.9rem;
+    color: var(--color-text);
+  }
+
+  #upload-mapping-warning {
+    margin: var(--space-2) 0 0 0;
+    font-size: 0.85rem;
+    color: var(--color-error-text);
+  }
 </style>
 </head>
 <body>
@@ -414,6 +495,24 @@
     />
     <button type="submit" id="send-button" data-testid="send-button">Send</button>
   </form>
+
+  <section id="upload-panel" data-testid="upload-panel" aria-labelledby="upload-heading">
+    <h2 id="upload-heading">Upload a dataset</h2>
+    <div class="upload-row">
+      <label for="upload-file-input" class="sr-only">Choose a CSV or XLSX file to upload</label>
+      <input
+        type="file"
+        id="upload-file-input"
+        data-testid="upload-file-input"
+        accept=".csv,.xlsx"
+      />
+      <button type="button" id="upload-analyze-button" data-testid="upload-analyze-button">Analyze</button>
+    </div>
+    <div id="upload-column-list" data-testid="upload-column-list"></div>
+    <p id="upload-mapping-warning" data-testid="upload-mapping-warning" role="alert" hidden></p>
+    <button type="button" id="upload-confirm-button" data-testid="upload-confirm-button" hidden>Confirm mapping</button>
+    <p id="upload-result" data-testid="upload-result" aria-live="polite" hidden></p>
+  </section>
 
   <section aria-labelledby="progress-heading">
     <h2 id="progress-heading">Progress</h2>
@@ -485,6 +584,10 @@
   // The turn block awaiting a live `result` event. Set on submit (fresh block)
   // or, after a resume-on-reload, to the rehydrated paused turn block.
   var inProgressBlock = null;
+  // The File object held between analyze → confirm (Option B: the same file is
+  // re-sent to /api/upload so the server re-parses it, §0/§5). The browser never
+  // holds parsed rows — only this File reference from the picker.
+  var uploadFile = null;
 
   var els = {
     sessionLine: document.getElementById("session-line"),
@@ -502,6 +605,12 @@
     errorMessage: document.getElementById("error-message"),
     transcript: document.getElementById("transcript"),
     turnTemplate: document.getElementById("turn-template"),
+    uploadFileInput: document.getElementById("upload-file-input"),
+    uploadAnalyzeButton: document.getElementById("upload-analyze-button"),
+    uploadColumnList: document.getElementById("upload-column-list"),
+    uploadMappingWarning: document.getElementById("upload-mapping-warning"),
+    uploadConfirmButton: document.getElementById("upload-confirm-button"),
+    uploadResult: document.getElementById("upload-result"),
   };
 
   function clearError() {
@@ -1071,6 +1180,245 @@
     if (event.key === "Enter") {
       event.preventDefault();
       els.askUserSubmit.click();
+    }
+  });
+
+  // --- Upload widget (UI Slice 4, §5) ---
+  // analyze → map columns → confirm. Additive to the transcript flow; shares
+  // sessionId + the showError banner. Both endpoints are multipart; the same
+  // File is sent to analyze (preview) and upload (authoritative re-parse).
+
+  // The four locked mapping roles (§1b). `none` is the default and is omitted
+  // from the mapping JSON; the others each canonicalize to a join key server-side.
+  var UPLOAD_ROLES = ["EmployeeCode", "DepartmentCode", "DepartmentName", "none"];
+
+  // Every role <select> in the rendered column list.
+  function roleSelects() {
+    return els.uploadColumnList.querySelectorAll("select[data-testid='upload-role-select']");
+  }
+
+  // Build the mapping JSON `{ <sanitized_col>: <role> }`, omitting `none` (§5.3).
+  function buildMapping() {
+    var mapping = {};
+    roleSelects().forEach(function (sel) {
+      var role = sel.value;
+      if (role && role !== "none") {
+        mapping[sel.getAttribute("data-col")] = role;
+      }
+    });
+    return mapping;
+  }
+
+  // Client-side fast path: is any non-`none` role selected on more than one
+  // column? The server rejection (UPLOAD_MAPPING_INVALID) remains authoritative.
+  function hasDuplicateRoles() {
+    var seen = {};
+    var duplicate = false;
+    roleSelects().forEach(function (sel) {
+      var role = sel.value;
+      if (role && role !== "none") {
+        if (seen[role]) duplicate = true;
+        seen[role] = true;
+      }
+    });
+    return duplicate;
+  }
+
+  // Reflect duplicate-role state onto the confirm button + inline warning.
+  function updateConfirmState() {
+    var duplicate = hasDuplicateRoles();
+    els.uploadConfirmButton.disabled = duplicate;
+    els.uploadMappingWarning.textContent = duplicate
+      ? "Each role may be assigned to at most one column."
+      : "";
+    els.uploadMappingWarning.hidden = !duplicate;
+  }
+
+  function setUploadBusy(isBusy) {
+    els.uploadFileInput.disabled = isBusy;
+    els.uploadAnalyzeButton.disabled = isBusy;
+    if (isBusy) els.uploadConfirmButton.disabled = true;
+  }
+
+  // Surface a non-OK upload response through the shared banner. Prefers the
+  // contract's {error, code}; falls back to FastAPI's {detail} from the BFF,
+  // then to raw text / status (mirrors runTurn's error handling, §1/§1c).
+  function reportUploadError(response) {
+    return response.text().then(function (text) {
+      var code = "HTTP_" + response.status;
+      var message = text || response.statusText || "Upload failed.";
+      try {
+        var parsed = JSON.parse(text);
+        if (parsed) {
+          if (parsed.code) code = parsed.code;
+          if (parsed.error) message = parsed.error;
+          else if (parsed.detail) message = parsed.detail;
+        }
+      } catch (err) {
+        // not JSON — keep the raw text/status
+      }
+      showError(code, message);
+    });
+  }
+
+  // Render one row per analyzed column: sanitized name + inferred type + a
+  // sample cell (first sample row, via textContent) + a role <select>. All
+  // strings go through textContent — an uploaded header/cell is untrusted (§5).
+  function renderColumnList(data) {
+    clearNode(els.uploadColumnList);
+    els.uploadMappingWarning.hidden = true;
+    var columns = data && Array.isArray(data.columns) ? data.columns : [];
+    var sampleRows = data && Array.isArray(data.sample_rows) ? data.sample_rows : [];
+    var firstSample = sampleRows.length > 0 && Array.isArray(sampleRows[0]) ? sampleRows[0] : [];
+
+    if (columns.length === 0) {
+      var note = document.createElement("p");
+      note.className = "prov-empty";
+      note.textContent = "No columns found in this file.";
+      els.uploadColumnList.appendChild(note);
+      els.uploadConfirmButton.hidden = true;
+      return;
+    }
+
+    columns.forEach(function (col, i) {
+      var colName = col && col.name !== undefined && col.name !== null ? String(col.name) : "";
+
+      var row = document.createElement("div");
+      row.className = "upload-column-row";
+      row.setAttribute("data-testid", "upload-column-row");
+
+      var nameSpan = document.createElement("span");
+      nameSpan.className = "upload-col-name";
+      nameSpan.textContent = colName;
+      row.appendChild(nameSpan);
+
+      var typeSpan = document.createElement("span");
+      typeSpan.className = "upload-col-type";
+      typeSpan.textContent = col && col.type ? cellText(col.type) : "";
+      row.appendChild(typeSpan);
+
+      var sampleSpan = document.createElement("span");
+      sampleSpan.className = "upload-col-sample";
+      sampleSpan.textContent = i < firstSample.length ? cellText(firstSample[i]) : "";
+      row.appendChild(sampleSpan);
+
+      var label = document.createElement("label");
+      label.className = "sr-only";
+      var selectId = "upload-role-" + i;
+      label.setAttribute("for", selectId);
+      label.textContent = "Role for column " + colName;
+      row.appendChild(label);
+
+      var select = document.createElement("select");
+      select.id = selectId;
+      select.setAttribute("data-testid", "upload-role-select");
+      select.setAttribute("data-col", colName);
+      UPLOAD_ROLES.forEach(function (role) {
+        var option = document.createElement("option");
+        option.value = role;
+        option.textContent = role;
+        select.appendChild(option);
+      });
+      select.value = "none"; // default (§5.2)
+      row.appendChild(select);
+
+      els.uploadColumnList.appendChild(row);
+    });
+
+    els.uploadConfirmButton.hidden = false;
+    updateConfirmState();
+  }
+
+  function renderUploadResult(data) {
+    var table = data && data.table ? cellText(data.table) : "";
+    var rowCount = data && typeof data.row_count === "number" ? data.row_count : 0;
+    els.uploadResult.textContent =
+      "scratch table ready: " + table + " (" + rowCount + " rows)";
+    els.uploadResult.hidden = false;
+  }
+
+  function analyzeUpload() {
+    if (!sessionId) {
+      showError("NO_SESSION", "Session not ready yet — try again in a moment.");
+      return;
+    }
+    var file = els.uploadFileInput.files && els.uploadFileInput.files[0];
+    if (!file) {
+      showError("UPLOAD_NO_FILE", "Choose a CSV or XLSX file first.");
+      return;
+    }
+    clearError();
+    uploadFile = file; // Option B: kept for the re-send at confirm.
+    clearNode(els.uploadColumnList);
+    els.uploadMappingWarning.hidden = true;
+    els.uploadConfirmButton.hidden = true;
+    els.uploadResult.hidden = true;
+    els.uploadResult.textContent = "";
+
+    var form = new FormData();
+    form.append("file", file);
+    setUploadBusy(true);
+    fetch("/api/upload/analyze?session_id=" + encodeURIComponent(sessionId), {
+      method: "POST",
+      body: form,
+    })
+      .then(function (response) {
+        if (!response.ok) return reportUploadError(response);
+        return response.json().then(renderColumnList);
+      })
+      .catch(function (err) {
+        showError("UPLOAD_ANALYZE_FAILED", String(err));
+      })
+      .finally(function () {
+        setUploadBusy(false);
+      });
+  }
+
+  function confirmUpload() {
+    if (!sessionId) {
+      showError("NO_SESSION", "Session not ready yet — try again in a moment.");
+      return;
+    }
+    if (!uploadFile) {
+      showError("UPLOAD_NO_FILE", "Analyze a file before confirming.");
+      return;
+    }
+    // Fast-path client guard; the server is still authoritative (§5.5).
+    if (hasDuplicateRoles()) {
+      updateConfirmState();
+      showError("UPLOAD_MAPPING_INVALID", "Each role may be assigned to at most one column.");
+      return;
+    }
+    clearError();
+    var mapping = buildMapping();
+    var form = new FormData();
+    form.append("file", uploadFile); // the SAME File object (Option B).
+    form.append("mapping", JSON.stringify(mapping));
+
+    setUploadBusy(true);
+    els.uploadConfirmButton.disabled = true;
+    fetch("/api/upload?session_id=" + encodeURIComponent(sessionId), {
+      method: "POST",
+      body: form,
+    })
+      .then(function (response) {
+        if (!response.ok) return reportUploadError(response);
+        return response.json().then(renderUploadResult);
+      })
+      .catch(function (err) {
+        showError("UPLOAD_FAILED", String(err));
+      })
+      .finally(function () {
+        setUploadBusy(false);
+        updateConfirmState();
+      });
+  }
+
+  els.uploadAnalyzeButton.addEventListener("click", analyzeUpload);
+  els.uploadConfirmButton.addEventListener("click", confirmUpload);
+  els.uploadColumnList.addEventListener("change", function (event) {
+    if (event.target && event.target.getAttribute("data-testid") === "upload-role-select") {
+      updateConfirmState();
     }
   });
 
