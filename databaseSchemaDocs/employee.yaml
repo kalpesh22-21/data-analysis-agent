@@ -80,7 +80,7 @@ columns:
   WorkLocationCountry: { type: Nullable(String), description: Work location country. }
   sales_sl_gradution: { type: Nullable(String), description: Internal sales training graduation date field; spelling preserved from source. }
   sales_sl_start_date: { type: Nullable(String), description: Internal sales training start date field. }
-  AnnualSalary: { type: "Nullable(Decimal(18, 6))", unit: USD, description: Annual salary amount when applicable; not actual payroll paid. }
+  AnnualSalary: { type: "Nullable(Decimal(18, 6))", unit: USD, description: "Authoritative annual salary figure; the single source for 'annual salary' / 'total salary' questions and department-level salary rollups (SUM(AnnualSalary) GROUP BY Department). Planned amount, not actual payroll paid." }
   EmploymentType:
     type: Nullable(String)
     values: { W2: employee, "1099": contractor }
@@ -142,6 +142,16 @@ ambiguities:
       non-unique and breaks on duplicate/changed names. Treat name matching as best-effort, not a
       foreign key; confirm the supervisor identity and prefer asking which supervisor tier is meant.
 
+  - term: annual salary
+    resolves_to: [ AnnualSalary ]
+    default: employee_annual_salary
+    clarify_if: >
+      NOT ambiguous — "annual salary" / "total annual salary" (including department-filtered rollups
+      like SUM(AnnualSalary) GROUP BY Department) is always employee.AnnualSalary. Both the "annual"
+      qualifier and a department filter point to this table; do NOT re-check payroll, which holds only
+      per-period line items (no annual amount, temporally gated). Fall through to the broader 'salary'
+      ambiguity below only if the user explicitly asks for actually-PAID earnings or net/take-home pay.
+
   - term: salary
     resolves_to:
       - AnnualSalary                                                    # planned annual (employee) — NOT actually paid
@@ -150,6 +160,8 @@ ambiguities:
       - "payroll net pay = SUM(Amount) WHERE RegisterType = 'NETPAYDIST'"    # take-home (payroll, per period)
     default: planned_annual_salary
     clarify_if: >
+      For "annual salary" use AnnualSalary directly (see the 'annual salary' entry above) — this broader
+      ambiguity applies only when planned-vs-actual is genuinely unclear.
       "salary" / "pay" / "compensation" is ambiguous across tables and meanings — planned AnnualSalary
       (employee, not actually paid) vs base Rate1 vs actually-paid gross earnings (payroll EARN) vs
       take-home net pay (payroll NETPAYDIST). Clarify planned-vs-actual and gross-vs-net; payroll
