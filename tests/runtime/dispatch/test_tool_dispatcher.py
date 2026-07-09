@@ -141,3 +141,80 @@ async def test_default_observer_is_noop_by_default() -> None:
     dispatcher = ToolDispatcher(mcp_client, CATALOG)
     result = await dispatcher.dispatch("listDatabases", {}, _credentials())
     assert result.status == "ok"
+
+
+async def test_column_scope_denial_surfaces_the_named_column() -> None:
+    """For COLUMN_SCOPE_VIOLATION SPECIFICALLY, the denied ToolResult.user_message
+    carries the MCP's author-controlled, column-naming detail (exc.message) so the
+    model sees WHICH column it lacks and can self-correct on the live turn.
+    Column names are catalog metadata (not PII / cell values, D25)."""
+    scope_message = (
+        "This query needs access to columns outside your permitted scope: "
+        "employee.EmployeeStatus. You do not have access to those columns — "
+        "remove them from the query, or ask the user to grant access."
+    )
+    mcp_client = FakeMCPClient(
+        scripted={"runQuery": [MCPToolError("COLUMN_SCOPE_VIOLATION", scope_message)]}
+    )
+    dispatcher = ToolDispatcher(mcp_client, CATALOG)
+
+    result = await dispatcher.dispatch(
+        "runQuery", {"sql": "SELECT EmployeeStatus FROM employee"}, _credentials()
+    )
+
+    assert result.status == "denied"
+    assert result.error_code == "COLUMN_SCOPE_VIOLATION"
+    assert result.retryable is False
+    # The specific out-of-scope column NAME reaches the model.
+    assert "employee.EmployeeStatus" in result.user_message
+    assert result.user_message == scope_message
+    # Still never leaks credentials.
+    blob = _result_to_scannable_json(result)
+    assert SECRET_JWT not in blob
+    assert SESSION_ID not in blob
+
+
+async def test_non_scope_denial_stays_generic_canned_message() -> None:
+    """Regression guard for B4/D25: a NON-scope MCP error must NOT surface its raw
+    exc.message — the model only ever sees the generic canned denial string. Here
+    the raw message contains backend detail that must be suppressed."""
+    raw_backend_detail = "Code: 47. DB::Exception: Unknown column secret_internal_col"
+    mcp_client = FakeMCPClient(
+        scripted={"runQuery": [MCPToolError("CLICKHOUSE_QUERY_ERROR", raw_backend_detail)]}
+    )
+    dispatcher = ToolDispatcher(mcp_client, CATALOG)
+
+    result = await dispatcher.dispatch(
+        "runQuery", {"sql": "SELECT bad FROM employee"}, _credentials()
+    )
+
+    assert result.status == "denied"
+    assert result.error_code == "CLICKHOUSE_QUERY_ERROR"
+    # Generic canned message only — the raw backend text must NOT leak.
+    assert result.user_message == "That query didn't run correctly. Let me fix it and try again."
+    assert "DB::Exception" not in result.user_message
+    assert "secret_internal_col" not in result.user_message
+
+
+async def test_raw_transport_exception_stays_generic_canned_message() -> None:
+    """Regression guard for B4/D25: a RAW (non-MCPToolError) transport exception
+    must never surface str(exc) — the model only sees the generic canned message."""
+    raw_transport_detail = "ConnectionRefusedError: [Errno 61] to 10.0.0.5:8123"
+
+    class _BoomClient(FakeMCPClient):
+        async def call_tool(self, tool_name, args, *, jwt, session_id):
+            raise RuntimeError(raw_transport_detail)
+
+    dispatcher = ToolDispatcher(_BoomClient(), CATALOG)
+
+    result = await dispatcher.dispatch(
+        "runQuery", {"sql": "SELECT 1"}, _credentials()
+    )
+
+    assert result.status == "error"
+    assert result.error_code == "INTERNAL_TRANSPORT_ERROR"
+    assert result.user_message == (
+        "Something went wrong reaching the data warehouse. Please try again."
+    )
+    assert "ConnectionRefusedError" not in result.user_message
+    assert "10.0.0.5" not in result.user_message

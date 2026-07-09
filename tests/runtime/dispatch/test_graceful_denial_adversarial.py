@@ -41,6 +41,17 @@ _ALL_SEVEN_CODES = (
     "CLICKHOUSE_UNAVAILABLE",
 )
 
+# COLUMN_SCOPE_VIOLATION is deliberately carved out of the "always canned"
+# guards below: its `MCPToolError.message` is an author-CONTROLLED
+# `ColumnScopeError` string minted by our own clickhouse-api service layer
+# (it NAMES out-of-scope columns — catalog metadata, not PII / cell values,
+# D25), forwarded verbatim by `_domain_to_tool_error`. The dispatcher surfaces
+# it so the model can self-correct on the live turn. Every OTHER code keeps the
+# canned message because its raw text CAN embed backend detail (e.g.
+# CLICKHOUSE_QUERY_ERROR splices ClickHouse's own `exc.message`). See the
+# dedicated COLUMN_SCOPE_VIOLATION test at the bottom of this file.
+_CANNED_CODES = tuple(c for c in _ALL_SEVEN_CODES if c != "COLUMN_SCOPE_VIOLATION")
+
 # A deliberately dangerous-looking raw MCP error message — simulates a real
 # backend leaking connection/credential-shaped detail in the ToolError text
 # (a realistic adversarial input: the MCP is an external/adopted dependency,
@@ -55,7 +66,7 @@ def _credentials() -> RuntimeCredentials:
     return RuntimeCredentials(session_id=SESSION_ID, jwt=JWT, column_scope=frozenset())
 
 
-@pytest.mark.parametrize("code", _ALL_SEVEN_CODES)
+@pytest.mark.parametrize("code", _CANNED_CODES)
 async def test_all_seven_codes_produce_correct_tool_result_via_real_dispatch(code: str) -> None:
     mcp = FakeMCPClient(
         scripted={"runQuery": [MCPToolError(code, f"[{code}] {_DANGEROUS_RAW_MESSAGE}")]}
@@ -75,7 +86,7 @@ async def test_all_seven_codes_produce_correct_tool_result_via_real_dispatch(cod
     assert result.result_full is None
 
 
-@pytest.mark.parametrize("code", _ALL_SEVEN_CODES)
+@pytest.mark.parametrize("code", _CANNED_CODES)
 async def test_user_message_never_leaks_raw_backend_detail(code: str) -> None:
     """Even when the raw `MCPToolError.message` carries connection strings,
     credentials, or a user's PII (as a real backend error plausibly could),
@@ -99,6 +110,39 @@ async def test_user_message_never_leaks_raw_backend_detail(code: str) -> None:
     assert "jane.doe@example.com" not in blob
     assert "admin" not in blob
     assert code not in result.user_message  # raw code string never in the user-facing text
+
+
+async def test_column_scope_violation_surfaces_author_controlled_column_names() -> None:
+    """The single carve-out from the "always canned" rule: COLUMN_SCOPE_VIOLATION.
+
+    Its `MCPToolError.message` is NOT attacker/backend-controlled — it is minted
+    by our own clickhouse-api `ColumnScopeError` and forwarded verbatim by
+    `_domain_to_tool_error`. It NAMES the out-of-scope column(s) (catalog
+    metadata, not PII / cell values, D25), which is exactly what lets the model
+    see WHICH column it lacks and self-correct on the live turn. So here — unlike
+    every other code — the dispatcher DOES surface `exc.message`.
+    """
+    scope_message = (
+        "This query needs access to columns outside your permitted scope: "
+        "dbpcm_warehouse.employee.EmployeeStatus. You do not have access to "
+        "those columns — remove them from the query, or ask the user to grant access."
+    )
+    mcp = FakeMCPClient(
+        scripted={"runQuery": [MCPToolError("COLUMN_SCOPE_VIOLATION", scope_message)]}
+    )
+    dispatcher = ToolDispatcher(mcp, CATALOG)
+
+    result = await dispatcher.dispatch("runQuery", {"sql": "SELECT 1"}, _credentials())
+
+    assert result.status == "denied"
+    assert result.error_code == "COLUMN_SCOPE_VIOLATION"
+    assert result.retryable is False
+    # The author-controlled column NAME reaches the model verbatim.
+    assert result.user_message == scope_message
+    assert "dbpcm_warehouse.employee.EmployeeStatus" in result.user_message
+    # Credentials still never leak.
+    assert JWT not in (result.user_message or "")
+    assert SESSION_ID not in (result.user_message or "")
 
 
 async def test_unparseable_mcp_error_code_is_classified_conservatively_via_real_dispatch() -> None:

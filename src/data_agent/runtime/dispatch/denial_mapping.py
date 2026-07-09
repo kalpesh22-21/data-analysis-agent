@@ -29,6 +29,14 @@ class DenialInfo:
 
 
 _DENIAL_TABLE: dict[str, DenialInfo] = {
+    # COLUMN_SCOPE_VIOLATION: on the LIVE turn the dispatcher
+    # (`dispatch/tool_dispatcher.py`) surfaces the MCP's author-controlled
+    # `ColumnScopeError` message instead of this string — that message NAMES the
+    # specific out-of-scope column(s) (catalog metadata, not PII / cell values,
+    # D25) so the model can self-correct. This generic string is the REPLAY
+    # fallback only: `user_message` is not persisted on TrailEntry, so
+    # `context/budget.py::_render_entry` re-derives it from `error_code` here,
+    # where the specific column name is no longer available.
     "COLUMN_SCOPE_VIOLATION": DenialInfo(
         code="COLUMN_SCOPE_VIOLATION",
         retryable=False,

@@ -228,6 +228,23 @@ class ToolDispatcher:
             )
         except MCPToolError as exc:
             denial: DenialInfo = classify_denial(exc.code)
+            # B4/D25 posture: the model-facing `user_message` is normally the
+            # GENERIC canned string from `denial_mapping.py` — raw backend /
+            # transport text is NEVER surfaced. The single narrow exception is
+            # COLUMN_SCOPE_VIOLATION: its `exc.message` is an author-CONTROLLED
+            # `ColumnScopeError` string that NAMES the out-of-scope column(s)
+            # (catalog metadata only — not PII / cell values), so surfacing it
+            # lets the model self-correct on the LIVE turn by seeing WHICH
+            # columns it lacks. All other codes (and the transport path below)
+            # stay canned. NOTE: `user_message` is not persisted on TrailEntry;
+            # on replay `context/budget.py::_render_entry` re-derives the
+            # GENERIC message from `error_code` via `denial_mapping.py` (it
+            # cannot know the column) — acceptable, since the column-specific
+            # message already reached the model on the live turn.
+            if denial.code == "COLUMN_SCOPE_VIOLATION" and exc.message:
+                user_message = exc.message
+            else:
+                user_message = denial.user_message
             self._observer(
                 "tool_dispatch_denied", {"tool_name": tool_name, "error_code": denial.code}
             )
@@ -239,7 +256,7 @@ class ToolDispatcher:
                 tool_name=tool_name,
                 error_code=denial.code,
                 retryable=denial.retryable,
-                user_message=denial.user_message,
+                user_message=user_message,
                 provenance=None,
                 result_preview=None,
                 result_full=None,
