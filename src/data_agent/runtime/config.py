@@ -19,6 +19,8 @@ from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
+
 
 class RuntimeSettings(BaseSettings):
     """All runtime configuration, read from environment variables (or `.env`)."""
@@ -194,6 +196,22 @@ class RuntimeSettings(BaseSettings):
         description="Fraction of model_context_window reserved for replayed history (OQ-G).",
     )
 
+    # --- Base agent system prompt (always-present leading instruction) ---
+    # A concise, static role + operating-procedure prompt prepended as the FIRST
+    # `role:"system"` message of every assembled model turn (before the retrieval
+    # block and history). Static constant => a D45 rebuild/resume re-derives
+    # byte-identical messages; inserted after compaction so it is exempt from the
+    # history-token-budget trimming (always leads the messages). Disable to run
+    # the raw, prompt-less loop, or override the text to experiment.
+    agent_system_prompt_enabled: bool = Field(
+        True,
+        description="When True (default) prepend the base agent system prompt as the first message.",
+    )
+    agent_system_prompt: str = Field(
+        AGENT_SYSTEM_PROMPT,
+        description="The base agent system prompt text (used only when agent_system_prompt_enabled).",
+    )
+
     # --- Agent loop / budget caps (D47/D55, OQ-H) ---
     max_loop_iterations: int = Field(
         15, ge=1, description="Max model<->tool round-trips per budget window."
@@ -353,6 +371,14 @@ class RuntimeSettings(BaseSettings):
             "Provisional; tune on Phase-0 traffic."
         ),
     )
+
+    def effective_agent_system_prompt(self) -> str | None:
+        """The base system prompt to prepend, or `None` when disabled.
+
+        `None` reproduces the pre-existing prompt-less loop exactly (no leading
+        system message from this feature).
+        """
+        return self.agent_system_prompt if self.agent_system_prompt_enabled else None
 
     def history_token_budget(self) -> int:
         """Absolute history token budget derived from the model's context window (OQ-G)."""

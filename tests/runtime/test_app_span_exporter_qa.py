@@ -97,7 +97,15 @@ def _build_app(
         },
     )
     settings = RuntimeSettings(
-        max_loop_iterations=15, max_wall_clock_seconds=60, max_budget_windows=3
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        # Hermeticity: this suite asserts the D25 DEFAULT redacted posture (SQL
+        # literals / result cells / raw scope never reach a span). Pin it here so
+        # an operator's ambient OTLP_DISABLE_REDACTION=1 debug flag (e.g. in .env)
+        # can't flip the posture out from under the invariant.
+        otlp_disable_redaction=False,
+        otlp_hide_llm_content=True,
     )
     return create_app(
         settings=settings,

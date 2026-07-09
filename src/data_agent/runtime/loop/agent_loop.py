@@ -85,7 +85,10 @@ from typing import Any, Literal, Protocol
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context import scope_filter
-from data_agent.runtime.context.assembly import ContextAssembler
+from data_agent.runtime.context.assembly import (
+    IDEMPOTENT_READ_ALREADY_SERVED_CODE,
+    ContextAssembler,
+)
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
@@ -154,6 +157,68 @@ TurnStatus = Literal[
 
 _BUDGET_CAP_QUESTION = "This is taking a while — continue, refine, or stop?"
 _BUDGET_CAP_OPTIONS = ["continue", "refine", "stop"]
+
+# Idempotent, side-effect-free read tools whose result depends ONLY on their
+# arguments — an identical repeat within a turn is guaranteed to return the same
+# already-served data (it is in the history above). The repeated-idempotent-read
+# guard (generalizing D94) declines to re-dispatch such a repeat and injects a
+# data-free "you already have this" nudge instead. runQuery/runBlueprint/askUser/
+# resolveValues are deliberately EXCLUDED — a repeated runQuery may be a distinct
+# legitimate step and is never guarded here.
+_IDEMPOTENT_READ_TOOLS = frozenset(
+    {"getTableSchema", "listTables", "listDatabases", "explainQuery"}
+)
+
+
+def _idempotent_read_signature(tool_name: str, arguments: Mapping[str, Any]) -> tuple[str, str]:
+    """The content key that identifies an already-served idempotent read: the
+    tool name plus its canonicalized arguments (stable key order, `str`-coerced
+    for any non-JSON-native arg). Two calls with the same key return the same
+    data by construction, so the second is a re-fetch."""
+    return (tool_name, json.dumps(dict(arguments), sort_keys=True, default=str))
+
+
+def _repeated_read_guard_event(
+    tool_name: str, tool_call_id: str, arguments: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Build the self-describing `loop_repeated_idempotent_read_guarded` observer
+    payload so the exported GUARDRAIL span reads unambiguously in a trace: it was a
+    SECOND, duplicate read that was deduped — NOT the first fetch being blocked.
+
+    Only CATALOG-safe identifier args are surfaced (`database`/`table` — the same
+    scalar identifiers a real `tool.<name>` dispatch span already exposes); free-form
+    args (notably `explainQuery`'s `sql`) are deliberately NEVER placed on the span,
+    keeping the default D25/OTLP shape-only posture intact. `deduped=True` +
+    `guard_reason` + a human-readable `note` make the span self-explain next to the
+    real `tool.<name>` span of the first, dispatched call."""
+    database = arguments.get("database")
+    table = arguments.get("table")
+    db = database if isinstance(database, str) and database else None
+    tbl = table if isinstance(table, str) and table else None
+    if db and tbl:
+        dedup_target = f"{db}.{tbl}"
+    elif tbl:
+        dedup_target = tbl
+    elif db:
+        dedup_target = db
+    else:
+        dedup_target = ""
+    payload: dict[str, Any] = {
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "deduped": True,
+        "guard_reason": "already_served_this_turn",
+        "dedup_target": dedup_target,
+        "note": (
+            f"duplicate {tool_name}({dedup_target}) — already served this turn; "
+            "not re-dispatched"
+        ),
+    }
+    if db:
+        payload["database"] = db
+    if tbl:
+        payload["table"] = tbl
+    return payload
 
 
 def _now_iso() -> str:
@@ -569,6 +634,17 @@ class AgentLoop:
             return frozenset()
         union: set[tuple[str, str]] = set()
         for entry in turn_entries:
+            # A repeated-idempotent-read guard entry is a data-free nudge (its
+            # `ok`+`None` provenance exists only to route it through the D94
+            # stranded-sentinel path). It fetched NO data — the real served read
+            # is a separate entry whose provenance is already unioned here — so it
+            # must NOT poison this union to `None` and drop the turn's answer from
+            # future-turn replay.
+            if (
+                entry.status == "ok"
+                and entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE
+            ):
+                continue
             if entry.provenance is None:
                 return None
             union.update(entry.provenance)
@@ -919,6 +995,24 @@ class AgentLoop:
         # diagnostic — same lifecycle as `retrieval_memo` (fresh per window,
         # not persisted) so the event fires at most once per stranded call.
         withheld_call_ids: set[str] = set()
+        # Repeated-idempotent-read guard (generalizes D94): the set of already-
+        # served idempotent-read signatures for THIS turn. Turn-window-local like
+        # the memos above, BUT seeded from the persisted trail so it survives both
+        # the D45 per-round-trip rebuild (the set would otherwise reset every
+        # `send_turn`) AND a budget-window `continue` resume (a fresh `_run_loop`
+        # window starts here with an empty in-memory set). Seeding from every prior
+        # `ok` idempotent-read entry of this turn is what lets the guard recognize a
+        # repeat it did not itself serve in the current window.
+        seen_read_calls: set[tuple[str, str]] = set()
+        for prior_entry in await self._session_store.load_trail(session_id):
+            if (
+                prior_entry.turn_index == turn_index
+                and prior_entry.status == "ok"
+                and prior_entry.tool_name in _IDEMPOTENT_READ_TOOLS
+            ):
+                seen_read_calls.add(
+                    _idempotent_read_signature(prior_entry.tool_name, prior_entry.args)
+                )
         # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §3):
         # turn-window-local accumulators for the enriched `result` event, same
         # lifecycle as the memos above (fresh per window, not persisted).
@@ -1018,6 +1112,58 @@ class AgentLoop:
             # on the next round-trip if it still wants them.
             capped_tool_calls = result.tool_calls[: self._max_tool_calls_per_iteration]
             for tool_call in capped_tool_calls:
+                # Repeated-idempotent-read guard (generalizes D94): the model
+                # re-issued an identical, already-served idempotent read (e.g.
+                # `getTableSchema(employee)` for the Nth time). Its result is
+                # DETERMINED provenance so the D94 ok+None sentinel never fires —
+                # yet re-fetching it is pure waste that can spin to the budget
+                # ceiling. Do NOT re-dispatch to the MCP; instead persist a
+                # data-free guard TrailEntry (ok+None, marked
+                # IDEMPOTENT_READ_ALREADY_SERVED_CODE) that `context/assembly.py`
+                # renders — via the SAME withheld-sentinel path D94 uses — as a
+                # "you already have this, proceed" nudge filling this repeat call's
+                # dangling tool-slot (keeping the OpenAI one-tool_call→one-result
+                # pairing valid). It is counted in `tool_calls_made` for reporting
+                # only; termination is bounded regardless because every round-trip
+                # still records an iteration against the budget window
+                # (`guard.record_iteration` below), so the worst case remains
+                # windows × iterations. The real served read stays in history under
+                # its own tool_call_id.
+                is_idempotent_read = tool_call.name in _IDEMPOTENT_READ_TOOLS
+                read_sig = (
+                    _idempotent_read_signature(tool_call.name, tool_call.arguments)
+                    if is_idempotent_read
+                    else None
+                )
+                if is_idempotent_read and read_sig in seen_read_calls:
+                    tool_calls_made += 1
+                    guard_entry = TrailEntry(
+                        turn_index=turn_index,
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        args=dict(tool_call.arguments),
+                        status="ok",
+                        error_code=IDEMPOTENT_READ_ALREADY_SERVED_CODE,
+                        # `None` (undetermined) is deliberate: it routes this
+                        # data-free entry through the D94 stranded-sentinel path.
+                        # `_compute_turn_provenance_union` excludes it by marker so
+                        # it never poisons the turn's replay provenance.
+                        provenance=None,
+                        result_preview=None,
+                        result_full_ref=None,
+                        ts=_now_iso(),
+                    )
+                    await self._session_store.append_trail_entry(session_id, guard_entry)
+                    self._observer(
+                        "loop_repeated_idempotent_read_guarded",
+                        _repeated_read_guard_event(
+                            tool_call.name, tool_call.id, tool_call.arguments
+                        ),
+                    )
+                    if guard.exceeded:
+                        break
+                    continue
+
                 # Runtime-tool registry (read-tools-design §2): a runtime tool
                 # (`resolveValues` + the three read tools) is intercepted here —
                 # it never reaches `dispatch` under its own name (only any inner
@@ -1096,6 +1242,13 @@ class AgentLoop:
                     blueprint_use=blueprint_use,
                     verification=verification,
                 )
+
+                # Record a SUCCESSFUL idempotent read so an identical repeat later
+                # this turn is caught by the guard above. Only `ok` reads are
+                # "already served" — a denied/errored read is NOT recorded, so a
+                # legitimate retry after a transient failure is never suppressed.
+                if is_idempotent_read and tool_result.status == "ok":
+                    seen_read_calls.add(read_sig)
 
                 # S3: also check the budget INSIDE the per-tool-call loop (not
                 # only once per outer iteration) so a slow batch of capped

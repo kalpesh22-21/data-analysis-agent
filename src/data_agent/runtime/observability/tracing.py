@@ -477,7 +477,27 @@ def recall_span(
 # float | bool)` filter would let it straight through into a span attribute
 # (and from there, Phoenix). Only these non-sensitive scalar counters/labels
 # are ever forwarded.
-_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = ("window", "tool_calls_made")
+#
+# The `tool_name`/`tool_call_id`/`deduped`/`guard_reason`/`dedup_target`/`note`/
+# `database`/`table` labels make the repeated-idempotent-read guard's
+# `loop_repeated_idempotent_read_guarded` span self-describing (so a reader can
+# tell a deduped SECOND read from a real first dispatch) and enrich the D94
+# `loop_result_withheld_provenance` span; every one is a non-sensitive identifier
+# or fixed label (`database`/`table` are catalog metadata — the same scalar
+# identifiers a real `tool.<name>` span already exposes; free-form args like
+# `sql` are NEVER placed on these events by the emitter, so no literal can leak).
+_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
+    "window",
+    "tool_calls_made",
+    "tool_name",
+    "tool_call_id",
+    "deduped",
+    "guard_reason",
+    "dedup_target",
+    "note",
+    "database",
+    "table",
+)
 
 
 def guardrail_observer(tracer: Tracer) -> Callable[[str, dict[str, Any]], None]:

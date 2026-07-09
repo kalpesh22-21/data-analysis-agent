@@ -61,6 +61,25 @@ _WITHHELD_PROVENANCE_SENTINEL = (
     "again. Try a different query or approach, or ask the user."
 )
 
+# Repeated-idempotent-read guard (generalizes D94 to "identical repeat of an
+# already-served read"). The loop (`loop/agent_loop.py`) detects that the model
+# re-issued an identical idempotent read it already served THIS turn and, instead
+# of re-dispatching to the MCP, persists a data-free guard TrailEntry marked with
+# `IDEMPOTENT_READ_ALREADY_SERVED_CODE`. That entry is `ok`+`None`-provenance, so
+# `filter_trail` drops it exactly like a D94 stranded entry and it flows through
+# the SAME stranded-detection + withheld-sentinel machinery below — only the
+# sentinel TEXT (and the diagnostic event) branch on the marker. The nudge carries
+# ZERO data (the real result is already in history under its own tool_call_id), so
+# it is PII-safe under any scope, and it fills the dangling repeat call's tool-slot
+# so the model stops re-fetching.
+IDEMPOTENT_READ_ALREADY_SERVED_CODE = "IDEMPOTENT_READ_ALREADY_SERVED"
+_REPEATED_IDEMPOTENT_READ_NUDGE = (
+    "Duplicate read: you already requested this exact call this turn, so its result "
+    "is already available to you (this response is not a new fetch). Re-requesting it "
+    "does nothing — use the result you already have and proceed to runQuery or give "
+    "your answer."
+)
+
 
 @dataclass(frozen=True)
 class AssembledContext:
@@ -88,6 +107,7 @@ class ContextAssembler:
         summarizer: Summarizer = default_summarizer,
         cache: SummaryCache | None = None,
         retrieval: RetrievalPipeline | None = None,
+        base_system_prompt: str | None = None,
         tracer: Tracer | None = None,
     ) -> None:
         self._session_store = session_store
@@ -95,6 +115,15 @@ class ContextAssembler:
         self._preview_row_count = preview_row_count
         self._summarizer = summarizer
         self._cache = cache if cache is not None else SummaryCache()
+        # Always-present base instruction (`prompts.AGENT_SYSTEM_PROMPT`, wired
+        # from settings by `app.py`). When set, `assemble` prepends it as the
+        # FIRST `role:"system"` message AFTER retrieval pre-injection, so the
+        # model always sees: base prompt -> retrieval cards -> history. It is a
+        # static constant inserted post-compaction, so it is BOTH exempt from
+        # the history-token-budget trimming AND byte-stable across a D45 rebuild/
+        # resume. `None` (Layer-1 tests, or the disabled toggle) reproduces the
+        # exact prompt-less message list.
+        self._base_system_prompt = base_system_prompt
         # Slice-1 retrieval (design §3.3): an OPTIONAL pre-loop stage. When
         # `None` (Layer-1 history-only tests, unconfigured deploy) `assemble`
         # is byte-identical to before this dependency existed — the whole
@@ -212,6 +241,15 @@ class ContextAssembler:
                     retrieval_memo=retrieval_memo,
                     observer=observer,
                 )
+
+            # 0b. base system prompt (always-present leading instruction): the
+            # LAST prepend so it precedes the retrieval block and history. It is
+            # inserted here — after `render_messages`/compaction has already run
+            # and the budget walk is complete — so it can never be trimmed by the
+            # history-token budget. As a static constant it keeps `assemble`
+            # byte-identical across the D45 per-round-trip rebuild/resume.
+            if self._base_system_prompt:
+                messages.insert(0, {"role": "system", "content": self._base_system_prompt})
 
             dropped_by_scope_count = len(raw_trail) - len(in_scope)
             if current_span is not None:
@@ -342,6 +380,15 @@ class ContextAssembler:
         `id` arg on the `runBlueprint` path, `None` for a raw `runQuery`."""
         if observer is None:
             return
+        # The repeated-idempotent-read guard reuses this stranded-detection path
+        # (its entry is also `ok`+`None`), but its telemetry is owned SOLELY by the
+        # loop's guard-decision site (`loop/agent_loop.py`), which emits
+        # `loop_repeated_idempotent_read_guarded` exactly once per guarded call.
+        # This render-time path must therefore stay SILENT for a guard entry —
+        # otherwise it would double-emit and, because `withheld_call_ids` resets
+        # per budget window, re-fire once per window for the same guarded call.
+        if entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE:
+            return
         if withheld_call_ids is not None:
             if entry.tool_call_id in withheld_call_ids:
                 return
@@ -377,12 +424,21 @@ def _build_withheld_sentinel_message(entry: TrailEntry) -> dict[str, Any]:
     own output, and the current-turn denied-entry exemption already replays full
     args via `budget.py::_render_entry`. The sentinel *content* stays the fixed,
     data-free string — no result_preview/result_full/column values.
+
+    A `IDEMPOTENT_READ_ALREADY_SERVED_CODE` guard entry (a repeat idempotent read
+    the loop declined to re-dispatch) reuses this exact shape but with the "you
+    already fetched this, proceed" nudge as its verbatim, data-free content.
     """
+    content = (
+        _REPEATED_IDEMPOTENT_READ_NUDGE
+        if entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE
+        else _WITHHELD_PROVENANCE_SENTINEL
+    )
     return {
         "role": "tool",
         "tool_call_id": entry.tool_call_id,
         "tool_name": entry.tool_name,
         "args": dict(entry.args),
         "withheld_sentinel": True,
-        "content": _WITHHELD_PROVENANCE_SENTINEL,
+        "content": content,
     }

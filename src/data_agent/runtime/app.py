@@ -362,6 +362,7 @@ def create_app(
         preview_row_count=settings.preview_row_count,
         summarizer=summarizer,
         retrieval=active_retrieval,
+        base_system_prompt=settings.effective_agent_system_prompt(),
         tracer=tracer,
     )
 

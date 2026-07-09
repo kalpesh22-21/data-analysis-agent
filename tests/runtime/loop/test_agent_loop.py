@@ -265,19 +265,32 @@ async def test_budget_cap_stop_answer_ends_turn_with_best_partial() -> None:
 
 
 async def test_credentials_never_appear_in_any_model_payload_across_multi_tool_call_turn() -> None:
+    # Two DISTINCT tool calls (a read + a query): the repeated-idempotent-read
+    # guard would collapse two IDENTICAL reads into one dispatch, which would
+    # defeat this test's "credentials reach the transport for every dispatched
+    # call" intent — so they are deliberately distinct here.
     model = ScriptedModelClient(
         [
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(id="call_1", name="listDatabases", arguments={}),
-                    ToolCallRequest(id="call_2", name="listDatabases", arguments={}),
+                    ToolCallRequest(
+                        id="call_2",
+                        name="runQuery",
+                        arguments={"sql": "SELECT EmployeeCode FROM employee"},
+                    ),
                 ]
             ),
             ModelTurnResult(assistant_text="All done."),
         ]
     )
     mcp = FakeMCPClient(
-        scripted={"listDatabases": [[{"name": "a"}], [{"name": "b"}]]}
+        scripted={
+            "listDatabases": [[{"name": "a"}]],
+            "runQuery": [
+                {"columns": ["EmployeeCode"], "rows": [["E1"]], "row_count": 1, "truncated": False}
+            ],
+        }
     )
     loop, store = _build_loop(model_client=model, mcp_client=mcp)
 
@@ -366,8 +379,12 @@ async def test_tool_calls_are_capped_per_iteration_never_unbounded() -> None:
     unbounded burst. Proven adversarially: `FakeMCPClient` is scripted with
     exactly `max_tool_calls_per_iteration` responses, so dispatching even ONE
     more would raise `AssertionError` from the fake itself."""
+    # Distinct `runQuery` calls (non-idempotent — never touched by the
+    # repeated-idempotent-read guard) so the per-iteration CAP is the sole limiter
+    # under test here, isolated from the read-dedup guard.
     many_calls = [
-        ToolCallRequest(id=f"c{i}", name="listDatabases", arguments={}) for i in range(10)
+        ToolCallRequest(id=f"c{i}", name="runQuery", arguments={"sql": f"SELECT {i}"})
+        for i in range(10)
     ]
     model = ScriptedModelClient(
         [
@@ -375,7 +392,14 @@ async def test_tool_calls_are_capped_per_iteration_never_unbounded() -> None:
             ModelTurnResult(assistant_text="done"),
         ]
     )
-    mcp = FakeMCPClient(scripted={"listDatabases": [[{"name": "db"}] for _ in range(3)]})
+    mcp = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                {"columns": ["n"], "rows": [[i]], "row_count": 1, "truncated": False}
+                for i in range(3)
+            ]
+        }
+    )
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp, CATALOG)
     assembler = ContextAssembler(store, history_token_budget=100_000)

@@ -20,7 +20,10 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
-from data_agent.runtime.context.assembly import ContextAssembler
+from data_agent.runtime.context.assembly import (
+    _REPEATED_IDEMPOTENT_READ_NUDGE,
+    ContextAssembler,
+)
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
@@ -183,3 +186,102 @@ async def _tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
             "parameters": {"type": "object", "properties": {"question": {"type": "string"}}},
         }
     ]
+
+
+async def _schema_tools_provider(_credentials: RuntimeCredentials) -> list[dict]:
+    return [{"type": "function", "name": "getTableSchema", "description": "", "parameters": {}}]
+
+
+class _RepeatSchemaModel:
+    """Re-issue the identical `getTableSchema(employee)` until its dedup nudge is
+    visible, then answer — the exact cold-start hang the read guard fixes."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self._n = 0
+
+    async def send_turn(self, messages: list[dict], tools: list[dict]) -> ModelTurnResult:
+        self.calls.append({"messages": messages})
+        saw_nudge = any(
+            m.get("role") == "tool"
+            and isinstance(m.get("content"), str)
+            and _REPEATED_IDEMPOTENT_READ_NUDGE in m["content"]
+            for m in messages
+        )
+        if saw_nudge:
+            return ModelTurnResult(assistant_text="Using the schema I have.", usage={"total_tokens": 1})
+        self._n += 1
+        return ModelTurnResult(
+            tool_calls=[
+                ToolCallRequest(
+                    id=f"gts_{self._n}",
+                    name="getTableSchema",
+                    arguments={"database": "dbpcm_warehouse", "table": "employee"},
+                )
+            ],
+            usage={"total_tokens": 1},
+        )
+
+    def begin_turn(self) -> _RepeatSchemaModel:
+        return self
+
+
+async def test_repeated_read_guard_span_is_legible_and_distinct_from_first_dispatch() -> None:
+    """A guarded (deduped) repeat is NOT dispatched, so it produces no
+    `tool.getTableSchema` TOOL span. To keep a reader from concluding "the FIRST
+    read was blocked", the guard's own GUARDRAIL span must self-describe: exactly
+    one real TOOL span (the first dispatch) sits beside one
+    `loop_repeated_idempotent_read_guarded` span carrying tool_name / deduped /
+    table / a human-readable note — routed through the REAL `guardrail_observer`
+    allowlist (proving the payload keys actually export)."""
+    tracer, exporter = _tracer_with_memory_exporter()
+    guardrail_observer = tracing.guardrail_observer(tracer)
+
+    store = InMemorySessionStore()
+    mcp = FakeMCPClient(
+        scripted={
+            "getTableSchema": [
+                {"database": "dbpcm_warehouse", "table": "employee", "columns": ["EmployeeCode"]}
+                for _ in range(10)
+            ]
+        }
+    )
+    model = _RepeatSchemaModel()
+    dispatcher = ToolDispatcher(mcp, CATALOG, observer=guardrail_observer, tracer=tracer)
+    assembler = ContextAssembler(store, history_token_budget=100_000, tracer=tracer)
+    loop = AgentLoop(
+        model_client=model,
+        tool_dispatcher=dispatcher,
+        context_assembler=assembler,
+        session_store=store,
+        tools_provider=_schema_tools_provider,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        observer=combine_observers(guardrail_observer),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="Describe employee."
+    )
+    assert outcome.status == "done"
+
+    spans = exporter.get_finished_spans()
+
+    # Exactly ONE real getTableSchema TOOL span — the FIRST call WAS dispatched
+    # (so a reader must not read the guard as "the first was blocked").
+    tool_spans = [s for s in spans if s.name == "tool.getTableSchema"]
+    assert len(tool_spans) == 1
+
+    # Exactly ONE self-describing guard span for the deduped SECOND call.
+    guard_spans = [s for s in spans if s.name == "loop_repeated_idempotent_read_guarded"]
+    assert len(guard_spans) == 1
+    attrs = dict(guard_spans[0].attributes)
+    assert attrs["tool_name"] == "getTableSchema"
+    assert attrs["deduped"] is True
+    assert attrs["guard_reason"] == "already_served_this_turn"
+    assert attrs["database"] == "dbpcm_warehouse"
+    assert attrs["table"] == "employee"
+    assert attrs["dedup_target"] == "dbpcm_warehouse.employee"
+    assert "duplicate getTableSchema(dbpcm_warehouse.employee)" in attrs["note"]
+    assert "not re-dispatched" in attrs["note"]
