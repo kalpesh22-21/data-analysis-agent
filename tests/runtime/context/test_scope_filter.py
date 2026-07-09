@@ -218,6 +218,52 @@ def test_errored_current_turn_entry_still_exempt_after_status_gate() -> None:
     assert [e.tool_call_id for e in filtered] == ["c1"]
 
 
+# ---------------------------------------------------------------------------
+# 2026-07-09 regression: getTableSchema (safe-empty provenance) survives a
+# restricted scope, sampleRows (all-columns provenance) is still dropped.
+# This is the filter-layer half of the bug fix — capture.py records
+# getTableSchema with `frozenset()` and sampleRows with all-columns provenance;
+# here we assert filter_trail treats those two provenance shapes correctly
+# under a narrow scope, exactly as capture.py now produces them.
+# ---------------------------------------------------------------------------
+
+
+def _read_entry(
+    tool_call_id: str,
+    tool_name: str,
+    provenance: frozenset[tuple[str, str]] | None,
+) -> TrailEntry:
+    return TrailEntry(
+        turn_index=0,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        args={"database": "dbpcm_warehouse", "table": "employee"},
+        status="ok",
+        error_code=None,
+        provenance=provenance,
+        result_preview=None,
+        result_full_ref=None,
+        ts="2026-07-09T00:00:00+00:00",
+    )
+
+
+def test_get_table_schema_survives_restricted_scope_but_sample_rows_dropped() -> None:
+    """Under a scope that grants only `employee.AnnualSalary`, a getTableSchema
+    entry (safe-empty `frozenset()` provenance, as capture.py now produces) is
+    KEPT, while a sampleRows entry (all-columns provenance including out-of-scope
+    columns) is DROPPED. This is the D44-filter half of the fetched-schema-
+    vanishes bug fix."""
+    scope = frozenset({f"{_E}.AnnualSalary"})
+    schema_entry = _read_entry("gts_1", "getTableSchema", frozenset())
+    sample_entry = _read_entry(
+        "sr_1", "sampleRows", frozenset({(_E, "AnnualSalary"), (_E, "Department")})
+    )
+
+    filtered = filter_trail([schema_entry, sample_entry], scope)
+
+    assert [e.tool_call_id for e in filtered] == ["gts_1"]
+
+
 def test_compute_scope_hash_is_stable_and_order_independent() -> None:
     scope_a = frozenset({f"{_E}.Department", f"{_E}.EmployeeCode"})
     scope_b = frozenset({f"{_E}.EmployeeCode", f"{_E}.Department"})

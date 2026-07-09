@@ -12,15 +12,17 @@ Provenance representation (load-bearing, D44/D63):
     `TrailEntry.provenance` is `frozenset[tuple[str, str]] | None`.
       - `None`  == "undetermined" (provenance could not be computed — e.g. the
         runtime's own independent re-parse of a `runQuery` SQL string failed,
-        or a `sampleRows`/`getTableSchema` table was uncatalogued). Per D44
+        or a `sampleRows` table was uncatalogued). Per D44
         fail-closed, an undetermined entry is ALWAYS dropped from replay by
         `context/scope_filter.py`, regardless of how open `column_scope` is —
         "never assume in-scope" is read literally here.
       - `frozenset()` (empty, non-None) == "no columns referenced" — the
         tool genuinely exposes no column-level data (`listDatabases`,
-        `listTables`, `explainQuery`) or the SQL genuinely referenced zero
-        catalog columns (e.g. `SELECT 1`). An empty-but-determined provenance
-        set is trivially a subset of any scope and is always kept.
+        `listTables`, `explainQuery`, or `getTableSchema` — the last returns
+        MCP-scope-filtered column METADATA, no cell values, so a fetched schema
+        is always replayable) or the SQL genuinely referenced zero catalog
+        columns (e.g. `SELECT 1`). An empty-but-determined provenance set is
+        trivially a subset of any scope and is always kept.
     On the wire (`to_doc`/`from_doc`), `None` round-trips as JSON `null`;
     `frozenset()` round-trips as `[]`; a non-empty set round-trips as the
     `[["db.table", "column"], ...]` pair-list shown in design §6.

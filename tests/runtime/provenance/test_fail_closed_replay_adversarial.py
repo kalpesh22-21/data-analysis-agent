@@ -2,8 +2,10 @@
 -> `scope_filter` end-to-end (QA hardening pass).
 
 `tests/runtime/provenance/test_capture.py` already proves `capture_provenance`
-returns `None` (undetermined) for an uncatalogued `sampleRows`/`getTableSchema`
-table and for a `runQuery` whose SQL the runtime's own extractor rejects.
+returns `None` (undetermined) for an uncatalogued `sampleRows` table and for a
+`runQuery` whose SQL the runtime's own extractor rejects (and that
+`getTableSchema` — MCP-scope-filtered metadata — is safe-empty `frozenset()`,
+NOT fail-closed `None`, since its result can carry no out-of-scope cell data).
 `tests/runtime/context/test_scope_filter.py` already proves `None` provenance
 is always dropped by `filter_trail`. This file proves the FULL chain those two
 suites individually assume: a live tool call that the (fake) MCP itself lets
@@ -143,12 +145,19 @@ async def test_sample_rows_uncatalogued_table_produces_none_and_is_dropped() -> 
     assert assembled.dropped_by_scope_count == 1
 
 
-async def test_get_table_schema_uncatalogued_table_produces_none_and_is_dropped() -> None:
+async def test_get_table_schema_is_safe_empty_and_replayable_under_any_scope() -> None:
+    """getTableSchema returns MCP-scope-filtered column METADATA (no cell
+    values), so — unlike sampleRows — it is NEVER fail-closed to `None`. It is
+    recorded with safe-empty `frozenset()` provenance and is KEPT by
+    `filter_trail` under every scope, including a narrow one that grants only a
+    subset of the table's columns. This is the fix for the fetched-schema-
+    vanishes bug (2026-07-09): a successfully fetched schema must stay in the
+    replayed context even under a restricted scope."""
     store = InMemorySessionStore()
     mcp = FakeMCPClient(
         scripted={
             "getTableSchema": [
-                {"database": "dbpcm_warehouse", "table": "ghost", "columns": []}
+                {"database": "dbpcm_warehouse", "table": "employee", "columns": []}
             ]
         }
     )
@@ -157,11 +166,19 @@ async def test_get_table_schema_uncatalogued_table_produces_none_and_is_dropped(
         mcp,
         CATALOG,
         tool_name="getTableSchema",
-        args={"database": "dbpcm_warehouse", "table": "ghost"},
-        call_id="call_schema_ghost",
+        args={"database": "dbpcm_warehouse", "table": "employee"},
+        call_id="call_schema_ok",
     )
-    assert entry.provenance is None
-    assert is_entry_in_scope(entry, frozenset()) is False  # allow-all still drops it
+    assert entry.provenance == frozenset()
+    # Kept under allow-all AND under a narrow scope granting only one column.
+    assert is_entry_in_scope(entry, frozenset()) is True
+    assert is_entry_in_scope(entry, frozenset({f"{_E}.Department"})) is True
+
+    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembled = await assembler.assemble(SESSION_ID, frozenset({f"{_E}.Department"}))
+    blob = json.dumps(assembled.messages, default=str)
+    assert "call_schema_ok" in blob
+    assert assembled.dropped_by_scope_count == 0
 
 
 async def test_denied_tool_call_never_persists_fabricated_provenance() -> None:

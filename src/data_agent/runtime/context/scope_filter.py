@@ -36,13 +36,19 @@ leaks nothing. This lets the model see its own current-turn denials/errors
 — a PRIOR turn's undetermined/denied entry is still always dropped. A
 **successful** (`status == "ok"`) current-turn entry is NEVER exempt — it IS
 data-bearing (`result_preview`/`result_full` are populated), and for
-`sampleRows`/`getTableSchema` the MCP does not itself column-scope the
-result (only `runQuery` does), so `provenance/capture.py` computes their
-provenance declaratively as "all columns of the table", which is frequently
-NOT a subset of a narrow `column_scope` — such an entry always goes through
-the ordinary strict `is_entry_in_scope` check, even within the current turn.
-Default `None` preserves the original all-strict behavior exactly (no
-exemption is ever applied).
+`sampleRows` the MCP does not itself column-scope the result (only `runQuery`
+and `sampleRows`-via-runQuery's SELECT-* rejection, plus `getTableSchema`,
+are scoped MCP-side; `sampleRows` returns real cell values from all columns),
+so `provenance/capture.py` computes `sampleRows` provenance declaratively as
+"all columns of the table", which is frequently NOT a subset of a narrow
+`column_scope` — such an entry always goes through the ordinary strict
+`is_entry_in_scope` check, even within the current turn. (`getTableSchema`
+is the counterpoint: the MCP scope-filters its metadata result, so
+`provenance/capture.py` records it with safe-empty `frozenset()` provenance —
+trivially in-scope, always replayable even under a narrow scope; that is what
+keeps a just-fetched schema visible to the model, 2026-07-09.) Default `None`
+preserves the original all-strict behavior exactly (no exemption is ever
+applied).
 """
 
 from __future__ import annotations

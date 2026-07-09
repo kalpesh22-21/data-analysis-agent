@@ -3,10 +3,11 @@ continuity exemption (`scope_filter.filter_trail`'s `current_turn_index`
 param) must be STATUS-GATED — it may only exempt a denied/errored (no-row)
 CURRENT-turn `TrailEntry` from the D44 replay drop, never a SUCCESSFUL one.
 
-The adopted MCP does NOT column-scope `sampleRows`/`getTableSchema` (only
-`runQuery` is column-scoped server-side, D80(b)); `provenance/capture.py`
-computes their provenance declaratively as "all columns of the table", which
-is frequently NOT a subset of a narrow `column_scope`. Before the fix, the
+The adopted MCP does NOT column-scope `sampleRows` (its result is real cell
+values from all columns; only `runQuery` — and `getTableSchema`'s metadata —
+are column-scoped server-side, D80(b)); `provenance/capture.py` computes
+`sampleRows` provenance declaratively as "all columns of the table", which is
+frequently NOT a subset of a narrow `column_scope`. Before the fix, the
 unconditional current-turn exemption let a successful, PII-bearing
 `sampleRows` result reach the model within the SAME external turn it ran in
 — exploitable end-to-end, not just in `context/scope_filter.py`'s pure-function
