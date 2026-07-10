@@ -84,6 +84,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.composite.record_assumptions import fold_assumptions
 from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import (
     IDEMPOTENT_READ_ALREADY_SERVED_CODE,
@@ -316,6 +317,11 @@ class TurnOutcome:
     blueprint_use: dict[str, Any] | None = None
     verification: dict[str, Any] | None = None
     provenance: frozenset[tuple[str, str]] | None = None
+    # recordAssumptions (docs/decisions/ui-assumptions-contract.md): the
+    # model-declared, plain-English assumptions behind the answer — a first-class
+    # result field mirroring `sql` in EVERY respect (additive, nullable, `[] ->
+    # None` fork, accumulated across budget windows at every return site).
+    assumptions: list[str] | None = None
 
 
 def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -540,6 +546,12 @@ class AgentLoop:
         # is the first). `None` when it cannot be found → retrieval simply does
         # not run on this resume (graceful).
         question = _first_user_question(updated_doc.messages, turn_index)
+        # Live/history parity: rehydrate any assumptions the model recorded in an
+        # earlier window of this turn (before the askUser / budget-cap pause) from
+        # the trail, so the resumed turn's live `result` event carries the same
+        # assumptions `project_history` reconstructs from the same trail. Without
+        # this seed, live and history would disagree for a paused-then-resumed turn.
+        seed_assumptions = await self._compute_turn_assumptions(session_id, turn_index)
         turn_model_client = self._begin_model_turn()
         return await self._run_loop(
             session_id=session_id,
@@ -548,6 +560,7 @@ class AgentLoop:
             turn_index=turn_index,
             model_client=turn_model_client,
             question=question,
+            seed_assumptions=seed_assumptions,
         )
 
     def _begin_model_turn(self) -> ModelClient:
@@ -645,10 +658,41 @@ class AgentLoop:
                 and entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE
             ):
                 continue
+            # A successful `recordAssumptions` entry carries NO warehouse data (it
+            # only echoes the model's plain-English assumptions) and deliberately
+            # has `None` provenance so it is dropped from replay by `filter_trail`
+            # (assumption strings never re-enter model context under a narrowed
+            # scope). Like the idempotent-read guard above, it must NOT collapse
+            # this union to `None` — otherwise every turn that records an
+            # assumption would tag its answer undetermined and lose it from history
+            # + replay (docs/decisions/ui-assumptions-contract.md).
+            if entry.status == "ok" and entry.tool_name == "recordAssumptions":
+                continue
             if entry.provenance is None:
                 return None
             union.update(entry.provenance)
         return frozenset(union)
+
+    async def _compute_turn_assumptions(
+        self, session_id: str, turn_index: int
+    ) -> list[str]:
+        """Reconstruct the plain-English assumptions recorded at *turn_index* from
+        the persisted `recordAssumptions` trail entries (deduped, first-occurrence
+        order, via the SAME `fold_assumptions` the loop and `session_history`
+        use). Used to SEED a resumed window on BOTH resume paths — the plain
+        `resume()` (askUser / budget-continue) and the blueprint approval-resume —
+        so assumptions the model recorded in an earlier window are not dropped and
+        the resumed turn's live result matches what `project_history` reconstructs."""
+        trail = await self._session_store.load_trail(session_id)
+        gathered: list[str] = []
+        for entry in trail:
+            if (
+                entry.turn_index == turn_index
+                and entry.status == "ok"
+                and entry.tool_name == "recordAssumptions"
+            ):
+                fold_assumptions(gathered, entry.args.get("assumptions"))
+        return gathered
 
     async def _run_runtime_tool(
         self,
@@ -688,6 +732,7 @@ class AgentLoop:
         result_table: ResultPreview | None = None,
         blueprint_use: dict[str, Any] | None = None,
         verification: dict[str, Any] | None = None,
+        assumptions: list[str] | None = None,
     ) -> TurnOutcome:
         """Honor a runtime tool's `ToolPause` (§2.5) — write the checkpoint (with
         the additive `blueprint_*` mid-DAG state) and return `paused_ask_user`,
@@ -723,6 +768,7 @@ class AgentLoop:
             result_table=result_table,
             blueprint_use=blueprint_use,
             verification=verification,
+            assumptions=assumptions,
         )
 
     async def _resume_blueprint(
@@ -841,6 +887,10 @@ class AgentLoop:
             (await self._session_store.get_or_create_session(session_id)).messages,
             turn_index,
         )
+        # recordAssumptions parity with the enrichment seed: rehydrate any
+        # assumptions the model recorded BEFORE this blueprint approval-pause from
+        # the trail, so the resumed window's final answer still carries them.
+        seed_assumptions = await self._compute_turn_assumptions(session_id, turn_index)
         turn_model_client = self._begin_model_turn()
         return await self._run_loop(
             session_id=session_id,
@@ -853,6 +903,7 @@ class AgentLoop:
             seed_preview=seed_preview,
             seed_blueprint_use=seed_blueprint_use,
             seed_verification=seed_verification,
+            seed_assumptions=seed_assumptions,
         )
 
     def _blueprint_outcome_to_tool_result(self, outcome: Any) -> ToolResult:
@@ -953,6 +1004,24 @@ class AgentLoop:
             return tool_result.result_preview, new_blueprint_use, new_verification
         return primary_preview, blueprint_use, verification
 
+    @staticmethod
+    def _accumulate_assumptions(
+        tool_name: str,
+        arguments: dict[str, Any],
+        tool_result: ToolResult,
+        *,
+        turn_assumptions: list[str],
+    ) -> None:
+        """Fold one SUCCESSFUL `recordAssumptions` call into `turn_assumptions`
+        (mirrors `_accumulate_enrichment`'s `turn_sql` discipline: mutated IN
+        PLACE, deduped, first-occurrence order). Read from the call ARGUMENTS via
+        the SAME `fold_assumptions` helper `session_history` uses, so the loop and
+        the history read-surface agree exactly. A no-op for any non-`ok` /
+        non-`recordAssumptions` call, so it is safe to call unconditionally."""
+        if tool_result.status != "ok" or tool_name != "recordAssumptions":
+            return
+        fold_assumptions(turn_assumptions, arguments.get("assumptions"))
+
     async def _run_loop(
         self,
         *,
@@ -970,6 +1039,11 @@ class AgentLoop:
         seed_preview: ResultPreview | None = None,
         seed_blueprint_use: dict[str, Any] | None = None,
         seed_verification: dict[str, Any] | None = None,
+        # recordAssumptions parity with `seed_sql`: seed the turn-window
+        # assumptions accumulator from a before-this-window source (the blueprint
+        # approval-resume path) so a resumed answer keeps assumptions recorded in
+        # an earlier window. Default `None`/empty → byte-identical to a fresh window.
+        seed_assumptions: list[str] | None = None,
     ) -> TurnOutcome:
         # The live MCP authenticates every request, including tools/list, so
         # the tools_provider seam is called WITH this turn's credentials on
@@ -1023,6 +1097,11 @@ class AgentLoop:
         primary_preview: ResultPreview | None = seed_preview
         blueprint_use: dict[str, Any] | None = seed_blueprint_use
         verification: dict[str, Any] | None = seed_verification
+        # recordAssumptions accumulator (mirrors `turn_sql`): the deduped,
+        # first-occurrence list of plain-English assumptions the model recorded
+        # this turn. Folded from each SUCCESSFUL recordAssumptions call's ARGUMENTS
+        # (`_accumulate_assumptions`), read at every `TurnOutcome(...)` return site.
+        turn_assumptions: list[str] = list(seed_assumptions) if seed_assumptions else []
 
         while True:
             canonical_messages = await self._build_canonical_messages(
@@ -1072,6 +1151,9 @@ class AgentLoop:
                     blueprint_use=blueprint_use,
                     verification=verification,
                     provenance=turn_provenance,
+                    # `[]` (no recordAssumptions this turn) -> `None`, same fork as
+                    # `sql`: the UI treats "no assumptions" and "empty" identically.
+                    assumptions=turn_assumptions or None,
                 )
 
             ask_user_call = next(
@@ -1101,6 +1183,7 @@ class AgentLoop:
                     result_table=primary_preview,
                     blueprint_use=blueprint_use,
                     verification=verification,
+                    assumptions=turn_assumptions or None,
                 )
 
             # S3: never dispatch an unbounded number of tool calls from one
@@ -1206,6 +1289,7 @@ class AgentLoop:
                         result_table=primary_preview,
                         blueprint_use=blueprint_use,
                         verification=verification,
+                        assumptions=turn_assumptions or None,
                     )
                 tool_calls_made += 1
 
@@ -1242,6 +1326,15 @@ class AgentLoop:
                     blueprint_use=blueprint_use,
                     verification=verification,
                 )
+                # recordAssumptions (docs/decisions/ui-assumptions-contract.md):
+                # fold a SUCCESSFUL call's plain-English assumptions into the
+                # turn accumulator, same discipline as the enrichment above.
+                self._accumulate_assumptions(
+                    tool_call.name,
+                    tool_call.arguments,
+                    tool_result,
+                    turn_assumptions=turn_assumptions,
+                )
 
                 # Record a SUCCESSFUL idempotent read so an identical repeat later
                 # this turn is caught by the guard above. Only `ok` reads are
@@ -1273,6 +1366,7 @@ class AgentLoop:
                         result_table=primary_preview,
                         blueprint_use=blueprint_use,
                         verification=verification,
+                        assumptions=turn_assumptions or None,
                     )
                 checkpoint = PauseCheckpoint(
                     reason="budget_cap",
@@ -1297,6 +1391,7 @@ class AgentLoop:
                     result_table=primary_preview,
                     blueprint_use=blueprint_use,
                     verification=verification,
+                    assumptions=turn_assumptions or None,
                 )
             # Under budget — loop back to 3a within the same window.
 

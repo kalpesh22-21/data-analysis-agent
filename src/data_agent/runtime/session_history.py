@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from data_agent.runtime.composite.record_assumptions import fold_assumptions
 from data_agent.runtime.context.scope_filter import filter_messages, filter_trail
 from data_agent.runtime.session.models import PauseCheckpoint, TrailEntry, TurnMessage
 
@@ -100,9 +101,35 @@ def project_history(
     for entry in surviving_trail:
         tools_by_turn.setdefault(entry.turn_index, []).append(entry)
 
+    # recordAssumptions (docs/decisions/ui-assumptions-contract.md): assumptions
+    # are MODEL-authored PLAIN ENGLISH — by contract they carry no warehouse data
+    # (no cell values, no column names). So they are NOT scope-gated per trail
+    # entry like `tool_calls` are; instead they inherit the ANSWER's scope
+    # treatment exactly (like `answer` / `pending_question` text). We therefore
+    # gather them from the RAW (unfiltered) trail — a `recordAssumptions` entry
+    # has `None` provenance and would be dropped by `filter_trail`, which is
+    # irrelevant here — and only SURFACE a turn's assumptions when that turn's
+    # assistant answer survives the message scope filter (`assistant is not None`
+    # below). If the answer is withheld, its assumptions are withheld with it.
+    raw_assumptions_by_turn: dict[int, list[str]] = {}
+    for entry in trail:
+        if entry.status == "ok" and entry.tool_name == "recordAssumptions":
+            fold_assumptions(
+                raw_assumptions_by_turn.setdefault(entry.turn_index, []),
+                entry.args.get("assumptions"),
+            )
+
     turns: list[dict[str, Any]] = []
     for turn_index in sorted(turn_order):
         assistant = answers.get(turn_index)
+        # Tie assumptions to answer survival (see the scope-posture comment above):
+        # a surfaced answer carries its assumptions; a withheld answer withholds
+        # them too. `[]` (turn recorded none) collapses to `None` — the `sql` fork.
+        assumptions = (
+            (raw_assumptions_by_turn.get(turn_index) or None)
+            if assistant is not None
+            else None
+        )
         turns.append(
             {
                 "turn_index": turn_index,
@@ -111,6 +138,7 @@ def project_history(
                 "provenance_union": (
                     _project_provenance(assistant.provenance) if assistant is not None else None
                 ),
+                "assumptions": assumptions,
                 "tool_calls": [
                     _project_tool_call(entry) for entry in tools_by_turn.get(turn_index, [])
                 ],

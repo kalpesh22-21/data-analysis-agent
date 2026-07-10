@@ -43,6 +43,7 @@ from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.auth.jwt_verify import JWTVerificationError, verify_jwt
 from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
+from data_agent.runtime.composite.record_assumptions import RecordAssumptionsTool
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.config import (
     RuntimeSettings,
@@ -157,6 +158,11 @@ def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
             if outcome.provenance is not None
             else None
         ),
+        # recordAssumptions (docs/decisions/ui-assumptions-contract.md): the
+        # model-declared, plain-English assumptions behind this answer. Pass-through
+        # list-or-`None` (the `[] -> None` fork mirrors `sql`), so an old client
+        # ignores the unknown key.
+        "assumptions": outcome.assumptions,
     }
 
 
@@ -425,6 +431,11 @@ def create_app(
         # is active — they share the one pipeline + store singleton, and carry
         # this request's observer/tracer for progress + the nested TOOL span.
         runtime_tools: dict[str, RuntimeTool] = {"resolveValues": composite}
+        # `recordAssumptions` (docs/decisions/ui-assumptions-contract.md): ALWAYS
+        # wired — it has no backing stack (it only echoes the model's plain-English
+        # assumptions into the turn result), so it is never subject to the
+        # advertised-but-unwired `RUNTIME_TOOL_UNAVAILABLE` path.
+        runtime_tools["recordAssumptions"] = RecordAssumptionsTool()
         blueprint_executor: BlueprintExecutor | None = None
         if active_retrieval is not None:
             # `disable_redaction` (telemetry-only debug switch) reveals the real

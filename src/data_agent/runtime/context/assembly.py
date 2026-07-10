@@ -389,6 +389,14 @@ class ContextAssembler:
         # per budget window, re-fire once per window for the same guarded call.
         if entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE:
             return
+        # `recordAssumptions` is intentionally `ok`+`None` provenance (it carries no
+        # warehouse data and stays out of replay — see
+        # `_compute_turn_provenance_union`'s carve-out + ui-assumptions-contract.md).
+        # It rides this same stranded-sentinel path to keep its tool_call paired,
+        # but firing `loop_result_withheld_provenance` on EVERY normal use would be
+        # routine noise — stay silent for it, exactly like the idempotent-read guard.
+        if entry.tool_name == "recordAssumptions":
+            return
         if withheld_call_ids is not None:
             if entry.tool_call_id in withheld_call_ids:
                 return

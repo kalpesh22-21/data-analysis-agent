@@ -86,6 +86,47 @@ def test_history_proxy_attaches_jwt_server_side(fake_httpx: list[dict], client: 
     assert hop["headers"]["X-Session-Id"] == _SESSION_ID
 
 
+def test_history_proxy_passes_assumptions_field_through_unchanged(
+    fake_httpx: list[dict], client: TestClient
+) -> None:
+    # recordAssumptions (docs/decisions/ui-assumptions-contract.md): the BFF is a
+    # transparent JSON proxy — a turn's `assumptions` (list or null) rides through
+    # the `/api/history` hop byte-for-byte, so the browser renders exactly what the
+    # runtime projected. The BFF neither re-shapes nor scope-gates it (the runtime
+    # already did, in `project_history`).
+    body = {
+        "session_id": _SESSION_ID,
+        "turns": [
+            {
+                "turn_index": 0,
+                "question": "how many active employees?",
+                "answer": "42",
+                "provenance_union": ["hr.employees.status"],
+                "assumptions": ["'Active' was taken to mean currently-employed staff"],
+                "tool_calls": [],
+            },
+            {
+                "turn_index": 1,
+                "question": "hi",
+                "answer": "hello",
+                "provenance_union": [],
+                "assumptions": None,  # no assumptions -> null, passes through as null
+                "tool_calls": [],
+            },
+        ],
+        "pending_question": None,
+    }
+    _FakeAsyncClient.response = _FakeResponse(200, body)
+
+    resp = client.get(f"/api/history?session_id={_SESSION_ID}")
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["turns"][0]["assumptions"] == [
+        "'Active' was taken to mean currently-employed staff"
+    ]
+    assert out["turns"][1]["assumptions"] is None
+
+
 def test_history_proxy_propagates_non_2xx(fake_httpx: list[dict], client: TestClient) -> None:
     _FakeAsyncClient.response = _FakeResponse(401, {"detail": "bad token"})
     resp = client.get(f"/api/history?session_id={_SESSION_ID}")

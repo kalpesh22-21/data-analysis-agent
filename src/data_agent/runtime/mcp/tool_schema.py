@@ -224,6 +224,42 @@ RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# `recordAssumptions` (docs/decisions/ui-assumptions-contract.md) — a runtime
+# tool the model calls ONCE, just before its final answer, to surface the
+# plain-English assumptions behind that answer as a first-class response field
+# (alongside `sql`/`result_table`). MODEL-DECLARED, PLAIN ENGLISH ONLY — never
+# SQL, codes, or column names. Declares NO session_id/jwt/scope (D5); it carries
+# no warehouse data and has no backing stack, so it is always available.
+RECORD_ASSUMPTIONS_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "recordAssumptions",
+    "description": (
+        "Record the plain-English assumptions behind your answer so the user can see "
+        "them. Use this when you interpreted an ambiguous term a particular way, applied "
+        "a default filter or time period, or resolved a fuzzy concept to specific values. "
+        "Call this exactly ONCE, just before you give your final answer, listing every "
+        "assumption you made. Each item must be a short, plain-English sentence stated in "
+        "the user's own terms — describe WHAT you assumed, never HOW you implemented it. "
+        "NEVER include SQL, code, column names, or raw codes. "
+        "Good: \"'Active employees' was taken to mean currently-employed staff.\" "
+        "Bad: \"EmployeeStatus = 'A'\". "
+        "If you did not make any assumptions, do not call this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "assumptions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "The plain-English assumptions behind your answer, one short "
+                "sentence each, in the user's own terms. No SQL, codes, or column names.",
+            },
+        },
+        "required": ["assumptions"],
+    },
+}
+
+
 # The locally-authored (runtime-implemented) tool schemas, appended after the
 # live-fetched MCP tools. This tuple is the SINGLE source of truth for "these
 # names are ours" — the name-collision guard (§6.1) asserts the MCP never
@@ -235,6 +271,7 @@ _LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     GET_BLUEPRINT_TOOL_SCHEMA,
     SEARCH_KNOWLEDGE_TOOL_SCHEMA,
     RUN_BLUEPRINT_TOOL_SCHEMA,
+    RECORD_ASSUMPTIONS_TOOL_SCHEMA,
 )
 _LOCAL_TOOL_NAMES: frozenset[str] = frozenset(s["name"] for s in _LOCAL_TOOL_SCHEMAS)
 
@@ -287,8 +324,8 @@ async def fetch_function_schemas(
         )
     schemas = [translate_tool_spec(tool) for tool in tools]
     # The locally-authored runtime tools (askUser + resolveValues + the three read
-    # tools + runBlueprint), always advertised, appended after the MCP tools
-    # (count 6 → 12).
+    # tools + runBlueprint + recordAssumptions), always advertised, appended after
+    # the MCP tools (count 6 → 13).
     schemas.extend(_LOCAL_TOOL_SCHEMAS)
     return schemas
 

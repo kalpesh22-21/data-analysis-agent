@@ -11,6 +11,7 @@ from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.tool_schema import (
     ASK_USER_TOOL_SCHEMA,
     GET_BLUEPRINT_TOOL_SCHEMA,
+    RECORD_ASSUMPTIONS_TOOL_SCHEMA,
     RESOLVE_VALUES_TOOL_SCHEMA,
     RUN_BLUEPRINT_TOOL_SCHEMA,
     SEARCH_BLUEPRINTS_TOOL_SCHEMA,
@@ -121,8 +122,9 @@ async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> Non
         "getBlueprint",
         "searchKnowledge",
         "runBlueprint",
+        "recordAssumptions",
     }
-    assert len(schemas) == 12
+    assert len(schemas) == 13
     ask_user = next(s for s in schemas if s["name"] == "askUser")
     assert ask_user == ASK_USER_TOOL_SCHEMA
     resolve_values = next(s for s in schemas if s["name"] == "resolveValues")
@@ -142,6 +144,11 @@ async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> Non
     # runBlueprint (Slice B), appended verbatim after the read tools.
     assert next(s for s in schemas if s["name"] == "runBlueprint") == RUN_BLUEPRINT_TOOL_SCHEMA
     assert set(RUN_BLUEPRINT_TOOL_SCHEMA["parameters"]["required"]) == {"id", "slot_bindings"}
+    # recordAssumptions, appended verbatim after runBlueprint.
+    assert next(s for s in schemas if s["name"] == "recordAssumptions") == (
+        RECORD_ASSUMPTIONS_TOOL_SCHEMA
+    )
+    assert set(RECORD_ASSUMPTIONS_TOOL_SCHEMA["parameters"]["required"]) == {"assumptions"}
 
 
 async def test_name_collision_guard_raises_when_mcp_shadows_a_local_tool() -> None:
@@ -156,10 +163,10 @@ async def test_name_collision_guard_raises_when_mcp_shadows_a_local_tool() -> No
 
 
 async def test_name_collision_guard_allows_disjoint_names() -> None:
-    # The real 6 MCP tools are disjoint from the 6 local names — no collision.
+    # The real 6 MCP tools are disjoint from the 7 local names — no collision.
     client = FakeMCPClient(tools=_FAKE_TOOLS)
     schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")
-    assert len(schemas) == 12
+    assert len(schemas) == 13
 
 
 async def test_no_credential_params_leak_in_any_schema() -> None:
@@ -176,7 +183,7 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
     cache = ToolSchemaCache(client)
 
     first = await cache.get_schemas(jwt="tok", session_id="s1")
-    assert len(first) == 12
+    assert len(first) == 13
 
     # Mutate the underlying client's tool list; without force_reload the cache
     # must not reflect the change.
@@ -197,4 +204,5 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
         GET_BLUEPRINT_TOOL_SCHEMA,
         SEARCH_KNOWLEDGE_TOOL_SCHEMA,
         RUN_BLUEPRINT_TOOL_SCHEMA,
+        RECORD_ASSUMPTIONS_TOOL_SCHEMA,
     ]
