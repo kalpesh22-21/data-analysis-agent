@@ -320,14 +320,17 @@ class TestScopeNarrowingDropsReplay:
 
         # Turn 1 (wide scope): run the payroll lookup — provenance resolves to
         # demo.payroll.salary; the sentinel lands in the replayable trail.
+        # Slice 3 made `answer`/`status` PER-TURN (each turn-block carries its own),
+        # so scope every assertion to the right turn-block (`.first`/`.last`) — an
+        # unscoped `get_by_test_id("answer")` matches N turns → strict-mode error.
         _send_message(page, "payroll lookup for sales")
-        expect(page.get_by_test_id("answer")).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
-        expect(page.get_by_test_id("status")).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("answer").first).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("status").first).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
 
         # Turn 2 (still wide): the figure IS recallable while the payroll column is
         # in scope — the entry was determined, kept, and rendered into context.
         _send_message(page, "recall payroll figure")
-        expect(page.get_by_test_id("answer")).to_contain_text(
+        expect(page.get_by_test_id("answer").last).to_contain_text(
             _PAYROLL_SENTINEL, timeout=_ASSERT_TIMEOUT_MS
         )
         expect(page.get_by_test_id("error-banner")).to_be_hidden()
@@ -337,9 +340,10 @@ class TestScopeNarrowingDropsReplay:
         session_id = page.locator("#session-line").inner_text().strip()
 
         # Turn 1 (wide scope): the payroll lookup lands its sentinel in the trail.
+        # Per-turn `answer`/`status` (Slice 3) → scope to the first turn-block.
         _send_message(page, "payroll lookup for sales")
-        expect(page.get_by_test_id("answer")).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
-        expect(page.get_by_test_id("status")).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("answer").first).not_to_have_text("", timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("status").first).to_contain_text("done", timeout=_ASSERT_TIMEOUT_MS)
 
         # Narrow the session's scope to EXCLUDE the payroll salary column (the
         # BFF re-mints the JWT server-side; the browser never sees it).
@@ -352,8 +356,9 @@ class TestScopeNarrowingDropsReplay:
 
         # Turn 2 (narrowed): the follow-up can no longer surface the figure — the
         # D44 replay filter dropped the out-of-scope prior entry from context.
+        # The recall turn is the SECOND turn-block → assert on `.last`.
         _send_message(page, "recall payroll figure")
-        expect(page.get_by_test_id("answer")).to_contain_text(
+        expect(page.get_by_test_id("answer").last).to_contain_text(
             "no longer", timeout=_ASSERT_TIMEOUT_MS
         )
         expect(page.get_by_test_id("error-banner")).to_be_hidden()
