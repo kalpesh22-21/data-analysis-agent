@@ -68,6 +68,7 @@ columns:
   TypeCode:
     type: Nullable(String)
     client_defined: true
+    description_col: TypeCodeDescription
     description: Payroll code within the register type (an earning, deduction, tax, benefit, or distribution code). CLIENT-DEFINED — resolve concepts to codes via resolveValues(TypeCode, <concept>), do not hardcode.
 
   TypeCodeDescription:
@@ -83,6 +84,7 @@ columns:
   DistributedDepartmentCode:
     type: Nullable(String)
     client_defined: true
+    description_col: distributedDepartmentDescription
     description: Department or labor-distribution code charged on the payroll item. CLIENT-DEFINED — resolve via resolveValues(DistributedDepartmentCode, <concept>).
 
   distributedDepartmentDescription:

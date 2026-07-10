@@ -61,6 +61,24 @@ def _extract_columns(raw_columns: dict[str, Any]) -> dict[str, str]:
     return result
 
 
+def _extract_description_cols(raw_columns: dict[str, Any]) -> dict[str, str]:
+    """Return {code_column: description_column} from a YAML `columns` block.
+
+    A code column declares its sibling human-readable label column via a truthy
+    string `description_col` field (e.g. `FieldId` -> `FieldLabel`). Columns whose
+    def is not a dict, or that omit / blank / non-string `description_col`, are
+    ignored. Casing is preserved exactly as authored (D70).
+    """
+    result: dict[str, str] = {}
+    for col_name, col_def in raw_columns.items():
+        if not isinstance(col_def, dict):
+            continue
+        desc_col = col_def.get("description_col")
+        if isinstance(desc_col, str) and desc_col.strip():
+            result[col_name] = desc_col.strip()
+    return result
+
+
 def _resolve_schema_dir(schema_dir: Path | str | None) -> Path:
     """Resolve the databaseSchemaDocs/ directory, defaulting relative to this file.
 
@@ -174,6 +192,31 @@ def load_semantic_catalog(schema_dir: Path | str | None = None) -> dict[str, dic
     `build_sqlglot_schema()` does.
     """
     return _load_raw_table_entries(_resolve_schema_dir(schema_dir))
+
+
+def load_description_cols(schema_dir: Path | str | None = None) -> dict[str, dict[str, str]]:
+    """Return {"database.table": {code_col: description_col}, ...} — the declared
+    code-column -> sibling-label-column linkage, one entry per table YAML.
+
+    A projection of the same `_load_raw_table_entries()` parse that
+    `build_sqlglot_schema()` and `load_semantic_catalog()` build from, so the three
+    views stay aligned (same keying, database-fallback, and file-skip rules). A code
+    column declares its human-readable label column via a truthy string
+    `description_col` field; `resolveValues` uses this to pull BOTH columns and embed
+    them jointly instead of relying on a naming convention.
+
+    Every catalogued table is present as a key; its value is `{}` when the table
+    declares no `description_col` links (kept for symmetry with the other views).
+
+    Column/table name casing is preserved exactly as authored (D70) — nothing is
+    lowercased. If `schema_dir` is None, resolves to databaseSchemaDocs/ the same
+    way `build_sqlglot_schema()` does.
+    """
+    raw_entries = _load_raw_table_entries(_resolve_schema_dir(schema_dir))
+    return {
+        qualified_key: _extract_description_cols(entry["columns"])
+        for qualified_key, entry in raw_entries.items()
+    }
 
 
 def is_scratch_table(database: str, table: str, session_id: str) -> bool:

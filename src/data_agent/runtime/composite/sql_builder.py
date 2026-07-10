@@ -12,9 +12,10 @@ identifiers are already catalog-allowlisted, this stacks a second independent
 guarantee, and `period` start/end become properly-escaped sqlglot string
 literals (design §2.4) rather than interpolated text.
 
-Description-column discovery (design §2.3): a convention-based, catalog-validated
-candidate list with a value-only fallback when no sibling description column
-exists (OQ-2).
+Description-column discovery (design §2.3): the catalog-authored `description_col`
+linkage is tried first, then a convention-based candidate list, then a value-only
+fallback when no sibling description column exists (OQ-2). Every candidate is
+catalog-validated and scope-pre-checked before use.
 """
 
 from __future__ import annotations
@@ -136,8 +137,21 @@ def resolve_target(
             f"No column '{column}' on table '{db_table}' is available."
         )
 
+    # Discovery order: the AUTHORED `description_col` linkage first, then the
+    # naming-convention candidates, then value-only. The declared column is not
+    # trusted blindly — it still must exist in the catalog AND be in the caller's
+    # scope (M1), so an author typo or out-of-scope declaration falls back to the
+    # convention rather than forcing a permanent COLUMN_SCOPE_VIOLATION.
+    declared = catalog.description_col_for(db_table, column)
+    candidates = _candidate_description_columns(column)
+    # Exclude a self-reference (`description_col: FieldId` on `FieldId`): otherwise
+    # discovery would select the value column as its own description and emit it
+    # twice. The convention path structurally cannot self-select.
+    if declared is not None and declared != column:
+        candidates = [declared, *candidates]
+
     description_col: str | None = None
-    for candidate in _candidate_description_columns(column):
+    for candidate in candidates:
         if candidate in columns and is_provenance_in_scope(
             frozenset({(db_table, candidate)}), column_scope
         ):

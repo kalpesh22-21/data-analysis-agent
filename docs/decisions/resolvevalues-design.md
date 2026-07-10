@@ -232,10 +232,19 @@ description column by **convention, validated against the `{col: type}` catalog*
 - **None found → value-only query** (`SELECT <column>, count() AS freq …`); rows return with
   `description=None`. Ranking then embeds `value` alone (§4).
 
-This is deliberately reversible and low-ceremony. The "right" long-term answer — an explicit
-`describes:`/`description_col:` catalog field plus a runtime rich-catalog loader
-([mcp-overlay-design.md](mcp-overlay-design.md) §3.2's `load_semantic_catalog`) — is recorded as **OQ-2**
-with the convention as the safe interim default.
+This is deliberately reversible and low-ceremony.
+
+> **[As-built] OQ-2 RESOLVED — structured `description_col` field added.** The "right" long-term answer
+> is now built: a per-column `description_col:` catalog field (authored in `databaseSchemaDocs/*.yaml`)
+> declares a code column's sibling label column explicitly. Discovery order in `sql_builder.resolve_target`
+> is now **declared → convention → value-only**: the authored `description_col` is tried first, then the
+> naming-convention candidates, then value-only — each still gated by the same `candidate in columns` +
+> `is_provenance_in_scope` (M1) check, so a mis-authored/out-of-scope/self-referential declaration
+> degrades gracefully. Surfaced to the runtime via `CatalogHandle.description_col_for()` (a new
+> `{db_table: {code_col: desc_col}}` projection from `loader.load_description_cols()`), so `resolveValues`
+> needed no new wiring. This unblocked non-conventional pairs the convention silently missed —
+> `FieldId → FieldLabel`, and `DistributedDepartmentCode → distributedDepartmentDescription` (a D70
+> case-mismatch the strip-Code/append-Description convention could never reach).
 
 ### 2.4 `period?` — validated structured form, sqlglot-literal bound (no interpolation)
 
@@ -674,10 +683,11 @@ mechanism; previews on the existing `_build_preview` list branch. `SESSION_TTL` 
   unconfigured; the degrade-to-freq path (§3.2) means an unconfigured/unreachable embedder never breaks
   the tool. The real `HttpEmbeddingClient` ships wired but its live Layer-2 test is deferred until the
   endpoint exists.
-- **OQ-2 (description-column discovery).** Convention + catalog-validation with value-only fallback
-  (§2.3) is the interim. The clean long-term answer is an explicit `describes:`/`description_col:` catalog
-  field consumed by a runtime rich-catalog loader ([mcp-overlay-design.md](mcp-overlay-design.md) §3.2) —
-  deferred (that loader is currently MCP-side only).
+- **OQ-2 (description-column discovery). RESOLVED (structured `description_col` field, see §2.3 as-built).**
+  A per-column `description_col:` catalog field now declares the sibling label column explicitly; discovery
+  is declared → convention → value-only, surfaced via `CatalogHandle.description_col_for()`. The convention
+  is retained as the fallback for undeclared columns. (Superseded the "deferred, loader is MCP-side only"
+  interim — the runtime already had `load_semantic_catalog`; only the field + a small projection were new.)
 - **OQ-3 (period-domain resolution).** This brick honors only a *concrete structured* `period`; deictic/
   relative/"latest settled period" resolution (D41/D65) is deferred to the D67 era. Absent `period` → no
   filter (freq-ranking still surfaces currently-common codes).

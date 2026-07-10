@@ -23,23 +23,49 @@ from types import MappingProxyType
 from typing import Any
 
 from data_agent.catalog import build_sqlglot_schema
-from data_agent.catalog.loader import load_semantic_catalog
+from data_agent.catalog.loader import load_description_cols, load_semantic_catalog
 
 
 class CatalogHandle:
     """Immutable, read-only view over the sqlglot catalog schema dict."""
 
-    def __init__(self, schema: dict[str, dict[str, str]]) -> None:
+    def __init__(
+        self,
+        schema: dict[str, dict[str, str]],
+        description_cols: dict[str, dict[str, str]] | None = None,
+    ) -> None:
         # Deep-freeze one level down (per-table column dicts) so callers cannot
         # mutate the shared catalog through the handle.
         self._schema: Mapping[str, Mapping[str, str]] = MappingProxyType(
             {table: MappingProxyType(dict(columns)) for table, columns in schema.items()}
+        )
+        # `description_cols` maps a code column to its declared sibling label
+        # column, per `database.table` (resolveValues embeds both jointly). Frozen
+        # the same way as `schema`; None == no declared links.
+        self._description_cols: Mapping[str, Mapping[str, str]] = MappingProxyType(
+            {
+                table: MappingProxyType(dict(links))
+                for table, links in (description_cols or {}).items()
+            }
         )
 
     @property
     def schema(self) -> Mapping[str, Mapping[str, str]]:
         """The full `database.table` -> `{column: type}` mapping (read-only)."""
         return self._schema
+
+    def description_col_for(self, db_table: str, column: str) -> str | None:
+        """Return *column*'s declared sibling description column on the qualified
+        `db_table` (e.g. `"dbpcm_warehouse.payroll"`), or None if none is declared.
+
+        This is the AUTHORED linkage only — it is NOT validated against the schema
+        or the caller's scope here (resolve_target still checks existence + scope
+        before using it, so an author typo or out-of-scope target falls back to the
+        naming convention rather than crashing)."""
+        table_links = self._description_cols.get(db_table)
+        if table_links is None:
+            return None
+        return table_links.get(column)
 
     def columns_for(self, database: str, table: str) -> frozenset[str] | None:
         """Return the column-name set for `database.table`, or None if uncatalogued."""
@@ -54,7 +80,7 @@ class CatalogHandle:
 
 def load_catalog_handle(schema_dir: Path | str | None = None) -> CatalogHandle:
     """Build the process-wide `CatalogHandle` from `databaseSchemaDocs/` (called once at startup)."""
-    return CatalogHandle(build_sqlglot_schema(schema_dir))
+    return CatalogHandle(build_sqlglot_schema(schema_dir), load_description_cols(schema_dir))
 
 
 @dataclass(frozen=True)

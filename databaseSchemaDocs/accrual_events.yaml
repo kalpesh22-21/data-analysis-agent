@@ -50,6 +50,7 @@ columns:
   EarnCode:
     type: Nullable(String)
     client_defined: true
+    description_col: EarnDescription
     description: Accrual earning code. CLIENT-DEFINED and drifts over time — resolve concepts to codes via resolveValues(EarnCode, <concept>), do not hardcode. Interpret with EarnDescription and the requested period.
 
   EarnDescription:

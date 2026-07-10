@@ -93,6 +93,7 @@ columns:
   FieldId:
     type: Nullable(String)
     client_defined: true
+    description_col: FieldLabel
     description: Identifier for the specific field being changed. CLIENT-DEFINED code space — resolve concepts to FieldId sets via resolveValues(FieldId, <concept>), never hardcode.
 
   FieldLabel:

@@ -42,7 +42,7 @@ columns:
     type: Nullable(String)
     observed_values: [ Entry, Experienced, Management, Senior ]
     description: Position level.
-  RequisitionDepartmentCode: { type: Nullable(String), client_defined: true, description: Department code for the requisition (CLIENT-DEFINED; resolve via resolveValues(RequisitionDepartmentCode, <concept>)). }
+  RequisitionDepartmentCode: { type: Nullable(String), client_defined: true, description_col: RequisitionDepartmentDescription, description: Department code for the requisition (CLIENT-DEFINED; resolve via resolveValues(RequisitionDepartmentCode, <concept>)). }
   RequisitionDepartmentDescription: { type: Nullable(String), client_defined: true, description: Department description for the requisition (CLIENT-DEFINED; resolve via resolveValues(RequisitionDepartmentDescription, <concept>)). }
   RequisitionOpenPositions: { type: Nullable(String), description: "Remaining open positions; stored as String. Cast with toInt32OrNull(RequisitionOpenPositions) before numeric use — nulls non-numeric values rather than erroring." }
   RequisitionNumberOfHires: { type: Nullable(Int32), description: Number of hires recorded against the requisition. }
