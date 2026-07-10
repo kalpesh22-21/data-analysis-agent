@@ -142,12 +142,12 @@ async def test_table_intermediate_blueprint_materializes_joins_and_verifies_live
     assert rf["row_count"] == 1
 
     # The verified answer is the TRUE per-department earnings JOIN result:
-    # Sales EARN = EMP001 (3750) + EMP003 (3600) = 7350.0 — computed by
+    # Sales EARN = EMP001 (3125.00) + EMP003 (3000.00) = 6125.0 — computed by
     # materializing per-employee earnings then row-JOINing to `employee`.
     cols = [c.lower() for c in rf["columns"]]
     total_idx = cols.index("total_earnings")
     total = float(rf["preview_rows"][0][total_idx])
-    assert total == 7350.0, f"expected Sales earnings 7350.0, got {total}"
+    assert total == 6125.0, f"expected Sales earnings 6125.0, got {total}"
 
     # TWO per-node SQLs surfaced (producer + consumer) for transparency (D56).
     assert len(rf["sql"]) == 2

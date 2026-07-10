@@ -93,7 +93,9 @@
 # executor folds the ranked codes into the `{earn_codes}` predicate as a typed AST
 # IN-list (F1/D10 — never interpolated). Value-only ranking (RegisterType has no
 # sibling description column) against the real embedder + the DISTINCT-domain freq.
-# The seed has EARN (4 rows) + DEDUCTION (1 row); "earnings" must rank EARN first.
+# The seed's catalog-faithful RegisterType domain is {EARN, EETAX, DDUCT,
+# NETPAYDIST, EEBEN, ERTAX} (EARN has one row per paid employee); "earnings" must
+# rank EARN first, above deduction/tax codes such as DDUCT/EETAX.
 - id: bp-total-earnings-by-department
   intent: Total earnings for a department, resolving the earnings register codes dynamically
   slots_summary: department

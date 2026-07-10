@@ -366,7 +366,8 @@ class RuntimeSettings(BaseSettings):
     # --- D67 resolve_via concept-subset selection (blueprint/rules.py) ---
     # The dynamic `resolve_via` rule expander binds the SUBSET of ranked codes the
     # concept actually names, not the whole domain. `earnings` must bind {EARN},
-    # never {EARN, DEDUCTION} (the latter nets deductions into an earnings total).
+    # never the full {EARN, EETAX, DDUCT, NETPAYDIST, EEBEN, ERTAX} domain (folding
+    # a deduction/tax code such as DDUCT would corrupt an earnings total).
     resolve_via_gap_threshold: float = Field(
         0.15,
         ge=0,

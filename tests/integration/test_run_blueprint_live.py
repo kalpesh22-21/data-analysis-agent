@@ -65,8 +65,9 @@ _EARN_ID = "bp-total-earnings-by-department"
 _E = "dbpcm_warehouse.employee"
 _P = "dbpcm_warehouse.payroll"
 # The D67 concept the resolve_via rule maps to the earnings register code set. The
-# seed's DISTINCT RegisterType domain is {EARN, DEDUCTION} (value-only ranking — no
-# sibling description column). "earnings" must rank EARN above DEDUCTION.
+# seed's DISTINCT RegisterType domain is the catalog-faithful set
+# {EARN, EETAX, DDUCT, NETPAYDIST, EEBEN, ERTAX} (value-only ranking — no sibling
+# description column). "earnings" must rank EARN above a deduction/tax code (DDUCT).
 _EARN_CONCEPT = "earnings"
 
 
@@ -228,15 +229,15 @@ async def test_single_node_resolve_via_earnings_runs_and_verifies_live(
     composite = _composite(dispatcher)
 
     # (a) The concept resolves to a real code set: EARN is present AND ranked above
-    # DEDUCTION by the real embedder over the live DISTINCT RegisterType domain.
+    # DDUCT by the real embedder over the live DISTINCT RegisterType domain.
     resolved = await composite.resolve(
         table=_P, column="RegisterType", concept=_EARN_CONCEPT, period=None, credentials=creds
     )
     assert resolved.status == "ok", resolved
     ranked = [v.value for v in resolved.values]
     assert "EARN" in ranked, f"EARN missing from resolved code set {ranked!r}"
-    assert ranked.index("EARN") < ranked.index("DEDUCTION"), (
-        f"EARN must rank above DEDUCTION for concept {_EARN_CONCEPT!r}; got {ranked!r} "
+    assert ranked.index("EARN") < ranked.index("DDUCT"), (
+        f"EARN must rank above DDUCT for concept {_EARN_CONCEPT!r}; got {ranked!r} "
         f"(scores={[(v.value, round(v.score, 4)) for v in resolved.values]})"
     )
 
@@ -259,14 +260,17 @@ async def test_single_node_resolve_via_earnings_runs_and_verifies_live(
     assert rf["verify"]["grain_ok"] is True
     assert rf["verify"]["grain_checked"] is True
     # (b) D67 concept-subset selection binds {EARN} ONLY as typed literals — the
-    # exact `IN ('EARN')` set, NOT the whole `{EARN, DEDUCTION}` domain, never the
-    # `{earn_codes}` placeholder nor interpolation. Binding DEDUCTION too nets its
-    # -150 into the "earnings" total (7200 instead of the true 7350) — the D67
-    # correctness gap this asserts is closed.
+    # exact `IN ('EARN')` set, NOT the whole {EARN, EETAX, DDUCT, NETPAYDIST, EEBEN,
+    # ERTAX} domain, never the `{earn_codes}` placeholder nor interpolation. Binding a
+    # non-earnings register (e.g. DDUCT/EETAX) into the "earnings" total would corrupt
+    # it — the D67 correctness gap this asserts is closed.
     assert len(rf["sql"]) == 1
     node_sql = rf["sql"][0]
+    # KEEP this: it encodes the intended D67 behavior (bind EARN only). NOTE: the
+    # resolve-domain grew from 2 → 6 catalog codes with the new fixture, so this exact
+    # `IN ('EARN')` binding must be re-confirmed on the next live L2 run.
     assert "IN ('EARN')" in node_sql, node_sql
-    assert "DEDUCTION" not in node_sql, node_sql
+    assert "DDUCT" not in node_sql, node_sql
     assert "{earn_codes}" not in node_sql
     # The concept NEVER reaches SQL as a value (D10) — it would only appear as a
     # quoted string literal if interpolated (`total_earnings` alias is authored SQL).
@@ -275,11 +279,11 @@ async def test_single_node_resolve_via_earnings_runs_and_verifies_live(
     assert rf["row_count"] == 1
     assert "department" in [c.lower() for c in rf["columns"]]
     # (b') The verified TOTAL is the TRUE earnings sum: Sales = Alice (EMP001 EARN
-    # 3750) + Carol (EMP003 EARN 3600) = 7350.0. With the old full-domain bind the
-    # DEDUCTION -150 would net this to 7200 — the assertion whose absence hid the bug.
+    # 3125.00) + Carol (EMP003 EARN 3000.00) = 6125.0. Binding any non-EARN register
+    # into this total would corrupt it — the assertion whose absence hid the bug.
     total_idx = [c.lower() for c in rf["columns"]].index("total_earnings")
     total = float(rf["preview_rows"][0][total_idx])
-    assert total == 7350.0, f"expected true earnings 7350.0 (EARN only), got {total}"
+    assert total == 6125.0, f"expected true earnings 6125.0 (EARN only), got {total}"
     # (d) provenance is the LIVE union across the resolveValues probe + the slot
     # domain probe + the node query + the grain probe.
     assert outcome.provenance is not None

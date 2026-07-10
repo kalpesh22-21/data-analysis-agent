@@ -50,13 +50,15 @@ _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # score, where score = 0.7·cosine(concept, value) + 0.3·norm_log_freq
 # (ranking.rank). A rule must bind the SUBSET of codes the concept actually names
 # — NOT the whole ranked domain. Binding the full domain is the correctness gap
-# this fixes: `earnings` → {EARN, DEDUCTION} nets the -150 DEDUCTION into an
-# "earnings" total (7200 instead of the true 7350) and mislabels it "verified".
+# this fixes: over the catalog-faithful RegisterType domain {EARN, EETAX, DDUCT,
+# NETPAYDIST, EEBEN, ERTAX}, `earnings` must bind {EARN}; folding a deduction/tax
+# code (e.g. DDUCT) into the "earnings" total corrupts the true Sales sum (6125)
+# yet still mislabels it "verified".
 #
 # Gap cut: walk the descending scores and cut after the FIRST significant gap —
 # `score[i] - score[i+1] > gap_threshold` binds the prefix `[0..i]`. A concept
 # that names one code opens a large gap after it (earnings: EARN 0.75 vs
-# DEDUCTION 0.35 → a 0.40 gap → bind {EARN}); a genuinely multi-code concept
+# DDUCT 0.35 → a 0.40 gap → bind {EARN}); a genuinely multi-code concept
 # clusters (VAC/SICK/PERSONAL all ~0.7, then a 0.45 gap before the noise → keep
 # the cluster); a uniformly-relevant domain (A 0.70, B 0.69, C 0.68) has no
 # significant gap → bind ALL (no false narrowing).

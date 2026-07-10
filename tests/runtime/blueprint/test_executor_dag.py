@@ -876,10 +876,14 @@ async def test_single_node_resolve_via_expands_and_executes() -> None:
 # D67 single-node resolve_via through the REAL ResolveValuesComposite — the
 # DISTINCT-domain probe → semantic+freq ranker → typed IN-list bind, end-to-end
 # with fakes (no FakeResolveHook shortcut). Mirrors the Layer-2 live test
-# (bp-total-earnings-by-department over payroll.RegisterType EARN/DEDUCTION) so
-# the executor↔composite wiring is proven without infra. The concept "earnings"
-# must rank EARN first; the code set binds as `IN ('EARN')` — the gap-cut prefix,
-# never the whole domain (binding DEDUCTION would net its -150 into the total).
+# (bp-total-earnings-by-department over payroll.RegisterType) so the
+# executor↔composite wiring is proven without infra. NOTE: the scripted domain
+# below ({EARN, DEDUCTION}, total 7350.0) is a SIMPLIFIED 2-code stand-in for this
+# fully-mocked test — it is NOT the warehouse seed. The live seed now uses the
+# catalog-faithful RegisterType domain {EARN, EETAX, DDUCT, NETPAYDIST, EEBEN,
+# ERTAX} with a true Sales EARN total of 6125.0. The concept "earnings" must rank
+# EARN first; the code set binds as `IN ('EARN')` — the gap-cut prefix, never the
+# whole domain (binding a non-earnings code would corrupt the total).
 # ---------------------------------------------------------------------------
 
 _PAYROLL = "dbpcm_warehouse.payroll"
@@ -945,6 +949,8 @@ def _earn_detail() -> BlueprintDetail:
 async def test_single_node_resolve_via_real_composite_ranks_earn_and_binds_in_list() -> None:
     # The real composite ranks against embeddings: "earnings" ≈ EARN, far from
     # DEDUCTION → EARN first. Freq (EARN 4, DEDUCTION 1) reinforces the same order.
+    # (DEDUCTION here is a simplified mock stand-in; see the block comment above —
+    # the live seed's non-earnings codes are DDUCT/EETAX/etc.)
     embedder = FakeEmbeddingClient(
         {"earnings": [1.0, 0.0], "EARN": [1.0, 0.0], "DEDUCTION": [0.0, 1.0]}, dim=2
     )
@@ -977,11 +983,12 @@ async def test_single_node_resolve_via_real_composite_ranks_earn_and_binds_in_li
     assert isinstance(outcome, ExecCompleted), outcome
     # The composite issued the DISTINCT-domain freq probe over RegisterType.
     assert "GROUP BY RegisterType" in mcp.calls[1].args["sql"]
-    # EARN ranked first with a large score gap to DEDUCTION → D67 concept-subset
-    # selection binds {EARN} ONLY (the gap-cut prefix), NOT the whole domain. The
-    # resolved code set binds as a typed AST IN-list literal (F1/D10), never
-    # string-interpolated; the placeholder is gone. Binding DEDUCTION too would
-    # net its -150 into the "earnings" total — the correctness gap this asserts.
+    # EARN ranked first with a large score gap to the (mock) non-earnings code →
+    # D67 concept-subset selection binds {EARN} ONLY (the gap-cut prefix), NOT the
+    # whole domain. The resolved code set binds as a typed AST IN-list literal
+    # (F1/D10), never string-interpolated; the placeholder is gone. Binding a
+    # non-earnings register too would corrupt the "earnings" total — the
+    # correctness gap this asserts (the live seed's true Sales EARN total is 6125.0).
     node_sql = mcp.calls[2].args["sql"]
     assert "IN ('EARN')" in node_sql
     assert "DEDUCTION" not in node_sql

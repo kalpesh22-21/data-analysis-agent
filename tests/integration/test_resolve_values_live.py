@@ -55,9 +55,10 @@ pytestmark = pytest.mark.skipif(
 _MODEL = "all-mpnet-base-v2"
 _P = "dbpcm_warehouse.payroll"
 _COLUMN = "RegisterType"
-# The D67-proven concept: the seed's DISTINCT RegisterType domain is
-# {EARN, DEDUCTION} (value-only ranking — no sibling description column), and
-# "earnings" must rank EARN above DEDUCTION under the real embedder.
+# The D67-proven concept: the seed's DISTINCT RegisterType domain is the
+# catalog-faithful set {EARN, EETAX, DDUCT, NETPAYDIST, EEBEN, ERTAX} (value-only
+# ranking — no sibling description column), and "earnings" must rank EARN above a
+# deduction/tax code such as DDUCT under the real embedder.
 _EARN_CONCEPT = "earnings"
 
 
@@ -136,9 +137,9 @@ async def test_run_earnings_ranks_over_real_mcp_and_embedder(mint: Mint) -> None
 
     ranked = [item["value"] for item in values]
     assert "EARN" in ranked, f"EARN missing from ranked domain {ranked!r}"
-    assert "DEDUCTION" in ranked, f"DEDUCTION missing from ranked domain {ranked!r}"
-    assert ranked.index("EARN") < ranked.index("DEDUCTION"), (
-        f"EARN must rank above DEDUCTION for concept {_EARN_CONCEPT!r}; got "
+    assert "DDUCT" in ranked, f"DDUCT missing from ranked domain {ranked!r}"
+    assert ranked.index("EARN") < ranked.index("DDUCT"), (
+        f"EARN must rank above DDUCT for concept {_EARN_CONCEPT!r}; got "
         f"{ranked!r} (scores={[(i['value'], i['score']) for i in values]})"
     )
 
