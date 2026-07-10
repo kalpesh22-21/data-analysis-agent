@@ -7,6 +7,8 @@ test that asserts a KEEP session persists candidates at `status=extracted`.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from .models import CandidateEnvelope
 
 
@@ -24,9 +26,16 @@ class InMemoryCandidateStore:
     async def get(self, candidate_id: str) -> CandidateEnvelope | None:
         return self._by_id.get(candidate_id)
 
-    async def list_by_status(self, status: str, *, limit: int = 100) -> list[CandidateEnvelope]:
+    async def list_by_status(
+        self, status: str, *, limit: int = 100, order: Literal["asc", "desc"] = "asc"
+    ) -> list[CandidateEnvelope]:
         matches = [c for c in self._by_id.values() if c.status == status]
         matches.sort(key=lambda c: c.created_at)
+        # DESC is the exact reverse of the deterministic ASC order — ties on
+        # created_at keep their (reversed) stable-sort order, so it stays
+        # deterministic. `desc` serves the newest-first rejected archive.
+        if order == "desc":
+            matches.reverse()
         return matches[:limit]
 
     async def supersede(self, content_hash: str) -> None:

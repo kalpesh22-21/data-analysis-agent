@@ -6,6 +6,7 @@ task items 8 (ref-only) + 9 (idempotency).
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from data_agent.learning.candidate import (
     CandidateStatus,
@@ -116,3 +117,73 @@ async def test_list_by_status_respects_limit():
                              evidence_refs=("evidence::sess-1::x",))
         await store.put(env)
     assert len(await store.list_by_status(CandidateStatus.EXTRACTED, limit=2)) == 2
+
+
+# --- order= (review queue ASC vs. rejected archive DESC) --------------------
+
+
+async def _put_dated(store, summary, cand, *, status, ids_and_dates):
+    for cid, created_at in ids_and_dates:
+        env = replace(
+            build_envelope(cand, summary, candidate_id=cid,
+                           evidence_refs=("evidence::sess-1::x",)),
+            status=status, created_at=created_at,
+        )
+        await store.put(env)
+
+
+async def test_list_by_status_defaults_to_created_at_asc():
+    """Default order (the review queue) is oldest-first — FIFO drain, unchanged."""
+    store = InMemoryCandidateStore()
+    summary = make_summary()
+    cand = _extracted(summary)
+    await _put_dated(store, summary, cand, status=CandidateStatus.IN_REVIEW,
+                     ids_and_dates=[
+                         ("candidate::h::1", "2026-07-03T00:00:01+00:00"),
+                         ("candidate::h::0", "2026-07-03T00:00:00+00:00"),
+                         ("candidate::h::2", "2026-07-03T00:00:02+00:00"),
+                     ])
+    got = await store.list_by_status(CandidateStatus.IN_REVIEW)
+    assert [c.candidate_id for c in got] == [
+        "candidate::h::0", "candidate::h::1", "candidate::h::2"
+    ]
+    # Explicit order="asc" is identical to the default.
+    got_asc = await store.list_by_status(CandidateStatus.IN_REVIEW, order="asc")
+    assert [c.candidate_id for c in got_asc] == [c.candidate_id for c in got]
+
+
+async def test_rejected_archive_lists_newest_first_with_order_desc():
+    """The durable archive lists DESC so a LIMIT trims OLD history, not present
+    rejects — the most-recent rejections stay visible (ui-inbox-type-archive §Retention)."""
+    store = InMemoryCandidateStore()
+    summary = make_summary()
+    cand = _extracted(summary)
+    await _put_dated(store, summary, cand, status=CandidateStatus.REJECTED,
+                     ids_and_dates=[
+                         ("candidate::h::0", "2026-07-03T00:00:00+00:00"),
+                         ("candidate::h::2", "2026-07-03T00:00:02+00:00"),
+                         ("candidate::h::1", "2026-07-03T00:00:01+00:00"),
+                     ])
+    got = await store.list_by_status(CandidateStatus.REJECTED, order="desc")
+    assert [c.candidate_id for c in got] == [
+        "candidate::h::2", "candidate::h::1", "candidate::h::0"
+    ]
+    # DESC is the exact reverse of ASC (mirror, no divergent tiebreak).
+    got_asc = await store.list_by_status(CandidateStatus.REJECTED, order="asc")
+    assert [c.candidate_id for c in got] == list(
+        reversed([c.candidate_id for c in got_asc])
+    )
+
+
+async def test_order_desc_limit_keeps_newest_not_oldest():
+    """DESC + LIMIT keeps the NEWEST N — the regression the archive change guards."""
+    store = InMemoryCandidateStore()
+    summary = make_summary()
+    cand = _extracted(summary)
+    await _put_dated(store, summary, cand, status=CandidateStatus.REJECTED,
+                     ids_and_dates=[
+                         (f"candidate::h::{i}", f"2026-07-03T00:00:0{i}+00:00")
+                         for i in range(5)
+                     ])
+    got = await store.list_by_status(CandidateStatus.REJECTED, limit=2, order="desc")
+    assert [c.candidate_id for c in got] == ["candidate::h::4", "candidate::h::3"]

@@ -108,6 +108,81 @@
     font-size: 0.9rem;
   }
 
+  /* --- Controls: status toggle + type tabs --- */
+  .inbox-controls {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .status-toggle {
+    display: inline-flex;
+    align-self: flex-start;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+
+  .status-toggle .status-btn {
+    background: var(--color-surface);
+    color: var(--color-text-dim);
+    border: none;
+    border-radius: 0;
+    padding: var(--space-2) var(--space-4);
+    font-size: 0.85rem;
+  }
+
+  .status-toggle .status-btn + .status-btn {
+    border-left: 1px solid var(--color-border);
+  }
+
+  .status-toggle .status-btn.is-active {
+    background: var(--color-accent);
+    color: var(--color-accent-text);
+  }
+
+  .type-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .type-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    background: transparent;
+    color: var(--color-text-dim);
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    padding: var(--space-2) var(--space-3);
+    font-size: 0.85rem;
+  }
+
+  .type-tab.is-active {
+    color: var(--color-text);
+    border-bottom-color: var(--color-accent);
+  }
+
+  .tab-count {
+    display: inline-flex;
+    justify-content: center;
+    min-width: 1.4em;
+    padding: 0 var(--space-2);
+    border-radius: 999px;
+    background: var(--color-surface-2);
+    color: var(--color-text-dim);
+    font-size: 0.7rem;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .type-tab.is-active .tab-count {
+    background: var(--color-accent);
+    color: var(--color-accent-text);
+  }
+
   /* --- Inbox list --- */
   #inbox-list {
     list-style: none;
@@ -141,6 +216,12 @@
     gap: var(--space-3);
   }
 
+  /* Items outside the active type tab stay in the DOM but are hidden. The
+     attribute selector out-specifies `.inbox-item { display: flex }`. */
+  .inbox-item[hidden] {
+    display: none;
+  }
+
   .item-header {
     display: flex;
     flex-wrap: wrap;
@@ -163,6 +244,20 @@
     padding: var(--space-1) var(--space-3);
     font-size: 0.75rem;
     color: var(--color-text-dim);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .item-status {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--color-error-border);
+    background: var(--color-error-bg);
+    color: var(--color-error-text);
+    border-radius: 999px;
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
     font-family: ui-monospace, SFMono-Regular, monospace;
   }
 
@@ -286,6 +381,15 @@
 
   <section aria-labelledby="inbox-heading">
     <h2 id="inbox-heading" class="sr-only">Items awaiting review</h2>
+
+    <div class="inbox-controls">
+      <div class="status-toggle" data-testid="inbox-status-toggle" role="group" aria-label="Inbox status">
+        <button type="button" class="status-btn is-active" data-status="in_review" aria-pressed="true">Review queue</button>
+        <button type="button" class="status-btn" data-status="rejected" aria-pressed="false">Archived</button>
+      </div>
+      <div class="type-tabs" data-testid="inbox-tabs" role="tablist" aria-label="Candidate type"></div>
+    </div>
+
     <ul id="inbox-list" data-testid="inbox-list" aria-live="polite"></ul>
     <div id="inbox-empty" data-testid="inbox-empty" role="status" hidden></div>
   </section>
@@ -297,7 +401,16 @@
 
   // write_plane === "offline" pre-disables approve so a reviewer never clicks
   // into a 503 (contract §5). Set by loadHealth() before the list renders.
-  var state = { offline: false };
+  var state = { offline: false, status: "in_review", activeType: "blueprint", items: [] };
+
+  // Fixed, always-shown candidate types (contract §Frontend): stable order,
+  // readable labels, live count badges. Grouping is client-side on item.type.
+  var TYPES = [
+    { type: "blueprint", label: "Blueprints" },
+    { type: "global_knowledge", label: "Global Knowledge" },
+    { type: "user_knowledge", label: "User Knowledge" },
+    { type: "schema_edit", label: "Schema Edits" },
+  ];
 
   var els = {
     countLine: document.getElementById("count-line"),
@@ -307,7 +420,17 @@
     healthBanner: document.getElementById("health-banner"),
     list: document.getElementById("inbox-list"),
     empty: document.getElementById("inbox-empty"),
+    tabs: document.querySelector('[data-testid="inbox-tabs"]'),
+    statusToggle: document.querySelector('[data-testid="inbox-status-toggle"]'),
   };
+
+  // Per-type tab controls, built once at init and keyed by candidate type.
+  var tabEls = {};
+
+  // Monotonic token for loadInbox(): status toggles + action refreshes can
+  // issue overlapping fetches, so only the latest one is allowed to mutate
+  // state/UI (last-issued wins, not last-resolved). See loadInbox().
+  var loadSeq = 0;
 
   function clearError() {
     els.errorBanner.hidden = true;
@@ -336,6 +459,127 @@
     }
   }
 
+  // --- Type tabs + status toggle ------------------------------------------
+
+  function typeLabel(type) {
+    for (var i = 0; i < TYPES.length; i++) {
+      if (TYPES[i].type === type) return TYPES[i].label;
+    }
+    return type || "unknown";
+  }
+
+  // Count the currently-fetched set by type. All four keys are always present
+  // (including 0) so every tab shows a badge (contract §Frontend).
+  function computeCounts() {
+    var counts = {};
+    TYPES.forEach(function (t) { counts[t.type] = 0; });
+    state.items.forEach(function (item) {
+      if (Object.prototype.hasOwnProperty.call(counts, item.type)) {
+        counts[item.type] += 1;
+      }
+    });
+    return counts;
+  }
+
+  // Build the four type tabs once as a roving-tabindex tablist. Clicking a tab
+  // is a client-side filter only — it never refetches.
+  function buildTabs() {
+    TYPES.forEach(function (t) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "type-tab";
+      btn.setAttribute("role", "tab");
+      btn.setAttribute("data-testid", "inbox-tab");
+      btn.setAttribute("data-type", t.type);
+      btn.setAttribute("aria-selected", "false");
+      btn.tabIndex = -1;
+      var label = document.createElement("span");
+      label.className = "tab-label";
+      label.textContent = t.label;
+      btn.appendChild(label);
+      var count = document.createElement("span");
+      count.className = "tab-count";
+      count.setAttribute("data-testid", "inbox-tab-count");
+      count.textContent = "0";
+      btn.appendChild(count);
+      btn.addEventListener("click", function () { setActiveType(t.type); });
+      tabEls[t.type] = { btn: btn, count: count };
+      els.tabs.appendChild(btn);
+    });
+    els.tabs.addEventListener("keydown", onTabKeydown);
+  }
+
+  // Left/Right/Home/End roving focus across the tablist.
+  function onTabKeydown(event) {
+    var idx = -1;
+    for (var i = 0; i < TYPES.length; i++) {
+      if (TYPES[i].type === state.activeType) { idx = i; break; }
+    }
+    if (idx === -1) return;
+    var next = idx;
+    if (event.key === "ArrowRight") next = (idx + 1) % TYPES.length;
+    else if (event.key === "ArrowLeft") next = (idx - 1 + TYPES.length) % TYPES.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = TYPES.length - 1;
+    else return;
+    event.preventDefault();
+    var type = TYPES[next].type;
+    setActiveType(type);
+    tabEls[type].btn.focus();
+  }
+
+  // Wire the two-option status toggle (Review queue ↔ Archived). Switching
+  // status REFETCHES the list for that status (contract §Status toggle).
+  function buildStatusToggle() {
+    els.statusToggle.querySelectorAll(".status-btn").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var next = btn.dataset.status;
+        if (next === state.status) return;
+        state.status = next;
+        loadInbox();
+      });
+    });
+  }
+
+  function updateStatusToggle() {
+    els.statusToggle.querySelectorAll(".status-btn").forEach(function (btn) {
+      var active = btn.dataset.status === state.status;
+      btn.classList.toggle("is-active", active);
+      btn.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+  }
+
+  // Filter the rendered list to a type (client-side; no refetch).
+  function setActiveType(type) {
+    state.activeType = type;
+    render();
+  }
+
+  // On a fresh fetch, keep the current tab if it still has items (preserves the
+  // reviewer's tab across status switches / action refreshes), else fall back to
+  // the first non-empty type, else the default (blueprint).
+  function pickDefaultType() {
+    var counts = computeCounts();
+    if (counts[state.activeType] > 0) return state.activeType;
+    for (var i = 0; i < TYPES.length; i++) {
+      if (counts[TYPES[i].type] > 0) return TYPES[i].type;
+    }
+    return "blueprint";
+  }
+
+  // Update tab active state + count badges + roving tabindex.
+  function updateTabs(counts) {
+    TYPES.forEach(function (t) {
+      var refs = tabEls[t.type];
+      if (!refs) return;
+      var active = t.type === state.activeType;
+      refs.count.textContent = String(counts[t.type]);
+      refs.btn.classList.toggle("is-active", active);
+      refs.btn.setAttribute("aria-selected", active ? "true" : "false");
+      refs.btn.tabIndex = active ? 0 : -1;
+    });
+  }
+
   // --- Per-item confirm / disable helpers ---------------------------------
 
   // Reset every action button in a row back to its default (non-confirming)
@@ -360,8 +604,9 @@
   }
 
   // Re-enable controls after an error. Approve stays disabled in offline mode
-  // (write plane can't land) and retract stays disabled (list is all
-  // in_review — retract only applies to validated items, contract §4).
+  // (write plane can't land) and retract stays disabled — neither the
+  // Review-queue (in_review) nor the Archive (rejected) list holds validated
+  // items, and retract only applies to validated items (contract §4).
   function enableActions(actions) {
     actions.querySelectorAll("button").forEach(function (btn) {
       var act = btn.dataset.action;
@@ -535,6 +780,15 @@
     type.setAttribute("data-testid", "inbox-type");
     type.textContent = item.type || "unknown";
     header.appendChild(type);
+    // Archived (terminal) items carry a REJECTED status badge (contract
+    // §Frontend). Its presence also drives the read-only, no-actions path below.
+    if (item.status === "rejected") {
+      var status = document.createElement("span");
+      status.className = "item-status";
+      status.setAttribute("data-testid", "inbox-status");
+      status.textContent = "REJECTED";
+      header.appendChild(status);
+    }
     li.appendChild(header);
 
     // Body: summary.
@@ -565,6 +819,10 @@
     if (scan) li.appendChild(scan);
     var dedup = renderDedup(item);
     if (dedup) li.appendChild(dedup);
+
+    // Terminal (archived) items are read-only — no approve/reject/retract
+    // (contract §Actions). The service also guards this; the hide is UX.
+    if (item.status === "rejected") return li;
 
     // Actions.
     var actions = document.createElement("div");
@@ -599,38 +857,80 @@
     return li;
   }
 
-  function renderList(payload) {
-    clearNode(els.list);
-    var items = payload && Array.isArray(payload.items) ? payload.items : [];
-    var count = payload && typeof payload.count === "number" ? payload.count : items.length;
+  function emptyMessage() {
+    var where = state.status === "rejected" ? "the archive" : "the review queue";
+    return "No " + typeLabel(state.activeType).toLowerCase() + " in " + where;
+  }
+
+  // Render the whole fetched set from state (tabs + toggle + list). Items are
+  // grouped by type: the active tab is filtered to view, other-type items stay
+  // in the DOM but hidden. Counts are recomputed against the loaded status set.
+  function render() {
+    var counts = computeCounts();
+    var total = state.items.length;
+
+    updateStatusToggle();
+    updateTabs(counts);
 
     els.countLine.textContent =
-      count === 1 ? "1 item awaiting review" : count + " items awaiting review";
+      state.status === "rejected"
+        ? (total === 1 ? "1 archived item" : total + " archived items")
+        : (total === 1 ? "1 item awaiting review" : total + " items awaiting review");
 
-    if (items.length === 0) {
-      els.empty.textContent = "Inbox is empty — nothing awaiting review";
-      els.empty.hidden = false;
-      return;
-    }
-    els.empty.hidden = true;
-    items.forEach(function (item) {
-      els.list.appendChild(renderItem(item));
+    clearNode(els.list);
+    // Active-type items first (stable), so the first DOM row is always the first
+    // visible row; other types follow, hidden. Keeps the whole set in the DOM.
+    var ordered = state.items.slice().sort(function (a, b) {
+      var ai = a.type === state.activeType ? 0 : 1;
+      var bi = b.type === state.activeType ? 0 : 1;
+      return ai - bi;
     });
+    ordered.forEach(function (item) {
+      var li = renderItem(item);
+      li.hidden = item.type !== state.activeType;
+      els.list.appendChild(li);
+    });
+
+    // Empty state is per active tab + per status.
+    if (counts[state.activeType] === 0) {
+      els.empty.textContent = emptyMessage();
+      els.empty.hidden = false;
+    } else {
+      els.empty.hidden = true;
+    }
   }
 
   // --- Loaders -------------------------------------------------------------
 
+  // Load the list for the active status (?status=in_review | rejected). Called
+  // on bootstrap, on a status switch, and after a successful action.
   function loadInbox() {
-    return fetch("/api/inbox", { headers: { Accept: "application/json" } })
+    clearError();
+    // Capture this call's token; a newer loadInbox() bumps loadSeq and makes
+    // any earlier (still in-flight) response stale, so it bails out below.
+    var seq = ++loadSeq;
+    var url = "/api/inbox?status=" + encodeURIComponent(state.status);
+    return fetch(url, { headers: { Accept: "application/json" } })
       .then(function (response) {
         if (!response.ok) {
           return response.text().then(function (text) {
+            if (seq !== loadSeq) return;
+            // Error path skips render(), so sync the toggle highlight here or
+            // it desyncs from state.status after a failed status switch.
+            updateStatusToggle();
             showError("HTTP_" + response.status, text || response.statusText);
           });
         }
-        return response.json().then(renderList);
+        return response.json().then(function (payload) {
+          if (seq !== loadSeq) return;
+          state.items = payload && Array.isArray(payload.items) ? payload.items : [];
+          state.activeType = pickDefaultType();
+          render();
+        });
       })
       .catch(function (err) {
+        if (seq !== loadSeq) return;
+        updateStatusToggle();
         showError("NETWORK", String(err));
       });
   }
@@ -661,7 +961,10 @@
       });
   }
 
-  // Bootstrap: health first (gates approve), then the list.
+  // Bootstrap: build the static controls, learn write-plane health (gates
+  // approve), then load the default Review-queue list.
+  buildTabs();
+  buildStatusToggle();
   loadHealth().then(loadInbox);
 })();
 </script>

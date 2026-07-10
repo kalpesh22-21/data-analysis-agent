@@ -55,9 +55,66 @@
     color: var(--color-text-dim);
   }
 
+  .header-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+  }
+
+  .new-session-button {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    background: var(--color-surface-2);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: 999px;
+    padding: var(--space-2) var(--space-4);
+    font-size: 0.85rem;
+  }
+
+  .new-session-button:hover:not(:disabled) {
+    border-color: var(--color-accent);
+  }
+
+  .new-session-icon {
+    font-size: 1rem;
+    line-height: 1;
+  }
+
   form#message-form {
     display: flex;
     gap: var(--space-2);
+    align-items: center;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 999px;
+    padding: var(--space-1);
+    padding-left: var(--space-3);
+  }
+
+  form#message-form input[type="text"] {
+    border: none;
+    background: transparent;
+    padding: var(--space-2) var(--space-1);
+  }
+
+  form#message-form input[type="text"]:focus {
+    outline: none;
+  }
+
+  form#message-form:focus-within {
+    border-color: var(--color-accent);
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  form#message-form #send-button {
+    border-radius: 999px;
+    padding: var(--space-2) var(--space-5);
+    flex: none;
   }
 
   input[type="text"] {
@@ -151,9 +208,10 @@
     text-overflow: ellipsis;
   }
 
-  /* --- Conversation transcript (UI Slice 3) --- */
-  /* #transcript is a plain flex container; each turn is its own card
-     (.turn-block) so the answer section can repeat once per turn. */
+  /* --- Conversation transcript (iMessage-style bubble list) --- */
+  /* #transcript is a scrollable, vertical message list; each turn is a
+     .turn-block flex column whose direct children (question bubble, answer
+     bubble, meta, status, detail panels) align left/right like a chat. */
   #transcript {
     background: none;
     border: none;
@@ -161,6 +219,8 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
+    max-height: 60vh;
+    overflow-y: auto;
   }
 
   #transcript:empty::after {
@@ -169,35 +229,64 @@
     font-size: 0.9rem;
   }
 
+  /* One turn = a stack of chat items; no card chrome — the bubbles carry it. */
   .turn-block {
-    background: var(--color-surface);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius);
-    padding: var(--space-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
   }
 
+  /* USER bubble — right-aligned accent, classic asymmetric tail corner. */
   .turn-question {
-    font-weight: 600;
-    margin: 0 0 var(--space-3) 0;
+    align-self: flex-end;
+    max-width: 78%;
+    margin: 0;
+    padding: var(--space-2) var(--space-4);
+    background: var(--color-accent);
+    color: var(--color-accent-text);
+    border-radius: 18px 18px 4px 18px;
     white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.4;
   }
 
+  /* ASSISTANT bubble — left-aligned surface, mirror-corner tail. */
   .turn-answer {
+    align-self: flex-start;
+    max-width: 78%;
+    padding: var(--space-2) var(--space-4);
+    background: var(--color-surface-2);
+    color: var(--color-text);
+    border-radius: 18px 18px 18px 4px;
     white-space: pre-wrap;
+    word-break: break-word;
     line-height: 1.5;
   }
 
   .turn-answer:empty::after {
-    /* Neutral placeholder — covers both an in-progress turn and a
-       scope-withheld / paused past turn without implying an answer is coming. */
-    content: "—";
+    /* Empty answer = in-progress / scope-withheld / paused past turn. Keep the
+       `:empty` selector the renderers depend on, but read as a subtle typing /
+       placeholder dot cluster rather than a bare em dash. */
+    content: "•••";
+    letter-spacing: 0.15em;
     color: var(--color-text-dim);
+  }
+
+  /* Assistant-side supporting content — meta chips, status, detail panels —
+     hang under the answer bubble, left-aligned. The flex `gap` handles vertical
+     rhythm, so the legacy top-margins are neutralized here. */
+  .turn-block .answer-meta,
+  .turn-block .turn-status,
+  .turn-block .result-panel {
+    align-self: flex-start;
+    max-width: 92%;
+    margin-top: 0;
   }
 
   .turn-status {
     font-size: 0.85rem;
     color: var(--color-text-dim);
-    margin-top: var(--space-2);
+    margin-top: 0;
   }
 
   #ask-user[hidden] {
@@ -374,6 +463,19 @@
     color: var(--color-text-dim);
   }
 
+  /* Plain-English assumptions — a bulleted list, never code. Reuses the shared
+     .result-panel chrome; only the list itself needs layout tokens. */
+  .assumptions-list {
+    margin: 0;
+    padding-left: var(--space-5);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    font-size: 0.85rem;
+    line-height: 1.4;
+    color: var(--color-text);
+  }
+
   /* Per-SQL lineage breakdown (history turns only) */
   .per-sql-item {
     margin-bottom: var(--space-3);
@@ -475,7 +577,19 @@
 <body>
 <main>
   <header>
-    <h1>Data Agent — Phase 0</h1>
+    <div class="header-row">
+      <h1>Data Agent — Phase 0</h1>
+      <button
+        type="button"
+        id="new-session-button"
+        data-testid="new-session-button"
+        class="new-session-button"
+        title="Start a new session"
+      >
+        <span class="new-session-icon" aria-hidden="true">⟳</span>
+        <span>New session</span>
+      </button>
+    </div>
     <p class="session-line">Session: <span id="session-line">connecting…</span></p>
   </header>
 
@@ -547,6 +661,11 @@
 
       <div class="turn-status" data-testid="status"></div>
 
+      <details class="assumptions-panel result-panel" data-testid="assumptions-panel" hidden>
+        <summary>Assumptions</summary>
+        <ul class="assumptions-list"></ul>
+      </details>
+
       <details class="sql-panel result-panel" data-testid="sql-panel" hidden>
         <summary>Show the query</summary>
         <div class="sql-blocks"></div>
@@ -589,8 +708,26 @@
   // holds parsed rows — only this File reference from the picker.
   var uploadFile = null;
 
+  // Stream lifecycle guards. Each turn (and each reset) bumps `streamEpoch` and
+  // becomes the sole owner of that epoch; events/finalizers whose captured epoch
+  // != the current one are dropped, so an abandoned SSE stream is fully inert.
+  // `currentController` aborts the in-flight fetch when a turn is superseded or
+  // the session is reset (stops the server-side read too, not just the UI).
+  var streamEpoch = 0;
+  var currentController = null;
+
+  // Supersede any in-flight stream and open a new epoch. Returns this stream's
+  // epoch for the caller to capture and gate its own finalizers on.
+  function beginStream() {
+    streamEpoch += 1;
+    if (currentController) currentController.abort();
+    currentController = new AbortController();
+    return streamEpoch;
+  }
+
   var els = {
     sessionLine: document.getElementById("session-line"),
+    newSessionButton: document.getElementById("new-session-button"),
     form: document.getElementById("message-form"),
     input: document.getElementById("message-input"),
     sendButton: document.getElementById("send-button"),
@@ -675,7 +812,17 @@
     var block = frag.querySelector(".turn-block");
     setBlockQuestion(block, question);
     els.transcript.appendChild(block);
+    scrollTranscriptToEnd();
     return block;
+  }
+
+  // Keep the newest message in view (messenger-style). The transcript is a
+  // max-height scroll container, so nudging its own scrollTop won't move the
+  // page — used on turn creation and when a live `result` arrives.
+  function scrollTranscriptToEnd() {
+    // Instant (behavior:"auto") — no animation to flake Playwright visibility
+    // waits or fight prefers-reduced-motion.
+    els.transcript.scrollTo({ top: els.transcript.scrollHeight, behavior: "auto" });
   }
 
   function setBlockQuestion(block, question) {
@@ -723,6 +870,27 @@
       sqlBlocks.appendChild(pre);
     });
     sqlPanel.hidden = false;
+  }
+
+  // Field 1b — `assumptions: string[] | null`: plain-English sentences the agent
+  // made when answering (never SQL/code). Rendered as an escaped bulleted list
+  // via textContent (defense-in-depth even though model-authored). null / [] →
+  // hide the panel — same omit-when-empty convention as renderSql.
+  function renderAssumptions(root, assumptions) {
+    var panel = root.querySelector(".assumptions-panel");
+    var list = root.querySelector(".assumptions-list");
+    clearNode(list);
+    if (!Array.isArray(assumptions) || assumptions.length === 0) {
+      panel.hidden = true;
+      return;
+    }
+    assumptions.forEach(function (assumption) {
+      var li = document.createElement("li");
+      li.setAttribute("data-testid", "assumption-item");
+      li.textContent = cellText(assumption);
+      list.appendChild(li);
+    });
+    panel.hidden = false;
   }
 
   // Field 2 — `result_table: {columns, preview_rows, row_count, truncated} | null`.
@@ -904,6 +1072,7 @@
   function renderTurnBlock(block, data) {
     setBlockAnswer(block, data.assistant_text);
     setBlockStatus(block, data);
+    renderAssumptions(block, data.assumptions);
     renderSql(block, data.sql);
     renderResultTable(block, data.result_table);
     renderBlueprintChip(block, data.blueprint_use);
@@ -944,6 +1113,7 @@
     var toolCalls = Array.isArray(turn.tool_calls) ? turn.tool_calls : [];
     renderTurnBlock(block, {
       assistant_text: turn.answer,
+      assumptions: turn.assumptions,
       sql: collectSql(toolCalls),
       result_table: pickResultTable(toolCalls),
       provenance: turn.provenance_union,
@@ -1001,6 +1171,11 @@
   }
 
   function showAskUser(pendingQuestion) {
+    // Re-enable at the render boundary: a superseded resume's gated .finally may
+    // have skipped setAskUserBusy(false), which would otherwise orphan the
+    // freetext input + Submit disabled on a re-rendered (possibly chip-less)
+    // question. Resetting here clears that regardless of which epoch orphaned it.
+    setAskUserBusy(false);
     els.askUserQuestion.textContent = pendingQuestion.question || "";
     clearNode(els.askUserOptions);
 
@@ -1098,6 +1273,7 @@
       // Populate the in-progress turn block (no clearing — prior blocks stay).
       if (inProgressBlock) {
         renderTurnBlock(inProgressBlock, data);
+        scrollTranscriptToEnd();
       }
       if (data.pending_question) {
         showAskUser(data.pending_question);
@@ -1109,15 +1285,20 @@
     }
   }
 
-  function runTurn(url, body) {
+  function runTurn(url, body, myEpoch) {
     clearError();
+    var signal = currentController ? currentController.signal : undefined;
     return fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: signal,
     }).then(function (response) {
+      // Superseded before the response arrived — this stream is abandoned.
+      if (myEpoch !== streamEpoch) return;
       if (!response.ok) {
         return response.text().then(function (text) {
+          if (myEpoch !== streamEpoch) return;
           var message = text || response.statusText;
           try {
             var parsed = JSON.parse(text);
@@ -1128,7 +1309,21 @@
           showError("HTTP_" + response.status, message);
         });
       }
-      return consumeSSE(response, handleSSEEvent);
+      // Drop every event (progress/result/pending_question/error) from an
+      // abandoned stream: the epoch check makes the whole handler inert.
+      return consumeSSE(response, function (eventName, data) {
+        if (myEpoch !== streamEpoch) return;
+        handleSSEEvent(eventName, data);
+      });
+    }).catch(function (err) {
+      // Aborting on reset/supersede is expected — never surface it as an error.
+      if (err && err.name === "AbortError") return;
+      // Stale-epoch rejections belong to an abandoned stream — stay silent.
+      if (myEpoch !== streamEpoch) return;
+      // Live-epoch fetch failure (e.g. server down → TypeError: Failed to fetch):
+      // surface it instead of re-throwing into an unhandled rejection. The non-OK
+      // HTTP branch returns normally (already showed its error), so no double-report.
+      showError("NETWORK_ERROR", String(err));
     });
   }
 
@@ -1137,19 +1332,35 @@
       showError("NO_SESSION", "Session not ready yet — try again in a moment.");
       return;
     }
+    var myEpoch = beginStream();
     setBusy(true);
     hideAskUser();
     clearProgress();
     // Fresh turn block, question rendered immediately, appended — prior blocks
     // are untouched. The live `result` event fills this block (§5.3).
     inProgressBlock = createTurnBlock(message);
-    runTurn("/api/turn", { session_id: sessionId, message: message }).finally(function () {
-      setBusy(false);
-    });
+    runTurn("/api/turn", { session_id: sessionId, message: message }, myEpoch).finally(
+      function () {
+        // A stale, superseded stream's finalizer must not clobber the new turn's
+        // busy state — only the current epoch's owner re-enables the composer.
+        if (myEpoch === streamEpoch) setBusy(false);
+      }
+    );
   }
 
   function submitAnswer(answer) {
     if (!answer || !answer.trim()) return;
+    // Defense in depth: never resume against a torn-down/unminted session.
+    if (!sessionId) {
+      showError("NO_SESSION", "Session not ready yet — try again in a moment.");
+      return;
+    }
+    var myEpoch = beginStream();
+    // A chip click can land in the gap between a `result` (which shows ask-user)
+    // and the prior stream's .finally; that finally is now stale and won't run
+    // setBusy(false). The composer should always be usable during a resume, so
+    // enable it here explicitly (consistent with the normal send flow).
+    setBusy(false);
     setAskUserBusy(true);
     // Resume continues the paused turn. Within a page session inProgressBlock is
     // already the paused block; after a reload rehydrate aimed it at the paused
@@ -1157,9 +1368,11 @@
     if (!inProgressBlock) {
       inProgressBlock = createTurnBlock("");
     }
-    runTurn("/api/turn/resume", { session_id: sessionId, answer: answer }).finally(function () {
-      setAskUserBusy(false);
-    });
+    runTurn("/api/turn/resume", { session_id: sessionId, answer: answer }, myEpoch).finally(
+      function () {
+        if (myEpoch === streamEpoch) setAskUserBusy(false);
+      }
+    );
   }
 
   els.form.addEventListener("submit", function (event) {
@@ -1465,6 +1678,66 @@
         els.sessionLine.textContent = sessionId;
       });
   }
+
+  // "New session": fully reset the client and mint a BRAND-NEW session_id. This
+  // must NOT reuse the old id — clearSavedSession() drops the persisted id and
+  // mintSession() issues a fresh POST /api/session whose new id replaces the old
+  // in both `sessionId` and sessionStorage. No rehydrate: a new session has no
+  // history, so we intentionally leave the transcript empty (":empty" placeholder).
+  function resetSession() {
+    els.newSessionButton.disabled = true;
+
+    // 0. Supersede + abort any still-draining stream. Bumping the epoch makes
+    //    every in-flight event and finalizer from the old turn a no-op; aborting
+    //    the fetch also stops the server-side read (belt and suspenders).
+    streamEpoch += 1;
+    if (currentController) {
+      currentController.abort();
+      currentController = null;
+    }
+
+    // 1. Drop the stale session so nothing can reuse it.
+    clearSavedSession();
+    sessionId = null;
+
+    // 2. Reset transcript + progress + ask-user + error banner.
+    clearNode(els.transcript);
+    inProgressBlock = null;
+    clearProgress();
+    hideAskUser();
+    clearError();
+
+    // 2a. Re-enable the composer + ask-user controls immediately. The old
+    //     stream's gated finalizer won't touch them (its epoch is now stale).
+    setBusy(false);
+    setAskUserBusy(false);
+
+    // 2b. Reset the upload widget back to its initial state.
+    clearNode(els.uploadColumnList);
+    els.uploadConfirmButton.hidden = true;
+    els.uploadConfirmButton.disabled = false;
+    els.uploadResult.hidden = true;
+    els.uploadResult.textContent = "";
+    els.uploadMappingWarning.hidden = true;
+    els.uploadMappingWarning.textContent = "";
+    els.uploadFileInput.value = "";
+    uploadFile = null;
+
+    els.sessionLine.textContent = "connecting…";
+
+    // 3. Re-mint: repoints sessionId, persists the new id, updates the line.
+    //    4. Guard double-clicks via the disabled flag; re-enable in .finally.
+    mintSession()
+      .catch(function (err) {
+        els.sessionLine.textContent = "failed to start session";
+        showError("SESSION_RESET_FAILED", String(err));
+      })
+      .finally(function () {
+        els.newSessionButton.disabled = false;
+      });
+  }
+
+  els.newSessionButton.addEventListener("click", resetSession);
 
   // Bootstrap: reuse a saved session_id if present (→ rehydrate the transcript),
   // otherwise mint a fresh one, then rehydrate.

@@ -31,6 +31,8 @@ candidate).
 
 from __future__ import annotations
 
+from typing import Literal
+
 from ..candidate.models import CandidateEnvelope, CandidateStatus
 from ..candidate.store import CandidateStore
 from ..promotion.models import ProbeResult
@@ -75,9 +77,23 @@ class ReviewInbox:
             store, probe=_NoOpProbe(), hit_counts=_ZeroHitCounts(),
         )
 
-    async def list(self, *, limit: int = 100) -> list[InboxItem]:
-        """The current inbox: every `in_review` candidate as a reviewer view."""
-        envelopes = await self._store.list_by_status(CandidateStatus.IN_REVIEW, limit=limit)
+    async def list(
+        self,
+        *,
+        status: str = CandidateStatus.IN_REVIEW,
+        limit: int = 100,
+        order: Literal["asc", "desc"] = "asc",
+    ) -> list[InboxItem]:
+        """The inbox projection for *status* (default `in_review`, the review queue).
+
+        The archive view passes `status=rejected` (durable rejected rows, D29) so the
+        SAME projection also serves the Archived tab (ui-inbox-type-archive contract).
+        The default (`status=in_review`, `order=asc`) is unchanged, so every existing
+        caller keeps the byte-identical review-queue view. The caller passes
+        `order="desc"` for the archive so the LIMIT trims OLD history, not present
+        rejects — the ordering is chosen explicitly here, never inferred from the
+        status string inside the store."""
+        envelopes = await self._store.list_by_status(status, limit=limit, order=order)
         return [InboxItem.from_envelope(env) for env in envelopes]
 
     async def _require(self, candidate_id: str, expected: str) -> CandidateEnvelope:

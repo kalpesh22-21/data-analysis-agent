@@ -73,6 +73,15 @@ async def _seed() -> None:
 
 asyncio.run(_seed())
 
+
+async def _reseed() -> None:
+    """Reset the in-memory store to the pristine two `in_review` seeds. The originals
+    (`_bp`/`_kn`) are frozen dataclasses that approve/reject never mutate (they
+    `replace()` into new docs), so re-putting them restores the review queue and clears
+    any rejected/validated rows a prior test left behind."""
+    store._by_id.clear()
+    await _seed()
+
 # --- wire the fakes-backed scheduler (no live infra) --------------------------
 
 scheduler = PromotionScheduler(
@@ -87,3 +96,14 @@ scheduler = PromotionScheduler(
 
 # `write_plane="full"` ⇒ `GET /inbox/health` reports full ⇒ the UI enables approve.
 app = create_inbox_app(inbox=ReviewInbox(store, scheduler=scheduler), write_plane="full")
+
+
+# TEST-ONLY reset hook (never mounted by production `create_inbox_app`): the session
+# store is shared + mutable across the whole `tests/e2e` run, so the Playwright suite
+# POSTs here before EACH test to restore the pristine two-candidate seed — making the
+# tests order-independent despite the one long-lived subprocess. No reviewer guard:
+# it exists only on this seeded app, bound to a fresh local test port.
+@app.post("/_test/reseed")
+async def _test_reseed() -> dict[str, bool]:
+    await _reseed()
+    return {"ok": True}

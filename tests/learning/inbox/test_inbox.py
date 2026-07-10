@@ -11,6 +11,7 @@ entity-span stripping (D17), retract→retired, and transition guards. Built aga
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from data_agent.learning.candidate.memory_candidate_store import InMemoryCandida
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.candidate.verdicts import LeakageVerdict
 from data_agent.learning.inbox import InboxTransitionError, ReviewInbox
+from data_agent.learning.inbox.models import InboxItem
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "learning"
 
@@ -64,6 +66,89 @@ async def test_inbox_item_summary_is_entity_free_one_liner():
     assert kn.summary == "the fiscal year starts in April"  # the statement
     bp = items["candidate::reason-blueprint_sampled::0"]
     assert bp.summary == "reason=blueprint_sampled example"  # the intent
+
+
+# --- status round-trips onto the projection (ui-inbox-type-archive contract) --
+
+
+async def test_inbox_item_status_round_trips_in_review():
+    """An `in_review` envelope projects `status='in_review'` (the review-queue default —
+    the badge driver the archive view flips)."""
+    store = await _store_with_all_reasons()  # every fixture is in_review
+    items = await ReviewInbox(store).list()
+    assert items, "the seeded store must project at least one in_review item"
+    assert all(it.status == CandidateStatus.IN_REVIEW for it in items)
+    assert all(it.status == "in_review" for it in items)
+
+
+async def test_inbox_item_status_round_trips_from_rejected_envelope():
+    """A REJECTED envelope projects `status='rejected'` verbatim onto the `InboxItem`
+    (drives the archive REJECTED badge); the rest of the projection still derives (the
+    reason is re-derived, the summary stays entity-free)."""
+    doc = copy.deepcopy(_load()["knowledge_pre_gate"])
+    doc["status"] = CandidateStatus.REJECTED
+    env = CandidateEnvelope.from_doc(doc)
+
+    item = InboxItem.from_envelope(env)
+    assert item.status == CandidateStatus.REJECTED
+    assert item.status == "rejected"
+    # Nothing else silently changed: id/type carry through and the reason re-derives.
+    assert item.candidate_id == env.candidate_id
+    assert item.type == "global_knowledge"
+    assert item.reason == "knowledge_pre_gate"
+
+
+async def test_list_status_rejected_returns_only_the_archive():
+    """`list(status='rejected')` is the durable archive projection — after a reject it
+    returns ONLY the rejected row, while the default `list()` (in_review) no longer
+    shows it. The rejected row is retained, not deleted (D29)."""
+    store = await _store_with_all_reasons()  # all in_review
+    inbox = ReviewInbox(store)
+    cid = "candidate::reason-knowledge_pre_gate::0"
+
+    await inbox.reject(cid)  # in_review → rejected (retained)
+
+    review = await inbox.list()  # default = in_review
+    assert cid not in {it.candidate_id for it in review}
+    assert all(it.status == "in_review" for it in review)
+
+    archive = await inbox.list(status=CandidateStatus.REJECTED)
+    assert {it.candidate_id for it in archive} == {cid}
+    assert all(it.status == "rejected" for it in archive)
+
+
+async def test_archive_list_is_newest_first_review_queue_stays_oldest_first():
+    """The archive (`order='desc'`) lists newest-first so a LIMIT trims OLD history,
+    not present rejects; the review queue keeps its oldest-first FIFO order."""
+    from dataclasses import replace
+
+    store = InMemoryCandidateStore()
+    base = CandidateEnvelope.from_doc(_load()["knowledge_pre_gate"])
+    # Three rejects at increasing timestamps, seeded out of order.
+    for cid, created_at in [
+        ("candidate::arch::0", "2026-07-03T00:00:00+00:00"),
+        ("candidate::arch::2", "2026-07-03T00:00:02+00:00"),
+        ("candidate::arch::1", "2026-07-03T00:00:01+00:00"),
+    ]:
+        await store.put(replace(base, candidate_id=cid,
+                                status=CandidateStatus.REJECTED, created_at=created_at))
+    # Two review-queue rows to prove ASC is untouched.
+    for cid, created_at in [
+        ("candidate::rev::1", "2026-07-03T01:00:01+00:00"),
+        ("candidate::rev::0", "2026-07-03T01:00:00+00:00"),
+    ]:
+        await store.put(replace(base, candidate_id=cid,
+                                status=CandidateStatus.IN_REVIEW, created_at=created_at))
+
+    inbox = ReviewInbox(store)
+    archive = await inbox.list(status=CandidateStatus.REJECTED, order="desc")
+    assert [it.candidate_id for it in archive] == [
+        "candidate::arch::2", "candidate::arch::1", "candidate::arch::0"
+    ]
+    review = await inbox.list()  # default in_review, order=asc
+    assert [it.candidate_id for it in review] == [
+        "candidate::rev::0", "candidate::rev::1"
+    ]
 
 
 # --- S7-reject-is-negative-signal ---------------------------------------------

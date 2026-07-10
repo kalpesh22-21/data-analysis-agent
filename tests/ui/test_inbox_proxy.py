@@ -100,6 +100,29 @@ def test_proxy_attaches_reviewer_token_server_side(
     assert hop["headers"]["X-Reviewer-Token"] == "bff-held-secret"
 
 
+def test_list_forwards_valid_status_query_param(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "REVIEWER_TOKEN", "bff-held-secret")
+
+    resp = client.get("/api/inbox", params={"status": "rejected"})
+    assert resp.status_code == 200
+    hop = fake_httpx[0]
+    # The validated status rides through to the upstream /inbox as a query param.
+    assert hop["url"].endswith("/inbox?status=rejected")
+    assert hop["headers"]["X-Reviewer-Token"] == "bff-held-secret"
+
+
+def test_list_rejects_unknown_status_at_bff(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    # A status outside {in_review, rejected} is a 400 at the BFF — never proxied.
+    assert client.get("/api/inbox", params={"status": "validated"}).status_code == 400
+    assert fake_httpx == []
+
+
 def test_proxy_action_attaches_token_and_hits_service(
     monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
 ) -> None:

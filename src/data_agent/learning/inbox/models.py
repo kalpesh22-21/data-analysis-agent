@@ -80,6 +80,7 @@ class InboxItem:
 
     candidate_id: str
     type: str  # blueprint | global_knowledge | user_knowledge | schema_edit
+    status: str  # the envelope's lifecycle status (in_review | rejected — archive view)
     reason: str  # one of InboxReason — re-derived, never stored
     summary: str  # entity-free one-liner
     payload_view: dict[str, Any]  # entity-free-where-required payload for review
@@ -93,6 +94,7 @@ class InboxItem:
         return cls(
             candidate_id=env.candidate_id,
             type=env.type,
+            status=env.status,
             reason=derive_inbox_reason(env),
             summary=_summary_of(env),
             payload_view=_entity_free_payload_view(env),

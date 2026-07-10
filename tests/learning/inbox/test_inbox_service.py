@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -96,10 +97,12 @@ def test_list_returns_exact_wire_shape(enabled: None) -> None:
     assert len(body["items"]) == 6
 
     item = next(i for i in body["items"] if i["candidate_id"] == KNOWLEDGE_ID)
-    # EXACTLY the §2a fields — no invented status/confidence/drift.
+    # EXACTLY the wire fields — the §List-API `status` plus the original set, no invented
+    # confidence/drift (ui-inbox-type-archive contract §List API).
     assert set(item) == {
         "candidate_id",
         "type",
+        "status",
         "reason",
         "summary",
         "payload_view",
@@ -109,13 +112,14 @@ def test_list_returns_exact_wire_shape(enabled: None) -> None:
         "created_at",
     }
     assert item["type"] == "global_knowledge"
+    assert item["status"] == "in_review"
     assert item["reason"] == "knowledge_pre_gate"
     assert item["summary"] == "the fiscal year starts in April"
     assert isinstance(item["payload_view"], dict)
     assert isinstance(item["evidence_refs"], list)
     assert item["entity_scan"]["result"] == "pass"
     assert item["dedup"] is None
-    assert "status" not in item and "confidence" not in item and "drift" not in item
+    assert "confidence" not in item and "drift" not in item
 
 
 def test_list_projects_dedup_and_entity_scan_via_to_doc(enabled: None) -> None:
@@ -128,6 +132,112 @@ def test_list_projects_dedup_and_entity_scan_via_to_doc(enabled: None) -> None:
     # entity_scan is serialized via .to_doc() (dict, not the dataclass).
     assert isinstance(conflict["entity_scan"], dict)
     assert "hits" in conflict["entity_scan"]
+
+
+# --- status filter (ui-inbox-type-archive contract §List API) ----------------
+
+
+def test_list_default_status_is_review_queue(enabled: None) -> None:
+    """No `?status=` ⇒ the review queue (in_review), byte-identical to before."""
+    store = InMemoryCandidateStore()
+    _populate(
+        store,
+        [
+            make_blueprint_candidate(status=CandidateStatus.IN_REVIEW),
+            with_type(
+                replace(
+                    make_blueprint_candidate(status=CandidateStatus.REJECTED),
+                    candidate_id="candidate::rejected::0",
+                    content_hash="hash-rejected",
+                ),
+                "global_knowledge",
+            ),
+        ],
+    )
+    body = _client(ReviewInbox(store)).get("/inbox", headers=AUTH).json()
+    assert body["count"] == 1
+    assert all(i["status"] == "in_review" for i in body["items"])
+
+
+def test_list_status_rejected_returns_only_archived(enabled: None) -> None:
+    """`?status=rejected` ⇒ the durable archive view (rejected rows only)."""
+    store = InMemoryCandidateStore()
+    _populate(
+        store,
+        [
+            make_blueprint_candidate(status=CandidateStatus.IN_REVIEW),
+            with_type(
+                replace(
+                    make_blueprint_candidate(status=CandidateStatus.REJECTED),
+                    candidate_id="candidate::rejected::0",
+                    content_hash="hash-rejected",
+                ),
+                "global_knowledge",
+            ),
+        ],
+    )
+    resp = _client(ReviewInbox(store)).get(
+        "/inbox", headers=AUTH, params={"status": "rejected"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["items"][0]["candidate_id"] == "candidate::rejected::0"
+    assert body["items"][0]["status"] == "rejected"
+
+
+def test_archive_list_returns_newest_reject_first(enabled: None) -> None:
+    """`?status=rejected` lists NEWEST-first so the LIMIT trims OLD history, not
+    present rejects; the default review queue keeps oldest-first (byte-identical)."""
+    store = InMemoryCandidateStore()
+    rejects = [
+        replace(
+            make_blueprint_candidate(status=CandidateStatus.REJECTED),
+            candidate_id=f"candidate::rejected::{i}",
+            content_hash=f"hash-rejected-{i}",
+            created_at=f"2026-07-03T00:00:0{i}+00:00",
+        )
+        for i in range(3)
+    ]
+    _populate(store, rejects)
+    resp = _client(ReviewInbox(store)).get(
+        "/inbox", headers=AUTH, params={"status": "rejected"}
+    )
+    assert resp.status_code == 200
+    ids = [i["candidate_id"] for i in resp.json()["items"]]
+    assert ids == [
+        "candidate::rejected::2",
+        "candidate::rejected::1",
+        "candidate::rejected::0",
+    ]
+
+
+def test_reject_then_archive_list_shows_row_with_status_rejected(enabled: None) -> None:
+    """End-to-end at the service seam (the unit mirror of the archive-on-reject E2E):
+    POST reject moves an in_review item out of the review queue, and
+    `GET /inbox?status=rejected` then returns it with `status='rejected'` (the archive
+    badge driver) — the row is archived, not deleted."""
+    store = _store_with_all_reasons()
+    client = _client(ReviewInbox(store))
+
+    assert client.post(f"/inbox/{KNOWLEDGE_ID}/reject", headers=AUTH).status_code == 200
+
+    # Gone from the default review queue.
+    review = client.get("/inbox", headers=AUTH).json()
+    assert all(i["candidate_id"] != KNOWLEDGE_ID for i in review["items"])
+
+    # Present in the archive with status=rejected (and its type/shape intact).
+    archive = client.get("/inbox", headers=AUTH, params={"status": "rejected"}).json()
+    row = next(i for i in archive["items"] if i["candidate_id"] == KNOWLEDGE_ID)
+    assert row["status"] == "rejected"
+    assert row["type"] == "global_knowledge"
+
+
+def test_list_invalid_status_is_400(enabled: None) -> None:
+    """A status outside {in_review, rejected} is a 400 — the inbox never enumerates an
+    arbitrary lifecycle state (defense-in-depth behind the BFF's own check)."""
+    resp = _default_client().get("/inbox", headers=AUTH, params={"status": "validated"})
+    assert resp.status_code == 400
 
 
 # --- redaction on the wire boundary (§2a: entity spans MUST be blanked) --------

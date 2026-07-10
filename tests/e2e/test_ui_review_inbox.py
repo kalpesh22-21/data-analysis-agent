@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import os
 
+import httpx
 import pytest
 
 _playwright = pytest.importorskip("playwright.sync_api")
 Page = _playwright.Page
+Locator = _playwright.Locator
 expect = _playwright.expect
 
 pytestmark = pytest.mark.skipif(
@@ -35,13 +37,49 @@ pytestmark = pytest.mark.skipif(
 )
 
 _INBOX_BFF_URL = "http://localhost:3001"
+# The seeded inbox service (same port the `running_inbox_stack` fixture boots it on).
+# The test-only `/_test/reseed` hook lives here — reachable directly (no reviewer token
+# needed) so each test starts from the pristine two-candidate seed.
+_INBOX_SERVICE_URL = "http://localhost:8101"
 _ASSERT_TIMEOUT_MS = 15_000
 
 
 @pytest.fixture(autouse=True)
 def _stack(running_inbox_stack: None) -> None:
-    """Every test depends on the seeded three-process inbox stack (session-scoped)."""
+    """Every test depends on the seeded three-process inbox stack (session-scoped).
+
+    The store is IN-MEMORY and SHARED across the whole session, so approve/reject in one
+    test would otherwise leak into the next. Reset to the pristine two `in_review` seeds
+    (a blueprint + a global_knowledge, archive empty) BEFORE each test so the suite is
+    order-independent."""
+    httpx.post(f"{_INBOX_SERVICE_URL}/_test/reseed", timeout=5.0).raise_for_status()
     return None
+
+
+# --- shared locators ---------------------------------------------------------
+
+_TYPES = ("blueprint", "global_knowledge", "user_knowledge", "schema_edit")
+
+
+def _tab(page: Page, type_: str) -> Locator:
+    """The type tab for *type_* (by its `data-type`)."""
+    return page.locator(f'[data-testid="inbox-tab"][data-type="{type_}"]')
+
+
+def _tab_count(page: Page, type_: str) -> Locator:
+    """The count badge inside the *type_* tab."""
+    return _tab(page, type_).get_by_test_id("inbox-tab-count")
+
+
+def _visible_items(page: Page) -> Locator:
+    """Only the inbox items in the ACTIVE tab — other-type items stay in the DOM but
+    are `hidden`, so `:visible` scopes to what the reviewer actually sees."""
+    return page.locator('[data-testid="inbox-item"]:visible')
+
+
+def _status_button(page: Page, label: str) -> Locator:
+    """A Review-queue/Archived toggle button by its visible label."""
+    return page.get_by_test_id("inbox-status-toggle").get_by_text(label)
 
 
 class TestReviewerApprovesBlueprintAndKnowledge:
@@ -61,12 +99,29 @@ class TestReviewerApprovesBlueprintAndKnowledge:
         items = page.get_by_test_id("inbox-item")
         expect(items).to_have_count(2, timeout=_ASSERT_TIMEOUT_MS)
 
-        # Both type badges are present (order-independent): blueprint + knowledge.
-        type_badges = page.get_by_test_id("inbox-type")
-        expect(type_badges).to_have_count(2, timeout=_ASSERT_TIMEOUT_MS)
-        badge_texts = type_badges.all_inner_texts()
-        assert "blueprint" in badge_texts, badge_texts
-        assert "global_knowledge" in badge_texts, badge_texts
+        # The seeded set splits one blueprint + one global_knowledge across the type
+        # tabs. Only the ACTIVE tab's items are visible now, so assert each type on its
+        # OWN tab — a hidden item's innerText is "" (the old both-at-once read is why
+        # this block had to become tab-aware).
+        expect(_tab_count(page, "blueprint")).to_have_text("1", timeout=_ASSERT_TIMEOUT_MS)
+        expect(_tab_count(page, "global_knowledge")).to_have_text(
+            "1", timeout=_ASSERT_TIMEOUT_MS
+        )
+
+        # Blueprint tab is active by default: its single item is the only visible one.
+        visible = _visible_items(page)
+        expect(visible).to_have_count(1, timeout=_ASSERT_TIMEOUT_MS)
+        expect(visible.get_by_test_id("inbox-type")).to_have_text("blueprint")
+
+        # Switch to the global_knowledge tab: now its single item is the visible one.
+        _tab(page, "global_knowledge").click()
+        expect(visible).to_have_count(1, timeout=_ASSERT_TIMEOUT_MS)
+        expect(visible.get_by_test_id("inbox-type")).to_have_text("global_knowledge")
+
+        # Back to the blueprint tab to drive the approve flow from a known tab (the
+        # first rendered row is then the blueprint).
+        _tab(page, "blueprint").click()
+        expect(_visible_items(page).get_by_test_id("inbox-type")).to_have_text("blueprint")
 
         # The reviewer-facing projection fields render on each item.
         expect(page.get_by_test_id("inbox-reason").first).to_be_visible(
@@ -112,3 +167,145 @@ class TestReviewerApprovesBlueprintAndKnowledge:
 
         # Second click FIRES the approve POST.
         approve.click()
+
+
+class TestTypeTabs:
+    """Per-type tabbed dashboard (ui-inbox-type-archive contract §Frontend)."""
+
+    def test_all_four_tabs_render_with_seeded_counts(self, page: Page) -> None:
+        page.goto(f"{_INBOX_BFF_URL}/inbox")
+        expect(page.get_by_test_id("inbox-tabs")).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+
+        # The fixed four types always render (shown even at 0), stable order.
+        tabs = page.get_by_test_id("inbox-tab")
+        expect(tabs).to_have_count(4, timeout=_ASSERT_TIMEOUT_MS)
+        for type_ in _TYPES:
+            expect(_tab(page, type_)).to_be_visible()
+
+        # Seeded set: one blueprint + one global_knowledge; the other two are empty.
+        expect(_tab_count(page, "blueprint")).to_have_text("1", timeout=_ASSERT_TIMEOUT_MS)
+        expect(_tab_count(page, "global_knowledge")).to_have_text("1")
+        expect(_tab_count(page, "user_knowledge")).to_have_text("0")
+        expect(_tab_count(page, "schema_edit")).to_have_text("0")
+
+    def test_clicking_a_tab_filters_the_visible_list_to_that_type(
+        self, page: Page
+    ) -> None:
+        page.goto(f"{_INBOX_BFF_URL}/inbox")
+        # Both seeded items are in the DOM …
+        expect(page.get_by_test_id("inbox-item")).to_have_count(2, timeout=_ASSERT_TIMEOUT_MS)
+
+        # … but only the active (default blueprint) tab's one item is VISIBLE.
+        visible = _visible_items(page)
+        expect(visible).to_have_count(1, timeout=_ASSERT_TIMEOUT_MS)
+        expect(visible.get_by_test_id("inbox-type")).to_have_text("blueprint")
+
+        # Clicking a tab is a client-side filter → the visible item switches type.
+        _tab(page, "global_knowledge").click()
+        expect(visible).to_have_count(1, timeout=_ASSERT_TIMEOUT_MS)
+        expect(visible.get_by_test_id("inbox-type")).to_have_text("global_knowledge")
+
+        _tab(page, "blueprint").click()
+        expect(visible).to_have_count(1, timeout=_ASSERT_TIMEOUT_MS)
+        expect(visible.get_by_test_id("inbox-type")).to_have_text("blueprint")
+
+    def test_empty_tab_shows_the_per_tab_empty_state(self, page: Page) -> None:
+        page.goto(f"{_INBOX_BFF_URL}/inbox")
+        expect(page.get_by_test_id("inbox-tabs")).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+
+        # user_knowledge has no seeded items → its tab shows the per-tab empty state,
+        # and none of the (other-type) seeded items are visible under it.
+        _tab(page, "user_knowledge").click()
+        empty = page.get_by_test_id("inbox-empty")
+        expect(empty).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+        expect(empty).to_contain_text("user knowledge")
+        expect(empty).to_contain_text("review queue")
+        expect(_visible_items(page)).to_have_count(0)
+
+
+class TestStatusToggleDefault:
+    """The Review-queue ↔ Archived toggle (ui-inbox-type-archive contract §Status)."""
+
+    def test_review_queue_active_on_load_and_archive_empty(self, page: Page) -> None:
+        page.goto(f"{_INBOX_BFF_URL}/inbox")
+        toggle = page.get_by_test_id("inbox-status-toggle")
+        expect(toggle).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+
+        # Review queue is the active status on load; Archived is not.
+        expect(_status_button(page, "Review queue")).to_have_attribute(
+            "aria-pressed", "true", timeout=_ASSERT_TIMEOUT_MS
+        )
+        expect(_status_button(page, "Archived")).to_have_attribute("aria-pressed", "false")
+
+        # It shows the two seeded in_review candidates.
+        expect(page.get_by_test_id("inbox-item")).to_have_count(2, timeout=_ASSERT_TIMEOUT_MS)
+
+        # Switching to Archived refetches; with nothing rejected yet it is empty.
+        _status_button(page, "Archived").click()
+        expect(_status_button(page, "Archived")).to_have_attribute(
+            "aria-pressed", "true", timeout=_ASSERT_TIMEOUT_MS
+        )
+        expect(page.get_by_test_id("inbox-item")).to_have_count(0, timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("inbox-empty")).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+
+class TestArchiveOnReject:
+    """Reject archives, not deletes: a rejected candidate leaves the review queue and
+    appears in the Archived view as a read-only REJECTED card (contract §Actions)."""
+
+    def test_reject_moves_candidate_from_review_queue_to_archive(
+        self, page: Page
+    ) -> None:
+        page.goto(f"{_INBOX_BFF_URL}/inbox")
+        expect(page.get_by_test_id("inbox-item")).to_have_count(2, timeout=_ASSERT_TIMEOUT_MS)
+
+        # Reject the seeded global_knowledge candidate from the review queue.
+        _tab(page, "global_knowledge").click()
+        target = _visible_items(page)
+        expect(target).to_have_count(1, timeout=_ASSERT_TIMEOUT_MS)
+        rejected_id = target.get_attribute("data-candidate-id")
+        assert rejected_id, "the seeded global_knowledge item must carry a candidate id"
+        self._reject_first_visible(page)
+
+        # It leaves the review queue: the global_knowledge tab count drops to 0 and the
+        # row is gone from the DOM (no error surfaced).
+        expect(_tab_count(page, "global_knowledge")).to_have_text(
+            "0", timeout=_ASSERT_TIMEOUT_MS
+        )
+        expect(page.locator(f'[data-candidate-id="{rejected_id}"]')).to_have_count(0)
+        expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+        # Switch to the Archived view → the rejected candidate now appears there.
+        _status_button(page, "Archived").click()
+        archived = _visible_items(page)
+        expect(archived).to_have_count(1, timeout=_ASSERT_TIMEOUT_MS)
+        expect(archived).to_have_attribute("data-candidate-id", rejected_id)
+        expect(archived.get_by_test_id("inbox-type")).to_have_text("global_knowledge")
+
+        # It carries a REJECTED status badge …
+        expect(archived.get_by_test_id("inbox-status")).to_have_text("REJECTED")
+        # … and NO action buttons (terminal, read-only — contract §Actions).
+        expect(page.get_by_test_id("inbox-approve")).to_have_count(0)
+        expect(page.get_by_test_id("inbox-reject")).to_have_count(0)
+        expect(page.get_by_test_id("inbox-retract")).to_have_count(0)
+        expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+        # Back to the Review queue → the rejected candidate is no longer there.
+        _status_button(page, "Review queue").click()
+        expect(page.get_by_test_id("inbox-item")).to_have_count(1, timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.locator(f'[data-candidate-id="{rejected_id}"]')).to_have_count(0)
+        expect(page.get_by_test_id("error-banner")).to_be_hidden()
+
+    @staticmethod
+    def _reject_first_visible(page: Page) -> None:
+        """Reject the first visible inbox item via its scoped two-step confirm."""
+        item = _visible_items(page).first
+        reject = item.get_by_test_id("inbox-reject")
+        expect(reject).to_be_enabled(timeout=_ASSERT_TIMEOUT_MS)
+
+        # First click ARMS the reject; second FIRES the POST.
+        reject.click()
+        expect(reject).to_have_attribute("data-confirming", "1", timeout=_ASSERT_TIMEOUT_MS)
+        expect(reject).to_have_text("Confirm Reject", timeout=_ASSERT_TIMEOUT_MS)
+        reject.click()

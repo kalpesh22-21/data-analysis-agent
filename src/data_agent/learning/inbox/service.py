@@ -44,6 +44,7 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, Header, HTTPException
 
 from ..candidate.memory_candidate_store import InMemoryCandidateStore
+from ..candidate.models import CandidateStatus
 from ..promotion.scheduler import PromotionScheduler
 from .inbox import InboxTransitionError, ReviewInbox, _NoOpProbe, _ZeroHitCounts
 from .models import InboxItem
@@ -52,19 +53,25 @@ _logger = logging.getLogger(__name__)
 
 WritePlaneMode = Literal["full", "offline"]
 
+# The only statuses the list surface exposes (ui-inbox-type-archive contract §List
+# API): the live review queue and the durable rejected archive. Any other value is a
+# 400 — the inbox never lets a caller enumerate arbitrary lifecycle states.
+_LISTABLE_STATUSES = frozenset({CandidateStatus.IN_REVIEW, CandidateStatus.REJECTED})
+
 
 # --- projections (contract §2a) ----------------------------------------------
 
 
 def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
-    """Project an `InboxItem` to the EXACT §2a wire shape. Carries only the real
-    fields (`models.py:61-73`) — NO invented `status`/`confidence`/`drift`. Every
-    listed item is `in_review` by construction of `list()`, so `status` is implicit.
-    `payload_view` is the already-redacted dict (D17) rendered verbatim — the raw
-    entity values never cross this boundary."""
+    """Project an `InboxItem` to the EXACT wire shape. Carries the real fields plus the
+    envelope `status` (a plain string; `in_review` for the review queue, `rejected` for
+    the archive view — ui-inbox-type-archive contract §List API). No invented
+    `confidence`/`drift`. `payload_view` is the already-redacted dict (D17) rendered
+    verbatim — the raw entity values never cross this boundary."""
     return {
         "candidate_id": item.candidate_id,
         "type": item.type,
+        "status": item.status,
         "reason": item.reason,
         "summary": item.summary,
         "payload_view": item.payload_view,
@@ -252,8 +259,22 @@ def create_inbox_app(
     guard = [Depends(_require_reviewer)]
 
     @app.get("/inbox", dependencies=guard)
-    async def list_inbox() -> dict[str, Any]:
-        items = await inbox.list(limit=100)
+    async def list_inbox(status: str | None = None) -> dict[str, Any]:
+        """List the review queue (default) or, with `?status=rejected`, the durable
+        archive (ui-inbox-type-archive contract §List API). The BFF already validates
+        `status`, but validate defensively here too — an out-of-set value is a 400, not a
+        pass-through to `list_by_status` (which would happily enumerate any status)."""
+        selected = status if status is not None else CandidateStatus.IN_REVIEW
+        if selected not in _LISTABLE_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail="status must be one of {'in_review', 'rejected'}.",
+            )
+        # The durable, unbounded rejected archive lists NEWEST-first so the LIMIT
+        # caps OLD history, not present rejects; the review queue keeps ASC (oldest
+        # first — FIFO drain). Chosen explicitly by the caller, per the contract.
+        order = "desc" if selected == CandidateStatus.REJECTED else "asc"
+        items = await inbox.list(status=selected, limit=100, order=order)
         wire = [_inbox_item_to_wire(it) for it in items]
         return {"items": wire, "count": len(wire)}
 

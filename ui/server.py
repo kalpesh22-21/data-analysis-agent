@@ -64,6 +64,10 @@ UPLOAD_MAX_BYTES = int(os.environ.get("UPLOAD_MAX_BYTES", str(8 * 1024 * 1024)))
 INBOX_SERVICE_URL = os.environ.get("INBOX_SERVICE_URL", "http://localhost:8100")
 REVIEWER_TOKEN = os.environ.get("REVIEWER_TOKEN", "")
 _INBOX_ACTIONS = frozenset({"approve", "reject", "retract"})
+# The only `?status=` values the list surface accepts (ui-inbox-type-archive contract
+# §List API): the live review queue and the durable rejected archive. Anything else is
+# rejected at the BFF (400, not proxied); the inbox service validates it again.
+_INBOX_LIST_STATUSES = frozenset({"in_review", "rejected"})
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _INDEX_HTML = _STATIC_DIR / "index.html"
@@ -356,9 +360,20 @@ async def inbox_page() -> FileResponse:
 
 
 @app.get("/api/inbox")
-async def inbox_list() -> JSONResponse:
+async def inbox_list(status: str | None = None) -> JSONResponse:
+    """Proxy the inbox list, optionally filtered by `?status=`. When absent, proxy
+    exactly as before (review queue, no param). When present, validate against
+    `{in_review, rejected}` (400 on anything else — do NOT proxy) and forward it as an
+    upstream query param (ui-inbox-type-archive contract §List API)."""
     _require_inbox_enabled()
-    return await _proxy_inbox("GET", "/inbox")
+    if status is None:
+        return await _proxy_inbox("GET", "/inbox")
+    if status not in _INBOX_LIST_STATUSES:
+        raise HTTPException(
+            status_code=400, detail="status must be one of {'in_review', 'rejected'}."
+        )
+    query = urllib.parse.urlencode({"status": status})
+    return await _proxy_inbox("GET", f"/inbox?{query}")
 
 
 @app.get("/api/inbox/health")

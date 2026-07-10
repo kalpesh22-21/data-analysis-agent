@@ -13,10 +13,18 @@ with or without the SDK; constructing without it raises.
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
 from ..config import LearningSettings
-from .models import CandidateEnvelope
+from .models import CandidateEnvelope, CandidateStatus
+
+# Terminal lifecycle states persist INDEFINITELY (ui-inbox-type-archive contract
+# §Retention): a rejected row is a durable D29 negative-training signal + the Archived
+# reviewer view, and validated/retired are settled records — none may be TTL-evicted.
+# Every other (transient) status keeps the configured candidate TTL.
+_TERMINAL_STATUSES = frozenset(
+    {CandidateStatus.REJECTED, CandidateStatus.VALIDATED, CandidateStatus.RETIRED}
+)
 
 try:  # pragma: no cover - exercised only when the couchbase SDK is installed
     from acouchbase.cluster import Cluster
@@ -54,8 +62,15 @@ class CouchbaseCandidateStore:
         self._ttl = timedelta(seconds=settings.learning_candidates_ttl_seconds)
 
     async def put(self, envelope: CandidateEnvelope) -> None:
+        # Terminal rows persist with NO TTL (expiry=0); transient rows keep the
+        # candidate TTL (ui-inbox-type-archive contract §Retention).
+        expiry = (
+            timedelta(0)
+            if envelope.status in _TERMINAL_STATUSES
+            else self._ttl
+        )
         await self._collection.upsert(
-            envelope.candidate_id, envelope.to_doc(), UpsertOptions(expiry=self._ttl)
+            envelope.candidate_id, envelope.to_doc(), UpsertOptions(expiry=expiry)
         )
 
     async def get(self, candidate_id: str) -> CandidateEnvelope | None:
@@ -65,11 +80,18 @@ class CouchbaseCandidateStore:
             return None
         return CandidateEnvelope.from_doc(result.content_as[dict])
 
-    async def list_by_status(self, status: str, *, limit: int = 100) -> list[CandidateEnvelope]:
+    async def list_by_status(
+        self, status: str, *, limit: int = 100, order: Literal["asc", "desc"] = "asc"
+    ) -> list[CandidateEnvelope]:
+        # ASC (default) is the small self-draining review queue; DESC (newest-first)
+        # is the durable rejected archive so LIMIT trims OLD history, not present
+        # rejects. DESC mirrors ASC's single created_at sort key (symmetric — no
+        # secondary tiebreak either side), so the ASC statement stays byte-identical.
+        direction = "DESC" if order == "desc" else "ASC"
         statement = (
             f"SELECT c.* FROM `{self._bucket_name}` c "
             "WHERE c.status = $status "
-            "ORDER BY c.created_at ASC LIMIT $limit"
+            f"ORDER BY c.created_at {direction} LIMIT $limit"
         )
         result = self._cluster.query(
             statement,
