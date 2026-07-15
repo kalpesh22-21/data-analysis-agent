@@ -16,7 +16,6 @@ primary_key: [ EmployeeCode ]
 # joins need NO tenant predicate and grain is the within-tenant key. See AUTHORING_NOTES Tenancy.
 join_keys:
   - { column: EmployeeCode, joins: payroll.EmployeeCode, cardinality: 1:N }
-  - { column: EmployeeCode, joins: weekly_booked_sales_reps_only.EmployeeCode, cardinality: 1:N }  # TODO: weekly_booked_sales_reps_only has no catalog YAML yet — getTableSchema(weekly_booked_sales_reps_only) will fail until authored
   - { column: EmployeeCode, joins: accrual_events.EmployeeCode, cardinality: 1:N }
   - { column: EmployeeCode, joins: performance_discussions.EmployeeCode, cardinality: 1:N }
   - { column: EmployeeCode, joins: personnel_action_form_changes.EmployeeCode, cardinality: 1:N }

@@ -145,6 +145,10 @@ measures:
     column: TypeHours
     agg: sum
     defined_over: "hours-bearing rows (usually RegisterType = 'EARN', narrowed by TypeCode via resolveValues); see 'hours worked' ambiguity for paid/worked/PTO/overtime disambiguation"
+  expense_reimbursements:
+    column: Amount
+    agg: sum
+    defined_over: "RegisterType = 'DDUCT' narrowed to expense-reimbursement TypeCode via resolveValues(TypeCode, <expense concept>); summed within (EmployeeCode, pay period). Excludes benefit deductions (401k/medical/dental)."
 
 rules:
   - id: gross_earnings
@@ -155,7 +159,7 @@ rules:
   - id: employee_deductions
     predicate: "RegisterType = 'DDUCT'"
     applies_when: deductions or expense-reimbursement-style deduction questions
-    description: Use deduction rows, then narrow by TypeCode as needed.
+    description: Use deduction rows, then narrow by TypeCode as needed. DDUCT includes BOTH benefit deductions (401k, medical, dental) and expense reimbursements; for expenses specifically, narrow TypeCode via resolveValues (see the 'expenses' ambiguity).
 
   - id: employee_taxes
     predicate: "RegisterType = 'EETAX'"
@@ -206,3 +210,13 @@ ambiguities:
     resolves_to: [ DistributedDepartmentCode, distributedDepartmentDescription ]
     default: payroll_distributed_department
     clarify_if: user means current employee department from employee.Department
+
+  - term: expenses
+    resolves_to: [ "resolveValues(TypeCode, 'expense reimbursement / travel / meals / mileage / airfare / lodging / office supplies') → filter TypeCode IN result AND RegisterType = 'DDUCT'; SUM(Amount)" ]
+    default: approved_expense_reimbursements
+    clarify_if: >
+      "expenses" / "reimbursements" means DDUCT rows for EXPENSE-REIMBURSEMENT codes only — NOT all
+      deductions. DDUCT ALSO holds benefit deductions (401k, medical, dental) which are NOT expenses.
+      Resolve expense codes via resolveValues(TypeCode, <expense concept>) — CLIENT-DEFINED and drifts
+      over time, never hardcode. Clarify if the user actually wants all deductions, benefit deductions,
+      or only one expense category (travel, meals, mileage).

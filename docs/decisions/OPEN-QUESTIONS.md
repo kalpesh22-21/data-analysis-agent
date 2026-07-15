@@ -151,8 +151,9 @@ only**; `ClientCode` is never in `grain`/`primary_key` nor a join predicate.
 - **Unconfirmed `terminated` rule** — the employee `rehired_not_terminated` guard rests on an explicit
   "ASSUMPTION to confirm" (rehire signalled by `MostRecentHireDate` advancing past `TerminationDate`);
   needs business sign-off.
-- **Missing table doc** — `weekly_booked_sales_reps_only` is a declared join target with no catalog YAML;
-  `getTableSchema` on it fails until authored.
+- **Sales tables out of scope (resolved)** — `weekly_booked_sales_reps_only` and the other
+  `weekly_booked_sales_*` tables belong to a separate sales agent, not this HR-only agent. The dangling
+  `employee.yaml` join target has been removed; these tables are intentionally absent from the catalog.
 - **Soft department joins** — `DistributedDepartmentCode`/`AccrualEventDepartmentCode → employee.DepartmentCode`
   are label-based, client-defined, low/medium confidence; not reliable FKs.
 

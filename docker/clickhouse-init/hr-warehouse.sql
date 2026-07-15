@@ -22,7 +22,9 @@
 --     FieldId<->FieldLabel, DistributedDepartmentCode<->distributedDepartmentDescription,
 --     RequisitionDepartmentCode<->RequisitionDepartmentDescription).
 --   * payroll Amount meaning is register-scoped and internally consistent per employee/period:
---     NETPAYDIST = EARN - EETAX - DDUCT.
+--     NETPAYDIST = EARN - EETAX - DDUCT. That identity covers STANDARD statutory/benefit deductions
+--     only; expense-reimbursement DDUCT codes (EP*, AIR, REI, EQ6, ...) are add-back reimbursements
+--     and are NOT included in the NETPAYDIST identity.
 
 CREATE DATABASE IF NOT EXISTS dbpcm_warehouse;
 
@@ -148,7 +150,12 @@ INSERT INTO dbpcm_warehouse.payroll
 ('CLIENT_B','EMP003','DDUCT',180.00,NULL,'DENT','Dental Premium','STD','D100','Sales',NULL,'2026-06-05 00:00:00','2026-05-16 00:00:00','2026-05-31 00:00:00','TXN-B-0605-003'),
 ('CLIENT_B','EMP003','EEBEN',140.00,NULL,'VIS','Vision Premium','STD','D100','Sales',NULL,'2026-06-05 00:00:00','2026-05-16 00:00:00','2026-05-31 00:00:00','TXN-B-0605-003'),
 ('CLIENT_B','EMP003','ERTAX',229.50,NULL,'FICA','FICA (Employer)','STD','D100','Sales',NULL,'2026-06-05 00:00:00','2026-05-16 00:00:00','2026-05-31 00:00:00','TXN-B-0605-003'),
-('CLIENT_B','EMP003','NETPAYDIST',2220.00,NULL,'ACH','ACH Deposit','STD','D100','Sales',NULL,'2026-06-05 00:00:00','2026-05-16 00:00:00','2026-05-31 00:00:00','TXN-B-0605-003');
+('CLIENT_B','EMP003','NETPAYDIST',2220.00,NULL,'ACH','ACH Deposit','STD','D100','Sales',NULL,'2026-06-05 00:00:00','2026-05-16 00:00:00','2026-05-31 00:00:00','TXN-B-0605-003'),
+('CLIENT_A','EMP001','DDUCT',45.00,NULL,'EP7','Meals (-)','STD','SLS','Sales',NULL,'2026-06-05 00:00:00','2026-05-16 00:00:00','2026-05-31 00:00:00','TXN-A-0605-001'),
+('CLIENT_A','EMP001','DDUCT',120.00,NULL,'EP6','Mileage (-)','STD','SLS','Sales',NULL,'2026-06-05 00:00:00','2026-05-16 00:00:00','2026-05-31 00:00:00','TXN-A-0605-001'),
+('CLIENT_A','EMP002','DDUCT',350.00,NULL,'AIR','Airfare (-)','STD','ENG','Engineering',NULL,'2026-06-05 00:00:00','2026-05-16 00:00:00','2026-05-31 00:00:00','TXN-A-0605-002'),
+('CLIENT_A','EMP005','DDUCT',75.00,NULL,'REI','Reimbursement (-)','STD','FIN','Finance',NULL,'2026-06-05 00:00:00','2026-05-16 00:00:00','2026-05-31 00:00:00','TXN-A-0605-005'),
+('CLIENT_B','EMP003','DDUCT',30.00,NULL,'EQ6','Taxi/Uber/Lyft (-)','STD','D100','Sales',NULL,'2026-06-05 00:00:00','2026-05-16 00:00:00','2026-05-31 00:00:00','TXN-B-0605-003');
 
 -- =====================================================================================================
 -- accrual_events — grain [] (grain_verifiable: false). ONE ROW PER DAY of a request.
