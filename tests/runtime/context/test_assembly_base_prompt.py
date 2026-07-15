@@ -5,8 +5,9 @@ retrieval block when retrieval is present; a D45 rebuild re-derives byte-identic
 messages (prompt still first); it survives history-token-budget trimming; the
 disabled/None toggle reproduces the exact prompt-less message list; the
 trust-boundary paragraph is present in the assembled prompt; the
-searchBlueprints-discovery nudge is present in the assembled prompt; and the
-batched-independent-reads guidance is present in the assembled prompt.
+searchBlueprints-discovery nudge is present in the assembled prompt; the
+batched-independent-reads guidance is present in the assembled prompt; and the
+scope-honesty and PII/data-minimization rules are present in the assembled prompt.
 """
 
 from __future__ import annotations
@@ -72,6 +73,26 @@ def test_base_prompt_carries_batched_reads_guidance() -> None:
     # Assert on a durable, distinctive substring.
     assert (
         "issue those tool calls together in one turn" in AGENT_SYSTEM_PROMPT
+    )
+
+
+def test_base_prompt_carries_partial_access_honesty_rule() -> None:
+    # Guard: the partial-access honesty rule (column-scope D5/D79 can hide
+    # columns/tables and tools can return nothing; the model must not imply
+    # coverage it lacks) must not be silently dropped by a future prompt edit.
+    # Assert on a durable, distinctive substring.
+    assert (
+        "never imply coverage you do not have" in AGENT_SYSTEM_PROMPT
+    )
+
+
+def test_base_prompt_carries_pii_minimization_rule() -> None:
+    # Guard: the PII / data-minimization rule (don't surface sensitive
+    # personal/compensation fields beyond what the question needs) must not be
+    # silently dropped by a future prompt edit. Assert on a durable, distinctive
+    # substring.
+    assert (
+        "Use the minimum data needed to answer" in AGENT_SYSTEM_PROMPT
     )
 
 
