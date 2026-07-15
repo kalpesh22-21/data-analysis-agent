@@ -23,10 +23,28 @@ _REPO = Path(__file__).resolve().parents[3]
 _FIXTURE_DIR = _REPO / "tests" / "fixtures" / "corpus"
 _SQL = _REPO / "docker" / "clickhouse-init" / "hr-warehouse.sql"
 
+# `IF NOT EXISTS` is optional: the warehouse DDL uses `DROP TABLE IF EXISTS x;`
+# followed by a bare `CREATE TABLE x (...)`. The non-greedy `(.*?)\)\s*ENGINE`
+# still captures each table's full column body despite inner parens in types like
+# `Nullable(String)`, `Decimal(18, 6)` or `DateTime64(6)`, because only the table's
+# own closing paren is immediately followed by `ENGINE`.
 _CREATE_TABLE = re.compile(
-    r"CREATE TABLE IF NOT EXISTS\s+(\w+)\.(\w+)\s*\((.*?)\)\s*ENGINE",
+    r"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+(\w+)\.(\w+)\s*\((.*?)\)\s*ENGINE",
     re.DOTALL | re.IGNORECASE,
 )
+
+# The nine tables the Layer-2 warehouse seed (hr-warehouse.sql) creates.
+_EXPECTED_TABLES = {
+    "dbpcm_warehouse.employee",
+    "dbpcm_warehouse.payroll",
+    "dbpcm_warehouse.accrual_events",
+    "dbpcm_warehouse.personnel_action_form_changes",
+    "dbpcm_warehouse.applicant_tracking_application",
+    "dbpcm_warehouse.applicant_tracking_requisition",
+    "dbpcm_warehouse.candidate_education",
+    "dbpcm_warehouse.candidate_employment_history",
+    "dbpcm_warehouse.performance_discussions",
+}
 
 
 def _warehouse_scope_keys() -> set[str]:
@@ -50,12 +68,27 @@ def test_ddl_parser_recovers_the_expected_columns() -> None:
     # nothing, the subset assertion below would vacuously pass. Anchor on known
     # columns so a broken parser fails loudly instead.
     keys = _warehouse_scope_keys()
+    # Known-column anchors spanning several of the nine seeded tables. If the
+    # parser silently returned nothing/garbage, these fail loudly.
     assert "dbpcm_warehouse.employee.Department" in keys
     assert "dbpcm_warehouse.payroll.Amount" in keys
     assert "dbpcm_warehouse.payroll.PayPeriodEndDate" in keys
-    # Exactly the two seeded tables, 6 + 5 columns.
-    assert len([k for k in keys if k.startswith("dbpcm_warehouse.employee.")]) == 6
-    assert len([k for k in keys if k.startswith("dbpcm_warehouse.payroll.")]) == 5
+    assert "dbpcm_warehouse.accrual_events.EarnCode" in keys
+    assert "dbpcm_warehouse.performance_discussions.DiscussionId" in keys
+    assert "dbpcm_warehouse.applicant_tracking_application.ApplicationId" in keys
+
+    # The parser must recover exactly the nine seeded tables — no more, no fewer.
+    recovered_tables = {k.rsplit(".", 1)[0] for k in keys}
+    assert recovered_tables == _EXPECTED_TABLES
+
+    # Lower bounds rather than exact per-table counts: this test was previously
+    # pinned to `== 6`/`== 5` and silently broke when the seed grew to full
+    # fidelity (employee now 53 cols, payroll 15). Bounds keep the guard honest
+    # against a broken parser while surviving future column additions.
+    employee_cols = [k for k in keys if k.startswith("dbpcm_warehouse.employee.")]
+    payroll_cols = [k for k in keys if k.startswith("dbpcm_warehouse.payroll.")]
+    assert len(employee_cols) >= 50
+    assert len(payroll_cols) >= 15
 
 
 def test_every_fixture_uses_key_byte_matches_a_real_warehouse_column() -> None:
@@ -81,10 +114,14 @@ def test_fixture_keys_are_case_sensitive_exact() -> None:
     assert "dbpcm_warehouse.employee.department" not in all_keys
 
 
-def test_no_fixture_key_references_an_unseeded_catalog_column() -> None:
-    # PayDate / PayPeriodStartDate exist in the catalog but are intentionally NOT
-    # seeded (SQL comment). A fixture must not reference them, or scope filtering
-    # against the real seeded warehouse would drop the blueprint.
+def test_no_fixture_key_references_a_disallowed_payroll_date_column() -> None:
+    # payroll carries three date columns: PayDate, PayPeriodStartDate and
+    # PayPeriodEndDate. All three ARE seeded in the current warehouse, but the
+    # fixtures deliberately anchor every pay-period predicate on PayPeriodEndDate
+    # (the register's period-close date) for a single, consistent period grain.
+    # A fixture drifting to PayDate or PayPeriodStartDate would silently change
+    # that grain, so guard against it — this is a convention guard, not a
+    # "column is unseeded" guard.
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
     all_keys = {k for bp in blueprints for k in bp.uses}
     assert not any("PayDate" in k or "PayPeriodStartDate" in k for k in all_keys)
