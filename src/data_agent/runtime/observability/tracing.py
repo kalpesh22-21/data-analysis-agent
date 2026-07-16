@@ -52,6 +52,7 @@ from opentelemetry.sdk.trace.export import (
     SpanExporter,
     SpanExportResult,
 )
+from opentelemetry.sdk.trace.id_generator import IdGenerator
 from opentelemetry.trace import Span, Tracer
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
@@ -175,6 +176,7 @@ def configure_tracing(
     hide_llm_content: bool = False,
     span_exporter: SpanExporter | None = None,
     drop_span_names: Collection[str] = (),
+    id_generator: IdGenerator | None = None,
 ) -> TracerProvider:
     """Build a `TracerProvider` exporting to *otlp_endpoint* (Phoenix), or a
     no-op provider (no span processor) when *otlp_endpoint* is empty.
@@ -194,13 +196,17 @@ def configure_tracing(
     named project without an `OTEL_RESOURCE_ATTRIBUTES` env hack. Defaults to
     *service_name* when omitted, so the project name is never empty.
 
-    *hide_llm_content* (D25): when True, install `LLMExceptionEventScrubber` as
-    the FIRST span processor so a recorded `exception` event (which the OpenAI
+    *hide_llm_content* (this PARAM): when True, install `LLMExceptionEventScrubber`
+    as the FIRST span processor so a recorded `exception` event (which the OpenAI
     instrumentor embeds the response error body into) is stripped off the auto-
     instrumented `LLM` span before export — closing the residual content channel
     `TraceConfig` (attributes-only) leaves open. Pair with
     `instrument_openai(hide_content=True)`; both are gated on the SAME
-    `otlp_hide_llm_content` setting by `app.py`.
+    `otlp_hide_llm_content` setting by `app.py`. NOTE (D25 amended 2026-07-15): the
+    SYSTEM default is now REVEAL — `otlp_hide_llm_content` defaults False, so `app.py`
+    passes `hide_llm_content=False` by default and this scrubber is NOT installed by
+    default (a failed OpenAI call's error body can then land on the span — the
+    accepted consequence of the reveal posture). This param default stays False.
 
     *span_exporter* (test-only seam, D-L3-5): when supplied, its spans are
     attached via a `SimpleSpanProcessor` (synchronous flush — a batched
@@ -220,6 +226,12 @@ def configure_tracing(
     Filtering is name-based and downstream of the span processor, so it never
     touches an instrumentation call site and never orphans a kept child badly
     (see `_NameFilteringSpanExporter` / `DEFAULT_DROP_SPAN_NAMES`).
+
+    *id_generator* (optional): a custom OTel `IdGenerator` for the provider — used
+    by the learning session-trace projection to mint DETERMINISTIC trace/span ids
+    (seeded by session id) so a re-export upserts the same Phoenix spans instead of
+    duplicating them. `None` (the default) leaves the provider byte-identical to
+    before (the SDK's random id generator).
     """
     drop_names = frozenset(drop_span_names)
 
@@ -234,7 +246,12 @@ def configure_tracing(
             "openinference.project.name": project_name or service_name,
         }
     )
-    provider = TracerProvider(resource=resource)
+    # Branch on *id_generator* so the default path stays byte-identical (passing
+    # id_generator=None explicitly would override the SDK's own default generator).
+    if id_generator is not None:
+        provider = TracerProvider(resource=resource, id_generator=id_generator)
+    else:
+        provider = TracerProvider(resource=resource)
     # FIRST (see LLMExceptionEventScrubber docstring): must precede any synchronous
     # SimpleSpanProcessor export so the LLM `exception` event is scrubbed pre-export.
     if hide_llm_content:
@@ -258,15 +275,16 @@ def llm_content_trace_config(hide_content: bool) -> TraceConfig | None:
     prompts) while leaving the non-content shape/timing attributes intact
     (`llm.model_name`, `llm.token_count.*`, `llm.provider`, span timing).
 
-    D25 (the ONLINE per-turn HARD invariant): unlike the manual AGENT/TOOL/CHAIN
-    spans — which already redact SQL literals / bound-slot values before setting
-    an attribute — the OpenAI auto-instrumentor (D24) captures the model's raw
-    prompt AND completion by DEFAULT, and the completion embeds cell values /
-    the query-derived answer. That is a content leak into the online Phoenix
-    project, which is a shape/count/latency-only surface. So the runtime hides
-    LLM content BY DEFAULT (`RuntimeSettings.otlp_hide_llm_content=True`) and the
-    reveal is an explicit, controlled opt-in — mirroring the learning loop's
-    verbose gate."""
+    D25, amended 2026-07-15: unlike the manual AGENT/TOOL/CHAIN spans — which
+    already redact SQL literals / bound-slot values before setting an attribute —
+    the OpenAI auto-instrumentor (D24) captures the model's raw prompt AND
+    completion by DEFAULT, and the completion embeds cell values / the query-derived
+    answer. By deliberate operator choice the runtime now REVEALS LLM content BY
+    DEFAULT (`RuntimeSettings.otlp_hide_llm_content=False`), so the online Phoenix
+    project is ENTITY-BEARING BY DEFAULT and MUST be access-controlled like the
+    audit/session store — mirroring the learning loop's verbose gate. Hiding is the
+    explicit opt-OUT (`otlp_hide_llm_content=True`), which restores the D25 shape/
+    count/latency-only surface. This function's redaction MECHANISM is unchanged."""
     if not hide_content:
         return None
     return TraceConfig(
@@ -293,15 +311,17 @@ def instrument_openai(provider: TracerProvider, *, hide_content: bool = True) ->
     app). The paired `LLMExceptionEventScrubber` (an OWN span processor, not the
     singleton) is NOT subject to this — each provider gets its own.
 
-    *hide_content* (D25, default True): when True the emitted `LLM` span carries
-    NO raw prompt/completion — only shape/timing/model-name/token-counts — so the
-    online per-turn Phoenix project stays content-free (structure fully visible,
-    content hidden). Set False ONLY in a controlled, access-controlled diagnostic
-    environment: revealing the LLM content makes the runtime Phoenix project
-    ENTITY-BEARING (the raw question AND the query-derived answer land on the
-    span), subject to the same in-boundary PII posture + access control as the
-    session/audit stores — NOT the shape-only D25 telemetry posture. This is the
-    exact same trade-off as the learning-loop `LEARNING_TRACE_VERBOSE` gate.
+    *hide_content* (this PARAM defaults True): when True the emitted `LLM` span
+    carries NO raw prompt/completion — only shape/timing/model-name/token-counts — so
+    the online per-turn Phoenix project stays content-free. NOTE (D25 amended
+    2026-07-15): the SYSTEM default is now REVEAL — `app.py` resolves
+    `otlp_hide_llm_content` (now defaulting False) via `effective_llm_hide` and passes
+    the result here, so by default `hide_content=False` and the runtime Phoenix
+    project is ENTITY-BEARING (the raw question AND the query-derived answer land on
+    the span), subject to the same in-boundary PII posture + access control as the
+    session/audit stores. Hiding is now the explicit opt-OUT (`otlp_hide_llm_content=
+    True`) restoring the shape-only D25 posture. Same trade-off as the learning-loop
+    `LEARNING_TRACE_VERBOSE` gate. This PARAM default stays True (call sites drive it).
     """
     instrumentor = OpenAIInstrumentor()
     if instrumentor.is_instrumented_by_opentelemetry:
