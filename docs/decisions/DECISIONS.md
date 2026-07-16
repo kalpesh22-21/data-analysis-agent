@@ -804,6 +804,19 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
 - **D25.** Traces grouped by `session.id`. **Never log JWT/scope token** (log a scope id/hash only);
   **mask result rows + bound slot values** via OpenInference hide flags + a custom redactor. Log
   shape (counts/columns/latency), not content. Leakage gate emits a `GUARDRAIL` span.
+  - **Amended 2026-07-15 (deliberate operator choice).** The shape-only / hidden telemetry
+    DEFAULTS are inverted to **verbose / reveal** by default: `LEARNING_TRACE_VERBOSE` now defaults
+    `true` and `otlp_hide_llm_content` now defaults `false`. Both Phoenix projects (`learning-loop` /
+    `learning-sessions` and the online runtime project) are therefore **entity-bearing by default** and
+    require access control equivalent to the audit/session stores (D51). The redaction MECHANISMS are
+    unchanged (the `verbose` gate + `_verbose_attrs`, the `TraceConfig` masking, the
+    `LLMExceptionEventScrubber`); only the default posture flipped, and shape-only / hidden remain
+    available as the explicit opt-OUTs (`LEARNING_TRACE_VERBOSE=false` / `otlp_hide_llm_content=true`).
+    **Consequence to note:** with hiding off the composition root no longer installs the
+    `LLMExceptionEventScrubber`, so a failed OpenAI call's error body can land on the span — the accepted
+    trade-off of the reveal posture. The `JWT/scope token` never-log rule above is NOT relaxed by this
+    amendment — it still holds. Original D25 rationale (never route HR PII to a shape-only telemetry
+    surface) is preserved above for the record.
 
 ## Model provider
 - **D71 (locked, 2026-06-30).** **Agent LLM is OpenAI; Responses API (`/v1/responses`) is primary,

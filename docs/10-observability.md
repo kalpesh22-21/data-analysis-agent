@@ -96,6 +96,17 @@ Traces must not become a PII or secret leak:
   [06-security-and-governance.md](06-security-and-governance.md): traces are operational telemetry,
   not a data store.
 
+> **Posture note (D25 amended 2026-07-15).** By deliberate operator choice the human-readable
+> telemetry defaults are now inverted: `LEARNING_TRACE_VERBOSE` defaults **on** (verbose) and
+> `otlp_hide_llm_content` defaults **off** (reveal). As a result **both Phoenix projects — the
+> `learning-loop`/`learning-sessions` projection AND the online-runtime project — are entity-bearing
+> BY DEFAULT** (they carry the user question, accepted SQL, learned intent/slots, evidence quotes, and
+> the raw LLM prompt+completion). They MUST therefore be **access-controlled equivalent to the audit /
+> session stores** (D51 in-boundary PII posture) — they are no longer the shape-only surface described
+> above. The redaction mechanisms are unchanged and shape-only/hidden remain available as explicit
+> opt-OUTs (`LEARNING_TRACE_VERBOSE=false` / `otlp_hide_llm_content=true`). The **never-log JWT/scope
+> token** rule and the **scratch/external-data** rule above are NOT relaxed by this amendment.
+
 ## What we get
 
 - **Debugging:** full trace tree per turn — which blueprint, which SQL, where latency went.

@@ -263,6 +263,37 @@ authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's
 
 ---
 
+## 2026-07-15 — Telemetry posture flip: traces VERBOSE / REVEAL by default (D25 amended)
+
+**Deliberate operator posture change (authorized by the user).** Inverted the two PII/telemetry
+defaults so traces are **entity-bearing by default** across both the learning loop and the online
+runtime — the reverse of the original D25 shape-only default:
+
+- `LearningSettings.learning_trace_verbose`: default `False → True`. The `learning-loop` and
+  `learning-sessions` Phoenix projects now carry the user question / accepted SQL / learned
+  intent+slots / resolves / rationale / evidence quotes BY DEFAULT.
+- `RuntimeSettings.otlp_hide_llm_content`: default `True → False`. The online runtime project now
+  reveals the raw OpenAI prompt + completion BY DEFAULT; `effective_llm_hide` truth table relabeled
+  (the `(False, False) → reveal` row is now the default). With hiding off, the composition root no
+  longer installs `LLMExceptionEventScrubber`, so a failed OpenAI call's error body can land on the
+  span — the accepted consequence of the reveal posture.
+
+**Access-control implication (load-bearing):** both Phoenix projects are now entity-bearing surfaces
+and MUST be access-controlled equivalent to the `learning_audit` / session stores (D51 in-boundary PII
+posture) — they are no longer the shape-only D25 telemetry surface. Shape-only / hidden remain
+available as explicit opt-OUTs (`LEARNING_TRACE_VERBOSE=false` / `otlp_hide_llm_content=true`).
+
+**Mechanisms unchanged.** Only the two Settings-field defaults flipped; the `verbose` gate +
+`_verbose_attrs`, the `TraceConfig` masking, the `LLMExceptionEventScrubber`, and every function PARAM
+default (`configure_tracing(hide_llm_content=False)`, `instrument_openai(hide_content=True)`, the
+`verbose=False` span-helper params) are untouched — call sites drive them explicitly. Recorded as a
+dated amendment on D25 (DECISIONS.md / TRACEABILITY.md), original rationale preserved. Tests: the one
+hard-break assertion flipped (`test_verbose_flag_defaults_on`), the rest are comment/name-only
+(pinned-flag suites still green). `tests/learning/ tests/runtime/observability/
+tests/runtime/test_app_span_exporter_qa.py` → **654 passed**.
+
+---
+
 ## 2026-07-08 — Session 22: the loop learns end-to-end with a REAL LLM, and is now observable in Phoenix
 
 Four reviewed + committed commits on `phase0/provenance-extractor` (nothing pushed — no git remote). This

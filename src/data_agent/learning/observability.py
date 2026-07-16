@@ -19,19 +19,22 @@ TWO cross-cutting concerns live in this module:
    `context_from_traceparent`); a missing/malformed value ⇒ a normal root span
    (fail-open).
 
-2. **The D25 verbose GATE (`verbose=`).** By DEFAULT (`verbose=False`) the ONLY
-   attributes ever set are non-PII counters/labels + `session.id` (the D25
-   trace-grouping key) + `content_hash`/`message_id` (non-PII audit keys) — the
-   raw JWT, the raw `column_scope`, and any transcript/SQL/question/intent content
-   are NEVER emitted (D25 shape-only telemetry posture). When `verbose=True` the
-   triage/consume/extract/promote/land helpers ADDITIONALLY set human-readable
-   attributes (the user question, a transcript preview, the accepted SQL, the
-   learned intent/slots/rationale, the blueprint id/intent/canonical_key). This
-   makes the `learning-loop` Phoenix project ENTITY-BEARING and therefore subject
-   to the SAME in-boundary PII posture + access control as the `learning_audit`
-   and session stores (D51) — NOT the shape-only D25 telemetry posture. Verbose is
-   OFF by default (`LEARNING_TRACE_VERBOSE`) and MUST only be enabled in a
-   controlled, access-controlled diagnostic environment.
+2. **The D25 verbose GATE (`verbose=`) — amended 2026-07-15.** By deliberate
+   operator choice the SETTING now defaults VERBOSE (`LEARNING_TRACE_VERBOSE=true`):
+   the triage/consume/extract/promote/land helpers set human-readable attributes
+   (the user question, a transcript preview, the accepted SQL, the learned
+   intent/slots/rationale, the blueprint id/intent/canonical_key) BY DEFAULT, so the
+   `learning-loop` (and `learning-sessions`) Phoenix project is ENTITY-BEARING BY
+   DEFAULT and therefore subject to the SAME in-boundary PII posture + access control
+   as the `learning_audit` and session stores (D51). Set `LEARNING_TRACE_VERBOSE=false`
+   to restore the D25 shape-only telemetry posture, where the ONLY attributes set are
+   non-PII counters/labels + `session.id` (the trace-grouping key) + `content_hash`/
+   `message_id` (non-PII audit keys) and no transcript/SQL/question/intent content is
+   emitted. The gate MECHANISM (the `verbose` param + `_verbose_attrs`) is unchanged;
+   only the default posture flipped. NOTE: the per-helper docstrings below still say
+   "SHAPE-only by default" — that describes the `verbose=False` PARAM default (still
+   accurate); the composition root now passes `verbose=True` by default via the
+   flipped setting.
 """
 
 from __future__ import annotations

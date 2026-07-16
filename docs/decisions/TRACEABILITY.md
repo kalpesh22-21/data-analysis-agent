@@ -432,14 +432,18 @@ The load-bearing NEW invariants of the Session-22 work — the extractor's force
 against a **real** LLM, and the learning-loop + online-runtime traces made **findable/chained in Phoenix
 without leaking content** (see WORKLOG Session 22, commits `0181388`/`7dc2737`/`a5bf077`/`661cda2`). These
 extend the D25 observability rows above. Marked `✅ green` where a Layer-1/Layer-2 test proves the
-invariant; the human-readable telemetry modes are DEFAULT-OFF (`LEARNING_TRACE_VERBOSE`) / DEFAULT-hidden
-(`otlp_hide_llm_content`), so verbose-ON entity exposure and Layer-3 conformance stay a separate concern.
+invariant. **AMENDED 2026-07-15 (deliberate operator posture flip):** the human-readable telemetry modes
+are now DEFAULT-**ON** (`LEARNING_TRACE_VERBOSE=true`) / DEFAULT-**reveal** (`otlp_hide_llm_content=false`),
+so BOTH Phoenix projects are entity-bearing BY DEFAULT and require access control equivalent to the
+audit/session stores (D51). Shape-only / hidden are now the opt-OUTs. The redaction MECHANISMS (the
+`verbose` gate, the `TraceConfig`, the `LLMExceptionEventScrubber`) are unchanged and stay Layer-1/2
+tested by pinning the flag explicitly; only the default posture flipped.
 
 | Decision | Invariant | Test layer | Test slug | Conformance scenario | Status |
 |---|---|---|---|---|---|
-| **D25** | `LEARNING_TRACE_VERBOSE` OFF (default) = shape-only learning spans: no question / extracted SQL / learned intent / slots / entity-bearing content on any learning-loop span; verbose-ON is the opt-in, access-controlled reveal | Unit | `learning-trace-verbose-off-shape-only` | **Observability + PII** | ✅ green |
+| **D25** (amended 2026-07-15) | `LEARNING_TRACE_VERBOSE` now defaults ON (verbose): learning-loop + learning-sessions spans carry question / extracted SQL / learned intent / slots / entity-bearing content BY DEFAULT (entity-bearing, access-controlled); set `=false` to restore shape-only. The gate mechanism (proven by pinning the flag) is unchanged | Unit | `learning-trace-verbose-off-shape-only` | **Observability + PII** | ✅ green |
 | **D25** | Every learning span is created via `_learning_span(record_exception=False)` — OTel's default `record_exception` can never attach model/entity content as an exception event on the failure path, even verbose-OFF (the review-caught residual) | Unit | `learning-span-no-exception-content` | **Observability + PII** | ✅ green |
 | **D25 / D30** | One trace per learning session: a W3C `traceparent` propagates through the `LearningJob`/Redis message and is carried on the candidate to the scheduler, so enqueue → consume → {triage, leakage, extract, promote → land, recall, demote} chain under a single trace (not atomic per-stage spans) | Unit | `learning-traces-chained-one-trace-per-session` | — | ✅ green |
-| **D25** | The online-runtime auto OpenAI LLM span hides all input/output/prompt content by default (`otlp_hide_llm_content=True`): raw question + answer never appear as span attributes (shape / model / token-count kept); reveal is an access-controlled opt-in | Unit | `runtime-llm-span-content-hidden-by-default` | **Observability + PII** | ✅ green |
+| **D25** (amended 2026-07-15) | The online-runtime auto OpenAI LLM span now REVEALS input/output/prompt content by default (`otlp_hide_llm_content=False`): raw question + answer land on span attributes (entity-bearing, access-controlled); set `=True` to restore hiding (shape / model / token-count only). The hide mechanism (proven by pinning the flag) is unchanged | Unit | `runtime-llm-span-content-hidden-when-hide-enabled` | **Observability + PII** | ✅ green |
 | **D25** | When LLM content is hidden, the `LLMExceptionEventScrubber` SpanProcessor drops content-bearing exception EVENTS off LLM spans — the failure-path residual is closed too (proven over the real `OpenAIInstrumentor` + `MockTransport`, parametrized responses + chat) | Unit | `runtime-llm-span-no-exception-content-when-hidden` | **Observability + PII** | ✅ green |
 | **D31** | The extractor's forced-tool schema is COMPLETE against a real model: the `_BLUEPRINT_PAYLOAD_SCHEMA` is wired into the tool the model sees (`allOf`/`if`/`then`, `kind` required, slot-type enum, FQ `binds_to`) so a real OpenAI model emits a valid blueprint; a malformed real-model payload becomes a traceable Decline, never a consumer dead-letter crash | Unit | `extractor-tool-schema-complete` | **Correction → learning** | ✅ green |

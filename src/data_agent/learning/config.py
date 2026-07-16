@@ -223,16 +223,18 @@ class LearningSettings(BaseSettings):
         "learning-loop", description="OTel service.name / Phoenix project for both processes."
     )
     learning_trace_verbose: bool = Field(
-        False,
+        True,
         description=(
-            "D25 GATE: when FALSE (default) the learning-loop spans carry SHAPE-only "
-            "attrs (counters/labels/session.id — no transcript, SQL, question, or intent). "
-            "When TRUE the triage/consume/extract/promote spans ALSO carry human-readable "
-            "content (the user question, accepted SQL, learned intent/slots, blueprint id). "
-            "Verbose makes the `learning-loop` Phoenix project ENTITY-BEARING and MUST be "
-            "access-controlled like the audit/session store (D51 in-boundary PII posture), "
-            "NOT the shape-only D25 telemetry posture. Enable ONLY in a controlled diagnostic "
-            "environment."
+            "D25 GATE, amended 2026-07-15 (deliberate operator posture flip): the default "
+            "is now TRUE (verbose). The triage/consume/extract/promote spans AND the "
+            "learning-sessions projection carry human-readable content (the user question, "
+            "accepted SQL, learned intent/slots, resolves, rationale, evidence quotes, "
+            "blueprint id) BY DEFAULT — so the `learning-loop` AND `learning-sessions` "
+            "Phoenix projects are ENTITY-BEARING BY DEFAULT and MUST be access-controlled "
+            "like the audit/session store (D51 in-boundary PII posture). Set FALSE to "
+            "restore the D25 shape-only telemetry posture (counters/labels/session.id only — "
+            "no transcript, SQL, question, or intent). The gate MECHANISM is unchanged; only "
+            "the default posture flipped."
         ),
     )
 

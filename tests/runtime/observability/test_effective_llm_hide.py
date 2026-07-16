@@ -1,6 +1,6 @@
 """`config.effective_llm_hide` — the pure resolver for the OpenAI-LLM-content
-hide, folding the D25 `otlp_hide_llm_content` default with the master telemetry
-debug switch `otlp_disable_redaction`.
+hide, folding `otlp_hide_llm_content` (the hidden/opt-out posture) with the master
+telemetry debug switch `otlp_disable_redaction`.
 
 Reviewer Suggestion 1: the LLM-content REVEAL direction (disable_redaction forcing
 content visible) was previously exercised only implicitly via app wiring. These
@@ -21,9 +21,9 @@ from data_agent.runtime.observability import tracing
 @pytest.mark.parametrize(
     ("hide_llm_content", "disable_redaction", "expected_hidden"),
     [
-        (True, False, True),  # D25 default: content hidden
+        (True, False, True),  # the hidden posture (opt-out — content hidden)
         (True, True, False),  # debug switch forces the reveal
-        (False, False, False),  # explicit LLM-content reveal
+        (False, False, False),  # D25-amended default: content revealed
         (False, True, False),  # debug switch: revealed regardless
     ],
 )
@@ -38,9 +38,11 @@ def test_effective_llm_hide_truth_table(
     assert effective_llm_hide(settings) is expected_hidden
 
 
-def test_only_hidden_row_is_the_d25_default() -> None:
-    """The ONLY combination that hides content is the D25 default (hide=True,
-    disable_redaction=False) — the other three all reveal."""
+def test_only_hidden_row_is_hide_true_redaction_off() -> None:
+    """The ONLY combination that hides content is the hidden posture (hide=True,
+    disable_redaction=False) — the other three all reveal. NOTE: since the
+    2026-07-15 amendment this hidden row is the opt-OUT, not the system default
+    (`otlp_hide_llm_content` now defaults False); the truth-table fact is unchanged."""
     hidden = [
         (h, d)
         for h in (True, False)

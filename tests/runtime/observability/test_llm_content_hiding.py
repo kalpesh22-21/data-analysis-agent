@@ -1,9 +1,13 @@
-"""D25 online-invariant: the auto-instrumented OpenAI `LLM` span must NOT carry
-raw prompt/completion content — nor a content-bearing exception event — BY
-DEFAULT.
+"""D25 online-invariant (mechanism): WHEN HIDING IS ENABLED
+(`hide_content=True` / `otlp_hide_llm_content=True`), the auto-instrumented OpenAI
+`LLM` span must NOT carry raw prompt/completion content — nor a content-bearing
+exception event. NOTE (amended 2026-07-15): hiding is now the explicit opt-OUT, not
+the system default (`otlp_hide_llm_content` defaults False → reveal); these tests
+drive `hide_content` EXPLICITLY, so they exercise the hide MECHANISM regardless of
+which posture is the default.
 
 Tags:
-  - runtime-llm-span-content-hidden-by-default
+  - runtime-llm-span-content-hidden-when-hide-enabled
   - runtime-llm-span-no-exception-content-when-hidden
 
 Unlike the manual AGENT/TOOL/CHAIN spans (which redact SQL literals / bound-slot
@@ -174,10 +178,10 @@ def test_trace_config_reveal_is_none_library_default() -> None:
 
 
 @pytest.mark.parametrize("api", ["responses", "chat"])
-async def test_llm_span_content_hidden_by_default(api: str) -> None:
-    """DEFAULT (hide_content=True): the LLM span carries NO raw prompt/completion
-    — no question text, no query-derived answer — while the non-content shape
-    attributes (model name, token counts) remain."""
+async def test_llm_span_content_hidden_when_hide_enabled(api: str) -> None:
+    """HIDE ENABLED (hide_content=True, the opt-out posture): the LLM span carries
+    NO raw prompt/completion — no question text, no query-derived answer — while the
+    non-content shape attributes (model name, token counts) remain."""
     span = _llm_span(await _emit_llm_span(hide_content=True, api=api))
     attrs = span.attributes
     blob = str(dict(attrs))
@@ -217,10 +221,10 @@ async def test_llm_span_content_visible_on_opt_in(api: str) -> None:
 
 @pytest.mark.parametrize("api", ["responses", "chat"])
 async def test_llm_span_no_exception_content_when_hidden(api: str) -> None:
-    """DEFAULT (hide_content=True): a FAILED OpenAI call records no `exception`
-    event on the LLM span, and the response error body (a secret) appears nowhere
-    on the span — TraceConfig masks attributes, LLMExceptionEventScrubber the
-    events."""
+    """HIDE ENABLED (hide_content=True, the opt-out posture): a FAILED OpenAI call
+    records no `exception` event on the LLM span, and the response error body (a
+    secret) appears nowhere on the span — TraceConfig masks attributes,
+    LLMExceptionEventScrubber the events."""
     span = _llm_span(await _emit_llm_span(hide_content=True, api=api, fail=True))
     event_names = [e.name for e in span.events]
     assert "exception" not in event_names, f"exception event not scrubbed: {event_names}"

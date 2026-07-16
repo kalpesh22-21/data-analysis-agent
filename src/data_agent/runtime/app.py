@@ -245,13 +245,13 @@ def create_app(
     )
 
     # The effective LLM-content hide (config.effective_llm_hide): normally
-    # `otlp_hide_llm_content` (D25 default True), but the master TELEMETRY DEBUG
-    # switch `otlp_disable_redaction` forces the reveal — disabling redaction across
-    # the board also shows the LLM Q/A + exception events, so a debugging operator
-    # sees the whole turn. Access-controlled (makes the Phoenix project entity-
-    # bearing); default keeps content hidden. Passed identically to
-    # configure_tracing (exception scrubber) AND instrument_openai (attribute
-    # TraceConfig) so both channels agree.
+    # `otlp_hide_llm_content` (D25 amended 2026-07-15 — now defaults FALSE, i.e.
+    # REVEAL), and the master TELEMETRY DEBUG switch `otlp_disable_redaction` also
+    # forces the reveal. So by default the whole turn's LLM Q/A + exception events are
+    # visible — the Phoenix project is entity-bearing BY DEFAULT and MUST be
+    # access-controlled; hiding is the explicit opt-OUT (`otlp_hide_llm_content=True`).
+    # Passed identically to configure_tracing (exception scrubber) AND instrument_openai
+    # (attribute TraceConfig) so both channels agree.
     hide_llm_content = effective_llm_hide(settings)
 
     tracer_provider = tracing.configure_tracing(
@@ -278,11 +278,11 @@ def create_app(
         # only changes WHICH spans export — not what CONTENT a kept span carries.
         drop_span_names=settings.otlp_drop_span_names,
     )
-    # D25: hide the auto-instrumented OpenAI LLM span's raw prompt/completion by
-    # default (the online per-turn Phoenix project is a shape/count/latency-only
-    # surface — the completion embeds cell values / the query-derived answer). The
-    # reveal is an explicit, access-controlled opt-in (`otlp_hide_llm_content`),
-    # mirroring the learning loop's verbose gate.
+    # D25 amended 2026-07-15: the auto-instrumented OpenAI LLM span's raw prompt/
+    # completion is REVEALED by default (the online per-turn Phoenix project is
+    # entity-bearing BY DEFAULT — the completion embeds cell values / the query-derived
+    # answer — and MUST be access-controlled). Hiding is the explicit opt-OUT
+    # (`otlp_hide_llm_content=True`), mirroring the learning loop's verbose gate.
     tracing.instrument_openai(tracer_provider, hide_content=hide_llm_content)
     tracer = tracing.get_tracer(tracer_provider)
 

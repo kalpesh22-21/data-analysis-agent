@@ -124,14 +124,16 @@ class RuntimeSettings(BaseSettings):
         ),
     )
     otlp_hide_llm_content: bool = Field(
-        True,
+        False,
         description=(
-            "D25 (online per-turn HARD invariant): when True (default) the auto-"
-            "instrumented OpenAI LLM span carries NO raw prompt/completion — only "
-            "shape/timing/model-name/token-counts — so the runtime Phoenix project "
-            "stays content-free. Set False ONLY in a controlled, access-controlled "
-            "diagnostic environment: it makes the project entity-bearing (raw question "
-            "+ query-derived answer land on the span), like LEARNING_TRACE_VERBOSE."
+            "D25 amended 2026-07-15 (deliberate operator posture flip): the default is "
+            "now False (REVEAL) — the auto-instrumented OpenAI LLM span carries the raw "
+            "prompt + completion, so the runtime Phoenix project is ENTITY-BEARING BY "
+            "DEFAULT (raw question + query-derived answer land on the span) and MUST be "
+            "access-controlled like the audit/session store (D51). Set True to restore "
+            "the D25 shape-only telemetry posture (NO raw prompt/completion — only "
+            "shape/timing/model-name/token-counts). The redaction MECHANISM is unchanged; "
+            "only which posture is the default flipped. Mirrors LEARNING_TRACE_VERBOSE."
         ),
     )
     otlp_drop_span_names: list[str] = Field(
@@ -155,9 +157,14 @@ class RuntimeSettings(BaseSettings):
     otlp_disable_redaction: bool = Field(
         False,
         description=(
-            "MASTER TELEMETRY DEBUG SWITCH — default False (D25 shape-only posture "
-            "preserved byte-for-byte). When True, the runtime disables Phoenix-trace "
-            "redaction so a debugging operator sees the REAL tool calls: (1) the TOOL "
+            "MASTER TELEMETRY DEBUG SWITCH — default False. At its default this flag "
+            "preserves ONLY the manual TOOL/AGENT/CHAIN cell-value redaction (SQL "
+            "literals / result cells / bound slot values masked byte-for-byte); it does "
+            "NOT govern the OpenAI LLM-span content, which is a SEPARATE posture set by "
+            "otlp_hide_llm_content (revealed by default since the 2026-07-15 D25 "
+            "amendment) — so the all-defaults posture is NOT shape-only overall. When "
+            "True, the runtime disables Phoenix-trace redaction so a debugging operator "
+            "sees the REAL tool calls: (1) the TOOL "
             "span carries the REAL args (actual SQL WITH literals, real resolveValues "
             "concept/period values) instead of the D25 masked shape; (2) the tool "
             "RESULT preview (columns + preview rows + row_count/truncated) is attached "
@@ -430,9 +437,9 @@ def effective_llm_hide(settings: RuntimeSettings) -> bool:
     table:
 
         hide_llm_content  disable_redaction  -> hidden?
-        True              False              -> True   (D25 default: hidden)
+        True              False              -> True   (opt-out: shape-only hidden)
         True              True               -> False  (debug: revealed)
-        False             False              -> False  (explicit LLM reveal)
+        False             False              -> False  (D25-amended default: reveal)
         False             True               -> False  (debug: revealed)
 
     `app.py` passes this single value to BOTH `configure_tracing(hide_llm_content=)`

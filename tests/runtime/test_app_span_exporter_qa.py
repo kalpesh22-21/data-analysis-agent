@@ -100,9 +100,11 @@ def _build_app(
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
         max_budget_windows=3,
-        # Hermeticity: this suite asserts the D25 DEFAULT redacted posture (SQL
-        # literals / result cells / raw scope never reach a span). Pin it here so
-        # an operator's ambient OTLP_DISABLE_REDACTION=1 debug flag (e.g. in .env)
+        # Hermeticity: this suite asserts the redacted/hidden posture (SQL literals /
+        # result cells / raw scope never reach a span). Since 2026-07-15 that is the
+        # NON-default (opt-out) posture — `otlp_hide_llm_content` now defaults False
+        # (reveal) — so both flags are pinned EXPLICITLY here to the hidden posture,
+        # so an operator's ambient OTLP_DISABLE_REDACTION=1 debug flag (e.g. in .env)
         # can't flip the posture out from under the invariant.
         otlp_disable_redaction=False,
         otlp_hide_llm_content=True,

@@ -11,9 +11,10 @@ span exporter (no Phoenix, no infra):
     `CandidateEnvelope`, makes the scheduler's `promote`/`land` continue the trace.
 
   * `traces-verbose-off-is-d25-shape-only` — with `learning_trace_verbose` OFF
-    (the default), NO human-readable attribute (question, transcript, SQL, intent)
-    is ever set on any learning span (the D25 shape-only posture is preserved);
-    ON, they appear (the entity-bearing diagnostic posture).
+    (now the opt-out — verbose is the default since the 2026-07-15 D25 amendment), NO
+    human-readable attribute (question, transcript, SQL, intent) is ever set on any
+    learning span (the D25 shape-only posture is preserved); ON (the default), they
+    appear (the entity-bearing diagnostic posture).
 """
 
 from __future__ import annotations
@@ -269,8 +270,9 @@ _VERBOSE_ATTRS = {
 async def test_verbose_off_sets_no_human_readable_attrs(
     store, queue, settings, seed_session, span_exporter, tracer
 ):
-    """[traces-verbose-off-is-d25-shape-only] With verbose OFF (default) NO learning
-    span carries any entity-bearing attribute — the D25 shape-only posture holds."""
+    """[traces-verbose-off-is-d25-shape-only] With verbose OFF (now the opt-out) NO
+    learning span carries any entity-bearing attribute — the D25 shape-only posture
+    holds."""
     seed_session(
         store, "sess-chain",
         messages=[make_message(0, "user", "secret question about Jane Doe"),
@@ -380,6 +382,8 @@ def test_learning_span_records_no_exception_event_on_raise(span_exporter, tracer
         assert sp.status.status_code == StatusCode.ERROR
 
 
-def test_verbose_flag_defaults_off():
-    """The D25 gate is OFF unless explicitly enabled."""
-    assert LearningSettings(_env_file=None).learning_trace_verbose is False
+def test_verbose_flag_defaults_on():
+    """The D25 gate now defaults ON — verbose by default (amended 2026-07-15). The
+    learning-loop/learning-sessions Phoenix projects are entity-bearing by default;
+    set LEARNING_TRACE_VERBOSE=false to restore the shape-only telemetry posture."""
+    assert LearningSettings(_env_file=None).learning_trace_verbose is True
