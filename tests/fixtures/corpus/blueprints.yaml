@@ -212,12 +212,17 @@
   uses:
     - dbpcm_warehouse.employee.EmployeeCode
     - dbpcm_warehouse.employee.MostRecentHireDate
+    - dbpcm_warehouse.employee.EmployeeStatus
   slots:
     - { name: window_months, type: relative_window, required: true, min_value: 1, max_value: 36 }
   result_grain: [ month ]
   # Anchor the trailing window on the DATA (the latest hire month present), not the
   # wall clock — so the fixture doesn't decay to empty as real time passes. The
-  # window yields N whole months PLUS the current partial (latest) bucket.
+  # window yields N whole months PLUS the current partial (latest) bucket (harmless
+  # here — this is a per-month listing, no division by N). exclude_not_hired_default:
+  # drop 'N' (pre-hire) records — in BOTH the outer WHERE and the anchor subquery, so
+  # a future-dated 'N' hire date can never become max() and drag the anchor. The
+  # `OR IS NULL` matters: EmployeeStatus is Nullable(String), a bare `!= 'N'` drops NULLs.
   sql_template: |
     SELECT toStartOfMonth(MostRecentHireDate) AS month,
            COUNT(DISTINCT EmployeeCode) AS hires
@@ -225,7 +230,9 @@
     WHERE MostRecentHireDate >= (
             SELECT toStartOfMonth(max(MostRecentHireDate))
             FROM dbpcm_warehouse.employee
+            WHERE EmployeeStatus != 'N' OR EmployeeStatus IS NULL
           ) - INTERVAL {window_months} MONTH
+      AND (EmployeeStatus != 'N' OR EmployeeStatus IS NULL)
     GROUP BY toStartOfMonth(MostRecentHireDate)
 
 # Windowed-period slot — `period_range` (an explicit {start, end}, D41/D49): the
@@ -243,13 +250,63 @@
   uses:
     - dbpcm_warehouse.employee.EmployeeCode
     - dbpcm_warehouse.employee.MostRecentHireDate
+    - dbpcm_warehouse.employee.EmployeeStatus
   slots:
     - { name: hire_window, type: period_range, required: true }
   result_grain: [ month ]
+  # exclude_not_hired_default: drop 'N' (pre-hire) records. `OR IS NULL` matters —
+  # EmployeeStatus is Nullable(String), a bare `!= 'N'` drops NULL rows.
   sql_template: |
     SELECT toStartOfMonth(MostRecentHireDate) AS month,
            COUNT(DISTINCT EmployeeCode) AS hires
     FROM dbpcm_warehouse.employee
     WHERE MostRecentHireDate >= {hire_window_start}
       AND MostRecentHireDate < {hire_window_end}
+      AND (EmployeeStatus != 'N' OR EmployeeStatus IS NULL)
     GROUP BY toStartOfMonth(MostRecentHireDate)
+
+# Second-order (D103/D104, second-order-analysis-design §2–§3): a run-rate PROJECTION.
+# The pivot away from a bespoke `projectSeries` tool — the projection math is plain
+# ClickHouse (sum-of-hires-in-window ÷ window_months × horizon_months), so it lives in
+# a VERIFIED blueprint that rides the existing D56-verify + provenance path, not a new
+# tool. A single-row aggregate (no GROUP BY / CTE / WITH FILL): `sum/N` counts zero-hire
+# months correctly BY CONSTRUCTION (a zero-hire month adds 0; the denominator is the
+# fixed window N), so the empty months never need materializing. `result_grain: []` → a
+# single-row aggregate, so D56 grain-verify is vacuously skipped.
+- id: bp-hires-projection
+  intent: Projected number of hires over the next N months at the current hiring pace (run-rate over a trailing window)
+  slots_summary: window_months, horizon_months
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.employee.EmployeeCode
+    - dbpcm_warehouse.employee.MostRecentHireDate
+    - dbpcm_warehouse.employee.EmployeeStatus
+  slots:
+    - { name: window_months,  type: relative_window, required: true, min_value: 2, max_value: 36 }
+    - { name: horizon_months, type: relative_window, required: true, min_value: 1, max_value: 24 }
+  result_grain: []
+  # Run-rate projection: avg monthly hires over the trailing window, projected forward.
+  # Denominator/span alignment: the anchor is shifted FORWARD one month (addMonths(...,1))
+  # before subtracting {window_months}, so the window spans EXACTLY N monthly buckets
+  # ending at the latest hire month — NOT N+1 (latest + N prior), which would divide N+1
+  # buckets' hires by N and bias the rate high (+50% at the min window). sum/N then counts
+  # zero-hire months correctly (a zero-hire month adds 0; denominator is the fixed N).
+  # Window anchored on the DATA (latest hire month), matching bp-hires-per-month, so it
+  # does not decay to empty as wall-clock time passes. exclude_not_hired_default: drop
+  # 'N' (pre-hire) records in BOTH the outer WHERE and the anchor subquery (a future-dated
+  # 'N' hire could otherwise become max() and drag the anchor). `OR IS NULL` matters —
+  # EmployeeStatus is Nullable(String), a bare `!= 'N'` drops NULL rows.
+  sql_template: |
+    SELECT
+      COUNT(DISTINCT EmployeeCode) AS hires_in_window,
+      round(COUNT(DISTINCT EmployeeCode) / {window_months}, 1) AS avg_monthly_hires,
+      round(COUNT(DISTINCT EmployeeCode) / {window_months} * {horizon_months}) AS projected_next_n_hires
+    FROM dbpcm_warehouse.employee
+    WHERE MostRecentHireDate >= addMonths((
+            SELECT toStartOfMonth(max(MostRecentHireDate))
+            FROM dbpcm_warehouse.employee
+            WHERE EmployeeStatus != 'N' OR EmployeeStatus IS NULL
+          ), 1) - INTERVAL {window_months} MONTH
+      AND (EmployeeStatus != 'N' OR EmployeeStatus IS NULL)

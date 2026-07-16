@@ -84,7 +84,16 @@ AGENT_SYSTEM_PROMPT = (
     "## Answering\n"
     "When you have the result, give a concise, direct answer grounded in the "
     "returned rows. Never fabricate numbers — every figure must come from a "
-    "query you actually ran."
+    "query you actually ran. For forward-looking questions (\"at this pace\", "
+    "\"if we keep going\", \"project\", \"forecast\", \"on track to\"), prefer a "
+    "projection blueprint via searchBlueprints/runBlueprint; if none fits, compute "
+    "the projection yourself in a single runQuery — for example a hiring pace as a "
+    "monthly average over a trailing window, projected forward — so the forward "
+    "figure still comes from a query you ran. Never hand-compute a forward figure "
+    "in prose. If the question implies a target or \"need\" with no target "
+    "available, state that assumption (recordAssumptions) or ask. When you report "
+    "a projection, state its assumption (it extrapolates the current pace over the "
+    "trailing window and is not seasonally adjusted) via recordAssumptions."
 )
 
 
