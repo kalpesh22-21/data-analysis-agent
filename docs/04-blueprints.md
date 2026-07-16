@@ -227,9 +227,44 @@ never parsed with `to_date`. The **period resolver** handles three fill paths:
 `as_of_date` is the analog for `as_of_date`-semantics tables (point-in-time snapshot), resolved to an
 effective date rather than a period key.
 
-> **Open:** single period only — ranges ("May vs June", "YTD") need a `period_range` slot shape or a
-> list-typed period slot (not yet decided). And the resolver wants a **period dimension table** rather
-> than `SELECT DISTINCT` on a large fact table.
+### Windowed-period slot types (`relative_window` / `period_range`)
+
+Two slot types cover trailing/explicit windows a single `period` key can't express. Both stay
+resolver-**pure** — no `to_date`, no wall-clock or relative→concrete date arithmetic (D49); the value
+becomes a **typed literal only** (F1/D10), never string-interpolated.
+
+| Type | Raw shape | Resolves to | Binds as |
+|---|---|---|---|
+| **`relative_window`** | `6`, `"6"` (a plain integer) | a **bounded integer** `n` | one `INTERVAL {n} <unit>` **number** literal |
+| **`period_range`** | `{start, end}` or `[start, end]` | a `PeriodRange(start, end)` | **two** string literals `{name}_start` / `{name}_end` |
+
+- **`relative_window`** — a trailing "last N `<unit>`". The unit lives in the **template**
+  (`INTERVAL {n} MONTH`), so the runtime accepts **only an integer or a pure-digit string** — any
+  trailing text (`"6 months"`, `"6 weeks"`, `"6; DROP"`), a fraction, or non-numeric → `askUser` (never
+  a silent unit mismatch, e.g. binding a *week* count as *months*). It enforces
+  `spec.min_value ≤ n ≤ spec.max_value` with `n ≥ 1` always; the ceiling **120 is a HARD cap** — the
+  resolver clamps to it and `SlotSpec.parse` rejects any authored bound outside
+  `1 ≤ min_value ≤ max_value ≤ 120`, so an absurd `INTERVAL 999999 MONTH` can neither be authored nor
+  bound. A `relative_window` slot declares **no `binds_to`** (it consumes no domain). The template
+  references the single `{name}` token (e.g. `INTERVAL {window_months} MONTH`).
+- **`period_range`** — an explicit `{start, end}`. The **one** slot expands to **two** bind tokens,
+  `{name}_start` and `{name}_end` (e.g. `{hire_window_start}` / `{hire_window_end}`), each a typed
+  string literal. Both bounds must be strict ISO (`YYYY-MM-DD`, optionally `THH:MM:SS`), a **real
+  calendar date** (`2026-13-99` is rejected), the same shape, and `start < end`; a deictic word
+  ("last month"), a missing key, or a malformed bound → `askUser`. A `period_range` slot declares
+  **no `binds_to`**. **Both tokens must be referenced** by *each* template that references either — a
+  range with a dropped bound is a dropped filter (the D56 wrong-answer class), so the corpus loader
+  **rejects** a template referencing only one (per-node, not just blueprint-wide), and the executor
+  fails closed (`SLOT_INVALID`) if either token is unreferenced. The loader also rejects **token
+  collisions** (two slots claiming the same bind token, e.g. a `string` slot `w_start` alongside a
+  range slot `w`). The `slot_token_names` / `expand_binding` helpers (`blueprint/slots.py`) centralize
+  this one-slot → two-token rule so the executor bind sites and the loader gates never drift.
+
+`as_of_date` remains a single point-in-time; `period` remains a single discrete key — reach for
+`period_range` only when the query genuinely spans an explicit `[start, end)`.
+
+> **Open:** the resolver still wants a **period dimension table** rather than `SELECT DISTINCT` on a
+> large fact table; and a list-typed period slot (discrete "May **and** June") is not yet decided.
 
 ## Execution — `runBlueprint(id, slot_bindings)`
 

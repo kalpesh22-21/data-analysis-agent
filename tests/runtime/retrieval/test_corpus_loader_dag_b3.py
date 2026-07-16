@@ -114,7 +114,9 @@ def test_all_seed_fixtures_still_validate_under_b3_s1_s3() -> None:
         "bp-total-earnings-by-department",
         "bp-departments-above-company-average-salary",
         "bp-earnings-by-department-via-scratch-join",
+        "bp-hires-per-month",
+        "bp-hires-in-range",
     }
     for bp in blueprints:
-        _validate_blueprint_dag(bp)  # no raise — every required slot is referenced,
-        # every binds_to ∈ uses, and each has ≤ 16 slots.
+        _validate_blueprint_dag(bp)  # no raise — every required slot (incl. both
+        # period_range tokens) is referenced, every binds_to ∈ uses, ≤ 16 slots.

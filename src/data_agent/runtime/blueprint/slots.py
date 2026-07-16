@@ -17,11 +17,13 @@ lets the executor wire the real probe later without changing this contract.
 
 from __future__ import annotations
 
+import datetime as _dt
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import SlotSpec
+from .models import RELATIVE_WINDOW_CEILING, RELATIVE_WINDOW_FLOOR, SlotSpec
 
 # Deictic / relative period words — never resolved to a concrete period here
 # (D49: fuzzy NL is never guessed); they route to `AskUser` (or, in Slice B, to a
@@ -29,6 +31,29 @@ from .models import SlotSpec
 _DEICTIC_PERIOD_TOKENS: frozenset[str] = frozenset(
     {"latest", "current", "last", "recent", "this", "next", "previous", "prior"}
 )
+
+# `relative_window` safety bounds (D49) — the shared floor/ceiling from `models`.
+# `n` binds as an `INTERVAL {n} <unit>` literal; the ceiling is a HARD cap so an
+# absurd `INTERVAL 999999 MONTH` can neither be authored nor bound. A slot's
+# `min_value`/`max_value` may narrow the window but never widen past the ceiling
+# (H1a: the resolver clamps `hi` to it even if a poisoned/legacy spec declares more).
+_RELATIVE_WINDOW_MIN = RELATIVE_WINDOW_FLOOR
+_RELATIVE_WINDOW_MAX = RELATIVE_WINDOW_CEILING
+# A `period_range` bound — an ISO calendar date, optionally with a `T`-time. Bound
+# as a TYPED string literal (F1/D10), never date-arithmeticed here (resolver-pure,
+# consistent with `_resolve_period`). `\A…\Z`-anchored (L1) so a trailing newline
+# can never slip past the fence; calendar validity is checked separately (L2).
+_ISO_DATE = re.compile(r"\A\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?\Z")
+
+
+@dataclass(frozen=True)
+class PeriodRange:
+    """An explicit `{start, end}` window for a `period_range` slot. Both bounds are
+    ISO date/datetime strings; the executor expands them to `{name}_start`/
+    `{name}_end` bind sites via `expand_binding` (each a TYPED literal, F1/D10)."""
+
+    start: str
+    end: str
 
 
 @dataclass(frozen=True)
@@ -73,6 +98,20 @@ def _normalize(raw: Any) -> Any:
     return raw.strip() if isinstance(raw, str) else raw
 
 
+def _is_valid_iso_calendar(value: str) -> bool:
+    """True iff *value* (already ISO-SHAPE-matched) is a REAL calendar date/datetime
+    (L2). `fromisoformat` rejects impossible dates like `2026-13-99` / `2026-02-30`.
+    Pure validation — no arithmetic, no wall-clock read (D49 resolver-purity)."""
+    try:
+        if "T" in value:
+            _dt.datetime.fromisoformat(value)
+        else:
+            _dt.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _is_absent(raw: Any) -> bool:
     return raw is None or (isinstance(raw, str) and raw.strip() == "")
 
@@ -107,6 +146,14 @@ def resolve_slot(
                 question=f"What value should I use for '{spec.name}'?",
             )
         return OmitSlot(name=spec.name)
+
+    # The windowed-period types resolve BEFORE the string/entity container guard
+    # (line below): a `period_range` value is legitimately a dict/list, which that
+    # guard would otherwise reject as "not a single value" (F1 windowed-slot gap).
+    if spec.type == "relative_window":
+        return _resolve_relative_window(raw, spec)
+    if spec.type == "period_range":
+        return _resolve_period_range(raw, spec)
 
     if spec.type in ("string", "entity"):
         # A CONTAINER (list/dict/tuple) handed to a scalar slot is not a value —
@@ -250,4 +297,153 @@ def _resolve_list(raw: Any, spec: SlotSpec, domain: Iterable[str] | None) -> Slo
     return SlotBinding(name=spec.name, value=resolved, resolved_from="list")
 
 
-__all__ = ["AskUser", "OmitSlot", "SlotBinding", "SlotResolution", "resolve_slot"]
+def _resolve_relative_window(raw: Any, spec: SlotSpec) -> SlotResolution:
+    """A trailing "last N <unit>" window (§3.2, the windowed-period gap): resolve
+    the raw value to a BOUNDED integer `n`, bound as an `INTERVAL {n} <unit>` number
+    literal (F1/D10 — never interpolated). Pure code, no LLM (D49).
+
+    Accepts ONLY an `int` or a PURE-DIGIT string (whole string is digits after a
+    strip). ANY trailing non-digit text — "6 months", "6 weeks", "6; DROP" — is
+    REJECTED (H2): the unit lives in the TEMPLATE (`INTERVAL {n} MONTH`), so taking
+    a leading integer and dropping the trailing "weeks" would silently bind a WEEK
+    count as MONTHS (a wrong-answer unit mismatch). A float, non-numeric, or any
+    trailing text → `AskUser`. `n` must fall in `[lo, hi]` where `lo = spec.min_value
+    or 1`, `hi = min(spec.max_value or 120, 120)` — the ceiling is a HARD cap the
+    resolver clamps to even if a spec declares more (H1a); `n >= 1` always."""
+    value = _normalize(raw)
+    if isinstance(value, bool):
+        # A bool is an int subclass — never a window count. Ask rather than bind 1/0.
+        return AskUser(
+            slot=spec.name,
+            reason="invalid",
+            question=f"'{spec.name}' expects a whole number of periods (e.g. 6).",
+        )
+    if isinstance(value, int):
+        n = value
+    elif isinstance(value, str) and value.isdigit():
+        # PURE digits only (H2). `str.isdigit()` is True iff every char is a decimal
+        # digit and the string is non-empty — so "6 months"/"6.5"/"6; DROP"/"" all
+        # fall through to the AskUser below (no leading-integer extraction).
+        n = int(value)
+    else:
+        # A float, a non-numeric string, or a phrase with a trailing unit/text — the
+        # unit is the template's job; a plain number of the template's own unit only.
+        return AskUser(
+            slot=spec.name,
+            reason="invalid",
+            question=f"'{spec.name}' expects a plain whole number of periods (e.g. 6), no unit.",
+        )
+    lo = spec.min_value if spec.min_value is not None else _RELATIVE_WINDOW_MIN
+    hi = spec.max_value if spec.max_value is not None else _RELATIVE_WINDOW_MAX
+    lo = max(lo, _RELATIVE_WINDOW_MIN)  # n >= 1 always (a 0/negative window is no filter)
+    hi = min(hi, _RELATIVE_WINDOW_MAX)  # H1a: the ceiling is HARD even if max_value > it
+    if not (lo <= n <= hi):
+        return AskUser(
+            slot=spec.name,
+            reason="invalid",
+            question=f"'{spec.name}' must be a whole number between {lo} and {hi}.",
+        )
+    # An int → the existing number-literal bind path (`exp.Literal.number`).
+    return SlotBinding(name=spec.name, value=n, resolved_from="direct")
+
+
+def _resolve_period_range(raw: Any, spec: SlotSpec) -> SlotResolution:
+    """An explicit `{start, end}` window (§3.2, the windowed-period gap). Resolves
+    to a `PeriodRange`; the executor expands it to `{name}_start`/`{name}_end` TYPED
+    string literals (F1/D10). Pure — NO relative→concrete date arithmetic (a deictic
+    word asks, consistent with `_resolve_period`).
+
+    Accepts a dict with string `start`/`end` keys, or a 2-element `[start, end]`
+    list/tuple. Both bounds must match a strict ISO date/datetime shape and
+    `start < end` (a same-shape ISO string compare is valid). A non-dict/list, a
+    missing key, a malformed/deictic bound, or mismatched shapes → `AskUser`."""
+    if isinstance(raw, dict):
+        start = raw.get("start")
+        end = raw.get("end")
+    elif isinstance(raw, (list, tuple)) and len(raw) == 2:
+        start, end = raw[0], raw[1]
+    else:
+        return AskUser(
+            slot=spec.name,
+            reason="invalid",
+            question=(
+                f"'{spec.name}' needs explicit start and end dates "
+                "(e.g. {\"start\": \"2026-01-01\", \"end\": \"2026-03-31\"})."
+            ),
+        )
+    start = _normalize(start)
+    end = _normalize(end)
+    if not isinstance(start, str) or not isinstance(end, str):
+        return AskUser(
+            slot=spec.name,
+            reason="invalid",
+            question=f"'{spec.name}' needs explicit start and end dates as ISO strings.",
+        )
+    if not _ISO_DATE.match(start) or not _ISO_DATE.match(end):
+        # Deictic/relative words ("last month") or a malformed date — never guessed.
+        return AskUser(
+            slot=spec.name,
+            reason="fuzzy",
+            question=(
+                f"'{spec.name}' needs explicit start and end dates in YYYY-MM-DD form "
+                "(e.g. 2026-01-01), not relative words."
+            ),
+        )
+    # L2: the regex proves the SHAPE, not calendar validity — "2026-13-99" matches
+    # `\d{4}-\d{2}-\d{2}` but is not a real date. `fromisoformat` parses (and REJECTS)
+    # it; this is VALIDATION, not date arithmetic, so the resolver stays pure (no
+    # relative→concrete math). A ValueError → ask rather than bind an impossible date.
+    if not _is_valid_iso_calendar(start) or not _is_valid_iso_calendar(end):
+        return AskUser(
+            slot=spec.name,
+            reason="invalid",
+            question=f"'{spec.name}' start/end must be real calendar dates (e.g. 2026-01-31).",
+        )
+    # A string compare is a valid ordering ONLY for same-shaped ISO strings; if one
+    # bound carries a `T`-time and the other does not, the compare is unsound → ask.
+    if ("T" in start) != ("T" in end):
+        return AskUser(
+            slot=spec.name,
+            reason="invalid",
+            question=f"'{spec.name}' start and end must be the same date shape (both date, or both datetime).",
+        )
+    if not (start < end):
+        return AskUser(
+            slot=spec.name,
+            reason="invalid",
+            question=f"'{spec.name}' start date must be before its end date.",
+        )
+    return SlotBinding(name=spec.name, value=PeriodRange(start, end), resolved_from="direct")
+
+
+def slot_token_names(spec: SlotSpec) -> set[str]:
+    """The set of `{token}` names *spec* may legally bind in a template — the
+    ANTI-DRIFT rule every downstream seam (executor bind sites, corpus-loader gates)
+    calls instead of reimplementing. A `period_range` occupies TWO tokens
+    (`{name}_start`, `{name}_end`); every other type occupies one (`{name}`)."""
+    if spec.type == "period_range":
+        return {f"{spec.name}_start", f"{spec.name}_end"}
+    return {spec.name}
+
+
+def expand_binding(spec: SlotSpec, value: Any) -> dict[str, Any]:
+    """Expand a resolved slot *value* into its `{token}: value` bind map — the
+    companion to `slot_token_names`. A `period_range` (value is a `PeriodRange`)
+    expands to both bounds as separate string bindings; every other type binds its
+    single value under `{name}`. The executor calls this so a `PeriodRange` NEVER
+    reaches `bind_template` (which only knows str/number/bool/list literals)."""
+    if spec.type == "period_range" and isinstance(value, PeriodRange):
+        return {f"{spec.name}_start": value.start, f"{spec.name}_end": value.end}
+    return {spec.name: value}
+
+
+__all__ = [
+    "AskUser",
+    "OmitSlot",
+    "PeriodRange",
+    "SlotBinding",
+    "SlotResolution",
+    "expand_binding",
+    "resolve_slot",
+    "slot_token_names",
+]

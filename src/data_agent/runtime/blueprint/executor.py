@@ -74,7 +74,14 @@ from .rules import (
     expand_rule,
     parse_rule,
 )
-from .slots import AskUser, OmitSlot, SlotBinding, resolve_slot
+from .slots import (
+    AskUser,
+    OmitSlot,
+    SlotBinding,
+    expand_binding,
+    resolve_slot,
+    slot_token_names,
+)
 from .template import (
     TemplateBindError,
     assert_read_only_select,
@@ -317,22 +324,28 @@ class BlueprintExecutor:
             if isinstance(outcome, OmitSlot):
                 continue  # absent optional slot — optional_pattern assembly is Slice C
             if isinstance(outcome, SlotBinding):
-                # B3: a resolved value whose `{slot}` the template does not
+                # B3: a resolved value whose `{slot}` token(s) the template does not
                 # reference must NEVER be silently dropped — dropping it would run
                 # the query WITHOUT the user's intended filter and return
                 # company-wide numbers that still pass the grain gate (the exact
                 # wrong-answer class D56 exists to block). Fail-closed to
                 # SLOT_INVALID → raw loop. (The loader also rejects this at write;
                 # this is the READ-side backstop for a poisoned/legacy record.)
-                if spec.name not in referenced:
+                # `slot_token_names` centralizes the rule: for a scalar slot
+                # `tokens={name}` (identical to the old `name not in referenced`);
+                # for a `period_range` BOTH `{name}_start` AND `{name}_end` must be
+                # referenced or a dropped bound = a dropped filter (D56 class).
+                tokens = slot_token_names(spec)
+                if tokens - referenced:
                     _logger.warning(
-                        "blueprint %s: resolved slot %r is not referenced by the template; "
-                        "SLOT_INVALID (never a silent filter drop)",
+                        "blueprint %s: resolved slot %r token(s) %s not referenced by the "
+                        "template; SLOT_INVALID (never a silent filter drop)",
                         blueprint_id,
                         spec.name,
+                        sorted(tokens - referenced),
                     )
                     return ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
-                bound[spec.name] = outcome.value
+                bound.update(expand_binding(spec, outcome.value))
 
         # S1: the single-node path is the CANONICAL D67 case (a PAF `*_change_fields`
         # rule filtering one query) — expand any `resolve_via` rule through the same
@@ -765,18 +778,24 @@ class BlueprintExecutor:
             if isinstance(outcome, OmitSlot):
                 continue
             if isinstance(outcome, SlotBinding):
-                if spec.name not in all_referenced:
-                    # A resolved slot referenced by NO node template is a silent
-                    # dropped filter (the D56 wrong-answer class) — fail-closed.
+                # Same all-tokens rule as the single-node path: a `period_range`
+                # needs BOTH `{name}_start`/`{name}_end` referenced across the DAG's
+                # node templates, or a dropped bound = a dropped filter (D56 class).
+                tokens = slot_token_names(spec)
+                if tokens - all_referenced:
+                    # A resolved slot token referenced by NO node template is a
+                    # silent dropped filter (the D56 wrong-answer class) — fail-closed.
                     _logger.warning(
-                        "blueprint %s: resolved slot %r referenced by no node; SLOT_INVALID",
+                        "blueprint %s: resolved slot %r token(s) %s referenced by no node; "
+                        "SLOT_INVALID",
                         blueprint.id,
                         spec.name,
+                        sorted(tokens - all_referenced),
                     )
                     return bound, ExecFailed(
                         SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True
                     )
-                bound[spec.name] = outcome.value
+                bound.update(expand_binding(spec, outcome.value))
         return bound, None
 
     async def _expand_rules(

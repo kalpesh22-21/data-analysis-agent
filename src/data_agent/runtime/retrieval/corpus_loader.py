@@ -36,6 +36,7 @@ from sqlglot.schema import MappingSchema
 
 from data_agent.runtime.blueprint.models import Blueprint, BlueprintParseError
 from data_agent.runtime.blueprint.rules import parse_rule
+from data_agent.runtime.blueprint.slots import slot_token_names
 from data_agent.runtime.blueprint.template import (
     TemplateBindError,
     assert_read_only_select,
@@ -644,7 +645,24 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
             "dead code and any slot it alone references a silent dropped filter)."
         )
 
-    slot_names = {s.name for s in blueprint.slots}
+    # A slot's LEGAL bind-site TOKENS (not its name): a scalar slot binds `{name}`,
+    # a `period_range` binds `{name}_start`/`{name}_end` (the anti-drift helper —
+    # identical rule the executor's B3 check uses). Undeclared-token and
+    # required-referenced gates below operate on tokens, not names.
+    # M1: build the token set collision-AWARE. Two slots whose tokens overlap (e.g. a
+    # `string` slot literally named `w_start` alongside a `period_range` slot `w`)
+    # would have ONE slot's validated bound silently shadow the other's at bind time
+    # — a bypass of the per-slot validation. Fail LOUD at load.
+    slot_tokens: set[str] = set()
+    for slot in blueprint.slots:
+        for token in slot_token_names(slot):
+            if token in slot_tokens:
+                raise CorpusLoadError(
+                    f"blueprint {bp.id}: slot bind-token {token!r} is claimed by two slots "
+                    "(a period_range expands to {name}_start/{name}_end — rename to avoid the "
+                    "collision, or one slot's validated bound would silently shadow the other's)."
+                )
+            slot_tokens.add(token)
     # Slice C: a node template placeholder may also be a `consumes` upstream-scalar
     # binding or a `resolve_via` rule IN-list — those are NOT slots but ARE valid
     # bind sites. Collect the rule-bind placeholder names once (blueprint-wide).
@@ -653,6 +671,15 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
         parsed = parse_rule(raw_rule)
         if parsed is not None:
             rule_binds.add(parsed.binds)
+    # M1 (cont.): a slot token colliding with a rule-bind IN-list name is the same
+    # shadow bug across the slot/rule boundary — reject it too. (A slot/`consumes`
+    # collision is checked per-node below, where the node's `consumes` set is known.)
+    slot_rule_overlap = slot_tokens & rule_binds
+    if slot_rule_overlap:
+        raise CorpusLoadError(
+            f"blueprint {bp.id}: slot bind-token(s) {sorted(slot_rule_overlap)} collide with a "
+            "resolve_via rule 'binds' name — one would silently shadow the other at bind time."
+        )
 
     nodes_by_order = {n.order: n for n in blueprint.composes}
     # (node_order | None) → the extra non-slot placeholders that node may reference.
@@ -664,15 +691,46 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
             allowed_extra = set(rule_binds) | set(node.consumes.keys())
             templates.append((node.order, node.sql_template, allowed_extra))
 
+    # M1/M2 precompute: a slot token collides with a node `consumes` key (checked
+    # per-node below); and a `period_range` slot's tokens must appear ALL-or-NONE in
+    # each template (M2). Map each range slot's name → its two-token set once.
+    range_token_sets = {
+        s.name: slot_token_names(s) for s in blueprint.slots if s.type == "period_range"
+    }
     for order, template, allowed_extra in templates:
         where = "sql_template" if order is None else f"node {order} sql_template"
-        # (a) undeclared placeholder — must be a slot, a `consumes`, or a rule bind.
-        unknown = referenced_slots(template) - slot_names - allowed_extra
+        referenced_here = referenced_slots(template)
+        # M1: a slot token that is ALSO this node's `consumes` key would shadow a
+        # validated slot bound with an upstream scalar — reject (the rule-bind case
+        # is caught blueprint-wide above; this is the per-node consumes case).
+        consumes_collision = slot_tokens & (allowed_extra - rule_binds)
+        if consumes_collision:
+            raise CorpusLoadError(
+                f"blueprint {bp.id}: {where} 'consumes' key(s) {sorted(consumes_collision)} "
+                "collide with a slot bind-token — rename the consume or the slot."
+            )
+        # (a) undeclared placeholder — must be a slot TOKEN, a `consumes`, or a rule
+        # bind. (A `period_range` slot contributes two tokens, so `{X_start}`/
+        # `{X_end}` are legal while a bare `{X}` is NOT.)
+        unknown = referenced_here - slot_tokens - allowed_extra
         if unknown:
             raise CorpusLoadError(
                 f"blueprint {bp.id}: {where} references undeclared slot(s) {sorted(unknown)} "
                 "(not a slot, a node 'consumes', or a resolve_via rule 'binds')"
             )
+        # M2: a `period_range` is ALL-OR-NONE per template — if a template references
+        # ANY of its tokens it must reference BOTH, so a range with a dropped bound is
+        # rejected PER NODE (a DAG with node1 using {X_start} and node2 using {X_end}
+        # binds a half-range on each — the D56 dropped-filter class). The
+        # blueprint-wide "every required token referenced" gate (e) is the converse.
+        for range_name, range_tokens in range_token_sets.items():
+            hit = range_tokens & referenced_here
+            if hit and hit != range_tokens:
+                raise CorpusLoadError(
+                    f"blueprint {bp.id}: {where} references only part of period_range slot "
+                    f"{range_name!r} ({sorted(hit)}); it must reference BOTH "
+                    f"{sorted(range_tokens)} or neither (a half-range is a dropped filter)."
+                )
         # (b) parses under ClickHouse dialect + is a single read-only SELECT (FIX 2).
         try:
             tree = parse_template(template)
@@ -707,8 +765,14 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
     all_referenced: set[str] = set()
     for _order, template, _extra in templates:
         all_referenced |= referenced_slots(template)
+    # A required slot is satisfied iff EVERY one of its bind tokens appears (so a
+    # `period_range` template referencing only `{X_start}` is REJECTED here — the
+    # dropped `{X_end}` bound would be a dropped filter, aligning with the
+    # executor's all-tokens B3 rule). Scalar slots (one token) are unchanged.
     unreferenced_required = {
-        s.name for s in blueprint.slots if s.required and s.name not in all_referenced
+        s.name
+        for s in blueprint.slots
+        if s.required and (slot_token_names(s) - all_referenced)
     }
     if unreferenced_required:
         raise CorpusLoadError(

@@ -19,10 +19,19 @@ from typing import Any
 # Valid slot `type`s (D41/D49). Kept as a frozenset so the parse layer and the
 # loader validation agree on the closed set.
 SLOT_TYPES: frozenset[str] = frozenset(
-    {"string", "entity", "enum", "period", "as_of_date", "list"}
+    {"string", "entity", "enum", "period", "as_of_date", "list",
+     "relative_window", "period_range"}
 )
 NODE_KINDS: frozenset[str] = frozenset({"query", "approval"})  # D59c (`guard` cut)
 ON_VIOLATION: frozenset[str] = frozenset({"abort", "skip", "ask"})
+
+# `relative_window` integer bounds (D49). The CEILING is a HARD safety cap: an
+# authored `max_value` may narrow the window but never widen it past this, so an
+# absurd `INTERVAL 999999 MONTH` can neither be authored (SlotSpec.parse gate) nor
+# bound (the resolver clamps to it). `slots.py` mirrors these as its resolver
+# defaults; kept here so the parse-time bounds gate and the resolver agree.
+RELATIVE_WINDOW_FLOOR = 1
+RELATIVE_WINDOW_CEILING = 120
 
 # Hard cap on declared `slots` (reviewer S3). Each `binds_to` slot can fire an
 # unbudgeted inner DISTINCT domain probe at execution, so a poisoned READ record
@@ -45,6 +54,12 @@ class SlotSpec:
     binds_to: str | None = None  # "database.table.column" the value validates against
     enum_values: tuple[str, ...] | None = None  # closed set for `type: enum`
     optional_pattern: str | None = None  # SQL fragment for an absent optional slot
+    # Inclusive bounds for a `relative_window` integer (trailing "last N <unit>",
+    # D41/D49). Meaningful ONLY for `relative_window`; ignored for every other type.
+    # `None` defers to the resolver's safety defaults (lo=1, hi=120 hard ceiling so
+    # an absurd `INTERVAL 999999 MONTH` can't be authored or bound).
+    min_value: int | None = None
+    max_value: int | None = None
 
     @classmethod
     def parse(cls, raw: Any) -> SlotSpec:
@@ -64,6 +79,14 @@ class SlotSpec:
         binds_to = raw.get("binds_to")
         if binds_to is not None and not isinstance(binds_to, str):
             raise BlueprintParseError(f"slot {name!r} 'binds_to' must be a string")
+        # L3: the windowed-period types never consume a warehouse DOMAIN (their
+        # values are validated structurally, not matched against a DISTINCT set), so
+        # a `binds_to` here would only fire a useless probe — reject it at parse.
+        if binds_to is not None and type_ in ("relative_window", "period_range"):
+            raise BlueprintParseError(
+                f"slot {name!r} of type {type_!r} must not declare 'binds_to' — a "
+                "windowed-period slot consumes no domain (it would fire a useless probe)"
+            )
         enum_values_raw = raw.get("enum_values")
         enum_values: tuple[str, ...] | None = None
         if enum_values_raw is not None:
@@ -77,6 +100,28 @@ class SlotSpec:
         optional_pattern = raw.get("optional_pattern")
         if optional_pattern is not None and not isinstance(optional_pattern, str):
             raise BlueprintParseError(f"slot {name!r} 'optional_pattern' must be a string")
+        # `min_value`/`max_value` — ints when present (only meaningful for
+        # `relative_window`; carried but unused for other types). A bool is an int
+        # subclass, so reject it explicitly (a `true` bound is an authoring bug).
+        min_value = raw.get("min_value")
+        if min_value is not None and (not isinstance(min_value, int) or isinstance(min_value, bool)):
+            raise BlueprintParseError(f"slot {name!r} 'min_value' must be an integer")
+        max_value = raw.get("max_value")
+        if max_value is not None and (not isinstance(max_value, int) or isinstance(max_value, bool)):
+            raise BlueprintParseError(f"slot {name!r} 'max_value' must be an integer")
+        # H1b: an authored bound must satisfy `1 <= min_value <= max_value <=
+        # RELATIVE_WINDOW_CEILING` so an absurd `max_value: 999999` or an inverted
+        # `min > max` NEVER loads (the ceiling is a HARD cap, D49). Checked at WRITE
+        # (BlueprintParseError) — the resolver additionally clamps at READ (H1a).
+        lo = min_value if min_value is not None else RELATIVE_WINDOW_FLOOR
+        hi = max_value if max_value is not None else RELATIVE_WINDOW_CEILING
+        if min_value is not None or max_value is not None:
+            if not (RELATIVE_WINDOW_FLOOR <= lo <= hi <= RELATIVE_WINDOW_CEILING):
+                raise BlueprintParseError(
+                    f"slot {name!r} bounds must satisfy "
+                    f"{RELATIVE_WINDOW_FLOOR} <= min_value <= max_value <= "
+                    f"{RELATIVE_WINDOW_CEILING}, got min={min_value!r} max={max_value!r}"
+                )
         return cls(
             name=name,
             type=type_,
@@ -84,6 +129,8 @@ class SlotSpec:
             binds_to=binds_to,
             enum_values=enum_values,
             optional_pattern=optional_pattern,
+            min_value=min_value,
+            max_value=max_value,
         )
 
 
@@ -261,6 +308,16 @@ class Blueprint:
                 f"cap (each binds_to slot can fire an inner probe; a Phase-1 blueprint is small)"
             )
         slot_specs = tuple(SlotSpec.parse(s) for s in slots_raw)
+        # M1 (read-side backstop): duplicate slot names silently collide their bind
+        # tokens (e.g. a second `w` slot would shadow the first's validated value, or
+        # a `string` slot `w_start` could shadow a `period_range` slot `w`'s expanded
+        # start bound). Reject any duplicate name here; the loader adds the richer
+        # token-level collision gate at WRITE.
+        seen_names: set[str] = set()
+        for spec in slot_specs:
+            if spec.name in seen_names:
+                raise BlueprintParseError(f"duplicate slot name {spec.name!r}")
+            seen_names.add(spec.name)
         if sql_template is not None and not isinstance(sql_template, str):
             raise BlueprintParseError("'sql_template' must be a string")
         nodes = tuple(Node.parse(n) for n in (composes or []))

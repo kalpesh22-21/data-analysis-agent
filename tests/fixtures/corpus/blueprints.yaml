@@ -197,3 +197,59 @@
         JOIN dbpcm_warehouse.employee AS e ON e.EmployeeCode = x.EmployeeCode
         WHERE e.Department = {department}
         GROUP BY e.Department
+
+# Windowed-period slot — `relative_window` (a trailing "last N months", D41/D49):
+# the runtime resolves the raw value to a BOUNDED integer and binds it as an
+# `INTERVAL {n} MONTH` NUMBER literal (F1/D10 — never interpolated). `min_value`/
+# `max_value` narrow the safety bounds (default 1..120); an out-of-range or
+# non-integer value → askUser, never an absurd `INTERVAL 999999 MONTH`.
+- id: bp-hires-per-month
+  intent: New hires per month over a trailing window of the last N months
+  slots_summary: window_months
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.employee.EmployeeCode
+    - dbpcm_warehouse.employee.MostRecentHireDate
+  slots:
+    - { name: window_months, type: relative_window, required: true, min_value: 1, max_value: 36 }
+  result_grain: [ month ]
+  # Anchor the trailing window on the DATA (the latest hire month present), not the
+  # wall clock — so the fixture doesn't decay to empty as real time passes. The
+  # window yields N whole months PLUS the current partial (latest) bucket.
+  sql_template: |
+    SELECT toStartOfMonth(MostRecentHireDate) AS month,
+           COUNT(DISTINCT EmployeeCode) AS hires
+    FROM dbpcm_warehouse.employee
+    WHERE MostRecentHireDate >= (
+            SELECT toStartOfMonth(max(MostRecentHireDate))
+            FROM dbpcm_warehouse.employee
+          ) - INTERVAL {window_months} MONTH
+    GROUP BY toStartOfMonth(MostRecentHireDate)
+
+# Windowed-period slot — `period_range` (an explicit {start, end}, D41/D49): the
+# ONE slot expands to TWO bind tokens `{hire_window_start}` / `{hire_window_end}`,
+# each bound as a TYPED string literal (F1/D10). BOTH tokens must be referenced or
+# the loader rejects the blueprint (a dropped bound is a dropped filter, the D56
+# wrong-answer class). The resolver does NO relative→concrete date math — an
+# explicit ISO {start,end} is required; a deictic word ("last month") → askUser.
+- id: bp-hires-in-range
+  intent: New hires per month within an explicit start/end date range
+  slots_summary: hire_window
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.employee.EmployeeCode
+    - dbpcm_warehouse.employee.MostRecentHireDate
+  slots:
+    - { name: hire_window, type: period_range, required: true }
+  result_grain: [ month ]
+  sql_template: |
+    SELECT toStartOfMonth(MostRecentHireDate) AS month,
+           COUNT(DISTINCT EmployeeCode) AS hires
+    FROM dbpcm_warehouse.employee
+    WHERE MostRecentHireDate >= {hire_window_start}
+      AND MostRecentHireDate < {hire_window_end}
+    GROUP BY toStartOfMonth(MostRecentHireDate)

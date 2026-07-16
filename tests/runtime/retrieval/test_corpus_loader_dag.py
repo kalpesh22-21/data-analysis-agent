@@ -53,10 +53,25 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
         "bp-total-earnings-by-department",
         "bp-departments-above-company-average-salary",
         "bp-earnings-by-department-via-scratch-join",
+        "bp-hires-per-month",
+        "bp-hires-in-range",
+    }
+    # The Department-grained, {department}-filtered seeds — the windowed-period
+    # seeds (relative_window / period_range) have a `month` grain and their own
+    # window tokens, so the content assertions below scope to this set.
+    department_seeds = {
+        "bp-overtime-by-department",
+        "bp-active-headcount-by-department",
+        "bp-average-salary-by-department",
+        "bp-total-earnings-by-department",
+        "bp-departments-above-company-average-salary",
+        "bp-earnings-by-department-via-scratch-join",
     }
     for bp in blueprints:
         _validate_blueprint_dag(bp)  # no raise
         props = _dag_properties(bp)
+        if bp.id not in department_seeds:
+            continue
         # result_grain round-trips as a JSON list; sql_template stored verbatim.
         assert json.loads(props["result_grain_json"]) == ["Department"]
         # Single-node seeds carry a top-level {department}-parameterized template;
