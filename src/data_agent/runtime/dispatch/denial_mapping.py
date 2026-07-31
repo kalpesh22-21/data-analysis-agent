@@ -64,6 +64,23 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         retryable=True,
         user_message="I couldn't find that table. Let me verify the table name.",
     ),
+    # CARTESIAN_JOIN_FORBIDDEN: the clickhouse-api guardrail rejects a query that
+    # cross-joins two physical base tables without a join condition. On the LIVE
+    # turn the dispatcher surfaces the MCP's author-controlled message instead of
+    # this string — that message NAMES the two offending base tables (catalog
+    # metadata, not PII / cell values, D25) and tells the model to add ON/USING or
+    # wrap a constant side in a subquery, so it can self-correct. This generic
+    # string is the REPLAY fallback only: `user_message` is not persisted on
+    # TrailEntry, so `context/budget.py::_render_entry` re-derives it from
+    # `error_code` here, where the specific table names are no longer available.
+    "CARTESIAN_JOIN_FORBIDDEN": DenialInfo(
+        code="CARTESIAN_JOIN_FORBIDDEN",
+        retryable=True,
+        user_message=(
+            "That query cross-joins two tables without a join condition. Add an ON "
+            "or USING clause, or wrap a constant side in a subquery."
+        ),
+    ),
     "CLICKHOUSE_QUERY_ERROR": DenialInfo(
         code="CLICKHOUSE_QUERY_ERROR",
         retryable=True,

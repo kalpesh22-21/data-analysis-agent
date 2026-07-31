@@ -1,4 +1,6 @@
-"""Table-driven tests for dispatch/denial_mapping.py over all 7 ToolError codes (Layer 1)."""
+"""Table-driven tests for dispatch/denial_mapping.py over every registered ToolError
+code (Layer 1). The authoritative set is `denial_mapping.KNOWN_DENIAL_CODES`; the
+groups below enumerate it by family so a new code must be added here deliberately."""
 
 from __future__ import annotations
 
@@ -14,6 +16,13 @@ _ALL_SEVEN_CODES = {
     "TABLE_NOT_FOUND",
     "CLICKHOUSE_QUERY_ERROR",
     "CLICKHOUSE_UNAVAILABLE",
+}
+
+# runQuery guardrail codes surfaced by the clickhouse-api service layer (not part
+# of the original seven): the cartesian-join block. Retryable — the model can
+# self-correct by adding an ON/USING condition or wrapping a constant side.
+_GUARDRAIL_CODES = {
+    "CARTESIAN_JOIN_FORBIDDEN",
 }
 
 # D77 resolveValues composite codes (L5): set locally by the composite, but
@@ -41,6 +50,7 @@ _EXPECTED_RETRYABLE = {
     "TABLE_NOT_FOUND": True,
     "CLICKHOUSE_QUERY_ERROR": True,
     "CLICKHOUSE_UNAVAILABLE": False,
+    "CARTESIAN_JOIN_FORBIDDEN": True,
     # Retryable flags MUST match what the composite itself sets so replay is
     # consistent with the live-call semantics (composite/resolve_values.py).
     "RESOLVE_VALUES_UNKNOWN_TARGET": True,
@@ -52,7 +62,7 @@ _EXPECTED_RETRYABLE = {
     "RUNTIME_TOOL_INTERNAL_ERROR": False,
 }
 
-_ALL_KNOWN_CODES = _ALL_SEVEN_CODES | _COMPOSITE_CODES | _READ_TOOL_CODES
+_ALL_KNOWN_CODES = _ALL_SEVEN_CODES | _GUARDRAIL_CODES | _COMPOSITE_CODES | _READ_TOOL_CODES
 
 
 def test_all_known_codes_are_registered() -> None:

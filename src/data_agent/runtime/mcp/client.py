@@ -31,11 +31,11 @@ class MCPToolError(Exception):
     """Raised on a tool-level denial/failure — mirrors the MCP's own
     `ToolError("[{CODE}] message")` convention (design §3.4).
 
-    `code` is one of the seven codes classified by `dispatch/denial_mapping.py`
-    (COLUMN_SCOPE_VIOLATION, SCRATCH_SESSION_VIOLATION, PARSE_FAILED_CLOSED,
-    DATABASE_NOT_ALLOWED, TABLE_NOT_FOUND, CLICKHOUSE_QUERY_ERROR,
-    CLICKHOUSE_UNAVAILABLE) or None if the `[{CODE}]` prefix could not be
-    parsed out of the raw tool-error text (unexpected/internal MCP error).
+    `code` is one of the ToolError codes classified by `dispatch/denial_mapping.py`
+    (the authoritative set is `denial_mapping.KNOWN_DENIAL_CODES`; e.g.
+    COLUMN_SCOPE_VIOLATION, TABLE_NOT_FOUND, CARTESIAN_JOIN_FORBIDDEN, …), or None
+    if the `[{CODE}]` prefix could not be parsed out of the raw tool-error text
+    (unexpected/internal MCP error).
     """
 
     def __init__(self, code: str | None, message: str) -> None:
