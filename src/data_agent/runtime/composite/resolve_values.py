@@ -42,6 +42,7 @@ from data_agent.runtime.composite.ranking import ResolvedValue, RowValue
 from data_agent.runtime.composite.sql_builder import Period, TargetValidationError
 from data_agent.runtime.dispatch.denial_mapping import DenialInfo, classify_denial
 from data_agent.runtime.dispatch.tool_dispatcher import (
+    CatalogProvider,
     ToolDispatcher,
     ToolObserver,
     ToolResult,
@@ -114,7 +115,7 @@ class ResolveValuesComposite:
         self,
         *,
         tool_dispatcher: ToolDispatcher,
-        catalog: CatalogHandle,
+        catalog: CatalogHandle | CatalogProvider,
         embedding_client: EmbeddingClient | None = None,
         query_limit: int = 200,
         top_k: int = 10,
@@ -125,6 +126,9 @@ class ResolveValuesComposite:
         disable_redaction: bool = False,
     ) -> None:
         self._tool_dispatcher = tool_dispatcher
+        # A fixed `CatalogHandle` OR an async provider resolving the handle from the
+        # turn's credentials via the process-wide `CatalogCache` (D75 Wave 1b),
+        # resolved in `resolve()` just before target validation.
         self._catalog = catalog
         self._embedding_client = embedding_client
         self._query_limit = query_limit
@@ -140,11 +144,16 @@ class ResolveValuesComposite:
         # gets the raw model_args, so resolution/enforcement is unaffected.
         self._disable_redaction = disable_redaction
 
+    async def _resolve_catalog(self, credentials: RuntimeCredentials) -> CatalogHandle:
+        """Resolve THIS turn's `CatalogHandle` — a fixed handle passes through; a
+        provider is awaited with the turn's credentials (D75 Wave 1b)."""
+        if isinstance(self._catalog, CatalogHandle):
+            return self._catalog
+        return await self._catalog(credentials)
+
     # -- model tool-call path -------------------------------------------------
 
-    async def run(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
-    ) -> ToolResult:
+    async def run(self, model_args: dict[str, Any], credentials: RuntimeCredentials) -> ToolResult:
         """Model tool-call path: validate args, resolve, wrap as a `ToolResult`.
 
         Emits one `TOOL` span for `resolveValues` (with `concept` redacted and
@@ -187,9 +196,7 @@ class ResolveValuesComposite:
             # backing result that slipped every guard, etc.) would abort the
             # whole turn. Log the real exception server-side ONLY; the
             # model/user only ever sees the generic canned message (D5/D25).
-            _logger.exception(
-                "resolveValues internal error (session=%s)", credentials.session_id
-            )
+            _logger.exception("resolveValues internal error (session=%s)", credentials.session_id)
             self._observer(
                 "tool_dispatch_error",
                 {"tool_name": TOOL_NAME, "error_code": INTERNAL_ERROR_CODE},
@@ -267,9 +274,10 @@ class ResolveValuesComposite:
         path and the D67 programmatic path.
         """
         self._observer("tool_dispatch_start", {"tool_name": TOOL_NAME})
+        catalog = await self._resolve_catalog(credentials)
         try:
             target = sql_builder.resolve_target(
-                self._catalog,
+                catalog,
                 table=table,
                 column=column,
                 period=period,
@@ -289,9 +297,7 @@ class ResolveValuesComposite:
 
         if inner.status != "ok":
             # Pass the inner denial/error through verbatim (design §7).
-            denial = (
-                classify_denial(inner.error_code) if inner.status == "denied" else None
-            )
+            denial = classify_denial(inner.error_code) if inner.status == "denied" else None
             self._observer(
                 f"tool_dispatch_{'denied' if inner.status == 'denied' else 'error'}",
                 {"tool_name": TOOL_NAME, "error_code": inner.error_code},
@@ -324,9 +330,7 @@ class ResolveValuesComposite:
             top_margin=ranking.top_margin(ranked),
         )
 
-    async def _rank(
-        self, concept: str, rows: list[RowValue]
-    ) -> tuple[list[ResolvedValue], bool]:
+    async def _rank(self, concept: str, rows: list[RowValue]) -> tuple[list[ResolvedValue], bool]:
         concept_vec: list[float] | None = None
         row_vecs: list[list[float]] | None = None
         if self._embedding_client is not None:

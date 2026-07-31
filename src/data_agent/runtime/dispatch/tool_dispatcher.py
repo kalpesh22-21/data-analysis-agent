@@ -40,7 +40,7 @@ scans every `ToolResult` field for the JWT/session_id substrings.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -58,6 +58,15 @@ if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
 
 ToolObserver = Callable[[str, dict[str, Any]], None]
+
+# A catalog PROVIDER resolves the immutable `CatalogHandle` for THIS turn from its
+# credentials (D75 Wave 1b): the runtime no longer holds a fixed startup handle — it
+# resolves lazily through the process-wide `CatalogCache`, which authenticates one
+# `/catalog/export` fetch with the turn's JWT and then serves every subsequent turn.
+# A bare `CatalogHandle` is still accepted (tests + any fixed-catalog caller) and used
+# as-is. The credentials are consumed ONLY to authenticate the fetch — never reflected
+# into a handle or message (D5).
+CatalogProvider = Callable[[RuntimeCredentials], Awaitable["CatalogHandle"]]
 
 _logger = logging.getLogger(__name__)
 
@@ -155,7 +164,7 @@ class ToolDispatcher:
     def __init__(
         self,
         mcp_client: MCPClient,
-        catalog: CatalogHandle,
+        catalog: CatalogHandle | CatalogProvider,
         *,
         preview_row_count: int = 20,
         observer: ToolObserver = _default_observer,
@@ -163,6 +172,11 @@ class ToolDispatcher:
         disable_redaction: bool = False,
     ) -> None:
         self._mcp_client = mcp_client
+        # `catalog` is EITHER a fixed `CatalogHandle` (tests / fixed-catalog callers)
+        # OR an async provider resolving the handle from this turn's credentials via
+        # the process-wide `CatalogCache` (D75 Wave 1b). Resolved per-dispatch just
+        # before `capture_provenance`; the cache guarantees one fetch, so warm turns
+        # are cheap.
         self._catalog = catalog
         self._preview_row_count = preview_row_count
         self._observer = observer
@@ -201,15 +215,20 @@ class ToolDispatcher:
         with tracing.tool_span(
             self._tracer,
             tool_name=tool_name,
-            args=tool_span_args(
-                tool_name, model_args, disable_redaction=self._disable_redaction
-            ),
+            args=tool_span_args(tool_name, model_args, disable_redaction=self._disable_redaction),
             status=status,
             error_code=error_code,
             result_preview=span_result,
             reveal_complex_args=self._disable_redaction,
         ):
             pass
+
+    async def _resolve_catalog(self, credentials: RuntimeCredentials) -> CatalogHandle:
+        """Resolve THIS turn's `CatalogHandle` — a fixed handle passes through; a
+        provider is awaited with the turn's credentials (D75 Wave 1b)."""
+        if isinstance(self._catalog, CatalogHandle):
+            return self._catalog
+        return await self._catalog(credentials)
 
     async def dispatch(
         self,
@@ -248,9 +267,7 @@ class ToolDispatcher:
             self._observer(
                 "tool_dispatch_denied", {"tool_name": tool_name, "error_code": denial.code}
             )
-            self._emit_tool_span(
-                tool_name, model_args, status="denied", error_code=denial.code
-            )
+            self._emit_tool_span(tool_name, model_args, status="denied", error_code=denial.code)
             return ToolResult(
                 status="denied",
                 tool_name=tool_name,
@@ -290,8 +307,9 @@ class ToolDispatcher:
                 result_full=None,
             )
 
+        catalog = await self._resolve_catalog(credentials)
         provenance = await capture_provenance(
-            tool_name, model_args, self._catalog, session_id=credentials.session_id
+            tool_name, model_args, catalog, session_id=credentials.session_id
         )
         preview = _build_preview(raw_result, self._preview_row_count)
 

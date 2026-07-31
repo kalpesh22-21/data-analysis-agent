@@ -131,8 +131,9 @@ def test_no_accepted_sql_for_refs_is_declined_unrewritable():
 
 def _plan_with(replacement: dict, *, column: str) -> list[dict]:
     """Payroll plan with the entry for *column* replaced (coverage preserved)."""
-    return [replacement if p["locator"]["column"] == column else p
-            for p in payroll_parameterization()]
+    return [
+        replacement if p["locator"]["column"] == column else p for p in payroll_parameterization()
+    ]
 
 
 def test_slot_needs_a_valid_type():
@@ -227,8 +228,7 @@ _JOIN_SQL = (
     "WHERE f.dept = '0420'"
 )
 _FN_LITERAL_SQL = (
-    "SELECT sum(pay) AS total FROM db.t "
-    "WHERE dept = '0420' AND pay_period = toDate('2025-01-01')"
+    "SELECT sum(pay) AS total FROM db.t WHERE dept = '0420' AND pay_period = toDate('2025-01-01')"
 )
 
 
@@ -237,7 +237,8 @@ def test_unplanned_join_on_predicate_declines_totality():
     plan = [param_slot("dept", value="0420", table="db.fact", binds_to="db.fact.dept")]
     out = to_candidate(
         blueprint_raw(parameterization=plan, source_refs=("tc1",)),
-        summary, known_rules=frozenset(),
+        summary,
+        known_rules=frozenset(),
     )
     assert isinstance(out, Decline)
     assert out.reason == REASON_TOTALITY
@@ -248,7 +249,8 @@ def test_unplanned_value_side_fn_literal_declines_totality():
     plan = [param_slot("dept", value="0420", table="db.t", binds_to="db.t.dept")]
     out = to_candidate(
         blueprint_raw(parameterization=plan, source_refs=("tc1",)),
-        summary, known_rules=frozenset(),
+        summary,
+        known_rules=frozenset(),
     )
     assert isinstance(out, Decline)
     assert out.reason == REASON_TOTALITY
@@ -259,12 +261,19 @@ def test_join_on_predicate_planned_passes_totality():
     summary = make_summary(tool_calls=(make_tool_call(ref="tc1", sql=_JOIN_SQL),))
     plan = [
         param_slot("dept", value="0420", table="db.fact", binds_to="db.fact.dept"),
-        param_slot("region", value="NA", required=False, optional_pattern="TRUE",
-                   table="db.dim", binds_to="db.dim.region"),
+        param_slot(
+            "region",
+            value="NA",
+            required=False,
+            optional_pattern="TRUE",
+            table="db.dim",
+            binds_to="db.dim.region",
+        ),
     ]
     out = to_candidate(
         blueprint_raw(parameterization=plan, source_refs=("tc1",)),
-        summary, known_rules=frozenset(),
+        summary,
+        known_rules=frozenset(),
     )
     assert isinstance(out, ExtractedCandidate)
 
@@ -278,8 +287,9 @@ def test_or_two_values_with_only_one_plan_entry_declines():
     summary = make_summary(tool_calls=(make_tool_call(ref="tc1", sql=_OR_SQL),))
     # Only the NA predicate is planned → the EU predicate is un-covered.
     plan = [param_slot("region", value="NA", table="db.t", binds_to="db.t.region")]
-    out = to_candidate(blueprint_raw(parameterization=plan, source_refs=("tc1",)),
-                       summary, known_rules=frozenset())
+    out = to_candidate(
+        blueprint_raw(parameterization=plan, source_refs=("tc1",)), summary, known_rules=frozenset()
+    )
     assert isinstance(out, Decline)
     assert out.reason == REASON_TOTALITY
 
@@ -287,13 +297,12 @@ def test_or_two_values_with_only_one_plan_entry_declines():
 def test_or_two_values_with_a_plan_per_value_passes():
     summary = make_summary(tool_calls=(make_tool_call(ref="tc1", sql=_OR_SQL),))
     plan = [
-        param_slot("region", name="region_na", value="NA", table="db.t",
-                   binds_to="db.t.region"),
-        param_slot("region", name="region_eu", value="EU", table="db.t",
-                   binds_to="db.t.region"),
+        param_slot("region", name="region_na", value="NA", table="db.t", binds_to="db.t.region"),
+        param_slot("region", name="region_eu", value="EU", table="db.t", binds_to="db.t.region"),
     ]
-    out = to_candidate(blueprint_raw(parameterization=plan, source_refs=("tc1",)),
-                       summary, known_rules=frozenset())
+    out = to_candidate(
+        blueprint_raw(parameterization=plan, source_refs=("tc1",)), summary, known_rules=frozenset()
+    )
     assert isinstance(out, ExtractedCandidate)
 
 
@@ -308,9 +317,10 @@ def test_bare_alias_happy_path_still_matches_no_false_decline():
 
 
 def test_rule_id_from_real_catalog_is_accepted():
-    from data_agent.learning.extractor.grounding import load_known_rule_ids
+    from data_agent.learning.extractor.grounding import known_rule_ids_from_catalog
+    from tests._catalog_fixture import fixture_catalog
 
-    known = load_known_rule_ids()
+    known = known_rule_ids_from_catalog(fixture_catalog())
     assert "active_employee" in known  # a real semantic-catalog rule id (D67)
     good = param_rule("record_type", "active_employee", value="EARNING")
     out = _validate(
@@ -321,9 +331,10 @@ def test_rule_id_from_real_catalog_is_accepted():
 
 
 def test_unknown_rule_id_against_real_catalog_declines_missing_rule():
-    from data_agent.learning.extractor.grounding import load_known_rule_ids
+    from data_agent.learning.extractor.grounding import known_rule_ids_from_catalog
+    from tests._catalog_fixture import fixture_catalog
 
-    known = load_known_rule_ids()
+    known = known_rule_ids_from_catalog(fixture_catalog())
     bad = param_rule("record_type", "not_a_real_catalog_rule_xyz", value="EARNING")
     assert "not_a_real_catalog_rule_xyz" not in known
     out = _validate(

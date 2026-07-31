@@ -1,0 +1,2775 @@
+{
+  "catalog_sha": "f1f467f392b7fc301c00f28b8ac9178229e56796",
+  "catalog": {
+    "dbpcm_warehouse.accrual_events": {
+      "database": "dbpcm_warehouse",
+      "table": "accrual_events",
+      "description": "Employee accrual-event log for time-off requests and related accrual activity. Event-level records, not an accrual-balance table.",
+      "grain": [],
+      "grain_verifiable": false,
+      "grain_note": "Event-level accrual log. No reliable exposed row id; do NOT assume uniqueness by EmployeeCode, RequestDate, EarnCode, or Status. Granularity is ONE ROW PER DAY of a request (see RequestDate), so SUM(Hours) over a RequestDate range is exact. Logical analysis grain: one accrual event/day row.\n",
+      "temporal": {
+        "dimensions": [
+          {
+            "name": "requested_for_date",
+            "role": "event",
+            "date_col": "RequestDate"
+          },
+          {
+            "name": "submission_event",
+            "role": "event",
+            "date_col": "DateAdded"
+          }
+        ],
+        "default_pin": "requested_for_date"
+      },
+      "primary_key": [],
+      "primary_key_note": "No reliable unique primary key is exposed.",
+      "join_keys": [
+        {
+          "column": "EmployeeCode",
+          "joins": "employee.EmployeeCode",
+          "cardinality": "N:1"
+        },
+        {
+          "column": "AccrualEventDepartmentCode",
+          "joins": "employee.DepartmentCode",
+          "cardinality": "many_to_reference",
+          "confidence": "low"
+        }
+      ],
+      "columns": {
+        "ClientCode": {
+          "type": "Nullable(String)",
+          "description": "Client/company code."
+        },
+        "EmployeeCode": {
+          "type": "String",
+          "description": "Employee identifier; canonical join key to employee."
+        },
+        "RequestDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "The single day the time off / accrual event is for. Granularity is ONE ROW PER DAY — a multi-day request creates one row per day — so SUM(Hours) over a RequestDate range is exact (no hidden multi-day spans). Use for when the leave/event occurs.\n"
+        },
+        "Hours": {
+          "type": "Nullable(Decimal(18, 6))",
+          "unit": "hours",
+          "description": "Hours attached to the accrual event. Do not assume these are approved/taken hours without filtering Status."
+        },
+        "EarnCode": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description_col": "EarnDescription",
+          "description": "Accrual earning code. CLIENT-DEFINED and drifts over time — resolve concepts to codes via resolveValues(EarnCode, <concept>), do not hardcode. Interpret with EarnDescription and the requested period."
+        },
+        "EarnDescription": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Human-readable description for EarnCode. Use with EarnCode; either field can be null or historically inconsistent."
+        },
+        "Status": {
+          "type": "Nullable(String)",
+          "values": {
+            "Approved": "approved_request",
+            "Requested": "submitted_or_pending_request",
+            "Denied": "denied_request",
+            "Removed": "removed_or_withdrawn_request",
+            "Calendar Only": "calendar_tracking_event"
+          },
+          "observed_values": [
+            "Approved",
+            "Requested",
+            "Denied",
+            "Removed",
+            "Calendar Only"
+          ],
+          "description": "Approval/workflow state of the accrual event."
+        },
+        "Reason": {
+          "type": "Nullable(String)",
+          "description": "Reason provided for the accrual event."
+        },
+        "EventType": {
+          "type": "Nullable(String)",
+          "values": {
+            "Time Off Request": "time_off_request",
+            "Payout Request": "payout_request"
+          },
+          "observed_values": [
+            "Time Off Request"
+          ],
+          "description": "Accrual event category. Current accessible rows show time-off requests."
+        },
+        "DateAdded": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Date/time the record was added or submitted in the system. Use for request-submission timing."
+        },
+        "Comments": {
+          "type": "Nullable(String)",
+          "description": "Workflow context field; may include Gone automated approval/denial context."
+        },
+        "GoneReason": {
+          "type": "Nullable(String)",
+          "description": "Workflow or supervisor context field. Do not treat as a canonical policy label without inspection."
+        },
+        "AccrualEventDepartmentCode": {
+          "type": "Nullable(String)",
+          "description": "Department or labor-allocation code selected for the accrual event when present."
+        }
+      },
+      "measures": {
+        "approved_time_off_hours": {
+          "column": "Hours",
+          "agg": "sum",
+          "defined_over": "Status = 'Approved' AND EventType = 'Time Off Request' plus the relevant EarnCode/EarnDescription category filter"
+        },
+        "request_count": {
+          "column": "*",
+          "agg": "count",
+          "defined_over": "rows after temporal, Status, EventType, employee, and EarnCode/EarnDescription filters"
+        }
+      },
+      "rules": [
+        {
+          "id": "approved_events",
+          "predicate": "Status = 'Approved'",
+          "applies_when": "measuring approved or taken time off",
+          "description": "Restrict to approved accrual events."
+        },
+        {
+          "id": "requested_events",
+          "predicate": "Status = 'Requested'",
+          "applies_when": "measuring pending/submitted request workflow",
+          "description": "Restrict to requested accrual events."
+        },
+        {
+          "id": "denied_events",
+          "predicate": "Status = 'Denied'",
+          "applies_when": "measuring denied requests",
+          "description": "Restrict to denied accrual events."
+        },
+        {
+          "id": "removed_events",
+          "predicate": "Status = 'Removed'",
+          "applies_when": "measuring removed, withdrawn, or cancelled requests",
+          "description": "Restrict to removed accrual events."
+        },
+        {
+          "id": "calendar_only_events",
+          "predicate": "Status = 'Calendar Only'",
+          "applies_when": "measuring calendar-only tracking entries",
+          "description": "Restrict to calendar-only entries; do not treat as standard approved paid time off by default."
+        },
+        {
+          "id": "time_off_request_events",
+          "predicate": "EventType = 'Time Off Request'",
+          "applies_when": "time-off request analysis",
+          "description": "Restrict to time-off request rows."
+        },
+        {
+          "id": "payout_request_events",
+          "predicate": "EventType = 'Payout Request'",
+          "applies_when": "payout request analysis",
+          "description": "Restrict to payout request rows if present."
+        },
+        {
+          "id": "has_hours",
+          "predicate": "Hours IS NOT NULL",
+          "applies_when": "aggregating hours",
+          "description": "Keep rows with an hours value."
+        }
+      ],
+      "ambiguities": [
+        {
+          "term": "time_off_taken",
+          "resolves_to": [
+            "SUM(Hours) with Status = 'Approved' and EventType = 'Time Off Request'"
+          ],
+          "default": "approved_time_off_hours",
+          "clarify_if": "user asks for requested, denied, removed, calendar-only, pending, or all request activity"
+        },
+        {
+          "term": "request_date",
+          "resolves_to": [
+            "RequestDate"
+          ],
+          "default": "requested_for_date",
+          "clarify_if": "user means when the employee submitted/entered the request"
+        },
+        {
+          "term": "submitted_date",
+          "resolves_to": [
+            "DateAdded"
+          ],
+          "default": "submission_event",
+          "clarify_if": "user means the date the time off was for"
+        },
+        {
+          "term": "PTO",
+          "resolves_to": [
+            "resolveValues(EarnCode, 'PTO / vacation / personal day / floating holiday') → filter EarnCode IN result; SUM(Hours) with approved_events"
+          ],
+          "default": "approved_pto_vacation_style",
+          "clarify_if": "user wants sick leave, bereavement, unpaid leave, FMLA/family leave, jury duty, holidays, all leave categories, or non-approved statuses"
+        },
+        {
+          "term": "sick_time",
+          "resolves_to": [
+            "resolveValues(EarnCode, 'sick leave / sick time') → filter EarnCode IN result; SUM(Hours) with approved_events"
+          ],
+          "default": "approved_sick_hours",
+          "clarify_if": "user wants PTO/vacation, family leave, COVID leave treated separately, or all leave categories"
+        },
+        {
+          "term": "leave",
+          "resolves_to": [
+            "resolveValues(EarnCode, 'unpaid leave / LOA / FMLA / USERRA / family leave') → filter EarnCode IN result; SUM(Hours) with approved_events"
+          ],
+          "default": "approved_leave_hours",
+          "clarify_if": "user means all paid time off, only unpaid leave, only FMLA, or all request statuses"
+        },
+        {
+          "term": "bereavement",
+          "resolves_to": [
+            "resolveValues(EarnCode, 'bereavement') → filter EarnCode IN result; SUM(Hours) with approved_events"
+          ],
+          "default": "approved_bereavement_hours",
+          "clarify_if": "user wants bereavement plus broader family leave or all leave categories"
+        },
+        {
+          "term": "jury_duty",
+          "resolves_to": [
+            "resolveValues(EarnCode, 'jury duty') → filter EarnCode IN result; SUM(Hours) with approved_events"
+          ],
+          "default": "approved_jury_duty_hours",
+          "clarify_if": "user wants all civic-duty or leave categories"
+        },
+        {
+          "term": "request_volume",
+          "resolves_to": [
+            "COUNT(*) grouped by Status, usually with EventType = 'Time Off Request'"
+          ],
+          "default": "status_scoped_request_count",
+          "clarify_if": "user wants only approved/taken hours instead of workflow volume"
+        }
+      ]
+    },
+    "dbpcm_warehouse.applicant_tracking_application": {
+      "database": "dbpcm_warehouse",
+      "table": "applicant_tracking_application",
+      "description": "Applicant Tracking application table. One row per candidate application, not one row per candidate. Use for application pipeline, status, offer workflow, source attribution, and hired-employee ATS linkage.",
+      "grain": [
+        "ApplicationId"
+      ],
+      "temporal": {
+        "dimensions": [
+          {
+            "name": "application_event",
+            "role": "event",
+            "date_col": "ApplicationDate"
+          },
+          {
+            "name": "disposition_event",
+            "role": "event",
+            "date_col": "DispositionDate"
+          },
+          {
+            "name": "offer_sent_event",
+            "role": "event",
+            "date_col": "OfferLetterSentDate"
+          },
+          {
+            "name": "offer_response_event",
+            "role": "event",
+            "date_col": "OfferLetterAcceptedRejectedDate"
+          },
+          {
+            "name": "offer_created_event",
+            "role": "event",
+            "date_col": "OfferLetterCreatedOnDate"
+          },
+          {
+            "name": "offer_approval_event",
+            "role": "event",
+            "date_col": "OfferLetterApprovalDate"
+          }
+        ],
+        "default_pin": "application_event"
+      },
+      "primary_key": [
+        "ApplicationId"
+      ],
+      "join_keys": [
+        {
+          "column": "ApplicationId",
+          "joins": "candidate_education.ApplicationId",
+          "cardinality": "1:N"
+        },
+        {
+          "column": "ApplicationId",
+          "joins": "candidate_employment_history.ApplicationId",
+          "cardinality": "1:N"
+        },
+        {
+          "column": "EmployeeCode",
+          "joins": "employee.EmployeeCode",
+          "cardinality": "N:1"
+        }
+      ],
+      "columns": {
+        "ClientCode": {
+          "type": "Nullable(String)",
+          "description": "Client/company code."
+        },
+        "ApplicationId": {
+          "type": "Int32",
+          "description": "Unique application identifier."
+        },
+        "ReferralSource": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Referral source named on the application (CLIENT-DEFINED; resolve via resolveValues(ReferralSource",
+          "<concept>)).": null
+        },
+        "ApplicationDate": {
+          "type": "DateTime64(6)",
+          "description": "Date/time the application was started."
+        },
+        "Disposition": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Application outcome or disposition label (CLIENT-DEFINED; resolve via resolveValues(Disposition",
+          "<concept>)).": null
+        },
+        "DispositionDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Date/time the disposition last changed."
+        },
+        "WorkFlowGroupName": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Hiring workflow group (CLIENT-DEFINED; resolve via resolveValues(WorkFlowGroupName",
+          "<concept>)).": null
+        },
+        "CandidateId": {
+          "type": "Nullable(Int32)",
+          "description": "Stable candidate identifier across applications."
+        },
+        "ApplicationSource": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Source channel for the application (CLIENT-DEFINED; resolve via resolveValues(ApplicationSource",
+          "<concept>)).": null
+        },
+        "ApplicantFirstName": {
+          "type": "Nullable(String)",
+          "description": "Applicant first name."
+        },
+        "ApplicantLastName": {
+          "type": "Nullable(String)",
+          "description": "Applicant last name."
+        },
+        "ApplicantPreferredFirstName": {
+          "type": "Nullable(String)",
+          "description": "Applicant preferred first name."
+        },
+        "ApplicantPreferredLastName": {
+          "type": "Nullable(String)",
+          "description": "Applicant preferred last name."
+        },
+        "ApplicantPrimaryPhone": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Sensitive applicant phone number."
+        },
+        "ApplicantSecondaryPhone": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Sensitive applicant secondary phone number."
+        },
+        "ApplicantEmailAddress": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Sensitive applicant email address."
+        },
+        "ApplicantBirthDate": {
+          "type": "Nullable(DateTime64(6))",
+          "sensitive": true,
+          "description": "Sensitive applicant birth date."
+        },
+        "ApplicantFullStreetAddress": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Sensitive applicant full street address."
+        },
+        "ApplicantStreetAddress1": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Sensitive applicant address line 1."
+        },
+        "ApplicantStreetAddress2": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Sensitive applicant address line 2."
+        },
+        "ApplicantCity": {
+          "type": "Nullable(String)",
+          "description": "Applicant city."
+        },
+        "ApplicantState": {
+          "type": "Nullable(String)",
+          "description": "Applicant state."
+        },
+        "ApplicantZipCode": {
+          "type": "Nullable(String)",
+          "description": "Applicant ZIP/postal code."
+        },
+        "ApplicantCounty": {
+          "type": "Nullable(String)",
+          "description": "Applicant county."
+        },
+        "ApplicationStatusEnum": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Hired",
+            "Offered",
+            "Active",
+            "Rejected",
+            "Knocked Out",
+            "Unknown Status",
+            "Declined Offer"
+          ],
+          "description": "Current application status."
+        },
+        "ApplicationType": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Internal",
+            "External",
+            "Past Employee"
+          ],
+          "description": "Application category."
+        },
+        "CompleteIncomplete": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Complete",
+            "Incomplete"
+          ],
+          "description": "Whether the application is complete."
+        },
+        "OfferLetterAcceptedRejectedDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Offer accepted/rejected timestamp."
+        },
+        "OfferLetterStatusEnum": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Approved",
+            "Not Sent",
+            "No Offer Letter",
+            "Offer Approval Pending",
+            "Offer Expired",
+            "Offer Incomplete",
+            "Offer Rejected",
+            "Offer Sent",
+            "Offer Signed"
+          ],
+          "description": "Offer-letter workflow status."
+        },
+        "OfferLetterSentDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Offer-letter sent timestamp."
+        },
+        "ApprovalStep": {
+          "type": "Nullable(String)",
+          "description": "Approval workflow step."
+        },
+        "WorkFlowStep": {
+          "type": "Nullable(String)",
+          "description": "Current workflow step."
+        },
+        "OfferLetterCreatedOnDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Offer-letter creation timestamp."
+        },
+        "OfferLetterApprovalDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Offer-letter approval timestamp."
+        },
+        "OfferVersion": {
+          "type": "Nullable(String)",
+          "description": "Offer version."
+        },
+        "ApplicationJobWageStart": {
+          "type": "Nullable(Decimal(18, 6))",
+          "unit": "USD",
+          "description": "Lower bound of application job wage range."
+        },
+        "ApplicationJobWageEnd": {
+          "type": "Nullable(Decimal(18, 6))",
+          "unit": "USD",
+          "description": "Upper bound of application job wage range."
+        },
+        "HiringProcessStep": {
+          "type": "Nullable(String)",
+          "description": "Hiring process step."
+        },
+        "UserAssignedToStep": {
+          "type": "Nullable(String)",
+          "description": "User assigned to the current workflow step."
+        },
+        "DaysInOfferStatus": {
+          "type": "Nullable(Int32)",
+          "unit": "days",
+          "description": "Aging in current offer status."
+        },
+        "HoursInOfferStatus": {
+          "type": "Nullable(Int32)",
+          "unit": "hours",
+          "description": "Aging in current offer status."
+        },
+        "DaysInHiringStep": {
+          "type": "Nullable(Int32)",
+          "unit": "days",
+          "description": "Aging in current hiring step."
+        },
+        "HoursInHiringStep": {
+          "type": "Nullable(Int32)",
+          "unit": "hours",
+          "description": "Aging in current hiring step."
+        },
+        "MinutesInHiringStep": {
+          "type": "Nullable(Int32)",
+          "unit": "minutes",
+          "description": "Aging in current hiring step."
+        },
+        "HoursInNewHireQueue": {
+          "type": "Nullable(Int32)",
+          "unit": "hours",
+          "description": "Time in new-hire queue."
+        },
+        "DaysInNewHireQueue": {
+          "type": "Nullable(Int32)",
+          "unit": "days",
+          "description": "Time in new-hire queue."
+        },
+        "TotalOnboardingHours": {
+          "type": "Nullable(Int32)",
+          "unit": "hours",
+          "description": "Total onboarding hours."
+        },
+        "ApplicationPositionSeatCode": {
+          "type": "Nullable(String)",
+          "description": "Position seat code captured on the application."
+        },
+        "ApplicationPositionSeatDescription": {
+          "type": "Nullable(String)",
+          "description": "Position seat description captured on the application."
+        },
+        "EmployeeCode": {
+          "type": "Nullable(String)",
+          "description": "Employee identifier when the application links to a hired/current employee."
+        }
+      },
+      "measures": {
+        "application_count": {
+          "column": "*",
+          "agg": "count",
+          "defined_over": "applications after temporal and status filters"
+        },
+        "candidate_count": {
+          "column": "CandidateId",
+          "agg": "count_distinct",
+          "defined_over": "applications with CandidateId after temporal and status filters"
+        },
+        "hired_application_count": {
+          "column": "ApplicationId",
+          "agg": "count_distinct",
+          "defined_over": "ApplicationStatusEnum = 'Hired'"
+        }
+      },
+      "rules": [
+        {
+          "id": "complete_applications",
+          "predicate": "CompleteIncomplete = 'Complete'",
+          "applies_when": "completed application analysis",
+          "description": "Restrict to completed applications."
+        },
+        {
+          "id": "hired_applications",
+          "predicate": "ApplicationStatusEnum = 'Hired'",
+          "applies_when": "hired application or conversion analysis",
+          "description": "Restrict to applications marked hired."
+        },
+        {
+          "id": "active_applications",
+          "predicate": "ApplicationStatusEnum = 'Active'",
+          "applies_when": "active pipeline analysis",
+          "description": "Restrict to active applications."
+        },
+        {
+          "id": "rejected_applications",
+          "predicate": "ApplicationStatusEnum IN ('Rejected', 'Knocked Out')",
+          "applies_when": "rejection analysis",
+          "description": "Restrict to rejected/knocked-out applications."
+        },
+        {
+          "id": "offered_applications",
+          "predicate": "ApplicationStatusEnum = 'Offered'",
+          "applies_when": "offer-stage pipeline analysis",
+          "description": "Restrict to offered applications."
+        },
+        {
+          "id": "declined_offer_applications",
+          "predicate": "ApplicationStatusEnum = 'Declined Offer'",
+          "applies_when": "declined-offer analysis",
+          "description": "Restrict to declined-offer applications."
+        },
+        {
+          "id": "external_applications",
+          "predicate": "ApplicationType = 'External'",
+          "applies_when": "external applicant analysis",
+          "description": "Restrict to external applications."
+        },
+        {
+          "id": "internal_applications",
+          "predicate": "ApplicationType = 'Internal'",
+          "applies_when": "internal applicant analysis",
+          "description": "Restrict to internal applications."
+        },
+        {
+          "id": "past_employee_applications",
+          "predicate": "ApplicationType = 'Past Employee'",
+          "applies_when": "rehire/past-employee applicant analysis",
+          "description": "Restrict to past-employee applications."
+        },
+        {
+          "id": "offer_signed",
+          "predicate": "OfferLetterStatusEnum = 'Offer Signed'",
+          "applies_when": "accepted/signed offer analysis",
+          "description": "Restrict to signed offers."
+        },
+        {
+          "id": "has_employee_link",
+          "predicate": "EmployeeCode IS NOT NULL",
+          "applies_when": "hired-employee ATS linkage",
+          "description": "Restrict to applications linked to an employee record."
+        }
+      ],
+      "ambiguities": [
+        {
+          "term": "applicant_count",
+          "resolves_to": [
+            "COUNT(DISTINCT CandidateId)"
+          ],
+          "default": "candidate_count",
+          "clarify_if": "user means application count rather than unique candidates"
+        },
+        {
+          "term": "application_count",
+          "resolves_to": [
+            "COUNT(*) or COUNT(DISTINCT ApplicationId)"
+          ],
+          "default": "application_count",
+          "clarify_if": "user means unique candidates"
+        },
+        {
+          "term": "hire",
+          "resolves_to": [
+            "ApplicationStatusEnum = 'Hired'"
+          ],
+          "default": "hired_applications",
+          "clarify_if": "user wants offer signed",
+          "employee-linked records": null,
+          "or current employee state": null
+        },
+        {
+          "term": "submitted_application",
+          "resolves_to": [
+            "CompleteIncomplete = 'Complete'"
+          ],
+          "default": "complete_applications",
+          "clarify_if": "user means started applications regardless of completion"
+        },
+        {
+          "term": "current_employee_state",
+          "resolves_to": [
+            "employee"
+          ],
+          "default": "employee_table_current_state",
+          "clarify_if": "user wants ATS application state instead"
+        },
+        {
+          "term": "requisition_join",
+          "resolves_to": [
+            "no direct RequisitionId is exposed on applicant_tracking_application"
+          ],
+          "default": "unavailable_without_mapping",
+          "clarify_if": "user asks for application-to-requisition conversion without a supplied mapping"
+        }
+      ]
+    },
+    "dbpcm_warehouse.applicant_tracking_requisition": {
+      "database": "dbpcm_warehouse",
+      "table": "applicant_tracking_requisition",
+      "description": "Applicant Tracking requisition table. One row per job requisition; use for job opening metadata, requisition status, posting windows, open positions, hires, recruiter, and hiring-manager context.",
+      "grain": [
+        "RequisitionId"
+      ],
+      "temporal": {
+        "dimensions": [
+          {
+            "name": "posting_period",
+            "role": "period",
+            "range": {
+              "start_col": "RequisitionPostingStartDate",
+              "end_col": "RequisitionPostingEndDate"
+            }
+          },
+          {
+            "name": "filled_event",
+            "role": "event",
+            "date_col": "RequisitionPostingFilledDate"
+          }
+        ],
+        "default_pin": "posting_period"
+      },
+      "primary_key": [
+        "RequisitionId"
+      ],
+      "join_keys": [],
+      "columns": {
+        "ClientCode": {
+          "type": "Nullable(String)",
+          "description": "Client/company code."
+        },
+        "RequisitionId": {
+          "type": "Int32",
+          "description": "Unique requisition identifier."
+        },
+        "RequisitionStatusEnum": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Posted",
+            "Denied",
+            "Draft",
+            "Filled",
+            "Closed"
+          ],
+          "description": "Current requisition workflow/status."
+        },
+        "RequisitionPositionTitle": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Internal position title (CLIENT-DEFINED; resolve via resolveValues(RequisitionPositionTitle",
+          "<concept>)).": null
+        },
+        "RequisitionPositionCode": {
+          "type": "Nullable(String)",
+          "description": "Position code."
+        },
+        "RequisitionPositionSeatCodes": {
+          "type": "Nullable(String)",
+          "description": "Position seat codes associated with the requisition."
+        },
+        "RequisitionPositionSeatTitles": {
+          "type": "Nullable(String)",
+          "description": "Position seat titles associated with the requisition."
+        },
+        "RequisitionJobTitle": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Job title (CLIENT-DEFINED; resolve via resolveValues(RequisitionJobTitle",
+          "<concept>)).": null
+        },
+        "RequisitionPublishedJobTitle": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Published job title shown externally (CLIENT-DEFINED; resolve via resolveValues(RequisitionPublishedJobTitle",
+          "<concept>)).": null
+        },
+        "RequisitionPositionType": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Contractor",
+            "Full Time",
+            "Internship"
+          ],
+          "description": "Position type for the requisition."
+        },
+        "RequisitionPostingStartDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Posting start date."
+        },
+        "RequisitionPostingEndDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Posting end date."
+        },
+        "RequisitionPostingFilledDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Date/time requisition was filled."
+        },
+        "RequisitionPositionLevelEnum": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Entry",
+            "Experienced",
+            "Management",
+            "Senior"
+          ],
+          "description": "Position level."
+        },
+        "RequisitionDepartmentCode": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description_col": "RequisitionDepartmentDescription",
+          "description": "Department code for the requisition (CLIENT-DEFINED; resolve via resolveValues(RequisitionDepartmentCode",
+          "<concept>)).": null
+        },
+        "RequisitionDepartmentDescription": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Department description for the requisition (CLIENT-DEFINED; resolve via resolveValues(RequisitionDepartmentDescription",
+          "<concept>)).": null
+        },
+        "RequisitionOpenPositions": {
+          "type": "Nullable(String)",
+          "description": "Remaining open positions; stored as String. Cast with toInt32OrNull(RequisitionOpenPositions) before numeric use — nulls non-numeric values rather than erroring."
+        },
+        "RequisitionNumberOfHires": {
+          "type": "Nullable(Int32)",
+          "description": "Number of hires recorded against the requisition."
+        },
+        "RequisitionLocation": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Requisition location (CLIENT-DEFINED; resolve via resolveValues(RequisitionLocation",
+          "<concept>)).": null
+        },
+        "RequestTypeEnum": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Seasonal",
+            "Replacement",
+            "Additional",
+            "Evergreen"
+          ],
+          "description": "Type of requisition request."
+        },
+        "RequestReason": {
+          "type": "Nullable(String)",
+          "description": "Reason for the requisition request."
+        },
+        "PrimaryRecruiter": {
+          "type": "Nullable(String)",
+          "description": "Primary recruiter assigned to the requisition."
+        },
+        "HiringManagerUsername": {
+          "type": "Nullable(String)",
+          "description": "Hiring manager username."
+        }
+      },
+      "measures": {
+        "requisition_count": {
+          "column": "RequisitionId",
+          "agg": "count_distinct",
+          "defined_over": "requisitions after temporal and status filters"
+        },
+        "requisition_hires": {
+          "column": "RequisitionNumberOfHires",
+          "agg": "sum",
+          "defined_over": "requisitions after temporal and status filters"
+        }
+      },
+      "rules": [
+        {
+          "id": "posted_requisitions",
+          "predicate": "RequisitionStatusEnum = 'Posted'",
+          "applies_when": "open/posted requisition analysis",
+          "description": "Restrict to posted requisitions."
+        },
+        {
+          "id": "filled_requisitions",
+          "predicate": "RequisitionStatusEnum = 'Filled'",
+          "applies_when": "filled requisition analysis",
+          "description": "Restrict to filled requisitions."
+        },
+        {
+          "id": "closed_requisitions",
+          "predicate": "RequisitionStatusEnum = 'Closed'",
+          "applies_when": "closed requisition analysis",
+          "description": "Restrict to closed requisitions."
+        },
+        {
+          "id": "draft_requisitions",
+          "predicate": "RequisitionStatusEnum = 'Draft'",
+          "applies_when": "draft requisition analysis",
+          "description": "Restrict to draft requisitions."
+        },
+        {
+          "id": "denied_requisitions",
+          "predicate": "RequisitionStatusEnum = 'Denied'",
+          "applies_when": "denied requisition analysis",
+          "description": "Restrict to denied requisitions."
+        },
+        {
+          "id": "active_postings",
+          "predicate": "RequisitionStatusEnum = 'Posted' AND (RequisitionPostingEndDate IS NULL OR RequisitionPostingEndDate >= now64(6))",
+          "applies_when": "currently active posting analysis",
+          "description": "Restrict to posted requisitions whose posting end date has not passed."
+        },
+        {
+          "id": "requisitions_with_hires",
+          "predicate": "RequisitionNumberOfHires > 0",
+          "applies_when": "requisitions with recorded hires",
+          "description": "Restrict to requisitions with at least one hire."
+        },
+        {
+          "id": "full_time_requisitions",
+          "predicate": "RequisitionPositionType = 'Full Time'",
+          "applies_when": "full-time requisition analysis",
+          "description": "Restrict to full-time requisitions."
+        },
+        {
+          "id": "contractor_requisitions",
+          "predicate": "RequisitionPositionType = 'Contractor'",
+          "applies_when": "contractor requisition analysis",
+          "description": "Restrict to contractor requisitions."
+        },
+        {
+          "id": "internship_requisitions",
+          "predicate": "RequisitionPositionType = 'Internship'",
+          "applies_when": "internship requisition analysis",
+          "description": "Restrict to internship requisitions."
+        }
+      ],
+      "ambiguities": [
+        {
+          "term": "open_requisition",
+          "resolves_to": [
+            "RequisitionStatusEnum = 'Posted'"
+          ],
+          "default": "posted_requisitions",
+          "clarify_if": "user means active by posting date",
+          "open positions > 0": null,
+          "or not filled/closed": null
+        },
+        {
+          "term": "active_posting",
+          "resolves_to": [
+            "RequisitionStatusEnum = 'Posted' and posting end date has not passed"
+          ],
+          "default": "active_postings",
+          "clarify_if": "user only means status Posted"
+        },
+        {
+          "term": "job_title",
+          "resolves_to": [
+            "RequisitionPublishedJobTitle",
+            "RequisitionJobTitle",
+            "RequisitionPositionTitle"
+          ],
+          "default": "RequisitionPublishedJobTitle",
+          "clarify_if": "user wants internal title or position title"
+        },
+        {
+          "term": "open_positions",
+          "resolves_to": [
+            "cast RequisitionOpenPositions before numeric use"
+          ],
+          "default": "requisition_open_positions_string_cast",
+          "clarify_if": "field contains non-numeric values or user needs exact requisition capacity logic"
+        },
+        {
+          "term": "hires",
+          "resolves_to": [
+            "RequisitionNumberOfHires"
+          ],
+          "default": "requisition_hires",
+          "clarify_if": "user wants hired applications from the application table"
+        },
+        {
+          "term": "application_link",
+          "resolves_to": [
+            "no RequisitionId is exposed on applicant_tracking_application; requisitions cannot be joined to applications/hires without an external mapping"
+          ],
+          "default": "unavailable_without_mapping",
+          "clarify_if": "user asks for applications per requisition",
+          "requisition fill rate": null,
+          "or time-to-fill spanning the application table": null
+        }
+      ]
+    },
+    "dbpcm_warehouse.candidate_education": {
+      "database": "dbpcm_warehouse",
+      "table": "candidate_education",
+      "description": "Candidate-provided education history linked to an ATS application. Not verified current employee education and not directly linked to EmployeeCode or CandidateId.",
+      "grain": [
+        "EducationId"
+      ],
+      "temporal": {
+        "dimensions": [],
+        "default_pin": null
+      },
+      "primary_key": [
+        "EducationId"
+      ],
+      "join_keys": [
+        {
+          "column": "ApplicationId",
+          "joins": "applicant_tracking_application.ApplicationId",
+          "cardinality": "N:1"
+        }
+      ],
+      "columns": {
+        "ClientCode": {
+          "type": "Nullable(String)",
+          "description": "Client/company code."
+        },
+        "EducationId": {
+          "type": "Nullable(Int32)",
+          "description": "Unique education-history row identifier."
+        },
+        "ApplicationId": {
+          "type": "Nullable(Int32)",
+          "description": "Application identifier; join through applicant_tracking_application."
+        },
+        "InstituteName": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided institution name."
+        },
+        "EducationCity": {
+          "type": "Nullable(String)",
+          "description": "Institution city."
+        },
+        "EducationState": {
+          "type": "Nullable(String)",
+          "description": "Institution state."
+        },
+        "EducationCountry": {
+          "type": "Nullable(String)",
+          "description": "Institution country."
+        },
+        "StudentDegree": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided degree."
+        },
+        "StudentMajor": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided major."
+        },
+        "StudentMinor": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided minor."
+        },
+        "StudentAlias": {
+          "type": "Nullable(String)",
+          "description": "Student alias/name used at institution."
+        },
+        "StudentGPA": {
+          "type": "Nullable(Decimal(18, 6))",
+          "description": "Candidate-provided GPA."
+        },
+        "Graduated": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            true,
+            false
+          ],
+          "description": "Whether the candidate reported graduating."
+        },
+        "CurrentlyEnrolled": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            false
+          ],
+          "description": "Whether the candidate reported being currently enrolled."
+        },
+        "EducationDateAttendedStart": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided attendance start date; stored as String."
+        },
+        "EducationDateAttendedEnd": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided attendance end date; stored as String."
+        },
+        "AnticipatedGraduationDate": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided anticipated graduation date; stored as String."
+        },
+        "EducationPhoneNumber": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Sensitive institution phone number."
+        },
+        "InstitutionType": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Other",
+            "High School",
+            "University",
+            "University / Graduate School"
+          ],
+          "description": "Candidate-provided institution type."
+        }
+      },
+      "measures": {
+        "education_entries": {
+          "column": "*",
+          "agg": "count",
+          "defined_over": "education rows after application/candidate filters"
+        }
+      },
+      "rules": [
+        {
+          "id": "graduated",
+          "predicate": "Graduated = 'Yes'",
+          "applies_when": "graduated education analysis",
+          "description": "Restrict to rows marked graduated."
+        },
+        {
+          "id": "not_graduated",
+          "predicate": "Graduated = 'No'",
+          "applies_when": "non-graduated education analysis",
+          "description": "Restrict to rows marked not graduated."
+        },
+        {
+          "id": "currently_enrolled",
+          "predicate": "CurrentlyEnrolled = 'Yes'",
+          "applies_when": "current enrollment analysis",
+          "description": "Restrict to rows marked currently enrolled."
+        },
+        {
+          "id": "university_institution",
+          "predicate": "InstitutionType IN ('University', 'University / Graduate School')",
+          "applies_when": "college/university education analysis",
+          "description": "Restrict to university-type institutions."
+        },
+        {
+          "id": "high_school_institution",
+          "predicate": "InstitutionType = 'High School'",
+          "applies_when": "high-school education analysis",
+          "description": "Restrict to high-school institutions."
+        },
+        {
+          "id": "has_gpa",
+          "predicate": "StudentGPA IS NOT NULL",
+          "applies_when": "GPA analysis",
+          "description": "Restrict to rows with a GPA value."
+        }
+      ],
+      "ambiguities": [
+        {
+          "term": "employee_education_history",
+          "resolves_to": [
+            "join employee -> applicant_tracking_application by EmployeeCode, pick the application with MAX(ApplicationDate) for that employee, then candidate_education on its ApplicationId"
+          ],
+          "default": "latest_application_by_ApplicationDate",
+          "clarify_if": "user wants all ATS education across every application",
+          "or a specific application": null
+        },
+        {
+          "term": "candidate_education_history",
+          "resolves_to": [
+            "candidate_education rows joined through ApplicationId"
+          ],
+          "default": "application_linked_education_rows",
+          "clarify_if": "candidate has multiple applications and user does not specify which one"
+        },
+        {
+          "term": "highest_degree",
+          "resolves_to": [
+            "StudentDegree"
+          ],
+          "default": "candidate_provided_degree_text",
+          "clarify_if": "degree ranking/mapping is required"
+        },
+        {
+          "term": "education_dates",
+          "resolves_to": [
+            "EducationDateAttendedStart",
+            "EducationDateAttendedEnd",
+            "AnticipatedGraduationDate"
+          ],
+          "default": "candidate_provided_string_dates",
+          "clarify_if": "candidate-entered String dates with NO guaranteed format — parse via parseDateTimeBestEffortOrNull(...) (nulls unparseable values rather than erroring); chronological sorting/filtering is best-effort and may silently drop rows. Confirm before relying on date math."
+        }
+      ]
+    },
+    "dbpcm_warehouse.candidate_employment_history": {
+      "database": "dbpcm_warehouse",
+      "table": "candidate_employment_history",
+      "description": "Candidate-provided prior employment history linked to an ATS application. Not verified internal employment history and not directly linked to EmployeeCode or CandidateId.",
+      "grain": [
+        "EmploymentId"
+      ],
+      "temporal": {
+        "dimensions": [],
+        "default_pin": null
+      },
+      "primary_key": [
+        "EmploymentId"
+      ],
+      "join_keys": [
+        {
+          "column": "ApplicationId",
+          "joins": "applicant_tracking_application.ApplicationId",
+          "cardinality": "N:1"
+        }
+      ],
+      "columns": {
+        "ClientCode": {
+          "type": "Nullable(String)",
+          "description": "Client/company code."
+        },
+        "EmploymentId": {
+          "type": "Nullable(Int32)",
+          "description": "Unique employment-history row identifier."
+        },
+        "ApplicationId": {
+          "type": "Nullable(Int32)",
+          "description": "Application identifier; join through applicant_tracking_application."
+        },
+        "EmployerName": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided employer name."
+        },
+        "EmployerStreetAddress": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Sensitive candidate-provided employer street address."
+        },
+        "EmployerCity": {
+          "type": "Nullable(String)",
+          "description": "Employer city."
+        },
+        "EmployerState": {
+          "type": "Nullable(String)",
+          "description": "Employer state."
+        },
+        "EmployerZipCode": {
+          "type": "Nullable(String)",
+          "description": "Employer ZIP/postal code."
+        },
+        "EmployerCountry": {
+          "type": "Nullable(String)",
+          "description": "Employer country."
+        },
+        "EmployerPhone": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Sensitive employer phone number."
+        },
+        "PreviousJobTitle": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided previous job title."
+        },
+        "PreviousJobDuties": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided previous job duties."
+        },
+        "PreviousSupervisor": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided previous supervisor."
+        },
+        "ReasonLeft": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided reason for leaving."
+        },
+        "CanContactEmployer": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            true,
+            false
+          ],
+          "description": "Whether the candidate says the employer may be contacted."
+        },
+        "CurrentEmployer": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            true,
+            false
+          ],
+          "description": "Whether the candidate marked this as their current employer."
+        },
+        "EmploymentStartDate": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided employment start date; stored as String."
+        },
+        "EmploymentEndDate": {
+          "type": "Nullable(String)",
+          "description": "Candidate-provided employment end date; stored as String."
+        }
+      },
+      "measures": {
+        "employment_history_entries": {
+          "column": "*",
+          "agg": "count",
+          "defined_over": "employment-history rows after application/candidate filters"
+        }
+      },
+      "rules": [
+        {
+          "id": "current_employer_rows",
+          "predicate": "CurrentEmployer = 'Yes'",
+          "applies_when": "current prior-employer analysis",
+          "description": "Restrict to rows marked as current employer."
+        },
+        {
+          "id": "former_employer_rows",
+          "predicate": "CurrentEmployer = 'No'",
+          "applies_when": "former-employer analysis",
+          "description": "Restrict to rows not marked as current employer."
+        },
+        {
+          "id": "can_contact_employer",
+          "predicate": "CanContactEmployer = 'Yes'",
+          "applies_when": "employer-contact-permission analysis",
+          "description": "Restrict to rows where employer contact is allowed."
+        },
+        {
+          "id": "cannot_contact_employer",
+          "predicate": "CanContactEmployer = 'No'",
+          "applies_when": "contact-restricted employer analysis",
+          "description": "Restrict to rows where employer contact is not allowed."
+        },
+        {
+          "id": "has_employment_start",
+          "predicate": "EmploymentStartDate IS NOT NULL",
+          "applies_when": "employment-date analysis",
+          "description": "Restrict to rows with a start date value."
+        },
+        {
+          "id": "has_employment_end",
+          "predicate": "EmploymentEndDate IS NOT NULL",
+          "applies_when": "employment-date analysis",
+          "description": "Restrict to rows with an end date value."
+        }
+      ],
+      "ambiguities": [
+        {
+          "term": "employee_work_history",
+          "resolves_to": [
+            "join employee -> applicant_tracking_application by EmployeeCode, pick the application with MAX(ApplicationDate) for that employee, then candidate_employment_history on its ApplicationId"
+          ],
+          "default": "latest_application_by_ApplicationDate",
+          "clarify_if": "user wants all ATS work history across every application",
+          "or a specific application": null
+        },
+        {
+          "term": "candidate_work_history",
+          "resolves_to": [
+            "candidate_employment_history rows joined through ApplicationId"
+          ],
+          "default": "application_linked_employment_rows",
+          "clarify_if": "candidate has multiple applications and user does not specify which one"
+        },
+        {
+          "term": "current_employer",
+          "resolves_to": [
+            "CurrentEmployer = 'Yes' in candidate-provided work history"
+          ],
+          "default": "current_employer_rows",
+          "clarify_if": "user means current Paycom employment status from employee table"
+        },
+        {
+          "term": "employment_dates",
+          "resolves_to": [
+            "EmploymentStartDate",
+            "EmploymentEndDate"
+          ],
+          "default": "candidate_provided_string_dates",
+          "clarify_if": "candidate-entered String dates with NO guaranteed format — parse via parseDateTimeBestEffortOrNull(...) (nulls unparseable values rather than erroring); chronological sorting/filtering is best-effort and may silently drop rows. Confirm before relying on date math."
+        }
+      ]
+    },
+    "dbpcm_warehouse.employee": {
+      "database": "dbpcm_warehouse",
+      "table": "employee",
+      "description": "Current-state employee record, one row per employee. Reflects current employee attributes, not historical snapshots.",
+      "grain": [
+        "EmployeeCode"
+      ],
+      "temporal": {
+        "dimensions": [],
+        "default_pin": null
+      },
+      "primary_key": [
+        "EmployeeCode"
+      ],
+      "join_keys": [
+        {
+          "column": "EmployeeCode",
+          "joins": "payroll.EmployeeCode",
+          "cardinality": "1:N"
+        },
+        {
+          "column": "EmployeeCode",
+          "joins": "weekly_booked_sales_reps_only.EmployeeCode",
+          "cardinality": "1:N"
+        },
+        {
+          "column": "EmployeeCode",
+          "joins": "accrual_events.EmployeeCode",
+          "cardinality": "1:N"
+        },
+        {
+          "column": "EmployeeCode",
+          "joins": "performance_discussions.EmployeeCode",
+          "cardinality": "1:N"
+        },
+        {
+          "column": "EmployeeCode",
+          "joins": "personnel_action_form_changes.EmployeeCode",
+          "cardinality": "1:N"
+        },
+        {
+          "column": "EmployeeCode",
+          "joins": "applicant_tracking_application.EmployeeCode",
+          "cardinality": "1:N"
+        }
+      ],
+      "columns": {
+        "ClientCode": {
+          "type": "Nullable(String)",
+          "description": "Client/company code."
+        },
+        "EmployeeCode": {
+          "type": "String",
+          "description": "Stable unique employee identifier; canonical employee join key."
+        },
+        "Department": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Current department label (CLIENT-DEFINED; resolve via resolveValues(Department",
+          "<concept>)).": null,
+          "synonyms": [
+            "dept",
+            "team"
+          ]
+        },
+        "Position": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Current position; preferred field for identifying/filtering managers (CLIENT-DEFINED; resolve via resolveValues(Position",
+          "<concept>)).": null
+        },
+        "EmployeeName": {
+          "type": "Nullable(String)",
+          "description": "Default employee display name."
+        },
+        "EmployeeStatus": {
+          "type": "Nullable(String)",
+          "values": {
+            "A": "active",
+            "D": "deceased",
+            "I": "inactive",
+            "N": "not_hired",
+            "P": "pre_hire",
+            "R": "retired",
+            "T": "terminated",
+            "V": "on_leave"
+          },
+          "observed_values": [
+            "A",
+            "D",
+            "I",
+            "N",
+            "T",
+            "V"
+          ],
+          "description": "Current employee status code."
+        },
+        "DepartmentCode": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Formal department code used in company maintenance/labor allocation context (CLIENT-DEFINED; resolve via resolveValues(DepartmentCode",
+          "<concept>)).": null
+        },
+        "LivesInState": {
+          "type": "Nullable(String)",
+          "description": "Residence state for assigned tax profile."
+        },
+        "WorksInState": {
+          "type": "Nullable(String)",
+          "description": "Work state for assigned tax profile."
+        },
+        "SUIState": {
+          "type": "Nullable(String)",
+          "description": "State unemployment insurance agency state for assigned tax profile."
+        },
+        "TerminationDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Current or latest termination date."
+        },
+        "OldTerminationDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Prior termination date before rehire."
+        },
+        "FirstName": {
+          "type": "Nullable(String)",
+          "description": "Employee first name."
+        },
+        "MiddleName": {
+          "type": "Nullable(String)",
+          "description": "Employee middle name."
+        },
+        "LastName": {
+          "type": "Nullable(String)",
+          "description": "Employee last name."
+        },
+        "Nickname": {
+          "type": "Nullable(String)",
+          "description": "Employee nickname or preferred informal name."
+        },
+        "HireDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Original hire date."
+        },
+        "MostRecentHireDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Latest hire date; default field for generic hire-date questions."
+        },
+        "LeaveAbsenceStart": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Leave-of-absence start date."
+        },
+        "LeaveAbsenceEnd": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Leave-of-absence end date."
+        },
+        "PrimarySupervisorEmployeeName": {
+          "type": "Nullable(String)",
+          "description": "Current primary supervisor name."
+        },
+        "SecondarySupervisorEmployeeName": {
+          "type": "Nullable(String)",
+          "description": "Current secondary supervisor name."
+        },
+        "TertiarySupervisorEmployeeName": {
+          "type": "Nullable(String)",
+          "description": "Current tertiary supervisor name."
+        },
+        "QuaternarySupervisorEmployeeName": {
+          "type": "Nullable(String)",
+          "description": "Current quaternary supervisor name."
+        },
+        "CountryCode": {
+          "type": "Nullable(String)",
+          "description": "Two-character residence country code."
+        },
+        "TermReason": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Termination reason code; CLIENT-DEFINED",
+          "requires lookup before interpreting — resolve via resolveValues(TermReason": null,
+          "<concept>).": null
+        },
+        "FullTimeToPartTimeDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Date employee moved from full-time to part-time."
+        },
+        "LastCheckDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Last pay date/check date."
+        },
+        "PositionFamilyName": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Broader position family classification (CLIENT-DEFINED; resolve via resolveValues(PositionFamilyName",
+          "<concept>)).": null
+        },
+        "AccrualProfileDesc": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Human-readable accrual profile description (CLIENT-DEFINED; resolve via resolveValues(AccrualProfileDesc",
+          "<concept>)).": null
+        },
+        "BusinessTitlePositionSeat": {
+          "type": "Nullable(String)",
+          "description": "Assigned business title for current position seat."
+        },
+        "PositionLevel": {
+          "type": "Nullable(Int32)",
+          "description": "Numeric org level; requires company mapping for semantic interpretation."
+        },
+        "PrimaryAddressLine1": {
+          "type": "Nullable(String)",
+          "description": "Primary residence address line 1."
+        },
+        "PrimaryAddressLine2": {
+          "type": "Nullable(String)",
+          "description": "Primary residence address line 2."
+        },
+        "PrimaryCityMunicipality": {
+          "type": "Nullable(String)",
+          "description": "Primary residence city/municipality."
+        },
+        "PrimaryState": {
+          "type": "Nullable(String)",
+          "description": "Primary residence state."
+        },
+        "PrimaryZipCode": {
+          "type": "Nullable(String)",
+          "description": "Primary residence ZIP/postal code."
+        },
+        "RehireDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Most recent rehire date when applicable."
+        },
+        "LastPositionChangeDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Most recent position-change date."
+        },
+        "LastWorkedDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Last day worked."
+        },
+        "PositionTitlePositionInfo": {
+          "type": "Nullable(String)",
+          "description": "Formal title from position management."
+        },
+        "PayTypeDescription": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Commission Only",
+            "None",
+            "Salary"
+          ],
+          "description": "Pay type description."
+        },
+        "WorkLocationDescription": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Human-readable work location name (CLIENT-DEFINED; resolve via resolveValues(WorkLocationDescription",
+          "<concept>)).": null
+        },
+        "WorkLocationAddress": {
+          "type": "Nullable(String)",
+          "description": "Work location street address."
+        },
+        "WorkLocationCity": {
+          "type": "Nullable(String)",
+          "description": "Work location city."
+        },
+        "WorkLocationState": {
+          "type": "Nullable(String)",
+          "description": "Work location state."
+        },
+        "WorkLocationZip": {
+          "type": "Nullable(String)",
+          "description": "Work location ZIP/postal code."
+        },
+        "WorkLocationCountry": {
+          "type": "Nullable(String)",
+          "description": "Work location country."
+        },
+        "sales_sl_gradution": {
+          "type": "Nullable(String)",
+          "description": "Internal sales training graduation date field; spelling preserved from source."
+        },
+        "sales_sl_start_date": {
+          "type": "Nullable(String)",
+          "description": "Internal sales training start date field."
+        },
+        "AnnualSalary": {
+          "type": "Nullable(Decimal(18, 6))",
+          "unit": "USD",
+          "description": "Authoritative annual salary figure; the single source for 'annual salary' / 'total salary' questions and department-level salary rollups (SUM(AnnualSalary) GROUP BY Department). Planned amount, not actual payroll paid."
+        },
+        "EmploymentType": {
+          "type": "Nullable(String)",
+          "values": {
+            "W2": "employee",
+            "1099": "contractor"
+          },
+          "observed_values": [
+            "W2",
+            "1099"
+          ],
+          "description": "Worker classification."
+        },
+        "Rate1": {
+          "type": "Nullable(Decimal(18, 6))",
+          "unit": "USD",
+          "description": "Base hourly/rate-1 pay rate when applicable."
+        }
+      },
+      "rules": [
+        {
+          "id": "active_employee",
+          "predicate": "EmployeeStatus = 'A'",
+          "applies_when": "user asks for active/current active employees",
+          "description": "Restrict to active employees."
+        },
+        {
+          "id": "exclude_not_hired_default",
+          "predicate": "EmployeeStatus != 'N' OR EmployeeStatus IS NULL",
+          "applies_when": "default for employee-based analysis when no explicit status filter (e.g. active_employee) is applied",
+          "description": "Exclude not-hired (pre-hire) records by default because they were never actually hired. Headcount uses active_employee instead, which already excludes 'N' — do not stack both defaults."
+        },
+        {
+          "id": "rehired_not_terminated",
+          "predicate": "TerminationDate IS NULL OR MostRecentHireDate IS NULL OR MostRecentHireDate < TerminationDate",
+          "applies_when": "termination-status evaluation — compose as `EmployeeStatus = 'T' AND <this guard>`",
+          "description": "Rehire guard for the `terminated` resolution: excludes anyone rehired on/after their TerminationDate (MostRecentHireDate >= TerminationDate ⇒ not currently terminated). ASSUMPTION to confirm: rehire is signalled by MostRecentHireDate advancing past TerminationDate.\n"
+        }
+      ],
+      "ambiguities": [
+        {
+          "term": "headcount",
+          "resolves_to": [
+            "COUNT(DISTINCT EmployeeCode) with EmployeeStatus = 'A'"
+          ],
+          "default": "active_only",
+          "clarify_if": "user asks for all employees, historical employees, terminated employees, or including not-hired records"
+        },
+        {
+          "term": "hire_date",
+          "resolves_to": [
+            "MostRecentHireDate"
+          ],
+          "default": "most_recent_hire",
+          "clarify_if": "user asks for original hire date or rehire-specific analysis"
+        },
+        {
+          "term": "terminated",
+          "resolves_to": [
+            "EmployeeStatus = 'T' with rehire check using MostRecentHireDate vs TerminationDate"
+          ],
+          "default": "current_termination_state",
+          "clarify_if": "user asks for termination events regardless of rehire"
+        },
+        {
+          "term": "manager",
+          "resolves_to": [
+            "Position"
+          ],
+          "default": "position_based",
+          "clarify_if": "user needs an exact business-defined manager population"
+        },
+        {
+          "term": "supervisor",
+          "resolves_to": [
+            "PrimarySupervisorEmployeeName",
+            "SecondarySupervisorEmployeeName",
+            "TertiarySupervisorEmployeeName",
+            "QuaternarySupervisorEmployeeName"
+          ],
+          "default": "primary_supervisor_name_best_effort",
+          "clarify_if": "DATA LIMITATION — org hierarchy is exposed ONLY as supervisor NAME strings; there is no SupervisorEmployeeCode and no reliable self-join key. \"Who reports to X\", span-of-control, and org rollups must match Primary…Quaternary SupervisorEmployeeName against employee names, which is non-unique and breaks on duplicate/changed names. Treat name matching as best-effort, not a foreign key; confirm the supervisor identity and prefer asking which supervisor tier is meant.\n"
+        },
+        {
+          "term": "annual salary",
+          "resolves_to": [
+            "AnnualSalary"
+          ],
+          "default": "employee_annual_salary",
+          "clarify_if": "NOT ambiguous — \"annual salary\" / \"total annual salary\" (including department-filtered rollups like SUM(AnnualSalary) GROUP BY Department) is always employee.AnnualSalary. Both the \"annual\" qualifier and a department filter point to this table; do NOT re-check payroll, which holds only per-period line items (no annual amount, temporally gated). Fall through to the broader 'salary' ambiguity below only if the user explicitly asks for actually-PAID earnings or net/take-home pay.\n"
+        },
+        {
+          "term": "salary",
+          "resolves_to": [
+            "AnnualSalary",
+            "Rate1",
+            "payroll gross earnings = SUM(Amount) WHERE RegisterType = 'EARN'",
+            "payroll net pay = SUM(Amount) WHERE RegisterType = 'NETPAYDIST'"
+          ],
+          "default": "planned_annual_salary",
+          "clarify_if": "For \"annual salary\" use AnnualSalary directly (see the 'annual salary' entry above) — this broader ambiguity applies only when planned-vs-actual is genuinely unclear. \"salary\" / \"pay\" / \"compensation\" is ambiguous across tables and meanings — planned AnnualSalary (employee, not actually paid) vs base Rate1 vs actually-paid gross earnings (payroll EARN) vs take-home net pay (payroll NETPAYDIST). Clarify planned-vs-actual and gross-vs-net; payroll figures additionally require a pinned pay period (temporal gate)."
+        }
+      ]
+    },
+    "dbpcm_warehouse.payroll": {
+      "database": "dbpcm_warehouse",
+      "table": "payroll",
+      "region": "workforce_payroll",
+      "description": "Payroll register line-item table. Contains paycheck components such as earnings, deductions, taxes, benefits, employer taxes, and net-pay distributions. Not one row per paycheck.",
+      "grain": [],
+      "grain_verifiable": false,
+      "grain_note": "Payroll register LINE ITEMS — one row per pay component, not one row per paycheck. No exposed unique row id (TransactionNumber is NOT unique). Multiple rows share the same EmployeeCode + PayDate. Logical analysis grains for GROUP BY: a \"paycheck\" = EmployeeCode + PayDate (often + pay-period dates); an employee's period earnings = SUM(Amount) WHERE RegisterType='EARN' grouped to EmployeeCode + period. Blueprints must declare their own result grain; this base table is unverifiable.\n",
+      "temporal": {
+        "dimensions": [
+          {
+            "name": "pay_period",
+            "role": "period",
+            "range": {
+              "start_col": "PayPeriodStartDate",
+              "end_col": "PayPeriodEndDate"
+            }
+          },
+          {
+            "name": "pay_event",
+            "role": "event",
+            "date_col": "PayDate"
+          }
+        ],
+        "default_pin": "pay_period"
+      },
+      "primary_key": [],
+      "primary_key_note": "No reliable unique primary key is exposed. Do not treat TransactionNumber as unique.",
+      "join_keys": [
+        {
+          "column": "EmployeeCode",
+          "joins": "employee.EmployeeCode",
+          "cardinality": "N:1"
+        },
+        {
+          "column": "DistributedDepartmentCode",
+          "joins": "employee.DepartmentCode",
+          "cardinality": "many_to_reference",
+          "confidence": "medium"
+        }
+      ],
+      "columns": {
+        "ClientCode": {
+          "type": "Nullable(String)",
+          "description": "Client/company code."
+        },
+        "EmployeeCode": {
+          "type": "String",
+          "description": "Employee identifier; canonical join key to employee."
+        },
+        "RegisterType": {
+          "type": "String",
+          "values": {
+            "EARN": "earnings",
+            "EETAX": "employee_tax",
+            "DDUCT": "deductions",
+            "NETPAYDIST": "net_pay_distribution",
+            "EEBEN": "employee_benefits",
+            "ERTAX": "employer_tax"
+          },
+          "description": "Main payroll register category for the line item."
+        },
+        "Amount": {
+          "type": "Nullable(Decimal(18, 6))",
+          "unit": "USD",
+          "description": "Monetary amount for the payroll line. Meaning depends on RegisterType."
+        },
+        "TypeHours": {
+          "type": "Nullable(Decimal(18, 6))",
+          "unit": "hours",
+          "description": "Hours associated with the payroll type code when applicable."
+        },
+        "TypeCode": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description_col": "TypeCodeDescription",
+          "description": "Payroll code within the register type (an earning, deduction, tax, benefit, or distribution code). CLIENT-DEFINED — resolve concepts to codes via resolveValues(TypeCode, <concept>), do not hardcode."
+        },
+        "TypeCodeDescription": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Human-readable description for TypeCode."
+        },
+        "ProfileCode": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Payroll profile/benefit eligibility profile code when applicable. CLIENT-DEFINED — resolve via resolveValues(ProfileCode, <concept>)."
+        },
+        "DistributedDepartmentCode": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description_col": "distributedDepartmentDescription",
+          "description": "Department or labor-distribution code charged on the payroll item. CLIENT-DEFINED — resolve via resolveValues(DistributedDepartmentCode, <concept>)."
+        },
+        "distributedDepartmentDescription": {
+          "type": "Nullable(String)",
+          "description": "Human-readable distributed department label for the payroll item."
+        },
+        "TypeRate": {
+          "type": "Nullable(Decimal(18, 6))",
+          "unit": "USD_per_hour",
+          "description": "Rate associated with the type code when applicable."
+        },
+        "PayDate": {
+          "type": "DateTime64(6)",
+          "description": "Check/payment date; use when the question is about when payroll was issued."
+        },
+        "PayPeriodStartDate": {
+          "type": "DateTime64(6)",
+          "description": "Start date of the pay period covered by the line item."
+        },
+        "PayPeriodEndDate": {
+          "type": "DateTime64(6)",
+          "description": "End date of the pay period covered by the line item."
+        },
+        "TransactionNumber": {
+          "type": "Nullable(String)",
+          "description": "Transaction reference number. Not unique in observed data."
+        }
+      },
+      "measures": {
+        "gross_earnings": {
+          "column": "Amount",
+          "agg": "sum",
+          "defined_over": "RegisterType = 'EARN'; summed over line items within (EmployeeCode, pay period)"
+        },
+        "employee_tax_withheld": {
+          "column": "Amount",
+          "agg": "sum",
+          "defined_over": "RegisterType = 'EETAX'; summed over line items within (EmployeeCode, pay period)"
+        },
+        "employee_deductions": {
+          "column": "Amount",
+          "agg": "sum",
+          "defined_over": "RegisterType = 'DDUCT'; summed over line items within (EmployeeCode, pay period)"
+        },
+        "net_pay_distributed": {
+          "column": "Amount",
+          "agg": "sum",
+          "defined_over": "RegisterType = 'NETPAYDIST'; summed over line items within (EmployeeCode, pay period)"
+        },
+        "employer_tax": {
+          "column": "Amount",
+          "agg": "sum",
+          "defined_over": "RegisterType = 'ERTAX'; summed over line items within (EmployeeCode, pay period)"
+        },
+        "employee_benefits": {
+          "column": "Amount",
+          "agg": "sum",
+          "defined_over": "RegisterType = 'EEBEN'; summed over line items within (EmployeeCode, pay period)"
+        },
+        "paid_hours": {
+          "column": "TypeHours",
+          "agg": "sum",
+          "defined_over": "hours-bearing rows (usually RegisterType = 'EARN', narrowed by TypeCode via resolveValues); see 'hours worked' ambiguity for paid/worked/PTO/overtime disambiguation"
+        },
+        "expense_reimbursements": {
+          "column": "Amount",
+          "agg": "sum",
+          "defined_over": "RegisterType = 'DDUCT' narrowed to expense-reimbursement TypeCode via resolveValues(TypeCode, <expense concept>); summed within (EmployeeCode, pay period). Excludes benefit deductions (401k/medical/dental)."
+        }
+      },
+      "rules": [
+        {
+          "id": "gross_earnings",
+          "predicate": "RegisterType = 'EARN'",
+          "applies_when": "gross earnings or payroll earnings questions",
+          "description": "Use earnings rows for gross compensation analysis."
+        },
+        {
+          "id": "employee_deductions",
+          "predicate": "RegisterType = 'DDUCT'",
+          "applies_when": "deductions or expense-reimbursement-style deduction questions",
+          "description": "Use deduction rows, then narrow by TypeCode as needed. DDUCT includes BOTH benefit deductions (401k, medical, dental) and expense reimbursements; for expenses specifically, narrow TypeCode via resolveValues (see the 'expenses' ambiguity)."
+        },
+        {
+          "id": "employee_taxes",
+          "predicate": "RegisterType = 'EETAX'",
+          "applies_when": "employee tax withholding questions",
+          "description": "Taxes withheld from employee pay."
+        },
+        {
+          "id": "employer_taxes",
+          "predicate": "RegisterType = 'ERTAX'",
+          "applies_when": "employer payroll tax questions",
+          "description": "Employer-paid payroll tax rows."
+        },
+        {
+          "id": "net_pay_distribution",
+          "predicate": "RegisterType = 'NETPAYDIST'",
+          "applies_when": "take-home pay distribution questions",
+          "description": "How net pay was distributed, such as direct deposit or check."
+        }
+      ],
+      "ambiguities": [
+        {
+          "term": "pay_timing",
+          "resolves_to": [
+            "PayDate",
+            "PayPeriodStartDate / PayPeriodEndDate (coverage period)"
+          ],
+          "default": "pay_period_coverage",
+          "clarify_if": "timing is ambiguous between the check/issue date (PayDate — use for \"when paid/issued\") and the work period covered (PayPeriodStartDate/EndDate — use for \"period worked/covered\"). Default pins the coverage period (temporal default_pin: pay_period); redirect to PayDate when intent is the payment event.\n"
+        },
+        {
+          "term": "payroll",
+          "resolves_to": [
+            "line items across all RegisterType values"
+          ],
+          "default": "all_register_types",
+          "clarify_if": "user needs only gross earnings, net pay, taxes, deductions, benefits, or employer cost"
+        },
+        {
+          "term": "paycheck",
+          "resolves_to": [
+            "group payroll line items by EmployeeCode + PayDate, and often pay-period dates"
+          ],
+          "default": "grouped_line_items",
+          "clarify_if": "exact check identity is required, because no unique paycheck id is exposed"
+        },
+        {
+          "term": "wages or earnings",
+          "resolves_to": [
+            "SUM(Amount) WHERE RegisterType = 'EARN'"
+          ],
+          "default": "gross_earnings",
+          "clarify_if": "user means net pay, taxable wages, employer payroll cost, or the planned AnnualSalary / Rate1 from the employee table (planned vs actually-paid — see employee.yaml 'salary' ambiguity)"
+        },
+        {
+          "term": "hours worked",
+          "resolves_to": [
+            "SUM(TypeHours), usually filtered to earnings/hour-related TypeCode rows"
+          ],
+          "default": "TypeHours",
+          "clarify_if": "user needs paid hours, worked hours, PTO hours, overtime hours, or all hours"
+        },
+        {
+          "term": "department",
+          "resolves_to": [
+            "DistributedDepartmentCode",
+            "distributedDepartmentDescription"
+          ],
+          "default": "payroll_distributed_department",
+          "clarify_if": "user means current employee department from employee.Department"
+        },
+        {
+          "term": "expenses",
+          "resolves_to": [
+            "resolveValues(TypeCode, 'expense reimbursement / travel / meals / mileage / airfare / lodging / office supplies') → filter TypeCode IN result AND RegisterType = 'DDUCT'; SUM(Amount)"
+          ],
+          "default": "approved_expense_reimbursements",
+          "clarify_if": "\"expenses\" / \"reimbursements\" means DDUCT rows for EXPENSE-REIMBURSEMENT codes only — NOT all deductions. DDUCT ALSO holds benefit deductions (401k, medical, dental) which are NOT expenses. Resolve expense codes via resolveValues(TypeCode, <expense concept>) — CLIENT-DEFINED and drifts over time, never hardcode. Clarify if the user actually wants all deductions, benefit deductions, or only one expense category (travel, meals, mileage)."
+        }
+      ]
+    },
+    "dbpcm_warehouse.performance_discussions": {
+      "database": "dbpcm_warehouse",
+      "table": "performance_discussions",
+      "description": "Performance discussion workflow and form-detail table. Use for writeups, coaching or disciplinary discussions, workflow state, acknowledgments, monitoring periods, uploaded-document filenames, and field-level discussion responses.",
+      "grain": [],
+      "grain_verifiable": false,
+      "grain_note": "Field-response-level rows. No reliable row-level natural key is exposed. Use DiscussionId for discussion-level grouping (COUNT(DISTINCT DiscussionId)); multiple rows exist per DiscussionId because field-level responses repeat. Logical analysis grain: one field-response row.\n",
+      "temporal": {
+        "dimensions": [
+          {
+            "name": "creation_event",
+            "role": "event",
+            "date_col": "CreationDate"
+          },
+          {
+            "name": "last_action_event",
+            "role": "event",
+            "date_col": "LastActionDate"
+          },
+          {
+            "name": "resolved_event",
+            "role": "event",
+            "date_col": "ResolvedDate"
+          },
+          {
+            "name": "employee_acknowledgment_event",
+            "role": "event",
+            "date_col": "EmployeeAcknowledgmentDate"
+          },
+          {
+            "name": "manager_approval_event",
+            "role": "event",
+            "date_col": "ManagerApprovalDate"
+          },
+          {
+            "name": "monitoring_end_event",
+            "role": "event",
+            "date_col": "MonitoringPeriodEndDate"
+          }
+        ],
+        "default_pin": "creation_event"
+      },
+      "primary_key": [],
+      "primary_key_note": "DiscussionId is the discussion-level identifier, but it is not row-unique.",
+      "join_keys": [
+        {
+          "column": "EmployeeCode",
+          "joins": "employee.EmployeeCode",
+          "cardinality": "N:1"
+        }
+      ],
+      "columns": {
+        "ClientCode": {
+          "type": "Nullable(String)",
+          "description": "Client/company code."
+        },
+        "EmployeeCode": {
+          "type": "String",
+          "description": "Employee identifier; canonical join key to employee."
+        },
+        "DiscussionId": {
+          "type": "Nullable(Int32)",
+          "description": "Discussion/form/workflow identifier. Group by this for discussion-level analysis."
+        },
+        "ApprovalNotes": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Approval or resolution notes. Sensitive workflow text."
+        },
+        "Approver": {
+          "type": "Nullable(String)",
+          "description": "User who approved or resolved the discussion."
+        },
+        "CreatedBy": {
+          "type": "Nullable(String)",
+          "description": "User who created the discussion."
+        },
+        "CreationDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Discussion creation timestamp."
+        },
+        "DiscussionNotes": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Discussion notes. Sensitive workflow text."
+        },
+        "DiscussionNotesUpdatedBy": {
+          "type": "Nullable(String)",
+          "description": "User who last updated discussion notes."
+        },
+        "DiscussionReason": {
+          "type": "Nullable(String)",
+          "description": "Reason for the discussion."
+        },
+        "DiscussionState": {
+          "type": "Nullable(String)",
+          "values": {
+            "Draft": "draft_not_submitted",
+            "Creator": "with_creator",
+            "Employee Approval": "awaiting_employee_approval",
+            "Eligibility Review": "eligibility_review_stage",
+            "Accrual Review": "accrual_review_stage",
+            "Human Resources": "hr_review_stage",
+            "Final Approval": "in_final_approval",
+            "Resolved": "resolved_closed",
+            "Archived": "archived"
+          },
+          "observed_values": [
+            "Draft",
+            "Creator",
+            "Resolved",
+            "Archived",
+            "Final Approval",
+            "Employee Approval"
+          ],
+          "description": "Current workflow state of the discussion."
+        },
+        "DiscussionTemplate": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Form/template used for the discussion (CLIENT-DEFINED; resolve via resolveValues(DiscussionTemplate",
+          "<concept>)).": null
+        },
+        "DiscussionType": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "observed_values": [
+            "Verbal",
+            "1 on 1",
+            "Manager Updates",
+            "Green Kudos",
+            "Exit Interview",
+            "Stay Interviews",
+            "Talent Acquisition",
+            "CRR Manager Shadow",
+            "New Hire Check In",
+            "Final Incident Summary - Involuntary Separation",
+            "Memo Of Conversation - Verbal",
+            "Corrective Action Form - Misconduct",
+            "Sales Performance Documentation",
+            "Corrective Action Form - Performance",
+            "Memo Of Conversation - Performance",
+            "Paycom Offboarding Interview",
+            "Corrective Action Form - Behavior",
+            "Performance Improvement Plan"
+          ],
+          "description": "Type/category of discussion. CLIENT-DEFINED (client-configured form types) — resolve concepts via resolveValues(DiscussionType, <concept>); observed_values is illustrative, not authoritative per client."
+        },
+        "DocumentUploads": {
+          "type": "Nullable(String)",
+          "description": "Uploaded document filenames only; not document contents."
+        },
+        "DocumentUploadsUpdatedBy": {
+          "type": "Nullable(String)",
+          "description": "User who updated uploaded document metadata."
+        },
+        "EmployeeAcknowledgment": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Declined",
+            "Acknowledgment",
+            "Individual Development Plan (initiator)"
+          ],
+          "description": "Employee acknowledgment state/text."
+        },
+        "EmployeeAcknowledgmentDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Timestamp when employee acknowledged the discussion."
+        },
+        "EmployeeSignature": {
+          "type": "Nullable(String)",
+          "description": "Employee signature or acknowledgment text."
+        },
+        "ExceptionPointThreshold": {
+          "type": "Nullable(String)",
+          "description": "Exception-point threshold tier associated with the discussion."
+        },
+        "ExceptionPointTotal": {
+          "type": "Nullable(String)",
+          "description": "Employee exception-point total at discussion creation time; stored as String. Cast with toFloat64OrNull(ExceptionPointTotal) before numeric use — nulls non-numeric values rather than erroring."
+        },
+        "FieldAnswer": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Field-level answer captured on the discussion form. Sensitive form text."
+        },
+        "FieldCompletedBy": {
+          "type": "Nullable(String)",
+          "description": "User or employee who completed the field-level answer."
+        },
+        "FieldDescription": {
+          "type": "Nullable(String)",
+          "description": "Field-level prompt/description on the discussion form."
+        },
+        "LastActionDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Timestamp of most recent workflow action."
+        },
+        "LastModifiedBy": {
+          "type": "Nullable(String)",
+          "description": "User who last modified the discussion."
+        },
+        "ManagerAcknowledgment": {
+          "type": "Nullable(String)",
+          "observed_values": [
+            "Acknowledgment",
+            "Declined",
+            "Individual Development Plan (initiator)",
+            "Individual Development Plan (leader)",
+            "Overridden"
+          ],
+          "description": "Manager acknowledgment state/text."
+        },
+        "ManagerApprovalDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Timestamp when manager approved or resolved the discussion."
+        },
+        "ManagerSignature": {
+          "type": "Nullable(String)",
+          "description": "Manager signature identifier or text."
+        },
+        "MonitoringPeriodDays": {
+          "type": "Nullable(String)",
+          "unit": "days",
+          "description": "Monitoring-period length; stored as String. Cast with toInt32OrNull(MonitoringPeriodDays) before numeric use — nulls non-numeric values rather than erroring."
+        },
+        "MonitoringPeriodEndDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Monitoring-period end timestamp."
+        },
+        "ResolvedDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Resolution timestamp when discussion is resolved."
+        },
+        "SendBackNotes": {
+          "type": "Nullable(String)",
+          "sensitive": true,
+          "description": "Notes entered when the discussion was sent back. Sensitive workflow text."
+        },
+        "WaitingOn": {
+          "type": "Nullable(String)",
+          "description": "Current pending owner",
+          "approver": null,
+          "employee": null,
+          "group": null,
+          "or relationship.": null
+        }
+      },
+      "measures": {
+        "discussion_count": {
+          "column": "DiscussionId",
+          "agg": "count_distinct",
+          "defined_over": "discussion rows after temporal, workflow-state, employee, and type filters"
+        },
+        "field_response_rows": {
+          "column": "*",
+          "agg": "count",
+          "defined_over": "field-level rows after temporal, workflow-state, employee, and type filters"
+        }
+      },
+      "rules": [
+        {
+          "id": "resolved_discussions",
+          "predicate": "DiscussionState = 'Resolved'",
+          "applies_when": "resolved discussion analysis",
+          "description": "Restrict to resolved discussions."
+        },
+        {
+          "id": "archived_discussions",
+          "predicate": "DiscussionState = 'Archived'",
+          "applies_when": "archived discussion analysis",
+          "description": "Restrict to archived discussions."
+        },
+        {
+          "id": "final_approval_discussions",
+          "predicate": "DiscussionState = 'Final Approval'",
+          "applies_when": "final approval workflow analysis",
+          "description": "Restrict to discussions in final approval."
+        },
+        {
+          "id": "employee_approval_discussions",
+          "predicate": "DiscussionState = 'Employee Approval'",
+          "applies_when": "employee approval or acknowledgment workflow analysis",
+          "description": "Restrict to discussions awaiting employee approval."
+        },
+        {
+          "id": "draft_discussions",
+          "predicate": "DiscussionState = 'Draft'",
+          "applies_when": "draft discussion analysis",
+          "description": "Restrict to draft discussions."
+        },
+        {
+          "id": "creator_discussions",
+          "predicate": "DiscussionState = 'Creator'",
+          "applies_when": "creator workflow queue analysis",
+          "description": "Restrict to discussions in creator workflow state."
+        },
+        {
+          "id": "open_discussions",
+          "predicate": "DiscussionState IS NOT NULL AND DiscussionState NOT IN ('Resolved', 'Archived')",
+          "applies_when": "open or in-flight discussion analysis",
+          "description": "Restrict to discussions not resolved or archived."
+        },
+        {
+          "id": "has_waiting_on",
+          "predicate": "WaitingOn IS NOT NULL AND WaitingOn != ''",
+          "applies_when": "pending-owner workflow analysis",
+          "description": "Restrict to discussions with a WaitingOn value."
+        },
+        {
+          "id": "employee_acknowledged",
+          "predicate": "EmployeeAcknowledgment = 'Acknowledgment' OR EmployeeAcknowledgmentDate IS NOT NULL",
+          "applies_when": "employee acknowledgment analysis",
+          "description": "Restrict to discussions with employee acknowledgment evidence."
+        },
+        {
+          "id": "employee_declined_acknowledgment",
+          "predicate": "EmployeeAcknowledgment = 'Declined'",
+          "applies_when": "declined employee acknowledgment analysis",
+          "description": "Restrict to employee-declined acknowledgment rows."
+        },
+        {
+          "id": "manager_acknowledged",
+          "predicate": "ManagerAcknowledgment = 'Acknowledgment' OR ManagerApprovalDate IS NOT NULL",
+          "applies_when": "manager acknowledgment or approval analysis",
+          "description": "Restrict to discussions with manager acknowledgment/approval evidence."
+        },
+        {
+          "id": "manager_declined_acknowledgment",
+          "predicate": "ManagerAcknowledgment = 'Declined'",
+          "applies_when": "declined manager acknowledgment analysis",
+          "description": "Restrict to manager-declined acknowledgment rows."
+        },
+        {
+          "id": "active_monitoring_period",
+          "predicate": "MonitoringPeriodEndDate IS NOT NULL AND MonitoringPeriodEndDate >= now64(6)",
+          "applies_when": "active monitoring-period analysis",
+          "description": "Restrict to discussions whose monitoring end date has not passed."
+        },
+        {
+          "id": "has_document_uploads",
+          "predicate": "DocumentUploads IS NOT NULL AND DocumentUploads != ''",
+          "applies_when": "uploaded-document filename analysis",
+          "description": "Restrict to rows with uploaded document filenames."
+        },
+        {
+          "id": "has_exception_points",
+          "predicate": "ExceptionPointTotal IS NOT NULL OR ExceptionPointThreshold IS NOT NULL",
+          "applies_when": "exception-point-triggered discussion analysis",
+          "description": "Restrict to discussions with exception-point fields populated."
+        },
+        {
+          "id": "corrective_action_discussions",
+          "predicate": "DiscussionType IN ('Corrective Action Form - Misconduct', 'Corrective Action Form - Performance', 'Corrective Action Form - Behavior')",
+          "applies_when": "corrective action analysis",
+          "description": "Restrict to corrective action discussion types."
+        },
+        {
+          "id": "performance_improvement_plan_discussions",
+          "predicate": "DiscussionType = 'Performance Improvement Plan'",
+          "applies_when": "PIP analysis",
+          "description": "Restrict to performance improvement plan discussions."
+        },
+        {
+          "id": "field_level_rows",
+          "predicate": "FieldDescription IS NOT NULL OR FieldAnswer IS NOT NULL",
+          "applies_when": "form field response analysis",
+          "description": "Restrict to rows with field-level form detail."
+        }
+      ],
+      "ambiguities": [
+        {
+          "term": "discussion_count",
+          "resolves_to": [
+            "COUNT(DISTINCT DiscussionId)"
+          ],
+          "default": "discussion_count",
+          "clarify_if": "user asks for field-level rows or form answers"
+        },
+        {
+          "term": "row_count",
+          "resolves_to": [
+            "COUNT(*) at field-response row grain"
+          ],
+          "default": "field_response_rows",
+          "clarify_if": "user means distinct discussions"
+        },
+        {
+          "term": "writeup",
+          "resolves_to": [
+            "DiscussionId"
+          ],
+          "default": "discussion_level_grouping",
+          "clarify_if": "user means corrective action only",
+          "PIP only": null,
+          "or all performance discussions": null
+        },
+        {
+          "term": "open_discussion",
+          "resolves_to": [
+            "DiscussionState NOT IN ('Resolved', 'Archived')"
+          ],
+          "default": "open_discussions",
+          "clarify_if": "user wants only a specific workflow state such as Employee Approval or Final Approval"
+        },
+        {
+          "term": "resolved",
+          "resolves_to": [
+            "DiscussionState = 'Resolved'",
+            "ResolvedDate"
+          ],
+          "default": "resolved_discussions",
+          "clarify_if": "user means manager-approved",
+          "final-approved": null,
+          "or archived": null
+        },
+        {
+          "term": "acknowledgment",
+          "resolves_to": [
+            "EmployeeAcknowledgment",
+            "EmployeeAcknowledgmentDate",
+            "ManagerAcknowledgment",
+            "ManagerApprovalDate"
+          ],
+          "default": "employee_and_manager_acknowledgment_fields",
+          "clarify_if": "user wants only employee acknowledgment or only manager acknowledgment"
+        },
+        {
+          "term": "monitoring_period",
+          "resolves_to": [
+            "MonitoringPeriodDays",
+            "MonitoringPeriodEndDate"
+          ],
+          "default": "monitoring_period_fields",
+          "clarify_if": "user wants active monitoring periods only"
+        },
+        {
+          "term": "uploaded_documents",
+          "resolves_to": [
+            "DocumentUploads"
+          ],
+          "default": "uploaded_filenames_only",
+          "clarify_if": "user expects document contents",
+          "which are not stored in this table": null
+        },
+        {
+          "term": "current_employee_state",
+          "resolves_to": [
+            "employee"
+          ],
+          "default": "employee_table_current_state",
+          "clarify_if": "user wants discussion workflow state instead"
+        }
+      ]
+    },
+    "dbpcm_warehouse.personnel_action_form_changes": {
+      "database": "dbpcm_warehouse",
+      "table": "personnel_action_form_changes",
+      "description": "Personnel Action Form workflow/change-log table. Each row records one proposed or approved field change within a personnel action transaction; one transaction can contain multiple changed fields.",
+      "grain": [
+        "PafTransactionId",
+        "FieldId"
+      ],
+      "grain_note": "Logical field-change grain. PafTransactionId identifies the personnel action transaction, but it is not row-unique because one transaction can span multiple field changes.",
+      "temporal": {
+        "dimensions": [
+          {
+            "name": "paf_effective_date",
+            "role": "as_of",
+            "effective_col": "PafEffectiveDate"
+          },
+          {
+            "name": "created_event",
+            "role": "event",
+            "date_col": "CreatedDate"
+          },
+          {
+            "name": "modified_event",
+            "role": "event",
+            "date_col": "ModifiedDate"
+          },
+          {
+            "name": "manager_signoff_event",
+            "role": "event",
+            "date_col": "ManagerSignDate"
+          }
+        ],
+        "default_pin": "paf_effective_date"
+      },
+      "primary_key": [],
+      "primary_key_note": "No reliable row-level primary key is exposed. Use PafTransactionId for transaction-level grouping, not row uniqueness.",
+      "join_keys": [
+        {
+          "column": "EmployeeCode",
+          "joins": "employee.EmployeeCode",
+          "cardinality": "N:1"
+        }
+      ],
+      "columns": {
+        "ClientCode": {
+          "type": "Nullable(String)",
+          "description": "Client/company code."
+        },
+        "PafTransactionId": {
+          "type": "Int32",
+          "description": "Personnel action transaction id. Group by this when analyzing one personnel action rather than individual changed fields."
+        },
+        "EmployeeCode": {
+          "type": "Nullable(String)",
+          "description": "Employee identifier for the employee affected by the personnel action."
+        },
+        "EmployeeName": {
+          "type": "Nullable(String)",
+          "description": "Employee display name captured on the PAF row."
+        },
+        "PafEffectiveDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Business-effective date for the proposed or approved change. Can be future dated."
+        },
+        "PafEffectiveDateTime": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "More exact effective timestamp. Use when ordering same-day personnel actions matters."
+        },
+        "PafStatus": {
+          "type": "Nullable(String)",
+          "values": {
+            "Draft": "draft_not_submitted",
+            "Pending": "submitted_in_progress",
+            "Approval": "in_approval_workflow",
+            "Final Approval": "approved_or_authorized",
+            "Denied": "rejected"
+          },
+          "description": "Workflow state of the PAF transaction. Not the employee's employment status."
+        },
+        "PafComments": {
+          "type": "Nullable(String)",
+          "description": "Comments associated with the PAF transaction."
+        },
+        "ForwardTo": {
+          "type": "Nullable(String)",
+          "description": "Next approver, recipient, or workflow destination."
+        },
+        "CreatedBy": {
+          "type": "Nullable(String)",
+          "description": "User who created the PAF."
+        },
+        "ModifiedBy": {
+          "type": "Nullable(String)",
+          "description": "User who last modified the PAF."
+        },
+        "CreatedDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Timestamp when the PAF was created or initiated."
+        },
+        "ModifiedDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Timestamp when the PAF was last modified."
+        },
+        "ManagerSignDate": {
+          "type": "Nullable(DateTime64(6))",
+          "description": "Manager signoff timestamp when applicable."
+        },
+        "FieldId": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description_col": "FieldLabel",
+          "description": "Identifier for the specific field being changed. CLIENT-DEFINED code space — resolve concepts to FieldId sets via resolveValues(FieldId, <concept>), never hardcode."
+        },
+        "FieldLabel": {
+          "type": "Nullable(String)",
+          "client_defined": true,
+          "description": "Human-readable label for the field being changed. Use with FieldId. CLIENT-DEFINED labels."
+        },
+        "OldValue": {
+          "type": "Nullable(String)",
+          "description": "Prior value captured by the PAF row."
+        },
+        "ProposedValue": {
+          "type": "Nullable(String)",
+          "description": "Proposed new value captured by the PAF row."
+        }
+      },
+      "measures": {
+        "changed_field_rows": {
+          "column": "*",
+          "agg": "count",
+          "defined_over": "rows after temporal, status, employee, and field filters"
+        },
+        "personnel_actions": {
+          "column": "PafTransactionId",
+          "agg": "count_distinct",
+          "defined_over": "distinct PafTransactionId after temporal, status, employee, and field filters"
+        }
+      },
+      "rules": [
+        {
+          "id": "final_approval",
+          "predicate": "PafStatus = 'Final Approval'",
+          "applies_when": "approved or authorized PAF changes",
+          "description": "Restrict to PAFs in final approval status."
+        },
+        {
+          "id": "pending_or_in_approval",
+          "predicate": "PafStatus IN ('Pending', 'Approval')",
+          "applies_when": "pending or in-progress workflow questions",
+          "description": "Restrict to submitted PAFs still moving through workflow."
+        },
+        {
+          "id": "draft_paf",
+          "predicate": "PafStatus = 'Draft'",
+          "applies_when": "draft personnel action questions",
+          "description": "Restrict to draft PAFs."
+        },
+        {
+          "id": "denied_paf",
+          "predicate": "PafStatus = 'Denied'",
+          "applies_when": "rejected personnel action questions",
+          "description": "Restrict to denied PAFs."
+        },
+        {
+          "id": "approved_and_effective",
+          "predicate": "PafStatus = 'Final Approval' AND coalesce(PafEffectiveDateTime, PafEffectiveDate) <= now64(6)",
+          "applies_when": "approved changes that should already be effective by date",
+          "description": "Restrict to final-approved PAFs whose effective timestamp/date has passed."
+        },
+        {
+          "id": "future_effective",
+          "predicate": "coalesce(PafEffectiveDateTime, PafEffectiveDate) > now64(6)",
+          "applies_when": "future-dated personnel action questions",
+          "description": "Restrict to PAF rows with a future effective date or timestamp."
+        },
+        {
+          "id": "employee_status_change_fields",
+          "predicate": "FieldId IN ({field_codes})",
+          "resolve_via": "resolveValues(FieldId, 'employee status')",
+          "applies_when": "employee-status change questions",
+          "description": "Restrict to PAF rows that change employee status. FieldId codes are CLIENT-DEFINED — runtime resolves the concept to a code set via resolve_via and binds it as a parameter; not a literal SQL predicate on its own."
+        },
+        {
+          "id": "termination_change_fields",
+          "predicate": "FieldId IN ({field_codes})",
+          "resolve_via": "resolveValues(FieldId, 'termination date / last date worked / termination type / termination reason / rehire eligibility')",
+          "applies_when": "termination or rehire eligibility questions from PAF",
+          "description": "Restrict to PAF rows related to termination details. FieldId codes are CLIENT-DEFINED — runtime resolves the concept to a code set via resolve_via and binds it; not a literal SQL predicate on its own."
+        },
+        {
+          "id": "compensation_change_fields",
+          "predicate": "FieldId IN ({field_codes})",
+          "resolve_via": "resolveValues(FieldId, 'pay rate / annualized estimate / pay class / pay basis / pay type / pay frequency / processing schedule')",
+          "applies_when": "compensation or payroll setup change questions",
+          "description": "Restrict to PAF rows related to compensation or payroll setup. FieldId codes are CLIENT-DEFINED — runtime resolves via resolve_via and binds; not a literal SQL predicate on its own."
+        },
+        {
+          "id": "org_change_fields",
+          "predicate": "FieldId IN ({field_codes})",
+          "resolve_via": "resolveValues(FieldId, 'department / supervisor / title / position / work location')",
+          "applies_when": "department, supervisor, title, position, or work-location change questions",
+          "description": "Restrict to PAF rows related to organization or position changes. FieldId codes are CLIENT-DEFINED — runtime resolves via resolve_via and binds; not a literal SQL predicate on its own."
+        }
+      ],
+      "ambiguities": [
+        {
+          "term": "personnel_action",
+          "resolves_to": [
+            "COUNT(DISTINCT PafTransactionId)"
+          ],
+          "default": "transaction_count",
+          "clarify_if": "user asks for changed fields, field updates, or raw rows"
+        },
+        {
+          "term": "field_change",
+          "resolves_to": [
+            "COUNT(*) at the PAF row level"
+          ],
+          "default": "changed_field_rows",
+          "clarify_if": "user means whole personnel actions rather than individual changed fields"
+        },
+        {
+          "term": "approved_change",
+          "resolves_to": [
+            "PafStatus = 'Final Approval'"
+          ],
+          "default": "final_approval",
+          "clarify_if": "user needs only changes already effective as of today or also future-dated approvals"
+        },
+        {
+          "term": "current_employee_state",
+          "resolves_to": [
+            "employee table current-state columns"
+          ],
+          "default": "employee_table_current_state",
+          "clarify_if": "user wants proposed, pending, denied, historical, or future-dated PAF changes"
+        },
+        {
+          "term": "effective_date",
+          "resolves_to": [
+            "PafEffectiveDate"
+          ],
+          "default": "paf_effective_date",
+          "clarify_if": "same-day ordering or exact timestamp matters"
+        },
+        {
+          "term": "exact_effective_time",
+          "resolves_to": [
+            "PafEffectiveDateTime"
+          ],
+          "default": "paf_effective_datetime",
+          "clarify_if": "user only needs date-level grouping"
+        },
+        {
+          "term": "created_date",
+          "resolves_to": [
+            "CreatedDate"
+          ],
+          "default": "created_event",
+          "clarify_if": "user means effective date, modified date, or manager signoff date"
+        },
+        {
+          "term": "pending_changes",
+          "resolves_to": [
+            "PafStatus IN ('Pending', 'Approval')"
+          ],
+          "default": "pending_or_in_approval",
+          "clarify_if": "user wants drafts included or only final-approved future changes"
+        },
+        {
+          "term": "termination",
+          "resolves_to": [
+            "PAF rows whose FieldId/FieldLabel indicate termination-related fields"
+          ],
+          "default": "termination_change_fields",
+          "clarify_if": "user asks who is currently terminated, which should be resolved against employee.EmployeeStatus with rehire logic"
+        }
+      ]
+    }
+  }
+}

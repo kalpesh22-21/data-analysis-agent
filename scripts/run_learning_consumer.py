@@ -36,13 +36,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
+from pathlib import Path
 
-from data_agent.catalog.loader import build_sqlglot_schema
+from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
 from data_agent.learning.audit.couchbase_audit_store import CouchbaseAuditStore
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
-from data_agent.learning.extractor.grounding import load_known_rule_ids
+from data_agent.learning.extractor.grounding import known_rule_ids_from_catalog
 from data_agent.learning.factory import build_learning_consumer
 from data_agent.learning.observability import configure_learning_tracing, get_learning_tracer
 from data_agent.learning.redis_queue import RedisStreamsLearningQueue
@@ -53,6 +55,12 @@ from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.model.openai_client import build_openai_model_client
 from data_agent.runtime.observability.tracing import set_global_tracer_provider
 from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
+
+# `_catalog` is a sibling module under `scripts/`. Put this script's own directory
+# on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND
+# when the file is loaded by path (importlib `spec_from_file_location`, e.g. tests).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _catalog import catalog_dict, catalog_fixture_path  # noqa: E402
 
 _logger = logging.getLogger(__name__)
 
@@ -89,6 +97,23 @@ async def _main() -> int:
             learning_settings, session_store=store, queue=queue, tracer=tracer
         )
     else:
+        # Semantic catalog source (D75 Wave 1b — `databaseSchemaDocs/` is gone). This
+        # consumer is an OFFLINE Redis/Couchbase worker: it drains the learning stream
+        # and never touches the MCP read plane, so it holds NO per-request MCP JWT and
+        # cannot authenticate the live `GET /catalog/export`. It therefore reads the
+        # FROZEN committed export snapshot (`tests/fixtures/catalog_export.json`, the
+        # SAME payload the MCP serves) resolved by `catalog_fixture_file()`. To refresh
+        # against the LIVE catalog without a redeploy, dump the MCP's `/catalog/export`
+        # body to a file and point `CATALOG_FIXTURE_PATH` at it. Loaded ONCE at startup
+        # and reused for the whole run; the extractor needs the sqlglot schema (D69)
+        # plus the `rules[*].id` grounding (the `rule` role, MEDIUM-2 fix).
+        catalog = catalog_dict(runtime_settings)
+        _logger.info(
+            "semantic catalog loaded from frozen export snapshot %s "
+            "(%d tables; set CATALOG_FIXTURE_PATH to a live /catalog/export dump to refresh)",
+            catalog_fixture_path(runtime_settings),
+            len(catalog),
+        )
         model_client = build_openai_model_client(
             api_key=learning_settings.learning_extractor_api_key,
             model=learning_settings.learning_extractor_model,
@@ -155,9 +180,9 @@ async def _main() -> int:
             candidate_store=candidate_store,
             blueprint_corpus=blueprint_corpus,
             user_store=user_store,
-            catalog_schema=build_sqlglot_schema(),
+            catalog_schema=build_sqlglot_schema_from_catalog(catalog),
             embedder=embedder,
-            known_rules=load_known_rule_ids(),
+            known_rules=known_rule_ids_from_catalog(catalog),
         )
 
     _logger.info(

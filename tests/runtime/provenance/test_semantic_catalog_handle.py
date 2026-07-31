@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from data_agent.runtime.provenance.catalog_handle import (
-    SemanticCatalogHandle,
-    load_semantic_catalog_handle,
-)
+from data_agent.runtime.provenance.catalog_handle import SemanticCatalogHandle
+from tests._catalog_fixture import fixture_semantic_catalog_handle
 
 _EMP = {
     "grain": ["EmployeeCode"],
@@ -73,8 +71,9 @@ def test_handle_is_read_only() -> None:
 
 
 def test_load_from_real_catalog() -> None:
-    # The real overlay: payroll must be grain_verifiable:false, employee true.
-    h = load_semantic_catalog_handle()
+    # The real overlay (from the committed MCP export fixture, D75 Wave 1b):
+    # payroll must be grain_verifiable:false, employee true.
+    h = fixture_semantic_catalog_handle()
     assert h.is_grain_verifiable("dbpcm_warehouse.employee") is True
     assert h.is_grain_verifiable("dbpcm_warehouse.payroll") is False
     assert "gross_earnings" in h.grain_for("dbpcm_warehouse.payroll").measures

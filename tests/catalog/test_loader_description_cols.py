@@ -1,15 +1,19 @@
 """Unit tests for the loader's `load_description_cols()` / `_extract_description_cols`.
 
 Layer: 1 — Unit (pure logic; temp-dir YAML fixtures for the parse edge cases plus
-the real databaseSchemaDocs/*.yaml for the shape/alignment checks; no ClickHouse).
+the committed export fixture for the shape/alignment checks; no ClickHouse).
 
-`load_description_cols()` is a third projection of the same
-`_load_raw_table_entries()` parse that `build_sqlglot_schema()` and
-`load_semantic_catalog()` build from. It returns the AUTHORED
-{code_col -> sibling-label-col} linkage so `resolveValues` can SELECT both columns
-jointly instead of relying on the `_candidate_description_columns` naming
+`load_description_cols()` is a third projection of the same catalog dict that
+`build_sqlglot_schema()` and `load_semantic_catalog()` build from. It returns the
+AUTHORED {code_col -> sibling-label-col} linkage so `resolveValues` can SELECT both
+columns jointly instead of relying on the `_candidate_description_columns` naming
 convention (which case-mismatches, e.g. `distributedDepartmentDescription`, and
 misses non-convention names, e.g. `FieldId` -> `FieldLabel`).
+
+D75 Wave 1b: the real-catalog shape/alignment checks are driven from the export
+fixture via the in-memory cores (`load_description_cols_from_catalog` /
+`build_sqlglot_schema_from_catalog`); the parse edge cases still exercise the
+dir-reading `load_description_cols()` against temp-dir YAML fixtures.
 """
 
 from __future__ import annotations
@@ -18,12 +22,13 @@ from pathlib import Path
 
 from data_agent.catalog.loader import (
     _extract_description_cols,
-    build_sqlglot_schema,
+    build_sqlglot_schema_from_catalog,
     load_description_cols,
+    load_description_cols_from_catalog,
 )
+from tests._catalog_fixture import fixture_catalog
 
-REPO_ROOT = Path(__file__).parent.parent.parent
-SCHEMA_DIR = REPO_ROOT / "databaseSchemaDocs"
+_CATALOG = fixture_catalog()
 
 _P = "dbpcm_warehouse.payroll"
 _PAF = "dbpcm_warehouse.personnel_action_form_changes"
@@ -133,7 +138,7 @@ def test_extract_empty_columns_block() -> None:
 
 
 def test_real_catalog_declared_links_present() -> None:
-    result = load_description_cols(SCHEMA_DIR)
+    result = load_description_cols_from_catalog(_CATALOG)
     assert result[_PAF] == {"FieldId": "FieldLabel"}
     # payroll declares two: TypeCode and the mixed-case DistributedDepartmentCode.
     assert result[_P]["TypeCode"] == "TypeCodeDescription"
@@ -143,7 +148,7 @@ def test_real_catalog_declared_links_present() -> None:
 def test_real_catalog_case_preserved_in_link_target() -> None:
     """The declared target casing is preserved exactly (D70) — the lowercase-leading
     `distributedDepartmentDescription` is the case the naming convention misses."""
-    payroll = load_description_cols(SCHEMA_DIR)[_P]
+    payroll = load_description_cols_from_catalog(_CATALOG)[_P]
     assert payroll["DistributedDepartmentCode"] == "distributedDepartmentDescription"
     assert payroll["DistributedDepartmentCode"] != "DistributedDepartmentDescription"
 
@@ -151,22 +156,18 @@ def test_real_catalog_case_preserved_in_link_target() -> None:
 def test_description_cols_keys_align_with_sqlglot_schema() -> None:
     """Same keying / file-skip rules as build_sqlglot_schema — one entry per table,
     never drifting from the schema view."""
-    desc = load_description_cols(SCHEMA_DIR)
-    schema = build_sqlglot_schema(SCHEMA_DIR)
+    desc = load_description_cols_from_catalog(_CATALOG)
+    schema = build_sqlglot_schema_from_catalog(_CATALOG)
     assert set(desc.keys()) == set(schema.keys())
 
 
 def test_declared_targets_are_real_columns_in_the_same_table() -> None:
     """Every declared description_col target must be an actual column on its table
     (guards against an author typo shipping in the real catalog)."""
-    desc = load_description_cols(SCHEMA_DIR)
-    schema = build_sqlglot_schema(SCHEMA_DIR)
+    desc = load_description_cols_from_catalog(_CATALOG)
+    schema = build_sqlglot_schema_from_catalog(_CATALOG)
     for db_table, links in desc.items():
         cols = schema[db_table]
         for code_col, desc_col in links.items():
             assert code_col in cols, f"{db_table}.{code_col} missing"
             assert desc_col in cols, f"{db_table}.{desc_col} (target of {code_col}) missing"
-
-
-def test_default_schema_dir_matches_explicit() -> None:
-    assert set(load_description_cols().keys()) == set(load_description_cols(SCHEMA_DIR).keys())

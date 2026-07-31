@@ -15,15 +15,13 @@ the Slice-6 dedup stage catches near-duplicates.
 from __future__ import annotations
 
 
-def load_known_rule_ids(schema_dir: str | None = None) -> frozenset[str]:
-    """Return the set of existing catalog rule ids (semantic-catalog `rules[*].id`).
+def known_rule_ids_from_catalog(catalog: dict) -> frozenset[str]:
+    """Return the set of catalog rule ids (`rules[*].id`) from a parsed catalog dict.
 
-    Empty if the catalog declares no rules or cannot be loaded — in which case the
-    `rule` role is inert (every `rule`-role plan declines `missing_rule`), which is
-    the SAFE direction (fail-to-review, never a silent unresolved rule)."""
-    from data_agent.catalog.loader import load_semantic_catalog
-
-    catalog = load_semantic_catalog(schema_dir)
+    The catalog dict has the shape `load_semantic_catalog()` returns and the MCP
+    `/catalog/export` serves — one `{db.table: <entry>}` mapping. Empty if no rules
+    are declared, which keeps the `rule` role inert (fail-to-review, the SAFE
+    direction) rather than silently accepting an unresolved rule."""
     ids: set[str] = set()
     for entry in catalog.values():
         rules = entry.get("rules") or []
@@ -34,3 +32,15 @@ def load_known_rule_ids(schema_dir: str | None = None) -> frozenset[str]:
             if rule_id:
                 ids.add(str(rule_id))
     return frozenset(ids)
+
+
+def load_known_rule_ids(schema_dir: str | None = None) -> frozenset[str]:
+    """Return the set of existing catalog rule ids (semantic-catalog `rules[*].id`).
+
+    Reads the dir-based semantic catalog (retained for the offline/dir path) and
+    projects it via `known_rule_ids_from_catalog`. Empty if the catalog declares no
+    rules or cannot be loaded — in which case the `rule` role is inert (every
+    `rule`-role plan declines `missing_rule`), the SAFE direction."""
+    from data_agent.catalog.loader import load_semantic_catalog
+
+    return known_rule_ids_from_catalog(load_semantic_catalog(schema_dir))

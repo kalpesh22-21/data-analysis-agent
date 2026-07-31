@@ -207,9 +207,7 @@ async def test_raw_transport_exception_stays_generic_canned_message() -> None:
 
     dispatcher = ToolDispatcher(_BoomClient(), CATALOG)
 
-    result = await dispatcher.dispatch(
-        "runQuery", {"sql": "SELECT 1"}, _credentials()
-    )
+    result = await dispatcher.dispatch("runQuery", {"sql": "SELECT 1"}, _credentials())
 
     assert result.status == "error"
     assert result.error_code == "INTERNAL_TRANSPORT_ERROR"
@@ -218,3 +216,40 @@ async def test_raw_transport_exception_stays_generic_canned_message() -> None:
     )
     assert "ConnectionRefusedError" not in result.user_message
     assert "10.0.0.5" not in result.user_message
+
+
+# --- D75 Wave 1b: catalog PROVIDER seam -------------------------------------
+
+
+async def test_catalog_provider_resolved_per_dispatch() -> None:
+    """A ToolDispatcher given an async catalog PROVIDER (not a fixed handle)
+    resolves it with THIS turn's credentials before capturing provenance, so a
+    runQuery over the resolved catalog yields DETERMINED provenance."""
+    calls: list[RuntimeCredentials] = []
+
+    async def _provider(credentials: RuntimeCredentials) -> CatalogHandle:
+        calls.append(credentials)
+        return CATALOG
+
+    mcp_client = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                {"columns": ["EmployeeCode"], "rows": [["E1"]], "row_count": 1, "truncated": False}
+            ]
+        }
+    )
+    dispatcher = ToolDispatcher(mcp_client, _provider)
+
+    result = await dispatcher.dispatch(
+        "runQuery", {"sql": f"SELECT EmployeeCode FROM {_E}"}, _credentials()
+    )
+
+    # The provider was awaited with the turn's credentials (D5: used only to
+    # resolve the handle, never surfaced on the result).
+    assert len(calls) == 1
+    assert calls[0].jwt == SECRET_JWT
+    # Provenance was captured against the resolved catalog (determined, non-None).
+    assert result.status == "ok"
+    assert result.provenance == frozenset({(_E, "EmployeeCode")})
+    blob = _result_to_scannable_json(result)
+    assert SECRET_JWT not in blob

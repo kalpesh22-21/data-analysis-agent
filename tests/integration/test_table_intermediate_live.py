@@ -40,9 +40,9 @@ from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.mcp.scratch_client import ScratchClient
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
-from data_agent.runtime.provenance.catalog_handle import load_catalog_handle
 from data_agent.runtime.retrieval.corpus_loader import load_corpus, load_seed_fixtures
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
+from tests._catalog_fixture import fixture_catalog_handle
 
 from .conftest import Mint
 
@@ -98,7 +98,9 @@ def _scratch_base() -> str:
 
 def _executor(index: Neo4jVectorIndex) -> BlueprintExecutor:
     return BlueprintExecutor(
-        tool_dispatcher=ToolDispatcher(RealMCPClient(os.environ["MCP_TEST_URL"]), load_catalog_handle()),
+        tool_dispatcher=ToolDispatcher(
+            RealMCPClient(os.environ["MCP_TEST_URL"]), fixture_catalog_handle()
+        ),
         vector_index=index,
         scratch_client=ScratchClient(_scratch_base()),
     )

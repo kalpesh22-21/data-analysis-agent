@@ -24,9 +24,12 @@ questions against real ClickHouse:
       import before uvicorn's loop is up — see `_LazyCouchbaseSessionStore`).
       Set `REAL_SESSION_STORE=memory` (or if the `couchbase` SDK is unimportable)
       to fall back to the in-memory store instead.
-    - `catalog`       -> the REAL `load_catalog_handle()` (databaseSchemaDocs),
-      so provenance for real warehouse tables is DETERMINED (a result with
-      undetermined provenance is dropped by the D44 replay/scope filter).
+    - `catalog`       -> the REAL `CatalogHandle` rebuilt from the frozen
+      catalog-export snapshot (D75 Wave 1b — `databaseSchemaDocs/` is gone; the
+      snapshot is the SAME payload the MCP `GET /catalog/export` serves), so
+      provenance for real warehouse tables is DETERMINED (a result with
+      undetermined provenance is dropped by the D44 replay/scope filter). Set
+      `CATALOG_FIXTURE_PATH` to a live `/catalog/export` dump to refresh.
     - JWT             -> REAL verification against the l2-token JWKS (NOT
       bypassed), exactly like `run_ui_runtime.py`. The BFF (`ui/server.py`) mints
       per-user-entitlement JWTs bound to the session id.
@@ -67,6 +70,7 @@ Run:
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -77,8 +81,13 @@ from data_agent.runtime.app import create_app
 from data_agent.runtime.config import RuntimeSettings, effective_llm_hide
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.openai_client import build_openai_model_client
-from data_agent.runtime.provenance.catalog_handle import load_catalog_handle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+
+# `_catalog` is a sibling module under `scripts/`. Put this script's own directory
+# on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND
+# when the file is loaded by path (importlib `spec_from_file_location`, e.g. tests).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _catalog import catalog_handle  # noqa: E402
 
 _REPO = Path(__file__).resolve().parent.parent
 
@@ -273,12 +282,16 @@ def build_real_app():
     # Print the EFFECTIVE hide (disable_redaction overrides otlp_hide_llm_content),
     # never the raw setting — otherwise the banner claims hide_llm_content=True while
     # OTLP_DISABLE_REDACTION=1 has actually revealed the LLM content.
-    print(f"[run_ui_runtime_real] otlp_endpoint  = {settings.otlp_endpoint} "
-          f"(project={settings.otlp_project_name}, "
-          f"effective_llm_hide={effective_llm_hide(settings)})")
+    print(
+        f"[run_ui_runtime_real] otlp_endpoint  = {settings.otlp_endpoint} "
+        f"(project={settings.otlp_project_name}, "
+        f"effective_llm_hide={effective_llm_hide(settings)})"
+    )
     if settings.otlp_disable_redaction:
-        print("[run_ui_runtime_real] otlp_disable_redaction = ON — Phoenix will show "
-              "REAL tool calls (SQL+values), results, and LLM Q/A. ACCESS-CONTROL this server.")
+        print(
+            "[run_ui_runtime_real] otlp_disable_redaction = ON — Phoenix will show "
+            "REAL tool calls (SQL+values), results, and LLM Q/A. ACCESS-CONTROL this server."
+        )
     print(f"[run_ui_runtime_real] retrieval      = {'ON (neo4j)' if retrieval_on else 'OFF'}")
     print(f"[run_ui_runtime_real] model          = {settings.openai_model}")
 
@@ -294,7 +307,7 @@ def build_real_app():
             model=settings.openai_model,
             base_url=settings.openai_base_url,
         ),
-        catalog=load_catalog_handle(),
+        catalog=catalog_handle(),
     )
 
 

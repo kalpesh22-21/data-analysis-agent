@@ -54,12 +54,16 @@ def _build_client(monkeypatch, model_client: ScriptedModelClient) -> TestClient:
     mcp_client = FakeMCPClient(
         tools=[
             MCPToolSpec(
-                name="listDatabases", description="", input_schema={"type": "object", "properties": {}}
+                name="listDatabases",
+                description="",
+                input_schema={"type": "object", "properties": {}},
             )
         ],
         scripted={},
     )
-    settings = RuntimeSettings(max_loop_iterations=15, max_wall_clock_seconds=60, max_budget_windows=3)
+    settings = RuntimeSettings(
+        max_loop_iterations=15, max_wall_clock_seconds=60, max_budget_windows=3
+    )
     app = create_app(
         settings=settings,
         session_store=InMemorySessionStore(),
@@ -79,9 +83,7 @@ def test_turn_endpoint_streams_progress_and_result(monkeypatch) -> None:
     model_client = ScriptedModelClient([ModelTurnResult(assistant_text="Here is your answer.")])
     client = _build_client(monkeypatch, model_client)
 
-    response = client.post(
-        "/turn", json={"message": "How many employees?"}, headers=HEADERS
-    )
+    response = client.post("/turn", json={"message": "How many employees?"}, headers=HEADERS)
 
     assert response.status_code == 200
     events = _parse_sse(response.text)
@@ -102,6 +104,120 @@ def test_turn_endpoint_streams_progress_and_result(monkeypatch) -> None:
     assert data["blueprint_use"] is None
     assert data["verification"] is None
     assert data["provenance"] == []
+
+
+def test_catalog_omitted_uses_fixture_cache_provider_for_provenance(monkeypatch) -> None:
+    """D75 Wave 1b: with NO injected `catalog`, `create_app` builds a `CatalogCache`
+    from settings (`catalog_source="fixture"`) and hands the dispatcher an async
+    provider. A runQuery over a real fixture table therefore captures DETERMINED
+    provenance BEFORE the first dispatch — proving the cache-built handle reaches
+    provenance without a startup `databaseSchemaDocs/` copy."""
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *args, **kwargs: frozenset())
+
+    mcp_client = FakeMCPClient(
+        tools=[
+            MCPToolSpec(
+                name="runQuery",
+                description="",
+                input_schema={"type": "object", "properties": {}},
+            )
+        ],
+        scripted={
+            "runQuery": [
+                {
+                    "columns": ["EmployeeCode"],
+                    "rows": [["E1"]],
+                    "row_count": 1,
+                    "truncated": False,
+                }
+            ]
+        },
+    )
+    model_client = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="q1",
+                        name="runQuery",
+                        arguments={"sql": "SELECT EmployeeCode FROM dbpcm_warehouse.employee"},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="Done."),
+        ]
+    )
+    app = create_app(
+        settings=RuntimeSettings(
+            _env_file=None,
+            catalog_source="fixture",
+            discovery_emulation_enabled=False,
+        ),
+        session_store=InMemorySessionStore(),
+        mcp_client=mcp_client,
+        model_client=model_client,
+        # NOTE: no `catalog=` — the cache-backed provider path is under test.
+    )
+    client = TestClient(app)
+
+    resp = client.post("/turn", json={"message": "codes?"}, headers=HEADERS)
+    assert resp.status_code == 200
+    data = _parse_sse(resp.text)[-1]["data"]
+    assert data["status"] == "done"
+    # The fixture-built catalog resolved employee.EmployeeCode → determined provenance.
+    assert data["provenance"] == ["dbpcm_warehouse.employee.EmployeeCode"]
+
+
+def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> None:
+    # Positive proof that the create_app -> AgentLoop wiring actually INJECTS the
+    # emulated discovery (not just the degrade path): with the feature enabled and a
+    # FakeMCPClient scripted for listDatabases/listTables, the synthetic
+    # emulated-listDatabases + emulated-listTables-<db> assistant/tool pairs must
+    # reach the model payload BEFORE the user question.
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *args, **kwargs: frozenset())
+
+    db = "dbpcm_warehouse"
+    mcp_client = FakeMCPClient(
+        tools=[
+            MCPToolSpec(
+                name="listDatabases",
+                description="",
+                input_schema={"type": "object", "properties": {}},
+            )
+        ],
+        scripted={
+            "listDatabases": [[{"name": db}]],
+            "listTables": [[{"database": db, "name": "employee", "engine": "MergeTree"}]],
+        },
+    )
+    model_client = ScriptedModelClient([ModelTurnResult(assistant_text="Here is your answer.")])
+    app = create_app(
+        settings=RuntimeSettings(
+            max_loop_iterations=15,
+            max_wall_clock_seconds=60,
+            max_budget_windows=3,
+            discovery_emulation_enabled=True,
+        ),
+        session_store=InMemorySessionStore(),
+        mcp_client=mcp_client,
+        model_client=model_client,
+        catalog=CatalogHandle({}),
+    )
+    client = TestClient(app)
+
+    response = client.post("/turn", json={"message": "How many employees?"}, headers=HEADERS)
+    assert response.status_code == 200
+
+    messages = model_client.calls[0].messages
+    tool_ids = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
+    assert "emulated-listDatabases" in tool_ids
+    assert f"emulated-listTables-{db}" in tool_ids
+    # The emulated pairs precede the real user question (earliest tool history).
+    last_emulated = max(i for i, m in enumerate(messages) if m.get("role") == "tool")
+    user_index = next(i for i, m in enumerate(messages) if m.get("role") == "user")
+    assert last_emulated < user_index
+    # The sweep dispatched exactly the two discovery tools through the real MCP.
+    assert [c.tool_name for c in mcp_client.calls] == ["listDatabases", "listTables"]
 
 
 def test_turn_endpoint_missing_auth_header_returns_401(monkeypatch) -> None:
@@ -231,7 +347,9 @@ def _read_tools_app(
     mcp_client = FakeMCPClient(
         tools=[
             MCPToolSpec(
-                name="listDatabases", description="", input_schema={"type": "object", "properties": {}}
+                name="listDatabases",
+                description="",
+                input_schema={"type": "object", "properties": {}},
             )
         ],
         scripted={},
@@ -275,7 +393,11 @@ def _read_tools_app(
             top_k_knowledge=3,
         )
     app = create_app(
-        settings=RuntimeSettings(_env_file=None),
+        # Disable the emulated-discovery sweep here: this smoke test asserts the
+        # EXACT MCP-dispatch sequence for the read-tool wiring, and the sweep's
+        # listDatabases/listTables probe would add unrelated calls. The sweep is
+        # covered directly in tests/runtime/context/test_discovery_emulation.py.
+        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
         session_store=store,
         mcp_client=mcp_client,
         model_client=model_client,
@@ -289,7 +411,9 @@ def test_read_tool_wired_when_retrieval_active_handled_not_dispatched(monkeypatc
     model = ScriptedModelClient(
         [
             ModelTurnResult(
-                tool_calls=[ToolCallRequest(id="gb1", name="getBlueprint", arguments={"id": "bp-x"})]
+                tool_calls=[
+                    ToolCallRequest(id="gb1", name="getBlueprint", arguments={"id": "bp-x"})
+                ]
             ),
             ModelTurnResult(assistant_text="Found bp-x."),
         ]
@@ -313,7 +437,9 @@ def test_read_tool_unavailable_when_retrieval_absent(monkeypatch) -> None:
         [
             ModelTurnResult(
                 tool_calls=[
-                    ToolCallRequest(id="sb1", name="searchBlueprints", arguments={"query": "overtime"})
+                    ToolCallRequest(
+                        id="sb1", name="searchBlueprints", arguments={"query": "overtime"}
+                    )
                 ]
             ),
             ModelTurnResult(assistant_text="No search available."),
@@ -368,9 +494,24 @@ def _run_blueprint_app(
         ],
         scripted={
             "runQuery": [
-                {"columns": ["Department"], "rows": [["Sales"]], "row_count": 1, "truncated": False},
-                {"columns": ["department", "avg_salary", "headcount"], "rows": [["Sales", 60000.0, 4]], "row_count": 1, "truncated": False},
-                {"columns": ["__bp_n", "__bp_d"], "rows": [[1, 1]], "row_count": 1, "truncated": False},
+                {
+                    "columns": ["Department"],
+                    "rows": [["Sales"]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
+                {
+                    "columns": ["department", "avg_salary", "headcount"],
+                    "rows": [["Sales", 60000.0, 4]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
+                {
+                    "columns": ["__bp_n", "__bp_d"],
+                    "rows": [[1, 1]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
             ]
         },
     )
@@ -386,7 +527,14 @@ def _run_blueprint_app(
             drift_status="clean",
             hit_count=0,
             catalog_sha="",
-            slots=[{"name": "department", "type": "string", "required": True, "binds_to": f"{_E}.Department"}],
+            slots=[
+                {
+                    "name": "department",
+                    "type": "string",
+                    "required": True,
+                    "binds_to": f"{_E}.Department",
+                }
+            ],
             sql_template=_AVG_TEMPLATE,
             result_grain=["Department"],
         )
@@ -401,10 +549,20 @@ def _run_blueprint_app(
             top_k_knowledge=3,
         )
     catalog = CatalogHandle(
-        {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+        {
+            _E: {
+                "EmployeeCode": "String",
+                "Department": "Nullable(String)",
+                "AnnualSalary": "Nullable(Float64)",
+            }
+        }
     )
     app = create_app(
-        settings=RuntimeSettings(_env_file=None),
+        # Disable the emulated-discovery sweep here: this smoke test asserts the
+        # EXACT MCP-dispatch sequence for the runBlueprint wiring, and the sweep's
+        # listDatabases/listTables probe would add unrelated calls. The sweep is
+        # covered directly in tests/runtime/context/test_discovery_emulation.py.
+        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
         session_store=store,
         mcp_client=mcp_client,
         model_client=model_client,
@@ -532,7 +690,13 @@ def _raw_loop_app(
     )
     store = InMemorySessionStore()
     catalog = CatalogHandle(
-        {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+        {
+            _E: {
+                "EmployeeCode": "String",
+                "Department": "Nullable(String)",
+                "AnnualSalary": "Nullable(Float64)",
+            }
+        }
     )
     app = create_app(
         settings=RuntimeSettings(_env_file=None),
@@ -615,7 +779,11 @@ def test_outcome_to_dict_projects_provenance_and_result_preview() -> None:
     assert doc["sql"] == ["SELECT 1"]
     assert doc["result_table"] == preview.to_doc()
     assert doc["blueprint_use"] == {"blueprint_id": "bp", "slots": {"period": "2026-05"}}
-    assert doc["verification"] == {"passed": True, "method": "blueprint_gate", "grain_checked": True}
+    assert doc["verification"] == {
+        "passed": True,
+        "method": "blueprint_gate",
+        "grain_checked": True,
+    }
     assert doc["provenance"] == ["hr.employees.department", "hr.employees.id"]
 
 
@@ -641,17 +809,33 @@ def test_raw_loop_multi_query_sql_list_ordered_and_deduped(monkeypatch) -> None:
         ],
         scripted={
             "runQuery": [
-                {"columns": ["avg_salary"], "rows": [[60000.0]], "row_count": 1, "truncated": False},
+                {
+                    "columns": ["avg_salary"],
+                    "rows": [[60000.0]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
                 {"columns": ["headcount"], "rows": [[9]], "row_count": 1, "truncated": False},
                 # The duplicate A is still dispatched (dedup is on the SQL list,
                 # not on dispatch), so it needs its own scripted result.
-                {"columns": ["avg_salary"], "rows": [[60000.0]], "row_count": 1, "truncated": False},
+                {
+                    "columns": ["avg_salary"],
+                    "rows": [[60000.0]],
+                    "row_count": 1,
+                    "truncated": False,
+                },
             ]
         },
     )
     store = InMemorySessionStore()
     catalog = CatalogHandle(
-        {_E: {"EmployeeCode": "String", "Department": "Nullable(String)", "AnnualSalary": "Nullable(Float64)"}}
+        {
+            _E: {
+                "EmployeeCode": "String",
+                "Department": "Nullable(String)",
+                "AnnualSalary": "Nullable(Float64)",
+            }
+        }
     )
     model = ScriptedModelClient(
         [
@@ -730,7 +914,9 @@ _HR_DEPT = ("hr.employees", "department")
 _HR_SALARY = ("hr.employees", "salary")
 
 
-def _history_client(monkeypatch, store: InMemorySessionStore, column_scope: frozenset) -> TestClient:
+def _history_client(
+    monkeypatch, store: InMemorySessionStore, column_scope: frozenset
+) -> TestClient:
     """A minimal app wired to a pre-seeded store, with `verify_jwt` returning a
     fixed *column_scope* so the endpoint's D44 read-surface filter is exercised
     end-to-end under a chosen scope."""
@@ -794,7 +980,8 @@ def _seed_two_turn_store() -> InMemorySessionStore:
             ),
         )
         await store.append_message(
-            SESSION_ID, TurnMessage(1, "assistant", "Jane earns $85,000.", "t", frozenset({_HR_SALARY}))
+            SESSION_ID,
+            TurnMessage(1, "assistant", "Jane earns $85,000.", "t", frozenset({_HR_SALARY})),
         )
 
     anyio.run(_seed)

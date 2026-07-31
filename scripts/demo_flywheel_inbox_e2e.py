@@ -90,7 +90,7 @@ from neo4j import AsyncGraphDatabase  # noqa: E402
 
 from data_agent.learning.candidate.models import mint_candidate_id  # noqa: E402
 from data_agent.learning.config import LearningSettings, learning_enabled  # noqa: E402
-from data_agent.learning.extractor.grounding import load_known_rule_ids  # noqa: E402
+from data_agent.learning.extractor.grounding import known_rule_ids_from_catalog  # noqa: E402
 from data_agent.learning.factory import (  # noqa: E402
     build_learning_consumer,
     build_promotion_write_plane,
@@ -109,9 +109,14 @@ from data_agent.runtime.config import RuntimeSettings  # noqa: E402
 from data_agent.runtime.mcp.real_client import RealMCPClient  # noqa: E402
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient  # noqa: E402
 from data_agent.runtime.model.openai_client import build_openai_model_client  # noqa: E402
-from data_agent.runtime.provenance.catalog_handle import load_catalog_handle  # noqa: E402
 from data_agent.runtime.retrieval.corpus_loader import apply_schema  # noqa: E402
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex  # noqa: E402
+
+# `_catalog` is a sibling module under `scripts/`. Put this script's own directory
+# on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND
+# when the file is loaded by path (importlib `spec_from_file_location`, e.g. tests).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _catalog import catalog_dict, catalog_handle  # noqa: E402
 
 # --------------------------------------------------------------------------- consts
 
@@ -337,14 +342,10 @@ async def _pick_openai_model() -> str:
     API). A 404 model / no-access error moves to the next; anything else re-raised."""
     client = openai.AsyncOpenAI(api_key=_OPENAI_KEY)
     last_err = None
-    candidates = (
-        (os.environ["DEMO_MODEL"],) if os.environ.get("DEMO_MODEL") else _MODEL_CANDIDATES
-    )
+    candidates = (os.environ["DEMO_MODEL"],) if os.environ.get("DEMO_MODEL") else _MODEL_CANDIDATES
     for model in candidates:
         try:
-            await client.responses.create(
-                model=model, input=[{"role": "user", "content": "ping"}]
-            )
+            await client.responses.create(model=model, input=[{"role": "user", "content": "ping"}])
             print(f"[MODEL] preflight OK on {model!r} (OpenAI Responses API)")
             return model
         except openai.NotFoundError as exc:
@@ -366,11 +367,15 @@ def _print_model_emission(result) -> None:  # noqa: ANN001
     print(f"  candidates: {len(result.candidates)}   declines: {len(result.declines)}")
     for i, cand in enumerate(result.candidates):
         h = cand.header
-        print(f"\n  --- candidate[{i}] type={h.type} confidence={h.confidence} "
-              f"proposed_action={h.proposed_action}")
+        print(
+            f"\n  --- candidate[{i}] type={h.type} confidence={h.confidence} "
+            f"proposed_action={h.proposed_action}"
+        )
         print(f"      rationale: {h.rationale}")
-        print(f"      entity_self_check: contains_entities={h.entity_self_check.contains_entities} "
-              f"found={list(h.entity_self_check.found)}")
+        print(
+            f"      entity_self_check: contains_entities={h.entity_self_check.contains_entities} "
+            f"found={list(h.entity_self_check.found)}"
+        )
         payload = cand.payload
         if hasattr(payload, "intent"):
             print(f"      intent (entity-free, embedded): {payload.intent!r}")
@@ -386,8 +391,10 @@ def _print_model_emission(result) -> None:  # noqa: ANN001
                     if slot is not None
                     else f"role={p.role} rule_id={p.rule_id} why={p.why}"
                 )
-                print(f"        - locator(table={loc.table}, column={loc.column}, "
-                      f"value={loc.value!r}) role={p.role} -> {slot_desc}")
+                print(
+                    f"        - locator(table={loc.table}, column={loc.column}, "
+                    f"value={loc.value!r}) role={p.role} -> {slot_desc}"
+                )
             if payload.result_signature is not None:
                 print(f"      result_signature: {payload.result_signature}")
             if payload.notes:
@@ -401,6 +408,7 @@ def _print_model_emission(result) -> None:  # noqa: ANN001
 
 # --------------------------------------------------------------------------- runtime
 
+
 def _parse_sse(text: str) -> tuple[list[dict], dict | None, dict | None]:
     """Return (progress_events, result_dict, error_dict) parsed from the SSE body
     the runtime `/turn` + `/turn/resume` endpoints stream (mirrors
@@ -411,9 +419,9 @@ def _parse_sse(text: str) -> tuple[list[dict], dict | None, dict | None]:
     event = None
     for line in text.splitlines():
         if line.startswith("event:"):
-            event = line[len("event:"):].strip()
+            event = line[len("event:") :].strip()
         elif line.startswith("data:"):
-            payload = json.loads(line[len("data:"):].strip())
+            payload = json.loads(line[len("data:") :].strip())
             if event == "progress":
                 progress.append(payload)
             elif event == "result":
@@ -460,20 +468,24 @@ def _build_runtime_app(infra: _Infra, model: str):
         embedding_api_url=_EMBEDDING_URL,
         embedding_model=_MODEL,
     )
-    print(f"[RUNTIME] create_app(retrieval=ON, mcp={_MCP_URL}, model={model!r}, "
-          f"embedding_model={_MODEL!r})")
+    print(
+        f"[RUNTIME] create_app(retrieval=ON, mcp={_MCP_URL}, model={model!r}, "
+        f"embedding_model={_MODEL!r})"
+    )
     return create_app(
         settings=settings,
         session_store=infra.session_store,
         mcp_client=infra.mcp_client,
-        model_client=build_openai_model_client(
-            api_key=_OPENAI_KEY, model=model, base_url=""
-        ),
-        catalog=load_catalog_handle(),
+        model_client=build_openai_model_client(api_key=_OPENAI_KEY, model=model, base_url=""),
+        # Provenance catalog from the frozen catalog-export snapshot (D75 Wave 1b;
+        # `databaseSchemaDocs/` is gone). Dev demo → reads the committed fixture.
+        catalog=catalog_handle(),
     )
 
 
-async def _drive_turn(client: httpx.AsyncClient, *, sid: str, jwt: str, message: str) -> dict | None:
+async def _drive_turn(
+    client: httpx.AsyncClient, *, sid: str, jwt: str, message: str
+) -> dict | None:
     """POST /turn (SSE) in-process; return the parsed `result` dict (or None)."""
     resp = await client.post(
         "/turn",
@@ -487,7 +499,9 @@ async def _drive_turn(client: httpx.AsyncClient, *, sid: str, jwt: str, message:
     return result
 
 
-async def _drive_resume(client: httpx.AsyncClient, *, sid: str, jwt: str, answer: str) -> dict | None:
+async def _drive_resume(
+    client: httpx.AsyncClient, *, sid: str, jwt: str, answer: str
+) -> dict | None:
     """POST /turn/resume (SSE) in-process; return the parsed `result` dict (or None)."""
     resp = await client.post(
         "/turn/resume",
@@ -535,8 +549,10 @@ def _print_runtime_result(label: str, result: dict | None) -> None:
     print(f"  sql            : {result.get('sql')}")
     rt = result.get("result_table")
     if isinstance(rt, dict):
-        print(f"  result_table   : row_count={rt.get('row_count')} "
-              f"columns={rt.get('columns')} preview_rows={rt.get('preview_rows')}")
+        print(
+            f"  result_table   : row_count={rt.get('row_count')} "
+            f"columns={rt.get('columns')} preview_rows={rt.get('preview_rows')}"
+        )
     bpu = result.get("blueprint_use")
     if bpu is not None:
         print(f"  blueprint_use  : {bpu}")
@@ -557,6 +573,7 @@ def _looks_like_ran_query(result: dict | None) -> bool:
 
 # --------------------------------------------------------------------------- run
 
+
 async def _run() -> int:
     if not learning_enabled():
         raise SystemExit("LEARNING_ENABLED must be truthy")
@@ -565,7 +582,7 @@ async def _run() -> int:
     infra = await _build_infra()
 
     tag = uuid.uuid4().hex[:10]
-    sid_a = f"flywheel-a-{tag}"   # underscore-free (D5/couchbase key + JWT-bound)
+    sid_a = f"flywheel-a-{tag}"  # underscore-free (D5/couchbase key + JWT-bound)
     sid_c = f"flywheel-c-{tag}"
 
     part_a = part_b = part_c = False
@@ -589,8 +606,10 @@ async def _run() -> int:
         _print_runtime_result("TURN 1 (ask)", turn1)
 
         if not _looks_like_ran_query(turn1):
-            print("\n[PART A] the real model did NOT run a query returning a number on turn 1 "
-                  "(a valid real-LLM outcome) — reporting as-is and stopping honestly.")
+            print(
+                "\n[PART A] the real model did NOT run a query returning a number on turn 1 "
+                "(a valid real-LLM outcome) — reporting as-is and stopping honestly."
+            )
             await _finish(infra, keys, part_a, part_b, part_c)
             return 0
         part_a = True  # the ask ran a real query
@@ -607,8 +626,10 @@ async def _run() -> int:
             turn2 = await _drive_to_answer(client, sid=sid_a, jwt=jwt_a, message=_RECTIFY_A)
             _print_runtime_result("TURN 2 (follow-up correction)", turn2)
         if turn2 is None:
-            print("  [PART A] the correction turn produced no result — proceeding with the "
-                  "turn-1 trail regardless (the session is still a real, learnable session).")
+            print(
+                "  [PART A] the correction turn produced no result — proceeding with the "
+                "turn-1 trail regardless (the session is still a real, learnable session)."
+            )
 
         # The session is now a REAL Couchbase session the sweeper can pick up.
         doc_a, _cas = await infra.session_store._get_doc(sid_a)
@@ -618,9 +639,11 @@ async def _run() -> int:
             return 0
         content_hash = compute_content_hash(doc_a)
         keys["content_hash"] = content_hash
-        print(f"\n[STAGE A3] captured live session {sid_a!r} "
-              f"(messages={len(doc_a.messages)} trail={len(doc_a.tool_trail)} "
-              f"content_hash={content_hash[:12]}...)")
+        print(
+            f"\n[STAGE A3] captured live session {sid_a!r} "
+            f"(messages={len(doc_a.messages)} trail={len(doc_a.tool_trail)} "
+            f"content_hash={content_hash[:12]}...)"
+        )
 
         # ==================================================================== PART B
         print("\n" + "#" * 72)
@@ -651,8 +674,10 @@ async def _run() -> int:
             print(f"[PART B] session not swept->queued (last={last_sweep}) — stopping honestly.")
             await _finish(infra, keys, part_a, part_b, part_c)
             return 0
-        print(f"[STAGE B2] SWEPT (scanned={last_sweep.scanned} claimed={last_sweep.claimed} "
-              f"enqueued={last_sweep.enqueued}); session->QUEUED")
+        print(
+            f"[STAGE B2] SWEPT (scanned={last_sweep.scanned} claimed={last_sweep.claimed} "
+            f"enqueued={last_sweep.enqueued}); session->QUEUED"
+        )
 
         # CONSUME with the REAL extractor. sampler=True is LOAD-BEARING: it routes a
         # clean blueprint candidate to `in_review` (reason blueprint_sampled) so it
@@ -661,23 +686,23 @@ async def _run() -> int:
             infra.settings,
             session_store=infra.session_store,
             queue=infra.queue,
-            model_client=build_openai_model_client(
-                api_key=_OPENAI_KEY, model=model, base_url=""
-            ),
+            model_client=build_openai_model_client(api_key=_OPENAI_KEY, model=model, base_url=""),
             audit_store=infra.audit_store,
             candidate_store=infra.candidate_store,
             blueprint_corpus=infra.corpus_store,
             user_store=infra.user_store,
             catalog_schema=_CATALOG,
             embedder=infra.embedder,
-            known_rules=load_known_rule_ids(),
+            known_rules=known_rule_ids_from_catalog(catalog_dict()),
             sampler=lambda _env: True,  # route the blueprint to the HUMAN inbox
         )
         capturing = _CapturingExtractor(consumer._extractor)
         consumer._extractor = capturing
         consumed = await consumer.run_once()
-        print(f"[STAGE B3] CONSUMED (done={consumed.done}) with the REAL {model!r} extractor "
-              "(sampler=True -> in_review)")
+        print(
+            f"[STAGE B3] CONSUMED (done={consumed.done}) with the REAL {model!r} extractor "
+            "(sampler=True -> in_review)"
+        )
         _print_model_emission(capturing.last_result)
 
         # Register EVERY produced candidate ordinal for teardown (declines make none).
@@ -732,9 +757,11 @@ async def _run() -> int:
                 None,
             )
         if item is None:
-            print("[PART B] no sampled blueprint landed in the review inbox — the real model "
-                  "produced no clean blueprint candidate from this session (a valid real-LLM "
-                  "outcome). Reporting as-is and stopping honestly.")
+            print(
+                "[PART B] no sampled blueprint landed in the review inbox — the real model "
+                "produced no clean blueprint candidate from this session (a valid real-LLM "
+                "outcome). Reporting as-is and stopping honestly."
+            )
             await _finish(infra, keys, part_a, part_b, part_c)
             return 0
 
@@ -767,8 +794,10 @@ async def _run() -> int:
         try:
             approved = await inbox.approve(item.candidate_id)
         except InboxTransitionError as exc:
-            print(f"[PART B] approve HELD: {exc} — a valid guarded outcome (replay/deps/static). "
-                  "Reporting as-is and stopping honestly.")
+            print(
+                f"[PART B] approve HELD: {exc} — a valid guarded outcome (replay/deps/static). "
+                "Reporting as-is and stopping honestly."
+            )
             await _finish(infra, keys, part_a, part_b, part_c)
             return 0
 
@@ -782,14 +811,18 @@ async def _run() -> int:
                 )
             ).single()
         if approved.status != "validated" or row is None:
-            print(f"[PART B] approve did not reach validated+landed "
-                  f"(status={approved.status}, neo4j_row={row}). Reporting as-is.")
+            print(
+                f"[PART B] approve did not reach validated+landed "
+                f"(status={approved.status}, neo4j_row={row}). Reporting as-is."
+            )
             await _finish(infra, keys, part_a, part_b, part_c)
             return 0
         keys["blueprint_id"] = node_id
         part_b = True
-        print(f"[STAGE B5] VALIDATED + LANDED -> :Blueprint {node_id} "
-              f"(created_by={row['created_by']}, status={row['status']}, src={row['src']})")
+        print(
+            f"[STAGE B5] VALIDATED + LANDED -> :Blueprint {node_id} "
+            f"(created_by={row['created_by']}, status={row['status']}, src={row['src']})"
+        )
 
         # ==================================================================== PART C
         print("\n" + "#" * 72)
@@ -806,26 +839,31 @@ async def _run() -> int:
         bpu = (turnc or {}).get("blueprint_use")
         # Backstop: did a runBlueprint entry actually get persisted to the trail?
         doc_c, _ = await infra.session_store._get_doc(sid_c)
-        ran_blueprint = bool(
-            doc_c and any(e.tool_name == "runBlueprint" for e in doc_c.tool_trail)
-        )
+        ran_blueprint = bool(doc_c and any(e.tool_name == "runBlueprint" for e in doc_c.tool_trail))
         if bpu is not None and bpu.get("blueprint_id"):
             slots = bpu.get("slots") or {}
-            print(f"\n[STAGE C2] AUTOPLAY FIRED: blueprint_id={bpu.get('blueprint_id')} "
-                  f"slots={slots}")
+            print(
+                f"\n[STAGE C2] AUTOPLAY FIRED: blueprint_id={bpu.get('blueprint_id')} slots={slots}"
+            )
             if any(str(v).lower() == "engineering" for v in slots.values()):
-                print("           slots bound to department=Engineering — the blueprint "
-                      "learned from 'Sales' autoplayed for 'Engineering'. PAYOFF.")
+                print(
+                    "           slots bound to department=Engineering — the blueprint "
+                    "learned from 'Sales' autoplayed for 'Engineering'. PAYOFF."
+                )
             part_c = True
         elif ran_blueprint:
-            print("\n[STAGE C2] the runtime ran runBlueprint (trail shows it) but the enriched "
-                  "blueprint_use was not surfaced on the result — inspecting the trail confirms "
-                  "the fast path fired.")
+            print(
+                "\n[STAGE C2] the runtime ran runBlueprint (trail shows it) but the enriched "
+                "blueprint_use was not surfaced on the result — inspecting the trail confirms "
+                "the fast path fired."
+            )
             part_c = True
         else:
-            print("\n[STAGE C2] the runtime took the RAW path (no runBlueprint) — a valid real-LLM "
-                  "outcome (recall may not have surfaced it, or the model chose raw tools). "
-                  "Reporting the runtime outcome honestly.")
+            print(
+                "\n[STAGE C2] the runtime took the RAW path (no runBlueprint) — a valid real-LLM "
+                "outcome (recall may not have surfaced it, or the model chose raw tools). "
+                "Reporting the runtime outcome honestly."
+            )
 
         # Deterministic recall BACKSTOP (like the learning demo's STAGE 5): does the
         # variant question vector recall the just-landed blueprint node at all?
@@ -841,11 +879,15 @@ async def _run() -> int:
             recalled = await index.recall(query_vector=query_vector, kind="blueprint", k=30)
             landed = next((c for c in recalled if c.id == node_id), None)
             if landed is None:
-                print(f"           the learned blueprint {node_id} was NOT recalled for "
-                      f"{_QUESTION_C!r} (semantic distance) — recall returned {len(recalled)} node(s).")
+                print(
+                    f"           the learned blueprint {node_id} was NOT recalled for "
+                    f"{_QUESTION_C!r} (semantic distance) — recall returned {len(recalled)} node(s)."
+                )
             else:
-                print(f"           RECALLED: {_QUESTION_C!r} surfaced {node_id} "
-                      f"(uses={sorted(landed.uses)}) — it IS recallable.")
+                print(
+                    f"           RECALLED: {_QUESTION_C!r} surfaced {node_id} "
+                    f"(uses={sorted(landed.uses)}) — it IS recallable."
+                )
         finally:
             await index.close()
 
@@ -854,8 +896,10 @@ async def _run() -> int:
     finally:
         await client.aclose()
         if os.environ.get("KEEP") == "1":
-            print("\n[TEARDOWN] KEEP=1 — SKIPPING teardown so you can inspect the landed "
-                  "blueprint + inbox state (session/candidate/corpus/neo4j left in place).")
+            print(
+                "\n[TEARDOWN] KEEP=1 — SKIPPING teardown so you can inspect the landed "
+                "blueprint + inbox state (session/candidate/corpus/neo4j left in place)."
+            )
         else:
             await _teardown(infra)
             print("\n[TEARDOWN] cleaned created session/candidate/corpus/neo4j artifacts.")

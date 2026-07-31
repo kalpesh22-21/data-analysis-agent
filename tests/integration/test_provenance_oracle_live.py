@@ -53,8 +53,9 @@ import os
 import httpx
 import pytest
 
-from data_agent.catalog.loader import build_sqlglot_schema
+from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
 from data_agent.sqlparse.oracle import run_oracle
+from tests._catalog_fixture import fixture_catalog
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("CLICKHOUSE_TEST_URL"),
@@ -109,7 +110,7 @@ def _pull_query_log_selects() -> list[str]:
 
 
 def test_provenance_oracle_replays_live_query_log() -> None:
-    catalog_schema = build_sqlglot_schema()
+    catalog_schema = build_sqlglot_schema_from_catalog(fixture_catalog())
     assert catalog_schema, "catalog schema must load — the oracle needs it to qualify columns"
 
     queries = _pull_query_log_selects()

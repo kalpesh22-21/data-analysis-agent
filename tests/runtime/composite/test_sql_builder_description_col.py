@@ -15,10 +15,8 @@ and the fallback chain when the declaration is out-of-scope or a typo.
 from __future__ import annotations
 
 from data_agent.runtime.composite.sql_builder import build_sql, resolve_target
-from data_agent.runtime.provenance.catalog_handle import (
-    CatalogHandle,
-    load_catalog_handle,
-)
+from data_agent.runtime.provenance.catalog_handle import CatalogHandle
+from tests._catalog_fixture import fixture_catalog_handle
 
 _PAF = "dbpcm_warehouse.personnel_action_form_changes"
 _DEPT = "dbpcm_warehouse.departments"
@@ -229,13 +227,13 @@ def test_convention_unchanged_when_description_cols_map_absent_entirely() -> Non
 
 # ---------------------------------------------------------------------------
 # 6. Real-catalog integration (light) — the two cases the convention missed.
-#    Built from the actual databaseSchemaDocs/ via load_catalog_handle(), the
-#    production entry point.
+#    Built from the committed MCP export fixture via the shared test helper
+#    (D75 Wave 1b — the runtime rebuilds the same handle from /catalog/export).
 # ---------------------------------------------------------------------------
 
 
 def test_real_catalog_field_id_discovers_field_label() -> None:
-    catalog = load_catalog_handle()
+    catalog = fixture_catalog_handle()
     target = resolve_target(catalog, table=_PAF, column="FieldId", period=None)
     assert target.description_col == "FieldLabel"
     assert "FieldLabel" in build_sql(target, period=None, limit=200)
@@ -243,7 +241,7 @@ def test_real_catalog_field_id_discovers_field_label() -> None:
 
 def test_real_catalog_distributed_department_code_discovers_mixed_case_label() -> None:
     payroll = "dbpcm_warehouse.payroll"
-    catalog = load_catalog_handle()
+    catalog = fixture_catalog_handle()
     target = resolve_target(catalog, table=payroll, column="DistributedDepartmentCode", period=None)
     # The convention would produce "DistributedDepartmentDescription" (leading
     # uppercase D) which does NOT exist; only the authored lowercase-d target does.
@@ -256,6 +254,6 @@ def test_real_catalog_distributed_department_code_discovers_mixed_case_label() -
 def test_real_catalog_convention_still_works_for_earn_code() -> None:
     """Regression: EarnCode -> EarnDescription is now BOTH declared and a convention
     match in the real catalog; either way it must resolve."""
-    catalog = load_catalog_handle()
+    catalog = fixture_catalog_handle()
     target = resolve_target(catalog, table=_ACC, column="EarnCode", period=None)
     assert target.description_col == "EarnDescription"

@@ -43,6 +43,7 @@ from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.auth.jwt_verify import JWTVerificationError, verify_jwt
 from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
+from data_agent.runtime.catalog.export_client import build_catalog_cache
 from data_agent.runtime.composite.record_assumptions import RecordAssumptionsTool
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.config import (
@@ -51,8 +52,16 @@ from data_agent.runtime.config import (
     get_runtime_settings,
 )
 from data_agent.runtime.context.assembly import ContextAssembler
+from data_agent.runtime.context.discovery_emulation import (
+    EmulatedDiscovery,
+    build_emulated_discovery,
+)
 from data_agent.runtime.context.llm_summarizer import build_llm_summarizer
-from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolObserver
+from data_agent.runtime.dispatch.tool_dispatcher import (
+    CatalogProvider,
+    ToolDispatcher,
+    ToolObserver,
+)
 from data_agent.runtime.loop.agent_loop import AgentLoop, RuntimeTool, TurnOutcome
 from data_agent.runtime.mcp.client import MCPClient
 from data_agent.runtime.mcp.real_client import RealMCPClient
@@ -65,7 +74,7 @@ from data_agent.runtime.model.reranker_client import HttpRerankerClient
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
 from data_agent.runtime.observability.redaction import hash_scope
-from data_agent.runtime.provenance.catalog_handle import CatalogHandle, load_catalog_handle
+from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.tools import (
     GetBlueprintTool,
@@ -231,7 +240,28 @@ def create_app(
     Tests inject a pipeline (real D71 clients + a seeded `FakeVectorIndex` or a
     live `Neo4jVectorIndex`) to exercise the whole embed→rerank→inject path."""
     settings = settings or get_runtime_settings()
-    catalog = catalog or load_catalog_handle()
+    # D75 Wave 1b: the runtime rebuilds its catalog handle from the MCP
+    # `/catalog/export` (via the process-wide `CatalogCache`) instead of a local
+    # `databaseSchemaDocs/` copy. An INJECTED `catalog` handle (tests / a fixed
+    # catalog) is honored verbatim and used as a fixed handle — no cache, no fetch.
+    # Otherwise a `CatalogCache` is built from settings (`catalog_source`: live 'mcp'
+    # export or the offline 'fixture' JSON) and exposed to the dispatcher/composite as
+    # an async provider that resolves the immutable handle from THIS turn's
+    # credentials. The cache is lazy (no fetch at construction — import/build-time
+    # safety preserved) and fetches exactly once (scope-independent, D5-safe:
+    # credentials authenticate the fetch only, never entering a handle).
+    catalog_provider: CatalogHandle | CatalogProvider
+    if catalog is not None:
+        catalog_provider = catalog
+    else:
+        catalog_cache = build_catalog_cache(settings)
+
+        async def _catalog_provider(credentials: RuntimeCredentials) -> CatalogHandle:
+            return await catalog_cache.get_catalog_handle(
+                jwt=credentials.jwt, session_id=credentials.session_id
+            )
+
+        catalog_provider = _catalog_provider
     mcp_client = mcp_client or RealMCPClient(settings.mcp_url)
     # The scratch side-channel client is a singleton shared by every per-request
     # BlueprintExecutor (it holds no per-request state — creds ride each call).
@@ -399,7 +429,7 @@ def create_app(
     def _build_agent_loop(observer: ToolObserver) -> AgentLoop:
         dispatcher = ToolDispatcher(
             mcp_client,
-            catalog,
+            catalog_provider,
             preview_row_count=settings.preview_row_count,
             observer=observer,
             tracer=tracer,
@@ -409,12 +439,32 @@ def create_app(
             # only — the dispatched call + enforced scope are unchanged.
             disable_redaction=settings.otlp_disable_redaction,
         )
+        # Emulated-discovery injection (context/discovery_emulation.py): a per-
+        # window closure that sweeps listDatabases+listTables through the SAME
+        # per-request `dispatcher` (so D5/D57/denial-mapping/telemetry are the
+        # free path) and returns the synthetic rendered entries + guard signatures.
+        # Gated on the setting; `None` (disabled) → AgentLoop runs byte-identically
+        # to before this feature.
+        discovery_emulation_provider = None
+        if settings.discovery_emulation_enabled:
+
+            async def _discovery_emulation_provider(
+                creds: RuntimeCredentials,
+            ) -> EmulatedDiscovery:
+                return await build_emulated_discovery(
+                    dispatcher,
+                    creds,
+                    preview_row_count=settings.preview_row_count,
+                    observer=observer,
+                )
+
+            discovery_emulation_provider = _discovery_emulation_provider
         # D77: the composite wraps the SAME dispatcher (so its inner runQuery
         # shares the per-request observer/tracer and the free D5/D57/provenance
         # path); an injected `resolve_values` (Layer-1 smoke test) overrides it.
         composite = resolve_values or ResolveValuesComposite(
             tool_dispatcher=dispatcher,
-            catalog=catalog,
+            catalog=catalog_provider,
             embedding_client=embedding_client,
             query_limit=settings.resolve_values_query_limit,
             top_k=settings.resolve_values_top_k,
@@ -515,6 +565,7 @@ def create_app(
             observer=observer,
             runtime_tools=runtime_tools,
             blueprint_executor=blueprint_executor,
+            discovery_emulation_provider=discovery_emulation_provider,
         )
 
     # Close the neo4j driver pool on shutdown (design §2.4, N1: lifespan not the
@@ -549,9 +600,7 @@ def create_app(
                 dumped.append(
                     {
                         "name": s.name,
-                        "kind": s.attributes.get(
-                            "openinference.span.kind"
-                        ),
+                        "kind": s.attributes.get("openinference.span.kind"),
                         "attributes": {k: str(v) for k, v in s.attributes.items()},
                     }
                 )

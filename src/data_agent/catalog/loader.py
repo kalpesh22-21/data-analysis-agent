@@ -105,6 +105,15 @@ def _load_raw_table_entries(schema_dir: Path | str) -> dict[str, dict[str, Any]]
     like AUTHORING_NOTES.md and rules-only YAMLs are silently skipped.
     """
     schema_dir = Path(schema_dir)
+    if not schema_dir.is_dir():
+        # The directory was removed (D75 Wave 1b): the catalog is now sourced from
+        # the MCP export, not a local YAML tree. Glob-ing a nonexistent dir would
+        # silently return {} and degrade provenance invisibly, so fail loudly instead.
+        raise FileNotFoundError(
+            f"catalog schema directory {schema_dir} does not exist: databaseSchemaDocs/ "
+            "was removed; the catalog is now sourced from the MCP export — use "
+            "build_catalog_cache / the fixture (tests/fixtures/catalog_export.json)."
+        )
     result: dict[str, dict[str, Any]] = {}
 
     for yaml_path in sorted(schema_dir.glob("*.yaml")):
@@ -131,6 +140,67 @@ def _load_raw_table_entries(schema_dir: Path | str) -> dict[str, dict[str, Any]]
     return result
 
 
+# ---------------------------------------------------------------------------
+# In-memory catalog cores (D75 Wave 1b).
+#
+# The three projections below are the SINGLE source of truth for how a parsed
+# catalog dict — `{"database.table": <verbatim catalog entry>, ...}` — is turned
+# into the sqlglot schema, the description-col linkage, and the semantic overlay.
+# Both the dir-reading functions (which parse YAML → dict → core) and the
+# MCP-export path (`/catalog/export` → dict → core) call these, so a schema built
+# from local YAML and one built from the MCP export can never drift.
+#
+# The input `catalog` has the EXACT shape `load_semantic_catalog()` returns and
+# the MCP's `GET /catalog/export` serves under its `catalog` key: one entry per
+# `database.table`, each entry carrying at least a `columns` block.
+# ---------------------------------------------------------------------------
+
+
+def build_sqlglot_schema_from_catalog(
+    catalog: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, str]]:
+    """Project a parsed catalog dict to the sqlglot schema `{db.table: {col: type}}`.
+
+    Applies `_extract_columns` per entry — the same projection the dir path uses,
+    so a schema built from the MCP export matches one built from `databaseSchemaDocs/`.
+    An entry with no (or a non-dict) `columns` block contributes an empty column map.
+    """
+    result: dict[str, dict[str, str]] = {}
+    for qualified_key, entry in catalog.items():
+        columns = entry.get("columns")
+        result[qualified_key] = _extract_columns(columns) if isinstance(columns, dict) else {}
+    return result
+
+
+def load_description_cols_from_catalog(
+    catalog: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, str]]:
+    """Project a parsed catalog dict to `{db.table: {code_col: description_col}}`.
+
+    Applies `_extract_description_cols` per entry (the authored code→label linkage).
+    Every table is present as a key; its value is `{}` when it declares no links.
+    """
+    result: dict[str, dict[str, str]] = {}
+    for qualified_key, entry in catalog.items():
+        columns = entry.get("columns")
+        result[qualified_key] = (
+            _extract_description_cols(columns) if isinstance(columns, dict) else {}
+        )
+    return result
+
+
+def load_semantic_catalog_from_catalog(
+    catalog: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Return the full semantic overlay from a parsed catalog dict — IDENTITY.
+
+    The MCP export's `catalog` value (and `_load_raw_table_entries()`'s output) IS
+    already the `{db.table: <full entry>}` shape `load_semantic_catalog()` returns,
+    so this is a shallow copy for isolation, not a transform.
+    """
+    return dict(catalog)
+
+
 def load_catalog_from_dir(schema_dir: Path | str) -> dict[str, dict[str, str]]:
     """Load all *.yaml files in `schema_dir` and return the sqlglot schema dict.
 
@@ -147,11 +217,11 @@ def load_catalog_from_dir(schema_dir: Path | str) -> dict[str, dict[str, str]]:
     YAMLs (e.g. `measures` as a sibling dict key accidentally inside columns) are
     naturally excluded because we iterate `raw_columns` which is the `columns`
     mapping only.
+
+    Implemented as (parse YAML → dict → `build_sqlglot_schema_from_catalog`) so it
+    shares the exact projection the MCP-export path uses.
     """
-    raw_entries = _load_raw_table_entries(schema_dir)
-    return {
-        qualified_key: _extract_columns(entry["columns"]) for qualified_key, entry in raw_entries.items()
-    }
+    return build_sqlglot_schema_from_catalog(_load_raw_table_entries(schema_dir))
 
 
 def build_sqlglot_schema(schema_dir: Path | str | None = None) -> dict[str, dict[str, str]]:
@@ -191,7 +261,9 @@ def load_semantic_catalog(schema_dir: Path | str | None = None) -> dict[str, dic
     If `schema_dir` is None, resolves to databaseSchemaDocs/ the same way
     `build_sqlglot_schema()` does.
     """
-    return _load_raw_table_entries(_resolve_schema_dir(schema_dir))
+    return load_semantic_catalog_from_catalog(
+        _load_raw_table_entries(_resolve_schema_dir(schema_dir))
+    )
 
 
 def load_description_cols(schema_dir: Path | str | None = None) -> dict[str, dict[str, str]]:
@@ -212,11 +284,9 @@ def load_description_cols(schema_dir: Path | str | None = None) -> dict[str, dic
     lowercased. If `schema_dir` is None, resolves to databaseSchemaDocs/ the same
     way `build_sqlglot_schema()` does.
     """
-    raw_entries = _load_raw_table_entries(_resolve_schema_dir(schema_dir))
-    return {
-        qualified_key: _extract_description_cols(entry["columns"])
-        for qualified_key, entry in raw_entries.items()
-    }
+    return load_description_cols_from_catalog(
+        _load_raw_table_entries(_resolve_schema_dir(schema_dir))
+    )
 
 
 def is_scratch_table(database: str, table: str, session_id: str) -> bool:

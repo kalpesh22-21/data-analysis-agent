@@ -6,11 +6,14 @@ temp-dir YAML fixtures for edge cases; no ClickHouse connection required).
 
 `load_semantic_catalog()` is a superset of `build_sqlglot_schema()`: same parse,
 keying, and file-skip rules (`_load_raw_table_entries()`), but returns the full
-per-table semantic entry instead of the `{col: type}` projection. These tests
-assert against the real production YAML files (values transcribed by hand from
-the source files, not invented) plus small temp-dir fixtures for the
-DEFAULT_DATABASE-fallback and file-skip edge cases that the real catalog
-doesn't currently exercise.
+per-table semantic entry instead of the `{col: type}` projection.
+
+D75 Wave 1b: the shape/value assertions are now driven from the committed export
+fixture `tests/fixtures/catalog_export.json` (the MCP `/catalog/export` payload) via
+the in-memory cores `load_semantic_catalog_from_catalog` / `build_sqlglot_schema_from_catalog`,
+since `databaseSchemaDocs/` is deleted. The DEFAULT_DATABASE-fallback and file-skip
+edge cases still exercise the dir-reading path against small temp-dir YAML fixtures
+(those functions are retained, implemented in terms of the same cores).
 """
 
 from __future__ import annotations
@@ -19,10 +22,17 @@ from pathlib import Path
 
 import pytest
 
-from data_agent.catalog import DEFAULT_DATABASE, build_sqlglot_schema, load_semantic_catalog
+from data_agent.catalog import (
+    DEFAULT_DATABASE,
+    build_sqlglot_schema_from_catalog,
+    load_semantic_catalog,
+    load_semantic_catalog_from_catalog,
+)
+from tests._catalog_fixture import fixture_catalog
 
-REPO_ROOT = Path(__file__).parent.parent.parent
-SCHEMA_DIR = REPO_ROOT / "databaseSchemaDocs"
+# The frozen MCP export catalog (`{db.table: <entry>}`) — the single source of
+# truth now that `databaseSchemaDocs/` is gone.
+_CATALOG = fixture_catalog()
 
 _E = "dbpcm_warehouse.employee"
 _P = "dbpcm_warehouse.payroll"
@@ -31,17 +41,19 @@ _CE = "dbpcm_warehouse.candidate_education"
 # Expected table keys, one per *.yaml file in databaseSchemaDocs/ that declares
 # a top-level `table` + `columns` block (AUTHORING_NOTES.md is not a YAML file
 # and is correctly excluded by the *.yaml glob).
-EXPECTED_TABLE_KEYS = frozenset([
-    "dbpcm_warehouse.accrual_events",
-    "dbpcm_warehouse.applicant_tracking_application",
-    "dbpcm_warehouse.applicant_tracking_requisition",
-    "dbpcm_warehouse.candidate_education",
-    "dbpcm_warehouse.candidate_employment_history",
-    "dbpcm_warehouse.employee",
-    "dbpcm_warehouse.payroll",
-    "dbpcm_warehouse.performance_discussions",
-    "dbpcm_warehouse.personnel_action_form_changes",
-])
+EXPECTED_TABLE_KEYS = frozenset(
+    [
+        "dbpcm_warehouse.accrual_events",
+        "dbpcm_warehouse.applicant_tracking_application",
+        "dbpcm_warehouse.applicant_tracking_requisition",
+        "dbpcm_warehouse.candidate_education",
+        "dbpcm_warehouse.candidate_employment_history",
+        "dbpcm_warehouse.employee",
+        "dbpcm_warehouse.payroll",
+        "dbpcm_warehouse.performance_discussions",
+        "dbpcm_warehouse.personnel_action_form_changes",
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -50,15 +62,8 @@ EXPECTED_TABLE_KEYS = frozenset([
 
 
 def test_load_semantic_catalog_returns_one_entry_per_table() -> None:
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     assert set(catalog.keys()) == EXPECTED_TABLE_KEYS
-
-
-def test_load_semantic_catalog_default_schema_dir_matches_explicit() -> None:
-    """schema_dir=None resolves to the same real databaseSchemaDocs/ directory."""
-    catalog_default = load_semantic_catalog()
-    catalog_explicit = load_semantic_catalog(SCHEMA_DIR)
-    assert set(catalog_default.keys()) == set(catalog_explicit.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -67,12 +72,12 @@ def test_load_semantic_catalog_default_schema_dir_matches_explicit() -> None:
 
 
 def test_employee_grain() -> None:
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     assert catalog[_E]["grain"] == ["EmployeeCode"]
 
 
 def test_employee_rules_contains_active_employee_rule() -> None:
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     rules = catalog[_E]["rules"]
     assert isinstance(rules, list)
     assert len(rules) >= 1
@@ -82,7 +87,7 @@ def test_employee_rules_contains_active_employee_rule() -> None:
 
 
 def test_employee_ambiguities_contains_headcount_term() -> None:
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     ambiguities = catalog[_E]["ambiguities"]
     assert isinstance(ambiguities, list)
     assert len(ambiguities) >= 1
@@ -92,7 +97,7 @@ def test_employee_ambiguities_contains_headcount_term() -> None:
 
 
 def test_employee_status_enum_values_map() -> None:
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     status_col = catalog[_E]["columns"]["EmployeeStatus"]
     assert status_col["values"] == {
         "A": "active",
@@ -108,7 +113,7 @@ def test_employee_status_enum_values_map() -> None:
 
 
 def test_employee_column_with_unit() -> None:
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     annual_salary = catalog[_E]["columns"]["AnnualSalary"]
     assert annual_salary["unit"] == "USD"
     assert annual_salary["type"] == "Nullable(Decimal(18, 6))"
@@ -127,7 +132,7 @@ def test_flow_style_decimal_types_are_not_truncated_by_yaml_comma() -> None:
     corrected parse across all previously-affected real columns so the flow-style
     trap can't silently reappear.
     """
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     affected = [
         (_E, "AnnualSalary"),
         (_E, "Rate1"),
@@ -143,7 +148,7 @@ def test_flow_style_decimal_types_are_not_truncated_by_yaml_comma() -> None:
 
 def test_column_with_sensitive_true() -> None:
     """candidate_education.EducationPhoneNumber is marked sensitive: true in the YAML."""
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     phone_col = catalog[_CE]["columns"]["EducationPhoneNumber"]
     assert phone_col["sensitive"] is True
     assert phone_col["type"] == "Nullable(String)"
@@ -155,7 +160,7 @@ def test_column_with_sensitive_true() -> None:
 
 def test_employee_client_defined_flag() -> None:
     """Department is client_defined: true in employee.yaml; EmployeeCode is not."""
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     columns = catalog[_E]["columns"]
     assert columns["Department"]["client_defined"] is True
     assert "client_defined" not in columns["EmployeeCode"]
@@ -167,7 +172,7 @@ def test_employee_client_defined_flag() -> None:
 
 
 def test_payroll_measures_present() -> None:
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     measures = catalog[_P]["measures"]
     assert "gross_earnings" in measures
     assert measures["gross_earnings"] == {
@@ -180,7 +185,7 @@ def test_payroll_measures_present() -> None:
 
 def test_employee_measures_absent() -> None:
     """employee.yaml declares no `measures` block — must not be fabricated."""
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     assert "measures" not in catalog[_E]
 
 
@@ -195,7 +200,7 @@ def test_case_preservation_mixed_case_column() -> None:
     The loader must not lowercase or titlecase this — exact casing from the YAML
     must be preserved (D70).
     """
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     columns = catalog[_P]["columns"]
     assert "distributedDepartmentDescription" in columns
     # Neither the fully-lowercased nor the PascalCase variant should exist as a
@@ -206,7 +211,7 @@ def test_case_preservation_mixed_case_column() -> None:
 
 def test_case_preservation_table_and_database_keys() -> None:
     """Table/database key components are not lowercased or uppercased."""
-    catalog = load_semantic_catalog(SCHEMA_DIR)
+    catalog = load_semantic_catalog_from_catalog(_CATALOG)
     assert catalog[_E]["table"] == "employee"
     assert catalog[_E]["database"] == "dbpcm_warehouse"
 
@@ -279,15 +284,15 @@ description: Declares a table but no columns block.
 
 
 def test_semantic_catalog_and_sqlglot_schema_table_keys_match() -> None:
-    semantic = load_semantic_catalog(SCHEMA_DIR)
-    sqlglot_schema = build_sqlglot_schema(SCHEMA_DIR)
+    semantic = load_semantic_catalog_from_catalog(_CATALOG)
+    sqlglot_schema = build_sqlglot_schema_from_catalog(_CATALOG)
     assert set(semantic.keys()) == set(sqlglot_schema.keys())
 
 
 def test_semantic_catalog_and_sqlglot_schema_column_pairs_match() -> None:
     """The set of (db.table, column) pairs derivable from each view must match exactly."""
-    semantic = load_semantic_catalog(SCHEMA_DIR)
-    sqlglot_schema = build_sqlglot_schema(SCHEMA_DIR)
+    semantic = load_semantic_catalog_from_catalog(_CATALOG)
+    sqlglot_schema = build_sqlglot_schema_from_catalog(_CATALOG)
 
     semantic_pairs = {
         (table_key, col_name)
@@ -295,17 +300,15 @@ def test_semantic_catalog_and_sqlglot_schema_column_pairs_match() -> None:
         for col_name in entry["columns"]
     }
     sqlglot_pairs = {
-        (table_key, col_name)
-        for table_key, cols in sqlglot_schema.items()
-        for col_name in cols
+        (table_key, col_name) for table_key, cols in sqlglot_schema.items() for col_name in cols
     }
     assert semantic_pairs == sqlglot_pairs
 
 
 def test_semantic_catalog_column_types_match_sqlglot_schema() -> None:
     """Per-column `type` in load_semantic_catalog must equal build_sqlglot_schema's type string."""
-    semantic = load_semantic_catalog(SCHEMA_DIR)
-    sqlglot_schema = build_sqlglot_schema(SCHEMA_DIR)
+    semantic = load_semantic_catalog_from_catalog(_CATALOG)
+    sqlglot_schema = build_sqlglot_schema_from_catalog(_CATALOG)
 
     for table_key, entry in semantic.items():
         for col_name, col_def in entry["columns"].items():

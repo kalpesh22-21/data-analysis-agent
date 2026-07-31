@@ -33,11 +33,14 @@ from pathlib import Path
 from neo4j import AsyncGraphDatabase
 
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
-from data_agent.runtime.provenance.catalog_handle import (
-    CatalogHandle,
-    load_catalog_handle,
-)
+from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.corpus_loader import load_corpus, load_seed_fixtures
+
+# `_catalog` is a sibling module under `scripts/`. Put this script's own directory
+# on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND
+# when the file is loaded by path (importlib `spec_from_file_location`, e.g. tests).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _catalog import catalog_handle  # noqa: E402
 
 _FIXTURE_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "corpus"
 _logger = logging.getLogger(__name__)
@@ -46,11 +49,12 @@ _logger = logging.getLogger(__name__)
 def _try_load_catalog() -> CatalogHandle | None:
     """Build the CatalogHandle for the D94 Part-3 seed-time skew warning, softly.
 
-    The check is a dev-time early warning, never a seed precondition: if the
-    schema dir is absent or `load_catalog_handle()` raises, log a note and return
-    `None` so `load_corpus` still proceeds (with the skew check skipped)."""
+    The check is a dev-time early warning, never a seed precondition: if the frozen
+    catalog-export snapshot is absent or unreadable (D75 Wave 1b — the catalog now
+    comes from the export, not `databaseSchemaDocs/`), log a note and return `None`
+    so `load_corpus` still proceeds (with the skew check skipped)."""
     try:
-        return load_catalog_handle()
+        return catalog_handle()
     except Exception as exc:  # noqa: BLE001 - soft dev-time aid, never blocks the seed
         _logger.warning(
             "catalog unavailable (%s) — skipping the D94 seed-time skew check; "

@@ -42,7 +42,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResu
 from data_agent.runtime.mcp.client import MCPToolSpec
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
-from data_agent.runtime.provenance.catalog_handle import load_catalog_handle
+from tests._catalog_fixture import fixture_catalog_handle
 
 from .conftest import Mint
 
@@ -84,16 +84,14 @@ class _CapturingMCPClient:
         self, tool_name: str, args: dict[str, Any], *, jwt: str, session_id: str
     ) -> dict[str, Any] | list[Any]:
         self.calls.append((tool_name, args))
-        return await self._inner.call_tool(
-            tool_name, args, jwt=jwt, session_id=session_id
-        )
+        return await self._inner.call_tool(tool_name, args, jwt=jwt, session_id=session_id)
 
     async def list_tools(self, *, jwt: str, session_id: str) -> list[MCPToolSpec]:
         return await self._inner.list_tools(jwt=jwt, session_id=session_id)
 
 
 def _composite() -> tuple[ResolveValuesComposite, _CapturingMCPClient]:
-    catalog = load_catalog_handle()
+    catalog = fixture_catalog_handle()
     client = _CapturingMCPClient(RealMCPClient(os.environ["MCP_TEST_URL"]))
     dispatcher = ToolDispatcher(client, catalog)
     composite = ResolveValuesComposite(
@@ -107,9 +105,7 @@ async def test_run_earnings_ranks_over_real_mcp_and_embedder(mint: Mint) -> None
     # MCP↔ClickHouse (the backing DISTINCT runQuery, scope-enforced end-to-end)
     # + the real embedder ranking the live domain.
     jwt = await mint(session_id="sess-rv-live")  # allow-all scope (D80b), session-bound
-    creds = RuntimeCredentials(
-        session_id="sess-rv-live", jwt=jwt, column_scope=frozenset()
-    )
+    creds = RuntimeCredentials(session_id="sess-rv-live", jwt=jwt, column_scope=frozenset())
     composite, client = _composite()
 
     result: ToolResult = await composite.run(

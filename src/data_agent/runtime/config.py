@@ -15,6 +15,7 @@ phase0-runtime-design.md §11 (OQ-D/G/H/I) for the provenance of these numbers
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -72,14 +73,37 @@ class RuntimeSettings(BaseSettings):
         description="Runtime column cap for a materializable table intermediate (fail-closed over-cap).",
     )
 
+    # --- Semantic-catalog source (D75 Wave 1b — MCP as the single source of truth) ---
+    # The runtime rebuilds its immutable CatalogHandle/SemanticCatalogHandle from the
+    # MCP's `GET /catalog/export` instead of a local `databaseSchemaDocs/` copy.
+    #   * "mcp"     (default) — fetch the export from the live MCP host, cached
+    #                 process-wide after the first successful fetch (CatalogCache).
+    #   * "fixture" — load the frozen `tests/fixtures/catalog_export.json` (or
+    #                 `catalog_fixture_path`) from disk; used by the test suite and
+    #                 fully-offline runs. No network.
+    catalog_source: str = Field(
+        "mcp",
+        description="Where the semantic catalog comes from: 'mcp' (live export) or 'fixture' (offline JSON).",
+    )
+    # The `/catalog/export` route rides the SAME MCP host as a plain authenticated
+    # GET (not an MCP tool), like the scratch side-channel. When empty, the base is
+    # derived from `mcp_url` (host root + `/catalog`), so a deploy that sets only
+    # `MCP_URL` wires the catalog surface automatically.
+    catalog_api_url: str = Field(
+        "",
+        description="Base URL of the MCP catalog export (…/catalog). Empty → derived from mcp_url.",
+    )
+    # Fixture path used when `catalog_source="fixture"`. Empty → the committed
+    # `tests/fixtures/catalog_export.json` relative to the repo root.
+    catalog_fixture_path: str = Field(
+        "",
+        description="Path to the offline catalog-export JSON. Empty → repo tests/fixtures/catalog_export.json.",
+    )
+
     # --- OpenAI model provider (D71) ---
     openai_api_key: str = Field("", description="OpenAI API key (secret).")
-    openai_model: str = Field(
-        "gpt-4.1", description="Model name for Responses/Chat Completions."
-    )
-    openai_base_url: str = Field(
-        "", description="Optional OpenAI-compatible base URL override."
-    )
+    openai_model: str = Field("gpt-4.1", description="Model name for Responses/Chat Completions.")
+    openai_base_url: str = Field("", description="Optional OpenAI-compatible base URL override.")
     model_context_window: int = Field(
         128_000,
         description=(
@@ -110,7 +134,8 @@ class RuntimeSettings(BaseSettings):
     # Phoenix; when empty the provider is a no-op (zero infra required). See
     # `runtime/observability/tracing.py`.
     otlp_endpoint: str = Field(
-        "", description="OTLP collector endpoint (self-hosted Phoenix). Empty => no-op provider (no export)."
+        "",
+        description="OTLP collector endpoint (self-hosted Phoenix). Empty => no-op provider (no export).",
     )
     otlp_service_name: str = Field(
         "data-agent-runtime", description="Service name reported in OTel spans (service.name)."
@@ -444,6 +469,39 @@ class RuntimeSettings(BaseSettings):
 
         parts = urlsplit(self.mcp_url)
         return urlunsplit((parts.scheme, parts.netloc, "/scratch/v1", "", "")).rstrip("/")
+
+    def catalog_api_base(self) -> str:
+        """Resolve the MCP catalog-export base URL (…/catalog), no trailing slash.
+
+        Uses `catalog_api_url` when set; otherwise derives it from `mcp_url` by
+        replacing the MCP mount path with `/catalog` (the route lives on the same MCP
+        host, Wave 1a). E.g. `http://host:18090/mcp` → `http://host:18090/catalog`.
+        `HttpCatalogClient` appends `/export`.
+
+        WARNING: the derivation keeps ONLY `mcp_url`'s scheme + netloc and
+        DISCARDS any path prefix. A path-routed ingress like
+        `https://host/prefix/mcp` therefore yields `https://host/catalog`
+        (NOT `https://host/prefix/catalog`), which may point at the wrong host
+        or 404. Set `catalog_api_url` to the explicit `…/catalog` base to
+        override the derivation in that case.
+        """
+        if self.catalog_api_url:
+            return self.catalog_api_url.rstrip("/")
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(self.mcp_url)
+        return urlunsplit((parts.scheme, parts.netloc, "/catalog", "", "")).rstrip("/")
+
+    def catalog_fixture_file(self) -> Path:
+        """Resolve the offline catalog-export fixture path (`catalog_source="fixture"`).
+
+        Uses `catalog_fixture_path` when set; otherwise the committed
+        `tests/fixtures/catalog_export.json` relative to the repo root (this file lives
+        at `src/data_agent/runtime/config.py`, so the repo root is 3 parents up)."""
+        if self.catalog_fixture_path:
+            return Path(self.catalog_fixture_path)
+        repo_root = Path(__file__).resolve().parents[3]
+        return repo_root / "tests" / "fixtures" / "catalog_export.json"
 
 
 def effective_llm_hide(settings: RuntimeSettings) -> bool:

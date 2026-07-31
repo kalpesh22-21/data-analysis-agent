@@ -31,9 +31,7 @@ import pytest
 import data_agent.learning.factory as factory_module
 from data_agent.learning.factory import LearningWiringError
 
-_SCRIPT = (
-    Path(__file__).resolve().parents[2] / "scripts" / "run_learning_consumer.py"
-)
+_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "run_learning_consumer.py"
 
 
 def _load_entrypoint():
@@ -100,8 +98,14 @@ def _patch(module, *, learning_settings, user_config, captured):
     module.CouchbaseUserKnowledgeStore = lambda *a, **k: SimpleNamespace(kind="user")
     module.build_openai_model_client = lambda **k: object()
     module.HttpEmbeddingClient = lambda **k: SimpleNamespace(kind="embedder")
-    module.build_sqlglot_schema = lambda: {}
-    module.load_known_rule_ids = lambda: frozenset({"active_employee"})
+    # Catalog now comes from the export snapshot (D75 Wave 1b): the entrypoint loads
+    # the raw `catalog` dict once via `catalog_dict(settings)` and projects the sqlglot
+    # schema + rule-id grounding from it. Stub the snapshot load (so no real fixture
+    # file is read against the fake `SimpleNamespace` settings) and the two projections.
+    module.catalog_dict = lambda settings=None: {}
+    module.catalog_fixture_path = lambda settings=None: "<test-fixture>"
+    module.build_sqlglot_schema_from_catalog = lambda catalog: {}
+    module.known_rule_ids_from_catalog = lambda catalog: frozenset({"active_employee"})
 
     # Let the REAL factory assemble the consumer, but capture it and neutralize
     # `run_forever` so the blocking loop never runs.

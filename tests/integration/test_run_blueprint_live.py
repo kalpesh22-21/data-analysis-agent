@@ -41,9 +41,9 @@ from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
-from data_agent.runtime.provenance.catalog_handle import load_catalog_handle
 from data_agent.runtime.retrieval.corpus_loader import load_corpus, load_seed_fixtures
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
+from tests._catalog_fixture import fixture_catalog_handle
 
 from .conftest import Mint
 
@@ -94,14 +94,14 @@ def _index() -> Neo4jVectorIndex:
 
 
 def _dispatcher() -> ToolDispatcher:
-    return ToolDispatcher(RealMCPClient(os.environ["MCP_TEST_URL"]), load_catalog_handle())
+    return ToolDispatcher(RealMCPClient(os.environ["MCP_TEST_URL"]), fixture_catalog_handle())
 
 
 def _composite(dispatcher: ToolDispatcher) -> ResolveValuesComposite:
     """The D67 `resolve_via` hook wired to the SAME dispatcher (so its inner
     runQuery shares the scope-enforced path) + the REAL embedder for ranking."""
     return ResolveValuesComposite(
-        tool_dispatcher=dispatcher, catalog=load_catalog_handle(), embedding_client=_embedder()
+        tool_dispatcher=dispatcher, catalog=fixture_catalog_handle(), embedding_client=_embedder()
     )
 
 

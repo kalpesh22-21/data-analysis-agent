@@ -94,7 +94,7 @@ from openinference.semconv.trace import OpenInferenceSpanKindValues  # noqa: E40
 
 from data_agent.learning.candidate.models import mint_candidate_id  # noqa: E402
 from data_agent.learning.config import LearningSettings, learning_enabled  # noqa: E402
-from data_agent.learning.extractor.grounding import load_known_rule_ids  # noqa: E402
+from data_agent.learning.extractor.grounding import known_rule_ids_from_catalog  # noqa: E402
 from data_agent.learning.factory import (  # noqa: E402
     build_learning_consumer,
     build_promotion_write_plane,
@@ -123,6 +123,12 @@ from data_agent.runtime.retrieval.corpus_loader import apply_schema  # noqa: E40
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex  # noqa: E402
 from data_agent.runtime.session.models import SessionDoc, TrailEntry, TurnMessage  # noqa: E402
 
+# `_catalog` is a sibling module under `scripts/`. Put this script's own directory
+# on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND
+# when the file is loaded by path (importlib `spec_from_file_location`, e.g. tests).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _catalog import catalog_dict  # noqa: E402
+
 # --------------------------------------------------------------------------- consts
 
 TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
@@ -145,9 +151,7 @@ _SALARY_COL = f"{_TABLE}.AnnualSalary"
 _DEPT_COL = f"{_TABLE}.Department"
 
 _QUESTION = "what is the total annual salary for the Sales department?"
-_ACCEPTED_SQL = (
-    f"SELECT sum(AnnualSalary) AS total_salary FROM {_TABLE} WHERE Department = 'Sales'"
-)
+_ACCEPTED_SQL = f"SELECT sum(AnnualSalary) AS total_salary FROM {_TABLE} WHERE Department = 'Sales'"
 _RELATED_QUESTION = "how much total salary does a department pay its employees"
 
 _CATALOG = {
@@ -367,14 +371,10 @@ async def _pick_openai_model() -> str:
     API). A 404 model / no-access error moves to the next; anything else re-raised."""
     client = openai.AsyncOpenAI(api_key=_OPENAI_KEY)
     last_err = None
-    candidates = (
-        (os.environ["DEMO_MODEL"],) if os.environ.get("DEMO_MODEL") else _MODEL_CANDIDATES
-    )
+    candidates = (os.environ["DEMO_MODEL"],) if os.environ.get("DEMO_MODEL") else _MODEL_CANDIDATES
     for model in candidates:
         try:
-            await client.responses.create(
-                model=model, input=[{"role": "user", "content": "ping"}]
-            )
+            await client.responses.create(model=model, input=[{"role": "user", "content": "ping"}])
             print(f"[MODEL] preflight OK on {model!r} (OpenAI Responses API)")
             return model
         except openai.NotFoundError as exc:
@@ -396,11 +396,15 @@ def _print_model_emission(result) -> None:  # noqa: ANN001
     print(f"  candidates: {len(result.candidates)}   declines: {len(result.declines)}")
     for i, cand in enumerate(result.candidates):
         h = cand.header
-        print(f"\n  --- candidate[{i}] type={h.type} confidence={h.confidence} "
-              f"proposed_action={h.proposed_action}")
+        print(
+            f"\n  --- candidate[{i}] type={h.type} confidence={h.confidence} "
+            f"proposed_action={h.proposed_action}"
+        )
         print(f"      rationale: {h.rationale}")
-        print(f"      entity_self_check: contains_entities={h.entity_self_check.contains_entities} "
-              f"found={list(h.entity_self_check.found)}")
+        print(
+            f"      entity_self_check: contains_entities={h.entity_self_check.contains_entities} "
+            f"found={list(h.entity_self_check.found)}"
+        )
         payload = cand.payload
         if hasattr(payload, "intent"):
             print(f"      intent (entity-free, embedded): {payload.intent!r}")
@@ -416,8 +420,10 @@ def _print_model_emission(result) -> None:  # noqa: ANN001
                     if slot is not None
                     else f"role={p.role} rule_id={p.rule_id} why={p.why}"
                 )
-                print(f"        - locator(table={loc.table}, column={loc.column}, "
-                      f"value={loc.value!r}) role={p.role} -> {slot_desc}")
+                print(
+                    f"        - locator(table={loc.table}, column={loc.column}, "
+                    f"value={loc.value!r}) role={p.role} -> {slot_desc}"
+                )
             if payload.result_signature is not None:
                 print(f"      result_signature: {payload.result_signature}")
             if payload.notes:
@@ -470,9 +476,7 @@ async def _confirm_phoenix(sid: str) -> None:
         resp.raise_for_status()
         data = resp.json()
     projects = data.get("data", {}).get("projects", {}).get("edges", [])
-    target = next(
-        (e["node"] for e in projects if e["node"]["name"] == "learning-loop"), None
-    )
+    target = next((e["node"] for e in projects if e["node"]["name"] == "learning-loop"), None)
     print("=" * 70)
     print(">>> PHOENIX TRACE CONFIRMATION")
     print("=" * 70)
@@ -483,8 +487,10 @@ async def _confirm_phoenix(sid: str) -> None:
         print(f"  Open the Phoenix UI to inspect: {_PHOENIX_UI}")
         return
     spans = [e["node"] for e in target["spans"]["edges"]]
-    print(f"  project: 'learning-loop'  traceCount={target['traceCount']} "
-          f"recordCount={target['recordCount']}  spans retrieved={len(spans)}")
+    print(
+        f"  project: 'learning-loop'  traceCount={target['traceCount']} "
+        f"recordCount={target['recordCount']}  spans retrieved={len(spans)}"
+    )
 
     # Group by traceId; find THE trace carrying this session's spans (session.id==sid).
     def _trace_id(s):  # noqa: ANN001
@@ -494,17 +500,17 @@ async def _confirm_phoenix(sid: str) -> None:
     for s in spans:
         by_trace.setdefault(_trace_id(s), []).append(s)
 
-    session_traces = {
-        _trace_id(s)
-        for s in spans
-        if _span_attrs(s).get("session.id") == sid
-    }
+    session_traces = {_trace_id(s) for s in spans if _span_attrs(s).get("session.id") == sid}
     if not session_traces:
-        print(f"  no spans found for session.id={sid!r} yet (ingestion lag?). "
-              f"Open {_PHOENIX_UI} (project: learning-loop).")
+        print(
+            f"  no spans found for session.id={sid!r} yet (ingestion lag?). "
+            f"Open {_PHOENIX_UI} (project: learning-loop)."
+        )
         return
-    print(f"\n  session {sid!r} spans span {len(session_traces)} traceId(s): "
-          f"{'ONE trace (chained ✓)' if len(session_traces) == 1 else 'MULTIPLE (NOT chained!)'}")
+    print(
+        f"\n  session {sid!r} spans span {len(session_traces)} traceId(s): "
+        f"{'ONE trace (chained ✓)' if len(session_traces) == 1 else 'MULTIPLE (NOT chained!)'}"
+    )
 
     for tid in session_traces:
         members = by_trace.get(tid, [])
@@ -570,16 +576,20 @@ async def _run() -> int:
         live_result = await infra.mcp_client.call_tool(
             "runQuery", {"sql": _ACCEPTED_SQL}, jwt=probe_jwt, session_id=probe_session
         )
-        print(f"[STAGE 1] accepted SQL ran live -> {live_result['rows']} "
-              f"(columns={live_result['columns']})")
+        print(
+            f"[STAGE 1] accepted SQL ran live -> {live_result['rows']} "
+            f"(columns={live_result['columns']})"
+        )
 
         doc = _closed_session(sid)
         content_hash = compute_content_hash(doc)
         await infra.session_store._upsert_doc(sid, doc)
         infra.created_sessions.append(sid)
         parked = await _park_foreign_idle_sessions(infra, sid)
-        print(f"[STAGE 1] seeded CLOSED session {sid!r} (content_hash={content_hash[:12]}...); "
-              f"parked {parked} foreign idle session(s)")
+        print(
+            f"[STAGE 1] seeded CLOSED session {sid!r} (content_hash={content_hash[:12]}...); "
+            f"parked {parked} foreign idle session(s)"
+        )
 
         # ============================================================ STAGE 2 — SWEEP
         sweeper = LearningSweeper(infra.session_store, infra.queue, infra.settings, tracer=tracer)
@@ -595,8 +605,10 @@ async def _run() -> int:
             await asyncio.sleep(0.5)
         if swept_doc is None or swept_doc.learning_status != LearningStatus.QUEUED:
             raise SystemExit(f"session not swept->queued (last={last_sweep})")
-        print(f"[STAGE 2] SWEPT (scanned={last_sweep.scanned} claimed={last_sweep.claimed} "
-              f"enqueued={last_sweep.enqueued}); session->QUEUED, job XADDed [traced]")
+        print(
+            f"[STAGE 2] SWEPT (scanned={last_sweep.scanned} claimed={last_sweep.claimed} "
+            f"enqueued={last_sweep.enqueued}); session->QUEUED, job XADDed [traced]"
+        )
 
         # ============================================================ STAGE 3 — CONSUME (REAL LLM)
         consumer = build_learning_consumer(
@@ -604,16 +616,16 @@ async def _run() -> int:
             session_store=infra.session_store,
             queue=infra.queue,
             tracer=tracer,
-            model_client=build_openai_model_client(
-                api_key=_OPENAI_KEY, model=model, base_url=""
-            ),
+            model_client=build_openai_model_client(api_key=_OPENAI_KEY, model=model, base_url=""),
             audit_store=infra.audit_store,
             candidate_store=infra.candidate_store,
             blueprint_corpus=infra.corpus_store,
             user_store=infra.user_store,
             catalog_schema=_CATALOG,
             embedder=infra.embedder,
-            known_rules=load_known_rule_ids(),
+            # Rule-role grounding from the frozen catalog-export snapshot (D75 Wave 1b;
+            # `databaseSchemaDocs/` is gone). Dev demo → reads the committed fixture.
+            known_rules=known_rule_ids_from_catalog(catalog_dict()),
             sampler=lambda _env: False,
         )
         # Wrap the factory-built real extractor to capture what the model emits.
@@ -621,7 +633,9 @@ async def _run() -> int:
         consumer._extractor = capturing
 
         consumed = await consumer.run_once()
-        print(f"[STAGE 3] CONSUMED (done={consumed.done}) with the REAL {model!r} extractor [traced]")
+        print(
+            f"[STAGE 3] CONSUMED (done={consumed.done}) with the REAL {model!r} extractor [traced]"
+        )
 
         _print_model_emission(capturing.last_result)
 
@@ -641,8 +655,10 @@ async def _run() -> int:
                 cid = candidate_id
 
         if stored is None:
-            print("[STAGE 3] the real model produced NO auto-landable blueprint candidate — "
-                  "reporting the traced run as-is (a valid real-LLM outcome).")
+            print(
+                "[STAGE 3] the real model produced NO auto-landable blueprint candidate — "
+                "reporting the traced run as-is (a valid real-LLM outcome)."
+            )
             await _flush_and_confirm(provider, model, sid, stages_done=3, extractor_real=True)
             return 0
 
@@ -650,31 +666,39 @@ async def _run() -> int:
         print(f"[STAGE 3] stored blueprint {cid} status={stored.status}")
         if gen is not None:
             sv = gen.get("static_validation", {})
-            print(f"          generalization.static_validation={sv.get('outcome')} "
-                  f"uses={sorted(gen.get('uses', []))}")
+            print(
+                f"          generalization.static_validation={sv.get('outcome')} "
+                f"uses={sorted(gen.get('uses', []))}"
+            )
             print(f"          static_validation detail: {sv}")
             if gen.get("template"):
                 print(f"          generalized template: {gen.get('template')}")
         if stored.dedup is not None:
-            print(f"          dedup.action={stored.dedup.action} "
-                  f"canonical_key={stored.dedup.canonical_key}")
+            print(
+                f"          dedup.action={stored.dedup.action} "
+                f"canonical_key={stored.dedup.canonical_key}"
+            )
             # Register for teardown NOW (any dedup write must be cleaned, even if we
             # skip promotion below) so a partial run never strands a corpus artifact.
             infra.created_corpus.append(stored.dedup.canonical_key)
         infra.created_neo4j_ids.append(landing_id(stored))
 
         if stored.status != "candidate" or stored.dedup is None:
-            print(f"[STAGE 3] candidate did NOT auto-land as 'candidate' (status={stored.status}) — "
-                  "the model's plan routed to review or failed static validation. "
-                  "Reporting the traced run; skipping promotion.")
+            print(
+                f"[STAGE 3] candidate did NOT auto-land as 'candidate' (status={stored.status}) — "
+                "the model's plan routed to review or failed static validation. "
+                "Reporting the traced run; skipping promotion."
+            )
             await _flush_and_confirm(provider, model, sid, stages_done=3, extractor_real=True)
             return 0
 
         ckey = stored.dedup.canonical_key
         node_id = landing_id(stored)
         artifact = await infra.corpus_store.get_by_canonical_key(ckey)
-        print(f"[STAGE 3] corpus artifact seeded hit_count={artifact.hit_count} "
-              f"(canonical_key={ckey[:20]}...)")
+        print(
+            f"[STAGE 3] corpus artifact seeded hit_count={artifact.hit_count} "
+            f"(canonical_key={ckey[:20]}...)"
+        )
 
         # ============================================================ STAGE 4 — PROMOTE + LAND
         policy = PromotionPolicy(blueprint_hit_threshold=3)
@@ -708,14 +732,18 @@ async def _run() -> int:
                 break
             await asyncio.sleep(0.5)
         if last_decision is not None:
-            print(f"[STAGE 4] scheduler decision for {cid}: action={last_decision.action} "
-                  f"to_status={getattr(last_decision, 'to_status', None)} "
-                  f"reason={getattr(last_decision, 'reason', None)}")
+            print(
+                f"[STAGE 4] scheduler decision for {cid}: action={last_decision.action} "
+                f"to_status={getattr(last_decision, 'to_status', None)} "
+                f"reason={getattr(last_decision, 'reason', None)}"
+            )
         if validated is None or validated.status != "validated":
             reason = getattr(last_decision, "reason", None) if last_decision else None
-            print(f"[STAGE 4] candidate did NOT reach 'validated' "
-                  f"(status={None if validated is None else validated.status}, "
-                  f"decision_reason={reason}). Reporting the traced run; skipping recall.")
+            print(
+                f"[STAGE 4] candidate did NOT reach 'validated' "
+                f"(status={None if validated is None else validated.status}, "
+                f"decision_reason={reason}). Reporting the traced run; skipping recall."
+            )
             await _flush_and_confirm(provider, model, sid, stages_done=4, extractor_real=True)
             return 0
 
@@ -727,8 +755,10 @@ async def _run() -> int:
                     {"id": node_id},
                 )
             ).single()
-        print(f"[STAGE 4] PROMOTED + LANDED (replay-gated vs live ClickHouse) -> validated; "
-              f":Blueprint {node_id} in neo4j (created_by={row['created_by']}, src={row['src']}) [traced]")
+        print(
+            f"[STAGE 4] PROMOTED + LANDED (replay-gated vs live ClickHouse) -> validated; "
+            f":Blueprint {node_id} in neo4j (created_by={row['created_by']}, src={row['src']}) [traced]"
+        )
 
         # ============================================================ STAGE 5 — RECALL
         query_vector = (await infra.embedder.embed([_RELATED_QUESTION]))[0]
@@ -746,22 +776,33 @@ async def _run() -> int:
                 recalled = await index.recall(query_vector=query_vector, kind="blueprint", k=30)
             landed = next((c for c in recalled if c.id == node_id), None)
             if landed is None:
-                print(f"[STAGE 5] the learned blueprint {node_id} was NOT recalled for the "
-                      "related question (semantic distance) — reporting as-is.")
+                print(
+                    f"[STAGE 5] the learned blueprint {node_id} was NOT recalled for the "
+                    "related question (semantic distance) — reporting as-is."
+                )
             else:
-                print(f"[STAGE 5] RECALLED: '{_RELATED_QUESTION}' surfaced {node_id} "
-                      f"(uses={sorted(landed.uses)}) — it became recallable [traced]")
+                print(
+                    f"[STAGE 5] RECALLED: '{_RELATED_QUESTION}' surfaced {node_id} "
+                    f"(uses={sorted(landed.uses)}) — it became recallable [traced]"
+                )
 
             # BONUS — DEMOTE -> forget
-            with span(tracer, "learning.demote", OpenInferenceSpanKindValues.CHAIN,
-                      {"session.id": sid, "learning.candidate_id": cid}, context=session_ctx):
+            with span(
+                tracer,
+                "learning.demote",
+                OpenInferenceSpanKindValues.CHAIN,
+                {"session.id": sid, "learning.candidate_id": cid},
+                context=session_ctx,
+            ):
                 demote = await scheduler.apply_user_correction(validated)
             demoted = await infra.candidate_store.get(cid)
             after = await index.recall(query_vector=query_vector, kind="blueprint", k=30)
             still = any(c.id == node_id for c in after)
-            print(f"[STAGE 5 BONUS] DEMOTED (action={demote.action}) -> status="
-                  f"{None if demoted is None else demoted.status}; recall now "
-                  f"{'STILL contains' if still else 'EXCLUDES'} {node_id} (forget path)")
+            print(
+                f"[STAGE 5 BONUS] DEMOTED (action={demote.action}) -> status="
+                f"{None if demoted is None else demoted.status}; recall now "
+                f"{'STILL contains' if still else 'EXCLUDES'} {node_id} (forget path)"
+            )
         finally:
             await index.close()
 
@@ -774,8 +815,10 @@ async def _run() -> int:
 async def _flush_and_confirm(provider, model, sid, *, stages_done, extractor_real) -> None:  # noqa: ANN001
     # Flush the BatchSpanProcessor so spans export before we query Phoenix / exit.
     provider.force_flush()
-    print(f"\n[SUMMARY] OpenAI model used: {model!r} | stages completed: {stages_done}/5 | "
-          f"real extractor: {extractor_real}")
+    print(
+        f"\n[SUMMARY] OpenAI model used: {model!r} | stages completed: {stages_done}/5 | "
+        f"real extractor: {extractor_real}"
+    )
     # Give Phoenix a moment to ingest the flushed batch (indexing lag).
     await asyncio.sleep(5.0)
     await _confirm_phoenix(sid)

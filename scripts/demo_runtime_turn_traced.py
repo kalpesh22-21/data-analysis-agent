@@ -10,9 +10,10 @@ REAL runtime composition root with REAL dependencies:
   2. a REAL `RealMCPClient` -> the live l2-mcp (streamable-HTTP), which runs a
      REAL ClickHouse query against the seeded `dbpcm_warehouse.employee` table
      the MCP live tests use,
-  3. the REAL catalog (`load_catalog_handle`, provenance) + a real minimal
-     in-memory session store (`InMemorySessionStore` — the production store,
-     not a fake),
+  3. the REAL catalog rebuilt from the frozen catalog-export snapshot (D75 Wave
+     1b — `databaseSchemaDocs/` is gone; `catalog_source="fixture"` reads the
+     committed export, provenance) + a real minimal in-memory session store
+     (`InMemorySessionStore` — the production store, not a fake),
   4. a scoped JWT minted via the live l2-token IdP (bound to the session id,
      like the MCP live tests / conftest).
 
@@ -135,9 +136,9 @@ def _parse_sse(text: str) -> tuple[list[dict], dict | None, dict | None]:
     event = None
     for line in text.splitlines():
         if line.startswith("event:"):
-            event = line[len("event:"):].strip()
+            event = line[len("event:") :].strip()
         elif line.startswith("data:"):
-            payload = json.loads(line[len("data:"):].strip())
+            payload = json.loads(line[len("data:") :].strip())
             if event == "progress":
                 progress.append(payload)
             elif event == "result":
@@ -202,8 +203,10 @@ async def _confirm_phoenix(trace_id: str | None, *, hide_content: bool) -> None:
         print(f"  Open the Phoenix UI to inspect: {_PHOENIX_UI}")
         return
     spans = [e["node"] for e in target["spans"]["edges"]]
-    print(f"  project: 'data-agent-runtime'  traceCount={target['traceCount']} "
-          f"recordCount={target['recordCount']}  spans retrieved={len(spans)}")
+    print(
+        f"  project: 'data-agent-runtime'  traceCount={target['traceCount']} "
+        f"recordCount={target['recordCount']}  spans retrieved={len(spans)}"
+    )
 
     def _tid(s):  # noqa: ANN001
         return (s.get("context") or {}).get("traceId")
@@ -220,8 +223,10 @@ async def _confirm_phoenix(trace_id: str | None, *, hide_content: bool) -> None:
         if agent_spans:
             chosen = _tid(agent_spans[0])  # spans are startTime-desc → newest first
     if chosen is None:
-        print("  no `agent.turn` trace found yet (ingestion lag?). "
-              f"Open {_PHOENIX_UI} (project: data-agent-runtime).")
+        print(
+            "  no `agent.turn` trace found yet (ingestion lag?). "
+            f"Open {_PHOENIX_UI} (project: data-agent-runtime)."
+        )
         return
 
     members = by_trace.get(chosen, [])
@@ -248,22 +253,28 @@ async def _confirm_phoenix(trace_id: str | None, *, hide_content: bool) -> None:
     # Is there a real OpenInference OpenAI LLM span? (Phoenix may return spanKind
     # lower-cased, so compare case-insensitively.)
     llm = [s for s in members if (s.get("spanKind") or "").upper() == "LLM"]
-    print(f"\n  OpenInference OpenAI LLM span(s) in this trace: {len(llm)}"
-          + (f"  ({', '.join(sorted({s['name'] for s in llm}))})" if llm else ""))
+    print(
+        f"\n  OpenInference OpenAI LLM span(s) in this trace: {len(llm)}"
+        + (f"  ({', '.join(sorted({s['name'] for s in llm}))})" if llm else "")
+    )
 
     # D25 proof: does the LLM span carry raw prompt/completion content?
-    print(f"\n  D25 posture: otlp_hide_llm_content={hide_content} "
-          f"({'DEFAULT (content hidden)' if hide_content else 'OPT-IN reveal (content shown)'})")
+    print(
+        f"\n  D25 posture: otlp_hide_llm_content={hide_content} "
+        f"({'DEFAULT (content hidden)' if hide_content else 'OPT-IN reveal (content shown)'})"
+    )
     for s in llm:
         attrs = _span_attrs(s)
         blob = json.dumps(attrs)
         present = [k for k in _LLM_CONTENT_KEYS if k in attrs]
         carries_question = _QUESTION in blob
         carries_sales = "Sales" in blob
-        print(f"    - {s['name']}: content_attr_keys_present={present or 'NONE'} | "
-              f"carries_question_text={carries_question} | carries_'Sales'={carries_sales} | "
-              f"non-content shape kept: model_name={attrs.get('llm.model_name')!r} "
-              f"total_tokens={attrs.get('llm.token_count.total')}")
+        print(
+            f"    - {s['name']}: content_attr_keys_present={present or 'NONE'} | "
+            f"carries_question_text={carries_question} | carries_'Sales'={carries_sales} | "
+            f"non-content shape kept: model_name={attrs.get('llm.model_name')!r} "
+            f"total_tokens={attrs.get('llm.token_count.total')}"
+        )
     print(f"\n  Open the Phoenix UI: {_PHOENIX_UI}  (project: data-agent-runtime)")
     print("=" * 70)
 
@@ -287,6 +298,11 @@ async def _run() -> int:
         jwks_url=_JWKS_URL,
         jwt_issuer=_TOKEN_ISSUER,
         jwt_audience=_TOKEN_AUDIENCE,
+        # Catalog from the frozen export snapshot (D75 Wave 1b — `databaseSchemaDocs/`
+        # is gone). This demo has no MCP catalog JWT wiring, so read the committed
+        # fixture rather than the live `/catalog/export`; `create_app` then rebuilds
+        # the CatalogHandle from it. Point `CATALOG_FIXTURE_PATH` at a live dump to refresh.
+        catalog_source="fixture",
         # Minimal: no retrieval/embedding/scratch wiring for this bare count turn.
         retrieval_enabled=False,
         scratch_enabled=False,
@@ -366,8 +382,10 @@ async def _run() -> int:
 
     # Flush the BatchSpanProcessor so spans export before we query Phoenix.
     provider.force_flush()  # type: ignore[attr-defined]
-    print(f"\n[SUMMARY] model={model!r} | traceId={trace_id_holder.get('trace_id')} | "
-          f"otlp_hide_llm_content={settings.otlp_hide_llm_content}")
+    print(
+        f"\n[SUMMARY] model={model!r} | traceId={trace_id_holder.get('trace_id')} | "
+        f"otlp_hide_llm_content={settings.otlp_hide_llm_content}"
+    )
     await asyncio.sleep(5.0)  # Phoenix ingestion lag
     await _confirm_phoenix(
         trace_id_holder.get("trace_id"), hide_content=settings.otlp_hide_llm_content

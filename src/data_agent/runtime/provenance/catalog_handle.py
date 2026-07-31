@@ -23,7 +23,13 @@ from types import MappingProxyType
 from typing import Any
 
 from data_agent.catalog import build_sqlglot_schema
-from data_agent.catalog.loader import load_description_cols, load_semantic_catalog
+from data_agent.catalog.loader import (
+    build_sqlglot_schema_from_catalog,
+    load_description_cols,
+    load_description_cols_from_catalog,
+    load_semantic_catalog,
+    load_semantic_catalog_from_catalog,
+)
 
 
 class CatalogHandle:
@@ -81,6 +87,16 @@ class CatalogHandle:
 def load_catalog_handle(schema_dir: Path | str | None = None) -> CatalogHandle:
     """Build the process-wide `CatalogHandle` from `databaseSchemaDocs/` (called once at startup)."""
     return CatalogHandle(build_sqlglot_schema(schema_dir), load_description_cols(schema_dir))
+
+
+def load_catalog_handle_from_catalog(catalog: dict[str, Any]) -> CatalogHandle:
+    """Build a `CatalogHandle` from a parsed catalog dict (the MCP `/catalog/export`
+    `catalog` value, or any `{db.table: <entry>}` mapping). Same projections as the
+    dir path — the schema `{col: type}` plus the authored description-col linkage."""
+    return CatalogHandle(
+        build_sqlglot_schema_from_catalog(catalog),
+        load_description_cols_from_catalog(catalog),
+    )
 
 
 @dataclass(frozen=True)
@@ -146,7 +162,11 @@ def _table_grain(entry: Mapping[str, Any]) -> TableGrain:
     if not isinstance(grain_verifiable, bool):
         grain_verifiable = True
     temporal_raw = entry.get("temporal") or {}
-    temporal = MappingProxyType(dict(temporal_raw)) if isinstance(temporal_raw, dict) else MappingProxyType({})
+    temporal = (
+        MappingProxyType(dict(temporal_raw))
+        if isinstance(temporal_raw, dict)
+        else MappingProxyType({})
+    )
     measures_raw = entry.get("measures") or {}
     measures: dict[str, Measure] = {}
     if isinstance(measures_raw, dict):
@@ -171,11 +191,39 @@ def load_semantic_catalog_handle(schema_dir: Path | str | None = None) -> Semant
     return SemanticCatalogHandle(load_semantic_catalog(schema_dir))
 
 
+def load_semantic_catalog_handle_from_catalog(catalog: dict[str, Any]) -> SemanticCatalogHandle:
+    """Build a `SemanticCatalogHandle` from a parsed catalog dict (the MCP export's
+    `catalog` value). The export IS the full overlay, so this is the identity view
+    the grain/temporal/measures projection reads from."""
+    return SemanticCatalogHandle(load_semantic_catalog_from_catalog(catalog))
+
+
+def load_catalog_handles_from_export(
+    export: dict[str, Any],
+) -> tuple[CatalogHandle, SemanticCatalogHandle]:
+    """Build BOTH the `CatalogHandle` and `SemanticCatalogHandle` from one parsed
+    `/catalog/export` payload (`{"catalog_sha": ..., "catalog": {...}}`).
+
+    This is the single entry point the runtime `CatalogCache` (and the shared test
+    fixture) use to rebuild the two immutable handles from the MCP export instead of
+    re-parsing `databaseSchemaDocs/`. The export's `catalog` value carries the
+    verbatim per-table entries, so the description-col linkage the `CatalogHandle`
+    exposes is derived from the SAME entries — nothing is dropped versus the dir path."""
+    catalog = export["catalog"]
+    return (
+        load_catalog_handle_from_catalog(catalog),
+        load_semantic_catalog_handle_from_catalog(catalog),
+    )
+
+
 __all__ = [
     "CatalogHandle",
     "Measure",
     "SemanticCatalogHandle",
     "TableGrain",
     "load_catalog_handle",
+    "load_catalog_handle_from_catalog",
+    "load_catalog_handles_from_export",
     "load_semantic_catalog_handle",
+    "load_semantic_catalog_handle_from_catalog",
 ]
