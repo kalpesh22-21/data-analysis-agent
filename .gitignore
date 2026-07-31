@@ -1,9 +1,14 @@
 .claude/
 
+# macOS
+.DS_Store
+
 # Secrets — never commit
 .env
 .env.*
 
+system.md
+skills/*
 # Python
 .venv/
 __pycache__/

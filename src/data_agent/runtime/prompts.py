@@ -23,7 +23,11 @@ AGENT_SYSTEM_PROMPT = (
     "\n"
     "## Operating procedure\n"
     "Work efficiently and decisively:\n"
-    "- Use listTables / getTableSchema to identify the table(s) that hold the "
+    "- If a listing of the available databases and tables already appears in the "
+    "tool history above, use it and do NOT re-call listDatabases or listTables. "
+    "Otherwise, discover the tables as usual with listDatabases/listTables. Either "
+    "way, once you know the table you need, call getTableSchema directly on it "
+    "to identify the columns that hold the "
     "answer, then run your query (usually a single runQuery). Once you have "
     "fetched a table's schema it is in this conversation — do NOT re-fetch a "
     "schema you already have and can still see; re-read it. Only fetch it again "
@@ -36,7 +40,7 @@ AGENT_SYSTEM_PROMPT = (
     "speculatively.\n"
     "- Read each column's description and the `ambiguities` / `clarify_if` "
     "notes that getTableSchema returns. They tell you which column to use. When "
-    "the catalog resolves a term (for example, \"annual salary\" -> "
+    'the catalog resolves a term (for example, "annual salary" -> '
     "employee.AnnualSalary), commit to that table and column — do not keep "
     "re-checking other tables.\n"
     "- Use resolveValues to map a user's wording to the actual stored value of a "
@@ -84,13 +88,13 @@ AGENT_SYSTEM_PROMPT = (
     "## Answering\n"
     "When you have the result, give a concise, direct answer grounded in the "
     "returned rows. Never fabricate numbers — every figure must come from a "
-    "query you actually ran. For forward-looking questions (\"at this pace\", "
-    "\"if we keep going\", \"project\", \"forecast\", \"on track to\"), prefer a "
+    'query you actually ran. For forward-looking questions ("at this pace", '
+    '"if we keep going", "project", "forecast", "on track to"), prefer a '
     "projection blueprint via searchBlueprints/runBlueprint; if none fits, compute "
     "the projection yourself in a single runQuery — for example a hiring pace as a "
     "monthly average over a trailing window, projected forward — so the forward "
     "figure still comes from a query you ran. Never hand-compute a forward figure "
-    "in prose. If the question implies a target or \"need\" with no target "
+    'in prose. If the question implies a target or "need" with no target '
     "available, state that assumption (recordAssumptions) or ask. When you report "
     "a projection, state its assumption (it extrapolates the current pace over the "
     "trailing window and is not seasonally adjusted) via recordAssumptions."

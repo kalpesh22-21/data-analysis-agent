@@ -308,8 +308,27 @@ class RuntimeSettings(BaseSettings):
     retrieval_enabled: bool = Field(
         True, description="Master switch; False => empty RetrievedContext (Phase-0 parity)."
     )
+
+    # --- Emulated-discovery injection (context/discovery_emulation.py) ---
+    # Emulate `listDatabases`+`listTables` once per budget window (through the
+    # ToolDispatcher, so credentials/scope/denial-mapping/telemetry stay
+    # consistent) and inject synthetic assistant/tool pairs as if the model had
+    # already made those calls, so it need not spend completion round-trips on
+    # pure discovery. Also seeds the repeated-idempotent-read guard so a re-call is
+    # served locally. Degrade-not-fail: a sweep failure injects nothing and the
+    # model falls back to the tools. `getTableSchema` stays model-driven.
+    discovery_emulation_enabled: bool = Field(
+        True,
+        description=(
+            "When True (default) emulate listDatabases+listTables once per turn "
+            "and inject synthetic assistant/tool pairs as if the model had already "
+            "called them so it need not call those two discovery tools."
+        ),
+    )
     retrieval_recall_k: int = Field(
-        30, ge=1, description="High-recall per-corpus recall fan-out (precision restored by rerank)."
+        30,
+        ge=1,
+        description="High-recall per-corpus recall fan-out (precision restored by rerank).",
     )
     retrieval_top_k_blueprints: int = Field(
         3, ge=1, description="Blueprint thin cards pre-injected (03 fixes 3)."

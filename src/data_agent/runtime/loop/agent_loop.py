@@ -81,7 +81,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
@@ -106,8 +106,17 @@ from data_agent.runtime.session.models import (
 from data_agent.runtime.session.store import SessionStore
 
 from .budget_guard import new_budget_window
+from .read_guard import IDEMPOTENT_READ_TOOLS, idempotent_read_signature
+
+if TYPE_CHECKING:
+    from data_agent.runtime.context.discovery_emulation import EmulatedDiscovery
 
 ToolsProvider = Callable[[RuntimeCredentials], Awaitable[list[dict[str, Any]]]]
+# Emulated-discovery injection (context/discovery_emulation.py): the per-window
+# sweep that emulates `listDatabases`+`listTables` and returns an `EmulatedDiscovery`
+# (the synthetic rendered entries + the guard signatures, or an empty result to
+# degrade). `None` provider (default) = feature absent, byte-identical.
+EmulatedDiscoveryProvider = Callable[[RuntimeCredentials], Awaitable["EmulatedDiscovery"]]
 
 _logger = logging.getLogger(__name__)
 
@@ -152,31 +161,15 @@ _RUNTIME_TOOL_UNAVAILABLE_MESSAGE: dict[str, str] = {
     ),
 }
 
-TurnStatus = Literal[
-    "done", "paused_ask_user", "paused_budget_cap", "stopped_hard_ceiling"
-]
+TurnStatus = Literal["done", "paused_ask_user", "paused_budget_cap", "stopped_hard_ceiling"]
 
 _BUDGET_CAP_QUESTION = "This is taking a while — continue, refine, or stop?"
 _BUDGET_CAP_OPTIONS = ["continue", "refine", "stop"]
 
-# Idempotent, side-effect-free read tools whose result depends ONLY on their
-# arguments — an identical repeat within a turn is guaranteed to return the same
-# already-served data (it is in the history above). The repeated-idempotent-read
-# guard (generalizing D94) declines to re-dispatch such a repeat and injects a
-# data-free "you already have this" nudge instead. runQuery/runBlueprint/askUser/
-# resolveValues are deliberately EXCLUDED — a repeated runQuery may be a distinct
-# legitimate step and is never guarded here.
-_IDEMPOTENT_READ_TOOLS = frozenset(
-    {"getTableSchema", "listTables", "listDatabases", "explainQuery"}
-)
-
-
-def _idempotent_read_signature(tool_name: str, arguments: Mapping[str, Any]) -> tuple[str, str]:
-    """The content key that identifies an already-served idempotent read: the
-    tool name plus its canonicalized arguments (stable key order, `str`-coerced
-    for any non-JSON-native arg). Two calls with the same key return the same
-    data by construction, so the second is a re-fetch."""
-    return (tool_name, json.dumps(dict(arguments), sort_keys=True, default=str))
+# The repeated-idempotent-read guard primitives (`IDEMPOTENT_READ_TOOLS` +
+# `idempotent_read_signature`) now live in `loop/read_guard.py` — a neutral leaf
+# shared with `context/discovery_emulation.py` so that module no longer reaches
+# into this one's private namespace at runtime. Imported at the top of this file.
 
 
 def _repeated_read_guard_event(
@@ -211,8 +204,7 @@ def _repeated_read_guard_event(
         "guard_reason": "already_served_this_turn",
         "dedup_target": dedup_target,
         "note": (
-            f"duplicate {tool_name}({dedup_target}) — already served this turn; "
-            "not re-dispatched"
+            f"duplicate {tool_name}({dedup_target}) — already served this turn; not re-dispatched"
         ),
     }
     if db:
@@ -435,12 +427,21 @@ class AgentLoop:
         observer: ToolObserver = _default_observer,
         runtime_tools: Mapping[str, RuntimeTool] | None = None,
         blueprint_executor: Any = None,
+        discovery_emulation_provider: EmulatedDiscoveryProvider | None = None,
     ) -> None:
         self._model_client = model_client
         self._tool_dispatcher = tool_dispatcher
         self._context_assembler = context_assembler
         self._session_store = session_store
         self._tools_provider = tools_provider
+        # Emulated-discovery injection (context/discovery_emulation.py): when wired
+        # (app.py, gated on `discovery_emulation_enabled`), `_run_loop` invokes this
+        # ONCE per budget window BEFORE the model loop to emulate `listDatabases`+
+        # `listTables` and splices the synthetic assistant/tool pairs into every
+        # per-round-trip rebuild (ephemeral) AND seeds the repeated-idempotent-read
+        # guard with their signatures. `None` (default, Layer-1 loop tests) =
+        # feature absent → byte-identical.
+        self._discovery_emulation_provider = discovery_emulation_provider
         # The runtime-tool registry (read-tools-design §2): model-facing tools
         # implemented in the runtime (`resolveValues` + the three read tools),
         # intercepted here and never dispatched to the MCP under their own name.
@@ -523,18 +524,14 @@ class AgentLoop:
             if normalized.startswith("stop"):
                 return TurnOutcome(
                     status="done",
-                    assistant_text=(
-                        "Stopping here — here is what I found before the budget cap."
-                    ),
+                    assistant_text=("Stopping here — here is what I found before the budget cap."),
                     pending_question=None,
                     tool_calls_made=0,
                     # UI Slice 1: a `done` return — surface the turn's lineage from
                     # the trail (the fail-closed source of truth). The in-loop sql/
                     # table/blueprint accumulators are gone with the prior window, so
                     # they stay `None` (best-effort partial, §1 nullability table).
-                    provenance=await self._compute_turn_provenance_union(
-                        session_id, turn_index
-                    ),
+                    provenance=await self._compute_turn_provenance_union(session_id, turn_index),
                 )
             window_count = prior_window_count + 1  # D55: "continue"/"refine" grants a fresh window
         else:
@@ -586,6 +583,7 @@ class AgentLoop:
         user_id: str | None,
         retrieval_memo: dict[tuple[str, str], Any],
         withheld_call_ids: set[str],
+        discovery_canonical: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """*current_turn_index* (turn-scoped continuity, 2026-07-01): passed
         through to `ContextAssembler.assemble` so the CURRENT in-progress
@@ -608,6 +606,18 @@ class AgentLoop:
         as *retrieval_memo* — a `set[str]` created fresh in `_run_loop` so the
         `loop_result_withheld_provenance` diagnostic fires at most ONCE per
         stranded `tool_call_id` despite the per-round-trip rebuild.
+
+        *discovery_canonical* (emulated-discovery injection): the per-window
+        synthetic `assistant(tool_calls=...)+tool(result)` pairs for
+        `listDatabases`+`listTables`, already run through
+        `_tool_trail_entry_to_canonical` (or `None`/empty). Computed ONCE in
+        `_run_loop` and threaded in (never recomputed per round-trip, D45). It is
+        spliced in AFTER the leading run of `role=="system"` messages (base prompt /
+        retrieval / summary) and BEFORE the real trail assistant/tool pairs + the
+        appended conversation, so the emulated reads read as the earliest tool
+        history, ahead of the user's question — mirroring how real trail pairs
+        already precede the convo. `None`/empty (feature off / degraded) leaves the
+        message list byte-identical.
         """
         assembled = await self._context_assembler.assemble(
             session_id,
@@ -620,6 +630,36 @@ class AgentLoop:
             observer=self._observer,
         )
         canonical = _assembled_to_canonical(assembled.messages)
+        if discovery_canonical:
+            # The emulated pairs are spliced in AFTER `_assembled_to_canonical`'s
+            # §6.2 duplicate-`tool_call_id` dedup already ran over the real trail, so
+            # a (pathological) persisted trail entry whose id collided with an
+            # `emulated-listTables-<db>` id would otherwise emit TWO `tool` messages
+            # with one id → an API 400 that poisons every round-trip. Drop any
+            # emulated PAIR whose `tool_call_id` is already present in the real
+            # canonical list (keep the real one), so the spliced result stays
+            # id-unique by construction.
+            existing_tool_call_ids = {m["tool_call_id"] for m in canonical if m["role"] == "tool"}
+            deduped_discovery: list[dict[str, Any]] = []
+            # discovery_canonical is a flat run of [assistant, tool] pairs; the tool
+            # message of each pair carries the shared id.
+            for pair_start in range(0, len(discovery_canonical), 2):
+                pair = discovery_canonical[pair_start : pair_start + 2]
+                tool_call_id = next(
+                    (m.get("tool_call_id") for m in pair if m["role"] == "tool"), None
+                )
+                if tool_call_id in existing_tool_call_ids:
+                    _logger.warning(
+                        "skipping emulated discovery pair with tool_call_id %r — it collides "
+                        "with a real trail entry; keeping the real one to stay API-valid",
+                        tool_call_id,
+                    )
+                    continue
+                deduped_discovery.extend(pair)
+            insert_at = 0
+            while insert_at < len(canonical) and canonical[insert_at]["role"] == "system":
+                insert_at += 1
+            canonical[insert_at:insert_at] = deduped_discovery
         doc = await self._session_store.get_or_create_session(session_id)
         # D44 (2026-07-01 clarification, B1): the same replay scope-filter
         # that gates the tool trail also gates conversational ASSISTANT
@@ -653,10 +693,7 @@ class AgentLoop:
             # is a separate entry whose provenance is already unioned here — so it
             # must NOT poison this union to `None` and drop the turn's answer from
             # future-turn replay.
-            if (
-                entry.status == "ok"
-                and entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE
-            ):
+            if entry.status == "ok" and entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE:
                 continue
             # A successful `recordAssumptions` entry carries NO warehouse data (it
             # only echoes the model's plain-English assumptions) and deliberately
@@ -673,9 +710,7 @@ class AgentLoop:
             union.update(entry.provenance)
         return frozenset(union)
 
-    async def _compute_turn_assumptions(
-        self, session_id: str, turn_index: int
-    ) -> list[str]:
+    async def _compute_turn_assumptions(self, session_id: str, turn_index: int) -> list[str]:
         """Reconstruct the plain-English assumptions recorded at *turn_index* from
         the persisted `recordAssumptions` trail entries (deduped, first-occurrence
         order, via the SAME `fold_assumptions` the loop and `session_history`
@@ -822,9 +857,7 @@ class AgentLoop:
             )
             tool_result = self._blueprint_outcome_to_tool_result(outcome)
         except Exception:
-            _logger.exception(
-                "runBlueprint resume raised (session=%s)", credentials.session_id
-            )
+            _logger.exception("runBlueprint resume raised (session=%s)", credentials.session_id)
             tool_result = _runtime_tool_internal_error("runBlueprint")
         self._observer(
             "tool_dispatch_ok" if tool_result.status == "ok" else "tool_dispatch_error",
@@ -1052,6 +1085,41 @@ class AgentLoop:
         # catalogue is scope-independent; this is not a live MCP round-trip
         # on every call in practice, just a credentialed one the first time.
         tools = await self._tools_provider(credentials)
+
+        # Emulated-discovery injection (context/discovery_emulation.py): emulate
+        # `listDatabases`+`listTables` ONCE per budget window, BEFORE the model loop.
+        # Both run() and resume() re-enter `_run_loop`, so "once per window" is the
+        # right cadence. It is computed HERE — next to `_tools_provider`, DELIBERATELY
+        # ABOVE `new_budget_window(...)` — so its 1 + N MCP round-trips run OUTSIDE the
+        # budget window's wall clock and never consume `max_wall_clock_seconds` (nor
+        # re-charge it on every `continue` resume): this injected context is "never
+        # budgeted". Two effects, both ephemeral (never persisted):
+        #   1. `discovery_canonical` — the synthetic assistant/tool pairs, threaded
+        #      into every per-round-trip rebuild below as the earliest tool history.
+        #   2. `emulation_read_signatures` — merged into `seen_read_calls` below to
+        #      seed the repeated-idempotent-read guard so a model RE-call of either
+        #      tool is served locally (the "already served" nudge) instead of hitting
+        #      the MCP.
+        # Degrade-not-fail: any failure → no pairs + no seed, and the model falls
+        # back to calling the two tools itself. D5: the sweep goes through the
+        # dispatcher (credentials attached only at the MCP transport boundary),
+        # never through the context assembler.
+        discovery_canonical: list[dict[str, Any]] = []
+        emulation_read_signatures: set[tuple[str, str]] = set()
+        if self._discovery_emulation_provider is not None:
+            emulation: EmulatedDiscovery | None = None
+            try:
+                emulation = await self._discovery_emulation_provider(credentials)
+            except Exception:
+                _logger.exception(
+                    "discovery-emulation provider failed (session=%s) — injecting nothing",
+                    credentials.session_id,
+                )
+            if emulation is not None:
+                for rendered_entry in emulation.entries:
+                    discovery_canonical.extend(_tool_trail_entry_to_canonical(rendered_entry))
+                emulation_read_signatures = emulation.read_signatures
+
         guard = new_budget_window(
             max_iterations=self._max_loop_iterations,
             max_wall_clock_seconds=self._max_wall_clock_seconds,
@@ -1082,11 +1150,15 @@ class AgentLoop:
             if (
                 prior_entry.turn_index == turn_index
                 and prior_entry.status == "ok"
-                and prior_entry.tool_name in _IDEMPOTENT_READ_TOOLS
+                and prior_entry.tool_name in IDEMPOTENT_READ_TOOLS
             ):
                 seen_read_calls.add(
-                    _idempotent_read_signature(prior_entry.tool_name, prior_entry.args)
+                    idempotent_read_signature(prior_entry.tool_name, prior_entry.args)
                 )
+        # Seed the guard with the emulated-discovery signatures swept above (outside
+        # the budget window) so a model re-call of listDatabases/listTables is served
+        # locally, not re-dispatched to the MCP. Empty when the feature is off/degraded.
+        seen_read_calls |= emulation_read_signatures
         # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §3):
         # turn-window-local accumulators for the enriched `result` event, same
         # lifecycle as the memos above (fresh per window, not persisted).
@@ -1112,6 +1184,7 @@ class AgentLoop:
                 user_id=None,
                 retrieval_memo=retrieval_memo,
                 withheld_call_ids=withheld_call_ids,
+                discovery_canonical=discovery_canonical,
             )
             self._observer("loop_model_call_start", {"window": window_count})
             result = await model_client.send_turn(canonical_messages, tools)
@@ -1124,9 +1197,7 @@ class AgentLoop:
                 # like the trail itself) AND the enriched `result` event's lineage.
                 # Computed ONCE here (the single fail-closed source of truth; do
                 # not re-derive in-loop).
-                turn_provenance = await self._compute_turn_provenance_union(
-                    session_id, turn_index
-                )
+                turn_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
                 if result.assistant_text:
                     await self._session_store.append_message(
                         session_id,
@@ -1156,9 +1227,7 @@ class AgentLoop:
                     assumptions=turn_assumptions or None,
                 )
 
-            ask_user_call = next(
-                (tc for tc in result.tool_calls if tc.name == "askUser"), None
-            )
+            ask_user_call = next((tc for tc in result.tool_calls if tc.name == "askUser"), None)
             if ask_user_call is not None:
                 question = str(ask_user_call.arguments.get("question", ""))
                 options = ask_user_call.arguments.get("options")
@@ -1212,9 +1281,9 @@ class AgentLoop:
                 # (`guard.record_iteration` below), so the worst case remains
                 # windows × iterations. The real served read stays in history under
                 # its own tool_call_id.
-                is_idempotent_read = tool_call.name in _IDEMPOTENT_READ_TOOLS
+                is_idempotent_read = tool_call.name in IDEMPOTENT_READ_TOOLS
                 read_sig = (
-                    _idempotent_read_signature(tool_call.name, tool_call.arguments)
+                    idempotent_read_signature(tool_call.name, tool_call.arguments)
                     if is_idempotent_read
                     else None
                 )
@@ -1396,4 +1465,10 @@ class AgentLoop:
             # Under budget — loop back to 3a within the same window.
 
 
-__all__ = ["AgentLoop", "RuntimeTool", "ToolsProvider", "TurnOutcome"]
+__all__ = [
+    "AgentLoop",
+    "EmulatedDiscoveryProvider",
+    "RuntimeTool",
+    "ToolsProvider",
+    "TurnOutcome",
+]

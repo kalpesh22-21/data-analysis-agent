@@ -15,6 +15,7 @@ def test_locked_defaults() -> None:
     assert settings.max_wall_clock_seconds == 60
     assert settings.max_budget_windows == 3
     assert settings.max_tool_calls_per_iteration == 8  # S3 hardening default
+    assert settings.discovery_emulation_enabled is True
 
 
 def test_history_token_budget_derivation() -> None:

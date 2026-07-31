@@ -244,17 +244,19 @@ class ContextAssembler:
 
             # 0b. base system prompt (always-present leading instruction): the
             # LAST prepend so it precedes the retrieval block and history. It is
-            # inserted here — after `render_messages`/compaction has already run
-            # and the budget walk is complete — so it can never be trimmed by the
-            # history-token budget. As a static constant it keeps `assemble`
-            # byte-identical across the D45 per-round-trip rebuild/resume.
+            # inserted here — after `render_messages`/compaction has
+            # already run and the budget walk is complete — so it can never be
+            # trimmed by the history-token budget. As a static constant it keeps
+            # `assemble` byte-identical across the D45 per-round-trip rebuild/resume.
             if self._base_system_prompt:
                 messages.insert(0, {"role": "system", "content": self._base_system_prompt})
 
             dropped_by_scope_count = len(raw_trail) - len(in_scope)
             if current_span is not None:
                 current_span.set_attribute("dropped_by_scope_count", dropped_by_scope_count)
-                current_span.set_attribute("compaction_applied", compaction.summary_text is not None)
+                current_span.set_attribute(
+                    "compaction_applied", compaction.summary_text is not None
+                )
                 current_span.set_attribute("compaction_cache_hit", compaction.cache_hit)
                 current_span.set_attribute("retrieved_blueprints", retrieved_counts[0])
                 current_span.set_attribute("retrieved_knowledge", retrieved_counts[1])
