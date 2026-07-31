@@ -1,0 +1,31 @@
+{{/*
+Shared ConfigMap of NON-SECRET env, mounted into every workload via envFrom.
+Secret keys are intentionally kept out of here (see secret.yaml). The UI-only
+derived values (RUNTIME_URL / INBOX_SERVICE_URL) are computed from the release
+name when not explicitly set in .Values.config.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "data-agent.configMapName" . }}
+  labels:
+    {{- include "data-agent.labels" . | nindent 4 }}
+data:
+  {{- range $key, $val := .Values.config }}
+  {{- /* RUNTIME_URL and INBOX_SERVICE_URL are handled below via helpers */}}
+  {{- if and (ne $key "RUNTIME_URL") (ne $key "INBOX_SERVICE_URL") }}
+  {{- if ne (toString $val) "" }}
+  {{ $key }}: {{ $val | quote }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- if .Values.components.runtime.enabled }}
+  RUNTIME_URL: {{ include "data-agent.runtimeUrl" . | quote }}
+  {{- else if .Values.config.RUNTIME_URL }}
+  RUNTIME_URL: {{ .Values.config.RUNTIME_URL | quote }}
+  {{- end }}
+  {{- if .Values.components.inbox.enabled }}
+  INBOX_SERVICE_URL: {{ include "data-agent.inboxServiceUrl" . | quote }}
+  {{- else if .Values.config.INBOX_SERVICE_URL }}
+  INBOX_SERVICE_URL: {{ .Values.config.INBOX_SERVICE_URL | quote }}
+  {{- end }}

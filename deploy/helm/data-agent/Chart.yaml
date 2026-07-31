@@ -1,0 +1,34 @@
+apiVersion: v2
+name: data-agent
+description: >-
+  Helm chart for the data-agent HR data-analysis agent (Python/FastAPI).
+  Deploys the first-party workloads that all run from a SINGLE application
+  image built from this repo: the core agent runtime API, the UI
+  backend-for-frontend, the learning sweeper + consumer background daemons,
+  and an optional review-inbox HTTP service. External backing services
+  (ClickHouse, MCP, token IdP, OpenAI, Couchbase, Neo4j, Redis, embedding /
+  reranker APIs) are NOT deployed by this chart — they are external infra and
+  must be provisioned separately and pointed to via config values + secrets.
+type: application
+
+# Chart version — bump on every chart change (SemVer).
+version: 0.1.0
+
+# The application version this chart deploys by default. Used as the default
+# container image tag when `image.tag` is not overridden.
+appVersion: "0.1.0"
+
+# Tested against Kubernetes 1.24+ (uses networking.k8s.io/v1 Ingress,
+# autoscaling/v2 HPA, policy/v1 PodDisruptionBudget).
+kubeVersion: ">=1.24.0-0"
+
+home: https://github.com/example/data-agent
+sources:
+  - https://github.com/example/data-agent
+maintainers:
+  - name: data-agent maintainers
+keywords:
+  - hr
+  - data-analysis
+  - agent
+  - fastapi

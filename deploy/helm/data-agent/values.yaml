@@ -1,0 +1,372 @@
+# Default values for data-agent.
+# This is a YAML-formatted file.
+# Every value is documented inline. See deploy/helm/README.md for the big picture.
+#
+# IMPORTANT: All of the first-party workloads (runtime, ui, learning-sweeper,
+# learning-consumer, inbox) run from ONE image built from this repo. External
+# backing services (ClickHouse, MCP/clickhouse-api, token IdP, OpenAI,
+# Couchbase, Neo4j, Redis, embedding/reranker APIs) are NOT deployed by this
+# chart — provision them separately and point to them via `config` + `secrets`.
+
+# -- Override the chart name portion of resource names.
+nameOverride: ""
+# -- Override the full name of resources (defaults to <release>-data-agent).
+fullnameOverride: ""
+
+image:
+  # -- Container image repository for ALL workloads.
+  #    There is no published image yet — you MUST build and push your own image
+  #    from this repo (see deploy/helm/README.md) and set this value.
+  repository: ghcr.io/example/data-agent
+  # -- Image tag. Defaults to the chart appVersion when left empty.
+  tag: ""
+  # -- Image pull policy (IfNotPresent | Always | Never).
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for private registries (list of {name: <secret>}).
+imagePullSecrets: []
+#  - name: regcred
+
+serviceAccount:
+  # -- Create a dedicated ServiceAccount used by all pods.
+  create: true
+  # -- Name of the ServiceAccount. Generated from the fullname when empty.
+  name: ""
+  # -- Annotations to add to the ServiceAccount (e.g. IRSA / workload identity).
+  annotations: {}
+  # -- Automount the ServiceAccount API token into pods. Default false: no
+  #    workload talks to the Kubernetes API, so the token is not needed. Also
+  #    enforced at the pod level so the posture holds when create=false.
+  automount: false
+
+# -- Global pod annotations applied to every workload (merged with the
+#    config/secret checksum annotations and any per-component podAnnotations).
+podAnnotations: {}
+
+# -- Global pod-level securityContext (fsGroup etc.). Sensible non-root defaults.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Global container-level securityContext. Hardened by default; the app runs
+#    read-only-root with an emptyDir mounted at /tmp for scratch writes.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Global default resource requests/limits. Override per component under
+#    `components.<name>.resources`. Empty by default so the chart installs on
+#    small clusters; SET THESE in production (see values-example.yaml).
+resources: {}
+#  requests:
+#    cpu: 100m
+#    memory: 256Mi
+#  limits:
+#    cpu: "1"
+#    memory: 1Gi
+
+# -- Global scheduling controls; each is overridable per component.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Global extra environment variables (list of core-v1 EnvVar), applied to
+#    every workload. Explicit `env` entries always take precedence over values
+#    from envFrom (ConfigMap/Secret), regardless of ordering. Per-component
+#    `env` is concatenated after these. Example:
+#    - name: LOG_LEVEL
+#      value: info
+env: []
+
+# ---------------------------------------------------------------------------
+# Non-secret configuration -> rendered into a shared ConfigMap and mounted via
+# `envFrom` into every workload. 1:1 with the app's pydantic-settings fields
+# (uppercased env-var names). Leave a value empty ("") to omit it and fall back
+# to the application's built-in default.
+# ---------------------------------------------------------------------------
+config:
+  # --- runtime / agent core ---
+  # -- URL of the MCP (clickhouse-api) service. EXTERNAL.
+  MCP_URL: "http://clickhouse-api:8000/mcp"
+  # -- Where the semantic catalog is sourced from: "mcp" (live GET
+  #    /catalog/export off the MCP host) or "fixture" (offline JSON on disk).
+  CATALOG_SOURCE: "mcp"
+  # -- Explicit base URL of the MCP catalog export (…/catalog; /export is
+  #    appended). Empty = derive scheme+host from MCP_URL. SET THIS when the MCP
+  #    is behind a path-routed ingress (e.g. https://host/prefix/mcp), because
+  #    the derivation DISCARDS the path prefix and would otherwise target
+  #    https://host/catalog.
+  CATALOG_API_URL: ""
+  # -- Path to the offline catalog-export JSON, used only when
+  #    CATALOG_SOURCE="fixture". Empty = the committed repo fixture.
+  CATALOG_FIXTURE_PATH: ""
+  # -- Enable the scratch workspace feature.
+  SCRATCH_ENABLED: "true"
+  # -- OpenAI (or compatible) chat model name.
+  OPENAI_MODEL: "gpt-4o"
+  # -- OpenAI (or compatible) base URL. Empty = OpenAI default.
+  OPENAI_BASE_URL: ""
+  # -- Model context window (tokens) the runtime plans against.
+  MODEL_CONTEXT_WINDOW: "128000"
+  # -- Couchbase connection string (primary session store). EXTERNAL.
+  COUCHBASE_CONNECTION_STRING: "couchbase://couchbase"
+  # -- Couchbase username.
+  COUCHBASE_USERNAME: "data_agent"
+  # -- Couchbase bucket for sessions.
+  COUCHBASE_BUCKET: "data_agent"
+  # -- OTLP traces endpoint. Empty disables OTLP export.
+  OTLP_ENDPOINT: ""
+  # -- Service name reported to the OTLP collector.
+  OTLP_SERVICE_NAME: "data-agent-runtime"
+  # -- JWKS URL used to validate inbound JWTs. EXTERNAL (token IdP).
+  JWKS_URL: "http://token:8000/.well-known/jwks.json"
+  # -- Expected JWT issuer.
+  JWT_ISSUER: "https://token.example.com"
+  # -- Expected JWT audience.
+  JWT_AUDIENCE: "data-agent"
+  # -- Token service (IdP) token endpoint. EXTERNAL.
+  TOKEN_SERVICE_URL: "http://token:8000/token"
+  # -- Neo4j bolt URL (retrieval graph). EXTERNAL.
+  NEO4J_URL: "bolt://neo4j:7687"
+  # -- Neo4j username.
+  NEO4J_USERNAME: "neo4j"
+  # -- Embedding API base URL. EXTERNAL.
+  EMBEDDING_API_URL: "http://embedding:8080/embed"
+  # -- Embedding model name.
+  EMBEDDING_MODEL: "text-embedding-3-small"
+  # -- Reranker API base URL. EXTERNAL.
+  RERANKER_API_URL: "http://reranker:8080/rerank"
+  # -- Reranker model name.
+  RERANKER_MODEL: "rerank-english-v3"
+  # -- Enable retrieval-augmented planning.
+  RETRIEVAL_ENABLED: "true"
+  # -- Session TTL in seconds.
+  SESSION_TTL_SECONDS: "3600"
+
+  # --- learning (sweeper + consumer) ---
+  # -- Redis URL backing the learning job stream. EXTERNAL.
+  LEARNING_REDIS_URL: "redis://redis:6379/0"
+  # -- Redis stream key for learning jobs.
+  LEARNING_JOBS_STREAM: "learning:jobs"
+  # -- Redis consumer group name.
+  LEARNING_CONSUMER_GROUP: "learning-consumers"
+  # -- Idle threshold (seconds) before the sweeper enqueues a session.
+  LEARNING_IDLE_THRESHOLD_SECONDS: "900"
+  # -- Sweeper scan interval (seconds).
+  LEARNING_SWEEP_INTERVAL_SECONDS: "60"
+  # -- Master enable flag for the learning loop.
+  LEARNING_ENABLED: "true"
+  # -- Extractor model used by the consumer.
+  LEARNING_EXTRACTOR_MODEL: "gpt-4o"
+  # -- Couchbase connection string for the learning AUDIT bucket. EXTERNAL.
+  LEARNING_AUDIT_CONNECTION_STRING: "couchbase://couchbase"
+  LEARNING_AUDIT_BUCKET: "learning_audit"
+  LEARNING_AUDIT_USERNAME: "learning_audit"
+  # -- Couchbase connection string for the learning CANDIDATES bucket. EXTERNAL.
+  LEARNING_CANDIDATES_CONNECTION_STRING: "couchbase://couchbase"
+  LEARNING_CANDIDATES_BUCKET: "learning_candidates"
+  LEARNING_CANDIDATES_USERNAME: "learning_candidates"
+  # -- Couchbase connection string for the learning CORPUS bucket. EXTERNAL.
+  LEARNING_CORPUS_CONNECTION_STRING: "couchbase://couchbase"
+  LEARNING_CORPUS_BUCKET: "learning_corpus"
+  LEARNING_CORPUS_USERNAME: "learning_corpus"
+
+  # --- ui (backend-for-frontend) ---
+  # -- Max upload size (bytes) accepted by the UI BFF. Default 8 MiB.
+  UPLOAD_MAX_BYTES: "8388608"
+  # -- RUNTIME_URL for the UI. Leave empty to auto-derive the in-cluster runtime
+  #    Service URL from the release name. Override to point elsewhere.
+  RUNTIME_URL: ""
+  # -- INBOX_SERVICE_URL for the UI BFF proxy. Leave empty to auto-derive the
+  #    in-cluster inbox Service URL from the release name (used when
+  #    components.inbox.enabled=true).
+  INBOX_SERVICE_URL: ""
+
+# ---------------------------------------------------------------------------
+# Secret configuration.
+#
+# In PRODUCTION prefer `existingSecret`: create the Secret out-of-band (sealed
+# secrets / external-secrets / vault) with the KEYS listed below, then set
+# `secrets.existingSecret: <name>`. When `existingSecret` is set the
+# chart-managed Secret is NOT rendered and pods reference the named Secret.
+#
+# For dev/testing you may inline values under `secrets.data` — they will be
+# base64-encoded into a chart-managed Secret. NEVER commit real secrets here.
+# ---------------------------------------------------------------------------
+secrets:
+  # -- Name of a pre-existing Secret to use instead of the chart-managed one.
+  #    When set, `secrets.data` is ignored and NOT rendered.
+  existingSecret: ""
+  # -- Inline secret values (only used when existingSecret is empty). Keys map
+  #    1:1 to env-var names. Empty-string values are SKIPPED (not injected), so
+  #    the app falls back to any ambient/default value rather than seeing "".
+  data:
+    OPENAI_API_KEY: ""
+    COUCHBASE_PASSWORD: ""
+    NEO4J_PASSWORD: ""
+    TOKEN_ISSUER_API_KEY: ""
+    EMBEDDING_API_KEY: ""
+    RERANKER_API_KEY: ""
+    LEARNING_EXTRACTOR_API_KEY: ""
+    LEARNING_AUDIT_PASSWORD: ""
+    LEARNING_CANDIDATES_PASSWORD: ""
+    LEARNING_CORPUS_PASSWORD: ""
+    REVIEWER_TOKEN: ""
+
+# ---------------------------------------------------------------------------
+# Per-workload configuration.
+#
+# Each component may override: enabled, replicaCount, image, resources,
+# nodeSelector, tolerations, affinity, podAnnotations, podSecurityContext,
+# securityContext, and env (extra). Anything left null/empty falls back to the
+# global values above.
+# ---------------------------------------------------------------------------
+components:
+
+  # ----- runtime: the core agent API (main scalable Deployment) -----
+  runtime:
+    enabled: true
+    # -- Replica count (ignored when autoscaling.enabled=true).
+    replicaCount: 1
+    image: {}          # {repository, tag, pullPolicy} override; falls back to global
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    # -- Extra env (list of core-v1 EnvVar), appended after envFrom.
+    env: []
+    service:
+      # -- Service type for the runtime API.
+      type: ClusterIP
+      # -- Service port (also the container port; readiness/liveness TCP probe).
+      port: 8000
+      annotations: {}
+    autoscaling:
+      # -- Enable an HPA for the runtime Deployment.
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+      # -- Optional memory target (set to enable a memory metric).
+      targetMemoryUtilizationPercentage: 0
+    podDisruptionBudget:
+      # -- Enable a PodDisruptionBudget for the runtime Deployment.
+      enabled: false
+      minAvailable: 1
+      # maxUnavailable: 1   # set one of minAvailable / maxUnavailable
+
+  # ----- ui: thin backend-for-frontend (gets the optional Ingress) -----
+  ui:
+    enabled: true
+    replicaCount: 1
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+    service:
+      type: ClusterIP
+      port: 3000
+      annotations: {}
+    podDisruptionBudget:
+      enabled: false
+      minAvailable: 1
+
+  # ----- learning-sweeper: periodic idle-scan daemon (DO NOT scale) -----
+  # Replica count is hardcoded to 1 in the template: this is a periodic
+  # idle-scan sweeper; running >1 replica would double-enqueue.
+  learningSweeper:
+    enabled: true
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+
+  # ----- learning-consumer: Redis Streams consumer group (scalable) -----
+  learningConsumer:
+    enabled: true
+    # -- Each replica is a distinct Redis Streams consumer; safe to scale.
+    replicaCount: 1
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+    autoscaling:
+      # -- Enable an HPA for the consumer Deployment.
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 8
+      targetCPUUtilizationPercentage: 70
+      targetMemoryUtilizationPercentage: 0
+
+  # ----- inbox: review-inbox HTTP service (OPTIONAL, off by default) -----
+  inbox:
+    # -- Disabled by default; the app is dormant unless REVIEW_INBOX_ENABLED=1
+    #    (this chart sets that env automatically when enabled).
+    enabled: false
+    replicaCount: 1
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+    service:
+      type: ClusterIP
+      # -- Inbox HTTP port (matches INBOX_SERVICE_PORT set by the chart).
+      port: 8100
+      annotations: {}
+
+# ---------------------------------------------------------------------------
+# Ingress for the UI backend-for-frontend. Standard helm-create style.
+# ---------------------------------------------------------------------------
+ingress:
+  # -- Enable an Ingress in front of the ui Service.
+  enabled: false
+  # -- IngressClass name (e.g. nginx, traefik).
+  className: ""
+  # -- Ingress annotations.
+  annotations: {}
+    # kubernetes.io/tls-acme: "true"
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: data-agent.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  # -- TLS configuration (list of {secretName, hosts[]}).
+  tls: []
+    # - secretName: data-agent-tls
+    #   hosts:
+    #     - data-agent.example.com

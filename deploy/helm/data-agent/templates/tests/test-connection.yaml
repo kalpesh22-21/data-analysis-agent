@@ -1,0 +1,32 @@
+{{- if .Values.components.ui.enabled -}}
+{{- $cmpArgs := dict "root" $ "component" "ui" -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "data-agent.fullname" . }}-test-connection"
+  labels:
+    {{- include "data-agent.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: wget
+      image: busybox:1.36
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+      command: ["wget"]
+      # Hits the UI's static index (GET /) to prove the Service is reachable.
+      args:
+        - "--spider"
+        - "-S"
+        - "http://{{ include "data-agent.componentFullname" $cmpArgs }}:{{ .Values.components.ui.service.port }}/"
+{{- end }}

@@ -1,0 +1,76 @@
+{{- $c := .Values.components.learningConsumer -}}
+{{- if $c.enabled }}
+{{- $cmpArgs := dict "root" $ "component" "learning-consumer" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "data-agent.componentFullname" $cmpArgs }}
+  labels:
+    {{- include "data-agent.componentLabels" $cmpArgs | nindent 4 }}
+spec:
+  {{- if not $c.autoscaling.enabled }}
+  replicas: {{ $c.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "data-agent.componentSelectorLabels" $cmpArgs | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "data-agent.checksumAnnotations" $ | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with $c.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "data-agent.componentSelectorLabels" $cmpArgs | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "data-agent.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      securityContext:
+        {{- toYaml (mergeOverwrite (deepCopy .Values.podSecurityContext) ($c.podSecurityContext | default dict)) | nindent 8 }}
+      containers:
+        - name: learning-consumer
+          image: {{ include "data-agent.image" (dict "root" $ "component" $c) }}
+          imagePullPolicy: {{ include "data-agent.imagePullPolicy" (dict "root" $ "component" $c) }}
+          # Redis Streams consumer-group worker (no HTTP server). Each replica is
+          # a distinct consumer, so this is safe to scale horizontally.
+          command:
+            - python
+            - scripts/run_learning_consumer.py
+          securityContext:
+            {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) ($c.securityContext | default dict)) | nindent 12 }}
+          envFrom:
+            {{- include "data-agent.envFrom" $ | nindent 12 }}
+          {{- with concat (.Values.env | default list) ($c.env | default list) }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # No HTTP server -> no readiness/liveness HTTP probe.
+          resources:
+            {{- toYaml (default .Values.resources $c.resources) | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with (default .Values.nodeSelector $c.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.affinity $c.affinity) }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.tolerations $c.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

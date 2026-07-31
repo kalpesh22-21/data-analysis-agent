@@ -1,0 +1,19 @@
+{{- $c := .Values.components.ui -}}
+{{- if and $c.enabled $c.podDisruptionBudget.enabled -}}
+{{- $cmpArgs := dict "root" $ "component" "ui" -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "data-agent.componentFullname" $cmpArgs }}
+  labels:
+    {{- include "data-agent.componentLabels" $cmpArgs | nindent 4 }}
+spec:
+  {{- if $c.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ $c.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ $c.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "data-agent.componentSelectorLabels" $cmpArgs | nindent 6 }}
+{{- end }}

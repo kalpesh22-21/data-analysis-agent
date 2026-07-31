@@ -1,0 +1,37 @@
+{{- $c := .Values.components.learningConsumer -}}
+{{- if and $c.enabled $c.autoscaling.enabled -}}
+{{- if not (or $c.autoscaling.targetCPUUtilizationPercentage $c.autoscaling.targetMemoryUtilizationPercentage) -}}
+{{- fail "components.learningConsumer.autoscaling is enabled but neither targetCPUUtilizationPercentage nor targetMemoryUtilizationPercentage is set" -}}
+{{- end -}}
+{{- $cmpArgs := dict "root" $ "component" "learning-consumer" -}}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "data-agent.componentFullname" $cmpArgs }}
+  labels:
+    {{- include "data-agent.componentLabels" $cmpArgs | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "data-agent.componentFullname" $cmpArgs }}
+  minReplicas: {{ $c.autoscaling.minReplicas }}
+  maxReplicas: {{ $c.autoscaling.maxReplicas }}
+  metrics:
+    {{- if $c.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $c.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if $c.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ $c.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+{{- end }}
