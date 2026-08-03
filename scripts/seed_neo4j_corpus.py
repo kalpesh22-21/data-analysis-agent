@@ -34,13 +34,17 @@ from neo4j import AsyncGraphDatabase
 
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
-from data_agent.runtime.retrieval.corpus_loader import load_corpus, load_seed_fixtures
+from data_agent.runtime.retrieval.corpus_loader import (
+    load_catalog_graph,
+    load_corpus,
+    load_seed_fixtures,
+)
 
 # `_catalog` is a sibling module under `scripts/`. Put this script's own directory
 # on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND
 # when the file is loaded by path (importlib `spec_from_file_location`, e.g. tests).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _catalog import catalog_handle  # noqa: E402
+from _catalog import catalog_export, catalog_handle  # noqa: E402
 
 _FIXTURE_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "corpus"
 _logger = logging.getLogger(__name__)
@@ -62,6 +66,28 @@ def _try_load_catalog() -> CatalogHandle | None:
             exc,
         )
         return None
+
+
+async def _try_seed_catalog_graph(driver: object, database: str) -> None:
+    """Seed the enriched `:Table`/`:Column` catalog graph from the frozen export
+    snapshot, softly. Mirrors `_try_load_catalog`: if the export is absent/unreadable
+    the corpus seed still proceeds (the `:USES` edges are then skipped as drift and a
+    warning is logged by `load_corpus`), so this never blocks a manual seed."""
+    try:
+        export = catalog_export()
+    except Exception as exc:  # noqa: BLE001 - soft dev-time aid, never blocks the seed
+        _logger.warning(
+            "catalog export unavailable (%s) — skipping catalog-graph hydration; "
+            "load_corpus will report any blueprint→column edge drift",
+            exc,
+        )
+        return
+    # The seed script is the EXPLICIT reconcile/maintenance path: gc=True runs the
+    # full reconcile (dropped-column GC + the GC-referenced drift signal). The online
+    # B1 self-heal (app.py) is upsert-only (gc=False) to avoid the rolling-deploy
+    # mutual-GC race.
+    graph_report = await load_catalog_graph(driver, export, database=database, gc=True)  # type: ignore[arg-type]
+    _logger.info("catalog graph seeded: %s", graph_report)
 
 
 async def _main() -> int:
@@ -86,6 +112,11 @@ async def _main() -> int:
     catalog = _try_load_catalog()
     driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
     try:
+        # Hydrate the enriched, self-healing `:Table`/`:Column` catalog graph FIRST
+        # (same path the runtime B1 self-heal uses), so `load_corpus`'s MERGE→MATCH
+        # `:USES` edges bind to real catalog nodes. Best-effort: a missing/unreadable
+        # export snapshot logs a note and proceeds (edges are then skipped as drift).
+        await _try_seed_catalog_graph(driver, database)
         report = await load_corpus(
             driver,
             embedder,
@@ -101,7 +132,7 @@ async def _main() -> int:
     print(
         f"Seeded neo4j corpus (model={report.model_id}): "
         f"{report.blueprints_written} blueprints, {report.knowledge_written} knowledge, "
-        f"{report.columns_written} columns, {report.tables_written} tables."
+        f"{report.columns_referenced} columns, {report.tables_referenced} tables."
     )
     return 0
 

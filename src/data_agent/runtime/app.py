@@ -75,6 +75,7 @@ from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
+from data_agent.runtime.retrieval.corpus_loader import load_catalog_graph
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.tools import (
     GetBlueprintTool,
@@ -240,28 +241,6 @@ def create_app(
     Tests inject a pipeline (real D71 clients + a seeded `FakeVectorIndex` or a
     live `Neo4jVectorIndex`) to exercise the whole embed→rerank→inject path."""
     settings = settings or get_runtime_settings()
-    # D75 Wave 1b: the runtime rebuilds its catalog handle from the MCP
-    # `/catalog/export` (via the process-wide `CatalogCache`) instead of a local
-    # `databaseSchemaDocs/` copy. An INJECTED `catalog` handle (tests / a fixed
-    # catalog) is honored verbatim and used as a fixed handle — no cache, no fetch.
-    # Otherwise a `CatalogCache` is built from settings (`catalog_source`: live 'mcp'
-    # export or the offline 'fixture' JSON) and exposed to the dispatcher/composite as
-    # an async provider that resolves the immutable handle from THIS turn's
-    # credentials. The cache is lazy (no fetch at construction — import/build-time
-    # safety preserved) and fetches exactly once (scope-independent, D5-safe:
-    # credentials authenticate the fetch only, never entering a handle).
-    catalog_provider: CatalogHandle | CatalogProvider
-    if catalog is not None:
-        catalog_provider = catalog
-    else:
-        catalog_cache = build_catalog_cache(settings)
-
-        async def _catalog_provider(credentials: RuntimeCredentials) -> CatalogHandle:
-            return await catalog_cache.get_catalog_handle(
-                jwt=credentials.jwt, session_id=credentials.session_id
-            )
-
-        catalog_provider = _catalog_provider
     mcp_client = mcp_client or RealMCPClient(settings.mcp_url)
     # The scratch side-channel client is a singleton shared by every per-request
     # BlueprintExecutor (it holds no per-request state — creds ride each call).
@@ -395,6 +374,52 @@ def create_app(
     # are simply absent from the registry → the loop advertises them but returns
     # RETRIEVAL_TOOL_UNAVAILABLE (Phase-0 parity, read-tools §6).
     active_retrieval = retrieval if settings.retrieval_enabled else None
+
+    # D75 Wave 1b: the runtime rebuilds its catalog handle from the MCP
+    # `/catalog/export` (via the process-wide `CatalogCache`) instead of a local
+    # `databaseSchemaDocs/` copy. An INJECTED `catalog` handle (tests / a fixed
+    # catalog) is honored verbatim and used as a fixed handle — no cache, no fetch.
+    # Otherwise a `CatalogCache` is built from settings (`catalog_source`: live 'mcp'
+    # export or the offline 'fixture' JSON) and exposed to the dispatcher/composite as
+    # an async provider that resolves the immutable handle from THIS turn's
+    # credentials. The cache is lazy (no fetch at construction — import/build-time
+    # safety preserved) and fetches exactly once (scope-independent, D5-safe:
+    # credentials authenticate the fetch only, never entering a handle).
+    #
+    # B1 self-healing catalog graph: when THIS app owns a `Neo4jVectorIndex`
+    # (retrieval/neo4j wired), the cache's cold-fetch fires a one-shot
+    # `load_catalog_graph` against the SAME driver the retrieval pipeline uses (no
+    # second pool). The `:CatalogMeta` sha-guard makes this a cheap no-op after the
+    # first process seeds, so replicas racing on boot are fine. When Neo4j is absent
+    # (`vector_index is None`), the callback is `None` — byte-identical Phase-0
+    # behavior (additive feature).
+    catalog_provider: CatalogHandle | CatalogProvider
+    if catalog is not None:
+        catalog_provider = catalog
+    else:
+        on_catalog_loaded: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+        if vector_index is not None:
+            seed_driver = vector_index.driver
+            seed_database = vector_index.database
+
+            async def _on_catalog_loaded(export: dict[str, Any]) -> None:
+                # Online B1 self-heal: upsert + meta-stamp ONLY (gc=False), so two
+                # replicas booting on different shas during a rolling deploy converge
+                # to a current-or-superset graph instead of GC-deleting each other's
+                # freshly-stamped nodes. Dropped-column GC is the explicit seed-script
+                # maintenance op (scripts/seed_neo4j_corpus.py, gc=True). Writes to the
+                # SAME database the retrieval pipeline recalls from (never hardcoded).
+                await load_catalog_graph(seed_driver, export, database=seed_database, gc=False)
+
+            on_catalog_loaded = _on_catalog_loaded
+        catalog_cache = build_catalog_cache(settings, on_catalog_loaded=on_catalog_loaded)
+
+        async def _catalog_provider(credentials: RuntimeCredentials) -> CatalogHandle:
+            return await catalog_cache.get_catalog_handle(
+                jwt=credentials.jwt, session_id=credentials.session_id
+            )
+
+        catalog_provider = _catalog_provider
 
     tool_schema_cache = ToolSchemaCache(mcp_client)
     summarizer = build_llm_summarizer(model_client)

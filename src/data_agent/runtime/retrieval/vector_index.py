@@ -36,9 +36,7 @@ _logger = logging.getLogger(__name__)
 class VectorIndex(Protocol):
     """The recall seam. Phase-1 real impl is `Neo4jVectorIndex` (Slice 2)."""
 
-    async def recall(
-        self, *, query_vector: list[float], kind: str, k: int
-    ) -> list[Candidate]:
+    async def recall(self, *, query_vector: list[float], kind: str, k: int) -> list[Candidate]:
         """Return up to *k* nearest `Candidate`s of *kind*, most-similar first.
 
         The real (neo4j) impl reads the `embedding_model` stamped on stored
@@ -94,9 +92,7 @@ class FakeVectorIndex:
         """Seed one blueprint's keyed projection for `get_blueprint`."""
         self._details[detail.id] = detail
 
-    async def recall(
-        self, *, query_vector: list[float], kind: str, k: int
-    ) -> list[Candidate]:
+    async def recall(self, *, query_vector: list[float], kind: str, k: int) -> list[Candidate]:
         self.calls.append((kind, k))
         if self._fail:
             return []
@@ -364,9 +360,21 @@ class Neo4jVectorIndex:
                 max_transaction_retry_time=timeout_seconds,
             )
 
-    async def recall(
-        self, *, query_vector: list[float], kind: str, k: int
-    ) -> list[Candidate]:
+    @property
+    def driver(self) -> AsyncDriver:
+        """The long-lived async driver this index owns (one per process). Exposed
+        so the composition root can REUSE it for the B1 catalog-graph seed instead
+        of opening a second pool against the same neo4j (app.py wiring)."""
+        return self._driver
+
+    @property
+    def database(self) -> str:
+        """The neo4j database this index recalls from. Exposed so the B1
+        catalog-graph seed writes to the SAME database recall reads (never a
+        hardcoded 'neo4j' that could diverge from a configured DB, L1)."""
+        return self._database
+
+    async def recall(self, *, query_vector: list[float], kind: str, k: int) -> list[Candidate]:
         """Recall up to *k* nearest `Candidate`s of *kind*, most-similar first.
 
         Never raises: an unknown kind, unreachable neo4j, auth failure, query
@@ -439,9 +447,7 @@ class Neo4jVectorIndex:
             )
             return None
 
-    async def _run(
-        self, query: str, parameters: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    async def _run(self, query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
         """Run one read query and return its rows as plain dicts.
 
         Factored out as the single driver-touching seam so Layer-1 tests can

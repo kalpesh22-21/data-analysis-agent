@@ -40,9 +40,13 @@ from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.mcp.scratch_client import ScratchClient
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
-from data_agent.runtime.retrieval.corpus_loader import load_corpus, load_seed_fixtures
+from data_agent.runtime.retrieval.corpus_loader import (
+    load_catalog_graph,
+    load_corpus,
+    load_seed_fixtures,
+)
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
-from tests._catalog_fixture import fixture_catalog_handle
+from tests._catalog_fixture import fixture_catalog_handle, load_catalog_export
 
 from .conftest import Mint
 
@@ -113,6 +117,8 @@ def seeded_dag_corpus() -> bool:
         try:
             async with driver.session() as session:
                 await session.run("MATCH (n) DETACH DELETE n")  # DESTRUCTIVE — l2 only
+            # Catalog-owned :Table/:Column graph first (load_corpus MATCHes these).
+            await load_catalog_graph(driver, load_catalog_export())
             blueprints, knowledge = load_seed_fixtures(_FIXTURE_DIR)
             await load_corpus(driver, _embedder(), blueprints, knowledge, model_id=_MODEL)
         finally:

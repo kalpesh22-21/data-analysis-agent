@@ -37,7 +37,11 @@ from neo4j import AsyncGraphDatabase
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.model.reranker_client import HttpRerankerClient
-from data_agent.runtime.retrieval.corpus_loader import load_corpus, load_seed_fixtures
+from data_agent.runtime.retrieval.corpus_loader import (
+    load_catalog_graph,
+    load_corpus,
+    load_seed_fixtures,
+)
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.tools import (
     GetBlueprintTool,
@@ -46,6 +50,7 @@ from data_agent.runtime.retrieval.tools import (
 )
 from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
+from tests._catalog_fixture import load_catalog_export
 
 pytestmark = pytest.mark.skipif(
     not (os.environ.get("NEO4J_TEST_URI") and os.environ.get("EMBEDDING_TEST_URL")),
@@ -135,6 +140,8 @@ def seeded_corpus() -> bool:
             async with driver.session() as session:
                 # DESTRUCTIVE — ephemeral l2 compose neo4j ONLY.
                 await session.run("MATCH (n) DETACH DELETE n")
+            # Catalog-owned :Table/:Column graph first (load_corpus MATCHes these).
+            await load_catalog_graph(driver, load_catalog_export())
             blueprints, knowledge = load_seed_fixtures(_FIXTURE_DIR)
             await load_corpus(driver, _embedder(), blueprints, knowledge, model_id=_MODEL)
         finally:
@@ -251,7 +258,10 @@ async def test_search_knowledge_returns_chunk_and_ignores_scope(seeded_corpus: b
 
 async def test_unreachable_neo4j_degrades_all_tools() -> None:
     index = Neo4jVectorIndex(
-        url="bolt://localhost:1", auth=("neo4j", "wrong"), expected_model=_MODEL, timeout_seconds=3.0
+        url="bolt://localhost:1",
+        auth=("neo4j", "wrong"),
+        expected_model=_MODEL,
+        timeout_seconds=3.0,
     )
     sb = SearchBlueprintsTool(pipeline=_pipeline(index), default_k=5, max_k=20)
     gb = GetBlueprintTool(vector_index=index)

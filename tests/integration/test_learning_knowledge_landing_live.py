@@ -34,10 +34,12 @@ from data_agent.learning.promotion.landing import CorpusLandingWriter, landing_i
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.retrieval.corpus_loader import (
     apply_schema,
+    load_catalog_graph,
     load_corpus,
     load_seed_fixtures,
 )
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
+from tests._catalog_fixture import load_catalog_export
 
 pytestmark = pytest.mark.skipif(
     not (os.environ.get("NEO4J_TEST_URI") and os.environ.get("EMBEDDING_TEST_URL")),
@@ -193,6 +195,9 @@ async def test_retract_excludes_knowledge_from_recall_seed_survives() -> None:
             # DESTRUCTIVE: ephemeral l2 neo4j only (see clean_schema note).
             await session.run("MATCH (n) DETACH DELETE n")
         await apply_schema(driver)
+        # Catalog-owned :Table/:Column graph first so load_corpus' MERGE→MATCH :USES
+        # edges bind to real catalog nodes (no spurious edge-drift warnings).
+        await load_catalog_graph(driver, load_catalog_export())
         blueprints, knowledge = load_seed_fixtures(_CORPUS_DIR)
         await load_corpus(driver, _embedder(), blueprints, knowledge, model_id=_MODEL)
         writer = CorpusLandingWriter(driver, _embedder(), model_id=_MODEL)
@@ -204,7 +209,9 @@ async def test_retract_excludes_knowledge_from_recall_seed_survives() -> None:
 
     index = Neo4jVectorIndex(url=_uri(), auth=_auth(), expected_model=_MODEL, timeout_seconds=15.0)
     try:
-        before = {c.id for c in await index.recall(query_vector=query_vector, kind="knowledge", k=30)}
+        before = {
+            c.id for c in await index.recall(query_vector=query_vector, kind="knowledge", k=30)
+        }
     finally:
         await index.close()
     assert landed_id in before, "the landed knowledge chunk must be recallable before retract"
@@ -220,7 +227,9 @@ async def test_retract_excludes_knowledge_from_recall_seed_survives() -> None:
 
     index = Neo4jVectorIndex(url=_uri(), auth=_auth(), expected_model=_MODEL, timeout_seconds=15.0)
     try:
-        after = {c.id for c in await index.recall(query_vector=query_vector, kind="knowledge", k=30)}
+        after = {
+            c.id for c in await index.recall(query_vector=query_vector, kind="knowledge", k=30)
+        }
     finally:
         await index.close()
     assert landed_id not in after, "a retracted knowledge chunk must NOT be recallable"

@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -183,22 +184,43 @@ class CatalogCache:
     re-fetch (it bypasses the warm-cache short-circuit inside the lock).
     """
 
-    def __init__(self, client: CatalogClient) -> None:
+    def __init__(
+        self,
+        client: CatalogClient,
+        *,
+        on_catalog_loaded: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> None:
         self._client = client
         self._catalog_handle: CatalogHandle | None = None
         self._semantic_handle: SemanticCatalogHandle | None = None
         self._lock = asyncio.Lock()
+        # Optional one-shot side effect on the FIRST successful COLD fetch (B1
+        # self-healing graph seed). Neo4j-AGNOSTIC: the cache only knows a
+        # `dict -> Awaitable[None]` callback; app.py binds it to `load_catalog_graph`
+        # against the retrieval driver (or `None` when Neo4j is absent).
+        self._on_catalog_loaded = on_catalog_loaded
+        self._graph_seed_done = False
 
     async def _ensure(self, *, jwt: str, session_id: str, force_reload: bool) -> None:
         # Already warm and not force-reloading — one fetch serves all turns. Cheap
         # lock-free fast path for the common (warm) case.
         if self._catalog_handle is not None and not force_reload:
             return
+        # Captured INSIDE the lock (one-shot) but invoked AFTER the lock is released,
+        # so the graph-seed callback never serializes concurrent first-turn waiters
+        # behind it (the handle they need is already built + frozen). `None` unless
+        # THIS call is the cold fetch that fires the one-shot seed.
+        export_for_seed: dict[str, Any] | None = None
         async with self._lock:
             # Double-checked: a racer may have warmed the cache while we waited for
             # the lock — reuse its frozen handle instead of issuing a second fetch.
             if self._catalog_handle is not None and not force_reload:
                 return
+            # A forced reload re-arms the one-shot graph seed (M2): a `force_reload`
+            # deliberately re-fetches, so the seed should run again against the fresh
+            # export rather than being permanently disarmed by the first cold fetch.
+            if force_reload:
+                self._graph_seed_done = False
             try:
                 export = await self._client.fetch_export(jwt=jwt, session_id=session_id)
                 catalog_handle, semantic_handle = load_catalog_handles_from_export(export)
@@ -224,6 +246,28 @@ class CatalogCache:
                 catalog_sha,
                 table_count,
             )
+            # Arm the one-shot graph seed for AFTER the lock releases (the handle is
+            # already built + frozen above, so this side effect blocks no reader).
+            if self._on_catalog_loaded is not None and not self._graph_seed_done:
+                self._graph_seed_done = True
+                export_for_seed = export
+        # Lock released. Fire the graph-seed callback at most once, OFF the lock, and
+        # DEGRADE-not-fail: a graph-seed failure must never fail the catalog load or
+        # the turn — the `CatalogHandle` the turn needs is already served regardless.
+        if export_for_seed is not None and self._on_catalog_loaded is not None:
+            try:
+                await self._on_catalog_loaded(export_for_seed)
+            except Exception:
+                # Degrade-not-fail: the seed failure must never fail the turn (the
+                # handle is already served). RE-ARM the one-shot (M2) so a transient
+                # neo4j blip is retried on the NEXT cold fetch rather than leaving the
+                # process unseeded for life. Safe under concurrency: a bool assignment,
+                # and the next cold fetch re-checks the flag inside the lock.
+                self._graph_seed_done = False
+                _logger.exception(
+                    "catalog graph seed callback failed; catalog load + turn unaffected "
+                    "(re-armed for retry on the next cold fetch)"
+                )
 
     async def get_catalog_handle(
         self, *, jwt: str, session_id: str, force_reload: bool = False
@@ -240,18 +284,26 @@ class CatalogCache:
         )
 
 
-def build_catalog_cache(settings: RuntimeSettings) -> CatalogCache:
+def build_catalog_cache(
+    settings: RuntimeSettings,
+    *,
+    on_catalog_loaded: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+) -> CatalogCache:
     """Build a `CatalogCache` from settings — HTTP against the MCP, or the fixture.
 
     `catalog_source="fixture"` (offline + tests) reads `catalog_fixture_file()`;
     anything else (default `"mcp"`) fetches from the MCP `/catalog/export` route
-    derived from `mcp_url` (or `catalog_api_url` when set)."""
+    derived from `mcp_url` (or `catalog_api_url` when set).
+
+    *on_catalog_loaded* (B1 self-healing graph seed): an optional one-shot callback
+    the cache invokes with the raw export dict on the first successful cold fetch
+    (see `CatalogCache`). `None` (default, and when Neo4j is absent) ⇒ no-op."""
     client: CatalogClient
     if settings.catalog_source == "fixture":
         client = FixtureCatalogClient(settings.catalog_fixture_file())
     else:
         client = HttpCatalogClient(settings.catalog_api_base())
-    return CatalogCache(client)
+    return CatalogCache(client, on_catalog_loaded=on_catalog_loaded)
 
 
 __all__ = [

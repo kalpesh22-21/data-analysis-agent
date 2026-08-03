@@ -34,11 +34,16 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.model.reranker_client import HttpRerankerClient
-from data_agent.runtime.retrieval.corpus_loader import load_corpus, load_seed_fixtures
+from data_agent.runtime.retrieval.corpus_loader import (
+    load_catalog_graph,
+    load_corpus,
+    load_seed_fixtures,
+)
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.scope_filter import filter_blueprints_by_scope
 from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
+from tests._catalog_fixture import load_catalog_export
 
 pytestmark = pytest.mark.skipif(
     not (os.environ.get("NEO4J_TEST_URI") and os.environ.get("EMBEDDING_TEST_URL")),
@@ -117,10 +122,12 @@ def seeded_corpus() -> bool:
                 # ephemeral l2 compose neo4j (docker-compose.integration.yml),
                 # NEVER at any real/shared instance.
                 await session.run("MATCH (n) DETACH DELETE n")
+            # Hydrate the catalog-owned :Table/:Column graph FIRST so load_corpus'
+            # MERGE→MATCH :USES edges bind to real catalog nodes (columns are no
+            # longer minted by the corpus loader).
+            await load_catalog_graph(driver, load_catalog_export())
             blueprints, knowledge = load_seed_fixtures(_FIXTURE_DIR)
-            await load_corpus(
-                driver, _embedder(), blueprints, knowledge, model_id=_MODEL
-            )
+            await load_corpus(driver, _embedder(), blueprints, knowledge, model_id=_MODEL)
         finally:
             await driver.close()
 

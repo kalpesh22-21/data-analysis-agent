@@ -5,8 +5,14 @@ TRUSTED seed (neo4j-corpus-design §3): it embeds every blueprint `intent` and
 knowledge `text` through the REAL `HttpEmbeddingClient` (the same D71 endpoint
 the online path uses — parity by construction), MERGE-by-id upserts the nodes
 with the embedding + `embedding_model` stamp + the denormalized `uses` list
-property, and writes the reserved `:Column`/`:Table` nodes + `:USES`/`:OF_TABLE`
-edges in the SAME transaction (the D60 graph shape; unread at recall in Slice 2).
+property, and links each blueprint's `:USES` edges to the PRE-EXISTING catalog
+`:Column` nodes (MERGE→MATCH — the nodes are owned by `load_catalog_graph`, no
+longer minted here) in the SAME transaction (the D60 graph shape; unread at recall).
+
+`load_catalog_graph(...)` is the separate, catalog-OWNED hydration of the enriched,
+self-healing `:Table`/`:Column` graph from the MCP catalog EXPORT dict (no embeds,
+no model-parity): every node carries its catalog props + a `catalog_sha` stamp, and
+GC removes any node a newer catalog run no longer touches (§ catalog-graph).
 
 Parity is STRICT at write (§3.3): the loader refuses to write two different
 embedding-model ids into one index — a mixed index is silently broken, so
@@ -21,6 +27,7 @@ the recall path.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -120,13 +127,39 @@ class KnowledgeSeed:
 @dataclass(frozen=True)
 class LoadReport:
     """Outcome of a `load_corpus` run — counts + the model the corpus was
-    stamped with (for a CLI/exit summary)."""
+    stamped with (for a CLI/exit summary).
+
+    `columns_referenced`/`tables_referenced` count the DISTINCT column/table keys
+    the seeded blueprints REFERENCE (their `uses` footprint) — NOT nodes this loader
+    writes. Since the MERGE→MATCH rewrite, `:Column`/`:Table` nodes are owned by
+    `load_catalog_graph`; `load_corpus` only links `:USES` to pre-existing catalog
+    nodes. These counts are a footprint summary for the CLI, nothing more."""
 
     model_id: str
     blueprints_written: int
     knowledge_written: int
-    columns_written: int
-    tables_written: int
+    columns_referenced: int
+    tables_referenced: int
+
+
+@dataclass(frozen=True)
+class CatalogGraphReport:
+    """Outcome of a `load_catalog_graph` run — the enriched `:Table`/`:Column`
+    hydration counts + the run's `catalog_sha`.
+
+    `skipped=True` is the B1 no-op fast path (the graph already carries this
+    export's sha, so nothing was written). `drift_referenced_columns` lists any
+    `:Column` the GC removed that STILL had an inbound `:USES` — a blueprint
+    referencing a column the catalog just dropped (GC wins; the drift is logged).
+    """
+
+    catalog_sha: str
+    skipped: bool
+    tables_upserted: int
+    columns_upserted: int
+    tables_gc: int
+    columns_gc: int
+    drift_referenced_columns: tuple[str, ...]
 
 
 class CorpusLoadError(Exception):
@@ -162,12 +195,8 @@ def load_seed_fixtures(
     place, masking an authoring mistake — fail loudly instead.
     """
     root = Path(corpus_dir)
-    blueprints = [
-        BlueprintSeed(**item) for item in _read_yaml_list(root / "blueprints.yaml")
-    ]
-    knowledge = [
-        KnowledgeSeed(**item) for item in _read_yaml_list(root / "knowledge.yaml")
-    ]
+    blueprints = [BlueprintSeed(**item) for item in _read_yaml_list(root / "blueprints.yaml")]
+    knowledge = [KnowledgeSeed(**item) for item in _read_yaml_list(root / "knowledge.yaml")]
     _reject_duplicate_ids([b.id for b in blueprints] + [k.id for k in knowledge])
     return blueprints, knowledge
 
@@ -178,9 +207,7 @@ def _reject_duplicate_ids(ids: list[str]) -> None:
     for id_ in ids:
         (dupes if id_ in seen else seen).add(id_)
     if dupes:
-        raise CorpusLoadError(
-            f"Duplicate seed id(s) in the corpus fixtures: {sorted(dupes)!r}."
-        )
+        raise CorpusLoadError(f"Duplicate seed id(s) in the corpus fixtures: {sorted(dupes)!r}.")
 
 
 def _read_yaml_list(path: Path) -> list[dict[str, Any]]:
@@ -195,17 +222,23 @@ def _read_yaml_list(path: Path) -> list[dict[str, Any]]:
 # Schema DDL — idempotent constraints + native vector indexes (§1.4)
 # --------------------------------------------------------------------------
 
+# The catalog-graph constraints (Table/Column node keys + the :CatalogMeta
+# singleton). Owned by `load_catalog_graph`'s lightweight `apply_catalog_graph_schema`
+# (constraints ONLY — no vector-index DDL, no `awaitIndexes` on the cold-fetch turn),
+# AND included in the full `SCHEMA_STATEMENTS` so `load_corpus` / the seed script
+# self-deploy them too. Every statement is idempotent (`IF NOT EXISTS`).
+_CATALOG_GRAPH_CONSTRAINTS: tuple[str, ...] = (
+    "CREATE CONSTRAINT column_key IF NOT EXISTS FOR (c:Column) REQUIRE c.key IS UNIQUE",
+    "CREATE CONSTRAINT table_key IF NOT EXISTS FOR (t:Table) REQUIRE t.key IS UNIQUE",
+    "CREATE CONSTRAINT catalog_meta_id IF NOT EXISTS FOR (m:CatalogMeta) REQUIRE m.id IS UNIQUE",
+)
+
 # Every statement is idempotent (`IF NOT EXISTS`) so `apply_schema` is safe to
 # re-run — the loader's whole write path (schema + upsert) is re-runnable.
 SCHEMA_STATEMENTS: tuple[str, ...] = (
-    "CREATE CONSTRAINT blueprint_id IF NOT EXISTS "
-    "FOR (b:Blueprint) REQUIRE b.id IS UNIQUE",
-    "CREATE CONSTRAINT knowledge_id IF NOT EXISTS "
-    "FOR (k:KnowledgeChunk) REQUIRE k.id IS UNIQUE",
-    "CREATE CONSTRAINT column_key IF NOT EXISTS "
-    "FOR (c:Column) REQUIRE c.key IS UNIQUE",
-    "CREATE CONSTRAINT table_key IF NOT EXISTS "
-    "FOR (t:Table) REQUIRE t.key IS UNIQUE",
+    "CREATE CONSTRAINT blueprint_id IF NOT EXISTS FOR (b:Blueprint) REQUIRE b.id IS UNIQUE",
+    "CREATE CONSTRAINT knowledge_id IF NOT EXISTS FOR (k:KnowledgeChunk) REQUIRE k.id IS UNIQUE",
+    *_CATALOG_GRAPH_CONSTRAINTS,
     "CREATE VECTOR INDEX blueprint_intent_vec IF NOT EXISTS "
     "FOR (b:Blueprint) ON (b.intent_embedding) "
     "OPTIONS { indexConfig: { `vector.dimensions`: 768, "
@@ -243,25 +276,90 @@ SET b.intent = $intent,
     b.result_grain_json = $result_grain_json
 """
 
-# Reserved graph shape (§1.3): the transitive USES closure written as edges,
+# Reserved graph shape (§1.3): the blueprint's USES closure written as edges,
 # same-txn with the denormalized `uses` property so they cannot drift. Unread at
 # recall in Slice 2. S1: DELETE this blueprint's existing :USES edges FIRST, so a
 # re-seed with a SHRUNK uses set leaves no phantom edges (MERGE alone never
 # removes stale edges). Runs unconditionally per blueprint (even when the new
-# use-set is empty), so the DELETE always clears stale edges. Orphan :Column
-# nodes left with no inbound :USES are NOT garbage-collected here (a shared
-# concept may still be referenced by other blueprints, and stale leaf columns are
-# harmless/unread in Slice 2) — a dedicated GC is deferred to the graph consumer.
+# use-set is empty), so the DELETE always clears stale edges.
+#
+# MERGE→MATCH (catalog-graph hydration): the `:Column`/`:Table` nodes are now
+# OWNED by `load_catalog_graph` (enriched + self-healing), not minted here. This
+# rewrite OPTIONAL-MATCHes a PRE-EXISTING catalog `:Column` and creates the `:USES`
+# edge only when it exists; it never mints a `:Column`/`:Table` and never writes
+# `:OF_TABLE` (now catalog-owned). Column keys the blueprint references but the
+# catalog does not carry are COLLECTED and RETURNed so `load_corpus._write` can log
+# a structured blueprint→column drift warning (a blueprint referencing a column the
+# catalog never advertised — the edge is silently absent, so surface it).
 _REWRITE_BLUEPRINT_EDGES = """
 MATCH (b:Blueprint {id: $id})
 OPTIONAL MATCH (b)-[r:USES]->()
 DELETE r
 WITH DISTINCT b
 UNWIND $use_edges AS ue
-MERGE (c:Column {key: ue.column_key})
-MERGE (t:Table {key: ue.table_key})
-MERGE (b)-[:USES]->(c)
+OPTIONAL MATCH (c:Column {key: ue.column_key})
+FOREACH (_ IN CASE WHEN c IS NULL THEN [] ELSE [1] END | MERGE (b)-[:USES]->(c))
+WITH ue.column_key AS column_key, c
+WHERE c IS NULL
+RETURN collect(column_key) AS missing
+"""
+
+# --------------------------------------------------------------------------
+# Catalog-graph hydration Cypher (independent, enriched, self-healing) — the
+# `:Table`/`:Column` nodes are catalog-OWNED, upserted from the MCP export dict,
+# stamped with the run's `catalog_sha`, and GC'd when a prior run's stamp is stale.
+# All node props are primitive/array-of-primitive (nested maps JSON-encoded to
+# `*_json` strings), so `SET x += row.props` is always a valid Neo4j write.
+# --------------------------------------------------------------------------
+
+# Batched table upsert: MERGE by key, overwrite the enriched props, stamp the sha.
+_UPSERT_TABLES = """
+UNWIND $rows AS row
+MERGE (t:Table {key: row.key})
+SET t += row.props, t.catalog_sha = $sha
+"""
+
+# Batched column upsert: MERGE the column, overwrite props + stamp sha, and MERGE
+# the `:OF_TABLE` edge to its (already-upserted) owning table (catalog-owned here).
+_UPSERT_COLUMNS = """
+UNWIND $rows AS row
+MERGE (c:Column {key: row.key})
+SET c += row.props, c.catalog_sha = $sha
+MERGE (t:Table {key: row.table_key})
 MERGE (c)-[:OF_TABLE]->(t)
+"""
+
+# GC columns not touched by THIS run (stamped sha != run sha, OR never stamped —
+# a legacy MERGE-minted phantom from before catalog ownership). Before deleting,
+# capture any inbound `:USES` blueprint ids (a blueprint referencing a column the
+# catalog just dropped → drift). `key`/`refs` are materialized in WITH BEFORE the
+# DETACH DELETE so they can be RETURNed (a deleted node's props are unreadable).
+_GC_COLUMNS = """
+MATCH (c:Column) WHERE coalesce(c.catalog_sha, '') <> $sha
+OPTIONAL MATCH (b:Blueprint)-[:USES]->(c)
+WITH c, c.key AS key, collect(b.id) AS refs
+DETACH DELETE c
+RETURN key, refs
+"""
+
+# GC tables not touched by this run (same stale-stamp rule; no inbound :USES to
+# capture — only columns carry blueprint references). Returns the delete count.
+_GC_TABLES = """
+MATCH (t:Table) WHERE coalesce(t.catalog_sha, '') <> $sha
+DETACH DELETE t
+RETURN count(*) AS deleted
+"""
+
+# `:CatalogMeta` singleton — the process-wide freshness stamp. The read powers the
+# B1 no-op fast path (skip hydration when the export sha already matches); the
+# upsert lands the new sha atomically with the node upserts + GC in one txn.
+_READ_CATALOG_META = """
+MATCH (m:CatalogMeta {id: 'singleton'}) RETURN m.catalog_sha AS catalog_sha
+"""
+
+_UPSERT_CATALOG_META = """
+MERGE (m:CatalogMeta {id: 'singleton'})
+SET m.catalog_sha = $sha
 """
 
 _UPSERT_KNOWLEDGE = """
@@ -317,6 +415,130 @@ def _use_edges(uses: list[str]) -> list[dict[str, str]]:
     return edges
 
 
+# --------------------------------------------------------------------------
+# Catalog-graph pure helpers (Layer-1 testable, no infra) — project one MCP
+# catalog EXPORT entry into the enriched `:Table`/`:Column` node props. Neo4j
+# props must be primitive/array-of-primitive, so every nested map/list-of-map is
+# JSON-encoded to a `*_json` string (mirroring the blueprint DAG `*_json` pattern);
+# `catalog_sha` is stamped separately in Cypher (`SET x.catalog_sha = $sha`), not
+# carried in `props`. Fields are WHITELISTED — the entry is never blindly spread.
+# --------------------------------------------------------------------------
+
+
+def _json_or_none(value: Any) -> str | None:
+    """JSON-encode a nested map/list value, or `None` when empty/absent — mirrors
+    `_dag_properties` so an absent structure carries no phantom `{}`/`[]` and a
+    re-seed with the value removed clears the stale `*_json` prop (null `+=` removes)."""
+    return json.dumps(value) if value else None
+
+
+def _str_list(value: Any) -> list[str]:
+    """Coerce a value into a list of strings (dropping a non-list to `[]`), for the
+    array-of-primitive node props (`grain`, `synonyms`). Casing is preserved (D70)."""
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def _table_node_props(db_table: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """Project one catalog entry into the enriched `:Table` node props.
+
+    `key` is `db_table` (byte-identical to `_use_edges`' `table_key`). Scalars +
+    arrays are stored natively; `temporal`/`primary_key`/`join_keys`/`measures`
+    (nested) are JSON-encoded to `*_json`. `grain_verifiable` defaults True when
+    absent (parity with `SemanticCatalogHandle._table_grain`). `catalog_sha` is NOT
+    included here — the upsert Cypher stamps it via `$sha`."""
+    default_db, _, default_table = db_table.partition(".")
+    grain_verifiable = entry.get("grain_verifiable", True)
+    if not isinstance(grain_verifiable, bool):
+        grain_verifiable = True
+    return {
+        "key": db_table,
+        "database": entry.get("database") or default_db,
+        "table": entry.get("table") or default_table,
+        "description": entry.get("description"),
+        "grain": _str_list(entry.get("grain")),
+        "grain_verifiable": grain_verifiable,
+        "temporal_json": _json_or_none(entry.get("temporal")),
+        "primary_key_json": _json_or_none(entry.get("primary_key")),
+        "join_keys_json": _json_or_none(entry.get("join_keys")),
+        "measures_json": _json_or_none(entry.get("measures")),
+    }
+
+
+def _column_node_props(db_table: str, name: str, col: dict[str, Any]) -> dict[str, Any]:
+    """Project one catalog column into the enriched `:Column` node props.
+
+    `key` is `f"{db_table}.{name}"` — byte-identical to `_use_edges`' `column_key`
+    (asserted by a unit test). Casing of `name` is preserved (D70). `values` (a
+    nested map) is JSON-encoded to `values_json`; every other listed field is a
+    native scalar/array. Unknown/adversarial extra keys (e.g. `client_defined`,
+    `observed_values`, or fixture-mangled keys) are simply not read (whitelist)."""
+    return {
+        "key": f"{db_table}.{name}",
+        "name": name,
+        "type": col.get("type"),
+        "description": col.get("description"),
+        "sensitive": bool(col.get("sensitive", False)),
+        "description_col": col.get("description_col"),
+        "synonyms": _str_list(col.get("synonyms")),
+        "unit": col.get("unit"),
+        "values_json": _json_or_none(col.get("values")),
+    }
+
+
+def _catalog_graph_rows(
+    catalog: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str], set[str]]:
+    """Build the batched UNWIND rows for the `:Table`/`:Column` upserts from a
+    parsed catalog dict (`{db.table: <entry>}`).
+
+    Returns `(table_rows, column_rows, table_keys, column_keys)` where a
+    `table_row` is `{key, props}` and a `column_row` is `{key, table_key, props}`.
+    A non-dict entry (or a non-dict column def) is tolerated: the entry is skipped /
+    the column def falls back to `{}` (so a mangled fixture never crashes the build,
+    it just yields sparse props via the whitelist)."""
+    table_rows: list[dict[str, Any]] = []
+    column_rows: list[dict[str, Any]] = []
+    table_keys: set[str] = set()
+    column_keys: set[str] = set()
+    for db_table, entry in catalog.items():
+        if not isinstance(entry, dict):
+            continue
+        table_rows.append({"key": db_table, "props": _table_node_props(db_table, entry)})
+        table_keys.add(db_table)
+        columns = entry.get("columns")
+        if not isinstance(columns, dict):
+            continue
+        for name, col in columns.items():
+            col_dict = col if isinstance(col, dict) else {}
+            col_key = f"{db_table}.{name}"
+            column_rows.append(
+                {
+                    "key": col_key,
+                    "table_key": db_table,
+                    "props": _column_node_props(db_table, name, col_dict),
+                }
+            )
+            column_keys.add(col_key)
+    return table_rows, column_rows, table_keys, column_keys
+
+
+def _referenced_gc_columns(gc_rows: list[dict[str, Any]]) -> tuple[str, ...]:
+    """From the `_GC_COLUMNS` result rows (`{key, refs}`), the sorted set of GC'd
+    column keys that STILL had ≥1 inbound `:USES` — a blueprint referencing a column
+    the catalog just dropped (drift). GC wins (the column is deleted anyway)."""
+    return tuple(sorted(str(row["key"]) for row in gc_rows if row.get("refs")))
+
+
+def _format_edge_drift(missing_by_blueprint: dict[str, list[str]]) -> str:
+    """Render the blueprint→column edge-drift map (blueprint id → missing column
+    keys) as a stable, sorted string for the structured warning log."""
+    return "; ".join(
+        f"{bp_id}: {sorted(keys)}" for bp_id, keys in sorted(missing_by_blueprint.items())
+    )
+
+
 def _validate_blueprint_uses(bp: BlueprintSeed) -> None:
     """Fail-closed with context on a malformed `uses` entry (S2 / §8).
 
@@ -329,14 +551,11 @@ def _validate_blueprint_uses(bp: BlueprintSeed) -> None:
     for key in bp.uses:
         if not isinstance(key, str) or len(key.split(".")) < 3 or not all(key.split(".")):
             raise CorpusLoadError(
-                f"blueprint {bp.id}: uses entry {key!r} is not a "
-                "database.table.column scope key"
+                f"blueprint {bp.id}: uses entry {key!r} is not a database.table.column scope key"
             )
 
 
-def _warn_on_catalog_skew(
-    blueprints: list[BlueprintSeed], catalog: CatalogHandle
-) -> None:
+def _warn_on_catalog_skew(blueprints: list[BlueprintSeed], catalog: CatalogHandle) -> None:
     """D94 Part 3 — log a SOFT WARNING per blueprint whose `uses` references a
     `db.table` absent from *catalog*. Never raises: a blueprint may legitimately
     reference tables absent from a partial/dev catalog snapshot, so this is a
@@ -380,9 +599,7 @@ def _dag_properties(bp: BlueprintSeed) -> dict[str, Any]:
         "uses_rules_json": json.dumps(bp.uses_rules) if bp.uses_rules else None,
         "sql_template": bp.sql_template,
         "composes_json": json.dumps(bp.composes) if bp.composes else None,
-        "result_grain_json": (
-            json.dumps(bp.result_grain) if bp.result_grain is not None else None
-        ),
+        "result_grain_json": (json.dumps(bp.result_grain) if bp.result_grain is not None else None),
     }
 
 
@@ -770,9 +987,7 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
     # dropped `{X_end}` bound would be a dropped filter, aligning with the
     # executor's all-tokens B3 rule). Scalar slots (one token) are unchanged.
     unreferenced_required = {
-        s.name
-        for s in blueprint.slots
-        if s.required and (slot_token_names(s) - all_referenced)
+        s.name for s in blueprint.slots if s.required and (slot_token_names(s) - all_referenced)
     }
     if unreferenced_required:
         raise CorpusLoadError(
@@ -895,9 +1110,7 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
             # the drift can never flip a gate. `empty($N)` is fine (shape-only).
             for counted in _COUNT_REF.findall(node.when.expr):
                 src = int(counted)
-                if any(
-                    kind == "scalar" for kind in outputs_by_order.get(src, {}).values()
-                ):
+                if any(kind == "scalar" for kind in outputs_by_order.get(src, {}).values()):
                     raise CorpusLoadError(
                         f"blueprint {bp.id}: node {node.order} when-clause applies "
                         f"count($ {src}) to a SCALAR-output node — a scalar's row "
@@ -915,6 +1128,159 @@ async def apply_schema(driver: AsyncDriver, *, database: str = "neo4j") -> None:
         for statement in SCHEMA_STATEMENTS:
             await session.run(statement)  # type: ignore[arg-type]
         await session.run("CALL db.awaitIndexes(300)")  # type: ignore[arg-type]
+
+
+async def apply_catalog_graph_schema(driver: AsyncDriver, *, database: str = "neo4j") -> None:
+    """Ensure ONLY the catalog-graph constraints (`Table.key`, `Column.key`,
+    `CatalogMeta.id`) — the lightweight schema-ensure `load_catalog_graph` uses.
+
+    Deliberately does NOT create the vector indexes NOR call `db.awaitIndexes(300)`:
+    those are irrelevant to the `:Table`/`:Column` upsert and would add index-await
+    latency to the B1 cold-fetch turn. The full `apply_schema` (with vector indexes)
+    stays owned by `load_corpus`. Self-deploys the `:CatalogMeta` singleton
+    constraint the graph's sha-guard relies on. Idempotent (`IF NOT EXISTS`)."""
+    async with driver.session(database=database) as session:
+        for statement in _CATALOG_GRAPH_CONSTRAINTS:
+            await session.run(statement)  # type: ignore[arg-type]
+
+
+async def _read_catalog_meta(session: Any) -> str | None:
+    """The stored `:CatalogMeta` sha, or `None` when the singleton is absent —
+    the B1 freshness stamp powering the no-op fast path. *session* is anything
+    with `.run` (a live session OR a stub recording calls, for the Layer-1 test)."""
+    result = await session.run(_READ_CATALOG_META)
+    row = await result.single()
+    if row is None:
+        return None
+    return row["catalog_sha"]
+
+
+def _effective_catalog_sha(catalog_export: dict[str, Any]) -> str:
+    """The stamp/guard key for a hydration run — the export's own `catalog_sha`,
+    or a deterministic content-hash FALLBACK when it is empty/missing (M1).
+
+    An empty sha would silently break BOTH the skip-guard (`current == ""` never
+    triggers a no-op) AND the GC predicate (`coalesce(sha,'') <> ''` matches every
+    node, incl. freshly-stamped ones), so we never propagate one: a missing sha
+    derives a stable SHA-1 over the `catalog` dict (sorted keys, `default=str` for
+    any non-JSON value) and logs a warning. The same content always yields the same
+    stamp, so the skip-guard + GC still function idempotently."""
+    sha = catalog_export.get("catalog_sha")
+    if isinstance(sha, str) and sha:
+        return sha
+    catalog = catalog_export.get("catalog") or {}
+    digest = hashlib.sha1(
+        json.dumps(catalog, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    _logger.warning(
+        "catalog export lacked a catalog_sha; using derived content hash %s "
+        "(the skip-guard + GC key off this stable digest)",
+        digest,
+    )
+    return digest
+
+
+async def load_catalog_graph(
+    driver: AsyncDriver,
+    catalog_export: dict[str, Any],
+    *,
+    database: str = "neo4j",
+    ensure_schema: bool = True,
+    gc: bool = True,
+) -> CatalogGraphReport:
+    """Independent, enriched, self-healing hydration of the `:Table`/`:Column`
+    catalog graph from the MCP catalog EXPORT dict (`{"catalog_sha", "catalog"}`).
+
+    Catalog-OWNED (separate from `load_corpus`): no embeddings, no model-parity.
+    Every node upsert stamps the run's `catalog_sha` (or a derived content hash when
+    the export lacks one, `_effective_catalog_sha`).
+
+    Two write modes (QA#1 — the different-sha mutual-GC race):
+      * `gc=True` (default, the EXPLICIT seed/reconcile path — `scripts/seed_neo4j_
+        corpus.py`): after upserting, GC deletes any `:Table`/`:Column` whose stamp
+        is stale (a dropped-column reconcile), logging any GC'd column that still had
+        an inbound `:USES` (a blueprint referencing a column the catalog just dropped
+        — GC wins). This is a full reconcile / maintenance op.
+      * `gc=False` (the ONLINE B1 self-heal wired in `app.py`): upsert + meta-stamp
+        ONLY, NEVER delete. Two replicas booting on DIFFERENT shas during a rolling
+        deploy then converge to a current-or-SUPERSET graph instead of GC-deleting
+        each other's freshly-stamped nodes. Dropped-column garbage collection is
+        deferred to the explicit seed-script maintenance op.
+
+    B1 no-op fast path (BOTH modes): if the stored `:CatalogMeta.catalog_sha` already
+    EQUALS this run's sha, returns `skipped=True` WITHOUT writing (an empty/absent
+    meta ⇒ proceed). Cheap short-circuit so replicas racing on boot stay idempotent.
+
+    Atomicity: the upserts + (optional) GCs + the meta upsert run in ONE
+    `session.execute_write`, so no concurrent reader ever sees a torn graph.
+    """
+    export_sha = _effective_catalog_sha(catalog_export)
+    catalog = catalog_export["catalog"]
+
+    # B1 guard (read-only, outside the write txn): skip when the graph already
+    # carries this run's sha. A truthy stored sha that matches ⇒ no-op.
+    async with driver.session(database=database) as session:
+        current_sha = await _read_catalog_meta(session)
+    if current_sha and current_sha == export_sha:
+        _logger.info(
+            "catalog graph already at catalog_sha=%s; skipping hydration (B1 no-op)",
+            export_sha,
+        )
+        return CatalogGraphReport(
+            catalog_sha=export_sha,
+            skipped=True,
+            tables_upserted=0,
+            columns_upserted=0,
+            tables_gc=0,
+            columns_gc=0,
+            drift_referenced_columns=(),
+        )
+
+    if ensure_schema:
+        # Constraints-ONLY ensure (Table.key / Column.key / CatalogMeta.id) — no
+        # vector-index DDL, no `awaitIndexes` on the cold-fetch turn (H1/L2).
+        await apply_catalog_graph_schema(driver, database=database)
+
+    table_rows, column_rows, _table_keys, _column_keys = _catalog_graph_rows(catalog)
+
+    async with driver.session(database=database) as session:
+
+        async def _write(tx: AsyncManagedTransaction) -> tuple[list[dict[str, Any]], int]:
+            await tx.run(_UPSERT_TABLES, rows=table_rows, sha=export_sha)
+            await tx.run(_UPSERT_COLUMNS, rows=column_rows, sha=export_sha)
+            gc_cols: list[dict[str, Any]] = []
+            deleted_tables = 0
+            if gc:
+                gc_cols_result = await tx.run(_GC_COLUMNS, sha=export_sha)
+                gc_cols = await gc_cols_result.data()
+                gc_tables_result = await tx.run(_GC_TABLES, sha=export_sha)
+                gc_tables_row = await gc_tables_result.single()
+                deleted_tables = gc_tables_row["deleted"] if gc_tables_row is not None else 0
+            await tx.run(_UPSERT_CATALOG_META, sha=export_sha)
+            return gc_cols, deleted_tables
+
+        gc_cols, tables_gc = await session.execute_write(_write)
+
+    drift_referenced = _referenced_gc_columns(gc_cols)
+    if drift_referenced:
+        _logger.warning(
+            "catalog GC dropped %d :Column(s) still referenced by a blueprint :USES "
+            "(catalog is source of truth — deleted anyway): %s",
+            len(drift_referenced),
+            list(drift_referenced),
+        )
+
+    report = CatalogGraphReport(
+        catalog_sha=export_sha,
+        skipped=False,
+        tables_upserted=len(table_rows),
+        columns_upserted=len(column_rows),
+        tables_gc=tables_gc,
+        columns_gc=len(gc_cols),
+        drift_referenced_columns=drift_referenced,
+    )
+    _logger.info("catalog graph hydration complete: %s", report)
+    return report
 
 
 async def load_corpus(
@@ -962,12 +1328,8 @@ async def load_corpus(
 
     # Embed offline through the SAME endpoint the online path uses (parity by
     # construction). Order-preserving: `embed` returns one vector per input.
-    bp_vectors = (
-        await embedding_client.embed([b.intent for b in blueprints]) if blueprints else []
-    )
-    kn_vectors = (
-        await embedding_client.embed([k.text for k in knowledge]) if knowledge else []
-    )
+    bp_vectors = await embedding_client.embed([b.intent for b in blueprints]) if blueprints else []
+    kn_vectors = await embedding_client.embed([k.text for k in knowledge]) if knowledge else []
 
     columns: set[str] = set()
     tables: set[str] = set()
@@ -975,6 +1337,11 @@ async def load_corpus(
         for key in bp.uses:
             columns.add(key)
             tables.add(key.rsplit(".", 1)[0])
+
+    # Aggregated per-blueprint blueprint→column edge drift (blueprint id →
+    # sorted missing column keys the catalog graph does not carry). Populated in
+    # `_write`, logged once AFTER the txn commits (§ MERGE→MATCH drift signal).
+    missing_by_blueprint: dict[str, list[str]] = {}
 
     async with driver.session(database=database) as session:
 
@@ -1002,10 +1369,16 @@ async def load_corpus(
                     **_dag_properties(bp),
                 )
                 # S1: unconditional — rewrites the edge set (delete-then-add), so
-                # a shrunk uses set leaves no phantom :USES edges.
-                await tx.run(
+                # a shrunk uses set leaves no phantom :USES edges. MERGE→MATCH:
+                # links only PRE-EXISTING catalog :Column nodes and RETURNs the
+                # missing keys (a blueprint referencing an uncatalogued column).
+                rewrite = await tx.run(
                     _REWRITE_BLUEPRINT_EDGES, id=bp.id, use_edges=_use_edges(bp.uses)
                 )
+                row = await rewrite.single()
+                missing = row["missing"] if row is not None else []
+                if missing:
+                    missing_by_blueprint[bp.id] = sorted(missing)
             for kn, vector in zip(knowledge, kn_vectors, strict=True):
                 await tx.run(
                     _UPSERT_KNOWLEDGE,
@@ -1026,12 +1399,24 @@ async def load_corpus(
         # caller (or the Layer-2 seed fixture) can recall immediately.
         await session.run("CALL db.awaitIndexes(300)")  # type: ignore[arg-type]
 
+    # Blueprint→column drift (MERGE→MATCH): one structured warning if any blueprint
+    # `uses` a column key the catalog graph does not carry (its :USES edge was
+    # silently skipped). Seed the catalog graph first (`load_catalog_graph`) so the
+    # nodes exist; a persistent miss is a genuine blueprint/catalog skew.
+    if missing_by_blueprint:
+        _logger.warning(
+            "blueprint→column edge drift: %d blueprint(s) reference column keys absent "
+            "from the catalog graph (:USES edges skipped) — %s",
+            len(missing_by_blueprint),
+            _format_edge_drift(missing_by_blueprint),
+        )
+
     report = LoadReport(
         model_id=model_id,
         blueprints_written=len(blueprints),
         knowledge_written=len(knowledge),
-        columns_written=len(columns),
-        tables_written=len(tables),
+        columns_referenced=len(columns),
+        tables_referenced=len(tables),
     )
     _logger.info("neo4j corpus load complete: %s", report)
     return report
@@ -1054,12 +1439,15 @@ async def _fetch_existing_models(runner: Any) -> set[str]:
 
 __all__ = [
     "BlueprintSeed",
+    "CatalogGraphReport",
     "CorpusLoadError",
     "KnowledgeSeed",
     "LoadReport",
     "SCHEMA_STATEMENTS",
+    "apply_catalog_graph_schema",
     "apply_schema",
     "check_model_parity",
+    "load_catalog_graph",
     "load_corpus",
     "load_seed_fixtures",
 ]

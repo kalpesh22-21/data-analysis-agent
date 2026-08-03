@@ -30,9 +30,14 @@ from neo4j import AsyncGraphDatabase
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.blueprint.template import bind_template
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
-from data_agent.runtime.retrieval.corpus_loader import load_corpus, load_seed_fixtures
+from data_agent.runtime.retrieval.corpus_loader import (
+    load_catalog_graph,
+    load_corpus,
+    load_seed_fixtures,
+)
 from data_agent.runtime.retrieval.tools import GetBlueprintTool
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
+from tests._catalog_fixture import load_catalog_export
 
 pytestmark = pytest.mark.skipif(
     not (os.environ.get("NEO4J_TEST_URI") and os.environ.get("EMBEDDING_TEST_URL")),
@@ -84,6 +89,8 @@ def seeded_dag_corpus() -> bool:
         try:
             async with driver.session() as session:
                 await session.run("MATCH (n) DETACH DELETE n")  # DESTRUCTIVE — l2 only
+            # Catalog-owned :Table/:Column graph first (load_corpus MATCHes these).
+            await load_catalog_graph(driver, load_catalog_export())
             blueprints, knowledge = load_seed_fixtures(_FIXTURE_DIR)
             await load_corpus(driver, _embedder(), blueprints, knowledge, model_id=_MODEL)
         finally:
