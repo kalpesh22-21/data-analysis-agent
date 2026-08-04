@@ -32,9 +32,9 @@ _FIXTURE_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "cor
 
 _BP_ID = "bp-hires-projection"
 _E = "dbpcm_warehouse.employee"
-_CODE = f"{_E}.EmployeeCode"
-_HIRE = f"{_E}.MostRecentHireDate"
-_STATUS = f"{_E}.EmployeeStatus"
+_CODE = f"{_E}.employee_code"
+_HIRE = f"{_E}.most_recent_hire_date"
+_STATUS = f"{_E}.employee_status"
 
 
 def _projection_seed() -> BlueprintSeed:
@@ -113,4 +113,7 @@ def test_projection_seed_slots_are_bounded_relative_windows() -> None:
     assert by_name["window_months"]["type"] == "relative_window"
     assert by_name["horizon_months"]["type"] == "relative_window"
     assert (by_name["window_months"]["min_value"], by_name["window_months"]["max_value"]) == (2, 36)
-    assert (by_name["horizon_months"]["min_value"], by_name["horizon_months"]["max_value"]) == (1, 24)
+    assert (by_name["horizon_months"]["min_value"], by_name["horizon_months"]["max_value"]) == (
+        1,
+        24,
+    )

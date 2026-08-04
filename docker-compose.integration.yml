@@ -71,8 +71,15 @@ services:
       CLICKHOUSE_HOST: "clickhouse"
       CLICKHOUSE_PORT: "8123"
       CLICKHOUSE_SECURE: "false"
-      CLICKHOUSE_USER: "default"
-      CLICKHOUSE_PASSWORD: ""
+      # RLS ENFORCEMENT (option A): the warehouse read path MUST connect as a user
+      # that HOLDS the `pcm_mcp_dev` role, otherwise ClickHouse row policies (which
+      # are `TO pcm_mcp_dev`) are BYPASSED and every tenant sees all rows. `default`
+      # does not hold the role -> RLS off. `pcm_mcp` holds it -> RLS enforced.
+      # Provision on the CH server: CREATE USER pcm_mcp IDENTIFIED BY 'pcm_dev_pw';
+      # GRANT SELECT ON dbpcm_warehouse.*, dbpcm_warehouse_security.* TO pcm_mcp;
+      # GRANT pcm_mcp_dev TO pcm_mcp; ALTER USER pcm_mcp DEFAULT ROLE pcm_mcp_dev;
+      CLICKHOUSE_USER: "pcm_mcp"
+      CLICKHOUSE_PASSWORD: "pcm_dev_pw"
       CLICKHOUSE_DATABASE: "dbpcm_warehouse"
       OIDC_JWKS_URL: "http://token:8000/.well-known/jwks.json"
       OIDC_ISSUER: "http://token:8000/"

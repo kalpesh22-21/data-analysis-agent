@@ -2,13 +2,15 @@
 
 The single most important schema constraint: every `uses` string in
 `tests/fixtures/corpus/blueprints.yaml` must byte-match a real
-`database.table.column` scope key of the Layer-2 HR warehouse
-(`docker/clickhouse-init/hr-warehouse.sql`). If any fixture key drifts by a byte,
-the scope pre-filter (`candidate.uses <= column_scope`) silently drops that
-blueprint at recall — no error, just empty retrieval.
+`database.table.column` scope key of the Layer-2 HR warehouse. The seed is now
+split across TWO coherent snake_case migrations: the 4 core tables (employee,
+payroll, department, labor_allocation) live in `hr-4tables-snake-migration.sql`
+and the other 7 in `hr-warehouse.sql`. If any fixture key drifts by a byte, the
+scope pre-filter (`candidate.uses <= column_scope`) silently drops that blueprint
+at recall — no error, just empty retrieval.
 
-This test derives the warehouse's true column set from the ClickHouse DDL and
-asserts the fixtures are a subset of it, end-to-end at the fixture level (no
+This test derives the warehouse's true column set from BOTH ClickHouse DDL files
+and asserts the fixtures are a subset of it, end-to-end at the fixture level (no
 live infra) so the contract holds before it ever reaches neo4j.
 """
 
@@ -22,6 +24,9 @@ from data_agent.runtime.retrieval.corpus_loader import load_seed_fixtures
 _REPO = Path(__file__).resolve().parents[3]
 _FIXTURE_DIR = _REPO / "tests" / "fixtures" / "corpus"
 _SQL = _REPO / "docker" / "clickhouse-init" / "hr-warehouse.sql"
+# The 4 core tables (employee/payroll/department/labor_allocation) moved to this
+# sibling migration; the warehouse scope is the UNION of both DDL files.
+_SQL_4T = _REPO / "docker" / "clickhouse-init" / "hr-4tables-snake-migration.sql"
 
 # `IF NOT EXISTS` is optional: the warehouse DDL uses `DROP TABLE IF EXISTS x;`
 # followed by a bare `CREATE TABLE x (...)`. The non-greedy `(.*?)\)\s*ENGINE`
@@ -33,10 +38,12 @@ _CREATE_TABLE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
-# The nine tables the Layer-2 warehouse seed (hr-warehouse.sql) creates.
+# The eleven tables the Layer-2 warehouse seed (both DDL migrations) creates.
 _EXPECTED_TABLES = {
     "dbpcm_warehouse.employee",
     "dbpcm_warehouse.payroll",
+    "dbpcm_warehouse.department",
+    "dbpcm_warehouse.labor_allocation",
     "dbpcm_warehouse.accrual_events",
     "dbpcm_warehouse.personnel_action_form_changes",
     "dbpcm_warehouse.applicant_tracking_application",
@@ -49,10 +56,13 @@ _EXPECTED_TABLES = {
 
 def _warehouse_scope_keys() -> set[str]:
     """Parse the ClickHouse DDL into the set of `database.table.column` keys —
-    the exact strings the runtime column-scope is built from."""
-    sql = _SQL.read_text(encoding="utf-8")
+    the exact strings the runtime column-scope is built from. The warehouse scope
+    is the UNION of both snake_case seed migrations (7 tables + the 4 core)."""
+    sql = _SQL.read_text(encoding="utf-8") + "\n" + _SQL_4T.read_text(encoding="utf-8")
     keys: set[str] = set()
     for db, table, body in _CREATE_TABLE.findall(sql):
+        if db != "dbpcm_warehouse":
+            continue  # the 4-table migration also creates a security-DB table
         for raw_line in body.splitlines():
             line = raw_line.strip()
             if not line or line.startswith("--"):
@@ -68,16 +78,16 @@ def test_ddl_parser_recovers_the_expected_columns() -> None:
     # nothing, the subset assertion below would vacuously pass. Anchor on known
     # columns so a broken parser fails loudly instead.
     keys = _warehouse_scope_keys()
-    # Known-column anchors spanning several of the nine seeded tables. If the
-    # parser silently returned nothing/garbage, these fail loudly.
-    assert "dbpcm_warehouse.employee.Department" in keys
-    assert "dbpcm_warehouse.payroll.Amount" in keys
-    assert "dbpcm_warehouse.payroll.PayPeriodEndDate" in keys
-    assert "dbpcm_warehouse.accrual_events.EarnCode" in keys
-    assert "dbpcm_warehouse.performance_discussions.DiscussionId" in keys
-    assert "dbpcm_warehouse.applicant_tracking_application.ApplicationId" in keys
+    # Known-column anchors (snake_case, Wave-1 catalog) spanning several seeded
+    # tables. If the parser silently returned nothing/garbage, these fail loudly.
+    assert "dbpcm_warehouse.employee.department_name" in keys
+    assert "dbpcm_warehouse.payroll.amount" in keys
+    assert "dbpcm_warehouse.payroll.pay_period_end_date" in keys
+    assert "dbpcm_warehouse.accrual_events.earn_code" in keys
+    assert "dbpcm_warehouse.performance_discussions.discussion_id" in keys
+    assert "dbpcm_warehouse.applicant_tracking_application.application_id" in keys
 
-    # The parser must recover exactly the nine seeded tables — no more, no fewer.
+    # The parser must recover exactly the eleven seeded tables — no more, no fewer.
     recovered_tables = {k.rsplit(".", 1)[0] for k in keys}
     assert recovered_tables == _EXPECTED_TABLES
 
@@ -106,22 +116,22 @@ def test_every_fixture_uses_key_byte_matches_a_real_warehouse_column() -> None:
 
 
 def test_fixture_keys_are_case_sensitive_exact() -> None:
-    # The catalog column names are case-sensitive (SQL header comment). Prove the
-    # fixtures preserve case exactly — a lowercased 'department' would drift.
+    # The catalog column names are case-sensitive snake_case (Wave-1). Prove the
+    # fixtures use the exact snake_case name — the old PascalCase would drift.
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
     all_keys = {k for bp in blueprints for k in bp.uses}
-    assert "dbpcm_warehouse.employee.Department" in all_keys
-    assert "dbpcm_warehouse.employee.department" not in all_keys
+    assert "dbpcm_warehouse.employee.department_name" in all_keys
+    assert "dbpcm_warehouse.employee.Department" not in all_keys
 
 
 def test_no_fixture_key_references_a_disallowed_payroll_date_column() -> None:
-    # payroll carries three date columns: PayDate, PayPeriodStartDate and
-    # PayPeriodEndDate. All three ARE seeded in the current warehouse, but the
-    # fixtures deliberately anchor every pay-period predicate on PayPeriodEndDate
+    # payroll carries three date columns: pay_date, pay_period_start_date and
+    # pay_period_end_date. All three ARE seeded in the current warehouse, but the
+    # fixtures deliberately anchor every pay-period predicate on pay_period_end_date
     # (the register's period-close date) for a single, consistent period grain.
-    # A fixture drifting to PayDate or PayPeriodStartDate would silently change
+    # A fixture drifting to pay_date or pay_period_start_date would silently change
     # that grain, so guard against it — this is a convention guard, not a
     # "column is unseeded" guard.
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
     all_keys = {k for bp in blueprints for k in bp.uses}
-    assert not any("PayDate" in k or "PayPeriodStartDate" in k for k in all_keys)
+    assert not any(k.endswith(".pay_date") or "pay_period_start_date" in k for k in all_keys)

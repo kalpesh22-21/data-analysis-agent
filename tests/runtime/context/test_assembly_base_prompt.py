@@ -90,6 +90,17 @@ def test_base_prompt_carries_partial_access_honesty_rule() -> None:
     assert "never imply coverage you do not have" in AGENT_SYSTEM_PROMPT
 
 
+def test_base_prompt_carries_row_scope_disclosure_rule() -> None:
+    # Guard: the row-level-security disclosure rule (a query can SUCCEED yet return
+    # only the caller's authorized rows, so a scoped count/total must not be
+    # presented as the complete org-wide number) must not be silently dropped by a
+    # future prompt edit. Assert on durable, distinctive substrings covering both
+    # the RLS framing and the proportionality guard.
+    assert "row-level-security scoped" in AGENT_SYSTEM_PROMPT
+    assert "only the records the caller is authorized to access" in AGENT_SYSTEM_PROMPT
+    assert "do not hedge every answer" in AGENT_SYSTEM_PROMPT
+
+
 def test_base_prompt_carries_pii_minimization_rule() -> None:
     # Guard: the PII / data-minimization rule (don't surface sensitive
     # personal/compensation fields beyond what the question needs) must not be

@@ -56,6 +56,7 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
         "bp-hires-per-month",
         "bp-hires-in-range",
         "bp-hires-projection",
+        "bp-compare-employee-check-detail-two-periods",
     }
     # The Department-grained, {department}-filtered seeds — the windowed-period
     # seeds (relative_window / period_range) have a `month` grain and their own

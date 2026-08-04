@@ -168,11 +168,12 @@ def test_catalog_graph_rows_over_fixture() -> None:
     assert {row["key"] for row in column_rows} == column_keys
 
     # A known column round-trips into a column row with its enriched type.
-    emp_status_key = f"{_E}.EmployeeStatus"
+    emp_status_key = f"{_E}.employee_status"
     assert emp_status_key in column_keys
     emp_status = next(r for r in column_rows if r["key"] == emp_status_key)
     assert emp_status["props"]["type"] == "Nullable(String)"
-    assert json.loads(emp_status["props"]["values_json"])["A"] == "active"
+    # The Wave-1 catalog authors employee_status `values` as the enum-code list.
+    assert "A" in json.loads(emp_status["props"]["values_json"])
 
 
 def test_catalog_graph_rows_tolerates_non_dict_entry() -> None:

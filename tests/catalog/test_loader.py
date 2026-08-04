@@ -48,7 +48,9 @@ EXPECTED_TABLE_KEYS = frozenset(
         "dbpcm_warehouse.applicant_tracking_requisition",
         "dbpcm_warehouse.candidate_education",
         "dbpcm_warehouse.candidate_employment_history",
+        "dbpcm_warehouse.department",
         "dbpcm_warehouse.employee",
+        "dbpcm_warehouse.labor_allocation",
         "dbpcm_warehouse.payroll",
         "dbpcm_warehouse.performance_discussions",
         "dbpcm_warehouse.personnel_action_form_changes",
@@ -73,7 +75,7 @@ def test_load_semantic_catalog_returns_one_entry_per_table() -> None:
 
 def test_employee_grain() -> None:
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
-    assert catalog[_E]["grain"] == ["EmployeeCode"]
+    assert catalog[_E]["grain"] == ["employee_code"]
 
 
 def test_employee_rules_contains_active_employee_rule() -> None:
@@ -83,42 +85,35 @@ def test_employee_rules_contains_active_employee_rule() -> None:
     assert len(rules) >= 1
     active_rule = next((r for r in rules if r.get("id") == "active_employee"), None)
     assert active_rule is not None, "expected an 'active_employee' rule in employee.yaml rules[]"
-    assert active_rule["predicate"] == "EmployeeStatus = 'A'"
+    assert active_rule["predicate"] == "employee_status = 'A'"
 
 
-def test_employee_ambiguities_contains_headcount_term() -> None:
+def test_employee_ambiguities_contains_department_term() -> None:
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
     ambiguities = catalog[_E]["ambiguities"]
     assert isinstance(ambiguities, list)
     assert len(ambiguities) >= 1
-    headcount = next((a for a in ambiguities if a.get("term") == "headcount"), None)
-    assert headcount is not None, "expected a 'headcount' ambiguity in employee.yaml ambiguities[]"
-    assert headcount["default"] == "active_only"
+    department = next((a for a in ambiguities if a.get("term") == "department"), None)
+    assert department is not None, (
+        "expected a 'department' ambiguity in employee.yaml ambiguities[]"
+    )
+    assert department["default"] == "department_name for display and department_code for filtering"
 
 
 def test_employee_status_enum_values_map() -> None:
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
-    status_col = catalog[_E]["columns"]["EmployeeStatus"]
-    assert status_col["values"] == {
-        "A": "active",
-        "D": "deceased",
-        "I": "inactive",
-        "N": "not_hired",
-        "P": "pre_hire",
-        "R": "retired",
-        "T": "terminated",
-        "V": "on_leave",
-    }
-    assert status_col["observed_values"] == ["A", "D", "I", "N", "T", "V"]
+    status_col = catalog[_E]["columns"]["employee_status"]
+    # The Wave-1 catalog authors `values` as the observed enum-code list.
+    assert status_col["values"] == ["A", "D", "I", "R", "T", "V"]
 
 
 def test_employee_column_with_unit() -> None:
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
-    annual_salary = catalog[_E]["columns"]["AnnualSalary"]
+    annual_salary = catalog[_E]["columns"]["annual_salary"]
     assert annual_salary["unit"] == "USD"
     assert annual_salary["type"] == "Nullable(Decimal(18, 6))"
 
-    rate1 = catalog[_E]["columns"]["Rate1"]
+    rate1 = catalog[_E]["columns"]["rate_1"]
     assert rate1["unit"] == "USD"
 
 
@@ -134,11 +129,11 @@ def test_flow_style_decimal_types_are_not_truncated_by_yaml_comma() -> None:
     """
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
     affected = [
-        (_E, "AnnualSalary"),
-        (_E, "Rate1"),
-        ("dbpcm_warehouse.candidate_education", "StudentGPA"),
-        ("dbpcm_warehouse.applicant_tracking_application", "ApplicationJobWageStart"),
-        ("dbpcm_warehouse.applicant_tracking_application", "ApplicationJobWageEnd"),
+        (_E, "annual_salary"),
+        (_E, "rate_1"),
+        ("dbpcm_warehouse.candidate_education", "student_gpa"),
+        ("dbpcm_warehouse.applicant_tracking_application", "application_job_wage_start"),
+        ("dbpcm_warehouse.applicant_tracking_application", "application_job_wage_end"),
     ]
     for table_key, col in affected:
         meta = catalog[table_key]["columns"][col]
@@ -147,23 +142,23 @@ def test_flow_style_decimal_types_are_not_truncated_by_yaml_comma() -> None:
 
 
 def test_column_with_sensitive_true() -> None:
-    """candidate_education.EducationPhoneNumber is marked sensitive: true in the YAML."""
+    """candidate_education.education_phone_number is marked sensitive: true in the YAML."""
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
-    phone_col = catalog[_CE]["columns"]["EducationPhoneNumber"]
+    phone_col = catalog[_CE]["columns"]["education_phone_number"]
     assert phone_col["sensitive"] is True
     assert phone_col["type"] == "Nullable(String)"
 
     # A representative non-sensitive column in the same table should not carry the flag.
-    institute_name_col = catalog[_CE]["columns"]["InstituteName"]
+    institute_name_col = catalog[_CE]["columns"]["institute_name"]
     assert "sensitive" not in institute_name_col
 
 
 def test_employee_client_defined_flag() -> None:
-    """Department is client_defined: true in employee.yaml; EmployeeCode is not."""
+    """department_code is client_defined: true in employee.yaml; employee_code is not."""
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
     columns = catalog[_E]["columns"]
-    assert columns["Department"]["client_defined"] is True
-    assert "client_defined" not in columns["EmployeeCode"]
+    assert columns["department_code"]["client_defined"] is True
+    assert "client_defined" not in columns["employee_code"]
 
 
 # ---------------------------------------------------------------------------
@@ -176,9 +171,12 @@ def test_payroll_measures_present() -> None:
     measures = catalog[_P]["measures"]
     assert "gross_earnings" in measures
     assert measures["gross_earnings"] == {
-        "column": "Amount",
+        "column": "amount",
         "agg": "sum",
-        "defined_over": "RegisterType = 'EARN'; summed over line items within (EmployeeCode, pay period)",
+        "defined_over": (
+            "register_type = 'EARN'; summed over payroll line items within the "
+            "selected employee and payroll-period or pay-date grain."
+        ),
     }
     assert "paid_hours" in measures
 
@@ -195,18 +193,17 @@ def test_employee_measures_absent() -> None:
 
 
 def test_case_preservation_mixed_case_column() -> None:
-    """payroll.yaml authors `distributedDepartmentDescription` (lowercase leading d).
+    """payroll.yaml authors `distributed_job_cost_code` in exact snake_case.
 
-    The loader must not lowercase or titlecase this — exact casing from the YAML
-    must be preserved (D70).
+    The loader must not re-case or mangle the authored name — the exact casing
+    from the YAML must be preserved (D70).
     """
     catalog = load_semantic_catalog_from_catalog(_CATALOG)
     columns = catalog[_P]["columns"]
-    assert "distributedDepartmentDescription" in columns
-    # Neither the fully-lowercased nor the PascalCase variant should exist as a
-    # *different* key — only the exact authored casing.
-    assert "DistributedDepartmentDescription" not in columns
-    assert "distributeddepartmentdescription" not in columns
+    assert "distributed_job_cost_code" in columns
+    # No re-cased PascalCase / lowercased-run variant should exist as a different key.
+    assert "DistributedJobCostCode" not in columns
+    assert "distributedjobcostcode" not in columns
 
 
 def test_case_preservation_table_and_database_keys() -> None:

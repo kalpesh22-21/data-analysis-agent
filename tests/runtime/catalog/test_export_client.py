@@ -170,18 +170,19 @@ async def test_built_handles_match_fixture_values() -> None:
 
     # Schema carries the employee columns + their type strings.
     emp_cols = catalog_handle.schema[_E]
-    assert emp_cols["EmployeeStatus"] == "Nullable(String)"
-    assert emp_cols["AnnualSalary"] == "Nullable(Decimal(18, 6))"
+    assert emp_cols["employee_status"] == "Nullable(String)"
+    assert emp_cols["annual_salary"] == "Nullable(Decimal(18, 6))"
 
-    # Description-col linkage survives the export round-trip (payroll TypeCode).
+    # Description-col linkage survives the export round-trip (payroll type_code).
     assert (
-        catalog_handle.description_col_for("dbpcm_warehouse.payroll", "TypeCode")
-        == "TypeCodeDescription"
+        catalog_handle.description_col_for("dbpcm_warehouse.payroll", "type_code")
+        == "type_code_description"
     )
 
-    # Semantic grain view: employee verifiable, payroll not.
+    # Semantic grain view: both employee and payroll declare a verifiable grain
+    # in the Wave-1 catalog (payroll now carries an explicit line-item grain).
     assert semantic_handle.is_grain_verifiable(_E) is True
-    assert semantic_handle.is_grain_verifiable("dbpcm_warehouse.payroll") is False
+    assert semantic_handle.is_grain_verifiable("dbpcm_warehouse.payroll") is True
 
 
 # --- build_catalog_cache selects the right client ---------------------------

@@ -140,7 +140,7 @@ def test_catalog_omitted_uses_fixture_cache_provider_for_provenance(monkeypatch)
                     ToolCallRequest(
                         id="q1",
                         name="runQuery",
-                        arguments={"sql": "SELECT EmployeeCode FROM dbpcm_warehouse.employee"},
+                        arguments={"sql": "SELECT employee_code FROM dbpcm_warehouse.employee"},
                     )
                 ]
             ),
@@ -165,7 +165,7 @@ def test_catalog_omitted_uses_fixture_cache_provider_for_provenance(monkeypatch)
     data = _parse_sse(resp.text)[-1]["data"]
     assert data["status"] == "done"
     # The fixture-built catalog resolved employee.EmployeeCode → determined provenance.
-    assert data["provenance"] == ["dbpcm_warehouse.employee.EmployeeCode"]
+    assert data["provenance"] == ["dbpcm_warehouse.employee.employee_code"]
 
 
 def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> None:

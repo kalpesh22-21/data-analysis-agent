@@ -71,9 +71,10 @@ def test_handle_is_read_only() -> None:
 
 
 def test_load_from_real_catalog() -> None:
-    # The real overlay (from the committed MCP export fixture, D75 Wave 1b):
-    # payroll must be grain_verifiable:false, employee true.
+    # The real overlay (from the committed MCP export fixture, D75 Wave 1b): both
+    # employee and payroll declare a verifiable grain in the Wave-1 catalog (payroll
+    # now carries an explicit line-item grain), and payroll retains its measures.
     h = fixture_semantic_catalog_handle()
     assert h.is_grain_verifiable("dbpcm_warehouse.employee") is True
-    assert h.is_grain_verifiable("dbpcm_warehouse.payroll") is False
+    assert h.is_grain_verifiable("dbpcm_warehouse.payroll") is True
     assert "gross_earnings" in h.grain_for("dbpcm_warehouse.payroll").measures

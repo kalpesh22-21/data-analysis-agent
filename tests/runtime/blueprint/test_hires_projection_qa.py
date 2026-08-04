@@ -52,13 +52,13 @@ _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "corpus"
 _BP_ID = "bp-hires-projection"
 
 _E = "dbpcm_warehouse.employee"
-_HIRE_COL = f"{_E}.MostRecentHireDate"
-_CODE_COL = f"{_E}.EmployeeCode"
+_HIRE_COL = f"{_E}.most_recent_hire_date"
+_CODE_COL = f"{_E}.employee_code"
 _USES = frozenset({_HIRE_COL, _CODE_COL})
 
 # The catalog the executor binds/scope-checks against (mirrors the seeded schema).
 CATALOG = CatalogHandle(
-    {_E: {"EmployeeCode": "String", "MostRecentHireDate": "Nullable(DateTime64(6))"}}
+    {_E: {"employee_code": "String", "most_recent_hire_date": "Nullable(DateTime64(6))"}}
 )
 
 
@@ -196,9 +196,9 @@ def test_window_and_horizon_at_bounds_bind() -> None:
 @pytest.mark.parametrize(
     "bindings",
     [
-        {"window_months": 1, "horizon_months": 6},   # window below min
+        {"window_months": 1, "horizon_months": 6},  # window below min
         {"window_months": 37, "horizon_months": 6},  # window above max
-        {"window_months": 6, "horizon_months": 0},   # horizon below min
+        {"window_months": 6, "horizon_months": 0},  # horizon below min
         {"window_months": 6, "horizon_months": 25},  # horizon above max
     ],
 )

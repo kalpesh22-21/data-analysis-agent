@@ -139,18 +139,17 @@ def test_extract_empty_columns_block() -> None:
 
 def test_real_catalog_declared_links_present() -> None:
     result = load_description_cols_from_catalog(_CATALOG)
-    assert result[_PAF] == {"FieldId": "FieldLabel"}
-    # payroll declares two: TypeCode and the mixed-case DistributedDepartmentCode.
-    assert result[_P]["TypeCode"] == "TypeCodeDescription"
-    assert result[_P]["DistributedDepartmentCode"] == "distributedDepartmentDescription"
+    assert result[_PAF] == {"field_id": "field_label"}
+    # payroll declares the code<->label sibling link on type_code.
+    assert result[_P]["type_code"] == "type_code_description"
 
 
 def test_real_catalog_case_preserved_in_link_target() -> None:
-    """The declared target casing is preserved exactly (D70) — the lowercase-leading
-    `distributedDepartmentDescription` is the case the naming convention misses."""
+    """The declared target casing is preserved exactly (D70) — the authored snake_case
+    `type_code_description` is stored verbatim, not re-cased by the loader."""
     payroll = load_description_cols_from_catalog(_CATALOG)[_P]
-    assert payroll["DistributedDepartmentCode"] == "distributedDepartmentDescription"
-    assert payroll["DistributedDepartmentCode"] != "DistributedDepartmentDescription"
+    assert payroll["type_code"] == "type_code_description"
+    assert payroll["type_code"] != "TypeCodeDescription"
 
 
 def test_description_cols_keys_align_with_sqlglot_schema() -> None:

@@ -20,28 +20,28 @@
   drift_status: clean
   catalog_sha: ""
   uses:
-    - dbpcm_warehouse.payroll.EmployeeCode
-    - dbpcm_warehouse.payroll.RegisterType
-    - dbpcm_warehouse.payroll.Amount
-    - dbpcm_warehouse.payroll.PayPeriodEndDate
-    - dbpcm_warehouse.employee.EmployeeCode
-    - dbpcm_warehouse.employee.Department
+    - dbpcm_warehouse.payroll.employee_code
+    - dbpcm_warehouse.payroll.register_type
+    - dbpcm_warehouse.payroll.amount
+    - dbpcm_warehouse.payroll.pay_period_end_date
+    - dbpcm_warehouse.employee.employee_code
+    - dbpcm_warehouse.employee.department_name
   resolves:
     overtime: gross_earnings
   slots:
-    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.Department }
-    - { name: pay_period, type: period, required: true, binds_to: dbpcm_warehouse.payroll.PayPeriodEndDate }
+    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
+    - { name: pay_period, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
   uses_rules:
     - gross_earnings
   result_grain: [ Department ]
   sql_template: |
-    SELECT e.Department AS department, SUM(p.Amount) AS overtime_pay
+    SELECT e.department_name AS department, SUM(p.amount) AS overtime_pay
     FROM dbpcm_warehouse.payroll AS p
-    JOIN dbpcm_warehouse.employee AS e ON e.EmployeeCode = p.EmployeeCode
-    WHERE p.RegisterType = 'EARN'
-      AND e.Department = {department}
-      AND p.PayPeriodEndDate = {pay_period}
-    GROUP BY e.Department
+    JOIN dbpcm_warehouse.employee AS e ON e.employee_code = p.employee_code
+    WHERE p.register_type = 'EARN'
+      AND e.department_name = {department}
+      AND p.pay_period_end_date = {pay_period}
+    GROUP BY e.department_name
 
 - id: bp-active-headcount-by-department
   intent: Active employee headcount by department
@@ -50,19 +50,19 @@
   drift_status: clean
   catalog_sha: ""
   uses:
-    - dbpcm_warehouse.employee.EmployeeCode
-    - dbpcm_warehouse.employee.Department
-    - dbpcm_warehouse.employee.EmployeeStatus
+    - dbpcm_warehouse.employee.employee_code
+    - dbpcm_warehouse.employee.department_name
+    - dbpcm_warehouse.employee.employee_status
   slots:
-    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.Department }
+    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
   uses_rules:
     - active_employee
   result_grain: [ Department ]
   sql_template: |
-    SELECT Department AS department, COUNT(DISTINCT EmployeeCode) AS headcount
+    SELECT department_name AS department, COUNT(DISTINCT employee_code) AS headcount
     FROM dbpcm_warehouse.employee
-    WHERE EmployeeStatus = 'A' AND Department = {department}
-    GROUP BY Department
+    WHERE employee_status = 'A' AND department_name = {department}
+    GROUP BY department_name
 
 - id: bp-average-salary-by-department
   intent: Average annual salary by department
@@ -71,29 +71,29 @@
   drift_status: clean
   catalog_sha: ""
   uses:
-    - dbpcm_warehouse.employee.EmployeeCode
-    - dbpcm_warehouse.employee.Department
-    - dbpcm_warehouse.employee.AnnualSalary
+    - dbpcm_warehouse.employee.employee_code
+    - dbpcm_warehouse.employee.department_name
+    - dbpcm_warehouse.employee.annual_salary
   resolves:
-    salary: AnnualSalary
+    salary: annual_salary
   slots:
-    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.Department }
+    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
   result_grain: [ Department ]
   sql_template: |
-    SELECT Department AS department,
-           AVG(AnnualSalary) AS avg_salary,
-           COUNT(DISTINCT EmployeeCode) AS headcount
+    SELECT department_name AS department,
+           AVG(annual_salary) AS avg_salary,
+           COUNT(DISTINCT employee_code) AS headcount
     FROM dbpcm_warehouse.employee
-    WHERE Department = {department}
-    GROUP BY Department
+    WHERE department_name = {department}
+    GROUP BY department_name
 
 # Slice-C SINGLE-NODE `resolve_via` blueprint (D67, runblueprint-design §3.4): the
-# `earnings_only` rule maps the concept "earnings" → the earnings RegisterType code
+# `earnings_only` rule maps the concept "earnings" → the earnings register_type code
 # set via the typed `resolveValues.resolve()` hook (NO model round-trip), and the
 # executor folds the ranked codes into the `{earn_codes}` predicate as a typed AST
-# IN-list (F1/D10 — never interpolated). Value-only ranking (RegisterType has no
+# IN-list (F1/D10 — never interpolated). Value-only ranking (register_type has no
 # sibling description column) against the real embedder + the DISTINCT-domain freq.
-# The seed's catalog-faithful RegisterType domain is {EARN, EETAX, DDUCT,
+# The seed's catalog-faithful register_type domain is {EARN, EETAX, DDUCT,
 # NETPAYDIST, EEBEN, ERTAX} (EARN has one row per paid employee); "earnings" must
 # rank EARN first, above deduction/tax codes such as DDUCT/EETAX.
 - id: bp-total-earnings-by-department
@@ -103,28 +103,28 @@
   drift_status: clean
   catalog_sha: ""
   uses:
-    - dbpcm_warehouse.payroll.EmployeeCode
-    - dbpcm_warehouse.payroll.RegisterType
-    - dbpcm_warehouse.payroll.Amount
-    - dbpcm_warehouse.employee.EmployeeCode
-    - dbpcm_warehouse.employee.Department
+    - dbpcm_warehouse.payroll.employee_code
+    - dbpcm_warehouse.payroll.register_type
+    - dbpcm_warehouse.payroll.amount
+    - dbpcm_warehouse.employee.employee_code
+    - dbpcm_warehouse.employee.department_name
   slots:
-    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.Department }
+    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
   uses_rules:
-    - { id: earnings_only, resolve_via: "resolveValues(RegisterType, 'earnings')", table: dbpcm_warehouse.payroll, binds: earn_codes }
+    - { id: earnings_only, resolve_via: "resolveValues(register_type, 'earnings')", table: dbpcm_warehouse.payroll, binds: earn_codes }
   result_grain: [ Department ]
   sql_template: |
-    SELECT e.Department AS department, SUM(p.Amount) AS total_earnings
+    SELECT e.department_name AS department, SUM(p.amount) AS total_earnings
     FROM dbpcm_warehouse.payroll AS p
-    JOIN dbpcm_warehouse.employee AS e ON e.EmployeeCode = p.EmployeeCode
-    WHERE p.RegisterType IN {earn_codes}
-      AND e.Department = {department}
-    GROUP BY e.Department
+    JOIN dbpcm_warehouse.employee AS e ON e.employee_code = p.employee_code
+    WHERE p.register_type IN {earn_codes}
+      AND e.department_name = {department}
+    GROUP BY e.department_name
 
 # Slice-C multi-node SCALAR-passing DAG (runblueprint-design §2.4/§Q7 Slice C):
 # node 0 computes the company-wide average as a SCALAR; node 1 consumes it as a
 # typed AST literal (F1/D10 — never interpolated) to select the departments above
-# it. No table intermediate (F2-clean); the declared result grain is Department.
+# it. No table intermediate (F2-clean); the declared result grain is department_name.
 - id: bp-departments-above-company-average-salary
   intent: Departments whose average salary exceeds the company-wide average
   slots_summary: ""
@@ -132,25 +132,25 @@
   drift_status: clean
   catalog_sha: ""
   uses:
-    - dbpcm_warehouse.employee.EmployeeCode
-    - dbpcm_warehouse.employee.Department
-    - dbpcm_warehouse.employee.AnnualSalary
+    - dbpcm_warehouse.employee.employee_code
+    - dbpcm_warehouse.employee.department_name
+    - dbpcm_warehouse.employee.annual_salary
   result_grain: [ Department ]
   composes:
     - order: 0
       output: { company_avg: scalar }
       sql_template: |
-        SELECT AVG(AnnualSalary) AS company_avg
+        SELECT AVG(annual_salary) AS company_avg
         FROM dbpcm_warehouse.employee
     - order: 1
       feeds_from: [ 0 ]
       consumes: { company_avg: "$0.company_avg" }
       output: {}
       sql_template: |
-        SELECT Department AS department, AVG(AnnualSalary) AS dept_avg
+        SELECT department_name AS department, AVG(annual_salary) AS dept_avg
         FROM dbpcm_warehouse.employee
-        GROUP BY Department
-        HAVING AVG(AnnualSalary) > {company_avg}
+        GROUP BY department_name
+        HAVING AVG(annual_salary) > {company_avg}
 
 # Table-intermediate DAG (table-intermediate-design §2.2/§Q2, Slice 2). Genuinely
 # NOT scalar-converging: node 0 produces a per-EMPLOYEE earnings TABLE (many rows,
@@ -159,10 +159,10 @@
 # this exercises the D93 materialize-and-join path — node 0's result is
 # materialized to `scratch.s_<sid>_bp_<uuid>` and node 1's `scratch.emp_earnings`
 # FROM token is AST-rewritten to it (runtime-controlled identifier, never model
-# text). The join key is CAST to a stable type (`toString(EmployeeCode)` — matches
+# text). The join key is CAST to a stable type (`toString(employee_code)` — matches
 # the String warehouse key) and the measure to `toFloat64` (§Q2/OQ-A). The scratch
 # columns are session-gated (excluded from `uses`, D69/OQ-4); the warehouse columns
-# stay ⊆ uses. The terminal grain (Department) is D56-verified.
+# stay ⊆ uses. The terminal grain (department_name) is D56-verified.
 - id: bp-earnings-by-department-via-scratch-join
   intent: Total earnings by department, materializing per-employee earnings and joining departments
   slots_summary: department
@@ -170,33 +170,33 @@
   drift_status: clean
   catalog_sha: ""
   uses:
-    - dbpcm_warehouse.payroll.EmployeeCode
-    - dbpcm_warehouse.payroll.RegisterType
-    - dbpcm_warehouse.payroll.Amount
-    - dbpcm_warehouse.employee.EmployeeCode
-    - dbpcm_warehouse.employee.Department
+    - dbpcm_warehouse.payroll.employee_code
+    - dbpcm_warehouse.payroll.register_type
+    - dbpcm_warehouse.payroll.amount
+    - dbpcm_warehouse.employee.employee_code
+    - dbpcm_warehouse.employee.department_name
   slots:
-    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.Department }
+    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
   result_grain: [ Department ]
   composes:
     - order: 0
       output: { emp_earnings: table }
       sql_template: |
-        SELECT toString(p.EmployeeCode) AS EmployeeCode,
-               toFloat64(SUM(p.Amount)) AS earnings
+        SELECT toString(p.employee_code) AS employee_code,
+               toFloat64(SUM(p.amount)) AS earnings
         FROM dbpcm_warehouse.payroll AS p
-        WHERE p.RegisterType = 'EARN'
-        GROUP BY p.EmployeeCode
+        WHERE p.register_type = 'EARN'
+        GROUP BY p.employee_code
     - order: 1
       feeds_from: [ 0 ]
       consumes: { emp_earnings: "$0" }
       output: {}
       sql_template: |
-        SELECT e.Department AS department, SUM(x.earnings) AS total_earnings
+        SELECT e.department_name AS department, SUM(x.earnings) AS total_earnings
         FROM scratch.emp_earnings AS x
-        JOIN dbpcm_warehouse.employee AS e ON e.EmployeeCode = x.EmployeeCode
-        WHERE e.Department = {department}
-        GROUP BY e.Department
+        JOIN dbpcm_warehouse.employee AS e ON e.employee_code = x.employee_code
+        WHERE e.department_name = {department}
+        GROUP BY e.department_name
 
 # Windowed-period slot — `relative_window` (a trailing "last N months", D41/D49):
 # the runtime resolves the raw value to a BOUNDED integer and binds it as an
@@ -210,9 +210,9 @@
   drift_status: clean
   catalog_sha: ""
   uses:
-    - dbpcm_warehouse.employee.EmployeeCode
-    - dbpcm_warehouse.employee.MostRecentHireDate
-    - dbpcm_warehouse.employee.EmployeeStatus
+    - dbpcm_warehouse.employee.employee_code
+    - dbpcm_warehouse.employee.most_recent_hire_date
+    - dbpcm_warehouse.employee.employee_status
   slots:
     - { name: window_months, type: relative_window, required: true, min_value: 1, max_value: 36 }
   result_grain: [ month ]
@@ -222,18 +222,18 @@
   # here — this is a per-month listing, no division by N). exclude_not_hired_default:
   # drop 'N' (pre-hire) records — in BOTH the outer WHERE and the anchor subquery, so
   # a future-dated 'N' hire date can never become max() and drag the anchor. The
-  # `OR IS NULL` matters: EmployeeStatus is Nullable(String), a bare `!= 'N'` drops NULLs.
+  # `OR IS NULL` matters: employee_status is Nullable(String), a bare `!= 'N'` drops NULLs.
   sql_template: |
-    SELECT toStartOfMonth(MostRecentHireDate) AS month,
-           COUNT(DISTINCT EmployeeCode) AS hires
+    SELECT toStartOfMonth(most_recent_hire_date) AS month,
+           COUNT(DISTINCT employee_code) AS hires
     FROM dbpcm_warehouse.employee
-    WHERE MostRecentHireDate >= (
-            SELECT toStartOfMonth(max(MostRecentHireDate))
+    WHERE most_recent_hire_date >= (
+            SELECT toStartOfMonth(max(most_recent_hire_date))
             FROM dbpcm_warehouse.employee
-            WHERE EmployeeStatus != 'N' OR EmployeeStatus IS NULL
+            WHERE employee_status != 'N' OR employee_status IS NULL
           ) - INTERVAL {window_months} MONTH
-      AND (EmployeeStatus != 'N' OR EmployeeStatus IS NULL)
-    GROUP BY toStartOfMonth(MostRecentHireDate)
+      AND (employee_status != 'N' OR employee_status IS NULL)
+    GROUP BY toStartOfMonth(most_recent_hire_date)
 
 # Windowed-period slot — `period_range` (an explicit {start, end}, D41/D49): the
 # ONE slot expands to TWO bind tokens `{hire_window_start}` / `{hire_window_end}`,
@@ -248,22 +248,22 @@
   drift_status: clean
   catalog_sha: ""
   uses:
-    - dbpcm_warehouse.employee.EmployeeCode
-    - dbpcm_warehouse.employee.MostRecentHireDate
-    - dbpcm_warehouse.employee.EmployeeStatus
+    - dbpcm_warehouse.employee.employee_code
+    - dbpcm_warehouse.employee.most_recent_hire_date
+    - dbpcm_warehouse.employee.employee_status
   slots:
     - { name: hire_window, type: period_range, required: true }
   result_grain: [ month ]
   # exclude_not_hired_default: drop 'N' (pre-hire) records. `OR IS NULL` matters —
-  # EmployeeStatus is Nullable(String), a bare `!= 'N'` drops NULL rows.
+  # employee_status is Nullable(String), a bare `!= 'N'` drops NULL rows.
   sql_template: |
-    SELECT toStartOfMonth(MostRecentHireDate) AS month,
-           COUNT(DISTINCT EmployeeCode) AS hires
+    SELECT toStartOfMonth(most_recent_hire_date) AS month,
+           COUNT(DISTINCT employee_code) AS hires
     FROM dbpcm_warehouse.employee
-    WHERE MostRecentHireDate >= {hire_window_start}
-      AND MostRecentHireDate < {hire_window_end}
-      AND (EmployeeStatus != 'N' OR EmployeeStatus IS NULL)
-    GROUP BY toStartOfMonth(MostRecentHireDate)
+    WHERE most_recent_hire_date >= {hire_window_start}
+      AND most_recent_hire_date < {hire_window_end}
+      AND (employee_status != 'N' OR employee_status IS NULL)
+    GROUP BY toStartOfMonth(most_recent_hire_date)
 
 # Second-order (D103/D104, second-order-analysis-design §2–§3): a run-rate PROJECTION.
 # The pivot away from a bespoke `projectSeries` tool — the projection math is plain
@@ -280,9 +280,9 @@
   drift_status: clean
   catalog_sha: ""
   uses:
-    - dbpcm_warehouse.employee.EmployeeCode
-    - dbpcm_warehouse.employee.MostRecentHireDate
-    - dbpcm_warehouse.employee.EmployeeStatus
+    - dbpcm_warehouse.employee.employee_code
+    - dbpcm_warehouse.employee.most_recent_hire_date
+    - dbpcm_warehouse.employee.employee_status
   slots:
     - { name: window_months,  type: relative_window, required: true, min_value: 2, max_value: 36 }
     - { name: horizon_months, type: relative_window, required: true, min_value: 1, max_value: 24 }
@@ -297,16 +297,103 @@
   # does not decay to empty as wall-clock time passes. exclude_not_hired_default: drop
   # 'N' (pre-hire) records in BOTH the outer WHERE and the anchor subquery (a future-dated
   # 'N' hire could otherwise become max() and drag the anchor). `OR IS NULL` matters —
-  # EmployeeStatus is Nullable(String), a bare `!= 'N'` drops NULL rows.
+  # employee_status is Nullable(String), a bare `!= 'N'` drops NULL rows.
   sql_template: |
     SELECT
-      COUNT(DISTINCT EmployeeCode) AS hires_in_window,
-      round(COUNT(DISTINCT EmployeeCode) / {window_months}, 1) AS avg_monthly_hires,
-      round(COUNT(DISTINCT EmployeeCode) / {window_months} * {horizon_months}) AS projected_next_n_hires
+      COUNT(DISTINCT employee_code) AS hires_in_window,
+      round(COUNT(DISTINCT employee_code) / {window_months}, 1) AS avg_monthly_hires,
+      round(COUNT(DISTINCT employee_code) / {window_months} * {horizon_months}) AS projected_next_n_hires
     FROM dbpcm_warehouse.employee
-    WHERE MostRecentHireDate >= addMonths((
-            SELECT toStartOfMonth(max(MostRecentHireDate))
+    WHERE most_recent_hire_date >= addMonths((
+            SELECT toStartOfMonth(max(most_recent_hire_date))
             FROM dbpcm_warehouse.employee
-            WHERE EmployeeStatus != 'N' OR EmployeeStatus IS NULL
+            WHERE employee_status != 'N' OR employee_status IS NULL
           ), 1) - INTERVAL {window_months} MONTH
-      AND (EmployeeStatus != 'N' OR EmployeeStatus IS NULL)
+      AND (employee_status != 'N' OR employee_status IS NULL)
+
+# Two-table-intermediate comparison DAG (table-intermediate-design §2.3, the
+# MULTI-table-consume case). Compares ONE employee's two paychecks at type_code
+# granularity across two pay periods, with per-line-item deltas. Two per-period
+# detail nodes each materialize a per-(register_type,type_code) TABLE to scratch;
+# the terminal node consumes BOTH via `feeds_from:[0,1]` + `consumes:{detail_a:"$0",
+# detail_b:"$1"}` and FULL OUTER JOINs them on (register_type, type_code) to compute
+# amount_a/amount_b/amount_delta + hours. Multi-table-consume is genuinely supported
+# by the executor: `_table_consumed_orders` collects EVERY `$N` table ref and
+# `_node_table_bindings` rewrites each `scratch.<placeholder>` FROM/JOIN token to its
+# materialized table — so a single consumer can join two upstream intermediates.
+#
+# Reads ONLY dbpcm_warehouse.payroll (client_code/proc_center are applied by RLS,
+# NEVER named here). The scratch columns are session-gated (excluded from `uses`,
+# D69/OQ-4); the warehouse columns stay ⊆ uses.
+#
+# result_grain [register_type, type_code]: one row per line-item. Each detail node
+# GROUPs BY (register_type, type_code) — with any(type_code_description) so the label
+# rides along WITHOUT widening the grain — so each key is UNIQUE per period by
+# construction; the FULL OUTER JOIN on that exact key then yields exactly one row per
+# distinct (register_type, type_code) in the union, so the D56 grain gate
+# (row_count == COUNT(DISTINCT register_type, type_code)) holds by construction.
+# The join keys are toString-CAST and the measures toFloat64-CAST (§Q2/OQ-A) so the
+# String keys match across scratch tables and the Decimal amounts materialize as a
+# native Float64 the terminal arithmetic (delta) can operate on.
+- id: bp-compare-employee-check-detail-two-periods
+  intent: Compare a single employee's two paychecks line-item by line-item across two pay periods, with per-item deltas
+  slots_summary: employee, period_a, period_b
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.payroll.employee_code
+    - dbpcm_warehouse.payroll.pay_period_end_date
+    - dbpcm_warehouse.payroll.register_type
+    - dbpcm_warehouse.payroll.type_code
+    - dbpcm_warehouse.payroll.type_code_description
+    - dbpcm_warehouse.payroll.amount
+    - dbpcm_warehouse.payroll.type_hours
+  slots:
+    - { name: employee, type: string, required: true, binds_to: dbpcm_warehouse.payroll.employee_code }
+    - { name: period_a, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
+    - { name: period_b, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
+  result_grain: [ register_type, type_code ]
+  composes:
+    - order: 0
+      output: { detail_a: table }
+      sql_template: |
+        SELECT toString(register_type) AS register_type,
+               toString(type_code) AS type_code,
+               any(toString(type_code_description)) AS type_code_description,
+               toFloat64(SUM(amount)) AS amount,
+               toFloat64(SUM(type_hours)) AS hours
+        FROM dbpcm_warehouse.payroll
+        WHERE employee_code = {employee}
+          AND pay_period_end_date = {period_a}
+        GROUP BY register_type, type_code
+    - order: 1
+      output: { detail_b: table }
+      sql_template: |
+        SELECT toString(register_type) AS register_type,
+               toString(type_code) AS type_code,
+               any(toString(type_code_description)) AS type_code_description,
+               toFloat64(SUM(amount)) AS amount,
+               toFloat64(SUM(type_hours)) AS hours
+        FROM dbpcm_warehouse.payroll
+        WHERE employee_code = {employee}
+          AND pay_period_end_date = {period_b}
+        GROUP BY register_type, type_code
+    - order: 2
+      feeds_from: [ 0, 1 ]
+      consumes: { detail_a: "$0", detail_b: "$1" }
+      output: {}
+      sql_template: |
+        SELECT coalesce(a.register_type, b.register_type) AS register_type,
+               coalesce(a.type_code, b.type_code) AS type_code,
+               coalesce(a.type_code_description, b.type_code_description) AS type_code_description,
+               coalesce(a.amount, 0) AS amount_a,
+               coalesce(b.amount, 0) AS amount_b,
+               coalesce(b.amount, 0) - coalesce(a.amount, 0) AS amount_delta,
+               coalesce(a.hours, 0) AS hours_a,
+               coalesce(b.hours, 0) AS hours_b
+        FROM scratch.detail_a AS a
+        FULL OUTER JOIN scratch.detail_b AS b
+          ON a.register_type = b.register_type AND a.type_code = b.type_code
+        ORDER BY coalesce(a.register_type, b.register_type),
+                 coalesce(a.type_code, b.type_code)

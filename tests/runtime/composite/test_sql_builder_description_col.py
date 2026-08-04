@@ -234,26 +234,26 @@ def test_convention_unchanged_when_description_cols_map_absent_entirely() -> Non
 
 def test_real_catalog_field_id_discovers_field_label() -> None:
     catalog = fixture_catalog_handle()
-    target = resolve_target(catalog, table=_PAF, column="FieldId", period=None)
-    assert target.description_col == "FieldLabel"
-    assert "FieldLabel" in build_sql(target, period=None, limit=200)
+    target = resolve_target(catalog, table=_PAF, column="field_id", period=None)
+    # field_id -> field_label is the non-convention case (Label is not a convention
+    # suffix, Id is not stripped): only the AUTHORED linkage discovers it.
+    assert target.description_col == "field_label"
+    assert "field_label" in build_sql(target, period=None, limit=200)
 
 
-def test_real_catalog_distributed_department_code_discovers_mixed_case_label() -> None:
+def test_real_catalog_payroll_type_code_discovers_declared_label() -> None:
     payroll = "dbpcm_warehouse.payroll"
     catalog = fixture_catalog_handle()
-    target = resolve_target(catalog, table=payroll, column="DistributedDepartmentCode", period=None)
-    # The convention would produce "DistributedDepartmentDescription" (leading
-    # uppercase D) which does NOT exist; only the authored lowercase-d target does.
-    assert target.description_col == "distributedDepartmentDescription"
+    target = resolve_target(catalog, table=payroll, column="type_code", period=None)
+    # The AUTHORED sibling link resolves the code column to its label column.
+    assert target.description_col == "type_code_description"
     sql = build_sql(target, period=None, limit=200)
-    assert "distributedDepartmentDescription" in sql
-    assert "DistributedDepartmentDescription" not in sql
+    assert "type_code_description" in sql
 
 
 def test_real_catalog_convention_still_works_for_earn_code() -> None:
-    """Regression: EarnCode -> EarnDescription is now BOTH declared and a convention
+    """Regression: earn_code -> earn_description is now BOTH declared and a convention
     match in the real catalog; either way it must resolve."""
     catalog = fixture_catalog_handle()
-    target = resolve_target(catalog, table=_ACC, column="EarnCode", period=None)
-    assert target.description_col == "EarnDescription"
+    target = resolve_target(catalog, table=_ACC, column="earn_code", period=None)
+    assert target.description_col == "earn_description"

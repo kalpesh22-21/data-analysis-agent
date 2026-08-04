@@ -135,8 +135,8 @@ def test_load_seed_fixtures_parses_blueprints_and_knowledge() -> None:
 
     overtime = next(b for b in blueprints if b.id == "bp-overtime-by-department")
     # THE contract: uses are byte-exact `database.table.column` scope keys.
-    assert "dbpcm_warehouse.payroll.Amount" in overtime.uses
-    assert "dbpcm_warehouse.employee.Department" in overtime.uses
+    assert "dbpcm_warehouse.payroll.amount" in overtime.uses
+    assert "dbpcm_warehouse.employee.department_name" in overtime.uses
 
 
 def test_every_fixture_use_key_is_a_three_part_dotted_scope_key() -> None:
