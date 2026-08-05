@@ -21,7 +21,6 @@ from data_agent.runtime.blueprint.models import (
     SlotSpec,
 )
 
-
 # -- both new types are in the closed set + parse -------------------------------
 
 

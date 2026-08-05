@@ -110,6 +110,7 @@ def test_list_returns_exact_wire_shape(enabled: None) -> None:
         "entity_scan",
         "dedup",
         "created_at",
+        "verified",
     }
     assert item["type"] == "global_knowledge"
     assert item["status"] == "in_review"
@@ -119,6 +120,7 @@ def test_list_returns_exact_wire_shape(enabled: None) -> None:
     assert isinstance(item["evidence_refs"], list)
     assert item["entity_scan"]["result"] == "pass"
     assert item["dedup"] is None
+    assert item["verified"] is False  # an in_review row is never verified
     assert "confidence" not in item and "drift" not in item
 
 
@@ -234,9 +236,10 @@ def test_reject_then_archive_list_shows_row_with_status_rejected(enabled: None) 
 
 
 def test_list_invalid_status_is_400(enabled: None) -> None:
-    """A status outside {in_review, rejected} is a 400 — the inbox never enumerates an
-    arbitrary lifecycle state (defense-in-depth behind the BFF's own check)."""
-    resp = _default_client().get("/inbox", headers=AUTH, params={"status": "validated"})
+    """A status outside {in_review, rejected, validated} is a 400 — the inbox never
+    enumerates an arbitrary lifecycle state (defense-in-depth behind the BFF's own
+    check). `quarantined` is a real lifecycle state that is NOT listable."""
+    resp = _default_client().get("/inbox", headers=AUTH, params={"status": "quarantined"})
     assert resp.status_code == 400
 
 
@@ -489,3 +492,112 @@ def test_retract_happy_path_mutates_store(enabled: None) -> None:
     assert resp.status_code == 200
     assert resp.json()["status"] == CandidateStatus.RETIRED
     assert asyncio.run(store.get(KNOWLEDGE_ID)).status == CandidateStatus.RETIRED
+
+
+# --- Phase-3: validated listing + verify + promote routes ---------------------
+
+
+def _validated_blueprint(*, verified: bool) -> CandidateEnvelope:
+    return replace(
+        make_blueprint_candidate(status=CandidateStatus.VALIDATED), verified=verified
+    )
+
+
+def test_list_status_validated_exposes_verified_flag(enabled: None) -> None:
+    """`?status=validated` returns the promotable-learning set with `verified` on each
+    wire item so the UI can tell a verified node from an auto-landed one."""
+    store = InMemoryCandidateStore()
+    _populate(
+        store,
+        [
+            replace(_validated_blueprint(verified=True),
+                    candidate_id="candidate::v::1", content_hash="h1"),
+            replace(_validated_blueprint(verified=False),
+                    candidate_id="candidate::v::0", content_hash="h0"),
+        ],
+    )
+    body = _client(ReviewInbox(store)).get(
+        "/inbox", headers=AUTH, params={"status": "validated"}
+    ).json()
+    assert body["count"] == 2
+    by_id = {i["candidate_id"]: i for i in body["items"]}
+    assert by_id["candidate::v::1"]["verified"] is True
+    assert by_id["candidate::v::0"]["verified"] is False
+    assert all(i["status"] == "validated" for i in body["items"])
+
+
+def _writer_scheduler(store):
+    return PromotionScheduler(
+        store,
+        probe=FakeWarehouseProbe(),
+        hit_counts=FakeHitCountReader(),
+        policy=PromotionPolicy(blueprint_hit_threshold=3),
+        landing_writer=FakeLandingWriter(),
+        require_landing=True,
+        clock=lambda: "2026-08-01T00:00:00+00:00",
+    )
+
+
+def test_verify_route_flips_verified(enabled: None) -> None:
+    store = InMemoryCandidateStore()
+    env = _validated_blueprint(verified=False)
+    _populate(store, [env])
+    client = _client(ReviewInbox(store, scheduler=_writer_scheduler(store)))
+
+    resp = client.post(f"/inbox/{env.candidate_id}/verify", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == CandidateStatus.VALIDATED
+    assert resp.json()["node_stamped"] is True  # the neo4j node was stamped
+    assert asyncio.run(store.get(env.candidate_id)).verified is True
+
+
+def test_promote_route_unverified_is_409(enabled: None) -> None:
+    store = InMemoryCandidateStore()
+    env = _validated_blueprint(verified=False)
+    _populate(store, [env])
+    client = _client(ReviewInbox(store))
+    resp = client.post(f"/inbox/{env.candidate_id}/promote", headers=AUTH)
+    assert resp.status_code == 409
+
+
+def test_promote_route_returns_yaml_and_moves_to_promoted(enabled: None) -> None:
+    store = InMemoryCandidateStore()
+    env = _validated_blueprint(verified=True)
+    _populate(store, [env])
+    client = _client(ReviewInbox(store))
+
+    resp = client.post(f"/inbox/{env.candidate_id}/promote", headers=AUTH)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == {
+        "yaml", "filename", "target_path", "suggested_branch", "commit_message", "note"
+    }
+    assert body["target_path"] == "app/corpus/data/blueprints/"
+    assert body["yaml"].startswith("id:")
+    assert asyncio.run(store.get(env.candidate_id)).status == CandidateStatus.PROMOTED
+
+
+def test_promote_route_malformed_body_is_422(enabled: None) -> None:
+    """A malformed body (a dict `doc_id`, not a string) is rejected by the Pydantic
+    `PromoteRequest` model with 422 — never serialized into the emitted YAML."""
+    store = InMemoryCandidateStore()
+    env = _validated_blueprint(verified=True)
+    _populate(store, [env])
+    client = _client(ReviewInbox(store))
+    resp = client.post(
+        f"/inbox/{env.candidate_id}/promote", headers=AUTH, json={"doc_id": {"x": 1}}
+    )
+    assert resp.status_code == 422
+
+
+def test_promote_route_unserializable_candidate_is_422(enabled: None) -> None:
+    """A validated+verified candidate that can't be serialized to MCP YAML (a knowledge
+    candidate with no `statement`) is a 422, not a 500 — fail-loud but mapped."""
+    store = InMemoryCandidateStore()
+    # A `global_knowledge` candidate whose payload has no `statement` → the knowledge seed
+    # builder raises ValueError → the route maps it to 422.
+    env = with_type(_validated_blueprint(verified=True), "global_knowledge")
+    _populate(store, [env])
+    client = _client(ReviewInbox(store))
+    resp = client.post(f"/inbox/{env.candidate_id}/promote", headers=AUTH)
+    assert resp.status_code == 422

@@ -42,6 +42,9 @@ import os
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel
+
+from data_agent.runtime.blueprint.models import BlueprintParseError
 
 from ..candidate.memory_candidate_store import InMemoryCandidateStore
 from ..candidate.models import CandidateStatus
@@ -49,14 +52,34 @@ from ..promotion.scheduler import PromotionScheduler
 from .inbox import InboxTransitionError, ReviewInbox, _NoOpProbe, _ZeroHitCounts
 from .models import InboxItem
 
+
+class PromoteRequest(BaseModel):
+    """The optional PROMOTE request body (contract §Promote). The human may refine the
+    knowledge `doc_id` (the candidate's is non-semantic) and `title`; both are typed
+    `str | None` so FastAPI 422s a malformed value (e.g. a dict `doc_id`) before it can
+    reach the emitted YAML. `id` is NEVER accepted here — it must equal the landing node
+    id verbatim."""
+
+    doc_id: str | None = None
+    title: str | None = None
+
 _logger = logging.getLogger(__name__)
 
 WritePlaneMode = Literal["full", "offline"]
 
-# The only statuses the list surface exposes (ui-inbox-type-archive contract §List
-# API): the live review queue and the durable rejected archive. Any other value is a
-# 400 — the inbox never lets a caller enumerate arbitrary lifecycle states.
-_LISTABLE_STATUSES = frozenset({CandidateStatus.IN_REVIEW, CandidateStatus.REJECTED})
+# The statuses the list surface exposes: the live review queue, the durable rejected
+# archive, and (Phase-3) the VALIDATED set of auto-landed learning nodes awaiting a
+# human verify/promote. Every validated candidate in the store is `source='learning'`
+# by construction (the MCP canon never enters `learning_candidates`), so `status=
+# validated` IS the promotable-learning listing. Any other value is a 400 — the inbox
+# never lets a caller enumerate arbitrary lifecycle states.
+_LISTABLE_STATUSES = frozenset(
+    {
+        CandidateStatus.IN_REVIEW,
+        CandidateStatus.REJECTED,
+        CandidateStatus.VALIDATED,
+    }
+)
 
 
 # --- projections (contract §2a) ----------------------------------------------
@@ -79,6 +102,10 @@ def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
         "entity_scan": item.entity_scan.to_doc(),
         "dedup": item.dedup.to_doc() if item.dedup is not None else None,
         "created_at": item.created_at,
+        # Phase-3: expose the human-approval flag so the UI can tell a VERIFIED validated
+        # learning node (promotable) from an auto-landed one. False for every review-queue
+        # / archive / auto-landed row.
+        "verified": item.verified,
     }
 
 
@@ -268,11 +295,12 @@ def create_inbox_app(
         if selected not in _LISTABLE_STATUSES:
             raise HTTPException(
                 status_code=400,
-                detail="status must be one of {'in_review', 'rejected'}.",
+                detail="status must be one of {'in_review', 'rejected', 'validated'}.",
             )
         # The durable, unbounded rejected archive lists NEWEST-first so the LIMIT
-        # caps OLD history, not present rejects; the review queue keeps ASC (oldest
-        # first — FIFO drain). Chosen explicitly by the caller, per the contract.
+        # caps OLD history, not present rejects; the review queue + the validated
+        # (Phase-3 promotable) listing keep ASC (oldest first — FIFO drain). Chosen
+        # explicitly by the caller, per the contract.
         order = "desc" if selected == CandidateStatus.REJECTED else "asc"
         items = await inbox.list(status=selected, limit=100, order=order)
         wire = [_inbox_item_to_wire(it) for it in items]
@@ -305,6 +333,44 @@ def create_inbox_app(
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc
         return _action_result(env)
+
+    @app.post("/inbox/{candidate_id}/verify", dependencies=guard)
+    async def verify(candidate_id: str) -> dict[str, Any]:
+        """Phase-3 VERIFY: a human vouches for an auto-landed validated learning node —
+        flips `verified=true` on the landed node + envelope. Requires status=validated.
+        The response carries `node_stamped` — False when the neo4j node write did not
+        land (fail-open), so the UI can prompt a re-verify."""
+        try:
+            env, node_stamped = await inbox.verify(candidate_id)
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        result = _action_result(env)
+        result["node_stamped"] = node_stamped
+        return result
+
+    @app.post("/inbox/{candidate_id}/promote", dependencies=guard)
+    async def promote(
+        candidate_id: str, body: PromoteRequest | None = None
+    ) -> dict[str, Any]:
+        """Phase-3 PROMOTE: emit the MCP-format YAML for a MANUAL PR into the MCP corpus
+        repo. The first promote (from `validated`, requires `verified=true`) also moves
+        the candidate → `promoted`; a re-promote (from `promoted`) re-emits the same YAML
+        with no status move. Optional body: `doc_id`/`title` (knowledge refinements); `id`
+        can NEVER be overridden. Returns the YAML + suggested PR metadata (no git here)."""
+        req = body or PromoteRequest()
+        try:
+            emit = await inbox.promote(
+                candidate_id, doc_id=req.doc_id, title=req.title
+            )
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        except (ValueError, BlueprintParseError) as exc:
+            # A malformed/non-landable validated candidate can't be serialized to MCP YAML
+            # (no generalization, an empty knowledge statement, or a malformed structure).
+            # This is an unprocessable candidate, not a client error — 422, fail-loud
+            # (never a 500 with a stack trace), mirroring the service's mapped style.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return emit.to_wire()
 
     if driver is not None:
 

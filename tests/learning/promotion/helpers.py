@@ -149,15 +149,26 @@ class FakeLandingWriter:
         fail_times: int = 0,
         update_fail: Exception | None = None,
         update_fail_times: int = 0,
+        verify_fail: Exception | None = None,
+        verify_fail_times: int = 0,
+        verify_stamped: bool = True,
     ) -> None:
         self._fail = fail
         self._fail_times = fail_times
         self._update_fail = update_fail
         self._update_fail_times = update_fail_times
+        self._verify_fail = verify_fail
+        self._verify_fail_times = verify_fail_times
+        self._verify_stamped = verify_stamped
         self.landed: list[CandidateEnvelope] = []
         # Every `forbidden_spans` tuple handed to the writer (so a test can assert the
         # scheduler captured the PRE-strip entity spans, D17 last gate).
         self.forbidden_spans: list[tuple[str, ...]] = []
+        # Every `verified` flag handed to `land` (Phase-3: auto=False, human-approve=True).
+        self.verified_flags: list[bool] = []
+        # Every candidate whose landed node was `mark_verified`'d (Phase-3 VERIFY action).
+        self.verified: list[CandidateEnvelope] = []
+        self.verify_calls = 0
         self.calls = 0
         # Every retraction write-back (S9-activation Slice 3): the (candidate, status,
         # drift_status) the scheduler stamped, so a test can assert the demote/reject/
@@ -166,10 +177,15 @@ class FakeLandingWriter:
         self.update_calls = 0
 
     async def land(
-        self, env: CandidateEnvelope, *, forbidden_spans: tuple[str, ...] = ()
+        self,
+        env: CandidateEnvelope,
+        *,
+        forbidden_spans: tuple[str, ...] = (),
+        verified: bool = False,
     ) -> None:
         self.calls += 1
         self.forbidden_spans.append(tuple(forbidden_spans))
+        self.verified_flags.append(verified)
         if self._fail is not None and self.calls <= self._fail_times:
             raise self._fail
         self.landed.append(env)
@@ -182,3 +198,12 @@ class FakeLandingWriter:
             raise self._update_fail
         self.status_updates.append((env, status, drift_status))
         return True
+
+    async def mark_verified(self, env: CandidateEnvelope) -> bool:
+        self.verify_calls += 1
+        if self._verify_fail is not None and self.verify_calls <= self._verify_fail_times:
+            raise self._verify_fail
+        self.verified.append(env)
+        # `verify_stamped=False` models a MATCH-by-id miss (the node was never landed):
+        # `mark_verified` runs but stamps nothing, so `node_stamped` reports False.
+        return self._verify_stamped

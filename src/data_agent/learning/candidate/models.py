@@ -30,6 +30,12 @@ class CandidateStatus:
     QUARANTINED = "quarantined"
     REJECTED = "rejected"
     RETIRED = "retired"
+    # Phase-3 terminal state (governed-corpus inbox PROMOTE): a verified learning node
+    # whose MCP-format YAML has been emitted for a manual PR into the MCP corpus repo.
+    # Terminal — it drops out of the inbox validated listing. Caveat: if the human
+    # never merges the PR, the neo4j node stays `source='learning'` (excluded from
+    # recall) while the candidate stays `promoted`; the emit is optimistic.
+    PROMOTED = "promoted"
 
 
 def _now() -> str:
@@ -71,6 +77,14 @@ class CandidateEnvelope:
     # produced this candidate. Additive, defaults None, round-trips through
     # to_doc/from_doc; a missing value ⇒ the scheduler starts a normal root span.
     traceparent: str | None = None
+    # Phase-3 human-approval flag, MIRRORING the `verified` property on the landed
+    # neo4j node. The node is the source of truth for recall; this envelope copy lets
+    # the inbox distinguish a human-VERIFIED landing (promotable) from an auto-landed
+    # one WITHOUT a neo4j read. The scheduler stamps it to match on land (True for a
+    # human-approve, False for auto) and the VERIFY action flips it True. Additive,
+    # defaults False, round-trips through to_doc/from_doc (emitted only when True so a
+    # pre-existing candidate doc stays byte-identical, mirroring `traceparent`).
+    verified: bool = False
 
     def to_doc(self) -> dict[str, Any]:
         doc: dict[str, Any] = {
@@ -98,6 +112,11 @@ class CandidateEnvelope:
         # pre-existing candidate doc (no traceparent) round-trips byte-identically.
         if self.traceparent is not None:
             doc["traceparent"] = self.traceparent
+        # Additive + OPTIONAL: emit `verified` only when True, so a pre-Phase-3
+        # candidate doc (no `verified`) round-trips byte-identically (mirrors
+        # `traceparent`). A missing key reads back as the False default.
+        if self.verified:
+            doc["verified"] = True
         return doc
 
     @classmethod
@@ -125,6 +144,7 @@ class CandidateEnvelope:
             content_hash=doc.get("content_hash", ""),
             created_at=doc.get("created_at", _now()),
             traceparent=doc.get("traceparent"),
+            verified=bool(doc.get("verified", False)),
         )
 
 

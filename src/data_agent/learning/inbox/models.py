@@ -88,6 +88,10 @@ class InboxItem:
     entity_scan: LeakageVerdict  # what S5 found (drives reviewer attention)
     dedup: DedupVerdict | None  # what it collided with, if anything
     created_at: str
+    # Phase-3 human-approval flag (mirrors the landed node's `verified`): lets the UI
+    # tell a human-VERIFIED validated learning node (promotable) from an auto-landed one.
+    # False for every pre-Phase-3 / auto-landed candidate.
+    verified: bool = False
 
     @classmethod
     def from_envelope(cls, env: CandidateEnvelope) -> InboxItem:
@@ -102,4 +106,5 @@ class InboxItem:
             entity_scan=_leakage_view(env),
             dedup=env.dedup,
             created_at=env.created_at,
+            verified=env.verified,
         )

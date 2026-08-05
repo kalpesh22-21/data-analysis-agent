@@ -44,6 +44,8 @@ DecisionAction = Literal[
     "approve",  # in_review → validated (human approval)
     "reject",  # in_review → rejected (human reject)
     "retire",  # * → retired (leaked/stale — out of Phase-1 scope; reserved)
+    "verify",  # validated stays validated; verified flag flipped true (Phase-3 inbox)
+    "promote_emit",  # validated → promoted (Phase-3 inbox — MCP YAML emitted for a PR)
     "skip",  # nothing to do (e.g. a non-replayable validated knowledge artifact)
 ]
 
@@ -176,12 +178,18 @@ class LandingWriter(Protocol):
     store transition; the recall filter + the periodic re-assert are the backstops)."""
 
     async def land(
-        self, env: CandidateEnvelope, *, forbidden_spans: tuple[str, ...] = ()
+        self,
+        env: CandidateEnvelope,
+        *,
+        forbidden_spans: tuple[str, ...] = (),
+        verified: bool = False,
     ) -> None: ...
 
     async def update_status(
         self, env: CandidateEnvelope, *, status: str, drift_status: str
     ) -> bool: ...
+
+    async def mark_verified(self, env: CandidateEnvelope) -> bool: ...
 
 
 __all__ = [

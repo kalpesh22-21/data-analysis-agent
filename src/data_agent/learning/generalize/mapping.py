@@ -80,7 +80,7 @@ def blueprint_from_generalization(
 
 
 def blueprint_seed_from_candidate(
-    env: CandidateEnvelope, *, id: str
+    env: CandidateEnvelope, *, id: str, verified: bool = False
 ) -> BlueprintSeed:
     """Project a validated candidate onto the neo4j-corpus `BlueprintSeed` (S9 §3.2).
 
@@ -93,6 +93,12 @@ def blueprint_seed_from_candidate(
 
     `id` is the deterministic landing id (derived from the canonical_key by the
     caller, `promotion/landing.py::landing_id`) so a re-promotion MERGEs in place.
+
+    `verified` is the Phase-3 human-approval flag threaded onto the seed: an auto-landed
+    node is `verified=False` (the safe default), a human-approved landing is
+    `verified=True` (the `apply_human_decision` approve path passes it through). `source`
+    stays `"learning"` regardless — verification does not move the node into the trusted
+    MCP canon partition (that is the Phase-3 promote → manual-PR reseed).
 
     Raises `ValueError` when the candidate carries no `generalization` (a non-blueprint
     or malformed candidate can never land), and `BlueprintParseError` when the
@@ -122,11 +128,12 @@ def blueprint_seed_from_candidate(
         # blueprint lands in the LEARNING STAGING tier, NOT the trusted MCP canon.
         # `source="learning"` keeps it OUT of the agent recall (the `source='mcp'`
         # trust gate) and out of the MCP-scoped corpus GC; `verified=False` is the
-        # safe default (the human-approve → verified=True triage is Phase-3). Without
-        # this explicit override the `BlueprintSeed` default (`mcp`/`True`) would leak
-        # unvetted learning output straight into the trusted recall partition.
+        # safe default; a human-approve landing threads `verified=True` here (Phase-3
+        # triage). Without this explicit override the `BlueprintSeed` default
+        # (`mcp`/`True`) would leak unvetted learning output straight into the trusted
+        # recall partition.
         source="learning",
-        verified=False,
+        verified=verified,
         resolves=dict(blueprint.resolves),
         slots=_slot_docs(env.payload),
         uses_rules=list(gen.uses_rules),
@@ -137,7 +144,7 @@ def blueprint_seed_from_candidate(
 
 
 def knowledge_seed_from_candidate(
-    env: CandidateEnvelope, *, id: str
+    env: CandidateEnvelope, *, id: str, verified: bool = False
 ) -> KnowledgeSeed:
     """Project an approved global-knowledge candidate onto the neo4j-corpus
     `KnowledgeSeed` (UI Slice 2 §1.1) — the knowledge-side mirror of
@@ -153,7 +160,9 @@ def knowledge_seed_from_candidate(
     entity-free before any neo4j write.
 
     `id` is the deterministic landing id (`promotion/landing.py::landing_id`, the
-    `kn::`-prefixed form) so a re-promotion MERGEs the same node in place.
+    `kn::`-prefixed form) so a re-promotion MERGEs the same node in place. `verified`
+    threads the Phase-3 human-approval flag (auto-land False, human-approve True);
+    `source` stays `"learning"` either way.
 
     Raises `ValueError` when `statement` is empty — an empty knowledge chunk is never
     landed (it would recall nothing meaningful and only pollute the index).
@@ -205,11 +214,11 @@ def knowledge_seed_from_candidate(
         # knowledge chunk lands in the LEARNING STAGING tier, NOT the trusted MCP
         # canon. `source="learning"` keeps it OUT of knowledge recall (the
         # `source='mcp'` trust gate) and out of the MCP-scoped corpus GC;
-        # `verified=False` is the safe default (Phase-3 human-approve triage). Without
-        # this the `KnowledgeSeed` default (`mcp`/`True`) would leak an unvetted chunk
-        # into the trusted recall partition.
+        # `verified` defaults False (safe); a human-approve landing threads True
+        # (Phase-3 triage). Without this the `KnowledgeSeed` default (`mcp`/`True`)
+        # would leak an unvetted chunk into the trusted recall partition.
         source="learning",
-        verified=False,
+        verified=verified,
     )
 
 

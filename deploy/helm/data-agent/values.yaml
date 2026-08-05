@@ -305,6 +305,22 @@ components:
     securityContext: {}
     env: []
 
+  # ----- learning-scheduler: cron-scanned promotion daemon (DO NOT scale) -----
+  # Replica count is hardcoded to 1 in the template: this is the single promotion
+  # writer (§7.2); running >1 replica would double-promote / double-land the same
+  # candidate. No replicaCount/autoscaling knobs by design.
+  learningScheduler:
+    enabled: true
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+
   # ----- learning-consumer: Redis Streams consumer group (scalable) -----
   learningConsumer:
     enabled: true

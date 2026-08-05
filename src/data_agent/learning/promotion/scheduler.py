@@ -261,7 +261,11 @@ class PromotionScheduler:
             # `_land_and_promote` strips, which blanks `entity_scan`, so the forbidden
             # spans must be read from the PRE-strip envelope here.
             return await self._land_and_promote(
-                env, drift, action="promote", forbidden_spans=entity_spans(env)
+                env,
+                drift,
+                action="promote",
+                forbidden_spans=entity_spans(env),
+                verified=False,  # auto-landed → unverified until a human approves
             )
         with self._promote_scope(env, "promote"):
             promoted = replace(env, status=CandidateStatus.VALIDATED, drift=drift)
@@ -427,7 +431,11 @@ class PromotionScheduler:
             # `landing_failed`, leaving the candidate at `in_review`.
             if self._landing_writer is not None:
                 return await self._land_and_promote(
-                    env, drift, action="approve", forbidden_spans=forbidden_spans
+                    env,
+                    drift,
+                    action="approve",
+                    forbidden_spans=forbidden_spans,
+                    verified=True,  # human-approved landing → verified
                 )
         else:
             # A pre-gated global_knowledge approve ALSO produces `validated`, so it too
@@ -440,7 +448,11 @@ class PromotionScheduler:
             # never-recallable chunk. `forbidden_spans` were captured PRE-strip above.
             if env.type == "global_knowledge" and self._landing_writer is not None:
                 return await self._land_and_promote(
-                    env, DriftStamp(), action="approve", forbidden_spans=forbidden_spans
+                    env,
+                    DriftStamp(),
+                    action="approve",
+                    forbidden_spans=forbidden_spans,
+                    verified=True,  # human-approved landing → verified
                 )
             if env.type == "global_knowledge" and self._landing_gate_blocks():
                 return CandidateDecision(
@@ -508,6 +520,62 @@ class PromotionScheduler:
         return CandidateDecision(
             env.candidate_id, env.type, "retire", env.status,
             CandidateStatus.RETIRED, reason=None,
+        )
+
+    async def apply_verify(
+        self, env: CandidateEnvelope
+    ) -> tuple[CandidateDecision, bool]:
+        """VERIFY a `validated` learning node (Phase-3 inbox VERIFY action) — the SINGLE
+        implementation `ReviewInbox.verify` delegates to. Flips `verified → true` on BOTH
+        the landed neo4j node AND the candidate-store envelope, and RETURNS whether the
+        node write actually landed (`node_stamped`) so the caller can surface a re-verify
+        prompt when it did not.
+
+        The node is stamped FIRST, then the authoritative envelope is written:
+          * a CRASH BETWEEN the two writes is the SAFE direction (node verified, envelope
+            not → the candidate still shows verifiable, a re-verify converges it);
+          * the node write FAILS OPEN (`_verify_corpus`) so a neo4j hiccup never BLOCKS
+            the verify — but that leaves the envelope `verified=true` over an unverified
+            node. That gap is NOT silent: it is REPORTED via `node_stamped=False`, and a
+            re-verify converges the two (the envelope write is idempotent and
+            `mark_verified` re-runs).
+
+        Status stays `validated` — verify is a flag flip, not a lifecycle transition, and
+        does NOT move the node into the trusted MCP recall partition (that is the promote
+        action's manual-PR reseed). Idempotent for a non-validated env (a no-op hold with
+        `node_stamped=False`; a mis-routed verify never mutates)."""
+        if env.status != CandidateStatus.VALIDATED:
+            return self._hold(env, "not_validated"), False
+        node_stamped = await self._verify_corpus(env)
+        verified = replace(env, verified=True)
+        await self._store.put(verified)
+        return (
+            CandidateDecision(
+                env.candidate_id, env.type, "verify", env.status, env.status, reason=None,
+            ),
+            node_stamped,
+        )
+
+    async def apply_promote(self, env: CandidateEnvelope) -> CandidateDecision:
+        """PROMOTE a verified learning node to the terminal `promoted` state (Phase-3
+        inbox PROMOTE action) — the store-side move `ReviewInbox.promote` delegates to
+        AFTER it has emitted the MCP-format YAML. Requires `validated` + `verified`
+        (fail-loud hold otherwise) and moves `validated → promoted` so the candidate
+        drops out of the inbox validated listing (optimistic — the actual `learning→mcp`
+        reseed happens when the human merges the emitted YAML PR; if they never do, the
+        node stays `source='learning'`/excluded and the candidate stays `promoted`).
+
+        Purely a candidate-store transition: it does NOT touch neo4j (the node stays
+        `source='learning'` until the manual PR reseeds it) and does NOT touch git."""
+        if env.status != CandidateStatus.VALIDATED:
+            return self._hold(env, "not_validated")
+        if not env.verified:
+            return self._hold(env, "not_verified")
+        promoted = replace(env, status=CandidateStatus.PROMOTED)
+        await self._store.put(promoted)
+        return CandidateDecision(
+            env.candidate_id, env.type, "promote_emit", env.status,
+            CandidateStatus.PROMOTED, reason=None,
         )
 
     # -- helpers --------------------------------------------------------------
@@ -584,6 +652,7 @@ class PromotionScheduler:
         *,
         action: str,
         forbidden_spans: tuple[str, ...],
+        verified: bool = False,
     ) -> CandidateDecision:
         """The SINGLE land-then-status sequence for the `→ validated` edge (§3.1),
         shared by the auto (`_advance_candidate`) and human-approve paths.
@@ -611,7 +680,11 @@ class PromotionScheduler:
         (Guard 2), the auto path only CHECKED `entity_scan` was clean — so strip here
         (idempotent) makes BOTH edges land an entity-free seed. *forbidden_spans* (the
         spans S5 identified, captured by the caller BEFORE the strip) drive the writer's
-        last-gate defense, which RAISES if the strip regressed and let one through."""
+        last-gate defense, which RAISES if the strip regressed and let one through.
+
+        *verified* (Phase-3) is the human-approval flag stamped onto BOTH the landed
+        neo4j node AND the candidate-store envelope so the two never diverge: the
+        human-approve path passes `verified=True`, the auto path `verified=False`."""
         from_status = env.status
         # Stamp the fresh drift BEFORE landing so the landed seed carries it (§8.1);
         # strip is idempotent (the human path already stripped at Guard 2).
@@ -624,7 +697,9 @@ class PromotionScheduler:
         with self._promote_scope(env, action):
             try:
                 with self._land_scope(env):
-                    await self._landing_writer.land(landed, forbidden_spans=forbidden_spans)
+                    await self._landing_writer.land(
+                        landed, forbidden_spans=forbidden_spans, verified=verified
+                    )
             except Exception:  # noqa: BLE001 - any landing failure HOLDS; never a half state
                 _logger.warning(
                     "landing failed for candidate %s; holding (status stays %s, "
@@ -637,7 +712,12 @@ class PromotionScheduler:
                     landed.candidate_id, landed.type, "hold", from_status, from_status,
                     reason="landing_failed",
                 )
-            await self._store.put(replace(landed, status=CandidateStatus.VALIDATED))
+            # Stamp `verified` on the store envelope to MATCH the landed node (Phase-3):
+            # the node is the recall source of truth, this copy lets the inbox tell a
+            # human-verified landing from an auto one without a neo4j read.
+            await self._store.put(
+                replace(landed, status=CandidateStatus.VALIDATED, verified=verified)
+            )
         return CandidateDecision(
             landed.candidate_id, landed.type, action, from_status,
             CandidateStatus.VALIDATED, reason=None,
@@ -685,6 +765,31 @@ class PromotionScheduler:
                 drift_status,
                 exc_info=True,
             )
+
+    async def _verify_corpus(self, env: CandidateEnvelope) -> bool:
+        """FAIL-OPEN corpus verify write-back (Phase-3): flip the landed node's
+        `verified` flag true via the landing writer, keyed by the deterministic landing
+        id. RETURNS whether a landed node was actually stamped — False when no writer is
+        wired, no node was landed, OR the write failed — so `apply_verify` can report a
+        re-verify prompt (`node_stamped`). The envelope write in `apply_verify` is
+        source-of-truth and must succeed even if this fails, so every exception is
+        swallowed + logged (never re-raised) — a neo4j hiccup never blocks a human verify.
+        No writer wired (dormant) ⇒ nothing landed ⇒ False. Idempotent for a never-landed
+        node (the MATCH-by-id misses → False)."""
+        if self._landing_writer is None:
+            return False
+        try:
+            return await self._landing_writer.mark_verified(env)
+        except Exception:  # noqa: BLE001 - fail-OPEN: a corpus write must never block verify
+            _logger.warning(
+                "corpus verify write-back FAILED for candidate %s; the envelope verify "
+                "proceeds (fail-open) and reports node_stamped=False. The node stays "
+                "unverified until a re-verify succeeds; recall is unaffected (a learning "
+                "node is never recallable).",
+                env.candidate_id,
+                exc_info=True,
+            )
+            return False
 
     async def _deps_resolved(self, env: CandidateEnvelope) -> bool:
         """True iff every `depends_on` ref resolves (§11.6). No deps ⇒ trivially

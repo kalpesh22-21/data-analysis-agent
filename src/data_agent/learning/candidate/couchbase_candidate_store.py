@@ -20,10 +20,16 @@ from .models import CandidateEnvelope, CandidateStatus
 
 # Terminal lifecycle states persist INDEFINITELY (ui-inbox-type-archive contract
 # §Retention): a rejected row is a durable D29 negative-training signal + the Archived
-# reviewer view, and validated/retired are settled records — none may be TTL-evicted.
-# Every other (transient) status keeps the configured candidate TTL.
+# reviewer view, validated/retired are settled records, and PROMOTED must survive so the
+# Phase-3 idempotent re-emit (regenerate the MCP YAML for a lost/abandoned PR) always has
+# its candidate — none may be TTL-evicted. Every other (transient) status keeps the TTL.
 _TERMINAL_STATUSES = frozenset(
-    {CandidateStatus.REJECTED, CandidateStatus.VALIDATED, CandidateStatus.RETIRED}
+    {
+        CandidateStatus.REJECTED,
+        CandidateStatus.VALIDATED,
+        CandidateStatus.RETIRED,
+        CandidateStatus.PROMOTED,
+    }
 )
 
 try:  # pragma: no cover - exercised only when the couchbase SDK is installed

@@ -128,6 +128,25 @@ SET k.status = $status, k.drift_status = $drift_status
 RETURN k.id AS id
 """
 
+# Phase-3 verify write-back (the inbox VERIFY action). MATCH-by-id so a never-landed /
+# already-removed node matches nothing → a safe idempotent no-op. Flips ONLY the
+# `verified` flag true on the landed learning node (`source` stays `learning` — verify
+# does not move the node into the trusted MCP recall partition; the manual-PR reseed
+# does). `$label` is interpolated from a FIXED per-type allow-list (never user input),
+# so there is no injection surface. `RETURN` reports whether a node was stamped.
+_MARK_VERIFIED = """
+MATCH (b:{label} {{id: $id}})
+SET b.verified = true
+RETURN b.id AS id
+"""
+
+# The neo4j label per artifact type — a blueprint lands as `:Blueprint`, a
+# global_knowledge chunk as `:KnowledgeChunk`. Fixed allow-list (never user input) so
+# the `_MARK_VERIFIED` label interpolation carries no injection surface.
+_VERIFY_LABEL: dict[str, str] = {
+    "global_knowledge": "KnowledgeChunk",
+}
+
 
 def _seed_haystack(seed: BlueprintSeed) -> str:
     """Every text-bearing generalized field of the seed, concatenated for the entity
@@ -208,16 +227,23 @@ class CorpusLandingWriter:
         self._database = database
 
     async def land(
-        self, env: CandidateEnvelope, *, forbidden_spans: tuple[str, ...] = ()
+        self,
+        env: CandidateEnvelope,
+        *,
+        forbidden_spans: tuple[str, ...] = (),
+        verified: bool = False,
     ) -> None:
         """Materialize *env* into the neo4j retrieval corpus (idempotent MERGE).
 
         Order: map → entity-defense → embed + MERGE. *forbidden_spans* are the entity
         spans S5 identified, captured by the caller BEFORE the strip (the scheduler
         passes `redaction.entity_spans(pre_strip_env)`); the last-gate defense RAISES if
-        any survives into the seed. Any failure RAISES (the entity defense, a malformed
-        seed, a model-parity violation, an embed/neo4j error) so the scheduler HOLDS
-        `landing_failed` and never writes `validated` (§3.1)."""
+        any survives into the seed. *verified* is the Phase-3 human-approval flag stamped
+        onto the seed (auto-land False, human-approve True) — `source` stays `"learning"`
+        either way; verification does NOT move the node into the trusted MCP partition.
+        Any failure RAISES (the entity defense, a malformed seed, a model-parity
+        violation, an embed/neo4j error) so the scheduler HOLDS `landing_failed` and
+        never writes `validated` (§3.1)."""
         seed_id = landing_id(env)
         if not (env.dedup is not None and env.dedup.canonical_key):
             # OQ-3 fallback: no canonical_key ⇒ a `candidate_id`-derived id. Two
@@ -237,10 +263,10 @@ class CorpusLandingWriter:
         knowledge_seeds: list[KnowledgeSeed] = []
         seed: BlueprintSeed | KnowledgeSeed
         if env.type == "global_knowledge":
-            seed = knowledge_seed_from_candidate(env, id=seed_id)
+            seed = knowledge_seed_from_candidate(env, id=seed_id, verified=verified)
             knowledge_seeds = [seed]
         else:
-            seed = blueprint_seed_from_candidate(env, id=seed_id)
+            seed = blueprint_seed_from_candidate(env, id=seed_id, verified=verified)
             blueprint_seeds = [seed]
         # Last gate BEFORE any embed/neo4j write: an entity in the seed → raise, no land.
         _assert_seed_entity_free(env.candidate_id, seed, forbidden_spans)
@@ -315,6 +341,35 @@ class CorpusLandingWriter:
                 env.candidate_id,
                 seed_id,
             )
+        return stamped
+
+    async def mark_verified(self, env: CandidateEnvelope) -> bool:
+        """Flip the landed node's `verified` flag true (the Phase-3 inbox VERIFY
+        action), keyed by the SAME deterministic `landing_id`.
+
+        IDEMPOTENT + safe no-op: MATCH-by-id, so a node that was never landed matches
+        nothing and NO write happens. NO embed / model-parity / entity defense — it only
+        flips one lifecycle scalar on an EXISTING node, never (re)writing the seed
+        payload, so none of the landing write's global-exposure gates apply. `source`
+        stays `"learning"`: verify does NOT move the node into the trusted MCP recall
+        partition (that is the manual-PR reseed the promote action emits). RAISES on a
+        driver/query failure; the scheduler catches it and FAILS OPEN (the store
+        transition is source-of-truth and must never be blocked by a corpus-write
+        failure). Returns True iff a node was actually stamped."""
+        seed_id = landing_id(env)
+        label = _VERIFY_LABEL.get(env.type, "Blueprint")
+        query = _MARK_VERIFIED.format(label=label)
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(query, id=seed_id)
+            rows = await result.data()
+        stamped = bool(rows)
+        _logger.info(
+            "corpus verify write-back%s: %s %s (id=%s)",
+            "" if stamped else " no-op (not landed)",
+            env.type,
+            env.candidate_id,
+            seed_id,
+        )
         return stamped
 
 

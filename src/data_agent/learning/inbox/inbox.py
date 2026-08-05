@@ -12,6 +12,10 @@ caller-driven transitions in the write router:
                                          NOT a delete: the row stays for the S9 learner)
     retract  → validated → retired      (a post-promotion pull-from-index; the physical
                                          index removal + D25 exposure trace are S10, §11.4)
+    verify   → validated → validated    (Phase-3: flip `verified=true` on the landed node
+                                         + envelope so a human vouches for a learning node)
+    promote  → validated → promoted     (Phase-3: emit the MCP-format YAML for a MANUAL PR;
+                                         requires `verified`; terminal `promoted` state)
 
 **One approve implementation (R4).** `approve`/`reject` are the caller-driven
 promotion transitions. To guarantee EVERY approve enforces the same invariants (the
@@ -35,6 +39,7 @@ from typing import Literal
 
 from ..candidate.models import CandidateEnvelope, CandidateStatus
 from ..candidate.store import CandidateStore
+from ..promotion.mcp_export import PromotionEmit, build_promotion_emit
 from ..promotion.models import ProbeResult
 from ..promotion.scheduler import PromotionScheduler
 from .models import InboxItem
@@ -144,3 +149,74 @@ class ReviewInbox:
         env = await self._require(candidate_id, CandidateStatus.VALIDATED)
         await self._scheduler.apply_retract(env)
         return await self._store.get(candidate_id)
+
+    async def verify(self, candidate_id: str) -> tuple[CandidateEnvelope, bool]:
+        """VERIFY an auto-landed learning node (Phase-3): flip `verified → true` on both
+        the landed neo4j node and the candidate envelope. Requires the current status to
+        be `validated` (a validated learning node is the verifiable set — all validated
+        candidates in the store are `source='learning'` by construction). DELEGATES to
+        the single `PromotionScheduler.apply_verify` path (fail-open node write-back +
+        the authoritative envelope write).
+
+        Returns `(env, node_stamped)`: `node_stamped` is False when the neo4j node write
+        did not land (no writer wired, node never landed, or a fail-open write error), so
+        the caller can prompt a re-verify — the envelope reads `verified=true` regardless
+        (source-of-truth for the inbox), a re-verify converges the node."""
+        env = await self._require(candidate_id, CandidateStatus.VALIDATED)
+        _decision, node_stamped = await self._scheduler.apply_verify(env)
+        return await self._store.get(candidate_id), node_stamped
+
+    async def promote(
+        self,
+        candidate_id: str,
+        *,
+        doc_id: str | None = None,
+        title: str | None = None,
+    ) -> PromotionEmit:
+        """PROMOTE a verified learning node (Phase-3): emit the MCP-format YAML for a
+        MANUAL PR into the MCP corpus repo. The FIRST promote (from `validated`) also
+        moves the candidate `validated → promoted`; a re-promote (from `promoted`)
+        RE-EMITS the same YAML with NO status move so an abandoned/revived/lost PR can
+        always regenerate it (`build_promotion_emit` is pure).
+
+        First promote requires `validated` AND `verified == True` — an unverified node is
+        refused with a clear transition error (a human must VERIFY before PROMOTE). A
+        `promoted` candidate was necessarily verified at its first promote (the only edge
+        into `promoted`), so the re-emit needs no re-check. Any other status is a fail-loud
+        transition error. The YAML `id` is the landing id VERBATIM so a later reseed flips
+        THAT SAME node `learning → mcp` instead of duplicating it. `doc_id`/`title` are
+        OPTIONAL human refinements for knowledge; `id` can NEVER be overridden.
+
+        The move is OPTIMISTIC (abandoned-PR caveat): the emit + status move happen here,
+        but the actual `learning → mcp` reseed only happens when the human MERGES the PR.
+        If they never do, the neo4j node stays `source='learning'` (excluded from recall)
+        and the candidate stays `promoted` — no recall exposure either way, and the
+        idempotent re-emit above lets the PR be regenerated."""
+        env = await self._store.get(candidate_id)
+        if env is None:
+            raise InboxTransitionError(f"candidate {candidate_id!r} not found")
+        # Idempotent re-emit for an already-promoted candidate: regenerate the YAML with
+        # NO status move (pure build), so a lost/abandoned PR can always be recreated.
+        if env.status == CandidateStatus.PROMOTED:
+            return build_promotion_emit(env, doc_id=doc_id, title=title)
+        if env.status != CandidateStatus.VALIDATED:
+            raise InboxTransitionError(
+                f"candidate {candidate_id!r} is {env.status!r}, "
+                "expected 'validated' or 'promoted'"
+            )
+        if not env.verified:
+            raise InboxTransitionError(
+                f"candidate {candidate_id!r} is not verified; verify it before promoting"
+            )
+        # Emit FIRST (pure — raises on a malformed/non-landable candidate before any
+        # store move), then move to the terminal `promoted` state via the single writer.
+        emit = build_promotion_emit(env, doc_id=doc_id, title=title)
+        decision = await self._scheduler.apply_promote(env)
+        if decision.action != "promote_emit":
+            # A held promote (e.g. a racing status change) must NOT return 200 + YAML with
+            # the candidate left validated — surface the hold reason fail-loud (mirrors
+            # `approve`).
+            raise InboxTransitionError(
+                f"promote held for {candidate_id}: {decision.reason}"
+            )
+        return emit

@@ -72,10 +72,10 @@ class _OrderCapturingWriter(FakeLandingWriter):
         self._candidate_id = candidate_id
         self.status_at_land: str | None = None
 
-    async def land(self, env, *, forbidden_spans=()) -> None:
+    async def land(self, env, *, forbidden_spans=(), verified=False) -> None:
         record = await self._store.get(self._candidate_id)
         self.status_at_land = record.status if record else None
-        await super().land(env, forbidden_spans=forbidden_spans)
+        await super().land(env, forbidden_spans=forbidden_spans, verified=verified)
 
 
 async def test_human_approve_knowledge_lands_then_validates():
