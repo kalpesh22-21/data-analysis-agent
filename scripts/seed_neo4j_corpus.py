@@ -20,10 +20,19 @@ Environment:
 
 Usage:
     EMBEDDING_URL=http://localhost:18003/embed uv run python scripts/seed_neo4j_corpus.py
+
+Governed-corpus GC (Phase 2) — SAFETY: by DEFAULT this script does an ADDITIVE corpus
+upsert (`gc=False`). Pass `--reconcile` (alias `--gc`) to enable the DESTRUCTIVE
+fixture-based corpus reconcile, which DELETES every `source='mcp'` node ABSENT from
+these fixtures. Do NOT `--reconcile` against a DB seeded from the LIVE MCP export — the
+fixtures are a small dev subset, so the sweep would wipe the real canon. Use
+`--reconcile` only when these fixtures ARE the intended full corpus. The reconcile is
+`source='mcp'`-scoped and can never touch a `source='learning'` staging node either way.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
@@ -35,6 +44,7 @@ from neo4j import AsyncGraphDatabase
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.corpus_loader import (
+    corpus_content_sha,
     load_catalog_graph,
     load_corpus,
     load_seed_fixtures,
@@ -91,6 +101,20 @@ async def _try_seed_catalog_graph(driver: object, database: str) -> None:
 
 
 async def _main() -> int:
+    parser = argparse.ArgumentParser(description="Seed the neo4j retrieval corpus.")
+    parser.add_argument(
+        "--reconcile",
+        "--gc",
+        dest="reconcile",
+        action="store_true",
+        help=(
+            "DESTRUCTIVE: run the fixture-based corpus GC, deleting every source='mcp' "
+            "node absent from these fixtures. Default off (additive upsert only). Never "
+            "use against a DB seeded from the live MCP export."
+        ),
+    )
+    args = parser.parse_args()
+
     embedding_url = os.environ.get("EMBEDDING_URL")
     if not embedding_url:
         print("EMBEDDING_URL is required (the /embed endpoint).", file=sys.stderr)
@@ -117,6 +141,15 @@ async def _main() -> int:
         # `:USES` edges bind to real catalog nodes. Best-effort: a missing/unreadable
         # export snapshot logs a note and proceeds (edges are then skipped as drift).
         await _try_seed_catalog_graph(driver, database)
+        # Governed corpus (Phase 2): the corpus load is ADDITIVE by default (gc=False)
+        # — an upsert that never deletes. `--reconcile` opts into the DESTRUCTIVE
+        # fixture-based GC (gc=True), which DELETES any `source='mcp'` node absent from
+        # these fixtures (a full reconcile). The GC is `source='mcp'`-scoped, so it can
+        # NEVER touch a learning-staging node either way. The content-derived
+        # `corpus_sha` is stable per fixture content, so a re-seed of unchanged fixtures
+        # is a B1 no-op and (under --reconcile) any edit flips the stamp to reap stale
+        # mcp nodes. See the module docstring for the "never against live-MCP" warning.
+        corpus_sha = corpus_content_sha(blueprints, knowledge)
         report = await load_corpus(
             driver,
             embedder,
@@ -125,12 +158,15 @@ async def _main() -> int:
             model_id=model_id,
             database=database,
             catalog=catalog,
+            corpus_sha=corpus_sha,
+            gc=args.reconcile,
         )
     finally:
         await driver.close()
 
+    mode = "RECONCILE (gc)" if args.reconcile else "additive"
     print(
-        f"Seeded neo4j corpus (model={report.model_id}): "
+        f"Seeded neo4j corpus [{mode}] (model={report.model_id}): "
         f"{report.blueprints_written} blueprints, {report.knowledge_written} knowledge, "
         f"{report.columns_referenced} columns, {report.tables_referenced} tables."
     )

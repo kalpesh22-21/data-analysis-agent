@@ -31,7 +31,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -91,6 +91,18 @@ class BlueprintSeed:
     # neo4j property (neo4j drops a `SET x = null`), so a fixture node is unchanged.
     created_by: str = "seed"
     source_candidate_id: str | None = None
+    # Governed-corpus trust partition (Phase 2). `source` places the node in the
+    # TRUSTED MCP-canon partition (`"mcp"`) or the learning STAGING tier
+    # (`"learning"`); recall serves ONLY `source="mcp"` (the trust gate in
+    # `vector_index._BLUEPRINT_RECALL_QUERY`), and corpus GC only ever touches
+    # `source="mcp"` nodes. `verified` is the human-approval flag (Phase-3 triage).
+    # Defaults are `mcp`/`True` so the FIXTURE/offline seed path + every existing
+    # test produces TRUSTED canon by construction (the fixtures carry no
+    # source/verified); the learning landing writer OVERRIDES these to
+    # `"learning"`/`False` so a landed node stays out of the trusted recall
+    # partition until Phase-3 promotes it.
+    source: str = "mcp"
+    verified: bool = True
     # --- additive full-DAG fields, the runBlueprint brick (OQ-T1, §1.2). All
     # optional-defaulted so existing D87/D88 fixtures still load (no migration).
     # Stored as JSON-string properties on the `:Blueprint` node; unread by recall.
@@ -122,6 +134,13 @@ class KnowledgeSeed:
     drift_status: str = "clean"
     created_by: str = "seed"
     source_candidate_id: str | None = None
+    # Governed-corpus trust partition (Phase 2) — the knowledge-side mirror of the
+    # blueprint fields. `source="mcp"` is the TRUSTED canon partition recall serves;
+    # `source="learning"` is the staging tier recall ignores. Defaults `mcp`/`True`
+    # keep the fixture path + existing tests trusted-by-construction; the landing
+    # writer overrides to `learning`/`False`. See `BlueprintSeed.source`.
+    source: str = "mcp"
+    verified: bool = True
 
 
 @dataclass(frozen=True)
@@ -140,6 +159,11 @@ class LoadReport:
     knowledge_written: int
     columns_referenced: int
     tables_referenced: int
+    # Governed-corpus B1 no-op fast path (Phase 2), mirroring `CatalogGraphReport`:
+    # `skipped=True` means the `:CorpusMeta` singleton already carried this run's
+    # `corpus_sha`, so nothing was embedded or written. Defaulted so existing
+    # (non-sha) callers — the landing writer, Layer-1 tests — are unaffected.
+    skipped: bool = False
 
 
 @dataclass(frozen=True)
@@ -201,6 +225,116 @@ def load_seed_fixtures(
     return blueprints, knowledge
 
 
+_BLUEPRINT_SEED_FIELDS = frozenset(f.name for f in fields(BlueprintSeed))
+_KNOWLEDGE_SEED_FIELDS = frozenset(f.name for f in fields(KnowledgeSeed))
+
+
+def _seed_from_entry(entry_id: str, entry: dict[str, Any], *, kind: str) -> Any:
+    """Project one MCP-export entry (`{<field>: <value>}`) onto a `BlueprintSeed`/
+    `KnowledgeSeed`, WHITELISTING to the dataclass fields.
+
+    The MCP export is a separate repo's canon, so unknown/extra keys are DROPPED
+    (never spread blindly into the dataclass constructor, which would `TypeError`) —
+    the same defensive whitelist the catalog-graph prop mappers use. The dict key is
+    the authoritative id (falls back to the entry's own `id` only if the key is
+    somehow absent). `source`/`verified` come through verbatim when the export carries
+    them (the MCP injects `source="mcp"`, `verified=True`); when absent (the offline
+    fixtures), the dataclass DEFAULTS (`mcp`/`True`) present the seed as trusted canon.
+    """
+    fields_ = _BLUEPRINT_SEED_FIELDS if kind == "blueprint" else _KNOWLEDGE_SEED_FIELDS
+    data = {k: v for k, v in entry.items() if k in fields_}
+    data["id"] = entry_id or data.get("id")
+    return BlueprintSeed(**data) if kind == "blueprint" else KnowledgeSeed(**data)
+
+
+def _seeds_from_entries(raw: dict[str, Any], *, kind: str) -> list[Any]:
+    """Build seeds from a `{<id>: <entry>}` map, DEGRADE-not-fail per entry.
+
+    A non-dict entry, a falsy id, or an entry the dataclass ctor rejects (a missing
+    required field → `TypeError`, an out-of-range value → `ValueError`) is SKIPPED with
+    a warning — never allowed to fail the whole seed. This is load-bearing: the cache
+    re-arms + retries the SAME export every turn on a raised seed, so one malformed
+    entry from the (separate-repo) MCP would otherwise brick the corpus indefinitely."""
+    seeds: list[Any] = []
+    for entry_id, entry in raw.items():
+        if not isinstance(entry, dict):
+            _logger.warning("skipping non-dict %s corpus entry %r", kind, entry_id)
+            continue
+        if not entry_id:
+            _logger.warning("skipping %s corpus entry with a falsy id", kind)
+            continue
+        try:
+            seeds.append(_seed_from_entry(str(entry_id), entry, kind=kind))
+        except Exception:  # noqa: BLE001 - one bad entry is skipped, never fatal to the seed
+            _logger.warning(
+                "skipping malformed %s corpus entry %r (bad shape/values); the rest of "
+                "the corpus still loads",
+                kind,
+                entry_id,
+                exc_info=True,
+            )
+    return seeds
+
+
+def corpus_seeds_from_export(
+    export: dict[str, Any],
+) -> tuple[list[BlueprintSeed], list[KnowledgeSeed]]:
+    """Build the seed lists from a combined corpus export dict (governed-corpus
+    Phase 2): `{"blueprints": {<id>: <entry>}, "knowledge": {<id>: <entry>}, ...}`.
+
+    Each entry is the verbatim blueprint/knowledge fields the MCP `/blueprints/export`
+    + `/knowledge/export` routes serve (PLUS `source="mcp"`/`verified=True` injected at
+    export time). DEGRADE-not-fail per entry (`_seeds_from_entries`): a non-dict /
+    falsy-id / malformed entry is skipped with a warning so a single bad entry from the
+    separate MCP repo can never brick the whole corpus seed. This is the online/HTTP
+    analogue of `load_seed_fixtures`."""
+    blueprints = _seeds_from_entries(export.get("blueprints") or {}, kind="blueprint")
+    knowledge = _seeds_from_entries(export.get("knowledge") or {}, kind="knowledge")
+    return blueprints, knowledge
+
+
+def effective_corpus_sha(export: dict[str, Any]) -> str:
+    """The stamp/guard key for an online corpus hydration — a stable combination of
+    the export's `blueprints_sha` + `knowledge_sha`, or a deterministic content hash
+    FALLBACK when either is empty/missing (mirrors `_effective_catalog_sha`).
+
+    A change to EITHER corpus flips the combined stamp, so the B1 skip-guard + GC
+    re-run. An empty combined stamp would silently break both guards, so a missing sha
+    derives a stable SHA-1 over the `{blueprints, knowledge}` content (sorted keys)."""
+    bp_sha = export.get("blueprints_sha")
+    kn_sha = export.get("knowledge_sha")
+    if isinstance(bp_sha, str) and bp_sha and isinstance(kn_sha, str) and kn_sha:
+        return f"{bp_sha}:{kn_sha}"
+    payload = {"blueprints": export.get("blueprints") or {}, "knowledge": export.get("knowledge") or {}}
+    digest = hashlib.sha1(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    _logger.warning(
+        "corpus export lacked blueprints_sha/knowledge_sha; using derived content hash "
+        "%s (the B1 skip-guard + GC key off this stable digest)",
+        digest,
+    )
+    return digest
+
+
+def corpus_content_sha(
+    blueprints: list[BlueprintSeed], knowledge: list[KnowledgeSeed]
+) -> str:
+    """A stable content-hash `corpus_sha` for a SEED-LIST reconcile (the seed script,
+    which loads fixtures directly rather than an export dict). Deterministic over the
+    seeds' full field content (sorted by id), so a re-seed of unchanged fixtures keeps
+    the same stamp (idempotent GC no-op) and any edit flips it (GC reaps stale nodes)."""
+    from dataclasses import asdict
+
+    payload = {
+        "blueprints": sorted((asdict(b) for b in blueprints), key=lambda d: d["id"]),
+        "knowledge": sorted((asdict(k) for k in knowledge), key=lambda d: d["id"]),
+    }
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def _reject_duplicate_ids(ids: list[str]) -> None:
     seen: set[str] = set()
     dupes: set[str] = set()
@@ -238,6 +372,8 @@ _CATALOG_GRAPH_CONSTRAINTS: tuple[str, ...] = (
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE CONSTRAINT blueprint_id IF NOT EXISTS FOR (b:Blueprint) REQUIRE b.id IS UNIQUE",
     "CREATE CONSTRAINT knowledge_id IF NOT EXISTS FOR (k:KnowledgeChunk) REQUIRE k.id IS UNIQUE",
+    # Governed-corpus B1 freshness singleton (Phase 2), mirroring `:CatalogMeta`.
+    "CREATE CONSTRAINT corpus_meta_id IF NOT EXISTS FOR (m:CorpusMeta) REQUIRE m.id IS UNIQUE",
     *_CATALOG_GRAPH_CONSTRAINTS,
     "CREATE VECTOR INDEX blueprint_intent_vec IF NOT EXISTS "
     "FOR (b:Blueprint) ON (b.intent_embedding) "
@@ -266,6 +402,9 @@ SET b.intent = $intent,
     b.catalog_sha = $catalog_sha,
     b.created_by = $created_by,
     b.source_candidate_id = $source_candidate_id,
+    b.source = $source,
+    b.verified = $verified,
+    b.corpus_sha = $corpus_sha,
     b.created_at = coalesce(b.created_at, datetime()),
     b.hit_count = coalesce(b.hit_count, 0),
     b.resolves_json = $resolves_json,
@@ -373,6 +512,9 @@ SET k.title = $title,
     k.drift_status = $drift_status,
     k.created_by = $created_by,
     k.source_candidate_id = $source_candidate_id,
+    k.source = $source,
+    k.verified = $verified,
+    k.corpus_sha = $corpus_sha,
     k.created_at = coalesce(k.created_at, datetime())
 """
 
@@ -381,6 +523,47 @@ MATCH (n) WHERE n:Blueprint OR n:KnowledgeChunk
 WITH DISTINCT n.embedding_model AS model
 WHERE model IS NOT NULL
 RETURN collect(model) AS models
+"""
+
+# --------------------------------------------------------------------------
+# Governed-corpus reconcile Cypher (Phase 2) — mirror of the catalog-graph
+# self-healing pattern, but stamping/keying on `corpus_sha` and SCOPED to the
+# TRUSTED `source='mcp'` partition. `load_corpus` stamps each seeded mcp node with
+# the run's `corpus_sha`; on `gc=True` (the explicit seed/reconcile op) the GC
+# deletes any `source='mcp'` node a newer run no longer touched (stale stamp).
+# --------------------------------------------------------------------------
+
+# `:CorpusMeta` singleton — the process-wide corpus freshness stamp. Read powers the
+# B1 no-op fast path (skip embed+write when the sha already matches); the upsert lands
+# the new sha atomically with the node upserts + GC in one txn. Mirrors `:CatalogMeta`.
+_READ_CORPUS_META = """
+MATCH (m:CorpusMeta {id: 'singleton'}) RETURN m.corpus_sha AS corpus_sha
+"""
+
+_UPSERT_CORPUS_META = """
+MERGE (m:CorpusMeta {id: 'singleton'})
+SET m.corpus_sha = $corpus_sha
+"""
+
+# GC trusted blueprints/knowledge NOT touched by THIS run (stamped corpus_sha !=
+# run sha, OR never stamped). The `node.source = 'mcp'` guard is SAFETY-CRITICAL and
+# NON-NEGOTIABLE: it is BARE equality, so the GC can NEVER match — and therefore never
+# DETACH DELETE — a `source='learning'` staging node (or any node with no `source`).
+# The learning tier is invisible to reconcile; only the MCP-canon projection is
+# self-healed. `coalesce(node.corpus_sha,'')` treats an unstamped mcp node as stale
+# (a legacy/broken row) so a stale-sha run reaps it.
+_GC_BLUEPRINTS = """
+MATCH (b:Blueprint)
+WHERE b.source = 'mcp' AND coalesce(b.corpus_sha, '') <> $corpus_sha
+DETACH DELETE b
+RETURN count(*) AS deleted
+"""
+
+_GC_KNOWLEDGE = """
+MATCH (k:KnowledgeChunk)
+WHERE k.source = 'mcp' AND coalesce(k.corpus_sha, '') <> $corpus_sha
+DETACH DELETE k
+RETURN count(*) AS deleted
 """
 
 
@@ -1155,6 +1338,17 @@ async def _read_catalog_meta(session: Any) -> str | None:
     return row["catalog_sha"]
 
 
+async def _read_corpus_meta(session: Any) -> str | None:
+    """The stored `:CorpusMeta` corpus_sha, or `None` when the singleton is absent —
+    the governed-corpus B1 freshness stamp powering the no-op fast path. *session* is
+    anything with `.run` (a live session OR a recording stub, for the Layer-1 test)."""
+    result = await session.run(_READ_CORPUS_META)
+    row = await result.single()
+    if row is None:
+        return None
+    return row["corpus_sha"]
+
+
 def _effective_catalog_sha(catalog_export: dict[str, Any]) -> str:
     """The stamp/guard key for a hydration run — the export's own `catalog_sha`,
     or a deterministic content-hash FALLBACK when it is empty/missing (M1).
@@ -1293,11 +1487,33 @@ async def load_corpus(
     database: str = "neo4j",
     ensure_schema: bool = True,
     catalog: CatalogHandle | None = None,
+    corpus_sha: str = "",
+    gc: bool = False,
 ) -> LoadReport:
     """Embed + upsert the seed corpus into neo4j (idempotent). See module docs.
 
     Raises `CorpusLoadError` on a malformed `uses` key (S2) or a write-time
     model-parity violation (§3.3).
+
+    Governed corpus (Phase 2): each seed carries a `source`/`verified` trust stamp
+    (defaulting `mcp`/`True`, so the fixture path + existing callers write TRUSTED
+    canon; the learning landing writer overrides to `learning`/`False`). These flow
+    onto the node so recall's `source='mcp'` trust gate + the corpus GC can partition
+    the trusted canon from the learning staging tier.
+
+    *corpus_sha* + *gc* mirror `load_catalog_graph`'s self-healing reconcile, keyed on
+    `corpus_sha` and SCOPED to `source='mcp'`:
+      * every seeded node is stamped with *corpus_sha*;
+      * a truthy *corpus_sha* enables the B1 no-op fast path — if the `:CorpusMeta`
+        singleton already carries it, the load SKIPS (no re-embed, no write) and
+        returns `skipped=True`;
+      * `gc=True` (the EXPLICIT seed/reconcile op — `scripts/seed_neo4j_corpus.py`)
+        additionally DELETES any `source='mcp'` node whose stamp is stale (a dropped
+        blueprint/knowledge reconcile). The GC WHERE clause is `source='mcp'`-scoped,
+        so it can NEVER touch a `source='learning'` staging node. `gc=False` (default;
+        the ONLINE seed wired in `app.py`, and the landing writer) is additive-only.
+    An empty *corpus_sha* (the landing writer, Layer-1 tests) NEVER skips and NEVER
+    stamps the `:CorpusMeta` singleton — behavior is byte-identical to before Phase 2.
 
     *catalog* (D94 Part 3, optional dev-time aid): when a `CatalogHandle` is
     supplied, every blueprint's `uses` tables are cross-checked against it and a
@@ -1311,6 +1527,29 @@ async def load_corpus(
     is MCP-fails-closed + both catalogs in agreement, not this check (D94 record
     correction).
     """
+    # Governed-corpus B1 no-op fast path (Phase 2): when a truthy corpus_sha is
+    # supplied AND the `:CorpusMeta` singleton already carries it, the seeded canon is
+    # already at this content — skip embed + write entirely (the expensive part is the
+    # embed). Checked BEFORE `apply_schema` (mirroring `load_catalog_graph`), so a
+    # sha-match cold fetch pays NO DDL + `awaitIndexes` cost either. An empty/absent
+    # meta ⇒ proceed. The landing writer + Layer-1 tests pass no corpus_sha, so they
+    # never enter this path (byte-identical to pre-Phase-2).
+    if corpus_sha:
+        async with driver.session(database=database) as session:
+            current_sha = await _read_corpus_meta(session)
+        if current_sha and current_sha == corpus_sha:
+            _logger.info(
+                "corpus already at corpus_sha=%s; skipping load (B1 no-op)", corpus_sha
+            )
+            return LoadReport(
+                model_id=model_id,
+                blueprints_written=0,
+                knowledge_written=0,
+                columns_referenced=0,
+                tables_referenced=0,
+                skipped=True,
+            )
+
     if ensure_schema:
         await apply_schema(driver, database=database)
 
@@ -1366,6 +1605,9 @@ async def load_corpus(
                     catalog_sha=bp.catalog_sha,
                     created_by=bp.created_by,
                     source_candidate_id=bp.source_candidate_id,
+                    source=bp.source,
+                    verified=bp.verified,
+                    corpus_sha=corpus_sha,
                     **_dag_properties(bp),
                 )
                 # S1: unconditional — rewrites the edge set (delete-then-add), so
@@ -1392,7 +1634,32 @@ async def load_corpus(
                     drift_status=kn.drift_status,
                     created_by=kn.created_by,
                     source_candidate_id=kn.source_candidate_id,
+                    source=kn.source,
+                    verified=kn.verified,
+                    corpus_sha=corpus_sha,
                 )
+            # Governed-corpus reconcile (Phase 2): on gc=True, DELETE any stale
+            # `source='mcp'` node this run did not re-stamp (dropped blueprint/
+            # knowledge). The GC Cypher is `source='mcp'`-scoped, so a
+            # `source='learning'` staging node can NEVER be reaped here. gc=False
+            # (online + landing writer) is additive-only — never deletes.
+            if gc:
+                bp_gc = await tx.run(_GC_BLUEPRINTS, corpus_sha=corpus_sha)
+                bp_gc_row = await bp_gc.single()
+                kn_gc = await tx.run(_GC_KNOWLEDGE, corpus_sha=corpus_sha)
+                kn_gc_row = await kn_gc.single()
+                _logger.info(
+                    "corpus GC (source='mcp') removed %d blueprint(s) + %d knowledge "
+                    "chunk(s) with a stale corpus_sha",
+                    bp_gc_row["deleted"] if bp_gc_row is not None else 0,
+                    kn_gc_row["deleted"] if kn_gc_row is not None else 0,
+                )
+            # Stamp the freshness singleton ONLY for a real (truthy) corpus_sha, and
+            # in the SAME txn as the upserts/GC (atomic). The landing writer + Layer-1
+            # tests (empty corpus_sha) never touch `:CorpusMeta`, so the online no-op
+            # fast path is never corrupted by a learning-tier write.
+            if corpus_sha:
+                await tx.run(_UPSERT_CORPUS_META, corpus_sha=corpus_sha)
 
         await session.execute_write(_write)
         # New nodes populate the vector index asynchronously — wait for it so a
@@ -1447,6 +1714,9 @@ __all__ = [
     "apply_catalog_graph_schema",
     "apply_schema",
     "check_model_parity",
+    "corpus_content_sha",
+    "corpus_seeds_from_export",
+    "effective_corpus_sha",
     "load_catalog_graph",
     "load_corpus",
     "load_seed_fixtures",

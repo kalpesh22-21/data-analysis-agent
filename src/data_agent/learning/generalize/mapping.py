@@ -118,6 +118,15 @@ def blueprint_seed_from_candidate(
         # candidate id, so incident response can find everything the loop landed.
         created_by="learning",
         source_candidate_id=env.candidate_id,
+        # Governed-corpus trust partition (Phase 2, SAFETY-CRITICAL): a loop-landed
+        # blueprint lands in the LEARNING STAGING tier, NOT the trusted MCP canon.
+        # `source="learning"` keeps it OUT of the agent recall (the `source='mcp'`
+        # trust gate) and out of the MCP-scoped corpus GC; `verified=False` is the
+        # safe default (the human-approve → verified=True triage is Phase-3). Without
+        # this explicit override the `BlueprintSeed` default (`mcp`/`True`) would leak
+        # unvetted learning output straight into the trusted recall partition.
+        source="learning",
+        verified=False,
         resolves=dict(blueprint.resolves),
         slots=_slot_docs(env.payload),
         uses_rules=list(gen.uses_rules),
@@ -192,6 +201,15 @@ def knowledge_seed_from_candidate(
         # originating candidate id for incident response.
         created_by="learning",
         source_candidate_id=env.candidate_id,
+        # Governed-corpus trust partition (Phase 2, SAFETY-CRITICAL): a loop-landed
+        # knowledge chunk lands in the LEARNING STAGING tier, NOT the trusted MCP
+        # canon. `source="learning"` keeps it OUT of knowledge recall (the
+        # `source='mcp'` trust gate) and out of the MCP-scoped corpus GC;
+        # `verified=False` is the safe default (Phase-3 human-approve triage). Without
+        # this the `KnowledgeSeed` default (`mcp`/`True`) would leak an unvetted chunk
+        # into the trusted recall partition.
+        source="learning",
+        verified=False,
     )
 
 

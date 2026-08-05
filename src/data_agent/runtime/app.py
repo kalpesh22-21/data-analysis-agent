@@ -75,7 +75,13 @@ from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
-from data_agent.runtime.retrieval.corpus_loader import load_catalog_graph
+from data_agent.runtime.retrieval.corpus_client import build_corpus_cache
+from data_agent.runtime.retrieval.corpus_loader import (
+    corpus_seeds_from_export,
+    effective_corpus_sha,
+    load_catalog_graph,
+    load_corpus,
+)
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.tools import (
     GetBlueprintTool,
@@ -421,6 +427,41 @@ def create_app(
 
         catalog_provider = _catalog_provider
 
+    # Governed corpus (Phase 2): project the MCP `/blueprints/export` +
+    # `/knowledge/export` canon into the neo4j `source='mcp'` recall partition (the
+    # ONLY partition recall serves — the trust gate in `vector_index`). Wired ONLY when
+    # THIS app owns a `Neo4jVectorIndex` (retrieval/neo4j present): the one-shot seed
+    # fires `load_corpus` against the SAME driver + database recall reads from (no
+    # second pool), embedding through the SAME embedding client (parity by
+    # construction). Online is additive (gc=False) — never deletes; the explicit
+    # dropped-node reconcile (gc=True) stays the seed-script maintenance op. When Neo4j
+    # is absent (`vector_index is None`) the callback stays `None` and no corpus cache
+    # is built — the feature is a byte-identical Phase-0 no-op.
+    corpus_cache = None
+    if vector_index is not None and embedding_client is not None:
+        corpus_index = vector_index
+        corpus_embedder = embedding_client
+        corpus_model_id = settings.embedding_model
+
+        async def _on_corpus_loaded(export: dict[str, Any]) -> None:
+            # `.driver`/`.database` are read HERE (lazily, when the seed actually
+            # fires on a turn), NOT at wiring time — reusing the SAME pool + database
+            # recall reads from (never a second driver, never a hardcoded 'neo4j').
+            blueprints, knowledge = corpus_seeds_from_export(export)
+            corpus_sha = effective_corpus_sha(export)
+            await load_corpus(
+                corpus_index.driver,
+                corpus_embedder,
+                blueprints,
+                knowledge,
+                model_id=corpus_model_id,
+                database=corpus_index.database,
+                corpus_sha=corpus_sha,
+                gc=False,
+            )
+
+        corpus_cache = build_corpus_cache(settings, on_corpus_loaded=_on_corpus_loaded)
+
     tool_schema_cache = ToolSchemaCache(mcp_client)
     summarizer = build_llm_summarizer(model_client)
     context_assembler = ContextAssembler(
@@ -606,6 +647,28 @@ def create_app(
 
     app = FastAPI(title="data-agent-runtime", lifespan=_lifespan)
 
+    # Governed-corpus seed trigger (Phase 2). The recall corpus is consumed by neo4j
+    # recall directly (not through a per-turn provider like the catalog), so nothing on
+    # the turn path fetches it — we trigger the one-shot seed here, FIRE-AND-FORGET, on
+    # the first AUTHENTICATED turn (mirroring the catalog-graph "seed on first turn"
+    # timing, and giving the HTTP corpus client a real JWT — startup has none). The
+    # cache's own once-semantics + `is_loaded` make this a cheap no-op after it seeds;
+    # `ensure_seeded` is degrade-not-fail, so a failed cold fetch simply retries on the
+    # NEXT turn. `corpus_cache is None` (Neo4j absent) ⇒ this does nothing.
+    _corpus_warm: dict[str, Any] = {"task": None}
+
+    def _maybe_warm_corpus(credentials: RuntimeCredentials) -> None:
+        if corpus_cache is None or corpus_cache.is_loaded:
+            return
+        in_flight = _corpus_warm["task"]
+        if in_flight is not None and not in_flight.done():
+            return  # a warm is already running — never stack duplicate seeds
+        _corpus_warm["task"] = asyncio.create_task(
+            corpus_cache.ensure_seeded(
+                jwt=credentials.jwt, session_id=credentials.session_id
+            )
+        )
+
     # Test-only span-dump endpoint (D-L3-5), registered ONLY when a
     # `span_exporter` is injected (the Layer-3 demo launcher's in-memory
     # exporter). Production passes `span_exporter=None`, so this route never
@@ -641,6 +704,7 @@ def create_app(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
         assert x_session_id is not None  # narrowed by _extract_credentials
+        _maybe_warm_corpus(credentials)
         emitter = ProgressEmitter()
         agent_loop = _build_agent_loop(combine_observers(emitter.observe, _tracing_observer))
 
@@ -670,6 +734,7 @@ def create_app(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
         assert x_session_id is not None  # narrowed by _extract_credentials
+        _maybe_warm_corpus(credentials)
 
         # Cheap, non-consuming pre-check for a clean 409 (D45): a genuinely
         # concurrent double-resume still races safely inside AgentLoop.resume

@@ -137,47 +137,65 @@ _CORPUS_LABEL: dict[str, str] = {
 # vector space. ORDER BY score DESC keeps recall order-preserving.
 #
 # S9-activation Slice 3 — recall-eligibility filter (retraction backstop, design
-# §8.6). A blueprint is recallable ONLY while it is `status='validated'` with a
-# non-`suspect` drift. The learning loop's demote/reject/user-correction edges write
-# this stamp back onto the landed node (`CorpusLandingWriter.update_status`); this
-# `WHERE` is the FAIL-CLOSED backstop that keeps a demoted/broken blueprint out of
-# retrieval even in the window between a demotion and its write-back (or when the
-# write-back transiently failed — fail-open on the corpus write, fail-closed here).
+# §8.6). WITHIN the `source='mcp'` trust partition (governed-corpus Phase 2), a
+# blueprint is recallable ONLY while it is `status='validated'` with a non-`suspect`
+# drift. The status/drift filters are the retraction backstop for the mcp partition;
+# they do NOT make a `source='learning'` node recallable — the `source='mcp'` gate
+# below is orthogonal and fail-closed, so a learning node is excluded no matter its
+# status/drift. The learning loop's demote/reject/user-correction edges write this
+# stamp back onto a landed node (`CorpusLandingWriter.update_status`); this `WHERE` is
+# the FAIL-CLOSED backstop that keeps a demoted/broken mcp blueprint out of retrieval
+# even in the window between a demotion and its write-back (or when the write-back
+# transiently failed — fail-open on the corpus write, fail-closed here).
 #
-# COMPAT (load-bearing): `coalesce(...)` treats an ABSENT property as recallable so
+# COMPAT (load-bearing): `coalesce(...)` treats an ABSENT status/drift as recallable so
 # the existing hand-authored seed corpus stays byte-recallable — a seed node with no
 # `status`/`drift_status` (or `status='validated'` + `drift_status='clean'`, which is
-# what the fixtures + the loop-landed nodes carry) is unchanged. Only an EXPLICIT
-# `candidate`/`rejected`/`retired` status or a `suspect` drift is excluded.
+# what the fixtures carry) is unchanged. Only an EXPLICIT `candidate`/`rejected`/
+# `retired` status or a `suspect` drift is excluded. NOTE the `source` gate is the
+# EXCEPTION to this compat trick — it is BARE equality, NOT coalesced (see below).
 _BLUEPRINT_RECALL_QUERY = """
 CALL db.index.vector.queryNodes($index_name, $k, $query_vector)
 YIELD node, score
 WHERE node.embedding_model = $expected_model
   AND coalesce(node.status, 'validated') = 'validated'
   AND coalesce(node.drift_status, 'clean') <> 'suspect'
+  AND node.source = 'mcp'
 RETURN node.id AS id, node.intent AS text, node.slots_summary AS slots_summary,
        node.uses AS uses, score
 ORDER BY score DESC
 """
+# THE TRUST GATE (governed-corpus Phase 2). Recall serves ONLY MCP-canon nodes
+# (`source='mcp'`). This is BARE equality, NOT `coalesce(node.source,'mcp')`, and
+# that is deliberate + safety-critical: a node with NO `source` property, or one
+# stamped `source='learning'` (the learning staging tier), MUST be excluded. Neo4j
+# is a projection of the MCP canon plus a learning-staging partition recall ignores;
+# a bare-equality miss fails CLOSED (excluded), never fail-open.
 
-# UI Slice 2 §1.1 row 5 — the knowledge recall-eligibility filter. A global_knowledge
-# chunk lands via the human-approve edge (`CorpusLandingWriter.land`) and can be
-# RETRACTED by `_RETRACT_KNOWLEDGE` stamping `status=retired`. Without this `WHERE`
+# UI Slice 2 §1.1 row 5 — the knowledge recall-eligibility filter, WITHIN the
+# `source='mcp'` trust partition (governed-corpus Phase 2). An mcp knowledge chunk can
+# be RETRACTED by `_RETRACT_KNOWLEDGE` stamping `status=retired`; without this `WHERE`
 # clause a retracted node still recalls (a SILENT no-op), so the retraction path and
-# this filter MUST ship together. `coalesce(...,'validated')` keeps every existing
-# fixture node recallable (they carry an explicit `status='validated'`, and an absent
-# property coalesces to the same default) — the SAME COMPAT trick as the blueprint
-# query. Drift is not applicable to knowledge (only blueprints replay), so no
+# this filter MUST ship together. The status filter governs eligibility only within the
+# mcp partition — it does NOT make a `source='learning'` chunk recallable (the
+# `source='mcp'` gate below is orthogonal + fail-closed). `coalesce(...,'validated')`
+# keeps every existing fixture node recallable (the SAME COMPAT trick as the blueprint
+# query). Drift is not applicable to knowledge (only blueprints replay), so no
 # drift_status clause here.
 _KNOWLEDGE_RECALL_QUERY = """
 CALL db.index.vector.queryNodes($index_name, $k, $query_vector)
 YIELD node, score
 WHERE node.embedding_model = $expected_model
   AND coalesce(node.status, 'validated') = 'validated'
+  AND node.source = 'mcp'
 RETURN node.id AS id, node.text AS text, node.title AS title,
        node.doc_id AS doc_id, score
 ORDER BY score DESC
 """
+# THE TRUST GATE (governed-corpus Phase 2) — the knowledge-side sibling. Recall
+# serves ONLY MCP-canon chunks (`source='mcp'`). BARE equality, NOT
+# `coalesce(...)`: a chunk with NO `source` or a `source='learning'` staging chunk
+# MUST be excluded (fail-closed). Same intentional posture as the blueprint gate.
 
 _CORPUS_QUERY: dict[str, str] = {
     "blueprint": _BLUEPRINT_RECALL_QUERY,
@@ -255,8 +273,13 @@ _CORPUS_MAPPER = {
 # field list, so the new properties are simply not read by recall (D87 invariant
 # preserved). No parity `WHERE embedding_model` guard: a keyed metadata read, not
 # a vector-space recall (§1.2), so a model-mismatched vector is irrelevant.
+#
+# THE TRUST GATE (governed-corpus Phase 2), defense-in-depth: `WHERE b.source = 'mcp'`
+# so a keyed fetch by id can never return a `source='learning'` staging blueprint (or
+# a node with no `source`). BARE equality — fail-closed, mirroring the recall gate.
 _GET_BLUEPRINT_QUERY = """
 MATCH (b:Blueprint {id: $id})
+WHERE b.source = 'mcp'
 RETURN b.id AS id, b.intent AS intent, b.slots_summary AS slots_summary,
        b.uses AS uses, b.status AS status, b.drift_status AS drift_status,
        b.hit_count AS hit_count, b.catalog_sha AS catalog_sha,
@@ -460,15 +483,23 @@ class Neo4jVectorIndex:
 
     async def _flag_model_mismatch(self, kind: str) -> None:
         """When a corpus recall came back empty, probe whether the corpus has any
-        nodes at all. If it does, the parity `WHERE` dropped everything (total
-        model mismatch) — set a shape-only `retrieval.model_mismatch` attribute
-        on the current span so the misconfiguration is observable (design §2.3).
+        RECALLABLE (`source='mcp'`) nodes at all. If it does, the parity `WHERE`
+        dropped everything (total model mismatch) — set a shape-only
+        `retrieval.model_mismatch` attribute on the current span so the
+        misconfiguration is observable (design §2.3).
+
+        The probe is `source='mcp'`-scoped to match the recall's trust gate
+        (governed-corpus Phase 2): a corpus that is empty-to-recall purely because its
+        nodes are `source='learning'`/sourceless is NOT a model mismatch, so counting
+        those would set a FALSE `model_mismatch` and misdirect the operator.
         Best-effort: any probe failure is swallowed (it is pure observability)."""
         label = _CORPUS_LABEL.get(kind)
         if label is None:
             return
         try:
-            rows = await self._run(f"MATCH (n:{label}) RETURN count(n) AS c", {})
+            rows = await self._run(
+                f"MATCH (n:{label}) WHERE n.source = 'mcp' RETURN count(n) AS c", {}
+            )
             count = rows[0]["c"] if rows else 0
         except Exception:  # noqa: BLE001 - probe is best-effort observability only
             return

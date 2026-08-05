@@ -1,9 +1,17 @@
 """promotion/landing.py — the S9 corpus-landing writer (S9-activation Slice 2, §3).
 
-The learning loop's FIRST write into what gets RECALLED. On `candidate → validated`,
-`CorpusLandingWriter.land` MERGE-upserts the validated blueprint into the neo4j
-retrieval corpus (via the reused `runtime/retrieval/corpus_loader.load_corpus`) so it
-becomes recallable end-to-end. The safety guards here are load-bearing:
+The learning loop's write into the neo4j retrieval corpus. On `candidate → validated`,
+`CorpusLandingWriter.land` MERGE-upserts the validated blueprint via the reused
+`runtime/retrieval/corpus_loader.load_corpus`.
+
+GOVERNED CORPUS (Phase 2): a landed node lands in the `source='learning'` STAGING tier
+(the mapping stamps `source="learning"`, `verified=False`), NOT the trusted MCP canon.
+The agent recall serves ONLY `source='mcp'` (the fail-closed trust gate in
+`runtime/retrieval/vector_index`), so a freshly-landed learning node is NEVER recallable
+end-to-end regardless of its status/drift_status — those two fields govern recall
+eligibility ONLY WITHIN the mcp partition. Promoting a vetted learning node into the
+recallable mcp canon is a Phase-3 future (human-approve → `verified=True` → re-source to
+mcp); until then landing is a stage-only write. The safety guards here are load-bearing:
 
   * **Deterministic id (idempotent MERGE, §3.2).** The seed's neo4j `id` is derived
     from the candidate's `canonical_key` (the S6 dedup identity), so a re-promotion of

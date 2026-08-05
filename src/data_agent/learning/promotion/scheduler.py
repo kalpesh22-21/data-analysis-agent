@@ -63,10 +63,13 @@ from .replay import ReplayOutcome, golden_replay
 
 _logger = logging.getLogger(__name__)
 
-# The artifact types the learning loop LANDS into the neo4j retrieval corpus (and thus
-# must converge back out of recall on a demote): a blueprint (`:Blueprint`) and a
-# global_knowledge chunk (`:KnowledgeChunk`, UI Slice 2). `schema_edit`/`user_knowledge`
-# never land here, so a demote of them has nothing to re-stamp.
+# The artifact types the learning loop LANDS into the neo4j retrieval corpus: a
+# blueprint (`:Blueprint`) and a global_knowledge chunk (`:KnowledgeChunk`, UI Slice 2).
+# `schema_edit`/`user_knowledge` never land here, so a demote of them has nothing to
+# re-stamp. GOVERNED CORPUS (Phase 2): a landed node is stamped `source='learning'` and
+# is NOT recallable regardless of status/drift (the recall trust gate serves only
+# `source='mcp'`), so the demote/re-stamp keeps the STAGING node's status coherent for a
+# future Phase-3 promotion — it is no longer what gates the node out of live recall.
 _LANDED_TYPES: frozenset[str] = frozenset({BLUEPRINT_TYPE, "global_knowledge"})
 
 

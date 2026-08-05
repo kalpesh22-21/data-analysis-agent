@@ -100,6 +100,38 @@ class RuntimeSettings(BaseSettings):
         description="Path to the offline catalog-export JSON. Empty → repo tests/fixtures/catalog_export.json.",
     )
 
+    # --- Governed corpus source (Phase 2 — the MCP as the single source of trusted
+    # recall canon). The runtime projects the MCP's `GET /blueprints/export` +
+    # `GET /knowledge/export` into the neo4j recall corpus as `source="mcp"` canon
+    # (the trust partition recall serves); the learning loop stages `source="learning"`
+    # nodes recall ignores.
+    #   * "mcp"     (default) — fetch both exports from the live MCP host and seed the
+    #                 trusted corpus partition (one-shot, self-healing, gc=False).
+    #   * "fixture" — read the offline `tests/fixtures/corpus/{blueprints,knowledge}.yaml`
+    #                 seeds from disk; used by the test suite + fully-offline runs.
+    corpus_source: str = Field(
+        "mcp",
+        description="Where the recall corpus canon comes from: 'mcp' (live exports) or 'fixture' (offline YAML).",
+    )
+    # The `/blueprints/export` + `/knowledge/export` routes ride the SAME MCP host root
+    # as plain authenticated GETs (NOT under `/catalog`). When empty, the base is
+    # derived from `mcp_url` (host root), so a deploy that sets only `MCP_URL` wires the
+    # corpus surface automatically. `HttpCorpusClient` appends the two route paths.
+    corpus_api_url: str = Field(
+        "",
+        description="Base URL of the MCP corpus exports (host root; /blueprints/export + /knowledge/export appended). Empty → derived from mcp_url.",
+    )
+    # Fixture paths used when `corpus_source="fixture"`. Empty → the committed
+    # `tests/fixtures/corpus/{blueprints,knowledge}.yaml` relative to the repo root.
+    corpus_blueprints_fixture_path: str = Field(
+        "",
+        description="Path to the offline blueprints seed YAML. Empty → repo tests/fixtures/corpus/blueprints.yaml.",
+    )
+    corpus_knowledge_fixture_path: str = Field(
+        "",
+        description="Path to the offline knowledge seed YAML. Empty → repo tests/fixtures/corpus/knowledge.yaml.",
+    )
+
     # --- OpenAI model provider (D71) ---
     openai_api_key: str = Field("", description="OpenAI API key (secret).")
     openai_model: str = Field("gpt-4.1", description="Model name for Responses/Chat Completions.")
@@ -502,6 +534,43 @@ class RuntimeSettings(BaseSettings):
             return Path(self.catalog_fixture_path)
         repo_root = Path(__file__).resolve().parents[3]
         return repo_root / "tests" / "fixtures" / "catalog_export.json"
+
+    def corpus_api_base(self) -> str:
+        """Resolve the MCP corpus-export host root (no trailing slash) — governed
+        corpus (Phase 2). `HttpCorpusClient` appends `/blueprints/export` and
+        `/knowledge/export`.
+
+        Uses `corpus_api_url` when set; otherwise derives the HOST ROOT from `mcp_url`
+        (scheme + netloc only — the two corpus routes live at the host root, NOT under
+        the `/mcp` mount NOR under `/catalog`). E.g. `http://host:18090/mcp` →
+        `http://host:18090`. Same path-prefix caveat as `catalog_api_base`: a
+        path-routed ingress must set `corpus_api_url` explicitly."""
+        if self.corpus_api_url:
+            return self.corpus_api_url.rstrip("/")
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(self.mcp_url)
+        return urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
+
+    def corpus_blueprints_fixture_file(self) -> Path:
+        """Resolve the offline blueprints seed YAML (`corpus_source="fixture"`).
+
+        Uses `corpus_blueprints_fixture_path` when set; otherwise the committed
+        `tests/fixtures/corpus/blueprints.yaml` (repo root is 3 parents up)."""
+        if self.corpus_blueprints_fixture_path:
+            return Path(self.corpus_blueprints_fixture_path)
+        repo_root = Path(__file__).resolve().parents[3]
+        return repo_root / "tests" / "fixtures" / "corpus" / "blueprints.yaml"
+
+    def corpus_knowledge_fixture_file(self) -> Path:
+        """Resolve the offline knowledge seed YAML (`corpus_source="fixture"`).
+
+        Uses `corpus_knowledge_fixture_path` when set; otherwise the committed
+        `tests/fixtures/corpus/knowledge.yaml` (repo root is 3 parents up)."""
+        if self.corpus_knowledge_fixture_path:
+            return Path(self.corpus_knowledge_fixture_path)
+        repo_root = Path(__file__).resolve().parents[3]
+        return repo_root / "tests" / "fixtures" / "corpus" / "knowledge.yaml"
 
 
 def effective_llm_hide(settings: RuntimeSettings) -> bool:
