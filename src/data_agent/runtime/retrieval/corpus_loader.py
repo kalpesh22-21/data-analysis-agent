@@ -50,6 +50,7 @@ from data_agent.runtime.blueprint.template import (
     contains_star,
     parse_template,
     referenced_slots,
+    validate_optional_pattern,
 )
 from data_agent.runtime.blueprint.when import WhenClauseError, validate_when
 
@@ -1192,6 +1193,19 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
                 "NOT in the blueprint's declared uses — a slot's domain probe must read only "
                 "an advertised column (add it to uses or fix binds_to)."
             )
+        # (f2) Slice C: an authored `optional_pattern` MUST pass the SAME parse gate
+        # the runtime applies (a self-contained boolean condition — no statement, no
+        # bare literal/arithmetic, no embedded placeholder). Validating at LOAD makes
+        # a malformed pattern fail LOUD here instead of silently burning a fast-path
+        # attempt (→ raw loop) on every hit.
+        if slot.optional_pattern is not None:
+            try:
+                validate_optional_pattern(slot.name, slot.optional_pattern)
+            except TemplateBindError as exc:
+                raise CorpusLoadError(
+                    f"blueprint {bp.id}: slot {slot.name!r} has a malformed "
+                    f"optional_pattern — {exc}"
+                ) from exc
 
     # (g) S6a: a `resolve_via` rule's probed column MUST be within the declared
     # `uses` (scope-honesty for rules, matching the template footprint check) —

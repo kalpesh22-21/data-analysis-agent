@@ -194,7 +194,13 @@ pay_period:"May 2026"}`.
 **Runtime pipeline (per slot):** presence → type-resolve → bind.
 
 1. **Presence.** `required` slot absent → `askUser`. Optional slot absent → its `optional_pattern`
-   applies (e.g. `({department} IS NULL OR …)` binds NULL = "all").
+   is applied at runtime (Slice C): the pattern is a **boolean SQL fragment that REPLACES the whole
+   predicate carrying the slot's `{token}`** — *not* a value substituted for the token. E.g.
+   `WHERE region = {region}` with `optional_pattern: 'TRUE'`, `region` omitted → `WHERE TRUE`
+   (all regions); one arm of an `AND`/`OR` is replaced in place (`A AND {slot-pred}` → `A AND TRUE`),
+   the rest renders normally. An optional slot omitted with **no** `optional_pattern` (or a malformed
+   one) leaves its `{token}` unbound → the bind fails closed → the raw-loop fallback (never silent
+   wrong SQL).
 2. **Type-resolve (deterministic per-type resolvers, against `binds_to`).** The model's raw value is
    coerced and validated by a resolver keyed on the slot `type`: `enum` → value ∈ allowed set; entity
    slot → optional existence check against `binds_to`; `period`/`as_of_date` → temporal resolution

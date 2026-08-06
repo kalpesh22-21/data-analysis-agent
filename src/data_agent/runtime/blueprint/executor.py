@@ -296,6 +296,10 @@ class BlueprintExecutor:
         referenced = referenced_slots(template_sql)
         provenances: list[frozenset[tuple[str, str]] | None] = []
         bound: dict[str, Any] = {}
+        # Slice C: an omitted optional slot's `optional_pattern` REPLACES the
+        # predicate carrying its `{token}` (never a value substitution). Collected
+        # here, applied in `bind_template` below.
+        optional_patterns: dict[str, str] = {}
         for spec in blueprint.slots:
             raw = slot_bindings.get(spec.name)
             # n3: fire the DISTINCT domain probe only when the value is PRESENT — a
@@ -322,7 +326,18 @@ class BlueprintExecutor:
                     slot_bindings_json=_dumps(slot_bindings),
                 )
             if isinstance(outcome, OmitSlot):
-                continue  # absent optional slot — optional_pattern assembly is Slice C
+                # Slice C: an absent optional slot with an `optional_pattern` → apply
+                # it to EVERY referenced `{token}` of the slot (a `period_range`
+                # occupies `{name}_start`/`{name}_end`, so key by `slot_token_names`,
+                # not the bare name — a `date >= {w_start} AND date < {w_end}` range
+                # omitted becomes `TRUE AND TRUE`). With NO pattern (or an
+                # unreferenced token) the `{token}` stays unbound → `bind_template`
+                # fails closed to SLOT_INVALID → raw loop (the correct safe default).
+                if outcome.optional_pattern is not None:
+                    for token in slot_token_names(spec):
+                        if token in referenced:
+                            optional_patterns[token] = outcome.optional_pattern
+                continue
             if isinstance(outcome, SlotBinding):
                 # B3: a resolved value whose `{slot}` token(s) the template does not
                 # reference must NEVER be silently dropped — dropping it would run
@@ -364,7 +379,9 @@ class BlueprintExecutor:
         # 4. Bind the typed AST literals into the template (F1/D10). A bind
         # failure (unbound {slot}, extra binding, unbindable value) is fail-closed.
         try:
-            node_sql = bind_template(template_sql, bound)
+            node_sql = bind_template(
+                template_sql, bound, optional_patterns=optional_patterns
+            )
         except TemplateBindError:
             _logger.warning("blueprint %s template bind failed", blueprint_id)
             return ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
@@ -525,7 +542,7 @@ class BlueprintExecutor:
         # 2. Resolve every slot up-front (deterministic, D49). A slot `askUser`
         # pauses BEFORE any node runs (awaiting_node=None — resume re-runs via the
         # model loop, the Slice-B contract).
-        bound_slots, slot_outcome = await self._resolve_all_slots(
+        bound_slots, omitted_patterns, slot_outcome = await self._resolve_all_slots(
             blueprint, slot_bindings, all_referenced, provenances, credentials
         )
         if slot_outcome is not None:
@@ -667,7 +684,7 @@ class BlueprintExecutor:
                 _record_empty_output(node, node_outputs)
                 continue
             node_bindings, bind_fail = _node_bindings(
-                node, bound_slots, rule_bindings, node_outputs
+                node, bound_slots, rule_bindings, node_outputs, omitted_patterns
             )
             if bind_fail is not None:
                 return bind_fail
@@ -679,7 +696,10 @@ class BlueprintExecutor:
                 return table_fail
             try:
                 node_sql = bind_template(
-                    node.sql_template, node_bindings, table_bindings=table_bindings
+                    node.sql_template,
+                    node_bindings,
+                    table_bindings=table_bindings,
+                    optional_patterns=omitted_patterns,
                 )
             except TemplateBindError:
                 _logger.warning("blueprint %s node %s bind failed", bid, node.order)
@@ -754,12 +774,16 @@ class BlueprintExecutor:
         all_referenced: set[str],
         provenances: list[frozenset[tuple[str, str]] | None],
         credentials: RuntimeCredentials,
-    ) -> tuple[dict[str, Any], ExecOutcome | None]:
+    ) -> tuple[dict[str, Any], dict[str, str], ExecOutcome | None]:
         """Resolve every slot to a typed binding (mirrors the Slice-B leaf loop,
         but the referenced-set spans ALL node templates). Returns
-        `(bound, None)` on success, or `(bound, ExecPaused|ExecFailed)`."""
+        `(bound, omitted_patterns, None)` on success, or
+        `(bound, omitted_patterns, ExecPaused|ExecFailed)`. `omitted_patterns` maps
+        each omitted optional slot that carries an `optional_pattern` to it (Slice
+        C) — applied per-node in `bind_template` for the nodes that reference it."""
         self._observer("blueprint_step", {"blueprint_id": blueprint.id, "step": "resolving_slots"})
         bound: dict[str, Any] = {}
+        omitted_patterns: dict[str, str] = {}
         for spec in blueprint.slots:
             raw = slot_bindings.get(spec.name)
             if _is_present(raw) and spec.binds_to:
@@ -769,13 +793,23 @@ class BlueprintExecutor:
                 domain = None
             outcome = resolve_slot(raw, spec, domain=domain)
             if isinstance(outcome, AskUser):
-                return bound, ExecPaused(
+                return bound, omitted_patterns, ExecPaused(
                     reason="blueprint_slot",
                     pending_question={"question": outcome.question, "options": outcome.options},
                     blueprint_id=blueprint.id,
                     slot_bindings_json=_dumps(slot_bindings),
                 )
             if isinstance(outcome, OmitSlot):
+                # Slice C: carry an omitted optional slot's `optional_pattern` for
+                # EVERY referenced `{token}` (keyed by `slot_token_names` so a
+                # `period_range`'s `{name}_start`/`{name}_end` both apply) so the
+                # referencing node's `bind_template` replaces each predicate instead
+                # of leaving an unbound `{token}`. No pattern / unreferenced → the
+                # token stays → that node fails closed to the raw loop (safe default).
+                if outcome.optional_pattern is not None:
+                    for token in slot_token_names(spec):
+                        if token in all_referenced:
+                            omitted_patterns[token] = outcome.optional_pattern
                 continue
             if isinstance(outcome, SlotBinding):
                 # Same all-tokens rule as the single-node path: a `period_range`
@@ -792,11 +826,11 @@ class BlueprintExecutor:
                         spec.name,
                         sorted(tokens - all_referenced),
                     )
-                    return bound, ExecFailed(
+                    return bound, omitted_patterns, ExecFailed(
                         SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True
                     )
                 bound.update(expand_binding(spec, outcome.value))
-        return bound, None
+        return bound, omitted_patterns, None
 
     async def _expand_rules(
         self,
@@ -1391,11 +1425,16 @@ def _node_bindings(
     bound_slots: dict[str, Any],
     rule_bindings: dict[str, Any],
     node_outputs: dict[str, Any],
+    omitted_patterns: dict[str, str],
 ) -> tuple[dict[str, Any], ExecFailed | None]:
     """Assemble the exact `{placeholder: value}` set a node template needs from
     (a) upstream scalar `consumes`, (b) resolved slots, (c) `resolve_via` rule
     IN-lists. An unbound placeholder or an unresolvable consume is fail-closed to
-    SLOT_INVALID (never a half-bound query)."""
+    SLOT_INVALID (never a half-bound query).
+
+    *omitted_patterns* (Slice C): tokens satisfied by an omitted optional slot's
+    `optional_pattern` — NOT value-bound here (the pattern replaces their predicate
+    in `bind_template`), so they are excluded from the unbound-token check."""
     refs = referenced_slots(node.sql_template or "")
     bindings: dict[str, Any] = {}
     # (a) consumes: {placeholder: "$N.name"} — the upstream SCALAR value.
@@ -1418,6 +1457,11 @@ def _node_bindings(
             bindings[ref] = bound_slots[ref]
         elif ref in rule_bindings:
             bindings[ref] = rule_bindings[ref]
+        elif ref in omitted_patterns:
+            # Slice C: an omitted optional slot's token — satisfied by its
+            # `optional_pattern` (which replaces the predicate in `bind_template`),
+            # so it needs NO value binding here. Not an unbound-token failure.
+            continue
         else:
             return {}, ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
     return bindings, None

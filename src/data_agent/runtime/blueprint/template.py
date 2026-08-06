@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from typing import Any
 
 import sqlglot
@@ -193,11 +194,224 @@ def _rewrite_scratch_tables(
     return tree.transform(_replace)
 
 
+# The boolean CONNECTORS / clause holders that bound a single predicate. When an
+# OPTIONAL slot is omitted, its `optional_pattern` REPLACES the whole boolean
+# predicate that contains the slot's `{token}` (Slice C) — NOT the token's value.
+# Walking up from the placeholder, the enclosing predicate is the highest ancestor
+# whose parent is one of these connectors (or a WHERE/PREWHERE/HAVING/QUALIFY
+# clause): e.g. in `A AND col = {slot}` the enclosing predicate is `col = {slot}`
+# (its parent is `And`), so only that arm is replaced (`A AND TRUE`), never the
+# whole `And`. `Not` is a boundary too, but replacing a predicate ANYWHERE under a
+# `Not` would invert the filter's polarity — that is fail-closed
+# (`_enclosing_predicate` raises), never silently emitted.
+_PREDICATE_BOUNDARY: tuple[type[exp.Expression], ...] = (
+    exp.And,
+    exp.Or,
+    exp.Not,
+    exp.Where,
+    exp.PreWhere,
+    exp.Having,
+    exp.Qualify,
+)
+
+# The filtering CLAUSES a predicate lives under. Walking up from the placeholder to
+# one of these bounds the "is this predicate negated?" scan — a `Not` ANYWHERE on
+# that path (not merely the immediate parent) means replacing the predicate would
+# invert polarity, so it is fail-closed.
+_CLAUSE_BOUNDARY: tuple[type[exp.Expression], ...] = (
+    exp.Where,
+    exp.PreWhere,
+    exp.Having,
+    exp.Qualify,
+)
+
+
+def _is_boolean_condition(node: exp.Expression | None) -> bool:
+    """True iff *node* is a BOOLEAN-valued condition fit to be a whole predicate —
+    a predicate (`=`/`IN`/`LIKE`/`IS`/…), a `TRUE`/`FALSE`, a connector
+    (`AND`/`OR`/`NOT`), or a parenthesized one. A bare literal (`1`), a column, or a
+    pure-arithmetic expression (`1 + 1`) is NOT a boolean predicate — replacing a
+    filter with one is a silent semantics change, so it is rejected (fail-closed)."""
+    if not isinstance(node, exp.Condition):
+        return False
+    if isinstance(node, (exp.Literal, exp.Column)):
+        return False  # a bare value, not a boolean test
+    if isinstance(node, exp.Paren):
+        return _is_boolean_condition(node.this)
+    # An arithmetic/bitwise/concat `Binary` (Add/Sub/Mul/DPipe/…) is a value, not a
+    # predicate; comparisons (`EQ`/`GT`/…) are `Predicate`, boolean glue is `Connector`.
+    if isinstance(node, exp.Binary) and not isinstance(node, (exp.Predicate, exp.Connector)):
+        return False
+    return True
+
+
+def _enclosing_predicate(placeholder: exp.Placeholder) -> exp.Expression:
+    """The boolean predicate subtree that CONTAINS *placeholder* — the highest
+    ancestor reached before a boolean connector (`AND`/`OR`/`NOT`) or a
+    `WHERE`/`PREWHERE`/`HAVING`/`QUALIFY` clause. For the corpus predicate forms
+    `col = {slot}` and `col IN {slot}` this is the `EQ`/`In` node; when the slot is
+    one arm of an `AND`/`OR`, only that arm is returned (the rest renders normally).
+
+    Fail-closed: a predicate anywhere under a `Not` (directly, or nested as
+    `NOT (a = 1 AND region = {region})`) raises `TemplateBindError` — replacing an
+    arm under negation inverts polarity (`NOT (region = {region})` → `NOT TRUE` = no
+    rows; `NOT (a = 1 AND TRUE)` = `NOT (a = 1)`, a silent narrowing)."""
+    name = placeholder.args.get("this")
+    # Polarity scan: ANY `Not` between the placeholder and its clause boundary means
+    # the predicate is negated — fail-closed, not just the immediate-parent case.
+    ancestor = placeholder.parent
+    while ancestor is not None and not isinstance(ancestor, _CLAUSE_BOUNDARY):
+        if isinstance(ancestor, exp.Not):
+            raise TemplateBindError(
+                f"optional_pattern for slot {name!r} sits under a NOT — applying it "
+                "would invert the filter's polarity; fail closed"
+            )
+        ancestor = ancestor.parent
+    node: exp.Expression = placeholder
+    parent = node.parent
+    while parent is not None and not isinstance(parent, _PREDICATE_BOUNDARY):
+        node = parent
+        parent = node.parent
+    return node
+
+
+def _parse_optional_pattern(name: str, pattern: str) -> exp.Expression:
+    """Parse an `optional_pattern` fragment to a boolean CONDITION node (fail-closed).
+
+    The fragment REPLACES a whole predicate, so it must itself be a self-contained
+    boolean condition (`TRUE`, `col IN (...)`, `a > 0 AND b < 5`, …): a parse
+    failure, a non-condition (a bare `SELECT`, a lone literal, pure arithmetic), or
+    a fragment carrying ANY `{token}`/placeholder (a self-referential or
+    foreign-slot pattern that could re-inject or loop) all raise `TemplateBindError`
+    so the executor degrades to the raw loop — never silently wrong SQL."""
+    try:
+        parsed = sqlglot.parse_one(pattern, dialect="clickhouse")
+    except Exception as exc:  # noqa: BLE001 - any parse failure is fail-closed
+        raise TemplateBindError(
+            f"optional_pattern for slot {name!r} does not parse under ClickHouse "
+            f"dialect: {exc}"
+        ) from exc
+    if not _is_boolean_condition(parsed):
+        raise TemplateBindError(
+            f"optional_pattern for slot {name!r} must be a boolean SQL condition "
+            f"(e.g. 'TRUE'), got {type(parsed).__name__ if parsed else 'empty'}"
+        )
+    # A pattern must be SELF-CONTAINED: no bind site inside it, in EITHER surface
+    # form — a colon `:placeholder` (which would re-inject every re-walk and spin the
+    # apply loop forever) OR a curly `{token}` (which is NOT substituted in a pattern,
+    # so it silently parses to a `map()` literal — an author's `region IN {allowed}`
+    # would become garbage SQL). Reject both at parse (a poisoned/legacy record and an
+    # authoring mistake are both in the threat model).
+    if parsed.find(exp.Placeholder) is not None or referenced_slots(pattern):
+        raise TemplateBindError(
+            f"optional_pattern for slot {name!r} must not contain a slot token or "
+            "placeholder — it must be a self-contained boolean fragment"
+        )
+    return parsed
+
+
+def validate_optional_pattern(name: str, pattern: str) -> None:
+    """Write-time (corpus-load) validation of an authored `optional_pattern` — the
+    SAME gate the runtime applies, so a malformed / placeholder-bearing /
+    non-Condition pattern fails LOUD at load instead of burning a fast-path attempt
+    on every hit. Raises `TemplateBindError` (the loader maps it to its own error)."""
+    _parse_optional_pattern(name, pattern)
+
+
+def _apply_optional_patterns(
+    tree: exp.Expression, optional_patterns: Mapping[str, str]
+) -> exp.Expression:
+    """Replace, for every omitted OPTIONAL slot in *optional_patterns*, the whole
+    boolean predicate containing its `:name` placeholder with the slot's parsed
+    `optional_pattern` condition (Slice C, 04-blueprints presence rule 1).
+
+    Every occurrence of the placeholder is handled; replacing the enclosing
+    predicate removes the placeholder, so the downstream value-binding step never
+    sees it. A pattern whose placeholder does NOT appear in the tree is inert — it
+    is never parsed (so a malformed pattern for a slot this template does not
+    reference cannot fail this bind).
+
+    Fail-closed on every ambiguous shape: a malformed/self-referential pattern
+    whose token IS present, a placeholder not inside a boolean predicate, a
+    predicate under a `NOT`, or a predicate SHARING its subtree with any OTHER bind
+    site (a provided value or a different omitted token — replacing the whole
+    predicate would silently DROP that sibling) all raise `TemplateBindError`."""
+    # Only patterns whose `:name` placeholder actually appears are applied (and so
+    # only they are parsed) — a pattern for an unreferenced token is a no-op.
+    present = {
+        name
+        for placeholder in tree.find_all(exp.Placeholder)
+        if isinstance((name := placeholder.args.get("this")), str) and name in optional_patterns
+    }
+    if not present:
+        return tree
+    parsed_patterns = {
+        name: _parse_optional_pattern(name, optional_patterns[name]) for name in present
+    }
+    # Re-walk after each replacement: replacing a predicate mutates the tree, so a
+    # fresh `find_all` avoids acting on a detached node. Each replacement strictly
+    # REMOVES one applicable placeholder (patterns are placeholder-free), so the
+    # loop terminates — but hard-cap at the initial applicable count as a
+    # belt-and-braces guard against an unforeseen re-insertion (fail-closed).
+    max_iterations = sum(
+        1
+        for placeholder in tree.find_all(exp.Placeholder)
+        if placeholder.args.get("this") in parsed_patterns
+    )
+    for _ in range(max_iterations):
+        target: exp.Placeholder | None = None
+        for placeholder in tree.find_all(exp.Placeholder):
+            name = placeholder.args.get("this")
+            if isinstance(name, str) and name in parsed_patterns:
+                target = placeholder
+                break
+        if target is None:
+            return tree
+        name = target.args["this"]
+        predicate = _enclosing_predicate(target)
+        if predicate is tree or not isinstance(predicate, exp.Condition):
+            # The placeholder is not inside a boolean predicate (e.g. it sits in a
+            # projection) — an optional_pattern cannot meaningfully replace it.
+            raise TemplateBindError(
+                f"optional_pattern for slot {name!r} could not locate an enclosing "
+                "boolean predicate to replace"
+            )
+        # The predicate must contain NO bind site other than this token, or
+        # replacing the whole predicate would silently drop it (a provided value in
+        # `x BETWEEN {lo} AND {hi}`, or a second omitted token). ANY non-target
+        # placeholder counts — NAMED (`:other`) OR anonymous (a bare `?`, whose
+        # `this` is None) — else `x BETWEEN ? AND {lo}` would drop the `?`. Fail closed.
+        foreign = sorted(
+            {
+                f"{{{other}}}" if isinstance((other := ph.args.get("this")), str) else "?"
+                for ph in predicate.find_all(exp.Placeholder)
+                if ph.args.get("this") != name
+            }
+        )
+        if foreign:
+            raise TemplateBindError(
+                f"optional_pattern for slot {name!r} shares its predicate with other "
+                f"bind site(s) {foreign}; replacing it would drop them — fail closed"
+            )
+        predicate.replace(parsed_patterns[name].copy())
+    if any(
+        placeholder.args.get("this") in parsed_patterns
+        for placeholder in tree.find_all(exp.Placeholder)
+    ):
+        # Cap hit with an applicable placeholder still present — an unexpected
+        # re-insertion. Never emit half-applied SQL.
+        raise TemplateBindError(
+            "optional_pattern application did not converge — fail closed"
+        )
+    return tree
+
+
 def bind_template(
     sql_template: str,
     bindings: dict[str, Any],
     *,
     table_bindings: dict[str, str] | None = None,
+    optional_patterns: Mapping[str, str] | None = None,
 ) -> str:
     """Return *sql_template* with every `{slot}` replaced by a typed AST literal.
 
@@ -211,11 +425,25 @@ def bind_template(
     identifier rewrite BEFORE the literal binding (§2.2 step 3). Table placeholders
     are NOT `{slot}` tokens, so they are invisible to the missing/extra slot
     checks — the two mechanisms compose cleanly.
+
+    *optional_patterns* (Slice C): maps an OMITTED optional slot's `{token}` (a
+    scalar slot's `{name}`, or each of a `period_range`'s `{name}_start`/
+    `{name}_end`) to its `optional_pattern` — a boolean SQL fragment that REPLACES
+    the whole predicate containing that token (e.g. `WHERE region = {region}` with
+    pattern `TRUE` → `WHERE TRUE`). Such a token is SATISFIED by its pattern (it has
+    no value), so it is excluded from the missing/extra checks and removed by the
+    predicate replacement BEFORE the value-binding step. Fail-closed on any
+    ambiguous shape (a predicate under `NOT`, a predicate shared with another bind
+    site, a self-referential/malformed pattern) — never silently wrong SQL.
     """
     referenced = referenced_slots(sql_template)
     provided = set(bindings)
+    pattern_names = set(optional_patterns or ())
 
-    missing = referenced - provided
+    # An omitted optional slot with an `optional_pattern` is fulfilled by the
+    # pattern, not by a value — exclude it from `missing` (it has no binding by
+    # design) and it can never be `extra` (it is not in `bindings`).
+    missing = referenced - provided - pattern_names
     if missing:
         raise TemplateBindError(
             f"template references slot(s) with no binding: {sorted(missing)}"
@@ -237,6 +465,11 @@ def bind_template(
     # scratch table) FIRST — a structural identifier swap, injection-safe.
     if table_bindings:
         tree = _rewrite_scratch_tables(tree, table_bindings)
+
+    # Slice C: apply each omitted optional slot's `optional_pattern` — replacing the
+    # enclosing predicate removes that `:name` placeholder BEFORE literal binding.
+    if optional_patterns:
+        tree = _apply_optional_patterns(tree, optional_patterns)
 
     def _replace(node: exp.Expression) -> exp.Expression:
         if isinstance(node, exp.Placeholder):
@@ -260,4 +493,5 @@ __all__ = [
     "contains_star",
     "parse_template",
     "referenced_slots",
+    "validate_optional_pattern",
 ]

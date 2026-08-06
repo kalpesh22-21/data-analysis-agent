@@ -71,10 +71,14 @@ class SlotBinding:
 
 @dataclass(frozen=True)
 class OmitSlot:
-    """An absent OPTIONAL slot — no binding; the node's `optional_pattern`
-    applies at template-assembly time (presence rule 1, 04-blueprints)."""
+    """An absent OPTIONAL slot — no binding; the slot's `optional_pattern` (carried
+    here) REPLACES the predicate containing its `{token}` at template-bind time
+    (Slice C, presence rule 1, 04-blueprints). `optional_pattern is None` means no
+    pattern was authored → the `{token}` stays unbound → the bind fails closed to
+    the raw loop (the safe default)."""
 
     name: str
+    optional_pattern: str | None = None
 
 
 @dataclass(frozen=True)
@@ -145,7 +149,7 @@ def resolve_slot(
                 reason="missing",
                 question=f"What value should I use for '{spec.name}'?",
             )
-        return OmitSlot(name=spec.name)
+        return OmitSlot(name=spec.name, optional_pattern=spec.optional_pattern)
 
     # The windowed-period types resolve BEFORE the string/entity container guard
     # (line below): a `period_range` value is legitimately a dict/list, which that

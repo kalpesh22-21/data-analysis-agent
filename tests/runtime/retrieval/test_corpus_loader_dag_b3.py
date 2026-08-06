@@ -60,7 +60,9 @@ def test_unreferenced_required_slot_fails_load() -> None:
 
 def test_unreferenced_optional_slot_is_allowed() -> None:
     # Only REQUIRED slots must be referenced; an optional slot may be unreferenced
-    # (its optional_pattern assembly is Slice C) — must NOT fail the load.
+    # (an omitted optional slot's optional_pattern is applied at runtime when its
+    # token IS referenced; an unreferenced optional slot is simply inert) — must
+    # NOT fail the load.
     bp = _seed(
         slots=[
             {"name": "department", "type": "string", "required": True},
@@ -68,6 +70,46 @@ def test_unreferenced_optional_slot_is_allowed() -> None:
         ]
     )
     _validate_blueprint_dag(bp)  # no raise
+
+
+# -- Slice C: optional_pattern validated at LOAD (fail loud, not per-hit) ----
+
+
+def test_valid_optional_pattern_loads() -> None:
+    bp = _seed(
+        slots=[
+            {"name": "department", "type": "string", "required": True},
+            {"name": "region", "type": "string", "required": False, "optional_pattern": "TRUE"},
+        ]
+    )
+    _validate_blueprint_dag(bp)  # no raise
+
+
+def test_malformed_optional_pattern_rejected_at_load() -> None:
+    # A non-Condition pattern (a full SELECT) must fail LOUD at load, not burn a
+    # fast-path attempt on every hit. (Validated even for an UNREFERENCED optional
+    # slot — the pattern itself is checked.)
+    bp = _seed(
+        slots=[
+            {"name": "department", "type": "string", "required": True},
+            {"name": "region", "type": "string", "required": False, "optional_pattern": "SELECT 1"},
+        ]
+    )
+    with pytest.raises(CorpusLoadError, match="optional_pattern"):
+        _validate_blueprint_dag(bp)
+
+
+def test_placeholder_bearing_optional_pattern_rejected_at_load() -> None:
+    # A pattern carrying a placeholder (`:region`) would loop the runtime apply — the
+    # load gate rejects it up front.
+    bp = _seed(
+        slots=[
+            {"name": "department", "type": "string", "required": True},
+            {"name": "region", "type": "string", "required": False, "optional_pattern": "b = :region"},
+        ]
+    )
+    with pytest.raises(CorpusLoadError, match="optional_pattern"):
+        _validate_blueprint_dag(bp)
 
 
 # -- S1: binds_to ⊆ uses ----------------------------------------------------
