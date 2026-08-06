@@ -112,7 +112,7 @@ def clean_schema() -> bool:
                 # DESTRUCTIVE: wipes ALL nodes. Point NEO4J_TEST_URI ONLY at the
                 # ephemeral l2 compose neo4j, NEVER a real/shared instance.
                 await session.run("MATCH (n) DETACH DELETE n")
-            await apply_schema(driver)
+            await apply_schema(driver, dimension=768)
         finally:
             await driver.close()
 
@@ -193,7 +193,7 @@ async def test_demote_write_back_excludes_from_recall_seed_survives() -> None:
         async with driver.session() as session:
             # DESTRUCTIVE: ephemeral l2 neo4j only (see clean_schema note).
             await session.run("MATCH (n) DETACH DELETE n")
-        await apply_schema(driver)
+        await apply_schema(driver, dimension=768)
         # Catalog-owned :Table/:Column graph first so load_corpus' MERGE→MATCH
         # :USES edges bind to real catalog nodes.
         await load_catalog_graph(driver, load_catalog_export())

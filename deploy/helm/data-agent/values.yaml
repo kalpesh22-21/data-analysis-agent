@@ -145,6 +145,10 @@ config:
   EMBEDDING_API_URL: "http://embedding:8080/embed"
   # -- Embedding model name.
   EMBEDDING_MODEL: "text-embedding-3-small"
+  # -- Hydrator daemon re-check cadence (seconds between MCP export polls).
+  HYDRATOR_POLL_INTERVAL_SECONDS: "60"
+  # -- Master kill-switch for the singleton hydrator daemon (read fresh per cycle).
+  HYDRATOR_ENABLED: "true"
   # -- Reranker API base URL. EXTERNAL.
   RERANKER_API_URL: "http://reranker:8080/rerank"
   # -- Reranker model name.
@@ -215,6 +219,10 @@ secrets:
     OPENAI_API_KEY: ""
     COUCHBASE_PASSWORD: ""
     NEO4J_PASSWORD: ""
+    # Static service key for the MCP export routes (sent as X-Service-Key). Read via
+    # the shared envFrom Secret, so it reaches BOTH the hydrator daemon (which seeds
+    # neo4j with it) and the runtime (its decoupled catalog-handle fetch).
+    MCP_SERVICE_KEY: ""
     TOKEN_ISSUER_API_KEY: ""
     EMBEDDING_API_KEY: ""
     RERANKER_API_KEY: ""
@@ -294,6 +302,22 @@ components:
   # Replica count is hardcoded to 1 in the template: this is a periodic
   # idle-scan sweeper; running >1 replica would double-enqueue.
   learningSweeper:
+    enabled: true
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+
+  # ----- hydrator: singleton neo4j seeder daemon (DO NOT scale) -----
+  # Replica count is hardcoded to 1 in the template: this is the SINGLETON graph seeder
+  # that owns the destructive nuke/rebuild; running >1 replica would race the graph write
+  # path. No replicaCount/autoscaling knobs by design.
+  hydrator:
     enabled: true
     image: {}
     resources: {}

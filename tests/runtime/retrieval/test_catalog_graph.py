@@ -20,7 +20,6 @@ from data_agent.runtime.retrieval.corpus_loader import (
     _UPSERT_CATALOG_META,
     _UPSERT_COLUMNS,
     _UPSERT_TABLES,
-    SCHEMA_STATEMENTS,
     _catalog_graph_rows,
     _column_node_props,
     _effective_catalog_sha,
@@ -30,6 +29,7 @@ from data_agent.runtime.retrieval.corpus_loader import (
     _use_edges,
     apply_catalog_graph_schema,
     load_catalog_graph,
+    schema_statements,
 )
 from tests._catalog_fixture import fixture_catalog, load_catalog_export
 
@@ -111,7 +111,10 @@ def test_column_props_scalars_arrays_and_values_json() -> None:
     props = _column_node_props(_E, "EmployeeStatus", col)
 
     assert props["key"] == "dbpcm_warehouse.employee.EmployeeStatus"
-    assert props["name"] == "EmployeeStatus"  # casing preserved (D70)
+    # `name` mirrors the FULL key (node identity, captions in Bloom); the bare short
+    # name (casing preserved, D70) is retained separately as `short_name`.
+    assert props["name"] == "dbpcm_warehouse.employee.EmployeeStatus"
+    assert props["short_name"] == "EmployeeStatus"
     assert props["type"] == "Nullable(String)"
     assert props["description"] == "Current status code."
     assert props["sensitive"] is True
@@ -126,7 +129,8 @@ def test_column_props_scalars_arrays_and_values_json() -> None:
 
 def test_column_props_defaults_when_sparse() -> None:
     props = _column_node_props(_E, "MixedCaseCol", {})
-    assert props["name"] == "MixedCaseCol"  # exact casing
+    assert props["name"] == "dbpcm_warehouse.employee.MixedCaseCol"  # full key identity
+    assert props["short_name"] == "MixedCaseCol"  # exact casing
     assert props["sensitive"] is False  # default bool
     assert props["synonyms"] == []
     assert props["values_json"] is None
@@ -163,7 +167,7 @@ def test_catalog_graph_rows_over_fixture() -> None:
 
     # Every column key is "<db.table>.<col>" and groups under its owning table_key.
     for row in column_rows:
-        assert row["key"] == f"{row['table_key']}.{row['props']['name']}"
+        assert row["key"] == f"{row['table_key']}.{row['props']['short_name']}"
         assert row["table_key"] in table_keys
     assert {row["key"] for row in column_rows} == column_keys
 
@@ -432,6 +436,6 @@ def test_catalog_meta_constraint_is_registered() -> None:
         "CatalogMeta" in stmt and "REQUIRE m.id IS UNIQUE" in stmt
         for stmt in _CATALOG_GRAPH_CONSTRAINTS
     )
-    # …and every graph constraint is ALSO in the full SCHEMA_STATEMENTS (seed path).
+    # …and every graph constraint is ALSO in the full schema DDL (seed path).
     for constraint in _CATALOG_GRAPH_CONSTRAINTS:
-        assert constraint in SCHEMA_STATEMENTS
+        assert constraint in schema_statements(768)

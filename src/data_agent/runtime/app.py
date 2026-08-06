@@ -76,13 +76,6 @@ from data_agent.runtime.observability.progress import ProgressEmitter, combine_o
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
-from data_agent.runtime.retrieval.corpus_client import build_corpus_cache
-from data_agent.runtime.retrieval.corpus_loader import (
-    corpus_seeds_from_export,
-    effective_corpus_sha,
-    load_catalog_graph,
-    load_corpus,
-)
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.tools import (
     GetBlueprintTool,
@@ -412,33 +405,21 @@ def create_app(
     # safety preserved) and fetches exactly once (scope-independent, D5-safe:
     # credentials authenticate the fetch only, never entering a handle).
     #
-    # B1 self-healing catalog graph: when THIS app owns a `Neo4jVectorIndex`
-    # (retrieval/neo4j wired), the cache's cold-fetch fires a one-shot
-    # `load_catalog_graph` against the SAME driver the retrieval pipeline uses (no
-    # second pool). The `:CatalogMeta` sha-guard makes this a cheap no-op after the
-    # first process seeds, so replicas racing on boot are fine. When Neo4j is absent
-    # (`vector_index is None`), the callback is `None` — byte-identical Phase-0
-    # behavior (additive feature).
+    # Reader-only runtime (singleton-hydrator redesign): the runtime NO LONGER seeds the
+    # neo4j graph on the request path — the independent `replicas:1` hydrator daemon
+    # (scripts/run_hydrator.py) owns ALL seeding + the nuke/rebuild. The catalog cache is
+    # KEPT (it builds the per-turn provenance handle via `ToolDispatcher._resolve_catalog`
+    # → `capture_provenance`), but with NO `on_catalog_loaded` seed callback. The cache's
+    # HTTP client is built with `service_key=settings.mcp_service_key` (via
+    # `build_catalog_cache`), so the runtime's catalog-handle fetch uses the STATIC
+    # service key — a full decouple, no user JWT ever reaches the MCP export. The
+    # per-turn `get_catalog_handle(jwt=, session_id=)` still passes the request creds,
+    # but the service-key client ignores them (the export is scope-independent + cached).
     catalog_provider: CatalogHandle | CatalogProvider
     if catalog is not None:
         catalog_provider = catalog
     else:
-        on_catalog_loaded: Callable[[dict[str, Any]], Awaitable[None]] | None = None
-        if vector_index is not None:
-            seed_driver = vector_index.driver
-            seed_database = vector_index.database
-
-            async def _on_catalog_loaded(export: dict[str, Any]) -> None:
-                # Online B1 self-heal: upsert + meta-stamp ONLY (gc=False), so two
-                # replicas booting on different shas during a rolling deploy converge
-                # to a current-or-superset graph instead of GC-deleting each other's
-                # freshly-stamped nodes. Dropped-column GC is the explicit seed-script
-                # maintenance op (scripts/seed_neo4j_corpus.py, gc=True). Writes to the
-                # SAME database the retrieval pipeline recalls from (never hardcoded).
-                await load_catalog_graph(seed_driver, export, database=seed_database, gc=False)
-
-            on_catalog_loaded = _on_catalog_loaded
-        catalog_cache = build_catalog_cache(settings, on_catalog_loaded=on_catalog_loaded)
+        catalog_cache = build_catalog_cache(settings)
 
         async def _catalog_provider(credentials: RuntimeCredentials) -> CatalogHandle:
             return await catalog_cache.get_catalog_handle(
@@ -446,41 +427,6 @@ def create_app(
             )
 
         catalog_provider = _catalog_provider
-
-    # Governed corpus (Phase 2): project the MCP `/blueprints/export` +
-    # `/knowledge/export` canon into the neo4j `source='mcp'` recall partition (the
-    # ONLY partition recall serves — the trust gate in `vector_index`). Wired ONLY when
-    # THIS app owns a `Neo4jVectorIndex` (retrieval/neo4j present): the one-shot seed
-    # fires `load_corpus` against the SAME driver + database recall reads from (no
-    # second pool), embedding through the SAME embedding client (parity by
-    # construction). Online is additive (gc=False) — never deletes; the explicit
-    # dropped-node reconcile (gc=True) stays the seed-script maintenance op. When Neo4j
-    # is absent (`vector_index is None`) the callback stays `None` and no corpus cache
-    # is built — the feature is a byte-identical Phase-0 no-op.
-    corpus_cache = None
-    if vector_index is not None and embedding_client is not None:
-        corpus_index = vector_index
-        corpus_embedder = embedding_client
-        corpus_model_id = settings.embedding_model
-
-        async def _on_corpus_loaded(export: dict[str, Any]) -> None:
-            # `.driver`/`.database` are read HERE (lazily, when the seed actually
-            # fires on a turn), NOT at wiring time — reusing the SAME pool + database
-            # recall reads from (never a second driver, never a hardcoded 'neo4j').
-            blueprints, knowledge = corpus_seeds_from_export(export)
-            corpus_sha = effective_corpus_sha(export)
-            await load_corpus(
-                corpus_index.driver,
-                corpus_embedder,
-                blueprints,
-                knowledge,
-                model_id=corpus_model_id,
-                database=corpus_index.database,
-                corpus_sha=corpus_sha,
-                gc=False,
-            )
-
-        corpus_cache = build_corpus_cache(settings, on_corpus_loaded=_on_corpus_loaded)
 
     tool_schema_cache = ToolSchemaCache(mcp_client)
     summarizer = build_llm_summarizer(model_client)
@@ -660,6 +606,9 @@ def create_app(
     # an injected `retrieval` (tests) owns its own store lifecycle.
     @asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # The runtime is a pure READER: it never seeds/nukes the graph (the singleton
+        # hydrator daemon owns that). The lifespan only closes the neo4j driver pool this
+        # app OWNS on shutdown (an injected `retrieval` owns its own store lifecycle).
         try:
             yield
         finally:
@@ -668,27 +617,19 @@ def create_app(
 
     app = FastAPI(title="data-agent-runtime", lifespan=_lifespan)
 
-    # Governed-corpus seed trigger (Phase 2). The recall corpus is consumed by neo4j
-    # recall directly (not through a per-turn provider like the catalog), so nothing on
-    # the turn path fetches it — we trigger the one-shot seed here, FIRE-AND-FORGET, on
-    # the first AUTHENTICATED turn (mirroring the catalog-graph "seed on first turn"
-    # timing, and giving the HTTP corpus client a real JWT — startup has none). The
-    # cache's own once-semantics + `is_loaded` make this a cheap no-op after it seeds;
-    # `ensure_seeded` is degrade-not-fail, so a failed cold fetch simply retries on the
-    # NEXT turn. `corpus_cache is None` (Neo4j absent) ⇒ this does nothing.
-    _corpus_warm: dict[str, Any] = {"task": None}
-
-    def _maybe_warm_corpus(credentials: RuntimeCredentials) -> None:
-        if corpus_cache is None or corpus_cache.is_loaded:
-            return
-        in_flight = _corpus_warm["task"]
-        if in_flight is not None and not in_flight.done():
-            return  # a warm is already running — never stack duplicate seeds
-        _corpus_warm["task"] = asyncio.create_task(
-            corpus_cache.ensure_seeded(
-                jwt=credentials.jwt, session_id=credentials.session_id
-            )
-        )
+    # Readiness gate (singleton-hydrator redesign): an UNAUTHENTICATED probe the runtime
+    # pod exposes so it stays out of the Service until the hydrator has seeded the graph.
+    # "Ready" = the `:CorpusMeta.corpus_sha` singleton is present (a completed seed). When
+    # THIS app owns no `Neo4jVectorIndex` (Neo4j absent / Phase-0 parity), there is
+    # nothing to seed → always ready. Deliberately does NOT call `_extract_credentials`
+    # (a k8s probe carries no JWT). Liveness stays a TCP probe (the process is up even
+    # while the graph is cold), so hydrator lag never restarts a pod — only de-routes it.
+    @app.get("/ready")
+    async def ready() -> JSONResponse:
+        if vector_index is None:
+            return JSONResponse(status_code=200, content={"ready": True})
+        ok = await vector_index.graph_ready()
+        return JSONResponse(status_code=200 if ok else 503, content={"ready": ok})
 
     # Test-only span-dump endpoint (D-L3-5), registered ONLY when a
     # `span_exporter` is injected (the Layer-3 demo launcher's in-memory
@@ -725,7 +666,6 @@ def create_app(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
         assert x_session_id is not None  # narrowed by _extract_credentials
-        _maybe_warm_corpus(credentials)
         emitter = ProgressEmitter()
         agent_loop = _build_agent_loop(combine_observers(emitter.observe, _tracing_observer))
 
@@ -755,7 +695,6 @@ def create_app(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
         assert x_session_id is not None  # narrowed by _extract_credentials
-        _maybe_warm_corpus(credentials)
 
         # Cheap, non-consuming pre-check for a clean 409 (D45): a genuinely
         # concurrent double-resume still races safely inside AgentLoop.resume

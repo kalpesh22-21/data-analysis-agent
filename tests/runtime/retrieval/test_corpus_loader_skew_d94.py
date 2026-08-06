@@ -46,6 +46,11 @@ class _FakeResult:
     async def single(self) -> dict[str, Any] | None:
         return self._row
 
+    async def data(self) -> list[dict[str, Any]]:
+        # apply_schema's dimension-parity introspection reads `.data()`; no existing
+        # vector index in this fake → empty set of dims (parity passes at target dim).
+        return []
+
 
 class _FakeRunner:
     """A session OR managed-transaction stand-in — anything with `.run`."""

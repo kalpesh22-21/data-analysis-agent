@@ -13,7 +13,6 @@ from pathlib import Path
 import pytest
 
 from data_agent.runtime.retrieval.corpus_loader import (
-    SCHEMA_STATEMENTS,
     BlueprintSeed,
     CorpusLoadError,
     KnowledgeSeed,
@@ -21,7 +20,12 @@ from data_agent.runtime.retrieval.corpus_loader import (
     _validate_blueprint_uses,
     check_model_parity,
     load_seed_fixtures,
+    schema_statements,
 )
+
+# A representative embedding dimension for the DDL-shape assertions (the runtime
+# resolves this from config/inference; the exact value is arbitrary here).
+_DIM = 768
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "corpus"
 
@@ -54,24 +58,26 @@ def test_check_model_parity_empty_stored_stamp_is_a_conflict() -> None:
 
 
 def test_every_schema_statement_is_idempotent() -> None:
-    assert SCHEMA_STATEMENTS  # non-empty
-    for statement in SCHEMA_STATEMENTS:
+    statements = schema_statements(_DIM)
+    assert statements  # non-empty
+    for statement in statements:
         assert "IF NOT EXISTS" in statement
 
 
-def test_vector_indexes_are_768_dim_cosine() -> None:
-    vector_ddl = [s for s in SCHEMA_STATEMENTS if "VECTOR INDEX" in s]
-    assert len(vector_ddl) == 2  # one per corpus (§1.2)
-    for ddl in vector_ddl:
-        assert "`vector.dimensions`: 768" in ddl
-        assert "`vector.similarity_function`: 'cosine'" in ddl
-    names = " ".join(vector_ddl)
-    assert "blueprint_intent_vec" in names
-    assert "knowledge_text_vec" in names
+def test_vector_indexes_render_the_given_dimension_cosine() -> None:
+    for dim in (768, 384, 1536):
+        vector_ddl = [s for s in schema_statements(dim) if "VECTOR INDEX" in s]
+        assert len(vector_ddl) == 2  # one per corpus (§1.2)
+        for ddl in vector_ddl:
+            assert f"`vector.dimensions`: {dim}" in ddl
+            assert "`vector.similarity_function`: 'cosine'" in ddl
+        names = " ".join(vector_ddl)
+        assert "blueprint_intent_vec" in names
+        assert "knowledge_text_vec" in names
 
 
 def test_uniqueness_constraints_cover_all_four_keyed_labels() -> None:
-    constraints = " ".join(s for s in SCHEMA_STATEMENTS if "CONSTRAINT" in s)
+    constraints = " ".join(s for s in schema_statements(_DIM) if "CONSTRAINT" in s)
     assert "b.id IS UNIQUE" in constraints
     assert "k.id IS UNIQUE" in constraints
     assert "c.key IS UNIQUE" in constraints

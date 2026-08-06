@@ -168,6 +168,11 @@ class _Result:
     async def single(self) -> dict[str, Any] | None:
         return self._row
 
+    async def data(self) -> list[dict[str, Any]]:
+        # apply_schema's dimension-parity introspection reads `.data()`; a fresh
+        # graph has no existing vector indexes → empty (parity passes at target dim).
+        return []
+
 
 class _RecordingTx:
     def __init__(self) -> None:
@@ -254,6 +259,25 @@ async def test_load_corpus_binds_source_verified_corpus_sha_on_upserts() -> None
     assert kn_params["source"] == "mcp"
     assert kn_params["verified"] is True
     assert kn_params["corpus_sha"] == "corpus-sha-1"
+
+
+async def test_upsert_cypher_sets_name_to_the_node_id() -> None:
+    # Part A: the blueprint/knowledge upserts caption by identity — `name = $id` — so
+    # Neo4j Browser/Bloom render the node by its id (consistent with :Table/:Column).
+    assert "b.name = $id" in _UPSERT_BLUEPRINT
+    assert "k.name = $id" in _UPSERT_KNOWLEDGE
+
+    driver = _RecordingDriver()
+    await load_corpus(
+        driver,  # type: ignore[arg-type]
+        _Embedder(),  # type: ignore[arg-type]
+        [_bp("bp-name")],
+        [KnowledgeSeed(id="kn-name", text="t", doc_id="d")],
+        model_id="all-mpnet-base-v2",
+    )
+    # `name` rides `$id`, which is bound on both upserts.
+    assert _upsert_params(driver.tx, _UPSERT_BLUEPRINT)["id"] == "bp-name"
+    assert _upsert_params(driver.tx, _UPSERT_KNOWLEDGE)["id"] == "kn-name"
 
 
 async def test_load_corpus_binds_learning_source_verbatim() -> None:

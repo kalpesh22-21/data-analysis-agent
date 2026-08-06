@@ -23,6 +23,41 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
 from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
+# Recognized truthy spellings for the hydrator kill-switch (case-insensitive).
+# Anything else (including unset → default) resolves per the rules in
+# `hydrator_enabled` (mirrors `learning/config.py::_TRUTHY`).
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+class _HydratorKillSwitchSettings(BaseSettings):
+    """A one-field settings surface for `HYDRATOR_ENABLED` ONLY, constructed FRESH on
+    every `hydrator_enabled()` call (never cached, deliberately NOT behind the
+    `@lru_cache`d `get_runtime_settings` singleton). Reads BOTH `.env` and the process
+    environment so an operator flipping the switch in EITHER place halts the hydrator on
+    the next poll cycle with NO restart (mirrors the learning-loop kill-switch)."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    hydrator_enabled: str | None = None
+
+
+def hydrator_enabled() -> bool:
+    """Read the hydrator master kill-switch `HYDRATOR_ENABLED` FRESH, EVERY call —
+    deliberately bypassing the `@lru_cache`d `RuntimeSettings` so a flip (of the env var
+    OR `.env`) takes effect on the next poll cycle with NO restart.
+
+    Default (unset/blank) is enabled. Unrecognized values are treated as DISABLED
+    (fail-safe: a typo'd override halts the seeder, it does not silently keep running)."""
+    raw = _HydratorKillSwitchSettings().hydrator_enabled
+    if raw is None or str(raw).strip() == "":
+        return True
+    return str(raw).strip().lower() in _TRUTHY
+
 
 class RuntimeSettings(BaseSettings):
     """All runtime configuration, read from environment variables (or `.env`)."""
@@ -377,6 +412,17 @@ class RuntimeSettings(BaseSettings):
     embedding_timeout_seconds: float = Field(
         10.0, gt=0, description="Per-request embedding timeout (seconds)."
     )
+    embedding_dimension: int | None = Field(
+        None,
+        gt=0,
+        description=(
+            "Embedding vector dimension for the neo4j vector-index DDL. None (default) "
+            "⇒ INFER it from the live embedder (embed a probe, read len(vector[0])); set "
+            "an int to pin it explicitly. A change here (or a changed embedding model) "
+            "against an existing index raises DimensionMismatchError; the singleton "
+            "hydrator daemon then nukes + rebuilds the graph at the new dimension."
+        ),
+    )
 
     # --- Reranker client (D71 custom API — retrieval pipeline building block) ---
     # Not wired into app.py yet; consumed by the upcoming retrieval brick.
@@ -467,6 +513,32 @@ class RuntimeSettings(BaseSettings):
             "embedding/reranker timeout convention."
         ),
     )
+
+    # --- Singleton hydrator daemon (owns neo4j seed + nuke/rebuild) ---
+    # The runtime pods are pure READERS: an INDEPENDENT `replicas:1` hydrator daemon
+    # (scripts/run_hydrator.py) seeds neo4j on boot, polls the MCP for changes and
+    # re-seeds live, and owns the DESTRUCTIVE nuke/rebuild on a dimension change. It
+    # authenticates to the MCP export routes with the STATIC service key below (no user
+    # JWT). The runtime's own catalog-handle fetch ALSO uses this service key (full
+    # decouple), so no per-request credential ever reaches the MCP export.
+    mcp_service_key: str = Field(
+        "",
+        description=(
+            "Static service key for the MCP export routes (sent as X-Service-Key INSTEAD "
+            "of a user JWT). Used by the hydrator daemon AND the runtime's decoupled "
+            "catalog-handle fetch. Empty ⇒ the export clients fall back to per-request JWT "
+            "auth. Secret."
+        ),
+    )
+    hydrator_poll_interval_seconds: int = Field(
+        60,
+        gt=0,
+        description="The hydrator daemon's re-check cadence (seconds between MCP export polls).",
+    )
+    # HYDRATOR_ENABLED (the daemon's master kill-switch) is deliberately read UNCACHED,
+    # per poll cycle, via the module-level `hydrator_enabled()` accessor — mirroring the
+    # learning-loop kill-switch — so a flip halts the seeder without a restart. It is not
+    # a field here (a field would freeze behind the `@lru_cache`d settings singleton).
 
     # --- resolveValues composite (D77) ---
     resolve_values_query_limit: int = Field(

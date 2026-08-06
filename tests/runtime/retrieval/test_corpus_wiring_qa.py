@@ -1,10 +1,14 @@
-"""Layer-1 tests for the governed-corpus app wiring gate (Phase 2, §E).
+"""Reader-ify guard (singleton-hydrator redesign): the runtime NO LONGER seeds neo4j on
+the request path — the independent hydrator daemon owns all seeding + nuke/rebuild.
 
-The corpus seed cache + `on_corpus_loaded` callback are wired ONLY when THIS app owns a
-`Neo4jVectorIndex` (retrieval/neo4j present). When Neo4j is absent the feature is a
-byte-identical Phase-0 no-op: no cache is built, no callback armed, no fetch triggered.
-`build_corpus_cache` is monkeypatched with a recorder so the gate is asserted without a
-real driver or MCP.
+These tests assert the seed machinery is GONE from the runtime app module:
+  * no corpus cache (`build_corpus_cache`/`_maybe_warm_corpus`) and no `HttpCorpusClient`
+    import survive in `app.py`;
+  * the DESTRUCTIVE runtime rebuild path (`_rebuild_graph_from_mcp` + its config flags)
+    is removed;
+  * the catalog cache is KEPT (per-turn provenance handle) and the catalog handle still
+    resolves per-turn (provenance path intact) — proven by a wired app whose dispatcher
+    resolves the catalog provider without any seed side effect.
 """
 
 from __future__ import annotations
@@ -21,43 +25,46 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 
-_EMBED_URL = "http://embedding.local/embed"
+
+def test_runtime_app_has_no_corpus_seed_machinery() -> None:
+    # The corpus cache + its warm trigger + the corpus client import are all removed.
+    assert not hasattr(app_module, "build_corpus_cache")
+    assert not hasattr(app_module, "HttpCorpusClient")
+    assert not hasattr(app_module, "_maybe_warm_corpus")
 
 
-class _RecordingIndex:
-    """Stand-in for `Neo4jVectorIndex` — records nothing, exposes no driver (proving the
-    corpus wiring never touches `.driver` at BUILD time; the seed reads it lazily)."""
-
-    def __init__(self, **_: Any) -> None:
-        pass
-
-    async def recall(self, **_: Any) -> list[Any]:
-        return []
-
-    async def close(self) -> None:
-        return None
+def test_runtime_app_has_no_rebuild_path() -> None:
+    # The DESTRUCTIVE runtime rebuild is removed — the hydrator owns nuke/rebuild.
+    assert not hasattr(app_module, "_rebuild_graph_from_mcp")
 
 
-def _build(monkeypatch, *, neo4j_url: str, embedding_url: str) -> dict[str, Any]:
-    calls: dict[str, Any] = {"count": 0, "on_corpus_loaded": "unset"}
+def test_rebuild_config_fields_removed() -> None:
+    settings = RuntimeSettings(_env_file=None)
+    assert not hasattr(settings, "neo4j_rebuild_from_mcp")
+    assert not hasattr(settings, "rebuild_mcp_jwt")
+    assert not hasattr(settings, "rebuild_mcp_session_id")
+    # ...and the new hydrator/service-key surface is present.
+    assert settings.mcp_service_key == ""
+    assert settings.hydrator_poll_interval_seconds == 60
 
-    def _fake_build_corpus_cache(_settings, *, on_corpus_loaded=None):  # type: ignore[no-untyped-def]
-        calls["count"] += 1
-        calls["on_corpus_loaded"] = on_corpus_loaded
-        return None
+
+def test_app_builds_without_seed_side_effects(monkeypatch) -> None:
+    """A wired app builds cleanly with the catalog cache kept (no seed callback). Neo4j
+    absent → no vector index → the app is a pure reader (Phase-0 parity)."""
+
+    class _RecordingIndex:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def recall(self, **_: Any) -> list[Any]:
+            return []
+
+        async def close(self) -> None:
+            return None
 
     monkeypatch.setattr(app_module, "Neo4jVectorIndex", _RecordingIndex)
-    monkeypatch.setattr(app_module, "build_corpus_cache", _fake_build_corpus_cache)
-
-    settings = RuntimeSettings(
-        _env_file=None,
-        neo4j_url=neo4j_url,
-        neo4j_username="neo4j",
-        neo4j_password="pw",
-        embedding_api_url=embedding_url,
-        embedding_model="all-mpnet-base-v2",
-    )
-    create_app(
+    settings = RuntimeSettings(_env_file=None)  # no neo4j_url → reader with no index
+    app = create_app(
         settings=settings,
         session_store=InMemorySessionStore(),
         mcp_client=FakeMCPClient(
@@ -73,23 +80,7 @@ def _build(monkeypatch, *, neo4j_url: str, embedding_url: str) -> dict[str, Any]
         model_client=ScriptedModelClient([ModelTurnResult(assistant_text="done")]),
         catalog=CatalogHandle({}),
     )
-    return calls
-
-
-def test_no_neo4j_builds_no_corpus_cache(monkeypatch) -> None:
-    # Neo4j absent → vector_index is None → the corpus feature is entirely absent.
-    calls = _build(monkeypatch, neo4j_url="", embedding_url=_EMBED_URL)
-    assert calls["count"] == 0
-
-
-def test_neo4j_without_embedder_builds_no_corpus_cache(monkeypatch) -> None:
-    # Store but no embedder → vector_index is None → no corpus cache.
-    calls = _build(monkeypatch, neo4j_url="bolt://localhost:7687", embedding_url="")
-    assert calls["count"] == 0
-
-
-def test_neo4j_and_embedder_wires_corpus_cache_with_a_callback(monkeypatch) -> None:
-    calls = _build(monkeypatch, neo4j_url="bolt://localhost:7687", embedding_url=_EMBED_URL)
-    assert calls["count"] == 1
-    # A real seed callback is armed (not None) — it fires load_corpus on the first turn.
-    assert callable(calls["on_corpus_loaded"])
+    # /ready exists (added by the reader-ify pass); /turn still wired.
+    routes = {getattr(r, "path", None) for r in app.router.routes}
+    assert "/ready" in routes
+    assert "/turn" in routes

@@ -110,13 +110,16 @@ def test_hydrate_writes_enriched_props_and_stamps_sha() -> None:
                 crow = await (
                     await session.run(
                         "MATCH (c:Column {key: $k})-[:OF_TABLE]->(t:Table {key: $t}) "
-                        "RETURN c.name AS name, c.type AS type, c.values_json AS vj, "
-                        "c.catalog_sha AS sha",
+                        "RETURN c.name AS name, c.short_name AS short_name, "
+                        "c.type AS type, c.values_json AS vj, c.catalog_sha AS sha",
                         k=_STATUS_COL,
                         t=_E,
                     )
                 ).single()
-                assert crow["name"] == "EmployeeStatus"  # casing preserved (D70)
+                # `name` mirrors the full key (node identity, captions in Bloom); the
+                # bare short name (casing preserved, D70) lives in `short_name`.
+                assert crow["name"] == _STATUS_COL
+                assert crow["short_name"] == "EmployeeStatus"
                 assert crow["type"] == "Nullable(String)"
                 assert crow["vj"] is not None  # values map JSON-encoded
                 assert crow["sha"] == export["catalog_sha"]
