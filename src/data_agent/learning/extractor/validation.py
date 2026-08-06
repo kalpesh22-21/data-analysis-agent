@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from data_agent.runtime.blueprint.template import TemplateBindError, validate_optional_pattern
+
 from ..summary.models import SessionSummary
 from .models import (
     SLOT_TYPES,
@@ -186,6 +188,21 @@ def _validate_roles(params: list[ParamPlan], known_rules: frozenset[str]) -> Dec
                     "blueprint", REASON_BAD_ROLE,
                     f"optional slot {p.slot.name} has no optional_pattern (would silently drop)",
                 )
+            # Well-formedness (Slice C): a PRESENT optional_pattern must be a
+            # self-contained boolean SQL fragment carrying NO placeholder — the SAME
+            # gate the corpus loader/runtime apply (corpus_loader validates whenever a
+            # pattern is present, regardless of `required`, so a REQUIRED slot that
+            # still carries a malformed pattern is caught here too rather than only at
+            # load). Catch a malformed pattern as a fail-to-review decline rather than
+            # let it pass extraction and only blow up at landing/runtime.
+            if p.slot.optional_pattern:
+                try:
+                    validate_optional_pattern(p.slot.name, p.slot.optional_pattern)
+                except TemplateBindError as exc:
+                    return Decline(
+                        "blueprint", REASON_BAD_ROLE,
+                        f"optional slot {p.slot.name} has a malformed optional_pattern: {exc}",
+                    )
         elif p.role == "rule":
             if not p.rule_id:
                 return Decline("blueprint", REASON_BAD_ROLE, "rule role without rule_id")

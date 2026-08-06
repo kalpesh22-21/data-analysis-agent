@@ -180,6 +180,43 @@ def test_optional_slot_needs_optional_pattern_no_silent_drop():
     assert "optional_pattern" in out.detail
 
 
+@pytest.mark.parametrize(
+    "bad_pattern",
+    [
+        "region = ((( bad sql",  # unparseable SQL
+        "region = {region}",  # carries a {placeholder}
+        "1 + 1",  # a non-boolean (arithmetic) fragment
+    ],
+)
+def test_optional_slot_with_malformed_optional_pattern_is_declined(bad_pattern):
+    # A PRESENT-but-malformed optional_pattern must fail-to-review at extraction
+    # (Slice C), not slip through to blow up at landing/runtime.
+    bad = param_slot("region", required=False, optional_pattern=bad_pattern, value="NA")
+    out = _validate(blueprint_raw(parameterization=_plan_with(bad, column="region")))
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+    assert "malformed optional_pattern" in out.detail
+
+
+def test_required_slot_with_malformed_optional_pattern_is_also_declined():
+    # A REQUIRED slot (or one whose `required` the model omitted → defaults True) that
+    # STILL carries a malformed optional_pattern is caught at extraction too — matching
+    # the corpus loader, which validates whenever a pattern is present regardless of
+    # `required`. Otherwise it would pass extraction and only fail at load.
+    bad = param_slot("region", required=True, optional_pattern="region = ((( bad sql", value="NA")
+    out = _validate(blueprint_raw(parameterization=_plan_with(bad, column="region")))
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_BAD_ROLE
+    assert "malformed optional_pattern" in out.detail
+
+
+def test_optional_slot_with_wellformed_true_pattern_is_accepted():
+    # The well-formed 'TRUE' pattern (the corpus default) still passes untouched.
+    good = param_slot("region", required=False, optional_pattern="TRUE", value="NA")
+    out = _validate(blueprint_raw(parameterization=_plan_with(good, column="region")))
+    assert isinstance(out, ExtractedCandidate)
+
+
 def test_rule_needs_an_existing_rule_id_missing_rule():
     bad = param_rule("record_type", "rule_does_not_exist", value="EARNING")
     out = _validate(
