@@ -73,6 +73,7 @@ from data_agent.runtime.model.openai_client import build_openai_model_client
 from data_agent.runtime.model.reranker_client import HttpRerankerClient
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
+from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.corpus_client import build_corpus_cache
@@ -258,6 +259,25 @@ def create_app(
         model=settings.openai_model,
         base_url=settings.openai_base_url,
     )
+
+    # LLM-generated progress summaries (opt-in, `progress_summary_enabled`). Built
+    # ONCE here from a SECOND, cheap `OpenAIModelClient` on `openai_summary_model`
+    # (its own lightweight instance sharing the OpenAI api_key/base_url). Wired ONLY
+    # when the flag is on AND an OpenAI key is present — absent either it stays
+    # `None`, the AgentLoop skips summarization, and behavior is byte-identical to
+    # today (no extra LLM call, no D25 relaxation). The extra call is auto-covered by
+    # `instrument_openai` below, like every other OpenAI round-trip.
+    progress_summarizer: ProgressSummarizer | None = None
+    if settings.progress_summary_enabled and settings.openai_api_key:
+        summary_model_client = build_openai_model_client(
+            api_key=settings.openai_api_key,
+            model=settings.openai_summary_model,
+            base_url=settings.openai_base_url,
+        )
+        progress_summarizer = ProgressSummarizer(
+            summary_model_client,
+            timeout_seconds=settings.progress_summary_timeout_seconds,
+        )
 
     # The effective LLM-content hide (config.effective_llm_hide): normally
     # `otlp_hide_llm_content` (D25 amended 2026-07-15 — now defaults FALSE, i.e.
@@ -632,6 +652,7 @@ def create_app(
             runtime_tools=runtime_tools,
             blueprint_executor=blueprint_executor,
             discovery_emulation_provider=discovery_emulation_provider,
+            progress_summarizer=progress_summarizer,
         )
 
     # Close the neo4j driver pool on shutdown (design §2.4, N1: lifespan not the

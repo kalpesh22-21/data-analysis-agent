@@ -144,6 +144,41 @@ class RuntimeSettings(BaseSettings):
         ),
     )
 
+    # --- LLM-generated progress summaries (opt-in; D25 relaxation for the
+    # progress channel only). When True, the agent loop fires a small/cheap side
+    # LLM over each tool CALL (name + args, NOT results) to mint a natural-
+    # language, present-tense progress line ("Querying overtime pay by
+    # department…") streamed to the UI alongside the instant template label. This
+    # DELIBERATELY relaxes the D25 "no cell/slot values in progress" rule for THIS
+    # channel — the value-rich line may include concrete parameters drawn from the
+    # tool arguments (docs/08-ui.md). Off by default → zero behavior change (no
+    # extra LLM call, no D25 relaxation). The summarization is fire-and-forget and
+    # never blocks tool dispatch or the turn result (fail-soft everywhere).
+    progress_summary_enabled: bool = Field(
+        False,
+        description=(
+            "Opt-in: run a cheap side LLM over each tool call (name+args) to stream a "
+            "natural-language, value-rich progress line to the UI. Adds one LLM call per "
+            "tool call and relaxes D25 for the progress channel. Off => byte-identical."
+        ),
+    )
+    openai_summary_model: str = Field(
+        "gpt-4.1-mini",
+        description=(
+            "Cheap/small model id used ONLY for progress-line summarization "
+            "(progress_summary_enabled). A second OpenAIModelClient is built on this "
+            "model, sharing the OpenAI api_key/base_url with the main client."
+        ),
+    )
+    progress_summary_timeout_seconds: float = Field(
+        3.0,
+        gt=0,
+        description=(
+            "Per-call timeout for the progress-line summarization LLM call. On timeout "
+            "the summary is dropped (fail-soft) and the instant template label stands."
+        ),
+    )
+
     # --- Couchbase session store (D22/D44/D45) ---
     couchbase_connection_string: str = Field(
         "couchbase://localhost", description="Couchbase cluster connection string."

@@ -77,12 +77,33 @@ class ProgressEvent:
     shape: dict[str, Any] = field(default_factory=dict)
 
 
+# The LLM-generated progress-summary channel (opt-in, `progress_summary_enabled`).
+# Unlike every other event above, its `step` is NOT drawn from `_STEP_LABELS` and
+# is NOT `.format()`-templated — the LLM-authored, present-tense line is used
+# VERBATIM. This channel DELIBERATELY RELAXES the D25 "no cell/slot values in
+# progress" rule: the line MAY carry concrete parameters drawn from the tool
+# arguments (a period, a department, …) — that value-richness is the whole point
+# of the feature, and why it is gated off by default. Only the `shape` (here just
+# the machine-readable `tool_name`) is still governed by `_SHAPE_ALLOWLIST`; the
+# value-bearing text lives in `step`, never in `shape`. See docs/08-ui.md.
+_PROGRESS_SUMMARY_EVENT = "tool_progress_summary"
+
+
 def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | None:
     """Translate one observer `(event, payload)` call into a `ProgressEvent`.
 
     Returns `None` for observer events that have no user-facing progress
     label (e.g. internal-only telemetry) — callers should simply drop those.
     """
+    if event == _PROGRESS_SUMMARY_EVENT:
+        # Value-rich, LLM-authored line → straight into `step` (verbatim, never
+        # templated so a `{` in the text cannot raise). D25-relaxed channel; see
+        # the module note above. Drop a missing/blank summary (fail-soft parity).
+        summary = payload.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            return None
+        shape = {key: payload[key] for key in _SHAPE_ALLOWLIST if key in payload}
+        return ProgressEvent(step=summary.strip(), shape=shape)
     label = _STEP_LABELS.get(event)
     if label is None:
         return None

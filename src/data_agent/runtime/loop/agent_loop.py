@@ -74,6 +74,7 @@ thread these through from `RuntimeSettings`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -97,6 +98,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolResult,
 )
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
+from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.session.models import (
     PauseCheckpoint,
     ResultPreview,
@@ -428,6 +430,7 @@ class AgentLoop:
         runtime_tools: Mapping[str, RuntimeTool] | None = None,
         blueprint_executor: Any = None,
         discovery_emulation_provider: EmulatedDiscoveryProvider | None = None,
+        progress_summarizer: ProgressSummarizer | None = None,
     ) -> None:
         self._model_client = model_client
         self._tool_dispatcher = tool_dispatcher
@@ -460,6 +463,14 @@ class AgentLoop:
         self._max_tool_calls_per_iteration = max_tool_calls_per_iteration
         self._clock = clock
         self._observer = observer
+        # LLM-generated progress summaries (opt-in, `progress_summary_enabled`).
+        # `None` (default) → the feature is absent and `_run_loop` is byte-identical
+        # to before it existed. When wired (app.py, gated on the flag + an OpenAI
+        # key), each tool CALL fires a FIRE-AND-FORGET summarization task tracked in
+        # `_summary_tasks` so a still-pending task can be best-effort cancelled when
+        # the turn ends (never awaited before dispatch, never blocking the result).
+        self._progress_summarizer = progress_summarizer
+        self._summary_tasks: set[asyncio.Task[None]] = set()
 
     async def run(
         self, *, session_id: str, credentials: RuntimeCredentials, user_message: str
@@ -728,6 +739,61 @@ class AgentLoop:
             ):
                 fold_assumptions(gathered, entry.args.get("assumptions"))
         return gathered
+
+    def _maybe_start_summary(self, tool_name: str, arguments: dict[str, Any]) -> None:
+        """Fire a FIRE-AND-FORGET progress-summary task for one tool CALL (opt-in).
+
+        Non-blocking is load-bearing: this schedules the LLM call CONCURRENTLY and
+        returns immediately — the caller dispatches the tool without ever awaiting
+        the summary, so the summarizer can never add latency to the tool nor delay
+        the turn result. The line arrives on the progress stream when ready
+        (additive to the instant `tool_dispatch_start` template label); if it never
+        arrives (slow / failed / cancelled at turn end), the template label stands.
+        A SHALLOW snapshot of `arguments` (`dict(...)`) is passed so a rebinding of
+        the top-level keys can't race the background read; nested mutable structures
+        are shared, which is fine because no in-loop mutation of the call arguments
+        exists today. No-op when the summarizer is not wired (feature off)."""
+        if self._progress_summarizer is None:
+            return
+        task: asyncio.Task[None] = asyncio.create_task(
+            self._summarize_and_emit(tool_name, dict(arguments))
+        )
+        self._summary_tasks.add(task)
+        task.add_done_callback(self._summary_tasks.discard)
+
+    async def _summarize_and_emit(self, tool_name: str, arguments: dict[str, Any]) -> None:
+        """Await the summarizer and emit the value-rich progress line — fail-soft:
+        a summarizer error/timeout yields `None` (dropped), and even the observer
+        emit is guarded so a late arrival after the emitter is closed (or any other
+        observer error) can never raise into this fire-and-forget task."""
+        try:
+            summary = await self._progress_summarizer.summarize(tool_name, arguments)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+        if not summary:
+            return
+        try:
+            # The ProgressEmitter drops a post-close emit (its `_closed` guard), and
+            # the tracing guardrail observer ignores non-`loop_` events — so this is
+            # safe against a turn that has already ended. The broad guard is defense
+            # in depth so no observer wiring can ever break the turn from here.
+            self._observer(
+                "tool_progress_summary", {"summary": summary, "tool_name": tool_name}
+            )
+        except Exception:
+            _logger.debug("progress-summary emit failed for %s (ignored)", tool_name)
+
+    def _cancel_pending_summaries(self) -> None:
+        """Best-effort cancel any still-pending summary tasks at turn end — the
+        turn result never blocks on them (design: the enriching line is optional).
+        `discard` in the done-callback keeps the set self-cleaning; clearing here is
+        belt-and-suspenders so a resumed window starts clean."""
+        for task in list(self._summary_tasks):
+            if not task.done():
+                task.cancel()
+        self._summary_tasks.clear()
 
     async def _run_runtime_tool(
         self,
@@ -1064,6 +1130,65 @@ class AgentLoop:
         turn_index: int,
         model_client: ModelClient,
         question: str | None = None,
+        seed_sql: list[str] | None = None,
+        seed_preview: ResultPreview | None = None,
+        seed_blueprint_use: dict[str, Any] | None = None,
+        seed_verification: dict[str, Any] | None = None,
+        seed_assumptions: list[str] | None = None,
+    ) -> TurnOutcome:
+        """Turn-window driver wrapper: guarantees a best-effort cancel of any
+        still-pending fire-and-forget progress-summary tasks when the window ends —
+        on a normal return, a pause, OR an exception — so they never outlive the
+        turn. The turn result is produced entirely by `_run_loop_body`; this
+        wrapper only adds the summary-task cleanup in a `finally`, so it is
+        byte-identical to `_run_loop_body` when the summarizer is not wired (the
+        task set is always empty and the cancel is a no-op).
+
+        The full keyword-only signature is mirrored explicitly (rather than an
+        opaque `**kwargs`) so a typo'd kwarg at any of the three call sites
+        (`run`/`resume`/`_resume_blueprint`) is still caught at type-check time.
+        """
+        try:
+            return await self._run_loop_body(
+                session_id=session_id,
+                credentials=credentials,
+                window_count=window_count,
+                turn_index=turn_index,
+                model_client=model_client,
+                question=question,
+                seed_sql=seed_sql,
+                seed_preview=seed_preview,
+                seed_blueprint_use=seed_blueprint_use,
+                seed_verification=seed_verification,
+                seed_assumptions=seed_assumptions,
+            )
+        finally:
+            # Give any ALREADY-FINISHED fire-and-forget summary task a single
+            # event-loop tick to land its emit before we cancel stragglers. This
+            # does NOT wait on an in-flight/slow summary (one `sleep(0)` is one
+            # scheduler iteration — a still-suspended summary stays pending and is
+            # cancelled just below, so the turn result never blocks on it); it only
+            # lets a summary that already completed during dispatch deliver its
+            # line. Gated on a non-empty task set so the feature-off path adds no
+            # extra tick and stays byte-identical. The drain-tick is itself nested
+            # in try/finally so that if the TURN task is being cancelled during
+            # shutdown (the `sleep(0)` then raises CancelledError), the straggler
+            # cancel still ALWAYS runs — a summary task must never outlive the turn.
+            try:
+                if self._summary_tasks:
+                    await asyncio.sleep(0)
+            finally:
+                self._cancel_pending_summaries()
+
+    async def _run_loop_body(
+        self,
+        *,
+        session_id: str,
+        credentials: RuntimeCredentials,
+        window_count: int,
+        turn_index: int,
+        model_client: ModelClient,
+        question: str | None = None,
         # UI Slice 1 Fix 1: seed the turn-window enrichment accumulators from a
         # completed-before-this-window result (the blueprint approval-resume path)
         # so the FINAL `done` result event carries the same enrichment a non-paused
@@ -1315,6 +1440,14 @@ class AgentLoop:
                     if guard.exceeded:
                         break
                     continue
+
+                # LLM-generated progress summary (opt-in, `progress_summary_enabled`):
+                # fire the value-rich present-tense line CONCURRENTLY, BEFORE dispatch
+                # and WITHOUT awaiting it, so it never adds latency to the tool. The
+                # instant `tool_dispatch_start` template label still fires as today
+                # (inside the dispatcher / the runtime tools); this line is additive,
+                # arriving when ready. No-op when the feature is off.
+                self._maybe_start_summary(tool_call.name, tool_call.arguments)
 
                 # Runtime-tool registry (read-tools-design §2): a runtime tool
                 # (`resolveValues` + the three read tools) is intercepted here —

@@ -45,6 +45,49 @@ def test_to_progress_event_falls_back_to_bare_label_on_missing_placeholder() -> 
     assert event.step == "running {tool_name}…"  # no KeyError raised
 
 
+def test_tool_progress_summary_uses_summary_verbatim_bypassing_labels() -> None:
+    # The value-rich LLM line goes straight into `step` (verbatim, D25-relaxed
+    # channel) — not templated from `_STEP_LABELS`, not allowlist-stripped. The
+    # machine-readable tool name still rides `shape.tool_name`.
+    event = to_progress_event(
+        "tool_progress_summary",
+        {"summary": "Querying overtime pay by department", "tool_name": "runQuery"},
+    )
+    assert event is not None
+    assert event.step == "Querying overtime pay by department"
+    assert event.shape == {"tool_name": "runQuery"}
+
+
+def test_tool_progress_summary_step_is_never_format_templated() -> None:
+    # A `{` in the value-rich text must NOT be `.format()`-ed (would KeyError or
+    # mangle) — it is used verbatim.
+    event = to_progress_event(
+        "tool_progress_summary",
+        {"summary": "Filtering rows where {dept} = sales", "tool_name": "runQuery"},
+    )
+    assert event is not None
+    assert event.step == "Filtering rows where {dept} = sales"
+
+
+def test_tool_progress_summary_drops_blank_or_missing_summary() -> None:
+    assert to_progress_event("tool_progress_summary", {"tool_name": "runQuery"}) is None
+    assert (
+        to_progress_event("tool_progress_summary", {"summary": "   ", "tool_name": "runQuery"})
+        is None
+    )
+
+
+def test_tool_progress_summary_shape_stays_allowlisted() -> None:
+    # Only allowlisted keys reach `shape`; a stray value key does not.
+    event = to_progress_event(
+        "tool_progress_summary",
+        {"summary": "Reading employee table", "tool_name": "getTableSchema", "sql": "SECRET"},
+    )
+    assert event is not None
+    assert "sql" not in event.shape
+    assert event.shape == {"tool_name": "getTableSchema"}
+
+
 async def test_progress_emitter_streams_events_until_closed() -> None:
     emitter = ProgressEmitter()
     emitter.observe("tool_dispatch_start", {"tool_name": "listDatabases"})
