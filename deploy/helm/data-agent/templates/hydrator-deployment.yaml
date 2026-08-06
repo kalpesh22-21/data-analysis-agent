@@ -1,6 +1,6 @@
-{{- $c := .Values.components.runtime -}}
+{{- $c := .Values.components.hydrator -}}
 {{- if $c.enabled }}
-{{- $cmpArgs := dict "root" $ "component" "runtime" -}}
+{{- $cmpArgs := dict "root" $ "component" "hydrator" -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,12 +8,18 @@ metadata:
   labels:
     {{- include "data-agent.componentLabels" $cmpArgs | nindent 4 }}
 spec:
-  {{- if not $c.autoscaling.enabled }}
-  replicas: {{ $c.replicaCount }}
-  {{- end }}
+  # Fixed single replica: this is the SINGLETON neo4j seeder — it owns the DESTRUCTIVE
+  # nuke/rebuild on a dimension change. >1 replica would race the graph write path (two
+  # writers reconciling/nuking the shared graph). A single runner needs no distributed
+  # lock. Do not scale.
+  replicas: 1
   selector:
     matchLabels:
       {{- include "data-agent.componentSelectorLabels" $cmpArgs | nindent 6 }}
+  # Background daemon with no HTTP server / readiness gate — recreate rather than rolling
+  # (never two seeders alive at once during a deploy).
+  strategy:
+    type: Recreate
   template:
     metadata:
       annotations:
@@ -36,65 +42,26 @@ spec:
       securityContext:
         {{- toYaml (mergeOverwrite (deepCopy .Values.podSecurityContext) ($c.podSecurityContext | default dict)) | nindent 8 }}
       containers:
-        - name: runtime
+        - name: hydrator
           image: {{ include "data-agent.image" (dict "root" $ "component" $c) }}
           imagePullPolicy: {{ include "data-agent.imagePullPolicy" (dict "root" $ "component" $c) }}
-          # The core agent API. Started via uvicorn's --factory entrypoint.
+          # Singleton neo4j seeder daemon (no HTTP server).
           command:
-            - uvicorn
-            - data_agent.runtime.app:create_app
-            - --factory
-            - --host
-            - "0.0.0.0"
-            - --port
-            - "8000"
+            - python
+            - scripts/run_hydrator.py
           securityContext:
             {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) ($c.securityContext | default dict)) | nindent 12 }}
-          ports:
-            - name: http
-              containerPort: 8000
-              protocol: TCP
           envFrom:
             {{- include "data-agent.envFrom" $ | nindent 12 }}
           {{- with concat (.Values.env | default list) ($c.env | default list) }}
           env:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          # READINESS gates on the graph: GET /ready is unauthenticated and returns 200
-          # only once the singleton hydrator has seeded neo4j (the :CorpusMeta.corpus_sha
-          # singleton is present), 503 otherwise — so a pod stays OUT of the Service until
-          # it can actually recall (Neo4j-absent deploys report ready immediately).
-          #
-          # timeoutSeconds: 5 — the kubelet default (1s) is BELOW the runtime's 10s Neo4j
-          # query timeout, so a slow-but-healthy DB would flap pods; 5s gives the readiness
-          # query room without waiting on the full degrade budget.
-          #
-          # REBUILD WINDOW (intended maintenance behavior): when the hydrator does a scoped
-          # source='mcp' rebuild (a model/dimension change) it deletes :CorpusMeta, so EVERY
-          # runtime replica reads 503 and de-routes until the reseed re-stamps it. That is
-          # correct — it keeps stale/empty-recall pods out of the Service during the rebuild.
-          # failureThreshold*periodSeconds (3*10=30s) bounds how long a pod tolerates the
-          # cold window before de-routing; tune consciously against your corpus reseed time.
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
-          # LIVENESS stays a TCP probe: it tests that the PROCESS is up, not that the
-          # graph is seeded — so hydrator lag never restarts a pod (it only de-routes it
-          # via the readiness gate above).
-          livenessProbe:
-            tcpSocket:
-              port: http
-            initialDelaySeconds: 15
-            periodSeconds: 20
+          # No HTTP server -> no readiness/liveness HTTP probe. The Deployment
+          # controller restarts the pod if the process exits.
           resources:
             {{- toYaml (default .Values.resources $c.resources) | nindent 12 }}
           volumeMounts:
-            # readOnlyRootFilesystem=true -> writable scratch space at /tmp.
             - name: tmp
               mountPath: /tmp
       volumes:

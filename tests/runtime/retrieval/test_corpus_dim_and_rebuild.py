@@ -18,6 +18,8 @@ import pytest
 
 from data_agent.runtime.retrieval.corpus_loader import (
     _CLAIM_REBUILD_LOCK,
+    _DELETE_FRESHNESS_SINGLETONS,
+    _DELETE_MCP_CORPUS_NODES,
     _EXISTING_VECTOR_DIMS,
     _NUKE_DELETE_NODES,
     _NUKE_STATEMENTS,
@@ -28,6 +30,7 @@ from data_agent.runtime.retrieval.corpus_loader import (
     check_dimension_parity,
     claim_rebuild_lock,
     nuke_graph,
+    rebuild_mcp_corpus_partition,
     resolve_embedding_dimension,
     schema_statements,
 )
@@ -66,6 +69,10 @@ class _Session:
         if query == _CLAIM_REBUILD_LOCK:
             return _Result(row={"claimed": self._driver.claim_result})
         return _Result(row=None)
+
+    async def execute_write(self, fn: Any) -> Any:
+        # The session doubles as the managed tx — its `run` records calls too.
+        return await fn(self)
 
 
 class _Driver:
@@ -179,10 +186,10 @@ def test_check_dimension_parity_passes_on_empty_or_matching() -> None:
 def test_check_dimension_parity_raises_on_a_differing_dim() -> None:
     with pytest.raises(DimensionMismatchError) as exc:
         check_dimension_parity({384}, 768)
-    # The error names BOTH dims and points at the rebuild flag.
+    # The error names BOTH dims and points at the hydrator's nuke+rebuild.
     assert "384" in str(exc.value)
     assert "768" in str(exc.value)
-    assert "NEO4J_REBUILD_FROM_MCP" in str(exc.value)
+    assert "hydrator" in str(exc.value)
 
 
 async def test_apply_schema_raises_on_a_preexisting_mismatched_index() -> None:
@@ -263,3 +270,38 @@ async def test_claim_rebuild_lock_returns_false_when_another_holds_it() -> None:
     driver = _Driver(claim_result=False)
     got = await claim_rebuild_lock(driver, holder="me")  # type: ignore[arg-type]
     assert got is False
+
+
+# ---------------------------------------------------------------------------
+# rebuild_mcp_corpus_partition — the SINGLETON hydrator's data-loss-safe rebuild
+# ---------------------------------------------------------------------------
+
+
+async def test_scoped_rebuild_with_dimension_reshapes_index_and_clears_mcp_only() -> None:
+    driver = _Driver()
+    await rebuild_mcp_corpus_partition(driver, dimension=512)  # type: ignore[arg-type]
+    issued = [q for q, _ in driver.calls]
+    # Vector indexes dropped + recreated at the NEW dimension.
+    assert any("DROP INDEX blueprint_intent_vec" in q for q in issued)
+    assert any("DROP INDEX knowledge_text_vec" in q for q in issued)
+    assert any("`vector.dimensions`: 512" in q for q in issued)
+    # ONLY the source='mcp' corpus + the freshness singletons are deleted...
+    assert _DELETE_MCP_CORPUS_NODES in issued
+    assert _DELETE_FRESHNESS_SINGLETONS in issued
+    # ...NEVER the unscoped full nuke (the source='learning' tier + :Table/:Column survive).
+    assert _NUKE_DELETE_NODES not in issued
+    # The mcp-delete Cypher is source='mcp'-scoped (fail-closed: learning nodes untouched).
+    assert "source = 'mcp'" in _DELETE_MCP_CORPUS_NODES
+
+
+async def test_scoped_rebuild_without_dimension_skips_index_reshape() -> None:
+    # A same-dim model swap: clear the mcp partition but DO NOT touch the vector indexes.
+    driver = _Driver()
+    await rebuild_mcp_corpus_partition(driver, dimension=None)  # type: ignore[arg-type]
+    issued = [q for q, _ in driver.calls]
+    assert not any("DROP INDEX" in q for q in issued)
+    assert not any("VECTOR INDEX" in q for q in issued)
+    # But the mcp corpus + metas ARE cleared so the reseed re-embeds parity-clean.
+    assert _DELETE_MCP_CORPUS_NODES in issued
+    assert _DELETE_FRESHNESS_SINGLETONS in issued
+    assert _NUKE_DELETE_NODES not in issued

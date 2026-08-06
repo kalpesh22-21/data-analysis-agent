@@ -7,6 +7,9 @@ Workloads enabled in this release:
 {{- if .Values.components.ui.enabled }}
   - ui                (backend-for-frontend, Service on :{{ .Values.components.ui.service.port }})
 {{- end }}
+{{- if .Values.components.hydrator.enabled }}
+  - hydrator          (singleton neo4j seeder daemon, no Service)
+{{- end }}
 {{- if .Values.components.learningSweeper.enabled }}
   - learning-sweeper  (background daemon, no Service)
 {{- end }}
@@ -39,6 +42,17 @@ Remember: the external backing services (ClickHouse, MCP, token IdP, OpenAI,
 Couchbase, Neo4j, Redis, embedding/reranker APIs) are NOT deployed by this
 chart. Confirm their endpoints in `config` and credentials in `secrets` /
 your existingSecret are correct.
+{{- if .Values.components.hydrator.enabled }}
+{{- if and (not .Values.secrets.existingSecret) (not .Values.secrets.data.MCP_SERVICE_KEY) }}
+
+WARNING: the hydrator is enabled but MCP_SERVICE_KEY is EMPTY. The hydrator
+authenticates the MCP export routes with a static service key (it has no user
+JWT); with an empty key it REFUSES to start (blank creds would 401 every poll),
+so neo4j is never seeded and every runtime pod fails its /ready gate FOREVER.
+Set secrets.data.MCP_SERVICE_KEY (or provide MCP_SERVICE_KEY via existingSecret),
+or disable the hydrator (components.hydrator.enabled=false).
+{{- end }}
+{{- end }}
 {{- if not .Values.secrets.existingSecret }}
 
 WARNING: you are using the chart-managed Secret with inline values. For

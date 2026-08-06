@@ -289,6 +289,14 @@ RETURN b.id AS id, b.intent AS intent, b.slots_summary AS slots_summary,
 """
 
 
+# Readiness probe (singleton-hydrator redesign): the `:CorpusMeta` freshness singleton
+# the hydrator stamps on a completed corpus seed. Its presence is the graph-ready signal
+# the runtime `/ready` handler reads (mirrors `corpus_loader._READ_CORPUS_META`).
+_GRAPH_READY_QUERY = """
+MATCH (m:CorpusMeta {id: 'singleton'}) RETURN m.corpus_sha AS corpus_sha
+"""
+
+
 def _decode_json(raw: Any) -> Any:
     """JSON-decode a stored `*_json` string property, tolerating null/malformed
     (→ `None`) so a corrupt DAG field degrades to "absent" rather than crashing
@@ -469,6 +477,20 @@ class Neo4jVectorIndex:
                 "skipping malformed getBlueprint row for id %r", blueprint_id[:80], exc_info=True
             )
             return None
+
+    async def graph_ready(self) -> bool:
+        """Readiness signal for the `/ready` probe (singleton-hydrator redesign): True
+        once the `:CorpusMeta.corpus_sha` singleton is present — i.e. the hydrator daemon
+        has completed at least one seed. Never raises: an unreachable/uninitialized graph
+        (or any driver/query error) degrades to `False` (not-ready), so a cold or down
+        neo4j keeps the pod OUT of the Service rather than 500ing the probe."""
+        try:
+            rows = await self._run(_GRAPH_READY_QUERY, {})
+        except Exception:  # noqa: BLE001 - any driver/query failure ⇒ not ready
+            _logger.warning("neo4j graph_ready probe failed; reporting not-ready", exc_info=True)
+            return False
+        sha = rows[0]["corpus_sha"] if rows else None
+        return bool(sha)
 
     async def _run(self, query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
         """Run one read query and return its rows as plain dicts.

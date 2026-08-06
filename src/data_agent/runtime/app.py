@@ -31,7 +31,6 @@ import asyncio
 import json
 import logging
 import re
-import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -44,7 +43,7 @@ from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.auth.jwt_verify import JWTVerificationError, verify_jwt
 from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
-from data_agent.runtime.catalog.export_client import HttpCatalogClient, build_catalog_cache
+from data_agent.runtime.catalog.export_client import build_catalog_cache
 from data_agent.runtime.composite.record_assumptions import RecordAssumptionsTool
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.config import (
@@ -76,17 +75,6 @@ from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.progress import ProgressEmitter, combine_observers
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
-from data_agent.runtime.retrieval.corpus_client import HttpCorpusClient, build_corpus_cache
-from data_agent.runtime.retrieval.corpus_loader import (
-    apply_schema,
-    claim_rebuild_lock,
-    corpus_seeds_from_export,
-    effective_corpus_sha,
-    load_catalog_graph,
-    load_corpus,
-    nuke_graph,
-    resolve_embedding_dimension,
-)
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.tools import (
     GetBlueprintTool,
@@ -153,95 +141,6 @@ def _extract_credentials(
         raise HTTPException(status_code=401, detail=exc.message) from exc
 
     return RuntimeCredentials(session_id=session_id, jwt=token, column_scope=column_scope)
-
-
-async def _rebuild_graph_from_mcp(
-    settings: RuntimeSettings,
-    *,
-    driver: Any,
-    database: str,
-    embedding_client: EmbeddingClient,
-    catalog_client: Any | None = None,
-    corpus_client: Any | None = None,
-) -> None:
-    """Part C — DESTRUCTIVE startup rebuild: nuke the whole neo4j graph and rebuild
-    table schema + blueprints + knowledge from the LIVE MCP using the passed-in JWT.
-
-    Armed only from the lifespan when `neo4j_rebuild_from_mcp` is set AND Neo4j is
-    present (the caller guards on `vector_index is not None`). Fails LOUD if the flag
-    is set without `rebuild_mcp_jwt` (can't fetch from MCP). A best-effort
-    `RebuildLock` single-flight claim means only one concurrent-boot replica nukes;
-    the others log + skip. See the flag's config docstring for the not-across-a-
-    rolling-deploy caveat."""
-    if not settings.rebuild_mcp_jwt:
-        raise RuntimeError(
-            "NEO4J_REBUILD_FROM_MCP is set but REBUILD_MCP_JWT is empty — the startup "
-            "rebuild cannot fetch the MCP catalog/corpus exports without a JWT. Set "
-            "REBUILD_MCP_JWT (and REBUILD_MCP_SESSION_ID), or unset NEO4J_REBUILD_FROM_MCP."
-        )
-
-    _logger.warning(
-        "NEO4J_REBUILD_FROM_MCP set — DROPPING the entire graph and rebuilding from MCP. "
-        "This is a maintenance operation; leaving the flag on across a rolling deploy will "
-        "re-nuke on every restart/replica."
-    )
-
-    # Best-effort single-flight: only the claimant nukes+rebuilds; concurrent replicas
-    # booting at the same time observe a fresh claim and skip.
-    holder = uuid.uuid4().hex
-    claimed = await claim_rebuild_lock(driver, holder=holder, database=database)
-    if not claimed:
-        _logger.warning(
-            "NEO4J_REBUILD_FROM_MCP: another replica holds the rebuild lock — "
-            "rebuild already in progress/done, skipping on this replica."
-        )
-        return
-
-    jwt = settings.rebuild_mcp_jwt
-    session_id = settings.rebuild_mcp_session_id
-    catalog_client = catalog_client or HttpCatalogClient(settings.catalog_api_base())
-    corpus_client = corpus_client or HttpCorpusClient(settings.corpus_api_base())
-
-    # Fetch the LIVE MCP exports with the passed-in credentials BEFORE nuking, so a
-    # fetch failure aborts the rebuild with the graph still intact.
-    catalog_export = await catalog_client.fetch_export(jwt=jwt, session_id=session_id)
-    corpus_export = await corpus_client.fetch_export(jwt=jwt, session_id=session_id)
-
-    # Resolve the embedding dimension. Probe the live embedder ALWAYS (a one-shot
-    # maintenance op can afford one embed) and pass it as the sample so
-    # resolve_embedding_dimension cross-checks it against a configured value (S1): if
-    # EMBEDDING_DIMENSION disagrees with the model's real vector length, raise here
-    # rather than build an index the written vectors are silently excluded from.
-    probe = await embedding_client.embed(["__dimension_probe__"])
-    dimension = await resolve_embedding_dimension(
-        embedding_client, configured=settings.embedding_dimension, sample_vectors=probe
-    )
-
-    # Nuke → schema (at the resolved dimension) → catalog graph → corpus. gc=True on
-    # both loads: this is the explicit full-reconcile maintenance op.
-    await nuke_graph(driver, database=database)
-    await apply_schema(driver, dimension=dimension, database=database)
-    await load_catalog_graph(driver, catalog_export, database=database, gc=True)
-    blueprints, knowledge = corpus_seeds_from_export(corpus_export)
-    corpus_sha = effective_corpus_sha(corpus_export)
-    report = await load_corpus(
-        driver,
-        embedding_client,
-        blueprints,
-        knowledge,
-        model_id=settings.embedding_model,
-        database=database,
-        corpus_sha=corpus_sha,
-        gc=True,
-        dimension=dimension,
-    )
-    _logger.warning(
-        "NEO4J_REBUILD_FROM_MCP complete: rebuilt at dimension=%d — %d blueprint(s), "
-        "%d knowledge chunk(s).",
-        dimension,
-        report.blueprints_written,
-        report.knowledge_written,
-    )
 
 
 def _format_sse(event: str, data: dict[str, Any]) -> str:
@@ -486,33 +385,21 @@ def create_app(
     # safety preserved) and fetches exactly once (scope-independent, D5-safe:
     # credentials authenticate the fetch only, never entering a handle).
     #
-    # B1 self-healing catalog graph: when THIS app owns a `Neo4jVectorIndex`
-    # (retrieval/neo4j wired), the cache's cold-fetch fires a one-shot
-    # `load_catalog_graph` against the SAME driver the retrieval pipeline uses (no
-    # second pool). The `:CatalogMeta` sha-guard makes this a cheap no-op after the
-    # first process seeds, so replicas racing on boot are fine. When Neo4j is absent
-    # (`vector_index is None`), the callback is `None` — byte-identical Phase-0
-    # behavior (additive feature).
+    # Reader-only runtime (singleton-hydrator redesign): the runtime NO LONGER seeds the
+    # neo4j graph on the request path — the independent `replicas:1` hydrator daemon
+    # (scripts/run_hydrator.py) owns ALL seeding + the nuke/rebuild. The catalog cache is
+    # KEPT (it builds the per-turn provenance handle via `ToolDispatcher._resolve_catalog`
+    # → `capture_provenance`), but with NO `on_catalog_loaded` seed callback. The cache's
+    # HTTP client is built with `service_key=settings.mcp_service_key` (via
+    # `build_catalog_cache`), so the runtime's catalog-handle fetch uses the STATIC
+    # service key — a full decouple, no user JWT ever reaches the MCP export. The
+    # per-turn `get_catalog_handle(jwt=, session_id=)` still passes the request creds,
+    # but the service-key client ignores them (the export is scope-independent + cached).
     catalog_provider: CatalogHandle | CatalogProvider
     if catalog is not None:
         catalog_provider = catalog
     else:
-        on_catalog_loaded: Callable[[dict[str, Any]], Awaitable[None]] | None = None
-        if vector_index is not None:
-            seed_driver = vector_index.driver
-            seed_database = vector_index.database
-
-            async def _on_catalog_loaded(export: dict[str, Any]) -> None:
-                # Online B1 self-heal: upsert + meta-stamp ONLY (gc=False), so two
-                # replicas booting on different shas during a rolling deploy converge
-                # to a current-or-superset graph instead of GC-deleting each other's
-                # freshly-stamped nodes. Dropped-column GC is the explicit seed-script
-                # maintenance op (scripts/seed_neo4j_corpus.py, gc=True). Writes to the
-                # SAME database the retrieval pipeline recalls from (never hardcoded).
-                await load_catalog_graph(seed_driver, export, database=seed_database, gc=False)
-
-            on_catalog_loaded = _on_catalog_loaded
-        catalog_cache = build_catalog_cache(settings, on_catalog_loaded=on_catalog_loaded)
+        catalog_cache = build_catalog_cache(settings)
 
         async def _catalog_provider(credentials: RuntimeCredentials) -> CatalogHandle:
             return await catalog_cache.get_catalog_handle(
@@ -520,41 +407,6 @@ def create_app(
             )
 
         catalog_provider = _catalog_provider
-
-    # Governed corpus (Phase 2): project the MCP `/blueprints/export` +
-    # `/knowledge/export` canon into the neo4j `source='mcp'` recall partition (the
-    # ONLY partition recall serves — the trust gate in `vector_index`). Wired ONLY when
-    # THIS app owns a `Neo4jVectorIndex` (retrieval/neo4j present): the one-shot seed
-    # fires `load_corpus` against the SAME driver + database recall reads from (no
-    # second pool), embedding through the SAME embedding client (parity by
-    # construction). Online is additive (gc=False) — never deletes; the explicit
-    # dropped-node reconcile (gc=True) stays the seed-script maintenance op. When Neo4j
-    # is absent (`vector_index is None`) the callback stays `None` and no corpus cache
-    # is built — the feature is a byte-identical Phase-0 no-op.
-    corpus_cache = None
-    if vector_index is not None and embedding_client is not None:
-        corpus_index = vector_index
-        corpus_embedder = embedding_client
-        corpus_model_id = settings.embedding_model
-
-        async def _on_corpus_loaded(export: dict[str, Any]) -> None:
-            # `.driver`/`.database` are read HERE (lazily, when the seed actually
-            # fires on a turn), NOT at wiring time — reusing the SAME pool + database
-            # recall reads from (never a second driver, never a hardcoded 'neo4j').
-            blueprints, knowledge = corpus_seeds_from_export(export)
-            corpus_sha = effective_corpus_sha(export)
-            await load_corpus(
-                corpus_index.driver,
-                corpus_embedder,
-                blueprints,
-                knowledge,
-                model_id=corpus_model_id,
-                database=corpus_index.database,
-                corpus_sha=corpus_sha,
-                gc=False,
-            )
-
-        corpus_cache = build_corpus_cache(settings, on_corpus_loaded=_on_corpus_loaded)
 
     tool_schema_cache = ToolSchemaCache(mcp_client)
     summarizer = build_llm_summarizer(model_client)
@@ -733,25 +585,10 @@ def create_app(
     # an injected `retrieval` (tests) owns its own store lifecycle.
     @asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # The runtime is a pure READER: it never seeds/nukes the graph (the singleton
+        # hydrator daemon owns that). The lifespan only closes the neo4j driver pool this
+        # app OWNS on shutdown (an injected `retrieval` owns its own store lifecycle).
         try:
-            # Part C: the DESTRUCTIVE nuke + rebuild-from-MCP override. Armed ONLY when
-            # the flag is set AND this app owns a Neo4j vector index (Neo4j-absent ⇒
-            # no-op, Phase-0 parity). `vector_index is not None` implies an embedder (the
-            # vector_index wiring gates on both) — assert it explicitly with a raise (not
-            # `assert`, which `python -O` strips) on this destructive path. Inside the
-            # `try` so a rebuild failure still runs the driver-close `finally`.
-            if settings.neo4j_rebuild_from_mcp and vector_index is not None:
-                if embedding_client is None:  # unreachable given the wiring gate, but explicit
-                    raise RuntimeError(
-                        "NEO4J_REBUILD_FROM_MCP is armed but no embedding client is wired — "
-                        "the rebuild cannot embed the corpus."
-                    )
-                await _rebuild_graph_from_mcp(
-                    settings,
-                    driver=vector_index.driver,
-                    database=vector_index.database,
-                    embedding_client=embedding_client,
-                )
             yield
         finally:
             if vector_index is not None:
@@ -759,27 +596,19 @@ def create_app(
 
     app = FastAPI(title="data-agent-runtime", lifespan=_lifespan)
 
-    # Governed-corpus seed trigger (Phase 2). The recall corpus is consumed by neo4j
-    # recall directly (not through a per-turn provider like the catalog), so nothing on
-    # the turn path fetches it — we trigger the one-shot seed here, FIRE-AND-FORGET, on
-    # the first AUTHENTICATED turn (mirroring the catalog-graph "seed on first turn"
-    # timing, and giving the HTTP corpus client a real JWT — startup has none). The
-    # cache's own once-semantics + `is_loaded` make this a cheap no-op after it seeds;
-    # `ensure_seeded` is degrade-not-fail, so a failed cold fetch simply retries on the
-    # NEXT turn. `corpus_cache is None` (Neo4j absent) ⇒ this does nothing.
-    _corpus_warm: dict[str, Any] = {"task": None}
-
-    def _maybe_warm_corpus(credentials: RuntimeCredentials) -> None:
-        if corpus_cache is None or corpus_cache.is_loaded:
-            return
-        in_flight = _corpus_warm["task"]
-        if in_flight is not None and not in_flight.done():
-            return  # a warm is already running — never stack duplicate seeds
-        _corpus_warm["task"] = asyncio.create_task(
-            corpus_cache.ensure_seeded(
-                jwt=credentials.jwt, session_id=credentials.session_id
-            )
-        )
+    # Readiness gate (singleton-hydrator redesign): an UNAUTHENTICATED probe the runtime
+    # pod exposes so it stays out of the Service until the hydrator has seeded the graph.
+    # "Ready" = the `:CorpusMeta.corpus_sha` singleton is present (a completed seed). When
+    # THIS app owns no `Neo4jVectorIndex` (Neo4j absent / Phase-0 parity), there is
+    # nothing to seed → always ready. Deliberately does NOT call `_extract_credentials`
+    # (a k8s probe carries no JWT). Liveness stays a TCP probe (the process is up even
+    # while the graph is cold), so hydrator lag never restarts a pod — only de-routes it.
+    @app.get("/ready")
+    async def ready() -> JSONResponse:
+        if vector_index is None:
+            return JSONResponse(status_code=200, content={"ready": True})
+        ok = await vector_index.graph_ready()
+        return JSONResponse(status_code=200 if ok else 503, content={"ready": ok})
 
     # Test-only span-dump endpoint (D-L3-5), registered ONLY when a
     # `span_exporter` is injected (the Layer-3 demo launcher's in-memory
@@ -816,7 +645,6 @@ def create_app(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
         assert x_session_id is not None  # narrowed by _extract_credentials
-        _maybe_warm_corpus(credentials)
         emitter = ProgressEmitter()
         agent_loop = _build_agent_loop(combine_observers(emitter.observe, _tracing_observer))
 
@@ -846,7 +674,6 @@ def create_app(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
         assert x_session_id is not None  # narrowed by _extract_credentials
-        _maybe_warm_corpus(credentials)
 
         # Cheap, non-consuming pre-check for a clean 409 (D45): a genuinely
         # concurrent double-resume still races safely inside AgentLoop.resume

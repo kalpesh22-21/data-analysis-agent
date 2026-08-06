@@ -212,3 +212,37 @@ def test_current_span_helper_is_safe_without_a_tracer() -> None:
     # Sanity: get_current_span with no active span is a no-op span whose
     # set_attribute never raises (the mismatch flag path stays crash-proof).
     trace.get_current_span().set_attribute("retrieval.model_mismatch", True)
+
+
+# --------------------------------------------------------------------------
+# graph_ready — the /ready probe signal (singleton-hydrator redesign)
+# --------------------------------------------------------------------------
+
+
+async def test_graph_ready_true_when_corpus_sha_present() -> None:
+    async def fake_run(query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        return [{"corpus_sha": "abc123"}]
+
+    assert await _index(fake_run).graph_ready() is True
+
+
+async def test_graph_ready_false_when_corpus_meta_absent() -> None:
+    async def fake_run(query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        return []  # no :CorpusMeta singleton yet (graph not seeded)
+
+    assert await _index(fake_run).graph_ready() is False
+
+
+async def test_graph_ready_false_when_corpus_sha_is_null() -> None:
+    async def fake_run(query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        return [{"corpus_sha": None}]
+
+    assert await _index(fake_run).graph_ready() is False
+
+
+async def test_graph_ready_degrades_driver_exception_to_false_not_500() -> None:
+    async def fake_run(query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        raise RuntimeError("neo4j unreachable")
+
+    # A driver/query failure must degrade to not-ready (→ 503), never propagate (→ 500).
+    assert await _index(fake_run).graph_ready() is False

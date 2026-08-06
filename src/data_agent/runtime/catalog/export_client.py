@@ -98,19 +98,40 @@ def _headers(jwt: str, session_id: str) -> dict[str, str]:
 
 
 class HttpCatalogClient:
-    """Real `CatalogClient` over the live MCP `/catalog/export` route (Layer 2+)."""
+    """Real `CatalogClient` over the live MCP `/catalog/export` route (Layer 2+).
 
-    def __init__(self, base_url: str, *, timeout: float = 30.0) -> None:
+    Two auth modes:
+      * per-request JWT (default) — sends `Authorization: Bearer <jwt>` +
+        `X-Session-Id`, the SAME credential binding the read plane uses. The catalog
+        is scope-INDEPENDENT, so those creds authenticate the fetch only.
+      * static SERVICE KEY (`service_key=`) — sends `X-Service-Key: <key>` INSTEAD of
+        the Bearer/session pair, so a NON-request principal (the singleton hydrator
+        daemon, or the fully-decoupled runtime catalog-handle fetch) can authenticate
+        the export with no user JWT. When a service key is configured, the per-request
+        `jwt`/`session_id` args are IGNORED (they never reach the wire).
+    """
+
+    def __init__(
+        self, base_url: str, *, timeout: float = 30.0, service_key: str | None = None
+    ) -> None:
         # base_url is the …/catalog base (no trailing slash); `/export` is appended.
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._service_key = service_key or None
 
-    async def fetch_export(self, *, jwt: str, session_id: str) -> dict[str, Any]:
+    def _auth_headers(self, *, jwt: str, session_id: str) -> dict[str, str]:
+        """The auth headers for one fetch — the static service key when configured,
+        else the per-request Bearer/session pair. Branches on `self._service_key`."""
+        if self._service_key:
+            return {"X-Service-Key": self._service_key}
+        return _headers(jwt, session_id)
+
+    async def fetch_export(self, *, jwt: str = "", session_id: str = "") -> dict[str, Any]:
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.get(
                     f"{self._base_url}/export",
-                    headers=_headers(jwt, session_id),
+                    headers=self._auth_headers(jwt=jwt, session_id=session_id),
                 )
         except httpx.HTTPError as exc:
             raise CatalogClientError(None, f"catalog export request failed: {exc}") from exc
@@ -297,12 +318,21 @@ def build_catalog_cache(
 
     *on_catalog_loaded* (B1 self-healing graph seed): an optional one-shot callback
     the cache invokes with the raw export dict on the first successful cold fetch
-    (see `CatalogCache`). `None` (default, and when Neo4j is absent) ⇒ no-op."""
+    (see `CatalogCache`). `None` (default, and when Neo4j is absent) ⇒ no-op.
+
+    The HTTP client is built with `service_key=settings.mcp_service_key`: when a service
+    key is configured the runtime's catalog-handle fetch rides the STATIC service key
+    (`X-Service-Key`) rather than the user's JWT — a full decouple, so no per-request
+    credential ever reaches the MCP export from the runtime (the export is
+    scope-independent + cached per-process). Empty ⇒ the per-request-JWT mode is
+    unchanged."""
     client: CatalogClient
     if settings.catalog_source == "fixture":
         client = FixtureCatalogClient(settings.catalog_fixture_file())
     else:
-        client = HttpCatalogClient(settings.catalog_api_base())
+        client = HttpCatalogClient(
+            settings.catalog_api_base(), service_key=settings.mcp_service_key or None
+        )
     return CatalogCache(client, on_catalog_loaded=on_catalog_loaded)
 
 

@@ -1,5 +1,4 @@
-"""CorpusClient + CorpusCache — the runtime side of the MCP corpus exports (governed
-corpus, Phase 2).
+"""CorpusClient — the transport for the MCP corpus exports (governed corpus, Phase 2).
 
 The MCP is the single source of TRUSTED recall canon. Two auth-required routes serve
 the git-versioned corpus:
@@ -8,51 +7,37 @@ the git-versioned corpus:
   - `GET /knowledge/export`  → `{"knowledge_sha": <sha>, "knowledge": {<id>: <entry>}}`
 
 Each entry is the verbatim blueprint/knowledge fields PLUS `source="mcp"` +
-`verified=True` injected at export time. The runtime projects these into the neo4j
-recall corpus as the `source="mcp"` partition — the ONLY partition the agent recall
-serves (the trust gate in `vector_index`). A separate learning-staging tier
-(`source="learning"`) recall ignores.
+`verified=True` injected at export time. The singleton hydrator daemon
+(`retrieval/hydrator.py`) projects these into the neo4j recall corpus as the
+`source="mcp"` partition — the ONLY partition the agent recall serves (the trust gate in
+`vector_index`). A separate learning-staging tier (`source="learning"`) recall ignores.
 
-This module mirrors `catalog/export_client.py` EXACTLY (transport + process-wide cache):
+`CorpusClient` (Protocol) has two implementations:
+  * `HttpCorpusClient`    — `GET {root}/blueprints/export` + `GET {root}/knowledge/export`
+    on the MCP host. Auth is EITHER the static service key (`X-Service-Key`, the hydrator's
+    mode — no user JWT) OR the per-request `Authorization: Bearer <jwt>` + `X-Session-Id`
+    pair (fallback). The corpus is scope-INDEPENDENT; credentials authenticate the fetch
+    only, never entering a node or a message (D5). Returns a COMBINED export dict.
+  * `FixtureCorpusClient` — reads the frozen offline seed YAML
+    (`tests/fixtures/corpus/{blueprints,knowledge}.yaml`) instead of HTTP. Those fixtures
+    do NOT carry `source`/`verified`; the client presents them as canon and the loader/seed
+    DEFAULTS (`source="mcp"`, `verified=True`) do the rest.
 
-  - `CorpusClient` (Protocol) with two implementations:
-      * `HttpCorpusClient`    — `GET {root}/blueprints/export` + `GET {root}/knowledge/export`
-        on the SAME MCP host, behind the SAME `JWTAuthMiddleware` as the read plane, so
-        it rides the SAME credential binding (`Authorization: Bearer <jwt>` +
-        `X-Session-Id: <session_id>`). The corpus is scope-INDEPENDENT (every principal
-        sees the same canon); the JWT authenticates the fetch only, never entering a
-        node or a message (D5). Returns a COMBINED export dict.
-      * `FixtureCorpusClient` — reads the frozen offline seed YAML
-        (`tests/fixtures/corpus/{blueprints,knowledge}.yaml`) instead of HTTP. Those
-        fixtures do NOT carry `source`/`verified`; the client presents them as canon and
-        the loader/seed DEFAULTS (`source="mcp"`, `verified=True`) do the rest.
-
-  - `CorpusCache` — mirrors `CatalogCache`'s cold-fetch-and-seed shape. The export is
-    scope-INDEPENDENT, so the FIRST successful fetch (with whichever turn's credentials
-    triggers it) fires the one-shot `on_corpus_loaded` seed callback PROCESS-WIDE, then
-    every subsequent turn is a warm no-op. The seed callback is fired OFF the lock, at
-    most once, DEGRADE-not-fail with re-arm on failure (copied from `CatalogCache`).
-
-Fail-closed / degrade-not-fail: a fetch failure with nothing warm is swallowed
-(logged server-side ONLY) and NOT cached — the next turn retries. A seed-callback
-failure never fails the turn (the callback re-arms so a transient neo4j blip retries).
+NOTE: the old per-turn `CorpusCache` one-shot seed trigger was REMOVED in the
+singleton-hydrator redesign — the runtime no longer seeds on the request path; the
+hydrator daemon owns the seed loop, building an `HttpCorpusClient` directly.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 import httpx
 import yaml
-
-if TYPE_CHECKING:
-    from data_agent.runtime.config import RuntimeSettings
 
 _logger = logging.getLogger(__name__)
 
@@ -72,7 +57,9 @@ class CorpusClientError(Exception):
 
 
 class CorpusClient(Protocol):
-    """The transport seam `CorpusCache` depends on (HTTP + fixture share it)."""
+    """The corpus-export transport seam (HTTP + fixture share it). Consumed by the
+    singleton hydrator daemon (`retrieval/hydrator.py`), which builds an `HttpCorpusClient`
+    with the static service key and seeds the neo4j `source='mcp'` recall partition."""
 
     async def fetch_export(self, *, jwt: str, session_id: str) -> dict[str, Any]:
         """Return the COMBINED corpus export dict:
@@ -103,13 +90,31 @@ def _combined_export(
 
 
 class HttpCorpusClient:
-    """Real `CorpusClient` over the live MCP corpus-export routes (Layer 2+)."""
+    """Real `CorpusClient` over the live MCP corpus-export routes (Layer 2+).
 
-    def __init__(self, base_url: str, *, timeout: float = 30.0) -> None:
+    Two auth modes (mirroring `HttpCatalogClient`):
+      * per-request JWT (default) — `Authorization: Bearer <jwt>` + `X-Session-Id`.
+      * static SERVICE KEY (`service_key=`) — `X-Service-Key: <key>` INSTEAD of the
+        Bearer/session pair, so the singleton hydrator daemon authenticates the corpus
+        exports with a static key and no user JWT. When set, the per-request
+        `jwt`/`session_id` args are IGNORED.
+    """
+
+    def __init__(
+        self, base_url: str, *, timeout: float = 30.0, service_key: str | None = None
+    ) -> None:
         # base_url is the MCP HOST ROOT (no trailing slash); the two route paths are
         # appended. The routes live at the host root, NOT under `/mcp` or `/catalog`.
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._service_key = service_key or None
+
+    def _auth_headers(self, *, jwt: str, session_id: str) -> dict[str, str]:
+        """The auth headers for one fetch — the static service key when configured,
+        else the per-request Bearer/session pair. Branches on `self._service_key`."""
+        if self._service_key:
+            return {"X-Service-Key": self._service_key}
+        return _headers(jwt, session_id)
 
     async def _get(
         self, path: str, *, jwt: str, session_id: str, expected_key: str
@@ -117,7 +122,8 @@ class HttpCorpusClient:
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.get(
-                    f"{self._base_url}{path}", headers=_headers(jwt, session_id)
+                    f"{self._base_url}{path}",
+                    headers=self._auth_headers(jwt=jwt, session_id=session_id),
                 )
         except httpx.HTTPError as exc:
             raise CorpusClientError(None, f"corpus export request failed: {exc}") from exc
@@ -135,7 +141,7 @@ class HttpCorpusClient:
             )
         return body
 
-    async def fetch_export(self, *, jwt: str, session_id: str) -> dict[str, Any]:
+    async def fetch_export(self, *, jwt: str = "", session_id: str = "") -> dict[str, Any]:
         blueprints_body = await self._get(
             "/blueprints/export", jwt=jwt, session_id=session_id, expected_key="blueprints"
         )
@@ -215,135 +221,9 @@ def _error_from_response(resp: httpx.Response, path: str) -> CorpusClientError:
     return CorpusClientError(code, message)
 
 
-class CorpusCache:
-    """Process-wide one-shot corpus seed trigger built on the MCP exports.
-
-    Unlike `CatalogCache` (which builds handles a turn consumes), the corpus is consumed
-    by RECALL reading neo4j directly — this cache's sole job is to fire the one-shot
-    `on_corpus_loaded` seed callback (which projects the export into the neo4j
-    `source='mcp'` partition via `load_corpus`) EXACTLY ONCE on the first successful
-    fetch, then serve warm no-ops.
-
-    Mirrors `CatalogCache`: lazily fetch on first use with the CURRENT turn's
-    `jwt`/`session_id`; the cold fetch is guarded by an `asyncio.Lock` (double-checked)
-    so concurrent first-turns issue AT MOST one in-flight fetch. The seed callback is
-    captured under the lock but AWAITED after it is released, so a slow seed never
-    serializes concurrent waiters. Degrade-not-fail: a fetch failure is swallowed +
-    uncached (next turn retries); a seed-callback failure re-arms the one-shot.
-    """
-
-    def __init__(
-        self,
-        client: CorpusClient,
-        *,
-        on_corpus_loaded: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-    ) -> None:
-        self._client = client
-        self._loaded = False
-        self._lock = asyncio.Lock()
-        # The one-shot corpus seed side effect on the FIRST successful COLD fetch.
-        # Neo4j-AGNOSTIC: the cache only knows a `dict -> Awaitable[None]` callback;
-        # app.py binds it to `load_corpus` against the retrieval driver (or `None` when
-        # Neo4j is absent, so the whole feature is a byte-identical no-op).
-        self._on_corpus_loaded = on_corpus_loaded
-        self._seed_done = False
-
-    @property
-    def is_loaded(self) -> bool:
-        """True once a cold fetch succeeded (the seed callback has been fired at least
-        once). Lets the composition root avoid re-scheduling the warm trigger."""
-        return self._loaded
-
-    async def ensure_seeded(
-        self, *, jwt: str, session_id: str, force_reload: bool = False
-    ) -> bool:
-        """Fetch the corpus export once and fire the one-shot seed callback. Returns
-        True iff the corpus is now loaded (a cold success or an already-warm cache);
-        False iff the cold fetch failed and nothing is cached (the caller may retry)."""
-        # Warm fast path — one fetch/seed serves every turn. Lock-free common case.
-        if self._loaded and not force_reload:
-            return True
-        export_for_seed: dict[str, Any] | None = None
-        async with self._lock:
-            if self._loaded and not force_reload:
-                return True
-            if force_reload:
-                self._seed_done = False
-            try:
-                export = await self._client.fetch_export(jwt=jwt, session_id=session_id)
-            except Exception:
-                # Degrade-not-fail: never crash the turn. Log server-side ONLY. Leave
-                # the cache cold so the NEXT turn retries the fetch.
-                _logger.exception(
-                    "corpus export fetch failed; recall corpus seed deferred to a later turn"
-                )
-                return False
-            self._loaded = True
-            # Drift observability: surface the two shas + counts on the cold-fetch
-            # success path. Shape-only — the shas are content digests, the counts are
-            # cardinalities (no PII/credentials).
-            blueprints = export.get("blueprints")
-            knowledge = export.get("knowledge")
-            _logger.info(
-                "corpus cache warmed from export: blueprints_sha=%s knowledge_sha=%s "
-                "blueprints=%d knowledge=%d",
-                export.get("blueprints_sha"),
-                export.get("knowledge_sha"),
-                len(blueprints) if isinstance(blueprints, dict) else 0,
-                len(knowledge) if isinstance(knowledge, dict) else 0,
-            )
-            # Arm the one-shot seed for AFTER the lock releases.
-            if self._on_corpus_loaded is not None and not self._seed_done:
-                self._seed_done = True
-                export_for_seed = export
-        # Lock released. Fire the seed callback at most once, OFF the lock, and
-        # DEGRADE-not-fail: a seed failure must never fail the turn (recall degrades to
-        # an empty/last-good corpus regardless). RE-ARM the one-shot so a transient
-        # neo4j blip is retried on the NEXT cold fetch.
-        if export_for_seed is not None and self._on_corpus_loaded is not None:
-            try:
-                await self._on_corpus_loaded(export_for_seed)
-            except Exception:
-                self._seed_done = False
-                self._loaded = False  # allow a later turn to re-fetch + retry the seed
-                _logger.exception(
-                    "corpus seed callback failed; turn unaffected "
-                    "(re-armed for retry on the next turn)"
-                )
-                return False
-        return True
-
-
-def build_corpus_cache(
-    settings: RuntimeSettings,
-    *,
-    on_corpus_loaded: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-) -> CorpusCache:
-    """Build a `CorpusCache` from settings — HTTP against the MCP, or the fixtures.
-
-    `corpus_source="fixture"` (offline + tests) reads the two seed YAML files;
-    anything else (default `"mcp"`) fetches from the MCP corpus routes derived from
-    `mcp_url` (or `corpus_api_url` when set).
-
-    *on_corpus_loaded* (the one-shot recall-corpus seed): an optional callback the cache
-    invokes with the raw combined export dict on the first successful cold fetch. `None`
-    (default, and when Neo4j is absent) ⇒ a byte-identical no-op."""
-    client: CorpusClient
-    if settings.corpus_source == "fixture":
-        client = FixtureCorpusClient(
-            settings.corpus_blueprints_fixture_file(),
-            settings.corpus_knowledge_fixture_file(),
-        )
-    else:
-        client = HttpCorpusClient(settings.corpus_api_base())
-    return CorpusCache(client, on_corpus_loaded=on_corpus_loaded)
-
-
 __all__ = [
-    "CorpusCache",
     "CorpusClient",
     "CorpusClientError",
     "FixtureCorpusClient",
     "HttpCorpusClient",
-    "build_corpus_cache",
 ]

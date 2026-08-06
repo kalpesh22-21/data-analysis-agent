@@ -198,8 +198,8 @@ class DimensionMismatchError(CorpusLoadError):
     A `CREATE VECTOR INDEX ... IF NOT EXISTS` silently KEEPS the old (wrong)
     dimension, so the only way to detect a changed embedding model/dimension is to
     introspect `SHOW VECTOR INDEXES` and raise LOUD — this error is the operator's
-    signal that the embedding model changed and the graph must be rebuilt (set
-    `NEO4J_REBUILD_FROM_MCP=true` to nuke + rebuild at the new dimension)."""
+    signal that the embedding model changed and the graph must be rebuilt — the
+    singleton hydrator daemon catches this and nukes + rebuilds at the new dimension."""
 
 
 # The default embedding dimension (all-mpnet-base-v2 → 768). Used when a caller
@@ -557,8 +557,15 @@ SET k.name = $id,
     k.created_at = coalesce(k.created_at, datetime())
 """
 
+# SCOPED to the TRUSTED `source='mcp'` partition (hydrator redesign). Model parity
+# governs the RECALLABLE partition only: recall filters `WHERE embedding_model=<expected>`
+# AND `source='mcp'`, so a `source='learning'` staging node lagging the embedding model is
+# harmless (it never matches recall's model filter, and gets a fresh embedding only if/when
+# it is promoted). Counting learning nodes here would falsely trip parity on a model swap and
+# wedge the hydrator. `n.source = 'mcp'` is BARE equality (fail-closed: a sourceless node is
+# NOT counted as mcp) mirroring the recall trust gate.
 _EXISTING_MODELS = """
-MATCH (n) WHERE n:Blueprint OR n:KnowledgeChunk
+MATCH (n) WHERE (n:Blueprint OR n:KnowledgeChunk) AND n.source = 'mcp'
 WITH DISTINCT n.embedding_model AS model
 WHERE model IS NOT NULL
 RETURN collect(model) AS models
@@ -652,9 +659,9 @@ def check_dimension_parity(existing_dims: set[int], target_dim: int) -> None:
             f"A corpus vector index already exists at dimension(s) {sorted(conflicting)!r} "
             f"but this run targets dimension {target_dim}. `CREATE VECTOR INDEX ... IF NOT "
             "EXISTS` silently keeps the OLD dimension, so the index cannot be reshaped in "
-            "place. The embedding model/dimension changed: rebuild the graph at the new "
-            "dimension by setting NEO4J_REBUILD_FROM_MCP=true (which drops + recreates the "
-            "vector indexes), or drop the stale indexes manually."
+            "place. The embedding model/dimension changed: the singleton hydrator daemon "
+            "nukes + rebuilds the graph at the new dimension (dropping + recreating the "
+            "vector indexes) — or drop the stale indexes manually."
         )
 
 
@@ -1478,9 +1485,9 @@ async def apply_schema(
 
 
 # --------------------------------------------------------------------------
-# Nuke + rebuild (Part C) — DESTRUCTIVE: drop the whole graph so it can be
-# rebuilt from the LIVE MCP at a (possibly new) embedding dimension. Strictly
-# gated behind NEO4J_REBUILD_FROM_MCP + a present Neo4j (wired in app.py).
+# Nuke + rebuild — DESTRUCTIVE: drop the whole graph so it can be rebuilt from the
+# LIVE MCP at a (possibly new) embedding dimension. Owned by the singleton hydrator
+# daemon (retrieval/hydrator.py), which nukes on a DimensionMismatchError and re-seeds.
 # --------------------------------------------------------------------------
 
 # The COMPLETE object set the nuke drops before `DETACH DELETE`: the 2 vector
@@ -1521,8 +1528,14 @@ _REBUILD_LOCK_CONSTRAINT = (
     "FOR (l:RebuildLock) REQUIRE l.id IS UNIQUE"
 )
 
-# Best-effort single-flight claim (Part C safety): a `RebuildLock` singleton CAS so
-# concurrent replicas don't all nuke on boot. The claim is Cypher-side (Neo4j
+# DEAD for the hydrator (retained for the seed script + back-compat): the hydrator is a
+# `replicas:1` SINGLETON, so it owns the graph write path alone and needs NO distributed
+# single-flight lock — it never calls `claim_rebuild_lock`, and the `:RebuildLock` sparing
+# in `_NUKE_DELETE_NODES` is moot for it. The lock (and `nuke_graph`) stay in the module
+# for `scripts/seed_neo4j_corpus.py` and any future multi-writer maintenance op.
+#
+# Best-effort single-flight claim: a `RebuildLock` singleton CAS so concurrent replicas
+# don't all nuke on boot. The claim is Cypher-side (Neo4j
 # `datetime()`, since the Python runtime has no cheap clock to embed) — ON CREATE the
 # caller claims; ON MATCH the caller re-claims ONLY if the prior claim is absent or
 # STALE (older than `$stale_seconds`, so a crashed holder can't wedge the lock
@@ -1578,12 +1591,93 @@ async def nuke_graph(driver: AsyncDriver, *, database: str = "neo4j") -> None:
     old dimension otherwise); deleting the nodes is REQUIRED so the B1 freshness
     singletons (`:CatalogMeta`/`:CorpusMeta`) don't short-circuit the re-seed. The
     `:RebuildLock` singleton is SPARED so the single-flight guard survives its own nuke
-    (see `_NUKE_DELETE_NODES`). Strictly for the flag-gated maintenance rebuild — never
-    call it on a normal turn."""
+    (see `_NUKE_DELETE_NODES`). Strictly for the seed-script maintenance op — the SINGLETON
+    hydrator does NOT call this (it would DESTROY the `source='learning'` staging tier, which
+    is not in the MCP export and would not be re-seeded); the hydrator uses the scoped
+    `rebuild_mcp_corpus_partition` instead."""
     async with driver.session(database=database) as session:
         for statement in _NUKE_STATEMENTS:
             await session.run(statement)  # type: ignore[arg-type]
         await session.run(_NUKE_DELETE_NODES)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------
+# Scoped mcp-partition rebuild (the SINGLETON hydrator's destructive op) — clears ONLY
+# the trusted `source='mcp'` corpus + the freshness singletons, PRESERVING the
+# `source='learning'` staging tier (human-promoted content, absent from the MCP export and
+# not re-seeded) and the whole `:Table`/`:Column` catalog graph. The data-loss-safe
+# replacement for `nuke_graph` on an automatic model/dimension change.
+# --------------------------------------------------------------------------
+
+# DELETE only the TRUSTED corpus partition — BARE `source = 'mcp'` equality (fail-closed:
+# a sourceless/learning node is never matched, so the learning tier survives).
+_DELETE_MCP_CORPUS_NODES = """
+MATCH (n) WHERE (n:Blueprint OR n:KnowledgeChunk) AND n.source = 'mcp'
+DETACH DELETE n
+"""
+
+# DELETE the B1 freshness singletons so the subsequent reseed does NOT short-circuit on a
+# stale sha (`load_catalog_graph`/`load_corpus` both re-run + re-stamp). `:Table`/`:Column`
+# are untouched — the catalog reseed re-upserts + re-stamps them (no data lost).
+_DELETE_FRESHNESS_SINGLETONS = """
+MATCH (m) WHERE m:CorpusMeta OR m:CatalogMeta
+DETACH DELETE m
+"""
+
+
+async def rebuild_mcp_corpus_partition(
+    driver: AsyncDriver, *, dimension: int | None = None, database: str = "neo4j"
+) -> None:
+    """Scoped destructive reseed-prep for the SINGLETON hydrator (data-loss-safe).
+
+    Clears ONLY the trusted `source='mcp'` `:Blueprint`/`:KnowledgeChunk` nodes + the
+    `:CorpusMeta`/`:CatalogMeta` freshness singletons, then leaves the caller to reseed.
+    PRESERVES the `source='learning'` staging tier (human-promoted content not in the MCP
+    export — a full `nuke_graph` would destroy it) AND the `:Table`/`:Column` catalog graph.
+
+    Two modes:
+      * *dimension* given (a DIMENSION change) — additionally DROP + recreate the two corpus
+        vector indexes at the new dimension (a `CREATE ... IF NOT EXISTS` silently keeps the
+        OLD dim, so the index must be dropped to reshape). The preserved learning-tier nodes
+        keep their old-dim embeddings; they are excluded from the new-dim index + the recall
+        source-gate, so no bad neighbours surface — they get a correct-dim embedding only
+        if/when promoted.
+      * *dimension* `None` (a same-dim MODEL swap) — leave the indexes; just clear the mcp
+        nodes so the reseed re-embeds every mcp node at the new model WITHOUT tripping the
+        (mcp-scoped) write-time model-parity guard, which reads the pre-write state.
+
+    Deleting the mcp nodes (not merely overwriting) is REQUIRED even for a same-dim model
+    swap: `load_corpus`'s parity check reads the existing mcp models as the FIRST statement
+    of its write txn, so a stale old-model node would raise `CorpusLoadError` before the
+    MERGE-by-id overwrite ran. Clearing first makes the reseed provably parity-clean.
+
+    ATOMICITY (crash-safety): the mcp-node delete AND the freshness-singleton delete run in
+    ONE `execute_write` transaction so they commit together. Were they two auto-commit
+    statements, a crash BETWEEN them (a transient neo4j/network blip `run_forever` swallows,
+    or a pod kill) could leave the mcp partition DELETED while `:CorpusMeta` SURVIVED at its
+    old sha — the next cycle would see no mcp model change, take the normal path, and
+    `load_corpus` would B1 sha-SKIP on the matching sha → recall permanently empty while
+    /ready still reads 200 (the silent-fleet-recall-loss class). Committing both deletes
+    atomically guarantees a crash leaves BOTH gone, forcing a converging reseed next cycle.
+    The vector-index DDL stays OUTSIDE the txn (neo4j forbids schema ops inside a data txn)."""
+    async with driver.session(database=database) as session:
+        if dimension is not None:
+            # Drop the vector indexes so they can be recreated at the new dimension.
+            # Schema DDL must run OUTSIDE the data txn below (neo4j forbids it inside one).
+            await session.run("DROP INDEX blueprint_intent_vec IF EXISTS")  # type: ignore[arg-type]
+            await session.run("DROP INDEX knowledge_text_vec IF EXISTS")  # type: ignore[arg-type]
+
+        async def _clear(tx: AsyncManagedTransaction) -> None:
+            # BOTH deletes in ONE txn — commit-together atomicity (see docstring).
+            await tx.run(_DELETE_MCP_CORPUS_NODES)
+            await tx.run(_DELETE_FRESHNESS_SINGLETONS)
+
+        await session.execute_write(_clear)
+
+        if dimension is not None:
+            for statement in schema_statements(dimension):
+                await session.run(statement)  # type: ignore[arg-type]
+            await session.run("CALL db.awaitIndexes(300)")  # type: ignore[arg-type]
 
 
 async def apply_catalog_graph_schema(driver: AsyncDriver, *, database: str = "neo4j") -> None:
@@ -1996,11 +2090,14 @@ async def load_corpus(
 
 
 async def _fetch_existing_models(runner: Any) -> set[str]:
-    """Distinct non-null `embedding_model` stamps already in the index.
+    """Distinct non-null `embedding_model` stamps on the TRUSTED `source='mcp'`
+    partition (the hydrator-redesign scope — learning-tier nodes are excluded; see
+    `_EXISTING_MODELS`). Powers BOTH load_corpus's write-txn parity check AND the
+    hydrator's model-change detection.
 
     *runner* is anything with `.run` — a session OR a managed transaction (S3
     calls this inside the write txn). Empty-string stamps are RETAINED (not
-    filtered), so a broken/unstamped row surfaces as a parity conflict (N2)
+    filtered), so a broken/unstamped mcp row surfaces as a parity conflict (N2)
     rather than a silent free pass; the Cypher already excludes true NULLs.
     """
     result = await runner.run(_EXISTING_MODELS)
@@ -2030,6 +2127,7 @@ __all__ = [
     "load_corpus",
     "load_seed_fixtures",
     "nuke_graph",
+    "rebuild_mcp_corpus_partition",
     "resolve_embedding_dimension",
     "schema_statements",
 ]
