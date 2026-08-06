@@ -342,6 +342,17 @@ class RuntimeSettings(BaseSettings):
     embedding_timeout_seconds: float = Field(
         10.0, gt=0, description="Per-request embedding timeout (seconds)."
     )
+    embedding_dimension: int | None = Field(
+        None,
+        gt=0,
+        description=(
+            "Embedding vector dimension for the neo4j vector-index DDL. None (default) "
+            "⇒ INFER it from the live embedder (embed a probe, read len(vector[0])); set "
+            "an int to pin it explicitly. A change here (or a changed embedding model) "
+            "against an existing index raises DimensionMismatchError until the graph is "
+            "rebuilt (see neo4j_rebuild_from_mcp)."
+        ),
+    )
 
     # --- Reranker client (D71 custom API — retrieval pipeline building block) ---
     # Not wired into app.py yet; consumed by the upcoming retrieval brick.
@@ -431,6 +442,34 @@ class RuntimeSettings(BaseSettings):
             "recall exceeding it degrades to empty (D86), matching the "
             "embedding/reranker timeout convention."
         ),
+    )
+
+    # --- Nuke + rebuild from MCP (Part C — DESTRUCTIVE maintenance override) ---
+    # A startup override that DROPS the entire neo4j graph and rebuilds table schema +
+    # blueprints + knowledge from the LIVE MCP using a passed-in JWT. Intended as a
+    # one-shot maintenance op (e.g. after the embedding model/dimension changed) — NOT
+    # meant to be left on across a rolling deploy (every restart/replica re-nukes; a
+    # best-effort RebuildLock single-flights the concurrent-boot window only). No-op
+    # when Neo4j is absent (Phase-0 parity). Fails LOUD at startup if set without a JWT.
+    neo4j_rebuild_from_mcp: bool = Field(
+        False,
+        description=(
+            "DESTRUCTIVE: at startup, nuke the whole neo4j graph and rebuild schema + "
+            "blueprints + knowledge from the live MCP. Maintenance-only; no-op when Neo4j "
+            "is absent; requires REBUILD_MCP_JWT."
+        ),
+    )
+    rebuild_mcp_jwt: str = Field(
+        "",
+        description=(
+            "The JWT used to authenticate the startup rebuild's MCP export fetches "
+            "(catalog + corpus). Required when neo4j_rebuild_from_mcp is set (else the "
+            "app fails loud at startup). Secret."
+        ),
+    )
+    rebuild_mcp_session_id: str = Field(
+        "",
+        description="X-Session-Id sent with the startup rebuild's MCP export fetches.",
     )
 
     # --- resolveValues composite (D77) ---

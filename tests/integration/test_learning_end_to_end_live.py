@@ -289,7 +289,7 @@ async def infra():
             os.environ.get("NEO4J_TEST_PASSWORD", "testpassword"),
         ),
     )
-    await apply_schema(neo4j_driver)
+    await apply_schema(neo4j_driver, dimension=768)
 
     mcp_client = RealMCPClient(_MCP_URL)
     token_minter = HttpTokenMinter(TOKEN_SERVICE_URL, TOKEN_ISSUER_API_KEY)

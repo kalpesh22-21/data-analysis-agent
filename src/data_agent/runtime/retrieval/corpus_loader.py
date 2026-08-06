@@ -191,6 +191,25 @@ class CorpusLoadError(Exception):
     """Raised on a write-time parity violation (mixed embedding models, §3.3)."""
 
 
+class DimensionMismatchError(CorpusLoadError):
+    """Raised when a pre-existing vector index carries a DIFFERENT embedding
+    dimension than the one this run wants to write (Part B dimension-parity).
+
+    A `CREATE VECTOR INDEX ... IF NOT EXISTS` silently KEEPS the old (wrong)
+    dimension, so the only way to detect a changed embedding model/dimension is to
+    introspect `SHOW VECTOR INDEXES` and raise LOUD — this error is the operator's
+    signal that the embedding model changed and the graph must be rebuilt (set
+    `NEO4J_REBUILD_FROM_MCP=true` to nuke + rebuild at the new dimension)."""
+
+
+# The default embedding dimension (all-mpnet-base-v2 → 768). Used when a caller
+# needs a concrete dimension but the runtime cannot/should not infer one (e.g. the
+# offline seed scripts + live integration tests wired to the 768 embedding mock).
+# The runtime resolver (`resolve_embedding_dimension`) prefers the configured value
+# or an inferred one; this constant is the last-resort literal for direct callers.
+DEFAULT_EMBEDDING_DIMENSION = 768
+
+
 # Hard cap on `composes` DAG size (FIX 3). Phase-1 blueprints are single-node or a
 # handful of scalar-converging nodes; anything beyond this is an authoring error /
 # adversarial input and is rejected LOUD (never traversed into a stack overflow).
@@ -360,31 +379,48 @@ def _read_yaml_list(path: Path) -> list[dict[str, Any]]:
 # The catalog-graph constraints (Table/Column node keys + the :CatalogMeta
 # singleton). Owned by `load_catalog_graph`'s lightweight `apply_catalog_graph_schema`
 # (constraints ONLY — no vector-index DDL, no `awaitIndexes` on the cold-fetch turn),
-# AND included in the full `SCHEMA_STATEMENTS` so `load_corpus` / the seed script
-# self-deploy them too. Every statement is idempotent (`IF NOT EXISTS`).
+# AND included in the full `schema_statements(dimension)` so `load_corpus` / the seed
+# script self-deploy them too. Every statement is idempotent (`IF NOT EXISTS`).
 _CATALOG_GRAPH_CONSTRAINTS: tuple[str, ...] = (
     "CREATE CONSTRAINT column_key IF NOT EXISTS FOR (c:Column) REQUIRE c.key IS UNIQUE",
     "CREATE CONSTRAINT table_key IF NOT EXISTS FOR (t:Table) REQUIRE t.key IS UNIQUE",
     "CREATE CONSTRAINT catalog_meta_id IF NOT EXISTS FOR (m:CatalogMeta) REQUIRE m.id IS UNIQUE",
 )
 
-# Every statement is idempotent (`IF NOT EXISTS`) so `apply_schema` is safe to
-# re-run — the loader's whole write path (schema + upsert) is re-runnable.
-SCHEMA_STATEMENTS: tuple[str, ...] = (
+# The idempotent constraints (dimension-independent). Every statement is idempotent
+# (`IF NOT EXISTS`) so `apply_schema` is safe to re-run.
+_CORPUS_CONSTRAINTS: tuple[str, ...] = (
     "CREATE CONSTRAINT blueprint_id IF NOT EXISTS FOR (b:Blueprint) REQUIRE b.id IS UNIQUE",
     "CREATE CONSTRAINT knowledge_id IF NOT EXISTS FOR (k:KnowledgeChunk) REQUIRE k.id IS UNIQUE",
     # Governed-corpus B1 freshness singleton (Phase 2), mirroring `:CatalogMeta`.
     "CREATE CONSTRAINT corpus_meta_id IF NOT EXISTS FOR (m:CorpusMeta) REQUIRE m.id IS UNIQUE",
     *_CATALOG_GRAPH_CONSTRAINTS,
-    "CREATE VECTOR INDEX blueprint_intent_vec IF NOT EXISTS "
-    "FOR (b:Blueprint) ON (b.intent_embedding) "
-    "OPTIONS { indexConfig: { `vector.dimensions`: 768, "
-    "`vector.similarity_function`: 'cosine' } }",
-    "CREATE VECTOR INDEX knowledge_text_vec IF NOT EXISTS "
-    "FOR (k:KnowledgeChunk) ON (k.text_embedding) "
-    "OPTIONS { indexConfig: { `vector.dimensions`: 768, "
-    "`vector.similarity_function`: 'cosine' } }",
 )
+
+
+def schema_statements(dimension: int) -> tuple[str, ...]:
+    """The full idempotent schema DDL (constraints + the two native vector indexes),
+    with the vector-index dimension parameterized (Part B).
+
+    The dimension is no longer hardcoded to 768: it is resolved from
+    `RuntimeSettings.embedding_dimension` (when set) or INFERRED from the live
+    embedder (`resolve_embedding_dimension`), so a different embedding model is
+    honored without a code edit. Constraints are unchanged. Every statement is
+    idempotent (`IF NOT EXISTS`) so the loader's whole write path is re-runnable —
+    BUT note a `CREATE VECTOR INDEX ... IF NOT EXISTS` silently keeps the OLD
+    dimension of a pre-existing index, which is why `apply_schema` introspects +
+    raises `DimensionMismatchError` BEFORE creating (see `check_dimension_parity`)."""
+    return (
+        *_CORPUS_CONSTRAINTS,
+        "CREATE VECTOR INDEX blueprint_intent_vec IF NOT EXISTS "
+        "FOR (b:Blueprint) ON (b.intent_embedding) "
+        f"OPTIONS {{ indexConfig: {{ `vector.dimensions`: {dimension}, "
+        "`vector.similarity_function`: 'cosine' } }",
+        "CREATE VECTOR INDEX knowledge_text_vec IF NOT EXISTS "
+        "FOR (k:KnowledgeChunk) ON (k.text_embedding) "
+        f"OPTIONS {{ indexConfig: {{ `vector.dimensions`: {dimension}, "
+        "`vector.similarity_function`: 'cosine' } }",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -393,7 +429,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 
 _UPSERT_BLUEPRINT = """
 MERGE (b:Blueprint {id: $id})
-SET b.intent = $intent,
+SET b.name = $id,
+    b.intent = $intent,
     b.slots_summary = $slots_summary,
     b.intent_embedding = $embedding,
     b.embedding_model = $model,
@@ -504,7 +541,8 @@ SET m.catalog_sha = $sha
 
 _UPSERT_KNOWLEDGE = """
 MERGE (k:KnowledgeChunk {id: $id})
-SET k.title = $title,
+SET k.name = $id,
+    k.title = $title,
     k.text = $text,
     k.text_embedding = $embedding,
     k.embedding_model = $model,
@@ -524,6 +562,17 @@ MATCH (n) WHERE n:Blueprint OR n:KnowledgeChunk
 WITH DISTINCT n.embedding_model AS model
 WHERE model IS NOT NULL
 RETURN collect(model) AS models
+"""
+
+# Dimension-parity introspection (Part B): the CONFIGURED dimension of the two
+# corpus vector indexes, read from the index options. A `CREATE VECTOR INDEX ...
+# IF NOT EXISTS` silently keeps the OLD dimension, so this is the ONLY way to detect
+# that the embedding model/dimension changed under an existing index — `apply_schema`
+# runs it BEFORE the create and raises `DimensionMismatchError` on a differing dim.
+_EXISTING_VECTOR_DIMS = """
+SHOW VECTOR INDEXES YIELD name, options
+WHERE name IN ['blueprint_intent_vec', 'knowledge_text_vec']
+RETURN name, options['indexConfig']['vector.dimensions'] AS dimensions
 """
 
 # --------------------------------------------------------------------------
@@ -585,6 +634,88 @@ def check_model_parity(existing_models: set[str], model_id: str) -> None:
         )
 
 
+def check_dimension_parity(existing_dims: set[int], target_dim: int) -> None:
+    """Refuse to (re)deploy the schema when a pre-existing vector index carries a
+    DIFFERENT embedding dimension than *target_dim* (Part B, mirrors
+    `check_model_parity`).
+
+    Pure function (Layer-1-testable without infra). *existing_dims* is the set of
+    `vector.dimensions` read from `SHOW VECTOR INDEXES` for the two corpus indexes;
+    an empty set (no index yet) passes trivially (the create runs at *target_dim*).
+    Any dimension other than *target_dim* → `DimensionMismatchError`, naming BOTH the
+    stored and target dims and instructing the operator to rebuild — because a
+    `CREATE ... IF NOT EXISTS` would silently keep the old (wrong) dimension, so an
+    embedding-model change is otherwise undetectable and recall would break."""
+    conflicting = {d for d in existing_dims if d != target_dim}
+    if conflicting:
+        raise DimensionMismatchError(
+            f"A corpus vector index already exists at dimension(s) {sorted(conflicting)!r} "
+            f"but this run targets dimension {target_dim}. `CREATE VECTOR INDEX ... IF NOT "
+            "EXISTS` silently keeps the OLD dimension, so the index cannot be reshaped in "
+            "place. The embedding model/dimension changed: rebuild the graph at the new "
+            "dimension by setting NEO4J_REBUILD_FROM_MCP=true (which drops + recreates the "
+            "vector indexes), or drop the stale indexes manually."
+        )
+
+
+async def _fetch_existing_vector_dims(runner: Any) -> set[int]:
+    """The set of `vector.dimensions` configured on the two corpus vector indexes.
+
+    *runner* is anything with `.run` (a live session OR a recording stub). Absent
+    indexes / a `SHOW VECTOR INDEXES` that yields nothing ⇒ an empty set (a fresh
+    graph — the create then runs at the target dim). A `None`/non-int dimension row is
+    skipped defensively."""
+    result = await runner.run(_EXISTING_VECTOR_DIMS)
+    rows = await result.data()
+    dims: set[int] = set()
+    for row in rows:
+        raw = row.get("dimensions")
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            dims.add(raw)
+    return dims
+
+
+async def resolve_embedding_dimension(
+    embedding_client: EmbeddingClient,
+    *,
+    configured: int | None = None,
+    sample_vectors: list[list[float]] | None = None,
+) -> int:
+    """Resolve the vector-index dimension (Part B): the CONFIGURED value when set,
+    else INFERRED from an already-embedded *sample_vectors* (no extra network call),
+    else a one-shot PROBE embed of a fixed string (`len(vectors[0])`).
+
+    `HttpEmbeddingClient.embed` guarantees a non-empty finite-float vector, so
+    `len(vectors[0])` is the true model dimension. An empty/degenerate probe result
+    raises `CorpusLoadError` (the schema cannot be shaped without a dimension).
+
+    S1 cross-check: when BOTH a *configured* value AND a non-empty sample vector are
+    present, the sample's length MUST equal *configured* — otherwise the operator set
+    `EMBEDDING_DIMENSION` to a value the live model does NOT emit, which would build the
+    index at one dimension, write vectors of another, and silently EXCLUDE every row
+    from the index (cryptic-empty-recall, the exact class this feature exists to kill).
+    Raise `CorpusLoadError` naming both numbers rather than ship a broken index."""
+    first_sample = next((vec for vec in sample_vectors or [] if vec), None)
+    if configured is not None:
+        if first_sample is not None and len(first_sample) != configured:
+            raise CorpusLoadError(
+                f"configured embedding_dimension={configured} does NOT match the live "
+                f"embedder's vector length {len(first_sample)} — the index would be built "
+                f"at {configured} while {len(first_sample)}-dim vectors are written and "
+                "silently excluded from recall. Fix EMBEDDING_DIMENSION or the model."
+            )
+        return configured
+    if first_sample is not None:
+        return len(first_sample)
+    probe = await embedding_client.embed(["__dimension_probe__"])
+    if not probe or not probe[0]:
+        raise CorpusLoadError(
+            "cannot resolve the embedding dimension — the embedder returned no/empty "
+            "vector for the probe (set RuntimeSettings.embedding_dimension explicitly)."
+        )
+    return len(probe[0])
+
+
 def _use_edges(uses: list[str]) -> list[dict[str, str]]:
     """Derive `{column_key, table_key}` edge rows from `"db.table.column"` keys.
 
@@ -638,6 +769,9 @@ def _table_node_props(db_table: str, entry: dict[str, Any]) -> dict[str, Any]:
         grain_verifiable = True
     return {
         "key": db_table,
+        # `name` mirrors `key` (the node identity) so Neo4j Browser/Bloom caption the
+        # node by its `db.table` key — consistent with :Blueprint/:KnowledgeChunk/:Column.
+        "name": db_table,
         "database": entry.get("database") or default_db,
         "table": entry.get("table") or default_table,
         "description": entry.get("description"),
@@ -654,13 +788,18 @@ def _column_node_props(db_table: str, name: str, col: dict[str, Any]) -> dict[st
     """Project one catalog column into the enriched `:Column` node props.
 
     `key` is `f"{db_table}.{name}"` — byte-identical to `_use_edges`' `column_key`
-    (asserted by a unit test). Casing of `name` is preserved (D70). `values` (a
-    nested map) is JSON-encoded to `values_json`; every other listed field is a
-    native scalar/array. Unknown/adversarial extra keys (e.g. `client_defined`,
-    `observed_values`, or fixture-mangled keys) are simply not read (whitelist)."""
+    (asserted by a unit test). `name` mirrors the FULL `key` (the node identity) so
+    Neo4j Browser/Bloom caption the column by its `db.table.column` key — consistent
+    with :Blueprint/:KnowledgeChunk/:Table; the bare short name (casing preserved, D70)
+    is retained separately as `short_name`. `values` (a nested map) is JSON-encoded to
+    `values_json`; every other listed field is a native scalar/array. Unknown/adversarial
+    extra keys (e.g. `client_defined`, `observed_values`, or fixture-mangled keys) are
+    simply not read (whitelist)."""
+    key = f"{db_table}.{name}"
     return {
-        "key": f"{db_table}.{name}",
-        "name": name,
+        "key": key,
+        "name": key,
+        "short_name": name,
         "type": col.get("type"),
         "description": col.get("description"),
         "sensitive": bool(col.get("sensitive", False)),
@@ -1318,13 +1457,133 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
     _validate_dag_structure(bp.id, blueprint)
 
 
-async def apply_schema(driver: AsyncDriver, *, database: str = "neo4j") -> None:
-    """Create the constraints + native vector indexes (idempotent), then wait
-    for every index to come ONLINE so a subsequent recall sees them (§4.2)."""
+async def apply_schema(
+    driver: AsyncDriver, *, dimension: int, database: str = "neo4j"
+) -> None:
+    """Create the constraints + native vector indexes (idempotent, at *dimension*),
+    then wait for every index to come ONLINE so a subsequent recall sees them (§4.2).
+
+    Part B dimension-parity: BEFORE the `CREATE VECTOR INDEX ... IF NOT EXISTS` (which
+    silently keeps a pre-existing index's OLD dimension), introspect the existing
+    vector-index dimensions and `check_dimension_parity` — raising
+    `DimensionMismatchError` if an index already exists at a DIFFERENT dimension (the
+    signal that the embedding model changed and the graph must be rebuilt). A fresh
+    graph (no such index) passes and the indexes are created at *dimension*."""
     async with driver.session(database=database) as session:
-        for statement in SCHEMA_STATEMENTS:
+        existing_dims = await _fetch_existing_vector_dims(session)
+        check_dimension_parity(existing_dims, dimension)
+        for statement in schema_statements(dimension):
             await session.run(statement)  # type: ignore[arg-type]
         await session.run("CALL db.awaitIndexes(300)")  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------
+# Nuke + rebuild (Part C) — DESTRUCTIVE: drop the whole graph so it can be
+# rebuilt from the LIVE MCP at a (possibly new) embedding dimension. Strictly
+# gated behind NEO4J_REBUILD_FROM_MCP + a present Neo4j (wired in app.py).
+# --------------------------------------------------------------------------
+
+# The COMPLETE object set the nuke drops before `DETACH DELETE`: the 2 vector
+# indexes (REQUIRED so a new-dimension index can be created — a `CREATE ... IF NOT
+# EXISTS` would otherwise keep the old dimension) and the 6 schema constraints (so a
+# fresh `apply_schema`/`apply_catalog_graph_schema` re-creates them cleanly). Every
+# statement is `IF EXISTS`, so the nuke is safe on a partially-provisioned graph.
+_NUKE_STATEMENTS: tuple[str, ...] = (
+    "DROP INDEX blueprint_intent_vec IF EXISTS",
+    "DROP INDEX knowledge_text_vec IF EXISTS",
+    "DROP CONSTRAINT blueprint_id IF EXISTS",
+    "DROP CONSTRAINT knowledge_id IF EXISTS",
+    "DROP CONSTRAINT corpus_meta_id IF EXISTS",
+    "DROP CONSTRAINT column_key IF EXISTS",
+    "DROP CONSTRAINT table_key IF EXISTS",
+    "DROP CONSTRAINT catalog_meta_id IF EXISTS",
+)
+
+# Clears EVERY node (and its relationships) EXCEPT the `:RebuildLock` singleton,
+# CRUCIALLY including the `:CatalogMeta`/`:CorpusMeta {id:'singleton'}` freshness
+# singletons — if those survive, the B1 no-op guards (`_read_catalog_meta`/
+# `_read_corpus_meta`) would short-circuit and SKIP the re-seed, leaving an empty graph.
+# The `:RebuildLock` is DELIBERATELY spared (`WHERE NOT n:RebuildLock`): if the nuke
+# deleted its own lock, a replica booting during another's rebuild (the widest window —
+# MCP fetch + full-corpus embed) would see no lock, claim fresh, and nuke AGAIN, tearing
+# the graph the B1 guards then certify as healthy. Sparing the lock protects the FULL
+# rebuild plus the `$stale_seconds` window (and makes a restart-with-the-flag-still-on
+# within that window a skip instead of a re-nuke).
+_NUKE_DELETE_NODES = "MATCH (n) WHERE NOT n:RebuildLock DETACH DELETE n"
+
+# A uniqueness constraint on the lock key so a simultaneous double-MERGE from two
+# concurrent-boot replicas cannot double-create the singleton (closing the last
+# single-flight hole). Created inside `claim_rebuild_lock` BEFORE the MERGE, and
+# deliberately NOT dropped by `_NUKE_STATEMENTS` (the lock + its keying must survive
+# the nuke that spares the lock node).
+_REBUILD_LOCK_CONSTRAINT = (
+    "CREATE CONSTRAINT rebuild_lock_id IF NOT EXISTS "
+    "FOR (l:RebuildLock) REQUIRE l.id IS UNIQUE"
+)
+
+# Best-effort single-flight claim (Part C safety): a `RebuildLock` singleton CAS so
+# concurrent replicas don't all nuke on boot. The claim is Cypher-side (Neo4j
+# `datetime()`, since the Python runtime has no cheap clock to embed) — ON CREATE the
+# caller claims; ON MATCH the caller re-claims ONLY if the prior claim is absent or
+# STALE (older than `$stale_seconds`, so a crashed holder can't wedge the lock
+# forever). `claimed` is True iff THIS `$holder` now owns the lock. The nuke SPARES this
+# node (`_NUKE_DELETE_NODES`), so the lock protects the full rebuild + the stale window.
+_CLAIM_REBUILD_LOCK = """
+MERGE (l:RebuildLock {id: 'singleton'})
+ON CREATE SET l.holder = $holder, l.claimed_at = datetime()
+ON MATCH SET
+    l.holder = CASE
+        WHEN l.claimed_at IS NULL
+             OR datetime() > l.claimed_at + duration({seconds: $stale_seconds})
+        THEN $holder ELSE l.holder END,
+    l.claimed_at = CASE
+        WHEN l.claimed_at IS NULL
+             OR datetime() > l.claimed_at + duration({seconds: $stale_seconds})
+        THEN datetime() ELSE l.claimed_at END
+RETURN l.holder = $holder AS claimed
+"""
+
+
+async def claim_rebuild_lock(
+    driver: AsyncDriver,
+    *,
+    holder: str,
+    stale_seconds: int = 300,
+    database: str = "neo4j",
+) -> bool:
+    """Best-effort single-flight claim on the `RebuildLock` singleton (Part C).
+
+    Returns True iff THIS *holder* now owns the lock (it may nuke + rebuild); False
+    iff another live holder holds a fresh claim (skip). Best-effort: without a
+    uniqueness constraint a simultaneous MERGE could in theory double-create, and the
+    nuke SPARES the lock node, so the claim protects the FULL rebuild + the stale
+    window; a `rebuild_lock_id` uniqueness constraint (created here, before the MERGE)
+    closes the simultaneous double-MERGE. A stale claim (holder crashed) is reclaimed
+    after *stale_seconds*."""
+    async with driver.session(database=database) as session:
+        await session.run(_REBUILD_LOCK_CONSTRAINT)  # type: ignore[arg-type]
+        result = await session.run(
+            _CLAIM_REBUILD_LOCK, holder=holder, stale_seconds=stale_seconds
+        )
+        row = await result.single()
+    return bool(row["claimed"]) if row is not None else False
+
+
+async def nuke_graph(driver: AsyncDriver, *, database: str = "neo4j") -> None:
+    """DESTRUCTIVE (Part C): drop the corpus vector indexes + all schema constraints,
+    then `DETACH DELETE` every node — leaving a completely empty graph ready for a
+    fresh `apply_schema` + reseed at a (possibly new) embedding dimension.
+
+    Dropping the vector indexes is REQUIRED (a `CREATE ... IF NOT EXISTS` keeps the
+    old dimension otherwise); deleting the nodes is REQUIRED so the B1 freshness
+    singletons (`:CatalogMeta`/`:CorpusMeta`) don't short-circuit the re-seed. The
+    `:RebuildLock` singleton is SPARED so the single-flight guard survives its own nuke
+    (see `_NUKE_DELETE_NODES`). Strictly for the flag-gated maintenance rebuild — never
+    call it on a normal turn."""
+    async with driver.session(database=database) as session:
+        for statement in _NUKE_STATEMENTS:
+            await session.run(statement)  # type: ignore[arg-type]
+        await session.run(_NUKE_DELETE_NODES)  # type: ignore[arg-type]
 
 
 async def apply_catalog_graph_schema(driver: AsyncDriver, *, database: str = "neo4j") -> None:
@@ -1503,8 +1762,15 @@ async def load_corpus(
     catalog: CatalogHandle | None = None,
     corpus_sha: str = "",
     gc: bool = False,
+    dimension: int | None = None,
 ) -> LoadReport:
     """Embed + upsert the seed corpus into neo4j (idempotent). See module docs.
+
+    *dimension* (Part B) is the vector-index embedding dimension. `None` (default)
+    INFERS it — from the just-embedded corpus vectors when present, else a one-shot
+    probe embed (`resolve_embedding_dimension`) — so the schema is shaped to the live
+    embedding model without a code edit; pass an explicit int to pin it (the app
+    startup-rebuild path resolves it once and threads it here).
 
     Raises `CorpusLoadError` on a malformed `uses` key (S2) or a write-time
     model-parity violation (§3.3).
@@ -1564,9 +1830,6 @@ async def load_corpus(
                 skipped=True,
             )
 
-    if ensure_schema:
-        await apply_schema(driver, database=database)
-
     # S2: validate the highest-risk contract BEFORE any embed/write — a malformed
     # scope key fails the whole load loudly rather than silently storing a
     # blueprint the scope filter will always drop. The full-DAG validation (§1.2)
@@ -1579,10 +1842,39 @@ async def load_corpus(
     if catalog is not None:
         _warn_on_catalog_skew(blueprints, catalog)
 
+    # Part B / S2: fail a STALE-INDEX dimension mismatch BEFORE the bulk corpus embed.
+    # The online B1 self-heal re-arms on failure (CorpusCache), so if we embedded the
+    # whole corpus first, a persistent mismatch would pay fetch+full-embed+raise EVERY
+    # turn. When an index already EXISTS, resolve the target cheaply (configured, or a
+    # SINGLE probe embed) and check parity now. A FRESH graph (no index) can't fail this
+    # check — its dimension is inferred from the corpus vectors below (no probe needed).
+    resolved_dimension: int | None = None
+    if ensure_schema:
+        async with driver.session(database=database) as session:
+            existing_dims = await _fetch_existing_vector_dims(session)
+        if existing_dims:
+            resolved_dimension = await resolve_embedding_dimension(
+                embedding_client, configured=dimension
+            )
+            check_dimension_parity(existing_dims, resolved_dimension)
+
     # Embed offline through the SAME endpoint the online path uses (parity by
-    # construction). Order-preserving: `embed` returns one vector per input.
+    # construction). Order-preserving: `embed` returns one vector per input. Done
+    # BEFORE apply_schema (Part B) so the vector length can INFER the schema dimension
+    # with NO extra probe embed when the corpus is non-empty (fresh-graph case).
     bp_vectors = await embedding_client.embed([b.intent for b in blueprints]) if blueprints else []
     kn_vectors = await embedding_client.embed([k.text for k in knowledge]) if knowledge else []
+
+    # Shape the schema to the resolved dimension. The stale-index case resolved +
+    # checked it above (pre-embed); the fresh-graph case infers it from the corpus
+    # vectors here (config → sample → probe; the S1 cross-check fires when both a
+    # configured value and a sample are present).
+    if ensure_schema:
+        if resolved_dimension is None:
+            resolved_dimension = await resolve_embedding_dimension(
+                embedding_client, configured=dimension, sample_vectors=bp_vectors + kn_vectors
+            )
+        await apply_schema(driver, dimension=resolved_dimension, database=database)
 
     columns: set[str] = set()
     tables: set[str] = set()
@@ -1719,19 +2011,25 @@ async def _fetch_existing_models(runner: Any) -> set[str]:
 
 
 __all__ = [
+    "DEFAULT_EMBEDDING_DIMENSION",
     "BlueprintSeed",
     "CatalogGraphReport",
     "CorpusLoadError",
+    "DimensionMismatchError",
     "KnowledgeSeed",
     "LoadReport",
-    "SCHEMA_STATEMENTS",
     "apply_catalog_graph_schema",
     "apply_schema",
+    "check_dimension_parity",
     "check_model_parity",
+    "claim_rebuild_lock",
     "corpus_content_sha",
     "corpus_seeds_from_export",
     "effective_corpus_sha",
     "load_catalog_graph",
     "load_corpus",
     "load_seed_fixtures",
+    "nuke_graph",
+    "resolve_embedding_dimension",
+    "schema_statements",
 ]
