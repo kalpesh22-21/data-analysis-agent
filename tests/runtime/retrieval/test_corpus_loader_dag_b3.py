@@ -112,6 +112,48 @@ def test_placeholder_bearing_optional_pattern_rejected_at_load() -> None:
         _validate_blueprint_dag(bp)
 
 
+# -- e2: a REFERENCED optional slot MUST carry an optional_pattern -----------
+
+
+def test_referenced_optional_slot_without_pattern_fails_load() -> None:
+    # An optional slot whose token IS referenced by the template but that carries NO
+    # optional_pattern would leave `{token}` unbound on omission → fast path burns to
+    # the raw loop (it does NOT run unfiltered). Fail LOUD at load so the model-facing
+    # "omit = all values" note is true by construction.
+    bp = _seed(
+        slots=[
+            {"name": "department", "type": "string", "required": False},  # referenced, no pattern
+        ]
+    )
+    with pytest.raises(CorpusLoadError, match="optional_pattern"):
+        _validate_blueprint_dag(bp)
+
+
+def test_referenced_optional_slot_with_pattern_loads() -> None:
+    # The same referenced optional slot WITH an optional_pattern loads fine — on
+    # omission the executor substitutes the pattern and the template runs unfiltered.
+    bp = _seed(
+        slots=[
+            {"name": "department", "type": "string", "required": False,
+             "optional_pattern": "TRUE"},
+        ]
+    )
+    _validate_blueprint_dag(bp)  # no raise
+
+
+def test_unreferenced_optional_slot_without_pattern_still_loads() -> None:
+    # An UNREFERENCED optional slot needs no pattern — nothing binds its token, so its
+    # omission is a genuine no-op. The e2 gate must not touch it (guards the converse
+    # of the referenced case above and re-confirms test_unreferenced_optional_slot).
+    bp = _seed(
+        slots=[
+            {"name": "department", "type": "string", "required": True},
+            {"name": "maybe", "type": "string", "required": False},  # unreferenced, no pattern
+        ]
+    )
+    _validate_blueprint_dag(bp)  # no raise
+
+
 # -- S1: binds_to ⊆ uses ----------------------------------------------------
 
 

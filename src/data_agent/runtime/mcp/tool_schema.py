@@ -142,9 +142,13 @@ GET_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
     "description": (
         "Expand one blueprint by id (from a thin card or a searchBlueprints result). "
         "Returns the blueprint's intent, the tables/columns it reads (its `uses` "
-        "footprint), and its status (validated/drift). Full parameter and SQL detail "
-        "arrives with the ability to run it. If the blueprint does not exist or is not "
-        "available to you, this returns `found: false` — re-search with searchBlueprints."
+        "footprint), its status (validated/drift), and its `slots` — each slot's name, "
+        "type, plain-English meaning, and whether it is required or optional. READ the "
+        "`slots` to know what to fill before you run it. For a composed blueprint it "
+        "also returns a `composition` summary (a step count and a note): that blueprint "
+        "is still ONE atomic runBlueprint call — the runtime chains its internal steps. "
+        "If the blueprint does not exist or is not available to you, this returns "
+        "`found: false` — re-search with searchBlueprints."
     ),
     "parameters": {
         "type": "object",
@@ -197,7 +201,9 @@ RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
         "answer the user's question the fast, deterministic way. Fill `slot_bindings` "
         "with the raw values from the conversation and the user's own words (use the "
         "blueprint's `slots` and `resolves` to know what each slot means) — the runtime "
-        "validates and binds them safely; you never write SQL or codes. If a required "
+        "validates and binds them safely; you never write SQL or codes. An OPTIONAL slot "
+        "may be omitted; omitting it means no filter on that dimension (all values) — "
+        "only fill it when the user actually constrained it. If a required "
         "slot is missing or a value is ambiguous, the run pauses to ask the user. Every "
         "result is verified before you see it; if verification fails, answer from the raw "
         "tools instead. The client/tenant is applied automatically — do not pass any "

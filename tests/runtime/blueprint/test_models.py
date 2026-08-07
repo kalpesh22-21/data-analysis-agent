@@ -8,13 +8,33 @@ from __future__ import annotations
 import pytest
 
 from data_agent.runtime.blueprint.models import (
+    GENERIC_SLOT_TYPE_GLOSS,
+    SLOT_TYPE_GLOSS,
+    SLOT_TYPES,
     Blueprint,
     BlueprintParseError,
     Node,
     ResultGrain,
     SlotSpec,
     WhenClause,
+    slot_type_gloss,
 )
+
+
+def test_slot_type_gloss_covers_exactly_slot_types() -> None:
+    # PARITY GUARD: every SLOT_TYPE has a plain-English gloss and there are no
+    # extras — a future new slot type cannot silently ship un-glossed (getBlueprint
+    # would then fall back to the generic gloss without anyone noticing).
+    assert set(SLOT_TYPE_GLOSS) == set(SLOT_TYPES)
+    assert all(g.strip() for g in SLOT_TYPE_GLOSS.values())
+
+
+def test_slot_type_gloss_helper_falls_back_for_unknown_type() -> None:
+    assert slot_type_gloss("period") == SLOT_TYPE_GLOSS["period"]
+    assert slot_type_gloss("wat") == GENERIC_SLOT_TYPE_GLOSS
+    assert slot_type_gloss(None) == GENERIC_SLOT_TYPE_GLOSS
+    # The generic fallback must NOT be a real slot type (keeps the parity honest).
+    assert GENERIC_SLOT_TYPE_GLOSS not in SLOT_TYPE_GLOSS.values()
 
 
 def test_parse_single_node_blueprint() -> None:

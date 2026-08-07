@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from data_agent.runtime.blueprint.models import slot_type_gloss
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolObserver,
     ToolResult,
@@ -210,6 +211,73 @@ def _uses_to_provenance(uses: frozenset[str]) -> frozenset[tuple[str, str]] | No
     return frozenset(tuples)
 
 
+# Per-slot notes the model reads to understand the required/optional contract:
+# a REQUIRED slot omitted PAUSES the run to ask; an OPTIONAL slot omitted runs
+# UNFILTERED on that dimension ("all values") — but ONLY when it carries an
+# `optional_pattern` (the executor substitutes it on omission). A pattern-less
+# optional slot omitted fails closed to the raw loop, so we do NOT promise "all
+# values" for it (the load gate forbids a referenced pattern-less optional, but
+# this note stays honest even if that gate is later relaxed). See _enrich_slot.
+_REQUIRED_SLOT_NOTE = "Must be provided; if omitted the run pauses to ask the user."
+_OPTIONAL_ALL_VALUES_NOTE = (
+    "May be omitted; omitting means no filter on this dimension (all values)."
+)
+_OPTIONAL_PLAIN_NOTE = "May be omitted."
+
+
+def _enrich_slot(raw: Any) -> dict[str, Any]:
+    """Shape one raw slot dict (name/type/required/binds_to/...) into the ENRICHED
+    model-facing view: keep name/type, ADD a plain-English `type_meaning` gloss, a
+    `requirement` ("required"/"optional"), and a `note` explaining the contract.
+    Preserves `binds_to`/`enum_values`/`min_value`/`max_value` when present (useful,
+    harmless). A raw slot missing `type` → generic gloss; missing/invalid `required`
+    → defaults to required=True (the SlotSpec default) — the slot is never dropped.
+
+    The optional note only promises "no filter (all values)" when the slot carries
+    an `optional_pattern` (round-tripped via slots_json) — the executor substitutes
+    that pattern on omission. Without one, omission fails closed to the raw loop, so
+    the note softens to a neutral "May be omitted." rather than overclaim."""
+    slot = raw if isinstance(raw, dict) else {}
+    type_ = slot.get("type")
+    required = slot.get("required", True)
+    if not isinstance(required, bool):
+        required = True
+    if required:
+        note = _REQUIRED_SLOT_NOTE
+    elif slot.get("optional_pattern"):
+        note = _OPTIONAL_ALL_VALUES_NOTE
+    else:
+        note = _OPTIONAL_PLAIN_NOTE
+    enriched: dict[str, Any] = {
+        "name": slot.get("name"),
+        "type": type_,
+        "type_meaning": slot_type_gloss(type_),
+        "requirement": "required" if required else "optional",
+        "note": note,
+    }
+    for key in ("binds_to", "enum_values", "min_value", "max_value"):
+        if slot.get(key) is not None:
+            enriched[key] = slot[key]
+    return enriched
+
+
+def _composition_annotation(composes: list[Any]) -> dict[str, Any]:
+    """Compact, model-facing stand-in for a composed blueprint's raw `composes`
+    DAG. The raw DAG (per-node `sql_template`/`feeds_from`/`consumes`/`$0.x` refs)
+    is the confusion vector — it invites the model to hand-run steps or reason
+    about their order. Replace it with a step count + a "one atomic call" note;
+    the runtime executes the DAG from the store, never from this serialization."""
+    steps = len(composes)
+    return {
+        "steps": steps,
+        "note": (
+            f"This blueprint runs {steps} internal steps that the runtime executes "
+            "and chains for you. Call runBlueprint once with the slots above — do "
+            "NOT run these steps yourself or reason about their order."
+        ),
+    }
+
+
 def _put_if_present(target: dict[str, Any], key: str, value: Any) -> None:
     """Add *key*→*value* only when the blueprint actually stored the DAG field
     (non-None) — keeps the `getBlueprint` FOUND shape strictly additive so a
@@ -373,17 +441,34 @@ class GetBlueprintTool(_ReadTool):
             "catalog_sha": detail.catalog_sha,
         }
         # Additive full-DAG expansion (runblueprint-design §1.3) — the D8
-        # progressive-disclosure "expand" step is now complete: the model sees the
-        # typed `slots` (to fill), `resolves`, `uses_rules`, `result_grain`, and
-        # SQL. Rendered ONLY when the blueprint stored them (a DAG-less D87/D88
-        # blueprint carries `None` → the FOUND shape is byte-identical to before,
-        # keeping the extension strictly additive). The non-oracle {found:false}
-        # posture (D88(b)) above is unchanged.
+        # progressive-disclosure "expand" step. Rendered ONLY when the blueprint
+        # stored them (a DAG-less D87/D88 blueprint carries `None` → the FOUND shape
+        # is byte-identical to before). The non-oracle {found:false} posture
+        # (D88(b)) above is unchanged.
         _put_if_present(result_full, "resolves", detail.resolves)
-        _put_if_present(result_full, "slots", detail.slots)
+        # ENRICH the model-facing `slots`: each slot carries a plain-English type
+        # gloss, a required/optional `requirement`, and a `note` on the contract, so
+        # the model grasps the nomenclature (period ≠ calendar date; optional omit =
+        # no filter) instead of the raw JSON dicts. The raw typed `slots` the runtime
+        # BINDS from are re-fetched by the executor from the store, untouched here.
+        if detail.slots is not None:
+            result_full["slots"] = [_enrich_slot(s) for s in detail.slots]
         _put_if_present(result_full, "uses_rules", detail.uses_rules)
+        # Single-node `sql_template` is INTENTIONALLY kept exposed (progressive
+        # disclosure) — do NOT "fix" the asymmetry with the composed-path DAG
+        # hiding below. A single-node blueprint is one query with no internal step
+        # order to confuse the model; the prompt's "NEVER hand-run" guidance is the
+        # mitigation. The composed DAG is hidden because its per-node SQL / step
+        # order / $0.x refs are the actual confusion vector, not leaf SQL itself.
         _put_if_present(result_full, "sql_template", detail.sql_template)
-        _put_if_present(result_full, "composes", detail.composes)
+        # COMPOSED blueprints: hide the raw `composes` DAG (per-node SQL / feeds_from
+        # / consumes / $0.x refs — the confusion vector) and show a compact "one
+        # atomic call" note instead. This is PURELY model-facing: the executor
+        # re-fetches the BlueprintDetail from the store and reads `detail.composes`
+        # itself (blueprint/executor.py::execute), so it never depends on this
+        # serialization. A DAG-less blueprint has no `composes` → no `composition`.
+        if detail.composes:
+            result_full["composition"] = _composition_annotation(detail.composes)
         _put_if_present(result_full, "result_grain", detail.result_grain)
         # S1: provenance is the blueprint's SCOPED uses footprint (NOT the
         # safe-empty frozenset()) — this is the same class of info getTableSchema

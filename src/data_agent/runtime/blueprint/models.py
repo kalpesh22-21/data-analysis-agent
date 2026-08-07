@@ -22,6 +22,42 @@ SLOT_TYPES: frozenset[str] = frozenset(
     {"string", "entity", "enum", "period", "as_of_date", "list",
      "relative_window", "period_range"}
 )
+
+# One plain-English gloss per SLOT_TYPE, surfaced by `getBlueprint` so the MODEL
+# understands the slot vocabulary (a `period` is a warehouse pay-period key, NOT a
+# calendar date; a `relative_window` is a bare integer N, not "6 months"; etc.).
+# INVARIANT: `set(SLOT_TYPE_GLOSS) == set(SLOT_TYPES)` — a new slot type cannot
+# ship un-glossed (parity test in `tests/runtime/blueprint/test_models.py`).
+SLOT_TYPE_GLOSS: dict[str, str] = {
+    "string": "a named value (e.g. a specific department).",
+    "entity": "a named value (e.g. a specific department or employee).",
+    "enum": "one value from a fixed, closed set of allowed options.",
+    "period": "a warehouse pay-period key, NOT a free calendar date.",
+    "as_of_date": (
+        "a warehouse pay-period key to evaluate as of, NOT a free calendar date."
+    ),
+    "list": "a set of values, matched as IN(...).",
+    "relative_window": (
+        "a whole number N of units (e.g. \"last N months\" -> pass the integer 6, "
+        "not \"6 months\")."
+    ),
+    "period_range": "an explicit {start, end} date range.",
+}
+
+# Fallback gloss for a slot whose `type` is missing or unknown (a corrupt/legacy
+# stored slot): `getBlueprint` still includes the slot, glossed generically rather
+# than dropping it. Deliberately NOT a `SLOT_TYPE_GLOSS` key (keeps the parity).
+GENERIC_SLOT_TYPE_GLOSS = "a value for this slot."
+
+
+def slot_type_gloss(type_: Any) -> str:
+    """The plain-English gloss for a slot `type` — the generic fallback for a
+    missing/unknown type so a slot is never dropped from `getBlueprint`."""
+    if isinstance(type_, str) and type_ in SLOT_TYPE_GLOSS:
+        return SLOT_TYPE_GLOSS[type_]
+    return GENERIC_SLOT_TYPE_GLOSS
+
+
 NODE_KINDS: frozenset[str] = frozenset({"query", "approval"})  # D59c (`guard` cut)
 ON_VIOLATION: frozenset[str] = frozenset({"abort", "skip", "ask"})
 

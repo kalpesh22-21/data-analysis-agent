@@ -121,6 +121,22 @@ def test_base_prompt_carries_pii_minimization_rule() -> None:
     assert "Use the minimum data needed to answer" in AGENT_SYSTEM_PROMPT
 
 
+def test_base_prompt_carries_blueprint_nomenclature_block() -> None:
+    # Guard: the "Understanding blueprints" nomenclature block must not be silently
+    # dropped by a future prompt edit. It teaches the three things the model got
+    # wrong: (1) a blueprint is ONE atomic call the runtime chains; (2) an OPTIONAL
+    # slot omitted means NO filter / all values; (3) the slot-type vocabulary (a
+    # `period` is a pay-period key, not a calendar date; `relative_window` is a bare
+    # integer N). Assert on durable, distinctive substrings for each.
+    assert "A blueprint is ONE atomic call." in AGENT_SYSTEM_PROMPT
+    assert "NEVER hand-run" in AGENT_SYSTEM_PROMPT
+    assert "An OPTIONAL slot MAY be omitted" in AGENT_SYSTEM_PROMPT
+    assert "omitting it means NO filter on that dimension" in AGENT_SYSTEM_PROMPT
+    assert "a warehouse pay-period key, NOT " in AGENT_SYSTEM_PROMPT
+    assert "`relative_window`" in AGENT_SYSTEM_PROMPT
+    assert "read the blueprint's `slots` via getBlueprint" in AGENT_SYSTEM_PROMPT
+
+
 async def test_base_prompt_is_first_message() -> None:
     store = InMemorySessionStore()
     await store.append_trail_entry("s1", _entry("c1", "SELECT Department FROM employee"))

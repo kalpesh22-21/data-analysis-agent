@@ -39,10 +39,42 @@ def _dag_detail() -> BlueprintDetail:
         hit_count=0,
         catalog_sha="sha",
         resolves={"salary": "AnnualSalary"},
-        slots=[{"name": "department", "type": "string", "required": True}],
+        slots=[
+            {"name": "department", "type": "string", "required": True,
+             "binds_to": "db.t.Department"},
+            {"name": "window", "type": "relative_window", "required": False,
+             "optional_pattern": "TRUE", "min_value": 1, "max_value": 12},
+        ],
         uses_rules=["active_employee"],
         sql_template="SELECT Department FROM t WHERE Department = {department}",
         composes=None,
+        result_grain=["Department"],
+    )
+
+
+def _composed_detail() -> BlueprintDetail:
+    # A 2-node composed DAG: node 1 computes the company average, node 2 consumes
+    # it via a `$0.company_avg` ref. The per-node SQL / feeds_from / consumes are
+    # exactly what getBlueprint must HIDE from the model.
+    return BlueprintDetail(
+        id="bp-composed",
+        intent="Departments paying above the company average",
+        slots_summary="department",
+        uses=frozenset({_A, _B}),
+        status="validated",
+        drift_status="clean",
+        hit_count=0,
+        catalog_sha="sha",
+        resolves={},
+        slots=[{"name": "department", "type": "string", "required": False}],
+        uses_rules=[],
+        sql_template=None,
+        composes=[
+            {"order": 0, "sql_template": "SELECT avg(Salary) AS company_avg FROM t",
+             "output": {"company_avg": "scalar"}},
+            {"order": 1, "feeds_from": [0], "consumes": {"avg": "$0.company_avg"},
+             "sql_template": "SELECT Department FROM t WHERE Salary > {avg}"},
+        ],
         result_grain=["Department"],
     )
 
@@ -106,12 +138,82 @@ async def test_get_blueprint_renders_dag_fields_when_present() -> None:
     rf = result.result_full
     assert rf["found"] is True
     assert rf["resolves"] == {"salary": "AnnualSalary"}
-    assert rf["slots"] == [{"name": "department", "type": "string", "required": True}]
     assert rf["uses_rules"] == ["active_employee"]
     assert rf["sql_template"].startswith("SELECT Department")
     assert rf["result_grain"] == ["Department"]
-    # `composes` was None → NOT rendered (strictly additive).
+    # `composes` was None → neither the raw DAG nor a composition summary render.
     assert "composes" not in rf
+    assert "composition" not in rf
+    # Slots are ENRICHED: type gloss + requirement + note on every slot.
+    required, optional = rf["slots"]
+    assert required["name"] == "department"
+    assert required["requirement"] == "required"
+    assert required["type_meaning"]  # a non-empty plain-English gloss
+    assert "pauses to ask" in required["note"]
+    assert required["binds_to"] == "db.t.Department"  # preserved, harmless
+    assert optional["name"] == "window"
+    assert optional["requirement"] == "optional"
+    assert "pay-period" not in optional["type_meaning"]  # relative_window ≠ period
+    assert "integer" in optional["type_meaning"]  # bare N, not "6 months"
+    # The optional slot carries an optional_pattern → the strong "all values" note.
+    assert "no filter" in optional["note"] and "all values" in optional["note"]
+    assert optional["min_value"] == 1 and optional["max_value"] == 12
+
+
+async def test_get_blueprint_optional_without_pattern_gets_neutral_note() -> None:
+    # Belt-and-suspenders: an optional slot with NO optional_pattern must NOT be
+    # promised "all values" (omission fails closed to the raw loop, it does not run
+    # unfiltered) — the note softens to a neutral "May be omitted." even though the
+    # load gate now forbids a REFERENCED pattern-less optional.
+    detail = _dag_detail()
+    patternless = BlueprintDetail(
+        **{
+            **detail.__dict__,
+            "slots": [{"name": "dept", "type": "string", "required": False}],
+        }
+    )
+    index = FakeVectorIndex(details={"bp-x": patternless})
+    tool = GetBlueprintTool(vector_index=index)
+    rf = (await tool.run({"id": "bp-x"}, _creds(frozenset({_A, _B})))).result_full
+    (slot,) = rf["slots"]
+    assert slot["requirement"] == "optional"
+    assert slot["note"] == "May be omitted."
+    assert "all values" not in slot["note"] and "no filter" not in slot["note"]
+
+
+async def test_get_blueprint_enriches_slot_with_unknown_type() -> None:
+    # A corrupt/legacy slot missing `type` (and `required`) must still appear,
+    # glossed generically and defaulted to required — never dropped.
+    detail = _dag_detail()
+    broken = BlueprintDetail(
+        **{**detail.__dict__, "slots": [{"name": "mystery"}]}
+    )
+    index = FakeVectorIndex(details={"bp-x": broken})
+    tool = GetBlueprintTool(vector_index=index)
+    rf = (await tool.run({"id": "bp-x"}, _creds(frozenset({_A, _B})))).result_full
+    (slot,) = rf["slots"]
+    assert slot["name"] == "mystery"
+    assert slot["type_meaning"] == "a value for this slot."
+    assert slot["requirement"] == "required"  # default when `required` absent
+
+
+async def test_get_blueprint_composed_hides_dag_shows_composition() -> None:
+    index = FakeVectorIndex(details={"bp-composed": _composed_detail()})
+    tool = GetBlueprintTool(vector_index=index)
+    rf = (await tool.run({"id": "bp-composed"}, _creds(frozenset({_A, _B})))).result_full
+    assert rf["found"] is True
+    # The raw DAG is gone; a compact "one atomic call" note stands in its place.
+    assert "composes" not in rf
+    assert rf["composition"]["steps"] == 2
+    assert "Call runBlueprint once" in rf["composition"]["note"]
+    assert "not run these steps yourself" in rf["composition"]["note"].lower()
+    # No per-node SQL / feeds_from / consumes / $0.x refs leak anywhere.
+    blob = str(rf)
+    assert "sql_template" not in blob or rf.get("sql_template") is None
+    assert "$0" not in blob and "feeds_from" not in blob and "consumes" not in blob
+    # The enriched slots still render (the model needs them to fill the one call).
+    assert rf["slots"][0]["requirement"] == "optional"
+    assert rf["intent"] and rf["result_grain"] == ["Department"]
 
 
 async def test_get_blueprint_dag_less_is_byte_identical_found_shape() -> None:

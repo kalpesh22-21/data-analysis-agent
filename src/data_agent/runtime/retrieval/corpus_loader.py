@@ -1326,6 +1326,31 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
             "silent dropped filter (D56 wrong-answer class). Reference it or make it optional."
         )
 
+    # (e2) An OPTIONAL slot whose token IS referenced by a template MUST carry an
+    # `optional_pattern`: on omission the executor substitutes that pattern (e.g.
+    # `TRUE`) so the template runs UNFILTERED on that dimension ("all values"). A
+    # pattern-LESS referenced optional slot instead leaves its `{token}` unbound on
+    # omission → the bind fails → the fast path burns to the raw loop (it does NOT
+    # run unfiltered). Fail LOUD at load — mirrors the learning extractor's D97
+    # optional⇒pattern gate — so the model-facing "omit = all values" note is true
+    # by construction. An UNREFERENCED optional slot needs no pattern (nothing binds
+    # it, so its omission is a genuine no-op — skip it).
+    referenced_optional_no_pattern = sorted(
+        s.name
+        for s in blueprint.slots
+        if not s.required
+        and s.optional_pattern is None
+        and (slot_token_names(s) & all_referenced)
+    )
+    if referenced_optional_no_pattern:
+        raise CorpusLoadError(
+            f"blueprint {bp.id}: optional slot(s) {referenced_optional_no_pattern} are "
+            "referenced by a template but declare NO optional_pattern — on omission the "
+            "token stays unbound and the run fails closed to the raw loop instead of "
+            "running unfiltered. Add an optional_pattern (e.g. 'TRUE' for no filter) or "
+            "make the slot required."
+        )
+
     # (f) S1: every slot's `binds_to` MUST be within the blueprint's declared
     # `uses` footprint — otherwise the runtime DISTINCT domain probe reads a column
     # the blueprint never advertised (D88c footprint story false for probes) and a
