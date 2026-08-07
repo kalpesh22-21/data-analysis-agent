@@ -111,7 +111,15 @@ class ToolResult:
     `pause` (additive, runblueprint-design §2.5) is set ONLY by a runtime tool
     that needs to pause the turn (`runBlueprint` on a slot-resolution `askUser`);
     it is `None` for every dispatched MCP tool and every non-pausing runtime tool,
-    so the existing trail/budget path is unchanged."""
+    so the existing trail/budget path is unchanged.
+
+    `authoritative` (additive) is set True ONLY by `runBlueprint` on a SUCCESSFUL,
+    D56-VERIFIED result (status verified + grain/signature ok). It is False for a
+    `runQuery`, for any denied/errored/paused outcome, and for a blueprint whose
+    verify did not pass — so a `result_preview` shaped identically to a raw query
+    result still carries an unambiguous "this is the trusted answer, do not
+    re-derive" signal into the model's tool message (see
+    `loop/agent_loop.py::_tool_trail_entry_to_canonical`)."""
 
     status: Literal["ok", "denied", "error"]
     tool_name: str
@@ -122,6 +130,7 @@ class ToolResult:
     result_preview: ResultPreview | None
     result_full: dict[str, Any] | list[Any] | None
     pause: ToolPause | None = None
+    authoritative: bool = False
 
 
 def _build_preview(raw_result: Any, preview_row_count: int) -> ResultPreview:

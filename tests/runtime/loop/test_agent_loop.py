@@ -859,6 +859,68 @@ def test_tool_trail_entry_to_canonical_includes_static_denial_user_message() -> 
     )
 
 
+def test_verified_blueprint_tool_message_carries_authoritative_marker() -> None:
+    from data_agent.runtime.loop.agent_loop import _tool_trail_entry_to_canonical
+
+    rendered_entry = {
+        "tool_call_id": "bp_1",
+        "tool_name": "runBlueprint",
+        "args": {"id": "bp.headcount"},
+        "status": "ok",
+        "error_code": None,
+        "user_message": None,
+        "result_preview": {"columns": ["n"], "row_count": 1, "truncated": False, "preview_rows": [[42]]},
+        "authoritative": True,
+    }
+
+    _assistant_message, tool_message = _tool_trail_entry_to_canonical(rendered_entry)
+
+    content = json.loads(tool_message["content"])
+    assert content["authoritative"] is True
+    assert "do not re-derive" in content["note"].lower()
+    # The verify block is NOT dumped into the model message — only the compact marker.
+    assert "verify" not in content
+
+
+def test_non_authoritative_tool_messages_carry_no_marker() -> None:
+    # A runQuery, a denied blueprint, and an errored blueprint all lack the flag —
+    # their canonical tool message is byte-identical to before (no marker, no note).
+    from data_agent.runtime.loop.agent_loop import _tool_trail_entry_to_canonical
+
+    run_query = {
+        "tool_call_id": "q_1",
+        "tool_name": "runQuery",
+        "args": {"sql": "SELECT count(*) FROM employee"},
+        "status": "ok",
+        "error_code": None,
+        "user_message": None,
+        "result_preview": {"columns": ["n"], "row_count": 1, "truncated": False, "preview_rows": [[42]]},
+    }
+    denied_bp = {
+        "tool_call_id": "bp_denied",
+        "tool_name": "runBlueprint",
+        "args": {"id": "bp.x"},
+        "status": "error",
+        "error_code": "RUN_BLUEPRINT_NOT_FOUND",
+        "user_message": "That blueprint is not available.",
+        "result_preview": None,
+    }
+    errored_bp = {
+        "tool_call_id": "bp_err",
+        "tool_name": "runBlueprint",
+        "args": {"id": "bp.y"},
+        "status": "error",
+        "error_code": "RUN_BLUEPRINT_VERIFY_FAILED",
+        "user_message": "The fast path produced a result that failed verification.",
+        "result_preview": None,
+    }
+    for rendered in (run_query, denied_bp, errored_bp):
+        _assistant_message, tool_message = _tool_trail_entry_to_canonical(rendered)
+        content = json.loads(tool_message["content"])
+        assert "authoritative" not in content
+        assert "note" not in content
+
+
 # ---------------------------------------------------------------------------
 # Turn-scoped continuity (2026-07-01): current-turn denials/errors reach the
 # model within the SAME turn; a PRIOR turn's denial/error stays dropped

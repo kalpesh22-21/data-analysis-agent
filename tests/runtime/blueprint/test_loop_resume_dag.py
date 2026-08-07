@@ -157,6 +157,51 @@ async def test_approval_pause_then_restart_resume_completes() -> None:
     assert bp_entries and bp_entries[-1].status == "ok"
 
 
+async def test_verified_resume_persists_authoritative_marker() -> None:
+    """`fix/blueprint-authoritative-stop`: a blueprint that PAUSES for approval and
+    then resumes to a D56-verified answer must carry the `authoritative` marker on
+    the persisted trail entry — identical to a non-paused verified run. The resume
+    path reuses the SAME outcome→ToolResult mapper, so the marker can't drift; a
+    regression here would strand exactly the multi-round-trip turn this fix targets
+    (the model would re-derive an already-verified answer)."""
+    store = InMemorySessionStore()
+
+    run_model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="c1", name="runBlueprint", arguments={"id": _BID, "slot_bindings": {}})
+                ]
+            ),
+        ]
+    )
+    run_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]})
+    loop1 = _make_loop(store, run_model, run_mcp)
+    paused = await loop1.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
+    assert paused.status == "paused_ask_user"
+
+    resume_model = ScriptedModelClient(
+        [ModelTurnResult(assistant_text="Flagged 2 departments above the average.")]
+    )
+    resume_mcp = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["department"], [["Sales"], ["Eng"]]),
+                _rq(["__bp_n", "__bp_d"], [[2, 2]]),
+            ]
+        }
+    )
+    loop2 = _make_loop(store, resume_model, resume_mcp)
+    done = await loop2.resume(session_id=SESSION_ID, credentials=_creds(), answer="approve")
+    assert done.status == "done"
+
+    trail = await store.load_trail(SESSION_ID)
+    bp_entries = [e for e in trail if e.tool_name == "runBlueprint"]
+    assert bp_entries and bp_entries[-1].status == "ok"
+    # The verified-resume result is flagged authoritative on the persisted entry.
+    assert bp_entries[-1].authoritative is True
+
+
 async def test_approval_resume_final_outcome_carries_enrichment() -> None:
     """UI Slice 1 Fix 1: a blueprint that pauses for approval and then RESUMES to a
     verified answer must carry the enriched result fields on the FINAL `done`

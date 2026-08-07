@@ -71,6 +71,68 @@ async def test_completed_maps_to_ok_result() -> None:
     assert result.provenance == frozenset({("dbpcm_warehouse.employee", "Department")})
 
 
+async def test_verified_completed_carries_authoritative_marker() -> None:
+    # A genuinely D56-verified result (status verified + clean verify block) earns
+    # the in-band `authoritative` flag so the model treats it as the trusted answer.
+    completed = ExecCompleted(
+        result_full={
+            "blueprint_id": "bp",
+            "status": "verified",
+            "columns": ["d"],
+            "verify": {"grain_ok": True, "grain_checked": True, "signature_ok": True},
+        },
+        preview=ResultPreview(columns=["d"], row_count=1, truncated=False, preview_rows=[["x"]]),
+        provenance=frozenset(),
+    )
+    tool, _ = _tool(completed)
+    result = await tool.run({"id": "bp", "slot_bindings": {}}, _creds())
+    assert result.status == "ok"
+    assert result.authoritative is True
+
+
+async def test_unverified_completed_does_not_carry_authoritative_marker() -> None:
+    # A poisoned/legacy ExecCompleted whose verify block reports a grain mismatch
+    # (or is missing) must NOT be flagged authoritative — the marker is over-claim-proof.
+    grain_mismatch = ExecCompleted(
+        result_full={
+            "blueprint_id": "bp",
+            "status": "verified",
+            "columns": ["d"],
+            "verify": {"grain_ok": False, "grain_checked": True, "signature_ok": True},
+        },
+        preview=ResultPreview(columns=["d"], row_count=1, truncated=False, preview_rows=[["x"]]),
+        provenance=frozenset(),
+    )
+    tool, _ = _tool(grain_mismatch)
+    result = await tool.run({"id": "bp", "slot_bindings": {}}, _creds())
+    assert result.status == "ok"
+    assert result.authoritative is False
+
+    no_verify_block = ExecCompleted(
+        result_full={"blueprint_id": "bp", "status": "verified", "columns": ["d"]},
+        preview=ResultPreview(columns=["d"], row_count=1, truncated=False, preview_rows=[["x"]]),
+        provenance=frozenset(),
+    )
+    tool2, _ = _tool(no_verify_block)
+    result2 = await tool2.run({"id": "bp", "slot_bindings": {}}, _creds())
+    assert result2.authoritative is False
+
+
+async def test_failed_and_paused_are_never_authoritative() -> None:
+    failed = ExecFailed(NOT_FOUND_CODE, "not available", retryable=True)
+    tool, _ = _tool(failed)
+    assert (await tool.run({"id": "bp", "slot_bindings": {}}, _creds())).authoritative is False
+
+    paused = ExecPaused(
+        reason="blueprint_slot",
+        pending_question={"question": "Which department?", "options": ["Sales"]},
+        blueprint_id="bp",
+        slot_bindings_json='{"department": "?"}',
+    )
+    tool2, _ = _tool(paused)
+    assert (await tool2.run({"id": "bp", "slot_bindings": {}}, _creds())).authoritative is False
+
+
 async def test_paused_maps_to_toolpause_seam() -> None:
     paused = ExecPaused(
         reason="blueprint_slot",

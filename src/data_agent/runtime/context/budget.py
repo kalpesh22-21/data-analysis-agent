@@ -256,7 +256,7 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
             "preview_rows": rows,
         }
     user_message = classify_denial(entry.error_code).user_message if entry.status != "ok" else None
-    return {
+    rendered: dict[str, Any] = {
         "role": "tool",
         "tool_call_id": entry.tool_call_id,
         "tool_name": entry.tool_name,
@@ -266,6 +266,13 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
         "user_message": user_message,
         "result_preview": preview,
     }
+    # Carry the verified-blueprint "authoritative" marker through so the canonical
+    # tool message (loop/agent_loop.py::_tool_trail_entry_to_canonical) can flag it
+    # to the model. Emitted only when set (a plain runQuery/denial entry is
+    # byte-identical to before — the key is simply absent).
+    if entry.authoritative:
+        rendered["authoritative"] = True
+    return rendered
 
 
 def render_messages(

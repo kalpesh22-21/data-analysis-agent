@@ -355,21 +355,32 @@ def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]
             "content": entry["content"],
         }
     else:
+        content: dict[str, Any] = {
+            "status": entry["status"],
+            "error_code": entry.get("error_code"),
+            # S4: the static, PII-safe denial message (never raw MCP error
+            # text) so the model can see WHY a retryable call failed and
+            # self-correct — see context/budget.py::_render_entry.
+            "user_message": entry.get("user_message"),
+            "result_preview": entry.get("result_preview"),
+        }
+        # A SUCCESSFUL, D56-verified runBlueprint result is the trusted answer for
+        # this intent. Surface an explicit, in-band marker + a terse human-readable
+        # note so the model treats it as authoritative and goes straight to the final
+        # answer — it must NOT re-derive/re-verify the same intent with ad-hoc
+        # runQuerys (see prompts.py). Present ONLY for a verified blueprint result;
+        # a runQuery, a denied/errored blueprint, or a blueprint that failed verify
+        # never carries the flag, so those tool messages are byte-identical to before.
+        if entry.get("authoritative"):
+            content["authoritative"] = True
+            content["note"] = (
+                "Verified blueprint result — authoritative; do not re-derive with "
+                "additional queries."
+            )
         tool_message = {
             "role": "tool",
             "tool_call_id": tool_call_id,
-            "content": json.dumps(
-                {
-                    "status": entry["status"],
-                    "error_code": entry.get("error_code"),
-                    # S4: the static, PII-safe denial message (never raw MCP error
-                    # text) so the model can see WHY a retryable call failed and
-                    # self-correct — see context/budget.py::_render_entry.
-                    "user_message": entry.get("user_message"),
-                    "result_preview": entry.get("result_preview"),
-                },
-                default=str,
-            ),
+            "content": json.dumps(content, default=str),
         }
     return [assistant_message, tool_message]
 
@@ -979,6 +990,7 @@ class AgentLoop:
             result_preview=tool_result.result_preview,
             result_full_ref=result_full_ref,
             ts=_now_iso(),
+            authoritative=tool_result.authoritative,
         )
         await self._session_store.append_trail_entry(session_id, entry)
 
@@ -1007,55 +1019,16 @@ class AgentLoop:
 
     def _blueprint_outcome_to_tool_result(self, outcome: Any) -> ToolResult:
         """Map a `BlueprintExecutor` `ExecOutcome` to a `ToolResult` — the SAME
-        mapping `RunBlueprintTool._execute` uses, reused here for the resume path
-        so a mid-DAG resume produces byte-identical results to a first call."""
-        from data_agent.runtime.blueprint.executor import (
-            ExecCompleted,
-            ExecFailed,
-            ExecPaused,
-        )
+        mapping `RunBlueprintTool._execute` uses (`blueprint_outcome_to_tool_result`),
+        reused here for the resume path so a mid-DAG resume produces byte-identical
+        results — INCLUDING the verified `authoritative` marker — to a first call.
+        Sharing the one mapper is what stops the resume path from silently losing
+        the marker (the exact drift this dedup fixes)."""
+        from data_agent.runtime.blueprint.tool import blueprint_outcome_to_tool_result
 
-        if isinstance(outcome, ExecCompleted):
-            return ToolResult(
-                status="ok",
-                tool_name="runBlueprint",
-                error_code=None,
-                retryable=None,
-                user_message=None,
-                provenance=outcome.provenance,
-                result_preview=outcome.preview,
-                result_full=outcome.result_full,
-            )
-        if isinstance(outcome, ExecPaused):
-            return ToolResult(
-                status="ok",
-                tool_name="runBlueprint",
-                error_code=None,
-                retryable=None,
-                user_message=None,
-                provenance=frozenset(),
-                result_preview=None,
-                result_full=None,
-                pause=ToolPause(
-                    reason=outcome.reason,
-                    pending_question=outcome.pending_question,
-                    blueprint_id=outcome.blueprint_id,
-                    slot_bindings_json=outcome.slot_bindings_json,
-                    completed_nodes_json=outcome.completed_nodes_json,
-                    awaiting_node=outcome.awaiting_node,
-                ),
-            )
-        if isinstance(outcome, ExecFailed):
-            return ToolResult(
-                status="error",
-                tool_name="runBlueprint",
-                error_code=outcome.error_code,
-                retryable=outcome.retryable,
-                user_message=outcome.user_message,
-                provenance=outcome.provenance,
-                result_preview=None,
-                result_full=None,
-            )
+        mapped = blueprint_outcome_to_tool_result(outcome)
+        if mapped is not None:
+            return mapped
         return _runtime_tool_internal_error("runBlueprint")
 
     @staticmethod
@@ -1512,6 +1485,7 @@ class AgentLoop:
                     result_preview=tool_result.result_preview,
                     result_full_ref=result_full_ref,
                     ts=_now_iso(),
+                    authoritative=tool_result.authoritative,
                 )
                 await self._session_store.append_trail_entry(session_id, entry)
 

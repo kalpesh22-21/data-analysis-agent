@@ -41,6 +41,7 @@ from .executor import (
     BlueprintExecutor,
     ExecCompleted,
     ExecFailed,
+    ExecOutcome,
     ExecPaused,
 )
 
@@ -57,6 +58,94 @@ _INVALID_ARGS_MESSAGE = "runBlueprint needs a blueprint 'id' and a 'slot_binding
 _INTERNAL_ERROR_MESSAGE = "The fast path hit an internal error — answer from the raw tools instead."
 
 _logger = logging.getLogger(__name__)
+
+
+def _is_verified_blueprint_result(result_full: Any) -> bool:
+    """True iff *result_full* is a genuinely D56-verified blueprint result — the
+    ONLY shape that earns the `authoritative` marker (§4). Requires the executor's
+    `status:"verified"` plus a clean `verify` block (grain_ok AND signature_ok). A
+    non-dict, a non-"verified" status, a missing/failed verify block (a poisoned or
+    legacy record) fails closed to False, so the marker is never over-claimed.
+
+    DELIBERATE: a blueprint with an empty or `grain_verifiable:false` grain reports
+    `grain_ok=True` VACUOUSLY (the §4.2 row-count-teeth skip, `grain_checked:false`),
+    so it earns the marker even though the teeth did not run. This intentionally
+    mirrors the executor's own `status:"verified"` labeling — the result IS the
+    trusted answer for that intent. Do not retighten this to `grain_checked` (it
+    would strip the marker from every legitimately-skipped-grain blueprint) nor
+    loosen it to accept a failed verify block."""
+    if not isinstance(result_full, dict):
+        return False
+    if result_full.get("status") != "verified":
+        return False
+    verify = result_full.get("verify")
+    if not isinstance(verify, dict):
+        return False
+    return bool(verify.get("grain_ok")) and bool(verify.get("signature_ok"))
+
+
+def blueprint_outcome_to_tool_result(outcome: ExecOutcome) -> ToolResult | None:
+    """The SINGLE `ExecOutcome` → `ToolResult` mapping, shared by
+    `RunBlueprintTool._execute` (a first call) AND the loop's mid-DAG resume path
+    (`agent_loop._blueprint_outcome_to_tool_result`) so a resumed blueprint returns
+    byte-identical results — including the verified `authoritative` marker — to a
+    non-paused run (D45). Keeping it in ONE place is what stops the two paths from
+    drifting (the resume path silently lost the marker before this dedup). Returns
+    `None` for a value outside the closed `ExecOutcome` union so each caller applies
+    its OWN internal-error fallback (their error codes differ)."""
+    if isinstance(outcome, ExecCompleted):
+        return ToolResult(
+            status="ok",
+            tool_name=TOOL_NAME,
+            error_code=None,
+            retryable=None,
+            user_message=None,
+            provenance=outcome.provenance,
+            result_preview=outcome.preview,
+            result_full=outcome.result_full,
+            # The D56-verified result is the trusted answer — carry an explicit
+            # "authoritative" marker into the model's tool message so it does not
+            # re-derive/re-verify the same intent with ad-hoc runQuerys. Set ONLY
+            # when the result is genuinely verified (status verified + grain +
+            # signature ok); an ExecCompleted whose verify block is not clean
+            # (poisoned/legacy shape) does NOT earn the marker.
+            authoritative=_is_verified_blueprint_result(outcome.result_full),
+        )
+    if isinstance(outcome, ExecPaused):
+        # §2.5 pause seam: surface a `ToolPause` the loop honors (writes the
+        # checkpoint + returns paused_ask_user). No result rows are returned.
+        return ToolResult(
+            status="ok",
+            tool_name=TOOL_NAME,
+            error_code=None,
+            retryable=None,
+            user_message=None,
+            provenance=frozenset(),
+            result_preview=None,
+            result_full=None,
+            pause=ToolPause(
+                reason=outcome.reason,
+                pending_question=outcome.pending_question,
+                blueprint_id=outcome.blueprint_id,
+                slot_bindings_json=outcome.slot_bindings_json,
+                completed_nodes_json=outcome.completed_nodes_json,
+                awaiting_node=outcome.awaiting_node,
+            ),
+        )
+    if isinstance(outcome, ExecFailed):
+        # A runBlueprint-family code OR an inner denial passed through verbatim
+        # (relabeled tool_name="runBlueprint", §5.4) → the raw-loop fallback.
+        return ToolResult(
+            status="error",
+            tool_name=TOOL_NAME,
+            error_code=outcome.error_code,
+            retryable=outcome.retryable,
+            user_message=outcome.user_message,
+            provenance=outcome.provenance,
+            result_preview=None,
+            result_full=None,
+        )
+    return None  # outside the closed union → caller supplies its internal-error fallback
 
 
 class RunBlueprintTool:
@@ -141,51 +230,11 @@ class RunBlueprintTool:
             credentials=credentials,
         )
 
-        if isinstance(outcome, ExecCompleted):
-            return ToolResult(
-                status="ok",
-                tool_name=TOOL_NAME,
-                error_code=None,
-                retryable=None,
-                user_message=None,
-                provenance=outcome.provenance,
-                result_preview=outcome.preview,
-                result_full=outcome.result_full,
-            )
-        if isinstance(outcome, ExecPaused):
-            # §2.5 pause seam: surface a `ToolPause` the loop honors (writes the
-            # checkpoint + returns paused_ask_user). No result rows are returned.
-            return ToolResult(
-                status="ok",
-                tool_name=TOOL_NAME,
-                error_code=None,
-                retryable=None,
-                user_message=None,
-                provenance=frozenset(),
-                result_preview=None,
-                result_full=None,
-                pause=ToolPause(
-                    reason=outcome.reason,
-                    pending_question=outcome.pending_question,
-                    blueprint_id=outcome.blueprint_id,
-                    slot_bindings_json=outcome.slot_bindings_json,
-                    completed_nodes_json=outcome.completed_nodes_json,
-                    awaiting_node=outcome.awaiting_node,
-                ),
-            )
-        if isinstance(outcome, ExecFailed):
-            # A runBlueprint-family code OR an inner denial passed through verbatim
-            # (relabeled tool_name="runBlueprint", §5.4) → the raw-loop fallback.
-            return ToolResult(
-                status="error",
-                tool_name=TOOL_NAME,
-                error_code=outcome.error_code,
-                retryable=outcome.retryable,
-                user_message=outcome.user_message,
-                provenance=outcome.provenance,
-                result_preview=None,
-                result_full=None,
-            )
+        # The ONE shared ExecOutcome → ToolResult mapper (the resume path reuses it,
+        # so the verified `authoritative` marker can never drift between the two).
+        mapped = blueprint_outcome_to_tool_result(outcome)
+        if mapped is not None:
+            return mapped
         # Unreachable for the closed ExecOutcome union — fail-closed.
         return self._error(INTERNAL_ERROR_CODE, _INTERNAL_ERROR_MESSAGE, retryable=False)
 
@@ -202,4 +251,10 @@ class RunBlueprintTool:
         )
 
 
-__all__ = ["INTERNAL_ERROR_CODE", "INVALID_ARGS_CODE", "TOOL_NAME", "RunBlueprintTool"]
+__all__ = [
+    "INTERNAL_ERROR_CODE",
+    "INVALID_ARGS_CODE",
+    "TOOL_NAME",
+    "RunBlueprintTool",
+    "blueprint_outcome_to_tool_result",
+]

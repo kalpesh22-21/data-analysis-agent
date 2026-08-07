@@ -139,6 +139,11 @@ class TrailEntry:
     result_preview: ResultPreview | None
     result_full_ref: str | None
     ts: str
+    # True ONLY for a SUCCESSFUL, D56-verified `runBlueprint` result — persisted so
+    # a replay/resume re-derives the same "authoritative" marker in the model's tool
+    # message (D45 determinism). Defaults False for every other entry (runQuery,
+    # denials, discovery), so the field is additive and legacy docs load unchanged.
+    authoritative: bool = False
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -152,6 +157,7 @@ class TrailEntry:
             "result_preview": self.result_preview.to_doc() if self.result_preview else None,
             "result_full_ref": self.result_full_ref,
             "ts": self.ts,
+            "authoritative": self.authoritative,
         }
 
     @classmethod
@@ -168,6 +174,7 @@ class TrailEntry:
             result_preview=ResultPreview.from_doc(preview_doc) if preview_doc else None,
             result_full_ref=doc.get("result_full_ref"),
             ts=doc["ts"],
+            authoritative=bool(doc.get("authoritative", False)),
         )
 
 

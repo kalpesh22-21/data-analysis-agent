@@ -57,6 +57,48 @@ def test_trail_entry_roundtrip_with_provenance() -> None:
     assert restored == entry
 
 
+def test_trail_entry_authoritative_roundtrips() -> None:
+    # A verified-blueprint entry persists its `authoritative` marker across the wire
+    # so a D45 replay/resume re-derives the same in-band signal.
+    entry = TrailEntry(
+        turn_index=0,
+        tool_call_id="bp_1",
+        tool_name="runBlueprint",
+        args={"id": "bp.headcount"},
+        status="ok",
+        error_code=None,
+        provenance=frozenset(),
+        result_preview=None,
+        result_full_ref="result::uuid-9",
+        ts="2026-07-01T00:00:00+00:00",
+        authoritative=True,
+    )
+    doc = entry.to_doc()
+    assert doc["authoritative"] is True
+    restored = TrailEntry.from_doc(doc)
+    assert restored.authoritative is True
+    assert restored == entry
+
+
+def test_trail_entry_legacy_doc_without_authoritative_loads_as_false() -> None:
+    # D45 backward-compat: a doc persisted BEFORE the marker existed has no
+    # `authoritative` key and must load as False (never a spurious marker on replay).
+    legacy_doc = {
+        "turn_index": 0,
+        "tool_call_id": "call_legacy",
+        "tool_name": "runQuery",
+        "args": {"sql": "SELECT 1"},
+        "status": "ok",
+        "error_code": None,
+        "provenance": [],
+        "result_preview": None,
+        "result_full_ref": None,
+        "ts": "2026-07-01T00:00:00+00:00",
+    }
+    restored = TrailEntry.from_doc(legacy_doc)
+    assert restored.authoritative is False
+
+
 def test_trail_entry_undetermined_provenance_is_null_on_wire() -> None:
     entry = TrailEntry(
         turn_index=0,

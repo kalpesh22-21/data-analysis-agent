@@ -75,6 +75,18 @@ def test_base_prompt_carries_searchblueprints_discovery_nudge() -> None:
     assert "call searchBlueprints with the intent in your own words" in AGENT_SYSTEM_PROMPT
 
 
+def test_base_prompt_carries_authoritative_blueprint_guidance() -> None:
+    # Guard: the "a returned validated blueprint result is authoritative — do not
+    # re-derive it with ad-hoc runQuerys" guidance must not be silently dropped by
+    # a future prompt edit. It references the in-band `authoritative` marker the
+    # tool result now carries, so prompt + signal reinforce each other. Assert on
+    # durable, distinctive substrings (the marker reference and the DISTINCT-part
+    # carve-out that keeps legitimate multi-part follow-ups working).
+    assert "treat that result as the authoritative answer for that intent" in AGENT_SYSTEM_PROMPT
+    assert '"authoritative"' in AGENT_SYSTEM_PROMPT
+    assert "DISTINCT part of the user's question" in AGENT_SYSTEM_PROMPT
+
+
 def test_base_prompt_carries_batched_reads_guidance() -> None:
     # Guard: the nudge to batch several INDEPENDENT reads into one turn (saving a
     # model round-trip each) must not be silently dropped by a future prompt edit.

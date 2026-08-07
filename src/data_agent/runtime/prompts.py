@@ -48,6 +48,13 @@ AGENT_SYSTEM_PROMPT = (
     "literal.\n"
     "- If a validated blueprint is offered to you or found that matches the "
     "intent, prefer runBlueprint over writing a fresh query.\n"
+    "- Once a validated blueprint has RETURNED a result, treat that result as the "
+    "authoritative answer for that intent and go straight to your final answer "
+    "(calling recordAssumptions first if needed). A verified blueprint result is "
+    'marked "authoritative" in its tool message — do NOT run additional runQuerys '
+    "to re-derive, double-check, re-verify, or reformat the same figure; it is "
+    "already verified. You MAY run further queries only for a DISTINCT part of the "
+    "user's question that the blueprint did not answer.\n"
     "- If none of the blueprints offered to you fit, call searchBlueprints "
     "with the intent in your own words before writing a fresh query — the ones "
     "offered are only the closest matches, not the full set, so a better one may "

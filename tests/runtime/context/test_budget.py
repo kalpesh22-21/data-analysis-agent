@@ -207,3 +207,28 @@ def test_render_entry_user_message_is_none_for_ok_status() -> None:
     messages = render_messages(result)
     tool_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
     assert tool_msg["user_message"] is None
+
+
+def test_render_entry_surfaces_authoritative_verified_blueprint_flag() -> None:
+    # A verified-blueprint TrailEntry threads its `authoritative` marker into the
+    # rendered model-facing dict; a plain runQuery entry omits the key entirely.
+    verified = TrailEntry(
+        turn_index=0,
+        tool_call_id="bp1",
+        tool_name="runBlueprint",
+        args={"id": "bp.headcount"},
+        status="ok",
+        error_code=None,
+        provenance=frozenset(),
+        result_preview=None,
+        result_full_ref="ref-1",
+        ts="2026-07-01T00:00:00+00:00",
+        authoritative=True,
+    )
+    plain = _entry("c1", "SELECT 1")
+    result = compact_trail([verified, plain], token_budget=10_000, scope_hash="h1")
+    messages = render_messages(result)
+    bp_msg = next(m for m in messages if m.get("tool_call_id") == "bp1")
+    query_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
+    assert bp_msg["authoritative"] is True
+    assert "authoritative" not in query_msg
