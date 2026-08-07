@@ -1,17 +1,26 @@
-"""render.py — RetrievedContext → one model-facing system message (design §3.1).
+"""render.py — RetrievedContext → one model-facing user message (design §3.1).
 
 Pure formatting: given the already-cut, already-ordered `RetrievedContext`,
-produce a single `{"role": "system", "content": ...}` message the assembler
+produce a single `{"role": "user", "content": ...}` message the assembler
 prepends before history. Deterministic (same block → same string), so a D45
 resume that re-derives the same block renders byte-identically (design §6).
 
+Non-system role: the block is rendered under `role: "user"` (not `system`) so
+the base prompt (`context/assembly.py`) stays the SOLE `role: "system"` message.
+A second system message here would compete with the base instructions on the
+OpenAI-compatible endpoints that honor only the first-or-last system message —
+the same anti-pattern the compaction-summary demotion closed. A leading prefix
+marks the block as retrieved prior-context so the model never mistakes it for
+the current user question.
+
 Trust boundary (H2 — structural sanitisation, as-built): this block is
-interpolated into a **system-role** message. Even though the corpus is written
-offline and passes the write-time leakage gate (so its CONTENT is trusted), the
-retrieved TEXT must not be able to forge the message's STRUCTURE — a newline in
-an intent/chunk/slot string could otherwise fabricate a new "## System" section
-or a fake instruction at system privilege. So every interpolated text field is
-structurally sanitised before it is placed in the message: newlines/tabs and
+interpolated into a model-facing message alongside the real conversation. Even
+though the corpus is written offline and passes the write-time leakage gate (so
+its CONTENT is trusted), the retrieved TEXT must not be able to forge the
+message's STRUCTURE — a newline in an intent/chunk/slot string could otherwise
+fabricate a new "## System" section or a fake instruction/bullet. So every
+interpolated text field is structurally sanitised before it is placed in the
+message: newlines/tabs and
 other C0/C1 control characters (incl. NUL) are collapsed to single spaces (or
 dropped), and each field is length-capped (`_MAX_FIELD_CHARS` for card fields,
 `_MAX_CHUNK_CHARS` for knowledge chunks) so one 100 KB card cannot dominate the
@@ -31,6 +40,10 @@ import unicodedata
 from typing import Any
 
 from .models import RetrievedContext
+
+# Marks the block as retrieved prior-context under the `user` role, so the model
+# reads it as candidate reference material rather than the current question.
+_USER_CONTEXT_PREFIX = "[Retrieved context — candidate blueprints/knowledge for this question]\n\n"
 
 _HEADER = (
     "Relevant context retrieved for this request "
@@ -66,7 +79,7 @@ def _sanitize(text: str, max_chars: int) -> str:
 
 
 def render_retrieved_context(context: RetrievedContext) -> dict[str, Any] | None:
-    """Render *context* to one system message, or `None` when it is empty.
+    """Render *context* to one `user`-role message, or `None` when it is empty.
 
     `None` means "prepend nothing" — the assembler then behaves exactly as if
     retrieval had not run, keeping the empty-retrieval path byte-identical to
@@ -102,7 +115,7 @@ def render_retrieved_context(context: RetrievedContext) -> dict[str, Any] | None
             kind = _sanitize(item.kind, _MAX_FIELD_CHARS)
             lines.append(f"- ({kind}) {_sanitize(item.text, _MAX_FIELD_CHARS)}")
 
-    return {"role": "system", "content": "\n".join(lines)}
+    return {"role": "user", "content": _USER_CONTEXT_PREFIX + "\n".join(lines)}
 
 
 __all__ = ["render_retrieved_context"]

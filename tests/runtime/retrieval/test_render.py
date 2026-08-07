@@ -1,4 +1,4 @@
-"""Layer-1 tests for retrieval/render.py — determinism + single system message."""
+"""Layer-1 tests for retrieval/render.py — determinism + single user-role block."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from data_agent.runtime.retrieval.models import (
     ThinCard,
     UserMemoryItem,
 )
-from data_agent.runtime.retrieval.render import render_retrieved_context
+from data_agent.runtime.retrieval.render import _USER_CONTEXT_PREFIX, render_retrieved_context
 
 
 def _ctx() -> RetrievedContext:
@@ -24,11 +24,14 @@ def test_empty_context_renders_none() -> None:
     assert render_retrieved_context(RetrievedContext.empty()) is None
 
 
-def test_renders_single_system_message() -> None:
+def test_renders_single_user_message() -> None:
+    # NON-system so the base prompt stays the sole `role: "system"` message, with
+    # the prior-context prefix marking it as retrieved reference material.
     msg = render_retrieved_context(_ctx())
     assert msg is not None
-    assert msg["role"] == "system"
+    assert msg["role"] == "user"
     assert isinstance(msg["content"], str)
+    assert msg["content"].startswith(_USER_CONTEXT_PREFIX)
 
 
 def test_render_is_deterministic() -> None:

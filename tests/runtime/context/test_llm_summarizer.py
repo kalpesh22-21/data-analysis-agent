@@ -9,6 +9,7 @@ proves the sync->async bridge actually works and does not deadlock).
 from __future__ import annotations
 
 from data_agent.runtime.context.assembly import ContextAssembler
+from data_agent.runtime.context.budget import _SUMMARY_CONTEXT_PREFIX
 from data_agent.runtime.context.llm_summarizer import build_llm_summarizer
 from data_agent.runtime.model.client import ModelTurnResult
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
@@ -98,5 +99,13 @@ async def test_summarizer_works_when_called_from_within_a_running_event_loop() -
     assembled = await assembler.assemble("sess-1", frozenset())
 
     assert assembled.compaction_applied is True
-    system_messages = [m for m in assembled.messages if m["role"] == "system"]
-    assert system_messages[0]["content"] == "summarized older history"
+    # No base prompt is configured here, so the summary is the leading message —
+    # rendered under a NON-system (`user`) role with the context prefix, never a
+    # `system` message.
+    assert not any(m["role"] == "system" for m in assembled.messages)
+    summary_messages = [
+        m
+        for m in assembled.messages
+        if m["role"] == "user" and str(m.get("content", "")).startswith(_SUMMARY_CONTEXT_PREFIX)
+    ]
+    assert summary_messages[0]["content"] == _SUMMARY_CONTEXT_PREFIX + "summarized older history"

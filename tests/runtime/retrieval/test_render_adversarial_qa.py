@@ -46,7 +46,7 @@ def _ctx(**kw) -> RetrievedContext:
 def test_injection_text_is_emitted_verbatim_single_message() -> None:
     msg = render_retrieved_context(_ctx(thin_cards=[_card(_INJECTION)]))
     assert msg is not None
-    assert msg["role"] == "system"
+    assert msg["role"] == "user"
     assert isinstance(msg["content"], str)
     # Posture: verbatim, not stripped. (Documenting, not endorsing.)
     assert _INJECTION in msg["content"]
@@ -128,8 +128,8 @@ def test_empty_string_intent_and_missing_title_render_cleanly() -> None:
 
 
 def test_newline_injected_intent_stays_within_one_message_object() -> None:
-    # A card intent full of newlines cannot split the single system message into
+    # A card intent full of newlines cannot split the single user-role message into
     # multiple message dicts — render always returns one dict or None.
     msg = render_retrieved_context(_ctx(thin_cards=[_card("line1\nline2\n\n- fake bullet")]))
     assert isinstance(msg, dict)
-    assert msg["role"] == "system"
+    assert msg["role"] == "user"

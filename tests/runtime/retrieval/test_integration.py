@@ -86,7 +86,7 @@ def _pipeline(embedder: FakeEmbeddingClient) -> RetrievalPipeline:
     )
 
 
-async def test_assemble_prepends_retrieval_system_message() -> None:
+async def test_assemble_prepends_retrieval_user_message() -> None:
     store = InMemorySessionStore()
     assembler = ContextAssembler(
         store, history_token_budget=100_000, retrieval=_pipeline(FakeEmbeddingClient())
@@ -94,7 +94,9 @@ async def test_assemble_prepends_retrieval_system_message() -> None:
     assembled = await assembler.assemble(
         SESSION_ID, frozenset(), user_message=_Q, retrieval_memo={}
     )
-    assert assembled.messages[0]["role"] == "system"
+    # No base prompt configured here, so the retrieval block leads — as a
+    # NON-system (`user`) message, never `system`.
+    assert assembled.messages[0]["role"] == "user"
     assert "sales overtime rollup" in assembled.messages[0]["content"]
     assert assembled.retrieved_counts == (1, 0)
 

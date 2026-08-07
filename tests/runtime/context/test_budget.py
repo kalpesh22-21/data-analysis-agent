@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from data_agent.runtime.context.budget import (
+    _SUMMARY_CONTEXT_PREFIX,
     SummaryCache,
     compact_trail,
     render_messages,
@@ -133,8 +134,10 @@ def test_render_messages_summary_prepended() -> None:
     entries = [_entry(f"c{i}", f"SELECT {i} FROM padding_table_name") for i in range(5)]
     result = compact_trail(entries, token_budget=1, scope_hash="h1")
     messages = render_messages(result)
-    assert messages[0]["role"] == "system"
-    assert messages[0]["content"] == result.summary_text
+    # The summary is a NON-system (`user`) message so it never competes with the
+    # base prompt; the raw summary text is preserved, only prefixed as prior-context.
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == _SUMMARY_CONTEXT_PREFIX + result.summary_text
 
 
 def test_render_messages_never_exposes_more_than_preview() -> None:

@@ -216,7 +216,7 @@ class ContextAssembler:
             # A non-data-bearing tool result is injected in the dropped entry's
             # slot to break the retry-until-budget-cap loop, and a diagnostic
             # observer event is emitted (de-duped). Runs BEFORE retrieval
-            # pre-injection so the retrieval system block still leads `messages`.
+            # pre-injection so the retrieval block still leads `messages`.
             self._inject_withheld_provenance_sentinels(
                 messages,
                 raw_trail=raw_trail,
@@ -228,8 +228,9 @@ class ContextAssembler:
 
             # 0. retrieval pre-injection (design §3.3): a SEPARATE, additive
             # pre-loop stage — runs alongside D50 history assembly, prepended
-            # as one system message before history. Only when both the pipeline
-            # and a user_message are present (else byte-identical to today).
+            # as one `user`-role prior-context message before history (NON-system
+            # so the base prompt stays the sole system message). Only when both the
+            # pipeline and a user_message are present (else byte-identical to today).
             retrieved_counts = (0, 0)
             if self._retrieval is not None and user_message is not None:
                 retrieved_counts = await self._prepend_retrieval(
@@ -243,7 +244,9 @@ class ContextAssembler:
                 )
 
             # 0b. base system prompt (always-present leading instruction): the
-            # LAST prepend so it precedes the retrieval block and history. It is
+            # LAST prepend so it precedes the retrieval block and history, and the
+            # SOLE `role: "system"` message (retrieval + summary are both demoted to
+            # `user` so nothing competes with these base instructions). It is
             # inserted here — after `render_messages`/compaction has
             # already run and the budget walk is complete — so it can never be
             # trimmed by the history-token budget. As a static constant it keeps

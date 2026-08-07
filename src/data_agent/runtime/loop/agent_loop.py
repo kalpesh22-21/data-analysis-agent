@@ -402,6 +402,12 @@ def _assembled_to_canonical(messages: list[dict[str, Any]]) -> list[dict[str, An
         role = message["role"]
         if role == "system":
             canonical.append({"role": "system", "content": message["content"]})
+        elif role == "user":
+            # The compaction summary (context/budget.py::render_messages) is the
+            # only `user`-role message the assembler emits — demoted from a second
+            # `system` message so it can never compete with the sole authoritative
+            # base prompt. It replays as ordinary prior-context content.
+            canonical.append({"role": "user", "content": message["content"]})
         elif role == "tool":
             tool_call_id = message.get("tool_call_id")
             if isinstance(tool_call_id, str) and tool_call_id in seen_tool_call_ids:
@@ -414,7 +420,7 @@ def _assembled_to_canonical(messages: list[dict[str, Any]]) -> list[dict[str, An
             if isinstance(tool_call_id, str):
                 seen_tool_call_ids.add(tool_call_id)
             canonical.extend(_tool_trail_entry_to_canonical(message))
-        else:  # pragma: no cover - render_messages only ever emits system/tool
+        else:  # pragma: no cover - render_messages only ever emits system/user/tool
             raise ValueError(f"Unexpected assembled-context message role: {role!r}")
     return canonical
 
@@ -635,11 +641,14 @@ class AgentLoop:
         `_tool_trail_entry_to_canonical` (or `None`/empty). Computed ONCE in
         `_run_loop` and threaded in (never recomputed per round-trip, D45). It is
         spliced in AFTER the leading run of `role=="system"` messages (base prompt /
-        retrieval / summary) and BEFORE the real trail assistant/tool pairs + the
-        appended conversation, so the emulated reads read as the earliest tool
-        history, ahead of the user's question — mirroring how real trail pairs
-        already precede the convo. `None`/empty (feature off / degraded) leaves the
-        message list byte-identical.
+        retrieval) and BEFORE the real trail assistant/tool pairs + the appended
+        conversation, so the emulated reads read as the earliest tool history, ahead
+        of the user's question — mirroring how real trail pairs already precede the
+        convo. The compaction summary is a `user`-role message (not `system`), so it
+        sits just after this leading system run; discovery therefore precedes it,
+        which is chronologically correct (the emulated listDatabases/listTables are
+        the earliest session activity, ahead of the steps the summary compacts).
+        `None`/empty (feature off / degraded) leaves the message list byte-identical.
         """
         assembled = await self._context_assembler.assemble(
             session_id,

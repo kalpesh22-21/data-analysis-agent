@@ -162,10 +162,13 @@ async def test_base_prompt_precedes_retrieval_block() -> None:
         "s1", frozenset(), current_turn_index=0, user_message="how many employees?"
     )
 
-    # base prompt first, then the retrieval card block, both system messages.
-    assert assembled.messages[0]["content"] == AGENT_SYSTEM_PROMPT
-    assert assembled.messages[1]["role"] == "system"
+    # base prompt first (the SOLE system message), then the retrieval card block
+    # as a NON-system (`user`) prior-context message so it never competes with the
+    # base instructions.
+    assert assembled.messages[0] == {"role": "system", "content": AGENT_SYSTEM_PROMPT}
+    assert assembled.messages[1]["role"] == "user"
     assert "bp.headcount" in assembled.messages[1]["content"]
+    assert sum(m["role"] == "system" for m in assembled.messages) == 1
     assert assembled.retrieved_counts == (1, 0)
 
 

@@ -275,13 +275,29 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
     return rendered
 
 
+# The compaction summary is rendered under a NON-system role so it can never
+# compete with the base prompt that `context/assembly.py` inserts at index 0 —
+# which is the SINGLE `role: "system"` message the assembler emits (the
+# retrieval cards block, `retrieval/render.py`, is likewise a `user` message, so
+# even on a retrieval-enabled deploy the base prompt is the sole system message).
+# Some OpenAI-compatible endpoints (self-hosted vLLM/TGI chat templates) honor
+# only the first OR only the last system message, so a second `role: "system"`
+# summary could silently override the agent's base instructions after N turns.
+# `user` is the most portable non-system role. The prefix marks the content as
+# compacted prior-context so the model never mistakes it for the current user
+# question to answer.
+_SUMMARY_CONTEXT_PREFIX = "[Earlier steps in this session were summarized to save space]\n\n"
+
+
 def render_messages(
     compaction: CompactionResult, *, preview_row_count: int = 20
 ) -> list[dict[str, Any]]:
     """Render a `CompactionResult` into the ordered, model-facing message list (D50 step 4)."""
     messages: list[dict[str, Any]] = []
     if compaction.summary_text:
-        messages.append({"role": "system", "content": compaction.summary_text})
+        messages.append(
+            {"role": "user", "content": _SUMMARY_CONTEXT_PREFIX + compaction.summary_text}
+        )
     for entry in compaction.verbatim:
         messages.append(_render_entry(entry, preview_row_count))
     return messages
