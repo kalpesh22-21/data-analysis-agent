@@ -6,8 +6,11 @@ from data_agent.runtime.context.budget import (
     _SUMMARY_CONTEXT_PREFIX,
     SummaryCache,
     compact_trail,
+    estimate_message_tokens,
+    fit_request_to_budget,
     render_messages,
 )
+from data_agent.runtime.retrieval.render import _USER_CONTEXT_PREFIX as _RETRIEVAL_CONTEXT_PREFIX
 from data_agent.runtime.session.models import ResultPreview, TrailEntry
 
 
@@ -44,18 +47,48 @@ def test_small_trail_fits_entirely_verbatim_no_compaction() -> None:
     assert result.summary_text is None
 
 
-def test_overflow_is_compacted_newest_verbatim() -> None:
-    # Each entry costs a nontrivial number of tokens; force a tiny budget so only
-    # the newest entry survives verbatim.
-    entries = [_entry(f"c{i}", f"SELECT {i} FROM some_wide_table_name_padding") for i in range(5)]
-    result = compact_trail(entries, token_budget=1, scope_hash="h1")
-    # At least the newest entry always survives verbatim (progress guarantee).
+def test_overflow_keeps_recent_verbatim_and_summarizes_older() -> None:
+    # A budget large enough for a few newest entries but not all: the newest
+    # survive verbatim (they each fit under the budget), the oldest overflow into
+    # the summary, and no entry is lost.
+    entries = [_entry(f"c{i}", f"SELECT {i} FROM some_wide_table_name_padding") for i in range(8)]
+    result = compact_trail(entries, token_budget=200, scope_hash="h1")
+    # The newest entry survives verbatim (it fits well under the budget).
     assert result.verbatim[-1] == entries[-1]
+    # Overflow genuinely happened: some older entries were summarized, not all kept.
+    assert result.summarized
+    assert len(result.verbatim) < len(entries)
     assert result.summary_text is not None
     seen_ids = {e.tool_call_id for e in result.summarized} | {
         e.tool_call_id for e in result.verbatim
     }
     assert seen_ids == {e.tool_call_id for e in entries}
+
+
+def test_single_over_budget_entry_is_summarized_not_forced_verbatim() -> None:
+    """Part 3 fix: when the NEWEST entry ALONE exceeds `token_budget` it must NOT
+    be force-kept verbatim (the old `if verbatim` guard admitted it regardless of
+    size, so one un-truncated ~30k getTableSchema survived verbatim and blew the
+    budget). It now falls into `summarized` — kept in a bounded form, not verbatim."""
+    giant_sql = "SELECT " + ("padding_col, " * 4000)  # far over any tiny budget
+    entry = _entry("giant", giant_sql)
+    result = compact_trail([entry], token_budget=50, scope_hash="h1")
+    # NOT kept verbatim — the whole point of the fix.
+    assert result.verbatim == []
+    # ...but still kept in a bounded form (folded into the summary).
+    assert [e.tool_call_id for e in result.summarized] == ["giant"]
+    assert result.summary_text is not None
+
+
+def test_over_budget_newest_does_not_drag_in_older_verbatim() -> None:
+    """With a giant NEWEST entry over budget, the walk stops at it (newest-first),
+    so nothing is force-kept verbatim and the older small entry is summarized too —
+    the compacted verbatim set is bounded by the budget (here: empty)."""
+    older_small = _entry("old", "SELECT 1")
+    giant_new = _entry("new", "SELECT " + ("x, " * 4000))
+    result = compact_trail([older_small, giant_new], token_budget=50, scope_hash="h1")
+    assert result.verbatim == []
+    assert {e.tool_call_id for e in result.summarized} == {"old", "new"}
 
 
 def test_sql_preserved_verbatim_for_kept_entries() -> None:
@@ -210,6 +243,215 @@ def test_render_entry_user_message_is_none_for_ok_status() -> None:
     messages = render_messages(result)
     tool_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
     assert tool_msg["user_message"] is None
+
+
+# ---------------------------------------------------------------------------
+# fit_request_to_budget — total-request token budget (2026-08 fix).
+# ---------------------------------------------------------------------------
+
+
+def _sys(content: str) -> dict:
+    return {"role": "system", "content": content}
+
+
+def _user(content: str) -> dict:
+    return {"role": "user", "content": content}
+
+
+def _assistant_answer(content: str) -> dict:
+    return {"role": "assistant", "content": content}
+
+
+def _tool_pair(call_id: str, sql: str, result: str) -> list[dict]:
+    """One [assistant(tool_calls), tool] canonical pair, as the loop emits them."""
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "runQuery", "arguments": f'{{"sql": "{sql}"}}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": result},
+    ]
+
+
+def _assert_pairing_intact(messages: list[dict]) -> None:
+    """Every `tool` message has an immediately-announcing assistant `tool_calls`,
+    and no assistant `tool_calls` message is left without its `tool` result(s)."""
+    open_ids: set[str] = set()
+    for m in messages:
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                open_ids.add(tc["id"])
+        elif m["role"] == "tool":
+            assert m["tool_call_id"] in open_ids, (
+                f"orphan tool message {m['tool_call_id']} without a preceding tool_calls"
+            )
+            open_ids.discard(m["tool_call_id"])
+    assert not open_ids, f"assistant tool_calls left without a tool result: {open_ids}"
+
+
+def test_fit_no_trim_when_under_budget() -> None:
+    messages = [_sys("base"), *_tool_pair("c1", "SELECT 1", "r1"), _user("q?")]
+    result = fit_request_to_budget(messages, token_budget=100_000)
+    assert result.messages == messages
+    assert result.dropped_messages == 0
+    assert result.dropped_units == 0
+
+
+def test_fit_pins_base_prompt_and_current_question_dropping_oldest() -> None:
+    base = _sys("BASE PROMPT " + "x" * 400)
+    question = _user("current question?")
+    # Several fat tool pairs, oldest first.
+    pairs: list[dict] = []
+    for i in range(10):
+        pairs.extend(_tool_pair(f"c{i}", f"SELECT {i} " + "col, " * 200, "row " * 200))
+    messages = [base, *pairs, question]
+    total = sum(estimate_message_tokens(m) for m in messages)
+    budget = total // 2  # force trimming
+
+    result = fit_request_to_budget(messages, token_budget=budget)
+
+    # Invariant 1: base prompt is still byte-identical at index 0.
+    assert result.messages[0] == base
+    # Invariant 3: the current question is still present (and last).
+    assert result.messages[-1] == question
+    # Invariant 2: fits the budget.
+    assert sum(estimate_message_tokens(m) for m in result.messages) <= budget
+    # Invariant 4: pairing intact.
+    _assert_pairing_intact(result.messages)
+    # Invariant 5: OLDEST dropped — c0 gone, the most recent c9 survived.
+    surviving_ids = {
+        tc["id"]
+        for m in result.messages
+        if m["role"] == "assistant" and m.get("tool_calls")
+        for tc in m["tool_calls"]
+    }
+    assert "c0" not in surviving_ids
+    assert "c9" in surviving_ids
+    assert result.dropped_units > 0
+
+
+def test_fit_drops_a_tool_pair_as_a_unit_never_orphaning() -> None:
+    base = _sys("base")
+    question = _user("q?")
+    messages = [base, *_tool_pair("c1", "SELECT " + "a, " * 500, "x" * 4000), question]
+    budget = estimate_message_tokens(base) + estimate_message_tokens(question) + 5
+
+    result = fit_request_to_budget(messages, token_budget=budget)
+
+    # The whole pair went (both messages), never a lone orphan tool message.
+    assert result.messages == [base, question]
+    assert result.dropped_units == 1
+    assert result.dropped_messages == 2
+    _assert_pairing_intact(result.messages)
+
+
+def test_fit_never_drops_base_or_question_even_if_they_exceed_budget() -> None:
+    # Degenerate corner: base + question alone exceed a tiny budget. They must
+    # STILL survive (invariants 1 + 3 outrank invariant 2).
+    base = _sys("BASE " + "x" * 2000)
+    question = _user("Q " + "y" * 2000)
+    messages = [base, *_tool_pair("c1", "SELECT 1", "r"), question]
+    result = fit_request_to_budget(messages, token_budget=1)
+    assert result.messages[0] == base
+    assert result.messages[-1] == question
+    _assert_pairing_intact(result.messages)
+
+
+def test_fit_no_user_message_never_orphans_a_trailing_tool_pair() -> None:
+    """SHOULD-FIX 1: a list ending in a tool PAIR with NO user message anywhere
+    must never pin the trailing `tool` while its announcing assistant unit stays
+    droppable (which would orphan the tool → API 400). The no-user-message branch
+    pins nothing as the tail; the whole pair is one droppable unit."""
+    base = _sys("base")
+    messages = [base, *_tool_pair("c1", "SELECT " + "a, " * 800, "x" * 6000)]
+    budget = estimate_message_tokens(base) + 5  # only the base fits
+
+    result = fit_request_to_budget(messages, token_budget=budget)
+
+    # The over-budget pair went as a whole unit — no orphan tool left behind.
+    assert result.messages == [base]
+    _assert_pairing_intact(result.messages)
+    assert result.dropped_by_kind == {"trail": 1}
+
+
+def test_fit_priority_keeps_current_turn_retrieval_over_stale_conversation() -> None:
+    """SHOULD-FIX 2: under moderate pressure the fit drops stale CONVERSATION and
+    old TRAIL first and keeps THIS question's retrieval-cards block (and the
+    compaction summary) longer — they carry the blueprint candidates / knowledge /
+    access rules that matter exactly when context is tight."""
+    base = _sys("base")
+    question = _user("current question?")
+    # A stale prior-turn conversation exchange + an old trail pair, both fat, plus
+    # this turn's (smaller) retrieval + summary context blocks.
+    stale_user = _user("stale old question " + "w" * 1500)
+    stale_answer = _assistant_answer("stale old answer " + "z" * 1500)
+    old_trail = _tool_pair("old", "SELECT " + "c, " * 300, "r" * 1500)
+    retrieval = _user(_RETRIEVAL_CONTEXT_PREFIX + "candidate blueprint bp.headcount")
+    summary = _user(_SUMMARY_CONTEXT_PREFIX + "earlier steps summarized")
+    messages = [base, stale_user, stale_answer, *old_trail, retrieval, summary, question]
+
+    # Budget that forces dropping the stale conversation + old trail but leaves
+    # room for base + retrieval + summary + question.
+    keep_tokens = (
+        estimate_message_tokens(base)
+        + estimate_message_tokens(retrieval)
+        + estimate_message_tokens(summary)
+        + estimate_message_tokens(question)
+    )
+    budget = keep_tokens + 5
+
+    result = fit_request_to_budget(messages, token_budget=budget)
+
+    contents = [m.get("content") for m in result.messages]
+    # The current-turn retrieval + summary survived...
+    assert retrieval["content"] in contents
+    assert summary["content"] in contents
+    # ...while the stale conversation + old trail were dropped (tier-0 first).
+    assert stale_user["content"] not in contents
+    assert stale_answer["content"] not in contents
+    assert "old" not in {
+        tc["id"]
+        for m in result.messages
+        if m["role"] == "assistant" and m.get("tool_calls")
+        for tc in m["tool_calls"]
+    }
+    # Base + question still pinned; pairing intact; by-kind breakdown reflects it.
+    assert result.messages[0] == base
+    assert result.messages[-1] == question
+    _assert_pairing_intact(result.messages)
+    assert result.dropped_by_kind.get("trail") == 1
+    assert result.dropped_by_kind.get("conversation") == 2
+    assert "retrieval" not in result.dropped_by_kind
+    assert "summary" not in result.dropped_by_kind
+
+
+def test_fit_drops_retrieval_and_summary_last_under_heavy_pressure() -> None:
+    """When even the stale conversation/trail being gone is not enough, the
+    retrieval + summary blocks ARE dropped (tier 1) — but only then."""
+    base = _sys("base")
+    question = _user("q?")
+    retrieval = _user(_RETRIEVAL_CONTEXT_PREFIX + "cards " + "k" * 400)
+    summary = _user(_SUMMARY_CONTEXT_PREFIX + "summary " + "s" * 400)
+    old_trail = _tool_pair("old", "SELECT 1", "r")
+    messages = [base, *old_trail, retrieval, summary, question]
+    # Only base + question fit — everything droppable must go, tier 0 then tier 1.
+    budget = estimate_message_tokens(base) + estimate_message_tokens(question) + 2
+
+    result = fit_request_to_budget(messages, token_budget=budget)
+
+    assert result.messages == [base, question]
+    _assert_pairing_intact(result.messages)
+    # Tier-1 blocks were among those dropped once tier-0 was exhausted.
+    assert result.dropped_by_kind.get("retrieval") == 1
+    assert result.dropped_by_kind.get("summary") == 1
+    assert result.dropped_by_kind.get("trail") == 1
 
 
 def test_render_entry_surfaces_authoritative_verified_blueprint_flag() -> None:

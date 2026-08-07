@@ -121,6 +121,80 @@ async def test_preview_truncates_to_preview_row_count() -> None:
     assert len(result.result_preview.preview_rows) == 5
 
 
+async def test_wide_get_table_schema_is_size_capped_with_a_marker() -> None:
+    """Part 2 fix: a wide getTableSchema (100+ columns) must NOT be stored as one
+    unbounded ~30k-token preview cell — it is size-capped to `max_tool_result_tokens`
+    with a clear marker, and the stored preview stays a VALID, parseable dict the
+    model can still read columns from."""
+    wide_schema = {
+        "database": "dbpcm_warehouse",
+        "table": "employee",
+        "columns": [
+            {"name": f"Column_{i}", "type": "String", "comment": "some descriptive comment"}
+            for i in range(400)
+        ],
+    }
+    mcp_client = FakeMCPClient(scripted={"getTableSchema": [wide_schema]})
+    dispatcher = ToolDispatcher(mcp_client, CATALOG, max_tool_result_tokens=500)
+
+    result = await dispatcher.dispatch(
+        "getTableSchema", {"database": "dbpcm_warehouse", "table": "employee"}, _credentials()
+    )
+
+    assert result.status == "ok"
+    assert result.result_preview is not None
+    assert result.result_preview.truncated is True
+    # The stored cell is the capped dict — still valid + parseable.
+    capped = result.result_preview.preview_rows[0][0]
+    assert isinstance(capped, dict)
+    assert capped["database"] == "dbpcm_warehouse"
+    assert capped["table"] == "employee"
+    # Head preserved: leading columns kept, far fewer than the full 400.
+    assert 0 < len(capped["columns"]) < 400
+    assert capped["columns"][0]["name"] == "Column_0"
+    # Marker names how many of how many were omitted.
+    assert "_truncated" in capped
+    assert "of 400 columns omitted" in capped["_truncated"]
+    # Actually bounded (JSON estimate under a small multiple of the cap).
+    assert len(json.dumps(capped)) // 4 <= 500 * 2
+
+    # The FULL, un-capped result is still returned on result_full for the caller
+    # (the preview cap bounds only the model-facing stored preview).
+    assert len(result.result_full["columns"]) == 400
+
+
+def test_dispatch_estimator_matches_budget_estimator() -> None:
+    """Parity guard (NIT 3): dispatch's per-result cap estimator and the trail
+    budget walk's estimator must measure token cost IDENTICALLY. They cannot share
+    an import (dispatch/__init__ eagerly imports tool_dispatcher and budget.py
+    transitively imports dispatch → cycle), so this pins the two copies together —
+    a future tokenizer swap must update both."""
+    from data_agent.runtime.context.budget import _estimate_tokens as budget_estimate
+    from data_agent.runtime.dispatch.tool_dispatcher import _estimate_tokens as dispatch_estimate
+
+    for text in ["", "a", "SELECT * FROM t", '{"columns": [{"name": "x"}]}' * 100, "x" * 30_000]:
+        assert dispatch_estimate(text) == budget_estimate(text)
+
+
+async def test_small_get_table_schema_is_unchanged_no_marker() -> None:
+    """A normal-sized getTableSchema is byte-identical to before the cap existed:
+    stored whole, truncated=False, no marker."""
+    schema = {
+        "database": "dbpcm_warehouse",
+        "table": "employee",
+        "columns": [{"name": "EmployeeCode", "type": "String", "comment": ""}],
+    }
+    mcp_client = FakeMCPClient(scripted={"getTableSchema": [schema]})
+    dispatcher = ToolDispatcher(mcp_client, CATALOG)
+    result = await dispatcher.dispatch(
+        "getTableSchema", {"database": "dbpcm_warehouse", "table": "employee"}, _credentials()
+    )
+    assert result.result_preview.truncated is False
+    stored = result.result_preview.preview_rows[0][0]
+    assert stored == schema
+    assert "_truncated" not in stored
+
+
 async def test_observer_is_called_at_each_stage() -> None:
     events: list[tuple[str, dict]] = []
 

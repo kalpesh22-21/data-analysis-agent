@@ -28,6 +28,14 @@ from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 # `hydrator_enabled` (mirrors `learning/config.py::_TRUTHY`).
 _TRUTHY = {"1", "true", "yes", "on"}
 
+# Headroom multiplier on the request fit budget. The shared chars/4 token
+# estimator (context/budget.py::_estimate_tokens) UNDER-counts real tokens on
+# punctuation-dense JSON/SQL — the fat trail is exactly that (~3 chars/token), so a
+# request "fitted" to the raw window could be ~128-150k REAL tokens and re-trigger
+# the front-truncation bug. Applied ONLY at `request_token_budget()` (the request
+# fit seam), never to the shared estimator, so trail-compaction math is unchanged.
+_REQUEST_BUDGET_HEADROOM = 0.8
+
 
 class _HydratorKillSwitchSettings(BaseSettings):
     """A one-field settings surface for `HYDRATOR_ENABLED` ONLY, constructed FRESH on
@@ -175,7 +183,32 @@ class RuntimeSettings(BaseSettings):
         128_000,
         description=(
             "Token budget of the configured model's context window. Used to derive the "
-            "absolute history token budget (history_token_budget_ratio * this value)."
+            "absolute history token budget (history_token_budget_ratio * this value) AND "
+            "the total-request fit budget (model_context_window - response_token_reserve)."
+        ),
+    )
+    response_token_reserve: int = Field(
+        16_000,
+        gt=0,
+        description=(
+            "Tokens reserved for the model's OUTPUT (completion). The total ASSEMBLED "
+            "request (every message handed to send_turn, base prompt included) is fit to "
+            "`model_context_window - response_token_reserve` before each model call so it "
+            "can never front-truncate the leading base prompt out of the window (the "
+            "root-cause of the dropped-system-prompt bug). See "
+            "loop/agent_loop.py::_build_canonical_messages + context/budget.py::"
+            "fit_request_to_budget."
+        ),
+    )
+    max_tool_result_tokens: int = Field(
+        4_000,
+        gt=0,
+        description=(
+            "Per-tool-result cap (approx tokens) on the stored preview of a single tool "
+            "call. A large non-tabular result (notably a wide getTableSchema with 100+ "
+            "columns) is truncated to this cap with a clear marker rather than stored as "
+            "one unbounded ~30k-token blob that survives the row-count-only trail budget. "
+            "See dispatch/tool_dispatcher.py::_build_preview."
         ),
     )
 
@@ -593,6 +626,26 @@ class RuntimeSettings(BaseSettings):
     def history_token_budget(self) -> int:
         """Absolute history token budget derived from the model's context window (OQ-G)."""
         return int(self.model_context_window * self.history_token_budget_ratio)
+
+    def request_token_budget(self) -> int:
+        """Absolute cap on the FULL assembled request (all messages) handed to
+        `send_turn`: the model context window minus the reserve held back for the
+        model's own output, times a 0.8 headroom factor.
+
+        The 0.8 is headroom because the chars/4 estimator under-counts JSON/SQL-
+        dense content (~3 chars/token in practice): a list "fitted" to the raw
+        window could still be ~20-30% over the REAL window and let the endpoint
+        front-truncate the leading base prompt (the exact bug this fixes). The
+        margin is applied ONLY at this request-fit seam, not to the shared
+        estimator, so trail-compaction token math is untouched.
+
+        Clamped to at least 1 so a (mis)configuration where the reserve meets or
+        exceeds the window can never yield a non-positive budget the fit walk
+        would treat as "drop everything"."""
+        headroom = (
+            self.model_context_window - self.response_token_reserve
+        ) * _REQUEST_BUDGET_HEADROOM
+        return max(1, int(headroom))
 
     def scratch_api_base(self) -> str:
         """Resolve the scratch side-channel base URL (…/scratch/v1), no trailing slash.

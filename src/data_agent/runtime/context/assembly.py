@@ -159,7 +159,10 @@ class ContextAssembler:
         *user_message*/*user_id* (Slice-1 retrieval, design §3.3, optional):
         when a `retrieval` pipeline was injected AND a *user_message* is given,
         the retrieved thin-cards/knowledge/user-memory block is pre-injected as
-        ONE system message at the front of `messages` (before history). Absent
+        ONE `user`-role message near the front of `messages` (after the base
+        prompt, before history) — NOT a system message, so the base prompt stays
+        the SOLE leading `role:"system"` message (the head-pin the total-request
+        fit and the send-seam base-prompt invariant both depend on). Absent
         either, no retrieval runs and the returned context is byte-identical to
         the pre-retrieval behavior.
 

@@ -91,6 +91,7 @@ from data_agent.runtime.context.assembly import (
     IDEMPOTENT_READ_ALREADY_SERVED_CODE,
     ContextAssembler,
 )
+from data_agent.runtime.context.budget import fit_request_to_budget
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
@@ -441,6 +442,7 @@ class AgentLoop:
         max_wall_clock_seconds: float,
         max_budget_windows: int,
         token_budget: int | None = None,
+        request_token_budget: int | None = None,
         max_tool_calls_per_iteration: int = 8,
         clock: Callable[[], float] = time.monotonic,
         observer: ToolObserver = _default_observer,
@@ -477,6 +479,13 @@ class AgentLoop:
         self._max_wall_clock_seconds = max_wall_clock_seconds
         self._max_budget_windows = max_budget_windows
         self._token_budget = token_budget
+        # Total-request fit budget (2026-08 fix): the absolute token cap on the
+        # FULL canonical list handed to `send_turn`, applied in
+        # `_build_canonical_messages` as the final step so the base prompt is never
+        # front-truncated out of the model window. `None` (Layer-1 loop tests that
+        # do not wire it) disables the fit step — byte-identical to before it
+        # existed. `app.py` wires `settings.request_token_budget()`.
+        self._request_token_budget = request_token_budget
         self._max_tool_calls_per_iteration = max_tool_calls_per_iteration
         self._clock = clock
         self._observer = observer
@@ -699,6 +708,50 @@ class AgentLoop:
         in_scope_messages = scope_filter.filter_messages(doc.messages, column_scope)
         for turn_message in in_scope_messages:
             canonical.append({"role": turn_message.role, "content": turn_message.content})
+
+        # Total-request fit (2026-08 fix, the core of this change): the assembled
+        # list above has no total token budget of its own — the trail compaction
+        # bounds only the trail, and the base prompt / retrieval+summary context /
+        # appended conversation are all added afterward, so after N turns the FULL
+        # request grew past the model context window. Sent as an ordinary LEADING
+        # message, the base prompt was then FRONT-truncated out first (the dropped
+        # system-prompt bug). Fit the whole list to `request_token_budget` here —
+        # the single site every `send_turn` payload passes through — dropping the
+        # OLDEST middle units (oldest trail pairs / conversation turns) while
+        # pinning the base prompt at [0] and the current question at the tail, and
+        # preserving assistant<->tool pairing. Never silent: a drop is logged
+        # (structured) and emitted as a guardrail span event. `None` budget (loop
+        # tests that do not wire it) skips the fit entirely (byte-identical).
+        if self._request_token_budget is not None:
+            fit = fit_request_to_budget(canonical, token_budget=self._request_token_budget)
+            if fit.dropped_messages:
+                _logger.warning(
+                    "request-budget trim (session=%s): dropped %d message-unit(s) "
+                    "(%d messages, ~%d tokens; by kind: %s) to fit the model window "
+                    "(budget=%d tokens, kept ~%d tokens)",
+                    session_id,
+                    fit.dropped_units,
+                    fit.dropped_messages,
+                    fit.dropped_tokens,
+                    dict(fit.dropped_by_kind),
+                    self._request_token_budget,
+                    fit.kept_tokens,
+                )
+                self._observer(
+                    "loop_request_budget_trimmed",
+                    {
+                        "dropped_units": fit.dropped_units,
+                        "dropped_messages": fit.dropped_messages,
+                        "dropped_tokens": fit.dropped_tokens,
+                        "dropped_conversation": fit.dropped_by_kind.get("conversation", 0),
+                        "dropped_trail": fit.dropped_by_kind.get("trail", 0),
+                        "dropped_retrieval": fit.dropped_by_kind.get("retrieval", 0),
+                        "dropped_summary": fit.dropped_by_kind.get("summary", 0),
+                        "kept_tokens": fit.kept_tokens,
+                        "budget": self._request_token_budget,
+                    },
+                )
+            canonical = fit.messages
         return canonical
 
     async def _compute_turn_provenance_union(

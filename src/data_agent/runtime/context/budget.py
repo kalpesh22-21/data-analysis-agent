@@ -32,11 +32,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from data_agent.runtime.dispatch.denial_mapping import classify_denial
+from data_agent.runtime.retrieval.render import _USER_CONTEXT_PREFIX as _RETRIEVAL_CONTEXT_PREFIX
 from data_agent.runtime.session.models import TrailEntry
 
 Summarizer = Callable[[Sequence[TrailEntry]], str]
@@ -127,10 +128,21 @@ def _split_for_budget(
     cutoff_index = len(trail)  # index (exclusive) where verbatim entries start
 
     # Walk newest-first, accumulate until the budget would be exceeded.
+    #
+    # Part 3 fix (2026-08): the newest entry is NO LONGER force-kept verbatim when
+    # it alone exceeds `token_budget`. The old guard (`if verbatim and ...`) always
+    # admitted the FIRST (newest) entry regardless of size, so one giant entry
+    # (e.g. an un-truncated getTableSchema ~30k tokens) survived verbatim and blew
+    # the budget the walk is meant to enforce. Dropping the guard means an
+    # over-budget newest entry falls into `summarized` instead — it is still kept
+    # in a BOUNDED form (folded into the compaction summary), just not verbatim, so
+    # the compacted trail is actually bounded by `token_budget`. Combined with the
+    # per-result cap (dispatch/tool_dispatcher.py::_build_preview) the newest entry
+    # is no longer 30k in practice; this keeps the walk correct even if one is.
     for i in range(len(trail) - 1, -1, -1):
         entry = trail[i]
         size = _entry_render_size(entry, preview_row_count)
-        if verbatim and running_tokens + size > token_budget:
+        if running_tokens + size > token_budget:
             cutoff_index = i + 1
             break
         running_tokens += size
@@ -301,3 +313,190 @@ def render_messages(
     for entry in compaction.verbatim:
         messages.append(_render_entry(entry, preview_row_count))
     return messages
+
+
+# --- Total-request token budget (2026-08 fix) ---------------------------------
+# The trail compaction above bounds ONLY the tool trail. The FULL canonical
+# request that `ModelClient.send_turn` receives is trail + base prompt +
+# retrieval/summary context + the appended conversation history + the current
+# question — and it had NO total budget, so after N turns it grew past the model
+# context window. Because the base prompt is sent as an ordinary LEADING message
+# (not a protected param), an over-window request lets the endpoint FRONT-truncate
+# the base prompt out first (production trace: messages[0] became an assistant
+# tool_call). `fit_request_to_budget` is the final fit step
+# (`loop/agent_loop.py::_build_canonical_messages`, right before send_turn) that
+# bounds the whole list while pinning the base prompt and the current question.
+
+
+def estimate_message_tokens(message: Mapping[str, Any]) -> int:
+    """Token estimate for one canonical `send_turn` message — reuses the SAME
+    chars/4 heuristic (`_estimate_tokens`) the trail budget walk uses, so the fit
+    step and the compaction walk agree on token cost and there is only one
+    estimator to swap for a real tokenizer later."""
+    return _estimate_tokens(json.dumps(message, default=str))
+
+
+@dataclass(frozen=True)
+class RequestFitResult:
+    """The outcome of one `fit_request_to_budget` call."""
+
+    messages: list[dict[str, Any]]  # the trimmed (or original) canonical list
+    dropped_units: int  # message-UNITS dropped (a tool_call/tool pair counts as 1)
+    dropped_messages: int  # raw messages dropped (a pair counts as 2)
+    dropped_tokens: int  # approx tokens dropped
+    kept_tokens: int  # approx tokens in the returned list (<= token_budget when possible)
+    # By-KIND breakdown of dropped units (see `_unit_kind`) so trimming is visible
+    # in telemetry — e.g. {"conversation": 3, "trail": 5}. Only non-zero kinds are
+    # present; an empty dict means nothing was dropped.
+    dropped_by_kind: Mapping[str, int]
+
+
+# Unit kinds, in DROP-PRIORITY order (lower index = dropped FIRST). Stale
+# conversation turns and old trail pairs go before the CURRENT question's
+# retrieval-cards block (candidate blueprints + knowledge + access rules) and the
+# compaction summary, which are the most useful middle content under tight
+# context — so those are dropped only if still over budget after the rest is gone.
+_UNIT_KIND_CONVERSATION = "conversation"
+_UNIT_KIND_TRAIL = "trail"
+_UNIT_KIND_SUMMARY = "summary"
+_UNIT_KIND_RETRIEVAL = "retrieval"
+_DROP_PRIORITY: dict[str, int] = {
+    _UNIT_KIND_CONVERSATION: 0,
+    _UNIT_KIND_TRAIL: 0,
+    _UNIT_KIND_SUMMARY: 1,
+    _UNIT_KIND_RETRIEVAL: 1,
+}
+
+
+def _fit_units(
+    messages: list[dict[str, Any]], head_end: int, tail_start: int
+) -> list[tuple[int, int]]:
+    """Group the droppable middle `messages[head_end:tail_start)` into
+    pairing-preserving UNITS (half-open `(start, end)` index ranges):
+
+      * an assistant message carrying `tool_calls` + its immediately following
+        `tool` result message(s) form ONE atomic unit — dropped/kept together so a
+        `tool` message is never orphaned from its announcing assistant and vice
+        versa (invariant 4);
+      * every other message (a `user` retrieval/summary/conversation message, a
+        plain assistant answer) is its own single-message unit.
+    """
+    units: list[tuple[int, int]] = []
+    i = head_end
+    while i < tail_start:
+        if messages[i].get("role") == "assistant" and messages[i].get("tool_calls"):
+            j = i + 1
+            while j < tail_start and messages[j].get("role") == "tool":
+                j += 1
+            units.append((i, j))
+            i = j
+        else:
+            units.append((i, i + 1))
+            i += 1
+    return units
+
+
+def _unit_kind(messages: list[dict[str, Any]], start: int, end: int) -> str:
+    """Classify a droppable unit for drop-priority + telemetry:
+
+      * `trail`        — an assistant `tool_calls` + `tool` result pair;
+      * `retrieval`    — the current question's retrieved-context `user` block
+                         (candidate blueprints/knowledge), detected by its prefix;
+      * `summary`      — the compaction summary `user` block (its prefix);
+      * `conversation` — anything else (a prior-turn user/assistant exchange).
+    """
+    first = messages[start]
+    if first.get("role") == "assistant" and first.get("tool_calls"):
+        return _UNIT_KIND_TRAIL
+    if first.get("role") == "user" and end - start == 1:
+        content = first.get("content")
+        if isinstance(content, str):
+            if content.startswith(_RETRIEVAL_CONTEXT_PREFIX):
+                return _UNIT_KIND_RETRIEVAL
+            if content.startswith(_SUMMARY_CONTEXT_PREFIX):
+                return _UNIT_KIND_SUMMARY
+    return _UNIT_KIND_CONVERSATION
+
+
+def fit_request_to_budget(
+    messages: list[dict[str, Any]], *, token_budget: int
+) -> RequestFitResult:
+    """Fit the FULL canonical request to `token_budget` while honoring the
+    send-seam invariants:
+
+      1. the base prompt (the leading run of `role:"system"` messages) is NEVER
+         dropped or truncated — it is pinned as the head;
+      2. the returned list never exceeds `token_budget` tokens WHEN that is
+         achievable without violating (1) or (3) — only the middle is droppable;
+      3. the current question (the LAST `user` message) is NEVER dropped — it and
+         anything after it are pinned as the tail;
+      4. assistant `tool_calls` <-> `tool` result pairing is preserved (units are
+         dropped/kept atomically, see `_fit_units`);
+      5. under pressure the droppable middle goes in DROP-PRIORITY order, not pure
+         position: the oldest CONVERSATION turns and oldest TRAIL pairs first
+         (tier 0), and only if still over budget the current question's RETRIEVAL
+         cards block + the compaction SUMMARY (tier 1) — those carry this
+         question's blueprint candidates / knowledge / access rules and are the
+         most useful middle content, so they survive longest. Within a tier the
+         OLDEST unit (lowest position) goes first, keeping the most recent context.
+
+    The head (base prompt) and tail (current question) are never dropped, so in the
+    pathological corner where those two ALONE exceed `token_budget` the result may
+    still exceed it — correctness of invariants 1+3 takes precedence over 2 (the
+    base prompt and the live question must survive). In practice both are tiny.
+    """
+    sizes = [estimate_message_tokens(m) for m in messages]
+    total = sum(sizes)
+    n = len(messages)
+    if total <= token_budget or n == 0:
+        return RequestFitResult(list(messages), 0, 0, 0, total, {})
+
+    # Pin the leading run of `system` messages (the base prompt lives at index 0).
+    head_end = 0
+    while head_end < n and messages[head_end].get("role") == "system":
+        head_end += 1
+
+    # Pin the tail: from the LAST `user` message (the current question) to the end.
+    # `no_user_message` → tail_start stays `n` (an EMPTY tail slice `messages[n:]`),
+    # so NOTHING is pinned as the tail and everything after the head is droppable
+    # via whole units. That is what keeps a list ending in a `tool` result from
+    # pinning that lone tool while its announcing assistant unit stays droppable
+    # (which would orphan the tool and break invariant 4). The wired path always
+    # has the current question, so this corner is public-API-only.
+    tail_start = n
+    for i in range(n - 1, head_end - 1, -1):
+        if messages[i].get("role") == "user":
+            tail_start = i
+            break
+
+    units = _fit_units(messages, head_end, tail_start)
+    unit_sizes = [sum(sizes[k] for k in range(s, e)) for (s, e) in units]
+    kinds = [_unit_kind(messages, s, e) for (s, e) in units]
+
+    # Consideration order: by drop-priority tier (0 before 1), then by position
+    # (oldest first) within a tier — a stable sort on (tier, index).
+    order = sorted(range(len(units)), key=lambda u: (_DROP_PRIORITY[kinds[u]], u))
+
+    keep = [True] * len(units)
+    running = total
+    dropped_units = dropped_messages = dropped_tokens = 0
+    dropped_by_kind: dict[str, int] = {}
+    for u in order:
+        if running <= token_budget:
+            break
+        s, e = units[u]
+        keep[u] = False
+        running -= unit_sizes[u]
+        dropped_tokens += unit_sizes[u]
+        dropped_messages += e - s
+        dropped_units += 1
+        dropped_by_kind[kinds[u]] = dropped_by_kind.get(kinds[u], 0) + 1
+
+    fitted: list[dict[str, Any]] = list(messages[:head_end])
+    for idx, (s, e) in enumerate(units):
+        if keep[idx]:
+            fitted.extend(messages[s:e])
+    fitted.extend(messages[tail_start:])
+    return RequestFitResult(
+        fitted, dropped_units, dropped_messages, dropped_tokens, running, dropped_by_kind
+    )

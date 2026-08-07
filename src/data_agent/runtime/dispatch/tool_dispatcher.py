@@ -39,6 +39,7 @@ scans every `ToolResult` field for the JWT/session_id substrings.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -133,7 +134,77 @@ class ToolResult:
     authoritative: bool = False
 
 
-def _build_preview(raw_result: Any, preview_row_count: int) -> ResultPreview:
+# Default per-result token cap for the stored preview (RuntimeSettings.
+# max_tool_result_tokens overrides it). The estimator below is intentionally a
+# byte-identical copy of context/budget.py::_estimate_tokens (chars/4) — the two
+# modules cannot share the import (dispatch/__init__ eagerly imports this module,
+# and budget.py transitively imports dispatch, so a direct import cycles). A
+# parity test (`tests/runtime/dispatch/test_tool_dispatcher.py`) pins the two
+# implementations together so a future tokenizer swap must update both.
+_DEFAULT_MAX_TOOL_RESULT_TOKENS = 4_000
+
+
+def _estimate_tokens(text: str) -> int:
+    """chars/4 token estimate — a byte-identical copy of context/budget.py::
+    `_estimate_tokens` (see the module note above on why it cannot be imported), so
+    the per-result cap and the trail budget walk measure token cost identically. A
+    parity test locks the two together."""
+    return max(1, len(text) // 4)
+
+
+def _cap_nontabular_result(raw_result: Any, max_result_tokens: int) -> tuple[Any, bool]:
+    """Bound a non-tabular tool result stored as ONE preview cell (esp. a wide
+    `getTableSchema`) so it can never be a 30k-token blob that survives the
+    row-count-only trail budget. Returns `(capped_value, truncated)`.
+
+    Truncation keeps the output VALID + parseable (never a broken JSON blob):
+      * a `{... "columns": [...]}` dict (getTableSchema) keeps the HEAD of the
+        column list — as many leading columns as fit under the cap — and adds a
+        `"_truncated"` marker naming how many of how many columns were omitted, so
+        the model sees a still-valid schema and knows to re-fetch/narrow if it
+        needs a dropped column;
+      * any other over-cap value is rendered to a string and truncated at the cap
+        with a `…[truncated: N of M chars omitted]` marker (a valid string cell).
+
+    Under the cap the value is returned unchanged (`truncated=False`) — byte-
+    identical to before this cap existed for every normal-sized schema/result.
+    """
+    rendered = json.dumps(raw_result, default=str)
+    if _estimate_tokens(rendered) <= max_result_tokens:
+        return raw_result, False
+
+    if isinstance(raw_result, dict) and isinstance(raw_result.get("columns"), list):
+        columns = raw_result["columns"]
+        total_columns = len(columns)
+        base = {k: v for k, v in raw_result.items() if k != "columns"}
+        kept: list[Any] = []
+        for column in columns:
+            trial = {**base, "columns": [*kept, column]}
+            if _estimate_tokens(json.dumps(trial, default=str)) > max_result_tokens:
+                break
+            kept.append(column)
+        omitted = total_columns - len(kept)
+        capped = {**base, "columns": kept}
+        capped["_truncated"] = (
+            f"…[truncated: {omitted} of {total_columns} columns omitted — "
+            f"re-fetch getTableSchema or narrow if you need an omitted column]"
+        )
+        return capped, True
+
+    # Generic over-cap value: keep a valid, truncated STRING cell with a marker.
+    char_cap = max_result_tokens * 4
+    truncated_str = (
+        rendered[:char_cap]
+        + f"…[truncated: {len(rendered) - char_cap} of {len(rendered)} chars omitted]"
+    )
+    return truncated_str, True
+
+
+def _build_preview(
+    raw_result: Any,
+    preview_row_count: int,
+    max_result_tokens: int = _DEFAULT_MAX_TOOL_RESULT_TOKENS,
+) -> ResultPreview:
     """Build the `{columns, row_count, truncated, preview_rows}` preview object.
 
     Handles the three MCP result shapes actually returned by the six tools
@@ -141,9 +212,10 @@ def _build_preview(raw_result: Any, preview_row_count: int) -> ResultPreview:
       - `{columns, rows, row_count, truncated}` (runQuery/sampleRows/explainQuery)
       - a bare list of dicts (listDatabases/listTables)
       - a small non-tabular dict (getTableSchema: `{database, table, columns}`)
-    The last two never grow unbounded (no PII-row exposure risk), so they are
-    previewed whole rather than truncated to N; only the first (row-oriented)
-    shape enforces the N-row preview cap.
+    The row/list shapes enforce the N-row preview cap. The non-tabular dict is
+    additionally SIZE-capped to `max_result_tokens` (a wide getTableSchema with
+    100+ columns is otherwise stored as one unbounded ~30k-token cell that the
+    row-count-only trail budget never trims) — see `_cap_nontabular_result`.
     """
     if isinstance(raw_result, dict) and "rows" in raw_result and "columns" in raw_result:
         rows = raw_result["rows"]
@@ -163,8 +235,9 @@ def _build_preview(raw_result: Any, preview_row_count: int) -> ResultPreview:
             truncated=len(raw_result) > preview_row_count,
             preview_rows=[[item] for item in preview_rows],
         )
-    # Small non-tabular dict (e.g. getTableSchema) — no row-level truncation.
-    return ResultPreview(columns=[], row_count=1, truncated=False, preview_rows=[[raw_result]])
+    # Small non-tabular dict (e.g. getTableSchema) — size-capped, not row-capped.
+    capped, truncated = _cap_nontabular_result(raw_result, max_result_tokens)
+    return ResultPreview(columns=[], row_count=1, truncated=truncated, preview_rows=[[capped]])
 
 
 class ToolDispatcher:
@@ -176,6 +249,7 @@ class ToolDispatcher:
         catalog: CatalogHandle | CatalogProvider,
         *,
         preview_row_count: int = 20,
+        max_tool_result_tokens: int = _DEFAULT_MAX_TOOL_RESULT_TOKENS,
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
         disable_redaction: bool = False,
@@ -188,6 +262,10 @@ class ToolDispatcher:
         # are cheap.
         self._catalog = catalog
         self._preview_row_count = preview_row_count
+        # Per-result preview SIZE cap (tokens): bounds a single stored tool result
+        # (esp. a wide getTableSchema) so it cannot balloon the trail. See
+        # `_cap_nontabular_result`.
+        self._max_tool_result_tokens = max_tool_result_tokens
         self._observer = observer
         # B5: optional — when a real tracer is wired (app.py's composition
         # root), dispatch() emits one TOOL span per call, SQL-literal-masked
@@ -320,7 +398,9 @@ class ToolDispatcher:
         provenance = await capture_provenance(
             tool_name, model_args, catalog, session_id=credentials.session_id
         )
-        preview = _build_preview(raw_result, self._preview_row_count)
+        preview = _build_preview(
+            raw_result, self._preview_row_count, self._max_tool_result_tokens
+        )
 
         self._observer("tool_dispatch_ok", {"tool_name": tool_name})
         self._emit_tool_span(

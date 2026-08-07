@@ -463,6 +463,9 @@ def create_app(
             mcp_client,
             catalog_provider,
             preview_row_count=settings.preview_row_count,
+            # Per-result preview size cap (2026-08 fix): bounds a single stored tool
+            # result (esp. a wide getTableSchema) so the trail cannot balloon.
+            max_tool_result_tokens=settings.max_tool_result_tokens,
             observer=observer,
             tracer=tracer,
             # Access-controlled TELEMETRY DEBUG switch: when set, the TOOL span
@@ -593,6 +596,10 @@ def create_app(
             max_wall_clock_seconds=settings.max_wall_clock_seconds,
             max_budget_windows=settings.max_budget_windows,
             token_budget=settings.model_context_window,
+            # Total-request fit budget (2026-08 fix): the FULL canonical request is
+            # fit to (model_context_window - response_token_reserve) before every
+            # send_turn so the leading base prompt is never front-truncated out.
+            request_token_budget=settings.request_token_budget(),
             max_tool_calls_per_iteration=settings.max_tool_calls_per_iteration,
             observer=observer,
             runtime_tools=runtime_tools,
