@@ -1,5 +1,5 @@
 {
-  "catalog_sha": "64512dd014e78e62e74278c917f166e3c7637a17",
+  "catalog_sha": "1d86876cf150f1ce92d991ca849aa05f80caaa06",
   "catalog": {
     "dbpcm_warehouse.accrual_events": {
       "database": "dbpcm_warehouse",
@@ -1694,7 +1694,8 @@
         "department_code": {
           "type": "Nullable(String)",
           "description": "Employee home Department code. This is the code assigned to the department within company maintenance and is related to labor allocations.",
-          "client_defined": true
+          "client_defined": true,
+          "description_col": "department_name"
         },
         "department_name": {
           "type": "Nullable(String)",
@@ -1889,7 +1890,8 @@
         "manager_level_code": {
           "type": "Nullable(String)",
           "description": "The Manager Level code is a hierarchical classification indicating a user's managerial authority tier for routing approval workflows, security permissions, and escalation chains.",
-          "client_defined": true
+          "client_defined": true,
+          "description_col": "manager_level_description"
         },
         "manager_level_description": {
           "type": "Nullable(String)",
@@ -2069,7 +2071,8 @@
         "paycode_profile_code": {
           "type": "Nullable(String)",
           "description": "A unique 3 digit alphanumeric code provided by the user that is set when creating a Benefit Eligibility Profile.",
-          "client_defined": true
+          "client_defined": true,
+          "description_col": "paycode_profile_description"
         },
         "paycode_profile_description": {
           "type": "Nullable(String)",

@@ -54,7 +54,7 @@ RESOLVE_VALUES_TOOL_SCHEMA: dict[str, Any] = {
         "Resolve a fuzzy business CONCEPT to the concrete, client-specific values of a "
         "code/category column, ranked by how well each value matches the concept and how "
         "frequently it occurs for THIS client. Use this for client-defined or time-varying "
-        "code spaces (e.g. EarnCode, TypeCode, department codes) where the exact codes differ "
+        "code spaces (e.g. earn_code, type_code, department codes) where the exact codes differ "
         "per client and drift over time — never hardcode such codes. Prefer this over sampleRows "
         "when you need the values that mean a concept (e.g. 'PTO earn codes'), not a raw sample. "
         "Each result has a `score` (0-1); if the top scores are low or clustered (no clear "
@@ -76,7 +76,7 @@ RESOLVE_VALUES_TOOL_SCHEMA: dict[str, Any] = {
             },
             "column": {
                 "type": "string",
-                "description": "The code/category column to resolve values for, e.g. 'EarnCode'.",
+                "description": "The code/category column to resolve values for, e.g. 'earn_code'.",
             },
             "concept": {
                 "type": "string",

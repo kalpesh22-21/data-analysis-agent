@@ -257,3 +257,55 @@ def test_real_catalog_convention_still_works_for_earn_code() -> None:
     catalog = fixture_catalog_handle()
     target = resolve_target(catalog, table=_ACC, column="earn_code", period=None)
     assert target.description_col == "earn_description"
+
+
+# ---------------------------------------------------------------------------
+# 6b. Real-catalog employee code columns — the AUTHORED `description_col` links
+#     now declared in the MCP semantic catalog (flowing into the export fixture).
+#     These siblings are NOT convention matches (a `_code` suffix is not stripped
+#     to `_name`/`_description`), so ONLY the authored linkage discovers them.
+# ---------------------------------------------------------------------------
+
+_EMP = "dbpcm_warehouse.employee"
+
+
+def test_real_catalog_employee_department_code_discovers_declared_name() -> None:
+    catalog = fixture_catalog_handle()
+    # The link is AUTHORED, not convention-derived — confirm it at the source.
+    assert catalog.description_col_for(_EMP, "department_code") == "department_name"
+    target = resolve_target(catalog, table=_EMP, column="department_code", period=None)
+    assert target.description_col == "department_name"
+    assert "department_name" in build_sql(target, period=None, limit=200)
+
+
+def test_real_catalog_employee_manager_level_code_discovers_declared_description() -> None:
+    catalog = fixture_catalog_handle()
+    assert (
+        catalog.description_col_for(_EMP, "manager_level_code")
+        == "manager_level_description"
+    )
+    target = resolve_target(catalog, table=_EMP, column="manager_level_code", period=None)
+    assert target.description_col == "manager_level_description"
+    assert "manager_level_description" in build_sql(target, period=None, limit=200)
+
+
+def test_real_catalog_employee_paycode_profile_code_discovers_declared_description() -> None:
+    catalog = fixture_catalog_handle()
+    assert (
+        catalog.description_col_for(_EMP, "paycode_profile_code")
+        == "paycode_profile_description"
+    )
+    target = resolve_target(catalog, table=_EMP, column="paycode_profile_code", period=None)
+    assert target.description_col == "paycode_profile_description"
+    assert "paycode_profile_description" in build_sql(target, period=None, limit=200)
+
+
+def test_real_catalog_employee_convention_only_columns_have_no_sibling() -> None:
+    """Regression: code columns with NO authored sibling AND no convention match
+    stay value-only. Confirms the authored links above did not broaden linking to
+    every `_code` column on the table."""
+    catalog = fixture_catalog_handle()
+    for column in ("union_code", "position_code"):
+        assert catalog.description_col_for(_EMP, column) is None
+        target = resolve_target(catalog, table=_EMP, column=column, period=None)
+        assert target.description_col is None

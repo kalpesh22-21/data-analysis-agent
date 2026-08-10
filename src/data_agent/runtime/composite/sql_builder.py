@@ -28,9 +28,18 @@ from sqlglot import exp
 from data_agent.runtime.context.scope_filter import is_provenance_in_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 
-# Ordered description-column candidate transforms (design §2.3). `<Base>` is the
-# code column with a trailing "Code" stripped (EarnCode -> Earn -> EarnDescription).
-_DESCRIPTION_SUFFIXES = ("Description", "Name")
+# Ordered description-column candidate transforms (design §2.3). Two naming
+# families are generated. Snake_case (production reality) FIRST: strip a single
+# trailing "_code"/"_id" segment to a base and append "_description"/"_label"/
+# "_name" (earn_code -> earn -> earn_description; field_id -> field -> field_label),
+# plus the un-stripped column + suffix to catch type_code -> type_code_description.
+# PascalCase (kept for pre-existing catalogs): strip a trailing "Code" and append
+# "Description"/"Name" (EarnCode -> Earn -> EarnDescription). Every candidate is
+# still catalog-validated and scope-pre-checked in `resolve_target`, so
+# over-generating is safe.
+_SNAKE_DESCRIPTION_SUFFIXES = ("_description", "_label", "_name")
+_SNAKE_CODE_SEGMENTS = ("_code", "_id")
+_PASCAL_DESCRIPTION_SUFFIXES = ("Description", "Name")
 
 
 class TargetValidationError(Exception):
@@ -72,17 +81,37 @@ class ResolvedTarget:
 
 
 def _candidate_description_columns(column: str) -> list[str]:
-    base = column[: -len("Code")] if column.endswith("Code") else column
+    """Convention-based sibling description/label column candidates (design §2.3).
+
+    Pure. Generates a snake_case family (production reality) followed by a
+    PascalCase family (kept for pre-existing catalogs/tests), de-duplicated
+    preserving first-seen order. A candidate can never equal *column* itself.
+    """
     candidates: list[str] = []
-    for suffix in _DESCRIPTION_SUFFIXES:
-        candidates.append(f"{base}{suffix}")
-        if base != column:
+
+    # Snake_case family (first): strip a single trailing "_code"/"_id" segment.
+    snake_base = column
+    for segment in _SNAKE_CODE_SEGMENTS:
+        if column.endswith(segment) and len(column) > len(segment):
+            snake_base = column[: -len(segment)]
+            break
+    for suffix in _SNAKE_DESCRIPTION_SUFFIXES:
+        if snake_base != column:
             candidates.append(f"{column}{suffix}")
-    # De-dup while preserving order.
+        candidates.append(f"{snake_base}{suffix}")
+
+    # PascalCase family: strip a trailing "Code".
+    pascal_base = column[: -len("Code")] if column.endswith("Code") else column
+    for suffix in _PASCAL_DESCRIPTION_SUFFIXES:
+        candidates.append(f"{pascal_base}{suffix}")
+        if pascal_base != column:
+            candidates.append(f"{column}{suffix}")
+
+    # De-dup while preserving order; never emit the input column itself.
     seen: set[str] = set()
     ordered: list[str] = []
     for candidate in candidates:
-        if candidate not in seen:
+        if candidate != column and candidate not in seen:
             seen.add(candidate)
             ordered.append(candidate)
     return ordered
