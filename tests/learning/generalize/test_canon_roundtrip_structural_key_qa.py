@@ -21,8 +21,11 @@ in ways no round-trip can simulate (that is what gaps (a)-(d) in
 lower bound — the match rate when the learning tier sees the identical query — and it is
 measured through production code rather than a regex.
 
-Measured result: 8 of 10 canon blueprints round-trip to their own structural key. The two
-that do not are pinned individually below with the reason.
+Measured result: every canon blueprint round-trips to its own structural key EXCEPT two
+(`_KNOWN_ROUNDTRIP_MISSES`), which are pinned individually below with the reason. That
+was 8 of 10 when first measured and is 9 of 11 since plan §2b extracted
+`bp-employee-check-detail-for-period`; the ratio moves with corpus size, the miss SET
+does not, so the miss set is what is asserted.
 """
 
 from __future__ import annotations
@@ -35,6 +38,10 @@ import pytest
 
 from data_agent.learning.generalize.rewrite import rewrite_sql_to_template
 from data_agent.runtime.blueprint.structural_key import structural_key_from_templates
+from data_agent.runtime.retrieval.corpus_loader import (
+    corpus_seeds_from_export,
+    resolve_blueprint_references,
+)
 
 _REAL_CANON_DIR = Path("/Users/kalpeshmulye/Development/clickhouse-api/app/corpus/data/blueprints")
 _SLOT_RE = re.compile(r"\{(\w+)\}")
@@ -59,12 +66,24 @@ def _yaml() -> Any:
 
 
 def _canon_docs() -> dict[str, Any]:
+    """The real canon YAMLs, with `composes[].ref` RESOLVED through the production
+    loader (plan §2b) so each doc carries the SQL its nodes actually run.
+
+    Resolving here is load-bearing, not tidiness. A referenced node has no
+    `sql_template` of its own until the loader inlines one, so reading the raw YAML
+    would silently drop those nodes from `_node_pairs` — and BOTH sides of the
+    round-trip use `_node_pairs`, so the comparison would still "pass" while measuring
+    a query neither tier runs."""
     if not _REAL_CANON_DIR.is_dir():
         pytest.skip(f"real MCP canon not checked out at {_REAL_CANON_DIR}")
-    docs = {}
+    raw = {}
     for path in sorted(_REAL_CANON_DIR.glob("bp-*.yaml")):
         doc = _yaml().safe_load(path.read_text())
-        docs[doc["id"]] = doc
+        raw[doc["id"]] = doc
+    seeds, _ = corpus_seeds_from_export({"blueprints": raw})
+    docs = dict(raw)
+    for seed in resolve_blueprint_references(seeds):
+        docs[seed.id] = {**raw[seed.id], "composes": seed.composes}
     return docs
 
 
@@ -158,21 +177,35 @@ def test_the_known_round_trip_misses_are_still_exactly_these_two(bp_id) -> None:
     assert _learning_twin_key(doc) != _canon_key(doc)
 
 
-def test_the_realistic_match_rate_is_eight_of_ten_not_ten_of_ten() -> None:
+def test_the_realistic_match_rate_is_all_but_the_two_known_rewriter_misses() -> None:
     """THE HEADLINE CORRECTION.
 
     The builder reported 10/10 against a hand-lowercased twin. Measured through the real
-    S4 rewriter over the real canon corpus, the rate is 8/10. The two-blueprint shortfall
-    is not a structural-key defect — it is the rewriter's inability to parameterize a slot
-    outside a comparison — but the honest number for "the learning tier saw this exact
-    query and recognized the canon blueprint" is 8/10, and it is an UPPER bound on real
-    performance because a real candidate's SQL also diverges in the ways gaps (a)-(d)
-    describe.
+    S4 rewriter over the real canon corpus, the rate was 8/10. The two-blueprint
+    shortfall is not a structural-key defect — it is the rewriter's inability to
+    parameterize a slot outside a comparison — but the honest number for "the learning
+    tier saw this exact query and recognized the canon blueprint" is that ratio, and it
+    is an UPPER bound on real performance because a real candidate's SQL also diverges
+    in the ways gaps (a)-(d) describe.
+
+    HISTORY, and why the number is no longer a literal. 8/10 became 9/11 when plan §2b
+    extracted `bp-employee-check-detail-for-period` from
+    `bp-compare-employee-check-detail-two-periods` — a corpus-size change, NOT a
+    measurement change. Pinning the two literals let a corpus edit look like a
+    regression in the rewriter and vice versa. What the finding actually claims is
+    "every canon blueprint round-trips EXCEPT the `_KNOWN_ROUNDTRIP_MISSES`", so that is
+    what is asserted, with the misses named. A rewriter regression still fails here (the
+    miss set grows); the earlier fixed ratio is recorded above so the delta stays
+    readable.
     """
     docs = _canon_docs()
-    assert len(docs) == 10
-    matched = sum(1 for doc in docs.values() if _learning_twin_key(doc) == _canon_key(doc))
-    assert matched == 8, f"round-trip match rate moved to {matched}/10"
+    assert len(docs) == 11
+    matched = {bid for bid, doc in docs.items() if _learning_twin_key(doc) == _canon_key(doc)}
+    assert matched == set(docs) - _KNOWN_ROUNDTRIP_MISSES, (
+        f"round-trip match set moved: {len(matched)}/{len(docs)} matched; "
+        f"unexpected misses {sorted(set(docs) - _KNOWN_ROUNDTRIP_MISSES - matched)}, "
+        f"unexpected hits {sorted(matched & _KNOWN_ROUNDTRIP_MISSES)}"
+    )
 
 
 def test_every_canon_blueprint_at_least_mints_a_key_on_both_sides() -> None:

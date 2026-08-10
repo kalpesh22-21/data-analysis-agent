@@ -30,6 +30,24 @@ The two compound: the loop pays a full extractor LLM call per session, produces 
 | `79d318a` | 1 | Shared `structural_key` — a looser cross-tier key than the frozen D48 one; real embedder wired into `DedupStage`; `status`/`source` on `CorpusArtifact` |
 | `f3c8949` | 1.x | Composite-path gaps between loop and runtime; the untrusted-JSON crash class |
 | `fcb1808` | 1.5 | Replay cached to ~12h; scan rotates on a `last_scanned_at` cursor; `stamp_drift` narrow write |
+| `7860f45` | 1.5 fix | Total scan ordering behind a 3-key index; retracted a self-heal claim the system didn't have |
+| `eebe516` | 2 | `PriorArtIndex` over the graph with the trust filter dropped; three-layer dedup; corpus status write-back |
+
+**Slice 2 verified end to end against live data**, not just fakes: a candidate re-deriving a canon blueprint produces `action='redundant_with_canon', layer='structural'`. The cross-authoring-path key holds — hand-written canon YAML (`SUM(...)`, grain `[Department]`) and an LLM-authored template (`sum(...)`, grain `{"columns":["department"]}`) mint the same digest, and that digest is what the graph stores.
+
+### Slice 2 follow-ups
+
+- **The N+1 embed is back, deliberately.** The soft layer scans the whole corpus bucket again because a correct expensive answer beats a cheap wrong one. The principled shrink is to scan only the not-yet-landed subset — impossible today, because `CorpusArtifact.status` is written solely by the terminal transitions, so a landed artifact still reads `extracted`. Recording a landed stamp is the enabling fix.
+- Untested: a stale-recipe split (canon re-derived under a new sqlglot while a landed learning node keeps an old digest). `structural_key_recipe` is stamped for exactly this and is still read by nothing.
+- Untested: over-fetch truncation when the terminal post-filter eats a page. 12 nodes can't exercise it.
+- Untested: two workers racing the same candidate through layers 2 and 3. Layer 1 is race-safe by hash construction; the others are not.
+
+### Dev-environment hazards (found while verifying slice 2)
+
+- **There is a concurrent writer on the dev graph.** `scripts/run_ui_runtime_real.py` has been up since mid-July holding a driver with the self-heal enabled; the graph mutates between consecutive read-only queries. Stop it before running destructive suites, and treat A/B live-test counts as noisy.
+- **Several live suites are destructive and some have no teardown.** `test_catalog_graph_live` wipes the graph and leaves a phantom node; `test_governed_corpus_live` leaves two clone nodes; `test_learning_corpus_landing_live` leaves a node the mcp-scoped GC can never reap.
+- **Never invent a corpus checksum to "restore" state.** `load_corpus` skips the entire embed-and-write when the stored sha equals the content sha, so a hand-written value can never match and every self-heal re-embeds the whole corpus. Seed with an empty sha and let the hydrator stamp the real one.
+- **Four live failures are stale assertions, not regressions.** `test_learning_corpus_landing_live` ×2 and `test_learning_knowledge_landing_live` ×2 assert "a landed blueprint must be recallable", which stopped being true when the trust gate began serving only the trusted partition. Worth fixing so the noise stops masking real failures.
 
 Unrelated, committed alongside: `048876a` (prompt decomposition step), `3f76784` (backend/UI contract doc).
 
@@ -105,13 +123,56 @@ The only genuinely missing read is neo4j. `learning_corpus` already covers in-fl
 
 **Prerequisite:** `CorpusArtifact` gained `status`/`source` in slice 1 but nothing writes them. Wire the scheduler's terminal transitions to stamp `status`, so rejected artifacts stop surfacing as live prior art.
 
-### 2b — Loader blueprint references *(parallel with 2)*
+### 2b — Loader blueprint references — **BUILT**
 
-- Reference field on the node; **load-time resolution and inlining**, executor untouched.
-- Topological resolution, depth cap, **cross-blueprint** cycle detection (today's is per-blueprint).
+Landed as `corpus_loader.resolve_blueprint_references` (the first step of `load_corpus`'s
+pre-write pass), `NODE_REF_KEY` + a reject-an-unresolved-reference backstop in
+`blueprint/models.py::Node.parse`, and a canon conversion: `bp-employee-check-detail-for-period`
+extracted from `bp-compare-employee-check-detail-two-periods`, whose nodes 0 and 1 now
+reference it with different `period` mappings.
+
+- Reference field on the node (`ref: {blueprint, slots}`); **load-time resolution and inlining**, executor untouched.
+- Topological resolution, depth cap (4), **cross-blueprint** cycle detection (today's is per-blueprint).
 - Slot mapping: parent slots → referenced blueprint's slots, plus collision rules. The fiddly part.
 - **`uses` union rule, fail-closed.** `uses` is *authored*, not derived, and it mints the JWT scope — `corpus_loader._validate_blueprint_uses` calls it "the design's own highest-risk contract". The loader must compute the union of referenced footprints and **refuse to load** when a composite declares less. Get this wrong and a composite silently reads columns outside its declared scope. **This wants a security review, not a code review.**
 - A reference to a missing or retracted blueprint fails the load.
+
+Decisions taken while building, each deliberate:
+
+* **A reference target must resolve to exactly ONE SQL statement** — a leaf, or a
+  single-node composite. Splicing a multi-node child would mean renumbering orders,
+  rewiring `feeds_from`/`consumes`, and merging the sink's `when`/`output` with the
+  referencing node's; each merge is a place a control-flow gate can be dropped silently.
+  The single-node-composite case is what makes a reference CHAIN possible at all (a leaf
+  holds no nodes and therefore no `ref`), which is what keeps the depth cap and the
+  cross-blueprint cycle check live rules rather than dead code.
+* **No implicit slot identity, ever** — `employee: employee` must still be written. Slots
+  resolve once per blueprint before the DAG walk, so after inlining only the PARENT's slot
+  declaration exists; an implicit bind would let a parent-side rename silently re-point a
+  referenced filter at a different domain. Arity mismatch (`period_range` ⇄ scalar) is a
+  hard error; a `type`/`binds_to` divergence is a warning, since the parent is the
+  authority on its own slots either way.
+* **A dead mapping is an error**, not a no-op — an author believing a filter is applied
+  when it is not is the D56 wrong-answer class arriving from the other direction.
+* **Rules are NOT inherited.** A referenced template's `resolve_via` bind name must be
+  re-declared by the composite, for the same reason `uses` is authored: a rule fires a
+  warehouse probe, and a composite must state every probe it causes.
+* **Two gates the requirement list did not name**, both derived from what the child's SQL
+  can reach: a reference may not cross the `source` trust partition (inlining copies SQL,
+  so an `mcp` composite pulling from the `learning` staging tier would launder unverified
+  SQL into the partition recall serves), and a referenced template may not read
+  `scratch.*` (nothing in the referencing DAG can materialize it, and
+  `_assert_source_tables_in_uses` deliberately skips `scratch.*` — so the escape would be
+  a scope check passing on a table that does not exist).
+
+**Correction to the framing above.** `uses` does not mint the *runtime* query's JWT — the
+caller's `column_scope` does, and the MCP enforces it server-side. What `uses` actually
+governs is (a) the recall scope pre-filter, which drops a blueprint whose `uses` ⊄ the
+caller's scope, and (b) `promotion/token_minter.mint(column_scope=<uses>)`, the offline
+golden-replay token. So the concrete exposure of under-declaring is that a composite is
+OFFERED to users whose scope does not cover what it reads (the pre-filter silently
+defeated), not that the query gains access it would not otherwise have. The union rule is
+still right and still fail-closed; the reason is narrower than "privilege escalation".
 
 ### 3 — Extractor *(sub-sliced; the prompt and tool schema are rewritten once each)*
 

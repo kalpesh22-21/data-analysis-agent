@@ -32,7 +32,9 @@ from data_agent.runtime.retrieval.corpus_loader import (
     KnowledgeSeed,
     _dag_properties,
     _validate_blueprint_dag,
+    corpus_seeds_from_export,
     load_corpus,
+    resolve_blueprint_references,
 )
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "corpus"
@@ -347,36 +349,24 @@ def test_every_real_canon_blueprint_mints_a_distinct_structural_key() -> None:
     """The builder's 10/10 claim, verified against the REAL MCP canon files rather than
     the mirror. This is the assertion that actually protects production: a canon
     blueprint with no structural key is invisible to cross-tier prior-art matching, and
-    two canon blueprints sharing one key would be false prior art for each other."""
+    two canon blueprints sharing one key would be false prior art for each other.
+
+    HISTORY: 10 became 11 when plan §2b extracted
+    `bp-employee-check-detail-for-period` from
+    `bp-compare-employee-check-detail-two-periods`. The seeds are built through the
+    PRODUCTION projection + resolver (`corpus_seeds_from_export` →
+    `resolve_blueprint_references`) rather than a local `node_pairs` reader, and that
+    swap is the point of the edit, not incidental: a `composes` node may now name
+    another blueprint instead of carrying SQL, so a hand-rolled reader would skip those
+    nodes and compute a key for a DIFFERENT query than the loader stores — the same
+    class of silent mirror drift this file exists to catch. Measured: the composite's
+    key is byte-identical before and after the extraction."""
     canon = _real_canon_docs()
-    assert len(canon) == 10
+    assert len(canon) == 11
 
-    def node_pairs(doc: dict[str, Any]) -> list[tuple[int, str]]:
-        pairs = []
-        for node in doc.get("composes") or []:
-            if not isinstance(node, dict):
-                continue
-            template, order = node.get("sql_template"), node.get("order")
-            if not isinstance(template, str) or not template.strip():
-                continue
-            if not isinstance(order, int) or isinstance(order, bool):
-                continue
-            pairs.append((order, template))
-        return pairs
-
-    seeds = [
-        BlueprintSeed(
-            id=bid,
-            intent=doc.get("intent", ""),
-            slots_summary="",
-            uses=list(doc.get("uses") or ["a.b.c"]),
-            result_grain=doc.get("result_grain"),
-            sql_template=doc.get("sql_template"),
-            composes=[{"order": o, "sql_template": t} for o, t in node_pairs(doc)],
-        )
-        for bid, doc in sorted(canon.items())
-    ]
-    keys = {bp.id: _dag_properties(bp)["structural_key"] for bp in seeds}
+    seeds, _ = corpus_seeds_from_export({"blueprints": canon})
+    assert len(seeds) == len(canon), "the export projection dropped a canon blueprint"
+    keys = {bp.id: _dag_properties(bp)["structural_key"] for bp in resolve_blueprint_references(seeds)}
 
     keyless = [bid for bid, key in keys.items() if not key]
     assert not keyless, f"real canon blueprints with NO structural key: {keyless}"

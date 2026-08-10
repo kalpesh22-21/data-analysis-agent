@@ -60,6 +60,14 @@ def slot_type_gloss(type_: Any) -> str:
 
 
 NODE_KINDS: frozenset[str] = frozenset({"query", "approval"})  # D59c (`guard` cut)
+# The kind a node has when it declares none — an ordinary query step, gating nothing.
+# ONE definition, used by the dataclass default, `Node.parse`'s `.get` fallback, and the
+# corpus loader's reference gate (a referenced blueprint may only contribute SQL, so a
+# child node whose kind is anything OTHER than this is refused rather than silently
+# de-gated: `_execute_dag` pauses on `node_kind == "approval"` on its own, independent of
+# `requires_approval`). It was three copies of the literal `"query"`; the loader's gate
+# was written against the third and the drift risk is a dropped human approval.
+DEFAULT_NODE_KIND = "query"
 ON_VIOLATION: frozenset[str] = frozenset({"abort", "skip", "ask"})
 
 # The CLOSED set of `output` kinds a node may declare — the two things the executor
@@ -88,6 +96,15 @@ NODE_OUTPUT_KINDS: frozenset[str] = frozenset({"scalar", "table"})
 # `tests/learning/generalize/test_dag_loader_parity_qa.py`.
 TABLE_CONSUME_REF = re.compile(r"^\$(\d+)$")
 SCALAR_CONSUME_REF = re.compile(r"^\$(\d+)\.([A-Za-z_][A-Za-z0-9_]*)$")
+
+# The `composes` node key that names ANOTHER blueprint instead of carrying inline SQL
+# (plan §2b). ONE definition, shared by the two places that must agree about it: the
+# corpus loader, which RESOLVES it (`resolve_blueprint_references` — inlining the
+# referenced blueprint's SQL at load), and `Node.parse` below, which REFUSES it (a
+# reference surviving to the parse layer means resolution was skipped, and the node
+# would otherwise parse as a silently template-less step). Two hand-copied string
+# literals is the exact shape `_TABLE_CONSUME_REF` drifted in three times.
+NODE_REF_KEY = "ref"
 
 # `relative_window` integer bounds (D49). The CEILING is a HARD safety cap: an
 # authored `max_value` may narrow the window but never widen it past this, so an
@@ -242,7 +259,7 @@ class Node:
     """
 
     order: int
-    node_kind: str = "query"
+    node_kind: str = DEFAULT_NODE_KIND
     feeds_from: tuple[int, ...] = ()
     consumes: dict[str, Any] = field(default_factory=dict)
     output: dict[str, str] = field(default_factory=dict)
@@ -257,7 +274,7 @@ class Node:
         order = raw.get("order")
         if not isinstance(order, int) or isinstance(order, bool):
             raise BlueprintParseError("compose node requires an integer 'order'")
-        node_kind = raw.get("node_kind", "query")
+        node_kind = raw.get("node_kind", DEFAULT_NODE_KIND)
         if not isinstance(node_kind, str) or node_kind not in NODE_KINDS:
             raise BlueprintParseError(
                 f"node {order} has unknown node_kind {node_kind!r} (allowed: {sorted(NODE_KINDS)})"
@@ -278,6 +295,29 @@ class Node:
             raise BlueprintParseError(
                 f"node {order} 'output' must map names → "
                 f"{'|'.join(repr(k) for k in sorted(NODE_OUTPUT_KINDS))}"
+            )
+        # An UNRESOLVED blueprint reference (plan §2b). A node names another blueprint
+        # with `ref: {blueprint: <id>, slots: {...}}`, and the corpus loader
+        # (`resolve_blueprint_references`) replaces it with that blueprint's SQL BEFORE
+        # anything parses the node — so by the time this layer runs, a surviving `ref`
+        # means resolution was skipped. Rejecting it is the read-side backstop that
+        # matters most: `ref` is not in this whitelist, so without this check the node
+        # would parse cleanly as a template-LESS query node, and the executor would run
+        # a DAG with a silently empty step. Fail loud instead (mirrors the duplicate-
+        # slot-name backstop below the loader's richer write-time gate).
+        #
+        # PRESENCE, not truthiness. This was `raw.get(NODE_REF_KEY) is not None`, which
+        # waved through the one shape the check exists for: `ref:` with the body deleted
+        # (`{"ref": None}`) is a reference key on a node with no SQL — exactly the empty
+        # step described above — and the loader's own guard had the identical bug, so
+        # both independent lines missed it together. A key that is present at all is
+        # unresolved by definition; resolution REMOVES it.
+        if NODE_REF_KEY in raw:
+            raise BlueprintParseError(
+                f"node {order} carries an unresolved blueprint reference "
+                f"({NODE_REF_KEY!r}={raw[NODE_REF_KEY]!r}) — references are inlined at "
+                "corpus load; a node reaching the parse layer with one would execute as "
+                "an empty step"
             )
         sql_template = raw.get("sql_template")
         if sql_template is not None and not isinstance(sql_template, str):

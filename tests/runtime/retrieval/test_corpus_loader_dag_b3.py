@@ -22,6 +22,7 @@ from data_agent.runtime.retrieval.corpus_loader import (
     CorpusLoadError,
     _validate_blueprint_dag,
     load_seed_fixtures,
+    resolve_blueprint_references,
 )
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "corpus"
@@ -190,7 +191,13 @@ def test_too_many_slots_fails_load() -> None:
 
 
 def test_all_seed_fixtures_still_validate_under_b3_s1_s3() -> None:
+    """References are resolved first, in `load_corpus`'s own order (`uses` grammar →
+    resolve → validate). B3(a) reads across the WHOLE blueprint: a required slot is
+    satisfied by any template referencing its token, and after plan §2b two of
+    `bp-compare-employee-check-detail-two-periods`' templates arrive by reference —
+    `{period_a}`/`{period_b}` exist only once the inlining has happened."""
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
+    blueprints = resolve_blueprint_references(blueprints)
     assert {b.id for b in blueprints} == {
         "bp-overtime-by-department",
         "bp-active-headcount-by-department",
@@ -202,6 +209,7 @@ def test_all_seed_fixtures_still_validate_under_b3_s1_s3() -> None:
         "bp-hires-in-range",
         "bp-hires-projection",
         "bp-compare-employee-check-detail-two-periods",
+        "bp-employee-check-detail-for-period",
     }
     for bp in blueprints:
         _validate_blueprint_dag(bp)  # no raise — every required slot (incl. both

@@ -9,6 +9,13 @@ property, and links each blueprint's `:USES` edges to the PRE-EXISTING catalog
 `:Column` nodes (MERGE→MATCH — the nodes are owned by `load_catalog_graph`, no
 longer minted here) in the SAME transaction (the D60 graph shape; unread at recall).
 
+`resolve_blueprint_references(...)` runs FIRST inside `load_corpus`'s pre-write pass
+(plan §2b): a `composes` node may name another blueprint by id instead of carrying
+its own SQL, and that reference is resolved and INLINED here, at load. The executor is
+untouched (it never resolves a reference), no reference id survives onto the node, and
+a composite must DECLARE the union of everything it inlines or the load fails closed —
+see the "Blueprint references" section for the rules and their rationale.
+
 `load_catalog_graph(...)` is the separate, catalog-OWNED hydration of the enriched,
 self-healing `:Table`/`:Column` graph from the MCP catalog EXPORT dict (no embeds,
 no model-parity): every node carries its catalog props + a `catalog_sha` stamp, and
@@ -31,7 +38,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -42,10 +49,13 @@ from sqlglot.optimizer.qualify_tables import qualify_tables
 from sqlglot.schema import MappingSchema
 
 from data_agent.runtime.blueprint.models import (
+    DEFAULT_NODE_KIND,
+    NODE_REF_KEY,
     SCALAR_CONSUME_REF,
     TABLE_CONSUME_REF,
     Blueprint,
     BlueprintParseError,
+    SlotSpec,
 )
 from data_agent.runtime.blueprint.rules import parse_rule
 from data_agent.runtime.blueprint.slots import slot_token_names
@@ -55,6 +65,7 @@ from data_agent.runtime.blueprint.structural_key import (
     structural_key_recipe,
 )
 from data_agent.runtime.blueprint.template import (
+    SLOT_TOKEN,
     TemplateBindError,
     assert_read_only_select,
     contains_star,
@@ -355,7 +366,21 @@ def _seeds_from_entries(raw: dict[str, Any], *, kind: str) -> list[Any]:
     required field → `TypeError`, an out-of-range value → `ValueError`) is SKIPPED with
     a warning — never allowed to fail the whole seed. This is load-bearing: the cache
     re-arms + retries the SAME export every turn on a raised seed, so one malformed
-    entry from the (separate-repo) MCP would otherwise brick the corpus indefinitely."""
+    entry from the (separate-repo) MCP would otherwise brick the corpus indefinitely.
+
+    **The scope of that promise is narrower than it reads, and always was.** It covers
+    the PROJECTION step only — turning an export entry into a `BlueprintSeed`. It does
+    NOT make the load as a whole tolerant: `load_corpus`'s pre-write pass runs
+    `_validate_blueprint_uses`, `resolve_blueprint_references` and
+    `_validate_blueprint_dag` over the surviving seeds and raises `CorpusLoadError` on
+    the first failure, aborting everything. A malformed scope key, an unparseable
+    template, a DAG cycle, and (since plan §2b) a dangling blueprint REFERENCE all brick
+    the corpus in exactly the way this function's skip exists to prevent. That is
+    deliberate — those are authoring errors that must not ship half-applied, and the
+    hydrator logs and retries rather than destructively rebuilding — but it means "never
+    fatal to the seed" is a claim about THIS function, not about the load. See
+    `_reference_graph` for the reference case, which is the one whose blast radius grew:
+    a widely-referenced blueprint is now a single point of failure for the whole load."""
     seeds: list[Any] = []
     for entry_id, entry in raw.items():
         if not isinstance(entry, dict):
@@ -972,12 +997,893 @@ def _validate_blueprint_uses(bp: BlueprintSeed) -> None:
     pre-filter at recall. Guard it at WRITE — every entry must be a `str` with at
     least 3 NON-EMPTY dot-separated parts, else raise with the offending key so
     an authoring mistake fails loudly instead of retrieving nothing.
+
+    The CONTAINER is type-checked before the loop, and that is not cosmetic. The
+    seed dataclass declares `uses: list[str]` but enforces nothing at runtime, and
+    the MCP export is a separate repo's JSON: `uses: 5` made this `for` raise a bare
+    `TypeError` — an un-wrapped third-party exception out of `load_corpus`, the class
+    the module docstring forbids because the hydration cache re-arms and retries the
+    same poisoned entry every turn. `uses: "db.t.c"` was worse than a crash: it
+    ITERATES CHARACTER-WISE, so every reader downstream (`_use_edges`, the union
+    rule, `columns`/`tables`) would see 8 one-character "scope keys". Both now fail
+    as one clean `CorpusLoadError`.
     """
+    if not isinstance(bp.uses, (list, tuple)):
+        raise CorpusLoadError(
+            f"blueprint {bp.id}: 'uses' must be a list of database.table.column scope "
+            f"keys, got {type(bp.uses).__name__}"
+        )
     for key in bp.uses:
         if not isinstance(key, str) or len(key.split(".")) < 3 or not all(key.split(".")):
             raise CorpusLoadError(
                 f"blueprint {bp.id}: uses entry {key!r} is not a database.table.column scope key"
             )
+
+
+# --------------------------------------------------------------------------
+# Blueprint references (plan §2b) — LOAD-TIME resolution + INLINING
+#
+# A `composes` node may name ANOTHER blueprint instead of carrying its own SQL:
+#
+#     - order: 0
+#       output: { detail_a: table }
+#       ref:
+#         blueprint: bp-employee-check-detail-for-period
+#         slots:                       # <CHILD slot name>: <THIS blueprint's slot name>
+#           employee: employee
+#           period:   period_a
+#
+# `resolve_blueprint_references` replaces that node's `ref` with the referenced
+# blueprint's SQL, renamed into this blueprint's slot vocabulary. Everything
+# downstream — `_validate_blueprint_dag`, the structural key, the `composes_json`
+# property, the executor, `getBlueprint`'s DAG strip — then sees a node that is
+# byte-indistinguishable from a hand-written inline one.
+#
+# WHY LOAD-TIME AND NOT RUNTIME. The corpus is git-versioned YAML re-seeded as a
+# unit, so inlining costs nothing in freshness and buys three things outright: the
+# executor needs no change (it never resolves a reference), there is no staleness
+# window between a child edit and a parent execution, and the model can never learn
+# that composition is nameable (requirement 6) because no reference id survives the
+# load. Do NOT add a reference lookup to the executor.
+#
+# WHAT A REFERENCE MAY POINT AT: a blueprint that resolves to exactly ONE SQL
+# statement — a leaf (top-level `sql_template`) or a single-node `composes`. A
+# reference carries SQL and nothing else, so a multi-node child would have to be
+# SPLICED into the parent DAG (order renumbering, `feeds_from`/`consumes` rewiring,
+# merging the sink's `when`/`output` with the referencing node's) and every one of
+# those merges is a place a gate can be silently dropped. One statement in, one
+# statement out; the rule is checkable in a sentence.
+# --------------------------------------------------------------------------
+
+# The node key that carries a reference, and its two sub-keys. `ref` is MUTUALLY
+# EXCLUSIVE with `sql_template`: a node is one or the other, never both. `NODE_REF_KEY`
+# is IMPORTED from `blueprint/models.py`, not re-declared — the parse layer's
+# reject-an-unresolved-reference backstop keys off the same constant, and a second copy
+# of the string would let the two silently disagree about what a reference even is.
+_REF_BLUEPRINT_KEY = "blueprint"
+_REF_SLOTS_KEY = "slots"
+_REF_KEYS = frozenset({_REF_BLUEPRINT_KEY, _REF_SLOTS_KEY})
+
+# Hard cap on the reference-CHAIN length (A→B→C→…), independent of the per-blueprint
+# `_MAX_COMPOSE_NODES` cap. Resolution is iterative and each blueprint resolves once,
+# so a deep chain is not a runaway cost — the cap exists because an inlining chain
+# deeper than this makes the SQL a node actually runs untraceable from any single
+# YAML file, which is an authoring smell in a corpus whose whole point is auditability.
+# Canon uses depth 1.
+_MAX_REF_DEPTH = 4
+
+# The trust partition a reference may cross: NONE. Inlining COPIES SQL from the child
+# into the parent, so an `mcp` composite referencing a `learning` blueprint would
+# launder unverified, human-unapproved SQL into the trusted canon partition that
+# recall serves (`vector_index._BLUEPRINT_RECALL_QUERY`'s `source='mcp'` gate). Equal
+# is the only rule that cannot be argued into an escalation.
+#
+# The `status`/`drift_status` pair mirrors that same recall gate, because "retracted"
+# has no other definition here: a `status='retired'` or `drift_status='suspect'`
+# blueprint is exactly one that recall refuses to serve. Inlining its SQL into a live
+# composite would resurrect it under another id.
+_RECALLABLE_STATUS = "validated"
+_SUSPECT_DRIFT = "suspect"
+
+
+@dataclass(frozen=True)
+class _NodeReference:
+    """One validated `ref` on one `composes` node, in resolution-ready shape.
+
+    `slot_map` is `{<child slot name>: <parent slot name>}` — keyed by the CHILD
+    deliberately. The resolution OPERATION is "rewrite every bind token in the child's
+    SQL into the parent's vocabulary", which needs a total function from child token →
+    parent token; keying by the child makes that function single-valued by
+    construction (a dict cannot repeat a key), whereas keying by the parent would
+    admit `{a: dept, b: dept}` — two parents claiming one child slot, an ambiguity with
+    no correct resolution.
+    """
+
+    index: int  # position in the raw `composes` list (nodes may lack a usable `order`)
+    where: str  # human-facing node label for error messages
+    target: str
+    slot_map: dict[str, str]
+
+
+def _is_bind_token_name(name: Any) -> bool:
+    """True iff `{name}` tokenizes to exactly the slot bind site *name*.
+
+    DERIVED, never mirrored: the candidate is round-tripped through the SAME
+    `referenced_slots` tokenizer the templates are read with, so this cannot drift
+    from `template.SLOT_TOKEN` the way a copied regex would (`_TABLE_CONSUME_REF`
+    existed in three hand-copied versions before that lesson was written down).
+
+    Load-bearing for SAFETY, not tidiness. A slot-map VALUE is substituted into the
+    child's SQL as the literal text `{<value>}`. A value that is not exactly a bind
+    token — say `"x} OR 1=1 --"` — would emit `{x} OR 1=1 --}`, i.e. attacker-chosen
+    raw SQL spliced into a template that is then parsed and executed. This round-trip
+    is the boundary that keeps the substitution a RENAME instead of an injection."""
+    return isinstance(name, str) and referenced_slots("{" + name + "}") == {name}
+
+
+def _seed_compose_nodes(bp: BlueprintSeed) -> list[dict[str, Any]]:
+    """*bp*'s raw `composes` entries, with the CONTAINER type-checked first.
+
+    `Blueprint.parse` rejects a non-list `composes` too — but that runs later
+    (`_validate_blueprint_dag`), and reference resolution has to walk the nodes
+    before then. A non-iterable (`composes: 5`) would raise a bare `TypeError` out of
+    `load_corpus`; a STRING would iterate CHARACTER-WISE and look like a perfectly
+    valid zero-reference DAG, which is the quieter and worse failure. A non-dict
+    ENTRY is passed through untouched — it carries no reference, and `Node.parse`
+    owns that error message."""
+    if bp.composes is None:
+        return []
+    if not isinstance(bp.composes, (list, tuple)):
+        raise CorpusLoadError(
+            f"blueprint {bp.id}: 'composes' must be a list, got {type(bp.composes).__name__}"
+        )
+    return list(bp.composes)
+
+
+def _seed_slot_specs(bp: BlueprintSeed) -> dict[str, SlotSpec]:
+    """*bp*'s declared slots as `{name: SlotSpec}`, parsed EARLY (before
+    `_validate_blueprint_dag`) because reference resolution needs each slot's bind
+    TOKENS — a `period_range` occupies two (`{n}_start`/`{n}_end`), everything else one.
+
+    Wraps `BlueprintParseError` as `CorpusLoadError` and re-checks the container type
+    for the same reason as `_seed_compose_nodes`. Duplicate names are rejected here as
+    well as in `Blueprint.parse`: this function builds a dict, and a silent last-wins
+    overwrite would make the reference rename pick one of two colliding specs
+    arbitrarily."""
+    if bp.slots is None:
+        return {}
+    if not isinstance(bp.slots, (list, tuple)):
+        raise CorpusLoadError(
+            f"blueprint {bp.id}: 'slots' must be a list, got {type(bp.slots).__name__}"
+        )
+    specs: dict[str, SlotSpec] = {}
+    for raw in bp.slots:
+        try:
+            spec = SlotSpec.parse(raw)
+        except BlueprintParseError as exc:
+            raise CorpusLoadError(f"blueprint {bp.id}: malformed slot — {exc}") from exc
+        if spec.name in specs:
+            raise CorpusLoadError(f"blueprint {bp.id}: duplicate slot name {spec.name!r}")
+        specs[spec.name] = spec
+    return specs
+
+
+def _seed_rules_by_bind(bp: BlueprintSeed) -> dict[str, Any]:
+    """The `resolve_via` rules *bp* declares, keyed by the `{token}` each binds
+    (`earn_codes` → the parsed `ResolvedRule`).
+
+    Keyed by BIND rather than by `id` because the bind name is what a template
+    references and therefore what a reference has to reconcile. The rule OBJECT is
+    kept, not just the name, so the caller can compare what two same-named rules
+    actually probe. `parse_rule` is total — a static/malformed entry yields `None` — so
+    the only guard needed is the container type."""
+    if bp.uses_rules is None:
+        return {}
+    if not isinstance(bp.uses_rules, (list, tuple)):
+        raise CorpusLoadError(
+            f"blueprint {bp.id}: 'uses_rules' must be a list, got "
+            f"{type(bp.uses_rules).__name__}"
+        )
+    rules: dict[str, Any] = {}
+    for raw_rule in bp.uses_rules:
+        parsed = parse_rule(raw_rule)
+        if parsed is not None:
+            rules[parsed.binds] = parsed
+    return rules
+
+
+def _node_reference(bp_id: str, index: int, node: Any) -> _NodeReference | None:
+    """Validate and project one node's `ref`, or `None` when the node has none.
+
+    Every field is untrusted (a separate repo's YAML, or a hand edit) and every check
+    below is derived from what the value is LATER USED FOR, not from its name:
+
+    | value                | downstream use                          | guard              |
+    |----------------------|-----------------------------------------|--------------------|
+    | `ref`                | `.get()` of two known keys              | must be a dict     |
+    | extra `ref` keys     | nothing — silently ignored              | whitelist, reject  |
+    | `ref.blueprint`      | key into the `{id: seed}` dict          | non-empty `str`    |
+    | `ref.slots`          | `.items()`, key lookups, set algebra    | must be a dict     |
+    | `ref.slots` keys     | matched against child slot NAMES        | bind-token shaped  |
+    | `ref.slots` values   | emitted into SQL as the text `{value}`  | bind-token shaped  |
+
+    The `ref.blueprint` guard is the unhashable-value case that has bitten this
+    codebase repeatedly: `blueprint: [a, b]` reaches `by_id[...]` and raises
+    `TypeError: unhashable type: 'list'` — un-wrapped, out of `load_corpus`. The
+    `ref.slots` VALUE guard is the injection boundary (see `_is_bind_token_name`).
+    Extra keys are rejected rather than ignored because the realistic authoring
+    mistake is `slot:` for `slots:`, which would otherwise resolve to "no mappings
+    declared" and produce a confusing downstream error about unmapped child slots."""
+    if not isinstance(node, dict):
+        return None  # `Node.parse` owns this error; it carries no reference
+    # MEMBERSHIP, not value. `ref:` with the body deleted is a real and distinguishable
+    # authoring state (`{"ref": None}`), and reading it as "no reference" left a
+    # template-LESS query node that `_execute_dag` skips as an empty step — from a
+    # blueprint the corpus advertises as validated, carrying a literal `"ref": null` in
+    # its stored `composes_json` and no `structural_key` at all. The parse-layer backstop
+    # had the identical value-vs-presence bug, so neither line caught it.
+    if NODE_REF_KEY not in node:
+        return None
+    raw = node[NODE_REF_KEY]
+    order = node.get("order")
+    where = f"node {order}" if isinstance(order, int) and not isinstance(order, bool) else (
+        f"composes[{index}]"
+    )
+    if not isinstance(raw, dict):
+        raise CorpusLoadError(
+            f"blueprint {bp_id}: {where} 'ref' must be an object with a "
+            f"{_REF_BLUEPRINT_KEY!r} (and optional {_REF_SLOTS_KEY!r}), got "
+            f"{type(raw).__name__}"
+            + (" — the key is present with no body" if raw is None else "")
+        )
+    # `sorted()` over the offending keys needs a TOTAL order, and dict keys are not
+    # mutually comparable: YAML resolves bare `on:`/`no:`/`y:` to BOOLEANS, so
+    # `{blueprint: …, on: x, note: y}` gives `sorted({True, 'note'})` →
+    # `TypeError: '<' not supported between 'str' and 'bool'`, un-wrapped, out of
+    # `load_corpus`. ONE unknown key of any type never compares, which is why every
+    # single-key test passed. Key on `(type name, repr)` — total for any two objects,
+    # deterministic, and it still prints the offending keys the author has to find.
+    unknown = sorted(
+        (k for k in raw if k not in _REF_KEYS), key=lambda k: (type(k).__name__, repr(k))
+    )
+    if unknown:
+        raise CorpusLoadError(
+            f"blueprint {bp_id}: {where} 'ref' has unknown key(s) "
+            f"{[repr(k) for k in unknown]} (allowed: {sorted(_REF_KEYS)})"
+        )
+    target = raw.get(_REF_BLUEPRINT_KEY)
+    if not isinstance(target, str) or not target.strip():
+        raise CorpusLoadError(
+            f"blueprint {bp_id}: {where} 'ref.{_REF_BLUEPRINT_KEY}' must be a non-empty "
+            f"blueprint id string, got {target!r}"
+        )
+    # STRIP, and use the stripped value for the lookup. The emptiness test above already
+    # stripped; looking up the raw value meant `" bp-child "` passed as non-empty and
+    # then failed as "unknown blueprint", which sends the author hunting for a missing
+    # file. Blueprint ids are bare tokens in every authored corpus, so stripping cannot
+    # resolve to a DIFFERENT blueprint than the author meant.
+    target = target.strip()
+    raw_slots = raw.get(_REF_SLOTS_KEY)
+    if raw_slots is None:
+        raw_slots = {}
+    if not isinstance(raw_slots, dict):
+        raise CorpusLoadError(
+            f"blueprint {bp_id}: {where} 'ref.{_REF_SLOTS_KEY}' must be an object mapping "
+            f"the referenced blueprint's slot names to this blueprint's, got "
+            f"{type(raw_slots).__name__}"
+        )
+    slot_map: dict[str, str] = {}
+    for child_slot, parent_slot in raw_slots.items():
+        if not _is_bind_token_name(child_slot) or not _is_bind_token_name(parent_slot):
+            raise CorpusLoadError(
+                f"blueprint {bp_id}: {where} 'ref.{_REF_SLOTS_KEY}' entry "
+                f"{child_slot!r}: {parent_slot!r} is not a slot-name → slot-name pair "
+                "(both sides must be plain slot identifiers — the value is emitted into "
+                "SQL as a `{token}`, so anything else would splice raw text into the "
+                "referenced template)"
+            )
+        slot_map[child_slot] = parent_slot
+    # `sql_template` and `ref` are mutually exclusive: with both, one is dead and it is
+    # not knowable WHICH the author meant to run. `Node.parse` would happily keep the
+    # inline one and the reference would evaporate — the silent branch, so reject here.
+    if node.get("sql_template") is not None:
+        raise CorpusLoadError(
+            f"blueprint {bp_id}: {where} declares BOTH a 'sql_template' and a 'ref' — a "
+            "node is one or the other (with both, the reference would be silently dropped)."
+        )
+    # A `consumes` on a reference node is either dead or a hidden coupling. The child
+    # cannot know the parent's upstream outputs, so a scalar consume's `{placeholder}`
+    # is absent from the inlined SQL (dead — a silently unapplied value), and a TABLE
+    # consume would have to match a `scratch.<placeholder>` token INSIDE the child,
+    # making the child's internal naming part of the parent's wiring contract. Feeding
+    # a referenced blueprint from an upstream node is deliberately out of scope; say so.
+    if node.get("consumes"):
+        raise CorpusLoadError(
+            f"blueprint {bp_id}: {where} declares both 'consumes' and 'ref' — a referenced "
+            "blueprint's SQL cannot bind an upstream node's output (it knows nothing about "
+            "this DAG). Inline the SQL in this node instead."
+        )
+    return _NodeReference(index=index, where=where, target=target, slot_map=slot_map)
+
+
+def _reference_graph(
+    by_id: dict[str, BlueprintSeed],
+) -> dict[str, list[_NodeReference]]:
+    """`{blueprint id: [validated references]}` for every seed that has any.
+
+    A reference to an id absent from THIS load is fatal (requirement 5). "Absent"
+    covers deleted, renamed, never-authored, and — because the whole load is one
+    fail-closed unit — a child that is itself unloadable for any other reason: if the
+    child's own validation raises, no blueprint is written at all, so a composite can
+    never ship holding SQL from a blueprint that did not.
+
+    **The availability trade, stated plainly.** `_seeds_from_entries` SKIPS a malformed
+    export entry precisely so one bad entry from the separate corpus repo cannot brick
+    the corpus; this function then fails the ENTIRE load when a reference points at an
+    id that entry would have supplied, and the hydrator deliberately does not catch it
+    (it logs and retries every poll rather than destructively rebuilding). So a skipped
+    child does, transitively, what the skip exists to prevent — and the canon conversion
+    that introduced the first real reference made the referenced blueprint the
+    highest-blast-radius entry in the export.
+
+    Considered and DECLINED for this slice: skipping the referencing parent too when its
+    target was present-but-skipped, reserving whole-load failure for a genuinely
+    never-authored id. It is a coherent asymmetry, but it would make the loader tolerant
+    of exactly ONE of the many ways a bad entry aborts the load — an unparseable
+    template, a bad scope key, a DAG cycle and a `uses` under-declaration all still abort
+    — so it buys a special case rather than a property. It also needs the set of skipped
+    ids threaded from `corpus_seeds_from_export` through `load_corpus` into this
+    resolver, which is real plumbing on the request path for a case that has never
+    occurred. If corpus availability is later made a first-class goal, do it uniformly
+    (a per-blueprint quarantine in `load_corpus`), not here."""
+    graph: dict[str, list[_NodeReference]] = {}
+    for bp in by_id.values():
+        refs = [
+            ref
+            for index, node in enumerate(_seed_compose_nodes(bp))
+            if (ref := _node_reference(bp.id, index, node)) is not None
+        ]
+        if not refs:
+            continue
+        for ref in refs:
+            if ref.target not in by_id:
+                raise CorpusLoadError(
+                    f"blueprint {bp.id}: {ref.where} references unknown blueprint "
+                    f"{ref.target!r} — a reference to a missing or retracted blueprint "
+                    "fails the load (the composite would otherwise ship with no SQL)."
+                )
+        graph[bp.id] = refs
+    return graph
+
+
+def _reference_resolution_order(graph: dict[str, list[_NodeReference]]) -> list[str]:
+    """Blueprint ids in CHILD-BEFORE-PARENT order, raising on a cycle.
+
+    Iterative DFS colouring with an explicit stack — the same shape, and for the same
+    reason, as `_validate_dag_structure`'s intra-DAG check: a long reference chain must
+    fail as a clean `CorpusLoadError`, never as a `RecursionError` escaping
+    `load_corpus`. That existing check is scoped to ONE blueprint's `feeds_from` edges
+    and structurally cannot see A→B→A; this is its cross-blueprint sibling, and the two
+    are independent (a corpus can be free of intra-DAG cycles and still have a
+    reference cycle).
+
+    Iteration order follows the seed list, so the reported cycle is deterministic."""
+    white, grey, black = 0, 1, 2
+    color: dict[str, int] = {}
+    order: list[str] = []
+    for start in graph:
+        if color.get(start, white) != white:
+            continue
+        stack: list[tuple[str, bool]] = [(start, True)]
+        path: list[str] = []
+        while stack:
+            bp_id, entering = stack.pop()
+            if not entering:
+                color[bp_id] = black
+                order.append(bp_id)
+                path.pop()
+                continue
+            if color.get(bp_id, white) == black:
+                continue
+            color[bp_id] = grey
+            path.append(bp_id)
+            stack.append((bp_id, False))
+            for ref in graph.get(bp_id, ()):
+                state = color.get(ref.target, white)
+                if state == grey:
+                    raise CorpusLoadError(
+                        "blueprint reference cycle spanning blueprints: "
+                        f"{' -> '.join([*path, ref.target])}. A reference is INLINED at "
+                        "load, so a cycle has no fixed point — it fails the load."
+                    )
+                if state == white:
+                    stack.append((ref.target, True))
+    return order
+
+
+def _assert_reference_depth(
+    order: list[str], graph: dict[str, list[_NodeReference]]
+) -> None:
+    """Reject a reference CHAIN longer than `_MAX_REF_DEPTH`. *order* is child-first,
+    so each child's depth is already known when its parent is reached."""
+    depth: dict[str, int] = {}
+    for bp_id in order:
+        refs = graph.get(bp_id, ())
+        depth[bp_id] = max((depth[ref.target] + 1 for ref in refs), default=0)
+        if depth[bp_id] > _MAX_REF_DEPTH:
+            raise CorpusLoadError(
+                f"blueprint {bp_id}: reference chain is {depth[bp_id]} deep, exceeding the "
+                f"{_MAX_REF_DEPTH}-level cap — the SQL a node actually runs would no longer "
+                "be traceable from any single blueprint file."
+            )
+
+
+def _assert_reference_target_loadable(parent: BlueprintSeed, child: BlueprintSeed, where: str) -> None:
+    """Refuse to inline from a child in a different trust partition, or from one recall
+    would refuse to serve (requirement 5, "retracted").
+
+    Both gates are DERIVED from `vector_index._BLUEPRINT_RECALL_QUERY`, which is the
+    only place the corpus defines "servable": `source = 'mcp'` (bare equality),
+    `coalesce(status,'validated') = 'validated'`, `coalesce(drift_status,'clean') <>
+    'suspect'`. Inlining copies the child's SQL into the parent, so a retracted or
+    learning-tier child would keep running under the parent's id — retraction that does
+    not retract, and a trust-partition crossing that no reader could see.
+
+    The `coalesce` halves are mirrored EXACTLY, via the property write in between.
+    `_UPSERT_BLUEPRINT` does `SET b.status = $status`, and neo4j REMOVES a property set
+    to null — so a Python `None` becomes an ABSENT property, which recall coalesces to
+    `validated` and serves. The first cut read `None` as `""`, failed the equality, and
+    refused the load with a message claiming recall would not serve it; that was false,
+    and `status: null` is reachable from the export (`_seed_from_entry` sanitizes
+    `source`/`verified`, not `status`), so a servable child would have bricked the whole
+    corpus. `""` is a DIFFERENT case and stays refused: an empty string is written as a
+    real property, coalesce leaves it alone, and it matches neither partition. A
+    non-`str` `status` also stays refused — it is written as some non-string property and
+    fails recall's equality just the same. Drift needs no coalesce: the test is
+    `== 'suspect'`, which `None` and any non-string already fail."""
+    if child.source != parent.source:
+        raise CorpusLoadError(
+            f"blueprint {parent.id}: {where} references {child.id!r}, which is in the "
+            f"{child.source!r} trust partition while this blueprint is in {parent.source!r}. "
+            "Inlining copies SQL across that boundary — refused."
+        )
+    status = _RECALLABLE_STATUS if child.status is None else child.status
+    if status != _RECALLABLE_STATUS or child.drift_status == _SUSPECT_DRIFT:
+        raise CorpusLoadError(
+            f"blueprint {parent.id}: {where} references {child.id!r}, which recall will not "
+            f"serve (status={child.status!r}, drift_status={child.drift_status!r}). Inlining "
+            "it would keep a retracted blueprint running under this id."
+        )
+
+
+def _referenced_sql_template(parent_id: str, where: str, child: BlueprintSeed) -> str:
+    """The ONE SQL statement *child* contributes to a referencing node.
+
+    A leaf (`sql_template`, no `composes`) contributes it directly. A single-node
+    `composes` contributes its one node's template — that shape exists so a reference
+    CHAIN is possible at all (a leaf carries no nodes and therefore no `ref`), which is
+    what makes the depth cap and the cross-blueprint cycle check live rules rather than
+    dead code.
+
+    Everything the child's node declares BESIDES the SQL is refused rather than
+    dropped, because the referencing node keeps its own. The control-flow trio —
+    `node_kind`, `when`, `requires_approval` — are the ones that matter: silently
+    discarding a gate is how an approval pause disappears. `feeds_from`/`consumes`
+    cannot mean anything in a one-node DAG. `output` IS ignored, deliberately and
+    alone: it describes what a node hands to a DOWNSTREAM sibling, a one-node DAG has
+    none, and the referencing node declares its own.
+
+    `node_kind` was MISSING from that list for a review cycle, and the docstring above
+    it asserted the list was complete — the confident-comment-contradicting-code shape
+    this codebase keeps paying for. It is a gate ON ITS OWN, not a modifier of
+    `requires_approval`: `executor._execute_dag` pauses on `node.node_kind ==
+    "approval" or node.requires_approval`, and the loader's own gate (i) accepts an
+    approval node that carries a `sql_template`, so `{order: 0, node_kind: "approval",
+    sql_template: ...}` was a legal, silently-de-gated reference target. Anything
+    PRESENT and not `"query"` is refused; absent is fine (`"query"` is the default and
+    what every canon node means). The check is `!= "query"` rather than `== "approval"`
+    so a future `NODE_KINDS` member is refused by default instead of waved through.
+
+    Called only after the child has itself been resolved (child-first order), so its
+    node template is already inlined if it was a reference."""
+    composes = _seed_compose_nodes(child)
+    if child.sql_template is not None and composes:
+        raise CorpusLoadError(
+            f"blueprint {parent_id}: {where} references {child.id!r}, which declares BOTH a "
+            "top-level sql_template and a composes DAG (no execution mode)."
+        )
+    if child.sql_template is not None:
+        if not isinstance(child.sql_template, str) or not child.sql_template.strip():
+            raise CorpusLoadError(
+                f"blueprint {parent_id}: {where} references {child.id!r}, whose sql_template "
+                f"is not usable SQL ({child.sql_template!r})."
+            )
+        return child.sql_template
+    if len(composes) != 1:
+        raise CorpusLoadError(
+            f"blueprint {parent_id}: {where} references {child.id!r}, which resolves to "
+            f"{len(composes)} DAG node(s). A reference inlines exactly ONE SQL statement, "
+            "so the target must be a leaf blueprint or a single-node composite."
+        )
+    node = composes[0]
+    if not isinstance(node, dict):
+        raise CorpusLoadError(
+            f"blueprint {parent_id}: {where} references {child.id!r}, whose single compose "
+            "node is not an object."
+        )
+    node_kind = node.get("node_kind")
+    if node_kind is not None and node_kind != DEFAULT_NODE_KIND:
+        raise CorpusLoadError(
+            f"blueprint {parent_id}: {where} references {child.id!r}, whose node declares "
+            f"node_kind={node_kind!r}. A reference takes only SQL, and the referencing node "
+            f"carries the default {DEFAULT_NODE_KIND!r} — an approval gate would be silently "
+            "dropped."
+        )
+    for key in ("when", "requires_approval"):
+        if node.get(key):
+            raise CorpusLoadError(
+                f"blueprint {parent_id}: {where} references {child.id!r}, whose node declares "
+                f"{key!r}. A reference takes only SQL — that gate would be silently dropped."
+            )
+    for key in ("feeds_from", "consumes"):
+        if node.get(key):
+            raise CorpusLoadError(
+                f"blueprint {parent_id}: {where} references {child.id!r}, whose single node "
+                f"declares {key!r} — it has no upstream node to take it from."
+            )
+    template = node.get("sql_template")
+    if not isinstance(template, str) or not template.strip():
+        raise CorpusLoadError(
+            f"blueprint {parent_id}: {where} references {child.id!r}, whose single node "
+            f"carries no usable sql_template ({template!r})."
+        )
+    return template
+
+
+def _reference_token_rename(
+    parent: BlueprintSeed,
+    child: BlueprintSeed,
+    ref: _NodeReference,
+    template: str,
+) -> dict[str, str]:
+    """The TOTAL `{child token}` → `{parent token}` map for one reference.
+
+    Total is the whole point: every bind token the child's template references gets an
+    entry (identity for a rule bind), so the substitution below can never leave a token
+    behind for a later gate to trip over with a confusing message.
+
+    SLOT-COLLISION SEMANTICS, and why each is what it is:
+
+    * **No implicit identity.** A child slot is bound ONLY through an explicit
+      `ref.slots` entry, even when the two names are identical. Slots are resolved ONCE
+      per blueprint before the DAG walk (`executor._resolve_all_slots`), so after
+      inlining the child's slot DECLARATIONS are gone — type, `binds_to`,
+      `enum_values`, `optional_pattern`, all of it — and the PARENT's same-named slot
+      governs. Letting that happen implicitly means renaming a parent slot silently
+      re-points a child's filter at a different domain. `employee: employee` reads as
+      redundant and is exactly the case worth writing down.
+    * **Child needs a slot the parent does not supply** → refuse, naming the slots. The
+      alternative is a `{token}` with nothing to bind it, i.e. a dropped filter (D56).
+    * **Parent maps a slot the child does not have, or does not USE** → refuse. A dead
+      mapping is an author believing a filter is applied when it is not — the same
+      wrong-answer class, arriving from the other direction.
+    * **Bind ARITY must match** → refuse on mismatch. A `period_range` occupies two
+      tokens and everything else one; mapping a range onto a scalar would emit
+      `{p_start}`/`{p_end}` against a parent slot that binds neither.
+    * **Bind TYPE and `binds_to` may differ** → WARN, do not refuse. The parent is the
+      authority on its own slots (the child's spec is discarded either way) and the
+      value still binds as a typed AST literal, so a divergence is a resolution-strictness
+      difference, not a safety one. It is worth a log line because the usual cause is a
+      copy-paste that will validate values against the wrong domain.
+    * **A `resolve_via` rule bind is NOT renamed**, and the parent must re-declare the
+      rule itself — see the residual-token branch at the bottom, which also warns when
+      the two same-named rules probe different things (the rule-side twin of the
+      `binds_to` divergence, and the more consequential one: a rule fires a probe).
+    """
+    parent_slots = _seed_slot_specs(parent)
+    child_slots = _seed_slot_specs(child)
+    referenced = referenced_slots(template)
+
+    rename: dict[str, str] = {}
+    for child_name, parent_name in sorted(ref.slot_map.items()):
+        child_spec = child_slots.get(child_name)
+        if child_spec is None:
+            raise CorpusLoadError(
+                f"blueprint {parent.id}: {ref.where} maps slot {child_name!r}, which "
+                f"{child.id!r} does not declare (its slots are {sorted(child_slots)})."
+            )
+        parent_spec = parent_slots.get(parent_name)
+        if parent_spec is None:
+            raise CorpusLoadError(
+                f"blueprint {parent.id}: {ref.where} feeds {child.id!r}'s slot "
+                f"{child_name!r} from {parent_name!r}, which this blueprint does not "
+                f"declare (its slots are {sorted(parent_slots)})."
+            )
+        child_tokens = slot_token_names(child_spec)
+        parent_tokens = slot_token_names(parent_spec)
+        if len(child_tokens) != len(parent_tokens):
+            raise CorpusLoadError(
+                f"blueprint {parent.id}: {ref.where} maps {child.id!r} slot {child_name!r} "
+                f"(type {child_spec.type!r}, {len(child_tokens)} bind token(s)) onto "
+                f"{parent_name!r} (type {parent_spec.type!r}, {len(parent_tokens)}). A "
+                "period_range occupies two tokens and every other type one — the arities "
+                "must match or the inlined SQL would reference a token nothing binds."
+            )
+        if not child_tokens & referenced:
+            raise CorpusLoadError(
+                f"blueprint {parent.id}: {ref.where} maps {child.id!r} slot {child_name!r}, "
+                "which its SQL never references — the value would be silently discarded "
+                "(a filter the author believes is applied and is not)."
+            )
+        if child_spec.type != parent_spec.type or child_spec.binds_to != parent_spec.binds_to:
+            _logger.warning(
+                "blueprint %s: %s feeds %s's slot %r (type=%r binds_to=%r) from %r "
+                "(type=%r binds_to=%r); after inlining ONLY this blueprint's declaration "
+                "governs, so the value is validated against ITS domain",
+                parent.id,
+                ref.where,
+                child.id,
+                child_name,
+                child_spec.type,
+                child_spec.binds_to,
+                parent_name,
+                parent_spec.type,
+                parent_spec.binds_to,
+            )
+        # Token-level, suffix-preserving: `{n}`→`{m}` for a scalar slot, and
+        # `{n}_start`/`{n}_end`→`{m}_start`/`{m}_end` for a period_range. Built from
+        # `slot_token_names` on BOTH sides rather than by string surgery, so a new
+        # multi-token slot type is a compile-time-visible change here, not a silent one.
+        mapped_here: set[str] = set()
+        for suffix in ("_start", "_end", ""):
+            child_token = f"{child_name}{suffix}"
+            parent_token = f"{parent_name}{suffix}"
+            if child_token in child_tokens and parent_token in parent_tokens:
+                rename[child_token] = parent_token
+                mapped_here.add(child_token)
+        if mapped_here != child_tokens:
+            raise CorpusLoadError(
+                f"blueprint {parent.id}: {ref.where} could not map every bind token of "
+                f"{child.id!r} slot {child_name!r} onto {parent_name!r} "
+                f"({sorted(child_tokens)} → {sorted(parent_tokens)})."
+            )
+
+    unmapped = sorted(referenced - set(rename))
+    if unmapped:
+        # A residual token is legitimate ONLY if it is a `resolve_via` rule bind — those
+        # are resolved blueprint-wide, by NAME, from `uses_rules`, so they are not
+        # renamed. The parent must therefore declare the same rule itself. That is
+        # authored, not inherited, for the same reason `uses` is: a rule fires a
+        # warehouse probe, and a composite must state every probe it causes.
+        child_rules = _seed_rules_by_bind(child)
+        parent_rules = _seed_rules_by_bind(parent)
+        for token in unmapped:
+            child_rule = child_rules.get(token)
+            if child_rule is None:
+                raise CorpusLoadError(
+                    f"blueprint {parent.id}: {ref.where} references {child.id!r}, whose SQL "
+                    f"binds {{{token}}} — neither one of its slots (map it with "
+                    f"'ref.{_REF_SLOTS_KEY}') nor one of its resolve_via rules."
+                )
+            parent_rule = parent_rules.get(token)
+            if parent_rule is None:
+                raise CorpusLoadError(
+                    f"blueprint {parent.id}: {ref.where} references {child.id!r}, whose SQL "
+                    f"binds the resolve_via rule name {{{token}}}. Rules are resolved per "
+                    "BLUEPRINT, so this blueprint must declare a matching rule in its own "
+                    "uses_rules — it is not inherited."
+                )
+            # Matching by BIND NAME alone is not the same as matching the rule. The
+            # parent's declaration is the one that runs (rules resolve per blueprint), so
+            # a same-named rule probing a different column or concept silently feeds the
+            # child's `IN {token}` a different value set. This is the rule-side twin of
+            # the slot `type`/`binds_to` divergence warned about above, and it is the more
+            # consequential of the two: a rule fires a real warehouse probe. Warned, not
+            # refused, for the same reason — the parent is the authority, and its probed
+            # column is already forced ⊆ its own `uses` by gate (g).
+            if (child_rule.table, child_rule.column, child_rule.concept) != (
+                parent_rule.table,
+                parent_rule.column,
+                parent_rule.concept,
+            ):
+                _logger.warning(
+                    "blueprint %s: %s references %s, whose SQL binds {%s} from rule %r "
+                    "(%s.%s / concept %r); THIS blueprint's same-named rule %r probes "
+                    "%s.%s / concept %r and is the one that will run — the inlined filter "
+                    "gets a different value set than the referenced blueprint does",
+                    parent.id,
+                    ref.where,
+                    child.id,
+                    token,
+                    child_rule.rule_id,
+                    child_rule.table,
+                    child_rule.column,
+                    child_rule.concept,
+                    parent_rule.rule_id,
+                    parent_rule.table,
+                    parent_rule.column,
+                    parent_rule.concept,
+                )
+            rename[token] = token
+    return rename
+
+
+def _inline_reference(
+    parent: BlueprintSeed,
+    child: BlueprintSeed,
+    ref: _NodeReference,
+    node: dict[str, Any],
+) -> dict[str, Any]:
+    """A NEW node dict with `ref` replaced by the child's SQL, renamed into *parent*'s
+    slot vocabulary. Never mutates the input node (the caller's seeds are shared)."""
+    _assert_reference_target_loadable(parent, child, ref.where)
+    template = _referenced_sql_template(parent.id, ref.where, child)
+    # A scratch source inside a referenced template is refused. It cannot be satisfied —
+    # a reference node may not declare `consumes` (the only thing that materializes a
+    # scratch table) — and the child is unrunnable standalone with one, so this is an
+    # authoring error in the child that would otherwise surface as a confusing
+    # scope-check pass (`_assert_source_tables_in_uses` skips `scratch.*`).
+    #
+    # Recognized CASE-INSENSITIVELY (`_scratch_db_sources`, NOT
+    # `_scratch_placeholder_names`). The exact-match version let `FROM SCRATCH.borrowed`
+    # read as an ordinary warehouse table and this gate never fired; the question here is
+    # "does this touch session scratch at all", whose authority — the MCP's
+    # `_references_scratch_db` — case-folds precisely so a spelling cannot route around
+    # the session gate.
+    scratch = sorted({f"{db}.{name}" for db, name in _scratch_db_sources(template)})
+    if scratch:
+        raise CorpusLoadError(
+            f"blueprint {parent.id}: {ref.where} references {child.id!r}, whose SQL reads "
+            f"session scratch source(s) {scratch}. A referenced blueprint must be runnable "
+            "on its own; nothing in this DAG can materialize them for it."
+        )
+    rename = _reference_token_rename(parent, child, ref, template)
+    # SIMULTANEOUS substitution in ONE pass. Sequential per-token replacement would
+    # chain (`a`→`b` then `b`→`c` renames the original `a` twice), and swapping two
+    # slot names is a realistic mapping.
+    inlined = SLOT_TOKEN.sub(lambda m: "{" + rename.get(m.group(1), m.group(1)) + "}", template)
+    resolved = {k: v for k, v in node.items() if k != NODE_REF_KEY}
+    resolved["sql_template"] = inlined
+    return resolved
+
+
+def _assert_uses_union(
+    parent: BlueprintSeed,
+    refs: list[_NodeReference],
+    footprint: dict[str, frozenset[str]],
+) -> None:
+    """THE SECURITY GATE (requirement 4). A composite must DECLARE at least the union
+    of its referenced blueprints' footprints, or the load fails. Not a warning.
+
+    `uses` is hand-AUTHORED, never derived from the SQL, and it is the corpus's only
+    machine-readable statement of what a blueprint reads. Three readers act on it:
+    the recall scope pre-filter drops a blueprint whose `uses` is not a subset of the
+    caller's `column_scope`; `promotion/token_minter.mint(column_scope=<uses>)` mints
+    the golden-replay JWT from it verbatim; and `_validate_blueprint_dag` gate (c)
+    checks every template against it. A composite that under-declares is offered to
+    users whose scope does not cover what it actually reads — the pre-filter's whole
+    job, silently defeated.
+
+    Gate (c) DOES independently re-check the inlined SQL against the parent's `uses`,
+    so this is not the only thing standing between a reference and a scope escape.
+    The union rule is stricter on purpose: it binds the parent to the child's DECLARED
+    footprint rather than to whatever columns the child's SQL happens to name today, so
+    a later widening of the child cannot quietly widen every composite that inlines it.
+    A child column added upstream fails the parent's load until a human re-declares it.
+
+    TRANSITIVITY. *footprint* accumulates `declared ∪ ⋃ children` in child-first order,
+    so a grandchild's columns reach the grandparent even though only direct children are
+    inspected. Once this check passes, `footprint[id] == set(declared)` — the union is
+    tracked separately anyway so transitivity does not rest on that induction holding.
+    """
+    declared = _declared_uses(parent)
+    required: frozenset[str] = frozenset()
+    contributors: dict[str, list[str]] = {}
+    for ref in refs:
+        child_footprint = footprint.get(ref.target, frozenset())
+        for key in sorted(child_footprint - declared):
+            contributors.setdefault(key, []).append(ref.target)
+        required |= child_footprint
+    missing = sorted(required - declared)
+    if missing:
+        detail = "; ".join(f"{key} (from {sorted(set(contributors[key]))})" for key in missing)
+        raise CorpusLoadError(
+            f"blueprint {parent.id}: declared `uses` is MISSING {len(missing)} scope key(s) "
+            f"its referenced blueprints read — {detail}. A composite's footprint is the "
+            "union of everything it inlines; declaring less would let it read columns "
+            "outside its advertised scope. Add them to `uses` (fail-closed, by design)."
+        )
+    footprint[parent.id] = declared | required
+
+
+def resolve_blueprint_references(blueprints: list[BlueprintSeed]) -> list[BlueprintSeed]:
+    """Resolve every `composes` node `ref` by INLINING the referenced blueprint's SQL.
+
+    Pure and hermetic (no I/O, no driver, no embedder) — `load_corpus` calls it as the
+    first step of its pre-write pass, so every write path (fixture seed, MCP export
+    hydration, the learning landing writer) goes through exactly this. Input seeds are
+    never mutated; a blueprint with no references is returned as-is, by identity.
+
+    Order of operations, and why:
+
+      1. build + shape-validate the reference graph (a dangling target fails here);
+      2. topologically order it CHILD-FIRST, failing on a cross-blueprint cycle;
+      3. cap the chain depth;
+      4. resolve in that order, so a child is already inlined when its parent reads it,
+         and check the `uses` union per parent against the accumulated footprint.
+
+    Returns the seeds in the ORIGINAL input order — `load_corpus` zips the returned list
+    against its embedding vectors, and a reordered list would silently mis-pair them.
+
+    Raises only `CorpusLoadError`. That is a hard requirement, not a style preference:
+    this runs inside `load_corpus`, which the hydrator's self-heal poll re-arms and
+    retries every turn, so an un-wrapped exception here bricks the corpus indefinitely.
+    """
+    by_id: dict[str, BlueprintSeed] = {}
+    for bp in blueprints:
+        # `id` is the KEY of every structure below (this map, the reference graph, the
+        # DFS colouring, the footprint accumulator), so it must be a hashable `str`
+        # before any of them touch it. The dataclass declares `id: str` and enforces
+        # nothing: `load_seed_fixtures` spreads a YAML entry straight into the ctor, so
+        # `id: [a, b]` reaches `bp.id in by_id` and raises `TypeError: unhashable type:
+        # 'list'` — un-wrapped, out of `load_corpus`, retried every poll. Found by
+        # sweeping this path for comparisons/memberships on untrusted values rather than
+        # by being pointed at it; the export path happens to be safe (`_seed_from_entry`
+        # coerces the dict key with `str()`), the fixture path is not.
+        if not isinstance(bp.id, str) or not bp.id:
+            raise CorpusLoadError(
+                f"blueprint id {bp.id!r} is not a non-empty string "
+                f"({type(bp.id).__name__}) — ids key the corpus and every reference to it"
+            )
+        if bp.id in by_id:
+            raise CorpusLoadError(
+                f"duplicate blueprint id {bp.id!r} in one corpus load — a reference to it "
+                "would resolve to whichever copy happened to be last."
+            )
+        by_id[bp.id] = bp
+
+    graph = _reference_graph(by_id)
+    if not graph:
+        return list(blueprints)
+
+    order = _reference_resolution_order(graph)
+    _assert_reference_depth(order, graph)
+
+    # `footprint` seeds from every seed's own declared `uses` — for a blueprint that
+    # inlines nothing that IS its footprint; `_assert_uses_union` widens the parents
+    # as it goes. `_declared_uses` re-runs the scope-key grammar check so this function
+    # is fail-closed when called directly (tests, tooling) and not only via
+    # `load_corpus`, whose pre-write pass has already validated them.
+    footprint: dict[str, frozenset[str]] = {bp.id: _declared_uses(bp) for bp in blueprints}
+    for bp_id in order:
+        refs = graph.get(bp_id)
+        if not refs:
+            continue
+        parent = by_id[bp_id]
+        nodes = _seed_compose_nodes(parent)
+        for ref in refs:
+            nodes[ref.index] = _inline_reference(
+                parent, by_id[ref.target], ref, nodes[ref.index]
+            )
+        _assert_uses_union(parent, refs, footprint)
+        by_id[bp_id] = replace(parent, composes=nodes)
+        _logger.info(
+            "blueprint %s: inlined %d blueprint reference(s) at load (%s)",
+            bp_id,
+            len(refs),
+            ", ".join(sorted({ref.target for ref in refs})),
+        )
+    return [by_id[bp.id] for bp in blueprints]
+
+
+def _declared_uses(bp: BlueprintSeed) -> frozenset[str]:
+    """*bp*'s declared scope keys as a set, grammar-checked first.
+
+    The check is not redundant with `load_corpus`'s pre-write pass: this is the set the
+    `uses` UNION rule compares, and building it from an unvalidated `uses` is how a
+    string silently becomes 8 one-character "scope keys" (see `_validate_blueprint_uses`)."""
+    _validate_blueprint_uses(bp)
+    return frozenset(bp.uses)
 
 
 def _warn_on_catalog_skew(blueprints: list[BlueprintSeed], catalog: CatalogHandle) -> None:
@@ -1129,7 +2035,17 @@ def _scratch_placeholder_names(sql_template: str | None) -> set[str]:
     """The set of `scratch.<placeholder>` table names a template references in a
     FROM/JOIN position (the table-consume bind sites, §2.3). Parsed via
     `parse_template` so a `{slot}` template parses too. A non-parsing template →
-    empty set (the other load checks surface the parse failure)."""
+    empty set (the other load checks surface the parse failure).
+
+    CASE-SENSITIVE, and that is the correct polarity HERE even though the sibling
+    recognizer below is not. This set answers "which placeholders will the executor
+    REWRITE", and `template._rewrite_scratch_tables` matches `db == 'scratch'`
+    exactly — so gate (h) ("a table-consume must appear as a `scratch.<ph>` source")
+    must use the same exact test or it would accept a spelling the executor cannot
+    rewrite. Case-folding here would LOOSEN gate (h) while tightening every other
+    caller: one function, two callers, opposite fail-closed directions. The two
+    questions are therefore split, and `_assert_canonical_scratch_spelling` keeps them
+    from ever disagreeing about a template that actually loads."""
     if not sql_template:
         return set()
     try:
@@ -1141,6 +2057,63 @@ def _scratch_placeholder_names(sql_template: str | None) -> set[str]:
         if table.text("db") == _SCRATCH_DB and table.name:
             names.add(table.name)
     return names
+
+
+def _scratch_db_sources(sql_template: str | None) -> list[tuple[str, str]]:
+    """Every `(db_as_written, table)` source whose database is the scratch DB under a
+    CASE-INSENSITIVE match — the "does this template touch session scratch at all?"
+    question, deliberately over-approximating.
+
+    The authority for that question is the MCP's `service._references_scratch_db`,
+    which matches the scratch database name with `re.IGNORECASE` *specifically* so a
+    spelling cannot route a query around the session gate, and which documents itself as
+    a fail-closed over-approximation. This mirrors that polarity; the exact-match
+    sibling above answers a different question (see its docstring).
+
+    Returns the db text AS WRITTEN so a caller can name the offending spelling."""
+    if not sql_template:
+        return []
+    try:
+        tree = parse_template(sql_template)
+    except TemplateBindError:
+        return []
+    return [
+        (table.text("db"), table.name)
+        for table in tree.find_all(exp.Table)
+        if table.text("db").casefold() == _SCRATCH_DB and table.name
+    ]
+
+
+def _assert_canonical_scratch_spelling(bp_id: str, where: str, tree: exp.Expression) -> None:
+    """Reject a scratch-database source spelled anything other than `scratch`.
+
+    This is what keeps the two recognizers above from disagreeing on anything that
+    actually loads: after this gate, "recognized case-insensitively" and "recognized
+    exactly" describe the same set, so gate (h), the executor's rewrite and the
+    reference gate cannot diverge.
+
+    Without it the escape is real and not merely cosmetic. sqlglot does NOT normalize
+    identifier case on this path (measured: `qualify_tables` and `qualify_columns` both
+    leave `SCRATCH` as written), so `FROM SCRATCH.borrowed` reads as an ordinary
+    warehouse source; declare `SCRATCH.borrowed.<col>` in `uses` — which passes the
+    `db.table.column` grammar unchanged — and `_assert_source_tables_in_uses` finds it
+    declared and the whole corpus loads. The result is a `validated` blueprint reading a
+    session-scoped table nothing can materialize for it, and an offline golden-replay
+    JWT minted from a `column_scope` containing a scratch key. The runtime still fails
+    closed (the MCP's own IGNORECASE gate catches it), so this is defence in depth —
+    but a blueprint that cannot run should not load."""
+    for db, name in [
+        (table.text("db"), table.name)
+        for table in tree.find_all(exp.Table)
+        if table.text("db").casefold() == _SCRATCH_DB and table.name
+    ]:
+        if db != _SCRATCH_DB:
+            raise CorpusLoadError(
+                f"blueprint {bp_id}: {where} reads {db}.{name} — the session scratch "
+                f"database must be spelled exactly {_SCRATCH_DB!r}. Every reader agrees "
+                "the source IS scratch, but only the canonical spelling is rewritten to "
+                "the materialized table, so this would load and could never run."
+            )
 
 
 def _template_output_columns(sql_template: str | None) -> list[str]:
@@ -1470,6 +2443,11 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
                 "columns so its scope footprint is verifiable"
             )
         _assert_no_dict_functions(bp.id, where, tree)
+        # (c0) The scratch DB must be spelled canonically, BEFORE the scope check reads
+        # `db == 'scratch'` to decide what is session-gated. `SCRATCH.borrowed` otherwise
+        # reads as an ordinary warehouse source and, once declared in `uses`, loads a
+        # blueprint that can never run (see `_assert_canonical_scratch_spelling`).
+        _assert_canonical_scratch_spelling(bp.id, where, tree)
         # A consumer node's `scratch.<placeholder>` columns are session-gated: register
         # the producing node's output columns so qualify resolves them, while the
         # warehouse columns are still checked ⊆ uses (§2.3 scope-honesty).
@@ -2143,8 +3121,17 @@ async def load_corpus(
     # scope key fails the whole load loudly rather than silently storing a
     # blueprint the scope filter will always drop. The full-DAG validation (§1.2)
     # runs in the same pre-write pass so an authoring mistake never ships.
+    #
+    # ORDER (plan §2b): `uses` grammar → reference resolution → full-DAG validation.
+    # Resolution INLINES each referenced blueprint's SQL and enforces the `uses` UNION
+    # rule, and it must sit between the two: it compares scope keys (so the grammar has
+    # to hold first) and it produces the templates gate (c) checks (so it has to run
+    # before the DAG validation). Everything after this point — embedding, the
+    # structural key, the `composes_json` property, the executor — sees only inline SQL.
     for bp in blueprints:
         _validate_blueprint_uses(bp)
+    blueprints = resolve_blueprint_references(blueprints)
+    for bp in blueprints:
         _validate_blueprint_dag(bp)
 
     # D94 Part 3: SOFT seed-time catalog-skew warning (optional, dev-time only).
@@ -2349,6 +3336,7 @@ __all__ = [
     "load_seed_fixtures",
     "nuke_graph",
     "rebuild_mcp_corpus_partition",
+    "resolve_blueprint_references",
     "resolve_embedding_dimension",
     "schema_statements",
 ]

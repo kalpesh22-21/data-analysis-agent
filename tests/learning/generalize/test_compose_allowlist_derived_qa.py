@@ -28,7 +28,7 @@ from data_agent.learning.generalize.mapping import (
     blueprint_from_generalization,
     blueprint_seed_from_candidate,
 )
-from data_agent.runtime.blueprint.models import Node
+from data_agent.runtime.blueprint.models import BlueprintParseError, Node
 
 from ..promotion.helpers import FIXTURES
 from .helpers import load_expected, load_plan
@@ -36,8 +36,22 @@ from .helpers import load_expected, load_plan
 _LANDING_ID = "bp::sha256:composite-bp"
 
 # Joined in from the S4 `NodeTemplate`s by `_compose_docs`, deliberately NOT copied
-# from the plan — the one key `Node.parse` reads that must not be allowlisted.
+# from the plan.
 _JOINED_IN_BY_S4 = {"sql_template"}
+
+# Keys `Node.parse` reads in order to REJECT them. Not allowlist candidates — carrying
+# one into `composes_json` would land the very thing the parse layer exists to refuse.
+#
+# HISTORY: this set did not exist until plan §2b added `ref` (a `composes` node naming
+# another blueprint, inlined by `corpus_loader.resolve_blueprint_references` at load).
+# `Node.parse` reads it only to raise, because a reference surviving to the parse layer
+# means resolution was skipped and the node would otherwise parse as a silently
+# template-less step. This test failed the moment that read landed, which is the whole
+# point of deriving the set by observation — but the fix was NOT to allowlist the key.
+# The learning loop authors no references (the S3 `ComposeNodePlan` has no such field),
+# and allowlisting `ref` would give a candidate a way to put an unresolved reference
+# into the governed corpus. So it is excluded HERE, next to the reason.
+_READ_ONLY_TO_REJECT = {"ref"}
 
 
 class _KeyRecordingDict(dict):
@@ -83,11 +97,30 @@ def _keys_node_parse_reads() -> set[str]:
 
 def test_the_allowlist_is_derived_from_what_node_parse_actually_reads() -> None:
     read = _keys_node_parse_reads()
-    assert read - _JOINED_IN_BY_S4 == set(_NODE_DOC_FIELDS), (
+    assert read - _JOINED_IN_BY_S4 - _READ_ONLY_TO_REJECT == set(_NODE_DOC_FIELDS), (
         "`Node.parse` and `_NODE_DOC_FIELDS` disagree. A key Node.parse reads that is "
         "missing from the allowlist is SILENTLY DROPPED at landing; a key in the "
-        "allowlist that Node.parse never reads is un-audited weight in the corpus."
+        "allowlist that Node.parse never reads is un-audited weight in the corpus. If "
+        "the new key is one Node.parse reads only to REJECT, add it to "
+        "`_READ_ONLY_TO_REJECT` with the reason — do NOT allowlist it."
     )
+
+
+def test_a_landed_candidate_can_never_carry_an_unresolved_blueprint_reference() -> None:
+    """The other side of `_READ_ONLY_TO_REJECT`: the landing projection must not pass a
+    `ref` through, and the parse layer must refuse one if it somehow did.
+
+    Blueprint references (plan §2b) are an MCP-canon authoring feature resolved by the
+    corpus loader; the learning tier neither authors nor resolves them. A candidate that
+    smuggled one in would land a compose node with no SQL at all."""
+    marker = "bp-some-other-blueprint"
+    env = _composite_candidate(ref={"blueprint": marker})
+    seed = blueprint_seed_from_candidate(env, id=_LANDING_ID)
+    assert all("ref" not in node for node in seed.composes)
+    assert marker not in json.dumps(seed.composes)
+
+    with pytest.raises(BlueprintParseError):
+        Node.parse({"order": 0, "ref": {"blueprint": marker}})
 
 
 def test_node_parse_reads_nothing_the_projection_deliberately_drops() -> None:
@@ -172,7 +205,5 @@ def test_the_plans_when_field_is_a_string_but_node_parse_needs_an_object() -> No
     composite with `when_bearing_composite` before the projection runs — so `when` is
     an allowlist entry that is currently unreachable-by-construction. Whoever lifts
     that decline must type-map `when` in `_compose_docs`, not just delete the guard."""
-    from data_agent.runtime.blueprint.models import BlueprintParseError
-
     with pytest.raises(BlueprintParseError):
         Node.parse({"order": 0, "when": "row_count > 0"})

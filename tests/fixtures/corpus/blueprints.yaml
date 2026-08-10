@@ -355,31 +355,22 @@
     - { name: period_a, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
     - { name: period_b, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
   result_grain: [ register_type, type_code ]
+  # Nodes 0 and 1 REFERENCE bp-employee-check-detail-for-period (plan §2b) instead of
+  # repeating its SQL; `corpus_loader.resolve_blueprint_references` inlines that
+  # blueprint's template at load, renaming its `{period}` bind site per the `slots`
+  # map. `employee: employee` is spelled out because a reference never binds a slot
+  # implicitly — after inlining only THIS blueprint's slot declarations exist.
   composes:
     - order: 0
       output: { detail_a: table }
-      sql_template: |
-        SELECT toString(register_type) AS register_type,
-               toString(type_code) AS type_code,
-               any(toString(type_code_description)) AS type_code_description,
-               toFloat64(SUM(amount)) AS amount,
-               toFloat64(SUM(type_hours)) AS hours
-        FROM dbpcm_warehouse.payroll
-        WHERE employee_code = {employee}
-          AND pay_period_end_date = {period_a}
-        GROUP BY register_type, type_code
+      ref:
+        blueprint: bp-employee-check-detail-for-period
+        slots: { employee: employee, period: period_a }
     - order: 1
       output: { detail_b: table }
-      sql_template: |
-        SELECT toString(register_type) AS register_type,
-               toString(type_code) AS type_code,
-               any(toString(type_code_description)) AS type_code_description,
-               toFloat64(SUM(amount)) AS amount,
-               toFloat64(SUM(type_hours)) AS hours
-        FROM dbpcm_warehouse.payroll
-        WHERE employee_code = {employee}
-          AND pay_period_end_date = {period_b}
-        GROUP BY register_type, type_code
+      ref:
+        blueprint: bp-employee-check-detail-for-period
+        slots: { employee: employee, period: period_b }
     - order: 2
       feeds_from: [ 0, 1 ]
       consumes: { detail_a: "$0", detail_b: "$1" }
@@ -398,3 +389,36 @@
           ON a.register_type = b.register_type AND a.type_code = b.type_code
         ORDER BY coalesce(a.register_type, b.register_type),
                  coalesce(a.type_code, b.type_code)
+
+# The blueprint the composite above REFERENCES (plan §2b). Extracted verbatim from
+# what were its nodes 0 and 1, which differed only in the pay-period slot: authored
+# once, retrievable and runnable in its own right, and inlined into the composite at
+# corpus load so the executor is unchanged and no reference id reaches the model.
+- id: bp-employee-check-detail-for-period
+  intent: A single employee's paycheck line items for one pay period, with per-item amount and hours
+  slots_summary: employee, period
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.payroll.employee_code
+    - dbpcm_warehouse.payroll.pay_period_end_date
+    - dbpcm_warehouse.payroll.register_type
+    - dbpcm_warehouse.payroll.type_code
+    - dbpcm_warehouse.payroll.type_code_description
+    - dbpcm_warehouse.payroll.amount
+    - dbpcm_warehouse.payroll.type_hours
+  slots:
+    - { name: employee, type: string, required: true, binds_to: dbpcm_warehouse.payroll.employee_code }
+    - { name: period, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
+  result_grain: [ register_type, type_code ]
+  sql_template: |
+    SELECT toString(register_type) AS register_type,
+           toString(type_code) AS type_code,
+           any(toString(type_code_description)) AS type_code_description,
+           toFloat64(SUM(amount)) AS amount,
+           toFloat64(SUM(type_hours)) AS hours
+    FROM dbpcm_warehouse.payroll
+    WHERE employee_code = {employee}
+      AND pay_period_end_date = {period}
+    GROUP BY register_type, type_code

@@ -9,9 +9,15 @@ byte-identical FOUND shape (extension is strictly additive); the non-oracle
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.retrieval.corpus_loader import (
+    _dag_properties,
+    load_seed_fixtures,
+    resolve_blueprint_references,
+)
 from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.tools import GetBlueprintTool
 from data_agent.runtime.retrieval.vector_index import (
@@ -22,6 +28,7 @@ from data_agent.runtime.retrieval.vector_index import (
 
 _A = "dbpcm_warehouse.employee.Department"
 _B = "dbpcm_warehouse.employee.EmployeeCode"
+_FIXTURE_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "corpus"
 
 
 def _creds(scope: frozenset[str]) -> RuntimeCredentials:
@@ -214,6 +221,51 @@ async def test_get_blueprint_composed_hides_dag_shows_composition() -> None:
     # The enriched slots still render (the model needs them to fill the one call).
     assert rf["slots"][0]["requirement"] == "optional"
     assert rf["intent"] and rf["result_grain"] == ["Department"]
+
+
+async def test_get_blueprint_never_teaches_the_model_that_composition_is_nameable() -> None:
+    """Plan §2b requirement 6, end to end over the REAL canon corpus.
+
+    A `composes` node may now name another blueprint (`ref: {blueprint: <id>}`), and the
+    model must not learn that. Inlining at load is what guarantees it — after
+    `resolve_blueprint_references` the node carries SQL and nothing else — but "the
+    property holds by construction" is exactly the claim worth checking against the
+    thing that actually reaches the model, since `getBlueprint` chooses independently
+    what to serialize.
+
+    Built from the real fixture through the real projection (`_dag_properties` →
+    `map_blueprint_detail_record`), so a future field that starts carrying reference
+    provenance onto the node fails here."""
+    seeds = resolve_blueprint_references(load_seed_fixtures(_FIXTURE_DIR)[0])
+    composite = next(
+        bp for bp in seeds if bp.id == "bp-compare-employee-check-detail-two-periods"
+    )
+    props = _dag_properties(composite)
+    detail = map_blueprint_detail_record(
+        {
+            "id": composite.id,
+            "intent": composite.intent,
+            "slots_summary": composite.slots_summary,
+            "uses": list(composite.uses),
+            "status": composite.status,
+            "drift_status": composite.drift_status,
+            "hit_count": 0,
+            "catalog_sha": "",
+            "slots_json": props["slots_json"],
+            "composes_json": props["composes_json"],
+            "result_grain_json": props["result_grain_json"],
+        }
+    )
+    tool = GetBlueprintTool(vector_index=FakeVectorIndex(details={composite.id: detail}))
+    result = await tool.run({"id": composite.id}, _creds(frozenset(composite.uses)))
+    blob = json.dumps(result.result_full) + str(result.result_preview)
+
+    assert result.result_full["composition"]["steps"] == 3
+    assert "bp-employee-check-detail-for-period" not in blob
+    assert '"ref"' not in blob and "blueprint:" not in blob
+    # The already-guarded DAG internals stay hidden too — the reference did not open a
+    # second door onto them.
+    assert "sql_template" not in blob and "feeds_from" not in blob
 
 
 async def test_get_blueprint_dag_less_is_byte_identical_found_shape() -> None:

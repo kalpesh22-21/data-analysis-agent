@@ -56,6 +56,7 @@ from data_agent.runtime.retrieval.corpus_loader import (
     _seed_structural_key,
     load_corpus,
     load_seed_fixtures,
+    resolve_blueprint_references,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -198,10 +199,16 @@ async def test_every_seeded_canon_blueprint_carries_a_structural_key(seeded_cano
     key rather than a remembered constant, so it also catches the half-failure: a corpus
     seeded by an OLDER recipe whose stored digests no longer match what the running code
     computes (which is exactly the split `structural_key_recipe` was stamped to make
-    visible)."""
+    visible).
+
+    References are resolved before re-deriving, exactly as `load_corpus` does (plan
+    §2b). Skipping that step made this test fail against a CORRECTLY seeded graph: a
+    `composes` node may name another blueprint rather than carry SQL, so the unresolved
+    fixture mints a key over the composite's remaining nodes only — a different query
+    from the one the loader keyed and the executor runs."""
     driver, _ = seeded_canon
     blueprints, _knowledge = load_seed_fixtures(_CORPUS_FIXTURES)
-    expected = {bp.id: _seed_structural_key(bp) for bp in blueprints}
+    expected = {bp.id: _seed_structural_key(bp) for bp in resolve_blueprint_references(blueprints)}
     assert all(expected.values()), "a fixture blueprint mints no key at all"
 
     async with driver.session() as session:

@@ -21,17 +21,26 @@ from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     _dag_properties,
     load_seed_fixtures,
+    resolve_blueprint_references,
 )
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "corpus"
 
 
 def test_every_canon_fixture_produces_a_structural_key() -> None:
-    """All ten canon-shaped blueprints (single-node AND composite) must mint a key —
+    """Every canon-shaped blueprint (single-node AND composite) must mint a key —
     a keyless canon tier is invisible to cross-tier prior-art matching, which is the
-    entire purpose of the property."""
+    entire purpose of the property.
+
+    The count was 10 until `bp-employee-check-detail-for-period` was extracted from
+    `bp-compare-employee-check-detail-two-periods` (plan §2b). References are resolved
+    FIRST, mirroring `load_corpus`: a `composes` node may name another blueprint
+    instead of carrying SQL, and the key is derived from the INLINED templates — the
+    SQL the node actually runs. Deriving it from unresolved seeds would silently key a
+    composite on its remaining nodes only."""
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
-    assert len(blueprints) == 10
+    blueprints = resolve_blueprint_references(blueprints)
+    assert len(blueprints) == 11
     keyed = {bp.id: _dag_properties(bp)["structural_key"] for bp in blueprints}
     assert all(key and key.startswith("sha256:") for key in keyed.values()), keyed
     # Distinct blueprints must not collide (several share the `Department` grain, so

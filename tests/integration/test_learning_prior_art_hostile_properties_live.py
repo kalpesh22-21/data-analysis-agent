@@ -438,7 +438,7 @@ async def test_the_object_shaped_uses_rules_the_canon_really_uses_comes_through(
     A `uses_rules` entry is legitimately EITHER a bare string (a static rule) or an
     OBJECT carrying `id`/`resolve_via`/`table`/`binds` — `runtime/blueprint/rules.py::
     parse_rule` handles the object form, and `tests/fixtures/corpus/blueprints.yaml`
-    authors both: 2 of the 10 canon blueprints use strings and
+    authors both: 2 canon blueprints use strings and
     `bp-total-earnings-by-department` uses an object.
 
     The card's mapper originally accepted ONLY the string form, so that blueprint's card

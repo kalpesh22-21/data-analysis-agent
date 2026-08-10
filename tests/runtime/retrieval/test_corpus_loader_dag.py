@@ -20,6 +20,7 @@ from data_agent.runtime.retrieval.corpus_loader import (
     _dag_properties,
     _validate_blueprint_dag,
     load_seed_fixtures,
+    resolve_blueprint_references,
 )
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "corpus"
@@ -45,7 +46,13 @@ def _seed(**overrides: object) -> BlueprintSeed:
 
 
 def test_seed_fixtures_all_validate_and_serialize() -> None:
+    """`resolve_blueprint_references` runs first, exactly as `load_corpus` orders it:
+    a `composes` node may name another blueprint rather than carry SQL (plan §2b), and
+    `_validate_blueprint_dag` deliberately REFUSES an unresolved one (`Node.parse`'s
+    backstop) — a node reaching validation with a live reference would otherwise parse
+    as a silently template-less step."""
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
+    blueprints = resolve_blueprint_references(blueprints)
     assert {b.id for b in blueprints} == {
         "bp-overtime-by-department",
         "bp-active-headcount-by-department",
@@ -57,6 +64,7 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
         "bp-hires-in-range",
         "bp-hires-projection",
         "bp-compare-employee-check-detail-two-periods",
+        "bp-employee-check-detail-for-period",
     }
     # The Department-grained, {department}-filtered seeds — the windowed-period
     # seeds (relative_window / period_range) have a `month` grain and their own
