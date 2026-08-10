@@ -9,6 +9,7 @@ answer-survival scope posture. Thorough coverage is left to the QA pass.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
@@ -29,6 +30,8 @@ from data_agent.runtime.session_history import project_history
 
 SESSION_ID = "sess-assumptions"
 CATALOG = CatalogHandle({"db.t": {"c": "String"}})
+# An assumption that ENCODES A VALUE — the leak the cross-turn drop exists to stop.
+_SECRETISH = "Employees earning above $100,000 were excluded."
 
 
 def _creds(scope: frozenset[str] = frozenset()) -> RuntimeCredentials:
@@ -107,7 +110,11 @@ async def test_tool_returns_ok_confirmation_shape() -> None:
     assert result.status == "ok"
     assert result.tool_name == "recordAssumptions"
     assert result.error_code is None
-    assert result.provenance is None
+    # DETERMINED-EMPTY, not `None`. `None` means UNDETERMINED (fail-closed) and
+    # cost a false failure message to the model on every successful call — see
+    # `test_successful_call_reaches_the_model_as_its_real_confirmation` below.
+    assert result.provenance == frozenset()
+    assert result.provenance is not None
     assert result.result_full is None
     # Confirmation carries the DEDUPED count (1, not 2).
     assert result.result_preview is not None
@@ -522,3 +529,157 @@ def test_outcome_to_dict_includes_assumptions_list_and_null() -> None:
         )
     )
     assert without["assumptions"] is None
+
+
+async def test_successful_call_reaches_the_model_as_its_real_confirmation() -> None:
+    """REGRESSION: a SUCCESSFUL recordAssumptions must reach the model as its own
+    `recorded: N` confirmation — NOT as the D94 withheld sentinel.
+
+    The tool used to return `provenance=None` (UNDETERMINED). `scope_filter.
+    filter_trail`'s current-turn exemption is status-gated to `status != "ok"`, so an
+    `ok`+`None` entry was never exempt: it was dropped and re-materialised as the
+    stranded sentinel. The model was shown
+
+        "result withheld: provenance could not be determined for this call … Do not
+         retry the identical call — it will be withheld again."
+
+    in place of its confirmation on EVERY successful recording, immediately before
+    writing its final answer. Asserted here under an ALLOW-ALL scope, because the bug
+    was not scope-dependent — it fired on every call.
+    """
+    store = InMemorySessionStore()
+    session_id = "sess-ra-render"
+    await store.get_or_create_session(session_id)
+    await store.append_message(
+        session_id,
+        TurnMessage(
+            turn_index=0, role="user", content="How many hires?", ts="t0",
+            provenance=frozenset(),
+        ),
+    )
+    # Persist EXACTLY what the tool returns, through the real ToolResult.
+    result = await RecordAssumptionsTool().run(
+        {"assumptions": ["'Hired' was taken to mean the most recent hire date."]}, _creds()
+    )
+    await store.append_trail_entry(
+        session_id,
+        TrailEntry(
+            turn_index=0,
+            tool_call_id="ra1",
+            tool_name="recordAssumptions",
+            args={"assumptions": ["'Hired' was taken to mean the most recent hire date."]},
+            status=result.status,
+            error_code=result.error_code,
+            provenance=result.provenance,
+            result_preview=result.result_preview,
+            result_full_ref=None,
+            ts="t1",
+        ),
+    )
+
+    assembled = await ContextAssembler(
+        session_store=store,
+        base_system_prompt="BASE",
+        preview_row_count=20,
+        history_token_budget=100_000,
+    ).assemble(session_id, frozenset(), current_turn_index=0)
+
+    rendered = [m for m in assembled.messages if m.get("tool_name") == "recordAssumptions"]
+    assert len(rendered) == 1, "the recordAssumptions entry must reach the model exactly once"
+    entry = rendered[0]
+    # THE POINT: a real result, not the sentinel.
+    assert not entry.get("withheld_sentinel")
+    assert "result withheld" not in json.dumps(entry)
+    assert entry["status"] == "ok"
+    assert entry["result_preview"]["preview_rows"] == [[1]]
+
+
+async def _store_with_assumptions_at_turn0() -> InMemorySessionStore:
+    """A 2-turn session whose turn 0 recorded an assumption and turn 1 is live."""
+    store = InMemorySessionStore()
+    await store.get_or_create_session(SESSION_ID)
+    result = await RecordAssumptionsTool().run({"assumptions": [_SECRETISH]}, _creds())
+    await store.append_message(
+        SESSION_ID,
+        TurnMessage(turn_index=0, role="user", content="Q0?", ts="t0", provenance=frozenset()),
+    )
+    await store.append_trail_entry(
+        SESSION_ID,
+        TrailEntry(
+            turn_index=0, tool_call_id="ra0", tool_name="recordAssumptions",
+            args={"assumptions": [_SECRETISH]}, status=result.status,
+            error_code=result.error_code, provenance=result.provenance,
+            result_preview=result.result_preview, result_full_ref=None, ts="t1",
+        ),
+    )
+    await store.append_message(
+        SESSION_ID,
+        TurnMessage(turn_index=0, role="assistant", content="A0.", ts="t2", provenance=frozenset()),
+    )
+    await store.append_message(
+        SESSION_ID,
+        TurnMessage(turn_index=1, role="user", content="Q1?", ts="t3", provenance=frozenset()),
+    )
+    return store
+
+
+def _assemble(store: InMemorySessionStore, current_turn_index: int | None):
+    return ContextAssembler(
+        session_store=store, base_system_prompt="BASE",
+        preview_row_count=20, history_token_budget=100_000,
+    ).assemble(SESSION_ID, frozenset(), current_turn_index=current_turn_index)
+
+
+async def test_prior_turn_assumptions_never_re_enter_model_context() -> None:
+    """Turn 0's assumption text must NOT be replayed into turn 1's context.
+
+    An assumption is plain English but MAY encode a value ("employees earning above
+    $100,000 were excluded"); by turn 1 the caller's `column_scope` may no longer
+    cover the column it came from. Asserted on the TEXT, not just the entry, because
+    the sentence rides in `args` — the old `None`-provenance mechanism withheld the
+    RESULT while still rendering `args`, so an entry-only assertion would have passed
+    against a design that leaked.
+    """
+    assembled = await _assemble(await _store_with_assumptions_at_turn0(), 1)
+
+    blob = json.dumps(assembled.messages)
+    assert _SECRETISH not in blob
+    assert not [m for m in assembled.messages if m.get("tool_name") == "recordAssumptions"]
+    # The rest of turn 0 still replays — this drops one entry, not the history.
+    assert [m.get("content") for m in assembled.messages if m.get("role") == "user"] == ["Q0?", "Q1?"]
+
+
+async def test_dropping_a_prior_turn_assumption_never_orphans_a_tool_call() -> None:
+    """Both halves of the pair are synthesized from the SAME entry, so dropping it
+    removes the assistant `tool_calls` and the `tool` result together. A leftover
+    announcement with no result is an API 400 that poisons every round-trip."""
+    assembled = await _assemble(await _store_with_assumptions_at_turn0(), 1)
+
+    assert not [m for m in assembled.messages if m.get("tool_call_id") == "ra0"]
+    assert not [m for m in assembled.messages if m.get("withheld_sentinel")]
+
+
+async def test_strict_replay_with_no_current_turn_also_drops_assumptions() -> None:
+    """`current_turn_index=None` is a strict replay with no live turn — every
+    recordAssumptions entry is non-current, so it drops the same fail-safe way."""
+    assembled = await _assemble(await _store_with_assumptions_at_turn0(), None)
+
+    assert _SECRETISH not in json.dumps(assembled.messages)
+
+
+async def test_the_drop_is_context_only_history_and_resume_still_see_them() -> None:
+    """The drop is a RENDER-time rule over the replayed context. The paths that
+    legitimately need the assumptions read the RAW persisted trail and must be
+    untouched — otherwise the UI silently loses the `assumptions` field and a
+    resumed window forgets what it already recorded."""
+    store = await _store_with_assumptions_at_turn0()
+
+    # (a) session_history — the UI's per-turn assumptions.
+    doc = await store.get_or_create_session(SESSION_ID)
+    body = project_history(doc.messages, doc.tool_trail, frozenset(), None)
+    assert body["turns"][0]["assumptions"] == [_SECRETISH]
+
+    # (b) the raw trail still carries the entry for resume seeding.
+    trail = await store.load_trail(SESSION_ID)
+    assert [e.tool_name for e in trail] == ["recordAssumptions"]
+    assert trail[0].args["assumptions"] == [_SECRETISH]

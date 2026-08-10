@@ -342,6 +342,8 @@ class ContextAssembler:
             )
         }
         for entry in raw_trail:
+            if _is_stale_assumptions_entry(entry, current_turn_index):
+                continue
             if id(entry) in in_scope_ids:
                 items.append(
                     (entry.turn_index, entry.ts, _STREAM_RANK_TRAIL,
@@ -444,12 +446,17 @@ class ContextAssembler:
         # per budget window, re-fire once per window for the same guarded call.
         if entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE:
             return
-        # `recordAssumptions` is intentionally `ok`+`None` provenance (it carries no
-        # warehouse data and stays out of replay — see
-        # `_compute_turn_provenance_union`'s carve-out + ui-assumptions-contract.md).
-        # It rides this same stranded-sentinel path to keep its tool_call paired,
-        # but firing `loop_result_withheld_provenance` on EVERY normal use would be
-        # routine noise — stay silent for it, exactly like the idempotent-read guard.
+        # `recordAssumptions` now carries DETERMINED-EMPTY (`frozenset()`)
+        # provenance, so it is in scope under any `column_scope` and never reaches
+        # the stranded path at all — this guard is unreachable in normal operation
+        # and kept only as belt-and-braces against a regression to `None`.
+        #
+        # It USED to return `None` (undetermined) and therefore hit this path on
+        # EVERY successful call, which is why the diagnostic was silenced here
+        # rather than the sentinel being fixed: the model was shown "result
+        # withheld … Do not retry" in place of its own confirmation every time it
+        # recorded assumptions. The cause is fixed at the source in
+        # `composite/record_assumptions.py`; this stays silent regardless.
         if entry.tool_name == "recordAssumptions":
             return
         if withheld_call_ids is not None:
@@ -478,6 +485,43 @@ def _last_user_index(messages: list[dict[str, Any]]) -> int:
         if messages[index].get("role") == "user":
             return index
     return len(messages)
+
+
+def _is_stale_assumptions_entry(entry: TrailEntry, current_turn_index: int | None) -> bool:
+    """True for a `recordAssumptions` entry from any turn OTHER than the current one.
+
+    Such an entry is dropped from the replayed context — not because its provenance
+    is unknown (it is `frozenset()`, determined-empty: the tool reads no warehouse
+    data, see `composite/record_assumptions.py`), but because its `args` carry the
+    model's plain-English assumption sentences and those must not re-enter model
+    context on a later turn, whose `column_scope` may since have narrowed. The tool
+    contract forbids SQL/codes/column names in an assumption but NOT values, so a
+    sentence like "employees earning above $100,000 were excluded" could outlive the
+    caller's access to the column it was derived from.
+
+    This states that rule directly. It was previously encoded by having the tool
+    return `None` (UNDETERMINED) provenance so `filter_trail` would fail-closed drop
+    it — which worked cross-turn but mis-fired in-turn, replacing the model's own
+    confirmation with the D94 "result withheld … Do not retry" sentinel on every
+    successful call. Provenance answers "what columns did this read"; it is the
+    wrong channel for "do not replay this later", so the two are now separate.
+
+    Dropping the entry cannot orphan a tool message: the assistant `tool_calls` half
+    and the `tool` result half are BOTH synthesized from this one entry by
+    `loop/agent_loop.py::_tool_trail_entry_to_canonical`, so they leave together —
+    the same reason the scope-drop path below is orphan-safe.
+
+    `current_turn_index is None` (a strict replay / Layer-1 assemble with no current
+    turn) drops every such entry, which is the same fail-safe direction.
+
+    The RAW trail is untouched, so the paths that legitimately need the assumptions
+    still read them: `agent_loop::_compute_turn_assumptions` (resume seeding) and
+    `session_history::project_history` (the UI's per-turn `assumptions`) both walk
+    the persisted trail, not this rendered context.
+    """
+    if entry.tool_name != "recordAssumptions":
+        return False
+    return current_turn_index is None or entry.turn_index != current_turn_index
 
 
 def _build_withheld_sentinel_message(entry: TrailEntry) -> dict[str, Any]:

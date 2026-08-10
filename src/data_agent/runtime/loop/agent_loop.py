@@ -862,13 +862,17 @@ class AgentLoop:
             if entry.status == "ok" and entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE:
                 continue
             # A successful `recordAssumptions` entry carries NO warehouse data (it
-            # only echoes the model's plain-English assumptions) and deliberately
-            # has `None` provenance so it is dropped from replay by `filter_trail`
-            # (assumption strings never re-enter model context under a narrowed
-            # scope). Like the idempotent-read guard above, it must NOT collapse
-            # this union to `None` — otherwise every turn that records an
-            # assumption would tag its answer undetermined and lose it from history
-            # + replay (docs/decisions/ui-assumptions-contract.md).
+            # only echoes the model's plain-English assumptions). It now has
+            # DETERMINED-EMPTY (`frozenset()`) provenance, so skipping it here and
+            # unioning it are equivalent — an empty set contributes nothing. Kept
+            # as belt-and-braces against a regression to `None`, which would
+            # otherwise collapse this union and tag the turn's answer undetermined,
+            # losing it from history + replay
+            # (docs/decisions/ui-assumptions-contract.md).
+            #
+            # Keeping the assumption STRINGS out of a later turn's model context is
+            # a separate rule with its own home:
+            # `context/assembly.py::_is_stale_assumptions_entry`.
             if entry.status == "ok" and entry.tool_name == "recordAssumptions":
                 continue
             if entry.provenance is None:

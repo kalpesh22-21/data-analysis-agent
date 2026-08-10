@@ -123,7 +123,31 @@ class RecordAssumptionsTool:
             error_code=None,
             retryable=None,
             user_message=None,
-            provenance=None,
+            # DETERMINED-EMPTY (`frozenset()`), not `None`. This tool reads no
+            # warehouse data at all — it echoes back the model's own plain-English
+            # sentences — so it belongs to the same class as `listDatabases` /
+            # `getTableSchema` / `searchKnowledge` in
+            # `provenance/capture.py::_NO_PROVENANCE_TOOLS`: "exposes no
+            # column-level data -> empty, not undetermined".
+            #
+            # It used to return `None`, which in this codebase means UNDETERMINED
+            # (fail-closed), and that had a cost paid on EVERY successful call:
+            # `scope_filter.filter_trail`'s current-turn exemption is status-gated
+            # to `status != "ok"`, so an `ok`+`None` entry is never exempt — it was
+            # dropped and re-materialised as the D94 stranded sentinel. The model
+            # therefore saw "result withheld: provenance could not be determined …
+            # Do not retry the identical call" in place of its confirmation, every
+            # time it recorded assumptions, immediately before writing the final
+            # answer. (The sentinel still rendered `args`, so the assumption text
+            # was in context anyway — the withholding bought nothing in-turn.)
+            #
+            # The `None` was ALSO doing a second, unrelated job: keeping assumption
+            # strings out of a LATER turn's context, whose `column_scope` may have
+            # narrowed. That rule is real, but provenance is the wrong channel for
+            # it — it now lives explicitly in
+            # `context/assembly.py::_is_stale_assumptions_entry`, which drops a
+            # non-current-turn `recordAssumptions` entry by name.
+            provenance=frozenset(),
             result_preview=confirmation,
             result_full=None,
         )
