@@ -65,13 +65,20 @@ def _doc_id(canonical_key: str) -> str:
 
 def _to_doc(artifact: CorpusArtifact) -> dict[str, Any]:
     """The persisted document for a landed artifact. `hit_count` is stored as a
-    plain integer so the sub-document counter can atomically increment it."""
+    plain integer so the sub-document counter can atomically increment it.
+
+    `status`/`source` are written from this slice on (PriorArtIndex Slice 1). Docs
+    already in the bucket carry neither; `CorpusArtifact.from_doc` defaults them to the
+    values those docs have always implicitly had, so no migration is needed and none of
+    the sub-document mutations below are affected (they address `hit_count` only)."""
     return {
         "id": artifact.id,
         "canonical_key": artifact.canonical_key,
         "intent": artifact.intent,
         "hit_count": int(artifact.hit_count),
         "uses_rules": list(artifact.uses_rules),
+        "status": artifact.status,
+        "source": artifact.source,
     }
 
 

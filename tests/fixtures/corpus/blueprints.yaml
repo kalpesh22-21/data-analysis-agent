@@ -14,31 +14,32 @@
 # write-time validation (§1.2) proves every `{slot}` is declared, each template
 # parses under ClickHouse, and the template's column footprint ⊆ `uses`.
 - id: bp-overtime-by-department
-  intent: Total overtime pay by department for a given pay period
-  slots_summary: department, pay_period
+  intent: Earnings by department for a given pay period, filtered to a specific pay type (type_code) such as overtime
+  slots_summary: department, pay_period, type_code
   status: validated
   drift_status: clean
   catalog_sha: ""
   uses:
     - dbpcm_warehouse.payroll.employee_code
     - dbpcm_warehouse.payroll.register_type
+    - dbpcm_warehouse.payroll.type_code
     - dbpcm_warehouse.payroll.amount
     - dbpcm_warehouse.payroll.pay_period_end_date
     - dbpcm_warehouse.employee.employee_code
     - dbpcm_warehouse.employee.department_name
-  resolves:
-    overtime: gross_earnings
   slots:
     - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
     - { name: pay_period, type: period, required: true, binds_to: dbpcm_warehouse.payroll.pay_period_end_date }
+    - { name: type_code, type: string, required: true, binds_to: dbpcm_warehouse.payroll.type_code }
   uses_rules:
     - gross_earnings
   result_grain: [ Department ]
   sql_template: |
-    SELECT e.department_name AS department, SUM(p.amount) AS overtime_pay
+    SELECT e.department_name AS department, SUM(p.amount) AS earnings
     FROM dbpcm_warehouse.payroll AS p
     JOIN dbpcm_warehouse.employee AS e ON e.employee_code = p.employee_code
     WHERE p.register_type = 'EARN'
+      AND p.type_code = {type_code}
       AND e.department_name = {department}
       AND p.pay_period_end_date = {pay_period}
     GROUP BY e.department_name
@@ -54,7 +55,7 @@
     - dbpcm_warehouse.employee.department_name
     - dbpcm_warehouse.employee.employee_status
   slots:
-    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
+    - { name: department, type: string, required: false, binds_to: dbpcm_warehouse.employee.department_name, optional_pattern: 'TRUE' }
   uses_rules:
     - active_employee
   result_grain: [ Department ]
@@ -77,7 +78,7 @@
   resolves:
     salary: annual_salary
   slots:
-    - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
+    - { name: department, type: string, required: false, binds_to: dbpcm_warehouse.employee.department_name, optional_pattern: 'TRUE' }
   result_grain: [ Department ]
   sql_template: |
     SELECT department_name AS department,

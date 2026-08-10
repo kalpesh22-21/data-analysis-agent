@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any
 
 from ...runtime.blueprint.models import Blueprint
+from ...runtime.blueprint.structural_key import structural_key_from_templates
 from ...runtime.retrieval.corpus_loader import BlueprintSeed, KnowledgeSeed
 from ..candidate.generalization import BlueprintGeneralization
 from ..candidate.models import CandidateEnvelope
@@ -134,6 +135,24 @@ def blueprint_seed_from_candidate(
         # recall partition.
         source="learning",
         verified=verified,
+        # The LOOSE cross-tier identity (`runtime/blueprint/structural_key.py`). Hashing
+        # only `[grain_columns, structural_ast_norm]` is what lets a landed learning node
+        # match a hand-authored MCP-canon blueprint, which the frozen D48 key cannot do
+        # (canon carries neither `resolves` nor `uses_rules`).
+        #
+        # Derived from S4's TEMPLATES, deliberately NOT from `gen.canonical_ast_norm`: the
+        # structural render additionally folds standard function names and strips comments,
+        # which the frozen render must never do (its digests are persisted). Passing the
+        # frozen string here would mint a key the canon tier can never match. This is the
+        # SAME call the seeder makes for a canon blueprint, which is what makes the two
+        # tiers agree; stamping it here rather than leaving the loader to re-derive just
+        # saves the second parse. Empty (⇒ absent, never colliding) when the templates do
+        # not normalize.
+        structural_key=structural_key_from_templates(
+            gen.result_grain.to_doc(),
+            gen.sql_template,
+            [(n.order, n.sql_template) for n in gen.node_templates],
+        ),
         resolves=dict(blueprint.resolves),
         slots=_slot_docs(env.payload),
         uses_rules=list(gen.uses_rules),

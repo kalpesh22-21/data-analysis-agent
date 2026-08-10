@@ -43,7 +43,11 @@ from .corpus import BlueprintCorpus, CorpusArtifact
 
 _logger = logging.getLogger(__name__)
 
-# Provisional bands (RuntimeSettings-style tunables, wired as knobs — §11).
+# The near-miss bands. These are the CONSTRUCTOR defaults only — production reads them
+# off `LearningSettings.learning_dedup_{merge,conflict}_threshold` and the composition
+# root passes them in, so an operator can retune without a code change. They stay here
+# (rather than becoming a settings import) because this stage must not read global
+# settings: injection is what keeps the unit suite hermetic (§11).
 _DEFAULT_MERGE_THRESHOLD = 0.95
 _DEFAULT_CONFLICT_THRESHOLD = 0.83
 
@@ -63,6 +67,10 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
+class ThresholdConfigError(ValueError):
+    """Raised when the soft-layer bands are ordered such that one is unreachable."""
+
+
 class DedupStage:
     """The S6 dedup stage. `stage_id == "dedup"` (the frozen pipeline slot)."""
 
@@ -76,6 +84,20 @@ class DedupStage:
         merge_threshold: float = _DEFAULT_MERGE_THRESHOLD,
         conflict_threshold: float = _DEFAULT_CONFLICT_THRESHOLD,
     ) -> None:
+        if conflict_threshold > merge_threshold:
+            # `_soft_layer` tests `>= merge` FIRST, so an inverted pair makes the
+            # `conflict` branch UNREACHABLE: with merge=0.80/conflict=0.90 a 0.85
+            # similarity is stamped `merge` — a mergeable variant — when the operator
+            # asked for it to be a `conflict`. Both verdicts route to the review inbox,
+            # so nothing lands wrongly, but every near-miss is silently MISLABELLED with
+            # no log to explain it. Fail at construction (composition root, process
+            # start) rather than mis-adjudicate for the life of the deployment.
+            raise ThresholdConfigError(
+                f"dedup conflict_threshold ({conflict_threshold}) must be <= "
+                f"merge_threshold ({merge_threshold}); the soft layer tests the merge "
+                "band first, so an inverted pair makes the conflict band unreachable "
+                "and silently relabels every near-miss as `merge`."
+            )
         self._corpus = corpus
         self._embedder = embedder
         self._merge_threshold = merge_threshold

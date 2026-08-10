@@ -32,15 +32,32 @@ class CorpusArtifact:
     intent: str
     hit_count: int = 1
     uses_rules: tuple[str, ...] = ()
+    # --- Lifecycle/provenance (PriorArtIndex Slice 1 — SCHEMA ONLY, nothing reads
+    # these yet). Today an artifact is write-once: S6 seeds it at first sighting and
+    # increments it forever, so a candidate the scheduler REJECTED leaves an artifact
+    # indistinguishable from a live one, still accruing hits toward the promotion
+    # threshold. `status` is the field that will let a reader tell those apart, and
+    # `source` the tier the artifact came from (learning staging vs. MCP canon). Both
+    # default to the CURRENT implicit values so every existing seeded artifact keeps its
+    # exact present meaning; wiring the scheduler's status write-back is a later slice.
+    status: str = "extracted"
+    source: str = "learning"
 
     @classmethod
     def from_doc(cls, doc: dict[str, Any]) -> CorpusArtifact:
+        """Rehydrate a persisted doc. `status`/`source` are read with the SAME defaults
+        as the dataclass so a doc written BEFORE this slice (which carries neither key)
+        loads as the live-learning artifact it has always been — the corpus bucket is
+        durable and is never migrated, so tolerating the older shape is required, not
+        merely polite."""
         return cls(
             id=doc["id"],
             canonical_key=doc["canonical_key"],
             intent=doc.get("intent", ""),
             hit_count=int(doc.get("hit_count", 1)),
             uses_rules=tuple(doc.get("uses_rules", []) or []),
+            status=str(doc.get("status") or "extracted"),
+            source=str(doc.get("source") or "learning"),
         )
 
 

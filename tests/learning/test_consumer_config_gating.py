@@ -57,6 +57,8 @@ def _fake_learning_settings(
         learning_candidates_password="p" if candidates else "",
         learning_corpus_username="u" if corpus else "",
         learning_corpus_password="p" if corpus else "",
+        learning_dedup_merge_threshold=0.95,
+        learning_dedup_conflict_threshold=0.83,
         otlp_endpoint="",
         learning_service_name="learning-loop",
         learning_consumer_group="learning-workers",

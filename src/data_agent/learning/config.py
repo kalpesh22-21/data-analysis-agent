@@ -200,6 +200,32 @@ class LearningSettings(BaseSettings):
         ),
     )
 
+    # --- S6 dedup soft layer (D48 §11) — the embedding near-miss bands. Previously
+    # hardcoded in `dedup/stage.py`; surfaced here so an operator can tune them without
+    # a code change. They are ORDERED bands over cosine similarity on `intent`:
+    # `>= merge` ⇒ a mergeable variant, `>= conflict` ⇒ a partial-overlap conflict,
+    # below ⇒ `insert`. NEITHER auto-appends: both route to the review inbox (D48 §3),
+    # so a mis-tuned band costs review noise, never a bad landing.
+    learning_dedup_merge_threshold: float = Field(
+        0.95,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Cosine similarity at/above which an intent near-match is stamped `merge` "
+            "(a mergeable blueprint variant, routed to review — never auto-appended)."
+        ),
+    )
+    learning_dedup_conflict_threshold: float = Field(
+        0.83,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Cosine similarity at/above which an intent near-match is stamped `conflict` "
+            "(partial overlap, routed to review). Must be <= the merge threshold; below "
+            "it the candidate is a genuinely-new `insert`."
+        ),
+    )
+
     # --- Extractor (Slice 3, D31/D34) — the LLM structured-output model + retry. ---
     learning_extractor_model: str = Field(
         "claude-opus-4-8",

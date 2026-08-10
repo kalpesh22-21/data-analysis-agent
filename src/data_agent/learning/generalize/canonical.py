@@ -5,24 +5,22 @@ the recipe is exact and the sqlglot version is pinned (`~=30.12`, `pyproject.tom
 a minor bump can change the render, silently mint a different `canonical_key`, and
 degrade a D48 `increment` into a spurious `insert` (a duplicate blueprint).
 
-The stored `sql_template` is BRACE authoring form (`{slot}`, runtime-executable with
-zero translation). The recipe converts each `{slot}` → `:slot` FIRST — reusing the
-runtime binder's `_SLOT_TOKEN` regex (`runtime/blueprint/template.py`), the SAME
-rewrite the executor applies — so the hash input is computed from the identical
-`:slot` intermediate the runtime parses. This keeps `canonical_ast_norm` byte-stable
-regardless of the stored placeholder surface.
+**The recipe itself now lives in `runtime/blueprint/structural_key.py`** and this
+module is the learning-side adapter over it. The move is load-bearing, not cosmetic:
+the MCP-canon corpus seeder (`runtime/retrieval/corpus_loader.py`, imported by the
+online hydrator) must derive the SAME normalized string for the cross-tier
+`structural_key`, and the D58c no-import invariant forbids the runtime/request path
+from importing `data_agent.learning.*`. One definition, imported downward — a second
+copy of the recipe would let the two writers drift and defeat the key.
 
 The recipe (schema-free, deterministic — do NOT run the full optimizer or `qualify`,
 which need a schema and choke on slot placeholders):
 
-    _SLOT_TOKEN.sub `{slot}` → `:slot`
+    SLOT_TOKEN.sub `{slot}` → `:slot`
       → parse_one(dialect="clickhouse")
       → normalize_identifiers   (case-fold)
       → normalize               (canonical boolean form)
       → .sql(dialect="clickhouse", normalize=True, pretty=False)
-
-A `:slot` placeholder parses to a sqlglot `Placeholder` and renders in the ClickHouse
-dialect as the stable canonical token `{slot: }`, surviving the round-trip unchanged.
 
 Composite rule (PINNED so the S4 producer and the S6 hasher cannot diverge): for a
 composite blueprint (top-level `sql_template` is None), `canonical_ast_norm` is the
@@ -35,28 +33,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-import sqlglot
-from sqlglot.optimizer.normalize import normalize
-from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
-
-from ...runtime.blueprint.template import SLOT_TOKEN
+from ...runtime.blueprint.structural_key import (
+    blueprint_canonical_ast_norm,
+    canonical_ast_norm_one,
+)
 from ..candidate.generalization import NodeTemplate
-
-_DIALECT = "clickhouse"
-
-
-def canonical_ast_norm_one(sql_template: str) -> str:
-    """Normalize a single template by the exact §11.2 recipe. Assumes a parseable
-    template (the caller has already produced it via the AST rewrite).
-
-    The stored template is BRACE authoring form (`{slot}`); rewrite each `{slot}` →
-    `:slot` FIRST (the runtime binder's `SLOT_TOKEN`, reused not reimplemented) so the
-    hash input is computed from the identical `:slot` intermediate the runtime parses."""
-    colon_template = SLOT_TOKEN.sub(lambda m: f":{m.group(1)}", sql_template)
-    ast = sqlglot.parse_one(colon_template, dialect=_DIALECT)
-    ast = normalize_identifiers(ast, dialect=_DIALECT)
-    ast = normalize(ast)
-    return ast.sql(dialect=_DIALECT, normalize=True, pretty=False)
 
 
 def canonical_ast_norm(
@@ -68,8 +49,14 @@ def canonical_ast_norm(
     Single: `sql_template` is the one top-level template.
     Composite: `sql_template` is None; join the per-node normalized templates in
     ascending `order` with a single newline.
+
+    Projects the S4 `NodeTemplate` value objects onto the shared `(order, template)`
+    pairs the runtime normalizer takes, so the learning plane and the canon seeder run
+    the IDENTICAL recipe over the IDENTICAL join.
     """
-    if sql_template is not None:
-        return canonical_ast_norm_one(sql_template)
-    ordered = sorted(node_templates, key=lambda n: n.order)
-    return "\n".join(canonical_ast_norm_one(n.sql_template) for n in ordered)
+    return blueprint_canonical_ast_norm(
+        sql_template, [(n.order, n.sql_template) for n in node_templates]
+    )
+
+
+__all__ = ["canonical_ast_norm", "canonical_ast_norm_one"]

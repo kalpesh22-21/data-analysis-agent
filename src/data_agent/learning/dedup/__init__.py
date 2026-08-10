@@ -6,12 +6,13 @@
 # `hit_count` bump (which lives on the corpus ARTIFACT, never the envelope).
 from .canonical_key import compute_canonical_key
 from .corpus import BlueprintCorpus, CorpusArtifact, InMemoryBlueprintCorpus
-from .stage import DedupStage
+from .stage import DedupStage, ThresholdConfigError
 
 __all__ = [
     "BlueprintCorpus",
     "CorpusArtifact",
     "DedupStage",
     "InMemoryBlueprintCorpus",
+    "ThresholdConfigError",
     "compute_canonical_key",
 ]

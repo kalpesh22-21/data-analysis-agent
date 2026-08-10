@@ -115,7 +115,12 @@ class _InsertOnlyEmbedder:
     """The DEFAULT dedup embedder when none is injected: its `embed` raises, so the
     S6 soft layer degrades to `insert` (D48/D52 fail-soft) — the race-safe hard
     canonical key still dedups exact duplicates; only the soft near-miss
-    adjudication is disabled. Inject a real embedder to enable it."""
+    adjudication is disabled. Inject a real embedder to enable it.
+
+    A deployment with no embedding endpoint configured is a SUPPORTED posture, not a
+    misconfiguration: it must keep running on hard-key-only dedup rather than crash. It
+    is, however, an INVISIBLE degrade (every candidate looks like a clean `insert`), so
+    the factory logs the fallback loudly at startup — see `build_learning_consumer`."""
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         raise RuntimeError(
@@ -200,7 +205,27 @@ def build_learning_consumer(
     )
 
     # Deliberate stage-level defaults (a fake is fine; the stage must be present).
-    embedder = embedder if embedder is not None else _InsertOnlyEmbedder()
+    if embedder is None:
+        # SUPPORTED but INVISIBLE degrade: with no embedding endpoint configured the S6
+        # soft layer cannot run at all, so every near-duplicate that misses the hard key
+        # is adjudicated `insert` and the loop happily re-proposes variants of artifacts
+        # it already holds. Never a crash (an unconfigured deployment must keep draining
+        # the queue) — but never silent either, because the symptom (duplicate
+        # candidates) points nowhere near the cause.
+        _logger.warning(
+            "no dedup embedder wired — the S6 soft near-miss layer is DISABLED and every "
+            "hard-key miss will be adjudicated `insert` (hard canonical-key dedup still "
+            "applies). Set EMBEDDING_API_URL so the entrypoint builds an "
+            "HttpEmbeddingClient, or inject one explicitly."
+        )
+        embedder = _InsertOnlyEmbedder()
+    else:
+        _logger.info(
+            "dedup soft layer ENABLED via %s (merge>=%.3f, conflict>=%.3f)",
+            type(embedder).__name__,
+            settings.learning_dedup_merge_threshold,
+            settings.learning_dedup_conflict_threshold,
+        )
     git_client = git_client if git_client is not None else _NullGitPullRequestClient()
     semantic_scanner = (
         semantic_scanner if semantic_scanner is not None else NullSemanticEntityScanner()
@@ -238,7 +263,12 @@ def build_learning_consumer(
             user_store=user_store,
             tracer=tracer,
         ),
-        DedupStage(blueprint_corpus, embedder),
+        DedupStage(
+            blueprint_corpus,
+            embedder,
+            merge_threshold=settings.learning_dedup_merge_threshold,
+            conflict_threshold=settings.learning_dedup_conflict_threshold,
+        ),
         SchemaEditPRStage(git_client=git_client, checks=checks),
         UserKnowledgeCommitStage(store=user_store),
         WriterStage(sampler=sampler),

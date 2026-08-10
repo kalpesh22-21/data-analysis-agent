@@ -44,6 +44,11 @@ from sqlglot.schema import MappingSchema
 from data_agent.runtime.blueprint.models import Blueprint, BlueprintParseError
 from data_agent.runtime.blueprint.rules import parse_rule
 from data_agent.runtime.blueprint.slots import slot_token_names
+from data_agent.runtime.blueprint.structural_key import (
+    normalize_structural_grain,
+    structural_key_from_templates,
+    structural_key_recipe,
+)
 from data_agent.runtime.blueprint.template import (
     TemplateBindError,
     assert_read_only_select,
@@ -104,6 +109,14 @@ class BlueprintSeed:
     # partition until Phase-3 promotes it.
     source: str = "mcp"
     verified: bool = True
+    # The LOOSE cross-authoring-path identity (`runtime/blueprint/structural_key.py`).
+    # Empty by DEFAULT: the MCP-canon YAMLs carry a `sql_template`/`composes` and no key,
+    # so `_dag_properties` DERIVES one from the seed's own templates + grain at write
+    # time. The learning landing seed sets it EXPLICITLY (from the same shared helper,
+    # over S4's templates) and that explicit value WINS — purely to save a second parse,
+    # since both paths run the identical derivation and must agree by construction. A
+    # seed whose templates do not normalize lands with NO key at all.
+    structural_key: str = ""
     # --- additive full-DAG fields, the runBlueprint brick (OQ-T1, §1.2). All
     # optional-defaulted so existing D87/D88 fixtures still load (no migration).
     # Stored as JSON-string properties on the `:Blueprint` node; unread by recall.
@@ -450,7 +463,9 @@ SET b.name = $id,
     b.uses_rules_json = $uses_rules_json,
     b.sql_template = $sql_template,
     b.composes_json = $composes_json,
-    b.result_grain_json = $result_grain_json
+    b.result_grain_json = $result_grain_json,
+    b.structural_key = $structural_key,
+    b.structural_key_recipe = $structural_key_recipe
 """
 
 # Reserved graph shape (§1.3): the blueprint's USES closure written as edges,
@@ -919,10 +934,86 @@ def _warn_on_catalog_skew(blueprints: list[BlueprintSeed], catalog: CatalogHandl
             )
 
 
+def _compose_node_templates(composes: list[dict[str, Any]]) -> list[tuple[int, str]]:
+    """The `(order, sql_template)` pairs of a composite seed's DAG nodes — the shape
+    the shared canonicalizer joins in ascending order (§11.2 composite rule).
+
+    A node with no `sql_template` (canon authors output-only DAG nodes) or a non-integer
+    `order` is SKIPPED, mirroring the learning side where every `NodeTemplate` carries a
+    real template — so both paths join the same set of normalized strings."""
+    pairs: list[tuple[int, str]] = []
+    for node in composes:
+        if not isinstance(node, dict):
+            continue
+        template = node.get("sql_template")
+        order = node.get("order")
+        if not isinstance(template, str) or not template.strip():
+            continue
+        if not isinstance(order, int) or isinstance(order, bool):
+            continue
+        pairs.append((order, template))
+    return pairs
+
+
+def _seed_structural_key(bp: BlueprintSeed) -> str:
+    """The seed's LOOSE cross-tier `structural_key`, or `""` when one cannot be minted.
+
+    An EXPLICIT `bp.structural_key` wins; absent one, DERIVE it from the seed's own
+    `sql_template`/`composes` + `result_grain`. Both branches run the SAME
+    `structural_key_from_templates` helper, so they agree by construction — the learning
+    landing seed stamps its key up front only to save a second sqlglot parse, and the
+    MCP-canon tier (whose YAMLs carry no key) always takes the derive branch.
+
+    FAIL-SOFT (D52): an unparseable template yields `""` and a WARNING, never a raise —
+    but that branch is defensive DEPTH, not the active load-path behavior. `load_corpus`
+    never reaches it with a bad template: `_validate_blueprint_dag` runs unconditionally
+    in the earlier pre-write pass and raises `CorpusLoadError` for anything this recipe
+    would also reject, aborting the WHOLE load fail-CLOSED (pre-existing by design — an
+    authoring mistake must not ship). The guard here becomes live only if the key recipe
+    ever grows stricter than loader validation, which
+    `test_every_template_the_key_recipe_rejects_is_also_rejected_by_loader_validation`
+    watches for."""
+    if bp.structural_key:
+        return bp.structural_key
+    if not bp.sql_template and not bp.composes:
+        return ""
+    key = structural_key_from_templates(
+        bp.result_grain, bp.sql_template, _compose_node_templates(bp.composes)
+    )
+    if not key:
+        # Name the ACTUAL cause. There are two, and they lead an operator to opposite
+        # places: an unparseable template, or a `result_grain` carrying a non-string
+        # member (a YAML null from a dangling `-`, an unquoted number). Blaming the
+        # template for a grain failure sends them to debug SQL that parses fine.
+        cause = (
+            "result_grain has a non-string member, so the grain is unusable"
+            if normalize_structural_grain(bp.result_grain) is None
+            else "the template did not normalize"
+        )
+        _logger.warning(
+            "blueprint %s: could not derive a structural_key (%s); the node lands WITHOUT "
+            "one and is invisible to cross-tier prior-art matching",
+            bp.id,
+            cause,
+        )
+    return key
+
+
 def _dag_properties(bp: BlueprintSeed) -> dict[str, Any]:
     """Serialize the additive full-DAG fields into the neo4j string properties
     (§1.1). Empty structures are stored as `null` so a DAG-less blueprint carries
-    no phantom `{}`/`[]` — additive and back-compatible with D87/D88 seeds."""
+    no phantom `{}`/`[]` — additive and back-compatible with D87/D88 seeds.
+
+    `structural_key` follows the same `null`-when-absent rule, and that is
+    SAFETY-RELEVANT rather than cosmetic: an empty-string key stored on every
+    unparseable blueprint would make a naive `MATCH (b {structural_key: $k})` lookup
+    match them ALL as false prior art. Absent means absent.
+
+    `structural_key_recipe` is written ONLY alongside a real key, under the same rule —
+    a recipe stamp on a keyless node describes nothing. Unread today; it exists so that a
+    sqlglot bump splitting the re-derived canon tier from the write-once learning tier is
+    DETECTABLE rather than silent (see `structural_key_recipe`)."""
+    key = _seed_structural_key(bp) or None
     return {
         "resolves_json": json.dumps(bp.resolves) if bp.resolves else None,
         "slots_json": json.dumps(bp.slots) if bp.slots else None,
@@ -930,6 +1021,8 @@ def _dag_properties(bp: BlueprintSeed) -> dict[str, Any]:
         "sql_template": bp.sql_template,
         "composes_json": json.dumps(bp.composes) if bp.composes else None,
         "result_grain_json": (json.dumps(bp.result_grain) if bp.result_grain is not None else None),
+        "structural_key": key,
+        "structural_key_recipe": structural_key_recipe() if key else None,
     }
 
 
@@ -2007,6 +2100,12 @@ async def load_corpus(
     # `_write`, logged once AFTER the txn commits (§ MERGE→MATCH drift signal).
     missing_by_blueprint: dict[str, list[str]] = {}
 
+    # Serialize the DAG properties BEFORE opening the write txn. `_dag_properties` now
+    # sqlglot-parses each template to derive the `structural_key`, and CPU work inside a
+    # write transaction holds neo4j locks for no reason — the computation depends only on
+    # the seeds, so it belongs out here with the embedding step.
+    dag_props = [_dag_properties(bp) for bp in blueprints]
+
     async with driver.session(database=database) as session:
 
         async def _write(tx: AsyncManagedTransaction) -> None:
@@ -2016,7 +2115,7 @@ async def load_corpus(
             # whichever commits second sees the first's stamp and is refused.
             existing = await _fetch_existing_models(tx)
             check_model_parity(existing, model_id)
-            for bp, vector in zip(blueprints, bp_vectors, strict=True):
+            for bp, vector, props in zip(blueprints, bp_vectors, dag_props, strict=True):
                 await tx.run(
                     _UPSERT_BLUEPRINT,
                     id=bp.id,
@@ -2033,7 +2132,7 @@ async def load_corpus(
                     source=bp.source,
                     verified=bp.verified,
                     corpus_sha=corpus_sha,
-                    **_dag_properties(bp),
+                    **props,
                 )
                 # S1: unconditional — rewrites the edge set (delete-then-add), so
                 # a shrunk uses set leaves no phantom :USES edges. MERGE→MATCH:

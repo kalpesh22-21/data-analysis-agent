@@ -107,8 +107,24 @@ def test_doc_mapping_round_trips():
         "intent": "total earnings by dept",
         "hit_count": 1,
         "uses_rules": ["active_employee"],
+        "status": "extracted",
+        "source": "learning",
     }
     assert CorpusArtifact.from_doc(doc) == art
+
+
+def test_from_doc_tolerates_a_pre_status_doc():
+    """The corpus bucket is durable and is never migrated, so every doc written before
+    `status`/`source` existed must still load — as the live-learning artifact it has
+    always implicitly been, not as a crash and not as a retired one."""
+    legacy = {
+        "id": "candidate::1",
+        "canonical_key": "sha256:abc",
+        "intent": "total earnings by dept",
+        "hit_count": 1,
+        "uses_rules": ["active_employee"],
+    }
+    assert CorpusArtifact.from_doc(legacy) == _artifact()
 
 
 def test_doc_id_is_namespaced():
