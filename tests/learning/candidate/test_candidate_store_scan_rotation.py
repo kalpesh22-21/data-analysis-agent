@@ -115,6 +115,47 @@ async def test_mixed_none_and_string_cursors_do_not_raise_on_sort():
     assert [c.candidate_id for c in got][:3] == ["c::0", "c::2", "c::4"]  # unscanned
 
 
+async def test_tied_cursors_break_on_candidate_id_not_on_insertion_order():
+    """Without a secondary key, rows sharing a cursor value fell back to whatever each
+    store happened to do — this fake to dict insertion order, the Couchbase GSI to its
+    implicit trailing doc key — so "which rows the bounded window contains" was
+    impl-defined and the two stores could disagree. Insertion order below is
+    deliberately NOT id order, so a regression changes the answer.
+
+    MEASURED equal against live Couchbase 7.6.5 with the shipped
+    `idx_candidates_scan_rotation(status, last_scanned_at, candidate_id)` index."""
+    store = InMemoryCandidateStore()
+    tied = "2026-08-10T12:00:00+00:00"
+    for i in (3, 0, 4, 1, 2):
+        await store.put(_envelope(f"c::{i}", last_scanned_at=tied))
+    await store.put(_envelope("c::never"))  # MISSING still outranks every tie
+
+    got = await store.list_by_status(
+        CandidateStatus.CANDIDATE, limit=4, order_by="last_scanned_at"
+    )
+
+    assert [c.candidate_id for c in got] == ["c::never", "c::0", "c::1", "c::2"]
+
+
+async def test_desc_stays_the_exact_reverse_of_asc_including_the_tiebreak():
+    """Every ORDER BY key takes the SAME direction in the N1QL statement, which is what
+    lets this fake implement DESC as `sort(); reverse()` and still match. If the tiebreak
+    were ever emitted with a fixed direction the two would silently diverge on ties."""
+    store = InMemoryCandidateStore()
+    tied = "2026-08-10T12:00:00+00:00"
+    for i in (2, 0, 1):
+        await store.put(_envelope(f"c::{i}", last_scanned_at=tied))
+
+    asc = await store.list_by_status(
+        CandidateStatus.CANDIDATE, order_by="last_scanned_at"
+    )
+    desc = await store.list_by_status(
+        CandidateStatus.CANDIDATE, order_by="last_scanned_at", order="desc"
+    )
+
+    assert [c.candidate_id for c in desc] == [c.candidate_id for c in reversed(asc)]
+
+
 async def test_created_at_ordering_is_unchanged_by_default():
     """The inbox/archive read is untouched: `order_by` defaults to `created_at`, so
     every existing caller keeps the byte-identical arrival-order view."""
@@ -308,7 +349,13 @@ async def test_rotation_read_orders_by_the_cursor_and_parameterizes_the_rest():
     )
 
     statement, options = cluster.queries[0]
-    assert "ORDER BY c.last_scanned_at ASC" in statement
+    # The tiebreak must be IN the statement, and both keys must take the same direction.
+    # MEASURED on couchbase 7.6.5: with the shipped three-key
+    # `idx_candidates_scan_rotation` this plans as `IndexScan3 index_order=[keypos 1,
+    # keypos 2] limit=200` — no Order stage. Against a two-key index the planner drops
+    # the index entirely and adds a full sort, so the ORDER BY and the index definition
+    # in scripts/learning-candidates-init.sh must be changed together.
+    assert "ORDER BY c.last_scanned_at ASC, c.candidate_id ASC" in statement
     # No freshness cutoff in the WHERE: a cutoff compares ISO timestamps as STRINGS,
     # so one row stamped with a different offset format could be excluded FOREVER —
     # re-creating the permanent starvation this ordering exists to fix. Ordering

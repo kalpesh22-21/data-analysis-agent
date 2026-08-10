@@ -24,11 +24,11 @@ from .models import CandidateEnvelope
 from .verdicts import DriftStamp
 
 
-def _sort_key(env: CandidateEnvelope, order_by: str) -> tuple[int, str]:
-    """The ASC sort key, shaped to reproduce the N1QL collation the Couchbase impl
-    gets for free.
+def _sort_key(env: CandidateEnvelope, order_by: str) -> tuple:
+    """The ASC sort key, shaped to reproduce the ordering the Couchbase impl gets from
+    the N1QL collation + `idx_candidates_scan_rotation`.
 
-    Returns a `(rank, value)` TUPLE rather than the bare field for two reasons:
+    The primary component is a `(rank, value)` TUPLE rather than the bare field:
 
       * `last_scanned_at` is `None` on every never-scanned candidate, and a bare
         `sorted()` over a mix of `None` and `str` raises `TypeError: '<' not
@@ -38,12 +38,33 @@ def _sort_key(env: CandidateEnvelope, order_by: str) -> tuple[int, str]:
         sort FIRST here too (rank 0). That is also the behaviour the rotation depends
         on: brand-new work jumps ahead of everything already examined.
 
-    Anything that is not a `str` is treated as absent (rank 0). `from_doc` already
-    normalizes rehydrated non-strings to None, but envelopes also arrive constructed
-    in-process (the dataclass validates nothing), and the fail-safe direction for a
-    malformed cursor is "scan it now" — one wasted scan, then a well-formed stamp."""
-    value = env.created_at if order_by == "created_at" else env.last_scanned_at
-    return (1, value) if isinstance(value, str) else (0, "")
+    The ROTATION key then appends `candidate_id`, matching the Couchbase `ORDER BY
+    last_scanned_at, candidate_id`. Without it the two stores broke ties differently —
+    this fake by dict insertion order, the GSI by its implicit trailing doc key — so
+    "which rows the window contains" was impl-defined and untestable. `created_at`
+    keeps its single key: its statement is byte-identical to the pre-rotation one and
+    its tie order is documented as impl-defined.
+
+    CAVEAT, so this is not read as more than it is: the tiebreak makes the order TOTAL,
+    it does not make it FAIR. Fairness comes from the cursor advancing, which confines
+    ties to rows stamped within one clock tick. A clock frozen across cycles (a test
+    double, never `_now_iso`) leaves every row tied forever and the same prefix is
+    returned every time — by construction, not for want of a tiebreak.
+
+    A non-`str` cursor is treated as absent (rank 0) — see `CandidateEnvelope`, which
+    documents why that DIVERGES from the server for array/object values.
+
+    The tuple is FLAT — `(rank, value[, candidate_id])` — so element 0 is always the
+    integer collation rank. The parity suite compares that rank directly against the
+    measured N1QL one, and burying it inside a nested tuple would break that comparison
+    without breaking any ordering, which is the worst way for it to go wrong."""
+    if order_by == "created_at":
+        raw = env.created_at
+        return (1, raw) if isinstance(raw, str) else (0, "")
+    raw = env.last_scanned_at
+    if isinstance(raw, str):
+        return (1, raw, env.candidate_id)
+    return (0, "", env.candidate_id)
 
 
 class InMemoryCandidateStore:

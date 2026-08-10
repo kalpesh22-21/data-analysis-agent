@@ -35,14 +35,27 @@ _TERMINAL_STATUSES = frozenset(
     }
 )
 
-# The two sort keys `list_by_status` will ORDER BY, mapped from the caller's
-# `order_by` Literal to a HARDCODED field name. The N1QL statement is built with an
-# f-string (a sort key cannot be a named parameter), so the value that reaches the
-# f-string must never be caller-controlled text: this dict is the allow-list, and an
-# unknown key raises rather than interpolating. Same posture as the `order` direction.
-_SORT_KEYS: dict[str, str] = {
-    "created_at": "created_at",
-    "last_scanned_at": "last_scanned_at",
+# The ORDER BY column LIST for each `order_by` Literal, mapped from the caller's value
+# to HARDCODED field names. The N1QL statement is built with an f-string (a sort key
+# cannot be a named parameter), so the value that reaches the f-string must never be
+# caller-controlled text: this dict is the allow-list, and an unknown key raises rather
+# than interpolating. Same posture as the `order` direction.
+#
+# The rotation read carries `candidate_id` as a SECONDARY key so its ordering is TOTAL
+# by construction. Without it, rows sharing a cursor value have impl-defined order, and
+# the two stores disagreed about what that order was (the fake fell back to dict
+# insertion order, the GSI to its implicit trailing doc-key) — a parity gap of exactly
+# the kind that makes a green unit suite prove nothing. Note what the tiebreak does and
+# does not do: it makes the order total and identical across both stores; it is NOT the
+# fairness mechanism. What rotates is the CURSOR advancing, so ties are confined to rows
+# stamped within a single clock tick. A clock that never advances at all stalls the
+# rotation whatever the tiebreak is — see `CandidateStore.list_by_status`.
+#
+# `created_at` deliberately keeps its single key so the inbox/archive statement stays
+# byte-identical; its ties are documented as impl-defined and nothing depends on them.
+_SORT_KEYS: dict[str, tuple[str, ...]] = {
+    "created_at": ("created_at",),
+    "last_scanned_at": ("last_scanned_at", "candidate_id"),
 }
 
 try:  # pragma: no cover - exercised only when the couchbase SDK is installed
@@ -116,12 +129,19 @@ class CouchbaseCandidateStore:
     ) -> list[CandidateEnvelope]:
         # `created_at` ASC (default) is the small self-draining review queue; DESC
         # (newest-first) is the durable rejected archive so LIMIT trims OLD history,
-        # not present rejects. `last_scanned_at` ASC is the S9 cron's ROTATION read:
-        # least-recently-examined first, and — because a never-scanned candidate omits
-        # the key entirely (`to_doc` emits it only when set) — MISSING sorts FIRST in
-        # the N1QL total collation order (MISSING < NULL < FALSE < TRUE < number <
-        # string < array < object < binary), so brand-new work is picked up on the very
-        # next cycle instead of queueing behind everything already examined.
+        # not present rejects. `(last_scanned_at, candidate_id)` ASC is the S9 cron's
+        # ROTATION read: least-recently-examined first, and — because a never-scanned
+        # candidate omits the key entirely (`to_doc` emits it only when set) — MISSING
+        # sorts FIRST in the N1QL total collation order (MISSING < NULL < FALSE < TRUE
+        # < number < string < array < object < binary), so brand-new work is picked up
+        # on the very next cycle instead of queueing behind everything already examined.
+        # MEASURED, not assumed: against couchbase 7.6.5 this plans as
+        # `IndexScan3 index_order=[keypos 1, keypos 2] limit=200` on
+        # `idx_candidates_scan_rotation` — index order, no sort stage, LIMIT pushed into
+        # the scan, MISSING rows included. The index MUST carry `candidate_id` as its
+        # third key for that to hold: with the tiebreak against a two-key
+        # `(status, last_scanned_at)` index the planner abandons it for the plain status
+        # index plus a full Order stage, losing both the index order and the pushdown.
         #
         # DELIBERATELY NO freshness predicate in the WHERE. Ordering alone spends the
         # LIMIT on the most-overdue rows (nothing is fetched-then-discarded in Python),
@@ -132,11 +152,16 @@ class CouchbaseCandidateStore:
         # the exact permanent starvation this ordering exists to fix. A mis-formatted
         # stamp under ORDER BY is merely sorted early or late; it is never dropped.
         direction = "DESC" if order == "desc" else "ASC"
-        sort_key = _SORT_KEYS[order_by]  # allow-listed; never caller text (see above)
+        # Allow-listed column list; never caller text (see `_SORT_KEYS`). Every key takes
+        # the SAME direction so DESC stays the exact reverse of ASC — which is what lets
+        # the in-memory fake implement DESC as `sort(); reverse()` and still match.
+        sort_clause = ", ".join(
+            f"c.{column} {direction}" for column in _SORT_KEYS[order_by]
+        )
         statement = (
             f"SELECT c.* FROM `{self._bucket_name}` c "
             "WHERE c.status = $status "
-            f"ORDER BY c.{sort_key} {direction} LIMIT $limit"
+            f"ORDER BY {sort_clause} LIMIT $limit"
         )
         result = self._cluster.query(
             statement,

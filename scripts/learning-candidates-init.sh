@@ -56,17 +56,29 @@ echo "[learning-candidates-init] status GSI..."
 $Q "statement=CREATE INDEX idx_candidates_status IF NOT EXISTS ON \`$BUCKET\`(status)" 2>&1 | tail -1 \
   || echo "[learning-candidates-init] status GSI exists (ok)"
 # S9 scan-rotation GSI. The cron reads
-#   WHERE status = $status ORDER BY last_scanned_at ASC LIMIT $limit
-# and this composite serves BOTH halves: `status` is a leading EQUALITY key, so the
-# remaining index order IS `last_scanned_at` ASC — the query streams in index order and
-# stops at the LIMIT, with no sort stage and no scan of the rows it will not return.
-# That is what lets the scan rotate fairly without a freshness predicate in the WHERE.
-# Every candidate doc has `status`, so no doc is skipped for having a missing key; a
-# never-scanned candidate simply has `last_scanned_at` MISSING, which is the LOWEST
-# value in the N1QL collation and therefore comes FIRST — new work jumps the queue.
-echo "[learning-candidates-init] scan-rotation GSI (status, last_scanned_at)..."
-$Q "statement=CREATE INDEX idx_candidates_status_scanned IF NOT EXISTS ON \`$BUCKET\`(status, last_scanned_at)" 2>&1 | tail -1 \
+#   WHERE status = $status ORDER BY last_scanned_at ASC, candidate_id ASC LIMIT $limit
+# and this composite serves ALL of it: `status` is a leading EQUALITY key, so the
+# remaining index order IS `(last_scanned_at, candidate_id)` ASC — the query streams in
+# index order and stops at the LIMIT, with no sort stage and no scan of the rows it will
+# not return. That is what lets the scan rotate fairly without a freshness predicate in
+# the WHERE. Every candidate doc has `status`, so no doc is skipped for having a missing
+# key; a never-scanned candidate simply has `last_scanned_at` MISSING, which is the
+# LOWEST value in the N1QL collation and therefore comes FIRST — new work jumps the queue.
+#
+# ALL THREE KEYS ARE REQUIRED. Measured on couchbase 7.6.5: with `candidate_id` present
+# the plan is `IndexScan3 index_order=[keypos 1, keypos 2] limit=200`; drop it back to
+# two keys while the query still asks for the tiebreak and the planner abandons this
+# index for the plain status index plus a full `Order` stage — index order and LIMIT
+# pushdown both lost, silently. `META().id` as the tiebreak keeps the index but still
+# adds an `Order`. Re-run EXPLAIN if you touch either the index or the ORDER BY.
+echo "[learning-candidates-init] scan-rotation GSI (status, last_scanned_at, candidate_id)..."
+$Q "statement=CREATE INDEX idx_candidates_scan_rotation IF NOT EXISTS ON \`$BUCKET\`(status, last_scanned_at, candidate_id)" 2>&1 | tail -1 \
   || echo "[learning-candidates-init] scan-rotation GSI exists (ok)"
+# Drop the superseded two-key form (shipped one commit earlier, before the tiebreak).
+# Created AFTER its replacement is online, so there is never a window with no rotation
+# index. A no-op where it never existed.
+$Q "statement=DROP INDEX idx_candidates_status_scanned IF EXISTS ON \`$BUCKET\`" 2>&1 | tail -1 \
+  || echo "[learning-candidates-init] superseded 2-key GSI already absent (ok)"
 
 echo "[learning-candidates-init] verify buckets:"
 $C bucket-list --cluster "$CLUSTER" -u "$U" -p "$P" 2>&1 | tail -10

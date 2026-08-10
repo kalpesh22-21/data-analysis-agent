@@ -172,9 +172,27 @@ class CandidateEnvelope:
             # an ISO-8601 STRING (`datetime.fromisoformat`, a `str`-vs-None sort key),
             # and `fromisoformat` raises TypeError — not ValueError — on an int/dict,
             # so a non-string here would be a crash site, not a wrong answer. Coerce
-            # anything that is not a `str` to None ("never scanned"), which is the
-            # SELF-HEALING direction: the candidate sorts first, gets scanned
-            # immediately, and the next stamp overwrites the malformed value.
+            # anything that is not a `str` to None ("never scanned").
+            #
+            # This normalization is IN-PROCESS ONLY, and it does NOT make a corrupt
+            # cursor self-healing — an earlier revision of this comment claimed it did,
+            # which was wrong and was disproved against live Couchbase. `ORDER BY` runs
+            # SERVER-SIDE on the RAW stored value, which this coercion never sees. In
+            # the N1QL collation a number sorts before strings (so a numeric cursor
+            # sorts early and does self-heal on the next stamp), but an ARRAY or OBJECT
+            # sorts AFTER every string — so a corrupt cursor of that shape sorts LAST
+            # and, past `scan_limit`, is never examined again. The in-memory fake ranks
+            # every non-string FIRST, so the two stores report exact opposites here and
+            # no unit test can catch it. Writing a non-string cursor requires a
+            # hand-edited or foreign-written document; S9 only ever writes
+            # `_now_iso()`. Repair is manual (fix or delete the document).
+            #
+            # The same ordering-without-a-cutoff design has one other permanent-loss
+            # case, accepted deliberately: a cursor stamped far in the FUTURE (clock
+            # skew, or a hand edit) sorts last for as long as it stays in the future and
+            # that row is starved. The alternative — a freshness cutoff in the WHERE —
+            # trades this for a strictly worse failure, since a cutoff DROPS rows rather
+            # than merely mis-ordering them (see `list_by_status`).
             last_scanned_at=(
                 doc["last_scanned_at"]
                 if isinstance(doc.get("last_scanned_at"), str)

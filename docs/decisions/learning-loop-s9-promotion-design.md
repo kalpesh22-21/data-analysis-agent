@@ -198,15 +198,21 @@ the point of use (clamped), so a misconfiguration can only make the scheduler pr
 reuse a verdict beyond the window its own policy says it may be believed.
 
 **The scan window rotates.** Both status reads use `list_by_status(..., order_by="last_scanned_at")` —
-least-recently-examined first, never-examined (MISSING) FIRST — and `_guard` stamps the cursor on
-EVERY examined candidate via `CandidateStore.touch_scanned`. The previous `created_at ASC` read handed
+`ORDER BY last_scanned_at ASC, candidate_id ASC`, least-recently-examined first, never-examined
+(MISSING) FIRST — and `_guard` stamps the cursor on EVERY examined candidate via
+`CandidateStore.touch_scanned`. The `candidate_id` tiebreak makes the order TOTAL and identical in both
+stores; it is not itself the fairness mechanism (fairness comes from the cursor advancing, which
+confines ties to one clock tick — a clock frozen across cycles stalls the rotation by construction). The previous `created_at ASC` read handed
 the bounded `scan_limit` window to the same oldest rows permanently, so past `scan_limit` held
 candidates a newly extracted one was never examined at all (silent head-of-line starvation).
 
 There is deliberately **no freshness predicate in the `WHERE`**. Ordering alone spends the LIMIT on the
 most-overdue rows (nothing is fetched then discarded in Python), and the composite GSI
-`idx_candidates_status_scanned(status, last_scanned_at)` serves the equality + the sort in index order
-with early LIMIT termination. A cutoff would have to compare ISO-8601 timestamps as STRINGS, which is
+`idx_candidates_scan_rotation(status, last_scanned_at, candidate_id)` serves the equality + both sort
+keys in index order with early LIMIT termination. Measured on couchbase 7.6.5: `IndexScan3
+index_order=[keypos 1, keypos 2] limit=200`, no Order stage. All three index keys are required — with
+the tiebreak against a two-key index the planner abandons it for the plain status index plus a full
+sort, and `META().id` as the tiebreak keeps the index but still adds a sort. A cutoff would have to compare ISO-8601 timestamps as STRINGS, which is
 only sound if every writer emits an identical offset format; one row stamped `+05:30` could be excluded
 FOREVER, silently re-creating the starvation. It would also throttle the per-cycle demote-convergence
 and self-heal re-asserts (§8.6) from every cycle to once per window, weakening a documented safety loop.

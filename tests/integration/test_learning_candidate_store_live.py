@@ -137,9 +137,9 @@ async def test_never_scanned_sorts_before_stamped_candidates_live(candidate_stor
     never be reached. The in-memory fake reproduces the claim; only real Couchbase can
     confirm it, so this is the test that actually settles it.
 
-    Also covers the index shape: `idx_candidates_status_scanned(status,
-    last_scanned_at)` must still include docs whose `last_scanned_at` is MISSING (it
-    does, because the leading `status` key is always present)."""
+    Also covers the index shape: `idx_candidates_scan_rotation(status,
+    last_scanned_at, candidate_id)` must still include docs whose `last_scanned_at` is
+    MISSING (it does, because the leading `status` key is always present)."""
     tag = uuid.uuid4().hex[:8]
     status = CandidateStatus.QUARANTINED  # a status nothing else in the suite writes
     stamped_id = f"candidate::rot-{tag}::stamped"

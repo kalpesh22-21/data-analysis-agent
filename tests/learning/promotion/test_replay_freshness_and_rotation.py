@@ -520,10 +520,44 @@ async def test_new_candidates_are_examined_even_behind_a_full_window_of_held_one
     assert "candidate::new::0" in seen2
 
     # And over enough cycles EVERY held candidate is examined — none is starved.
-    for _ in range(4):
-        clock.iso = "2026-08-10T12:10:00+00:00"
+    #
+    # The clock ADVANCES per cycle here, and that is load-bearing rather than tidiness.
+    # Rotation is driven by the cursor moving; a pinned clock leaves every row tied on
+    # one value, in which case the same window comes back for ever and this loop would
+    # pass while proving nothing (an earlier revision of this test did exactly that —
+    # QA caught it by demonstrating a real stall at 300/500 candidates under a literal
+    # clock). The `candidate_id` tiebreak makes the tied order TOTAL and identical in
+    # both stores, but it cannot rotate a set whose cursor never changes.
+    for minute in range(10, 30, 5):
+        clock.iso = f"2026-08-10T12:{minute}:00+00:00"
         seen2 |= {d.candidate_id for d in (await sched.run_once()).decisions}
     assert {f"candidate::held::{i}" for i in range(3)} <= (seen | seen2)
+
+
+async def test_tied_cursors_return_the_same_window_in_both_stores():
+    """The tiebreak's actual contract: with rows sharing a cursor value, WHICH rows the
+    bounded window contains is decided by `candidate_id`, not by whichever accident each
+    store happened to fall back on (the fake to dict insertion order, the GSI to its
+    implicit trailing doc key). Insertion order here is deliberately NOT id order, so a
+    regression to the old behaviour changes the answer.
+
+    Verified equal against live Couchbase 7.6.5 with the shipped
+    `idx_candidates_scan_rotation` index; this is the in-process pin of the same
+    ordering. Note what it does NOT claim — see
+    `test_rotation_stalls_when_every_cursor_is_identical_is_a_known_limitation`: a total
+    order is not a rotating one, and a frozen cursor still stalls."""
+    store = InMemoryCandidateStore()
+    tied = "2026-08-10T12:00:00+00:00"
+    for ordinal in (3, 0, 4, 1, 2):  # shuffled
+        await store.put(replace(_held(ordinal), last_scanned_at=tied))
+
+    got = await store.list_by_status(
+        CandidateStatus.CANDIDATE, limit=3, order_by="last_scanned_at"
+    )
+
+    assert [c.candidate_id for c in got] == [
+        "candidate::held::0", "candidate::held::1", "candidate::held::2",
+    ]
 
 
 async def test_a_hold_now_advances_the_cursor_without_rewriting_the_envelope():

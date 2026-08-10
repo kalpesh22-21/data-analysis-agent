@@ -43,19 +43,31 @@ class CandidateStore(Protocol):
         history, not present rejects (ui-inbox-type-archive contract §Retention).
 
         `order_by="last_scanned_at"` is the S9 cron's ROTATION read — least-recently-
-        examined first, with NEVER-examined (MISSING/None) candidates FIRST. This is
-        load-bearing, not cosmetic: `created_at ASC` gave the bounded `scan_limit`
-        window to the OLDEST rows permanently, so once more than `scan_limit`
-        candidates were stuck in a hold the scheduler could never see a newly extracted
-        one again — silent head-of-line starvation with no error. Sorting on the scan
-        cursor makes the window round-robin: examining a candidate pushes it to the
-        back, and a brand-new candidate (no cursor) jumps to the front.
+        examined first, with NEVER-examined (MISSING/None) candidates FIRST, and
+        `candidate_id` as a SECONDARY key. This is load-bearing, not cosmetic:
+        `created_at ASC` gave the bounded `scan_limit` window to the OLDEST rows
+        permanently, so once more than `scan_limit` candidates were stuck in a hold the
+        scheduler could never see a newly extracted one again — silent head-of-line
+        starvation with no error. Sorting on the scan cursor makes the window
+        round-robin: examining a candidate pushes it to the back, and a brand-new
+        candidate (no cursor) jumps to the front.
 
-        No direction adds a secondary tiebreak, so tie order on equal sort keys is
-        impl-defined: the in-memory store is deterministic (DESC is the exact reverse
-        of ASC — a stable sort then reverse), while the Couchbase impl does not
-        guarantee tie order (pre-existing). Nothing depends on Couchbase tie order, and
-        the default `created_at` N1QL is intentionally byte-identical to before."""
+        The `candidate_id` tiebreak makes that ordering TOTAL, so both impls return the
+        same window for a tied set instead of each falling back to its own accident (the
+        fake to dict insertion order, the GSI to its implicit trailing doc key). Be
+        precise about what it buys, though: totality, not fairness. FAIRNESS comes from
+        the cursor ADVANCING, which confines ties to rows stamped inside a single clock
+        tick — any clock that moves between cycles rotates fine, including a coarse one.
+        A clock frozen across cycles (only ever a test double; `_now_iso` has microsecond
+        resolution) leaves every row permanently tied and the same prefix comes back
+        every time. That is a property of ordering-by-cursor, not something a tiebreak
+        could fix, and a test with a pinned clock cannot detect a rotation stall.
+
+        `created_at` keeps its single sort key so the inbox/archive statement stays
+        byte-identical; its tie order remains impl-defined and nothing depends on it. In
+        both modes DESC is the exact reverse of ASC (every key takes the same direction),
+        which is what lets the fake implement it as a stable sort followed by a
+        reverse."""
         ...
 
     async def touch_scanned(self, candidate_id: str, at: str) -> None:
