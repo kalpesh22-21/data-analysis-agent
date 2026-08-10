@@ -449,29 +449,38 @@ def test_a_template_less_query_node_really_is_an_empty_step() -> None:
 
 @pytest.mark.parametrize("db", ["scratch", "SCRATCH", "Scratch", "sCrAtCh"])
 def test_the_referenced_scratch_gate_is_not_defeated_by_the_databases_spelling(db: str) -> None:
-    """DEFECT (partial — `scratch` passes, the rest do not).
+    """FIXED — this was a real escape, and the refusal now fires for every spelling.
 
-    `_inline_reference` refuses a referenced template that reads session scratch, via
-    `_scratch_placeholder_names`, which compares `table.text("db") == "scratch"` on a
-    RAW parse — case-SENSITIVELY. `SCRATCH.borrowed` therefore reads as an ordinary
-    warehouse table and the gate never fires.
+    `_inline_reference` refuses a referenced template that reads session scratch. It
+    USED to ask `_scratch_placeholder_names`, which compares `table.text("db") ==
+    "scratch"` on a RAW parse — case-SENSITIVELY — so `SCRATCH.borrowed` read as an
+    ordinary warehouse table and the gate never fired. It now asks
+    `_scratch_db_sources`, which case-folds.
 
     The guard is supposed to be derived from what the scratch surface actually treats
-    as scratch, and the authority disagrees with it: clickhouse-api's
+    as scratch, and the authority disagreed with it: clickhouse-api's
     `service._references_scratch_db` matches the scratch database name with
     `re.IGNORECASE`, precisely so a spelling cannot route a query around the session
     gate. Two guards on the same boundary, one case-folding and one not.
 
-    The load-time consequence is a real escape, not just an ugly message: with the
+    The load-time consequence was a real escape, not just an ugly message: with the
     child declaring `SCRATCH.borrowed.<col>` in its `uses` (which passes the
-    `db.table.column` grammar unchanged), `_assert_source_tables_in_uses` finds the
-    source declared and the whole corpus loads — shipping a validated blueprint that
+    `db.table.column` grammar unchanged), `_assert_source_tables_in_uses` found the
+    source declared and the whole corpus loaded — shipping a validated blueprint that
     reads a session-scoped table nothing in its DAG can materialize, and minting the
     golden-replay JWT from a `column_scope` containing a scratch key.
 
-    Every other reader on this path already case-folds (sqlglot's
-    `normalize_identifiers` lowercases unquoted identifiers before gate (c) sees them),
-    which is what makes the mismatch invisible until someone writes the caps."""
+    Nothing on this path case-folds for you, which is what made the mismatch invisible
+    until someone wrote the caps: sqlglot's `normalize_identifiers` is NOT applied here,
+    and `qualify_tables`/`qualify_columns` both leave `SCRATCH` exactly as written
+    before gate (c) sees it (measured; see the note on
+    `corpus_loader._assert_canonical_scratch_spelling`).
+
+    NOTE ON COVERAGE: for every spelling here — `scratch` included — it is the
+    REFERENCE gate inside `_inline_reference` that raises, before
+    `_validate_blueprint_dag` runs at all. The direct (non-reference) path through
+    `_assert_canonical_scratch_spelling` is therefore untouched by this test and is
+    covered separately below."""
     child = BlueprintSeed(
         id="bp-child",
         intent="borrowed rows",
@@ -493,6 +502,69 @@ def test_the_referenced_scratch_gate_is_not_defeated_by_the_databases_spelling(d
     with pytest.raises(CorpusLoadError, match="scratch"):
         for bp in resolve_blueprint_references([child, parent]):
             _validate_blueprint_dag(bp)
+
+
+def _direct_scratch_reader(db: str) -> BlueprintSeed:
+    """An ordinary blueprint — NO reference, so nothing in `resolve_blueprint_references`
+    looks at it — whose template reads `<db>.borrowed` and whose `uses` DECLARES that
+    exact spelling. The declaration is the point: it is what makes gate (c)'s scope
+    check PASS on a non-canonical spelling, so the only thing left that can refuse is
+    `_assert_canonical_scratch_spelling`."""
+    return BlueprintSeed(
+        id="bp-direct-scratch",
+        intent="borrowed rows",
+        slots_summary="",
+        uses=[f"{db}.borrowed.department_name"],
+        slots=[],
+        result_grain=["department"],
+        sql_template=f"SELECT x.department_name AS department FROM {db}.borrowed AS x",
+    )
+
+
+@pytest.mark.parametrize("db", ["SCRATCH", "Scratch", "sCrAtCh"])
+def test_a_non_reference_blueprint_cannot_spell_the_scratch_db_uncanonically(db: str) -> None:
+    """The DIRECT path into `_assert_canonical_scratch_spelling`, which nothing else
+    fires.
+
+    That gate is what guarantees the two scratch recognizers agree on anything that
+    actually LOADS: after it, "recognized case-insensitively" (`_scratch_db_sources`,
+    the reference gate) and "recognized exactly" (`_scratch_placeholder_names`, gate (h)
+    and the executor's rewrite) describe the same set. It is therefore the reason
+    keeping `_scratch_placeholder_names` exact-match is safe — and until this test it
+    had no firing coverage at all: the parametrization above never reaches
+    `_validate_blueprint_dag`, because `_inline_reference` raises first for every
+    spelling.
+
+    Escaping this gate is not cosmetic. `SCRATCH.borrowed` reads as an ordinary
+    warehouse source, the matching `uses` entry passes the `db.table.column` grammar
+    unchanged, gate (c) finds the source declared, and the corpus loads a `validated`
+    blueprint reading a session-scoped table nothing can materialize for it — with an
+    offline golden-replay JWT minted from a `column_scope` carrying a scratch key.
+
+    Pinned on the message, not just the exception type, so an edit that weakens this
+    gate (or reorders it behind the scope check, which passes on this shape) breaks
+    here rather than silently handing the refusal to a different rule."""
+    with pytest.raises(CorpusLoadError, match="must be spelled exactly"):
+        _validate_blueprint_dag(_direct_scratch_reader(db))
+
+
+def test_the_canonical_scratch_spelling_is_not_refused_by_the_spelling_gate() -> None:
+    """The control for the parametrization above: the gate must fire on the SPELLING
+    and nothing else, or it is just a blanket ban on reading scratch.
+
+    Today the canonical form loads outright, which is a separate pre-existing gap
+    recorded in `docs/decisions/learning-prior-art-and-promotion-plan.md` (a
+    `scratch.<name>` source with no backing table-consume should not load; the runtime
+    fails closed on the unbound placeholder, so it is an unrunnable-blueprint-loads gap,
+    not a scope escape). Asserted as "not refused for the SPELLING reason" rather than
+    "loads", so closing that gap does not turn this control red."""
+    try:
+        _validate_blueprint_dag(_direct_scratch_reader("scratch"))
+    except CorpusLoadError as exc:
+        assert "must be spelled exactly" not in str(exc), (
+            "the canonical spelling was refused BY THE SPELLING GATE — the gate is "
+            f"rejecting scratch reads outright, not non-canonical spellings: {exc}"
+        )
 
 
 # ==========================================================================

@@ -55,8 +55,16 @@ _READ_ONLY_TO_REJECT = {"ref"}
 
 
 class _KeyRecordingDict(dict):
-    """A dict that remembers every key looked up through `.get()`/`[]` — `Node.parse`
-    reads its input only through those two."""
+    """A dict that remembers every key `Node.parse` touches, through ANY of the three
+    ways it reads its input: `.get()`, `[]`, and `in`.
+
+    `__contains__` is not optional here, and it is the one this class originally
+    missed. `Node.parse` tests for `ref` with `NODE_REF_KEY in raw` (PRESENCE, not
+    truthiness, so an explicit `ref: null` is still refused) and never subscripts it on
+    the passing path — so with only `.get()`/`[]` recorded, `ref` never entered `read`,
+    the `- _READ_ONLY_TO_REJECT` subtraction below became a silent no-op, and this
+    observer went blind to exactly the read it was added for. A membership test is a
+    read; record it."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -69,6 +77,10 @@ class _KeyRecordingDict(dict):
     def __getitem__(self, key: Any) -> Any:
         self.read.add(key)
         return super().__getitem__(key)
+
+    def __contains__(self, key: Any) -> bool:
+        self.read.add(key)
+        return super().__contains__(key)
 
 
 def _keys_node_parse_reads() -> set[str]:

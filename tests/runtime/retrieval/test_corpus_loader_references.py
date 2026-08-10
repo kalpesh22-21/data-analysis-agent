@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from data_agent.runtime.blueprint.models import (
     DEFAULT_NODE_KIND,
@@ -844,6 +845,42 @@ def test_a_non_string_blueprint_id_raises_corpus_load_error_not_a_type_error(
     key with `str()`."""
     with pytest.raises(CorpusLoadError, match="is not a non-empty string"):
         resolve_blueprint_references([replace(_leaf(), id=bad_id), _parent()])
+
+
+@pytest.mark.parametrize("bad_id", [["bp", "child"], {"a": 1}, 5, None, ""])
+def test_a_non_string_fixture_id_is_refused_before_the_duplicate_check(
+    bad_id: Any, tmp_path: Path
+) -> None:
+    """The same class one frame ABOVE the guard that clears it.
+
+    `load_seed_fixtures` runs `_reject_duplicate_ids` before anything reaches
+    `resolve_blueprint_references`, and its `id_ in seen` hashes the raw YAML value —
+    so `id: [bp, child]` in a fixture used to raise a bare `TypeError: unhashable type:
+    'list'` and the guard above never got the chance to fire. Only the CLI seed script
+    reads fixtures, so this could not brick the hydrator; it is still the same
+    unhashable-untrusted-value class, and a seed run deserves a message that names the
+    offending id."""
+    (tmp_path / "blueprints.yaml").write_text(
+        yaml.safe_dump(
+            [
+                {
+                    "id": bad_id,
+                    "intent": "borrowed",
+                    "slots_summary": "",
+                    "uses": [f"{_E}.department_name"],
+                    "slots": [],
+                    "result_grain": ["department"],
+                    "sql_template": (
+                        "SELECT department_name AS department FROM dbpcm_warehouse.employee"
+                    ),
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "knowledge.yaml").write_text("[]", encoding="utf-8")
+    with pytest.raises(CorpusLoadError, match="is not a non-empty string"):
+        load_seed_fixtures(tmp_path)
 
 
 # -- 4. inlining is invisible downstream ------------------------------------

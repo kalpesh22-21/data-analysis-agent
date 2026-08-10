@@ -461,10 +461,24 @@ def corpus_content_sha(
     ).hexdigest()
 
 
-def _reject_duplicate_ids(ids: list[str]) -> None:
+def _reject_duplicate_ids(ids: list[Any]) -> None:
     seen: set[str] = set()
     dupes: set[str] = set()
     for id_ in ids:
+        # The membership test below needs a HASHABLE id, and these come straight from
+        # YAML via `BlueprintSeed(**item)` — the dataclass declares `id: str` and
+        # enforces nothing, so `id: [a, b]` in a fixture reaches `id_ in seen` and
+        # raises a raw `TypeError: unhashable type: 'list'` one frame above the
+        # `resolve_blueprint_references` guard that already refuses the same shape.
+        # Only the CLI seed script reads fixtures (the hydrator loads the MCP export,
+        # whose `_seed_from_entry` coerces the key with `str()`), so this cannot brick
+        # the corpus — but it is the same class, and an unreadable traceback out of a
+        # seed run is no better than a message that names the offending id.
+        if not isinstance(id_, str) or not id_:
+            raise CorpusLoadError(
+                f"Seed id {id_!r} is not a non-empty string ({type(id_).__name__}) — "
+                "ids key the corpus and every reference to it."
+            )
         (dupes if id_ in seen else seen).add(id_)
     if dupes:
         raise CorpusLoadError(f"Duplicate seed id(s) in the corpus fixtures: {sorted(dupes)!r}.")
@@ -2059,6 +2073,23 @@ def _scratch_placeholder_names(sql_template: str | None) -> set[str]:
     return names
 
 
+def _scratch_db_sources_in_tree(tree: exp.Expression) -> list[tuple[str, str]]:
+    """Every `(db_as_written, table)` source in a PARSED template whose database is the
+    scratch DB under a CASE-INSENSITIVE match.
+
+    The single tree-level definition of "this source is session scratch", shared by its
+    two callers so they cannot drift: `_scratch_db_sources` (which parses a template
+    string first) and `_assert_canonical_scratch_spelling` (which already holds the
+    tree). Their agreement IS the load-bearing property of the D3 scratch split — the
+    canonical-spelling gate is only sound if it recognizes exactly the sources the
+    reference gate does — so it gets one implementation, not two identical ones."""
+    return [
+        (table.text("db"), table.name)
+        for table in tree.find_all(exp.Table)
+        if table.text("db").casefold() == _SCRATCH_DB and table.name
+    ]
+
+
 def _scratch_db_sources(sql_template: str | None) -> list[tuple[str, str]]:
     """Every `(db_as_written, table)` source whose database is the scratch DB under a
     CASE-INSENSITIVE match — the "does this template touch session scratch at all?"
@@ -2077,11 +2108,7 @@ def _scratch_db_sources(sql_template: str | None) -> list[tuple[str, str]]:
         tree = parse_template(sql_template)
     except TemplateBindError:
         return []
-    return [
-        (table.text("db"), table.name)
-        for table in tree.find_all(exp.Table)
-        if table.text("db").casefold() == _SCRATCH_DB and table.name
-    ]
+    return _scratch_db_sources_in_tree(tree)
 
 
 def _assert_canonical_scratch_spelling(bp_id: str, where: str, tree: exp.Expression) -> None:
@@ -2102,11 +2129,7 @@ def _assert_canonical_scratch_spelling(bp_id: str, where: str, tree: exp.Express
     JWT minted from a `column_scope` containing a scratch key. The runtime still fails
     closed (the MCP's own IGNORECASE gate catches it), so this is defence in depth —
     but a blueprint that cannot run should not load."""
-    for db, name in [
-        (table.text("db"), table.name)
-        for table in tree.find_all(exp.Table)
-        if table.text("db").casefold() == _SCRATCH_DB and table.name
-    ]:
+    for db, name in _scratch_db_sources_in_tree(tree):
         if db != _SCRATCH_DB:
             raise CorpusLoadError(
                 f"blueprint {bp_id}: {where} reads {db}.{name} — the session scratch "

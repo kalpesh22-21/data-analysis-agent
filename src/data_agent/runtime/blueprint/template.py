@@ -171,9 +171,23 @@ def _rewrite_scratch_tables(
     The `scratch` database and any table alias are preserved, so the consumer's
     aliased column references (`e.earnings`) stay valid.
 
-    Fail-closed: a `scratch.<placeholder>` reference in the template with NO
-    matching binding (an intermediate that was never materialized) raises — the
-    executor never emits a query pointing at a non-existent scratch table.
+    Fail-closed WITHIN its binding map, which is narrower than it sounds: a
+    `scratch.<placeholder>` reference absent from a NON-EMPTY *table_bindings* (an
+    intermediate that was never materialized) raises here. That is the only case this
+    function sees, because `bind_template` calls it under `if table_bindings:` — a
+    template whose scratch sources are ENTIRELY unbacked has an empty binding map and
+    skips this rewrite altogether, so the query is emitted with `scratch.<placeholder>`
+    intact and fails outside this process (at the warehouse, or at the MCP's scratch
+    ownership check) rather than here.
+
+    Measured, not inferred: `bind_template('… FROM scratch.nobody_makes_me', {},
+    table_bindings={})` returns the SQL unchanged. This docstring previously claimed
+    "the executor never emits a query pointing at a non-existent scratch table"
+    without that qualifier; do not restore that wording without also moving the guard
+    out from behind the `if`. Closing the hole properly belongs at LOAD time — see the
+    slice-2b follow-up in `docs/decisions/learning-prior-art-and-promotion-plan.md`
+    (every `scratch.*` source must be a consumed placeholder, the converse of the
+    corpus loader's gate (h)).
     """
     def _replace(node: exp.Expression) -> exp.Expression:
         if isinstance(node, exp.Table):
@@ -463,6 +477,10 @@ def bind_template(
 
     # Rewrite table-consume placeholders (scratch.<placeholder> → the materialized
     # scratch table) FIRST — a structural identifier swap, injection-safe.
+    # NOTE: this `if` is also what scopes `_rewrite_scratch_tables`' unbound-placeholder
+    # guard. With no table-consumes the map is empty, the rewrite is skipped, and a
+    # template reading `scratch.*` anyway is emitted verbatim (measured). Documented on
+    # that function; the real fix is a load-time gate, not widening this condition.
     if table_bindings:
         tree = _rewrite_scratch_tables(tree, table_bindings)
 
