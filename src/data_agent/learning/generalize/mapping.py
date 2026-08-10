@@ -30,12 +30,39 @@ from ..leakage.gate import _collect_text
 def _slot_docs(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Project the S3 `parameterization` entries onto the `slots_json` shape — every
     `role=slot` param's `slot` dict (name/type/binds_to/required/…). The SINGLE slot
-    projection reused by both the runtime `Blueprint` and the landed `BlueprintSeed`."""
+    projection reused by both the runtime `Blueprint` and the landed `BlueprintSeed`.
+
+    Reads the raw plan defensively, in the same shape as `promotion/replay.py::
+    _slot_types`: a non-list `parameterization` is not iterable and a non-dict entry
+    has no `.get`, and this module's documented failure mode is `BlueprintParseError`
+    (fail-closed landing), never a `TypeError`/`AttributeError`. A skipped malformed
+    entry cannot smuggle anything through: the slot it would have declared is then
+    missing, so its `{token}` is an undeclared placeholder that the corpus loader
+    refuses at the landing write."""
+    params = payload.get("parameterization")
+    if not isinstance(params, list):
+        return []
     return [
         p["slot"]
-        for p in payload.get("parameterization", []) or []
-        if p.get("role") == "slot" and p.get("slot")
+        for p in params
+        if isinstance(p, dict) and p.get("role") == "slot" and p.get("slot")
     ]
+
+
+# The `composes_json` field ALLOWLIST — exactly the keys `runtime/blueprint/models.py
+# ::Node.parse` reads (`sql_template` is joined in from S4, not copied from the plan).
+# An ALLOWLIST, not the PLAN dict minus the fields we happen to dislike today: the S3
+# `ComposeNodePlan` is session-scoped working state, so a field added there must land
+# in the governed corpus only by an explicit decision here, never by default.
+_NODE_DOC_FIELDS: tuple[str, ...] = (
+    "order",
+    "node_kind",
+    "feeds_from",
+    "consumes",
+    "output",
+    "when",
+    "requires_approval",
+)
 
 
 def _compose_docs(
@@ -43,11 +70,25 @@ def _compose_docs(
 ) -> list[dict[str, Any]]:
     """Project the S3 `composes` DAG ⨝ the S4 per-node `sql_template` (by `order`)
     onto the `composes_json` shape. The SINGLE composes projection reused by both the
-    runtime `Blueprint` and the landed `BlueprintSeed`."""
+    runtime `Blueprint` and the landed `BlueprintSeed`.
+
+    Only `_NODE_DOC_FIELDS` are carried. Two PLAN fields are deliberately dropped:
+
+      * `source_tool_call_ref` — a SESSION-scoped identifier (D17). The corpus holds
+        entity-free, session-independent artifacts; session linkage belongs in the
+        `evidence_ref`s in the access-controlled `learning_audit` store, not in a
+        globally-recallable `:Blueprint` property.
+      * `step_intent` — free NL, and (unlike `intent`/`notes`) NOT one of the S5
+        `_ENTITY_FREE_SURFACES` the leakage gate scans. Landing it would put
+        UNSCANNED model prose into the global corpus, and because the last-gate
+        `_assert_seed_entity_free` can only match spans S5 already identified, the
+        tripwire could not catch it either. Dropped until it is either scanned or
+        proven unnecessary — the runtime never reads it, so nothing regresses.
+    """
     template_by_order = {n.order: n.sql_template for n in generalization.node_templates}
     composes: list[dict[str, Any]] = []
     for node in payload.get("composes", []) or []:
-        mapped = dict(node)
+        mapped = {key: node[key] for key in _NODE_DOC_FIELDS if key in node}
         mapped["sql_template"] = template_by_order.get(node.get("order"))
         composes.append(mapped)
     return composes

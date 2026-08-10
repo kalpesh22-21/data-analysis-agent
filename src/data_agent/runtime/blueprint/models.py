@@ -13,6 +13,7 @@ pure: no I/O, no LLM, no SQL execution.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -61,6 +62,33 @@ def slot_type_gloss(type_: Any) -> str:
 NODE_KINDS: frozenset[str] = frozenset({"query", "approval"})  # D59c (`guard` cut)
 ON_VIOLATION: frozenset[str] = frozenset({"abort", "skip", "ask"})
 
+# The CLOSED set of `output` kinds a node may declare — the two things the executor
+# knows how to pass downstream: a `scalar` (bound as a typed literal into the
+# consumer's `{placeholder}`) and a `table` (materialized to a session scratch table
+# and AST-JOINed into the consumer, `executor._materialize_node`, §2.3). A frozenset
+# for the same reason as `NODE_KINDS`: the parse layer, the loader and the OFFLINE
+# learning validator (`learning/generalize/validate.py::check_dag`) must agree on one
+# set — they drifted once (learning stayed scalar-only after table intermediates
+# landed) and the loop could not emit a shape the runtime executes.
+NODE_OUTPUT_KINDS: frozenset[str] = frozenset({"scalar", "table"})
+
+# The two `consumes` reference grammars (§2.3) — the node contract, so they live with
+# the node model rather than in each consumer:
+#
+#   TABLE_CONSUME_REF   `$1`            node 1's WHOLE table output, materialized to
+#                                       scratch and injected as a `scratch.<placeholder>`
+#                                       FROM/JOIN token.
+#   SCALAR_CONSUME_REF  `$3.company_avg` one NAMED scalar output, bound as a typed
+#                                       literal into `{placeholder}`.
+#
+# SINGLE SOURCE: the executor (replay), the corpus loader (landing) and the offline
+# S4 validator all match refs with THESE objects. They were three hand-copied regexes;
+# the loop had copied only the table one, which is why S4 could stamp `dag_ok=True` on
+# a consume shape the loader rejects. Identity + behaviour pinned in
+# `tests/learning/generalize/test_dag_loader_parity_qa.py`.
+TABLE_CONSUME_REF = re.compile(r"^\$(\d+)$")
+SCALAR_CONSUME_REF = re.compile(r"^\$(\d+)\.([A-Za-z_][A-Za-z0-9_]*)$")
+
 # `relative_window` integer bounds (D49). The CEILING is a HARD safety cap: an
 # authored `max_value` may narrow the window but never widen it past this, so an
 # absurd `INTERVAL 999999 MONTH` can neither be authored (SlotSpec.parse gate) nor
@@ -105,7 +133,11 @@ class SlotSpec:
         if not isinstance(name, str) or not name:
             raise BlueprintParseError("slot is missing a non-empty 'name'")
         type_ = raw.get("type")
-        if type_ not in SLOT_TYPES:
+        # `isinstance` FIRST: `x not in <frozenset>` hashes x, so an unhashable stored
+        # value (`"type": []`) would raise TypeError — escaping every `except
+        # BlueprintParseError` on the read path and aborting the whole corpus load with
+        # an un-wrapped third-party error. Same guard on every closed-set test below.
+        if not isinstance(type_, str) or type_ not in SLOT_TYPES:
             raise BlueprintParseError(
                 f"slot {name!r} has unknown type {type_!r} (allowed: {sorted(SLOT_TYPES)})"
             )
@@ -186,7 +218,7 @@ class WhenClause:
         if not isinstance(expr, str) or not expr.strip():
             raise BlueprintParseError("'when' requires a non-empty 'expr'")
         on_violation = raw.get("on_violation")
-        if on_violation not in ON_VIOLATION:
+        if not isinstance(on_violation, str) or on_violation not in ON_VIOLATION:
             raise BlueprintParseError(
                 f"'when.on_violation' must be one of {sorted(ON_VIOLATION)}, got {on_violation!r}"
             )
@@ -198,11 +230,15 @@ class WhenClause:
 
 @dataclass(frozen=True)
 class Node:
-    """One `composes` DAG node (§1.1). `output` maps each name → 'scalar'|'table'.
+    """One `composes` DAG node (§1.1). `output` maps each name → a `NODE_OUTPUT_KINDS`
+    value ('scalar' | 'table').
 
-    Phase-1 executes single-node blueprints + scalar-converging DAGs; `table`
-    intermediates are rejected downstream (F2). This parse layer records the
-    shape faithfully; the loader (§1.2) enforces the DAG invariants.
+    Both kinds now execute: scalar-converging DAGs bind literals, and a `table`
+    intermediate consumed as `{ph: "$N"}` is materialized to session scratch (§2.3)
+    when a `scratch_client` is wired (the original F2 scalar-only boundary was lifted
+    there; without a scratch client the executor still degrades to UNSUPPORTED). This
+    parse layer records the shape faithfully; the loader (§1.2) enforces the DAG
+    invariants (including the table-consume ⇄ table-output pairing).
     """
 
     order: int
@@ -222,7 +258,7 @@ class Node:
         if not isinstance(order, int) or isinstance(order, bool):
             raise BlueprintParseError("compose node requires an integer 'order'")
         node_kind = raw.get("node_kind", "query")
-        if node_kind not in NODE_KINDS:
+        if not isinstance(node_kind, str) or node_kind not in NODE_KINDS:
             raise BlueprintParseError(
                 f"node {order} has unknown node_kind {node_kind!r} (allowed: {sorted(NODE_KINDS)})"
             )
@@ -236,10 +272,12 @@ class Node:
             raise BlueprintParseError(f"node {order} 'consumes' must be an object")
         output_raw = raw.get("output") or {}
         if not isinstance(output_raw, dict) or not all(
-            isinstance(k, str) and v in ("scalar", "table") for k, v in output_raw.items()
+            isinstance(k, str) and isinstance(v, str) and v in NODE_OUTPUT_KINDS
+            for k, v in output_raw.items()
         ):
             raise BlueprintParseError(
-                f"node {order} 'output' must map names → 'scalar'|'table'"
+                f"node {order} 'output' must map names → "
+                f"{'|'.join(repr(k) for k in sorted(NODE_OUTPUT_KINDS))}"
             )
         sql_template = raw.get("sql_template")
         if sql_template is not None and not isinstance(sql_template, str):
@@ -337,6 +375,26 @@ class Blueprint:
             ):
                 raise BlueprintParseError("'resolves' must be an object of string→string")
             resolves_map = dict(resolves)
+        # The three ARRAY properties, type-checked BEFORE anything iterates them: a
+        # non-iterable (`slots=5`, `composes=5`) raises `TypeError: 'int' object is not
+        # iterable`, which is NOT a `BlueprintParseError` — it escapes the loader's
+        # `except BlueprintParseError` and aborts `load_corpus` un-wrapped. That bricks
+        # the corpus indefinitely (the hydration cache re-arms and retries the same
+        # poisoned entry every turn), which is exactly the failure this fail-loud parse
+        # layer exists to convert into one clean, attributable error.
+        #
+        # `uses_rules` HAD this check — but on the line AFTER `tuple(uses_rules or ())`,
+        # so it was dead for the only input that needed it. Order is the whole fix.
+        for label, value, allowed in (
+            ("slots", slots, (list, tuple)),
+            ("composes", composes, (list, tuple)),
+            ("uses_rules", uses_rules, (list,)),  # kept list-only, as authored
+        ):
+            if value is not None and not isinstance(value, allowed):
+                raise BlueprintParseError(
+                    f"'{label}' must be a {' or '.join(t.__name__ for t in allowed)}, "
+                    f"got {type(value).__name__}"
+                )
         slots_raw = list(slots or [])
         if len(slots_raw) > _MAX_SLOTS:
             raise BlueprintParseError(
@@ -358,8 +416,6 @@ class Blueprint:
             raise BlueprintParseError("'sql_template' must be a string")
         nodes = tuple(Node.parse(n) for n in (composes or []))
         rules = tuple(uses_rules or ())
-        if uses_rules is not None and not isinstance(uses_rules, list):
-            raise BlueprintParseError("'uses_rules' must be a list")
         return cls(
             id=id,
             intent=intent,

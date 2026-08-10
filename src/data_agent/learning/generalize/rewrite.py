@@ -135,8 +135,14 @@ def rewrite_sql_to_template(
         if role == "slot":
             slot = param.get("slot") or {}
             name = slot.get("name")
-            if not name:
-                raise RewriteError("role=slot param is missing slot.name.")
+            # A truthy NON-STRING name passed this check and then died on the
+            # `"{" + name` render below with a TypeError — this module's contract is
+            # that an un-rewritable plan raises `RewriteError` (the only exception its
+            # callers catch), so the type belongs in the same guard as the emptiness.
+            # The builder's `_plan_params_ok` gates this too; this keeps the contract
+            # true for any other caller.
+            if not isinstance(name, str) or not name:
+                raise RewriteError("role=slot param is missing a string slot.name.")
             literal.replace(exp.Placeholder(this=name))
             slot_names.append(name)
         elif role == "rule":

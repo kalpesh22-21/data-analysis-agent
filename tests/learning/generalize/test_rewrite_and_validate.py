@@ -4,6 +4,8 @@ not (role=rule predicate drop; dict-family + star rejection)."""
 
 from __future__ import annotations
 
+import pytest
+
 from data_agent.learning.generalize.builder import generalize_blueprint
 from data_agent.learning.generalize.rewrite import RewriteError, rewrite_sql_to_template
 from data_agent.learning.generalize.validate import check_read_only_select
@@ -68,6 +70,22 @@ def test_missing_slot_literal_raises_in_strict_mode():
         pass
     else:  # pragma: no cover
         raise AssertionError("expected RewriteError for an unlocatable slot literal")
+
+
+@pytest.mark.parametrize("name", [["department"], 7, {"n": "department"}, 1.5])
+def test_non_string_slot_name_raises_rewrite_error_not_type_error(name):
+    """A TRUTHY non-string `slot.name` passed the `if not name` guard and then died on
+    the `"{" + name + ": }"` render with a `TypeError` — past the `except RewriteError`
+    that is the only exception this module's callers catch. The module contract is that
+    an un-rewritable plan raises `RewriteError`, so the type check belongs in the same
+    guard as the emptiness one. (The builder's `_plan_params_ok` gates this field too;
+    this keeps the contract true for every other caller.)"""
+    params = [
+        {"locator": {"table": "payroll.payroll_fact", "column": "department", "value": "0420"},
+         "role": "slot", "slot": {"name": name}},
+    ]
+    with pytest.raises(RewriteError, match="slot.name"):
+        rewrite_sql_to_template(_SQL, params, strict=True)
 
 
 def test_read_only_rejects_star_and_dict_family():

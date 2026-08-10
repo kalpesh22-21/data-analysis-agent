@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -61,7 +60,7 @@ from .grain_probe import (
     map_grain_columns,
     unpack_grain_probe,
 )
-from .models import Blueprint, BlueprintParseError, Node
+from .models import TABLE_CONSUME_REF, Blueprint, BlueprintParseError, Node
 from .rules import (
     _GAP_THRESHOLD as _DEFAULT_GAP_THRESHOLD,
 )
@@ -1261,20 +1260,13 @@ def _has_table_intermediate(nodes: tuple[Node, ...]) -> bool:
     )
 
 
-# A TABLE consume value is a bare `$N` (the WHOLE table output of node N) — the
-# table analogue of the scalar `$N.name` consume (§2.3). Table passing:
-# `consumes: {placeholder: "$N"}`, with `{placeholder}` a `scratch.<placeholder>`
-# FROM/JOIN token in the consumer's sql_template.
-_TABLE_CONSUME_REF = re.compile(r"^\$(\d+)$")
-
-
 def _table_consumed_orders(nodes: tuple[Node, ...]) -> set[int]:
     """Every upstream node order consumed as a TABLE (`consumes: {ph: "$N"}`) — the
     nodes that must be materialized to scratch before their consumer dispatches."""
     orders: set[int] = set()
     for n in nodes:
         for ref in n.consumes.values():
-            match = _TABLE_CONSUME_REF.match(str(ref))
+            match = TABLE_CONSUME_REF.match(str(ref))
             if match is not None:
                 orders.add(int(match.group(1)))
     return orders
@@ -1290,7 +1282,7 @@ def _node_table_bindings(
     are value bindings, handled by `_node_bindings`)."""
     bindings: dict[str, str] = {}
     for placeholder, ref in node.consumes.items():
-        match = _TABLE_CONSUME_REF.match(str(ref))
+        match = TABLE_CONSUME_REF.match(str(ref))
         if match is None:
             continue  # a scalar `$N.name` consume — not a table binding
         order = int(match.group(1))

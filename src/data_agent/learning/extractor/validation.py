@@ -25,6 +25,7 @@ from data_agent.runtime.blueprint.template import TemplateBindError, validate_op
 
 from ..summary.models import SessionSummary
 from .models import (
+    NODE_KINDS,
     SLOT_TYPES,
     BlueprintPayload,
     CandidateHeader,
@@ -147,7 +148,124 @@ def _result_signature(raw: dict[str, Any] | None) -> ResultSignature | None:
     )
 
 
+def _node_index(value: Any) -> int | None:
+    """Coerce an LLM-emitted node index (`order` / a `feeds_from` entry) to an int,
+    or `None` when the value is not one.
+
+    A real model emits `0` or the string `"0"`, so a numeric string is accepted. A
+    BOOL is not an index (`True` would silently become node 1) and a fractional float
+    is a typo, not something to truncate — both are `None` (⇒ decline)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _validate_compose_nodes(raw_nodes: Any) -> Decline | None:
+    """Structural gate over the raw `composes` DAG plan — the composite sibling of
+    `_validate_roles`, run BEFORE `_compose_nodes` builds the typed plans.
+
+    This is LLM output: every field is untrusted. The gate exists so a shape-confused
+    node (`order` absent, `"order": "first"`, `feeds_from` a string or a bare index,
+    `consumes` a list) becomes a Decline naming WHICH node and WHICH field, rather
+    than a raw interpreter message — or, worse, an exception: an uncaught raise out of
+    `to_candidate` leaves the consumer message un-acked → reclaim → dead-letter,
+    losing the whole session. Nothing here may raise; `to_candidate` additionally runs
+    this inside its malformed-payload try as the belt.
+
+    Checked here: the STRUCTURE `_compose_nodes` assumes and `Node.parse` requires at
+    landing. Deliberately NOT checked here: the DAG SEMANTICS (unique orders, acyclic
+    edges, executable `output` kinds) — S4's `check_dag` owns those and routes them to
+    `fail_to_review`, the human-review valve, which a hard `malformed` reject would
+    bypass. `when` is likewise left alone: S4 declines ANY when-bearing composite
+    (`when_bearing_composite`) whatever its type."""
+    if raw_nodes is None:
+        return None  # a single (non-composite) blueprint declares no DAG
+    if not isinstance(raw_nodes, list):
+        return Decline("blueprint", REASON_MALFORMED, "composes is not a list")
+    for idx, rn in enumerate(raw_nodes):
+        where = f"composes[{idx}]"
+        if not isinstance(rn, dict):
+            return Decline("blueprint", REASON_MALFORMED, f"{where} is not an object")
+        if "order" not in rn:
+            return Decline("blueprint", REASON_MALFORMED, f"{where} has no 'order'")
+        order = _node_index(rn["order"])
+        if order is None:
+            return Decline(
+                "blueprint", REASON_MALFORMED,
+                f"{where} 'order' {rn['order']!r} is not an integer",
+            )
+        node_kind = rn.get("node_kind", "query")
+        # `isinstance` BEFORE the frozenset test: `x not in <frozenset>` HASHES x, so
+        # `"node_kind": ["query"]` — ordinary model output — would raise TypeError
+        # straight out of `to_candidate` and out of `LearningExtractor.extract` (no
+        # try/except there), costing the whole session's extraction. That is precisely
+        # the failure this gate exists to prevent, so it must not be the gate's own
+        # crash site. `node_kind` was the ONLY untrusted field here fed raw to a
+        # membership test; every other one is isinstance-checked or `str()`-coerced.
+        if not isinstance(node_kind, str) or node_kind not in NODE_KINDS:
+            return Decline(
+                "blueprint", REASON_MALFORMED,
+                f"{where} has unknown node_kind {node_kind!r} (allowed: {sorted(NODE_KINDS)})",
+            )
+        # ABSENT means "none"; every other wrong type declines, INCLUDING the falsy
+        # ones. `x or []` would have normalized `0`, `""` and `{}` alike to no-edges:
+        # `feeds_from: 0` ("feeds from node 0", the likeliest scalar-for-list slip
+        # since node 0 is always first) silently lost an edge, leaving a `consumes`
+        # whose source is absent from `feeds_from` — a CorpusLoadError at landing. The
+        # falsy CONTAINERS lose no information, but "the model sent a string where a
+        # list belongs" is the signal you want in a decline reason when tuning the
+        # prompt, and one type violation treated two ways is a rule nobody remembers.
+        # Same rule for the two maps below.
+        feeds = rn.get("feeds_from")
+        if feeds is None:
+            feeds = []
+        if not isinstance(feeds, list):
+            return Decline(
+                "blueprint", REASON_MALFORMED,
+                f"{where} 'feeds_from' is not a list (got {type(feeds).__name__})",
+            )
+        for src in feeds:
+            if _node_index(src) is None:
+                return Decline(
+                    "blueprint", REASON_MALFORMED,
+                    f"{where} 'feeds_from' entry {src!r} is not an integer",
+                )
+        for field_name in ("consumes", "output"):
+            value = rn.get(field_name)
+            if value is None:
+                value = {}
+            if not isinstance(value, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+            ):
+                return Decline(
+                    "blueprint", REASON_MALFORMED,
+                    f"{where} {field_name!r} must be an object of string→string "
+                    f"(got {type(value).__name__})",
+                )
+        # `requires_approval` has no downstream gate before `Node.parse` at LANDING,
+        # where a non-object raises past the promotion path — reject it here instead.
+        requires_approval = rn.get("requires_approval")
+        if requires_approval is not None and not isinstance(requires_approval, dict):
+            return Decline(
+                "blueprint", REASON_MALFORMED, f"{where} 'requires_approval' is not an object"
+            )
+    return None
+
+
 def _compose_nodes(raw_nodes: list[dict[str, Any]]) -> tuple[ComposeNodePlan, ...]:
+    """Build the typed `ComposeNodePlan`s. PRECONDITION (load-bearing):
+    `_validate_compose_nodes` has already passed on `raw_nodes`, which is what makes
+    every coercion below total — `int(...)` here is exactly `_node_index` given that
+    gate (bools and fractional floats are already declined)."""
     nodes: list[ComposeNodePlan] = []
     for rn in raw_nodes:
         nodes.append(
@@ -158,7 +276,13 @@ def _compose_nodes(raw_nodes: list[dict[str, Any]]) -> tuple[ComposeNodePlan, ..
                 feeds_from=tuple(int(f) for f in (rn.get("feeds_from") or [])),
                 consumes=dict(rn.get("consumes") or {}),
                 output=dict(rn.get("output") or {}),
-                source_tool_call_ref=rn.get("source_tool_call_ref"),
+                # Coerced (as `_param_plans` coerces `rule_id`): S4 looks the ref up in
+                # a dict, so an unhashable model-emitted value must never reach it.
+                source_tool_call_ref=(
+                    str(rn["source_tool_call_ref"])
+                    if rn.get("source_tool_call_ref") is not None
+                    else None
+                ),
                 when=rn.get("when"),
                 requires_approval=rn.get("requires_approval"),
             )
@@ -329,6 +453,15 @@ def to_candidate(
     if not isinstance(payload_raw, dict):
         return Decline(ctype, REASON_MALFORMED, "blueprint payload is not an object")
     try:
+        # Gate the composite DAG BEFORE building the payload: `_compose_nodes` coerces
+        # (`int(rn["order"])`) on the assumption this passed. INSIDE the try as well:
+        # the gate is the thing standing between malformed model output and the
+        # dead-letter path, so its OWN bugs must degrade to a generic malformed
+        # decline rather than become the escape it exists to close (it shipped once
+        # with an unhashable-`node_kind` TypeError doing exactly that).
+        compose_decline = _validate_compose_nodes(payload_raw.get("composes"))
+        if compose_decline is not None:
+            return compose_decline
         payload = _blueprint_payload(payload_raw)
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         return Decline(ctype, REASON_MALFORMED, f"bad blueprint payload: {exc}")

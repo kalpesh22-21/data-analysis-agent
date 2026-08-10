@@ -41,7 +41,12 @@ from sqlglot.optimizer.qualify_columns import qualify_columns, validate_qualify_
 from sqlglot.optimizer.qualify_tables import qualify_tables
 from sqlglot.schema import MappingSchema
 
-from data_agent.runtime.blueprint.models import Blueprint, BlueprintParseError
+from data_agent.runtime.blueprint.models import (
+    SCALAR_CONSUME_REF,
+    TABLE_CONSUME_REF,
+    Blueprint,
+    BlueprintParseError,
+)
 from data_agent.runtime.blueprint.rules import parse_rule
 from data_agent.runtime.blueprint.slots import slot_token_names
 from data_agent.runtime.blueprint.structural_key import (
@@ -228,13 +233,10 @@ DEFAULT_EMBEDDING_DIMENSION = 768
 # adversarial input and is rejected LOUD (never traversed into a stack overflow).
 _MAX_COMPOSE_NODES = 64
 
-# A `consumes` upstream-output reference (`$3.company_avg`) and a `count($N)`
-# occurrence in a `when` expr — used by the Slice-C load-time validations.
-_CONSUME_REF = re.compile(r"^\$(\d+)\.([A-Za-z_][A-Za-z0-9_]*)$")
+# The two `consumes` grammars (`$3.company_avg` scalar / `$1` table) come from
+# `blueprint/models.py` — one definition shared with the executor and the offline S4
+# validator. `count($N)` in a `when` expr is loader-local (Slice-C validations).
 _COUNT_REF = re.compile(r"count\(\s*\$(\d+)")
-# A TABLE consume reference (`$1`) — node 1's WHOLE table output, injected as a
-# `scratch.<placeholder>` FROM/JOIN token (table-intermediate Slice 2, §2.3).
-_TABLE_CONSUME_REF = re.compile(r"^\$(\d+)$")
 # The reserved database a table-consume placeholder lives under in a consumer
 # template. The scope-honesty gate treats `scratch.*` sources as SESSION-GATED
 # (D69/OQ-4) — not required in `uses` — while the consumer's warehouse columns
@@ -1085,7 +1087,7 @@ def _scratch_schema_for_node(
     against `uses` (the D69/OQ-4 scope-honesty split, §2.3)."""
     schema: dict[str, dict[str, str]] = {}
     for placeholder, ref in node.consumes.items():
-        match = _TABLE_CONSUME_REF.match(str(ref))
+        match = TABLE_CONSUME_REF.match(str(ref))
         if match is None:
             continue
         src = outputs_by_order.get(int(match.group(1)))
@@ -1156,8 +1158,11 @@ def _assert_template_reads_within_uses(
     # WITHOUT adding them to the warehouse `uses` footprint (§2.3 scope-honesty).
     if scratch_schema:
         schema_dict.setdefault(_SCRATCH_DB, {}).update(scratch_schema)
-    schema = MappingSchema(schema_dict, dialect="clickhouse")
     try:
+        # INSIDE the try: `MappingSchema` itself raises on a malformed schema mapping
+        # (e.g. an empty column map), and every failure on this path must surface as a
+        # `CorpusLoadError`, never a raw sqlglot exception.
+        schema = MappingSchema(schema_dict, dialect="clickhouse")
         qualified = qualify_tables(tree.copy(), dialect="clickhouse")
         _assert_source_tables_in_uses(bp_id, where, qualified, schema_dict)
         qualified = qualify_columns(
@@ -1395,6 +1400,20 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
             if order is not None and order in nodes_by_order
             else None
         )
+        # A producer with no `sql_template` (or one with no NAMED select aliases)
+        # yields an EMPTY column map, which `MappingSchema` rejects with a raw sqlglot
+        # `SchemaError` — an un-wrapped third-party exception out of `load_corpus`
+        # instead of the `CorpusLoadError` its callers handle. Reject it here with the
+        # actual cause: an un-schema'd scratch source cannot be scope-checked at all,
+        # so this is fail-closed, not cosmetic.
+        un_schemad = sorted(ph for ph, cols in (scratch_schema or {}).items() if not cols)
+        if un_schemad:
+            raise CorpusLoadError(
+                f"blueprint {bp.id}: {where} consumes table placeholder(s) {un_schemad} "
+                "whose producing node declares no derivable output columns (no "
+                "sql_template, or a template with no named SELECT aliases) — the "
+                "scratch JOIN cannot be scope-checked."
+            )
         _assert_template_reads_within_uses(bp.id, where, tree, bp.uses, scratch_schema)
 
     # (e) B3(a): every declared REQUIRED slot MUST be referenced by ≥1 template —
@@ -1501,7 +1520,7 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
         scratch_refs = _scratch_placeholder_names(node.sql_template)
         for placeholder, ref in node.consumes.items():
             ref_str = str(ref)
-            table_match = _TABLE_CONSUME_REF.match(ref_str)
+            table_match = TABLE_CONSUME_REF.match(ref_str)
             if table_match is not None:
                 src_order = int(table_match.group(1))
                 if src_order not in node.feeds_from:
@@ -1521,7 +1540,7 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
                         f"appear as a 'scratch.{placeholder}' source in a FROM/JOIN position."
                     )
                 continue
-            match = _CONSUME_REF.match(ref_str)
+            match = SCALAR_CONSUME_REF.match(ref_str)
             if match is None:
                 raise CorpusLoadError(
                     f"blueprint {bp.id}: node {node.order} consumes {placeholder!r} "
