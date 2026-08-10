@@ -122,7 +122,26 @@ async def _mint(scope: list[str], session_id: str) -> str:
         resp = await client.post(
             TOKEN_SERVICE_URL,
             headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
-            json={"user_name": "alice", "column_scope": scope, "session_id": session_id},
+            json={
+                "user_name": "alice",
+                "column_scope": scope,
+                "session_id": session_id,
+                # The warehouse TENANT claims. `app/token_service.py::_mint` stamps
+                # only sub/iss/aud/exp/user_name/column_scope/sid_hash itself, so
+                # without these the l2-mcp auth middleware rejects EVERY request
+                # with 403 MISSING_TENANT_CLAIM ("Token missing required tenant
+                # claim 'clientcode'") and this demo cannot make a single tool call.
+                # The names are the l2-mcp CLICKHOUSE_TENANT_SETTINGS map's inputs
+                # (clientcode -> paycom_client_code etc., app/config.py:181); the
+                # values match the seeded warehouse tenant (CLIENT_A/PC01) and the
+                # test principal the RLS row policies key on (TESTJTI001, see
+                # docker/clickhouse-init/hr-4tables-snake-migration.sql).
+                "claims": {
+                    "clientcode": "CLIENT_A",
+                    "proc_center": "PC01",
+                    "jti": "TESTJTI001",
+                },
+            },
         )
         resp.raise_for_status()
         return resp.json()["access_token"]

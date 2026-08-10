@@ -475,9 +475,17 @@ def _real_discovery_provider(discovery_mcp: FakeMCPClient):
     return _provider
 
 
-async def test_emulated_discovery_pairs_injected_after_system_before_user() -> None:
-    # A wired provider splices the synthetic listDatabases+listTables assistant/tool
-    # pairs in AFTER the leading system message and BEFORE the real user question.
+async def test_emulated_discovery_pairs_injected_after_the_current_question() -> None:
+    # SEQUENTIAL TURN LAYOUT: a wired provider splices the synthetic
+    # listDatabases+listTables assistant/tool pairs in immediately AFTER the current
+    # turn's question, so the turn reads system -> question -> emulated discovery ->
+    # the model's own work.
+    #
+    # This previously spliced after the leading `system` run, hoisting every emulated
+    # pair ABOVE turn-0's question — a block of tool calls before the user had asked
+    # anything. The sweep is re-run per budget window against the CURRENT turn, so it
+    # was never prior-session history; prepending it broke the sequential layout
+    # `context/assembly.py`'s interleave otherwise maintains.
     model = ScriptedModelClient([ModelTurnResult(assistant_text="Done.")])
     mcp = FakeMCPClient()
     loop, _store = _build_loop(
@@ -490,7 +498,7 @@ async def test_emulated_discovery_pairs_injected_after_system_before_user() -> N
     await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="How many?")
 
     messages = model.calls[0].messages
-    # [0] system base prompt; [1..4] emulated pairs; [-1] the real user question.
+    # The base prompt stays the sole pinned head.
     assert messages[0] == {"role": "system", "content": "BASE PROMPT"}
 
     assistant_calls = [
@@ -505,11 +513,24 @@ async def test_emulated_discovery_pairs_injected_after_system_before_user() -> N
     tool_ids = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
     assert tool_ids == ["emulated-listDatabases", f"emulated-listTables-{_DB}"]
 
-    # The emulated pairs precede the real user message (earliest tool history).
-    last_emulated = max(i for i, m in enumerate(messages) if m.get("role") == "tool")
+    # THE POINT: every emulated pair FOLLOWS the real user question, and the
+    # question immediately precedes the first of them — nothing sits between.
     user_index = next(i for i, m in enumerate(messages) if m.get("role") == "user")
-    assert last_emulated < user_index
     assert messages[user_index]["content"] == "How many?"
+    first_emulated = min(
+        i for i, m in enumerate(messages) if m["role"] == "assistant" and m.get("tool_calls")
+    )
+    assert first_emulated == user_index + 1
+
+    # Full expected order, so a future reordering cannot pass by accident.
+    assert [m["role"] for m in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "tool",
+    ]
 
 
 async def test_emulated_discovery_seeds_guard_model_recall_not_dispatched() -> None:

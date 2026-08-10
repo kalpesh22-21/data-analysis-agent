@@ -489,6 +489,7 @@ def create_app(
                 return await build_emulated_discovery(
                     dispatcher,
                     creds,
+                    base_database=settings.base_database,
                     preview_row_count=settings.preview_row_count,
                     observer=observer,
                 )

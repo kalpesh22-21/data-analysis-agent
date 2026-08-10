@@ -59,6 +59,40 @@ def _parse_tool_error_text(text: str) -> tuple[str | None, str]:
     return None, text
 
 
+def _unwrap_fastmcp_result(structured: Any) -> Any:
+    """Strip FastMCP's `{"result": <value>}` envelope from a `structuredContent`.
+
+    The MCP spec requires `structuredContent` to be a JSON OBJECT, so FastMCP
+    wraps any tool whose return type is not an object under a single `"result"`
+    key and advertises that in the tool's `outputSchema`. Of our six tools this
+    hits exactly the two list-returning ones — observed live:
+
+        listDatabases outputSchema: {"properties": {"result": {"type": "array", ...}},
+                                     "required": ["result"], ...}
+        structuredContent:          {"result": [{"name": "dbpcm_warehouse"}, ...]}
+
+    Returned un-stripped, every downstream consumer sees a dict where the tool's
+    contract says list: `dispatch/tool_dispatcher.py::_build_preview` misses its
+    bare-list branch and renders the whole listing as ONE blob row, and
+    `context/discovery_emulation.py::_database_names` type-checks for `list`,
+    finds a dict, and degrades the emulated-discovery sweep to empty on every
+    turn (silently, by design) — the bug this function exists to close.
+
+    Unwrapping HERE, at the transport boundary, is what keeps the rest of the
+    runtime written against the tool's real return shape instead of against a
+    serialization detail of the server's framework.
+
+    Narrow by construction: only a dict whose ONLY key is `"result"` is
+    unwrapped. None of the six tools returns such an object itself
+    (runQuery/sampleRows/explainQuery return `{columns, rows, ...}`;
+    getTableSchema returns `{database, table, columns}`), so a real payload can
+    never be mistaken for the envelope.
+    """
+    if isinstance(structured, dict) and set(structured) == {"result"}:
+        return structured["result"]
+    return structured
+
+
 class RealMCPClient:
     """`MCPClient` over the live `clickhouse-api` MCP (streamable-HTTP)."""
 
@@ -89,7 +123,7 @@ class RealMCPClient:
 
         structured = getattr(result, "structuredContent", None)
         if structured is not None:
-            return structured
+            return _unwrap_fastmcp_result(structured)
         for block in result.content:
             if getattr(block, "type", None) == "text":
                 return json.loads(block.text)

@@ -173,7 +173,7 @@ def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> Non
     # emulated discovery (not just the degrade path): with the feature enabled and a
     # FakeMCPClient scripted for listDatabases/listTables, the synthetic
     # emulated-listDatabases + emulated-listTables-<db> assistant/tool pairs must
-    # reach the model payload BEFORE the user question.
+    # reach the model payload, spliced in sequentially AFTER the user question.
     monkeypatch.setattr(app_module, "verify_jwt", lambda *args, **kwargs: frozenset())
 
     db = "dbpcm_warehouse"
@@ -212,11 +212,14 @@ def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> Non
     tool_ids = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
     assert "emulated-listDatabases" in tool_ids
     assert f"emulated-listTables-{db}" in tool_ids
-    # The emulated pairs precede the real user question (earliest tool history).
-    last_emulated = max(i for i, m in enumerate(messages) if m.get("role") == "tool")
+    # SEQUENTIAL TURN LAYOUT: every emulated pair FOLLOWS the real user question,
+    # which immediately precedes the first of them.
+    first_emulated = min(i for i, m in enumerate(messages) if m.get("role") == "tool") - 1
     user_index = next(i for i, m in enumerate(messages) if m.get("role") == "user")
-    assert last_emulated < user_index
-    # The sweep dispatched exactly the two discovery tools through the real MCP.
+    assert first_emulated == user_index + 1
+    assert messages[user_index]["content"] == "How many employees?"
+    # The sweep dispatched exactly the two discovery tools through the real MCP —
+    # ONE listTables, for the base database only.
     assert [c.tool_name for c in mcp_client.calls] == ["listDatabases", "listTables"]
 
 

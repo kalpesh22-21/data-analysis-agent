@@ -2,12 +2,13 @@
 listTables sweep that injects synthetic assistant/tool pairs as if the model had
 already made those discovery calls.
 
-Covers: the happy path builds a listDatabases entry + one listTables entry per
-database with the correct tool_name/args/tool_call_id and a `result_preview` that
-is byte-identical to a REAL replayed read (`context/budget.py::_render_entry`);
-`read_signatures` seed the loop's guard 1:1 with the entries; a listDatabases
-denial/empty degrades to an empty result; one db's listTables failure omits only
-that db; and the sweep never raises.
+Covers: the happy path builds a listDatabases entry + exactly ONE listTables entry
+(for the base database — NOT one per database returned) with the correct
+tool_name/args/tool_call_id and a `result_preview` that is byte-identical to a REAL
+replayed read (`context/budget.py::_render_entry`); `read_signatures` seed the loop's
+guard 1:1 with the entries; a listDatabases denial/empty degrades to an empty result;
+a base-database listTables denial (or a base database absent from the listDatabases
+result) still injects the listDatabases pair on its own; and the sweep never raises.
 """
 
 from __future__ import annotations
@@ -100,7 +101,11 @@ def _expected_rendered(
     return _render_entry(entry, 20)
 
 
-async def test_happy_path_builds_listdatabases_and_per_db_listtables_entries() -> None:
+async def test_happy_path_lists_tables_for_the_base_database_only() -> None:
+    # BREADTH: `listTables` is emulated for the ONE base database, NOT for every
+    # database `listDatabases` returned. The others on a live warehouse are not
+    # analysis surface, so sweeping them spent an MCP round-trip per turn to inject
+    # listings the model should never query from.
     db_result = _ok("listDatabases", [{"name": "warehouse_a"}, {"name": "warehouse_b"}])
     tables_a = _ok(
         "listTables",
@@ -121,23 +126,23 @@ async def test_happy_path_builds_listdatabases_and_per_db_listtables_entries() -
         }
     )
 
-    discovery = await build_emulated_discovery(dispatcher, _CREDS)
+    discovery = await build_emulated_discovery(
+        dispatcher, _CREDS, base_database="warehouse_a"
+    )
 
-    # listDatabases first, then one listTables per database (in returned order).
-    assert [e["tool_name"] for e in discovery.entries] == [
-        "listDatabases",
-        "listTables",
-        "listTables",
-    ]
+    # listDatabases (in full) + exactly ONE listTables, for the base database.
+    assert [e["tool_name"] for e in discovery.entries] == ["listDatabases", "listTables"]
     assert [e["tool_call_id"] for e in discovery.entries] == [
         "emulated-listDatabases",
         "emulated-listTables-warehouse_a",
-        "emulated-listTables-warehouse_b",
     ]
-    assert [e["args"] for e in discovery.entries] == [
-        {},
-        {"database": "warehouse_a"},
-        {"database": "warehouse_b"},
+    assert [e["args"] for e in discovery.entries] == [{}, {"database": "warehouse_a"}]
+
+    # The non-base database was never dispatched at all — this is the round-trip
+    # the narrowing exists to save, so assert on the CALLS, not just the entries.
+    assert dispatcher.calls == [
+        ("listDatabases", {}),
+        ("listTables", {"database": "warehouse_a"}),
     ]
 
     # Each entry is byte-identical to a REAL replayed read's rendered shape,
@@ -147,9 +152,6 @@ async def test_happy_path_builds_listdatabases_and_per_db_listtables_entries() -
     )
     assert discovery.entries[1] == _expected_rendered(
         "emulated-listTables-warehouse_a", "listTables", {"database": "warehouse_a"}, tables_a
-    )
-    assert discovery.entries[2] == _expected_rendered(
-        "emulated-listTables-warehouse_b", "listTables", {"database": "warehouse_b"}, tables_b
     )
     # An ok entry carries no denial user_message and a real result_preview.
     assert discovery.entries[1]["user_message"] is None
@@ -165,7 +167,7 @@ async def test_read_signatures_match_the_loop_guard_1to1_with_entries() -> None:
         }
     )
 
-    discovery = await build_emulated_discovery(dispatcher, _CREDS)
+    discovery = await build_emulated_discovery(dispatcher, _CREDS, base_database="db1")
 
     # Exactly the guard signatures the loop computes for a model re-call.
     assert discovery.read_signatures == {
@@ -197,33 +199,43 @@ async def test_list_databases_empty_returns_empty_result() -> None:
     assert discovery.read_signatures == set()
 
 
-async def test_one_db_list_tables_failure_omits_only_that_db() -> None:
-    good_tables = _ok("listTables", [{"database": "good_db", "name": "employee"}])
+async def test_base_db_list_tables_failure_still_injects_the_listdatabases_pair() -> None:
+    # A denied `listTables` on the base database must not throw away the
+    # `listDatabases` discovery we DID get — the model keeps that and falls back to
+    # calling listTables itself. No listTables guard signature is seeded, so that
+    # fallback call really reaches the MCP rather than being served locally.
     dispatcher = _StubDispatcher(
         {
-            ("listDatabases", None): _ok(
-                "listDatabases", [{"name": "good_db"}, {"name": "bad_db"}]
-            ),
-            ("listTables", "good_db"): good_tables,
-            ("listTables", "bad_db"): _denied("listTables"),
+            ("listDatabases", None): _ok("listDatabases", [{"name": "base_db"}]),
+            ("listTables", "base_db"): _denied("listTables"),
         }
     )
 
-    discovery = await build_emulated_discovery(dispatcher, _CREDS)
+    discovery = await build_emulated_discovery(dispatcher, _CREDS, base_database="base_db")
 
-    # listDatabases + only the good db's listTables — bad_db is omitted entirely
-    # (no entry AND no guard signature, so a model re-call of it hits the MCP).
-    assert [e["tool_call_id"] for e in discovery.entries] == [
-        "emulated-listDatabases",
-        "emulated-listTables-good_db",
-    ]
-    assert discovery.read_signatures == {
-        idempotent_read_signature("listDatabases", {}),
-        idempotent_read_signature("listTables", {"database": "good_db"}),
-    }
-    assert idempotent_read_signature("listTables", {"database": "bad_db"}) not in (
+    assert [e["tool_call_id"] for e in discovery.entries] == ["emulated-listDatabases"]
+    assert discovery.read_signatures == {idempotent_read_signature("listDatabases", {})}
+    assert idempotent_read_signature("listTables", {"database": "base_db"}) not in (
         discovery.read_signatures
     )
+
+
+async def test_base_db_absent_from_listdatabases_skips_the_listtables_dispatch() -> None:
+    # On a token whose scope (or the server's ALLOWED_DATABASES allowlist) excludes
+    # the base database, dispatching listTables anyway would spend a round-trip to
+    # earn a denial. Gate on the listDatabases result instead.
+    dispatcher = _StubDispatcher(
+        {("listDatabases", None): _ok("listDatabases", [{"name": "some_other_db"}])}
+    )
+
+    discovery = await build_emulated_discovery(
+        dispatcher, _CREDS, base_database="dbpcm_warehouse"
+    )
+
+    assert [e["tool_call_id"] for e in discovery.entries] == ["emulated-listDatabases"]
+    assert discovery.read_signatures == {idempotent_read_signature("listDatabases", {})}
+    # No listTables round-trip was spent at all.
+    assert [c[0] for c in dispatcher.calls] == ["listDatabases"]
 
 
 async def test_never_raises_on_dispatcher_exception() -> None:
@@ -274,7 +286,9 @@ async def test_preview_row_count_is_honored_end_to_end() -> None:
         }
     )
 
-    discovery = await build_emulated_discovery(dispatcher, _CREDS, preview_row_count=50)
+    discovery = await build_emulated_discovery(
+        dispatcher, _CREDS, base_database="db1", preview_row_count=50
+    )
 
     lt_entry = discovery.entries[1]
     assert lt_entry["tool_name"] == "listTables"
@@ -294,7 +308,7 @@ async def test_default_preview_row_count_caps_at_20() -> None:
         }
     )
 
-    discovery = await build_emulated_discovery(dispatcher, _CREDS)
+    discovery = await build_emulated_discovery(dispatcher, _CREDS, base_database="db1")
 
     lt_entry = discovery.entries[1]
     assert len(lt_entry["result_preview"]["preview_rows"]) == 20
@@ -314,7 +328,7 @@ async def test_observer_receives_shape_only_event() -> None:
     events: list[tuple[str, dict[str, Any]]] = []
 
     discovery = await build_emulated_discovery(
-        dispatcher, _CREDS, observer=lambda e, p: events.append((e, p))
+        dispatcher, _CREDS, base_database="db1", observer=lambda e, p: events.append((e, p))
     )
 
     assert discovery.entries  # non-empty

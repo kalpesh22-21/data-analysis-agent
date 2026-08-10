@@ -674,13 +674,30 @@ class AgentLoop:
         synthetic `assistant(tool_calls=...)+tool(result)` pairs for
         `listDatabases`+`listTables`, already run through
         `_tool_trail_entry_to_canonical` (or `None`/empty). Computed ONCE in
-        `_run_loop` and threaded in (never recomputed per round-trip, D45). It is
-        spliced in AFTER the leading run of `role=="system"` messages (the base
-        prompt) and BEFORE the interleaved turn history, so the emulated reads read
-        as the earliest tool history, ahead of turn 0's question. That is
-        chronologically correct: the emulated listDatabases/listTables are the
-        earliest session activity, ahead of every real turn. `None`/empty (feature
-        off / degraded) leaves the message list byte-identical.
+        `_run_loop` and threaded in (never recomputed per round-trip, D45).
+
+        It is spliced in immediately AFTER the CURRENT turn's question (the LAST
+        `user` message), so the turn reads sequentially — question, then the
+        discovery the model "already did" for it, then the model's own work. This
+        is the whole point of emulating the CALLS rather than summarizing them: the
+        pairs must sit where the model's own calls would have, which is inside the
+        current turn.
+
+        It used to splice after the leading `role=="system"` run instead, hoisting
+        every emulated pair ABOVE turn-0's question on the theory that they were
+        "the earliest session activity". That read as a block of tool calls before
+        the user had asked anything — the sweep is re-run per budget window against
+        the CURRENT turn, so it was never prior-session history in the first place,
+        and prepending it broke the sequential turn layout the interleave in
+        `context/assembly.py` otherwise maintains.
+
+        Splicing after the last `user` message keeps it inside the range
+        `context/budget.py::fit_request_to_budget` pins as the current turn, so the
+        pairs are treated as current-turn tool pairs (droppable only at tier 2,
+        under real budget pressure) rather than as prior-turn history that gets
+        trimmed first. When there is no `user` message at all (a Layer-1 assemble
+        with no dialogue) it falls back to the old position after the system head.
+        `None`/empty (feature off / degraded) leaves the message list byte-identical.
         """
         assembled = await self._context_assembler.assemble(
             session_id,
@@ -719,9 +736,24 @@ class AgentLoop:
                     )
                     continue
                 deduped_discovery.extend(pair)
-            insert_at = 0
-            while insert_at < len(canonical) and canonical[insert_at]["role"] == "system":
-                insert_at += 1
+            # Splice immediately AFTER the current turn's question — the LAST `user`
+            # message — so the turn reads question -> emulated discovery -> the
+            # model's own work, instead of hoisting the pairs above turn-0's
+            # question. `context/assembly.py::_insert_retrieval` guarantees the
+            # retrieval block goes BEFORE that last `user` message, so "last user
+            # message" is the question itself, not the cards block.
+            last_user = next(
+                (i for i in range(len(canonical) - 1, -1, -1) if canonical[i]["role"] == "user"),
+                None,
+            )
+            if last_user is not None:
+                insert_at = last_user + 1
+            else:
+                # No dialogue at all (Layer-1 assemble) — fall back to after the
+                # leading `system` run so the base prompt stays the pinned head.
+                insert_at = 0
+                while insert_at < len(canonical) and canonical[insert_at]["role"] == "system":
+                    insert_at += 1
             canonical[insert_at:insert_at] = deduped_discovery
 
         # Conversation dialogue is now interleaved INTO `assembled.messages` by

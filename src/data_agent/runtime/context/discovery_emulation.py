@@ -21,6 +21,19 @@ Depth is deliberately shallow: `listDatabases` + `listTables` ONLY. `getTableSch
 stays model-driven (it is scope-sensitive and per-table — pre-fetching every table's
 schema would be large and mostly wasted).
 
+BREADTH is deliberately narrow too: `listTables` is emulated for the ONE
+`base_database` (`settings.base_database`, default `dbpcm_warehouse`) — NOT for every
+database `listDatabases` returns. The other databases on a live warehouse are not
+analysis surface (`dbpcm_warehouse_security` is the access-control side, `scratch` is
+the D93 per-session materialization area), so sweeping them cost an MCP round-trip
+each per turn to inject listings the model should never query from. `listDatabases`
+is still emulated in full, so the model still sees that the others EXIST and can list
+them itself if it ever genuinely needs to — that path is simply no longer pre-paid.
+
+Note the guard interaction of that choice: only the emulated `listTables(base)` call
+seeds the read guard, so a model `listTables` on a NON-base database is a real
+dispatch (correct — nothing was injected for it to be served from).
+
 Shape fidelity (load-bearing): the injected `tool` message must render through the
 SAME path a real replayed read uses so the model sees an identical shape
 (status/error_code/user_message/result_preview). We therefore build each synthetic
@@ -66,6 +79,11 @@ _logger = logging.getLogger(__name__)
 # `build_emulated_discovery(..., preview_row_count=...)` so an emulated entry
 # re-truncates identically to a real replayed read under a non-default setting.
 _DEFAULT_PREVIEW_ROW_COUNT = 20
+# Default base database — the one whose tables are emulated. The real value is
+# threaded in from `settings.base_database` via
+# `build_emulated_discovery(..., base_database=...)`; this literal only backs
+# direct callers (tests) and matches `catalog/loader.py::DEFAULT_DATABASE`.
+_DEFAULT_BASE_DATABASE = "dbpcm_warehouse"
 # Placeholder timestamp — `_render_entry` never reads `ts`; the synthetic entries
 # are ephemeral and never persisted, so this value is inert.
 _EMULATED_TS = "1970-01-01T00:00:00+00:00"
@@ -79,8 +97,8 @@ class EmulatedDiscovery:
 
     `entries`: synthetic rendered-entry dicts in the exact shape
     `loop/agent_loop.py::_tool_trail_entry_to_canonical` consumes (the
-    `context/budget.py::_render_entry` shape) — `listDatabases` first, then one
-    `listTables` per database returned. An empty list means nothing to inject.
+    `context/budget.py::_render_entry` shape) — `listDatabases` first, then a single
+    `listTables` for the base database. An empty list means nothing to inject.
 
     `read_signatures`: the `idempotent_read_signature(tool_name, args)` of each
     emulated call, used by the loop to SEED its repeated-idempotent-read guard so a
@@ -157,11 +175,19 @@ async def build_emulated_discovery(
     dispatcher: ToolDispatcher,
     credentials: RuntimeCredentials,
     *,
+    base_database: str = _DEFAULT_BASE_DATABASE,
     preview_row_count: int = _DEFAULT_PREVIEW_ROW_COUNT,
     observer: Observer | None = None,
 ) -> EmulatedDiscovery:
-    """Sweep `listDatabases`+`listTables` through *dispatcher* and build the
-    synthetic rendered entries + guard signatures, or an EMPTY result to degrade.
+    """Sweep `listDatabases` + `listTables(base_database)` through *dispatcher* and
+    build the synthetic rendered entries + guard signatures, or an EMPTY result to
+    degrade.
+
+    *base_database* (threaded from `settings.base_database`): the ONE database whose
+    tables are emulated. `listDatabases` is still emulated in full — only the
+    `listTables` fan-out is narrowed, from one call per returned database to exactly
+    one. See the module docstring for why the other databases are not analysis
+    surface.
 
     *preview_row_count* (threaded from `settings.preview_row_count`): the row-count
     each emulated entry re-truncates to, so it matches a real replayed read under a
@@ -170,11 +196,12 @@ async def build_emulated_discovery(
     undiscoverable for the turn).
 
     Returns an empty `EmulatedDiscovery` (never raises) when: `listDatabases` is not
-    `ok` / empty / not a list; or any unexpected exception occurred. A single
-    database whose `listTables` call is not `ok` is skipped (no entry, no signature)
-    — the others still render. Every degrade path emits the shape-only
-    `discovery_emulated` observer event with `degraded: true` so a silent MCP blip
-    is observable.
+    `ok` / empty / not a list; or any unexpected exception occurred. When
+    *base_database* is absent from the `listDatabases` result, or its `listTables`
+    call is not `ok`, the `listDatabases` pair is STILL injected on its own (the
+    model keeps the discovery it did get, and falls back to calling `listTables`
+    itself). Every degrade path emits the shape-only `discovery_emulated` observer
+    event with `degraded: true` so a silent MCP blip is observable.
     """
     try:
         db_result = await dispatcher.dispatch("listDatabases", {}, credentials)
@@ -198,24 +225,39 @@ async def build_emulated_discovery(
 
         injected_dbs = 0
         table_count = 0
-        for db in db_names:
-            args = {"database": db}
+        # `listTables` for the base database ONLY (see the module docstring). Gate on
+        # it actually being in the `listDatabases` result: on a token whose scope /
+        # the server's ALLOWED_DATABASES allowlist excludes it, dispatching anyway
+        # would spend a round-trip to earn a denial.
+        if base_database not in db_names:
+            _logger.warning(
+                "emulated discovery: base database %r not in listDatabases result — "
+                "injecting the listDatabases pair only",
+                base_database,
+            )
+        else:
+            args = {"database": base_database}
             table_result = await dispatcher.dispatch("listTables", args, credentials)
             if table_result.status != "ok":
                 _logger.warning(
-                    "emulated discovery: listTables(%s) not ok (status=%s) — skipping db",
-                    db,
+                    "emulated discovery: listTables(%s) not ok (status=%s) — injecting the "
+                    "listDatabases pair only",
+                    base_database,
                     table_result.status,
                 )
-                continue
-            entries.append(
-                _rendered_entry(
-                    f"emulated-listTables-{db}", "listTables", args, table_result, preview_row_count
+            else:
+                entries.append(
+                    _rendered_entry(
+                        f"emulated-listTables-{base_database}",
+                        "listTables",
+                        args,
+                        table_result,
+                        preview_row_count,
+                    )
                 )
-            )
-            read_signatures.add(idempotent_read_signature("listTables", args))
-            injected_dbs += 1
-            table_count += _row_count(table_result.result_full)
+                read_signatures.add(idempotent_read_signature("listTables", args))
+                injected_dbs = 1
+                table_count = _row_count(table_result.result_full)
 
         if observer is not None:
             observer(
