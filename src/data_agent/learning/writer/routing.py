@@ -29,9 +29,17 @@ Routing (precedence, top wins):
       else `fail_to_review` (R8 — the PR stage was bypassed). Never auto-landed.
   2. blueprint, `static_validation.outcome == "fail_to_review"` → `in_review`,
      reason `fail_to_review` (un-rewritable, reviewed not dropped — D52/D97).
-  3. blueprint, `dedup.action ∈ {conflict, merge}` (a SOFT-layer near-miss) →
-     `in_review`, reason `dedup_conflict` ("soft conflict/variant" — never
-     auto-append, §3). (A hard-key `increment` was already dropped upstream.)
+  3. blueprint, `dedup.action` is anything other than `insert` → `in_review`, reason
+     `dedup_conflict` ("conflict/variant" — never auto-append, §3). An ALLOWLIST, not a
+     denylist (see `_AUTO_LAND_DEDUP_ACTIONS`): only `insert` auto-lands, so an
+     unrecognized or rehydrated-from-elsewhere action becomes review noise rather than a
+     silent auto-land. Two layers produce a `merge`: a soft-layer cosine near-miss, and
+     (PriorArt Slice 2) a DETERMINISTIC cross-tier structural-key hit against the
+     LEARNING tier, where we can see we probably already own it but cannot bump a count
+     we cannot key. Both want the same thing — a human's glance.
+     The two DROP verdicts (`increment`, `redundant_with_canon`) should never reach the
+     writer at all — S6 stops the pipeline on both — but if one does, the allowlist
+     routes it to a human instead of trusting that guarantee.
   4. blueprint, settled `entity_scan.result != "pass"` (a leakage near-miss) →
      ALWAYS `in_review`, reason `leakage_near_miss` (100% of near-misses, D58b).
   5. clean blueprint, sampled (`blueprint_inbox_sample_rate`) → `in_review`, reason
@@ -49,10 +57,32 @@ from ..candidate.models import CandidateEnvelope, CandidateStatus
 from ..candidate.verdicts import LeakageVerdict
 from ..stage import StageControl
 
-# The soft-layer dedup actions that force a candidate into the inbox (never
-# auto-appended, §3). `increment` never reaches the writer (dropped at S6);
-# `insert` is the clean auto-land path.
-_INBOX_DEDUP_ACTIONS = frozenset({"conflict", "merge"})
+# The ONLY dedup action that may auto-land. An ALLOWLIST, not a denylist, and the
+# inversion is load-bearing.
+#
+# This was `_INBOX_DEDUP_ACTIONS = {"conflict", "merge"}` — force those to review, let
+# everything else through. That was safe only because the two DROP actions (`increment`,
+# `redundant_with_canon`) never reach the writer: S6 stops the pipeline on both, in the
+# same in-process pass. But `DedupVerdict.from_doc` rehydrates `action` with NO
+# validation, so a persisted envelope, a redelivery, or an envelope written by anything
+# other than today's S6 could arrive here carrying a drop action — and a denylist would
+# route it as CLEAN and auto-land a blueprint the loop had decided was redundant with
+# the canon. Making the invariant depend on another module's control flow is exactly the
+# shape this codebase keeps getting bitten by.
+#
+# So: `insert` (or no verdict at all — a candidate that never ran S6) is the clean path;
+# EVERY other value, recognized or not, routes to a human. An unknown action becoming
+# review noise is the cheap failure; an unknown action auto-landing is not.
+_AUTO_LAND_DEDUP_ACTIONS = frozenset({"insert"})
+
+
+def _dedup_forces_review(env: CandidateEnvelope) -> bool:
+    """True iff this candidate's dedup verdict must NOT auto-land (see the allowlist).
+
+    `dedup is None` is clean by construction — a non-blueprint, or a blueprint that
+    reached the writer without S6 having adjudicated it, both of which the other
+    routing rules already cover."""
+    return env.dedup is not None and env.dedup.action not in _AUTO_LAND_DEDUP_ACTIONS
 
 
 @dataclass(frozen=True)
@@ -107,7 +137,7 @@ def derive_inbox_reason(env: CandidateEnvelope) -> str:
     # blueprint (or any other target that got routed to review)
     if _static_outcome(env) == "fail_to_review":
         return "fail_to_review"
-    if env.dedup is not None and env.dedup.action in _INBOX_DEDUP_ACTIONS:
+    if _dedup_forces_review(env):
         return "dedup_conflict"
     if _is_leakage_near_miss(env):
         return "leakage_near_miss"
@@ -130,7 +160,7 @@ def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> Routi
     if env.type == "blueprint":
         if _static_outcome(env) == "fail_to_review":
             return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", "fail_to_review")
-        if env.dedup is not None and env.dedup.action in _INBOX_DEDUP_ACTIONS:
+        if _dedup_forces_review(env):
             return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", "dedup_conflict")
         if _is_leakage_near_miss(env):
             return RoutingDecision(

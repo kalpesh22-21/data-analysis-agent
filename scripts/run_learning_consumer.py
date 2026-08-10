@@ -81,117 +81,182 @@ async def _main() -> int:
     store = CouchbaseSessionStore(runtime_settings)
     queue = RedisStreamsLearningQueue.from_settings(learning_settings)
 
-    # Extraction is a UNIT (the S3 precedent, extended to the full write-router):
-    # extractor model + durable audit + durable candidate + durable corpus + durable
-    # per-user store + the catalog. When the extractor model is UNCONFIGURED, build
-    # the stub consumer (empty pipeline, would-extract fallback). When it IS
-    # configured, build every durable collaborator (None where its RBAC creds are
-    # absent) and hand them to the factory, which FAILS FAST (`LearningWiringError`)
-    # on any missing piece — never a partial pipeline that strands candidates.
-    if not learning_settings.learning_extractor_api_key:
-        _logger.info(
-            "extractor model unconfigured — KEEP path uses the would-extract stub "
-            "(empty write-router pipeline)"
-        )
-        consumer = build_learning_consumer(
-            learning_settings, session_store=store, queue=queue, tracer=tracer
-        )
-    else:
-        # Semantic catalog source (D75 Wave 1b — `databaseSchemaDocs/` is gone). This
-        # consumer is an OFFLINE Redis/Couchbase worker: it drains the learning stream
-        # and never touches the MCP read plane, so it holds NO per-request MCP JWT and
-        # cannot authenticate the live `GET /catalog/export`. It therefore reads the
-        # FROZEN committed export snapshot (`tests/fixtures/catalog_export.json`, the
-        # SAME payload the MCP serves) resolved by `catalog_fixture_file()`. To refresh
-        # against the LIVE catalog without a redeploy, dump the MCP's `/catalog/export`
-        # body to a file and point `CATALOG_FIXTURE_PATH` at it. Loaded ONCE at startup
-        # and reused for the whole run; the extractor needs the sqlglot schema (D69)
-        # plus the `rules[*].id` grounding (the `rule` role, MEDIUM-2 fix).
-        catalog = catalog_dict(runtime_settings)
-        _logger.info(
-            "semantic catalog loaded from frozen export snapshot %s "
-            "(%d tables; set CATALOG_FIXTURE_PATH to a live /catalog/export dump to refresh)",
-            catalog_fixture_path(runtime_settings),
-            len(catalog),
-        )
-        model_client = build_openai_model_client(
-            api_key=learning_settings.learning_extractor_api_key,
-            model=learning_settings.learning_extractor_model,
-            base_url=learning_settings.learning_extractor_base_url,
-        )
-        audit_store = (
-            CouchbaseAuditStore(learning_settings)
-            if learning_settings.learning_audit_username
-            and learning_settings.learning_audit_password
-            else None
-        )
-        candidate_store = (
-            CouchbaseCandidateStore(learning_settings)
-            if learning_settings.learning_candidates_username
-            and learning_settings.learning_candidates_password
-            else None
-        )
-        blueprint_corpus = (
-            CouchbaseBlueprintCorpus(learning_settings)
-            if learning_settings.learning_corpus_username
-            and learning_settings.learning_corpus_password
-            else None
-        )
-        user_store = (
-            CouchbaseUserKnowledgeStore(user_config)
-            if user_config.user_knowledge_username and user_config.user_knowledge_password
-            else None
-        )
-        # The dedup soft-layer embedder: the real HTTP client when the embedding API
-        # is configured, else None (the factory defaults to the insert-only embedder
-        # → hard-key-only dedup; the soft near-miss layer degrades to insert, D52).
-        embedder = (
-            HttpEmbeddingClient(
-                url=runtime_settings.embedding_api_url,
-                api_key=runtime_settings.embedding_api_key,
-                model=runtime_settings.embedding_model,
-                timeout_seconds=runtime_settings.embedding_timeout_seconds,
-                tracer=tracer,
+    # The neo4j driver is owned by THIS function: created below only when the
+    # prior-art index is wired, and closed in the `finally` that wraps EVERYTHING
+    # from here on — not just `run_forever`. A `finally` around the run loop alone
+    # would leak the pool whenever composition itself raised (a `LearningWiringError`,
+    # a bad catalog snapshot), which is precisely the startup path most likely to
+    # fail. Mirrors how the scheduler entrypoint owns and closes its driver.
+    neo4j_driver = None
+    try:
+        # Extraction is a UNIT (the S3 precedent, extended to the full write-router):
+        # extractor model + durable audit + durable candidate + durable corpus + durable
+        # per-user store + the catalog. When the extractor model is UNCONFIGURED, build
+        # the stub consumer (empty pipeline, would-extract fallback). When it IS
+        # configured, build every durable collaborator (None where its RBAC creds are
+        # absent) and hand them to the factory, which FAILS FAST (`LearningWiringError`)
+        # on any missing piece — never a partial pipeline that strands candidates.
+        if not learning_settings.learning_extractor_api_key:
+            _logger.info(
+                "extractor model unconfigured — KEEP path uses the would-extract stub "
+                "(empty write-router pipeline)"
             )
-            if runtime_settings.embedding_api_url
-            else None
-        )
-        _logger.info(
-            "extractor model configured — building the full write-router pipeline "
-            "(audit=%s candidates=%s corpus=%s user=%s embedder=%s); any missing "
-            "durable collaborator FAILS FAST at composition",
-            audit_store is not None,
-            candidate_store is not None,
-            blueprint_corpus is not None,
-            user_store is not None,
-            embedder is not None,
-        )
-        # `git_client` is left to the factory's null default (opens no real PR, stamps
-        # the schema_edit_review marker → routes to human review; real GitHub PR
-        # authoring is deferred, D53). `known_rules` grounds the `rule` role in the
-        # semantic catalog (MEDIUM-2 fix); `catalog_schema` is the D69 sqlglot catalog.
-        consumer = build_learning_consumer(
-            learning_settings,
-            session_store=store,
-            queue=queue,
-            tracer=tracer,
-            model_client=model_client,
-            audit_store=audit_store,
-            candidate_store=candidate_store,
-            blueprint_corpus=blueprint_corpus,
-            user_store=user_store,
-            catalog_schema=build_sqlglot_schema_from_catalog(catalog),
-            embedder=embedder,
-            known_rules=known_rule_ids_from_catalog(catalog),
-        )
+            consumer = build_learning_consumer(
+                learning_settings, session_store=store, queue=queue, tracer=tracer
+            )
+        else:
+            # Semantic catalog source (D75 Wave 1b — `databaseSchemaDocs/` is gone). This
+            # consumer is an OFFLINE Redis/Couchbase worker: it drains the learning stream
+            # and never touches the MCP read plane, so it holds NO per-request MCP JWT and
+            # cannot authenticate the live `GET /catalog/export`. It therefore reads the
+            # FROZEN committed export snapshot (`tests/fixtures/catalog_export.json`, the
+            # SAME payload the MCP serves) resolved by `catalog_fixture_file()`. To refresh
+            # against the LIVE catalog without a redeploy, dump the MCP's `/catalog/export`
+            # body to a file and point `CATALOG_FIXTURE_PATH` at it. Loaded ONCE at startup
+            # and reused for the whole run; the extractor needs the sqlglot schema (D69)
+            # plus the `rules[*].id` grounding (the `rule` role, MEDIUM-2 fix).
+            catalog = catalog_dict(runtime_settings)
+            _logger.info(
+                "semantic catalog loaded from frozen export snapshot %s "
+                "(%d tables; set CATALOG_FIXTURE_PATH to a live /catalog/export dump to refresh)",
+                catalog_fixture_path(runtime_settings),
+                len(catalog),
+            )
+            model_client = build_openai_model_client(
+                api_key=learning_settings.learning_extractor_api_key,
+                model=learning_settings.learning_extractor_model,
+                base_url=learning_settings.learning_extractor_base_url,
+            )
+            audit_store = (
+                CouchbaseAuditStore(learning_settings)
+                if learning_settings.learning_audit_username
+                and learning_settings.learning_audit_password
+                else None
+            )
+            candidate_store = (
+                CouchbaseCandidateStore(learning_settings)
+                if learning_settings.learning_candidates_username
+                and learning_settings.learning_candidates_password
+                else None
+            )
+            blueprint_corpus = (
+                CouchbaseBlueprintCorpus(learning_settings)
+                if learning_settings.learning_corpus_username
+                and learning_settings.learning_corpus_password
+                else None
+            )
+            user_store = (
+                CouchbaseUserKnowledgeStore(user_config)
+                if user_config.user_knowledge_username and user_config.user_knowledge_password
+                else None
+            )
+            # The dedup soft-layer embedder: the real HTTP client when the embedding API
+            # is configured, else None (the factory defaults to the insert-only embedder
+            # → hard-key-only dedup; the soft near-miss layer degrades to insert, D52).
+            embedder = (
+                HttpEmbeddingClient(
+                    url=runtime_settings.embedding_api_url,
+                    api_key=runtime_settings.embedding_api_key,
+                    model=runtime_settings.embedding_model,
+                    timeout_seconds=runtime_settings.embedding_timeout_seconds,
+                    tracer=tracer,
+                )
+                if runtime_settings.embedding_api_url
+                else None
+            )
+            # PriorArt Slice 2 — the CROSS-TIER prior-art index. This process had no neo4j
+            # driver at all before now (only the scheduler and the inbox service did), which
+            # is precisely why the dedup stage could see nothing but the `learning_corpus`
+            # bucket it seeds itself.
+            #
+            # FAIL-OPEN, not all-or-nothing (unlike the extraction unit above): a missing or
+            # unreachable graph must NEVER stop the loop draining its queue. Absent, the
+            # factory logs loudly and dedup falls back to exactly today's behaviour. The
+            # driver's timeouts bound the "unreachable host" degrade so a down neo4j raises
+            # `PriorArtUnavailable` inside the budget instead of hanging a candidate.
+            #
+            # The SAME `embedder` instance is reused deliberately: the prior-art query text
+            # must be embedded with the model the corpus was built with, and
+            # `RuntimeSettings.embedding_model` is the single source of truth for that (it is
+            # what `build_hydrator` passes as both the client's `model` and the vector
+            # index's `expected_model`). Building a second client, or configuring a second
+            # model id, would produce a 100% `model_matched=False` rate indistinguishable
+            # from a genuine corpus skew.
+            prior_art = None
+            if (
+                runtime_settings.neo4j_url
+                and runtime_settings.neo4j_username
+                and runtime_settings.neo4j_password
+                and embedder is not None
+            ):
+                from neo4j import AsyncGraphDatabase
 
-    _logger.info(
-        "learning consumer starting (group=%s, consumer=%s, batch=%s)",
-        learning_settings.learning_consumer_group,
-        learning_settings.learning_consumer_name,
-        learning_settings.learning_batch_size,
-    )
-    await consumer.run_forever(sleep=asyncio.sleep)
+                from data_agent.learning.priorart.neo4j_index import Neo4jPriorArtIndex
+
+                neo4j_driver = AsyncGraphDatabase.driver(
+                    runtime_settings.neo4j_url,
+                    auth=(runtime_settings.neo4j_username, runtime_settings.neo4j_password),
+                    connection_timeout=runtime_settings.neo4j_timeout_seconds,
+                    connection_acquisition_timeout=runtime_settings.neo4j_timeout_seconds,
+                    max_transaction_retry_time=runtime_settings.neo4j_timeout_seconds,
+                )
+                prior_art = Neo4jPriorArtIndex(
+                    driver=neo4j_driver,
+                    embedding_client=embedder,
+                    expected_model=runtime_settings.embedding_model,
+                )
+            else:
+                _logger.warning(
+                    "prior-art index NOT wired (neo4j_url=%s creds=%s embedder=%s) — the "
+                    "dedup stage will see ONLY the learning_corpus bucket it seeds itself, "
+                    "so the MCP canon and the landed learning tier are invisible and "
+                    "already-owned blueprints will be re-proposed as new",
+                    bool(runtime_settings.neo4j_url),
+                    bool(runtime_settings.neo4j_username and runtime_settings.neo4j_password),
+                    embedder is not None,
+                )
+            _logger.info(
+                "extractor model configured — building the full write-router pipeline "
+                "(audit=%s candidates=%s corpus=%s user=%s embedder=%s prior_art=%s); any "
+                "missing durable collaborator FAILS FAST at composition (prior_art is "
+                "fail-open and excluded from that rule)",
+                audit_store is not None,
+                candidate_store is not None,
+                blueprint_corpus is not None,
+                user_store is not None,
+                embedder is not None,
+                prior_art is not None,
+            )
+            # `git_client` is left to the factory's null default (opens no real PR, stamps
+            # the schema_edit_review marker → routes to human review; real GitHub PR
+            # authoring is deferred, D53). `known_rules` grounds the `rule` role in the
+            # semantic catalog (MEDIUM-2 fix); `catalog_schema` is the D69 sqlglot catalog.
+            consumer = build_learning_consumer(
+                learning_settings,
+                session_store=store,
+                queue=queue,
+                tracer=tracer,
+                model_client=model_client,
+                audit_store=audit_store,
+                candidate_store=candidate_store,
+                blueprint_corpus=blueprint_corpus,
+                prior_art=prior_art,
+                user_store=user_store,
+                catalog_schema=build_sqlglot_schema_from_catalog(catalog),
+                embedder=embedder,
+                known_rules=known_rule_ids_from_catalog(catalog),
+            )
+
+        _logger.info(
+            "learning consumer starting (group=%s, consumer=%s, batch=%s)",
+            learning_settings.learning_consumer_group,
+            learning_settings.learning_consumer_name,
+            learning_settings.learning_batch_size,
+        )
+        await consumer.run_forever(sleep=asyncio.sleep)
+    finally:
+        if neo4j_driver is not None:
+            await neo4j_driver.close()
     return 0
 
 

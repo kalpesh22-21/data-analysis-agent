@@ -714,6 +714,11 @@ async def _run() -> int:
             neo4j_driver=infra.neo4j_driver,
             embedding_client=infra.embedder,
             model_id=_MODEL,
+            # PriorArt Slice 2: the SAME corpus object as `hit_counts`, so a
+            # reject/retract in this demo stamps the artifact terminal and the
+            # flywheel actually demonstrates that a declined idea stops
+            # surfacing as live prior art.
+            corpus_status=infra.corpus_store,
             policy=policy,
             tracer=tracer,  # REAL scheduler tracer seam: promote/land emit their own
             # spans STARTED under the candidate's traceparent → the SAME session trace.

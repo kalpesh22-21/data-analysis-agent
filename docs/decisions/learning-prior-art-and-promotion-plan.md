@@ -1,7 +1,7 @@
 # Learning loop: prior art + promotion rework — plan
 
-**Status:** slices 1, 1.x and 1.5 built and committed. Everything below them is designed, not built.
-**Written:** 2026-08-10. Pick up from "Remaining slices".
+**Status:** slices 1, 1.x, 1.5 and **2** built. Everything below them is designed, not built.
+**Written:** 2026-08-10. Pick up from "Remaining slices" (next: 2b or 3).
 
 ---
 
@@ -61,7 +61,37 @@ These are the durable part. The slice list below is downstream of them.
 
 ## Remaining slices
 
-### 2 — `PriorArtIndex`
+### 2 — `PriorArtIndex` — **BUILT**
+
+Landed as `learning/priorart/` (port + card + in-memory fake + `Neo4jPriorArtIndex`), a third
+DETERMINISTIC layer in `DedupStage` between the frozen hard key and the soft band, a neo4j
+driver in the consumer entrypoint, and the scheduler's terminal-status write-back.
+
+Deviations from the sketch below, each deliberate:
+
+* **The soft layer is a UNION of two stores, not a fan-out behind the port.** The
+  `PriorArtIndex` reads neo4j only; `DedupStage._soft_layer` unions its cards with a scan of
+  the `learning_corpus` bucket and bands the merged set. The first cut treated the bucket as a
+  FALLBACK (consulted only when the index raised) and that was a regression, not a residual
+  gap: `_seed_on_insert` puts a candidate in the bucket long before it lands, so the bucket is
+  the only place an in-flight sibling is visible, and QA measured a real paraphrase pair at
+  0.9645 — above the merge threshold — silently becoming two inserts. The O(corpus)×embed cost
+  is paid back deliberately. Shrinking it needs a landed stamp on the artifact (nothing
+  distinguishes landed from unlanded today); that is the follow-up.
+  The two sources are de-duplicated by the deterministic landing id (`bp::<canonical_key>`),
+  with the graph copy kept — it is the richer projection.
+* **`redundant_with_canon` fires on the STRUCTURAL KEY only, never on a cosine.** A cosine over
+  intent prose is not an identity claim; a canon soft near-match routes to a human as `merge`
+  and is counted separately (`action=merge AND prior_art_tier=mcp`).
+* **`result_grain`, not `result_signature`, on the card** — the graph has no
+  `result_signature` property, and the raw extractor field of that name is a leakage-scanned
+  surface it would be dangerous to invite someone to populate the card from.
+* **Verified live end to end.** All 10 canon blueprints carry a `structural_key` matching
+  what the current recipe derives, and a learning candidate re-deriving `bp-overtime-by-
+  department` drops with `action='redundant_with_canon', layer='structural'`. The
+  cross-authoring-path fold holds against real data: canon YAML (`SUM(...)`,
+  `result_grain: [Department]`) and an LLM-authored template (`sum(...)`,
+  `{"columns":["department"]}`) mint the same key.
 
 The only genuinely missing read is neo4j. `learning_corpus` already covers in-flight candidates, because `_seed_on_insert` registers every minted artifact at `hit_count=1` before anything lands.
 

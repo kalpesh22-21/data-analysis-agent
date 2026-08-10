@@ -77,11 +77,20 @@ def _fake_user_config(*, user: bool) -> SimpleNamespace:
 def _fake_runtime_settings() -> SimpleNamespace:
     # embedding_api_url empty ⇒ the entrypoint passes embedder=None (factory defaults
     # to the insert-only embedder). No HttpEmbeddingClient is constructed.
+    #
+    # neo4j_url empty ⇒ prior_art=None and NO driver is created (PriorArt Slice 2). That
+    # is the posture these tests want: the prior-art index is deliberately OUTSIDE the
+    # all-or-nothing extraction unit (it is fail-open), so its absence must not change
+    # any gating outcome asserted below — and asserting that is part of the point.
     return SimpleNamespace(
         embedding_api_url="",
         embedding_api_key="",
         embedding_model="all-mpnet-base-v2",
         embedding_timeout_seconds=10.0,
+        neo4j_url="",
+        neo4j_username="",
+        neo4j_password="",
+        neo4j_timeout_seconds=10.0,
     )
 
 

@@ -136,6 +136,71 @@ async def test_seed_then_increment_then_seed_preserves_count(corpus):
     assert art.hit_count == 2  # the increment survived the late seed
 
 
+# --- terminal-status stamp (PriorArt Slice 2) --------------------------------
+
+
+async def test_set_status_is_a_narrow_write_that_preserves_an_accrued_count(corpus):
+    """The S9 reject/retract edges stamp the artifact so a declined idea stops surfacing
+    as live prior art. It MUST be a sub-document write, not a document upsert: a full
+    upsert would clobber a `hit_count` another worker incremented between the scan read
+    and this write, and would renew the TTL. Only real Couchbase can show that."""
+    key = f"sha256:live-status-{uuid.uuid4().hex[:8]}"
+    corpus._created.append(key)
+    await corpus.seed_artifact(_artifact(key, hit_count=1))
+    await corpus.increment_hit_count(key)  # → 2
+
+    await corpus.set_status(key, "rejected")
+
+    art = await corpus.get_by_canonical_key(key)
+    assert art is not None
+    assert art.status == "rejected"
+    assert art.is_terminal
+    assert art.hit_count == 2  # the accrued counter survived the stamp
+    assert art.intent == "total earnings for a department in a year"  # nothing else moved
+    assert art.uses_rules == ("active_employee",)
+
+
+async def test_set_status_is_idempotent_and_re_stampable(corpus):
+    key = f"sha256:live-restatus-{uuid.uuid4().hex[:8]}"
+    corpus._created.append(key)
+    await corpus.seed_artifact(_artifact(key))
+
+    await corpus.set_status(key, "rejected")
+    await corpus.set_status(key, "retired")
+
+    assert (await corpus.get_by_canonical_key(key)).status == "retired"
+
+
+async def test_set_status_never_resurrects_a_vanished_artifact(corpus):
+    """`mutate_in` has REPLACE semantics on the DOCUMENT: stamping an artifact that was
+    removed raises `DocumentNotFoundException`, which is swallowed. A document upsert
+    would CREATE a `rejected` artifact with no history — a phantom the promotion guard
+    would then read a `hit_count` of 1 from."""
+    key = f"sha256:live-gone-{uuid.uuid4().hex[:8]}"
+    await corpus.set_status(key, "rejected")  # must not raise
+    assert await corpus.get_by_canonical_key(key) is None
+
+
+async def test_a_pre_slice_document_without_status_reads_as_a_live_artifact(corpus):
+    """The `learning_corpus` bucket is durable and never migrated. A doc written before
+    `status`/`source` existed carries neither key, and must still load as the live
+    learning artifact it has always been — not as a terminal one, which would silently
+    delete it from prior art."""
+    key = f"sha256:live-legacy-{uuid.uuid4().hex[:8]}"
+    corpus._created.append(key)
+    await corpus._collection.upsert(
+        _doc_id(key),
+        {"id": "candidate::legacy", "canonical_key": key, "intent": "legacy", "hit_count": 3},
+    )
+
+    art = await corpus.get_by_canonical_key(key)
+    assert art is not None
+    assert art.status == "extracted"
+    assert art.source == "learning"
+    assert not art.is_terminal
+    assert art.hit_count == 3
+
+
 # --- RBAC boundary (D48/D17) ------------------------------------------------
 
 

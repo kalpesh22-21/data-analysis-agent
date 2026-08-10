@@ -299,6 +299,64 @@ def extract_span(
     return _learning_span(tracer, "learning.extract", OpenInferenceSpanKindValues.CHAIN, attrs)
 
 
+def dedup_span(
+    tracer: Tracer,
+    *,
+    session_id: str,
+    candidate_id: str,
+    action: str,
+    layer: str,
+    similarity: float,
+    prior_art_tier: str | None = None,
+    matched_status: str | None = None,
+    matched_origin: str | None = None,
+) -> Any:
+    """The S6 dedup verdict (`learning.dedup`, CHAIN).
+
+    ALWAYS SHAPE-ONLY — no `verbose` parameter, unlike its neighbours. Every attribute
+    here is a machine tag, a float, a tier label or a lifecycle status; there is no
+    entity-bearing content to gate, and adding a verbose branch would only create a place
+    for someone to put the candidate's intent later.
+
+    Exists so the loop's DROP decisions are COUNTS and not just log lines. Three rates
+    the plan asks for come out of these attributes:
+
+      * `action=redundant_with_canon` — a DETERMINISTIC structural-key identity with the
+        MCP canon. The agent owns this blueprint and failed to recall it.
+      * `action=merge AND prior_art_tier=mcp` — the same story on softer (cosine)
+        evidence, routed to a human instead of dropped.
+        A rising rate of either means RETRIEVAL is missing artifacts it already holds;
+        the fix is in the recall path, not in the learning loop.
+      * `action=increment AND matched_status IN (rejected, retired)` — a byte-identical
+        re-derivation of an idea a human already DECLINED. A different question ("how
+        good are our rejections / are analysts repeatedly reaching for something we said
+        no to?"), and without the status tag it is indistinguishable from an ordinary
+        hit-count bump against a live artifact.
+      * `matched_origin=corpus` — the soft match came from the `learning_corpus` bucket,
+        i.e. from an IN-FLIGHT sibling candidate no graph read can see. A rising rate is
+        concurrency: analysts converging on the same question inside one landing cycle.
+        `matched_origin=graph` is a match against something already landed.
+    """
+    return _learning_span(
+        tracer,
+        "learning.dedup",
+        OpenInferenceSpanKindValues.CHAIN,
+        {
+            "session.id": session_id,
+            "learning.candidate_id": candidate_id,
+            "learning.dedup.action": action,
+            "learning.dedup.layer": layer,
+            "learning.dedup.similarity": similarity,
+            # "" (not None) when the verdict matched nothing / matched something with no
+            # tier or status, so both attributes are ALWAYS present and a Phoenix filter
+            # never has to distinguish "zero" from "no data" via a missing key.
+            "learning.dedup.prior_art_tier": prior_art_tier or "",
+            "learning.dedup.matched_status": matched_status or "",
+            "learning.dedup.matched_origin": matched_origin or "",
+        },
+    )
+
+
 def promote_span(
     tracer: Tracer,
     *,
@@ -391,6 +449,7 @@ __all__ = [
     "configure_learning_tracing",
     "consume_span",
     "context_from_traceparent",
+    "dedup_span",
     "disabled_span",
     "enqueue_span",
     "extract_span",

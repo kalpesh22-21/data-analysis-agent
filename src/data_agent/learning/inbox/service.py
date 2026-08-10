@@ -186,6 +186,11 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         # instead of the default scheduler's fake `validated`. The no-op probe/hit-count
         # doubles are the same ones an unwired `ReviewInbox` uses.
         store = InMemoryCandidateStore()
+        # NO `corpus_status` here, deliberately: offline dev mode has no
+        # `learning_corpus` store at all (its RBAC creds are part of what
+        # `write_plane_ready` tests), so there is no artifact to stamp. A reject still
+        # transitions the candidate; only the corpus-side stamp is absent, which is the
+        # correct shape for a mode that has no corpus.
         scheduler = PromotionScheduler(
             store,
             probe=_NoOpProbe(),
@@ -232,6 +237,18 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
             timeout_seconds=runtime_settings.embedding_timeout_seconds,
         ),
         model_id=runtime_settings.embedding_model,
+        # PriorArt Slice 2 — THE process where humans actually reject. `reject` and
+        # `retract` reach the scheduler through THIS service, not through
+        # `run_learning_scheduler.py`, so omitting this made the whole
+        # "rejected artifacts stop surfacing as live prior art" prerequisite a no-op in
+        # deployment — silently, because `_stamp_corpus_status` returns without logging
+        # when no writer is wired.
+        #
+        # The SAME `corpus` object already passed as `hit_counts`
+        # (`CouchbaseBlueprintCorpus` duck-types both ports): the terminal stamp and the
+        # promotion guard's count must address the same artifacts, and a split would let
+        # a reject kill one store while the guard read another.
+        corpus_status=corpus,
     )
     _logger.info("inbox service running with the FULL write plane (neo4j landing ACTIVE)")
     return inbox, "full", neo4j_driver

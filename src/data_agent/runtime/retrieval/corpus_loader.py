@@ -273,13 +273,79 @@ def _seed_from_entry(entry_id: str, entry: dict[str, Any], *, kind: str) -> Any:
     the same defensive whitelist the catalog-graph prop mappers use. The dict key is
     the authoritative id (falls back to the entry's own `id` only if the key is
     somehow absent). `source`/`verified` come through verbatim when the export carries
-    them (the MCP injects `source="mcp"`, `verified=True`); when absent (the offline
-    fixtures), the dataclass DEFAULTS (`mcp`/`True`) present the seed as trusted canon.
-    """
+    them AS THE RIGHT TYPE (the MCP injects `source="mcp"`, `verified=True`); when
+    absent OR malformed, the dataclass DEFAULTS (`mcp`/`True`) present the seed as
+    trusted canon.
+
+    **Why malformed falls back to the default rather than through to neo4j.** The upsert
+    writes `b.source = $source`, and neo4j REMOVES a property set to null — so an export
+    entry carrying an explicit `"source": null` produced a SOURCELESS node. That node is
+    invisible to recall (its trust gate is bare `= 'mcp'`, fail-closed) but perfectly
+    visible to the prior-art read, which deliberately drops that gate. Rather than teach
+    every reader to coalesce, the WRITER is made to always stamp: after this whitelist,
+    `source` is a non-empty `str` and `verified` is a `bool` on every seed this loader
+    builds, so a sourceless/unstamped node can only come from a hand edit or a foreign
+    writer — which is exactly what `priorart.models.TIER_UNSOURCED` is for.
+
+    This is NOT a trust escalation. Everything this function projects came from the MCP
+    canon export, fetched over the service-key-authenticated route; trust rests on the
+    TRANSPORT, and `source` is provenance metadata the export happens to echo back. The
+    dataclass already treats "absent" as canon for exactly that reason — this only
+    extends the same rule to "present but not a `str`/`bool`", which is otherwise a
+    silent property-deleting write."""
     fields_ = _BLUEPRINT_SEED_FIELDS if kind == "blueprint" else _KNOWLEDGE_SEED_FIELDS
     data = {k: v for k, v in entry.items() if k in fields_}
     data["id"] = entry_id or data.get("id")
+    _drop_malformed_trust_stamp(data, entry_id=data["id"], kind=kind)
     return BlueprintSeed(**data) if kind == "blueprint" else KnowledgeSeed(**data)
+
+
+def _drop_malformed_trust_stamp(
+    data: dict[str, Any], *, entry_id: Any, kind: str
+) -> None:
+    """Coerce a malformed `source`/`verified` so the node write always gets a usable
+    value (see `_seed_from_entry`). Mutates *data*.
+
+    **The two fields take DIFFERENT fallbacks, and the asymmetry is the point.**
+
+    `source` must be a NON-EMPTY `str` (`""` would write an empty-string property that
+    matches neither trust partition — a third state nothing handles). A malformed one is
+    DROPPED so the dataclass default (`mcp`) applies. That is not a trust escalation:
+    an exporter emitting `"source": null` is indistinguishable in trust terms from one
+    omitting the key entirely — which already defaults to `mcp` — and anyone who controls
+    that value could simply have written `"mcp"`. Trust rests on the service-key
+    authenticated transport, not on a field in the payload.
+
+    `verified` must be a real `bool`, and a malformed one is set to **`False`**, NOT
+    dropped. The `source` argument does not transfer: a present `"verified": "false"`
+    plausibly MEANT false, and falling back to the dataclass default would silently
+    INVERT it to true. `False` is a legal, honest value — "landed but nobody has verified
+    it" — it costs nothing today (recall does not read `verified`), and it stays correct
+    when `recheck_verified_only` starts reading it. An ABSENT `verified` still defaults
+    to `True` via the dataclass; only a malformed one gets the untrusting value.
+    """
+    source = data.get("source")
+    if "source" in data and not (isinstance(source, str) and source.strip()):
+        _logger.warning(
+            "%s corpus entry %r carries a malformed `source` (%r); defaulting to the "
+            "trusted `mcp` stamp. Writing it through would REMOVE the property (neo4j "
+            "drops null-valued sets) and leave a sourceless node.",
+            kind,
+            entry_id,
+            source,
+        )
+        del data["source"]
+    verified = data.get("verified")
+    if "verified" in data and not isinstance(verified, bool):
+        _logger.warning(
+            "%s corpus entry %r carries a non-boolean `verified` (%r); stamping FALSE "
+            "(unverified). Not the dataclass default: a malformed value may well have "
+            "meant false, and defaulting would invert it to true.",
+            kind,
+            entry_id,
+            verified,
+        )
+        data["verified"] = False
 
 
 def _seeds_from_entries(raw: dict[str, Any], *, kind: str) -> list[Any]:
@@ -427,6 +493,18 @@ def schema_statements(dimension: int) -> tuple[str, ...]:
     raises `DimensionMismatchError` BEFORE creating (see `check_dimension_parity`)."""
     return (
         *_CORPUS_CONSTRAINTS,
+        # PriorArt Slice 2 — the LOOSE cross-tier key's lookup index. The learning
+        # loop's `PriorArtIndex.get_by_structural_key` matches a new candidate against
+        # every tier by this key; without a RANGE index that MATCH is a
+        # `NodeByLabelScan` over every :Blueprint. Cheap at 12 nodes and quietly linear
+        # at 12,000, so it goes in with the query rather than after someone notices.
+        # A plain (non-unique) index deliberately: two tiers legitimately carry the SAME
+        # structural key — a canon blueprint and the learning node that re-derived it —
+        # which is precisely the collision the key exists to detect, so a UNIQUE
+        # constraint here would refuse to land the very thing we want to find.
+        # (`EXPLAIN` against the live graph: `NodeIndexSeek`, not `NodeByLabelScan`.)
+        "CREATE INDEX blueprint_structural_key IF NOT EXISTS "
+        "FOR (b:Blueprint) ON (b.structural_key)",
         "CREATE VECTOR INDEX blueprint_intent_vec IF NOT EXISTS "
         "FOR (b:Blueprint) ON (b.intent_embedding) "
         f"OPTIONS {{ indexConfig: {{ `vector.dimensions`: {dimension}, "

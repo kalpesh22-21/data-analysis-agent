@@ -177,6 +177,12 @@ async def _main() -> int:
                 timeout_seconds=runtime_settings.embedding_timeout_seconds,
             ),
             model_id=runtime_settings.embedding_model,
+            # The SAME `corpus` object already passed as `hit_counts`
+            # (`CouchbaseBlueprintCorpus` duck-types both ports). The terminal
+            # transitions stamp the artifact's `status` so a rejected/retired blueprint
+            # stops surfacing as live prior art to the dedup stage; the promotion guard
+            # reads the count off those same artifacts, so the two MUST be one object.
+            corpus_status=corpus,
         )
     else:
         # Dormant / fail-closed: the deferred stubs auto-promote nothing, and with no
@@ -190,6 +196,12 @@ async def _main() -> int:
             dependency_resolver=_DeferredDependencyResolver(),
             landing_writer=None,
             require_landing=False,
+            # Wired even in the dormant posture: the terminal-status stamp is a
+            # Couchbase write on a store this process ALWAYS has (the entrypoint
+            # refuses to start without it), and it is entirely independent of the
+            # neo4j write plane. A human rejecting a candidate through the inbox must
+            # kill its corpus artifact whether or not auto-promotion is active.
+            corpus_status=corpus,
         )
 
     _logger.info(

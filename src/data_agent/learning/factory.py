@@ -63,9 +63,11 @@ from .leakage import (
     NullSemanticEntityScanner,
     SemanticEntityScanner,
 )
+from .priorart import PriorArtIndex
 from .promotion import (
     CandidateStoreDependencyResolver,
     CorpusLandingWriter,
+    CorpusStatusWriter,
     DependencyResolver,
     HitCountReader,
     LandingWriter,
@@ -148,6 +150,7 @@ def build_learning_consumer(
     audit_store: AuditStore | None = None,
     candidate_store: CandidateStore | None = None,
     blueprint_corpus: BlueprintCorpus | None = None,
+    prior_art: PriorArtIndex | None = None,
     user_store: UserKnowledgeStore | None = None,
     catalog_schema: dict[str, dict[str, str]] | None = None,
     embedder: Embedder | None = None,
@@ -174,6 +177,14 @@ def build_learning_consumer(
     Stage-level fakes default in place (null semantic scanner → regex-only gate,
     insert-only embedder → hard-key-only dedup, null git client → PR-marker-only
     schema-edit) so the SIX stages are always all present or all absent.
+
+    `prior_art` is deliberately NOT part of the all-or-nothing unit (PriorArt Slice 2).
+    Absent, the dedup stage behaves exactly as it did before the slice — hard key plus a
+    brute-force corpus-bucket scan — which is a fully correct, if blinkered, loop. Making
+    it required would mean a neo4j outage stops learning, and the whole point of the
+    fail-open posture is that it must not. It is logged loudly instead, because the
+    symptom of running without it (duplicate candidates for blueprints the canon already
+    carries) points nowhere near the cause.
     """
     loader_triage = _loader_triage_kwargs(summary_loader, triage)
 
@@ -226,6 +237,27 @@ def build_learning_consumer(
             settings.learning_dedup_merge_threshold,
             settings.learning_dedup_conflict_threshold,
         )
+    if prior_art is None:
+        # SUPPORTED but INVISIBLE degrade (PriorArt Slice 2). Without the cross-tier
+        # index the dedup stage can only see the `learning_corpus` bucket — which is
+        # seeded solely by the dedup stage itself, so it contains ONLY what this loop
+        # already minted. The MCP canon the agent recalls and the landed learning tier
+        # are both invisible, and a session re-deriving a blueprint we already own
+        # produces a duplicate that nothing notices. Never a crash (a deployment with no
+        # graph must keep draining the queue) — but never silent.
+        _logger.warning(
+            "no prior-art index wired — the S6 cross-tier layer is DISABLED: dedup can "
+            "see ONLY the learning_corpus bucket (which this loop seeds itself), so the "
+            "MCP canon and the landed learning tier are INVISIBLE and already-owned "
+            "blueprints will be re-proposed as new. The soft layer also falls back to "
+            "the O(corpus) brute-force scan (N+1 embeddings per candidate). Set "
+            "NEO4J_URL + EMBEDDING_API_URL so the entrypoint builds a "
+            "Neo4jPriorArtIndex, or inject one explicitly."
+        )
+    else:
+        _logger.info(
+            "dedup cross-tier prior-art layer ENABLED via %s", type(prior_art).__name__
+        )
     git_client = git_client if git_client is not None else _NullGitPullRequestClient()
     semantic_scanner = (
         semantic_scanner if semantic_scanner is not None else NullSemanticEntityScanner()
@@ -266,8 +298,10 @@ def build_learning_consumer(
         DedupStage(
             blueprint_corpus,
             embedder,
+            prior_art=prior_art,
             merge_threshold=settings.learning_dedup_merge_threshold,
             conflict_threshold=settings.learning_dedup_conflict_threshold,
+            tracer=tracer,
         ),
         SchemaEditPRStage(git_client=git_client, checks=checks),
         UserKnowledgeCommitStage(store=user_store),
@@ -302,6 +336,7 @@ def build_promotion_plane(
     dependency_resolver: DependencyResolver | None = None,
     landing_writer: LandingWriter | None = None,
     require_landing: bool = False,
+    corpus_status: CorpusStatusWriter | None = None,
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
     tracer: object | None = None,
@@ -314,6 +349,13 @@ def build_promotion_plane(
     CAS-write the wrong one. Prefer this over the two thin builders below when wiring
     both — it makes the split impossible to express.
 
+    *corpus_status* (PriorArt Slice 2) is the `learning_corpus` write-side port the
+    TERMINAL transitions stamp so a rejected/retired artifact stops surfacing as live
+    prior art. Pass the SAME object as `hit_counts` — `CouchbaseBlueprintCorpus`
+    duck-types both ports, and a split would let a reject stamp one store while the
+    promotion guard reads the count from another. Omitted ⇒ no stamping (the exact
+    pre-slice behaviour), which is why every existing caller is unaffected.
+
     *tracer* (optional) wires the scheduler's promote/land span seam; `trace_verbose`
     is read off `settings.learning_trace_verbose` (D25 gate)."""
     scheduler = build_promotion_scheduler(
@@ -324,6 +366,7 @@ def build_promotion_plane(
         dependency_resolver=dependency_resolver,
         landing_writer=landing_writer,
         require_landing=require_landing,
+        corpus_status=corpus_status,
         policy=policy,
         clock=clock,
         tracer=tracer,
@@ -343,6 +386,7 @@ def build_promotion_write_plane(
     embedding_client: EmbeddingClient,
     model_id: str,
     neo4j_database: str = "neo4j",
+    corpus_status: CorpusStatusWriter | None = None,
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
     tracer: object | None = None,
@@ -372,6 +416,7 @@ def build_promotion_write_plane(
         dependency_resolver=resolver,
         landing_writer=landing_writer,
         require_landing=True,
+        corpus_status=corpus_status,
         policy=policy,
         clock=clock,
         tracer=tracer,
@@ -387,6 +432,7 @@ def build_promotion_scheduler(
     dependency_resolver: DependencyResolver | None = None,
     landing_writer: LandingWriter | None = None,
     require_landing: bool = False,
+    corpus_status: CorpusStatusWriter | None = None,
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
     tracer: object | None = None,
@@ -408,6 +454,7 @@ def build_promotion_scheduler(
         dependency_resolver=dependency_resolver,
         landing_writer=landing_writer,
         require_landing=require_landing,
+        corpus_status=corpus_status,
         tracer=tracer,
         trace_verbose=settings.learning_trace_verbose,
         **extra,

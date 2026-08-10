@@ -84,6 +84,7 @@ from .models import (
     BLUEPRINT_TYPE,
     HUMAN_GATED_TYPES,
     CandidateDecision,
+    CorpusStatusWriter,
     DependencyResolver,
     HitCountReader,
     LandingWriter,
@@ -156,6 +157,13 @@ class PromotionScheduler:
         # silent gap). Both default OFF so today's callers are unchanged.
         landing_writer: LandingWriter | None = None,
         require_landing: bool = False,
+        # PriorArtIndex Slice 2 — the corpus-artifact status write-back. The TERMINAL
+        # transitions (reject/retract) stamp the `learning_corpus` artifact so the dedup
+        # prior-art read stops surfacing an idea a human explicitly declined. Optional
+        # and fail-open: absent ⇒ a no-op, exactly as before this slice, so no existing
+        # caller changes behaviour. `CouchbaseBlueprintCorpus` duck-types it, which is
+        # why the entrypoint can pass the SAME object it already passes as `hit_counts`.
+        corpus_status: CorpusStatusWriter | None = None,
         clock: Callable[[], str] = _now_iso,
         tracer: object | None = None,
         trace_verbose: bool = False,
@@ -167,6 +175,7 @@ class PromotionScheduler:
         self._deps = dependency_resolver
         self._landing_writer = landing_writer
         self._require_landing = require_landing
+        self._corpus_status = corpus_status
         self._clock = clock
         # Tracer seam (mirrors the consumer's): when wired, the promote/land edges
         # emit `learning.promote`/`learning.land` spans STARTED under the candidate's
@@ -530,6 +539,11 @@ class PromotionScheduler:
                 status=CandidateStatus.REJECTED,
                 drift_status=env.drift.status,
             )
+            # PriorArt Slice 2: kill the CORPUS ARTIFACT too. The node write-back above
+            # only reaches neo4j, and a rejected candidate's `learning_corpus` artifact
+            # is what the dedup soft layer reads — leave it live and the same declined
+            # idea keeps surfacing as prior art, and keeps accruing hits, for ever.
+            await self._stamp_corpus_status(env, CandidateStatus.REJECTED)
             await self._store.put(rejected)
             return CandidateDecision(
                 env.candidate_id, env.type, "reject", env.status,
@@ -686,6 +700,9 @@ class PromotionScheduler:
         await self._retract_corpus(
             retired, status=CandidateStatus.RETIRED, drift_status=env.drift.status
         )
+        # PriorArt Slice 2: a retracted artifact is dead prior art too — a LEAKED
+        # blueprint pulled from recall must not come back as "we already have this".
+        await self._stamp_corpus_status(env, CandidateStatus.RETIRED)
         await self._store.put(retired)
         return CandidateDecision(
             env.candidate_id, env.type, "retire", env.status,
@@ -970,6 +987,42 @@ class PromotionScheduler:
                 env.candidate_id,
                 status,
                 drift_status,
+                exc_info=True,
+            )
+
+    async def _stamp_corpus_status(self, env: CandidateEnvelope, status: str) -> None:
+        """FAIL-OPEN `learning_corpus` artifact status write-back (PriorArt Slice 2).
+
+        Called ONLY on the two terminal edges (reject, retract). Keyed by the S6
+        `canonical_key`, which is the artifact's identity — no dedup verdict means S6
+        never ran, so there is no artifact and nothing to stamp (a clean no-op, not an
+        error: a human-approved candidate that skipped S6 is a supported path, OQ-3).
+
+        Fail-open for the same reason `_retract_corpus` is: the candidate-store
+        transition is source of truth and a human's reject must never be blocked by a
+        Couchbase hiccup. The cost of a lost stamp is bounded and self-correcting in the
+        direction that matters — the artifact stays visible as prior art, so the worst
+        case is one extra candidate reaching a human, not a bad landing. Unlike the
+        neo4j write-back there is deliberately NO periodic re-assert: the terminal edges
+        are one-shot human actions with no recurring scan behind them, and inventing a
+        convergence loop for a review-noise-grade failure would be more machinery than
+        the risk justifies. The warning is the recovery path."""
+        if self._corpus_status is None:
+            return
+        key = self._canonical_key(env)
+        if not key:
+            return
+        try:
+            await self._corpus_status.set_status(key, status)
+        except Exception:  # noqa: BLE001 - fail-OPEN: never block a terminal transition
+            _logger.warning(
+                "learning_corpus status write-back FAILED for candidate %s "
+                "(canonical_key=%s, status=%s); the store transition proceeds "
+                "(fail-open). The artifact stays visible to the dedup prior-art read, "
+                "so this declined idea can resurface as prior art until it is stamped.",
+                env.candidate_id,
+                key[:23],
+                status,
                 exc_info=True,
             )
 

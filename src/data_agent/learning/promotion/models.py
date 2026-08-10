@@ -169,6 +169,32 @@ class HitCountReader(Protocol):
     async def hit_count(self, canonical_key: str) -> int: ...
 
 
+class CorpusStatusWriter(Protocol):
+    """Stamps a corpus artifact's lifecycle `status` (PriorArtIndex Slice 2).
+
+    The write-side sibling of `HitCountReader` over the SAME `learning_corpus`
+    artifacts, kept as its own narrow port because the two have opposite risk profiles:
+    a stale read costs a delayed promotion, a bad write corrupts the cross-session
+    counter the promotion guard depends on.
+
+    Only the scheduler's TERMINAL transitions call it (reject → `rejected`, retract →
+    `retired`). Nothing else should: an intermediate state (`candidate`, `in_review`,
+    `validated`) lives on the ENVELOPE, and mirroring it onto the artifact would create
+    a second, divergent lifecycle for the same thing. What the artifact needs to know is
+    only whether it is DEAD.
+
+    Why it exists at all: `BlueprintCorpus` is get/seed/increment/list — no delete and
+    (until now) no status write — so a rejected candidate's artifact survived, kept
+    accruing hits, and kept surfacing as live prior art. `CouchbaseBlueprintCorpus`
+    duck-types this port, the same way it already duck-types `HitCountReader`.
+
+    Fail-open at the call site: the store transition is source of truth, so a corpus
+    write failure is logged, never allowed to block a human's reject.
+    """
+
+    async def set_status(self, canonical_key: str, status: str) -> None: ...
+
+
 class DependencyResolver(Protocol):
     """Resolves a `depends_on` artifact ref (§11.6). A blueprint depending on a
     not-yet-landed `schema_edit(add_rule)` (D35) stays `candidate` until every ref
@@ -217,6 +243,7 @@ __all__ = [
     "BLUEPRINT_TYPE",
     "HUMAN_GATED_TYPES",
     "CandidateDecision",
+    "CorpusStatusWriter",
     "DecisionAction",
     "DependencyResolver",
     "HitCountReader",

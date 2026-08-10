@@ -144,13 +144,34 @@ class CouchbaseBlueprintCorpus:
         except DocumentNotFoundException:
             return
 
+    async def set_status(self, canonical_key: str, status: str) -> None:
+        # NARROW sub-document write on the ONE field (PriorArtIndex Slice 2), for the
+        # same three reasons `CandidateStore.stamp_drift` is one: a full-document upsert
+        # would (a) clobber a `hit_count` another worker incremented between our read and
+        # our write, (b) renew the TTL, and (c) RESURRECT a document something else
+        # removed. `upsert` here is the SUB-DOCUMENT upsert (create-or-replace the
+        # `status` path), not a document upsert — a missing DOCUMENT still raises
+        # `DocumentNotFoundException`, which is swallowed as a tolerated no-op
+        # (fail-soft, D52) exactly like `increment_hit_count`'s.
+        try:
+            await self._collection.mutate_in(
+                _doc_id(canonical_key), [subdoc.upsert("status", status)]
+            )
+        except DocumentNotFoundException:
+            return
+
     async def list_artifacts(self) -> list[CorpusArtifact]:
         # Default (NOT_BOUNDED) query consistency: a just-seeded artifact may not yet
         # be visible to this scan — fine for the S6 soft near-miss layer (a missed
-        # near-duplicate degrades to `insert`, the fail-soft direction, D52). This is
-        # a full O(corpus) scan per candidate — a known scaling ceiling; the S6 soft
-        # layer is a heuristic, and the RAG-over-corpus grounding (D27) that would
-        # replace this brute scan is a documented later-slice deferral.
+        # near-duplicate degrades to `insert`, the fail-soft direction, D52).
+        #
+        # This is a full O(corpus) scan and the caller embeds EVERY row's intent, so one
+        # candidate costs N+1 embeddings. It is no longer the primary path: with a
+        # `PriorArtIndex` wired, `DedupStage` gets the same answer from ONE
+        # approximate-nearest-neighbour call against the neo4j vector index. This
+        # remains as the FAIL-OPEN fallback for a deployment with no graph configured
+        # (or a graph that is transiently unreachable) — the loop must keep learning
+        # when a read fails, and degraded-but-running beats stopped.
         statement = f"SELECT c.* FROM `{self._bucket_name}` c"
         result = self._cluster.query(statement, QueryOptions())
         out: list[CorpusArtifact] = []

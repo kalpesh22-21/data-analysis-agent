@@ -105,13 +105,35 @@ class LeakageVerdict:
 
 @dataclass(frozen=True)
 class DedupVerdict:
-    """The D48 two-layer dedup verdict, serialized into `envelope.dedup`."""
+    """The D48 dedup verdict, serialized into `envelope.dedup`.
+
+    Three layers now produce one, and the `layer` tag says which — the actions are not
+    interchangeable across them:
+
+      * `hard`       — the frozen SHA-256 canonical key over the `learning_corpus`
+                       bucket. Race-safe by construction (identical semantics ⇒
+                       identical key), which is what makes `increment` a sound
+                       cross-session counter. Only this layer emits `increment`.
+      * `structural` — the LOOSE cross-authoring-path key
+                       (`runtime/blueprint/structural_key.py`) looked up through the
+                       `PriorArtIndex`. Deterministic like the hard key, but it reaches
+                       artifacts the loop does NOT own — the MCP canon. Emits
+                       `redundant_with_canon` (canon) or `merge` (learning tier).
+      * `soft`       — embedding near-miss adjudication. A hint, never a drop.
+
+    `redundant_with_canon` exists because `increment` is WRONG against the canon: the
+    hit count lives on an artifact in the learning corpus bucket, and a git-versioned
+    MCP blueprint has no such artifact and no count the loop is entitled to bump. The
+    candidate is dropped instead, and the verdict is what makes the drop COUNTABLE — a
+    high rate of it is a RETRIEVAL defect surfacing here (the agent is failing to recall
+    a blueprint it already has), not a learning-loop success.
+    """
 
     canonical_key: str  # sha256 over (resolves, uses_rules, result_grain, canonical_ast_norm)
     matched_id: str | None  # existing artifact this collided with, or None
-    similarity: float  # 0.0–1.0 (1.0 for a hard-key hit)
-    action: Literal["insert", "increment", "merge", "conflict"]
-    layer: Literal["hard", "soft"]  # which layer produced the verdict
+    similarity: float  # 0.0–1.0 (1.0 for a hard-key or structural-key hit)
+    action: Literal["insert", "increment", "merge", "conflict", "redundant_with_canon"]
+    layer: Literal["hard", "structural", "soft"]  # which layer produced the verdict
 
     def to_doc(self) -> dict[str, Any]:
         return {
