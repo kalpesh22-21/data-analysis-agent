@@ -29,6 +29,38 @@ Load-bearing guards (D29/D98):
 
 Fail-closed throughout: one bad candidate must not abort the cycle (mirrors the
 sweeper's per-item guard); the kill-switch is read FRESH every cycle (D58c).
+
+**Cost + fairness (the two properties that make the cron survivable at scale).**
+This is a daemon, not a one-shot, so every per-candidate cost is multiplied by 288
+cycles a day, forever:
+
+  * **The golden replay is rate-limited, the cheap guards are not.** One replay costs
+    a JWT mint plus two live warehouse queries. Guards 0-2 (`entity_scan`, static
+    validation, `depends_on`) are pure field reads / one resolver call and keep running
+    on every examination, so a dependency that lands mid-day is still noticed the next
+    time the candidate comes up. Only Guard 3 consults
+    `PromotionPolicy.replay_recheck_interval_seconds`: inside that window the STORED
+    D43 verdict is reused (`reusable_replay_verdict`), outside it the probe runs for
+    real. Without this a candidate that can never clear Guard 4 was fully replayed
+    every 5 minutes forever — 576 warehouse queries a day, each one re-deriving a
+    verdict that had not changed.
+  * **The scan window ROTATES.** Both status reads are ordered by `last_scanned_at`
+    (never-scanned FIRST), and every examined candidate gets its cursor stamped. The
+    old `created_at ASC` read handed the bounded `scan_limit` window to the same oldest
+    rows forever, so once more than `scan_limit` candidates were parked in a hold, a
+    newly extracted candidate was NEVER examined — no error, no metric, the loop simply
+    stopped making progress on anything new.
+
+A consequence worth stating plainly, because several comments below used to say "every
+cycle": the corpus re-asserts and the cheap guards now run on every EXAMINATION, which
+is every cycle while the backlog fits in `scan_limit` and once per rotation period
+beyond that. That is strictly better than the previous behaviour (where the overflow was
+examined NEVER), but it is a rotation guarantee, not a per-cycle one.
+
+The cursor stamp makes a HOLD a write path, which it previously was not. It is a
+narrow sub-document write (`CandidateStore.touch_scanned`), issued AFTER the handler
+has finished, precisely so it cannot revert whatever that handler — or a concurrent
+S7 inbox transition — wrote to the envelope; see `run_once`.
 """
 
 from __future__ import annotations
@@ -46,7 +78,7 @@ from ..candidate.store import CandidateStore
 from ..candidate.verdicts import DriftStamp, LeakageVerdict
 from ..config import learning_enabled
 from ..observability import context_from_traceparent, land_span, promote_span
-from .drift import drift_from_replay, user_correction_stamp
+from .drift import drift_from_replay, reusable_replay_verdict, user_correction_stamp
 from .landing import landing_id
 from .models import (
     BLUEPRINT_TYPE,
@@ -75,6 +107,23 @@ _LANDED_TYPES: frozenset[str] = frozenset({BLUEPRINT_TYPE, "global_knowledge"})
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _parse_clock(now_iso: str) -> datetime | None:
+    """The injected clock's string as a tz-AWARE datetime, or `None` if it is not one.
+
+    `clock` is a `Callable[[], str]` injected by the caller (tests pin it to a literal),
+    so its output is not a guaranteed ISO-8601 string; `datetime.fromisoformat` raises
+    ValueError on a malformed string and TypeError on a non-string. Both mean the same
+    thing to every caller here — "no usable now" — and every caller treats that as
+    "cannot judge freshness, run the real probe", i.e. the pre-rate-limit behaviour."""
+    if not isinstance(now_iso, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(now_iso)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _entity_scan_is_clean(env: CandidateEnvelope) -> bool:
@@ -150,11 +199,19 @@ class PromotionScheduler:
         # candidate promoted this cycle must not be re-scanned as `validated` in
         # the SAME cycle (it lands in the store at `validated` immediately). The
         # next cycle re-checks it via the drift probes.
+        # ROTATING read (`order_by="last_scanned_at"`, never-scanned FIRST) — see the
+        # module docstring. With `created_at ASC` a permanently-held candidate held its
+        # slot in the bounded window for its entire lifetime, so a store with more than
+        # `scan_limit` held candidates silently stopped examining new ones.
         candidates = await self._store.list_by_status(
-            CandidateStatus.CANDIDATE, limit=self._policy.scan_limit
+            CandidateStatus.CANDIDATE,
+            limit=self._policy.scan_limit,
+            order_by="last_scanned_at",
         )
         validated = await self._store.list_by_status(
-            CandidateStatus.VALIDATED, limit=self._policy.scan_limit
+            CandidateStatus.VALIDATED,
+            limit=self._policy.scan_limit,
+            order_by="last_scanned_at",
         )
 
         decisions: list[CandidateDecision] = []
@@ -166,6 +223,21 @@ class PromotionScheduler:
         return PromotionSweep(decisions=tuple(decisions))
 
     async def _guard(self, fn, env: CandidateEnvelope) -> CandidateDecision:
+        """Run one per-candidate handler, then advance its scan cursor — ALWAYS.
+
+        The cursor write is in the `finally` for the same reason the whole handler is
+        wrapped: the cycle must keep its fairness property even for the candidate that
+        just blew up. If a candidate that raises kept its cursor, it would stay pinned
+        at the front of the rotation and re-raise on every cycle for ever, which is the
+        head-of-line starvation this ordering exists to remove — now caused by the one
+        row least likely to ever succeed.
+
+        Stamping AFTER the handler (not before, not as part of a re-put of `env`) is
+        what makes it clobber-free: `touch_scanned` writes the single cursor path on
+        whatever the CURRENT stored document is, so it cannot undo the handler's own
+        `put` and cannot revert a concurrent S7 inbox transition. It also cannot fail
+        the cycle — a cursor is bookkeeping, so a store hiccup here is logged and
+        swallowed rather than being allowed to mask the real decision."""
         try:
             return await fn(env)
         except Exception:  # noqa: BLE001 - one bad candidate must not abort the cycle
@@ -174,33 +246,63 @@ class PromotionScheduler:
                 env.candidate_id,
             )
             return self._hold(env, "error")
+        finally:
+            await self._mark_scanned(env)
+
+    async def _mark_scanned(self, env: CandidateEnvelope) -> None:
+        """Advance this candidate's rotation cursor (fail-quiet — see `_guard`)."""
+        try:
+            await self._store.touch_scanned(env.candidate_id, self._clock())
+        except Exception:  # noqa: BLE001 - a cursor write must never fail the cycle
+            _logger.warning(
+                "scan-cursor write failed for candidate %s; it keeps its old position "
+                "in the rotation and will be re-examined next cycle",
+                env.candidate_id,
+                exc_info=True,
+            )
 
     # -- candidate → validated (the auto-promotion edge) ----------------------
 
     async def _advance_candidate(self, env: CandidateEnvelope) -> CandidateDecision:
         # Demote-direction CONVERGENCE re-assert (Slice 3 §9.4, review BLOCKER 1). A
-        # DEMOTED landed artifact (`drift.status == "suspect"`, now back in the
-        # `candidate` scan) re-stamps its landed node ineligible EVERY cycle here —
-        # because the demote edge's write-back is fail-open (a transient neo4j failure at
-        # demote leaves the node `validated`/`clean`, i.e. still RECALLABLE, and the
-        # coalesce-default recall filter does NOT catch an un-stamped node). The
-        # clean-branch re-assert only scans `validated`, so it never revisits this
-        # now-`candidate` envelope — THIS is the re-assert that closes the loop: it is
-        # idempotent (one MATCH/SET) and converges the node to non-recallable once neo4j
-        # recovers. If a blueprint goes on to RE-PROMOTE below, the land overwrites the
-        # stamp with `validated`/`clean`, so running it up front is safe.
+        # DEMOTED landed artifact, now back in the `candidate` scan, re-stamps its landed
+        # node ineligible on EVERY examination here — because the demote edge's write-back
+        # is fail-open (a transient neo4j failure at demote leaves the node
+        # `validated`/`clean`, i.e. still RECALLABLE, and the coalesce-default recall
+        # filter does NOT catch an un-stamped node). The clean-branch re-assert only scans
+        # `validated`, so it never revisits this now-`candidate` envelope — THIS is the
+        # re-assert that closes the loop: it is idempotent (one MATCH/SET) and converges
+        # the node to non-recallable once neo4j recovers. If a blueprint goes on to
+        # RE-PROMOTE below, the land overwrites the stamp with `validated`/`clean`, so
+        # running it up front is safe.
         #
-        # UI Slice 2 (knowledge convergence gap): global_knowledge now LANDS too, and a
-        # user-correction demote of a validated knowledge chunk (→ `candidate`, drift
-        # `suspect`) re-enters THIS scan — but it returns `hold: human_gated_target`
-        # below and `_recheck_validated` skips non-blueprints, so without this it would
-        # NEVER re-stamp and a transiently-failed write-back would leave the chunk
-        # recallable forever. `_retract_corpus`/`update_status` dispatch the Cypher by
-        # `env.type`, so this re-asserts the `:KnowledgeChunk` node too. Both landed
-        # types converge here; a never-landed type is an idempotent no-op (MATCH misses).
-        if env.type in _LANDED_TYPES and env.drift.status == "suspect":
+        # The trigger is the STATUS, not the drift stamp. It used to be
+        # `drift.status == "suspect"`, and that coupling was a silent hole: a user
+        # correction demotes with `suspect`/`probes=()`, Guard 3 rightly refuses to reuse
+        # that as a replay verdict and probes for real, and the replay PASSES (a
+        # correction is about values, not structure — D98) — so the stamp becomes `clean`
+        # and the re-assert switched itself off for ever. If neo4j had been down for the
+        # demote and the blueprint sits below the hit threshold, nothing would ever
+        # re-land it and the node would stay recallable indefinitely while the store said
+        # `candidate`. Every envelope reaching this scan IS `candidate` by construction,
+        # and a candidate-status landed node must be non-recallable whatever drift says,
+        # so the status alone is the correct and un-defeatable condition.
+        #
+        # Cost: one idempotent Cypher per examined landed-type candidate — the same class
+        # as the clean-side self-heal, which is likewise kept outside the replay rate
+        # limit (only the warehouse probe is expensive). A never-landed candidate is a
+        # MATCH-miss no-op.
+        #
+        # UI Slice 2 (knowledge convergence gap): global_knowledge LANDS too, and a
+        # user-correction demote of a validated knowledge chunk re-enters THIS scan — but
+        # it returns `hold: human_gated_target` below and `_recheck_validated` skips
+        # non-blueprints, so without this it would NEVER re-stamp and a transiently-failed
+        # write-back would leave the chunk recallable for ever.
+        # `_retract_corpus`/`update_status` dispatch the Cypher by `env.type`, so this
+        # re-asserts the `:KnowledgeChunk` node too.
+        if env.type in _LANDED_TYPES:
             await self._retract_corpus(
-                env, status=env.status, drift_status="suspect"
+                env, status=env.status, drift_status=env.drift.status
             )
 
         # Human-gated / non-blueprint targets never auto-promote here (D58a/D18):
@@ -228,10 +330,45 @@ class PromotionScheduler:
         if not await self._deps_resolved(env):
             return self._hold(env, "depends_on_unresolved")
 
-        # Guard 3 — golden replay must pass (structure, not values — D98).
-        replay = await golden_replay(env, probe=self._probe)
-        if not replay.passed:
-            return self._hold(env, f"replay_failed:{replay.reason}")
+        # Guard 3 — golden replay must pass (structure, not values — D98). This is the
+        # ONLY expensive guard (a JWT mint + two live warehouse queries), so it is the
+        # only one that is rate-limited: within `replay_recheck_interval_seconds` the
+        # stored D43 verdict is REUSED rather than re-derived. The guards above stay
+        # unconditional — they are field reads, and gating them would delay picking up
+        # a dependency that resolved five minutes ago for no saving at all.
+        drift = self._reusable_drift(env)
+        if drift is None:
+            replay = await golden_replay(env, probe=self._probe)
+            drift = drift_from_replay(replay, now=self._clock())
+            # PERSIST the verdict even though nothing is promoting yet. This is what
+            # makes the rate limit real: without a stored stamp the next cycle has
+            # nothing to reuse and pays for the identical probe again. It also upgrades
+            # what the reviewer sees — a candidate parked below the hit threshold now
+            # carries the evidence that its template still executes.
+            #
+            # `stamp_drift`, NOT `put`: this is bookkeeping on a candidate S9 is not
+            # transitioning, so it must not rewrite fields S9 does not own, must not
+            # renew the 90-day retention TTL (which would make a parked candidate
+            # immortal), and must not RESURRECT a document `supersede` deleted between
+            # this cycle's scan read and now. A full-envelope upsert would do all three.
+            #
+            # Safe against the readers of `drift`: `silent_eligible` requires
+            # `status == validated`, which a candidate by definition is not, and the
+            # demote-direction re-assert above is keyed on STATUS, not on this stamp —
+            # deliberately, because a passing replay overwriting a correction's `suspect`
+            # with `clean` would otherwise switch that convergence loop off for good.
+            env = replace(env, drift=drift)
+            await self._store.stamp_drift(env.candidate_id, drift)
+            if not replay.passed:
+                # The LIVE reason verbatim (`no_generalization` / `bind_failed` /
+                # `probe_unavailable` / the D56 verdict): far more diagnostic than the
+                # probe id the stamp can carry, and unchanged from before.
+                return self._hold(env, f"replay_failed:{replay.reason}")
+        elif drift.status != "clean":
+            # A DISTINCT tag, not the live one: an operator reading this must be able
+            # to tell "the warehouse just said no" from "we are still holding yesterday's
+            # no and did not ask again", because only the second one has a maximum age.
+            return self._hold(env, "replay_failed:cached_suspect")
 
         # Guard 4 — hit_count ≥ T OR human approval. A GREEN replay with a
         # single-session count is NOT enough (D98 layer iii — replay never promotes
@@ -248,14 +385,22 @@ class PromotionScheduler:
         if self._landing_gate_blocks():
             return self._hold(env, "landing_unavailable")
 
-        # All guards pass → promote, stamping a fresh clean drift (the passing
-        # replay IS the live grain_integrity probe), so it is immediately
-        # silent-eligible. With a real landing writer wired, LAND into the neo4j
-        # retrieval corpus FIRST, then CAS `validated` (§3.1); a landing failure HOLDS
-        # `landing_failed` and the candidate stays `candidate` (not landed ⇒ not
-        # validated). Without a writer (require_landing off), promote directly (today's
-        # baseline behavior — nothing to land into).
-        drift = drift_from_replay(replay, now=self._clock())
+        # All guards pass → promote, stamping the clean drift `drift` already holds
+        # (the passing replay IS the live grain_integrity probe), so it is immediately
+        # silent-eligible. When the verdict was REUSED, `drift` is the stored stamp with
+        # its ORIGINAL `last_drift_check_at` — deliberately not re-dated to now: the
+        # blueprint is promoted on evidence gathered at that earlier moment, and moving
+        # the timestamp forward would claim a probe that did not run and hand the silent
+        # fast path a full trust window it did not earn. The stamp can be at most
+        # `replay_recheck_interval_seconds` old, which the policy keeps inside
+        # `drift_freshness_seconds`, so a freshly promoted blueprint is still
+        # silent-eligible either way.
+        #
+        # With a real landing writer wired, LAND into the neo4j retrieval corpus FIRST,
+        # then CAS `validated` (§3.1); a landing failure HOLDS `landing_failed` and the
+        # candidate stays `candidate` (not landed ⇒ not validated). Without a writer
+        # (require_landing off), promote directly (today's baseline behavior — nothing
+        # to land into).
         if self._landing_writer is not None:
             # Capture the entity spans S5 identified BEFORE the strip (D17 last gate) —
             # `_land_and_promote` strips, which blanks `entity_scan`, so the forbidden
@@ -291,6 +436,31 @@ class PromotionScheduler:
                 reason="not_replayable",
             )
 
+        # Drift re-check is the SAME expensive probe as the promotion gate, so it obeys
+        # the same rate limit. A `validated` blueprint whose stored verdict is still
+        # inside `replay_recheck_interval_seconds` keeps that verdict and is NOT
+        # re-probed — otherwise every validated blueprint costs two live warehouse
+        # queries every five minutes for as long as it stays validated.
+        #
+        # The self-heal re-assert below deliberately stays OUTSIDE the rate limit: it is
+        # one idempotent Cypher, and it is the loop that repairs a landed node whose
+        # demote/land write-back transiently failed. Slowing a convergence guarantee to
+        # save a cheap write would be the wrong trade — only the probe is expensive.
+        reused = self._reusable_drift(env)
+        if reused is not None and reused.status == "clean":
+            await self._retract_corpus(
+                env, status=CandidateStatus.VALIDATED, drift_status=reused.status
+            )
+            return CandidateDecision(
+                env.candidate_id, env.type, "drift_clean", env.status, env.status,
+                reason="replay_fresh",
+            )
+
+        # No reusable verdict (never probed, expired, or a stamp that is not a replay
+        # verdict at all — e.g. a user correction) ⇒ probe for real. A stale-but-clean
+        # stamp and a `suspect` one both land here: `suspect` on a validated artifact is
+        # not reused to demote, because a demotion retracts a live recallable artifact
+        # and must rest on a probe run NOW, not on a cached no.
         replay = await golden_replay(env, probe=self._probe)
         drift = drift_from_replay(replay, now=self._clock())
         if replay.passed:
@@ -580,6 +750,35 @@ class PromotionScheduler:
 
     # -- helpers --------------------------------------------------------------
 
+    def _reusable_drift(self, env: CandidateEnvelope) -> DriftStamp | None:
+        """`env.drift` when it is a golden-replay verdict still inside the re-check
+        window, else `None` meaning "pay for a real replay".
+
+        Two things are load-bearing here, both of them fail-SAFE in the direction of
+        spending money rather than fabricating a verdict:
+
+          * The window is `min(replay_recheck_interval_seconds,
+            drift_freshness_seconds)`. The policy documents the invariant that the
+            re-check interval sits inside the trust window; this ENFORCES it at the
+            point of use, so a misconfiguration can only make the scheduler probe more
+            often — never make it reuse a verdict for longer than its own policy says
+            that verdict may be believed.
+          * `now` is parsed from the injected clock, and an unparseable/naive clock
+            yields `None` (`_is_fresh` requires both sides aware). That degrades to the
+            pre-rate-limit behaviour — always replay — which is correct but expensive,
+            rather than to "everything looks fresh", which would silently disable the
+            structural gate."""
+        now = _parse_clock(self._clock())
+        if now is None:
+            return None
+        window = min(
+            self._policy.replay_recheck_interval_seconds,
+            self._policy.drift_freshness_seconds,
+        )
+        if reusable_replay_verdict(env.drift, now=now, window_seconds=window) is None:
+            return None
+        return env.drift
+
     def _generalization(self, env: CandidateEnvelope) -> BlueprintGeneralization | None:
         gen_doc = env.payload.get("generalization")
         if not isinstance(gen_doc, dict):
@@ -736,13 +935,21 @@ class PromotionScheduler:
         coalesce default is fail-OPEN for an UN-stamped node (a node that never got
         stamped still reads `validated`/`clean` ⇒ recallable), so the filter alone is NOT
         a backstop for a FAILED demote write-back. Convergence is provided by the
-        per-cycle RE-ASSERTS instead:
-          * a DEMOTED blueprint (`drift.status == "suspect"`) re-stamps its node
-            ineligible every `_advance_candidate` cycle (the demote-direction re-assert);
+        RE-ASSERTS instead, which fire on EVERY EXAMINATION of the artifact:
+          * a landed-type artifact in the `candidate` scan re-stamps its node with its
+            CURRENT status/drift every `_advance_candidate` pass (the demote direction);
           * a still-validated blueprint's clean `_recheck_validated` re-stamps it
             `validated`/`clean` (the self-heal direction).
-        So a transient failure at demote is retried each subsequent cycle and converges
-        the node to non-recallable once neo4j recovers.
+        Neither is keyed on the drift STAMP — a re-assert whose trigger a later write can
+        erase is not a convergence guarantee (see the comment in `_advance_candidate`).
+        Both are also outside the golden-replay rate limit: a re-assert is one idempotent
+        Cypher, and only the warehouse probe is expensive enough to ration.
+
+        "Every examination" is once per cycle while the backlog fits in `scan_limit`, and
+        once per rotation period beyond that (the scan is ordered by `last_scanned_at`, so
+        the window round-robins rather than pinning the oldest rows). So a transient
+        failure at demote is retried on each subsequent examination and converges the node
+        to non-recallable once neo4j recovers.
 
         No writer wired (the dormant Slice-1 state, `landing_writer is None`) ⇒ nothing
         ever landed ⇒ nothing to retract ⇒ a no-op. Idempotent for a never-landed /
@@ -757,8 +964,8 @@ class PromotionScheduler:
             _logger.warning(
                 "corpus status write-back FAILED for candidate %s (status=%s, "
                 "drift_status=%s); the store transition proceeds (fail-open). This is "
-                "retried every subsequent cycle by the per-cycle re-assert (a demoted "
-                "blueprint re-stamps in the candidate scan; a validated one in the clean "
+                "retried on every subsequent EXAMINATION by the re-asserts (a demoted "
+                "artifact re-stamps in the candidate scan; a validated one in the clean "
                 "rescan), converging the node to non-recallable once neo4j recovers.",
                 env.candidate_id,
                 status,

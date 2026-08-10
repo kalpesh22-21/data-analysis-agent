@@ -57,9 +57,30 @@ class PromotionPolicy:
     # T for blueprints (D-OQ1 provisional). global_knowledge/schema_edit are T=∞
     # (HUMAN_GATED_TYPES); user_knowledge auto-commits elsewhere (S8).
     blueprint_hit_threshold: int = 3
-    # `fresh(last_drift_check_at)` window for the silent-eligibility predicate.
+    # `fresh(last_drift_check_at)` window for the silent-eligibility predicate — how
+    # STALE a drift verdict may be and still be TRUSTED on the blueprint fast path.
     drift_freshness_seconds: float = 86_400.0  # 24h (provisional)
-    # Max candidates scanned per status per cycle (bounds one sweep).
+    # How often the scheduler is willing to PAY for a golden replay (a JWT mint + two
+    # live warehouse queries) on one candidate. Inside this window the stored D43
+    # verdict is REUSED instead of re-probed; outside it the replay runs again.
+    #
+    # A SEPARATE knob from `drift_freshness_seconds`, deliberately, because the two
+    # answer different questions — "how often do I spend money" vs "how stale a verdict
+    # will I trust" — and because setting them EQUAL guarantees a periodic gap: the
+    # stamp would expire at exactly the moment the re-check becomes due, so every
+    # validated blueprint would fall out of `silent_eligible` for however long the scan
+    # lag is, every single window, through no fault of its own. Keeping the re-check
+    # interval strictly SHORTER refreshes the stamp before it can expire (the ordinary
+    # refresh-before-expiry pattern), so the fast path never flickers.
+    #
+    # INVARIANT (enforced at the point of use in the scheduler, not silently trusted):
+    # `replay_recheck_interval_seconds <= drift_freshness_seconds`. A verdict must never
+    # be reused for longer than the trust window says it may be believed — reusing it
+    # longer would be the scheduler acting on evidence its own policy calls stale.
+    replay_recheck_interval_seconds: float = 43_200.0  # 12h (half the trust window)
+    # Max candidates scanned per status per cycle (bounds one sweep). NOT a fairness
+    # hazard any more: the scan is ordered by `last_scanned_at`, so the window rotates
+    # (see `CandidateStore.list_by_status`) instead of pinning the same oldest rows.
     scan_limit: int = 200
     # run_forever cadence (its OWN knob, mirroring the sweeper's interval).
     promotion_interval_seconds: float = 300.0

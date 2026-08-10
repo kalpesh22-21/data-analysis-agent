@@ -122,6 +122,114 @@ async def test_list_by_status_returns_extracted_live(candidate_store):
                await candidate_store.list_by_status(CandidateStatus.EXTRACTED, limit=500))
 
 
+# --- S9 scan rotation: the MISSING-sorts-first claim, against real N1QL -------
+
+
+async def test_never_scanned_sorts_before_stamped_candidates_live(candidate_store):
+    """VERIFY, do not assume, the collation the whole rotation rests on.
+
+    The scheduler's fairness fix is `ORDER BY last_scanned_at ASC` with the key OMITTED
+    from a never-scanned candidate's document, relying on N1QL's documented total
+    ordering (MISSING < NULL < FALSE < TRUE < number < string < array < object) to put
+    brand-new work FIRST. If that were wrong — if MISSING sorted last, or the row were
+    excluded from the index entirely — the fix would invert into a WORSE starvation
+    bug: newly extracted candidates would queue behind every already-examined one and
+    never be reached. The in-memory fake reproduces the claim; only real Couchbase can
+    confirm it, so this is the test that actually settles it.
+
+    Also covers the index shape: `idx_candidates_status_scanned(status,
+    last_scanned_at)` must still include docs whose `last_scanned_at` is MISSING (it
+    does, because the leading `status` key is always present)."""
+    tag = uuid.uuid4().hex[:8]
+    status = CandidateStatus.QUARANTINED  # a status nothing else in the suite writes
+    stamped_id = f"candidate::rot-{tag}::stamped"
+    never_id = f"candidate::rot-{tag}::never"
+
+    # The STAMPED one is written first and is OLDER by created_at, so a leftover
+    # created_at ordering (or an insertion-order fluke) cannot produce a false pass.
+    stamped = CandidateEnvelope.from_doc({
+        **_envelope(stamped_id, status=status).to_doc(),
+        "created_at": "2020-01-01T00:00:00+00:00",
+        "last_scanned_at": "2020-01-02T00:00:00+00:00",
+    })
+    never = CandidateEnvelope.from_doc({
+        **_envelope(never_id, status=status).to_doc(),
+        "created_at": "2030-01-01T00:00:00+00:00",
+    })
+    assert "last_scanned_at" not in never.to_doc()  # the key is MISSING, not null
+    await candidate_store.put(stamped)
+    await candidate_store.put(never)
+    candidate_store._created.extend([stamped_id, never_id])
+
+    # N1QL is eventually consistent w.r.t. the KV writes — poll until both appear.
+    deadline = asyncio.get_event_loop().time() + 15.0
+    ordered: list[str] = []
+    while asyncio.get_event_loop().time() < deadline:
+        rows = await candidate_store.list_by_status(
+            status, limit=500, order_by="last_scanned_at"
+        )
+        ordered = [c.candidate_id for c in rows if c.candidate_id in (stamped_id, never_id)]
+        if len(ordered) == 2:
+            break
+        await asyncio.sleep(0.5)
+
+    assert ordered == [never_id, stamped_id], (
+        "a never-scanned candidate must sort FIRST under ORDER BY last_scanned_at ASC; "
+        "if this fails, the scan rotation starves new work instead of old"
+    )
+
+
+async def test_touch_scanned_stamps_the_cursor_without_disturbing_the_doc_live(
+    candidate_store,
+):
+    """The sub-document cursor write against real Couchbase: it must create the path
+    on a document that has never had it, and leave every other field alone (it is
+    issued after the cycle's handler precisely so it cannot revert a concurrent
+    write)."""
+    cid = f"candidate::touch-{uuid.uuid4().hex[:8]}"
+    await candidate_store.put(_envelope(cid))
+    candidate_store._created.append(cid)
+    assert (await candidate_store.get(cid)).last_scanned_at is None
+
+    await candidate_store.touch_scanned(cid, "2026-08-10T12:00:00+00:00")
+
+    got = await candidate_store.get(cid)
+    assert got.last_scanned_at == "2026-08-10T12:00:00+00:00"
+    assert got.status == CandidateStatus.EXTRACTED
+    assert got.evidence_refs == ("evidence::sess-1::abc",)
+
+    # Idempotent re-stamp, and a no-op for a document that is already gone.
+    await candidate_store.touch_scanned(cid, "2026-08-10T12:05:00+00:00")
+    assert (await candidate_store.get(cid)).last_scanned_at == "2026-08-10T12:05:00+00:00"
+    await candidate_store.touch_scanned(f"candidate::gone::{uuid.uuid4().hex}", "x")
+
+
+async def test_stamp_drift_does_not_resurrect_a_deleted_candidate_live(candidate_store):
+    """The property the in-memory fake can only imitate: `mutate_in` uses REPLACE
+    semantics, so stamping a verdict on a document that `supersede` deleted between the
+    cron's scan read and the write raises `DocumentNotFoundException` and is swallowed —
+    the candidate stays deleted. A full-envelope `put` (an upsert) would resurrect a row
+    the pipeline deliberately dropped, leaving a duplicate from an abandoned extraction
+    attempt (MEDIUM-3)."""
+    from data_agent.learning.candidate.verdicts import DriftStamp
+
+    cid = f"candidate::drift-{uuid.uuid4().hex[:8]}"
+    await candidate_store.put(_envelope(cid))
+    candidate_store._created.append(cid)
+
+    await candidate_store.stamp_drift(
+        cid, DriftStamp(status="clean", last_drift_check_at="2026-08-10T12:00:00+00:00",
+                        probes=("grain_integrity",))
+    )
+    got = await candidate_store.get(cid)
+    assert got.drift.status == "clean"
+    assert got.status == CandidateStatus.EXTRACTED  # nothing else disturbed
+
+    await candidate_store._collection.remove(cid)
+    await candidate_store.stamp_drift(cid, DriftStamp(status="suspect"))
+    assert await candidate_store.get(cid) is None  # NOT recreated
+
+
 # --- MEDIUM-3: supersede live -----------------------------------------------
 
 

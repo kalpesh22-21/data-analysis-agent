@@ -85,6 +85,20 @@ class CandidateEnvelope:
     # defaults False, round-trips through to_doc/from_doc (emitted only when True so a
     # pre-existing candidate doc stays byte-identical, mirroring `traceparent`).
     verified: bool = False
+    # SCAN-ROTATION cursor (S9). "The promotion scheduler EXAMINED this envelope at T"
+    # — a bookkeeping timestamp with NO verdict semantics whatsoever. Deliberately NOT
+    # `drift.last_drift_check_at`: that field means "the D43 drift probes RAN", and the
+    # scheduler stamps this one on holds where NO probe ran (a human-gated target, an
+    # unsettled entity_scan, an unresolved `depends_on`), so overloading drift would
+    # claim a check that never happened and feed a fabricated freshness to
+    # `silent_eligible`. Load-bearing for scan FAIRNESS: `list_by_status(...,
+    # order_by="last_scanned_at")` sorts on it so the bounded `scan_limit` window
+    # rotates instead of pinning the same permanently-held candidates forever
+    # (head-of-line starvation — a never-scanned candidate has no value here and MUST
+    # sort FIRST: MISSING/NULL precede every string in both the N1QL collation and the
+    # in-memory fake's sort key). Additive, defaults None, emitted only when set so a
+    # pre-existing candidate doc round-trips byte-identically (mirrors `traceparent`).
+    last_scanned_at: str | None = None
 
     def to_doc(self) -> dict[str, Any]:
         doc: dict[str, Any] = {
@@ -117,6 +131,14 @@ class CandidateEnvelope:
         # `traceparent`). A missing key reads back as the False default.
         if self.verified:
             doc["verified"] = True
+        # Additive + OPTIONAL: emit the scan cursor only once the scheduler has
+        # actually looked at this candidate, so (a) a pre-S9 doc round-trips
+        # byte-identically and (b) a never-scanned candidate leaves the key MISSING —
+        # which is what makes it sort FIRST in the rotation query (MISSING precedes
+        # NULL precedes every string in the N1QL collation order), i.e. brand-new work
+        # jumps the queue ahead of everything already examined.
+        if self.last_scanned_at is not None:
+            doc["last_scanned_at"] = self.last_scanned_at
         return doc
 
     @classmethod
@@ -145,6 +167,19 @@ class CandidateEnvelope:
             created_at=doc.get("created_at", _now()),
             traceparent=doc.get("traceparent"),
             verified=bool(doc.get("verified", False)),
+            # NORMALIZE, do not trust: this doc is rehydrated JSON from a store other
+            # code (and humans, via cbq) can write. Every consumer treats the value as
+            # an ISO-8601 STRING (`datetime.fromisoformat`, a `str`-vs-None sort key),
+            # and `fromisoformat` raises TypeError — not ValueError — on an int/dict,
+            # so a non-string here would be a crash site, not a wrong answer. Coerce
+            # anything that is not a `str` to None ("never scanned"), which is the
+            # SELF-HEALING direction: the candidate sorts first, gets scanned
+            # immediately, and the next stamp overwrites the malformed value.
+            last_scanned_at=(
+                doc["last_scanned_at"]
+                if isinstance(doc.get("last_scanned_at"), str)
+                else None
+            ),
         )
 
 

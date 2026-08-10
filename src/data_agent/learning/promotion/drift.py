@@ -77,11 +77,21 @@ def user_correction_stamp(*, now: str) -> DriftStamp:
     )
 
 
-def _is_fresh(last_check: str | None, now: datetime, window_seconds: float) -> bool:
-    """True iff `last_check` is within `window_seconds` of `now`. A missing or
-    unparseable timestamp is NOT fresh (fail-closed — an un-drift-checked artifact
-    is never silent-eligible)."""
-    if not last_check:
+def _is_fresh(last_check: object, now: datetime, window_seconds: float) -> bool:
+    """True iff `last_check` is within `window_seconds` of `now`. A missing,
+    unparseable, or WRONG-TYPED timestamp is NOT fresh (fail-closed — an
+    un-drift-checked artifact is never silent-eligible, and an unreadable stamp is
+    treated as no stamp at all).
+
+    The `isinstance` guard is not defensive padding, it is the actual boundary:
+    `last_check` reaches here straight out of `DriftStamp.from_doc`, which is a plain
+    `doc.get("last_drift_check_at")` over rehydrated JSON from a store that humans and
+    other processes can write. `datetime.fromisoformat(123)` and
+    `fromisoformat({"a": 1})` raise **TypeError**, not the ValueError caught below, so
+    a non-string stamp would not be a wrong answer — it would be an uncaught crash
+    inside the cron scan and inside the silent-path predicate. Type-check first, then
+    parse."""
+    if not isinstance(last_check, str) or not last_check:
         return False
     try:
         checked = datetime.fromisoformat(last_check)
@@ -90,6 +100,40 @@ def _is_fresh(last_check: str | None, now: datetime, window_seconds: float) -> b
     if checked.tzinfo is None or now.tzinfo is None:
         return False
     return 0.0 <= (now - checked).total_seconds() <= window_seconds
+
+
+def reusable_replay_verdict(
+    drift: DriftStamp, *, now: datetime, window_seconds: float
+) -> bool | None:
+    """The stored golden-replay verdict, IF it is still within `window_seconds` and
+    therefore safe to reuse instead of paying for a fresh replay.
+
+    Returns `True` (last replay passed), `False` (last replay failed), or `None`
+    meaning "no reusable verdict — run the real replay". `None` is the fail-safe
+    default: every ambiguous case degrades to today's behaviour (probe the warehouse),
+    never to a fabricated pass.
+
+    The `GRAIN_INTEGRITY in drift.probes` test is what keeps this honest. A `suspect`
+    stamp is NOT proof that a replay ran and failed — `user_correction_stamp` writes
+    `suspect` with `probes=()` because a human said the answer was wrong, which says
+    nothing about whether the template still executes. Reusing that as "the replay
+    failed" would suppress the real structural check for a whole window. Only a stamp
+    that NAMES the live `grain_integrity` probe is a replay verdict.
+
+    That membership test is also why `probes` is read with `in` and not, say, indexed:
+    `DriftStamp.from_doc` does `tuple(doc.get("probes", []) or [])`, so a doc holding
+    the string `"grain_integrity"` rehydrates as a tuple of 15 single CHARACTERS. `in`
+    on that is simply False → `None` → the replay runs. A malformed stamp costs one
+    unnecessary probe; it can never fabricate a verdict."""
+    if GRAIN_INTEGRITY not in drift.probes:
+        return None
+    if not _is_fresh(drift.last_drift_check_at, now, window_seconds):
+        return None
+    if drift.status == "clean":
+        return True
+    if drift.status == "suspect":
+        return False
+    return None
 
 
 def silent_eligible(
@@ -117,6 +161,7 @@ __all__ = [
     "STUBBED_PROBES",
     "USER_CORRECTION",
     "drift_from_replay",
+    "reusable_replay_verdict",
     "silent_eligible",
     "user_correction_stamp",
 ]

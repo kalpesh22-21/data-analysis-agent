@@ -144,9 +144,82 @@ Three Protocols (Layer-1 fakes = live path; no real infra in tests):
   dependency.
 
 `PromotionPolicy` (config knobs, provisional per D-OQ1): `blueprint_hit_threshold = 3`,
-`drift_freshness_seconds = 86_400`, `scan_limit = 200`, `promotion_interval_seconds = 300`.
+`drift_freshness_seconds = 86_400`, `replay_recheck_interval_seconds = 43_200`, `scan_limit = 200`,
+`promotion_interval_seconds = 300`.
 `HUMAN_GATED_TYPES = {global_knowledge, schema_edit}` (T = ∞); `user_knowledge` auto-commits in S8, not
 here.
+
+**Caveat: `PromotionPolicy` is never wired from settings.** All three factories accept `policy=`, and
+no entrypoint passes one — production runs on the hardcoded defaults above. Wiring it from env is a
+separate slice; until then, changing a knob means changing this dataclass.
+
+### 5.1 Cost + fairness (the cron is a daemon, not a one-shot)
+
+Every per-candidate cost is multiplied by 288 cycles a day, forever. Two properties keep that bounded:
+
+**The golden replay is rate-limited; the cheap guards are not.** One replay = a JWT mint + two live
+ClickHouse queries. Guard 3 reuses the STORED D43 verdict when it is inside
+`replay_recheck_interval_seconds` (`drift.reusable_replay_verdict`), and the verdict is now PERSISTED
+on a hold-after-replay so there is something to reuse. Guards 0–2 (`entity_scan`, static validation,
+`depends_on`) are field reads and keep running on every examination, so a dependency that lands
+mid-window is picked up on the next examination rather than the next window. Only a stamp that NAMES
+`grain_integrity` is reusable — a `suspect` written by a user correction (`probes = ()`) says nothing
+about whether the template still executes and never suppresses the real probe. On the validated side,
+a fresh `clean` verdict skips the re-probe but the corpus self-heal re-assert still runs on every
+examination (one idempotent Cypher; only the probe is expensive), and a `suspect` stamp is never
+reused to demote — retracting a live recallable artifact must rest on a probe run now.
+
+**The corpus re-asserts are keyed on STATUS, never on the drift stamp (§8.6/§9.4).** The
+demote-direction re-assert in `_advance_candidate` fires for every landed-type candidate, not only a
+`suspect` one. The old drift-keyed trigger could switch itself off permanently: a user correction
+demotes with `suspect`/`probes = ()` while neo4j is down (write-back fails open, node left recallable),
+Guard 3 correctly declines to reuse a correction stamp and probes for real, the replay PASSES (a
+correction is about values, not structure — D98), the persisted verdict overwrites `suspect` with
+`clean`, and the re-assert never fires again. Below the hit threshold nothing re-lands the blueprint
+either, so the node would stay recallable forever against a store that says `candidate`. Every envelope
+in that scan IS `candidate`, and a candidate-status landed node must be non-recallable whatever drift
+says — a trigger a later write can erase is not a convergence guarantee.
+
+**S9's bookkeeping writes are sub-document, not `put`.** `CandidateStore.touch_scanned` (scan cursor)
+and `CandidateStore.stamp_drift` (replay verdict on a candidate S9 is not transitioning) are
+`mutate_in` single-path writes with `preserve_expiry=True`. That closes three things a full-envelope
+upsert would open: clobbering fields S9 does not own from a cycle-start snapshot; RESURRECTING a
+document `supersede` deleted mid-cycle (`mutate_in` replaces, it does not upsert, so a missing document
+is a swallowed no-op); and renewing the 90-day retention TTL on a schedule, which would make a
+permanently parked candidate immortal. Genuine lifecycle writes (promote / demote / approve / retire)
+still go through `put` and still renew the TTL — those are events, not bookkeeping.
+
+`replay_recheck_interval_seconds` is deliberately a SEPARATE knob from `drift_freshness_seconds`, and
+strictly smaller. They answer different questions ("how often do I pay" vs "how stale a verdict will I
+trust"), and setting them equal guarantees a periodic gap: the stamp would expire exactly when the
+re-check becomes due, dropping every validated blueprint out of `silent_eligible` for the scan lag,
+every window. The invariant `replay_recheck_interval_seconds <= drift_freshness_seconds` is ENFORCED at
+the point of use (clamped), so a misconfiguration can only make the scheduler probe more often — never
+reuse a verdict beyond the window its own policy says it may be believed.
+
+**The scan window rotates.** Both status reads use `list_by_status(..., order_by="last_scanned_at")` —
+least-recently-examined first, never-examined (MISSING) FIRST — and `_guard` stamps the cursor on
+EVERY examined candidate via `CandidateStore.touch_scanned`. The previous `created_at ASC` read handed
+the bounded `scan_limit` window to the same oldest rows permanently, so past `scan_limit` held
+candidates a newly extracted one was never examined at all (silent head-of-line starvation).
+
+There is deliberately **no freshness predicate in the `WHERE`**. Ordering alone spends the LIMIT on the
+most-overdue rows (nothing is fetched then discarded in Python), and the composite GSI
+`idx_candidates_status_scanned(status, last_scanned_at)` serves the equality + the sort in index order
+with early LIMIT termination. A cutoff would have to compare ISO-8601 timestamps as STRINGS, which is
+only sound if every writer emits an identical offset format; one row stamped `+05:30` could be excluded
+FOREVER, silently re-creating the starvation. It would also throttle the per-cycle demote-convergence
+and self-heal re-asserts (§8.6) from every cycle to once per window, weakening a documented safety loop.
+
+The cursor stamp makes a HOLD a write path, which it previously was not. It cannot clobber: it is a
+sub-document write of one scheduler-owned path, issued AFTER the handler, on whatever the CURRENT
+stored document is — so it can neither undo the handler's own `put` nor revert a concurrent S7 inbox
+transition.
+
+**Wording caveat.** Several comments (and earlier revisions of this section) say the re-asserts and
+cheap guards run "every cycle". Post-rotation that is exact only while the backlog fits in
+`scan_limit`; beyond that they run once per rotation period. Strictly fairer than before — the
+overflow previously ran NEVER — but it is a rotation guarantee, not a per-cycle one.
 
 ---
 

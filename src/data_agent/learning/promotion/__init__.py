@@ -15,6 +15,7 @@ from .drift import (
     RULE_CURRENCY,
     STUBBED_PROBES,
     drift_from_replay,
+    reusable_replay_verdict,
     silent_eligible,
     user_correction_stamp,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "drift_from_replay",
     "golden_replay",
     "landing_id",
+    "reusable_replay_verdict",
     "silent_eligible",
     "user_correction_stamp",
 ]

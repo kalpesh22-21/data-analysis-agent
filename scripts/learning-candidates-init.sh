@@ -55,6 +55,18 @@ $Q "statement=CREATE PRIMARY INDEX IF NOT EXISTS ON \`$BUCKET\`" 2>&1 | tail -1 
 echo "[learning-candidates-init] status GSI..."
 $Q "statement=CREATE INDEX idx_candidates_status IF NOT EXISTS ON \`$BUCKET\`(status)" 2>&1 | tail -1 \
   || echo "[learning-candidates-init] status GSI exists (ok)"
+# S9 scan-rotation GSI. The cron reads
+#   WHERE status = $status ORDER BY last_scanned_at ASC LIMIT $limit
+# and this composite serves BOTH halves: `status` is a leading EQUALITY key, so the
+# remaining index order IS `last_scanned_at` ASC — the query streams in index order and
+# stops at the LIMIT, with no sort stage and no scan of the rows it will not return.
+# That is what lets the scan rotate fairly without a freshness predicate in the WHERE.
+# Every candidate doc has `status`, so no doc is skipped for having a missing key; a
+# never-scanned candidate simply has `last_scanned_at` MISSING, which is the LOWEST
+# value in the N1QL collation and therefore comes FIRST — new work jumps the queue.
+echo "[learning-candidates-init] scan-rotation GSI (status, last_scanned_at)..."
+$Q "statement=CREATE INDEX idx_candidates_status_scanned IF NOT EXISTS ON \`$BUCKET\`(status, last_scanned_at)" 2>&1 | tail -1 \
+  || echo "[learning-candidates-init] scan-rotation GSI exists (ok)"
 
 echo "[learning-candidates-init] verify buckets:"
 $C bucket-list --cluster "$CLUSTER" -u "$U" -p "$P" 2>&1 | tail -10
