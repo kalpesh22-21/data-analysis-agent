@@ -8,12 +8,10 @@ proves the sync->async bridge actually works and does not deadlock).
 
 from __future__ import annotations
 
-from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.context.budget import _SUMMARY_CONTEXT_PREFIX
 from data_agent.runtime.context.llm_summarizer import build_llm_summarizer
 from data_agent.runtime.model.client import ModelTurnResult
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
-from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview, TrailEntry
 
 
@@ -84,28 +82,31 @@ def test_summarizer_falls_back_to_placeholder_on_model_error() -> None:
 
 
 async def test_summarizer_works_when_called_from_within_a_running_event_loop() -> None:
-    """The real call path: ContextAssembler.assemble() is itself a coroutine,
-    and compact_trail() invokes the sync Summarizer callable synchronously
-    from inside it — proving the thread-bridged sync->async call does not
-    deadlock against the already-running pytest-asyncio event loop."""
+    """The sync->async bridge: `compact_trail_async` invokes the sync Summarizer
+    callable (which internally does a blocking `future.result()` wait) from inside a
+    coroutine via `asyncio.to_thread`, proving it does not deadlock against the
+    already-running pytest-asyncio event loop.
+
+    Phase 1 `ContextAssembler.assemble` no longer compacts, so this drives the
+    retained `compact_trail_async` machinery directly (the path a later
+    summary-reintroducing phase will call from within assemble again)."""
+    from data_agent.runtime.context.budget import compact_trail_async, render_messages
+
     model = ScriptedModelClient([ModelTurnResult(assistant_text="summarized older history")])
     summarizer = build_llm_summarizer(model)
-    store = InMemorySessionStore()
 
-    for i in range(20):
-        await store.append_trail_entry("sess-1", _entry(f"c{i}", f"SELECT {i} FROM padding"))
+    entries = [_entry(f"c{i}", f"SELECT {i} FROM padding") for i in range(20)]
+    result = await compact_trail_async(
+        entries, token_budget=1, scope_hash="h", summarizer=summarizer
+    )
 
-    assembler = ContextAssembler(store, history_token_budget=1, summarizer=summarizer)
-    assembled = await assembler.assemble("sess-1", frozenset())
-
-    assert assembled.compaction_applied is True
-    # No base prompt is configured here, so the summary is the leading message —
-    # rendered under a NON-system (`user`) role with the context prefix, never a
-    # `system` message.
-    assert not any(m["role"] == "system" for m in assembled.messages)
+    assert result.summary_text == "summarized older history"
+    # The summary renders under a NON-system (`user`) role with the context prefix.
+    messages = render_messages(result)
+    assert not any(m["role"] == "system" for m in messages)
     summary_messages = [
         m
-        for m in assembled.messages
+        for m in messages
         if m["role"] == "user" and str(m.get("content", "")).startswith(_SUMMARY_CONTEXT_PREFIX)
     ]
     assert summary_messages[0]["content"] == _SUMMARY_CONTEXT_PREFIX + "summarized older history"

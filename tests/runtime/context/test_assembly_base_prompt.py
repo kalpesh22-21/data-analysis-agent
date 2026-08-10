@@ -203,8 +203,11 @@ async def test_d45_rebuild_is_byte_identical() -> None:
 
 async def test_base_prompt_survives_history_budget_trimming() -> None:
     store = InMemorySessionStore()
-    # Many entries + a tiny token budget forces compaction/summarization; the
-    # base prompt must still lead and never be trimmed.
+    # Many entries; the base prompt must still lead and be the sole system message.
+    # Phase 1 bypasses the history-token compaction (the whole trail interleaves
+    # verbatim; the downstream total-request fit is the sole bound), so the
+    # history_token_budget=1 no longer triggers a summary — but the base-prompt
+    # invariant is unchanged.
     for i in range(30):
         await store.append_trail_entry(
             "s1", _entry(f"c{i}", f"SELECT Department FROM employee WHERE id = {i}", turn_index=i)
@@ -216,6 +219,7 @@ async def test_base_prompt_survives_history_budget_trimming() -> None:
     assembled = await assembler.assemble("s1", scope)
 
     assert assembled.messages[0] == {"role": "system", "content": AGENT_SYSTEM_PROMPT}
-    assert assembled.compaction_applied is True
-    # The base prompt appears exactly once (not duplicated into the summary block).
+    assert assembled.compaction_applied is False
+    # The base prompt appears exactly once, and it is the sole system message.
     assert sum(m.get("content") == AGENT_SYSTEM_PROMPT for m in assembled.messages) == 1
+    assert sum(m["role"] == "system" for m in assembled.messages) == 1

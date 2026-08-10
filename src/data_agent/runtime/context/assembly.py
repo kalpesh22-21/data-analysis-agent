@@ -1,20 +1,37 @@
-"""ContextAssembler — the D50 fixed-order context assembly pipeline (design §5).
+"""ContextAssembler — the interleaved context-assembly pipeline (Phase 1).
 
-    1. load   — `SessionStore.load_trail(session_id)`
-    2. filter — D44 scope re-filter (`scope_filter.filter_trail`)
-    3. budget — D46 token-budgeted compaction (`budget.compact_trail`)
-    4. inject — render to model-facing messages (`budget.render_messages`)
+    1. load      — `SessionStore.get_or_create_session(session_id)`, reading BOTH
+                   `doc.tool_trail` (tool pairs) AND `doc.messages` (dialogue).
+    2. filter    — D44 scope re-filter of EACH stream independently, order-preserving
+                   (`scope_filter.filter_trail` + `scope_filter.filter_messages`).
+    3. interleave — merge the two streams by a STABLE SORT on the key
+                   `(turn_index, ts, stream_rank)` so tool results land chronologically
+                   next to the question that triggered them (design "true chronological
+                   interleave by turn"). `stream_rank` (user=0, trail=1, assistant=2) is
+                   only a tie-break for identical `ts`; `ts` (`_now_iso()`,
+                   lexicographically sortable) drives real order.
+    4. retrieval — the retrieved thin-cards/knowledge block is inserted as ONE
+                   `user`-role message IMMEDIATELY BEFORE the LAST `user` message
+                   (the current question — or, on an askUser resume, the
+                   clarification answer). It reads as this question's context and
+                   stays inside the current turn, which `fit_request_to_budget` pins
+                   as a whole (from the current turn's FIRST `user` message through
+                   the end), so neither the question nor this block is dropped.
+    5. base      — the base system prompt is inserted at index 0, the SOLE
+                   `role:"system"` message.
 
-Ordering is load-bearing (D50): filtering strictly before compaction means the
-summarizer (Pass B: an LLM call) never sees an out-of-scope entry, so the
-resulting prose is safe by construction and needs no residual per-column
-provenance tag.
+Phase 1 deliberately BYPASSES compaction (no summary): every in-scope turn
+interleaves verbatim and `fit_request_to_budget` (downstream, in
+`loop/agent_loop.py`) is the sole size bound. The compaction machinery in
+`context/budget.py` is retained but no longer invoked here.
 
-Pass-B seam: `summarizer`/`cache` are injected dependencies (see
-`context/budget.py`); Pass B's `AgentLoop` also passes the current
-`RuntimeCredentials` to `ToolDispatcher` separately — `ContextAssembler` only
-ever needs `column_scope`, never the JWT (design §2: "scope only, no jwt
-needed here").
+D44 fail-closed folding (design §5): each current-turn `ok`+`None`-provenance
+entry that `filter_trail` dropped is re-materialised as a non-data-bearing
+withheld sentinel AT THE DROPPED ENTRY'S `ts`, so it lands in its chronological
+slot within the current turn (replacing the former post-hoc tool-message sort).
+
+`ContextAssembler` only ever needs `column_scope`, never the JWT (design §2:
+"scope only, no jwt needed here").
 """
 
 from __future__ import annotations
@@ -29,12 +46,10 @@ from data_agent.runtime.session.store import SessionStore
 
 from . import scope_filter
 from .budget import (
-    CompactionResult,
     Summarizer,
     SummaryCache,
-    compact_trail_async,
+    _render_entry,
     default_summarizer,
-    render_messages,
 )
 
 if TYPE_CHECKING:
@@ -44,9 +59,19 @@ if TYPE_CHECKING:
 
     from data_agent.runtime.retrieval.models import RetrievedContext
     from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
-    from data_agent.runtime.session.models import TrailEntry
+    from data_agent.runtime.session.models import TrailEntry, TurnMessage
 
     Observer = Callable[[str, dict[str, Any]], None]
+
+# Interleave tie-break ranks (design "merge by (turn_index, ts, stream_rank)"):
+# used ONLY to order items that share an identical `(turn_index, ts)`. `ts` drives
+# real order; within a single instant this yields question -> tool pairs -> answer.
+# `ts` is wall-clock (`_now_iso`), so it is the orderer but not guaranteed
+# monotonic — `turn_index` dominates the sort, so any clock skew/backward-step can
+# only misorder items WITHIN one turn, never across turns (see `_now_iso`).
+_STREAM_RANK_USER = 0
+_STREAM_RANK_TRAIL = 1
+_STREAM_RANK_ASSISTANT = 2
 
 
 # D94 Part 1 — the exact, non-data-bearing sentinel surfaced in place of a
@@ -87,6 +112,9 @@ class AssembledContext:
 
     messages: list[dict[str, Any]]
     dropped_by_scope_count: int
+    # Always `False` in Phase 1 — the interleave path bypasses compaction (no
+    # summary). Retained for the CHAIN span / caller-shape stability; a later phase
+    # that reintroduces a compaction summary will set it True again.
     compaction_applied: bool
     # Slice-1 retrieval: shape-only counts of the pre-injected block (design
     # §12 "AssembledContext may gain retrieved_counts for the span"); `(0, 0)`
@@ -111,6 +139,13 @@ class ContextAssembler:
         tracer: Tracer | None = None,
     ) -> None:
         self._session_store = session_store
+        # PHASE-1 INERT (retained, UNREAD by `assemble`): `history_token_budget`,
+        # `summarizer` and `cache` drove the D46 compaction that Phase 1 bypasses —
+        # `assemble` no longer calls `compact_trail_async`, so none of these three
+        # affect the assembled request today (the downstream `fit_request_to_budget`
+        # is the sole size bound). They are kept on the constructor so the phase that
+        # reintroduces a compaction summary can re-wire them without a signature
+        # change; do NOT assume setting `history_token_budget` shrinks history now.
         self._history_token_budget = history_token_budget
         self._preview_row_count = preview_row_count
         self._summarizer = summarizer
@@ -158,13 +193,16 @@ class ContextAssembler:
 
         *user_message*/*user_id* (Slice-1 retrieval, design §3.3, optional):
         when a `retrieval` pipeline was injected AND a *user_message* is given,
-        the retrieved thin-cards/knowledge/user-memory block is pre-injected as
-        ONE `user`-role message near the front of `messages` (after the base
-        prompt, before history) — NOT a system message, so the base prompt stays
-        the SOLE leading `role:"system"` message (the head-pin the total-request
-        fit and the send-seam base-prompt invariant both depend on). Absent
-        either, no retrieval runs and the returned context is byte-identical to
-        the pre-retrieval behavior.
+        the retrieved thin-cards/knowledge/user-memory block is inserted as ONE
+        `user`-role message IMMEDIATELY BEFORE the LAST `user` message (the current
+        question — or an askUser clarification answer on a resume) — NOT a system
+        message, so the base prompt stays the SOLE leading `role:"system"` message
+        (the head-pin the total-request fit and the send-seam base-prompt invariant
+        both depend on). The block sits inside the current turn, which
+        `fit_request_to_budget` pins as a whole (from the current turn's FIRST
+        `user` message through the end), so neither the originating question nor
+        this block is ever dropped. Absent either, no retrieval runs and the
+        returned context is byte-identical to the pre-retrieval behavior.
 
         *retrieval_memo* (design §3.3, turn-local): a caller-owned dict that
         memoizes the `RetrievedContext` by `(user_message, scope_hash)` so the
@@ -192,51 +230,40 @@ class ContextAssembler:
             else nullcontext()
         )
         with span_cm as current_span:
-            raw_trail = await self._session_store.load_trail(session_id)  # 1. load
+            # 1. load BOTH streams from the SAME doc (single get_or_create_session):
+            # the tool pairs AND the user/assistant dialogue that interleave by turn.
+            doc = await self._session_store.get_or_create_session(session_id)
+            raw_trail = doc.tool_trail
+            raw_messages = doc.messages
 
-            in_scope = scope_filter.filter_trail(  # 2. D44 filter
+            # 2. D44 filter EACH stream independently, order-preserving.
+            in_scope_trail = scope_filter.filter_trail(
                 raw_trail, column_scope, current_turn_index
             )
+            in_scope_messages = scope_filter.filter_messages(raw_messages, column_scope)
 
-            # S2: compact_trail_async keeps a cache HIT synchronous/cheap and
-            # only off-loads a cache-MISS summarizer call (e.g. a blocking LLM
-            # round trip) to a worker thread, so it never stalls this loop.
-            compaction: CompactionResult = await compact_trail_async(  # 3. D46 budget/compact
-                in_scope,
-                token_budget=self._history_token_budget,
-                scope_hash=scope_hash,
-                preview_row_count=self._preview_row_count,
-                summarizer=self._summarizer,
-                cache=self._cache,
-            )
-
-            messages = render_messages(  # 4. inject
-                compaction, preview_row_count=self._preview_row_count
-            )
-
-            # 4b. D94 Part 1/2 — sentinel injection for current-turn `ok`+`None`
-            # entries that `filter_trail` just dropped (undetermined provenance).
-            # A non-data-bearing tool result is injected in the dropped entry's
-            # slot to break the retry-until-budget-cap loop, and a diagnostic
-            # observer event is emitted (de-duped). Runs BEFORE retrieval
-            # pre-injection so the retrieval block still leads `messages`.
-            self._inject_withheld_provenance_sentinels(
-                messages,
+            # 3/4/5. Phase 1: NO compaction (summary_text = None). Interleave the two
+            # in-scope streams verbatim by (turn_index, ts, stream_rank), folding the
+            # D94 withheld/idempotent-read sentinels into their chronological slot.
+            messages = self._interleave(
+                in_scope_trail=in_scope_trail,
+                in_scope_messages=in_scope_messages,
                 raw_trail=raw_trail,
-                in_scope=in_scope,
                 current_turn_index=current_turn_index,
                 withheld_call_ids=withheld_call_ids,
                 observer=observer,
             )
 
-            # 0. retrieval pre-injection (design §3.3): a SEPARATE, additive
-            # pre-loop stage — runs alongside D50 history assembly, prepended
-            # as one `user`-role prior-context message before history (NON-system
-            # so the base prompt stays the sole system message). Only when both the
-            # pipeline and a user_message are present (else byte-identical to today).
+            # 6. retrieval (design §3.3): render this turn's retrieved thin-cards/
+            # knowledge as ONE `user`-role block and insert it IMMEDIATELY BEFORE the
+            # current-turn question (the last `user` message), so the current question
+            # stays the last `user` message (fit's tail-pin) and the block reads as
+            # this question's context. NON-system so the base prompt stays the sole
+            # system message. Only when both the pipeline and a user_message are
+            # present (else byte-identical to the retrieval-off path).
             retrieved_counts = (0, 0)
             if self._retrieval is not None and user_message is not None:
-                retrieved_counts = await self._prepend_retrieval(
+                retrieved_counts = await self._insert_retrieval(
                     messages,
                     user_message=user_message,
                     user_id=user_id,
@@ -246,35 +273,118 @@ class ContextAssembler:
                     observer=observer,
                 )
 
-            # 0b. base system prompt (always-present leading instruction): the
-            # LAST prepend so it precedes the retrieval block and history, and the
-            # SOLE `role: "system"` message (retrieval + summary are both demoted to
-            # `user` so nothing competes with these base instructions). It is
-            # inserted here — after `render_messages`/compaction has
-            # already run and the budget walk is complete — so it can never be
-            # trimmed by the history-token budget. As a static constant it keeps
-            # `assemble` byte-identical across the D45 per-round-trip rebuild/resume.
+            # 7. base system prompt at index 0 — the SOLE `role:"system"` message.
+            # Inserted last so it precedes the interleaved history + retrieval block.
+            # As a static constant it keeps `assemble` byte-stable across the D45
+            # per-round-trip rebuild/resume, and it can never be trimmed here (the
+            # downstream `fit_request_to_budget` pins it as the head).
             if self._base_system_prompt:
                 messages.insert(0, {"role": "system", "content": self._base_system_prompt})
 
-            dropped_by_scope_count = len(raw_trail) - len(in_scope)
+            dropped_by_scope_count = len(raw_trail) - len(in_scope_trail)
             if current_span is not None:
                 current_span.set_attribute("dropped_by_scope_count", dropped_by_scope_count)
-                current_span.set_attribute(
-                    "compaction_applied", compaction.summary_text is not None
-                )
-                current_span.set_attribute("compaction_cache_hit", compaction.cache_hit)
+                # Phase 1 bypasses compaction — no summary is ever produced.
+                current_span.set_attribute("compaction_applied", False)
                 current_span.set_attribute("retrieved_blueprints", retrieved_counts[0])
                 current_span.set_attribute("retrieved_knowledge", retrieved_counts[1])
 
         return AssembledContext(
             messages=messages,
             dropped_by_scope_count=dropped_by_scope_count,
-            compaction_applied=compaction.summary_text is not None,
+            compaction_applied=False,
             retrieved_counts=retrieved_counts,
         )
 
-    async def _prepend_retrieval(
+    def _interleave(
+        self,
+        *,
+        in_scope_trail: Sequence[TrailEntry],
+        in_scope_messages: Sequence[TurnMessage],
+        raw_trail: Sequence[TrailEntry],
+        current_turn_index: int | None,
+        withheld_call_ids: set[str] | None,
+        observer: Observer | None,
+    ) -> list[dict[str, Any]]:
+        """Merge the two in-scope streams into ONE chronological render list.
+
+        The merge key is `(turn_index, ts, stream_rank)` and the sort is STABLE, so
+        for items sharing an identical `(turn_index, ts)` the `stream_rank`
+        (user=0, trail=1, assistant=2) is a deterministic tie-break — and for items
+        sharing the SAME key (e.g. two trail entries written in the same instant in a
+        test) insertion order is preserved. `ts` (an ISO-8601 `_now_iso()` stamp on
+        both `TurnMessage` and `TrailEntry`) drives real order, so within a turn this
+        yields question(earliest ts) -> tool pairs -> answer(latest ts), and an
+        askUser mid-turn answer lands between the tool pairs its ts falls between.
+
+        D94 fold: each current-turn `ok`+`None` entry that `filter_trail` dropped is
+        re-materialised as a non-data-bearing withheld sentinel at the DROPPED
+        ENTRY'S `ts` (so it occupies its chronological slot in the current turn),
+        and its de-duped diagnostic event fires here.
+        """
+        # (turn_index, ts, stream_rank, render_dict) — sorted by the first three.
+        items: list[tuple[int, str, int, dict[str, Any]]] = []
+
+        # Dialogue stream (inserted in doc order so identical-key ties are stable).
+        for message in in_scope_messages:
+            rank = _STREAM_RANK_USER if message.role == "user" else _STREAM_RANK_ASSISTANT
+            items.append(
+                (message.turn_index, message.ts, rank, {"role": message.role, "content": message.content})
+            )
+
+        # Trail stream + folded D94 sentinels, walked in raw_trail order so
+        # identical-`ts` entries keep their original ordinal order.
+        in_scope_ids = {id(entry) for entry in in_scope_trail}
+        stranded_ids = {
+            id(entry)
+            for entry in self._stranded_current_turn_entries(
+                raw_trail, in_scope_ids, current_turn_index
+            )
+        }
+        for entry in raw_trail:
+            if id(entry) in in_scope_ids:
+                items.append(
+                    (entry.turn_index, entry.ts, _STREAM_RANK_TRAIL,
+                     _render_entry(entry, self._preview_row_count))
+                )
+            elif id(entry) in stranded_ids:
+                items.append(
+                    (entry.turn_index, entry.ts, _STREAM_RANK_TRAIL,
+                     _build_withheld_sentinel_message(entry))
+                )
+                self._emit_withheld_provenance_event(
+                    entry, current_turn_index, withheld_call_ids, observer
+                )
+            # else: dropped by scope and not stranded -> absent (no orphan).
+
+        items.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [render for (_turn, _ts, _rank, render) in items]
+
+    @staticmethod
+    def _stranded_current_turn_entries(
+        raw_trail: Sequence[TrailEntry],
+        in_scope_ids: set[int],
+        current_turn_index: int | None,
+    ) -> list[TrailEntry]:
+        """The current-turn `ok`+`None`-provenance entries `filter_trail` dropped
+        (design §2 stranded predicate — covers BOTH the raw `runQuery` and the
+        `runBlueprint`/`_union_provenance`→`None` paths). Cross-turn `ok`+`None`
+        stays dropped as history (no sentinel). The `provenance is None` conjunct is
+        belt-and-braces: such a current-turn entry can never survive `filter_trail`,
+        so `id(entry) not in in_scope_ids` already holds — do not "simplify" it away.
+        """
+        if current_turn_index is None:
+            return []
+        return [
+            entry
+            for entry in raw_trail
+            if entry.turn_index == current_turn_index
+            and entry.status == "ok"
+            and entry.provenance is None
+            and id(entry) not in in_scope_ids
+        ]
+
+    async def _insert_retrieval(
         self,
         messages: list[dict[str, Any]],
         *,
@@ -285,7 +395,9 @@ class ContextAssembler:
         retrieval_memo: dict[tuple[str, str], RetrievedContext] | None,
         observer: Observer | None,
     ) -> tuple[int, int]:
-        """Run retrieval (memoized), render the block, and prepend it in place.
+        """Run retrieval (memoized), render the block, and insert it IMMEDIATELY
+        BEFORE the current-turn question (the last `user` message; appended at the
+        end when there is no question yet — e.g. a Layer-1 assemble with no dialogue).
 
         Returns the shape-only `(blueprints, knowledge)` counts. Retrieval never
         raises (degrade-not-fail, design §2), so this never breaks assembly.
@@ -307,73 +419,8 @@ class ContextAssembler:
 
         rendered = render_retrieved_context(retrieved)
         if rendered is not None:
-            messages.insert(0, rendered)
+            messages.insert(_last_user_index(messages), rendered)
         return (len(retrieved.thin_cards), len(retrieved.knowledge_hits))
-
-    def _inject_withheld_provenance_sentinels(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        raw_trail: Sequence[TrailEntry],
-        in_scope: Sequence[TrailEntry],
-        current_turn_index: int | None,
-        withheld_call_ids: set[str] | None,
-        observer: Observer | None,
-    ) -> None:
-        """D94 Part 1/2 — surface a non-data-bearing sentinel for each current-turn
-        `ok`+`None` entry that `filter_trail` dropped, and emit the diagnostic event.
-
-        Stranded predicate (design §2, covers BOTH the raw `runQuery` and the
-        `runBlueprint`/`_union_provenance`→`None` paths with one condition):
-        `entry.turn_index == current_turn_index` AND `entry.status == "ok"` AND
-        `entry.provenance is None` AND the entry was dropped (not in *in_scope*).
-        Cross-turn `ok`+`None` stays dropped as history (no sentinel, no event).
-
-        The sentinel is keyed to the stranded entry's `tool_call_id` and reinserted
-        into its chronological slot (by trail order) so the assistant `tool_call` it
-        answers keeps a valid matching tool result for the OpenAI API. It carries
-        ONLY `_WITHHELD_PROVENANCE_SENTINEL` — never any field of the dropped entry's
-        data — so the fail-closed invariant holds under any scope. Injection is
-        unconditional every round-trip; the observer event is de-duped via
-        *withheld_call_ids* (once per `tool_call_id` per budget window).
-        """
-        if current_turn_index is None:
-            return
-        # `id(entry)` membership relies on `filter_trail` returning the SAME
-        # `TrailEntry` objects it was handed (it does — a filtered sub-list, no
-        # copies). The `provenance is None` conjunct is belt-and-braces: an
-        # `ok`+`None` current-turn entry can NEVER survive `filter_trail` (it is
-        # not status-exempt and `is_provenance_in_scope(None, ...)` is always
-        # False), so `id(entry) not in in_scope_ids` already holds — do not
-        # "simplify" the predicate by dropping either conjunct.
-        in_scope_ids = {id(entry) for entry in in_scope}
-        stranded = [
-            entry
-            for entry in raw_trail
-            if entry.turn_index == current_turn_index
-            and entry.status == "ok"
-            and entry.provenance is None
-            and id(entry) not in in_scope_ids
-        ]
-        if not stranded:
-            return
-
-        trail_order = {entry.tool_call_id: index for index, entry in enumerate(raw_trail)}
-        leading: list[dict[str, Any]] = []
-        tool_messages: list[dict[str, Any]] = []
-        for message in messages:
-            (tool_messages if message["role"] == "tool" else leading).append(message)
-
-        for entry in stranded:
-            tool_messages.append(_build_withheld_sentinel_message(entry))
-            self._emit_withheld_provenance_event(
-                entry, current_turn_index, withheld_call_ids, observer
-            )
-
-        # Re-sort so each sentinel occupies the ordinal slot its dropped entry
-        # would have held; survivors are already chronological, so this is stable.
-        tool_messages.sort(key=lambda m: trail_order.get(m["tool_call_id"], len(raw_trail)))
-        messages[:] = leading + tool_messages
 
     def _emit_withheld_provenance_event(
         self,
@@ -420,6 +467,17 @@ class ContextAssembler:
                 "reason": "provenance_undetermined",
             },
         )
+
+
+def _last_user_index(messages: list[dict[str, Any]]) -> int:
+    """Index of the last `role:"user"` render item (the current-turn question), or
+    `len(messages)` when there is none yet. The retrieval block is inserted at this
+    index so it lands IMMEDIATELY BEFORE the current question, keeping that question
+    the last `user` message (the tail `fit_request_to_budget` pins)."""
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            return index
+    return len(messages)
 
 
 def _build_withheld_sentinel_message(entry: TrailEntry) -> dict[str, Any]:

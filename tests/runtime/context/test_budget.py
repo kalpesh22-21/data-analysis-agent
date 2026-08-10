@@ -432,26 +432,91 @@ def test_fit_priority_keeps_current_turn_retrieval_over_stale_conversation() -> 
     assert "summary" not in result.dropped_by_kind
 
 
-def test_fit_drops_retrieval_and_summary_last_under_heavy_pressure() -> None:
-    """When even the stale conversation/trail being gone is not enough, the
-    retrieval + summary blocks ARE dropped (tier 1) — but only then."""
+def test_fit_pins_current_turn_retrieval_and_summary_even_under_heavy_pressure() -> None:
+    """The current-turn retrieval + summary blocks are now PINNED as part of the
+    current-turn tail (they sit after `_current_turn_start`, the interleave blocker
+    fix), so under heavy pressure ONLY the PRIOR trail is dropped — the retrieval +
+    summary + question survive even when base + question alone would exhaust the
+    budget (the pinned-corner: invariants 1/3/6 outrank strict budget compliance)."""
     base = _sys("base")
     question = _user("q?")
     retrieval = _user(_RETRIEVAL_CONTEXT_PREFIX + "cards " + "k" * 400)
     summary = _user(_SUMMARY_CONTEXT_PREFIX + "summary " + "s" * 400)
     old_trail = _tool_pair("old", "SELECT 1", "r")
     messages = [base, *old_trail, retrieval, summary, question]
-    # Only base + question fit — everything droppable must go, tier 0 then tier 1.
+    # A budget so tight only base + question would "fit" — proving the current-turn
+    # retrieval/summary are pinned (kept) rather than dropped as a last resort.
     budget = estimate_message_tokens(base) + estimate_message_tokens(question) + 2
 
     result = fit_request_to_budget(messages, token_budget=budget)
 
-    assert result.messages == [base, question]
+    # The PRIOR trail pair is dropped (tier 0); the current-turn retrieval + summary
+    # + question are pinned and survive.
+    assert result.messages == [base, retrieval, summary, question]
     _assert_pairing_intact(result.messages)
-    # Tier-1 blocks were among those dropped once tier-0 was exhausted.
-    assert result.dropped_by_kind.get("retrieval") == 1
-    assert result.dropped_by_kind.get("summary") == 1
     assert result.dropped_by_kind.get("trail") == 1
+    assert "retrieval" not in result.dropped_by_kind
+    assert "summary" not in result.dropped_by_kind
+
+
+def test_fit_current_turn_older_tool_pairs_are_last_resort_droppable_tier2() -> None:
+    """Interleave blocker fix: the CURRENT turn's tool pairs sit AFTER the question
+    (their `ts` follows it), so they are in the current-turn tail. They must NOT be
+    an un-trimmable pinned tail: the most-recent K (default 3) are pinned, but OLDER
+    current-turn pairs are a last-resort droppable TIER 2 — dropped only after every
+    PRIOR-turn unit, so a runaway single turn still fits the budget."""
+    base = _sys("base")
+    prior = _tool_pair("prior", "SELECT prior " + "p, " * 200, "r" * 800)
+    question = _user("current question?")
+    # Four current-turn tool pairs AFTER the question (a oldest ... d newest).
+    cur_a = _tool_pair("a", "SELECT a " + "x, " * 200, "r" * 800)
+    cur_b = _tool_pair("b", "SELECT b " + "x, " * 200, "r" * 800)
+    cur_c = _tool_pair("c", "SELECT c " + "x, " * 200, "r" * 800)
+    cur_d = _tool_pair("d", "SELECT d " + "x, " * 200, "r" * 800)
+    messages = [base, *prior, question, *cur_a, *cur_b, *cur_c, *cur_d]
+
+    def _surviving_ids(msgs: list[dict]) -> set[str]:
+        return {
+            tc["id"]
+            for m in msgs
+            if m["role"] == "assistant" and m.get("tool_calls")
+            for tc in m["tool_calls"]
+        }
+
+    pair = estimate_message_tokens(cur_a[0]) + estimate_message_tokens(cur_a[1])
+    base_q = estimate_message_tokens(base) + estimate_message_tokens(question)
+
+    # (1) Moderate pressure: room for base + question + all four current pairs but
+    # NOT the prior pair → the PRIOR pair drops first (tier 0), every current pair
+    # (incl. the older `a`) survives — prior turns go before current-turn tools.
+    result = fit_request_to_budget(messages, token_budget=base_q + 4 * pair + 5)
+    ids = _surviving_ids(result.messages)
+    assert "prior" not in ids
+    assert {"a", "b", "c", "d"} <= ids
+    assert result.messages[0] == base
+    assert result.messages[1] == question  # question pinned right after base
+    _assert_pairing_intact(result.messages)
+
+    # (2) Heavy pressure: only base + question + K(=3) current pairs fit. The prior
+    # pair AND the OLDEST current pair `a` (tier 2) are dropped; the most-recent
+    # three (b, c, d) are pinned and survive.
+    result2 = fit_request_to_budget(messages, token_budget=base_q + 3 * pair + 5)
+    ids2 = _surviving_ids(result2.messages)
+    assert "prior" not in ids2
+    assert "a" not in ids2  # older current-turn pair trimmed as tier 2...
+    assert {"b", "c", "d"} <= ids2  # ...most-recent K=3 pinned survive
+    assert sum(estimate_message_tokens(m) for m in result2.messages) <= base_q + 3 * pair + 5
+    assert result2.messages[0] == base
+    assert any(m.get("content") == "current question?" for m in result2.messages)
+    _assert_pairing_intact(result2.messages)
+
+    # (3) A smaller K pins fewer current pairs (the knob is honored).
+    result3 = fit_request_to_budget(
+        messages, token_budget=base_q + pair + 5, pinned_recent_tool_pairs=1
+    )
+    ids3 = _surviving_ids(result3.messages)
+    assert ids3 == {"d"}  # only the single most-recent current-turn pair pinned
+    _assert_pairing_intact(result3.messages)
 
 
 def test_render_entry_surfaces_authoritative_verified_blueprint_flag() -> None:

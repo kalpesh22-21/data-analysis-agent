@@ -351,8 +351,8 @@ class RequestFitResult:
     dropped_by_kind: Mapping[str, int]
 
 
-# Unit kinds, in DROP-PRIORITY order (lower index = dropped FIRST). Stale
-# conversation turns and old trail pairs go before the CURRENT question's
+# Unit kinds, in DROP-PRIORITY order (lower index = dropped FIRST). PRIOR-turn
+# conversation turns and PRIOR-turn trail pairs go before the CURRENT question's
 # retrieval-cards block (candidate blueprints + knowledge + access rules) and the
 # compaction summary, which are the most useful middle content under tight
 # context — so those are dropped only if still over budget after the rest is gone.
@@ -366,6 +366,20 @@ _DROP_PRIORITY: dict[str, int] = {
     _UNIT_KIND_SUMMARY: 1,
     _UNIT_KIND_RETRIEVAL: 1,
 }
+
+# TIER-2 (2026-08 interleave blocker fix): the CURRENT turn's OWN older tool pairs
+# — those beyond the most-recent K that are pinned. In the interleaved layout the
+# current turn's tool pairs have `ts` AFTER the question, so they land in the tail;
+# if the whole tail were pinned, a single non-terminating turn would accumulate an
+# UN-trimmable tail of ~30k-token results that exceeds the request budget (then the
+# real model window) — reproducing the very front-truncation bug the budget exists
+# to prevent. Making the current turn's OLDER tool pairs a last-resort droppable
+# tier (dropped only AFTER every prior-turn unit is gone, oldest-first) keeps the
+# request bounded even under a runaway turn, while the most-recent K pairs + the
+# question + retrieval stay pinned (K protects the D94 re-fetch/self-correct loop).
+_TIER_CURRENT_OLDER_TRAIL = 2
+# Default K: how many of the current turn's most-recent tool pairs stay pinned.
+_DEFAULT_PINNED_RECENT_TOOL_PAIRS = 3
 
 
 def _fit_units(
@@ -418,8 +432,46 @@ def _unit_kind(messages: list[dict[str, Any]], start: int, end: int) -> str:
     return _UNIT_KIND_CONVERSATION
 
 
+def _current_turn_start(messages: list[dict[str, Any]], head_end: int, n: int) -> int:
+    """Index where the CURRENT (in-progress) turn's messages begin — the first
+    `user` message after the last COMPLETED prior turn.
+
+    A completed prior turn always ends in a plain `assistant` ANSWER (a persisted
+    `TurnMessage`, role `assistant` with NO `tool_calls`); the in-progress current
+    turn has none yet (its answer is not persisted until the turn ends, and its
+    synthetic `assistant` messages all carry `tool_calls`). So the current turn is
+    the run of messages after the LAST plain-assistant answer, starting at that
+    run's first `user` message (the originating question — even after an askUser
+    resume appended a later clarification-answer `user` message). This is the
+    boundary `fit_request_to_budget` pins from, so the ORIGINATING question is
+    never dropped and the current turn's tool pairs are identified positionally
+    (no `turn_index` threading needed).
+
+    Returns `n` when there is no current-turn `user` message (e.g. a list ending in
+    a tool pair, public-API-only) → nothing is pinned as the current turn and every
+    unit after the head is droppable, which is what stops a lone trailing `tool`
+    from being pinned while its announcing assistant unit stays droppable (invariant
+    4). Edge: if EVERY prior turn's assistant answer was scope-dropped, the boundary
+    walks back to the first user message, harmlessly over-pinning some prior units —
+    never unsafe (base + question survive, pairing intact).
+    """
+    last_answer = head_end - 1
+    for i in range(n - 1, head_end - 1, -1):
+        m = messages[i]
+        if m.get("role") == "assistant" and not m.get("tool_calls"):
+            last_answer = i
+            break
+    for i in range(max(last_answer + 1, head_end), n):
+        if messages[i].get("role") == "user":
+            return i
+    return n
+
+
 def fit_request_to_budget(
-    messages: list[dict[str, Any]], *, token_budget: int
+    messages: list[dict[str, Any]],
+    *,
+    token_budget: int,
+    pinned_recent_tool_pairs: int = _DEFAULT_PINNED_RECENT_TOOL_PAIRS,
 ) -> RequestFitResult:
     """Fit the FULL canonical request to `token_budget` while honoring the
     send-seam invariants:
@@ -427,23 +479,30 @@ def fit_request_to_budget(
       1. the base prompt (the leading run of `role:"system"` messages) is NEVER
          dropped or truncated — it is pinned as the head;
       2. the returned list never exceeds `token_budget` tokens WHEN that is
-         achievable without violating (1) or (3) — only the middle is droppable;
-      3. the current question (the LAST `user` message) is NEVER dropped — it and
-         anything after it are pinned as the tail;
+         achievable without violating (1), (3) or (6) — only droppable units go;
+      3. the CURRENT turn's question is NEVER dropped. The current turn is pinned
+         from its FIRST `user` message (the originating question, `_current_turn_
+         start`) through the end, so its question, its retrieval-cards block, and an
+         askUser clarification-answer are all undroppable;
       4. assistant `tool_calls` <-> `tool` result pairing is preserved (units are
          dropped/kept atomically, see `_fit_units`);
-      5. under pressure the droppable middle goes in DROP-PRIORITY order, not pure
-         position: the oldest CONVERSATION turns and oldest TRAIL pairs first
-         (tier 0), and only if still over budget the current question's RETRIEVAL
-         cards block + the compaction SUMMARY (tier 1) — those carry this
-         question's blueprint candidates / knowledge / access rules and are the
-         most useful middle content, so they survive longest. Within a tier the
-         OLDEST unit (lowest position) goes first, keeping the most recent context.
+      5. under pressure droppable units go in DROP-PRIORITY tier order, not pure
+         position: PRIOR-turn CONVERSATION + PRIOR-turn TRAIL first (tier 0), then a
+         prior RETRIEVAL/SUMMARY block (tier 1), and ONLY as a last resort the
+         current turn's OLDER tool pairs (tier 2, `_TIER_CURRENT_OLDER_TRAIL`).
+         Within a tier the OLDEST unit (lowest position) goes first;
+      6. the current turn's most-recent `pinned_recent_tool_pairs` (K) tool pairs
+         are PINNED (never dropped) — K protects the D94 withheld/idempotent-read
+         self-correct loop and the immediate reasoning context; only the current
+         turn's tool pairs OLDER than those K are droppable (tier 2). This is what
+         keeps a single non-terminating turn (whose tool pairs would otherwise be an
+         un-trimmable pinned tail) bounded by the budget.
 
-    The head (base prompt) and tail (current question) are never dropped, so in the
-    pathological corner where those two ALONE exceed `token_budget` the result may
-    still exceed it — correctness of invariants 1+3 takes precedence over 2 (the
-    base prompt and the live question must survive). In practice both are tiny.
+    The head (base prompt), the current question, its retrieval block, and the K
+    most-recent current-turn tool pairs are never dropped, so in the pathological
+    corner where those ALONE exceed `token_budget` the result may still exceed it —
+    invariants 1/3/6 take precedence over 2. In practice base + question are tiny
+    and K is small.
     """
     sizes = [estimate_message_tokens(m) for m in messages]
     total = sum(sizes)
@@ -456,26 +515,55 @@ def fit_request_to_budget(
     while head_end < n and messages[head_end].get("role") == "system":
         head_end += 1
 
-    # Pin the tail: from the LAST `user` message (the current question) to the end.
-    # `no_user_message` → tail_start stays `n` (an EMPTY tail slice `messages[n:]`),
-    # so NOTHING is pinned as the tail and everything after the head is droppable
-    # via whole units. That is what keeps a list ending in a `tool` result from
-    # pinning that lone tool while its announcing assistant unit stays droppable
-    # (which would orphan the tool and break invariant 4). The wired path always
-    # has the current question, so this corner is public-API-only.
-    tail_start = n
-    for i in range(n - 1, head_end - 1, -1):
-        if messages[i].get("role") == "user":
-            tail_start = i
-            break
+    turn_start = _current_turn_start(messages, head_end, n)
 
-    units = _fit_units(messages, head_end, tail_start)
+    # Unitize the WHOLE non-head range (prior turns AND the current turn), so the
+    # current turn's older tool pairs are droppable units too — not a monolithic
+    # pinned tail. Pairing stays atomic (an assistant `tool_calls` + its `tool`
+    # result(s) are one unit).
+    units = _fit_units(messages, head_end, n)
     unit_sizes = [sum(sizes[k] for k in range(s, e)) for (s, e) in units]
     kinds = [_unit_kind(messages, s, e) for (s, e) in units]
 
-    # Consideration order: by drop-priority tier (0 before 1), then by position
-    # (oldest first) within a tier — a stable sort on (tier, index).
-    order = sorted(range(len(units)), key=lambda u: (_DROP_PRIORITY[kinds[u]], u))
+    # The current turn's tool-pair units, in position order; the LAST K are pinned.
+    current_tool_units = [
+        u
+        for u, (s, _e) in enumerate(units)
+        if s >= turn_start
+        and messages[s].get("role") == "assistant"
+        and messages[s].get("tool_calls")
+    ]
+    pinned_recent = (
+        set(current_tool_units[-pinned_recent_tool_pairs:])
+        if pinned_recent_tool_pairs > 0
+        else set()
+    )
+
+    # Classify every unit: pinned (never dropped) or droppable with a tier.
+    pinned: list[bool] = [False] * len(units)
+    tiers: list[int] = [0] * len(units)
+    droppable: list[int] = []
+    for u, (s, _e) in enumerate(units):
+        is_current = s >= turn_start
+        is_tool_pair = (
+            messages[s].get("role") == "assistant" and messages[s].get("tool_calls")
+        )
+        if is_current and not is_tool_pair:
+            # Current-turn question / retrieval block / askUser answer — pinned.
+            pinned[u] = True
+        elif is_current and is_tool_pair:
+            if u in pinned_recent:
+                pinned[u] = True  # most-recent K current-turn tool pairs — pinned.
+            else:
+                tiers[u] = _TIER_CURRENT_OLDER_TRAIL  # older current-turn pair (tier 2).
+                droppable.append(u)
+        else:
+            tiers[u] = _DROP_PRIORITY[kinds[u]]  # prior-turn unit (tier 0 / 1).
+            droppable.append(u)
+
+    # Consideration order: by tier (0, then 1, then 2), then by position (oldest
+    # first) within a tier — a stable sort on (tier, index).
+    order = sorted(droppable, key=lambda u: (tiers[u], u))
 
     keep = [True] * len(units)
     running = total
@@ -496,7 +584,6 @@ def fit_request_to_budget(
     for idx, (s, e) in enumerate(units):
         if keep[idx]:
             fitted.extend(messages[s:e])
-    fitted.extend(messages[tail_start:])
     return RequestFitResult(
         fitted, dropped_units, dropped_messages, dropped_tokens, running, dropped_by_kind
     )

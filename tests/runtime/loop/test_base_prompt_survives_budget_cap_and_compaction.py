@@ -155,20 +155,12 @@ async def test_base_prompt_is_messages0_on_every_main_loop_call_through_cap_resu
     # Exactly one main-loop send_turn per iteration per window (no hidden calls).
     assert len(main_model.calls) == _EXPECTED_MAIN_CALLS
 
-    # (pre-condition) Compaction genuinely fired: the summary is threaded back into
-    # the main-loop context, and the LLM summarizer subcall path ran.
-    assert summarizer_model.calls, "history compaction did not fire — test is not exercising it"
-    # The compaction summary is a NON-system (`user`) message with the context
-    # prefix — never a second `system` message competing with the base prompt.
-    compaction_indices = [
-        i
-        for i, msgs in enumerate(main_model.calls)
-        if any(
-            m.get("role") == "user" and "summar" in str(m.get("content", "")).lower()
-            for m in msgs[1:]  # anything AFTER index 0
-        )
-    ]
-    assert compaction_indices, "no post-compaction main-loop call observed"
+    # Phase 1 bypasses compaction: the trail interleaves VERBATIM (no summary), so
+    # the request grows across the run and `compact_trail` is never invoked — the
+    # base-prompt invariant below is what this regression guards, and it must hold on
+    # EVERY call regardless of how large the verbatim history has grown.
+    assert not summarizer_model.calls, "Phase 1 must not invoke the history summarizer"
+    compaction_indices: list[int] = []
 
     # ---- THE INVARIANT: base prompt is messages[0] on EVERY main-loop call. ----
     # Covers (a) first call, (b) every mid-loop iteration, (c) the last call before
@@ -332,17 +324,11 @@ async def test_base_prompt_survives_across_n_real_turns_with_history_replay_comp
     )
     assert max_replayed >= 6, "later turns did not replay a large accumulated history"
 
-    # (suspect 3) Compaction of the ACCUMULATED cross-turn trail fired in a later
-    # turn. The summary rides in as a NON-system (`user`) message, never a second
-    # `system` message.
-    assert summarizer_model.calls, "cross-turn trail compaction never fired"
-    assert any(
-        any(
-            m.get("role") == "user" and "summar" in str(m.get("content", "")).lower()
-            for m in msgs[1:]
-        )
-        for _, _, msgs in model.calls
-    ), "no post-compaction main-loop call across the multi-turn run"
+    # (suspect 3) Phase 1 bypasses compaction: the accumulated cross-turn trail
+    # interleaves VERBATIM (no summary) — `compact_trail` is never invoked. The
+    # cross-turn base-prompt invariant below is what this multi-turn regression
+    # guards, independent of compaction.
+    assert not summarizer_model.calls, "Phase 1 must not invoke the history summarizer"
 
     # ---- THE INVARIANT across EVERY main-loop call of EVERY turn. ----
     for i, (label, it, msgs) in enumerate(model.calls):
@@ -362,32 +348,22 @@ async def test_base_prompt_survives_across_n_real_turns_with_history_replay_comp
     # instructions after N turns) — it is demoted to a `user`-role message with
     # the context prefix, sitting at index 1 right after the base prompt.
     syscounts: set[int] = set()
-    saw_post_compaction_summary = False
     for _label, _it, msgs in model.calls:
         sys_idxs = [j for j, m in enumerate(msgs) if m["role"] == "system"]
         # No system message is ever anything but the base prompt, and it is
-        # strictly at index 0 (never displaced by the summary).
+        # strictly at index 0 (never displaced).
         assert sys_idxs == [0]
         assert msgs[0]["content"] == AGENT_SYSTEM_PROMPT
         syscounts.add(len(sys_idxs))
-        # A "summary" user message = the demoted compaction summary carrying the
-        # context prefix; when present it is at index 1, directly after the base
-        # prompt, and never at index 0.
-        summary_idxs = [
-            j
-            for j, m in enumerate(msgs)
-            if m["role"] == "user" and str(m.get("content", "")).startswith(_SUMMARY_CONTEXT_PREFIX)
-        ]
-        if summary_idxs:
-            saw_post_compaction_summary = True
-            assert summary_idxs[0] == 1, (
-                "the demoted compaction summary is not immediately after the base prompt"
-            )
+        # Phase 1 emits no compaction summary, so no `user` message ever carries the
+        # summary context prefix (it is never a competing second system message).
+        assert not any(
+            m["role"] == "user" and str(m.get("content", "")).startswith(_SUMMARY_CONTEXT_PREFIX)
+            for m in msgs
+        )
     # Exactly ONE authoritative system message (the base prompt) on every call —
     # the whole point of the fix; the count never becomes 2.
     assert syscounts == {1}
-    # ...and the compacted context still reaches the model, just under a user role.
-    assert saw_post_compaction_summary, "no post-compaction summary user message observed"
 
     # Explicit later-turn spot check: the last main-loop call of EACH turn — the
     # phase the user points at (present early, allegedly gone in a later turn).
@@ -457,16 +433,16 @@ async def test_base_prompt_is_sole_system_message_with_retrieval_wired_through_c
         outcome = await loop.resume(session_id=SESSION_ID, credentials=_creds(), answer="continue")
         statuses.append(outcome.status)
 
-    # The run really did traverse cap -> resume -> ... -> hard ceiling and compact.
+    # The run really did traverse cap -> resume -> ... -> hard ceiling.
     assert statuses == ["paused_budget_cap", "paused_budget_cap", "stopped_hard_ceiling"]
     assert len(main_model.calls) == _EXPECTED_MAIN_CALLS
-    assert summarizer_model.calls, "history compaction did not fire — test not exercising it"
+    # Phase 1 bypasses compaction — the summarizer is never invoked.
+    assert not summarizer_model.calls, "Phase 1 must not invoke the history summarizer"
 
     saw_retrieval_card = False
-    saw_post_compaction_summary = False
     for i, msgs in enumerate(main_model.calls):
         # (a) exactly ONE system message, the base prompt, strictly at index 0 —
-        # with retrieval WIRED, on every call, before AND after compaction.
+        # with retrieval WIRED, on every call.
         sys_idxs = [j for j, m in enumerate(msgs) if m["role"] == "system"]
         assert sys_idxs == [0], (
             f"retrieval-enabled call[{i}] has system messages at {sys_idxs}, not just [0]"
@@ -485,13 +461,10 @@ async def test_base_prompt_is_sole_system_message_with_retrieval_wired_through_c
             assert "bp.headcount" in retrieval_msgs[0]["content"], (
                 "retrieval cards content did not reach the model"
             )
-        # (c) the compaction summary, when present, is likewise a NON-system user
-        # message with its own prefix.
-        if any(
+        # (c) Phase 1 emits no compaction summary user message.
+        assert not any(
             m["role"] == "user" and str(m.get("content", "")).startswith(_SUMMARY_CONTEXT_PREFIX)
             for m in msgs
-        ):
-            saw_post_compaction_summary = True
+        )
 
     assert saw_retrieval_card, "retrieval cards block never reached the model as a user message"
-    assert saw_post_compaction_summary, "no post-compaction summary user message observed"

@@ -67,8 +67,13 @@ async def test_assemble_allow_all_empty_scope_keeps_determined_entries() -> None
     assert assembled.dropped_by_scope_count == 1
 
 
-async def test_assemble_never_shows_summarizer_an_out_of_scope_entry() -> None:
-    """D50: filtering strictly before compaction — the summarizer never sees a dropped entry."""
+async def test_phase1_assemble_never_calls_the_summarizer_at_all() -> None:
+    """Phase-1 lock: `assemble` BYPASSES compaction entirely, so the injected
+    summarizer is NEVER invoked — regardless of a tiny `history_token_budget` that
+    would previously have forced a summary. (Compaction — and the D50
+    filter-before-compact guarantee that the summarizer never sees a dropped entry —
+    is exercised directly against `compact_trail_async` in the sibling tests; this
+    test locks that the interleave path calls it zero times.)"""
     seen_by_summarizer: list = []
 
     def spy_summarizer(entries):
@@ -90,18 +95,23 @@ async def test_assemble_never_shows_summarizer_an_out_of_scope_entry() -> None:
     )
     await assembler.assemble("sess-1", scope)
 
-    seen_ids = {e.tool_call_id for e in seen_by_summarizer}
-    assert "forbidden" not in seen_ids
+    # Phase-1 assemble must never call the summarizer (no compaction / no summary).
+    assert not seen_by_summarizer
 
 
-async def test_assemble_compaction_applied_flag() -> None:
+async def test_assemble_compaction_applied_flag_is_false_in_phase1() -> None:
+    """Phase 1 bypasses compaction — `assemble` never produces a summary, so
+    `compaction_applied` is always False regardless of the history budget, and every
+    in-scope entry interleaves verbatim (nothing is folded into a summary)."""
     store = InMemorySessionStore()
     for i in range(5):
         await store.append_trail_entry("sess-1", _entry(f"c{i}", frozenset(), sql=f"SELECT {i} FROM padding"))
 
     tiny_budget_assembler = ContextAssembler(store, history_token_budget=1)
     assembled_tiny = await tiny_budget_assembler.assemble("sess-1", frozenset())
-    assert assembled_tiny.compaction_applied is True
+    assert assembled_tiny.compaction_applied is False
+    # All five entries survive verbatim (no summary folding under the tiny budget).
+    assert len([m for m in assembled_tiny.messages if m.get("role") == "tool"]) == 5
 
     huge_budget_assembler = ContextAssembler(store, history_token_budget=1_000_000)
     assembled_huge = await huge_budget_assembler.assemble("sess-1", frozenset())
@@ -118,7 +128,13 @@ async def test_summarizer_cache_miss_never_blocks_other_concurrent_event_loop_wo
     `context/llm_summarizer.py`'s genuinely-blocking `future.result()` wait —
     must run off the event-loop thread (`asyncio.to_thread`, S2), so a SHORTER
     concurrent coroutine on the same loop finishes first instead of being
-    starved until the summarizer returns."""
+    starved until the summarizer returns.
+
+    Phase 1 `assemble` no longer compacts, so this exercises the retained
+    compaction machinery (`compact_trail_async`) directly — the S2 non-blocking
+    guarantee still holds for the phase that reintroduces the summary path."""
+    from data_agent.runtime.context.budget import compact_trail_async
+
     order: list[str] = []
 
     def slow_blocking_summarizer(entries) -> str:  # noqa: ANN001
@@ -126,22 +142,22 @@ async def test_summarizer_cache_miss_never_blocks_other_concurrent_event_loop_wo
         order.append("summarizer_done")
         return "summary"
 
-    store = InMemorySessionStore()
-    for i in range(5):
-        await store.append_trail_entry(
-            "sess-1", _entry(f"c{i}", frozenset(), sql=f"SELECT {i} FROM padding_table_name_long")
-        )
-
-    assembler = ContextAssembler(store, history_token_budget=1, summarizer=slow_blocking_summarizer)
+    entries = [
+        _entry(f"c{i}", frozenset(), sql=f"SELECT {i} FROM padding_table_name_long")
+        for i in range(5)
+    ]
 
     async def _short_concurrent_task() -> None:
         await asyncio.sleep(0.02)
         order.append("short_task_done")
 
-    assembled, _ = await asyncio.gather(
-        assembler.assemble("sess-1", frozenset()), _short_concurrent_task()
+    result, _ = await asyncio.gather(
+        compact_trail_async(
+            entries, token_budget=1, scope_hash="h", summarizer=slow_blocking_summarizer
+        ),
+        _short_concurrent_task(),
     )
-    assert assembled.compaction_applied is True
+    assert result.summary_text is not None
     # The short task must finish WHILE the summarizer is still blocking its
     # own worker thread — proving the event loop was never stalled by it.
     assert order == ["short_task_done", "summarizer_done"]
@@ -190,8 +206,11 @@ async def test_assemble_current_turn_index_exempts_only_that_turns_entries() -> 
 
 async def test_summarizer_cache_hit_stays_synchronous_and_cheap() -> None:
     """A cache HIT must resolve without ever invoking `asyncio.to_thread` (no
-    added latency/thread-hop) — the summarizer callable is not called again."""
-    from data_agent.runtime.context.budget import SummaryCache
+    added latency/thread-hop) — the summarizer callable is not called again.
+
+    Phase 1 `assemble` no longer compacts, so this exercises the retained
+    `compact_trail_async` cache directly."""
+    from data_agent.runtime.context.budget import SummaryCache, compact_trail_async
 
     calls = {"n": 0}
 
@@ -199,21 +218,20 @@ async def test_summarizer_cache_hit_stays_synchronous_and_cheap() -> None:
         calls["n"] += 1
         return f"summary-{calls['n']}"
 
-    store = InMemorySessionStore()
-    for i in range(5):
-        await store.append_trail_entry(
-            "sess-1", _entry(f"c{i}", frozenset(), sql=f"SELECT {i} FROM padding_table_name_long")
-        )
-
+    entries = [
+        _entry(f"c{i}", frozenset(), sql=f"SELECT {i} FROM padding_table_name_long")
+        for i in range(5)
+    ]
     cache = SummaryCache()
-    assembler = ContextAssembler(
-        store, history_token_budget=1, summarizer=counting_summarizer, cache=cache
-    )
 
-    first = await assembler.assemble("sess-1", frozenset())
-    assert first.compaction_applied is True
+    first = await compact_trail_async(
+        entries, token_budget=1, scope_hash="h", summarizer=counting_summarizer, cache=cache
+    )
+    assert first.summary_text is not None
     assert calls["n"] == 1
 
-    second = await assembler.assemble("sess-1", frozenset())
-    assert second.compaction_applied is True
+    second = await compact_trail_async(
+        entries, token_budget=1, scope_hash="h", summarizer=counting_summarizer, cache=cache
+    )
+    assert second.cache_hit is True
     assert calls["n"] == 1  # cache hit — summarizer NOT invoked again

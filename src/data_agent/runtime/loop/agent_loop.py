@@ -86,7 +86,6 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
-from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import (
     IDEMPOTENT_READ_ALREADY_SERVED_CODE,
     ContextAssembler,
@@ -218,6 +217,12 @@ def _repeated_read_guard_event(
 
 
 def _now_iso() -> str:
+    # Wall-clock `ts` is now the CONTEXT ORDERER (context/assembly.py merges the two
+    # streams by `(turn_index, ts, stream_rank)`), not just a display stamp. It need
+    # not be perfectly monotonic: `turn_index` dominates the sort, so any clock
+    # skew/backward step can only misorder items WITHIN a single turn — never across
+    # turns, and never in a way that breaks assistant/tool pairing (that is enforced
+    # structurally downstream), so there is no API-400 risk from a ts wobble.
     return datetime.now(UTC).isoformat()
 
 
@@ -387,8 +392,16 @@ def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]
 
 
 def _assembled_to_canonical(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """`AssembledContext.messages` (Pass-A shape, `context/budget.py::render_messages`)
+    """`AssembledContext.messages` (the interleaved render list, Phase 1)
     -> the canonical `ModelClient.send_turn` message shape (design §1 `model/client.py`).
+
+    The interleaved list carries four render shapes: the base `system` message; a
+    `user` message (a prior-turn question, the current question, an askUser answer,
+    or the retrieval cards block); an `assistant` TEXT message (a prior turn's
+    answer — new in the interleave, passed straight through); and a `tool` render
+    item (a trail entry / withheld sentinel) that expands to a synthetic
+    `assistant(tool_calls)` + `tool(result)` PAIR (D22 discards the model's original
+    free text around a tool call, so replay synthesizes a minimal API-valid pair).
 
     §6.2 defensive dedup: the OpenAI API requires every `tool_call_id` in a turn to
     be UNIQUE with exactly one matching `tool` response. A legacy/corrupt trail (or
@@ -404,11 +417,16 @@ def _assembled_to_canonical(messages: list[dict[str, Any]]) -> list[dict[str, An
         if role == "system":
             canonical.append({"role": "system", "content": message["content"]})
         elif role == "user":
-            # The compaction summary (context/budget.py::render_messages) is the
-            # only `user`-role message the assembler emits — demoted from a second
-            # `system` message so it can never compete with the sole authoritative
-            # base prompt. It replays as ordinary prior-context content.
+            # A prior-turn question, the current question, an askUser answer, or the
+            # retrieval cards block — all replay as ordinary `user` content. None is
+            # a second `system` message, so the base prompt stays the sole one.
             canonical.append({"role": "user", "content": message["content"]})
+        elif role == "assistant":
+            # A prior turn's free-text answer (`TurnMessage` role="assistant"), now
+            # interleaved into history in its chronological slot. Passed straight
+            # through as a plain assistant message (no tool_calls — those flow via
+            # the `tool` render-item pair-expansion branch below).
+            canonical.append({"role": "assistant", "content": message["content"]})
         elif role == "tool":
             tool_call_id = message.get("tool_call_id")
             if isinstance(tool_call_id, str) and tool_call_id in seen_tool_call_ids:
@@ -421,7 +439,7 @@ def _assembled_to_canonical(messages: list[dict[str, Any]]) -> list[dict[str, An
             if isinstance(tool_call_id, str):
                 seen_tool_call_ids.add(tool_call_id)
             canonical.extend(_tool_trail_entry_to_canonical(message))
-        else:  # pragma: no cover - render_messages only ever emits system/user/tool
+        else:  # pragma: no cover - assemble only ever emits system/user/assistant/tool
             raise ValueError(f"Unexpected assembled-context message role: {role!r}")
     return canonical
 
@@ -443,6 +461,7 @@ class AgentLoop:
         max_budget_windows: int,
         token_budget: int | None = None,
         request_token_budget: int | None = None,
+        request_budget_pinned_recent_tool_pairs: int = 3,
         max_tool_calls_per_iteration: int = 8,
         clock: Callable[[], float] = time.monotonic,
         observer: ToolObserver = _default_observer,
@@ -486,6 +505,13 @@ class AgentLoop:
         # do not wire it) disables the fit step — byte-identical to before it
         # existed. `app.py` wires `settings.request_token_budget()`.
         self._request_token_budget = request_token_budget
+        # K (interleave blocker fix, 2026-08): how many of the CURRENT turn's
+        # most-recent tool pairs `fit_request_to_budget` pins. The current turn's
+        # tool pairs sit in the tail (their `ts` follows the question) in the
+        # interleaved layout; pinning only the most-recent K — not ALL of them —
+        # lets a runaway turn's OLDER pairs be trimmed so the request stays bounded,
+        # while K protects the D94 re-fetch/self-correct loop. Default 3.
+        self._request_budget_pinned_recent_tool_pairs = request_budget_pinned_recent_tool_pairs
         self._max_tool_calls_per_iteration = max_tool_calls_per_iteration
         self._clock = clock
         self._observer = observer
@@ -649,15 +675,12 @@ class AgentLoop:
         `listDatabases`+`listTables`, already run through
         `_tool_trail_entry_to_canonical` (or `None`/empty). Computed ONCE in
         `_run_loop` and threaded in (never recomputed per round-trip, D45). It is
-        spliced in AFTER the leading run of `role=="system"` messages (base prompt /
-        retrieval) and BEFORE the real trail assistant/tool pairs + the appended
-        conversation, so the emulated reads read as the earliest tool history, ahead
-        of the user's question — mirroring how real trail pairs already precede the
-        convo. The compaction summary is a `user`-role message (not `system`), so it
-        sits just after this leading system run; discovery therefore precedes it,
-        which is chronologically correct (the emulated listDatabases/listTables are
-        the earliest session activity, ahead of the steps the summary compacts).
-        `None`/empty (feature off / degraded) leaves the message list byte-identical.
+        spliced in AFTER the leading run of `role=="system"` messages (the base
+        prompt) and BEFORE the interleaved turn history, so the emulated reads read
+        as the earliest tool history, ahead of turn 0's question. That is
+        chronologically correct: the emulated listDatabases/listTables are the
+        earliest session activity, ahead of every real turn. `None`/empty (feature
+        off / degraded) leaves the message list byte-identical.
         """
         assembled = await self._context_assembler.assemble(
             session_id,
@@ -700,14 +723,13 @@ class AgentLoop:
             while insert_at < len(canonical) and canonical[insert_at]["role"] == "system":
                 insert_at += 1
             canonical[insert_at:insert_at] = deduped_discovery
-        doc = await self._session_store.get_or_create_session(session_id)
-        # D44 (2026-07-01 clarification, B1): the same replay scope-filter
-        # that gates the tool trail also gates conversational ASSISTANT
-        # messages — user messages carry no warehouse data and are always
-        # kept; see context/scope_filter.py::filter_messages.
-        in_scope_messages = scope_filter.filter_messages(doc.messages, column_scope)
-        for turn_message in in_scope_messages:
-            canonical.append({"role": turn_message.role, "content": turn_message.content})
+
+        # Conversation dialogue is now interleaved INTO `assembled.messages` by
+        # `ContextAssembler.assemble` (it reads `doc.messages` and merges the two
+        # streams chronologically), including the D44 `filter_messages` scope gate —
+        # so there is no longer a separate append of prior user/assistant messages
+        # here. `assembled.messages` already IS the full interleaved request minus
+        # the discovery splice above and the fit below.
 
         # Total-request fit (2026-08 fix, the core of this change): the assembled
         # list above has no total token budget of its own — the trail compaction
@@ -723,7 +745,11 @@ class AgentLoop:
         # (structured) and emitted as a guardrail span event. `None` budget (loop
         # tests that do not wire it) skips the fit entirely (byte-identical).
         if self._request_token_budget is not None:
-            fit = fit_request_to_budget(canonical, token_budget=self._request_token_budget)
+            fit = fit_request_to_budget(
+                canonical,
+                token_budget=self._request_token_budget,
+                pinned_recent_tool_pairs=self._request_budget_pinned_recent_tool_pairs,
+            )
             if fit.dropped_messages:
                 _logger.warning(
                     "request-budget trim (session=%s): dropped %d message-unit(s) "
