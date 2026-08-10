@@ -736,18 +736,33 @@ class AgentLoop:
                     )
                     continue
                 deduped_discovery.extend(pair)
-            # Splice immediately AFTER the current turn's question — the LAST `user`
-            # message — so the turn reads question -> emulated discovery -> the
-            # model's own work, instead of hoisting the pairs above turn-0's
-            # question. `context/assembly.py::_insert_retrieval` guarantees the
-            # retrieval block goes BEFORE that last `user` message, so "last user
-            # message" is the question itself, not the cards block.
-            last_user = next(
-                (i for i in range(len(canonical) - 1, -1, -1) if canonical[i]["role"] == "user"),
-                None,
+            # Splice immediately AFTER the SESSION'S FIRST question, so the emulated
+            # discovery appears ONCE, at the beginning, and STAYS there.
+            #
+            # Anchoring on the LAST `user` message instead made the pairs migrate:
+            # they are ephemeral (never persisted), so every rebuild re-spliced them
+            # after whatever the newest question was. Mid-session the model saw a
+            # fresh block of listDatabases/listTables appear AFTER it had already
+            # fetched schemas — discovery arriving later than the work it was meant
+            # to precede.
+            #
+            # The anchor is the end of the FIRST CONTIGUOUS RUN of `user` messages,
+            # not simply the first `user` message, because
+            # `context/assembly.py::_insert_retrieval` inserts the retrieval-cards
+            # block as a `user` message IMMEDIATELY BEFORE the current question. On
+            # the very first turn that block therefore PRECEDES turn-0's question and
+            # is itself the first `user` message — splicing after it would drop the
+            # pairs between the cards and the question they belong to. Consuming the
+            # whole contiguous run lands after the question in both shapes:
+            #   first turn : [cards, q0]           -> after q0
+            #   later turn : [q0] then tool/assistant -> after q0
+            first_user = next(
+                (i for i, m in enumerate(canonical) if m["role"] == "user"), None
             )
-            if last_user is not None:
-                insert_at = last_user + 1
+            if first_user is not None:
+                insert_at = first_user
+                while insert_at < len(canonical) and canonical[insert_at]["role"] == "user":
+                    insert_at += 1
             else:
                 # No dialogue at all (Layer-1 assemble) — fall back to after the
                 # leading `system` run so the base prompt stays the pinned head.
@@ -781,6 +796,15 @@ class AgentLoop:
                 canonical,
                 token_budget=self._request_token_budget,
                 pinned_recent_tool_pairs=self._request_budget_pinned_recent_tool_pairs,
+                # Pin the emulated-discovery pairs (invariant 7): anchored at the
+                # session's first question they are prior-turn trail, so the tier-0
+                # sweep would drop them first — stranding the model with a guard that
+                # says "already served" for a listing it can no longer see.
+                pinned_tool_call_ids=frozenset(
+                    m["tool_call_id"]
+                    for m in (discovery_canonical or [])
+                    if m["role"] == "tool"
+                ),
             )
             if fit.dropped_messages:
                 _logger.warning(

@@ -472,6 +472,7 @@ def fit_request_to_budget(
     *,
     token_budget: int,
     pinned_recent_tool_pairs: int = _DEFAULT_PINNED_RECENT_TOOL_PAIRS,
+    pinned_tool_call_ids: frozenset[str] | None = None,
 ) -> RequestFitResult:
     """Fit the FULL canonical request to `token_budget` while honoring the
     send-seam invariants:
@@ -498,12 +499,24 @@ def fit_request_to_budget(
          keeps a single non-terminating turn (whose tool pairs would otherwise be an
          un-trimmable pinned tail) bounded by the budget.
 
-    The head (base prompt), the current question, its retrieval block, and the K
-    most-recent current-turn tool pairs are never dropped, so in the pathological
-    corner where those ALONE exceed `token_budget` the result may still exceed it —
-    invariants 1/3/6 take precedence over 2. In practice base + question are tiny
-    and K is small.
+      7. any unit whose `tool_call_id` is in *pinned_tool_call_ids* is PINNED
+         regardless of tier or age. This carries the emulated-discovery pairs
+         (`context/discovery_emulation.py`), which are anchored at the SESSION'S
+         FIRST question and so classify as prior-turn trail — tier 0, the FIRST
+         thing dropped. Dropping them is uniquely harmful: the loop seeds its
+         repeated-idempotent-read guard from the SAME sweep, so a trimmed listing
+         leaves the model unable to see the tables AND unable to re-fetch them (the
+         guard answers "already served"). They are a handful of database/table
+         names, so pinning them costs almost nothing. `None`/empty is
+         byte-identical to before this parameter existed.
+
+    The head (base prompt), the current question, its retrieval block, the K
+    most-recent current-turn tool pairs, and any *pinned_tool_call_ids* unit are
+    never dropped, so in the pathological corner where those ALONE exceed
+    `token_budget` the result may still exceed it — invariants 1/3/6/7 take
+    precedence over 2. In practice base + question are tiny and K is small.
     """
+    pinned_ids = pinned_tool_call_ids or frozenset()
     sizes = [estimate_message_tokens(m) for m in messages]
     total = sum(sizes)
     n = len(messages)
@@ -543,12 +556,16 @@ def fit_request_to_budget(
     pinned: list[bool] = [False] * len(units)
     tiers: list[int] = [0] * len(units)
     droppable: list[int] = []
-    for u, (s, _e) in enumerate(units):
+    for u, (s, e) in enumerate(units):
         is_current = s >= turn_start
         is_tool_pair = (
             messages[s].get("role") == "assistant" and messages[s].get("tool_calls")
         )
-        if is_current and not is_tool_pair:
+        if pinned_ids and any(
+            messages[k].get("tool_call_id") in pinned_ids for k in range(s, e)
+        ):
+            pinned[u] = True  # invariant 7 — emulated discovery, never dropped.
+        elif is_current and not is_tool_pair:
             # Current-turn question / retrieval block / askUser answer — pinned.
             pinned[u] = True
         elif is_current and is_tool_pair:

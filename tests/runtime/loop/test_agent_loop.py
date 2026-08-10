@@ -533,6 +533,46 @@ async def test_emulated_discovery_pairs_injected_after_the_current_question() ->
     ]
 
 
+async def test_emulated_discovery_stays_anchored_at_the_first_question_on_later_turns() -> None:
+    # The pairs are ephemeral and re-spliced on every rebuild, so the anchor decides
+    # where they LAND each time. Anchored on the LAST user message they migrated to
+    # whatever the newest question was — mid-session the model saw a fresh block of
+    # listDatabases/listTables appear AFTER it had already fetched schemas. Anchored
+    # at the session's FIRST question they stay put, which is what "emulated once, at
+    # the beginning" has to mean in a rebuilt-every-round-trip context.
+    model = ScriptedModelClient(
+        [ModelTurnResult(assistant_text="A0."), ModelTurnResult(assistant_text="A1.")]
+    )
+    loop, _store = _build_loop(
+        model_client=model,
+        mcp_client=FakeMCPClient(),
+        discovery_emulation_provider=_discovery_provider(),
+        base_system_prompt="BASE PROMPT",
+    )
+
+    creds = _credentials()
+    await loop.run(session_id=SESSION_ID, credentials=creds, user_message="Q0?")
+    await loop.run(session_id=SESSION_ID, credentials=creds, user_message="Q1?")
+
+    messages = model.calls[1].messages
+    # Turn 1's request: the emulated pairs sit between Q0 and turn-0's answer — at
+    # the START of the session — NOT after Q1.
+    assert [m["role"] for m in messages] == [
+        "system",
+        "user",  # Q0
+        "assistant",  # emulated listDatabases
+        "tool",
+        "assistant",  # emulated listTables
+        "tool",
+        "assistant",  # A0
+        "user",  # Q1
+    ]
+    assert messages[1]["content"] == "Q0?"
+    assert messages[-1]["content"] == "Q1?"
+    # Nothing emulated trails the current question.
+    assert not any(m.get("tool_calls") for m in messages[7:])
+
+
 async def test_emulated_discovery_seeds_guard_model_recall_not_dispatched() -> None:
     # The model re-issues listTables with the SAME args the emulation served. The
     # repeated-idempotent-read guard must fire: NO MCP dispatch, and a guard trail

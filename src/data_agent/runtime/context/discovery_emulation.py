@@ -4,8 +4,9 @@ already called them (design §4.1 optimization).
 Motivation: on every turn the model was prompted to call the two discovery tools
 `listDatabases` + `listTables` before it could do real work, burning a couple of
 completion round-trips on pure discovery. Since that catalog is scope-independent
-warehouse metadata (never row/cell data), the runtime can fetch it up front — once
-per budget window — through the SAME `ToolDispatcher` the model would have used
+warehouse metadata (never row/cell data), the runtime can fetch it up front — ONCE
+PER SESSION (memoized by `EmulatedDiscoveryCache` below) — through the SAME
+`ToolDispatcher` the model would have used
 (so credentials/scope/denial-mapping/telemetry all stay consistent, D5/D57) and
 inject it into the model's message list as if the model had ALREADY made those
 calls: synthetic `assistant(tool_calls=...) + tool(result)` pairs, one per call.
@@ -46,7 +47,11 @@ Degrade-not-fail (design §2): this is pure injected context. If the MCP is
 unreachable, denies discovery, or returns an unexpected shape,
 `build_emulated_discovery` returns an EMPTY `EmulatedDiscovery` and the turn proceeds
 exactly as before — the model simply falls back to calling the two tools itself. It
-never raises out. It is never persisted to the trail and never budgeted.
+never raises out. It is never persisted to the trail, and the injected pairs are
+PINNED by `context/budget.py::fit_request_to_budget` rather than budgeted: anchored
+at the session's first question they are otherwise a prior-turn unit, the first thing
+dropped under pressure — which would strand the model with a guard that says
+"already served" for a listing no longer in its context.
 
 D5: the JWT/session_id never enter this module's output. Credentials are consumed
 only by `ToolDispatcher.dispatch`, which attaches them at the MCP transport boundary;
@@ -56,6 +61,7 @@ warehouse metadata (database + table names) only.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -65,7 +71,7 @@ from data_agent.runtime.loop.read_guard import idempotent_read_signature
 from data_agent.runtime.session.models import TrailEntry
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
     from data_agent.runtime.auth.credentials import RuntimeCredentials
     from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
@@ -88,7 +94,60 @@ _DEFAULT_BASE_DATABASE = "dbpcm_warehouse"
 # are ephemeral and never persisted, so this value is inert.
 _EMULATED_TS = "1970-01-01T00:00:00+00:00"
 
-__all__ = ["EmulatedDiscovery", "build_emulated_discovery"]
+__all__ = ["EmulatedDiscovery", "EmulatedDiscoveryCache", "build_emulated_discovery"]
+
+
+class EmulatedDiscoveryCache:
+    """Process-wide, session-keyed, bounded cache of the ONCE-PER-SESSION sweep.
+
+    `_run_loop` is re-entered by `run()`, `resume()` AND the blueprint
+    approval-resume, so an uncached sweep re-dispatched `listDatabases` +
+    `listTables` to the MCP on every budget window — and, because the pairs are
+    ephemeral and re-spliced per rebuild, the model watched a fresh block of
+    discovery calls appear mid-session AFTER it had already read schemas. The
+    warehouse catalogue is scope-independent metadata that does not change within a
+    session, so it is swept once and served from here for every later window.
+
+    Only a NON-EMPTY sweep is cached. A degraded one (MCP blip, denial, base
+    database absent) is deliberately NOT memoized — caching it would disable
+    discovery for the whole remaining session on one transient failure, so the next
+    window retries. This preserves the module's degrade-not-fail posture.
+
+    Bounded by `max_size` with FIFO eviction: an evicted session simply re-sweeps
+    once. The lock makes concurrent windows of the SAME session issue at most one
+    in-flight sweep (double-checked, mirroring `catalog/export_client.py::
+    CatalogCache`); the first result wins.
+
+    D5: only `session_id` is used as the key — no JWT/credential material is stored.
+    """
+
+    def __init__(self, max_size: int = 512) -> None:
+        self._max_size = max_size
+        self._store: dict[str, EmulatedDiscovery] = {}
+        self._order: list[str] = []
+        self._lock = asyncio.Lock()
+
+    async def get_or_build(
+        self, session_id: str, build: Callable[[], Awaitable[EmulatedDiscovery]]
+    ) -> EmulatedDiscovery:
+        """Return this session's cached sweep, or run *build* once and cache it."""
+        cached = self._store.get(session_id)
+        if cached is not None:
+            return cached
+        async with self._lock:
+            # Double-checked: a racing window may have populated it while we waited.
+            cached = self._store.get(session_id)
+            if cached is not None:
+                return cached
+            result = await build()
+            # Degrade-not-fail: never memoize an empty/degraded sweep (see above).
+            if result.entries:
+                if len(self._store) >= self._max_size:
+                    evicted = self._order.pop(0)
+                    del self._store[evicted]
+                self._store[session_id] = result
+                self._order.append(session_id)
+            return result
 
 
 @dataclass(frozen=True)

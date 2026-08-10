@@ -54,6 +54,7 @@ from data_agent.runtime.config import (
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.context.discovery_emulation import (
     EmulatedDiscovery,
+    EmulatedDiscoveryCache,
     build_emulated_discovery,
 )
 from data_agent.runtime.context.llm_summarizer import build_llm_summarizer
@@ -448,6 +449,12 @@ def create_app(
     # `loop_paused_ask_user`'s `question` payload specifically).
     _tracing_observer = tracing.guardrail_observer(tracer)
 
+    # Emulated-discovery sweep cache — built ONCE per app, NOT per request, so it
+    # actually spans a session. `_build_agent_loop` runs per request, so a cache
+    # created in there would memoize nothing across turns and the sweep would still
+    # re-dispatch on every budget window.
+    discovery_emulation_cache = EmulatedDiscoveryCache()
+
     async def _tools_provider(credentials: RuntimeCredentials) -> list[dict[str, Any]]:
         # The live MCP authenticates tools/list too (no anonymous
         # introspection) — thread this turn's credentials through, but the
@@ -486,12 +493,20 @@ def create_app(
             async def _discovery_emulation_provider(
                 creds: RuntimeCredentials,
             ) -> EmulatedDiscovery:
-                return await build_emulated_discovery(
-                    dispatcher,
-                    creds,
-                    base_database=settings.base_database,
-                    preview_row_count=settings.preview_row_count,
-                    observer=observer,
+                # ONCE PER SESSION: `_run_loop` is re-entered by run()/resume()/the
+                # blueprint approval-resume, so without this the sweep re-dispatched
+                # to the MCP on every budget window. The cache serves the first
+                # non-empty sweep for the rest of the session; a degraded one is not
+                # memoized, so a transient MCP blip retries next window.
+                return await discovery_emulation_cache.get_or_build(
+                    creds.session_id,
+                    lambda: build_emulated_discovery(
+                        dispatcher,
+                        creds,
+                        base_database=settings.base_database,
+                        preview_row_count=settings.preview_row_count,
+                        observer=observer,
+                    ),
                 )
 
             discovery_emulation_provider = _discovery_emulation_provider

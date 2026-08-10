@@ -542,3 +542,76 @@ def test_render_entry_surfaces_authoritative_verified_blueprint_flag() -> None:
     query_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
     assert bp_msg["authoritative"] is True
     assert "authoritative" not in query_msg
+
+
+def test_fit_pins_emulated_discovery_pairs_against_the_tier0_sweep() -> None:
+    # Invariant 7. The emulated-discovery pairs are anchored at the SESSION'S FIRST
+    # question, so they classify as PRIOR-TURN trail — tier 0, the first thing the
+    # drop sweep takes. Dropping them is uniquely harmful: the loop seeds its
+    # repeated-idempotent-read guard from the SAME sweep, so a trimmed listing leaves
+    # the model unable to see the tables AND unable to re-fetch them (the guard
+    # answers "already served"). Pinning by tool_call_id is what prevents that.
+    base = _sys("BASE PROMPT " + "x" * 400)
+    emulated = [
+        *_tool_pair("emulated-listDatabases", "SELECT db", "databases"),
+        *_tool_pair("emulated-listTables-dbpcm_warehouse", "SELECT tbl", "tables"),
+    ]
+    # Fat PRIOR-turn pairs + conversation that must be sacrificed instead.
+    prior: list[dict] = []
+    for i in range(10):
+        prior.extend(_tool_pair(f"c{i}", f"SELECT {i} " + "col, " * 200, "row " * 200))
+    question = _user("current question?")
+    messages = [base, _user("Q0?"), *emulated, *prior, _assistant_answer("A0."), question]
+    total = sum(estimate_message_tokens(m) for m in messages)
+    budget = total // 3  # force heavy trimming
+
+    result = fit_request_to_budget(
+        messages,
+        token_budget=budget,
+        pinned_tool_call_ids=frozenset(
+            {"emulated-listDatabases", "emulated-listTables-dbpcm_warehouse"}
+        ),
+    )
+
+    surviving_ids = {
+        tc["id"]
+        for m in result.messages
+        if m["role"] == "assistant" and m.get("tool_calls")
+        for tc in m["tool_calls"]
+    }
+    # THE POINT: both emulated pairs survive heavy pressure...
+    assert "emulated-listDatabases" in surviving_ids
+    assert "emulated-listTables-dbpcm_warehouse" in surviving_ids
+    # ...while the ordinary prior-turn pairs were genuinely sacrificed.
+    assert "c0" not in surviving_ids
+    assert result.dropped_units > 0
+    assert result.messages[0] == base
+    assert result.messages[-1] == question
+    _assert_pairing_intact(result.messages)
+
+
+def test_fit_without_pinned_ids_is_unchanged() -> None:
+    # The parameter is additive: omitting it (or passing empty) must behave exactly
+    # as before it existed — the emulated pairs are then droppable prior-turn trail.
+    base = _sys("BASE PROMPT " + "x" * 400)
+    emulated = _tool_pair("emulated-listDatabases", "SELECT db " + "x " * 200, "d " * 200)
+    prior: list[dict] = []
+    for i in range(6):
+        prior.extend(_tool_pair(f"c{i}", f"SELECT {i} " + "col, " * 200, "row " * 200))
+    question = _user("current question?")
+    messages = [base, _user("Q0?"), *emulated, *prior, question]
+    budget = sum(estimate_message_tokens(m) for m in messages) // 3
+
+    default = fit_request_to_budget(messages, token_budget=budget)
+    explicit_empty = fit_request_to_budget(
+        messages, token_budget=budget, pinned_tool_call_ids=frozenset()
+    )
+
+    assert default.messages == explicit_empty.messages
+    surviving_ids = {
+        tc["id"]
+        for m in default.messages
+        if m["role"] == "assistant" and m.get("tool_calls")
+        for tc in m["tool_calls"]
+    }
+    assert "emulated-listDatabases" not in surviving_ids  # droppable without the pin

@@ -190,7 +190,12 @@ def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> Non
             "listTables": [[{"database": db, "name": "employee", "engine": "MergeTree"}]],
         },
     )
-    model_client = ScriptedModelClient([ModelTurnResult(assistant_text="Here is your answer.")])
+    model_client = ScriptedModelClient(
+        [
+            ModelTurnResult(assistant_text="Here is your answer."),
+            ModelTurnResult(assistant_text="Second answer."),
+        ]
+    )
     app = create_app(
         settings=RuntimeSettings(
             max_loop_iterations=15,
@@ -221,6 +226,20 @@ def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> Non
     # The sweep dispatched exactly the two discovery tools through the real MCP —
     # ONE listTables, for the base database only.
     assert [c.tool_name for c in mcp_client.calls] == ["listDatabases", "listTables"]
+
+    # ONCE PER SESSION: a SECOND turn on the SAME session must be served from
+    # `EmulatedDiscoveryCache` — no further MCP round-trips. `_run_loop` is
+    # re-entered by run()/resume()/the blueprint approval-resume, so before the cache
+    # every budget window re-swept, and the ephemeral pairs re-appeared mid-session
+    # after the model had already fetched schemas.
+    response2 = client.post("/turn", json={"message": "And by department?"}, headers=HEADERS)
+    assert response2.status_code == 200
+    assert [c.tool_name for c in mcp_client.calls] == ["listDatabases", "listTables"]
+
+    # The pairs still reach the second turn's payload — served from cache, not re-swept.
+    tool_ids2 = [m["tool_call_id"] for m in model_client.calls[1].messages if m["role"] == "tool"]
+    assert "emulated-listDatabases" in tool_ids2
+    assert f"emulated-listTables-{db}" in tool_ids2
 
 
 def test_turn_endpoint_missing_auth_header_returns_401(monkeypatch) -> None:

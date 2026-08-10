@@ -13,12 +13,14 @@ result) still injects the listDatabases pair on its own; and the sweep never rai
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.budget import _render_entry
 from data_agent.runtime.context.discovery_emulation import (
     EmulatedDiscovery,
+    EmulatedDiscoveryCache,
     build_emulated_discovery,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
@@ -333,3 +335,109 @@ async def test_observer_receives_shape_only_event() -> None:
 
     assert discovery.entries  # non-empty
     assert events == [("discovery_emulated", {"database_count": 1, "table_count": 2})]
+
+
+# ---------------------------------------------------------------------------
+# EmulatedDiscoveryCache — the ONCE-PER-SESSION memo
+# ---------------------------------------------------------------------------
+
+
+def _nonempty() -> EmulatedDiscovery:
+    return EmulatedDiscovery(entries=[{"tool_name": "listDatabases"}], read_signatures={("a", "b")})
+
+
+async def test_cache_sweeps_once_per_session_and_serves_the_rest() -> None:
+    # THE POINT of the cache: `_run_loop` is re-entered by run()/resume()/the
+    # blueprint approval-resume, so an uncached sweep re-dispatched listDatabases +
+    # listTables to the MCP on EVERY budget window.
+    cache = EmulatedDiscoveryCache()
+    builds = 0
+
+    async def _build() -> EmulatedDiscovery:
+        nonlocal builds
+        builds += 1
+        return _nonempty()
+
+    first = await cache.get_or_build("sess-1", _build)
+    second = await cache.get_or_build("sess-1", _build)
+    third = await cache.get_or_build("sess-1", _build)
+
+    assert builds == 1
+    assert first is second is third
+
+
+async def test_cache_is_keyed_per_session() -> None:
+    cache = EmulatedDiscoveryCache()
+    builds = 0
+
+    async def _build() -> EmulatedDiscovery:
+        nonlocal builds
+        builds += 1
+        return _nonempty()
+
+    await cache.get_or_build("sess-1", _build)
+    await cache.get_or_build("sess-2", _build)
+
+    assert builds == 2
+
+
+async def test_cache_does_not_memoize_a_degraded_sweep() -> None:
+    # Degrade-not-fail: caching an empty result would disable discovery for the whole
+    # remaining session on ONE transient MCP blip. The next window must retry — and
+    # once it succeeds, THAT result is the one that sticks.
+    cache = EmulatedDiscoveryCache()
+    results = [EmulatedDiscovery(), EmulatedDiscovery(), _nonempty()]
+    builds = 0
+
+    async def _build() -> EmulatedDiscovery:
+        nonlocal builds
+        result = results[builds]
+        builds += 1
+        return result
+
+    assert (await cache.get_or_build("s", _build)).entries == []
+    assert (await cache.get_or_build("s", _build)).entries == []
+    good = await cache.get_or_build("s", _build)
+    assert good.entries  # the retry succeeded
+    assert builds == 3
+
+    # Now it is memoized — no fourth build.
+    assert await cache.get_or_build("s", _build) is good
+    assert builds == 3
+
+
+async def test_cache_concurrent_windows_of_one_session_build_once() -> None:
+    # Double-checked lock: concurrent windows must not each spend the 1+N MCP
+    # round-trips. Without the lock all three racers would miss the cache together.
+    cache = EmulatedDiscoveryCache()
+    builds = 0
+
+    async def _build() -> EmulatedDiscovery:
+        nonlocal builds
+        builds += 1
+        await asyncio.sleep(0)  # yield, so a lock-free impl would interleave
+        return _nonempty()
+
+    await asyncio.gather(*(cache.get_or_build("s", _build) for _ in range(3)))
+
+    assert builds == 1
+
+
+async def test_cache_evicts_fifo_at_max_size() -> None:
+    cache = EmulatedDiscoveryCache(max_size=2)
+    builds = 0
+
+    async def _build() -> EmulatedDiscovery:
+        nonlocal builds
+        builds += 1
+        return _nonempty()
+
+    await cache.get_or_build("a", _build)
+    await cache.get_or_build("b", _build)
+    await cache.get_or_build("c", _build)  # evicts "a"
+    assert builds == 3
+
+    await cache.get_or_build("b", _build)  # still cached
+    assert builds == 3
+    await cache.get_or_build("a", _build)  # evicted -> re-sweeps
+    assert builds == 4
