@@ -47,6 +47,26 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         retryable=False,
         user_message="That data isn't available in this session.",
     ),
+    # ANSWER_TABLE_BLUEPRINT_NOT_RUN: the model ended its turn with
+    # `answerWithTable(blueprint_id=…)` naming a blueprint it never actually ran, so
+    # there is no terminal SQL to resolve and the user would have got prose with no
+    # table. RETRYABLE and instructional: the fix is one `runBlueprint` call away and
+    # the model can make it inside the same turn.
+    #
+    # It lives HERE, not only on the ToolResult, because `user_message` is not
+    # persisted on TrailEntry — `context/budget.py::_render_entry` re-derives it from
+    # `error_code` on every later rebuild. An unregistered code renders as the
+    # generic "Something went wrong processing that request.", which would strand
+    # the model with no idea what to do differently.
+    "ANSWER_TABLE_BLUEPRINT_NOT_RUN": DenialInfo(
+        code="ANSWER_TABLE_BLUEPRINT_NOT_RUN",
+        retryable=True,
+        user_message=(
+            "You referenced a blueprint you have not run in this turn, so there is no "
+            "table to show. Call runBlueprint with that blueprint first, then call "
+            "answerWithTable again."
+        ),
+    ),
     "PARSE_FAILED_CLOSED": DenialInfo(
         code="PARSE_FAILED_CLOSED",
         retryable=True,

@@ -278,16 +278,66 @@ async def test_last_designation_wins() -> None:
 # --- blueprint_id designation ----------------------------------------------
 
 
-async def test_an_unresolvable_blueprint_id_keeps_the_prose_and_drops_the_table() -> None:
+async def test_an_unrun_blueprint_id_nudges_instead_of_ending_the_turn() -> None:
     """A blueprint that did not run this turn has no terminal SQL to resolve to.
-    Re-running it to find out would decouple the paged table from the D56
-    verification that gated the answer, so the answer ships without a table."""
-    loop, _ = _build_loop(
-        ScriptedModelClient([_answer("a1", answer="See table.", blueprint_id="bp-never-ran")])
+    Silently shipping prose with no table would leave the model none the wiser, so
+    the call becomes a RETRYABLE nudge and the turn continues — the fix is one
+    runBlueprint away and the model can make it in the same turn.
+
+    (Re-running the blueprint HERE to find out is not the answer: it would decouple
+    the paged table from the D56 verification that gated the answer the user sees.)
+    """
+    model = ScriptedModelClient(
+        [
+            _answer("a1", answer="See table.", blueprint_id="bp-never-ran"),
+            ModelTurnResult(assistant_text="Recovered without a table."),
+        ]
     )
+    loop, store = _build_loop(model)
+
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
-    assert outcome.assistant_text == "See table."
+
+    # It did NOT terminate on the designation — the model got another round-trip.
+    assert len(model.calls) == 2
+    assert outcome.assistant_text == "Recovered without a table."
     assert outcome.answer_sql is None
+
+    entry = [e for e in await store.load_trail(SESSION_ID) if e.tool_name == "answerWithTable"][0]
+    assert entry.status == "error"
+    assert entry.error_code == "ANSWER_TABLE_BLUEPRINT_NOT_RUN"
+
+
+async def test_the_nudge_is_visible_to_the_model_on_the_next_round_trip() -> None:
+    """The instruction has to SURVIVE the rebuild. `user_message` is not persisted on
+    TrailEntry, so `_render_entry` re-derives it from `error_code` — an unregistered
+    code would degrade to the generic "Something went wrong processing that request."
+    and the model would be told nothing actionable. Asserted on the RENDERED context,
+    not on the ToolResult, because that is what the model actually reads."""
+    model = ScriptedModelClient(
+        [
+            _answer("a1", answer="See table.", blueprint_id="bp-never-ran"),
+            ModelTurnResult(assistant_text="ok"),
+        ]
+    )
+    loop, _ = _build_loop(model)
+    await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
+
+    rendered = [
+        m for m in model.calls[1].messages
+        if m.get("role") == "tool" and "runBlueprint" in str(m.get("content", ""))
+    ]
+    assert rendered, "the nudge must reach the model's next round-trip"
+    assert "run" in str(rendered[0]["content"]).lower()
+
+
+async def test_a_raw_sql_designation_is_never_nudged() -> None:
+    """The nudge is only for an unresolvable BLUEPRINT reference. A raw-SQL answer
+    has nothing to look up, so it must terminate normally."""
+    model = ScriptedModelClient([_answer("a1", answer="Done.", sql=_ANSWER_SQL)])
+    loop, _ = _build_loop(model)
+    outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
+    assert len(model.calls) == 1
+    assert outcome.answer_sql == _ANSWER_SQL
 
 
 async def test_raw_sql_wins_when_both_are_given() -> None:

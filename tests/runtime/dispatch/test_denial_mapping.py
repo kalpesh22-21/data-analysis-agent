@@ -43,6 +43,9 @@ _READ_TOOL_CODES = {
 }
 
 _EXPECTED_RETRYABLE = {
+    # RETRYABLE on purpose: the fix is one runBlueprint call away and the model can
+    # make it inside the same turn.
+    "ANSWER_TABLE_BLUEPRINT_NOT_RUN": True,
     "COLUMN_SCOPE_VIOLATION": False,
     "SCRATCH_SESSION_VIOLATION": False,
     "PARSE_FAILED_CLOSED": True,
@@ -62,7 +65,20 @@ _EXPECTED_RETRYABLE = {
     "RUNTIME_TOOL_INTERNAL_ERROR": False,
 }
 
-_ALL_KNOWN_CODES = _ALL_SEVEN_CODES | _GUARDRAIL_CODES | _COMPOSITE_CODES | _READ_TOOL_CODES
+# `answerWithTable(blueprint_id=…)` naming a blueprint that never ran this turn.
+# Registered here — not only on the ToolResult — because `user_message` is not
+# persisted on TrailEntry: every later rebuild re-derives it from `error_code`, and
+# an unregistered code would render as the generic failure string, stranding the
+# model with no idea what to do differently.
+_ANSWER_TABLE_CODES = {"ANSWER_TABLE_BLUEPRINT_NOT_RUN"}
+
+_ALL_KNOWN_CODES = (
+    _ALL_SEVEN_CODES
+    | _GUARDRAIL_CODES
+    | _COMPOSITE_CODES
+    | _READ_TOOL_CODES
+    | _ANSWER_TABLE_CODES
+)
 
 
 def test_all_known_codes_are_registered() -> None:

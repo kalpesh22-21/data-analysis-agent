@@ -349,6 +349,46 @@ class TurnOutcome:
     assumptions: list[str] | None = None
 
 
+ANSWER_TABLE_BLUEPRINT_NOT_RUN_CODE = "ANSWER_TABLE_BLUEPRINT_NOT_RUN"
+
+
+def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
+    """The nudge for `answerWithTable(blueprint_id=X)` where X never ran this turn.
+
+    Without it the call SUCCEEDS and — because it carries `answer` — TERMINATES the
+    turn, so the user gets prose with no table and the model never learns why. The
+    designation is advisory, but silently swallowing a designation the model
+    explicitly made is the wrong kind of advisory.
+
+    A non-`ok` status is what makes this work end-to-end: it stops the terminal exit
+    firing (so the turn continues and the model can fix it), and
+    `scope_filter.filter_trail`'s current-turn exemption is status-gated to
+    `status != "ok"`, so the entry reaches the model this same turn instead of being
+    dropped as undetermined-provenance history.
+
+    The instructional text is ALSO registered in `dispatch/denial_mapping.py` — the
+    `user_message` here is what the model sees on the live turn, but it is not
+    persisted on `TrailEntry`, so every later rebuild re-derives it from
+    `error_code`. Unregistered, that would degrade to the generic "Something went
+    wrong processing that request." and the nudge would be lost on the next
+    round-trip.
+    """
+    return ToolResult(
+        status="error",
+        tool_name=ANSWER_TABLE_TOOL_NAME,
+        error_code=ANSWER_TABLE_BLUEPRINT_NOT_RUN_CODE,
+        retryable=True,
+        user_message=(
+            f"You referenced blueprint '{blueprint_id}', but you have not run it in "
+            "this turn, so there is no table to show. Call runBlueprint with that "
+            "blueprint first, then call answerWithTable again."
+        ),
+        provenance=frozenset(),
+        result_preview=None,
+        result_full=None,
+    )
+
+
 def _capture_terminal_sql(
     tool_name: str, tool_result: ToolResult, *, into: dict[str, str]
 ) -> None:
@@ -1380,22 +1420,24 @@ class AgentLoop:
                 resolved = replacement
         return resolved
 
+    @staticmethod
     def _accumulate_answer_sql(
-        self,
         tool_name: str,
-        arguments: dict[str, Any],
         tool_result: ToolResult,
         *,
         answer_sql: str | None,
-        blueprint_terminal_sql: dict[str, str],
-        session_id: str,
-        turn_index: int,
+        resolved: str | None,
     ) -> str | None:
         """Fold one SUCCESSFUL `answerWithTable` call into the turn's `answer_sql`
         (mirrors `_accumulate_assumptions`: read from the call ARGUMENTS, never from
         the result). Returns the new value; a no-op returning *answer_sql* unchanged
         for any non-`ok` / non-`answerWithTable` call, so it is safe to call
         unconditionally.
+
+        *resolved* is the output of `_resolve_answer_sql`, computed ONCE by the
+        caller and passed in — resolving here as well would fire the
+        `hooks/answer_table.py` seams TWICE per designation, which a registered hook
+        would see as two events for one model decision.
 
         LAST designation wins. A second `answerWithTable` means the model changed its
         mind about which query is the answer — the later choice is the current one.
@@ -1405,16 +1447,7 @@ class AgentLoop:
         than clearing it, so a malformed retry cannot silently drop a good table."""
         if tool_result.status != "ok" or tool_name != ANSWER_TABLE_TOOL_NAME:
             return answer_sql
-        args = arguments if isinstance(arguments, dict) else {}
-        return (
-            self._resolve_answer_sql(
-                args,
-                blueprint_terminal_sql=blueprint_terminal_sql,
-                session_id=session_id,
-                turn_index=turn_index,
-            )
-            or answer_sql
-        )
+        return resolved or answer_sql
 
     @staticmethod
     def _accumulate_assumptions(
@@ -1797,6 +1830,39 @@ class AgentLoop:
                         tool_call.name, tool_call.arguments, credentials
                     )
 
+                # answerWithTable naming a blueprint it never ran: turn the call
+                # into a retryable NUDGE rather than letting it terminate the turn
+                # with no table. Done HERE, before the trail entry is written, so the
+                # persisted entry IS the nudge and the model sees it on the next
+                # round-trip. Only when there is no raw `sql` to fall back on, and
+                # only after `_resolve_answer_sql` has had its go — which includes
+                # giving the dormant ON_ANSWER_TABLE_UNRESOLVED hook first refusal, so
+                # a registered hook that supplies a replacement wins over the nudge.
+                resolved_answer_sql: str | None = None
+                if (
+                    tool_call.name == ANSWER_TABLE_TOOL_NAME
+                    and tool_result.status == "ok"
+                    and isinstance(tool_call.arguments, dict)
+                ):
+                    # Resolved ONCE — the hooks fire here and nowhere else.
+                    resolved_answer_sql = self._resolve_answer_sql(
+                        tool_call.arguments,
+                        blueprint_terminal_sql=blueprint_terminal_sql,
+                        session_id=session_id,
+                        turn_index=turn_index,
+                    )
+                    named_blueprint = clean_blueprint_id(
+                        tool_call.arguments.get("blueprint_id")
+                    )
+                    if named_blueprint is not None and resolved_answer_sql is None:
+                        _logger.info(
+                            "answerWithTable named blueprint %r that did not run this "
+                            "turn — nudging the model to run it first (session=%s)",
+                            named_blueprint,
+                            session_id,
+                        )
+                        tool_result = _answer_table_blueprint_not_run(named_blueprint)
+
                 # §2.5 pausing-runtime-tool seam: a runtime tool may signal a
                 # pause (today only `runBlueprint`, on a slot-resolution
                 # `askUser`). This GENERALIZES the terminal `askUser` branch
@@ -1872,12 +1938,9 @@ class AgentLoop:
                 # rather than accumulating, since a turn has one answer table.
                 answer_sql = self._accumulate_answer_sql(
                     tool_call.name,
-                    tool_call.arguments,
                     tool_result,
                     answer_sql=answer_sql,
-                    blueprint_terminal_sql=blueprint_terminal_sql,
-                    session_id=session_id,
-                    turn_index=turn_index,
+                    resolved=resolved_answer_sql,
                 )
                 # TERMINAL: a successful `answerWithTable` carries the final prose,
                 # so the turn ends on it. Recorded here and acted on AFTER the whole
