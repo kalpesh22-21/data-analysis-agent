@@ -10,8 +10,9 @@ from __future__ import annotations
 from typing import Any
 
 from data_agent.learning.extractor import ExtractorConfig, LearningExtractor
-from data_agent.learning.extractor.schema import EXTRACTOR_TOOL_NAME
-from data_agent.learning.summary.models import SessionSummary, ToolCallSummary
+from data_agent.learning.extractor.schema import EXTRACTOR_TOOL_NAME, SEARCH_CORPUS_TOOL_NAME
+from data_agent.learning.priorart import PriorArtCard
+from data_agent.learning.summary.models import SessionSummary, ToolCallSummary, TurnSummary
 from data_agent.learning.triage import TriageVerdict
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
@@ -46,9 +47,23 @@ def make_tool_call(
     )
 
 
+def make_turn(
+    turn_index: int = 0,
+    *,
+    user_nl: str | None = "how much did Analytics earn in 2025?",
+    assistant_text: str | None = None,
+    tool_call_refs: tuple[str, ...] = ("tc1",),
+) -> TurnSummary:
+    return TurnSummary(
+        turn_index=turn_index, user_nl=user_nl, assistant_text=assistant_text,
+        tool_call_refs=tool_call_refs,
+    )
+
+
 def make_summary(
     *,
     tool_calls: tuple[ToolCallSummary, ...] | None = None,
+    turns: tuple[TurnSummary, ...] = (),
     accepted_signal: str | None = "no_correction",
     session_id: str = "sess-1",
     trace_id: str = "trace-1",
@@ -58,7 +73,7 @@ def make_summary(
     return SessionSummary(
         session_id=session_id, user_id=user_id, scope_ref="scope-abc", trace_id=trace_id,
         content_hash=content_hash,
-        turns=(),
+        turns=turns,
         tool_calls=tool_calls if tool_calls is not None else (make_tool_call(),),
         blueprint_usages=(), askuser_exchanges=(), failed_fixed_sql=(),
         accepted_signal=accepted_signal,
@@ -68,6 +83,13 @@ def make_summary(
 # --- parameterization entry builders -----------------------------------------
 
 
+# Sentinel for `param_slot(binds_to=...)`: absent ⇒ derive the FQ default, explicit
+# `None` ⇒ emit a NULL `binds_to`. The two are different candidates now (a windowed
+# slot must declare null; every other type must declare a column), so the builder
+# cannot use `None` to mean "unspecified" the way it did before plan §3a.
+_DERIVE_BINDS_TO = "<derive>"
+
+
 def param_slot(
     column: str,
     *,
@@ -75,7 +97,7 @@ def param_slot(
     slot_type: str = "entity",
     required: bool = True,
     optional_pattern: str | None = None,
-    binds_to: str | None = None,
+    binds_to: str | None = _DERIVE_BINDS_TO,
     value: str = "X",
     table: str = "payroll.payroll_fact",
 ) -> dict[str, Any]:
@@ -85,7 +107,7 @@ def param_slot(
         "slot": {
             "name": name or column,
             "type": slot_type,
-            "binds_to": binds_to or f"{table}.{column}",
+            "binds_to": f"{table}.{column}" if binds_to == _DERIVE_BINDS_TO else binds_to,
             "required": required,
             "optional_pattern": optional_pattern,
         },
@@ -170,24 +192,80 @@ def scripted_turn(candidates: list[dict[str, Any]]) -> ModelTurnResult:
     )
 
 
+def search_turn(query: str = "headcount by department",
+                *, kinds: list[str] | None = None,
+                call_id: str = "call_s1") -> ModelTurnResult:
+    """One `searchCorpus` tool call (plan §3a) — the model asking before emitting."""
+    args: dict[str, Any] = {"query": query}
+    if kinds is not None:
+        args["kinds"] = kinds
+    return ModelTurnResult(
+        tool_calls=[ToolCallRequest(id=call_id, name=SEARCH_CORPUS_TOOL_NAME, arguments=args)]
+    )
+
+
 def make_extractor(
     turns: list[ModelTurnResult],
     *,
     known_rules: frozenset[str] = frozenset(),
     max_retries: int = 2,
+    prior_art: object | None = None,
+    max_search_calls: int = 3,
 ) -> LearningExtractor:
     client = ScriptedModelClient(turns)
-    return LearningExtractor(client, config=ExtractorConfig(max_retries=max_retries,
-                                                            known_rules=known_rules))
+    return LearningExtractor(
+        client,
+        config=ExtractorConfig(
+            max_retries=max_retries,
+            known_rules=known_rules,
+            max_search_calls=max_search_calls,
+        ),
+        prior_art=prior_art,  # type: ignore[arg-type]
+    )
 
 
 def emit_extractor(
     candidates: list[dict[str, Any]],
     *,
     known_rules: frozenset[str] = frozenset(),
+    prior_art: object | None = None,
 ) -> LearningExtractor:
     """Extractor scripted to emit exactly *candidates* in one tool call."""
-    return make_extractor([scripted_turn(candidates)], known_rules=known_rules)
+    return make_extractor(
+        [scripted_turn(candidates)], known_rules=known_rules, prior_art=prior_art
+    )
+
+
+def prior_art_card(
+    id_: str,
+    *,
+    intent: str = "",
+    tier: str = "mcp",
+    status: str = "validated",
+    kind: str = "blueprint",
+    verified: bool | None = True,
+    drift_status: str = "clean",
+    result_grain: tuple[str, ...] = (),
+    uses_rules: tuple[str, ...] = (),
+    similarity: float = 0.0,
+    model_matched: bool = True,
+) -> PriorArtCard:
+    """A `PriorArtCard` for the extractor tests (mirrors the priorart suite's builder)."""
+    return PriorArtCard(
+        id=id_,
+        kind=kind,  # type: ignore[arg-type]
+        tier=tier,  # type: ignore[arg-type]
+        status=status,
+        verified=verified,
+        drift_status=drift_status,
+        intent=intent or id_,
+        result_grain=result_grain,
+        uses_rules=uses_rules,
+        structural_key="",
+        embedding_model="all-mpnet-base-v2",
+        similarity=similarity,
+        model_matched=model_matched,
+    )
 
 
 def malformed_turn(text: str = "here are your candidates") -> ModelTurnResult:

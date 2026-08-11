@@ -197,14 +197,30 @@ def _bool_or_none(raw: Any) -> bool | None:
 
 
 def _float(raw: Any) -> float:
-    """The index score as a float. A non-numeric score means the row is unusable for
-    ranking (every consumer `>=`-compares it against a threshold, which raises on a
-    str/None), so it degrades to 0.0 — the bottom of the list — rather than crashing the
-    whole search. `bool` is excluded explicitly: it is an `int` subclass, and a `True`
-    score silently ranking as 1.0 would be a perfect false positive."""
+    """The index score as a renderable float in `[0.0, 1.0]`.
+
+    A score that is unusable for RANKING degrades to 0.0 — the bottom of the list —
+    rather than crashing the whole search. Three ways to be unusable, and the third was
+    missing until a prompt started rendering these:
+
+      * non-numeric — every consumer `>=`-compares it against a threshold, which raises
+        on a `str`/`None`;
+      * `bool` — an `int` subclass, and a `True` silently ranking as 1.0 is a perfect
+        false positive;
+      * OUT OF RANGE or unconvertible. The score is a cosine, so anything outside
+        `[0, 1]` is a broken signal rather than a weak one. `float(10**400)` raises
+        `OverflowError`; `inf` outranks every genuine hit and would let a hand-edited
+        node top the list; `nan` fails both comparisons here and is rejected by the
+        same test. Only a hand edit or a foreign writer can put such a value on a node,
+        which is exactly the population the `unsourced` tier exists to flag.
+    """
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return 0.0
-    return float(raw)
+    try:
+        value = float(raw)
+    except (OverflowError, ValueError):  # an int too large to be a float
+        return 0.0
+    return value if 0.0 <= value <= 1.0 else 0.0
 
 
 def _rule_ids(raw: Any) -> tuple[str, ...]:

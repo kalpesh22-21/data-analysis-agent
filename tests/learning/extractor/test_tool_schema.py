@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from data_agent.learning.extractor.models import SLOT_TYPES
+from data_agent.learning.extractor.models import SLOT_TYPES, UNSUPPORTED_SLOT_TYPES
 from data_agent.learning.extractor.schema import (
     EXTRACTOR_TOOL_NAME,
     SLOT_TYPE_ENUM,
@@ -56,7 +56,12 @@ def test_slot_type_is_constrained_to_the_real_enum():
     slot = payload["properties"]["parameterization"]["items"]["properties"]["slot"]
     slot_obj = next(s for s in slot["anyOf"] if s.get("type") == "object")
     assert slot_obj["properties"]["type"]["enum"] == SLOT_TYPE_ENUM
-    assert set(SLOT_TYPE_ENUM) == set(SLOT_TYPES)  # in lockstep with the models
+    # In lockstep with the models, MINUS what the pipeline cannot generalize. This was
+    # a bare `== set(SLOT_TYPES)` until `period_range` was withdrawn — the enum is now
+    # a DERIVED subtraction rather than a copy, so there is still exactly one place to
+    # change. See `test_period_range_withdrawn_qa.py` for why the type is withheld.
+    assert set(SLOT_TYPE_ENUM) == set(SLOT_TYPES) - set(UNSUPPORTED_SLOT_TYPES)
+    assert set(UNSUPPORTED_SLOT_TYPES) <= set(SLOT_TYPES)
 
 
 def test_slot_binds_to_documents_the_fully_qualified_rule():

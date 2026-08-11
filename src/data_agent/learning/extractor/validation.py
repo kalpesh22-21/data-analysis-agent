@@ -12,9 +12,10 @@ a reason code the consumer traces). The validations are the S3 safety teeth:
   - **Totality, no drop** (D97): exactly one `ParamPlan` per literal predicate of
     the accepted SQL — a missing predicate is a silent dropped filter →
     `totality_violation` (fail-to-review). Un-parseable SQL → `unrewritable_sql`.
-  - **Role consistency** (D97): slot→valid type + optional slot carries an
-    `optional_pattern` (no silent drop); rule→an EXISTING catalog `rule_id`
-    (missing ⇒ `missing_rule`, the §7 pairing hook); inline→a `why`.
+  - **Role consistency** (D97): slot→valid type + a `binds_to` iff the type takes
+    one (see `WINDOWED_SLOT_TYPES`) + optional slot carries an `optional_pattern`
+    (no silent drop); rule→an EXISTING catalog `rule_id` (missing ⇒ `missing_rule`,
+    the §7 pairing hook); inline→a `why`.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from ..summary.models import SessionSummary
 from .models import (
     NODE_KINDS,
     SLOT_TYPES,
+    UNSUPPORTED_SLOT_TYPES,
+    WINDOWED_SLOT_TYPES,
     BlueprintPayload,
     CandidateHeader,
     ColumnShape,
@@ -97,10 +100,18 @@ def _header(raw: dict[str, Any], evidence: tuple[EvidenceRef, ...]) -> Candidate
 
 def _slot_plan(raw: dict[str, Any]) -> SlotPlan:
     enum_values = raw.get("enum_values")
+    # ABSENT and explicit-null both mean "this slot declares no column domain", which
+    # is legal for exactly the two `WINDOWED_SLOT_TYPES` and illegal for everything
+    # else — `_validate_roles` decides which, because it is the only place that knows
+    # the type. A PRESENT non-null value is still `str()`-coerced exactly as before,
+    # so a model emitting `binds_to: 123` keeps its existing route (a bogus bind that
+    # fails S4's `binds_to ⊆ uses` check and reaches a HUMAN via fail-to-review),
+    # rather than being newly hard-rejected here.
+    raw_binds = raw.get("binds_to")
     return SlotPlan(
         name=str(raw["name"]),
         type=str(raw["type"]),
-        binds_to=str(raw["binds_to"]),
+        binds_to=None if raw_binds is None else str(raw_binds),
         # A real model sometimes omits `required`. Default to True: a predicate that
         # appeared in the ACCEPTED SQL is required unless the model explicitly marks
         # it optional — the safe side of the no-drop (D97) invariant (an optional slot
@@ -295,6 +306,67 @@ def _validate_roles(params: list[ParamPlan], known_rules: frozenset[str]) -> Dec
         if p.role == "slot":
             if p.slot is None or p.slot.type not in SLOT_TYPES:
                 return Decline("blueprint", REASON_BAD_ROLE, f"slot {p.locator.column} invalid type")
+            # A type the RUNTIME executes but this pipeline cannot GENERALIZE. Declined
+            # FIRST, before the `binds_to` rules below, so the reason names the actual
+            # blocker rather than a consequence of it.
+            #
+            # Reached only by a replayed candidate, a hand-fed payload or a
+            # non-enforcing model — the prompt enum does not offer these
+            # (`schema.py::SLOT_TYPE_ENUM`). It exists because the alternative is the
+            # failure this whole rule family is about: `period_range` extracts and
+            # generalizes into a template whose tokens no slot declares, dies at the
+            # landing gates, and golden replay says `passed=True` on the way there
+            # (the fake probe never executes the SQL). An honest decline beats a
+            # silent dead end four stages downstream.
+            if p.slot.type in UNSUPPORTED_SLOT_TYPES:
+                return Decline(
+                    "blueprint", REASON_BAD_ROLE,
+                    f"slot {p.slot.name} has type {p.slot.type!r}, which the runtime "
+                    "executes but S4 cannot yet generalize (rewrite_sql_to_template "
+                    "emits ONE token per predicate; this type binds two, "
+                    "{name}_start/{name}_end). Express the filter as two separate "
+                    "as_of_date/period slots instead.",
+                )
+            # `binds_to` presence is TYPE-DEPENDENT, and the two directions are
+            # DIFFERENT tests on purpose — each mirrors the operation its own
+            # downstream reader performs, not the English sentence "must/must not
+            # declare a binding target":
+            #
+            #   windowed  → `is not None`. `SlotSpec.parse` (models.py:170) refuses on
+            #     `binds_to is not None`, so `""` is a REFUSAL there. A truthiness test
+            #     here agreed with it on every input except that one — and `""` is
+            #     exactly what an "emit null" instruction routinely produces, and what
+            #     the schema's `["string","null"]` permits. It passed this validator,
+            #     passed S4 (`builder.py:75` also skips falsy), and raised
+            #     `BlueprintParseError` at LANDING out of `blueprint_seed_from_candidate`
+            #     — reintroducing the extraction-clean-then-landing-raise failure this
+            #     rule exists to eliminate. Seventh sighting of the derive-the-guard
+            #     class; the guard was written from the INTENT rather than the read.
+            #
+            #   non-windowed → truthiness. Nothing downstream raises on an absent
+            #     `binds_to` here; the harm is silent (the slot lands with no domain, so
+            #     the DISTINCT-domain probe that makes a value checkable never fires and
+            #     S4's `binds_to ⊆ uses` assertion is vacuous), and `""` is just as
+            #     unusable as absent. So the empty string belongs on the REJECT side of
+            #     this branch and on the ACCEPT side of the one above — which is why
+            #     they cannot share a predicate.
+            #     (Before this slice the field was mandatory in `_slot_plan`, so an
+            #     absent one was a KeyError ⇒ `malformed_candidate`; it is now a named
+            #     role decline, the same hard reject with a reason a prompt-tuner can
+            #     act on.)
+            if p.slot.type in WINDOWED_SLOT_TYPES:
+                if p.slot.binds_to is not None:
+                    return Decline(
+                        "blueprint", REASON_BAD_ROLE,
+                        f"{p.slot.type} slot {p.slot.name} must not declare binds_to "
+                        "(a windowed-period slot consumes no column domain; emit null)",
+                    )
+            elif not p.slot.binds_to:
+                return Decline(
+                    "blueprint", REASON_BAD_ROLE,
+                    f"slot {p.slot.name} has no binds_to (only a "
+                    f"{sorted(WINDOWED_SLOT_TYPES)} slot may omit it)",
+                )
             # An `enum` slot MUST carry non-empty enum_values — the runtime
             # `SlotSpec.parse` rejects an enum slot without them (un-landable). Catch
             # it here as a traceable decline rather than a crash at landing. A

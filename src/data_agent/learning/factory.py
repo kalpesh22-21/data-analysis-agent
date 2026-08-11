@@ -178,13 +178,16 @@ def build_learning_consumer(
     insert-only embedder → hard-key-only dedup, null git client → PR-marker-only
     schema-edit) so the SIX stages are always all present or all absent.
 
-    `prior_art` is deliberately NOT part of the all-or-nothing unit (PriorArt Slice 2).
-    Absent, the dedup stage behaves exactly as it did before the slice — hard key plus a
-    brute-force corpus-bucket scan — which is a fully correct, if blinkered, loop. Making
-    it required would mean a neo4j outage stops learning, and the whole point of the
-    fail-open posture is that it must not. It is logged loudly instead, because the
-    symptom of running without it (duplicate candidates for blueprints the canon already
-    carries) points nowhere near the cause.
+    `prior_art` is deliberately NOT part of the all-or-nothing unit (PriorArt Slice 2),
+    and it is threaded to TWO collaborators: the S6 dedup stage and — since plan §3a —
+    the S3 extractor, which pre-fetches a PRIOR ART block and gains a `searchCorpus`
+    tool. Absent, BOTH behave exactly as they did before their respective slices: dedup
+    on hard key plus a brute-force corpus-bucket scan, and the extractor on a single
+    forced `emit_candidates` call with no block and no search tool. Making it required
+    would mean a neo4j outage stops learning, and the whole point of the fail-open
+    posture is that it must not. It is logged loudly instead, because the symptom of
+    running without it (duplicate candidates for blueprints the canon already carries)
+    points nowhere near the cause.
     """
     loader_triage = _loader_triage_kwargs(summary_loader, triage)
 
@@ -246,9 +249,11 @@ def build_learning_consumer(
         # produces a duplicate that nothing notices. Never a crash (a deployment with no
         # graph must keep draining the queue) — but never silent.
         _logger.warning(
-            "no prior-art index wired — the S6 cross-tier layer is DISABLED: dedup can "
-            "see ONLY the learning_corpus bucket (which this loop seeds itself), so the "
-            "MCP canon and the landed learning tier are INVISIBLE and already-owned "
+            "no prior-art index wired — the S6 cross-tier layer AND the S3 extractor's "
+            "PRIOR ART block are DISABLED: dedup can see ONLY the learning_corpus "
+            "bucket (which this loop seeds itself), so the MCP canon and the landed "
+            "learning tier are INVISIBLE, the extractor is never shown what already "
+            "exists (no PRIOR ART block, no searchCorpus tool), and already-owned "
             "blueprints will be re-proposed as new. The soft layer also falls back to "
             "the O(corpus) brute-force scan (N+1 embeddings per candidate). Set "
             "NEO4J_URL + EMBEDDING_API_URL so the entrypoint builds a "
@@ -256,7 +261,8 @@ def build_learning_consumer(
         )
     else:
         _logger.info(
-            "dedup cross-tier prior-art layer ENABLED via %s", type(prior_art).__name__
+            "cross-tier prior-art layer ENABLED via %s (S6 dedup + the S3 extractor's "
+            "PRIOR ART pre-fetch and searchCorpus tool)", type(prior_art).__name__
         )
     git_client = git_client if git_client is not None else _NullGitPullRequestClient()
     semantic_scanner = (
@@ -282,6 +288,13 @@ def build_learning_consumer(
             max_retries=settings.learning_extractor_max_retries,
             known_rules=known_rules,
         ),
+        # THE SAME index instance the dedup stage gets (plan §3a). One object, two
+        # readers: the extractor asks "has this been proposed before?" BEFORE the LLM
+        # call, dedup asks "is what came back a duplicate?" after it. Splitting them
+        # would let the two stages disagree about what the corpus contains within a
+        # single candidate's lifetime — and would double the neo4j pools this process
+        # opens for no benefit.
+        prior_art=prior_art,
     )
 
     # The FROZEN write-router order (D102 §7.1). The SAME `candidate_store` /

@@ -30,7 +30,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from data_agent.runtime.blueprint.models import ResultGrain
+from data_agent.runtime.blueprint.models import ResultGrain, SlotSpec
+from data_agent.runtime.blueprint.slots import slot_token_names
 from data_agent.runtime.blueprint.template import (
     TemplateBindError,
     bind_template,
@@ -68,14 +69,48 @@ def _pick_template(gen: BlueprintGeneralization) -> str | None:
     return None
 
 
-# A fixed synthetic date for `as_of_date` slots (D17 — never a stored value).
+# A fixed synthetic date for `as_of_date` / `period_range` slots (D17 — never a
+# stored value).
 _SAMPLE_DATE = "2020-01-01"
+
+# A synthetic `relative_window` count. Must be a bare INT, not a string: the type's
+# whole contract is that the unit lives in the template (`INTERVAL {n} MONTH`), so the
+# bind site is a NUMBER literal. `1` rather than `6` because it is the only value
+# guaranteed to sit inside every authorable `[min_value, max_value]` band — the
+# resolver floors at 1 and a canon blueprint may narrow the ceiling to anything above
+# it (`bp-hires-per-month` uses 1..36).
+_SAMPLE_RELATIVE_WINDOW = 1
 
 
 def _slot_types(payload: dict[str, Any]) -> dict[str, str]:
-    """Map each slot NAME → its declared `type` from `payload.parameterization`
-    (role=="slot"). Used to sample a TYPE-CORRECT synthetic value per slot (R7) so a
-    date/list slot does not type-error when the replay hits a real warehouse."""
+    """Map each `{token}` a slot may bind → the slot's declared `type` from
+    `payload.parameterization` (role=="slot"). Used to sample a TYPE-CORRECT synthetic
+    value per bind site (R7) so a date/list/windowed slot does not type-error when the
+    replay hits a real warehouse.
+
+    Keyed by TOKEN, not by slot name, and the difference is only visible for one type:
+    a `period_range` occupies TWO bind sites (`{name}_start`/`{name}_end`) and every
+    other type occupies one. `_sample_bindings` looks values up by what
+    `referenced_slots(template)` found in the SQL — i.e. by token — so a name-keyed map
+    silently missed both halves of a `period_range` and sampled them as untyped
+    strings, which a real warehouse rejects as a date comparison.
+
+    The expansion calls `slot_token_names`, the runtime's own anti-drift helper, rather
+    than re-spelling the `_start`/`_end` grammar: that grammar already exists in the
+    executor, the corpus loader and the binder, and a fourth hand-written copy is the
+    mirror-drift failure this codebase keeps paying for. A `SlotSpec` is constructed
+    directly (not via `parse`) because only `name`/`type` matter to the helper and the
+    plan's slot dict is untrusted — running the full parse here would turn a malformed
+    plan into a raise on the fail-closed promotion path.
+
+    NOTE: the `period_range` half is currently AHEAD of the pipeline. S4's
+    `rewrite_sql_to_template` emits one token per predicate, so the loop cannot yet
+    produce a range slot at all and the extractor declines the type
+    (`extractor/models.py::UNSUPPORTED_SLOT_TYPES`). It is kept, and kept correct,
+    because removing it would re-arm exactly the trap that motivated it: the fake probe
+    never executes the SQL, so a name-keyed map made golden replay report `passed=True`
+    on SQL ClickHouse rejects. When the rewriter learns the grammar, this must not be a
+    second thing to remember."""
     types: dict[str, str] = {}
     params = payload.get("parameterization")
     if not isinstance(params, list):
@@ -84,18 +119,27 @@ def _slot_types(payload: dict[str, Any]) -> dict[str, str]:
         if not isinstance(entry, dict):
             continue
         slot = entry.get("slot")
-        if isinstance(slot, dict) and isinstance(slot.get("name"), str):
-            types[slot["name"]] = slot.get("type", "")
+        if not isinstance(slot, dict) or not isinstance(slot.get("name"), str):
+            continue
+        name = slot["name"]
+        slot_type = slot.get("type")
+        slot_type = slot_type if isinstance(slot_type, str) else ""
+        for token in slot_token_names(SlotSpec(name=name, type=slot_type)):
+            types[token] = slot_type
     return types
 
 
 def _sample_value(name: str, slot_type: str) -> Any:
     """A SYNTHETIC value typed per the slot's declared type (R7) — never a stored
-    entity input (D17). `as_of_date` → a fixed ISO date; `list` → a one-element set
-    (so `IN {slot}` binds); every other type (string/entity/enum/period) → a
-    synthetic string token that binds as a typed literal (F1)."""
-    if slot_type == "as_of_date":
+    entity input (D17). `as_of_date` and each bound of a `period_range` → a fixed ISO
+    date; `relative_window` → a bare INTEGER (the unit lives in the template, so the
+    bind site is a number literal); `list` → a one-element set (so `IN {slot}` binds);
+    every other type (string/entity/enum/period) → a synthetic string token that binds
+    as a typed literal (F1)."""
+    if slot_type in ("as_of_date", "period_range"):
         return _SAMPLE_DATE
+    if slot_type == "relative_window":
+        return _SAMPLE_RELATIVE_WINDOW
     if slot_type == "list":
         return [f"__replay_sample_{name}__"]
     return f"__replay_sample_{name}__"

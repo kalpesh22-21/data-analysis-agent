@@ -108,14 +108,17 @@ def _blueprint_verbose(
     candidate: ExtractedCandidate,
 ) -> tuple[str | None, str | None, str | None]:
     """The learned (intent, slot-plan, rationale) of a blueprint candidate for the
-    verbose extract span. `slots` renders as `name→binds_to; ...`. Entity-bearing —
+    verbose extract span. `slots` renders as `name→binds_to; ...` — with the slot TYPE
+    in place of `binds_to` for a windowed slot, which legitimately declares none (it
+    consumes no column domain; see `extractor/models.py::WINDOWED_SLOT_TYPES`). An
+    f-string would have rendered the literal `None` there. Entity-bearing —
     verbose-gated."""
     payload = candidate.payload
     if not isinstance(payload, BlueprintPayload):
         return None, None, candidate.header.rationale or None
     slots = (
         "; ".join(
-            f"{p.slot.name}→{p.slot.binds_to}"
+            f"{p.slot.name}→{p.slot.binds_to or f'<{p.slot.type}>'}"
             for p in payload.parameterization
             if p.role == "slot" and p.slot is not None
         )

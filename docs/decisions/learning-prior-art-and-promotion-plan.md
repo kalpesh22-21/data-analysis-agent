@@ -1,7 +1,7 @@
 # Learning loop: prior art + promotion rework — plan
 
-**Status:** slices 1, 1.x, 1.5 and **2** built. Everything below them is designed, not built.
-**Written:** 2026-08-10. Pick up from "Remaining slices" (next: 2b or 3).
+**Status:** slices 1, 1.x, 1.5, **2**, **2b** and **3a** built. Everything below them is designed, not built.
+**Written:** 2026-08-10. Pick up from "Remaining slices" (next: 3b — the judge).
 
 ---
 
@@ -183,9 +183,94 @@ still right and still fail-closed; the reason is narrower than "privilege escala
 
 ### 3 — Extractor *(sub-sliced; the prompt and tool schema are rewritten once each)*
 
-**3a — Vocabulary**
+**3a — Vocabulary — BUILT**
+
+Landed as `learning/extractor/prior_art.py` (query builder, fail-open lookup, card
+renderer, `searchCorpus` argument guard), a `searchCorpus` tool in `extractor/schema.py`,
+a bounded tool loop in `extractor/extractor.py`, and the widened `SLOT_TYPES` mirror.
+
 - PRIOR ART pre-fetch block (mandatory — guarantees the model always sees the closest match) + `searchCorpus` tool capped at ~3 calls (covers the multi-candidate case a single fetch misses).
-- **`SLOT_TYPES` mirror drift.** `learning/extractor/models.py` has `{string, entity, enum, period, as_of_date, list}`; `runtime/blueprint/models.py` adds `relative_window` and `period_range`. Three of ten canon blueprints are un-relearnable. The exposure is worse than a decline: the prompt enum omits the correct answer, so a compliant model reaches for `period`/`string`/`entity` and those extract cleanly with no warning. Add a parity test — `NODE_KINDS` has one, `SLOT_TYPES` doesn't.
+- **`SLOT_TYPES` mirror drift.** `learning/extractor/models.py` had `{string, entity, enum, period, as_of_date, list}`; `runtime/blueprint/models.py` adds `relative_window` and `period_range`. Three of ten canon blueprints were un-relearnable. The exposure was worse than a decline: the prompt enum omitted the correct answer, so a compliant model reached for `period`/`string`/`entity` and those extract cleanly with no warning. Parity test added — `NODE_KINDS` had one, `SLOT_TYPES` didn't.
+
+Decisions taken while building, each deliberate:
+
+* **Widening the mirror alone would have been a REGRESSION.** The tool schema marks
+  `binds_to` required for every slot, while `SlotSpec.parse` REFUSES a `binds_to` on a
+  windowed type ("a windowed-period slot consumes no domain"). Offering the type
+  without carving `binds_to` out would have traded a clean extraction-time decline for
+  a `BlueprintParseError` raised at LANDING. So `binds_to` is nullable,
+  `WINDOWED_SLOT_TYPES` is the one place the rule lives, and `_validate_roles` enforces
+  both directions (windowed ⇒ must be null; everything else ⇒ must be present).
+* **Golden replay keyed off the slot types too, and was wrong for both new ones.**
+  `_sample_value` had one default branch ("every other type ⇒ a synthetic STRING"),
+  which is a ClickHouse parse error for a `relative_window` (`INTERVAL '<str>' MONTH`)
+  and a date-comparison error for a `period_range`. Worse, `_slot_types` was keyed by
+  slot NAME while `_sample_bindings` looks up by BIND TOKEN, so both halves of a
+  `period_range` missed the map entirely. Fixed by keying on `slot_token_names`, the
+  runtime's own anti-drift helper — not a fourth hand-written `_start`/`_end` copy.
+  Without this `relative_window` extracts but can never PROMOTE — a silent dead end.
+* **`period_range` is WITHDRAWN, not shipped — only `relative_window` is relearnable.**
+  QA found a SIXTH consumer: `generalize/rewrite.py::rewrite_sql_to_template` stamps
+  ONE placeholder per matched literal, named after the slot, while the runtime's range
+  grammar is two tokens (`{name}_start`/`{name}_end`). Nothing in the extractor or
+  generalize packages knows that grammar exists. Both shapes a model can emit dead-end
+  at landing (duplicate slot name / undeclared bind tokens) — and golden replay reports
+  `passed=True` on the way there, because the fake probe never executes the SQL.
+  So the type is withheld from the prompt enum (`UNSUPPORTED_SLOT_TYPES`) and declined
+  at validation with a reason naming S4. The MIRROR stays at parity: drift (silently
+  disagreeing about which types exist) and withdrawal (knowingly not offering one we
+  cannot generalize) are different statements, and the enum is now a derived
+  subtraction so re-enabling is one line. `relative_window` was verified by QA end to
+  end through the real generalize stage, the real binder, the real landing gates and
+  real ClickHouse. Pinned by `test_period_range_s4_rewrite_gap_qa.py` (the gap) and
+  `test_period_range_withdrawn_qa.py` (the withdrawal).
+* **The prior-art rules are appended to the system prompt only when an index is
+  wired.** Describing a block that never arrives and a tool that is never offered
+  invites a call the extractor cannot serve — and with no index that call burns one of
+  the three malformed-response retries. A deployment with no graph keeps the tool list
+  and turn count it had before this slice and sees no prior-art surface at all. Its
+  system prompt is NOT byte-identical, and no claim that it is should be made: rule 5
+  gained the windowed slot-type instructions, which every deployment needs.
+* **A card is untrusted input to a PROMPT, which is a threat the port did not have.**
+  `_card_from_record`'s readers were logs and comparisons; a prompt is line-oriented
+  and delimiter-fenced, so every rendered field is flattened (control/format/line/
+  paragraph separators → space), length-capped, and stripped of `=` runs so no card can
+  spell the fence. The renderer is also total over any field type, because
+  `PriorArtIndex` is a protocol and only one implementation has the coercing mapper.
+* **`limit` is not a `searchCorpus` parameter.** The caller knows how many cards fit in
+  the prompt; the model does not. One fewer untrusted number to clamp.
+* **The search budget counts CALLS, not turns** (a model can request five searches in
+  one turn, each an embed plus an ANN query per corpus), and a search turn does not
+  consume a malformed-response retry (that budget is about bad output).
+
+Not done, deliberately: `min_value`/`max_value` are not in the extractor's slot schema,
+so a re-derived `relative_window` defaults to the resolver's `1..120` rather than the
+canon's authored `1..36`. A loosening within the hard ceiling, not an escape — but it
+means a relearned `bp-hires-per-month` is not byte-identical to the canon one.
+
+**Net relearnability change: 1 of the 3 blocked canon blueprints, not 3.**
+`bp-hires-per-month` and `bp-hires-projection` (`relative_window`) are now
+relearnable; `bp-hires-in-range` (`period_range`) is not, and is blocked on the
+rewriter slice below rather than on the mirror.
+
+### 3a-follow-up — the two-token bind grammar in S4
+
+Unblocks `period_range` (and any future multi-token type). NOT a suffix in the
+rewriter:
+
+- `parameterization` is one entry per literal predicate, each carrying its own `slot`,
+  so there is no way to express "these two predicates are the two BOUNDS of one range".
+  Needs a payload shape.
+- `rewrite_sql_to_template` must emit `{name}_start`/`{name}_end` instead of `{name}`,
+  which means it needs `slot_token_names` (or the arity it implies) rather than just
+  `slot["name"]`.
+- **The dangerous part is deciding WHICH bound each predicate is.** Inferring it from
+  the operator (`>=` ⇒ start, `<` ⇒ end) is the obvious rule and it is wrong for
+  `BETWEEN`, for reversed operand order, and for a range expressed with two `<=`. Get
+  it backwards and the filter is silently inverted — the D56 wrong-answer class, on the
+  learning plane where nothing re-checks values.
+- Wants the equivalence check 3d builds (recompose and assert equality to the accepted
+  SQL), which would catch an inverted bound mechanically. **Sequence it after 3d.**
 
 **3b — The judge**
 - Pre-extraction: embed → retrieve → judge; skip extraction above `prior_art_skip_threshold`. A small judge call cancels a much larger extractor call, so at scale it *saves* money.
@@ -227,10 +312,16 @@ still right and still fail-closed; the reason is narrower than "privilege escala
 
 ## Known limitations, and where they are pinned
 
-Two `strict=True` xfails — each flips to a CI failure the moment it is fixed:
+One `strict=True` xfail remains — it flips to a CI failure the moment it is fixed:
 
-- `tests/learning/extractor/test_slot_type_mirror_drift_qa.py::test_the_extractor_slot_type_mirror_matches_the_runtime` → 3a
 - `tests/learning/generalize/test_scratch_join_s4_limitation_qa.py::test_the_loop_can_learn_the_canon_scratch_join_blueprint` → after 2b
+
+FIXED in 3a: `tests/learning/extractor/test_slot_type_mirror_drift_qa.py::test_the_extractor_slot_type_mirror_matches_the_runtime` was the second one. It is now a plain passing parity assertion; the file keeps the full before/after history in its module docstring.
+
+NEW in 3a — `period_range` is withdrawn, pinned in two places rather than xfailed (both are plain passing assertions on the CURRENT behaviour, per the house convention for a named limitation):
+
+- `tests/learning/generalize/test_period_range_s4_rewrite_gap_qa.py` — the gap itself, proved by driving the real rewriter and the real landing gates. `test_every_template_token_s4_emits_is_a_declared_bind_token` is parametrized over the offered enum, so re-enabling a withdrawn type without teaching S4 its grammar fails there immediately.
+- `tests/learning/extractor/test_period_range_withdrawn_qa.py` — the extractor-side consequence: known in the mirror, absent from the prompt enum, declined with a reason naming S4.
 
 Plus named `..._is_a_known_limitation` tests asserting current behaviour:
 
@@ -272,4 +363,8 @@ Things that cost time this work, worth not repeating:
 - **"Verified against pre-fix" claims did not survive checking, twice.** A 10/10 cross-tier match figure was circular — the twin was built by applying the transformation the fold inverts. A "7 of 18 tests fail pre-fix" figure was an 18/18 collection error. Confirm such numbers independently.
 - **Live Couchbase verification is cheap here.** `docker-compose.integration.yml` ships couchbase 7.6.5. The MISSING-first collation the scan rotation depends on was settled by measuring it — `IndexScan3`, `index_order` keypos 1, no sort stage — rather than deferring to an integration test nobody runs.
 - **Derive validation guards from downstream reads.** Four rounds on one slice kept finding the same class because each fixed the fields it was pointed at. See `untrusted-json-derive-the-guard` reasoning in `_plan_params_ok`'s docstring, which now carries the reader/operation table it was derived from.
+- **"Derive from the read" means the PREDICATE, not just the field.** The seventh sighting (3a) was subtler than the first six: the field was the right one and the guard still wrong, because it was written from the English intent ("a windowed slot must not declare a binding target") as `if binds_to:` while the downstream read is `binds_to is not None`. The two agree on every input except `""` — which is exactly what an "emit null" instruction produces — so the fix for extraction-clean-then-landing-raise reintroduced it. Mirror the OPERATOR, not the sentence. Corollary from the same fix: two branches whose English reads symmetric can legitimately need different predicates (`""` is a refusal for a windowed slot and merely unusable for every other type), so a shared helper would have been the wrong tidy-up.
+- **A skip is indistinguishable from an absence.** Any layer that can only DROP what it does not understand must not be the layer that decides whether something exists. 3a's renderer skips a non-card member; the block would then have said "the corpus was searched successfully and nothing close was found" for a port returning raw records instead of mapped cards. The available/unavailable decision belongs in the ONE place that already distinguishes the failure shapes, and it must check members, not just the container.
+- **Enumerate consumers of the CONCEPT, not readers of the field.** 3a's blast-radius enumeration listed five consumers of a slot's `type`, a reviewer independently confirmed all five, and both missed a sixth — `rewrite_sql_to_template`, which is a WRITER. It never reads `slot["type"]`; it depends on the type only through the ARITY of the bind sites that type implies, and spells the placeholder from `slot["name"]`. No grep for the field can find that. When widening a vocabulary, ask "what does each value IMPLY downstream?" and enumerate against the implication (here: how many `{tokens}` does this type occupy?).
+- **Replay correctness is structurally unreachable by the unit suite.** The sampler's only job is producing values a real warehouse ACCEPTS, and the fake probe never executes SQL — so golden replay reported `passed=True` on templates ClickHouse rejects, and no amount of unit testing could have said otherwise. Anything whose contract is "the far system tolerates this" needs a live probe (`tests/integration/test_windowed_replay_clickhouse_live.py` is the pattern) or an explicit tripwire admitting the gap. Treat a green `ReplayOutcome` from the unit suite as evidence about BINDING, never about EXECUTION.
 - **Mirror constants drift.** `NODE_KINDS`, `SLOT_TYPES`, and `_TABLE_CONSUME_REF` (three copies) all drifted or duplicated. Prefer one definition plus an identity-based parity test over a copy plus a `.pattern` comparison.

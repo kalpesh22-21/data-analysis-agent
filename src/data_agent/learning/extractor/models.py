@@ -24,9 +24,65 @@ Role = Literal["slot", "rule", "inline"]
 # Mirror of blueprint/models.py SLOT_TYPES + NODE_KINDS (kept local so the
 # extractor package does not import the request-path blueprint module; Stage-4
 # maps these 1:1 onto SlotSpec/Node).
+#
+# PARITY IS ENFORCED, not remembered: `tests/learning/extractor/
+# test_slot_type_mirror_drift_qa.py` asserts set-equality with the runtime for BOTH
+# mirrors. It has to be, because this one drifted. The mirror shipped without
+# `relative_window`/`period_range` (D41/D49) and the gap was invisible for two
+# reasons at once: `schema.py::SLOT_TYPE_ENUM` is derived from this set, so the tool
+# schema never OFFERED the correct type, and a compliant model therefore reached for
+# `period`/`string` instead — which extract CLEANLY. Three of the ten canon
+# blueprints (`bp-hires-per-month`, `bp-hires-projection`, `bp-hires-in-range`) were
+# un-relearnable as a result. The parity test is the only thing that makes a mirror
+# safe; add one with the mirror, never after it.
 SLOT_TYPES: frozenset[str] = frozenset(
-    {"string", "entity", "enum", "period", "as_of_date", "list"}
+    {"string", "entity", "enum", "period", "as_of_date", "list",
+     "relative_window", "period_range"}
 )
+
+# The two WINDOWED types, and the ONE thing that makes them structurally different
+# from every other slot: they consume no warehouse column DOMAIN, so
+# `runtime/blueprint/models.py::SlotSpec.parse` REFUSES a `binds_to` on them ("a
+# windowed-period slot consumes no domain — it would fire a useless probe"). That is
+# a landing-time raise, several stages downstream of here, so the rule is mirrored
+# and enforced at extraction (`validation.py::_validate_roles`) where it becomes a
+# traceable Decline instead of a `BlueprintParseError` out of the promotion path.
+#
+# This is the reason widening `SLOT_TYPES` alone is NOT sufficient: the tool schema
+# marks `binds_to` required for every slot, so a model that finally CAN say
+# `relative_window` would attach a `binds_to` to it and land nothing.
+WINDOWED_SLOT_TYPES: frozenset[str] = frozenset({"relative_window", "period_range"})
+
+# Types the runtime EXECUTES but this pipeline cannot yet PRODUCE. Withheld from the
+# prompt enum (`schema.py::SLOT_TYPE_ENUM`) and declined at validation.
+#
+# `period_range` is the only member, and the reason is a WRITER, not a reader:
+# `generalize/rewrite.py::rewrite_sql_to_template` stamps exactly ONE placeholder per
+# matched literal, named after the slot (`literal.replace(exp.Placeholder(this=name))`).
+# The runtime's date-range grammar is TWO tokens — `{name}_start` and `{name}_end`
+# (`runtime/blueprint/slots.py::slot_token_names`) — and nothing in the extractor or
+# generalize packages knows that grammar exists (grep `_start` across both: no hits).
+# So both shapes a model can emit dead-end at landing:
+#
+#   one slot, two predicates → two `{name}` tokens for a slot whose legal tokens are
+#     `{name}_start`/`{name}_end`, plus a duplicated slot declaration
+#     ⇒ BlueprintParseError: duplicate slot name
+#   two slots each typed period_range → each mints `{n}_start_start`, `{n}_start_end`…
+#     ⇒ CorpusLoadError: references undeclared slot(s)
+#
+# And — the reason this is WITHHELD rather than merely documented — golden replay
+# reports `passed=True` for both, because the fake probe never executes the SQL. A
+# silent dead end at replay is strictly worse than an honest decline at extraction; it
+# is the same argument that made `binds_to` type-dependent rather than merely offered.
+#
+# TO RE-ENABLE this is NOT a suffix in the rewriter. `parameterization` is one entry per
+# literal predicate, each carrying its own `slot`, so there is no way to say "these two
+# predicates are the two BOUNDS of one range". That needs a payload shape, a rewriter
+# change, and a rule deciding WHICH bound each predicate is — and getting that last one
+# wrong silently inverts a date filter, which is the D56 wrong-answer class. Tracked in
+# the plan doc; pinned by `test_period_range_withdrawn_qa.py`.
+UNSUPPORTED_SLOT_TYPES: frozenset[str] = frozenset({"period_range"})
+
 NODE_KINDS: frozenset[str] = frozenset({"query", "approval"})
 
 
@@ -77,7 +133,16 @@ class Locator:
 class SlotPlan:
     name: str
     type: str  # ∈ SLOT_TYPES
-    binds_to: str  # "database.table.column" — Stage-4 asserts ⊆ uses
+    # "database.table.column" — Stage-4 asserts ⊆ uses. `None` ONLY for a
+    # `WINDOWED_SLOT_TYPES` slot, which consumes no column domain and which the
+    # runtime `SlotSpec.parse` refuses to accept a `binds_to` for.
+    #
+    # `None` means ABSENT, and `""` is NOT a synonym for it here — `SlotSpec.parse`
+    # tests `binds_to is not None`, so an empty string is a value it REFUSES, and
+    # `_validate_roles` mirrors that exact test rather than a truthiness one. A
+    # surviving `None` on a windowed slot is therefore a deliberate declaration that
+    # passed an `is not None` gate, not merely a falsy field.
+    binds_to: str | None
     required: bool
     optional_pattern: str | None = None  # SQL fragment when an optional slot is ABSENT
     enum_values: tuple[str, ...] | None = None
