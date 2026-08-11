@@ -241,6 +241,117 @@ class LearningSettings(BaseSettings):
         "", description="Optional OpenAI-compatible base URL for the extractor model client."
     )
 
+    # --- Coverage judge (plan §3b) — the model call that cancels an extraction. ---
+    #
+    # Every threshold here is a knob because the plan requires it ("everything
+    # threshold-shaped must be config, not a constant") and because one of them can
+    # DISCARD an analyst's session. They live on `LearningSettings` rather than on
+    # `PromotionPolicy` deliberately: `PromotionPolicy` is accepted by all three
+    # promotion factories and passed by NO entrypoint, so a knob added there today is a
+    # knob that does not exist in production. Wiring that is slice 4's job; a knob that
+    # silently cancels work must be live from the first deploy.
+    learning_judge_enabled: bool = Field(
+        True,
+        description=(
+            "Master switch for the coverage judge. ON: a session whose work the corpus "
+            "already carries is DROPPED before extraction (a durable record is written "
+            "to learning_audit for every drop). OFF: the judge is never built and the "
+            "loop behaves exactly as it did before plan §3b. Requires a prior-art index "
+            "— with no index there is nothing to be covered BY, so no judge is built "
+            "regardless of this flag."
+        ),
+    )
+    learning_judge_shadow_mode: bool = Field(
+        False,
+        description=(
+            "SHADOW MODE — the safe rollout. The judge runs, is asked, and records "
+            "EVERY verdict to learning_audit exactly as it would in anger, but the drop "
+            "is forced to False and logged: nothing is ever discarded. The row carries "
+            "`would_drop=true` and `shadow=true`, so "
+            "`SELECT count(*) ... WHERE would_drop = true` answers 'what would we have "
+            "thrown away last week?' before anything is thrown away. This is NOT the "
+            "same as a very high confidence bar (a bar cannot exceed 1.0, and at 1.0 a "
+            "model asserting perfect certainty still drops) and NOT the same as "
+            "LEARNING_JUDGE_ENABLED=false (which records nothing at all). Run this for "
+            "a period, read the distribution, then turn it off."
+        ),
+    )
+    learning_judge_record_ttl_seconds: int = Field(
+        94_608_000,  # 3 years
+        ge=1,
+        description=(
+            "Retention for judge verdict records — its OWN clock, deliberately much "
+            "longer than LEARNING_AUDIT_TTL_SECONDS. An evidence quote is "
+            "entity-bearing and should expire on the D95 90-day floor; a verdict row is "
+            "scalars plus one capped reason, and the questions it exists to answer "
+            "('how many drops last quarter', 'do verdicts skew to existing-plus-delta') "
+            "accumulate over months. Inheriting the evidence retention would erase the "
+            "dataset about as fast as its signal accrues."
+        ),
+    )
+    learning_judge_model: str = Field(
+        "",
+        description=(
+            "Model id for the judge's structured-output call. EMPTY => reuse the "
+            "extractor's model client. The economics favour a smaller/cheaper model "
+            "here: the judge sees a bounded brief plus five summary cards, while the "
+            "call it cancels carries the whole session transcript."
+        ),
+    )
+    learning_judge_pre_drop_confidence: float = Field(
+        0.90,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "PRE-extraction drop bar: a `duplicate` verdict at or above this cancels "
+            "extraction entirely. Deliberately HIGHER than the post-extraction bar — "
+            "the pre-extraction judge sees raw SQL with literals but no generalization, "
+            "no parameterization and no result grain, so it is the cheapest place to "
+            "drop and the least-informed one."
+        ),
+    )
+    learning_judge_post_drop_confidence: float = Field(
+        0.75,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "POST-extraction drop bar: a `duplicate` verdict at or above this discards "
+            "an extracted candidate. Lower than the pre-extraction bar because the "
+            "judge is shown the generalized template, the grain and the rule ids."
+        ),
+    )
+    learning_judge_band_low: float = Field(
+        0.70,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Bottom of the ambiguous prior-art band. Below it nothing in the corpus is "
+            "close enough to be worth a model call, at either stage."
+        ),
+    )
+    learning_judge_band_high: float = Field(
+        0.97,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Top of the ambiguous band, applied to the POST-extraction judge only. "
+            "Above it the deterministic dedup layers and the merge routing already have "
+            "an opinion. Not applied pre-extraction: there the score compares a "
+            "session's raw text against entity-free corpus intents, which is far "
+            "noisier than the post-extraction intent-against-intent comparison, so a "
+            "high score is not a settled answer. Must be >= the band low."
+        ),
+    )
+    learning_judge_timeout_seconds: float = Field(
+        30.0,
+        gt=0.0,
+        description=(
+            "Hard ceiling on one judge model call. On expiry the judge fails OPEN and "
+            "extraction proceeds — it is an optimization and must never be the reason a "
+            "session takes longer than it used to."
+        ),
+    )
+
     # --- Observability (D23/D24) ---
     otlp_endpoint: str = Field(
         "", description="OTLP collector endpoint (Phoenix). Empty => no-op provider."

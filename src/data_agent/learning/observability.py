@@ -357,6 +357,80 @@ def dedup_span(
     )
 
 
+def judge_span(
+    tracer: Tracer,
+    *,
+    session_id: str,
+    stage: str,
+    outcome: str,
+    candidate_id: str | None = None,
+    verdict: str | None = None,
+    confidence: float = 0.0,
+    covered_by_tier: str | None = None,
+    best_similarity: float = 0.0,
+    cards_shown: int = 0,
+    dropped: bool = False,
+    would_drop: bool = False,
+    shadow: bool = False,
+    reused: bool = False,
+) -> Any:
+    """The coverage judge's verdict (plan §3b, `learning.judge`, CHAIN).
+
+    ALWAYS SHAPE-ONLY — no `verbose` parameter, deliberately, and unlike its
+    triage/extract neighbours. The one entity-bearing thing the judge produces is
+    `reason`, free model prose about a real session, and it goes to the
+    access-controlled `learning_audit` bucket with the evidence quotes. Adding a verbose
+    branch here would create the obvious place for someone to put it later.
+
+    The span is the DENOMINATOR; the audit record is the numerator. Deliberately: the
+    store holds only verdicts a judge actually gave (fabricating one would poison the
+    dataset that decides whether composable blueprints are worth building), so the
+    several reasons a session was NOT judged exist only here. Rates that come out of it:
+
+      * `outcome=dropped` — work cancelled. Cross-check against
+        `SELECT count(*) FROM learning_audit WHERE record_type='judge_verdict' AND
+        dropped=true`; a divergence means drops are happening without records, which is
+        the one failure this design refuses.
+      * `outcome=skipped_unavailable` — the graph or the embedder was down. NOT a
+        corpus that holds nothing, and never a drop.
+      * `outcome=skipped_below_floor` vs `skipped_above_band` — the band is mistuned in
+        one direction or the other. Together with `best_similarity` this is what makes
+        the band tunable from evidence rather than from taste.
+      * `outcome=failed` — the model errored, timed out, or emitted something
+        unparseable. Every one of them proceeded to extraction; a rising rate is a
+        broken judge quietly costing what it was built to save.
+      * `would_drop=true AND shadow=true` — SHADOW MODE. The judge is running for real
+        and discarding nothing; this is the rollout dashboard ("what would we have
+        thrown away last week?"), readable here as well as in the audit bucket. Outside
+        shadow mode `would_drop` and `dropped` are always equal.
+      * `reused=true` — a redelivery served from the content-keyed audit record instead
+        of a second, non-idempotent model call.
+    """
+    return _learning_span(
+        tracer,
+        "learning.judge",
+        OpenInferenceSpanKindValues.CHAIN,
+        {
+            "session.id": session_id,
+            "learning.judge.stage": stage,
+            "learning.judge.outcome": outcome,
+            # "" rather than None throughout, so every attribute is ALWAYS present and a
+            # Phoenix filter never has to distinguish "no value" from "no data" via a
+            # missing key (the posture `dedup_span` settled on).
+            "learning.candidate_id": candidate_id or "",
+            "learning.judge.verdict": verdict or "",
+            "learning.judge.confidence": confidence,
+            "learning.judge.covered_by_tier": covered_by_tier or "",
+            "learning.judge.best_similarity": best_similarity,
+            "learning.judge.cards_shown": cards_shown,
+            "learning.judge.dropped": dropped,
+            "learning.judge.would_drop": would_drop,
+            "learning.judge.shadow": shadow,
+            "learning.judge.reused": reused,
+        },
+    )
+
+
 def promote_span(
     tracer: Tracer,
     *,

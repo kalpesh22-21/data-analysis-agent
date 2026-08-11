@@ -59,6 +59,17 @@ def _fake_learning_settings(
         learning_corpus_password="p" if corpus else "",
         learning_dedup_merge_threshold=0.95,
         learning_dedup_conflict_threshold=0.83,
+        # Coverage judge (plan §3b). Present so this namespace stays a faithful stand-in
+        # for `LearningSettings`; the judge itself never builds in these tests because
+        # no prior-art index is wired.
+        learning_judge_enabled=True,
+        learning_judge_shadow_mode=False,
+        learning_judge_model="",
+        learning_judge_pre_drop_confidence=0.90,
+        learning_judge_post_drop_confidence=0.75,
+        learning_judge_band_low=0.70,
+        learning_judge_band_high=0.97,
+        learning_judge_timeout_seconds=30.0,
         otlp_endpoint="",
         learning_service_name="learning-loop",
         learning_consumer_group="learning-workers",

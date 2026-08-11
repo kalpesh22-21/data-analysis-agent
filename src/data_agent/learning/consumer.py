@@ -45,6 +45,7 @@ from .candidate import (
 from .config import LearningSettings, learning_enabled
 from .extractor import ExtractedCandidate, LearningExtractor
 from .extractor.models import BlueprintPayload
+from .judge import CoverageJudge
 from .models import LearningStatus, compute_content_hash
 from .observability import (
     consume_span,
@@ -152,6 +153,7 @@ class LearningConsumer:
         extractor: LearningExtractor | None = None,
         candidates: CandidateStore | None = None,
         stages: tuple[CandidateStage, ...] = (),
+        judge: CoverageJudge | None = None,
     ) -> None:
         self._store = store
         self._queue = queue
@@ -175,6 +177,11 @@ class LearningConsumer:
         # additive keys only). Builders register their stage here at the
         # composition root; the consumer never hard-codes one.
         self._stages = stages
+        # Plan §3b: the PRE-extraction coverage judge. Optional and default-absent, so a
+        # deployment without one behaves exactly as it did before the slice. It sits
+        # between triage and the extractor because that is the only place a drop saves
+        # the extractor's call, which carries the whole session transcript.
+        self._judge = judge
 
     async def run_once(self) -> ConsumeResult:
         # Kill-switch gate FIRST (design §7): disabled ⇒ do NOT XREADGROUP or
@@ -371,8 +378,53 @@ class LearningConsumer:
             # Back-compat: no extractor wired ⇒ the S2 `would_extract` stub.
             self._emit_extract_stub(summary.session_id, verdict.target_hints)
             return summary
+        if await self._judged_covered(summary):
+            return summary
         await self._run_extractor(summary, verdict)
         return summary
+
+    async def _judged_covered(self, summary: SessionSummary) -> bool:
+        """Ask the coverage judge whether this session's work already exists (plan
+        §3b). `True` ⇒ SKIP extraction entirely.
+
+        Placed after the extractor-present check on purpose: with no extractor there is
+        no call to cancel, so paying a judge to cancel nothing would be pure cost — and
+        would drop a session on the ONE path that never spends money anyway.
+
+        NEVER raises. The judge is documented fail-open at every internal boundary, but
+        this call site is what makes that a guarantee rather than an intention: an
+        unforeseen escape (a Protocol violation by an injected audit store, a bug in the
+        judge itself) must degrade to "extract as usual", not dead-letter the session
+        through the consumer's blanket handler. The direction matters — a wrong keep
+        costs one extraction and lands in a review queue; a wrong drop is invisible.
+        """
+        if self._judge is None:
+            return False
+        try:
+            outcome = await self._judge.screen_session(summary)
+        except Exception:  # noqa: BLE001 - the judge may never cost a session
+            _logger.warning(
+                "learning: the coverage judge raised for session %s — extracting "
+                "anyway (fail-open). This is a judge bug: every internal failure path "
+                "is supposed to be handled inside it.",
+                summary.session_id,
+                exc_info=True,
+            )
+            return False
+        if not outcome.drop:
+            return False
+        # The judge has already written the durable audit record (it refuses to drop
+        # without one) and logged the drop with its reason and covered-by ref. The
+        # extract span is emitted with zero candidates and a machine-readable decline
+        # reason so the loop's own telemetry shows a session that produced nothing AND
+        # why, rather than a silent gap between triage and nothing.
+        self._emit_extract(
+            summary,
+            candidate_count=0,
+            decline_reasons=("judge_prior_art_covered",),
+            target_hints=(),
+        )
+        return True
 
     async def _run_extractor(self, summary: SessionSummary, verdict: TriageVerdict) -> None:
         """S3: extract candidates → snapshot each candidate's evidence into

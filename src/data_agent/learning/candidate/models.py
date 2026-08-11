@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from ..audit.judgement import CoverageAssessment
 from ..extractor.models import ExtractedCandidate
 from ..summary.models import SessionSummary
 from .verdicts import DedupVerdict, DriftStamp
@@ -99,6 +100,24 @@ class CandidateEnvelope:
     # in-memory fake's sort key). Additive, defaults None, emitted only when set so a
     # pre-existing candidate doc round-trips byte-identically (mirrors `traceparent`).
     last_scanned_at: str | None = None
+    # The POST-extraction coverage verdict (plan §3b), stamped by the dedup stage when
+    # the soft-layer cosine landed in the ambiguous band. `None` means the judge did not
+    # run — no judge wired, the score outside the band, or a fail-open path — and is
+    # NOT the same as a `new` verdict, which is a positive statement a model made.
+    #
+    # It is here for two reasons, one weaker than it looks. The strong one: a human
+    # opening this candidate in the review inbox can see that the machine already had an
+    # opinion about its novelty, and the field is part of the queryable dataset that
+    # decides whether composable blueprints are worth building. The weaker one: it lets
+    # a re-run of the pipeline over an EXISTING envelope skip the model call. It is NOT
+    # what makes a redelivery idempotent — a redelivery re-extracts and mints a fresh
+    # envelope with this field unset; the deterministic `learning_audit` key
+    # (`post_extraction_ref`) is what actually prevents the second model call. Do not
+    # read this field as the idempotency mechanism.
+    #
+    # Additive, defaults None, emitted only when set so a pre-slice candidate doc
+    # round-trips byte-identically (mirrors `traceparent`).
+    judge: CoverageAssessment | None = None
 
     def to_doc(self) -> dict[str, Any]:
         doc: dict[str, Any] = {
@@ -139,6 +158,10 @@ class CandidateEnvelope:
         # jumps the queue ahead of everything already examined.
         if self.last_scanned_at is not None:
             doc["last_scanned_at"] = self.last_scanned_at
+        # Additive + OPTIONAL, mirroring the three above: absent means "the judge did
+        # not run", which must stay distinguishable from a stored `new` verdict.
+        if self.judge is not None:
+            doc["judge"] = self.judge.to_doc()
         return doc
 
     @classmethod
@@ -196,6 +219,14 @@ class CandidateEnvelope:
             last_scanned_at=(
                 doc["last_scanned_at"]
                 if isinstance(doc.get("last_scanned_at"), str)
+                else None
+            ),
+            # A non-dict `judge` (a hand edit, a foreign writer) reads back as "the
+            # judge did not run" rather than raising inside a queue worker — the same
+            # normalize-do-not-trust posture as `last_scanned_at` above.
+            judge=(
+                CoverageAssessment.from_doc(doc["judge"])
+                if isinstance(doc.get("judge"), dict)
                 else None
             ),
         )

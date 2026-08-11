@@ -18,6 +18,7 @@ from datetime import timedelta
 from typing import Any
 
 from ..config import LearningSettings
+from .judgement import JudgeRecord
 from .models import EvidenceSnapshot
 from .store import mint_evidence_ref
 
@@ -54,6 +55,16 @@ class CouchbaseAuditStore:
         # KV-only, default scope/collection (no GSI needed — §4.1).
         self._collection = bucket.default_collection()
         self._ttl = timedelta(seconds=settings.learning_audit_ttl_seconds)
+        # A SEPARATE clock for judge verdicts (plan §3b). Same bucket, different
+        # question: an evidence quote is entity-bearing and SHOULD expire on the D95
+        # 90-day audit floor, while a verdict row is scalars plus one capped reason and
+        # exists to be aggregated over quarters. Inheriting the evidence retention would
+        # have erased the dataset roughly as fast as the skew signal it carries
+        # accumulates — the composable-blueprint question is answered by months of rows,
+        # not by 90 days of them.
+        self._judgement_ttl = timedelta(
+            seconds=settings.learning_judge_record_ttl_seconds
+        )
 
     def mint_evidence_ref(self, session_id: str) -> str:
         return mint_evidence_ref(session_id)
@@ -69,3 +80,29 @@ class CouchbaseAuditStore:
         except DocumentNotFoundException:
             return None
         return EvidenceSnapshot.from_doc(result.content_as[dict])
+
+    async def record_judgement(self, record: JudgeRecord) -> None:
+        """Upsert one coverage judgement (plan §3b) under its content-derived key.
+
+        Same collection and same RBAC boundary as the evidence snapshots — splitting
+        them across buckets would mean a second user for no gain, and the `record_type`
+        discriminator keeps the two families apart in N1QL — but its OWN, much longer
+        TTL. See `__init__`.
+
+        DELIBERATELY NOT swallowed: the caller drops a candidate only if this returns.
+        Note what that does and does not guarantee — `store.py::AuditStore.
+        record_judgement` states plainly that a plain upsert acks from the managed cache
+        and that persistence is asynchronous.
+        """
+        await self._collection.upsert(
+            record.judgement_ref,
+            record.to_doc(),
+            UpsertOptions(expiry=self._judgement_ttl),
+        )
+
+    async def read_judgement(self, ref: str) -> JudgeRecord | None:
+        try:
+            result = await self._collection.get(ref, GetOptions())
+        except DocumentNotFoundException:
+            return None
+        return JudgeRecord.from_doc(result.content_as[dict])

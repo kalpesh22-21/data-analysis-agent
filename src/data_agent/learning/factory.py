@@ -58,6 +58,7 @@ from .dedup import BlueprintCorpus, DedupStage
 from .extractor import ExtractorConfig, LearningExtractor
 from .generalize import GeneralizeStage
 from .inbox import ReviewInbox
+from .judge import CoverageJudge, JudgeConfig
 from .leakage import (
     LeakageGateStage,
     NullSemanticEntityScanner,
@@ -147,6 +148,7 @@ def build_learning_consumer(
     session_store: SessionStore,
     queue: LearningQueue,
     model_client: object | None = None,
+    judge_model_client: object | None = None,
     audit_store: AuditStore | None = None,
     candidate_store: CandidateStore | None = None,
     blueprint_corpus: BlueprintCorpus | None = None,
@@ -188,6 +190,17 @@ def build_learning_consumer(
     posture is that it must not. It is logged loudly instead, because the symptom of
     running without it (duplicate candidates for blueprints the canon already carries)
     points nowhere near the cause.
+
+    **The coverage judge (plan §3b) is built here, and it can DISCARD work.** It is
+    wired only when all three of its preconditions hold — the kill-switch
+    (`LEARNING_JUDGE_ENABLED`) is on, a prior-art index is present, and a durable audit
+    store is present — and it is handed THE SAME audit store instance the consumer
+    snapshots evidence into. That sharing is not incidental: every drop's durable record
+    goes to that store, and a split would put the records somewhere nobody queries,
+    leaving the mitigation present in code and absent in practice. Absent any
+    precondition, no judge is built and the loop behaves exactly as it did before the
+    slice. `judge_model_client` overrides which model answers (the economics favour a
+    smaller one); omitted, the extractor's client is reused.
     """
     loader_triage = _loader_triage_kwargs(summary_loader, triage)
 
@@ -297,6 +310,17 @@ def build_learning_consumer(
         prior_art=prior_art,
     )
 
+    judge = _build_judge(
+        settings,
+        model_client=judge_model_client if judge_model_client is not None else model_client,
+        # The recorded model id must describe the client that will actually answer, not
+        # the one an operator configured. See `_build_judge`.
+        judge_client_injected=judge_model_client is not None,
+        audit_store=audit_store,
+        prior_art=prior_art,
+        tracer=tracer,
+    )
+
     # The FROZEN write-router order (D102 §7.1). The SAME `candidate_store` /
     # `user_store` instances thread through the stages that need them and the
     # consumer — a split-brain store would strand candidates (§1).
@@ -314,6 +338,10 @@ def build_learning_consumer(
             prior_art=prior_art,
             merge_threshold=settings.learning_dedup_merge_threshold,
             conflict_threshold=settings.learning_dedup_conflict_threshold,
+            # THE SAME judge instance the consumer screens sessions with — one object,
+            # two stages. A split would let the two halves of one candidate's lifetime
+            # run under different thresholds and write to different audit stores.
+            judge=judge,
             tracer=tracer,
         ),
         SchemaEditPRStage(git_client=git_client, checks=checks),
@@ -336,8 +364,145 @@ def build_learning_consumer(
         candidates=candidate_store,
         extractor=extractor,
         stages=stages,
+        judge=judge,
         **loader_triage,
     )
+
+
+def _build_judge(
+    settings: LearningSettings,
+    *,
+    model_client: object | None,
+    judge_client_injected: bool,
+    audit_store: AuditStore | None,
+    prior_art: PriorArtIndex | None,
+    tracer: object | None,
+) -> CoverageJudge | None:
+    """Build the coverage judge, or `None` when any precondition is missing.
+
+    THREE preconditions, and each absence is a different fact so each gets its own log
+    line — a single "judge not wired" message would leave an operator guessing which of
+    three things to fix:
+
+      * the kill-switch is off — a deliberate operator choice, logged at INFO;
+      * no prior-art index — there is nothing to be covered BY, so a judge could only
+        ever answer `new` at the price of a model call. Already warned about loudly by
+        the caller (the same absence disables two other surfaces), so this one is INFO
+        too;
+      * no audit store — the DISQUALIFYING one, and it is a WARNING. Without a durable
+        record a drop is invisible, and an invisible drop is precisely the risk the
+        record was agreed as the mitigation for. Building a judge that cannot write is
+        not a degraded judge, it is the failure mode; so we build none.
+
+    Note the third check is redundant TODAY — `_require_full_pipeline` has already
+    refused a missing audit store by the time this runs — and it stays because the
+    guarantee it encodes ("no record store, no judge") must not depend on another
+    function's ordering. That coupling is the shape this codebase keeps getting bitten
+    by (see `writer/routing.py::_AUTO_LAND_DEDUP_ACTIONS`).
+    """
+    if not settings.learning_judge_enabled:
+        _logger.info(
+            "coverage judge DISABLED by LEARNING_JUDGE_ENABLED — every KEEP-triaged "
+            "session pays a full extraction, including the ones that re-derive "
+            "something the corpus already carries (pre-plan-§3b behaviour)"
+        )
+        return None
+    if prior_art is None:
+        _logger.info(
+            "coverage judge NOT wired: no prior-art index, so there is nothing for a "
+            "session to be covered BY and the judge could only ever answer `new`"
+        )
+        return None
+    if audit_store is None:
+        _logger.warning(
+            "coverage judge NOT wired: no durable audit store. The judge DROPS work, "
+            "and every drop must leave a queryable record — a judge that cannot write "
+            "one would make discarded sessions invisible."
+        )
+        return None
+    if model_client is None:  # unreachable via build_learning_consumer; see the docstring
+        return None
+    config = JudgeConfig(
+        pre_drop_confidence=settings.learning_judge_pre_drop_confidence,
+        post_drop_confidence=settings.learning_judge_post_drop_confidence,
+        band_low=settings.learning_judge_band_low,
+        band_high=settings.learning_judge_band_high,
+        timeout_seconds=settings.learning_judge_timeout_seconds,
+        shadow=settings.learning_judge_shadow_mode,
+        model_id=_judge_model_id(settings, injected=judge_client_injected),
+    )
+    if config.shadow:
+        _logger.warning(
+            "coverage judge ENABLED in SHADOW MODE (model=%s): every verdict is "
+            "recorded to learning_audit with would_drop/shadow set, and NOTHING is "
+            "discarded. Query `WHERE record_type='judge_verdict' AND would_drop=true` "
+            "to see what it would have thrown away, then set "
+            "LEARNING_JUDGE_SHADOW_MODE=false.",
+            config.model_id,
+        )
+    else:
+        _logger.warning(
+            "coverage judge ENABLED (model=%s): a KEEP-triaged session whose work the "
+            "corpus already carries is DROPPED before extraction at confidence >= %.2f, "
+            "and an extracted candidate is discarded at >= %.2f inside the %.2f-%.2f "
+            "band. Every drop writes a durable record to the learning_audit bucket "
+            "(record_type='judge_verdict'); nothing else records it. Set "
+            "LEARNING_JUDGE_SHADOW_MODE=true to record without discarding, or "
+            "LEARNING_JUDGE_ENABLED=false to turn it off entirely.",
+            config.model_id,
+            config.pre_drop_confidence,
+            config.post_drop_confidence,
+            config.band_low,
+            config.band_high,
+        )
+    return CoverageJudge(
+        model_client,  # type: ignore[arg-type]
+        audit_store,
+        prior_art=prior_art,
+        config=config,
+        tracer=tracer,
+    )
+
+
+def _judge_model_id(settings: LearningSettings, *, injected: bool) -> str:
+    """The model id STAMPED ON EVERY VERDICT — which must describe the client that will
+    actually answer, not the one an operator configured.
+
+    `JudgeRecord.model` exists for exactly one purpose: verdicts are compared across
+    months, the model changes underneath them, and without this field the dataset
+    silently pools two judges. Reading it off `LEARNING_JUDGE_MODEL` unconditionally
+    would defeat that at the first opportunity — the shipped entrypoint only builds a
+    separate client when that setting names a DIFFERENT model, but `build_learning_
+    consumer` is called from other places (both demo scripts) that pass one model client
+    and never look at the setting. Those runs would have recorded the configured id
+    while the extractor's model answered: the exact mislabel the field exists to
+    prevent, asserted with a straight face.
+
+    So the id follows the CLIENT:
+      * a judge-specific client was injected ⇒ the configured judge model (or an
+        explicit `unknown-injected-judge-client` when the caller injected a client and
+        configured no id — honest rather than plausible);
+      * no separate client ⇒ the extractor's model, because that is what will answer,
+        and a configured-but-unused `LEARNING_JUDGE_MODEL` is warned about loudly rather
+        than believed.
+    """
+    if injected:
+        return settings.learning_judge_model or "unknown-injected-judge-client"
+    if settings.learning_judge_model and (
+        settings.learning_judge_model != settings.learning_extractor_model
+    ):
+        _logger.warning(
+            "LEARNING_JUDGE_MODEL=%r is set but no separate judge model client was "
+            "passed, so the EXTRACTOR's client (%r) will answer every judgement. "
+            "Recording %r on the verdicts, not %r — the model field exists so the "
+            "coverage dataset never silently pools two judges. Pass "
+            "judge_model_client=... to actually use the configured model.",
+            settings.learning_judge_model,
+            settings.learning_extractor_model,
+            settings.learning_extractor_model,
+            settings.learning_judge_model,
+        )
+    return settings.learning_extractor_model
 
 
 def build_promotion_plane(

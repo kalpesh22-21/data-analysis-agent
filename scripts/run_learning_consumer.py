@@ -127,6 +127,24 @@ async def _main() -> int:
                 model=learning_settings.learning_extractor_model,
                 base_url=learning_settings.learning_extractor_base_url,
             )
+            # The coverage judge's own client (plan §3b), built ONLY when
+            # `LEARNING_JUDGE_MODEL` names a different model. The judge sees a bounded
+            # brief plus five summary cards where the extractor ships the whole session,
+            # so a smaller model is the economically right answer — but a second client
+            # on the SAME model would be two connection pools for one behaviour, so the
+            # default is to reuse the extractor's. Same API key and base URL: the judge
+            # is not a second provider, it is a second model on the same one.
+            judge_model_client = None
+            if (
+                learning_settings.learning_judge_model
+                and learning_settings.learning_judge_model
+                != learning_settings.learning_extractor_model
+            ):
+                judge_model_client = build_openai_model_client(
+                    api_key=learning_settings.learning_extractor_api_key,
+                    model=learning_settings.learning_judge_model,
+                    base_url=learning_settings.learning_extractor_base_url,
+                )
             audit_store = (
                 CouchbaseAuditStore(learning_settings)
                 if learning_settings.learning_audit_username
@@ -237,6 +255,7 @@ async def _main() -> int:
                 queue=queue,
                 tracer=tracer,
                 model_client=model_client,
+                judge_model_client=judge_model_client,
                 audit_store=audit_store,
                 candidate_store=candidate_store,
                 blueprint_corpus=blueprint_corpus,

@@ -1,7 +1,7 @@
 # Learning loop: prior art + promotion rework — plan
 
-**Status:** slices 1, 1.x, 1.5, **2**, **2b** and **3a** built. Everything below them is designed, not built.
-**Written:** 2026-08-10. Pick up from "Remaining slices" (next: 3b — the judge).
+**Status:** slices 1, 1.x, 1.5, **2**, **2b**, **3a** and **3b** built. Everything below them is designed, not built.
+**Written:** 2026-08-10. Pick up from "Remaining slices" (next: 3c — composites, or 4 — promotion policy).
 
 ---
 
@@ -272,12 +272,167 @@ rewriter:
 - Wants the equivalence check 3d builds (recompose and assert equality to the accepted
   SQL), which would catch an inverted bound mechanically. **Sequence it after 3d.**
 
-**3b — The judge**
+**3b — The judge — BUILT**
+
+Landed as `learning/judge/` (the two-stage `CoverageJudge`, its forced tool + response
+guard, and the two briefs), `learning/audit/judgement.py` (the verdict vocabulary +
+`JudgeRecord`), two new `AuditStore` methods, a `judge` field on `CandidateEnvelope`, a
+`learning.judge` span, seven `LEARNING_JUDGE_*` settings, and the `learning_audit`
+GSI + `query_select` grant that make the drop count a query.
+
 - Pre-extraction: embed → retrieve → judge; skip extraction above `prior_art_skip_threshold`. A small judge call cancels a much larger extractor call, so at scale it *saves* money.
 - Structured verdict (see Decisions). Drop above the confidence bar + durable audit record.
 - Post-extraction adjudication only in the ambiguous cosine band (~0.70–0.97); outside it the answer is obvious and free.
 - Keep the SHA-256 hard key as the deterministic race-safe layer. Record the verdict on the envelope so a redelivery never re-runs the LLM.
 - Set the confidence bar **higher pre-extraction than post**: the pre-extraction judge sees a `SessionSummary` with raw SQL and literals, but no generalization, no parameterization, no `result_grain`. It is the cheapest place to drop and the least-informed one.
+
+Decisions taken while building, each deliberate:
+
+* **EVERY judgement is recorded, not only the drops.** The plan asks for a durable row
+  per drop; recording only drops would have censored the dataset the field exists for.
+  Drops are almost entirely `duplicate` by construction (that is the only verdict that
+  may cancel work), so a drop-only store could never show an `existing-plus-delta`
+  skew — which is the *stated trigger* for building atomic composable blueprints. The
+  superset costs one KV upsert per judged session.
+* **A verdict is never fabricated.** When the judge does not run (index unavailable, an
+  empty corpus, a best score below the band) NOTHING is written, because a
+  loop-invented `new` would be indistinguishable in the store from one a model gave.
+  The consequence is that the store is the numerator and the `learning.judge` span is
+  the denominator; the skip reasons exist only in telemetry.
+* **The record is a PRECONDITION of the drop, not a consequence.** It is written first
+  and the drop happens only if the write returned; a failed write converts a drop into
+  a proceed. On the proceed path the same failure is swallowed — refusing to extract
+  because an analytics row did not land would be a self-inflicted outage.
+* **A drop needs five positive facts, not the absence of objections.**
+  `verdict == duplicate` (only that one — `existing-plus-delta` says by construction
+  there is an increment to keep), confidence at/above the bar, a `covered_by` that was
+  actually in the block the judge was shown, a tier of `mcp`/`learning`, and an ORIGIN
+  of `graph`. The membership test is the guard on the id and it handles `""`, an
+  unknown id and a hallucinated id identically — derived from what `covered_by` is FOR
+  (a human looks the artifact up), because an id nobody can resolve makes the audit row
+  unauditable and the drop therefore unreviewable. The last two conditions are not new
+  rules: `priorart/models.py` already states that an `unsourced` node "can never
+  trigger the drop-the-candidate verdict" and that a `corpus` card (an unlanded
+  in-flight sibling that may yet be rejected) "can at most route to a human". The
+  origin is stored on the row, because it is the one drop condition a reader cannot
+  infer from the others. A duplicate id resolves MOST-RESTRICTIVE-WINS, not last-wins,
+  so a discard never depends on the order two producers were concatenated in.
+* **The envelope stamp is NOT the idempotency mechanism**, and the docstring says so.
+  A redelivery re-extracts and mints a fresh envelope with the field unset; what
+  actually prevents the second (non-idempotent) model call is a `learning_audit` key
+  derived from a CONTENT fingerprint over the exact brief the judge was shown. Keying
+  the post stage on `candidate_id` (the first cut) bound a POSITION —
+  `candidate::<content_hash>::<ordinal>`, and `_run_extractor`'s own comment says a
+  re-extraction can emit "a different count/order" — so a reordered redelivery could
+  serve candidate A the verdict rendered about candidate B, with the audit `reason`
+  describing B. A content-keyed MISS costs one small judge call; a position-keyed false
+  HIT costs a session. What is REUSED is the model's assessment; the drop gate is
+  re-applied every time, so retuning a bar takes effect on the next delivery instead of
+  being frozen into a stored outcome.
+* **Shadow mode is a real flag, and an earlier draft of this document was wrong about
+  it.** That draft said the safe rollout was expressible as a confidence bar above 1.0.
+  It is not: pydantic and `JudgeConfig.__post_init__` both refuse a bar outside `[0,1]`,
+  at exactly 1.0 the comparison is inclusive so a model asserting certainty still drops,
+  and disabling the judge records nothing at all. So the one safe rollout path — run for
+  a week, read the distribution, discard nothing — could not be configured while two
+  documents asserted that it could. `LEARNING_JUDGE_SHADOW_MODE` now runs everything and
+  forces the drop to False; the row carries `would_drop` and `shadow`.
+* **Judge verdicts get their OWN retention** (`LEARNING_JUDGE_RECORD_TTL_SECONDS`,
+  3 years). Inheriting the D95 90-day evidence floor would have erased the dataset about
+  as fast as the skew signal accrues — the questions are quarterly. An evidence quote is
+  entity-bearing and should expire; a verdict row is scalars plus one capped reason.
+* **The drop precondition is an ACK, not durability**, and the docstring says so rather
+  than implying otherwise. A plain Couchbase upsert returns from the managed cache;
+  persistence and replication are asynchronous, so a node failure shortly after the ack
+  loses the record after the drop was taken. Closing it means a server durability level,
+  which costs latency on every judgement and is not exercisable on the single-node dev
+  cluster — named, not implied away.
+* **The recorded `model` follows the CLIENT, not the setting.** The field exists so the
+  dataset never silently pools two judges; reading it off `LEARNING_JUDGE_MODEL`
+  unconditionally would have defeated that for every caller that passes one model client
+  and never looks at the setting (both demo scripts), stamping a model id that did not
+  answer. A configured-but-unused setting is warned about loudly instead.
+* **The knobs are on `LearningSettings`, NOT on `PromotionPolicy`.** The plan lists
+  `prior_art_skip_threshold` among slice 4's `PromotionPolicy` knobs, but that class is
+  accepted by all three promotion factories and passed by no entrypoint, so a knob
+  added there today does not exist in production. A knob that silently cancels
+  extractions must be live from the first deploy. Slice 4 should either move them or
+  leave them; they must not end up in both places.
+* **The post-extraction judge lives INSIDE `DedupStage`, not as a new stage.** The
+  stage order is frozen (D102 §7.1), and this is a better-informed version of the
+  decision the soft layer is already making: it needs exactly the cards the soft layer
+  just retrieved, and a separate stage would either re-embed and re-search or
+  adjudicate a set the routing never saw. `_soft_layer` now returns the whole union as
+  a third element — an `insert` returns no *matched* card by design, but a 0.75
+  near-match is precisely the ambiguous case.
+* **The judge may only ever REMOVE.** It never softens a `merge`, never turns a
+  `conflict` into an `insert`, never advances anything past a gate. A dropped candidate
+  also never reaches `_seed_on_insert`, so no `learning_corpus` artifact is left
+  accruing hits for work nobody kept.
+* **A `learning.dedup` span is emitted for a judge-dropped candidate exactly as it
+  would be otherwise.** It faithfully reports what DEDUP decided; the drop is on the
+  `learning.judge` span. So a dedup span is not a claim that the candidate survived the
+  pipeline — worth knowing before writing a Phoenix query over `action=insert`.
+* **No retries on the judge call.** The whole justification is that it costs less than
+  the call it cancels; a retry budget spends the saving to salvage an optimization. The
+  extractor retries because its output IS the product.
+
+**What the unit suite does NOT establish** — pinned as a tripwire in
+`tests/learning/judge/test_judge_limits_qa.py`, in the house convention for a named
+limitation (plain passing assertions about today's behaviour, not an xfail):
+
+A scripted model client proves that a verdict is parsed, guarded, gated, recorded,
+honoured and made idempotent. It proves NOTHING about whether a real model would call
+the right session a duplicate — the one question the judge exists to answer is the one
+question no test in that directory asks. This is the same shape as the golden-replay
+lesson (`passed=True` on SQL ClickHouse rejects, because the fake probe never
+executes). What would establish accuracy: a labelled set of real sessions scored
+against the judge; a live probe against the real corpus and a real model; or a period
+running with the pre-drop bar at 1.0 so verdicts are recorded and nothing is dropped.
+None of the three is in this slice.
+
+**Deployment:** re-run `scripts/learning-audit-init.sh` wherever `learning_audit` was
+provisioned KV-only. It now grants `query_select` and creates
+`idx_audit_judge_verdicts (record_type, judged_at)`. Without it the drops are still
+recorded and nobody can count them, which defeats the mitigation. QA confirmed the dev
+stack's `learning_audit` currently has **no indexes at all, not even a primary**, so the
+dataset queries there answer by full scan until the script is run.
+
+**Found by review + QA and fixed during the slice** (all pinned by regression tests that
+were strict xfails until the fix landed):
+
+* the post-extraction key bound a position, not content (the blocker above);
+* `CoverageAssessment.from_doc` coerced an unknown stored verdict to `new` — inside the
+  vocabulary — and `_judge` re-persists a reused assessment, so a corrupted row would
+  have been permanently rewritten as a verdict no model ever gave. It refuses now, and
+  the caller re-judges;
+* `timeout_seconds` bounded the model call only, so a hung audit read or write stalled
+  the judge — and the consumer — indefinitely, against this component's own "must never
+  be the reason a session takes longer than it used to". All three I/O paths are
+  deadline-bound; a write timeout counts as a failed write and therefore refuses a drop;
+* `begin_turn_client` and `parse_assessment` sat outside `_ask`'s try, so a Protocol
+  implementation returning `None` or a foreign object went dark: no fail-open log and no
+  `learning.judge` span, which blinded the numerator/denominator cross-check for the
+  whole class;
+* `parse_assessment` iterated `tool_calls` with no container check (the eighth sighting
+  of that class here — the correct version was already in the same package, in
+  `lookup_prior_art`), and `_best_card` claimed totality on a type check that said
+  nothing about the FIELDS: a non-str `id` crashed only on a confidence TIE, i.e. a
+  latent load-dependent crash;
+* a `BaseException` from a model client escaped every handler and killed the whole
+  consumer batch, stranding the session at `processing`. `_ask` now catches it and
+  re-raises exactly `CancelledError`, `KeyboardInterrupt` and `SystemExit`;
+* a raising tracer between the record write and the return left a `dropped=true` row for
+  a session that was then extracted — telemetry rewriting the one dataset the mitigation
+  depends on;
+* `best_similarity` was the score that opened the band, which need not be the score of
+  the artifact the verdict names; `authorizing_similarity` records the latter.
+
+**Corrected reasoning:** the key's motivating comment named a PEL redelivery after a
+crash between `processing` and `done`. QA traced it — there is no
+`processing → processing` edge, so the reclaim CAS-mismatches and never reaches the
+judge. The key earns its keep on re-enqueues, peer races, pipeline re-runs and
+re-extractions instead.
 
 **3c — Composites**
 - `composes` in the tool schema + prompt (today there is a `kind: single|composite` flag with no field to describe steps).
@@ -305,7 +460,7 @@ rewriter:
 | Work | Blocked on / trigger |
 |---|---|
 | S4 scratch handling — a `extract_column_provenance_for_template` entry point taking known-local relation names | **2b**. Unreachable today. |
-| Atomic blueprints in the learning loop | Judge verdicts skewing to `existing-plus-delta`. |
+| Atomic blueprints in the learning loop | Judge verdicts skewing to `existing-plus-delta`. **Now measurable** (3b): `SELECT verdict, count(*) FROM \`learning_audit\` WHERE record_type = 'judge_verdict' GROUP BY verdict`. |
 | Guard-4 negative signal (`corrected_at`/`correction_count`) | Confirm slice 4's routing change doesn't already fix it. |
 
 ---

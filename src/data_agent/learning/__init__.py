@@ -8,7 +8,18 @@
 # Slice 3 (D31/D34/D97/D98/D101): the grounded structured-output extractor + the
 # `learning_candidates` holding store (first real evidence writes). No writers into
 # the recall stores / leakage gate / dedup / promotion (later slices).
-from .audit import AuditStore, EvidenceSnapshot, InMemoryAuditStore, mint_evidence_ref
+# Prior-art plan §3b: the coverage judge — a small model call between triage and the
+# extractor that cancels the (much larger) extraction when the corpus already carries
+# the session's work, and a second one inside dedup for the ambiguous cosine band.
+# Every drop leaves a durable, queryable record in `learning_audit`.
+from .audit import (
+    AuditStore,
+    CoverageAssessment,
+    EvidenceSnapshot,
+    InMemoryAuditStore,
+    JudgeRecord,
+    mint_evidence_ref,
+)
 from .candidate import (
     CandidateEnvelope,
     CandidateStatus,
@@ -30,6 +41,7 @@ from .factory import (
     build_promotion_scheduler,
     build_review_inbox,
 )
+from .judge import CoverageJudge, JudgeConfig
 from .memory_queue import InMemoryLearningQueue
 from .models import (
     SWEEPABLE_STATUSES,
@@ -52,6 +64,8 @@ __all__ = [
     "CandidateStatus",
     "CandidateStore",
     "ConsumeResult",
+    "CoverageAssessment",
+    "CoverageJudge",
     "DeliveredJob",
     "EvidenceSnapshot",
     "ExtractedCandidate",
@@ -61,6 +75,8 @@ __all__ = [
     "InMemoryCandidateStore",
     "InMemoryLearningQueue",
     "InvalidTransitionError",
+    "JudgeConfig",
+    "JudgeRecord",
     "LearningConsumer",
     "LearningExtractor",
     "LearningJob",

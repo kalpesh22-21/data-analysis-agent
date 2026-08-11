@@ -63,6 +63,27 @@ making the rate queryable rather than anecdotal.
   * A degraded/failing embedder, or a failed corpus scan, contributes an empty bucket
     half — never a wrong `merge`.
 
+**A FOURTH, optional adjudicator sits behind the soft layer (plan §3b).** When a
+`CoverageJudge` is wired, a soft-layer best score inside the ambiguous band
+(~0.70-0.97) is put to a model: "does this artifact already do what the candidate
+does?" Outside the band nothing is asked, because outside it the answer is obvious and
+free — below, nothing is close; above, the deterministic layers and the merge routing
+already have an opinion.
+
+It runs HERE rather than as a new pipeline stage for two reasons. The stage order is
+frozen (D102 §7.1), and this is not a new decision so much as a better-informed version
+of the one the soft layer is already making — it needs exactly the cards the soft layer
+just retrieved, and a separate stage would either re-embed and re-search (paying the
+soft layer's cost twice) or adjudicate a set the routing never saw.
+
+The judge may only ever DROP. It never softens a verdict, never turns a `merge` into an
+`insert`, and never advances a candidate past a gate — so the worst a mis-tuned judge
+can do is discard work, which is why it drops only on positive evidence and writes a
+durable `learning_audit` record before it does. Note that a `learning.dedup` span is
+emitted for a judge-dropped candidate exactly as it would be otherwise: it faithfully
+reports what DEDUP decided, and the drop is reported on the `learning.judge` span. So a
+dedup span is not a claim that the candidate survived the pipeline.
+
 The stage only adjudicates BLUEPRINTS (both keys are AST-derived). Non-blueprint targets
 pass through untouched (`dedup` stays `None`); the writer stage routes them.
 
@@ -79,6 +100,7 @@ from dataclasses import replace
 
 from ..candidate.models import CandidateEnvelope
 from ..candidate.verdicts import DedupVerdict
+from ..judge import CoverageJudge
 from ..observability import dedup_span
 from ..priorart import (
     TIER_LEARNING,
@@ -251,6 +273,7 @@ class DedupStage:
         merge_threshold: float = _DEFAULT_MERGE_THRESHOLD,
         conflict_threshold: float = _DEFAULT_CONFLICT_THRESHOLD,
         prior_art_limit: int = _DEFAULT_PRIOR_ART_LIMIT,
+        judge: CoverageJudge | None = None,
         tracer: object | None = None,
     ) -> None:
         if conflict_threshold > merge_threshold:
@@ -273,6 +296,9 @@ class DedupStage:
         self._merge_threshold = merge_threshold
         self._conflict_threshold = conflict_threshold
         self._prior_art_limit = max(1, prior_art_limit)
+        # Plan §3b. Optional and default-absent: with none wired this stage behaves
+        # exactly as it did before the slice, and no model is ever called from here.
+        self._judge = judge
         self._tracer = tracer
 
     async def process(self, env: CandidateEnvelope, ctx: StageContext) -> StageResult:
@@ -355,8 +381,17 @@ class DedupStage:
             return StageResult(replace(env, dedup=verdict), "continue")
 
         # Layer 3 — the soft near-miss band.
-        verdict, card = await self._soft_layer(env, hard_key=hard_key)
-        await self._seed_on_insert(env, verdict)
+        verdict, card, cards = await self._soft_layer(env, hard_key=hard_key)
+        env = replace(env, dedup=verdict)
+
+        # Layer 3b (plan §3b) — the optional model adjudication, ambiguous band only.
+        # BEFORE `_seed_on_insert`, deliberately: a candidate the judge discards must not
+        # first register a `learning_corpus` artifact that would then accrue hit counts
+        # for work nobody kept.
+        env, dropped = await self._adjudicate(env, ctx, cards)
+
+        if not dropped:
+            await self._seed_on_insert(env, verdict)
         self._observe(
             env,
             verdict,
@@ -364,7 +399,45 @@ class DedupStage:
             matched_status=card.status if card is not None else None,
             matched_origin=card.origin if card is not None else None,
         )
-        return StageResult(replace(env, dedup=verdict), "continue")
+        return StageResult(env, "drop" if dropped else "continue")
+
+    # -- layer 3b: the optional coverage judge ---------------------------------
+
+    async def _adjudicate(
+        self, env: CandidateEnvelope, ctx: StageContext, cards: list[PriorArtCard]
+    ) -> tuple[CandidateEnvelope, bool]:
+        """Put a band-straddling near-match to the coverage judge. Returns the (possibly
+        verdict-stamped) envelope and whether the candidate was DROPPED.
+
+        The band test itself lives in the judge, not here: it is the judge's own knob and
+        both of its stages consult it, so duplicating the comparison would be a second
+        place for the band to drift. This method's job is to decide whether the judge is
+        ASKED at all (blueprint, judge wired) and to carry the result back onto the
+        envelope.
+
+        Never raises. The judge is fail-open internally, but a Protocol violation by an
+        injected collaborator must not escape into `_run_stages` and abort the whole
+        extraction — the same posture every other read in this stage takes (D52)."""
+        if self._judge is None:
+            return env, False
+        try:
+            outcome = await self._judge.adjudicate_candidate(env, ctx.summary, cards)
+        except Exception:  # noqa: BLE001 - a broken judge may never cost the candidate
+            _logger.warning(
+                "dedup: the coverage judge raised for candidate %s — keeping the "
+                "candidate (fail-open). This is a judge bug: every internal failure "
+                "path is supposed to be handled inside it.",
+                env.candidate_id,
+                exc_info=True,
+            )
+            return env, False
+        if outcome.assessment is not None:
+            # Stamped even when the verdict did NOT drop: `new` and
+            # `existing-plus-delta` on a surviving candidate are the two most useful
+            # rows in the dataset, and a human reading the review inbox wants to see
+            # that the machine already had an opinion.
+            env = replace(env, judge=outcome.assessment)
+        return env, outcome.drop
 
     # -- layer 2: the cross-tier structural key --------------------------------
 
@@ -490,7 +563,7 @@ class DedupStage:
 
     async def _soft_layer(
         self, env: CandidateEnvelope, *, hard_key: str
-    ) -> tuple[DedupVerdict, PriorArtCard | None]:
+    ) -> tuple[DedupVerdict, PriorArtCard | None, list[PriorArtCard]]:
         """Embedding near-miss adjudication on `intent` over the UNION of both soft
         sources — the neo4j prior-art index AND the `learning_corpus` bucket.
 
@@ -510,10 +583,17 @@ class DedupStage:
           * the BUCKET sees candidates that have not landed yet, expensively (N+1
             embeddings — see `_corpus_cards`).
 
-        Returns the verdict plus the matched CARD (or `None` on an `insert`) so the
-        caller can record its tier, status and origin: a `merge` against the canon, a
-        `merge` against a landed node, and a `merge` against an unlanded sibling are the
-        same verdict but three very different facts.
+        Returns the verdict, the matched CARD (or `None` on an `insert`) so the caller
+        can record its tier, status and origin — a `merge` against the canon, a `merge`
+        against a landed node, and a `merge` against an unlanded sibling are the same
+        verdict but three very different facts — and the WHOLE union.
+
+        The third element exists for the coverage judge (plan §3b) and is deliberately
+        NOT the matched card: an `insert` returns no matched card by design (nothing was
+        near enough to route on), but a 0.75 near-match is exactly the ambiguous case
+        the judge is for, so the judge must see the candidates the banding rejected.
+        Handing over the assembled list rather than a search handle is what keeps the
+        judge adjudicating EXACTLY what dedup banded, and pays the embed once.
 
         Degrades to `insert` on an empty intent, both sources empty, or ANY failure —
         never a wrong merge. An index that RAISES is logged loudly and simply contributes
@@ -521,7 +601,7 @@ class DedupStage:
         is now strictly a subset of the healthy path rather than a different one."""
         intent = _text(env.payload.get("intent"))
         if not intent:
-            return DedupVerdict(hard_key, None, 0.0, "insert", "soft"), None
+            return DedupVerdict(hard_key, None, 0.0, "insert", "soft"), None, []
 
         graph_cards: list[PriorArtCard] = []
         if self._prior_art is not None:
@@ -547,7 +627,9 @@ class DedupStage:
             # graph already returned — see `_corpus_cards` for the join.
             already_seen=frozenset(card.id for card in graph_cards),
         )
-        return self._adjudicate_cards(graph_cards + bucket_cards, hard_key=hard_key)
+        cards = graph_cards + bucket_cards
+        verdict, matched = self._adjudicate_cards(cards, hard_key=hard_key)
+        return verdict, matched, cards
 
     def _adjudicate_cards(
         self, cards: list[PriorArtCard], *, hard_key: str
