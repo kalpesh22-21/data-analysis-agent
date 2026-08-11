@@ -1218,9 +1218,15 @@
     renderAssumptions(block, data.assumptions);
     // `sql` was renamed `sql_executed` (every query the turn RAN — the audit list).
     renderSql(block, data.sql_executed);
-    // `result_table` is gone from the live result; the answer table is the
-    // model-designated `answer_sql`, paged from the runtime.
-    renderAnswerTable(block, data.answer_sql);
+    // The answer table: prefer the model-designated `answer_sql` (paged from the
+    // runtime, live AND on reload — `/session/history` returns it too). Fall back to
+    // a static `result_table` preview only for history turns that designated
+    // nothing, which is all older sessions have.
+    if (data.answer_sql) {
+      renderAnswerTable(block, data.answer_sql);
+    } else {
+      renderResultTable(block, data.result_table || null);
+    }
     renderBlueprintChip(block, data.blueprint_use);
     renderVerification(block, data.verification);
     renderProvenance(block, data.provenance);
@@ -1254,13 +1260,23 @@
   // shape onto the renderTurnBlock shape: provenance_union → provenance,
   // tool_calls → sql / result_table / per-SQL breakdown. History turns carry no
   // blueprint_use / verification / status, so those panels stay hidden.
+  //
+  // The key names here must match what `renderTurnBlock` READS. They drifted once:
+  // the live result renamed `sql` -> `sql_executed` and `result_table` ->
+  // `answer_sql`, and this adapter kept passing the old names, so a RELOADED
+  // transcript silently lost both its SQL panel and its table while the live turn
+  // rendered fine. Reload is the only place that regression shows.
   function renderHistoryTurn(turn) {
     var block = createTurnBlock(turn.question);
     var toolCalls = Array.isArray(turn.tool_calls) ? turn.tool_calls : [];
     renderTurnBlock(block, {
       assistant_text: turn.answer,
       assumptions: turn.assumptions,
-      sql: collectSql(toolCalls),
+      sql_executed: collectSql(toolCalls),
+      // `/session/history` resolves this for BOTH designation forms, including
+      // `blueprint_id`, so a reloaded blueprint answer pages the same table it did
+      // live. `pickResultTable` is the fallback for turns that designated nothing.
+      answer_sql: turn.answer_sql,
       result_table: pickResultTable(toolCalls),
       provenance: turn.provenance_union,
       tool_calls: toolCalls,

@@ -1088,3 +1088,68 @@ def test_history_paused_session_pending_question(monkeypatch) -> None:
     assert body["turns"][0]["question"] == "payroll?"
     assert body["turns"][0]["answer"] is None
     assert body["pending_question"] == {"question": "Which department?", "options": None}
+
+
+def test_history_survives_an_unreadable_blueprint_result(monkeypatch) -> None:
+    """`GET /session/history` is a pure read path whose job is rebuilding a
+    transcript. Resolving a blueprint-designated `answer_sql` needs a D46 KV read,
+    and if that read RAISES the whole session's history must not 500 — one
+    unreadable blueprint result costs that turn its `answer_sql`, nothing more.
+
+    This is not hypothetical: a store proxy in the dev launcher was missing
+    `read_full_result` entirely, and history 500'd for every session until it
+    degraded instead.
+    """
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **k: frozenset())
+
+    store = InMemorySessionStore()
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("KV unavailable")
+
+    monkeypatch.setattr(store, "read_full_result", _boom, raising=False)
+
+    app = create_app(
+        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        session_store=store,
+        mcp_client=FakeMCPClient(),
+        model_client=ScriptedModelClient([ModelTurnResult(assistant_text="hi")]),
+        catalog=CatalogHandle({}),
+    )
+    client = TestClient(app)
+
+    import asyncio
+
+    from data_agent.runtime.session.models import TrailEntry, TurnMessage
+
+    async def _seed() -> None:
+        await store.get_or_create_session(SESSION_ID)
+        await store.append_message(
+            SESSION_ID,
+            TurnMessage(turn_index=0, role="user", content="q?", ts="t0",
+                        provenance=frozenset()),
+        )
+        await store.append_message(
+            SESSION_ID,
+            TurnMessage(turn_index=0, role="assistant", content="a", ts="t3",
+                        provenance=frozenset()),
+        )
+        await store.append_trail_entry(
+            SESSION_ID,
+            TrailEntry(
+                turn_index=0, tool_call_id="b1", tool_name="runBlueprint",
+                args={"id": "bp-x"}, status="ok", error_code=None,
+                provenance=frozenset(), result_preview=None,
+                result_full_ref="result::gone", ts="t1",
+            ),
+        )
+
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_seed())
+
+    resp = client.get("/session/history", headers=HEADERS)
+
+    assert resp.status_code == 200, "an unreadable blueprint result must not 500 history"
+    turns = resp.json()["turns"]
+    assert len(turns) == 1
+    assert turns[0]["answer"] == "a"          # the transcript still rebuilds
+    assert turns[0]["answer_sql"] is None     # only the table reference is lost

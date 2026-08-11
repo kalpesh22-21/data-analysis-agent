@@ -822,9 +822,23 @@ def create_app(
                 or entry.result_full_ref is None
             ):
                 continue
-            result_full = await session_store.read_full_result(
-                x_session_id, entry.result_full_ref
-            )
+            try:
+                result_full = await session_store.read_full_result(
+                    x_session_id, entry.result_full_ref
+                )
+            except Exception:
+                # DEGRADE, never 500. This is a pure read path whose job is to
+                # rebuild a transcript; one unreadable blueprint result must cost
+                # that turn its `answer_sql`, not the whole session's history. (A
+                # store proxy missing this method did exactly that once.)
+                _logger.warning(
+                    "history: could not read full result %s for blueprint answer_sql "
+                    "(session=%s) — that turn reports answer_sql=null",
+                    entry.result_full_ref,
+                    x_session_id,
+                    exc_info=True,
+                )
+                continue
             if isinstance(result_full, dict):
                 bp_id = result_full.get("blueprint_id")
                 terminal_sql = result_full.get("terminal_sql")

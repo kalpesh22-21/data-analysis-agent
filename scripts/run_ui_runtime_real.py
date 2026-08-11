@@ -202,6 +202,15 @@ class _LazyCouchbaseSessionStore:
     ) -> str:
         return await self._store().write_full_result(session_id, result_id, result_full)
 
+    async def read_full_result(self, session_id: str, result_full_ref: str) -> Any:
+        # The read-back half of `write_full_result`. It was missing while the write
+        # half was present, so every caller of the read path hit an AttributeError
+        # here rather than in the real store — `GET /session/history` 500'd once it
+        # started de-referencing blueprint results. A hand-maintained proxy silently
+        # drifts from the protocol it stands in for; add new SessionStore methods
+        # here too.
+        return await self._store().read_full_result(session_id, result_full_ref)
+
     async def write_pause_checkpoint(self, session_id: str, checkpoint: Any) -> None:
         await self._store().write_pause_checkpoint(session_id, checkpoint)
 
@@ -266,9 +275,17 @@ def build_real_app():
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
         max_budget_windows=3,
-        # Retrieval / scratch: off unless REAL_RETRIEVAL=1 (documented follow-on).
+        # Retrieval / scratch: both off unless REAL_RETRIEVAL=1.
+        #
+        # `scratch_enabled` was hardcoded False here while the comment claimed it
+        # followed the flag. The effect was that a COMPOSED (table-intermediate)
+        # blueprint could never run in the UI: `runBlueprint` reported "not supported
+        # in this environment" and the model silently degraded to the raw loop. It is
+        # gated on the SAME flag because the two are only useful together — a
+        # scratch-join blueprint has to be FOUND by retrieval before it can
+        # materialize anything.
         retrieval_enabled=retrieval_on,
-        scratch_enabled=False,
+        scratch_enabled=retrieval_on,
         neo4j_url=_NEO4J_URL if retrieval_on else "",
         neo4j_username=_NEO4J_USERNAME,
         neo4j_password=_NEO4J_PASSWORD,
