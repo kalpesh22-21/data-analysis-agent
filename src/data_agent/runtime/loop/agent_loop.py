@@ -85,6 +85,12 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.composite.answer_with_table import TOOL_NAME as ANSWER_TABLE_TOOL_NAME
+from data_agent.runtime.composite.answer_with_table import (
+    clean_answer_sql,
+    clean_answer_text,
+    clean_blueprint_id,
+)
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
 from data_agent.runtime.context.assembly import (
     IDEMPOTENT_READ_ALREADY_SERVED_CODE,
@@ -97,11 +103,16 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolPause,
     ToolResult,
 )
+from data_agent.runtime.hooks.answer_table import (
+    AnswerTableEvent,
+    AnswerTableHooks,
+    references_scratch,
+)
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
+from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.session.models import (
     PauseCheckpoint,
-    ResultPreview,
     TrailEntry,
     TurnMessage,
 )
@@ -312,8 +323,22 @@ class TurnOutcome:
     # populates these best-effort at every return site (never load-bearing for
     # correctness). All default `None` so existing construction sites stay valid
     # and an old client ignores the unknown keys (backward compatible).
-    sql: list[str] | None = None
-    result_table: ResultPreview | None = None
+    # Every read-only query the turn actually EXECUTED, in first-occurrence order
+    # (was `sql`; renamed so it can never be mistaken for "the answer"). This is
+    # the audit/explain list — what ran, including intermediate probes and
+    # sanity checks.
+    sql_executed: list[str] | None = None
+    # The single query the MODEL designated as the answer, via `presentTable`
+    # (composite/present_table.py). The UI runs THIS one itself, paginated, rather
+    # than the model transcribing rows into its prose. `None` when the answer is a
+    # scalar/single row — or when the model simply did not call the tool, since the
+    # designation is advisory.
+    #
+    # It replaced `result_table` (a `ResultPreview` of the last successful query):
+    # that shipped a fixed 20-row preview the user could not page past, and it was
+    # picked by the runtime ("last successful query"), which is wrong exactly when
+    # a turn resolves values or probes before answering.
+    answer_sql: str | None = None
     blueprint_use: dict[str, Any] | None = None
     verification: dict[str, Any] | None = None
     provenance: frozenset[tuple[str, str]] | None = None
@@ -322,6 +347,31 @@ class TurnOutcome:
     # result field mirroring `sql` in EVERY respect (additive, nullable, `[] ->
     # None` fork, accumulated across budget windows at every return site).
     assumptions: list[str] | None = None
+
+
+def _capture_terminal_sql(
+    tool_name: str, tool_result: ToolResult, *, into: dict[str, str]
+) -> None:
+    """Record a SUCCESSFUL blueprint's `terminal_sql` under its id, in place.
+
+    The terminal SQL is the ONE query whose rows are that blueprint's answer
+    (`blueprint/executor.py`), exposed explicitly rather than inferred as "the last
+    element of `result_full["sql"]`" — rehydrated nodes are appended to that list
+    FIRST on a D45 resume, so the positional assumption is not safe.
+
+    Captured HERE, at dispatch, because `result_full` is in hand: a blueprint's
+    result is persisted behind a D46 KV pointer (`result_full_ref`), so reading it
+    back off the trail later would cost a store round-trip. A no-op for any
+    non-`ok` / non-runBlueprint call, so it is safe to call unconditionally."""
+    if tool_result.status != "ok" or tool_name != "runBlueprint":
+        return
+    result_full = tool_result.result_full
+    if not isinstance(result_full, dict):
+        return
+    blueprint_id = result_full.get("blueprint_id")
+    terminal_sql = result_full.get("terminal_sql")
+    if isinstance(blueprint_id, str) and isinstance(terminal_sql, str) and terminal_sql.strip():
+        into[blueprint_id] = terminal_sql
 
 
 def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -469,6 +519,11 @@ class AgentLoop:
         blueprint_executor: Any = None,
         discovery_emulation_provider: EmulatedDiscoveryProvider | None = None,
         progress_summarizer: ProgressSummarizer | None = None,
+        # Answer-table lifecycle seams (D72, hooks/answer_table.py). Defaults to an
+        # EMPTY registry — dormant, every hook point a no-op, byte-identical to not
+        # having them. `app.py` does not populate it; activating one is a
+        # deliberate registration, never a config flag.
+        answer_table_hooks: AnswerTableHooks | None = None,
     ) -> None:
         self._model_client = model_client
         self._tool_dispatcher = tool_dispatcher
@@ -522,6 +577,7 @@ class AgentLoop:
         # `_summary_tasks` so a still-pending task can be best-effort cancelled when
         # the turn ends (never awaited before dispatch, never blocking the result).
         self._progress_summarizer = progress_summarizer
+        self._answer_table_hooks = answer_table_hooks or AnswerTableHooks()
         self._summary_tasks: set[asyncio.Task[None]] = set()
 
     async def run(
@@ -612,6 +668,7 @@ class AgentLoop:
         # assumptions `project_history` reconstructs from the same trail. Without
         # this seed, live and history would disagree for a paused-then-resumed turn.
         seed_assumptions = await self._compute_turn_assumptions(session_id, turn_index)
+        seed_answer_sql = await self._compute_turn_answer_sql(session_id, turn_index)
         turn_model_client = self._begin_model_turn()
         return await self._run_loop(
             session_id=session_id,
@@ -621,6 +678,7 @@ class AgentLoop:
             model_client=turn_model_client,
             question=question,
             seed_assumptions=seed_assumptions,
+            seed_answer_sql=seed_answer_sql,
         )
 
     def _begin_model_turn(self) -> ModelClient:
@@ -899,6 +957,27 @@ class AgentLoop:
                 fold_assumptions(gathered, entry.args.get("assumptions"))
         return gathered
 
+    async def _compute_turn_answer_sql(self, session_id: str, turn_index: int) -> str | None:
+        """Reconstruct the model-designated `answer_sql` for *turn_index* from the
+        persisted `presentTable` trail entries — the `_compute_turn_assumptions`
+        sibling, used to SEED a resumed window on BOTH resume paths so a designation
+        the model made BEFORE an askUser / blueprint-approval pause survives it.
+
+        LAST successful designation wins, matching `_accumulate_answer_sql`'s
+        in-window rule (a later `presentTable` supersedes an earlier one). Without
+        this, a turn that designated its answer table and THEN paused would come back
+        with `answer_sql=None` and the UI would silently lose the table."""
+        trail = await self._session_store.load_trail(session_id)
+        designated: str | None = None
+        for entry in trail:
+            if (
+                entry.turn_index == turn_index
+                and entry.status == "ok"
+                and entry.tool_name == ANSWER_TABLE_TOOL_NAME
+            ):
+                designated = clean_answer_sql(entry.args.get("sql")) or designated
+        return designated
+
     def _maybe_start_summary(self, tool_name: str, arguments: dict[str, Any]) -> None:
         """Fire a FIRE-AND-FORGET progress-summary task for one tool CALL (opt-in).
 
@@ -988,8 +1067,8 @@ class AgentLoop:
         window_count: int,
         assistant_text: str | None,
         tool_calls_made: int,
-        sql: list[str] | None = None,
-        result_table: ResultPreview | None = None,
+        sql_executed: list[str] | None = None,
+        answer_sql: str | None = None,
         blueprint_use: dict[str, Any] | None = None,
         verification: dict[str, Any] | None = None,
         assumptions: list[str] | None = None,
@@ -1024,8 +1103,8 @@ class AgentLoop:
             assistant_text=assistant_text,
             pending_question=checkpoint.pending_question,
             tool_calls_made=tool_calls_made,
-            sql=sql,
-            result_table=result_table,
+            sql_executed=sql_executed,
+            answer_sql=answer_sql,
             blueprint_use=blueprint_use,
             verification=verification,
             assumptions=assumptions,
@@ -1105,20 +1184,25 @@ class AgentLoop:
 
         # UI Slice 1 Fix 1: fold this COMPLETED blueprint result into seed
         # enrichment so the resumed loop's FINAL `done` result event carries the
-        # same sql/result_table/blueprint_use/verification a non-paused blueprint
+        # same sql_executed/blueprint_use/verification a non-paused blueprint
         # answer would (a fresh `_run_loop` window would otherwise start empty and
         # drop it). Raw slots ride the checkpoint's `slot_bindings`. A no-op on a
         # non-`ok` (failed/degraded) resume → no seed, matching a raw-loop fallback.
         seed_sql: list[str] = []
-        seed_preview, seed_blueprint_use, seed_verification = self._accumulate_enrichment(
+        seed_blueprint_use, seed_verification = self._accumulate_enrichment(
             "runBlueprint",
             {"slot_bindings": slot_bindings},
             tool_result,
             turn_sql=seed_sql,
-            primary_preview=None,
             blueprint_use=None,
             verification=None,
         )
+        # Seed the id -> terminal-SQL map too, so the resumed window can honor an
+        # `answerWithTable(blueprint_id=…)` naming the blueprint that completed
+        # BEFORE this approval pause — otherwise the designation resolves to nothing
+        # and the user loses the table on exactly the verified path.
+        seed_blueprint_terminal_sql: dict[str, str] = {}
+        _capture_terminal_sql("runBlueprint", tool_result, into=seed_blueprint_terminal_sql)
 
         # Persist the completed/failed runBlueprint result as a trail entry so the
         # continued loop (and any replay) sees it, then let the model narrate.
@@ -1150,6 +1234,10 @@ class AgentLoop:
         # assumptions the model recorded BEFORE this blueprint approval-pause from
         # the trail, so the resumed window's final answer still carries them.
         seed_assumptions = await self._compute_turn_assumptions(session_id, turn_index)
+        # `presentTable` parity with the assumptions seed: a designation the model
+        # made BEFORE this blueprint approval-pause must survive it, or the resumed
+        # answer comes back with `answer_sql=None` and the UI silently loses the table.
+        seed_answer_sql = await self._compute_turn_answer_sql(session_id, turn_index)
         turn_model_client = self._begin_model_turn()
         return await self._run_loop(
             session_id=session_id,
@@ -1159,7 +1247,8 @@ class AgentLoop:
             model_client=turn_model_client,
             question=question,
             seed_sql=seed_sql,
-            seed_preview=seed_preview,
+            seed_answer_sql=seed_answer_sql,
+            seed_blueprint_terminal_sql=seed_blueprint_terminal_sql,
             seed_blueprint_use=seed_blueprint_use,
             seed_verification=seed_verification,
             seed_assumptions=seed_assumptions,
@@ -1186,24 +1275,29 @@ class AgentLoop:
         tool_result: ToolResult,
         *,
         turn_sql: list[str],
-        primary_preview: ResultPreview | None,
         blueprint_use: dict[str, Any] | None,
         verification: dict[str, Any] | None,
-    ) -> tuple[ResultPreview | None, dict[str, Any] | None, dict[str, Any] | None]:
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Fold one SUCCESSFUL runQuery/runBlueprint result into the turn-window
         enrichment accumulators (UI Slice 1, contract §3.2). `turn_sql` is mutated
-        in place (deduped, first-occurrence order); the other three are RETURNED
+        in place (deduped, first-occurrence order); the other two are RETURNED
         for the caller to reassign. A no-op for any non-`ok` / non-query tool call,
         so it is safe to call unconditionally. Shared by the in-loop dispatch path
         AND the blueprint approval-resume seed path so both produce identical
-        enrichment (Fix 1: a resumed verified answer keeps its badge + chip)."""
+        enrichment (Fix 1: a resumed verified answer keeps its badge + chip).
+
+        No longer tracks a `primary_preview`: the turn result used to carry the LAST
+        successful query's `ResultPreview` as `result_table`, a fixed ~20-row window
+        the user could not page past AND a choice the RUNTIME made. The answer table
+        is now the model-designated `answer_sql` (`presentTable`), which the UI runs
+        itself with real paging."""
         if tool_result.status != "ok":
-            return primary_preview, blueprint_use, verification
+            return blueprint_use, verification
         if tool_name == "runQuery":
             query_sql = arguments.get("sql")
             if query_sql and query_sql not in turn_sql:
                 turn_sql.append(query_sql)
-            return tool_result.result_preview, blueprint_use, verification
+            return blueprint_use, verification
         if tool_name == "runBlueprint":
             rf = tool_result.result_full or {}
             for bp_sql in rf.get("sql", []):
@@ -1221,8 +1315,106 @@ class AgentLoop:
                     # None-safe: a `verify: None` must not AttributeError.
                     "grain_checked": bool((rf.get("verify") or {}).get("grain_checked")),
                 }
-            return tool_result.result_preview, new_blueprint_use, new_verification
-        return primary_preview, blueprint_use, verification
+            return new_blueprint_use, new_verification
+        return blueprint_use, verification
+
+    def _resolve_answer_sql(
+        self,
+        arguments: dict[str, Any],
+        *,
+        blueprint_terminal_sql: dict[str, str],
+        session_id: str,
+        turn_index: int,
+    ) -> str | None:
+        """Resolve one `answerWithTable` designation to a concrete pageable query.
+
+        Two inputs, one output. `sql=` is taken as given (it need not be a query the
+        agent ran — see `composite/answer_with_table.py`). `blueprint_id=` is looked
+        up in *blueprint_terminal_sql*, the turn-window map of
+        `blueprint_id -> result_full["terminal_sql"]` captured when each blueprint
+        actually RAN. Resolving server-side is what keeps ONE field on the wire and
+        stops the UI re-executing a DAG (and re-materializing scratch) per page.
+
+        `sql=` wins if both are given: it is the more specific instruction.
+
+        An unresolvable `blueprint_id` (naming a blueprint that did not run
+        successfully this turn) yields `None` — the answer keeps its prose and loses
+        its table — after firing the dormant ON_ANSWER_TABLE_UNRESOLVED seam
+        (`hooks/answer_table.py`), which may supply a replacement. Re-running the
+        blueprint here to find out would decouple the paged table from the D56
+        verification that gated the answer the user was shown.
+
+        A resolved query that reads the session-scoped `scratch` database fires the
+        dormant ON_ANSWER_TABLE_EPHEMERAL seam: it works now and stops working at
+        the scratch TTL, so a hook may swap in a durable equivalent. With no hook
+        registered (the shipped default) both seams return `None` and this behaves
+        exactly as if they did not exist.
+        """
+        raw_sql = clean_answer_sql(arguments.get("sql"))
+        blueprint_id = clean_blueprint_id(arguments.get("blueprint_id"))
+        event_base = {
+            # D5: hashed, never the raw session id — a hook is never given one.
+            "session_id_hash": hash_scope(frozenset({session_id})),
+            "turn_index": turn_index,
+        }
+
+        resolved = raw_sql
+        if resolved is None and blueprint_id is not None:
+            resolved = blueprint_terminal_sql.get(blueprint_id)
+            if resolved is None:
+                _logger.warning(
+                    "answerWithTable designated blueprint %r, which did not run "
+                    "successfully this turn — no answer table (session=%s)",
+                    blueprint_id,
+                    session_id,
+                )
+                resolved = self._answer_table_hooks.resolve_unresolved(
+                    AnswerTableEvent(blueprint_id=blueprint_id, sql=None, **event_base)
+                )
+
+        if resolved is not None and references_scratch(resolved):
+            replacement = self._answer_table_hooks.resolve_ephemeral(
+                AnswerTableEvent(blueprint_id=blueprint_id, sql=resolved, **event_base)
+            )
+            if replacement is not None:
+                resolved = replacement
+        return resolved
+
+    def _accumulate_answer_sql(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        tool_result: ToolResult,
+        *,
+        answer_sql: str | None,
+        blueprint_terminal_sql: dict[str, str],
+        session_id: str,
+        turn_index: int,
+    ) -> str | None:
+        """Fold one SUCCESSFUL `answerWithTable` call into the turn's `answer_sql`
+        (mirrors `_accumulate_assumptions`: read from the call ARGUMENTS, never from
+        the result). Returns the new value; a no-op returning *answer_sql* unchanged
+        for any non-`ok` / non-`answerWithTable` call, so it is safe to call
+        unconditionally.
+
+        LAST designation wins. A second `answerWithTable` means the model changed its
+        mind about which query is the answer — the later choice is the current one.
+        (`recordAssumptions` accumulates instead, because assumptions are additive;
+        an answer table is singular.) A designation that resolves to nothing (blank
+        args, or an unresolvable blueprint id) leaves the previous one intact rather
+        than clearing it, so a malformed retry cannot silently drop a good table."""
+        if tool_result.status != "ok" or tool_name != ANSWER_TABLE_TOOL_NAME:
+            return answer_sql
+        args = arguments if isinstance(arguments, dict) else {}
+        return (
+            self._resolve_answer_sql(
+                args,
+                blueprint_terminal_sql=blueprint_terminal_sql,
+                session_id=session_id,
+                turn_index=turn_index,
+            )
+            or answer_sql
+        )
 
     @staticmethod
     def _accumulate_assumptions(
@@ -1252,7 +1444,8 @@ class AgentLoop:
         model_client: ModelClient,
         question: str | None = None,
         seed_sql: list[str] | None = None,
-        seed_preview: ResultPreview | None = None,
+        seed_answer_sql: str | None = None,
+        seed_blueprint_terminal_sql: dict[str, str] | None = None,
         seed_blueprint_use: dict[str, Any] | None = None,
         seed_verification: dict[str, Any] | None = None,
         seed_assumptions: list[str] | None = None,
@@ -1278,7 +1471,7 @@ class AgentLoop:
                 model_client=model_client,
                 question=question,
                 seed_sql=seed_sql,
-                seed_preview=seed_preview,
+                seed_answer_sql=seed_answer_sql,
                 seed_blueprint_use=seed_blueprint_use,
                 seed_verification=seed_verification,
                 seed_assumptions=seed_assumptions,
@@ -1315,7 +1508,8 @@ class AgentLoop:
         # so the FINAL `done` result event carries the same enrichment a non-paused
         # answer would. Default `None`/empty → byte-identical to a fresh window.
         seed_sql: list[str] | None = None,
-        seed_preview: ResultPreview | None = None,
+        seed_answer_sql: str | None = None,
+        seed_blueprint_terminal_sql: dict[str, str] | None = None,
         seed_blueprint_use: dict[str, Any] | None = None,
         seed_verification: dict[str, Any] | None = None,
         # recordAssumptions parity with `seed_sql`: seed the turn-window
@@ -1412,7 +1606,14 @@ class AgentLoop:
         # every `TurnOutcome(...)` return site. Seeded (Fix 1) on the blueprint
         # approval-resume path so a resumed verified answer keeps its enrichment.
         turn_sql: list[str] = list(seed_sql) if seed_sql else []
-        primary_preview: ResultPreview | None = seed_preview
+        answer_sql: str | None = seed_answer_sql
+        # `blueprint_id -> result_full["terminal_sql"]` for every blueprint that ran
+        # SUCCESSFULLY this turn, captured at dispatch (the result is in hand here,
+        # so this needs no D46 KV de-reference). It is what lets
+        # `answerWithTable(blueprint_id=…)` resolve to a concrete pageable query
+        # without re-running the DAG. Seeded on the approval-resume path so a
+        # blueprint that completed BEFORE the pause is still designatable after it.
+        blueprint_terminal_sql: dict[str, str] = dict(seed_blueprint_terminal_sql or {})
         blueprint_use: dict[str, Any] | None = seed_blueprint_use
         verification: dict[str, Any] | None = seed_verification
         # recordAssumptions accumulator (mirrors `turn_sql`): the deduped,
@@ -1432,6 +1633,10 @@ class AgentLoop:
                 withheld_call_ids=withheld_call_ids,
                 discovery_canonical=discovery_canonical,
             )
+            # Set by a SUCCESSFUL answerWithTable in this iteration's batch; drives
+            # terminal exit #2 below. Reset per iteration — a designation only ends
+            # the turn it was made in.
+            designated_answer_text: str | None = None
             self._observer("loop_model_call_start", {"window": window_count})
             result = await model_client.send_turn(canonical_messages, tools)
             last_assistant_text = result.assistant_text
@@ -1463,8 +1668,8 @@ class AgentLoop:
                     tool_calls_made=tool_calls_made,
                     # `[]` (no successful query this turn) -> `None`, so the UI
                     # treats "no SQL panel" and "empty SQL" identically (§1 fork 1).
-                    sql=turn_sql or None,
-                    result_table=primary_preview,
+                    sql_executed=turn_sql or None,
+                    answer_sql=answer_sql,
                     blueprint_use=blueprint_use,
                     verification=verification,
                     provenance=turn_provenance,
@@ -1494,8 +1699,8 @@ class AgentLoop:
                     # Best-effort partial (§1): whatever succeeded in an earlier
                     # window of this turn; `provenance` stays `None` (the fail-closed
                     # union is reused only on the `done` return).
-                    sql=turn_sql or None,
-                    result_table=primary_preview,
+                    sql_executed=turn_sql or None,
+                    answer_sql=answer_sql,
                     blueprint_use=blueprint_use,
                     verification=verification,
                     assumptions=turn_assumptions or None,
@@ -1608,8 +1813,8 @@ class AgentLoop:
                         assistant_text=result.assistant_text,
                         tool_calls_made=tool_calls_made,
                         # Fix 2: surface whatever succeeded earlier in this window.
-                        sql=turn_sql or None,
-                        result_table=primary_preview,
+                        sql_executed=turn_sql or None,
+                        answer_sql=answer_sql,
                         blueprint_use=blueprint_use,
                         verification=verification,
                         assumptions=turn_assumptions or None,
@@ -1641,14 +1846,16 @@ class AgentLoop:
                 # this SUCCESSFUL tool call (runQuery arg SQL + preview; runBlueprint
                 # `result_full` SQL/blueprint_id/verify + preview). Shared with the
                 # blueprint approval-resume seed path via `_accumulate_enrichment`.
-                primary_preview, blueprint_use, verification = self._accumulate_enrichment(
+                blueprint_use, verification = self._accumulate_enrichment(
                     tool_call.name,
                     tool_call.arguments,
                     tool_result,
                     turn_sql=turn_sql,
-                    primary_preview=primary_preview,
                     blueprint_use=blueprint_use,
                     verification=verification,
+                )
+                _capture_terminal_sql(
+                    tool_call.name, tool_result, into=blueprint_terminal_sql
                 )
                 # recordAssumptions (docs/decisions/ui-assumptions-contract.md):
                 # fold a SUCCESSFUL call's plain-English assumptions into the
@@ -1659,6 +1866,32 @@ class AgentLoop:
                     tool_result,
                     turn_assumptions=turn_assumptions,
                 )
+                # answerWithTable (composite/answer_with_table.py): the
+                # model-designated answer table. Same discipline again — read from
+                # the call ARGUMENTS on success — except LAST designation wins
+                # rather than accumulating, since a turn has one answer table.
+                answer_sql = self._accumulate_answer_sql(
+                    tool_call.name,
+                    tool_call.arguments,
+                    tool_result,
+                    answer_sql=answer_sql,
+                    blueprint_terminal_sql=blueprint_terminal_sql,
+                    session_id=session_id,
+                    turn_index=turn_index,
+                )
+                # TERMINAL: a successful `answerWithTable` carries the final prose,
+                # so the turn ends on it. Recorded here and acted on AFTER the whole
+                # tool batch drains, so a model that batches recordAssumptions +
+                # answerWithTable still gets both folded before the turn closes.
+                if (
+                    tool_call.name == ANSWER_TABLE_TOOL_NAME
+                    and tool_result.status == "ok"
+                ):
+                    designated_answer_text = (
+                        clean_answer_text(tool_call.arguments.get("answer"))
+                        if isinstance(tool_call.arguments, dict)
+                        else None
+                    )
 
                 # Record a SUCCESSFUL idempotent read so an identical repeat later
                 # this turn is caught by the guard above. Only `ok` reads are
@@ -1674,6 +1907,46 @@ class AgentLoop:
                 if guard.exceeded:
                     break
 
+            # TERMINAL EXIT #2 (answerWithTable). The loop's other exit is a model
+            # turn with NO tool calls; this one fires when the model ended the turn
+            # THROUGH a tool, carrying its final prose in the call. It is checked
+            # AFTER the whole batch drains so a batched recordAssumptions +
+            # answerWithTable still folds both before the turn closes.
+            #
+            # Everything below mirrors the no-tool-calls exit exactly — the same
+            # `_compute_turn_provenance_union` (the single fail-closed source of
+            # truth) and the same persisted assistant `TurnMessage` — because
+            # replay, `session_history`, and the D44 scope gate all read that
+            # message. A divergence here would make history disagree with the live
+            # answer for exactly the turns that produced a table.
+            if designated_answer_text is not None:
+                turn_provenance = await self._compute_turn_provenance_union(
+                    session_id, turn_index
+                )
+                await self._session_store.append_message(
+                    session_id,
+                    TurnMessage(
+                        turn_index=turn_index,
+                        role="assistant",
+                        content=designated_answer_text,
+                        ts=_now_iso(),
+                        provenance=turn_provenance,
+                    ),
+                )
+                self._observer("loop_turn_done", {"tool_calls_made": tool_calls_made})
+                return TurnOutcome(
+                    status="done",
+                    assistant_text=designated_answer_text,
+                    pending_question=None,
+                    tool_calls_made=tool_calls_made,
+                    sql_executed=turn_sql or None,
+                    answer_sql=answer_sql,
+                    blueprint_use=blueprint_use,
+                    verification=verification,
+                    provenance=turn_provenance,
+                    assumptions=turn_assumptions or None,
+                )
+
             guard.record_iteration(tokens_used=int(result.usage.get("total_tokens") or 0))
 
             if guard.exceeded:
@@ -1686,8 +1959,8 @@ class AgentLoop:
                         tool_calls_made=tool_calls_made,
                         # Best-effort partial (§1): whatever succeeded before the
                         # hard ceiling; `provenance` stays `None` (done-only).
-                        sql=turn_sql or None,
-                        result_table=primary_preview,
+                        sql_executed=turn_sql or None,
+                        answer_sql=answer_sql,
                         blueprint_use=blueprint_use,
                         verification=verification,
                         assumptions=turn_assumptions or None,
@@ -1711,8 +1984,8 @@ class AgentLoop:
                     tool_calls_made=tool_calls_made,
                     # Best-effort partial (§1): whatever succeeded before the cap;
                     # `provenance` stays `None` (done-only).
-                    sql=turn_sql or None,
-                    result_table=primary_preview,
+                    sql_executed=turn_sql or None,
+                    answer_sql=answer_sql,
                     blueprint_use=blueprint_use,
                     verification=verification,
                     assumptions=turn_assumptions or None,

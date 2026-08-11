@@ -266,6 +266,59 @@ RECORD_ASSUMPTIONS_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# `answerWithTable` (composite/answer_with_table.py) — the TERMINAL runtime tool
+# the model calls INSTEAD of a plain final message when its answer is a table. It
+# carries the final prose AND designates the query whose rows the user should see;
+# the runtime ends the turn on it, saving the round-trip a non-terminal designation
+# tool cost. `blueprint_id` is resolved server-side to that blueprint's terminal
+# SQL, so the UI only ever sees one field (`answer_sql`) and one route
+# (`POST /query/page`). Declares NO session_id/jwt/scope (D5).
+ANSWER_WITH_TABLE_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "answerWithTable",
+    "description": (
+        "Give your FINAL answer when that answer is a table. This ENDS the turn — "
+        "pass your complete written answer in 'answer', and the user sees it together "
+        "with the full table, which their interface renders itself as a scrollable, "
+        "paginated grid. Do not send a separate message afterwards. "
+        "Use this WHENEVER the answer is more than one row: a breakdown by group, a "
+        "month-by-month series, a ranking, a list. "
+        "Identify the table in ONE of two ways. Either pass 'sql' — the single query "
+        "whose rows ARE the answer, written WITHOUT a LIMIT clause, since the interface "
+        "adds its own paging and a LIMIT would cap what the user can scroll through. Or "
+        "pass 'blueprint_id' when a blueprint you ran THIS TURN produced the answer; the "
+        "runtime then reuses that blueprint's own final query, so you need not copy its "
+        "SQL. If you pass both, 'sql' is used. "
+        "Do NOT copy the table's rows into 'answer' — the user can already see them. "
+        "Describe what the table shows and call out what matters: the shape, the "
+        "outliers, the trend, the total. Quoting two or three individual figures is fine. "
+        "If your answer is a single number or a single row, do NOT use this tool — just "
+        "reply with your answer as an ordinary message."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "answer": {
+                "type": "string",
+                "description": "Your complete final answer to the user, in plain prose. "
+                "Describes the table rather than reproducing its rows.",
+            },
+            "sql": {
+                "type": "string",
+                "description": "The single read-only SELECT whose rows are the answer, "
+                "without a LIMIT clause. Omit if you are passing blueprint_id.",
+            },
+            "blueprint_id": {
+                "type": "string",
+                "description": "The id of a blueprint you ran successfully this turn whose "
+                "result is the answer. Omit if you are passing sql.",
+            },
+        },
+        "required": ["answer"],
+    },
+}
+
+
 # The locally-authored (runtime-implemented) tool schemas, appended after the
 # live-fetched MCP tools. This tuple is the SINGLE source of truth for "these
 # names are ours" — the name-collision guard (§6.1) asserts the MCP never
@@ -278,6 +331,7 @@ _LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     SEARCH_KNOWLEDGE_TOOL_SCHEMA,
     RUN_BLUEPRINT_TOOL_SCHEMA,
     RECORD_ASSUMPTIONS_TOOL_SCHEMA,
+    ANSWER_WITH_TABLE_TOOL_SCHEMA,
 )
 _LOCAL_TOOL_NAMES: frozenset[str] = frozenset(s["name"] for s in _LOCAL_TOOL_SCHEMAS)
 

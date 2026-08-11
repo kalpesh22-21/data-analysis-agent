@@ -58,24 +58,47 @@ backward compatible).
 | 2 | `assistant_text` | `string \| null` | yes | `TurnOutcome.assistant_text` | the answer bubble |
 | 3 | `pending_question` | `{question: string, options: string[] \| null} \| null` | yes | `TurnOutcome.pending_question` (`agent_loop.py:860`) | clarify chip / prompt |
 | 4 | `tool_calls_made` | `int` | no | `TurnOutcome.tool_calls_made` | (debug / count) |
-| 5 | `sql` | `string[] \| null` | yes | ordered successful `runQuery`.args["sql"] + `runBlueprint`.result_full["sql"] | "show the query" panel |
-| 6 | `result_table` | `{columns: string[], preview_rows: any[][], row_count: int, truncated: bool} \| null` | yes | last successful `ToolResult.result_preview` (`ResultPreview`, `tool_dispatcher.py:98-149`) | expandable table |
+| 5 | `sql_executed` | `string[] \| null` | yes | ordered successful `runQuery`.args["sql"] + `runBlueprint`.result_full["sql"] | "show the query" panel |
+| 6 | `answer_sql` | `string \| null` | yes | the model's `presentTable(sql=…)` argument (`composite/present_table.py`) | the paginated answer table, via `POST /query/page` |
 | 7 | `blueprint_use` | `{blueprint_id: string, slots: {[name: string]: any}} \| null` | yes | `result_full["blueprint_id"]` + `tool_call.arguments["slot_bindings"]` | `Using blueprint …` chip |
 | 8 | `verification` | `{passed: bool, method: "blueprint_gate", grain_checked: bool} \| null` | yes | `result_full["verify"]` + `["status"]` (`executor.py:402-417`) | passive **verified ✓** badge |
 | 9 | `provenance` | `string[] \| null` (sorted, deduped `"database.table.column"`) | yes | `_compute_turn_provenance_union` (`agent_loop.py:533`) | lineage panel |
 
 ### Field rules
 
-- **`sql`** (fork 1): a **list** of SQL strings executed this turn, **in execution order**, from
+> **2026-08 revision.** `sql` was renamed **`sql_executed`** and `result_table` was **removed**
+> and replaced by **`answer_sql`**. The two changes are one idea: separate *what the turn ran*
+> from *what the answer IS*.
+>
+> `result_table` shipped the last successful query's `ResultPreview` — a fixed ~20-row window the
+> user could not page past, chosen by the RUNTIME ("last successful query"), which is wrong exactly
+> when a turn resolves values or probes a code space before answering. It also pushed the model
+> toward transcribing rows into its prose, since the preview was the only table the user got.
+>
+> Now the model designates ONE query as the answer via the `presentTable` runtime tool, and the UI
+> executes that itself against `POST /query/page` (`runtime/query_page.py`) with real paging. The
+> endpoint adds no authority: it dispatches through the same scope-enforced `runQuery` path under
+> the caller's own JWT. The designation is **advisory** — a model that forgets leaves `answer_sql`
+> null, which is the right default for a scalar answer and a degradation for a table one.
+>
+> Migration: `result_table` is **gone, not nulled**, so a client keying on it fails loudly instead
+> of silently rendering an empty table. `GET /session/history` is unchanged and still carries a
+> per-tool-call `result_table`.
+
+- **`sql_executed`** (fork 1): a **list** of SQL strings executed this turn, **in execution order**, from
   successful (`status=="ok"`) `runQuery` and `runBlueprint` trail entries only. Deduped
   **preserving first-occurrence order** (a turn re-running the identical string shows it once).
   Empty handling: a turn that ran **no** successful query → `null` (not `[]`), so the UI can treat
   "no SQL panel" and "empty SQL" identically. `runBlueprint` contributes its `result_full["sql"]`
   list (already a list; Slice B = one node → one string).
-- **`result_table`** (fork 2): the **last successful** `result_preview` (the one backing the final
-  answer). **Reuse `ResultPreview` verbatim** — `{columns, row_count, truncated, preview_rows}`,
-  serialized via its existing `.to_doc()`. Do **not** invent a new shape. `preview_rows` **may
-  carry real cell values** — see §5 (allowed on `result`, unlike `progress`).
+- **`answer_sql`** (fork 2): the **single** query the MODEL designated as the answer, via
+  `presentTable`. **Last designation wins** (a turn has one answer table; a second call means the
+  model changed its mind), and a call whose `sql` cleans to `None` leaves the previous designation
+  intact rather than clearing it. `null` when the answer is a scalar/single row — or when the model
+  simply did not call the tool. It is seeded across both resume paths from the trail
+  (`_compute_turn_answer_sql`), so a designation made before an askUser / blueprint-approval pause
+  survives it. The rows themselves are **no longer on the result event** — the UI fetches them a
+  page at a time.
 - **`blueprint_use`** (fork 3): **null unless a blueprint produced the answer** (a successful
   `runBlueprint`). Shape `{blueprint_id, slots}`. `slots` = the model-supplied
   `slot_bindings` map (raw). **No `version` field** — no version concept exists in the code.

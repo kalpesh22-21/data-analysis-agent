@@ -44,6 +44,7 @@ from data_agent.runtime.auth.jwt_verify import JWTVerificationError, verify_jwt
 from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
 from data_agent.runtime.catalog.export_client import build_catalog_cache
+from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.composite.record_assumptions import RecordAssumptionsTool
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.config import (
@@ -77,6 +78,11 @@ from data_agent.runtime.observability.progress import ProgressEmitter, combine_o
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
+from data_agent.runtime.query_page import (
+    QueryPageError,
+    build_page_sql,
+    clamp_page_params,
+)
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.tools import (
     GetBlueprintTool,
@@ -119,6 +125,19 @@ class ResumeRequest(BaseModel):
     answer: str
 
 
+class QueryPageRequest(BaseModel):
+    """`POST /query/page` — one page of the model-designated answer table.
+
+    `limit`/`offset` are permissive (`Any`, clamped by `clamp_page_params`) rather
+    than validated ints: a bad paging param is UI plumbing, not a reason to 422 a
+    user's scroll. `sql` is the only field that can fail the request.
+    """
+
+    sql: str
+    limit: Any = None
+    offset: Any = None
+
+
 def _extract_credentials(
     *, authorization: str | None, session_id: str | None, settings: RuntimeSettings
 ) -> RuntimeCredentials:
@@ -156,12 +175,22 @@ def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
         "pending_question": outcome.pending_question,
         "tool_calls_made": outcome.tool_calls_made,
         # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §1):
-        # 5 additive, nullable fields. `sql`/`blueprint_use`/`verification` pass
-        # through as-is; `result_table` serializes via `ResultPreview.to_doc()`;
-        # `provenance` projects the fail-closed `frozenset[(db.table, column)]`
-        # union to a sorted, deduped list of `"database.table.column"` strings.
-        "sql": outcome.sql,
-        "result_table": outcome.result_table.to_doc() if outcome.result_table else None,
+        # additive, nullable fields. `sql_executed`/`answer_sql`/`blueprint_use`/
+        # `verification` pass through as-is; `provenance` projects the fail-closed
+        # `frozenset[(db.table, column)]` union to a sorted, deduped list of
+        # `"database.table.column"` strings.
+        #
+        # `sql_executed` (was `sql`) is EVERY query the turn ran — the audit list,
+        # including probes and intermediate steps. `answer_sql` is the ONE query the
+        # model designated as the answer via `presentTable`; the UI runs that itself
+        # against `POST /query/page` and renders it with real paging. The two are
+        # deliberately distinct: what ran, versus what the answer IS.
+        #
+        # `result_table` is GONE. It carried a fixed ~20-row `ResultPreview` of
+        # whichever query happened to run last — unpageable, and chosen by the
+        # runtime rather than the model.
+        "sql_executed": outcome.sql_executed,
+        "answer_sql": outcome.answer_sql,
         "blueprint_use": outcome.blueprint_use,
         "verification": outcome.verification,
         "provenance": (
@@ -465,8 +494,13 @@ def create_app(
             jwt=credentials.jwt, session_id=credentials.session_id
         )
 
-    def _build_agent_loop(observer: ToolObserver) -> AgentLoop:
-        dispatcher = ToolDispatcher(
+    def _build_dispatcher(observer: ToolObserver) -> ToolDispatcher:
+        """The ONE `ToolDispatcher` construction, shared by the agent loop and the
+        `/query/page` endpoint. Extracted so the paging endpoint provably runs the
+        SAME enforced path the model does — same catalog provider, same scope
+        enforcement, same denial mapping, same telemetry — rather than a
+        near-identical copy that could drift apart from it."""
+        return ToolDispatcher(
             mcp_client,
             catalog_provider,
             preview_row_count=settings.preview_row_count,
@@ -481,6 +515,9 @@ def create_app(
             # only — the dispatched call + enforced scope are unchanged.
             disable_redaction=settings.otlp_disable_redaction,
         )
+
+    def _build_agent_loop(observer: ToolObserver) -> AgentLoop:
+        dispatcher = _build_dispatcher(observer)
         # Emulated-discovery injection (context/discovery_emulation.py): a per-
         # window closure that sweeps listDatabases+listTables through the SAME
         # per-request `dispatcher` (so D5/D57/denial-mapping/telemetry are the
@@ -537,6 +574,13 @@ def create_app(
         # assumptions into the turn result), so it is never subject to the
         # advertised-but-unwired `RUNTIME_TOOL_UNAVAILABLE` path.
         runtime_tools["recordAssumptions"] = RecordAssumptionsTool()
+        # `answerWithTable` (composite/answer_with_table.py): ALWAYS wired, same
+        # reasoning — it only echoes the model's final prose + designated query into
+        # the turn result and has no backing stack. It is TERMINAL: a successful call
+        # ends the turn, so the model does not spend a further round-trip restating
+        # an answer it already wrote. The UI pages the designated query itself via
+        # `POST /query/page`.
+        runtime_tools["answerWithTable"] = AnswerWithTableTool()
         blueprint_executor: BlueprintExecutor | None = None
         if active_retrieval is not None:
             # `disable_redaction` (telemetry-only debug switch) reveals the real
@@ -765,7 +809,68 @@ def create_app(
         )
         return JSONResponse(content={"session_id": x_session_id, **body})
 
+    @app.post("/query/page")
+    async def query_page(
+        body: QueryPageRequest,
+        authorization: str | None = Header(default=None),
+        x_session_id: str | None = Header(default=None, alias="X-Session-Id"),
+    ) -> JSONResponse:
+        """Execute the model-designated `answer_sql` and return ONE page of rows.
+
+        This is what replaced the old `result_table` field: instead of the runtime
+        shipping a fixed ~20-row `ResultPreview` the user could not page past, the
+        model designates the answer query via `presentTable` and the UI pages
+        through it here.
+
+        It adds NO authority. The query runs through the SAME
+        `ToolDispatcher.dispatch("runQuery", ...)` the model uses, with THIS
+        caller's credentials — so column-scope (D57/D80), read-only enforcement,
+        row caps, denial mapping and provenance capture are the identical code
+        path. A designated query can never read a column the same caller could not
+        already reach by asking the agent. See `runtime/query_page.py`.
+
+        Paging is applied by WRAPPING the SQL via sqlglot
+        (`SELECT * FROM (<sql>) LIMIT n OFFSET m`), never by splicing a LIMIT onto
+        model text — which also rejects multi-statement and non-SELECT payloads
+        before dispatch. A rejection is a 400 with a STATIC message (never the
+        offending SQL, never a raw parser message). A denial from the MCP is
+        returned as the dispatcher's own canned `user_message`, exactly as the
+        model would have seen it.
+        """
+        credentials = _extract_credentials(
+            authorization=authorization, session_id=x_session_id, settings=settings
+        )
+        limit, offset = clamp_page_params(body.limit, body.offset)
+        try:
+            page_sql = build_page_sql(body.sql, limit=limit, offset=offset)
+        except QueryPageError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+
+        dispatcher = _build_dispatcher(_tracing_observer)
+        result = await dispatcher.dispatch("runQuery", {"sql": page_sql}, credentials)
+        if result.status != "ok" or result.result_preview is None:
+            # Denied/errored: surface the dispatcher's canned, PII-safe message —
+            # the same one the model would have received. Never the raw backend text.
+            return JSONResponse(
+                status_code=403 if result.status == "denied" else 502,
+                content={"error": result.user_message or "The query could not be run.",
+                         "error_code": result.error_code},
+            )
+        preview = result.result_preview
+        return JSONResponse(
+            content={
+                "columns": list(preview.columns),
+                "rows": [list(row) for row in preview.preview_rows],
+                "limit": limit,
+                "offset": offset,
+                # `has_more` is a HINT derived from a full page, not a total count:
+                # counting all rows would mean a second aggregate query per page.
+                # The UI shows "next" while a page comes back full.
+                "has_more": len(preview.preview_rows) >= limit,
+            }
+        )
+
     return app
 
 
-__all__ = ["ResumeRequest", "TurnRequest", "create_app"]
+__all__ = ["QueryPageRequest", "ResumeRequest", "TurnRequest", "create_app"]

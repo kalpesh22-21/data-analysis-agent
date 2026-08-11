@@ -434,6 +434,13 @@ class BlueprintExecutor:
             "truncated": truncated,
             "preview_rows": rows[: self._preview_row_count],
             "sql": [node_sql],  # per-node SQL for transparency (D56 "SQL stays visible")
+            # The ONE query whose rows ARE this blueprint's answer. For a
+            # single-node blueprint that is trivially the node's SQL; the key exists
+            # so `answerWithTable(blueprint_id=…)` can resolve a designation to a
+            # concrete pageable query WITHOUT re-running the blueprint (see
+            # `composite/answer_with_table.py`). Kept separate from `sql` above,
+            # which is the full transparency list and is NOT ordered by terminality.
+            "terminal_sql": node_sql,
             "verify": {
                 "grain_ok": verify_out.grain_ok,
                 "grain_checked": verify_out.grain_checked,
@@ -934,6 +941,11 @@ class BlueprintExecutor:
             "truncated": truncated,
             "preview_rows": rows[: self._preview_row_count],
             "sql": node_sqls,  # every per-node SQL (transparency, D56)
+            # The TERMINAL node's SQL — the one whose rows are the blueprint's
+            # answer. Exposed explicitly rather than left as "the last element of
+            # `sql`": rehydrated nodes (D45 exactly-once resume) are appended to
+            # `node_sqls` FIRST, so that positional assumption is not safe.
+            "terminal_sql": terminal_sql,
             "verify": {
                 "grain_ok": verify_out.grain_ok,
                 "grain_checked": verify_out.grain_checked,

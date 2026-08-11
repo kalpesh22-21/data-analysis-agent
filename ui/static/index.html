@@ -359,8 +359,31 @@
   .result-panel[hidden],
   .blueprint-chip[hidden],
   .verified-badge[hidden],
+  .table-pager[hidden],
   .result-table-caption[hidden] {
     display: none;
+  }
+
+  .table-pager {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.5rem;
+  }
+
+  .table-pager button {
+    padding: 0.2rem 0.7rem;
+    cursor: pointer;
+  }
+
+  .table-pager button:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+
+  .pager-status {
+    font-size: 0.85em;
+    opacity: 0.75;
   }
 
   .answer-meta {
@@ -680,6 +703,11 @@
           </table>
         </div>
         <div class="result-table-caption result-caption" hidden></div>
+        <div class="table-pager" hidden>
+          <button type="button" class="pager-prev" disabled>Previous</button>
+          <span class="pager-status"></span>
+          <button type="button" class="pager-next" disabled>Next</button>
+        </div>
       </details>
 
       <details class="provenance-panel result-panel" data-testid="provenance-panel" hidden>
@@ -893,27 +921,13 @@
     panel.hidden = false;
   }
 
-  // Field 2 — `result_table: {columns, preview_rows, row_count, truncated} | null`.
-  // Header from `columns` (may be [] → no header, raw cells only). Body from
-  // `preview_rows` (row-arrays of scalars). Truncation caption when the preview
-  // is a subset of `row_count`. null / no rows → hide.
-  function renderResultTable(root, table) {
-    var resultTable = root.querySelector(".result-table");
-    var head = root.querySelector(".result-table-head");
-    var body = root.querySelector(".result-table-body");
-    var caption = root.querySelector(".result-table-caption");
+  // Fill a turn's grid from column names + row-arrays. Shared by the LIVE answer
+  // table (paged from `answer_sql`) and the HISTORY path (which still carries a
+  // per-tool-call `result_table` — `/session/history` is unchanged).
+  function fillGrid(head, body, columns, rows) {
     clearNode(head);
     clearNode(body);
-    var rows = table && Array.isArray(table.preview_rows) ? table.preview_rows : null;
-    if (!table || !rows || rows.length === 0) {
-      resultTable.hidden = true;
-      caption.hidden = true;
-      caption.textContent = "";
-      return;
-    }
-
-    var columns = Array.isArray(table.columns) ? table.columns : [];
-    if (columns.length > 0) {
+    if (Array.isArray(columns) && columns.length > 0) {
       var headRow = document.createElement("tr");
       columns.forEach(function (col) {
         var th = document.createElement("th");
@@ -923,7 +937,6 @@
       });
       head.appendChild(headRow);
     }
-
     rows.forEach(function (row) {
       var tr = document.createElement("tr");
       var cells = Array.isArray(row) ? row : [row];
@@ -934,6 +947,136 @@
       });
       body.appendChild(tr);
     });
+  }
+
+  // How many rows one page fetches. The runtime clamps to its own MAX_PAGE_SIZE
+  // regardless, so this is a display choice, not a limit.
+  var PAGE_SIZE = 50;
+
+  // Field 2 (2026-08) — `answer_sql: string | null`: the ONE query the model
+  // designated as its answer via `answerWithTable`. This replaced `result_table`,
+  // which shipped a fixed ~20-row preview the user could not page past.
+  //
+  // The rows are NOT on the result event any more — we fetch them a page at a time
+  // from `POST /api/query/page`, which proxies the runtime's `/query/page`. The BFF
+  // attaches the JWT server-side (D82/D5: the browser never holds a token), and the
+  // runtime re-parses and re-runs the SQL through the SAME scope-enforced dispatch
+  // path the agent uses. So echoing `answer_sql` back from the browser grants
+  // nothing: a tampered query can only reach what this session's own scope allows.
+  function renderAnswerTable(root, answerSql) {
+    var panel = root.querySelector(".result-table");
+    var head = root.querySelector(".result-table-head");
+    var body = root.querySelector(".result-table-body");
+    var caption = root.querySelector(".result-table-caption");
+    var pager = root.querySelector(".table-pager");
+    var prev = root.querySelector(".pager-prev");
+    var next = root.querySelector(".pager-next");
+    var status = root.querySelector(".pager-status");
+
+    clearNode(head);
+    clearNode(body);
+    if (!answerSql) {
+      // No designated table — a scalar answer, or a model that did not call the
+      // tool. Both are "no grid", which is the correct default for a single value.
+      panel.hidden = true;
+      pager.hidden = true;
+      caption.hidden = true;
+      return;
+    }
+
+    var offset = 0;
+
+    function setBusy(busy) {
+      prev.disabled = busy || offset === 0;
+      next.disabled = busy;
+    }
+
+    function load() {
+      setBusy(true);
+      status.textContent = "loading…";
+      fetch("/api/query/page", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId,
+          sql: answerSql,
+          limit: PAGE_SIZE,
+          offset: offset,
+        }),
+      })
+        .then(function (r) {
+          return r.json().then(function (payload) {
+            return { ok: r.ok, payload: payload };
+          });
+        })
+        .then(function (res) {
+          if (!res.ok) {
+            // A denial (403) or an unparseable query (400) is shown in place of the
+            // grid rather than swallowed — the user should see why the table is
+            // missing, not an empty panel.
+            clearNode(head);
+            clearNode(body);
+            caption.textContent =
+              "Could not load the table: " + cellText(res.payload.error || "unknown error");
+            caption.hidden = false;
+            pager.hidden = true;
+            panel.hidden = false;
+            return;
+          }
+          var rows = Array.isArray(res.payload.rows) ? res.payload.rows : [];
+          fillGrid(head, body, res.payload.columns, rows);
+          caption.hidden = true;
+          caption.textContent = "";
+          var first = rows.length === 0 ? offset : offset + 1;
+          status.textContent = "rows " + first + "–" + (offset + rows.length);
+          prev.disabled = offset === 0;
+          // `has_more` is a hint derived from a full page, not a total count —
+          // there is no row count to show without a second aggregate query.
+          next.disabled = res.payload.has_more !== true;
+          pager.hidden = false;
+          panel.hidden = false;
+        })
+        .catch(function () {
+          caption.textContent = "Could not load the table.";
+          caption.hidden = false;
+          pager.hidden = true;
+          panel.hidden = false;
+        });
+    }
+
+    prev.onclick = function () {
+      offset = Math.max(0, offset - PAGE_SIZE);
+      load();
+    };
+    next.onclick = function () {
+      offset = offset + PAGE_SIZE;
+      load();
+    };
+    load();
+  }
+
+  // HISTORY path — `result_table: {columns, preview_rows, row_count, truncated} | null`.
+  // Header from `columns` (may be [] → no header, raw cells only). Body from
+  // `preview_rows` (row-arrays of scalars). Truncation caption when the preview
+  // is a subset of `row_count`. null / no rows → hide.
+  function renderResultTable(root, table) {
+    var resultTable = root.querySelector(".result-table");
+    var head = root.querySelector(".result-table-head");
+    var body = root.querySelector(".result-table-body");
+    var caption = root.querySelector(".result-table-caption");
+    var pager = root.querySelector(".table-pager");
+    clearNode(head);
+    clearNode(body);
+    if (pager) pager.hidden = true;  // history rows are static — nothing to page
+    var rows = table && Array.isArray(table.preview_rows) ? table.preview_rows : null;
+    if (!table || !rows || rows.length === 0) {
+      resultTable.hidden = true;
+      caption.hidden = true;
+      caption.textContent = "";
+      return;
+    }
+
+    fillGrid(head, body, Array.isArray(table.columns) ? table.columns : [], rows);
 
     var shown = rows.length;
     var rowCount = typeof table.row_count === "number" ? table.row_count : shown;
@@ -1073,8 +1216,11 @@
     setBlockAnswer(block, data.assistant_text);
     setBlockStatus(block, data);
     renderAssumptions(block, data.assumptions);
-    renderSql(block, data.sql);
-    renderResultTable(block, data.result_table);
+    // `sql` was renamed `sql_executed` (every query the turn RAN — the audit list).
+    renderSql(block, data.sql_executed);
+    // `result_table` is gone from the live result; the answer table is the
+    // model-designated `answer_sql`, paged from the runtime.
+    renderAnswerTable(block, data.answer_sql);
     renderBlueprintChip(block, data.blueprint_use);
     renderVerification(block, data.verification);
     renderProvenance(block, data.provenance);

@@ -243,8 +243,10 @@ async def test_approval_resume_final_outcome_carries_enrichment() -> None:
     # The verified-blueprint enrichment SURVIVES the approval-resume boundary.
     assert done.blueprint_use == {"blueprint_id": _BID, "slots": {}}
     assert done.verification == {"passed": True, "method": "blueprint_gate", "grain_checked": True}
-    assert done.sql and all(isinstance(s, str) for s in done.sql)
-    assert done.result_table is not None
+    assert done.sql_executed and all(isinstance(s, str) for s in done.sql_executed)
+    # `result_table` is gone — the answer table is now the model-designated
+    # `answer_sql` (`presentTable`), and this scripted model never designates one.
+    assert done.answer_sql is None
     # Lineage also survives: the runBlueprint trail entry is persisted before the
     # loop re-enters, so the provenance union on the resumed answer is determined.
     assert done.provenance is not None
@@ -284,7 +286,7 @@ def _make_loop_ex(
 async def test_in_loop_pause_carries_partial_enrichment_from_prior_query() -> None:
     """UI Slice 1 Fix 2: when a runQuery succeeds and THEN a runBlueprint pauses
     (approval) in the same window, the `paused_ask_user` outcome surfaces the
-    partial sql/result_table from the query — pause-path symmetry, so the
+    partial sql_executed from the query — pause-path symmetry, so the
     runtime-tool pause flavor matches the direct `askUser` pause. blueprint_use /
     verification stay `None` (the blueprint did not produce an answer)."""
     store = InMemorySessionStore()
@@ -308,9 +310,9 @@ async def test_in_loop_pause_carries_partial_enrichment_from_prior_query() -> No
 
     assert paused.status == "paused_ask_user"
     # The prior runQuery's partial enrichment is surfaced on the runtime-tool pause.
-    assert paused.sql == [query_sql]
-    assert paused.result_table is not None
-    assert paused.result_table.columns == ["Department"]
+    assert paused.sql_executed == [query_sql]
+    # No `presentTable` call in this script, so no designated answer table.
+    assert paused.answer_sql is None
     # The blueprint did not complete → no chip / badge.
     assert paused.blueprint_use is None
     assert paused.verification is None

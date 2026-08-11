@@ -95,12 +95,12 @@ def test_turn_endpoint_streams_progress_and_result(monkeypatch) -> None:
     assert data["pending_question"] is None
     assert data["tool_calls_made"] == 0
     # (b) the 5 UI Slice 1 keys are present.
-    for key in ("sql", "result_table", "blueprint_use", "verification", "provenance"):
+    for key in ("sql_executed", "answer_sql", "blueprint_use", "verification", "provenance"):
         assert key in data, f"missing enriched-result key {key!r}"
     # Pure-chat turn (no tools): no SQL/table/blueprint, and a determined-empty
     # provenance union (frozenset() -> []).
-    assert data["sql"] is None
-    assert data["result_table"] is None
+    assert data["sql_executed"] is None
+    assert data["answer_sql"] is None
     assert data["blueprint_use"] is None
     assert data["verification"] is None
     assert data["provenance"] == []
@@ -338,7 +338,7 @@ def test_full_ask_user_pause_then_resume_round_trip_over_http(monkeypatch) -> No
     assert paused["pending_question"]["question"] == "Which dept?"
     # (e) a paused turn tolerates all-null enrichment (paused before any query
     # ran) — the 5 keys are present but null.
-    for key in ("sql", "result_table", "blueprint_use", "verification", "provenance"):
+    for key in ("sql_executed", "answer_sql", "blueprint_use", "verification", "provenance"):
         assert key in paused, f"missing enriched-result key {key!r}"
         assert paused[key] is None
 
@@ -624,14 +624,11 @@ def test_run_blueprint_wired_when_retrieval_active_executes_verified(monkeypatch
         "method": "blueprint_gate",
         "grain_checked": True,
     }
-    assert data["sql"] and all(isinstance(s, str) for s in data["sql"])
-    assert data["result_table"] is not None
-    assert set(data["result_table"].keys()) == {
-        "columns",
-        "row_count",
-        "truncated",
-        "preview_rows",
-    }
+    assert data["sql_executed"] and all(isinstance(s, str) for s in data["sql_executed"])
+    # `result_table` is gone. A blueprint answer still reports what it EXECUTED;
+    # the answer TABLE would come from a `presentTable` designation, which this
+    # scripted model does not make.
+    assert data["answer_sql"] is None
     assert data["provenance"] is not None
 
     import anyio
@@ -732,7 +729,7 @@ def _raw_loop_app(
 
 def test_raw_loop_turn_enriched_result_no_blueprint(monkeypatch) -> None:
     """(d) A raw-loop answer (a dispatched runQuery, no blueprint) yields
-    blueprint_use==null + verification==null + non-null sql/result_table/
+    blueprint_use==null + verification==null + non-null sql_executed/
     provenance."""
     model = ScriptedModelClient(
         [
@@ -751,13 +748,10 @@ def test_raw_loop_turn_enriched_result_no_blueprint(monkeypatch) -> None:
     assert data["status"] == "done"
     assert data["blueprint_use"] is None
     assert data["verification"] is None
-    assert data["sql"] == [_RAW_SQL]
-    assert data["result_table"] == {
-        "columns": ["avg_salary"],
-        "row_count": 1,
-        "truncated": False,
-        "preview_rows": [[60000.0]],
-    }
+    assert data["sql_executed"] == [_RAW_SQL]
+    # The rows themselves are no longer shipped on the result — the UI pages the
+    # designated `answer_sql` via POST /query/page instead. Not designated here.
+    assert data["answer_sql"] is None
     # The scope-enforced extractor determined the USES set (sorted db.table.column).
     assert data["provenance"] == [
         "dbpcm_warehouse.employee.AnnualSalary",
@@ -765,27 +759,19 @@ def test_raw_loop_turn_enriched_result_no_blueprint(monkeypatch) -> None:
     ]
 
 
-def test_outcome_to_dict_projects_provenance_and_result_preview() -> None:
+def test_outcome_to_dict_projects_provenance_and_answer_sql() -> None:
     """Unit test: `_outcome_to_dict` projects the frozenset provenance to sorted
-    `"db.table.column"` strings and a `ResultPreview` via `.to_doc()`, and passes
-    the other new fields through as-is."""
+    `"db.table.column"` strings and passes the other fields through as-is."""
     from data_agent.runtime.app import _outcome_to_dict
     from data_agent.runtime.loop.agent_loop import TurnOutcome
-    from data_agent.runtime.session.models import ResultPreview
 
-    preview = ResultPreview(
-        columns=["department", "headcount"],
-        row_count=3,
-        truncated=False,
-        preview_rows=[["Engineering", 3], ["Sales", 3]],
-    )
     outcome = TurnOutcome(
         status="done",
         assistant_text="ans",
         pending_question=None,
         tool_calls_made=1,
-        sql=["SELECT 1"],
-        result_table=preview,
+        sql_executed=["SELECT 1"],
+        answer_sql="SELECT department, count() FROM hr.employees GROUP BY department",
         blueprint_use={"blueprint_id": "bp", "slots": {"period": "2026-05"}},
         verification={"passed": True, "method": "blueprint_gate", "grain_checked": True},
         # Deliberately UNSORTED input to prove the projection sorts.
@@ -798,8 +784,11 @@ def test_outcome_to_dict_projects_provenance_and_result_preview() -> None:
     assert doc["assistant_text"] == "ans"
     assert doc["pending_question"] is None
     assert doc["tool_calls_made"] == 1
-    assert doc["sql"] == ["SELECT 1"]
-    assert doc["result_table"] == preview.to_doc()
+    assert doc["sql_executed"] == ["SELECT 1"]
+    assert doc["answer_sql"] == "SELECT department, count() FROM hr.employees GROUP BY department"
+    # The old `result_table` key is GONE, not merely null — an old client keying on
+    # it must fail loudly rather than silently render an empty table.
+    assert "result_table" not in doc
     assert doc["blueprint_use"] == {"blueprint_id": "bp", "slots": {"period": "2026-05"}}
     assert doc["verification"] == {
         "passed": True,
@@ -887,9 +876,8 @@ def test_raw_loop_multi_query_sql_list_ordered_and_deduped(monkeypatch) -> None:
 
     assert data["status"] == "done"
     # Execution order preserved; the duplicate A is collapsed to one occurrence.
-    assert data["sql"] == [_MULTI_SQL_A, _MULTI_SQL_B]
-    # result_table is the LAST successful preview (the dup-A re-run here).
-    assert data["result_table"]["columns"] == ["avg_salary"]
+    assert data["sql_executed"] == [_MULTI_SQL_A, _MULTI_SQL_B]
+    assert data["answer_sql"] is None
     assert data["blueprint_use"] is None
     assert data["verification"] is None
     # Fail-closed UNION across BOTH distinct queries' provenance (sorted).
@@ -914,7 +902,7 @@ def test_outcome_to_dict_null_enrichment_projects_to_null() -> None:
             tool_calls_made=0,
         )
     )
-    for key in ("sql", "result_table", "blueprint_use", "verification", "provenance"):
+    for key in ("sql_executed", "answer_sql", "blueprint_use", "verification", "provenance"):
         assert doc[key] is None
 
 

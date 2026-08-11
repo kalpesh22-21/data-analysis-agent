@@ -42,6 +42,29 @@ RUNTIME_URL = os.environ.get("RUNTIME_URL", "http://localhost:8000")
 TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
 TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
 
+# Warehouse TENANT claims stamped into every minted token.
+#
+# The MCP's auth middleware REQUIRES these — `app/config.py`'s
+# CLICKHOUSE_TENANT_SETTINGS maps clientcode/proc_center/jti onto the
+# `paycom_client_code` / `paycom_proc_center` / `paycom_authenticated_user`
+# ClickHouse settings that the row policies read (`getSetting(...)`). Without them
+# every request is rejected `403 MISSING_TENANT_CLAIM` before any tool runs, so the
+# whole UI is dead. `app/token_service.py::_mint` stamps only
+# sub/iss/aud/exp/user_name/column_scope/sid_hash itself, which is why the BFF has
+# to supply them.
+#
+# ENTRA SEAM: under a real IdP these come from the CALLER'S OWN identity token —
+# they are the tenant the user actually belongs to, and minting them from
+# process-level config would let one deployment issue tokens for another tenant.
+# They are env-configurable here (rather than hardcoded) so a deployment can point
+# at its own tenant, but resolving them PER IDENTITY — beside
+# `ui/entitlements.py::resolve_column_scope`, which already does exactly that for
+# column scope — is the real fix. Defaults match the seeded local warehouse
+# (docker/clickhouse-init/hr-4tables-snake-migration.sql).
+TENANT_CLIENT_CODE = os.environ.get("TENANT_CLIENT_CODE", "CLIENT_A")
+TENANT_PROC_CENTER = os.environ.get("TENANT_PROC_CENTER", "PC01")
+TENANT_JTI = os.environ.get("TENANT_JTI", "TESTJTI001")
+
 # Upload BFF wiring (UI Slice 4, §4). The scratch upload routes live on the MCP /
 # clickhouse-api host, NOT the runtime — so they get their own base env, MCP_URL
 # (matching the runtime's own default, runtime/config.py:35). The `/scratch/v1`
@@ -104,6 +127,23 @@ class ResumeBody(BaseModel):
     answer: str
 
 
+class QueryPageBody(BaseModel):
+    """`POST /api/query/page` — one page of a turn's designated answer table.
+
+    `sql` is the `answer_sql` the runtime returned on that turn's `result` event,
+    echoed back by the browser. It is NOT trusted on the strength of that echo: the
+    runtime re-parses it and runs it through the SAME scope-enforced dispatch path
+    the agent uses, under the JWT this BFF attaches server-side. A browser that
+    tampers with it can therefore only ask for something the same session's own
+    scope already permits.
+    """
+
+    session_id: str
+    sql: str
+    limit: int | None = None
+    offset: int | None = None
+
+
 class ScopeBody(BaseModel):
     session_id: str
     column_scope: list[str]
@@ -136,6 +176,13 @@ async def _mint_jwt(user_name: str, column_scope: list[str], session_id: str) ->
                     "user_name": user_name,
                     "column_scope": column_scope,
                     "session_id": session_id,
+                    # Required by the MCP — see TENANT_* above. Omitting them is a
+                    # 403 MISSING_TENANT_CLAIM on every tool call.
+                    "claims": {
+                        "clientcode": TENANT_CLIENT_CODE,
+                        "proc_center": TENANT_PROC_CENTER,
+                        "jti": TENANT_JTI,
+                    },
                 },
             )
             response.raise_for_status()
@@ -302,6 +349,31 @@ async def history(session_id: str) -> JSONResponse:
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             r = await client.get(f"{RUNTIME_URL}/session/history", headers=headers)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Runtime unreachable: {exc}") from exc
+    try:
+        content = r.json()
+    except ValueError:
+        content = {"detail": r.text}
+    return JSONResponse(status_code=r.status_code, content=content)
+
+
+@app.post("/api/query/page")
+async def query_page(body: QueryPageBody) -> JSONResponse:
+    """JSON proxy for the runtime's `POST /query/page` — the paging behind the
+    answer table that replaced the old `result_table` preview.
+
+    Same server-side-token attach as `/api/history` (D82/D5: the browser never
+    sees the JWT, it sends only `session_id`). The runtime's status + JSON body
+    propagate as-is, so a 400 (unparseable/non-SELECT SQL) or 403 (column-scope
+    denial) reaches the browser's error branch unchanged rather than being
+    flattened into a generic failure."""
+    jwt = _jwt_for_session(body.session_id)
+    headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": body.session_id}
+    payload = {"sql": body.sql, "limit": body.limit, "offset": body.offset}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            r = await client.post(f"{RUNTIME_URL}/query/page", headers=headers, json=payload)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"Runtime unreachable: {exc}") from exc
     try:
