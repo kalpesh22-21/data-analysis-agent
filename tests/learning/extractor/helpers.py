@@ -211,7 +211,13 @@ def make_extractor(
     max_retries: int = 2,
     prior_art: object | None = None,
     max_search_calls: int = 3,
+    max_shape_corrections: int = 2,
 ) -> LearningExtractor:
+    """A scripted extractor. Every budget defaults to the PRODUCTION default, so a
+    test that scripts one turn and gets an `AssertionError` from
+    `ScriptedModelClient` is telling the truth about what the shipped extractor would
+    do — a helper default of 0 here would hide the corrective turn from every test
+    that did not deliberately ask for it."""
     client = ScriptedModelClient(turns)
     return LearningExtractor(
         client,
@@ -219,6 +225,7 @@ def make_extractor(
             max_retries=max_retries,
             known_rules=known_rules,
             max_search_calls=max_search_calls,
+            max_shape_corrections=max_shape_corrections,
         ),
         prior_art=prior_art,  # type: ignore[arg-type]
     )

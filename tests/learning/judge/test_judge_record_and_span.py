@@ -22,7 +22,10 @@ Slugs:
   * J-record-queryable        — every field the headline queries need, flat.
   * J-record-normalizes       — a hand-edited doc degrades, never raises.
   * J-record-verdict-unknown  — an unrecognized stored verdict can never drop.
-  * J-span-shape-only         — no `reason` on the span; it is entity-bearing prose.
+  * J-span-shape-only         — with the D25 gate SHUT, no `reason` on the span; it is
+                                entity-bearing prose. (The gate is now openable and
+                                ships OPEN — `test_judge_span_verbose.py` pins that
+                                side, and this file pins that closing it still works.)
   * J-span-denominator        — the skip reasons are counted where the store cannot.
 """
 
@@ -270,10 +273,16 @@ async def test_a_corrupted_stored_verdict_causes_a_re_judgement_not_a_rewrite() 
 
 
 async def test_the_span_carries_the_shape_and_never_the_reason(tracer, exporter) -> None:
-    """`reason` is free model prose about a real session and can name a department or a
-    person. It goes to the access-controlled audit bucket with the evidence quotes — the
-    span has no verbose branch at all, deliberately, so there is no obvious place for
-    someone to add it later."""
+    """With the D25 gate SHUT (`LEARNING_TRACE_VERBOSE=false`) the span is shape-only:
+    labels, floats and counts, and no `reason`.
+
+    This used to assert something stronger — that the span had no verbose branch AT ALL
+    — and that is no longer true (2026-08-10, deliberate operator choice; see
+    `observability.py::judge_span`). What remains, and what this test now defends, is the
+    OPT-OUT: `reason` is free model prose about a real session and can name a department
+    or a person, and an operator who turns the gate off must get the old behaviour back
+    byte-for-byte rather than "mostly". A flipped default is only reversible if the
+    reverse is tested."""
     judge, _client, _audit, _index = make_judge(
         [
             verdict_turn(
@@ -298,10 +307,16 @@ async def test_the_span_carries_the_shape_and_never_the_reason(tracer, exporter)
     assert attrs["learning.judge.dropped"] is True
     assert attrs["learning.judge.covered_by_tier"] == "mcp"
     assert attrs["learning.judge.confidence"] == pytest.approx(0.95)
+    # The BAR is shape-only and always present: a configured float with no content, and
+    # `confidence` is unreadable without it (the two stages use different bars and both
+    # are retunable).
+    assert attrs["learning.judge.threshold"] == pytest.approx(0.90)
     assert attrs["learning.judge.cards_shown"] == 1
     assert attrs["learning.judge.reused"] is False
     assert not any("Analytics" in str(v) for v in attrs.values())
     assert not any("reason" in k for k in attrs)
+    assert "learning.judge.covered_by" not in attrs  # the tier is shape; the id is not
+    assert "learning.judge.prior_art" not in attrs
 
 
 async def test_the_span_is_the_denominator_the_store_cannot_be(tracer, exporter) -> None:

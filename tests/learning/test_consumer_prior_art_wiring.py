@@ -41,6 +41,7 @@ def _learning_settings() -> SimpleNamespace:
         learning_extractor_model="gpt-x",
         learning_extractor_base_url="",
         learning_extractor_max_retries=2,
+        learning_extractor_max_shape_corrections=2,
         learning_audit_username="u", learning_audit_password="p",
         learning_candidates_username="u", learning_candidates_password="p",
         learning_corpus_username="u", learning_corpus_password="p",

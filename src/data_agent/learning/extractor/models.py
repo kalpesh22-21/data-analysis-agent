@@ -283,14 +283,37 @@ class ExtractedCandidate:
 @dataclass(frozen=True)
 class Decline:
     """A candidate the extractor rejected before emit (never persisted), with the
-    reason code the consumer traces (fail-to-review / no-evidence / totality / …)."""
+    reason code the consumer traces (fail-to-review / no-evidence / totality / …).
+
+    `correctable` splits the two kinds apart. A CORRECTABLE decline is one a reader
+    produced: the candidate could not be turned into the typed model, `detail` names
+    the field and the shape required, and the extractor may put that sentence in front
+    of the model and let it re-emit. Everything else is a rule about CONTENT judging a
+    candidate it read successfully, and re-asking is talking a model into a candidate
+    it was right to decline. Only `validation.py::_malformed` sets the flag; see it for
+    why the line sits at "did a reader fail" rather than at a list of field names.
+
+    `corrections_attempted` / `correction_history` are the record of what was actually
+    tried, and they exist so "the model could not produce a valid candidate" is
+    distinguishable from "the model was never asked twice" — a zero here on a
+    correctable decline means the budget was spent or disabled, not that the model
+    refused. `correction_history` is entity-free (it is the messages that were sent,
+    and those are `shape.py`-derived)."""
 
     type: str
     reason: str
     detail: str = ""
+    correctable: bool = False
+    corrections_attempted: int = 0
+    correction_history: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class ExtractionResult:
     candidates: tuple[ExtractedCandidate, ...]
     declines: tuple[Decline, ...] = ()
+    # Corrective turns SPENT on this extraction (0 for the overwhelming majority).
+    # Surfaced on the extract span because it is a prompt-quality signal, not a model
+    # one: a rate that climbs means the tool schema and the system prompt are asking
+    # for something the model keeps mis-packaging, and that is fixable at the prompt.
+    corrections: int = 0

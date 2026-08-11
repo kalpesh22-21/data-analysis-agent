@@ -338,6 +338,20 @@ class LearningSettings(BaseSettings):
     learning_extractor_max_retries: int = Field(
         2, ge=0, description="Retries on a malformed (non-tool-call) extractor response (D31)."
     )
+    learning_extractor_max_shape_corrections: int = Field(
+        2,
+        ge=0,
+        description=(
+            "CORRECTIVE turns one extraction may spend when a candidate PARSED but "
+            "could not be READ — the model is told which field and what shape, and "
+            "re-emits. A separate budget from LEARNING_EXTRACTOR_MAX_RETRIES on "
+            "purpose: that one is for 'you did not call the tool', this one is for "
+            "'your candidate is the wrong shape', and pooling them would let either "
+            "failure starve the other. 0 disables it (a shape decline becomes terminal "
+            "again and the model is never told). Watch learning.extract.correction_count: "
+            "a rate that climbs is a PROMPT defect, not a model one."
+        ),
+    )
     learning_extractor_api_key: str = Field(
         "", description="API key for the extractor model client (secret). Empty ⇒ extractor dormant."
     )

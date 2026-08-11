@@ -301,6 +301,7 @@ def build_learning_consumer(
         model_client,
         config=ExtractorConfig(
             max_retries=settings.learning_extractor_max_retries,
+            max_shape_corrections=settings.learning_extractor_max_shape_corrections,
             known_rules=known_rules,
         ),
         # THE SAME index instance the dedup stage gets (plan §3a). One object, two
@@ -464,6 +465,11 @@ def _build_judge(
         prior_art=prior_art,
         config=config,
         tracer=tracer,
+        # The SAME D25 gate the consumer's triage/extract spans read, from the SAME
+        # setting. Read here rather than defaulted inside `CoverageJudge` so a session's
+        # spans cannot end up half entity-bearing: one switch, one posture, decided at
+        # the composition root.
+        trace_verbose=settings.learning_trace_verbose,
     )
 
 

@@ -20,17 +20,45 @@ front of the emit, and they are deliberately different in kind:
     unrelated topic), and a single pre-fetch keyed on the session intent cannot cover
     the second one. The tool is what makes the second candidate checkable.
 
-**The control flow is bounded, and the no-index path keeps its shape.** With no
-`PriorArtIndex` wired this class makes one forced tool call with `emit_candidates` as
-the only tool offered and retry-on-malformed, exactly as before the slice — no PRIOR
-ART block, no `searchCorpus` tool, no prior-art rules in the system prompt. (The system
-prompt is NOT byte-identical for such a deployment: rule 5 gained the windowed
-slot-type instructions, which every deployment needs — see `SLOT_TYPES`. What is
-unchanged is the tool list, the turn count, and the absence of every prior-art
-surface.) With an index wired the loop admits at most `max_search_calls` served search
-calls plus the unchanged `max_retries + 1` parse attempts, and a search turn never
-consumes a parse attempt. The search tool stops being OFFERED once the budget is spent,
-so the model is forced back to emitting rather than left able to spin.
+**Three loop-ish behaviours, three independent budgets.** `_drive_turns` is one `while`
+with three ways to go round again, and they are deliberately not pooled:
+
+  * a SEARCH turn (`max_search_calls`, per CALL) — the model asked the corpus a
+    question instead of answering; it is served and re-asked.
+  * a MALFORMED-response retry (`max_retries`) — the response was not a valid
+    `emit_candidates` call at all, so nothing could be read from it. Exhausting this
+    one RAISES, which is what routes the session to dead-letter.
+  * a SHAPE CORRECTION (`max_shape_corrections`) — the call parsed, but a candidate
+    inside it could not be read into the typed model. The model is told which field
+    and what shape, and re-emits. Exhausting this one DECLINES, with the attempt
+    recorded on the decline.
+
+Pooling any two would couple failures with unrelated causes: a model that cannot call
+the tool would eat the budget meant for a model that called it with a mis-shaped
+argument, and vice versa — and the second direction is worse, because a shape decline
+that consumed the retry budget would turn a later genuinely-malformed response into a
+raise, i.e. a dead-lettered session caused by an unrelated formatting slip.
+
+**Termination.** Every iteration ends in exactly one of four ways, three of which
+strictly decrease a distinct non-negative counter that also guards the branch:
+`searches_left` (search turn, guarded `> 0`, decreases by the number served, which is
+`>= 1` whenever the branch is taken), `attempts_left` (malformed retry, guarded by the
+`while`, decreases by 1, raises at 0), `corrections_left` (correction, guarded `> 0`,
+decreases by 1). The fourth returns. So the loop makes at most
+`max_search_calls + (max_retries + 1) + max_shape_corrections` provider round-trips —
+6 + 2 = 8 at the shipped defaults. `test_search_loop_termination_qa.py` and
+`test_correction_loop_qa.py` assert that bound empirically against hostile scripts,
+because a three-counter argument spread over four functions is not something to trust
+on inspection alone.
+
+**The no-index path keeps its shape.** With no `PriorArtIndex` wired this class makes
+one forced tool call with `emit_candidates` as the only tool offered and
+retry-on-malformed, exactly as before plan §3a — no PRIOR ART block, no `searchCorpus`
+tool, no prior-art rules in the system prompt. (The system prompt is NOT byte-identical
+for such a deployment: rule 5 gained the windowed slot-type instructions, which every
+deployment needs — see `SLOT_TYPES`. What is unchanged is the tool list, the turn
+count, and the absence of every prior-art surface.) The correction budget is orthogonal
+to the index: it costs nothing until a candidate declines on shape.
 
 **Fail-open, everywhere.** An unreachable index degrades the prompt, never the run —
 see `prior_art.py::lookup_prior_art`. The distinction between "we looked and found
@@ -42,13 +70,14 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from data_agent.runtime.model.client import ModelClient, ModelTurnResult, begin_turn_client
 
 from ..priorart import PriorArtIndex
 from ..summary.models import SessionSummary
 from ..triage import TriageVerdict
+from .correction import build_correction_message
 from .models import Decline, ExtractedCandidate, ExtractionResult
 from .prior_art import (
     DEFAULT_KINDS,
@@ -67,7 +96,7 @@ from .schema import (
     build_search_corpus_tool,
     parse_candidates,
 )
-from .validation import REASON_MALFORMED, to_candidate
+from .validation import to_candidate
 
 _logger = logging.getLogger(__name__)
 
@@ -148,13 +177,28 @@ class ExtractorConfig:
     # spend. Small: the pre-fetch already covers the session's primary intent, so this
     # budget exists for the SECOND candidate, not for exploration.
     max_search_calls: int = 3
+    # How many CORRECTIVE turns one extraction may spend telling the model that a
+    # candidate it emitted could not be read, and what shape the field needs.
+    #
+    # 2, not 1, and the reason is a property of the validator rather than a guess about
+    # models: `to_candidate` returns on the FIRST problem it finds in a candidate, so a
+    # candidate with two independent shape faults needs two corrections to surface both.
+    # A single correction would report the grain and never get to the parameterization.
+    # 2, not more, because a model that has been told twice is not converging and each
+    # correction re-sends the whole session prompt.
+    #
+    # 0 disables the corrective turn entirely and restores the pre-slice behaviour (a
+    # shape decline is terminal and the model is never told). A NEGATIVE value behaves
+    # exactly like 0 — see `__post_init__`.
+    max_shape_corrections: int = 2
     # Cards per lookup. Enough to show a near-tie, few enough that the block stays a
     # glance rather than a page of the corpus (`prior_art.py::_MAX_BLOCK_CHARS`).
     prior_art_limit: int = 5
 
     def __post_init__(self) -> None:
         # ONLY `max_retries` is validated, and the asymmetry with `max_search_calls`
-        # is the whole point: validate what BREAKS, tolerate what degrades safely.
+        # and `max_shape_corrections` is the whole point: validate what BREAKS,
+        # tolerate what degrades safely.
         #
         # `max_retries < 0` gives ZERO model calls — `_call_model_with_retry`'s loop
         # never runs and falls through to `assert last_exc is not None`, so an operator
@@ -164,11 +208,12 @@ class ExtractorConfig:
         # CONSTRUCTION (the composition root, at process start) — the posture
         # `DedupStage` takes for an inverted threshold pair.
         #
-        # `max_search_calls <= 0` is different in kind: the tool is simply never
-        # offered and the extractor does its job exactly as it does with no index
-        # wired. Raising on a negative value there would turn a harmless config into an
-        # outage. Pinned by QA's `test_a_non_positive_budget_never_offers_the_tool_
-        # and_still_terminates`.
+        # `max_search_calls <= 0` and `max_shape_corrections <= 0` are different in
+        # kind: the branch each guards is simply never taken and the extractor does its
+        # job exactly as it did before that branch existed (no tool offered; a shape
+        # decline stays terminal). Raising on a negative value there would turn a
+        # harmless config into an outage. Pinned by QA's `test_a_non_positive_budget_
+        # never_offers_the_tool_and_still_terminates` and its correction-loop sibling.
         if self.max_retries < 0:
             raise ExtractorConfigError(
                 f"max_retries must be >= 0 (got {self.max_retries}); a negative budget "
@@ -197,20 +242,7 @@ class LearningExtractor:
         """Run the forced-structured-output call + validation. Returns the
         structurally-valid candidates + the declines (each with a reason code)."""
         prior_art = await self._prefetch_prior_art(summary)
-        raw_candidates = await self._call_model_with_retry(summary, verdict, prior_art)
-
-        candidates: list[ExtractedCandidate] = []
-        declines: list[Decline] = []
-        for raw in raw_candidates:
-            if not isinstance(raw, dict):
-                declines.append(Decline("unknown", REASON_MALFORMED, "candidate is not an object"))
-                continue
-            outcome = to_candidate(raw, summary, known_rules=self._config.known_rules)
-            if isinstance(outcome, ExtractedCandidate):
-                candidates.append(outcome)
-            else:
-                declines.append(outcome)
-        return ExtractionResult(candidates=tuple(candidates), declines=tuple(declines))
+        return await self._drive_turns(summary, verdict, prior_art)
 
     # -- prior art -------------------------------------------------------------
 
@@ -315,21 +347,38 @@ class LearningExtractor:
 
     # -- the model turn --------------------------------------------------------
 
-    async def _call_model_with_retry(
+    async def _drive_turns(
         self,
         summary: SessionSummary,
         verdict: TriageVerdict,
         prior_art: PriorArtLookup | None,
-    ) -> list[dict]:
-        """Drive the turn(s) to a parsed `candidates` array, or raise.
+    ) -> ExtractionResult:
+        """Drive the turn(s) to a validated `ExtractionResult`, or raise.
 
-        TERMINATION (the reason this is a `while` and not a `for`): each iteration
-        either serves >=1 search call — which strictly decreases `searches_left`, and is
-        only reachable while `searches_left > 0` — or consumes one parse attempt. So the
-        loop runs at most `max_search_calls + max_retries + 1` times. A search turn
-        deliberately does NOT consume a parse attempt: the retry budget is for MALFORMED
-        output, and spending it on a tool call the extractor itself offered would make
-        the retry contract depend on how chatty the model is.
+        TERMINATION (the reason this is a `while` and not a `for`): every iteration ends
+        in exactly one of four ways, and three of them strictly decrease a distinct
+        non-negative counter that also guards the branch —
+
+            searches_left     search turn      guarded `> 0`; -= served, and
+                                               `served >= 1` whenever the branch runs
+            attempts_left     malformed retry  guarded by the `while`; -= 1; raises at 0
+            corrections_left  shape correction guarded `> 0`; -= 1
+            (return)          a validated result
+
+        so the loop runs at most `max_search_calls + (max_retries + 1) +
+        max_shape_corrections` times. A search turn and a correction turn deliberately
+        do NOT consume a parse attempt: the retry budget is for MALFORMED output, and
+        spending it on a tool call the extractor itself offered — or on a candidate that
+        parsed perfectly well and merely had a field of the wrong type — would make the
+        retry contract depend on how chatty or how sloppy the model is.
+
+        ONE ASYMMETRY WORTH STATING. Exhausting `attempts_left` raises, EXCEPT once a
+        correction has been issued, where it returns what has already been validated.
+        Before this slice a parsed turn returned immediately, so an unparseable response
+        after a good one was impossible; now it is reachable, and raising there would
+        dead-letter a session whose candidates we already hold. A correction is an
+        optional extra ask, and an optional extra ask must never be able to cost more
+        than it was asked for.
         """
         client = begin_turn_client(self._model_client)
         messages = self._build_messages(summary, verdict, prior_art)
@@ -341,7 +390,13 @@ class LearningExtractor:
         # response — D31 retry-on-mismatch. A persistent malformed response raises
         # (→ the consumer leaves the message un-acked → reclaim → dead-letter).
         attempts_left = self._config.max_retries + 1
+        corrections_left = max(self._config.max_shape_corrections, 0)
         last_exc: SchemaMismatchError | None = None
+
+        kept: list[ExtractedCandidate] = []
+        settled: list[Decline] = []  # substantive — judged on content, never re-asked
+        pending: list[tuple[int, Decline]] = []  # shape declines from the LAST batch
+        history: list[str] = []  # the correction messages already sent, in order
 
         while attempts_left > 0:
             tools = [build_extractor_tool()]
@@ -357,11 +412,11 @@ class LearningExtractor:
                 searches_left -= served
                 continue
 
-            attempts_left -= 1
             try:
-                return parse_candidates(result)
+                raw_candidates = parse_candidates(result)
             except SchemaMismatchError as exc:
                 last_exc = exc
+                attempts_left -= 1
                 _logger.warning(
                     "extractor structured-output mismatch (attempt %d/%d): %s",
                     self._config.max_retries + 1 - attempts_left,
@@ -377,8 +432,74 @@ class LearningExtractor:
                         ),
                     },
                 ]
+                continue
+
+            batch_kept, batch_settled, pending = self._validate_batch(raw_candidates, summary)
+            # PARTIAL SUCCESS: a candidate that passed every gate is KEPT and never
+            # re-asked. Re-emitting the whole array to fix one sibling would put work
+            # that already cleared validation back at risk — a model told it made a
+            # mistake will happily restructure things nobody complained about — and the
+            # trade is bad in one direction only: a duplicate from a model that
+            # re-sends anyway is a review-queue nuisance S6 dedup already handles,
+            # while a regressed good candidate is silent loss.
+            kept.extend(batch_kept)
+            settled.extend(batch_settled)
+
+            if pending and corrections_left > 0:
+                corrections_left -= 1
+                correction = build_correction_message(
+                    pending, emitted=len(raw_candidates), accepted=len(batch_kept)
+                )
+                history.append(correction)
+                messages = [*messages, *_correction_messages(result, correction)]
+                _logger.info(
+                    "extractor: correcting %d shape-declined candidate(s) for session "
+                    "%s (correction %d/%d)",
+                    len(pending),
+                    summary.session_id,
+                    len(history),
+                    max(self._config.max_shape_corrections, 0),
+                )
+                continue
+
+            return _finish(kept, settled, pending, history, summary)
+
+        if history:
+            # See ONE ASYMMETRY above: a correction was issued and the model then
+            # stopped producing parseable tool calls. Return what was validated rather
+            # than dead-lettering the session over the extra ask.
+            _logger.warning(
+                "extractor: session %s stopped returning a parseable tool call after "
+                "%d correction(s) — returning the %d candidate(s) already validated",
+                summary.session_id, len(history), len(kept),
+            )
+            return _finish(kept, settled, pending, history, summary)
         assert last_exc is not None
         raise last_exc
+
+    def _validate_batch(
+        self, raw_candidates: list[dict], summary: SessionSummary
+    ) -> tuple[list[ExtractedCandidate], list[Decline], list[tuple[int, Decline]]]:
+        """Validate one emitted array → `(kept, settled, shape-declined)`.
+
+        The three-way split IS the correction policy: `settled` holds the declines that
+        judged the candidate's CONTENT (no evidence, an unknown rule id, an un-covered
+        predicate) and must never be re-asked, because re-asking those is talking a
+        model out of a refusal it was right to make. The shape-declined keep their
+        position in the emitted array so the correction can name which candidate it
+        means without quoting the candidate back."""
+        kept: list[ExtractedCandidate] = []
+        settled: list[Decline] = []
+        shape: list[tuple[int, Decline]] = []
+        for index, raw in enumerate(raw_candidates):
+            outcome = to_candidate(raw, summary, known_rules=self._config.known_rules)
+            if isinstance(outcome, ExtractedCandidate):
+                kept.append(outcome)
+            elif outcome.correctable:
+                shape.append((index, outcome))
+            else:
+                settled.append(outcome)
+        return kept, settled, shape
 
     def _build_messages(
         self,
@@ -424,6 +545,68 @@ class LearningExtractor:
             messages.append({"role": "user", "content": render_prior_art_block(prior_art)})
         messages.append({"role": "user", "content": json.dumps(payload, ensure_ascii=False)})
         return messages
+
+
+def _finish(
+    kept: list[ExtractedCandidate],
+    settled: list[Decline],
+    pending: list[tuple[int, Decline]],
+    history: list[str],
+    summary: SessionSummary,
+) -> ExtractionResult:
+    """Assemble the result, stamping the correction record onto the declines that
+    SURVIVED correction.
+
+    Only *pending* is stamped. A substantive decline was never re-asked and must not
+    look as though it was; a shape decline that outlived the budget must carry both the
+    count and the messages, so a human reading the inbox can tell "the model could not
+    produce a valid candidate" from "the model was never asked twice" — and so the
+    second reading is impossible to reach by accident, since a zero on a correctable
+    decline now means the budget was disabled or already spent elsewhere."""
+    corrected = [
+        replace(
+            decline,
+            corrections_attempted=len(history),
+            correction_history=tuple(history),
+        )
+        for _index, decline in pending
+    ]
+    if corrected and history:
+        _logger.warning(
+            "extractor: %d candidate(s) for session %s still shape-declined after %d "
+            "correction(s): %s",
+            len(corrected), summary.session_id, len(history),
+            "; ".join(d.detail for d in corrected),
+        )
+    return ExtractionResult(
+        candidates=tuple(kept),
+        declines=(*settled, *corrected),
+        corrections=len(history),
+    )
+
+
+def _correction_messages(result: ModelTurnResult, correction: str) -> list[dict]:
+    """Echo the emitting turn and answer EVERY tool call in it, the correction riding
+    on the reply to `emit_candidates`.
+
+    A tool RESULT rather than a fresh user message, because that is where a model looks
+    for the outcome of a call it just made — and because leaving the call unanswered is
+    not an option: a provider rejects a follow-up whose history has a dangling tool
+    call, which is the same rule `_serve_search_calls` follows and for the same reason.
+    A `searchCorpus` call that arrived alongside the emit is answered too (it was not
+    served — the emit wins, see `_is_search_only`) so nothing dangles."""
+    messages: list[dict] = [_assistant_tool_calls(result)]
+    for call in result.tool_calls:
+        content = (
+            correction
+            if call.name == EXTRACTOR_TOOL_NAME
+            else (
+                f"not served: this turn also called {EXTRACTOR_TOOL_NAME}, so no other "
+                "tool was run."
+            )
+        )
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
+    return messages
 
 
 def _is_search_only(result: ModelTurnResult) -> bool:

@@ -149,8 +149,14 @@ def make_judge(
     config: JudgeConfig | None = None,
     model_client: Any = None,
     tracer: object | None = None,
+    trace_verbose: bool = False,
 ) -> tuple[CoverageJudge, ScriptedModelClient | Any, InMemoryAuditStore, InMemoryPriorArtIndex]:
-    """A judge over a scripted model, an in-memory audit store and a fake index."""
+    """A judge over a scripted model, an in-memory audit store and a fake index.
+
+    *trace_verbose* defaults FALSE — the D25 PARAM default, not the shipped setting
+    default (`LEARNING_TRACE_VERBOSE` is True). Every pre-existing test in this suite
+    asserts the shape-only span, so the helper keeps the gate shut unless a test opts in;
+    `test_judge_span_verbose.py` is where the ON posture is pinned."""
     client = model_client if model_client is not None else ScriptedModelClient(turns)
     store = audit if audit is not None else InMemoryAuditStore()
     index = InMemoryPriorArtIndex(cards or [], scores=scores or {}, fail=index_fails)
@@ -160,6 +166,7 @@ def make_judge(
         prior_art=index,
         config=config or JudgeConfig(),
         tracer=tracer,
+        trace_verbose=trace_verbose,
     )
     return judge, client, store, index
 

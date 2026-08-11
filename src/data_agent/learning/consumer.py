@@ -44,7 +44,7 @@ from .candidate import (
 )
 from .config import LearningSettings, learning_enabled
 from .extractor import ExtractedCandidate, LearningExtractor
-from .extractor.models import BlueprintPayload
+from .extractor.models import BlueprintPayload, Decline
 from .judge import CoverageJudge
 from .models import LearningStatus, compute_content_hash
 from .observability import (
@@ -70,6 +70,20 @@ Triage = Callable[[SessionSummary], TriageVerdict]
 
 # The verbose transcript-preview length cap (D25-gated; entity-bearing).
 _TRANSCRIPT_PREVIEW_LIMIT = 500
+
+# Caps for the verbose `decline_details` attribute. Per-decline first, then a total:
+# `Decline.detail` interpolates MODEL-authored strings (a slot name, a role, a type the
+# model invented), so one pathological candidate must not be able to inflate a span, and
+# neither must fifty ordinary ones.
+_DECLINE_DETAIL_LIMIT = 300
+_DECLINE_DETAILS_TOTAL_LIMIT = 2000
+
+# Decline reason codes whose detail is known to carry a value lifted from the analyst's
+# SQL rather than only a path/requirement/type. Maintained as documentation, NOT as a
+# filter — see `_decline_details` for why filtering by this list would be the wrong
+# guard. Today: `totality_violation`, whose message interpolates `pred.value`
+# (`validation.py::_validate_totality`).
+ENTITY_BEARING_DECLINE_REASONS: frozenset[str] = frozenset({"totality_violation"})
 
 
 def _session_question(summary: SessionSummary) -> str | None:
@@ -105,18 +119,21 @@ def _accepted_sql(summary: SessionSummary) -> str | None:
     return sql
 
 
-def _blueprint_verbose(
-    candidate: ExtractedCandidate,
-) -> tuple[str | None, str | None, str | None]:
-    """The learned (intent, slot-plan, rationale) of a blueprint candidate for the
-    verbose extract span. `slots` renders as `name→binds_to; ...` — with the slot TYPE
-    in place of `binds_to` for a windowed slot, which legitimately declares none (it
-    consumes no column domain; see `extractor/models.py::WINDOWED_SLOT_TYPES`). An
-    f-string would have rendered the literal `None` there. Entity-bearing —
-    verbose-gated."""
-    payload = candidate.payload
-    if not isinstance(payload, BlueprintPayload):
-        return None, None, candidate.header.rationale or None
+def _blueprint_verbose(payload: BlueprintPayload) -> tuple[str | None, str | None]:
+    """The learned (intent, slot-plan) of a BLUEPRINT payload for the verbose extract
+    span. `slots` renders as `name→binds_to; ...` — with the slot TYPE in place of
+    `binds_to` for a windowed slot, which legitimately declares none (it consumes no
+    column domain; see `extractor/models.py::WINDOWED_SLOT_TYPES`). An f-string would
+    have rendered the literal `None` there. Entity-bearing — verbose-gated.
+
+    Takes the PAYLOAD, not the candidate, and no longer returns the rationale. It used to
+    take a candidate of any type and return `(None, None, rationale)` for the three
+    non-blueprint targets — which meant the caller's `isinstance(payload,
+    BlueprintPayload)` guard skipped it entirely for a knowledge candidate and the
+    rationale went with it. A session that extracted only knowledge therefore emitted a
+    verbose extract span with NO human-readable attribute at all. The rationale lives on
+    `CandidateHeader` for EVERY target, so the caller reads it there and this function
+    answers only the question its name asks."""
     slots = (
         "; ".join(
             f"{p.slot.name}→{p.slot.binds_to or f'<{p.slot.type}>'}"
@@ -125,7 +142,61 @@ def _blueprint_verbose(
         )
         or None
     )
-    return payload.intent or None, slots, candidate.header.rationale or None
+    return payload.intent or None, slots
+
+
+def _decline_details(declines: tuple[Decline, ...]) -> str | None:
+    """The verbose extract span's `decline_details` — one `reason: detail` line per
+    decline, or `None` when nothing was declined or no decline carried a detail.
+
+    THE POINT: `decline_reasons` (shape-only) says `bad_role`; this says "slot pay_period
+    has no binds_to (only a ['as_of_quarter', 'period'] slot may omit it)". A session that
+    produced nothing and offered no readable why is the hole this closes, and a reason
+    code alone does not close it — the code names a class, the detail names the fix.
+
+    BOUNDED and FLATTENED, and not as a formality. `Decline.detail` interpolates
+    MODEL-authored strings (`f"unknown role {p.role!r}"`, a slot name, a candidate type),
+    which are neither a closed vocabulary nor a leakage-scanned surface: a newline in one
+    would smear the attribute across the Phoenix UI and an unbounded one would put an
+    arbitrary generation on a span. Same posture, and the same reason, as
+    `judge/schema.py::_clean` on the judge's `reason`.
+
+    **ENTITY-BEARING, and one detail is measurably so.** Most messages are derived from
+    `(path, requirement, arrived_json_type)` and name no value. `totality_violation` is
+    the exception: it interpolates `pred.value` — a literal lifted from a real analyst's
+    accepted SQL (`validation.py::_validate_totality`). That is a deliberate accepted
+    consequence of the D25 gate, not an oversight, and it is recorded here so the next
+    reader does not have to rediscover it:
+
+      * it changes no CLASS of content. This same span already carries
+        `learning.accepted_sql` — the whole accepted query WITH its literals — under the
+        SAME gate, and `pred.value` is by construction a literal out of a cited source
+        query. The span was entity-bearing before this attribute existed;
+      * it is therefore governed by the posture already stated on
+        `observability.py::judge_span` and the module docstring: with verbose ON the
+        `learning-loop` Phoenix project holds session content and MUST be
+        access-controlled like `learning_audit` and the session store (D51);
+      * the RIGHT fix is at the producer — that message should name the path and the
+        requirement like its neighbours and drop the value, which no human debugging a
+        totality violation needs. That belongs in `validation.py`, where it also cleans
+        the log line the same string reaches.
+
+    **Not filtered by reason code here, deliberately.** Excluding `totality_violation`
+    from this attribute would be a guard keyed on a NAME — precisely the shape that has
+    already missed this class of bug repeatedly in this package, because the next
+    entity-bearing message added upstream inherits the exemption silently. It would also
+    fail closed on the one thing this attribute exists for: a decline that shows no
+    reason. `ENTITY_BEARING_DECLINE_REASONS` above records what is known, so a reader can
+    audit it; it is documentation, not a filter.
+    """
+    lines = [
+        f"{d.reason}: {' '.join(d.detail.split())[:_DECLINE_DETAIL_LIMIT]}"
+        for d in declines
+        if d.detail
+    ]
+    if not lines:
+        return None
+    return " | ".join(lines)[:_DECLINE_DETAILS_TOTAL_LIMIT]
 
 
 @dataclass(frozen=True)
@@ -451,8 +522,13 @@ class LearningConsumer:
                 traceparent=traceparent,
             )
             await self._candidates.put(envelope)
+            # The rationale comes off the HEADER, which every target has — see
+            # `_blueprint_verbose`. Reading it only inside the blueprint branch left a
+            # knowledge-only extraction with a verbose span carrying nothing readable.
+            if rationale is None:
+                rationale = candidate.header.rationale or None
             if intent is None and isinstance(candidate.payload, BlueprintPayload):
-                intent, slots, rationale = _blueprint_verbose(candidate)
+                intent, slots = _blueprint_verbose(candidate.payload)
             if await self._run_stages(envelope, summary, verdict) == "halt":
                 break
         decline_reasons = tuple(d.reason for d in result.declines)
@@ -461,9 +537,11 @@ class LearningConsumer:
             candidate_count=len(result.candidates),
             decline_reasons=decline_reasons,
             target_hints=verdict.target_hints,
+            correction_count=result.corrections,
             intent=intent,
             slots=slots,
             rationale=rationale,
+            decline_details=_decline_details(result.declines),
         )
 
     async def _run_stages(
@@ -566,9 +644,11 @@ class LearningConsumer:
         candidate_count: int,
         decline_reasons: tuple[str, ...],
         target_hints: tuple[str, ...],
+        correction_count: int = 0,
         intent: str | None = None,
         slots: str | None = None,
         rationale: str | None = None,
+        decline_details: str | None = None,
     ) -> None:
         if self._tracer is None:
             return
@@ -580,11 +660,13 @@ class LearningConsumer:
             decline_count=len(decline_reasons),
             decline_reasons=decline_reasons,
             target_hints=target_hints,
+            correction_count=correction_count,
             verbose=verbose,
             accepted_sql=_accepted_sql(summary) if verbose else None,
             intent=intent if verbose else None,
             slots=slots if verbose else None,
             rationale=rationale if verbose else None,
+            decline_details=decline_details if verbose else None,
         ):
             pass
 

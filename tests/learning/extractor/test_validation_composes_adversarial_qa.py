@@ -46,10 +46,11 @@ from data_agent.learning.extractor.validation import REASON_MALFORMED, to_candid
 from .helpers import (
     KEEP_VERDICT,
     blueprint_raw,
-    emit_extractor,
+    make_extractor,
     make_summary,
     make_tool_call,
     param_slot,
+    scripted_turn,
 )
 
 _NODE_SQL = {
@@ -117,14 +118,23 @@ def test_unhashable_node_kind_declines_rather_than_raising(node_kind: Any) -> No
 
 
 async def test_unhashable_node_kind_does_not_escape_the_extractor() -> None:
-    """WAS a strict xfail (HIGH), the end-to-end half of FINDING 1: there is still no
-    try/except around `to_candidate` (extractor.py:93), so the gate returning a
-    Decline rather than raising is the ONLY thing keeping one bad node from costing
-    the whole session's extraction."""
-    extractor = emit_extractor([_raw([_node(node_kind=["query"])])])
+    """WAS a strict xfail (HIGH), the end-to-end half of FINDING 1: `to_candidate` is
+    still called with no try/except around it, so the gate returning a Decline rather
+    than raising is the ONLY thing keeping one bad node from costing the whole
+    session's extraction.
+
+    The script is three identical turns because a `malformed_candidate` is now
+    CORRECTABLE: the extractor tells the model which field is wrong and lets it
+    re-emit, twice, before giving up (`ExtractorConfig.max_shape_corrections`). A model
+    that repeats the same bad node still ends where it always did — one decline, no
+    candidates, no exception — and the decline now records that it WAS asked again."""
+    bad = _raw([_node(node_kind=["query"])])
+    extractor = make_extractor([scripted_turn([bad]) for _ in range(3)])
     result = await extractor.extract(_summary(), KEEP_VERDICT)
     assert result.candidates == ()
     assert [d.reason for d in result.declines] == [REASON_MALFORMED]
+    assert result.declines[0].corrections_attempted == 2
+    assert result.corrections == 2
 
 
 # --- FINDING 2 (FIXED): `feeds_from: 0` was silently dropped -------------------

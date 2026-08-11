@@ -16,6 +16,19 @@ a reason code the consumer traces). The validations are the S3 safety teeth:
     one (see `WINDOWED_SLOT_TYPES`) + optional slot carries an `optional_pattern`
     (no silent drop); rule→an EXISTING catalog `rule_id` (missing ⇒ `missing_rule`,
     the §7 pairing hook); inline→a `why`.
+
+**Two kinds of decline, and only one of them is re-askable.** A decline is CORRECTABLE
+when the fix is a change of EXPRESSION — restating something the candidate already
+decided in a form the pipeline can read — and terminal when it would be a change of
+DECISION. `_correctable` is the single place the flag is set and states the rule in
+full; `_malformed` and `_role_shape` are its two families. The rule is derived from
+what the CHECK consults, not from the field's name: a check that reads only the
+candidate is re-askable, a check that consults the catalog, the accepted SQL, the
+session or this pipeline's capabilities is not.
+
+Field-shape checks come from `shape.py`, whose readers write their own message. Nothing
+in this module may hand an interpreter exception string to a `Decline`: that message is
+fed back to the model on the corrective turn and recorded on the final decline.
 """
 
 from __future__ import annotations
@@ -44,6 +57,18 @@ from .models import (
     ResultSignature,
     SlotPlan,
 )
+from .shape import (
+    ShapeError,
+    as_array,
+    as_flag,
+    as_int,
+    as_number,
+    as_object,
+    as_text,
+    one_of,
+    optional,
+    require,
+)
 from .sql_predicates import literal_predicates
 
 # Reason codes (traced by the consumer). `fail_to_review` reasons are the D52/D97
@@ -60,102 +85,502 @@ REASON_MALFORMED = "malformed_candidate"
 # it may still legitimately appear on a candidate the extractor forwards).
 _ACCEPTED_SIGNAL_DOMAIN = frozenset({"no_correction", "thumbs_up", "explicit_confirm"})
 
+CANDIDATE_TYPES: tuple[str, ...] = (
+    "blueprint",
+    "global_knowledge",
+    "user_knowledge",
+    "schema_edit",
+)
 
-def _evidence(raw: dict[str, Any]) -> tuple[EvidenceRef, ...]:
-    items = raw.get("evidence") or []
-    if not isinstance(items, list):
-        return ()
-    refs: list[EvidenceRef] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        try:
-            refs.append(
-                EvidenceRef(
-                    turn_ref=int(item["turn_ref"]),
-                    tool_call_ref=str(item["tool_call_ref"]),
-                    quote=str(item["quote"]),
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-    return tuple(refs)
+# Spelled out because a real model got exactly this wrong: `gpt-4.1` emitted the
+# blueprint payload's fields at the TOP level with no `type` and no `payload` wrapper.
+# "unknown candidate type" told it nothing about the envelope it had skipped.
+_CANDIDATE_TYPE_REQUIREMENT = (
+    'one of "blueprint", "global_knowledge", "user_knowledge" or "schema_edit". Each '
+    "candidate is an ENVELOPE — {type, confidence, evidence, rationale, "
+    "entity_self_check, payload} — and every type-specific field (intent, kind, "
+    "parameterization, source_tool_call_refs, ...) goes INSIDE payload, never at the "
+    "top level of the candidate"
+)
+
+_BLUEPRINT_PAYLOAD_REQUIREMENT = (
+    'an object with "intent", "kind", "source_tool_call_refs", "accepted_signal" and '
+    '"parameterization"'
+)
 
 
-def _header(raw: dict[str, Any], evidence: tuple[EvidenceRef, ...]) -> CandidateHeader:
-    esc = raw.get("entity_self_check") or {}
-    return CandidateHeader(
-        type=raw["type"],
-        confidence=float(raw.get("confidence", 0.0)),
-        evidence=evidence,
-        rationale=str(raw.get("rationale", "")),
-        proposed_action=str(raw.get("proposed_action", "new")),
-        entity_self_check=EntitySelfCheck(
-            contains_entities=bool(esc.get("contains_entities", False)),
-            found=tuple(str(f) for f in (esc.get("found") or [])),
-        ),
-        depends_on=tuple(str(d) for d in (raw.get("depends_on") or [])),
+def _correctable(candidate_type: str, reason: str, detail: str) -> Decline:
+    """The ONE place `Decline.correctable` is set. Everything else builds a plain
+    `Decline`, which is terminal.
+
+    Correctable means the extractor will put *detail* in front of the model and let it
+    re-emit (`extractor.py::_drive_turns`), so *detail* must be (a) actionable — it
+    names the field and what the field must contain — and (b) ENTITY-FREE, since it
+    becomes prompt text and is recorded on the final decline.
+
+    WHERE THE LINE IS. A decline is correctable iff the fix is a change of EXPRESSION —
+    restating something the candidate already decided in a form the pipeline can read —
+    and never a change of DECISION. Operationally that is exactly two families, and both
+    are properties of the CHECK, not of the field's name:
+
+      (a) a JSON-shape requirement of a downstream read — `shape.py` and the `composes`
+          gate. The candidate could not be turned into the typed model at all.
+      (b) a REQUIRED-FIELD or CLOSED-ENUM obligation that follows mechanically from a
+          role or type the candidate ITSELF declared — `_validate_roles`, via
+          `_role_shape`.
+
+    A check that consults anything OUTSIDE the candidate is never correctable: the
+    catalog's rule ids (`missing_rule`), the accepted SQL's predicates
+    (`totality_violation`), the session's acceptance (`no_acceptance`), a SQL parser
+    (a malformed `optional_pattern`), this pipeline's own capabilities (`period_range`).
+    Nor is a check that asks for content the candidate does not contain (`no_evidence`,
+    the D31 primary guard — re-asking there is an invitation to invent a citation).
+    Re-asking any of those is talking a model into a candidate it was right to decline,
+    and in the `missing_rule` case it would destroy the §7 signal that a human needs to
+    ADD a rule. `_unreadable` is excluded too — see its docstring.
+    """
+    return Decline(candidate_type, reason, detail, correctable=True)
+
+
+def _malformed(candidate_type: str, detail: str) -> Decline:
+    """Family (a) of `_correctable`: a READER failed, so the candidate could not be
+    turned into the typed model. Every `malformed_candidate` in this module comes
+    through here EXCEPT `_unreadable`."""
+    return _correctable(candidate_type, REASON_MALFORMED, detail)
+
+
+def _role_shape(detail: str) -> Decline:
+    """Family (b) of `_correctable`: a required-field or closed-enum obligation of a
+    role/type the candidate declared for itself. Still `role_inconsistent` — the reason
+    code is what the consumer traces and it has not changed meaning — but re-askable,
+    because the candidate has already made every decision the fix needs."""
+    return _correctable("blueprint", REASON_BAD_ROLE, detail)
+
+
+def _unreadable(candidate_type: str, where: str, exc: Exception) -> Decline:
+    """The BELT: a shape that escaped every reader above and raised out of the build.
+
+    NOT correctable, and that is the point of having it separate. It names no field,
+    because if it could name one, a reader would have caught it — so feeding it to the
+    model would be asking it to guess at random, and each guess costs a full extraction
+    prompt. It is an EXTRACTOR bug report, not a candidate fix, and it says so.
+
+    The exception TYPE is named (safe — it describes the interpreter's complaint) and
+    its MESSAGE is not (it interpolates the offending value, which is model-authored
+    from an entity-bearing session)."""
+    return Decline(
+        candidate_type,
+        REASON_MALFORMED,
+        f"the {where} could not be read, and no shape check named the field that "
+        f"failed — this is an extractor gap ({type(exc).__name__}), not something the "
+        "candidate can be corrected into",
     )
 
 
-def _slot_plan(raw: dict[str, Any]) -> SlotPlan:
-    enum_values = raw.get("enum_values")
-    # ABSENT and explicit-null both mean "this slot declares no column domain", which
-    # is legal for exactly the two `WINDOWED_SLOT_TYPES` and illegal for everything
-    # else — `_validate_roles` decides which, because it is the only place that knows
-    # the type. A PRESENT non-null value is still `str()`-coerced exactly as before,
-    # so a model emitting `binds_to: 123` keeps its existing route (a bogus bind that
-    # fails S4's `binds_to ⊆ uses` check and reaches a HUMAN via fail-to-review),
-    # rather than being newly hard-rejected here.
-    raw_binds = raw.get("binds_to")
+def _evidence(raw: dict[str, Any]) -> tuple[EvidenceRef, ...]:
+    """The cited evidence, or `()` when the candidate cites none. Raises `ShapeError`
+    when it cites some and NONE of them can be read.
+
+    PARTIAL tolerance is deliberate and unchanged: an item this cannot read is skipped,
+    because evidence is a `>= 1` gate and one malformed quote among three should not
+    cost the candidate. What changed is the ALL-BAD case. It used to fall through to
+    `no_evidence` — "the candidate cites nothing", a judgement about CONTENT — when the
+    truth was that it cited three things in a shape this could not read. That
+    misdiagnosis is the expensive kind: a substantive decline is never re-asked, so a
+    purely mechanical mistake became terminal. The last reader error is re-raised
+    instead, which routes it to the correctable side."""
+    items = raw.get("evidence")
+    if items is None:
+        return ()
+    items = as_array(
+        items,
+        at="candidate.evidence",
+        requirement=(
+            'an array of {"turn_ref": <turn index>, "tool_call_ref": <tool call id>, '
+            '"quote": <text from the session>} objects'
+        ),
+    )
+    refs: list[EvidenceRef] = []
+    last_error: ShapeError | None = None
+    for idx, item in enumerate(items):
+        at = f"candidate.evidence[{idx}]"
+        try:
+            obj = as_object(
+                item,
+                at=at,
+                requirement='an object with "turn_ref", "tool_call_ref" and "quote"',
+            )
+            refs.append(
+                EvidenceRef(
+                    turn_ref=require(
+                        obj,
+                        "turn_ref",
+                        as_int,
+                        at=at,
+                        requirement="the integer turn_index the quote came from",
+                    ),
+                    tool_call_ref=require(
+                        obj,
+                        "tool_call_ref",
+                        as_text,
+                        at=at,
+                        requirement="the tool_call_ref of the session tool call it came from",
+                    ),
+                    quote=require(
+                        obj,
+                        "quote",
+                        as_text,
+                        at=at,
+                        requirement="the quoted text, copied from the session",
+                    ),
+                )
+            )
+        except ShapeError as exc:
+            last_error = exc
+    if not refs and last_error is not None:
+        raise last_error
+    return tuple(refs)
+
+
+def _header(
+    raw: dict[str, Any], candidate_type: str, evidence: tuple[EvidenceRef, ...]
+) -> CandidateHeader:
+    at = "candidate"
+    esc_at = f"{at}.entity_self_check"
+    esc = optional(
+        raw,
+        "entity_self_check",
+        as_object,
+        at=at,
+        requirement=(
+            'an object with a boolean "contains_entities" and a "found" array of the '
+            "literal values you found"
+        ),
+        default={},
+    )
+    found = optional(
+        esc,
+        "found",
+        as_array,
+        at=esc_at,
+        requirement="an array of the literal values found in this candidate (strings)",
+        default=[],
+    )
+    depends_on = optional(
+        raw,
+        "depends_on",
+        as_array,
+        at=at,
+        requirement="an array of sibling candidate ids this one is blocked on (strings)",
+        default=[],
+    )
+    return CandidateHeader(
+        # Already read through `one_of` by `to_candidate` — passed in rather than
+        # re-read so there is exactly one place the candidate type is validated.
+        type=candidate_type,  # type: ignore[arg-type]
+        confidence=optional(
+            raw,
+            "confidence",
+            as_number,
+            at=at,
+            requirement="a number between 0.0 and 1.0",
+            default=0.0,
+        ),
+        evidence=evidence,
+        # `rationale` and `proposed_action` get no reader: `str()` is total, and both
+        # are advisory prose whose worst case is a useless-but-harmless string. A
+        # reader here would decline candidates over a field nothing gates on.
+        rationale=str(raw.get("rationale", "")),
+        proposed_action=str(raw.get("proposed_action", "new")),
+        entity_self_check=EntitySelfCheck(
+            contains_entities=optional(
+                esc,
+                "contains_entities",
+                as_flag,
+                at=esc_at,
+                requirement="true or false",
+                default=False,
+            ),
+            found=tuple(
+                as_text(
+                    f,
+                    at=f"{esc_at}.found[{i}]",
+                    requirement="a literal value found in this candidate",
+                )
+                for i, f in enumerate(found)
+            ),
+        ),
+        depends_on=tuple(
+            as_text(d, at=f"{at}.depends_on[{i}]", requirement="a sibling candidate id")
+            for i, d in enumerate(depends_on)
+        ),
+    )
+
+
+def _slot_plan(raw: Any, *, at: str) -> SlotPlan:
+    slot = as_object(
+        raw,
+        at=at,
+        requirement='an object with "name", "type", "binds_to" and "required"',
+    )
     return SlotPlan(
-        name=str(raw["name"]),
-        type=str(raw["type"]),
-        binds_to=None if raw_binds is None else str(raw_binds),
+        name=require(
+            slot, "name", as_text, at=at, requirement="a short identifier for the slot"
+        ),
+        # Presence only — `_validate_roles` owns the enum, because it is the one place
+        # that also knows the type-dependent `binds_to` rule, and a decline naming the
+        # wrong blocker is worse than a late one.
+        type=require(
+            slot,
+            "type",
+            as_text,
+            at=at,
+            requirement=f"one of {', '.join(sorted(SLOT_TYPES - UNSUPPORTED_SLOT_TYPES))}",
+        ),
+        # ABSENT and explicit-null both mean "this slot declares no column domain",
+        # which is legal for exactly the two `WINDOWED_SLOT_TYPES` and illegal for
+        # everything else — `_validate_roles` decides which. A model emitting
+        # `binds_to: 123` is still coerced to "123" and keeps its existing route (a
+        # bogus bind that fails S4's `binds_to ⊆ uses` check and reaches a HUMAN via
+        # fail-to-review) rather than being newly hard-rejected here; a CONTAINER is
+        # rejected, because `str(["a"])` lands a Python repr in the corpus.
+        binds_to=optional(
+            slot,
+            "binds_to",
+            as_text,
+            at=at,
+            requirement=(
+                "the FULLY-QUALIFIED 'database.table.column' this slot binds to, or "
+                "null for a relative_window slot"
+            ),
+            default=None,
+        ),
         # A real model sometimes omits `required`. Default to True: a predicate that
         # appeared in the ACCEPTED SQL is required unless the model explicitly marks
         # it optional — the safe side of the no-drop (D97) invariant (an optional slot
         # still needs an optional_pattern, enforced in `_validate_roles`).
-        required=bool(raw.get("required", True)),
-        optional_pattern=(
-            str(raw["optional_pattern"]) if raw.get("optional_pattern") is not None else None
+        required=optional(
+            slot, "required", as_flag, at=at, requirement="true or false", default=True
         ),
-        enum_values=tuple(str(v) for v in enum_values) if enum_values else None,
+        optional_pattern=optional(
+            slot,
+            "optional_pattern",
+            as_text,
+            at=at,
+            requirement=(
+                "a self-contained boolean SQL fragment that renders when the slot is "
+                "ABSENT (usually 'TRUE'), carrying no {placeholder}, or null"
+            ),
+            default=None,
+        ),
+        enum_values=_enum_values(slot, at=at),
     )
 
 
-def _param_plans(raw_params: list[dict[str, Any]]) -> list[ParamPlan]:
+def _enum_values(slot: dict[str, Any], *, at: str) -> tuple[str, ...] | None:
+    """An `enum` slot's closed set, or `None` when it declares none.
+
+    An EMPTY array collapses to `None` (unchanged): both say "no closed set", and
+    `_validate_roles` declines either one for an `enum` slot. The `as_array` read is
+    what stops `enum_values: "NA,EU"` — a string is iterable, so the old code turned it
+    into seven single-character values with no error anywhere."""
+    values = optional(
+        slot,
+        "enum_values",
+        as_array,
+        at=at,
+        requirement="an array of the closed set of allowed values, or null",
+        default=None,
+    )
+    if not values:
+        return None
+    return tuple(
+        as_text(v, at=f"{at}.enum_values[{i}]", requirement="one allowed value")
+        for i, v in enumerate(values)
+    )
+
+
+def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
     plans: list[ParamPlan] = []
-    for rp in raw_params:
-        loc = rp["locator"]
+    for idx, rp in enumerate(raw_params):
+        entry_at = f"{at}[{idx}]"
+        entry = as_object(
+            rp,
+            at=entry_at,
+            requirement=(
+                'an object with "locator", "role" ("slot"|"rule"|"inline") and the '
+                "field that role requires"
+            ),
+        )
+        loc_at = f"{entry_at}.locator"
+        loc = require(
+            entry,
+            "locator",
+            as_object,
+            at=entry_at,
+            requirement=(
+                'an object with "table" (the \'database.table\'), "column" (the BARE '
+                'column) and "value" (the literal as it appeared)'
+            ),
+        )
         plans.append(
             ParamPlan(
                 locator=Locator(
-                    table=str(loc["table"]), column=str(loc["column"]), value=str(loc["value"])
+                    table=require(
+                        loc,
+                        "table",
+                        as_text,
+                        at=loc_at,
+                        requirement="the 'database.table' the column belongs to",
+                    ),
+                    column=require(
+                        loc,
+                        "column",
+                        as_text,
+                        at=loc_at,
+                        requirement="the BARE column name, with no table prefix",
+                    ),
+                    value=require(
+                        loc,
+                        "value",
+                        as_text,
+                        at=loc_at,
+                        requirement="the literal exactly as it appeared in the SQL",
+                    ),
                 ),
-                role=rp["role"],
-                slot=_slot_plan(rp["slot"]) if rp.get("slot") else None,
-                rule_id=str(rp["rule_id"]) if rp.get("rule_id") is not None else None,
-                why=str(rp["why"]) if rp.get("why") is not None else None,
+                # Presence and stringness only. An unknown role string still declines
+                # `role_inconsistent` in `_validate_roles`, which is where the roles and
+                # their obligations are described together.
+                role=require(
+                    entry,
+                    "role",
+                    as_text,
+                    at=entry_at,
+                    requirement='exactly one of "slot", "rule" or "inline"',
+                ),  # type: ignore[arg-type]
+                slot=(
+                    _slot_plan(entry["slot"], at=f"{entry_at}.slot")
+                    if entry.get("slot")
+                    else None
+                ),
+                rule_id=optional(
+                    entry,
+                    "rule_id",
+                    as_text,
+                    at=entry_at,
+                    requirement="the id of an EXISTING catalog rule",
+                    default=None,
+                ),
+                why=optional(
+                    entry,
+                    "why",
+                    as_text,
+                    at=entry_at,
+                    requirement="a sentence saying why this predicate is metric-defining",
+                    default=None,
+                ),
             )
         )
     return plans
 
 
-def _result_signature(raw: dict[str, Any] | None) -> ResultSignature | None:
+def _result_signature(raw: Any) -> ResultSignature | None:
+    """The GROUP BY output contract, or `None` when the candidate declares none.
+
+    `grain` is where a live `gpt-5.5` extraction died: it emitted a prose SENTENCE
+    ("one row per organizational unit above the ...") where the schema wants an object,
+    and `grain.get("columns")` raised `AttributeError` out of the whole payload build.
+    The requirement below is written to be the answer to that mistake."""
     if not raw:
         return None
-    grain = raw.get("grain") or {}
+    at = "candidate.payload.result_signature"
+    sig = as_object(
+        raw,
+        at=at,
+        requirement=(
+            'an object with "shape" (an array of {column, type}), "grain" (an object) '
+            'and "invariants" (an array of strings), or null when the SQL has no GROUP BY'
+        ),
+    )
+    grain_at = f"{at}.grain"
+    grain = optional(
+        sig,
+        "grain",
+        as_object,
+        at=at,
+        requirement=(
+            'an OBJECT with a "columns" array naming the GROUP BY columns and a boolean '
+            '"verifiable" — a prose description of the grain is not a grain'
+        ),
+        default={},
+    )
+    columns = optional(
+        grain,
+        "columns",
+        as_array,
+        at=grain_at,
+        requirement="an array of the grouped column names (strings)",
+        default=[],
+    )
+    shape_items = optional(
+        sig,
+        "shape",
+        as_array,
+        at=at,
+        requirement='an array of {"column": <name>, "type": <type>} objects',
+        default=[],
+    )
+    invariants = optional(
+        sig,
+        "invariants",
+        as_array,
+        at=at,
+        requirement="an array of invariant statements (strings)",
+        default=[],
+    )
+    shape: list[ColumnShape] = []
+    for idx, item in enumerate(shape_items):
+        item_at = f"{at}.shape[{idx}]"
+        column_shape = as_object(
+            item, at=item_at, requirement='an object with "column" and "type"'
+        )
+        shape.append(
+            ColumnShape(
+                column=require(
+                    column_shape,
+                    "column",
+                    as_text,
+                    at=item_at,
+                    requirement="the output column name",
+                ),
+                type=require(
+                    column_shape,
+                    "type",
+                    as_text,
+                    at=item_at,
+                    requirement="the output column's type",
+                ),
+            )
+        )
     return ResultSignature(
-        shape=tuple(
-            ColumnShape(column=str(s["column"]), type=str(s["type"]))
-            for s in (raw.get("shape") or [])
-        ),
+        shape=tuple(shape),
         grain=ResultGrainPlan(
-            columns=tuple(str(c) for c in (grain.get("columns") or [])),
-            verifiable=bool(grain.get("verifiable", True)),
+            columns=tuple(
+                as_text(
+                    c,
+                    at=f"{grain_at}.columns[{i}]",
+                    requirement="one grouped column name",
+                )
+                for i, c in enumerate(columns)
+            ),
+            verifiable=optional(
+                grain, "verifiable", as_flag, at=grain_at, requirement="true or false", default=True
+            ),
         ),
-        invariants=tuple(str(i) for i in (raw.get("invariants") or [])),
+        invariants=tuple(
+            as_text(inv, at=f"{at}.invariants[{i}]", requirement="one invariant statement")
+            for i, inv in enumerate(invariants)
+        ),
     )
 
 
@@ -201,18 +626,35 @@ def _validate_compose_nodes(raw_nodes: Any) -> Decline | None:
     if raw_nodes is None:
         return None  # a single (non-composite) blueprint declares no DAG
     if not isinstance(raw_nodes, list):
-        return Decline("blueprint", REASON_MALFORMED, "composes is not a list")
+        return _malformed(
+            "blueprint",
+            "candidate.payload.composes is not a list — it must be an ARRAY of node "
+            f"objects, one per step of the DAG (got {type(raw_nodes).__name__})",
+        )
     for idx, rn in enumerate(raw_nodes):
-        where = f"composes[{idx}]"
+        where = f"candidate.payload.composes[{idx}]"
         if not isinstance(rn, dict):
-            return Decline("blueprint", REASON_MALFORMED, f"{where} is not an object")
+            return _malformed(
+                "blueprint",
+                f"{where} is not an object — each node is an object with an integer "
+                "'order' and optional 'feeds_from'/'consumes'/'output' "
+                f"(got {type(rn).__name__})",
+            )
         if "order" not in rn:
-            return Decline("blueprint", REASON_MALFORMED, f"{where} has no 'order'")
+            return _malformed(
+                "blueprint",
+                f"{where} has no 'order'; every node declares its integer position in "
+                "the DAG",
+            )
         order = _node_index(rn["order"])
         if order is None:
-            return Decline(
-                "blueprint", REASON_MALFORMED,
-                f"{where} 'order' {rn['order']!r} is not an integer",
+            # The TYPE, not the value. Every message this gate produces is fed back to
+            # the model on the corrective turn and recorded on the decline, so it
+            # obeys the same entity-free rule as `shape.py`: `order`, `node_kind` and a
+            # `feeds_from` entry are all model-authored from an entity-bearing session.
+            return _malformed(
+                "blueprint",
+                f"{where} 'order' is not an integer (got {type(rn['order']).__name__})",
             )
         node_kind = rn.get("node_kind", "query")
         # `isinstance` BEFORE the frozenset test: `x not in <frozenset>` HASHES x, so
@@ -223,9 +665,10 @@ def _validate_compose_nodes(raw_nodes: Any) -> Decline | None:
         # crash site. `node_kind` was the ONLY untrusted field here fed raw to a
         # membership test; every other one is isinstance-checked or `str()`-coerced.
         if not isinstance(node_kind, str) or node_kind not in NODE_KINDS:
-            return Decline(
-                "blueprint", REASON_MALFORMED,
-                f"{where} has unknown node_kind {node_kind!r} (allowed: {sorted(NODE_KINDS)})",
+            return _malformed(
+                "blueprint",
+                f"{where} has an unknown node_kind (got {type(node_kind).__name__}; "
+                f"it must be exactly one of {sorted(NODE_KINDS)})",
             )
         # ABSENT means "none"; every other wrong type declines, INCLUDING the falsy
         # ones. `x or []` would have normalized `0`, `""` and `{}` alike to no-edges:
@@ -240,15 +683,17 @@ def _validate_compose_nodes(raw_nodes: Any) -> Decline | None:
         if feeds is None:
             feeds = []
         if not isinstance(feeds, list):
-            return Decline(
-                "blueprint", REASON_MALFORMED,
+            return _malformed(
+                "blueprint",
                 f"{where} 'feeds_from' is not a list (got {type(feeds).__name__})",
             )
-        for src in feeds:
+        for src_idx, src in enumerate(feeds):
             if _node_index(src) is None:
-                return Decline(
-                    "blueprint", REASON_MALFORMED,
-                    f"{where} 'feeds_from' entry {src!r} is not an integer",
+                return _malformed(
+                    "blueprint",
+                    f"{where} 'feeds_from' entry {src_idx} is not an integer "
+                    f"(got {type(src).__name__}); each entry is the `order` of an "
+                    "upstream node",
                 )
         for field_name in ("consumes", "output"):
             value = rn.get(field_name)
@@ -257,8 +702,8 @@ def _validate_compose_nodes(raw_nodes: Any) -> Decline | None:
             if not isinstance(value, dict) or not all(
                 isinstance(k, str) and isinstance(v, str) for k, v in value.items()
             ):
-                return Decline(
-                    "blueprint", REASON_MALFORMED,
+                return _malformed(
+                    "blueprint",
                     f"{where} {field_name!r} must be an object of string→string "
                     f"(got {type(value).__name__})",
                 )
@@ -266,8 +711,8 @@ def _validate_compose_nodes(raw_nodes: Any) -> Decline | None:
         # where a non-object raises past the promotion path — reject it here instead.
         requires_approval = rn.get("requires_approval")
         if requires_approval is not None and not isinstance(requires_approval, dict):
-            return Decline(
-                "blueprint", REASON_MALFORMED, f"{where} 'requires_approval' is not an object"
+            return _malformed(
+                "blueprint", f"{where} 'requires_approval' is not an object"
             )
     return None
 
@@ -302,10 +747,33 @@ def _compose_nodes(raw_nodes: list[dict[str, Any]]) -> tuple[ComposeNodePlan, ..
 
 
 def _validate_roles(params: list[ParamPlan], known_rules: frozenset[str]) -> Decline | None:
-    for p in params:
+    """Each `ParamPlan` against the obligations of the role it declared.
+
+    TWO KINDS OF DECLINE COME OUT OF HERE, and `_role_shape` vs `Decline(...)` is which.
+    A required-field or closed-enum obligation that follows MECHANICALLY from a role or
+    type the candidate itself chose (`role: rule` with no `rule_id`, `role: inline` with
+    no `why`, a slot type outside the enum, a windowed slot that declared a `binds_to`)
+    is a change of EXPRESSION: the candidate already decided the thing, it just did not
+    say it in the field that carries it. Those are correctable.
+
+    Everything else here consults something OUTSIDE the candidate — the catalog's rule
+    ids, this pipeline's generalization capability, a SQL parser — and a corrective turn
+    on one of those is asking the model to make a different DECISION. Those are not.
+    See `_malformed` for the same rule stated for the shape family.
+
+    The live case that forced the distinction: `gpt-5.5` classified a status filter as
+    inline and wrote its justification under `reason` instead of `why`. It had done the
+    analysis; it had used the wrong key. "inline role without 'why'" was a terminal
+    `role_inconsistent`, which is a judgement about content — the wrong diagnosis for a
+    key name."""
+    for index, p in enumerate(params):
+        at = f"candidate.payload.parameterization[{index}]"
         if p.role == "slot":
             if p.slot is None or p.slot.type not in SLOT_TYPES:
-                return Decline("blueprint", REASON_BAD_ROLE, f"slot {p.locator.column} invalid type")
+                return _role_shape(
+                    f"{at}.slot.type is missing or not a known slot type; it must be "
+                    f"exactly one of {sorted(SLOT_TYPES - UNSUPPORTED_SLOT_TYPES)}"
+                )
             # A type the RUNTIME executes but this pipeline cannot GENERALIZE. Declined
             # FIRST, before the `binds_to` rules below, so the reason names the actual
             # blocker rather than a consequence of it.
@@ -318,6 +786,13 @@ def _validate_roles(params: list[ParamPlan], known_rules: frozenset[str]) -> Dec
             # landing gates, and golden replay says `passed=True` on the way there
             # (the fake probe never executes the SQL). An honest decline beats a
             # silent dead end four stages downstream.
+            #
+            # NOT correctable, and it is the sharpest case for the line. The decline
+            # text below reads like an instruction ("express it as two slots"), so it
+            # is tempting — but acting on it re-models a DATE RANGE, and getting the
+            # start/end assignment wrong silently inverts a filter, which is the D56
+            # wrong-answer class this withdrawal exists to avoid. A capability limit of
+            # this pipeline is also not a mistake the model made.
             if p.slot.type in UNSUPPORTED_SLOT_TYPES:
                 return Decline(
                     "blueprint", REASON_BAD_ROLE,
@@ -356,15 +831,14 @@ def _validate_roles(params: list[ParamPlan], known_rules: frozenset[str]) -> Dec
             #     act on.)
             if p.slot.type in WINDOWED_SLOT_TYPES:
                 if p.slot.binds_to is not None:
-                    return Decline(
-                        "blueprint", REASON_BAD_ROLE,
-                        f"{p.slot.type} slot {p.slot.name} must not declare binds_to "
+                    return _role_shape(
+                        f"{at}.slot: a {p.slot.type} slot must not declare binds_to "
                         "(a windowed-period slot consumes no column domain; emit null)",
                     )
             elif not p.slot.binds_to:
-                return Decline(
-                    "blueprint", REASON_BAD_ROLE,
-                    f"slot {p.slot.name} has no binds_to (only a "
+                return _role_shape(
+                    f"{at}.slot has no binds_to; it must be the FULLY-QUALIFIED "
+                    "'database.table.column' (only a "
                     f"{sorted(WINDOWED_SLOT_TYPES)} slot may omit it)",
                 )
             # An `enum` slot MUST carry non-empty enum_values — the runtime
@@ -372,17 +846,18 @@ def _validate_roles(params: list[ParamPlan], known_rules: frozenset[str]) -> Dec
             # it here as a traceable decline rather than a crash at landing. A
             # free-text filter value should be typed `entity`/`string`, not `enum`.
             if p.slot.type == "enum" and not p.slot.enum_values:
-                return Decline(
-                    "blueprint", REASON_BAD_ROLE,
-                    f"enum slot {p.slot.name} has no enum_values "
-                    "(a free-text value should be type 'entity', not 'enum')",
+                return _role_shape(
+                    f"{at}.slot is type 'enum' but has no enum_values; give the closed "
+                    "set, or use type 'entity' for a free-text value",
                 )
             # No-drop (D97): an optional slot MUST carry an optional_pattern, else
             # an absent bind silently drops the predicate.
             if not p.slot.required and not p.slot.optional_pattern:
-                return Decline(
-                    "blueprint", REASON_BAD_ROLE,
-                    f"optional slot {p.slot.name} has no optional_pattern (would silently drop)",
+                return _role_shape(
+                    f"{at}.slot is optional (required=false) but has no "
+                    "optional_pattern, so an absent bind would silently drop the "
+                    "predicate; give the fragment that renders when it is absent "
+                    "(usually 'TRUE'), or mark the slot required",
                 )
             # Well-formedness (Slice C): a PRESENT optional_pattern must be a
             # self-contained boolean SQL fragment carrying NO placeholder — the SAME
@@ -391,6 +866,13 @@ def _validate_roles(params: list[ParamPlan], known_rules: frozenset[str]) -> Dec
             # still carries a malformed pattern is caught here too rather than only at
             # load). Catch a malformed pattern as a fail-to-review decline rather than
             # let it pass extraction and only blow up at landing/runtime.
+            #
+            # NOT correctable, for two independent reasons. The fix is a SQL fragment,
+            # and the extractor's contract is plan-not-SQL (D35) — a corrective
+            # round-trip here is asking a model to keep guessing at SQL. And the
+            # message carries `TemplateBindError`, which quotes the offending fragment:
+            # entity-bearing text that must not become prompt text or sit on a decline
+            # that is fed back. It stays a fail-to-review for a human.
             if p.slot.optional_pattern:
                 try:
                     validate_optional_pattern(p.slot.name, p.slot.optional_pattern)
@@ -401,16 +883,33 @@ def _validate_roles(params: list[ParamPlan], known_rules: frozenset[str]) -> Dec
                     )
         elif p.role == "rule":
             if not p.rule_id:
-                return Decline("blueprint", REASON_BAD_ROLE, "rule role without rule_id")
+                return _role_shape(
+                    f"{at} declares role 'rule' but has no rule_id; give the id of an "
+                    "EXISTING catalog rule, or reclassify the predicate as slot/inline"
+                )
             if p.rule_id not in known_rules:
                 # §7 missing-rule: a rule-shaped predicate with no catalog rule →
                 # fail-to-review (Slice-6 will pair a schema_edit(add_rule)).
+                #
+                # NOT correctable, and deliberately so even though it is a one-field
+                # fix. The id is checked against the CATALOG, so the only honest
+                # answers are "a different existing rule" or "none exists" — and the
+                # second one is the valuable outcome this decline exists to produce.
+                # Re-asking converts a request for a human to add a rule into pressure
+                # on the model to name any id that passes.
                 return Decline("blueprint", REASON_MISSING_RULE, f"unknown rule {p.rule_id!r}")
         elif p.role == "inline":
             if not p.why:
-                return Decline("blueprint", REASON_BAD_ROLE, "inline role without 'why'")
+                return _role_shape(
+                    f"{at} declares role 'inline' but has no 'why'; the field carrying "
+                    "the reason the predicate is metric-defining is named `why` (not "
+                    "`reason`, not `note`)"
+                )
         else:
-            return Decline("blueprint", REASON_BAD_ROLE, f"unknown role {p.role!r}")
+            return _role_shape(
+                f"{at}.role is not a known role; it must be exactly one of "
+                '"slot", "rule" or "inline"'
+            )
     return None
 
 
@@ -477,13 +976,66 @@ def _resolves(raw_resolves: Any) -> dict[str, str]:
 
 
 def _blueprint_payload(raw: dict[str, Any]) -> BlueprintPayload:
+    at = "candidate.payload"
     return BlueprintPayload(
-        intent=str(raw["intent"]),
-        kind=str(raw["kind"]),
+        intent=require(
+            raw,
+            "intent",
+            as_text,
+            at=at,
+            requirement=(
+                "an ENTITY-FREE natural-language sentence describing what the query "
+                "does (no literal values)"
+            ),
+        ),
+        kind=require(
+            raw, "kind", as_text, at=at, requirement='either "single" or "composite"'
+        ),
         resolves=_resolves(raw.get("resolves")),
-        source_tool_call_refs=tuple(str(r) for r in (raw.get("source_tool_call_refs") or [])),
-        accepted_signal=str(raw["accepted_signal"]),
-        parameterization=tuple(_param_plans(raw.get("parameterization") or [])),
+        source_tool_call_refs=tuple(
+            as_text(
+                r,
+                at=f"{at}.source_tool_call_refs[{i}]",
+                requirement="a tool_call_ref from the session",
+            )
+            for i, r in enumerate(
+                optional(
+                    raw,
+                    "source_tool_call_refs",
+                    as_array,
+                    at=at,
+                    requirement=(
+                        "an array of the session tool_call_refs that produced the "
+                        "accepted answer"
+                    ),
+                    default=[],
+                )
+            )
+        ),
+        accepted_signal=require(
+            raw,
+            "accepted_signal",
+            as_text,
+            at=at,
+            requirement='one of "no_correction", "thumbs_up" or "explicit_confirm"',
+        ),
+        parameterization=tuple(
+            _param_plans(
+                optional(
+                    raw,
+                    "parameterization",
+                    as_array,
+                    at=at,
+                    requirement=(
+                        "an ARRAY (not an object) with exactly one entry per literal "
+                        "predicate of the accepted SQL, each an object with locator, "
+                        "role and the field that role requires"
+                    ),
+                    default=[],
+                ),
+                at=f"{at}.parameterization",
+            )
+        ),
         composes=_compose_nodes(raw.get("composes") or []),
         result_signature=_result_signature(raw.get("result_signature")),
         notes=str(raw.get("notes", "")),
@@ -491,40 +1043,76 @@ def _blueprint_payload(raw: dict[str, Any]) -> BlueprintPayload:
 
 
 def to_candidate(
-    raw: dict[str, Any], summary: SessionSummary, *, known_rules: frozenset[str]
+    raw: Any, summary: SessionSummary, *, known_rules: frozenset[str]
 ) -> ExtractedCandidate | Decline:
-    """Validate one raw candidate → `ExtractedCandidate` or `Decline`."""
-    ctype = raw.get("type")
-    if ctype not in ("blueprint", "global_knowledge", "user_knowledge", "schema_edit"):
-        return Decline(str(ctype), REASON_MALFORMED, "unknown candidate type")
+    """Validate one raw candidate → `ExtractedCandidate` or `Decline`.
 
-    evidence = _evidence(raw)
+    NEVER raises. An uncaught exception here leaves the consumer's queue message
+    un-acked → reclaim → dead-letter, losing the whole session AND the traceable
+    reason; every escape route is closed by a reader (`shape.py`), the compose gate, or
+    the `_unreadable` belt."""
+    try:
+        envelope = as_object(
+            raw,
+            at="candidate",
+            requirement="an object (one candidate envelope)",
+        )
+        ctype = require(
+            envelope,
+            "type",
+            one_of(CANDIDATE_TYPES),
+            at="candidate",
+            requirement=_CANDIDATE_TYPE_REQUIREMENT,
+        )
+    except ShapeError as exc:
+        # `"unknown"`, not the value that arrived: `Decline.type` is a label a human
+        # and a metric group by, and a model that flattened the envelope can put
+        # arbitrary session-derived text in `type`.
+        return _malformed("unknown", str(exc))
+
+    try:
+        evidence = _evidence(envelope)
+    except ShapeError as exc:
+        return _malformed(ctype, str(exc))
     if not evidence:
         # D31 primary guard — no evidence ⇒ rejected before the audit snapshot.
+        # Reached only when the candidate cited NOTHING: an unreadable citation raises
+        # above rather than being miscounted as an absent one (see `_evidence`).
         return Decline(ctype, REASON_NO_EVIDENCE, "candidate cites no evidence")
 
     try:
-        header = _header(raw, evidence)
-    except (KeyError, TypeError, ValueError) as exc:
-        return Decline(ctype, REASON_MALFORMED, f"bad header: {exc}")
+        header = _header(envelope, ctype, evidence)
+    except ShapeError as exc:
+        return _malformed(ctype, str(exc))
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        return _unreadable(ctype, "candidate header", exc)
 
     if ctype != "blueprint":
         # §3.3: other targets are emitted with their Locked payload as a dict in
         # S3 (depth is on blueprint). Evidence-mandatory already enforced above.
-        payload = raw.get("payload")
-        if not isinstance(payload, dict):
-            return Decline(ctype, REASON_MALFORMED, "payload is not an object")
+        try:
+            payload = require(
+                envelope,
+                "payload",
+                as_object,
+                at="candidate",
+                requirement=f"an object carrying the {ctype} payload",
+            )
+        except ShapeError as exc:
+            return _malformed(ctype, str(exc))
         return ExtractedCandidate(header=header, payload=dict(payload))
 
     # --- blueprint depth path ---
-    payload_raw = raw.get("payload") or {}
     # A real model can emit a field with the wrong JSON type (e.g. a list where a
     # dict is expected). ANY shape confusion here MUST become a traceable Decline —
     # never an uncaught exception that escapes to the consumer (which would skip the
     # job and route it to dead-letter instead of recording a malformed_candidate).
-    if not isinstance(payload_raw, dict):
-        return Decline(ctype, REASON_MALFORMED, "blueprint payload is not an object")
     try:
+        payload_raw = as_object(
+            envelope.get("payload") if envelope.get("payload") is not None else {},
+            at="candidate.payload",
+            requirement=_BLUEPRINT_PAYLOAD_REQUIREMENT,
+        )
         # Gate the composite DAG BEFORE building the payload: `_compose_nodes` coerces
         # (`int(rn["order"])`) on the assumption this passed. INSIDE the try as well:
         # the gate is the thing standing between malformed model output and the
@@ -535,8 +1123,10 @@ def to_candidate(
         if compose_decline is not None:
             return compose_decline
         payload = _blueprint_payload(payload_raw)
+    except ShapeError as exc:
+        return _malformed(ctype, str(exc))
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
-        return Decline(ctype, REASON_MALFORMED, f"bad blueprint payload: {exc}")
+        return _unreadable(ctype, "blueprint payload", exc)
 
     # Lift-not-generate (D34): acceptance mandatory, IN the D34 domain (LOW-2 —
     # not merely truthy; an out-of-domain value like "banana" is rejected), AND

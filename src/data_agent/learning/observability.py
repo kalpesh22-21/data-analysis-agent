@@ -19,11 +19,12 @@ TWO cross-cutting concerns live in this module:
    `context_from_traceparent`); a missing/malformed value ⇒ a normal root span
    (fail-open).
 
-2. **The D25 verbose GATE (`verbose=`) — amended 2026-07-15.** By deliberate
-   operator choice the SETTING now defaults VERBOSE (`LEARNING_TRACE_VERBOSE=true`):
-   the triage/consume/extract/promote/land helpers set human-readable attributes
+2. **The D25 verbose GATE (`verbose=`) — amended 2026-07-15, extended 2026-08-10.** By
+   deliberate operator choice the SETTING defaults VERBOSE (`LEARNING_TRACE_VERBOSE=true`):
+   the triage/consume/extract/judge/promote/land helpers set human-readable attributes
    (the user question, a transcript preview, the accepted SQL, the learned
-   intent/slots/rationale, the blueprint id/intent/canonical_key) BY DEFAULT, so the
+   intent/slots/rationale, the extractor's decline detail, the judge's reason and the
+   prior-art block it was shown, the blueprint id/intent/canonical_key) BY DEFAULT, so the
    `learning-loop` (and `learning-sessions`) Phoenix project is ENTITY-BEARING BY
    DEFAULT and therefore subject to the SAME in-boundary PII posture + access control
    as the `learning_audit` and session stores (D51). Set `LEARNING_TRACE_VERBOSE=false`
@@ -264,19 +265,41 @@ def extract_span(
     decline_count: int,
     decline_reasons: tuple[str, ...] = (),
     target_hints: tuple[str, ...] = (),
+    correction_count: int = 0,
     verbose: bool = False,
     accepted_sql: str | None = None,
     intent: str | None = None,
     slots: str | None = None,
     rationale: str | None = None,
+    decline_details: str | None = None,
 ) -> Any:
     """The S3 grounded-extractor outcome (`learning.extract`, CHAIN). SHAPE-only by
     default (D25): candidate/decline COUNTS + decline reason codes + hint labels.
     `outcome=extracted` when any candidate was produced, else `declined`.
 
+    `correction_count` is the corrective turns the extractor spent telling the model
+    that a candidate could not be READ (`extractor.py`). It sits in the SHAPE-only set
+    because it is a plain integer, and it is here rather than in a log line because it
+    is the loop's prompt-quality signal: 0 on nearly every session is the healthy
+    reading, and a rate that climbs means the tool schema and the system prompt are
+    asking for something models keep mis-packaging. Correlate it with
+    `learning.extract.outcome` — corrections that end in `extracted` are the loop
+    healing, corrections that end in `declined` are a prompt to go fix.
+
     With *verbose*, ALSO carries the accepted SQL, the learned blueprint `intent`, the
-    `slots` plan (e.g. `department→dbpcm_warehouse.employee.Department`), and the
-    extractor `rationale` (D25 entity-bearing — see module docstring)."""
+    `slots` plan (e.g. `department→dbpcm_warehouse.employee.Department`), the extractor
+    `rationale`, and `decline_details` (D25 entity-bearing — see module docstring).
+
+    `decline_details` is the SENTENCE behind each `decline_reasons` code, and it is the
+    half of a decline that an operator actually needs. `bad_role` names a class of
+    failure; "slot pay_period has no binds_to" names the thing to go fix. The codes stay
+    SHAPE-only (they are a closed vocabulary and the rates are read off them), while the
+    detail is gated because it interpolates MODEL-authored strings — a slot name, a role,
+    a type the model invented — and, in the `totality_violation` case, a SQL literal out
+    of the analyst's own query. It is gated with `accepted_sql`, alongside which it adds
+    no new class of content; `consumer.py::_decline_details` owns that argument and the
+    bounding. A session that produced nothing and says nothing about why is the exact
+    hole this attribute closes."""
     attrs: dict[str, Any] = {
         "session.id": session_id,
         "learning.extract.outcome": "extracted" if candidate_count else "declined",
@@ -284,6 +307,7 @@ def extract_span(
         "learning.extract.decline_count": decline_count,
         "learning.extract.decline_reasons": ",".join(decline_reasons),
         "learning.extract.target_hints": ",".join(target_hints),
+        "learning.extract.correction_count": correction_count,
     }
     attrs.update(
         _verbose_attrs(
@@ -293,6 +317,7 @@ def extract_span(
                 "learning.extract.intent": intent,
                 "learning.extract.slots": slots,
                 "learning.extract.rationale": rationale,
+                "learning.extract.decline_details": decline_details,
             },
         )
     )
@@ -368,19 +393,50 @@ def judge_span(
     confidence: float = 0.0,
     covered_by_tier: str | None = None,
     best_similarity: float = 0.0,
+    threshold: float = 0.0,
     cards_shown: int = 0,
     dropped: bool = False,
     would_drop: bool = False,
     shadow: bool = False,
     reused: bool = False,
+    verbose: bool = False,
+    reason: str | None = None,
+    covered_by: str | None = None,
+    prior_art: str | None = None,
 ) -> Any:
     """The coverage judge's verdict (plan §3b, `learning.judge`, CHAIN).
 
-    ALWAYS SHAPE-ONLY — no `verbose` parameter, deliberately, and unlike its
-    triage/extract neighbours. The one entity-bearing thing the judge produces is
-    `reason`, free model prose about a real session, and it goes to the
-    access-controlled `learning_audit` bucket with the evidence quotes. Adding a verbose
-    branch here would create the obvious place for someone to put it later.
+    SHAPE-only by default; GATED-VERBOSE since 2026-08-10, and this span used to refuse
+    a `verbose` parameter on principle. The refusal is reversed by deliberate operator
+    choice, and the reasoning that replaces it is worth stating because the old reasoning
+    is still in the git history: a judge that CANCELS work while the only readable
+    account of why lives in an audit bucket behind separate credentials is a judge nobody
+    tunes. `outcome=dropped` with a tier and a float answers "how often"; it does not
+    answer "was that drop right", and the drop gate is the one thing in this loop that
+    destroys work irrecoverably. So under *verbose* the span carries the whole basis of
+    the decision — what the model was SHOWN (`prior_art`, the rendered block verbatim),
+    what it NAMED (`covered_by`), and what it SAID (`reason`).
+
+    It is GATED and not hardcoded, deliberately: the reverse of an absolute must not be
+    another absolute. `LEARNING_TRACE_VERBOSE=false` restores the previous shape-only
+    behaviour of this span exactly, and that switch is what makes the operator's choice
+    reversible without a code change.
+
+    **`reason` is ENTITY-BEARING and is the reason this gate exists.** It is free model
+    prose about a REAL analyst session — capped and single-lined by
+    `judge/schema.py::parse_assessment`, but not scanned by any leakage gate — and it can
+    name a department, a cost centre or a person. `prior_art` is corpus text
+    (`extractor/prior_art.py::render_prior_art_block`, the SAME renderer the model was
+    fed, so the span cannot drift from the prompt) and is bounded but likewise not a
+    reviewed surface. With verbose ON — the default — the `learning-loop` Phoenix project
+    therefore holds the same class of content as the `learning_audit` bucket and MUST be
+    access-controlled to the same standard (D51). That is the price of the reveal, and it
+    is the one thing an operator must decide BEFORE turning it on rather than after.
+
+    `threshold` is SHAPE-only (a configured float, no content) and always present. It is
+    here because `confidence` alone is unreadable: the two bars differ per stage and are
+    retunable, so "0.82" means nothing without the number it was compared against, and
+    joining a span against a config file is not a thing anyone does at 2am.
 
     The span is the DENOMINATOR; the audit record is the numerator. Deliberately: the
     store holds only verdicts a judge actually gave (fabricating one would poison the
@@ -406,29 +462,36 @@ def judge_span(
       * `reused=true` — a redelivery served from the content-keyed audit record instead
         of a second, non-idempotent model call.
     """
-    return _learning_span(
-        tracer,
-        "learning.judge",
-        OpenInferenceSpanKindValues.CHAIN,
-        {
-            "session.id": session_id,
-            "learning.judge.stage": stage,
-            "learning.judge.outcome": outcome,
-            # "" rather than None throughout, so every attribute is ALWAYS present and a
-            # Phoenix filter never has to distinguish "no value" from "no data" via a
-            # missing key (the posture `dedup_span` settled on).
-            "learning.candidate_id": candidate_id or "",
-            "learning.judge.verdict": verdict or "",
-            "learning.judge.confidence": confidence,
-            "learning.judge.covered_by_tier": covered_by_tier or "",
-            "learning.judge.best_similarity": best_similarity,
-            "learning.judge.cards_shown": cards_shown,
-            "learning.judge.dropped": dropped,
-            "learning.judge.would_drop": would_drop,
-            "learning.judge.shadow": shadow,
-            "learning.judge.reused": reused,
-        },
+    attrs: dict[str, Any] = {
+        "session.id": session_id,
+        "learning.judge.stage": stage,
+        "learning.judge.outcome": outcome,
+        # "" rather than None throughout, so every attribute is ALWAYS present and a
+        # Phoenix filter never has to distinguish "no value" from "no data" via a
+        # missing key (the posture `dedup_span` settled on).
+        "learning.candidate_id": candidate_id or "",
+        "learning.judge.verdict": verdict or "",
+        "learning.judge.confidence": confidence,
+        "learning.judge.threshold": threshold,
+        "learning.judge.covered_by_tier": covered_by_tier or "",
+        "learning.judge.best_similarity": best_similarity,
+        "learning.judge.cards_shown": cards_shown,
+        "learning.judge.dropped": dropped,
+        "learning.judge.would_drop": would_drop,
+        "learning.judge.shadow": shadow,
+        "learning.judge.reused": reused,
+    }
+    attrs.update(
+        _verbose_attrs(
+            verbose,
+            {
+                "learning.judge.reason": reason,
+                "learning.judge.covered_by": covered_by,
+                "learning.judge.prior_art": prior_art,
+            },
+        )
     )
+    return _learning_span(tracer, "learning.judge", OpenInferenceSpanKindValues.CHAIN, attrs)
 
 
 def promote_span(

@@ -51,6 +51,7 @@ def _fake_learning_settings(
         learning_extractor_model="gpt-x",
         learning_extractor_base_url="",
         learning_extractor_max_retries=2,
+        learning_extractor_max_shape_corrections=2,
         learning_audit_username="u" if audit else "",
         learning_audit_password="p" if audit else "",
         learning_candidates_username="u" if candidates else "",

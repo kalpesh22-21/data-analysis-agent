@@ -293,9 +293,17 @@ _VERBOSE_ATTRS = {
     "learning.extract.intent",
     "learning.extract.slots",
     "learning.extract.rationale",
+    "learning.extract.decline_details",
     "learning.blueprint_id",
     "learning.blueprint.intent",
     "learning.canonical_key",
+    # The judge's own gated attrs (2026-08-10). Listed HERE and not only in
+    # `judge/test_judge_span_verbose.py` because this is the suite that walks EVERY span
+    # of a real session with the gate shut — a judge span leaking under a global opt-out
+    # is a different failure from the judge span's own gate being wrong.
+    "learning.judge.reason",
+    "learning.judge.covered_by",
+    "learning.judge.prior_art",
 }
 
 

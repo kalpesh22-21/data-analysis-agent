@@ -246,6 +246,7 @@ class CoverageJudge:
         prior_art: PriorArtIndex,
         config: JudgeConfig | None = None,
         tracer: object | None = None,
+        trace_verbose: bool = False,
     ) -> None:
         self._model_client = model_client
         # MUST be the same instance the consumer writes evidence snapshots with. A split
@@ -259,6 +260,14 @@ class CoverageJudge:
         self._prior_art = prior_art
         self._config = config or JudgeConfig()
         self._tracer = tracer
+        # The D25 gate for THIS span (`observability.py::judge_span`). A ctor argument
+        # next to `tracer` rather than a `JudgeConfig` field, mirroring
+        # `PromotionScheduler`: it configures the telemetry seam, not the judgement, and
+        # nothing about a verdict may depend on it. Sourced from
+        # `LearningSettings.learning_trace_verbose` at the composition root
+        # (`factory.py::_build_judge`), so this span's posture can never disagree with
+        # the triage/extract spans of the same session.
+        self._trace_verbose = trace_verbose
 
     # -- stage 1: before extraction --------------------------------------------
 
@@ -364,9 +373,9 @@ class CoverageJudge:
         gate = self._free_gate(lookup, best, band_high=band_high)
         if gate is not None:
             self._observe(
-                stage, summary, gate, candidate_id=candidate_id,
+                stage, summary, gate, candidate_id=candidate_id, lookup=lookup,
                 best_similarity=best.confidence if best is not None else 0.0,
-                cards_shown=len(lookup.cards), reused=False,
+                threshold=threshold, reused=False,
             )
             return gate
 
@@ -378,9 +387,8 @@ class CoverageJudge:
         if assessment is None:
             result = JudgeOutcomeResult(outcome=OUTCOME_FAILED)
             self._observe(
-                stage, summary, result, candidate_id=candidate_id,
-                best_similarity=best.confidence, cards_shown=len(lookup.cards),
-                reused=False,
+                stage, summary, result, candidate_id=candidate_id, lookup=lookup,
+                best_similarity=best.confidence, threshold=threshold, reused=False,
             )
             return result
 
@@ -421,8 +429,8 @@ class CoverageJudge:
                 assessment=assessment, outcome=OUTCOME_RECORD_WRITE_FAILED
             )
             self._observe(
-                stage, summary, result, candidate_id=candidate_id,
-                best_similarity=best.confidence, cards_shown=len(lookup.cards),
+                stage, summary, result, candidate_id=candidate_id, lookup=lookup,
+                best_similarity=best.confidence, threshold=threshold,
                 reused=reused is not None,
             )
             return result
@@ -447,8 +455,8 @@ class CoverageJudge:
             )
         result = JudgeOutcomeResult(drop=drop, assessment=assessment, outcome=outcome)
         self._observe(
-            stage, summary, result, candidate_id=candidate_id,
-            best_similarity=best.confidence, cards_shown=len(lookup.cards),
+            stage, summary, result, candidate_id=candidate_id, lookup=lookup,
+            best_similarity=best.confidence, threshold=threshold,
             reused=reused is not None, would_drop=would_drop,
         )
         return result
@@ -653,18 +661,29 @@ class CoverageJudge:
         result: JudgeOutcomeResult,
         *,
         candidate_id: str | None,
+        lookup: PriorArtLookup,
         best_similarity: float,
-        cards_shown: int,
+        threshold: float,
         reused: bool,
         would_drop: bool = False,
     ) -> None:
-        """Emit the SHAPE-ONLY `learning.judge` span. NEVER raises.
+        """Emit the `learning.judge` span — shape-only, plus the D25-gated basis of the
+        verdict. NEVER raises.
 
-        No verbose branch and no `reason`. The reason is free model prose about a real
-        session and can name a department or a person; it belongs in the
-        access-controlled audit bucket with the evidence quotes, not in a telemetry
-        backend. Everything here is a label, a float or a count — the same posture
-        `dedup_span` takes, for the same reason.
+        Takes the whole *lookup* rather than a pre-computed `cards_shown`, because the
+        verbose branch needs the CARDS and a caller that passed a count could not be made
+        to also pass the block they were rendered into. Under verbose the span carries
+        `render_prior_art_block(lookup)` — the SAME renderer, on the same object, that
+        built the message the model was actually sent (`_ask`), which is the only way
+        "what was fed in" on the span cannot drift from what was fed in. It is rendered
+        ONLY when verbose is on: the renderer sanitizes every field of every card, and
+        paying for that on a path that would discard the result is a cost for nothing.
+
+        The verbose attrs are ENTITY-BEARING (`reason` is free model prose about a real
+        session) — see `observability.py::judge_span`, which owns that argument, and note
+        that they appear on the free-gate paths too, where no model ran: `reason` is
+        empty there, but the prior-art block is exactly what makes a `skipped_below_floor`
+        readable ("nothing was close" vs "these three were close and the floor is wrong").
 
         The blanket catch is not defensive habit. This is called AFTER the durable record
         has been written and BEFORE `_judge` returns, so an exporter or a mis-wired
@@ -688,11 +707,18 @@ class CoverageJudge:
                     assessment.covered_by_tier if assessment is not None else None
                 ),
                 best_similarity=best_similarity,
-                cards_shown=cards_shown,
+                threshold=threshold,
+                cards_shown=len(lookup.cards),
                 dropped=result.drop,
                 would_drop=would_drop,
                 shadow=self._config.shadow,
                 reused=reused,
+                verbose=self._trace_verbose,
+                reason=assessment.reason if assessment is not None else None,
+                covered_by=assessment.covered_by if assessment is not None else None,
+                prior_art=(
+                    render_prior_art_block(lookup) if self._trace_verbose else None
+                ),
             ):
                 pass
         except Exception:  # noqa: BLE001 - see the docstring: telemetry never rewrites history
