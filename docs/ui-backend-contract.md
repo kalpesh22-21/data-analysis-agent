@@ -11,6 +11,7 @@ Source of truth for each section is cited so you can diff this doc against the c
 | Runtime (chat) | `src/data_agent/runtime/app.py` |
 | Turn result fields | `src/data_agent/runtime/loop/agent_loop.py` (`TurnOutcome`) |
 | Result table / trail types | `src/data_agent/runtime/session/models.py` |
+| Answer-table paging | `src/data_agent/runtime/query_page.py` |
 | History projection | `src/data_agent/runtime/session_history.py` |
 | Progress events | `src/data_agent/runtime/observability/progress.py` |
 | Review inbox service | `src/data_agent/learning/inbox/service.py`, `.../inbox/models.py` |
@@ -180,8 +181,9 @@ interface TurnResult {
   tool_calls_made: number;
 
   // --- additive, best-effort, nullable on EVERY status ---
-  sql: string[] | null;
-  result_table: ResultTable | null;
+  sql_executed: string[] | null;      // every query the turn RAN (audit list)
+  answer_sql: string | null;          // the ONE query whose rows ARE the answer
+
   blueprint_use: BlueprintUse | null;
   verification: Verification | null;
   provenance: string[] | null;        // "database.table.column", sorted + deduped
@@ -195,6 +197,8 @@ interface PendingQuestion {
   options: string[] | null;   // null == free-text answer expected
 }
 
+// HISTORY ONLY. `GET /session/history` still returns this per tool call; the live
+// `result` event no longer carries it (see §4.2.2).
 interface ResultTable {                  // ResultPreview.to_doc(), session/models.py:38
   columns: string[];
   row_count: number;                     // TOTAL rows, not preview length
@@ -214,13 +218,25 @@ interface Verification {
 }
 ```
 
-#### 4.2.1 `sql` — null vs `[]`
-A list of SQL strings executed this turn, **in execution order**, deduped preserving first occurrence. A turn that ran no successful query serializes as **`null`, not `[]`** — treat "no SQL panel" and "empty" identically. `runBlueprint` contributes its node SQL list.
+#### 4.2.1 `sql_executed` — null vs `[]`
+*(was `sql` before 2026-08 — renamed so it can never be read as "the answer".)*
 
-#### 4.2.2 `result_table`
-The **last successful** tool result preview — the table backing the final answer, not every table produced. `preview_rows.length` may be `< row_count`; show "showing N of `row_count`" when `truncated || preview_rows.length < row_count`. `columns` may be `[]` for non-tabular results.
+Every query the turn **actually ran**, in execution order, deduped preserving first occurrence — the audit/explain list, including intermediate probes and sanity checks. A turn that ran no successful query serializes as **`null`, not `[]`** — treat "no SQL panel" and "empty" identically. `runBlueprint` contributes its node SQL list.
 
-`preview_rows` **is allowed to contain real cell values** — it is the caller's own scope-filtered answer data, returned once over the authenticated session. This is the deliberate asymmetry with `progress` (§4.1). Still render every cell via `textContent` / auto-escaping — it is warehouse text, not trusted markup.
+Not the same thing as `answer_sql`: this is *what ran*, that is *what the answer is*. A turn commonly has several entries here and one (or zero) there. Queries issued **inside** `resolveValues` do not appear — the list is per model-issued tool call.
+
+#### 4.2.2 `answer_sql` — the answer table
+*(replaced `result_table` in 2026-08. `result_table` is **gone from the live result**, not nulled — a client keying on it will get `undefined`, deliberately, so the change fails loudly rather than silently rendering an empty grid. `GET /session/history` still returns it per tool call; see §7.2.)*
+
+**The rows are no longer on the result event.** `answer_sql` is a single query string; you fetch its rows yourself, a page at a time, from `POST /query/page` (§4.4). That is the whole rendering contract for the answer table.
+
+Why it changed: `result_table` was a fixed ~20-row preview the user could not page past, and the *runtime* picked it ("the last successful query"), which is wrong exactly when a turn resolves values or probes a code space before answering. Now the **model** designates which query is the answer, and the UI renders the full result with real paging.
+
+`answer_sql` is `null` when:
+- the answer is a **scalar or single row** — correct, render prose only, a one-cell grid helps nobody; or
+- the model simply did not designate one. The designation is **advisory** (the model calls an `answerWithTable` tool); a table-shaped answer with `answer_sql: null` is possible and must degrade to prose, not to an error.
+
+Rows returned by §4.4 **may contain real cell values** — the caller's own scope-filtered answer data over an authenticated session. This is the deliberate asymmetry with `progress` (§4.1). Render every cell via `textContent` / auto-escaping — warehouse text, never trusted markup.
 
 #### 4.2.3 `blueprint_use`
 `null` unless a **blueprint** produced the answer. `slots` are the *raw* model-proposed bindings, which can differ from post-resolution bound values (a `resolve_via` expansion, a defaulted slot). There is **no version field** — no blueprint version concept exists.
@@ -241,14 +257,16 @@ The **last successful** tool result preview — the table backing the final answ
 Never inside-scope-leaks: the set is produced by the scope-enforced extractor, so it can never name a column outside the caller's `column_scope`.
 
 #### 4.2.6 `assumptions`
-Model-declared, **plain-English** sentences ("'Active employees' was taken to mean currently-employed staff."). Never SQL, codes, or column names — enforced by prompt, not by the runtime, so treat as untrusted text. Same `[] → null` fork as `sql`. Dedupe/order/caps are applied server-side.
+Model-declared, **plain-English** sentences ("'Active employees' was taken to mean currently-employed staff."). Never SQL, codes, or column names — enforced by prompt, not by the runtime, so treat as untrusted text. Same `[] → null` fork as `sql_executed`. Dedupe/order/caps are applied server-side.
 
 #### 4.2.7 Nullability by `status`
 
 | `status` | What to expect |
 |---|---|
 | `done` (blueprint path) | all six enrichment fields populated |
-| `done` (raw loop) | `sql` + `result_table` + `provenance` populated; `blueprint_use` and `verification` **null** |
+| `done` (raw loop) | `sql_executed` + `provenance` populated; `blueprint_use` and `verification` **null** |
+| `done` (table answer) | `answer_sql` non-null → page it via §4.4 |
+| `done` (scalar answer) | `answer_sql` **null** — expected, not an error |
 | `done` (pure chat) | all may be null; `provenance` may be `[]` |
 | `paused_ask_user` | usually all null; `pending_question` non-null → **render the prompt and call `/turn/resume`** |
 | `paused_budget_cap` | partial; `pending_question` = `{question, options:["continue","refine","stop"]}` |
@@ -268,6 +286,65 @@ interface TurnError {
 - `AlreadyConsumedError` — the pause checkpoint was already consumed (duplicate/stale resume). Refresh via `GET /session/history`.
 - `CASMismatchError` — concurrent writes to the same session. Safe to retry the turn.
 - `INTERNAL_ERROR` — `message` is always the canned string `"Something went wrong processing this turn. Please try again."`. Raw exception text is **never** streamed (info-disclosure guard, `app.py:110`); the real error is server-side only. Do not try to parse it.
+
+---
+
+### 4.4 `POST /query/page` — fetching the answer table
+
+Runs `answer_sql` and returns one page of rows. This is what replaced the inline
+`result_table` preview.
+
+| | |
+|---|---|
+| Path | `POST /query/page` |
+| Headers | same as `/turn` (`Authorization` + `X-Session-Id`) |
+| Body | `{ sql: string, limit?: number, offset?: number }` |
+
+```ts
+interface QueryPageRequest {
+  sql: string;              // echo back TurnResult.answer_sql verbatim
+  limit?: number | null;    // default 100, clamped to 1..1000
+  offset?: number | null;   // default 0, clamped to >= 0
+}
+
+interface QueryPageResponse {
+  columns: string[];
+  rows: unknown[][];        // heterogeneous JSON scalars per cell
+  limit: number;            // the limit ACTUALLY applied after clamping
+  offset: number;
+  has_more: boolean;        // hint: this page came back full. NOT a total count.
+}
+```
+
+**`has_more` is a hint, not a count.** It is `rows.length >= limit`. There is no total —
+counting every row would mean a second aggregate query per page. Drive a "Next"
+control off `has_more`; do not render "page 3 of 12".
+
+**Paging bounds are the server's.** The SQL is parsed and re-emitted as
+`SELECT * FROM (<your sql>) AS page_src LIMIT n OFFSET m`. A `LIMIT` inside
+`answer_sql` still bounds the inner result, but can never let a page exceed `limit`.
+Bad paging params are clamped, never rejected — a malformed `limit` is UI plumbing,
+not a reason to fail a user's scroll.
+
+**It grants no extra access.** The query runs through the same scope-enforced
+`runQuery` path the agent uses, under this caller's own credentials. Echoing
+`answer_sql` back from the browser therefore confers nothing: a tampered query can
+only reach what the same session's `column_scope` already allows.
+
+Errors — check `response.ok` and render the `error` string in place of the grid:
+
+| Status | Body | When |
+|---|---|---|
+| `400` | `{error}` | not a single read-only `SELECT` (writes, multi-statement, unparseable). The message is **static** — it never echoes your SQL back |
+| `403` | `{error, error_code}` | column-scope or scratch-session denial; `error` is the canned, PII-safe string |
+| `502` | `{error, error_code}` | the query failed downstream |
+
+**A scratch-backed answer can expire.** If the turn was answered by a composed
+blueprint that materialises into `scratch.*`, `answer_sql` reads a session-scoped
+table with a TTL (1h by default). Paging it from a **different session** is a `403
+SCRATCH_SESSION_VIOLATION`, and after the TTL it fails downstream. Treat a
+previously-working table that starts erroring as expected, not as a bug — re-ask the
+question.
 
 ---
 
@@ -319,6 +396,14 @@ An `answer: null` is **deliberately indistinguishable** from "paused" or "never 
 Only **successful, in-scope** tool calls appear — denials and errors carry undetermined provenance and are filtered out. History shows what the answer read, not the model's dead ends.
 
 `tool_calls[]` is per-SQL; the live `result` event is union-only. That asymmetry is intentional and frozen.
+
+**History and the live result now describe the answer table differently.** A live turn
+gives you `answer_sql` (paged via §4.4); history gives you a per-tool-call
+`result_table` preview and **no** `answer_sql`. So a table answer looks different on
+reload than it did live — a ~20-row static preview instead of a paged grid — and a
+`runBlueprint` turn's history `sql` is `null` besides. Rebuilding a live-quality
+table from history is not currently possible; render the preview and accept the
+downgrade, or re-ask.
 
 ### 5.2 Live vs history reconciliation
 The reference client rebuilds the whole transcript from `/session/history` on page load, then appends live turns from `result` events within that page session. Running both for the same turn double-renders — pick one path per turn.
@@ -520,6 +605,7 @@ If you build your own BFF, mirror these. Paths are what the shipped demo UI call
 | `POST /api/turn` | runtime `POST /turn` | body `{session_id, message}`; streams SSE back byte-for-byte |
 | `POST /api/turn/resume` | runtime `POST /turn/resume` | body `{session_id, answer}` |
 | `GET /api/history?session_id=` | runtime `GET /session/history` | JSON passthrough |
+| `POST /api/query/page` | runtime `POST /query/page` | body `{session_id, sql, limit?, offset?}`; JSON passthrough. Status + body propagate, so a `400`/`403` reaches the browser unchanged |
 | `GET /api/inbox?status=` | inbox `GET /inbox` | validates `status ∈ {in_review, rejected}` → else 400 |
 | `GET /api/inbox/health` | inbox `GET /inbox/health` | |
 | `POST /api/inbox/{id}/{action}` | inbox | `action ∈ {approve, reject, retract}`; id is URL-encoded on the hop |
@@ -538,12 +624,13 @@ Upstream status codes and bodies propagate **as-is** — a non-2xx from the runt
 1. **Detect pre-stream errors first.** `POST /turn` can return JSON with a 4xx. Check `response.ok`; only then attach an SSE parser.
 2. **Guard every nullable field on every status.** A partial/errored/paused turn may carry all six enrichment fields as `null`.
 3. **Ignore unknown keys.** The result event is versioned by *addition only* — new nullable fields will appear without notice; an old client ignoring them stays correct. Never validate with a closed schema that rejects extras.
-4. **`null` ≠ `[]`.** For `sql`, `assumptions`, and `provenance` the distinction is deliberate. `provenance: []` means "read nothing"; `provenance: null` means "we could not determine what was read" — the second must not render as the first.
+4. **`null` ≠ `[]`.** For `sql_executed`, `assumptions`, and `provenance` the distinction is deliberate. `provenance: []` means "read nothing"; `provenance: null` means "we could not determine what was read" — the second must not render as the first.
 5. **Escape everything.** Cell values, column names, SQL, questions, answers, assumptions, uploaded headers, and inbox payloads are all untrusted text. Use `textContent`/auto-escaping, never `innerHTML`.
 6. **Never persist or expose the JWT client-side.** The browser holds only `session_id`.
 7. **Resume is exactly-once.** Disable the resume control after firing; on `409`/`AlreadyConsumedError`, re-fetch history rather than retrying.
 8. **Rebuild the transcript from history on load**, then append live turns — do not merge both sources for the same turn.
-9. **Long turns are normal.** A turn does retrieval + multiple LLM round-trips + queries. Keep the SSE read timeout unbounded (the reference BFF sets `read=None`) and drive perceived latency from `progress` events.
+9. **Render the answer table from `answer_sql`, not from the result event.** The rows are not in the payload — fetch them from §4.4. `answer_sql: null` is the normal scalar case; degrade to prose rather than showing an error or an empty grid.
+10. **Long turns are normal.** A turn does retrieval + multiple LLM round-trips + queries. Keep the SSE read timeout unbounded (the reference BFF sets `read=None`) and drive perceived latency from `progress` events.
 
 ---
 
@@ -554,6 +641,9 @@ Upstream status codes and bodies propagate **as-is** — a non-2xx from the runt
 | **No CORS anywhere** | a browser cannot call the runtime/inbox/clickhouse-api directly; a same-origin proxy is mandatory |
 | **No pagination** on `/session/history` or `GET /inbox` | whole-session and top-100 payloads; large sessions are large responses |
 | **`runBlueprint` history `sql` is always `null`** | node SQL lives behind a KV pointer that the read path deliberately does not dereference; the live `result` event *does* carry it |
+| **History has no `answer_sql`** | a table answer reloads as a static ~20-row `result_table` preview, not the paged grid it was live (§5.2) |
+| **A scratch-backed `answer_sql` expires** | composed blueprints that materialise into `scratch.*` produce a session-scoped, TTL'd answer table; paging it later or from another session fails (§4.4) |
+| **`answer_sql` is advisory** | the model may not designate one for a genuinely tabular answer; there is no server-side fallback, so plan for prose-only |
 | **`verification` only exists on the blueprint path** | there is no raw-loop verification gate; absence is not failure |
 | **`blueprint_use.slots` are raw model inputs** | may differ from post-resolution bound values |
 | **In-memory session→JWT map** in the reference BFF | single-process only; a real deployment needs shared storage |
@@ -564,20 +654,16 @@ Upstream status codes and bodies propagate **as-is** — a non-2xx from the runt
 
 ## 12. Worked examples
 
-**Blueprint-answered turn:**
+**Blueprint-answered TABLE turn** — note the answer text DESCRIBES the table instead of
+listing it, and the rows come from `POST /query/page`, not from this payload:
 ```json
 {
   "status": "done",
-  "assistant_text": "Headcount by department: Engineering 3, Sales 3, Ops 3.",
+  "assistant_text": "Headcount is split evenly across 3 departments.",
   "pending_question": null,
   "tool_calls_made": 1,
-  "sql": ["SELECT department, count(*) FROM hr.employees GROUP BY department"],
-  "result_table": {
-    "columns": ["department", "headcount"],
-    "preview_rows": [["Engineering", 3], ["Sales", 3], ["Ops", 3]],
-    "row_count": 3,
-    "truncated": false
-  },
+  "sql_executed": ["SELECT department, count(*) FROM hr.employees GROUP BY department"],
+  "answer_sql": "SELECT department, count(*) AS headcount FROM hr.employees GROUP BY department",
   "blueprint_use": { "blueprint_id": "headcount_by_dept", "slots": { "period": "2026-05" } },
   "verification": { "passed": true, "method": "blueprint_gate", "grain_checked": true },
   "provenance": ["hr.employees.department", "hr.employees.id"],
@@ -585,15 +671,16 @@ Upstream status codes and bodies propagate **as-is** — a non-2xx from the runt
 }
 ```
 
-**Raw-loop turn** — note `blueprint_use` and `verification` are null:
+**Raw-loop SCALAR turn** — `blueprint_use`/`verification` null, and `answer_sql` null
+because a single number needs no grid. This is the common case, not a degraded one:
 ```json
 {
   "status": "done",
   "assistant_text": "The average salary in Sales is $60,000.",
   "pending_question": null,
   "tool_calls_made": 2,
-  "sql": ["SELECT avg(base_salary) FROM hr.employees WHERE department = 'Sales'"],
-  "result_table": { "columns": ["avg_base_salary"], "preview_rows": [[60000]], "row_count": 1, "truncated": false },
+  "sql_executed": ["SELECT avg(base_salary) FROM hr.employees WHERE department = 'Sales'"],
+  "answer_sql": null,
   "blueprint_use": null,
   "verification": null,
   "provenance": ["hr.employees.base_salary", "hr.employees.department"],
@@ -608,9 +695,18 @@ Upstream status codes and bodies propagate **as-is** — a non-2xx from the runt
   "assistant_text": null,
   "pending_question": { "question": "Did you mean base salary or gross pay?", "options": ["base salary", "gross pay"] },
   "tool_calls_made": 1,
-  "sql": null, "result_table": null, "blueprint_use": null,
+  "sql_executed": null, "answer_sql": null, "blueprint_use": null,
   "verification": null, "provenance": null, "assumptions": null
 }
+```
+
+**Paging that table** — `answer_sql` echoed back verbatim:
+```
+POST /api/query/page   {"session_id":"s…","sql":"SELECT department, count(*) AS headcount FROM hr.employees GROUP BY department","limit":2,"offset":0}
+→ 200 {"columns":["department","headcount"],"rows":[["Engineering",3],["Sales",3]],"limit":2,"offset":0,"has_more":true}
+
+POST /api/query/page   {… "offset":2}
+→ 200 {"columns":["department","headcount"],"rows":[["Ops",3]],"limit":2,"offset":2,"has_more":false}
 ```
 
 **Budget pause** — fixed three options:
@@ -620,7 +716,7 @@ Upstream status codes and bodies propagate **as-is** — a non-2xx from the runt
   "assistant_text": null,
   "pending_question": { "question": "…", "options": ["continue", "refine", "stop"] },
   "tool_calls_made": 12,
-  "sql": ["…"], "result_table": null, "blueprint_use": null,
+  "sql_executed": ["…"], "answer_sql": null, "blueprint_use": null,
   "verification": null, "provenance": null, "assumptions": null
 }
 ```
