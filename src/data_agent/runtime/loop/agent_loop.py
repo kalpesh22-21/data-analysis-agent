@@ -87,9 +87,9 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.answer_with_table import TOOL_NAME as ANSWER_TABLE_TOOL_NAME
 from data_agent.runtime.composite.answer_with_table import (
-    clean_answer_sql,
     clean_answer_text,
     clean_blueprint_id,
+    resolve_designation,
 )
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
 from data_agent.runtime.context.assembly import (
@@ -1059,12 +1059,7 @@ class AgentLoop:
         for entry in turn_entries:
             if entry.tool_name != ANSWER_TABLE_TOOL_NAME:
                 continue
-            resolved = clean_answer_sql(entry.args.get("sql"))
-            if resolved is None:
-                blueprint_id = clean_blueprint_id(entry.args.get("blueprint_id"))
-                if blueprint_id is not None:
-                    resolved = terminal_by_id.get(blueprint_id)
-            designated = resolved or designated
+            designated = resolve_designation(entry.args, terminal_by_id) or designated
         return designated
 
     def _maybe_start_summary(self, tool_name: str, arguments: dict[str, Any]) -> None:
@@ -1440,7 +1435,6 @@ class AgentLoop:
         registered (the shipped default) both seams return `None` and this behaves
         exactly as if they did not exist.
         """
-        raw_sql = clean_answer_sql(arguments.get("sql"))
         blueprint_id = clean_blueprint_id(arguments.get("blueprint_id"))
         event_base = {
             # D5: hashed, never the raw session id — a hook is never given one.
@@ -1448,19 +1442,17 @@ class AgentLoop:
             "turn_index": turn_index,
         }
 
-        resolved = raw_sql
+        resolved = resolve_designation(arguments, blueprint_terminal_sql)
         if resolved is None and blueprint_id is not None:
-            resolved = blueprint_terminal_sql.get(blueprint_id)
-            if resolved is None:
-                _logger.warning(
-                    "answerWithTable designated blueprint %r, which did not run "
-                    "successfully this turn — no answer table (session=%s)",
-                    blueprint_id,
-                    session_id,
-                )
-                resolved = self._answer_table_hooks.resolve_unresolved(
-                    AnswerTableEvent(blueprint_id=blueprint_id, sql=None, **event_base)
-                )
+            _logger.warning(
+                "answerWithTable designated blueprint %r, which did not run "
+                "successfully this turn — no answer table (session=%s)",
+                blueprint_id,
+                session_id,
+            )
+            resolved = self._answer_table_hooks.resolve_unresolved(
+                AnswerTableEvent(blueprint_id=blueprint_id, sql=None, **event_base)
+            )
 
         if resolved is not None and references_scratch(resolved):
             replacement = self._answer_table_hooks.resolve_ephemeral(

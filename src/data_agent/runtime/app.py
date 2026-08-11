@@ -804,8 +804,38 @@ def create_app(
         )
         assert x_session_id is not None  # narrowed by _extract_credentials
         doc = await session_store.get_or_create_session(x_session_id)
+        # `blueprint_id -> terminal_sql` for every blueprint that ran successfully in
+        # this session, so a turn whose answer table was designated BY BLUEPRINT can
+        # still expose `answer_sql` and be re-paged after a reload. The de-reference
+        # is done HERE, not in `project_history`, because that projection is a pure
+        # function over the doc and the value lives behind a D46 KV pointer.
+        #
+        # Cost is bounded by the number of successful runBlueprint calls in the
+        # session (typically 0-2), and a missing/expired ref simply leaves that id
+        # unresolved — the turn then reports `answer_sql: null`, exactly as it did
+        # before this existed.
+        blueprint_terminal_sql: dict[str, str] = {}
+        for entry in doc.tool_trail:
+            if (
+                entry.status != "ok"
+                or entry.tool_name != "runBlueprint"
+                or entry.result_full_ref is None
+            ):
+                continue
+            result_full = await session_store.read_full_result(
+                x_session_id, entry.result_full_ref
+            )
+            if isinstance(result_full, dict):
+                bp_id = result_full.get("blueprint_id")
+                terminal_sql = result_full.get("terminal_sql")
+                if isinstance(bp_id, str) and isinstance(terminal_sql, str) and terminal_sql:
+                    blueprint_terminal_sql[bp_id] = terminal_sql
         body = project_history(
-            doc.messages, doc.tool_trail, credentials.column_scope, doc.pause_checkpoint
+            doc.messages,
+            doc.tool_trail,
+            credentials.column_scope,
+            doc.pause_checkpoint,
+            blueprint_terminal_sql=blueprint_terminal_sql,
         )
         return JSONResponse(content={"session_id": x_session_id, **body})
 

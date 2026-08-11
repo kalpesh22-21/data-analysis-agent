@@ -315,32 +315,44 @@ class RuntimeSettings(BaseSettings):
         ),
     )
     otlp_disable_redaction: bool = Field(
-        False,
+        True,
         description=(
-            "MASTER TELEMETRY DEBUG SWITCH — default False. At its default this flag "
-            "preserves ONLY the manual TOOL/AGENT/CHAIN cell-value redaction (SQL "
-            "literals / result cells / bound slot values masked byte-for-byte); it does "
-            "NOT govern the OpenAI LLM-span content, which is a SEPARATE posture set by "
+            "MASTER TELEMETRY DEBUG SWITCH — default TRUE since 2026-08-10 (deliberate "
+            "operator posture flip; it defaulted False before). PLAIN ENGLISH FIRST, "
+            "because the field name is a double negative and flipping its default makes "
+            "the config read backwards: AT THE DEFAULT NOTHING IS REDACTED. Set it FALSE "
+            "to turn redaction back ON. "
+            "CONSEQUENCE, stated so nobody has to derive it from the mechanism: runtime "
+            "spans now carry the REAL tool arguments, hence real ENTITY VALUES — the "
+            "actual SQL WITH its literals, the real resolveValues concept/period values "
+            "— plus the tool RESULT preview (columns + preview rows + "
+            "row_count/truncated) attached to the TOOL span. Combined with "
             "otlp_hide_llm_content (revealed by default since the 2026-07-15 D25 "
-            "amendment) — so the all-defaults posture is NOT shape-only overall. When "
-            "True, the runtime disables Phoenix-trace redaction so a debugging operator "
-            "sees the REAL tool calls: (1) the TOOL "
-            "span carries the REAL args (actual SQL WITH literals, real resolveValues "
-            "concept/period values) instead of the D25 masked shape; (2) the tool "
-            "RESULT preview (columns + preview rows + row_count/truncated) is attached "
-            "to the TOOL span (results NEVER hit spans in the default posture); (3) the "
-            "OpenAI LLM span shows content + exception events (the effective LLM hide is "
-            "`otlp_hide_llm_content AND NOT otlp_disable_redaction`). "
+            "amendment) the OpenAI LLM span also shows content + exception events (the "
+            "effective LLM hide is `otlp_hide_llm_content AND NOT "
+            "otlp_disable_redaction`). THE OTLP COLLECTOR IS THEREFORE AS SENSITIVE AS "
+            "THE SESSION STORE and must be access-controlled to the same standard (D51): "
+            "a Phoenix instance anyone on the network can reach is now a data egress. "
+            "That is the price of this default, and it is the thing to decide BEFORE "
+            "pointing OTLP_ENDPOINT at a shared collector. "
+            "Set FALSE to restore the D25 posture: TOOL/AGENT/CHAIN cell values (SQL "
+            "literals / result cells / bound slot values) masked byte-for-byte and no "
+            "result preview on any span. Even FALSE was never shape-only OVERALL, "
+            "because it does not govern the LLM-span content. "
             "TELEMETRY-ONLY: this changes ONLY what Phoenix sees — it does NOT weaken "
             "any actual scope/PII ENFORCEMENT (D5 credential injection + D57 column-"
             "scope live in the MCP/injected-credentials path, not in the span "
-            "redactor). Turning it on makes the Phoenix project ENTITY-BEARING (real "
-            "SQL + values + Q/A) and so MUST be access-controlled like the audit store. "
-            "NOT everything is revealed even when on: the askUser question (dropped by "
-            "the guardrail-observer allowlist), the embedding/rerank/recall text (never "
-            "an attribute), and the raw column_scope (only its hash is ever emitted) "
-            "STAY redacted — the LLM-span reveal (see otlp_hide_llm_content) partially "
-            "compensates by showing the model's Q/A."
+            "redactor). NOT everything is revealed even at the default: the askUser "
+            "question (dropped by the guardrail-observer allowlist), the "
+            "embedding/rerank/recall text (never an attribute), and the raw column_scope "
+            "(only its hash is ever emitted) STAY redacted — the LLM-span reveal (see "
+            "otlp_hide_llm_content) partially compensates by showing the model's Q/A. "
+            "NAME KEPT DELIBERATELY: `otlp_redact_tool_args=False` would read correctly "
+            "at this default, but model_config sets extra='ignore', so at a rename every "
+            "deployment carrying an explicit OTLP_DISABLE_REDACTION would have that "
+            "setting SILENTLY DROPPED — an operator's explicit choice turned into a "
+            "no-op with no error, which is worse than an awkward name. Same treatment "
+            "otlp_hide_llm_content got when its default flipped in 2026-07."
         ),
     )
 
@@ -789,13 +801,18 @@ def effective_llm_hide(settings: RuntimeSettings) -> bool:
     telemetry debug switch `otlp_disable_redaction` is False. Disabling redaction
     forces the reveal (so a debugging operator sees the LLM Q/A + exception events
     alongside the real tool calls) regardless of `otlp_hide_llm_content`. Truth
-    table:
+    table (both flags now default toward REVEAL — see their field descriptions):
 
         hide_llm_content  disable_redaction  -> hidden?
-        True              False              -> True   (opt-out: shape-only hidden)
-        True              True               -> False  (debug: revealed)
-        False             False              -> False  (D25-amended default: reveal)
-        False             True               -> False  (debug: revealed)
+        True              False              -> True   (the ONLY hiding combination)
+        True              True               -> False  (revealed; disable wins)
+        False             False              -> False
+        False             True               -> False  (2026-08-10 SHIPPED DEFAULT)
+
+    Note what the flip cost: hiding the LLM content now takes TWO settings, not one.
+    `OTLP_HIDE_LLM_CONTENT=true` alone no longer hides anything, because
+    `otlp_disable_redaction` defaults True and overrides it. An operator who wants the
+    shape-only posture must set BOTH.
 
     `app.py` passes this single value to BOTH `configure_tracing(hide_llm_content=)`
     (the LLMExceptionEventScrubber) and `instrument_openai(hide_content=)` (the

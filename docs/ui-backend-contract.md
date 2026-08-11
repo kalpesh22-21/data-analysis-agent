@@ -370,6 +370,7 @@ interface HistoryTurn {
   answer: string | null;             // null == withheld-by-scope OR paused OR none yet
   provenance_union: string[] | null; // same 3-valued encoding as TurnResult.provenance
   assumptions: string[] | null;
+  answer_sql: string | null;         // page it via §4.4, exactly like the live field
   tool_calls: HistoryToolCall[];
 }
 
@@ -397,13 +398,14 @@ Only **successful, in-scope** tool calls appear — denials and errors carry und
 
 `tool_calls[]` is per-SQL; the live `result` event is union-only. That asymmetry is intentional and frozen.
 
-**History and the live result now describe the answer table differently.** A live turn
-gives you `answer_sql` (paged via §4.4); history gives you a per-tool-call
-`result_table` preview and **no** `answer_sql`. So a table answer looks different on
-reload than it did live — a ~20-row static preview instead of a paged grid — and a
-`runBlueprint` turn's history `sql` is `null` besides. Rebuilding a live-quality
-table from history is not currently possible; render the preview and accept the
-downgrade, or re-ask.
+**History carries `answer_sql` too**, so a reloaded transcript pages the same table
+the live turn showed — send it to §4.4 exactly as you would the live field. Both
+designation forms resolve, including `blueprint_id`. It is withheld with the answer:
+if `answer` is null by scope, so is `answer_sql`.
+
+History still ALSO carries per-tool-call `result_table` previews, which the live
+`result` event no longer does. Prefer `answer_sql` when present and treat
+`result_table` as the fallback for turns that designated nothing.
 
 ### 5.2 Live vs history reconciliation
 The reference client rebuilds the whole transcript from `/session/history` on page load, then appends live turns from `result` events within that page session. Running both for the same turn double-renders — pick one path per turn.
@@ -641,7 +643,6 @@ Upstream status codes and bodies propagate **as-is** — a non-2xx from the runt
 | **No CORS anywhere** | a browser cannot call the runtime/inbox/clickhouse-api directly; a same-origin proxy is mandatory |
 | **No pagination** on `/session/history` or `GET /inbox` | whole-session and top-100 payloads; large sessions are large responses |
 | **`runBlueprint` history `sql` is always `null`** | node SQL lives behind a KV pointer that the read path deliberately does not dereference; the live `result` event *does* carry it |
-| **History has no `answer_sql`** | a table answer reloads as a static ~20-row `result_table` preview, not the paged grid it was live (§5.2) |
 | **A scratch-backed `answer_sql` expires** | composed blueprints that materialise into `scratch.*` produce a session-scoped, TTL'd answer table; paging it later or from another session fails (§4.4) |
 | **`answer_sql` is advisory** | the model may not designate one for a genuinely tabular answer; there is no server-side fallback, so plan for prose-only |
 | **`verification` only exists on the blueprint path** | there is no raw-loop verification gate; absence is not failure |

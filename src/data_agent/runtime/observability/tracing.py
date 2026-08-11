@@ -21,13 +21,15 @@ redacted by the caller (`observability/redaction.py`) — this module does not
 re-redact; it only forwards `{key: value}` pairs onto the OTel span. Callers
 must never pass raw SQL/scope/JWT/result rows here IN THE DEFAULT POSTURE.
 
-The ONE exception is the access-controlled debug switch
-`RuntimeSettings.otlp_disable_redaction` (see `config.py`): when set, the
-composition root deliberately passes the caller the REAL (un-redacted) tool
-args + the tool RESULT preview into `tool_span`, so Phoenix shows the real
-tool call for debugging. That flip is TELEMETRY-ONLY (it never weakens actual
-scope/PII enforcement) but it DOES make the Phoenix project entity-bearing, so
-it must be access-controlled like the audit store.
+The ONE exception is `RuntimeSettings.otlp_disable_redaction` (see `config.py`),
+and since 2026-08-10 it is the DEFAULT rather than an exception an operator opts
+into: the composition root passes the caller the REAL (un-redacted) tool args +
+the tool RESULT preview into `tool_span`, so Phoenix shows the real tool call —
+real SQL literals, real resolved values. That flip is TELEMETRY-ONLY (it never
+weakens actual scope/PII enforcement) but it DOES make the Phoenix project
+entity-bearing, so the collector must be access-controlled like the session
+store. "IN THE DEFAULT POSTURE" above therefore now describes the OPT-OUT
+(`OTLP_DISABLE_REDACTION=false`), not the shipped default.
 """
 
 from __future__ import annotations

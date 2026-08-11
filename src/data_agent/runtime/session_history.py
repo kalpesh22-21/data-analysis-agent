@@ -27,9 +27,13 @@ KV de-reference happens on the read path.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
+from data_agent.runtime.composite.answer_with_table import (
+    TOOL_NAME as ANSWER_TABLE_TOOL_NAME,
+)
+from data_agent.runtime.composite.answer_with_table import resolve_designation
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
 from data_agent.runtime.context.scope_filter import filter_messages, filter_trail
 from data_agent.runtime.session.models import PauseCheckpoint, TrailEntry, TurnMessage
@@ -68,6 +72,7 @@ def project_history(
     trail: Sequence[TrailEntry],
     column_scope: frozenset[str],
     pause_checkpoint: PauseCheckpoint | None,
+    blueprint_terminal_sql: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Project the persisted `messages`/`tool_trail` into the §1.1 transcript
     shape under *column_scope*, applying the two D44 filters first.
@@ -119,6 +124,24 @@ def project_history(
                 entry.args.get("assumptions"),
             )
 
+    # `answer_sql` per turn — the query the model designated as the answer, so a
+    # RELOADED transcript can page the same table the live turn showed (via
+    # `POST /query/page`) instead of degrading to a static preview. Reconstructed
+    # from the RAW trail for the same reason assumptions are: an `answerWithTable`
+    # entry has determined-EMPTY provenance and survives `filter_trail`, but reading
+    # the raw trail keeps this independent of that gate, and the value is surfaced
+    # only when the turn's answer itself survives the scope filter (below).
+    #
+    # LAST designation wins, matching the loop. `blueprint_terminal_sql` is supplied
+    # by the caller because resolving a `blueprint_id` needs a D46 KV de-reference,
+    # which this pure projection cannot do — see `GET /session/history` in `app.py`.
+    answer_sql_by_turn: dict[int, str] = {}
+    for entry in trail:
+        if entry.status == "ok" and entry.tool_name == ANSWER_TABLE_TOOL_NAME:
+            resolved = resolve_designation(entry.args, blueprint_terminal_sql or {})
+            if resolved is not None:
+                answer_sql_by_turn[entry.turn_index] = resolved
+
     turns: list[dict[str, Any]] = []
     for turn_index in sorted(turn_order):
         assistant = answers.get(turn_index)
@@ -139,6 +162,11 @@ def project_history(
                     _project_provenance(assistant.provenance) if assistant is not None else None
                 ),
                 "assumptions": assumptions,
+                # Withheld with the answer, exactly like `assumptions`: if the answer
+                # did not survive the scope filter, neither does the query behind it.
+                "answer_sql": (
+                    answer_sql_by_turn.get(turn_index) if assistant is not None else None
+                ),
                 "tool_calls": [
                     _project_tool_call(entry) for entry in tools_by_turn.get(turn_index, [])
                 ],

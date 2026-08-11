@@ -331,3 +331,85 @@ def test_scratch_mixed_with_out_of_scope_warehouse_column_is_dropped() -> None:
     doc = project_history(messages, trail, scope, None)
 
     assert doc["turns"][0]["tool_calls"] == []  # out-of-scope warehouse pair sinks it
+
+
+# ---------------------------------------------------------------------------
+# `answer_sql` on a history turn — so a RELOADED transcript can page the same
+# table the live turn showed, instead of degrading to a static preview.
+# ---------------------------------------------------------------------------
+
+_AWT_SQL = "SELECT department_code, department_name FROM dbpcm_warehouse.department"
+
+
+def _awt_entry(turn: int, **args) -> TrailEntry:
+    return TrailEntry(
+        turn_index=turn, tool_call_id=f"awt{turn}", tool_name="answerWithTable",
+        args=dict(args), status="ok", error_code=None, provenance=frozenset(),
+        result_preview=None, result_full_ref=None, ts="t9",
+    )
+
+
+def _turn_messages(turn: int = 0) -> list[TurnMessage]:
+    return [
+        TurnMessage(turn_index=turn, role="user", content="q?", ts="t0", provenance=frozenset()),
+        TurnMessage(turn_index=turn, role="assistant", content="a", ts="t8", provenance=frozenset()),
+    ]
+
+
+def test_history_exposes_a_raw_sql_designation() -> None:
+    body = project_history(_turn_messages(), [_awt_entry(0, answer="x", sql=_AWT_SQL)], frozenset(), None)
+    assert body["turns"][0]["answer_sql"] == _AWT_SQL
+
+
+def test_history_resolves_a_blueprint_designation_via_the_supplied_map() -> None:
+    """The live model designates with `sql=""` beside `blueprint_id`. Reading only
+    `args["sql"]` would report `answer_sql: null` for every blueprint-answered turn —
+    precisely the turns where the model was told not to copy the SQL."""
+    terminal = "SELECT department, headcount FROM dbpcm_warehouse.headcount_by_dept"
+    body = project_history(
+        _turn_messages(),
+        [_awt_entry(0, answer="x", sql="", blueprint_id="bp-headcount")],
+        frozenset(),
+        None,
+        blueprint_terminal_sql={"bp-headcount": terminal},
+    )
+    assert body["turns"][0]["answer_sql"] == terminal
+
+
+def test_an_unresolvable_blueprint_designation_reports_null_not_an_error() -> None:
+    """A blueprint whose result_full ref expired leaves the id unresolved. The turn
+    still renders — it just has no table, exactly as before this field existed."""
+    body = project_history(
+        _turn_messages(),
+        [_awt_entry(0, answer="x", blueprint_id="bp-gone")],
+        frozenset(),
+        None,
+        blueprint_terminal_sql={},
+    )
+    assert body["turns"][0]["answer_sql"] is None
+    assert body["turns"][0]["answer"] == "a"
+
+
+def test_answer_sql_is_withheld_with_the_answer() -> None:
+    """It is derived from the answer, so it inherits the answer's scope treatment:
+    if the assistant message is dropped by the scope filter, the query behind it goes
+    too. Leaking it would hand back a runnable query for an answer just withheld."""
+    messages = [
+        TurnMessage(turn_index=0, role="user", content="q?", ts="t0", provenance=frozenset()),
+        TurnMessage(
+            turn_index=0, role="assistant", content="a", ts="t8",
+            provenance=frozenset({("dbpcm_warehouse.employee", "AnnualSalary")}),
+        ),
+    ]
+    body = project_history(
+        messages, [_awt_entry(0, answer="x", sql=_AWT_SQL)],
+        frozenset({"dbpcm_warehouse.employee.EmployeeCode"}), None,
+    )
+    turn = body["turns"][0]
+    assert turn["answer"] is None          # withheld by scope
+    assert turn["answer_sql"] is None      # …and so is the query behind it
+
+
+def test_a_turn_with_no_designation_reports_null() -> None:
+    body = project_history(_turn_messages(), [], frozenset(), None)
+    assert body["turns"][0]["answer_sql"] is None

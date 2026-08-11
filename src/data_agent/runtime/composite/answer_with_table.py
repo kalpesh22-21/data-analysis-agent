@@ -51,6 +51,7 @@ separately, which is a larger change than this tool.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
@@ -97,6 +98,35 @@ def clean_blueprint_id(raw: Any) -> str | None:
         return None
     text = raw.strip()
     return text[:200] if text else None
+
+
+def resolve_designation(
+    args: Any, terminal_by_id: Mapping[str, str]
+) -> str | None:
+    """Resolve ONE `answerWithTable` call's arguments to a concrete query, or `None`.
+
+    The single expression of the two-forms rule, shared by every caller so they
+    cannot drift: the agent loop (in-window and on resume) and
+    `session_history.project_history`. `sql=` wins when both are given — it is the
+    more specific instruction; otherwise `blueprint_id` is looked up in
+    *terminal_by_id*, the `blueprint_id -> terminal_sql` map of blueprints that ran
+    successfully in that turn.
+
+    Callers differ only in how they BUILD that map: in-window the loop reads
+    `terminal_sql` straight off the dispatch result, while the resume and history
+    paths de-reference each blueprint's `result_full` from the D46 KV store. The
+    resolution itself is identical, which is the point of this function — reading
+    only `args["sql"]` looked complete and silently dropped every blueprint
+    designation, the form the live model actually emits (`sql=""` beside
+    `blueprint_id`).
+    """
+    if not isinstance(args, dict):
+        return None
+    raw_sql = clean_answer_sql(args.get("sql"))
+    if raw_sql is not None:
+        return raw_sql
+    blueprint_id = clean_blueprint_id(args.get("blueprint_id"))
+    return terminal_by_id.get(blueprint_id) if blueprint_id is not None else None
 
 
 class AnswerWithTableTool:
@@ -153,6 +183,7 @@ class AnswerWithTableTool:
 __all__ = [
     "TOOL_NAME",
     "AnswerWithTableTool",
+    "resolve_designation",
     "clean_answer_sql",
     "clean_answer_text",
     "clean_blueprint_id",

@@ -2,15 +2,24 @@
 switch, driven through the real `create_app` + a turn over Layer-1 fakes and the
 `/_test/spans` dump endpoint (no OpenAI spend, no Phoenix collector).
 
-Companion to `test_app_span_exporter_qa.py` (which proves the D25 default holds).
-This proves the FLIP: with `otlp_disable_redaction=True`, the runQuery TOOL span
-Phoenix ships carries the REAL SQL (literal present) AND the result preview
-(columns + the result cell) — so a debugging operator sees the whole tool call —
-WHILE the flag stays a pure telemetry choice (default OFF is byte-identical to
-the D25 posture proven in the companion file).
+**The default flipped on 2026-08-10** (deliberate operator posture choice): the flag now
+defaults TRUE, so an all-defaults runtime ships UN-redacted spans and the collector is as
+sensitive as the session store. This file proves BOTH directions with the same harness,
+because a flipped default is only defensible if the opt-out is tested as hard as the
+default:
+
+  * the DEFAULT — a `RuntimeSettings` nobody configured puts the real SQL literal and the
+    result preview on the span. Asserted through the app rather than off the field,
+    because `extra="ignore"` means a field's value and its EFFECT are two claims.
+  * the OPT-OUT (`otlp_disable_redaction=False`) — byte-identical to the D25 posture
+    proven in the companion `test_app_span_exporter_qa.py`.
+
+Every builder here pins `_env_file=None`. Without it these tests read the repo's `.env`,
+which carries an explicit `OTLP_DISABLE_REDACTION` — a default test that a developer's
+local file can flip is not a test of the default.
 
 Tags:
-  - otlp-redaction-on-by-default
+  - otlp-unredacted-by-default
   - otlp-disable-redaction-shows-real-tool-calls
   - otlp-disable-redaction-is-telemetry-only
 """
@@ -40,7 +49,9 @@ PII_SQL_LITERAL = "PII_SQL_LITERAL_QARED_551155"
 PII_RESULT_CELL = "PII_RESULT_CELL_QARED_662266"
 
 
-def _build_app(monkeypatch, *, disable_redaction: bool, span_exporter: Any) -> Any:
+def _build_app(monkeypatch, *, disable_redaction: bool | None, span_exporter: Any) -> Any:
+    """*disable_redaction* `None` means "leave the field at its SHIPPED DEFAULT" — the
+    only way to test a default is to not set it."""
     monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **k: frozenset())
     mcp_client = FakeMCPClient(
         tools=[
@@ -62,10 +73,11 @@ def _build_app(monkeypatch, *, disable_redaction: bool, span_exporter: Any) -> A
         },
     )
     settings = RuntimeSettings(
+        _env_file=None,
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
         max_budget_windows=3,
-        otlp_disable_redaction=disable_redaction,
+        **({} if disable_redaction is None else {"otlp_disable_redaction": disable_redaction}),
     )
     return create_app(
         settings=settings,
@@ -102,9 +114,27 @@ def _drive_and_dump(app: Any) -> dict[str, Any]:
     return tool_spans[0]
 
 
+def test_the_shipped_default_puts_the_real_tool_call_on_the_span(monkeypatch) -> None:
+    """otlp-unredacted-by-default: an all-defaults runtime — nobody set the flag, nobody
+    set an env var — ships the REAL SQL literal and the result preview to the collector.
+
+    This is the whole 2026-08-10 posture flip, asserted at the only place that can prove
+    it. `RuntimeSettings.otlp_disable_redaction is True` proves the FIELD; this proves the
+    EFFECT, and the two are separate claims: the value has to survive `create_app`'s
+    threading into the dispatcher and the tool-span writer to change a single attribute.
+    """
+    app = _build_app(monkeypatch, disable_redaction=None, span_exporter=InMemorySpanExporter())
+    attrs = _drive_and_dump(app)["attributes"]
+    assert PII_SQL_LITERAL in attrs["tool.args.sql"]
+    assert PII_RESULT_CELL in attrs["tool.result.preview_rows"]
+
+
 def test_flag_off_app_keeps_d25_shape_only_span(monkeypatch) -> None:
-    """otlp-redaction-on-by-default: through the full app, the default posture
-    masks the SQL literal and puts NO result on the runQuery TOOL span."""
+    """otlp-unredacted-by-default (the OPT-OUT): `otlp_disable_redaction=False` masks the
+    SQL literal and puts NO result on the runQuery TOOL span — the D25 posture, intact.
+
+    Named "flag off" and no longer "the default": it is now the thing an operator must
+    ASK for. The reveal is only a defensible default while this stays exact."""
     app = _build_app(monkeypatch, disable_redaction=False, span_exporter=InMemorySpanExporter())
     tool_span = _drive_and_dump(app)
     attrs = tool_span["attributes"]

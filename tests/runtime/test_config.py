@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from data_agent.runtime.config import RuntimeSettings
+from data_agent.runtime.config import RuntimeSettings, effective_llm_hide
 
 
 def test_locked_defaults() -> None:
@@ -51,3 +51,35 @@ def test_env_var_override(monkeypatch) -> None:
     settings = RuntimeSettings(_env_file=None)
     assert settings.session_ttl_seconds == 3600
     assert settings.mcp_url == "http://mcp.internal:9000/mcp"
+
+
+def test_telemetry_defaults_toward_reveal() -> None:
+    """The 2026-08-10 posture, pinned where a reader looks for the default.
+
+    `otlp_disable_redaction` reads as a double negative and its default now makes the
+    config read backwards, so the plain-English claim is asserted rather than left to be
+    derived: NOTHING IS REDACTED AT THE DEFAULT, and `effective_llm_hide` is therefore
+    False whatever `otlp_hide_llm_content` says. The consequence is that the OTLP
+    collector holds real entity values and must be access-controlled like the session
+    store — see the field description."""
+    settings = RuntimeSettings(_env_file=None)
+    assert settings.otlp_disable_redaction is True
+    assert effective_llm_hide(settings) is False
+    # Hiding the LLM content now takes BOTH settings; the single flag no longer does it.
+    assert effective_llm_hide(RuntimeSettings(_env_file=None, otlp_hide_llm_content=True)) is False
+    assert (
+        effective_llm_hide(
+            RuntimeSettings(
+                _env_file=None, otlp_hide_llm_content=True, otlp_disable_redaction=False
+            )
+        )
+        is True
+    )
+
+
+def test_the_redaction_opt_out_is_reachable_by_env_var(monkeypatch) -> None:
+    """`extra="ignore"` means a typo'd env var is silently dropped and the (now
+    revealing) default silently stands — so the opt-out has to be proven reachable by the
+    exact name an operator would type, not assumed from the field name."""
+    monkeypatch.setenv("OTLP_DISABLE_REDACTION", "false")
+    assert RuntimeSettings(_env_file=None).otlp_disable_redaction is False
