@@ -267,7 +267,21 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
             ),
             "preview_rows": rows,
         }
-    user_message = classify_denial(entry.error_code).user_message if entry.status != "ok" else None
+    # The model-facing reason for a non-`ok` entry. `denial_detail` — set only where
+    # the runtime already decided the specific text is safe (the dispatcher's
+    # COLUMN_SCOPE_VIOLATION carve-out, the answerWithTable nudge) — wins, because it
+    # names the thing the model must change: WHICH column is out of scope, WHICH
+    # blueprint was not run. Everything else falls back to the canned
+    # `denial_mapping.py` string, so an ordinary denial is byte-identical to before.
+    #
+    # This function is the SINGLE producer of every model-facing tool message, which
+    # is why a specific reason that is not persisted on the entry cannot reach the
+    # model at all — `ToolResult.user_message` has no field here and is dropped.
+    user_message = (
+        (entry.denial_detail or classify_denial(entry.error_code).user_message)
+        if entry.status != "ok"
+        else None
+    )
     rendered: dict[str, Any] = {
         "role": "tool",
         "tool_call_id": entry.tool_call_id,

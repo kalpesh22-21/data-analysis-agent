@@ -366,12 +366,16 @@ def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
     `status != "ok"`, so the entry reaches the model this same turn instead of being
     dropped as undetermined-provenance history.
 
-    The instructional text is ALSO registered in `dispatch/denial_mapping.py` — the
-    `user_message` here is what the model sees on the live turn, but it is not
-    persisted on `TrailEntry`, so every later rebuild re-derives it from
-    `error_code`. Unregistered, that would degrade to the generic "Something went
-    wrong processing that request." and the nudge would be lost on the next
-    round-trip.
+    The instructional text below is NOT what the model reads. `TrailEntry` has no
+    `user_message` field at all, and `context/budget.py::_render_entry` — the single
+    producer of every model-facing tool message — sets it from
+    `classify_denial(entry.error_code)` unconditionally. So the model sees the
+    DENIAL-TABLE text, on the first rebuild and every one after; the string here only
+    reaches non-model readers (logs, `/query/page`'s error body).
+    That is why `ANSWER_TABLE_BLUEPRINT_NOT_RUN` is registered in
+    `dispatch/denial_mapping.py`: without an entry there, `classify_denial` falls
+    back to "Something went wrong processing that request." and the model is told
+    nothing actionable. The two strings are kept in step deliberately.
     """
     return ToolResult(
         status="error",
@@ -386,6 +390,14 @@ def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
         provenance=frozenset(),
         result_preview=None,
         result_full=None,
+        # The channel that actually reaches the model. It NAMES the blueprint, which
+        # the denial-table fallback cannot: `classify_denial` sees only the code, so
+        # its text can say "that blueprint" but never which one.
+        denial_detail=(
+            f"You referenced blueprint '{blueprint_id}', but you have not run it in "
+            "this turn, so there is no table to show. Call runBlueprint with "
+            f"'{blueprint_id}' first, then call answerWithTable again."
+        ),
     )
 
 
@@ -1263,6 +1275,7 @@ class AgentLoop:
             result_full_ref=result_full_ref,
             ts=_now_iso(),
             authoritative=tool_result.authoritative,
+            denial_detail=tool_result.denial_detail,
         )
         await self._session_store.append_trail_entry(session_id, entry)
 
@@ -1905,6 +1918,7 @@ class AgentLoop:
                     result_full_ref=result_full_ref,
                     ts=_now_iso(),
                     authoritative=tool_result.authoritative,
+                    denial_detail=tool_result.denial_detail,
                 )
                 await self._session_store.append_trail_entry(session_id, entry)
 

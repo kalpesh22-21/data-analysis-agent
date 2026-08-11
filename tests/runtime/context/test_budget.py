@@ -5,11 +5,13 @@ from __future__ import annotations
 from data_agent.runtime.context.budget import (
     _SUMMARY_CONTEXT_PREFIX,
     SummaryCache,
+    _render_entry,
     compact_trail,
     estimate_message_tokens,
     fit_request_to_budget,
     render_messages,
 )
+from data_agent.runtime.dispatch.denial_mapping import classify_denial
 from data_agent.runtime.retrieval.render import _USER_CONTEXT_PREFIX as _RETRIEVAL_CONTEXT_PREFIX
 from data_agent.runtime.session.models import ResultPreview, TrailEntry
 
@@ -615,3 +617,78 @@ def test_fit_without_pinned_ids_is_unchanged() -> None:
         for tc in m["tool_calls"]
     }
     assert "emulated-listDatabases" not in surviving_ids  # droppable without the pin
+
+
+# ---------------------------------------------------------------------------
+# `denial_detail` — the ONLY channel by which a SPECIFIC denial reason reaches
+# the model. `ToolResult.user_message` does not: `TrailEntry` has no field for it,
+# and `_render_entry` (the single producer of every model-facing tool message)
+# regenerates the text from `error_code` alone. Anything not persisted here is
+# invisible to the model, on the live turn and on every rebuild after it.
+# ---------------------------------------------------------------------------
+
+
+def _denied(error_code: str, *, detail: str | None = None) -> TrailEntry:
+    return TrailEntry(
+        turn_index=0, tool_call_id="c1", tool_name="runQuery", args={},
+        status="denied", error_code=error_code, provenance=None,
+        result_preview=None, result_full_ref=None, ts="t", denial_detail=detail,
+    )
+
+
+def test_denial_detail_reaches_the_model_verbatim() -> None:
+    """The column-naming message the dispatcher works to produce must ARRIVE. Before
+    this field it was assigned to `ToolResult.user_message`, dropped at persistence,
+    and the model saw only the generic string — so it retried blind against a
+    constraint it could not see."""
+    detail = "Query references columns outside your permitted scope: employee.AnnualSalary"
+    rendered = _render_entry(_denied("COLUMN_SCOPE_VIOLATION", detail=detail), 20)
+    assert rendered["user_message"] == detail
+    assert "AnnualSalary" in rendered["user_message"]
+
+
+def test_without_a_detail_the_canned_string_is_unchanged() -> None:
+    """An ordinary denial renders byte-identically to before the field existed."""
+    rendered = _render_entry(_denied("COLUMN_SCOPE_VIOLATION"), 20)
+    assert rendered["user_message"] == (
+        classify_denial("COLUMN_SCOPE_VIOLATION").user_message
+    )
+
+
+def test_an_unregistered_code_with_no_detail_is_still_the_generic_failure() -> None:
+    """The fallback is intact: a code nobody registered and no detail says nothing
+    actionable. This is the failure mode `denial_detail` and the denial-table
+    registration exist to avoid — it is silent, not loud."""
+    rendered = _render_entry(_denied("SOME_UNREGISTERED_CODE"), 20)
+    assert rendered["user_message"] == "Something went wrong processing that request."
+
+
+def test_denial_detail_is_ignored_on_an_ok_entry() -> None:
+    """`user_message` is a non-`ok` concept — a successful entry never carries one,
+    detail or not, so a stray value cannot leak into a normal result."""
+    entry = TrailEntry(
+        turn_index=0, tool_call_id="c1", tool_name="runQuery", args={},
+        status="ok", error_code=None, provenance=frozenset(),
+        result_preview=None, result_full_ref=None, ts="t",
+        denial_detail="should never be shown",
+    )
+    assert _render_entry(entry, 20)["user_message"] is None
+
+
+def test_denial_detail_round_trips_through_the_session_document() -> None:
+    """It has to survive persistence — that is the entire point of the field."""
+    detail = "Query references columns outside your permitted scope: employee.AnnualSalary"
+    restored = TrailEntry.from_doc(_denied("COLUMN_SCOPE_VIOLATION", detail=detail).to_doc())
+    assert restored.denial_detail == detail
+
+
+def test_a_legacy_document_without_the_field_loads_unchanged() -> None:
+    """Documents written before this field existed must load, with `None`, and render
+    exactly as they always did."""
+    doc = _denied("COLUMN_SCOPE_VIOLATION", detail="x").to_doc()
+    del doc["denial_detail"]
+    restored = TrailEntry.from_doc(doc)
+    assert restored.denial_detail is None
+    assert _render_entry(restored, 20)["user_message"] == (
+        classify_denial("COLUMN_SCOPE_VIOLATION").user_message
+    )

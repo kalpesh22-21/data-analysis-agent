@@ -132,6 +132,18 @@ class ToolResult:
     result_full: dict[str, Any] | list[Any] | None
     pause: ToolPause | None = None
     authoritative: bool = False
+    # `denial_detail` (additive): the SPECIFIC, model-actionable reason for a
+    # non-`ok` outcome, when the runtime has already decided that text is safe to
+    # show and to persist. `None` (the default, and the case for every ordinary
+    # denial) means "the canned `denial_mapping.py` string is the whole story".
+    #
+    # It exists because `user_message` NEVER reaches the model: `TrailEntry` has no
+    # field for it, and `context/budget.py::_render_entry` — the single producer of
+    # every model-facing tool message — regenerates the text from `error_code`
+    # alone. So a specific message set on `user_message` is silently dropped, and
+    # the model is told only the generic string. `denial_detail` is the persisted
+    # channel that actually arrives.
+    denial_detail: str | None = None
 
 
 # Default per-result token cap for the stored preview (RuntimeSettings.
@@ -334,23 +346,34 @@ class ToolDispatcher:
             )
         except MCPToolError as exc:
             denial: DenialInfo = classify_denial(exc.code)
-            # B4/D25 posture: the model-facing `user_message` is normally the
-            # GENERIC canned string from `denial_mapping.py` — raw backend /
-            # transport text is NEVER surfaced. The single narrow exception is
+            # B4/D25 posture: the model-facing message is normally the GENERIC
+            # canned string from `denial_mapping.py` — raw backend / transport text
+            # is NEVER surfaced. The single narrow exception is
             # COLUMN_SCOPE_VIOLATION: its `exc.message` is an author-CONTROLLED
             # `ColumnScopeError` string that NAMES the out-of-scope column(s)
-            # (catalog metadata only — not PII / cell values), so surfacing it
-            # lets the model self-correct on the LIVE turn by seeing WHICH
-            # columns it lacks. All other codes (and the transport path below)
-            # stay canned. NOTE: `user_message` is not persisted on TrailEntry;
-            # on replay `context/budget.py::_render_entry` re-derives the
-            # GENERIC message from `error_code` via `denial_mapping.py` (it
-            # cannot know the column) — acceptable, since the column-specific
-            # message already reached the model on the live turn.
+            # (catalog metadata only — not PII / cell values), so showing it lets
+            # the model self-correct by seeing WHICH columns it lacks instead of
+            # retrying blind. All other codes (and the transport path below) stay
+            # canned.
+            #
+            # It rides `denial_detail`, NOT `user_message`. This carve-out used to
+            # set only `user_message` and claim the specific text "already reached
+            # the model on the live turn" — it never did, on the live turn or any
+            # other: `TrailEntry` has no `user_message` field, so the string was
+            # dropped at persistence and `_render_entry` regenerated the generic one
+            # from `error_code`. The model has always been told "columns outside your
+            # current permissions" with no column named. `denial_detail` IS
+            # persisted, so the specific text now actually arrives.
+            #
+            # Replay safety: a denial carries `provenance=None`, and
+            # `scope_filter.filter_trail` exempts a non-`ok` entry only for the
+            # CURRENT turn — a prior-turn denial is dropped outright. So this detail
+            # can only ever render inside the turn whose scope produced it, and can
+            # never leak a column name into a later, narrower-scoped turn.
+            denial_detail: str | None = None
             if denial.code == "COLUMN_SCOPE_VIOLATION" and exc.message:
-                user_message = exc.message
-            else:
-                user_message = denial.user_message
+                denial_detail = exc.message
+            user_message = denial_detail or denial.user_message
             self._observer(
                 "tool_dispatch_denied", {"tool_name": tool_name, "error_code": denial.code}
             )
@@ -364,6 +387,7 @@ class ToolDispatcher:
                 provenance=None,
                 result_preview=None,
                 result_full=None,
+                denial_detail=denial_detail,
             )
         except Exception:
             # B4: a RAW (non-MCPToolError) transport exception — connection

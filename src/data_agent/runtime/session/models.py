@@ -144,6 +144,22 @@ class TrailEntry:
     # message (D45 determinism). Defaults False for every other entry (runQuery,
     # denials, discovery), so the field is additive and legacy docs load unchanged.
     authoritative: bool = False
+    # `denial_detail` (additive, 2026-08): the SPECIFIC model-actionable reason for
+    # a non-`ok` entry — the out-of-scope column name, the blueprint that was never
+    # run. `None` (the default, and every ordinary denial) means the canned
+    # `denial_mapping.py` string derived from `error_code` is the whole story, so
+    # legacy documents load byte-identically.
+    #
+    # It is the ONLY channel by which a specific denial reason reaches the model.
+    # `ToolResult.user_message` does not: there is deliberately no field for it here,
+    # and `context/budget.py::_render_entry` regenerates the message from
+    # `error_code` alone. Anything not persisted here is invisible to the model.
+    #
+    # Persisting it is scope-safe: a denial carries `provenance=None`, and
+    # `scope_filter.filter_trail` exempts a non-`ok` entry only for the CURRENT
+    # turn, so a prior-turn denial never replays at all. The detail can only render
+    # inside the turn whose scope produced it.
+    denial_detail: str | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -158,6 +174,7 @@ class TrailEntry:
             "result_full_ref": self.result_full_ref,
             "ts": self.ts,
             "authoritative": self.authoritative,
+            "denial_detail": self.denial_detail,
         }
 
     @classmethod
@@ -175,6 +192,9 @@ class TrailEntry:
             result_full_ref=doc.get("result_full_ref"),
             ts=doc["ts"],
             authoritative=bool(doc.get("authoritative", False)),
+            # `.get` (not `[...]`): a document written before this field existed
+            # loads with `None` and renders exactly as it always did.
+            denial_detail=doc.get("denial_detail"),
         )
 
 
