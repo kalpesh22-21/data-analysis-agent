@@ -156,6 +156,22 @@ def _build_loop(
     )
 
 
+def _loop_over(store: InMemorySessionStore) -> AgentLoop:
+    """An AgentLoop bound to an EXISTING store, for exercising the trail-reseed
+    helpers directly against a hand-built trail."""
+    return AgentLoop(
+        model_client=ScriptedModelClient([ModelTurnResult(assistant_text="x")]),
+        tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
+        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        session_store=store,
+        tools_provider=_tools_provider,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        runtime_tools={"answerWithTable": AnswerWithTableTool()},
+    )
+
+
 def _answer(call_id: str, **args: object) -> ModelTurnResult:
     return ModelTurnResult(
         tool_calls=[ToolCallRequest(id=call_id, name="answerWithTable", arguments=dict(args))]
@@ -509,3 +525,57 @@ async def test_a_blueprint_id_resolves_to_that_blueprints_terminal_sql() -> None
     assert outcome.assistant_text == "Six months of hires."
     # The transparency list still records what RAN, distinctly from what the answer IS.
     assert outcome.sql_executed == ["SELECT 1 /* an earlier node */", terminal]
+
+
+async def test_a_blueprint_designation_survives_a_pause_and_resume() -> None:
+    """REGRESSION. `_compute_turn_answer_sql` reseeds a resumed window from the trail,
+    and it originally read only `args["sql"]` — silently dropping every BLUEPRINT
+    designation. That is the form the live model actually emits: observed in a real
+    turn it sent `sql=""` next to `blueprint_id`, which cleans to `None`. So a
+    blueprint-answered turn that paused came back with `answer_sql=None` and the user
+    lost the table, in exactly the case the blueprint path exists for.
+
+    Reconstructing it requires de-referencing the blueprint's `result_full` (D46 KV
+    pointer) to reach `terminal_sql` — the in-window path reads that straight off the
+    dispatch result and never pays the cost.
+    """
+    terminal = "SELECT month, hires FROM dbpcm_warehouse.employee_hires_by_month"
+    store = InMemorySessionStore()
+    await store.get_or_create_session(SESSION_ID)
+
+    # The blueprint ran: its result_full lives behind a KV ref, as in production.
+    ref = await store.write_full_result(
+        SESSION_ID, "r1",
+        {"blueprint_id": "bp-hires-per-month", "status": "verified",
+         "sql": ["SELECT 1 /* earlier node */", terminal], "terminal_sql": terminal},
+    )
+    await store.append_trail_entry(SESSION_ID, TrailEntry(
+        turn_index=0, tool_call_id="b1", tool_name="runBlueprint",
+        args={"id": "bp-hires-per-month", "slot_bindings": {}}, status="ok",
+        error_code=None, provenance=frozenset({("db.t", "c")}), result_preview=None,
+        result_full_ref=ref, ts="t1",
+    ))
+    # …and the model designated it the ANSWER using the exact live shape: empty
+    # `sql` beside `blueprint_id`.
+    await store.append_trail_entry(SESSION_ID, TrailEntry(
+        turn_index=0, tool_call_id="a1", tool_name="answerWithTable",
+        args={"answer": "Six months of hires.", "sql": "", "blueprint_id": "bp-hires-per-month"},
+        status="ok", error_code=None, provenance=frozenset(), result_preview=None,
+        result_full_ref=None, ts="t2",
+    ))
+
+    loop = _loop_over(store)
+    assert await loop._compute_turn_answer_sql(SESSION_ID, 0) == terminal
+
+
+async def test_a_raw_sql_designation_still_reseeds() -> None:
+    """The `sql=` form must keep working — the blueprint branch is additive."""
+    store = InMemorySessionStore()
+    await store.get_or_create_session(SESSION_ID)
+    await store.append_trail_entry(SESSION_ID, TrailEntry(
+        turn_index=0, tool_call_id="a1", tool_name="answerWithTable",
+        args={"answer": "x", "sql": _ANSWER_SQL}, status="ok", error_code=None,
+        provenance=frozenset(), result_preview=None, result_full_ref=None, ts="t",
+    ))
+    loop = _loop_over(store)
+    assert await loop._compute_turn_answer_sql(SESSION_ID, 0) == _ANSWER_SQL

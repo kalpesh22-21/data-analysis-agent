@@ -1011,23 +1011,60 @@ class AgentLoop:
 
     async def _compute_turn_answer_sql(self, session_id: str, turn_index: int) -> str | None:
         """Reconstruct the model-designated `answer_sql` for *turn_index* from the
-        persisted `presentTable` trail entries — the `_compute_turn_assumptions`
+        persisted `answerWithTable` trail entries — the `_compute_turn_assumptions`
         sibling, used to SEED a resumed window on BOTH resume paths so a designation
         the model made BEFORE an askUser / blueprint-approval pause survives it.
 
         LAST successful designation wins, matching `_accumulate_answer_sql`'s
-        in-window rule (a later `presentTable` supersedes an earlier one). Without
-        this, a turn that designated its answer table and THEN paused would come back
-        with `answer_sql=None` and the UI would silently lose the table."""
+        in-window rule (a later call supersedes an earlier one). Without this, a turn
+        that designated its answer table and THEN paused comes back with
+        `answer_sql=None` and the UI silently loses the table.
+
+        BOTH designation forms are reconstructed. Reading only `args["sql"]` looked
+        sufficient but silently dropped every blueprint designation — and that is the
+        form the live model actually emits: observed in a real turn, it sent
+        `sql=""` alongside `blueprint_id`, which cleans to `None`. So a
+        blueprint-answered turn that paused lost its table on resume, in exactly the
+        case the blueprint path exists for.
+
+        Resolving `blueprint_id` here needs the blueprint's `terminal_sql`, which
+        lives in `result_full` behind a D46 KV pointer (the in-window path reads it
+        straight off the dispatch result and never pays this cost). The
+        de-reference happens ONLY on the resume path, once per blueprint, and a
+        missing/expired ref simply leaves that id unresolved rather than raising."""
         trail = await self._session_store.load_trail(session_id)
+        turn_entries = [
+            e for e in trail if e.turn_index == turn_index and e.status == "ok"
+        ]
+        # blueprint_id -> terminal_sql, rebuilt from this turn's successful runs.
+        terminal_by_id: dict[str, str] = {}
+        for entry in turn_entries:
+            if entry.tool_name != "runBlueprint" or entry.result_full_ref is None:
+                continue
+            result_full = await self._session_store.read_full_result(
+                session_id, entry.result_full_ref
+            )
+            if isinstance(result_full, dict):
+                _capture_terminal_sql(
+                    "runBlueprint",
+                    ToolResult(
+                        status="ok", tool_name="runBlueprint", error_code=None,
+                        retryable=None, user_message=None, provenance=None,
+                        result_preview=None, result_full=result_full,
+                    ),
+                    into=terminal_by_id,
+                )
+
         designated: str | None = None
-        for entry in trail:
-            if (
-                entry.turn_index == turn_index
-                and entry.status == "ok"
-                and entry.tool_name == ANSWER_TABLE_TOOL_NAME
-            ):
-                designated = clean_answer_sql(entry.args.get("sql")) or designated
+        for entry in turn_entries:
+            if entry.tool_name != ANSWER_TABLE_TOOL_NAME:
+                continue
+            resolved = clean_answer_sql(entry.args.get("sql"))
+            if resolved is None:
+                blueprint_id = clean_blueprint_id(entry.args.get("blueprint_id"))
+                if blueprint_id is not None:
+                    resolved = terminal_by_id.get(blueprint_id)
+            designated = resolved or designated
         return designated
 
     def _maybe_start_summary(self, tool_name: str, arguments: dict[str, Any]) -> None:
