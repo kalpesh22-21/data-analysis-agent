@@ -686,6 +686,30 @@ happen is any durable record of the correction (see slice 4's residues). `apply_
 
 ---
 
+## End-to-end run, 2026-08-11 — what actually happened
+
+Ten questions grounded in the real warehouse schema, driven through the live agent, then swept and consumed by the real learning loop.
+
+**Worked.** All ten answered correctly, row-level security enforced and reported. The sweeper claimed and enqueued every session and survived four mid-flight process kills without loss or double-processing. Triage kept every question. Prior art retrieved five cards per session from the canon. **The coverage judge dropped three sessions correctly** — matched to `bp-active-headcount-by-department` at 0.97–1.00 confidence, extraction cancelled, each with a durable record carrying verdict, artifact, tier, the threshold in force, the model, and its reasoning.
+
+**Did not produce candidates.** The configured extractor model was unavailable on the endpoint at hand, so a substitute ran and flattened the response envelope — payload fields at the top level, no `type`, declined as malformed. The *content* was right (correct intent, correct metric column, correct grouping, evidence cited); only the packaging was wrong. Re-run with the configured model to get a real mining result; the sessions are still in the store.
+
+**The finding that matters.** Getting there required fixing **seven paths that had never once executed**, every one failing in a way that looked like correct behaviour:
+
+| Path | Looked like | Was |
+|---|---|---|
+| Golden replay | clean `probe_unavailable` hold | token missing three tenant claims |
+| Replay sampling | `passed=True` | fake probe never executes SQL |
+| Sweeper + 4 other stores | "retrying next interval" | cluster connect never awaited |
+| Recall | `blueprints: 0` | corpus wiped, `/ready` false for hours |
+| Consumer idle loop | retries, work still drains | socket timeout races the blocking read at the same value |
+| Approve-edge leakage guard | guard present on the cron edge | never added to the edge that now does all the landing |
+| Tenant readiness gate | gate exists | defaults are the dev seed; blanking the chart alone is a no-op, since the template omits empty values |
+
+They all fail *closed*, which is correct design and exactly why none were noticed: a gate that holds because it cannot verify is indistinguishable from a gate that holds because verification failed. **The paths that worked were the ones someone ran interactively and fixed when they broke in the foreground; the paths that didn't were daemons and offline jobs, where the failure is a log line nobody tails.**
+
+Open, from this run: a structurally malformed tool call is a hard decline while a non-tool-call response is retried — so model drift yields zero candidates and reads as "nothing worth learning". Worth a corrective retry and a logged decline.
+
 ## Measure before building
 
 Both are cheap, and both would have changed a decision earlier in this work.
