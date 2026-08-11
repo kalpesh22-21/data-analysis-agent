@@ -1198,3 +1198,97 @@ def test_prov_unqualified_scratch_only_column_not_rejected() -> None:
     )
     result = extract_column_provenance(sql, CATALOG_SCHEMA, session_id="sessabc123")
     assert result == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Scalar `WITH` bindings + pure row generators (2026-08).
+#
+# Both shapes previously failed closed with PARSE_FAILED_CLOSED, which the MCP
+# surfaces as a denial. Neither is a leak — the failures were false positives that
+# cost real round-trips: an observed live turn wrote a `numbers()` month scaffold,
+# was denied, rewrote, was denied again, and ended `paused_budget_cap` with no
+# answer at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "sql"),
+    [
+        ("function binding", "WITH today() AS d SELECT d"),
+        ("literal binding", "WITH 5 AS n SELECT n"),
+    ],
+)
+def test_scalar_with_binding_extracts_determined_empty(label: str, sql: str) -> None:
+    """`WITH <expr> AS name` binds a VALUE, not a subquery. Referencing it is a
+    query-internal derived read — no table access — so provenance is
+    determined-EMPTY (replayable under any scope), never undetermined."""
+    assert extract_column_provenance(sql, CATALOG_SCHEMA) == frozenset()
+
+
+def test_scalar_with_binding_agrees_with_the_equivalent_select_alias() -> None:
+    """THE INCONSISTENCY THAT MADE THIS A BUG: `SELECT today() AS d` extracted
+    cleanly while the semantically identical `WITH today() AS d SELECT d` failed
+    closed, purely because the reference sits in the projection list. Same query,
+    same exposure, so the same answer."""
+    assert extract_column_provenance(
+        "SELECT today() AS d", CATALOG_SCHEMA
+    ) == extract_column_provenance("WITH today() AS d SELECT d", CATALOG_SCHEMA)
+
+
+def test_a_scalar_with_binding_does_not_mask_a_real_column() -> None:
+    """The binding is skipped; the real table's columns are still extracted."""
+    uses = extract_column_provenance(
+        "WITH today() AS d SELECT EmployeeCode, d FROM dbpcm_warehouse.employee",
+        CATALOG_SCHEMA,
+    )
+    assert ("dbpcm_warehouse.employee", "EmployeeCode") in uses
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT number FROM numbers(6)",
+        "SELECT addMonths(toStartOfMonth(today()), -number) AS m FROM numbers(6)",
+    ],
+)
+def test_pure_generators_extract_determined_empty(sql: str) -> None:
+    """`numbers(N)` generates integers from nothing — it reads no catalog table, so
+    there is nothing for provenance to under-report. This is the zero-filled
+    time-series idiom (scaffold a month range, LEFT JOIN the real data onto it)."""
+    assert extract_column_provenance(sql, CATALOG_SCHEMA) == frozenset()
+
+
+def test_a_generator_joined_to_a_real_table_still_reports_that_table() -> None:
+    """The generator contributes nothing, but it must not swallow its neighbours —
+    admitting the source cannot become a way to hide a real column read."""
+    uses = extract_column_provenance(
+        "WITH m AS (SELECT number AS n FROM numbers(6)) "
+        "SELECT e.EmployeeCode, m.n FROM dbpcm_warehouse.employee AS e, m",
+        CATALOG_SCHEMA,
+    )
+    assert ("dbpcm_warehouse.employee", "EmployeeCode") in uses
+
+
+@pytest.mark.parametrize(
+    ("label", "sql"),
+    [
+        ("generateRandom", "SELECT * FROM generateRandom('a UInt8')"),
+        ("url", "SELECT * FROM url('http://example.invalid/x', CSV)"),
+        ("file", "SELECT * FROM file('/etc/passwd', CSV)"),
+    ],
+)
+def test_non_generator_table_functions_still_fail_closed(label: str, sql: str) -> None:
+    """The allowlist is narrow ON PURPOSE. These read from OUTSIDE the catalog, so
+    what they expose cannot be verified — the exact case the step-6b guard exists
+    for. Widening it to "any table function" would have been the fail-OPEN fix."""
+    with pytest.raises(ProvenanceExtractionError):
+        extract_column_provenance(sql, CATALOG_SCHEMA)
+
+
+def test_select_star_over_a_generator_still_fails_closed() -> None:
+    """Deliberately NOT fixed: `SELECT *` over a source absent from the catalog
+    cannot be expanded, and that is a separate guard (D69/OQ-2) from the
+    table-function one. Explicit projections — what the scaffold idiom actually
+    writes — work; widening star-expansion is a bigger change than this."""
+    with pytest.raises(ProvenanceExtractionError):
+        extract_column_provenance("SELECT * FROM numbers(6)", CATALOG_SCHEMA)

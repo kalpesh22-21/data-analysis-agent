@@ -323,6 +323,78 @@ def _has_select_star(ast: exp.Expression) -> bool:
     return False
 
 
+# Table functions that GENERATE rows from nothing — they read no catalog table, no
+# warehouse data, and no other session's scratch, so a query using one exposes
+# nothing through it. Everything else function-shaped (generateRandom, url, file,
+# remote, s3, system.*) stays fail-closed at step 6b below.
+#
+# Why an allowlist rather than lifting the guard: the guard's real job is "this
+# source is not in the catalog, so I cannot verify what it exposes". For a pure
+# integer generator there is nothing TO expose — the question does not arise. A
+# generator JOINed to a real table still has that table's columns extracted
+# normally, so provenance stays complete.
+#
+# This exists because the zero-filled-series idiom (`FROM numbers(6)` to scaffold a
+# month range) is how ClickHouse writes a gap-free time series, and rejecting it
+# sent the model into rewrite loops — one observed turn burned its whole budget
+# window and returned no answer at all.
+_PURE_GENERATOR_FUNCTIONS = frozenset({"numbers", "numbers_mt", "generate_series", "generateseries"})
+# The synthetic column names those generators project. Kept explicit (not "any
+# column of a generator source") so a real unresolvable column in the same query
+# still fails closed.
+_GENERATOR_COLUMN_NAMES = frozenset({"number", "generate_series"})
+
+
+def _generator_source_name(tbl_node: exp.Table) -> str | None:
+    """The pure-generator function name backing *tbl_node*, or None.
+
+    A table function parses as `Table(this=Anonymous(this=<fn>, ...))` with an EMPTY
+    `.name`, which is exactly what step 6b keys on. Returns the lowercased function
+    name only when it is in `_PURE_GENERATOR_FUNCTIONS`.
+    """
+    inner = tbl_node.this
+    # sqlglot gives `generate_series` a TYPED node while `numbers`/`generateSeries`
+    # stay `Anonymous`, so both shapes have to be recognized — matching only on
+    # `Anonymous` silently missed the snake_case spelling.
+    if isinstance(inner, exp.GenerateSeries):
+        return "generate_series"
+    if isinstance(inner, exp.Anonymous):
+        fn_name = str(inner.this or "").strip().lower()
+        if fn_name in _PURE_GENERATOR_FUNCTIONS:
+            return fn_name
+    return None
+
+
+def _scalar_with_aliases(ast: exp.Expression) -> set[str]:
+    """Names declared by SCALAR `WITH` clauses — `WITH today() AS d`, `WITH 5 AS n`.
+
+    ClickHouse's `WITH <expr> AS <name>` binds an EXPRESSION, not a subquery, and
+    sqlglot parses it as a `CTE` whose `this` is that expression (flagged
+    `scalar=True`) rather than a `Select`. Referencing such a name is a
+    query-internal derived value — no table access — exactly like a SELECT-list
+    computed alias, which `_is_output_alias_reference` already skips.
+
+    Without this the two forms disagreed: `SELECT today() AS d` extracted cleanly
+    while the SEMANTICALLY IDENTICAL `WITH today() AS d SELECT d` failed closed,
+    because the reference sits in the projection list (so rule 1 of
+    `_is_output_alias_reference` correctly refuses to treat it as an alias ref) and
+    the name is absent from the catalog. `WITH 5 AS n SELECT n` failed the same way,
+    which is hard to read as intended.
+
+    Detected structurally (`this` is not a Select/Subquery/Union) rather than via
+    the `scalar` flag, so it does not depend on that flag surviving a sqlglot
+    upgrade. Real CTEs — `WITH x AS (SELECT …)` — are unaffected and keep flowing
+    through `cte_names`.
+    """
+    names: set[str] = set()
+    for cte in ast.find_all(exp.CTE):
+        if not isinstance(cte.this, exp.Select | exp.Subquery | exp.Union):
+            alias = (cte.alias or "").strip()
+            if alias:
+                names.add(alias)
+    return names
+
+
 def _is_output_alias_reference(col_node: exp.Column) -> bool:
     """Return True if an unresolved unqualified column is a provable SELECT-list alias ref.
 
@@ -646,6 +718,11 @@ def extract_column_provenance(
     # Step 5: Collect CTE names (virtual tables; excluded from alias map)
     # ------------------------------------------------------------------
     cte_names = _collect_virtual_table_names(ast_qt)
+    # Names bound by a SCALAR `WITH` (`WITH today() AS d`) — query-internal derived
+    # values, not table access. Collected here so step 8's unqualified-column branch
+    # can skip a reference to one instead of failing closed. See
+    # `_scalar_with_aliases`.
+    scalar_with_names = _scalar_with_aliases(ast_qt)
 
     # ------------------------------------------------------------------
     # Step 6: Build alias -> (table, database) map; validate scratch names
@@ -665,14 +742,25 @@ def extract_column_provenance(
     #           These are not in the catalog and cannot have columns qualified.
     #           Fail-closed (D63).
     # ------------------------------------------------------------------
+    generator_aliases: set[str] = set()
     for tbl_node in ast_qt.find_all(exp.Table):
         tbl_name = (tbl_node.name or "").strip()
         if not tbl_name:
-            # Table with no name — likely a table-valued function (generateRandom, etc.)
-            raise ProvenanceExtractionError(
-                "Query references a table-valued function or anonymous table source. "
-                "Column provenance cannot be extracted — fail-closed (D63)."
-            )
+            generator = _generator_source_name(tbl_node)
+            if generator is None:
+                # Table with no name — a table-valued function (generateRandom, url,
+                # file, remote, …) whose exposure cannot be verified against the
+                # catalog. Fail-closed (D63).
+                raise ProvenanceExtractionError(
+                    "Query references a table-valued function or anonymous table source. "
+                    "Column provenance cannot be extracted — fail-closed (D63)."
+                )
+            # A PURE GENERATOR (numbers/generate_series): reads nothing, so it
+            # contributes no provenance. Record its alias so its own synthetic
+            # columns (`number`, `generate_series`) are not later mistaken for
+            # unresolvable base-table columns.
+            alias = (tbl_node.alias or "").strip()
+            generator_aliases.add(alias or generator)
 
     # ------------------------------------------------------------------
     # Step 7: qualify_columns — resolve unqualified column refs to their table
@@ -805,6 +893,15 @@ def extract_column_provenance(
             elif not (
                 _is_output_alias_reference(col_node)
                 or _references_only_scratch_sources(col_node)
+                # A scalar-`WITH` name (`WITH today() AS d SELECT d`) — a derived
+                # value, no table access. Unlike an output-alias reference this MAY
+                # legitimately sit in the projection list, which is why
+                # `_is_output_alias_reference` alone cannot cover it.
+                or col_name in scalar_with_names
+                # A pure generator's own synthetic column (`number` from
+                # `numbers(6)`): the source reads nothing, so the column exposes
+                # nothing. Only reachable when step 6b admitted the generator.
+                or (generator_aliases and col_name in _GENERATOR_COLUMN_NAMES)
             ):
                 # case (D) — genuinely unresolvable unqualified column.  It is neither a
                 # catalog column, a provable SELECT-list output alias reference, nor a
