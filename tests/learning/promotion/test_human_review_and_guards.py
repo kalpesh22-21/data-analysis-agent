@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from data_agent.learning.candidate import InMemoryCandidateStore
 from data_agent.learning.candidate.models import CandidateStatus
-from data_agent.learning.promotion import PromotionPolicy, PromotionScheduler
+from data_agent.learning.promotion import PromotionScheduler
 
 from .helpers import (
     FakeDependencyResolver,
@@ -18,6 +18,7 @@ from .helpers import (
     FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
+    promotion_policy,
     with_type,
 )
 
@@ -30,7 +31,7 @@ def _scheduler(store, *, probe=None, hits=None, landing_writer=None, require_lan
         probe=probe or FakeWarehouseProbe(),
         hit_counts=FakeHitCountReader(hits or {}),
         dependency_resolver=FakeDependencyResolver(),
-        policy=PromotionPolicy(blueprint_hit_threshold=3),
+        policy=promotion_policy(),
         landing_writer=landing_writer,
         require_landing=require_landing,
         clock=lambda: "2026-07-03T12:00:00+00:00",

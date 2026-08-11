@@ -79,6 +79,9 @@ def _to_doc(artifact: CorpusArtifact) -> dict[str, Any]:
         "uses_rules": list(artifact.uses_rules),
         "status": artifact.status,
         "source": artifact.source,
+        # Written from plan §4 on, as a plain integer for the same reason `hit_count` is:
+        # the sub-document counter below increments it server-side.
+        "recurrence_count": int(artifact.recurrence_count),
     }
 
 
@@ -144,6 +147,30 @@ class CouchbaseBlueprintCorpus:
         except DocumentNotFoundException:
             return
 
+    async def increment_recurrence_count(self, canonical_key: str) -> None:
+        # The SOFT paraphrase counter (plan §4). Atomic server-side, exactly like
+        # `increment_hit_count`, and for the same reason: several concurrent sessions can
+        # be near the same artifact and a read-modify-write would lose updates.
+        #
+        # `create_parents=True` is LOAD-BEARING here in a way it is not for `hit_count`.
+        # Every artifact seeded before this slice has NO `recurrence_count` path at all
+        # and the corpus bucket is durable and never migrated, so a counter mutation
+        # against a legacy document would otherwise fail on a missing path. With the flag
+        # the path is created and initialized to the delta, which is the correct starting
+        # value for "this is the first soft sighting we have recorded".
+        #
+        # NOT verified against a live Couchbase in this slice — the unit suite drives a
+        # spec-recording double, so what is proven here is that the right spec is issued,
+        # not that the server honours it on a legacy doc. A failure would be a lost soft
+        # count on pre-slice artifacts only, on a counter that is weighted 0.0 today.
+        try:
+            await self._collection.mutate_in(
+                _doc_id(canonical_key),
+                [subdoc.increment("recurrence_count", 1, create_parents=True)],
+            )
+        except DocumentNotFoundException:
+            return
+
     async def set_status(self, canonical_key: str, status: str) -> None:
         # NARROW sub-document write on the ONE field (PriorArtIndex Slice 2), for the
         # same three reasons `CandidateStore.stamp_drift` is one: a full-document upsert
@@ -184,3 +211,13 @@ class CouchbaseBlueprintCorpus:
         `hit_count`, or 0 when no artifact is keyed here (nothing has accrued)."""
         artifact = await self.get_by_canonical_key(canonical_key)
         return artifact.hit_count if artifact is not None else 0
+
+    async def recurrence_count(self, canonical_key: str) -> int:
+        """The S9 `RecurrenceCountReader` port (plan §4): the artifact's SOFT paraphrase
+        count, or 0 when no artifact is keyed here.
+
+        Duck-typed onto this store for the same reason `hit_count` is — the scheduler's
+        corroboration gate weighs both counts and they must come from the ONE set of
+        artifacts the dedup stage writes, not from two stores that could diverge."""
+        artifact = await self.get_by_canonical_key(canonical_key)
+        return artifact.recurrence_count if artifact is not None else 0

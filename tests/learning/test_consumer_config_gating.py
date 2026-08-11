@@ -58,6 +58,7 @@ def _fake_learning_settings(
         learning_corpus_username="u" if corpus else "",
         learning_corpus_password="p" if corpus else "",
         learning_dedup_merge_threshold=0.95,
+        learning_recurrence_similarity_threshold=0.90,
         learning_dedup_conflict_threshold=0.83,
         # Coverage judge (plan §3b). Present so this namespace stays a faithful stand-in
         # for `LearningSettings`; the judge itself never builds in these tests because

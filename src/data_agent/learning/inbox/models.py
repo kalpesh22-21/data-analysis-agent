@@ -15,13 +15,14 @@ verdict (what it collided with, if anything).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from ..candidate.models import CandidateEnvelope
 from ..candidate.redaction import entity_free_payload_view, entity_spans, redact_payload
 from ..candidate.verdicts import DedupVerdict, LeakageVerdict
 from ..writer.routing import derive_inbox_reason
+from .ranking import RankedScore, review_score
 
 InboxReason = Literal[
     "knowledge_pre_gate",
@@ -92,6 +93,39 @@ class InboxItem:
     # tell a human-VERIFIED validated learning node (promotable) from an auto-landed one.
     # False for every pre-Phase-3 / auto-landed candidate.
     verified: bool = False
+    # WHY the S9 scheduler routed this candidate, when it knew something the reviewer
+    # cannot otherwise see. `"user_corrected"` or `None` today.
+    #
+    # DISTINCT FROM `reason`, and the pair of names is unfortunate but the distinction is
+    # real: `reason` is the routing CATEGORY, re-derived on every projection from the
+    # writer's own rules so it can never drift from them. `route_reason` is a fact only
+    # the scheduler held, at one moment, and that nothing can reconstruct afterwards — the
+    # user-correction drift stamp is overwritten by the very next replay.
+    #
+    # It is the difference between a reviewer approving a corrected blueprint knowingly
+    # and approving it blind: the approve path re-runs static validation and the golden
+    # replay, and NEITHER can see the value error a user reported.
+    route_reason: str | None = None
+    # The plan-§4 review score + its three axes. DERIVED, never stored — recomputed on
+    # every projection from the two durable stamps (`session_signals`, `novelty`) and the
+    # payload, exactly like `reason` is, and for the same reason: a score persisted next
+    # to the weights that produced it drifts from them the moment either changes, and
+    # nothing would notice.
+    #
+    # Non-optional with a neutral default rather than `None`, because every consumer
+    # (sort key, cutoff, wire projection) would otherwise need the same three-line
+    # None-guard. `RankedScore.measured` is what says whether the numbers mean anything.
+    score: RankedScore = field(
+        default_factory=lambda: RankedScore(
+            score=0.0,
+            novelty=0.0,
+            groundedness=0.0,
+            session_quality=0.0,
+            novelty_measured=False,
+            quality_measured=False,
+            groundedness_measured=False,
+        )
+    )
 
     @classmethod
     def from_envelope(cls, env: CandidateEnvelope) -> InboxItem:
@@ -107,4 +141,6 @@ class InboxItem:
             dedup=env.dedup,
             created_at=env.created_at,
             verified=env.verified,
+            route_reason=env.route_reason,
+            score=review_score(env),
         )

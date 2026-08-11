@@ -13,12 +13,12 @@ import pytest
 
 from data_agent.learning.candidate.models import CandidateStatus
 from data_agent.learning.candidate.verdicts import DriftStamp
-from data_agent.learning.promotion import PromotionPolicy, silent_eligible
+from data_agent.learning.promotion import silent_eligible
 
-from .helpers import make_blueprint_candidate
+from .helpers import make_blueprint_candidate, promotion_policy
 
 NOW = datetime(2026, 7, 3, 12, 0, 0, tzinfo=UTC)
-POLICY = PromotionPolicy(drift_freshness_seconds=86_400.0)  # 24h window
+POLICY = promotion_policy(drift_freshness_seconds=86_400.0)  # 24h window
 
 
 def _drift(status: str, *, ago_seconds: float) -> DriftStamp:

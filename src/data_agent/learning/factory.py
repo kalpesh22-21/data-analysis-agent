@@ -75,7 +75,9 @@ from .promotion import (
     MCPWarehouseProbe,
     PromotionPolicy,
     PromotionScheduler,
+    RecurrenceCountReader,
     WarehouseProbe,
+    policy_from_settings,
 )
 from .queue import LearningQueue
 from .schema_edit import AllPassChecks, GitPullRequestClient, SchemaEditChecks
@@ -338,6 +340,7 @@ def build_learning_consumer(
             prior_art=prior_art,
             merge_threshold=settings.learning_dedup_merge_threshold,
             conflict_threshold=settings.learning_dedup_conflict_threshold,
+            recurrence_threshold=settings.learning_recurrence_similarity_threshold,
             # THE SAME judge instance the consumer screens sessions with — one object,
             # two stages. A split would let the two halves of one candidate's lifetime
             # run under different thresholds and write to different audit stores.
@@ -511,6 +514,7 @@ def build_promotion_plane(
     candidate_store: CandidateStore,
     probe: WarehouseProbe,
     hit_counts: HitCountReader,
+    recurrence_counts: RecurrenceCountReader | None = None,
     dependency_resolver: DependencyResolver | None = None,
     landing_writer: LandingWriter | None = None,
     require_landing: bool = False,
@@ -535,12 +539,19 @@ def build_promotion_plane(
     pre-slice behaviour), which is why every existing caller is unaffected.
 
     *tracer* (optional) wires the scheduler's promote/land span seam; `trace_verbose`
-    is read off `settings.learning_trace_verbose` (D25 gate)."""
+    is read off `settings.learning_trace_verbose` (D25 gate).
+
+    *policy* is optional and is built from *settings* when omitted (plan §4) — see
+    `build_promotion_scheduler`. The SAME policy object is handed to the inbox, because
+    `review_score_cutoff` and the routing threshold are two ends of one decision about how
+    much a reviewer is asked to look at, and reading them from two objects would let a
+    deployment route work into a queue its own cutoff then hides."""
     scheduler = build_promotion_scheduler(
         settings,
         candidate_store=candidate_store,
         probe=probe,
         hit_counts=hit_counts,
+        recurrence_counts=recurrence_counts,
         dependency_resolver=dependency_resolver,
         landing_writer=landing_writer,
         require_landing=require_landing,
@@ -549,7 +560,9 @@ def build_promotion_plane(
         clock=clock,
         tracer=tracer,
     )
-    inbox = build_review_inbox(candidate_store, scheduler=scheduler)
+    inbox = build_review_inbox(
+        candidate_store, scheduler=scheduler, policy=scheduler.policy
+    )
     return scheduler, inbox
 
 
@@ -591,6 +604,14 @@ def build_promotion_write_plane(
         candidate_store=candidate_store,
         probe=probe,
         hit_counts=hit_counts,
+        # The SAME object as `hit_counts` when the caller passed a corpus store, which is
+        # what every real caller does (`CouchbaseBlueprintCorpus` duck-types both ports).
+        # Checked structurally rather than assumed: `hit_counts` is a Protocol parameter
+        # and a caller may legitimately pass a narrow reader, in which case the dormant
+        # soft count simply reads 0 — the shipped weight is 0.0, so nothing changes.
+        recurrence_counts=(
+            hit_counts if hasattr(hit_counts, "recurrence_count") else None  # type: ignore[arg-type]
+        ),
         dependency_resolver=resolver,
         landing_writer=landing_writer,
         require_landing=True,
@@ -607,6 +628,7 @@ def build_promotion_scheduler(
     candidate_store: CandidateStore,
     probe: WarehouseProbe,
     hit_counts: HitCountReader,
+    recurrence_counts: RecurrenceCountReader | None = None,
     dependency_resolver: DependencyResolver | None = None,
     landing_writer: LandingWriter | None = None,
     require_landing: bool = False,
@@ -621,6 +643,14 @@ def build_promotion_scheduler(
     entrypoint via `run_forever(sleep=asyncio.sleep)` (or `run_once` from a cron).
     When wiring the inbox too, prefer `build_promotion_plane` (pins the shared store).
 
+    **The POLICY is built from *settings* when the caller omits it (plan §4).** Before
+    this slice `policy=None` fell through to `PromotionScheduler`'s own
+    `PromotionPolicy()` default, and since no entrypoint ever passed one, every knob on
+    that class was a hardcoded constant wearing a config's clothes. Defaulting HERE — at
+    the composition root, which is the only place that legitimately reads settings —
+    means an operator's `LEARNING_PROMOTION_*` vars take effect without any entrypoint
+    change, while an explicit `policy=` (tests, demos) still wins.
+
     *tracer* (optional) wires the promote/land span seam; `trace_verbose` is read off
     `settings.learning_trace_verbose` (the D25 gate)."""
     extra = {} if clock is None else {"clock": clock}
@@ -628,7 +658,8 @@ def build_promotion_scheduler(
         candidate_store,
         probe=probe,
         hit_counts=hit_counts,
-        policy=policy,
+        recurrence_counts=recurrence_counts,
+        policy=policy if policy is not None else policy_from_settings(settings),
         dependency_resolver=dependency_resolver,
         landing_writer=landing_writer,
         require_landing=require_landing,
@@ -640,7 +671,10 @@ def build_promotion_scheduler(
 
 
 def build_review_inbox(
-    candidate_store: CandidateStore, *, scheduler: PromotionScheduler
+    candidate_store: CandidateStore,
+    *,
+    scheduler: PromotionScheduler,
+    policy: PromotionPolicy | None = None,
 ) -> ReviewInbox:
     """Wire the writer↔inbox↔scheduler linkage: the S7 writer routes to `in_review`,
     the inbox projects those rows, and a human `approve` DELEGATES to the injected
@@ -657,7 +691,15 @@ def build_review_inbox(
             "(the inbox reads it; the scheduler CAS-writes it on approve). Build both "
             "from one store — prefer build_promotion_plane(...)."
         )
-    return ReviewInbox(candidate_store, scheduler=scheduler)
+    # Default to the SCHEDULER's policy rather than to a fresh `PromotionPolicy()`: the
+    # routing threshold and the review cutoff are two ends of one decision, and a fresh
+    # default here would silently apply a cutoff of 0.0 to a deployment that configured
+    # one — a knob turned in the env and ignored at the surface it governs.
+    return ReviewInbox(
+        candidate_store,
+        scheduler=scheduler,
+        policy=policy if policy is not None else scheduler.policy,
+    )
 
 
 def _require_full_pipeline(

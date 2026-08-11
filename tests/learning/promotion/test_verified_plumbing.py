@@ -16,13 +16,14 @@ from data_agent.learning.generalize.mapping import (
     blueprint_seed_from_candidate,
     knowledge_seed_from_candidate,
 )
-from data_agent.learning.promotion import PromotionPolicy, PromotionScheduler
+from data_agent.learning.promotion import PromotionScheduler
 
 from .helpers import (
     FakeHitCountReader,
     FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
+    promotion_policy,
     with_type,
 )
 
@@ -46,7 +47,7 @@ def _scheduler(store, *, writer):
         store,
         probe=FakeWarehouseProbe(),
         hit_counts=FakeHitCountReader({KEY: 5}),
-        policy=PromotionPolicy(blueprint_hit_threshold=3),
+        policy=promotion_policy(),
         landing_writer=writer,
         require_landing=True,
         clock=lambda: "2026-08-01T00:00:00+00:00",
@@ -104,9 +105,16 @@ async def test_human_approve_knowledge_lands_verified_true() -> None:
     assert (await store.get(env.candidate_id)).verified is True
 
 
-async def test_auto_promote_lands_verified_false() -> None:
-    """The cron auto-promotion edge lands `verified=False` on the node AND leaves the
-    store envelope False — an auto-landed node is never silently verified."""
+async def test_the_cron_never_lands_anything_so_nothing_is_auto_verified() -> None:
+    """WAS `test_auto_promote_lands_verified_false`, and the property it guarded is now
+    unreachable rather than merely enforced.
+
+    The concern was that the cron's auto-landing edge might stamp `verified=True` and
+    silently claim a human vouched for a node nobody looked at. Plan §4 removed the edge:
+    the cron routes to `in_review` and never calls `land`, so the only landing path is the
+    human approve — which passes `verified=True` legitimately, because a human is
+    standing right there. The assertion is re-pointed at the absence, since a
+    re-introduced auto-land would restore the original hazard."""
     store = InMemoryCandidateStore()
     env = make_blueprint_candidate(status=CandidateStatus.CANDIDATE, canonical_key=KEY)
     await store.put(env)
@@ -115,6 +123,6 @@ async def test_auto_promote_lands_verified_false() -> None:
 
     sweep = await sched.run_once()
 
-    assert sweep.decisions[0].action == "promote"
-    assert writer.verified_flags == [False]  # the landed node got verified=False
+    assert sweep.decisions[0].action == "route"
+    assert writer.verified_flags == []  # `land` was never called at all
     assert (await store.get(env.candidate_id)).verified is False

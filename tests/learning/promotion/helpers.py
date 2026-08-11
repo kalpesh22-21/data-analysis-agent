@@ -17,9 +17,37 @@ from typing import Any
 
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.candidate.verdicts import DedupVerdict, DriftStamp
-from data_agent.learning.promotion.models import ProbeResult
+from data_agent.learning.config import LearningSettings
+from data_agent.learning.promotion.models import (
+    ProbeResult,
+    PromotionPolicy,
+    policy_from_settings,
+)
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "learning"
+
+
+def promotion_policy(**overrides: Any) -> PromotionPolicy:
+    """THE policy every promotion test builds on — PRODUCTION's, not a literal.
+
+    Roughly fourteen test files used to spell `PromotionPolicy(blueprint_hit_threshold=3)`
+    inline. That was safe only while 3 was also the shipped value; the moment plan §4
+    moved the shipped threshold to 1 those literals became fourteen assertions about a
+    gate production no longer has — all still green, all describing a system that no
+    longer exists. Editing the literals would have re-created the same trap at the next
+    change.
+
+    So the builder resolves the SHIPPED configuration (`policy_from_settings` over
+    `LearningSettings` defaults) and lets a test override only the knob it is actually
+    about. A test that pins `blueprint_hit_threshold=` here is making a deliberate
+    statement about the corroboration gate itself; every other test gets whatever
+    production gets, and fails loudly when that changes.
+
+    `_env_file=None` keeps the unit suite HERMETIC: without it, a developer's `.env` (or
+    a CI secret file) would feed real thresholds into these assertions and the suite
+    would pass or fail depending on the machine.
+    """
+    return replace(policy_from_settings(LearningSettings(_env_file=None)), **overrides)
 
 # The frozen S4 single-blueprint result signature column shape → the replay's
 # expected columns. A passing replay's probe must return exactly these columns.
@@ -116,13 +144,27 @@ class FakeWarehouseProbe:
 
 class FakeHitCountReader:
     """A fake corpus `hit_count` reader keyed by `canonical_key` (D-OQ1). An
-    unknown key reads 0 (a not-yet-landed artifact)."""
+    unknown key reads 0 (a not-yet-landed artifact).
 
-    def __init__(self, counts: dict[str, int] | None = None) -> None:
+    Also duck-types `RecurrenceCountReader` (plan §4) — the SAME shape the production
+    `CouchbaseBlueprintCorpus` has, where one object serves both ports so the two counts
+    can never address different artifact sets. *recurrences* defaults to empty, so a test
+    that says nothing about the soft counter reads 0 for it, which at the shipped
+    `recurrence_weight = 0.0` is what production does anyway."""
+
+    def __init__(
+        self,
+        counts: dict[str, int] | None = None,
+        recurrences: dict[str, int] | None = None,
+    ) -> None:
         self._counts = dict(counts or {})
+        self._recurrences = dict(recurrences or {})
 
     async def hit_count(self, canonical_key: str) -> int:
         return self._counts.get(canonical_key, 0)
+
+    async def recurrence_count(self, canonical_key: str) -> int:
+        return self._recurrences.get(canonical_key, 0)
 
 
 class FakeDependencyResolver:

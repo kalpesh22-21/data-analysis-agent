@@ -17,8 +17,9 @@ Five things are pinned here that the slice's own tests do not cover:
   4. THE RETENTION CLOCK. The Guard-3 verdict write must NOT be a `put`, or a parked
      candidate's 90-day TTL is renewed on a schedule and it becomes immortal — a new
      unbounded-growth vector in exchange for the one the slice removed.
-  5. A PRE-EXISTING DEFECT the rate limit does NOT fix: a user correction is undone by
-     the very next cron cycle.
+  5. A PRE-EXISTING DEFECT the rate limit did not fix: a user correction was undone by
+     the very next cron cycle. FIXED by plan §4's routing change, and re-pointed here to
+     assert the fix (plus the residue the fix does NOT cover).
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ from data_agent.learning.candidate.verdicts import DriftStamp
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.promotion import (
     GRAIN_INTEGRITY,
-    PromotionPolicy,
     PromotionScheduler,
 )
 from data_agent.learning.promotion.drift import _is_fresh
@@ -52,6 +52,7 @@ from .helpers import (
     FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
+    promotion_policy,
     with_type,
 )
 
@@ -117,7 +118,7 @@ async def test_every_held_candidate_is_examined_within_one_rotation_period():
     for i in range(n):
         await store.put(_cheap_hold(i))
     sched = _scheduler(
-        store, clock=TickingClock(), policy=PromotionPolicy(scan_limit=limit)
+        store, clock=TickingClock(), policy=promotion_policy(scan_limit=limit)
     )
 
     period = math.ceil(n / limit)
@@ -142,7 +143,7 @@ async def test_a_newcomer_never_waits_longer_than_one_cycle_however_deep_the_bac
     for i in range(500):
         await store.put(_cheap_hold(i))
     clock = TickingClock()
-    sched = _scheduler(store, clock=clock, policy=PromotionPolicy(scan_limit=200))
+    sched = _scheduler(store, clock=clock, policy=promotion_policy(scan_limit=200))
     await sched.run_once()
     await sched.run_once()
 
@@ -183,7 +184,7 @@ async def test_rotation_stalls_when_every_cursor_is_identical_is_a_known_limitat
     store = InMemoryCandidateStore()
     for i in range(n):
         await store.put(_cheap_hold(i))
-    sched = _scheduler(store, clock=Clock(), policy=PromotionPolicy(scan_limit=limit))
+    sched = _scheduler(store, clock=Clock(), policy=promotion_policy(scan_limit=limit))
 
     per_cycle = [
         {d.candidate_id for d in (await sched.run_once()).decisions} for _ in range(8)
@@ -219,7 +220,7 @@ async def test_the_validated_scan_rotates_too_not_only_the_candidate_scan():
                 created_at=f"2020-01-01T00:00:{n - i:02d}+00:00",
             )
         )
-    sched = _scheduler(store, clock=TickingClock(), policy=PromotionPolicy(scan_limit=limit))
+    sched = _scheduler(store, clock=TickingClock(), policy=promotion_policy(scan_limit=limit))
 
     period = math.ceil(n / limit)
     per_cycle = [
@@ -255,7 +256,7 @@ async def test_a_far_future_cursor_starves_that_candidate_is_a_known_limitation(
             last_scanned_at="2099-01-01T00:00:00+00:00",
         )
     )
-    sched = _scheduler(store, clock=TickingClock(), policy=PromotionPolicy(scan_limit=2))
+    sched = _scheduler(store, clock=TickingClock(), policy=promotion_policy(scan_limit=2))
 
     seen: set[str] = set()
     for _ in range(20):
@@ -381,7 +382,7 @@ async def test_couchbase_store_rotates_under_overload_too():
         docs[env.candidate_id] = env.to_doc()
     store, collection = _cb_store(docs)
     sched = _scheduler(
-        store, clock=TickingClock(), policy=PromotionPolicy(scan_limit=limit)
+        store, clock=TickingClock(), policy=promotion_policy(scan_limit=limit)
     )
 
     period = math.ceil(n / limit)
@@ -404,7 +405,7 @@ async def test_couchbase_store_reaches_a_newcomer_behind_a_full_window():
         env = _cheap_hold(i)
         docs[env.candidate_id] = env.to_doc()
     store, collection = _cb_store(docs)
-    sched = _scheduler(store, clock=TickingClock(), policy=PromotionPolicy(scan_limit=200))
+    sched = _scheduler(store, clock=TickingClock(), policy=promotion_policy(scan_limit=200))
     await sched.run_once()
 
     newcomer = replace(_cheap_hold(999), candidate_id="newcomer")
@@ -552,7 +553,7 @@ async def test_a_mixture_of_stamped_and_never_scanned_never_raises_on_the_first_
         )
 
     sweep = await _scheduler(
-        store, clock=TickingClock(), policy=PromotionPolicy(scan_limit=10)
+        store, clock=TickingClock(), policy=promotion_policy(scan_limit=10)
     ).run_once()
 
     assert len(sweep.decisions) == 6
@@ -569,7 +570,7 @@ async def test_a_clock_that_raises_does_not_abort_the_cycle():
     def _explode() -> str:
         raise RuntimeError("clock unavailable")
 
-    sched = _scheduler(store, clock=_explode, policy=PromotionPolicy())
+    sched = _scheduler(store, clock=_explode, policy=promotion_policy())
 
     sweep = await sched.run_once()
 
@@ -617,9 +618,12 @@ async def test_a_parked_candidate_never_has_its_90_day_ttl_renewed():
     sched = PromotionScheduler(
         store,
         probe=FakeWarehouseProbe(),
-        hit_counts=FakeHitCountReader({KEY: 1}),  # below T ⇒ can NEVER promote
+        hit_counts=FakeHitCountReader({KEY: 1}),
         dependency_resolver=FakeDependencyResolver(),
-        policy=PromotionPolicy(),
+        # Threshold RAISED above the shipped 1 on purpose: this test is about a candidate
+        # that stays PARKED across days of cycles, and at the shipped threshold nothing
+        # parks (see PARKED_POLICY in test_replay_freshness_and_rotation.py).
+        policy=promotion_policy(blueprint_hit_threshold=3),
         clock=clock,
     )
 
@@ -660,7 +664,9 @@ async def test_the_verdict_write_on_a_hold_is_a_stamp_not_an_envelope_put():
         probe=FakeWarehouseProbe(),
         hit_counts=FakeHitCountReader({KEY: 1}),
         dependency_resolver=FakeDependencyResolver(),
-        policy=PromotionPolicy(),
+        # Raised above the shipped 1 for the same reason as the Couchbase mirror above:
+        # the hold path is what is being tested, and nothing holds at threshold 1.
+        policy=promotion_policy(blueprint_hit_threshold=3),
         clock=Clock(),
     )
 
@@ -672,56 +678,65 @@ async def test_the_verdict_write_on_a_hold_is_a_stamp_not_an_envelope_put():
     assert (await store.get(env.candidate_id)).drift.status == "clean"
 
 
-# --- 5. the pre-existing defect the rate limit does NOT fix ---------------------
+# --- 5. the pre-existing defect the rate limit did not fix (plan §4 closed it) ---
 
 
 @pytest.mark.parametrize("with_landing_writer", [False, True])
-async def test_a_user_correction_is_erased_by_the_next_cron_cycle_is_a_known_limitation(
+async def test_a_user_correction_is_no_longer_erased_by_the_next_cron_cycle(
     with_landing_writer,
 ):
-    """KNOWN LIMITATION (pre-existing, HIGH user-visible impact, NOT introduced or
-    closed by the rate-limit slice).
+    """FIXED BY PLAN §4 — as a SIDE EFFECT of the routing change, which is exactly why it
+    is verified here rather than assumed.
 
+    HISTORY. This test was named `..._is_erased_by_the_next_cron_cycle_is_a_known_
+    limitation` and asserted the OPPOSITE of what it asserts now.
     `apply_user_correction` demotes `validated → candidate` and stamps
     `user_correction_stamp` (`suspect`, `probes=()`). The very next `_advance_candidate`
-    then re-runs the guards, and every one of them passes:
+    re-ran the guards, and every one of them passed:
 
       * Guard 0-2 are unchanged by a correction (the entity scan still reads `pass` —
         `strip_entity_bearing` only blanks spans when the S5 verdict HAS hits, so a
         clean candidate keeps its `pass` on the landing path too, which is why this
-        reproduces with AND without a landing writer);
+        reproduced with AND without a landing writer);
       * Guard 3 replays and PASSES — a correction is about a VALUE and the replay is
         structure-only by design (D98: there is no value oracle);
-      * Guard 4 still reads `hit_count >= T`, because a correction does not decrement it.
+      * Guard 4 still read `hit_count >= T`, because a correction does not decrement it.
 
-    So the artifact is re-promoted on the next cycle — about five minutes — and the
-    human's negative signal is silently erased. The demote is not durable; it is a blip.
+    So the artifact was re-promoted to `validated` about five minutes later and the
+    human's negative signal was silently erased.
 
-    The 12h cached-verdict window does NOT delay this even by one cycle, and that is
-    deliberate: `reusable_replay_verdict` refuses to reuse a stamp that does not NAME
-    `grain_integrity`, precisely so a user correction cannot suppress the real structural
-    probe (`test_a_user_correction_stamp_is_not_mistaken_for_a_replay_verdict` pins it).
-    The correct fix is a durable negative signal S9 reads at Guard 4 — a `corrected_at`
-    /`correction_count` field that suppresses AUTO re-promotion and routes the candidate
-    to the S7 human inbox instead. Out of scope here; pinned so it is not rediscovered
-    as new."""
+    **NOT ONE OF THOSE FACTS CHANGED.** The guards still all pass; the replay still
+    returns green; the hit count is still untouched and, at a threshold of 1, is easier
+    to clear than it has ever been. What changed is the DESTINATION: the re-examination
+    routes to `in_review` instead of `validated`. The corrected artifact therefore stops
+    being a recallable artifact and becomes a question for a human, and only a human
+    approve can put it back — which is what a correction should produce.
+
+    WHAT THIS STILL DOES NOT DO, asserted at the bottom so the residue is not mistaken
+    for a complete fix: the correction leaves no durable mark on the ARTIFACT. There is
+    still no `corrected_at`/`correction_count`, the passing replay overwrites the
+    `suspect` drift stamp with `clean`, and the reviewer who opens the resulting inbox
+    item is not told this blueprint was ever corrected. This closes the ERASURE, not the
+    amnesia."""
     store = InMemoryCandidateStore()
     env = await _store_put(
         store,
-        make_blueprint_candidate(status=CandidateStatus.CANDIDATE, canonical_key=KEY),
+        make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY),
     )
     clock = Clock("2026-08-10T12:00:00+00:00")
+    writer = FakeLandingWriter() if with_landing_writer else None
     sched = PromotionScheduler(
         store,
         probe=FakeWarehouseProbe(),
         hit_counts=FakeHitCountReader({KEY: 5}),  # >= T, and a correction does not
         dependency_resolver=FakeDependencyResolver(),  # decrement it
-        policy=PromotionPolicy(),
-        landing_writer=FakeLandingWriter() if with_landing_writer else None,
+        policy=promotion_policy(),
+        landing_writer=writer,
         clock=clock,
     )
 
-    assert (await sched.run_once()).decisions[0].action == "promote"
+    # A human approves it into the corpus — the only edge that reaches `validated`.
+    assert (await sched.apply_human_decision(env, "approve")).action == "approve"
     promoted = await store.get(env.candidate_id)
     assert promoted.status == CandidateStatus.VALIDATED
 
@@ -733,27 +748,49 @@ async def test_a_user_correction_is_erased_by_the_next_cron_cycle_is_a_known_lim
     assert corrected.drift.status == "suspect"
     assert corrected.drift.probes == ()  # not a replay verdict
 
-    # One cron interval later (the shipped cadence is 300s).
+    # One cron interval later (the shipped cadence is 300s). The replay STILL passes and
+    # the count is STILL above the threshold — and the artifact still does not come back.
     clock.iso = "2026-08-10T12:05:00+00:00"
     sweep = await sched.run_once()
 
-    assert sweep.decisions[0].action == "promote", "the correction should have survived"
-    assert (await store.get(env.candidate_id)).status == CandidateStatus.VALIDATED
+    assert sweep.decisions[0].action == "route"
+    assert (
+        await store.get(env.candidate_id)
+    ).status == CandidateStatus.IN_REVIEW, "the correction must survive"
+    if writer is not None:
+        # ...and the LANDED node is left non-recallable: the demote stamped it
+        # `candidate` and the route re-stamped it `in_review`. Neither is `validated`,
+        # which is what the recall filter requires.
+        assert [u[1] for u in writer.status_updates][-1] == CandidateStatus.IN_REVIEW
+
+    # And it stays there — more cycles never re-promote it.
+    for minute in (10, 15, 20, 25):
+        clock.iso = f"2026-08-10T12:{minute}:00+00:00"
+        await sched.run_once()
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+
+    # The drift stamp IS overwritten by the passing replay — that part of the residue is
+    # real and unavoidable, because the replay genuinely ran and genuinely passed.
     assert (await store.get(env.candidate_id)).drift.status == "clean"
+    # ...but the CORRECTION is carried forward independently, so the reviewer is not
+    # adjudicating blind. See the dedicated tests below.
+    assert (await store.get(env.candidate_id)).route_reason == "user_corrected"
 
 
-async def test_the_cached_verdict_window_does_not_even_delay_the_re_promotion():
-    """The follow-up question: does the new 12h rate limit at least BUY TIME on the
-    defect above (a cached `suspect` holding the candidate down for a window)?
+async def test_the_cached_verdict_window_still_does_not_delay_the_re_examination():
+    """The mechanism underneath the fix above, pinned separately so a future change to
+    the replay cache cannot quietly become the thing that appears to hold a correction
+    down.
 
-    No — it does not delay it by a single cycle. A `user_correction_stamp` carries
-    `probes=()`, `reusable_replay_verdict` returns `None` for it, and the real probe runs
-    immediately. The warehouse is queried on the very next cycle after a correction, so
-    the rate limit changes neither the outcome nor its timing."""
+    A `user_correction_stamp` carries `probes=()`, `reusable_replay_verdict` returns
+    `None` for it, and the real probe runs on the very next cycle. So the correction does
+    NOT survive because a cached `suspect` suppresses anything — the warehouse is
+    re-queried five minutes later, it answers green, and the candidate is routed to a
+    human anyway. The durability comes from the destination, not from a timer."""
     store = InMemoryCandidateStore()
     env = await _store_put(
         store,
-        make_blueprint_candidate(status=CandidateStatus.CANDIDATE, canonical_key=KEY),
+        make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY),
     )
     clock = Clock("2026-08-10T12:00:00+00:00")
     probe = FakeWarehouseProbe()
@@ -762,10 +799,10 @@ async def test_the_cached_verdict_window_does_not_even_delay_the_re_promotion():
         probe=probe,
         hit_counts=FakeHitCountReader({KEY: 5}),
         dependency_resolver=FakeDependencyResolver(),
-        policy=PromotionPolicy(),
+        policy=promotion_policy(),
         clock=clock,
     )
-    await sched.run_once()
+    await sched.apply_human_decision(env, "approve")
     await sched.apply_user_correction(await store.get(env.candidate_id))
     probes_before = len(probe.calls)
 

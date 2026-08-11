@@ -106,6 +106,20 @@ def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
         # learning node (promotable) from an auto-landed one. False for every review-queue
         # / archive / auto-landed row.
         "verified": item.verified,
+        # Plan §4: `"user_corrected"` when a human corrected the artifact this candidate
+        # was promoted from and the cron routed it back here, else null. Distinct from
+        # `reason` (the routing CATEGORY) — see `InboxItem.route_reason`. The UI should
+        # render it prominently: the approve path re-runs static validation and the golden
+        # replay, and NEITHER can see the value error the user reported, so this is the
+        # only warning a reviewer gets.
+        "route_reason": item.route_reason,
+        # Plan §4: the review score AND its three axes, not just the composite. A bare
+        # number would make the queue's ordering unfalsifiable — the axes are what let a
+        # reviewer (or an operator debugging a suspicious order) see that a row is high
+        # because it is genuinely novel rather than because nothing could be measured.
+        # `*_measured` distinguishes a real zero from an absent stamp; the UI is expected
+        # to render an unmeasured axis as unknown rather than as a low score.
+        "score": item.score.to_doc(),
     }
 
 

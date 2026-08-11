@@ -111,7 +111,7 @@ from data_agent.learning.observability import (  # noqa: E402
     learning_recall_span,
 )
 from data_agent.learning.promotion.landing import landing_id  # noqa: E402
-from data_agent.learning.promotion.models import PromotionPolicy  # noqa: E402
+from data_agent.learning.promotion.models import policy_from_settings  # noqa: E402
 from data_agent.learning.promotion.token_minter import HttpTokenMinter  # noqa: E402
 from data_agent.learning.sweeper import LearningSweeper  # noqa: E402
 from data_agent.runtime.config import RuntimeSettings  # noqa: E402
@@ -700,12 +700,15 @@ async def _run() -> int:
             f"(canonical_key={ckey[:20]}...)"
         )
 
-        # ============================================================ STAGE 4 — PROMOTE + LAND
-        policy = PromotionPolicy(blueprint_hit_threshold=3)
+        # =================================================== STAGE 4 — ROUTE, APPROVE, LAND
+        # The SHIPPED policy (plan §4): threshold 1, and the cron routes to `in_review`
+        # rather than validating. The two extra increments stay because the demo's whole
+        # point is showing the cross-session counter accrue.
+        policy = policy_from_settings(infra.settings)
         await infra.corpus_store.increment_hit_count(ckey)
         await infra.corpus_store.increment_hit_count(ckey)
 
-        scheduler, _inbox = build_promotion_write_plane(
+        scheduler, inbox = build_promotion_write_plane(
             infra.settings,
             candidate_store=infra.candidate_store,
             hit_counts=infra.corpus_store,
@@ -723,7 +726,7 @@ async def _run() -> int:
             tracer=tracer,  # REAL scheduler tracer seam: promote/land emit their own
             # spans STARTED under the candidate's traceparent → the SAME session trace.
         )
-        validated = None
+        routed = None
         last_decision = None
         for _ in range(30):
             promo = await scheduler.run_once()
@@ -732,8 +735,8 @@ async def _run() -> int:
             d = next((x for x in promo.decisions if x.candidate_id == cid), None)
             if d is not None:
                 last_decision = d
-            validated = await infra.candidate_store.get(cid)
-            if validated is not None and validated.status == "validated":
+            routed = await infra.candidate_store.get(cid)
+            if routed is not None and routed.status == "in_review":
                 break
             await asyncio.sleep(0.5)
         if last_decision is not None:
@@ -742,12 +745,28 @@ async def _run() -> int:
                 f"to_status={getattr(last_decision, 'to_status', None)} "
                 f"reason={getattr(last_decision, 'reason', None)}"
             )
-        if validated is None or validated.status != "validated":
+        if routed is None or routed.status != "in_review":
             reason = getattr(last_decision, "reason", None) if last_decision else None
             print(
-                f"[STAGE 4] candidate did NOT reach 'validated' "
-                f"(status={None if validated is None else validated.status}, "
+                f"[STAGE 4] candidate did NOT reach 'in_review' "
+                f"(status={None if routed is None else routed.status}, "
                 f"decision_reason={reason}). Reporting the traced run; skipping recall."
+            )
+            await _flush_and_confirm(provider, model, sid, stages_done=4, extractor_real=True)
+            return 0
+
+        # The human step the demo is FOR: approve → land. Standing in for a reviewer
+        # clicking approve in the inbox, which is now the only edge that reaches the graph.
+        validated = None
+        try:
+            validated = await inbox.approve(cid)
+        except Exception as exc:  # noqa: BLE001 - a demo reports, never crashes
+            print(f"[STAGE 4] approve did not land: {exc}")
+        if validated is None or validated.status != "validated":
+            print(
+                f"[STAGE 4] candidate did NOT reach 'validated' after approve "
+                f"(status={None if validated is None else validated.status}). "
+                "Reporting the traced run; skipping recall."
             )
             await _flush_and_confirm(provider, model, sid, stages_done=4, extractor_real=True)
             return 0

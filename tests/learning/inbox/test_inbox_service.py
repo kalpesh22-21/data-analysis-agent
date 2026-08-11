@@ -31,13 +31,14 @@ from data_agent.learning.candidate.memory_candidate_store import InMemoryCandida
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.inbox import ReviewInbox
 from data_agent.learning.inbox.service import _build_inbox_from_env, create_inbox_app
-from data_agent.learning.promotion import PromotionPolicy, PromotionScheduler
+from data_agent.learning.promotion import PromotionScheduler
 
 from ..promotion.helpers import (
     FakeHitCountReader,
     FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
+    promotion_policy,
     with_type,
 )
 
@@ -111,6 +112,25 @@ def test_list_returns_exact_wire_shape(enabled: None) -> None:
         "dedup",
         "created_at",
         "verified",
+        # Plan §4: the review score + its axes. Deliberately part of the EXACT wire shape
+        # rather than an extra the UI may ignore — the queue is ordered by it, so a client
+        # that cannot see it cannot explain the order it is rendering.
+        "score",
+        # Plan §4: what the SCHEDULER knew when it routed, which nothing downstream can
+        # reconstruct. `"user_corrected"` or null.
+        "route_reason",
+    }
+    assert set(item["score"]) == {
+        "score",
+        "novelty",
+        "groundedness",
+        "session_quality",
+        "novelty_measured",
+        "quality_measured",
+        "groundedness_measured",
+        # The conjunction the sort partitions on and the cutoff exempts — on the wire so
+        # a UI cannot derive a different one.
+        "measured",
     }
     assert item["type"] == "global_knowledge"
     assert item["status"] == "in_review"
@@ -365,7 +385,7 @@ def test_offline_approve_of_landing_target_503(enabled: None) -> None:
         store,
         probe=FakeWarehouseProbe(),
         hit_counts=FakeHitCountReader(),
-        policy=PromotionPolicy(blueprint_hit_threshold=3),
+        policy=promotion_policy(),
         landing_writer=None,
         require_landing=True,
         clock=lambda: "2026-07-09T00:00:00+00:00",
@@ -459,7 +479,7 @@ def test_approve_happy_path_returns_action_result(enabled: None) -> None:
         store,
         probe=FakeWarehouseProbe(),
         hit_counts=FakeHitCountReader(),
-        policy=PromotionPolicy(blueprint_hit_threshold=3),
+        policy=promotion_policy(),
         landing_writer=writer,
         require_landing=True,
         clock=lambda: "2026-07-09T00:00:00+00:00",
@@ -531,7 +551,7 @@ def _writer_scheduler(store):
         store,
         probe=FakeWarehouseProbe(),
         hit_counts=FakeHitCountReader(),
-        policy=PromotionPolicy(blueprint_hit_threshold=3),
+        policy=promotion_policy(),
         landing_writer=FakeLandingWriter(),
         require_landing=True,
         clock=lambda: "2026-08-01T00:00:00+00:00",

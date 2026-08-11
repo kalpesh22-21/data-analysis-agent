@@ -1,7 +1,7 @@
 # Learning loop: prior art + promotion rework — plan
 
-**Status:** slices 1, 1.x, 1.5, **2**, **2b**, **3a** and **3b** built. Everything below them is designed, not built.
-**Written:** 2026-08-10. Pick up from "Remaining slices" (next: 3c — composites, or 4 — promotion policy).
+**Status:** slices 1, 1.x, 1.5, **2**, **2b**, **3a**, **3b** and **4** built. Everything below them is designed, not built.
+**Written:** 2026-08-10. Pick up from "Remaining slices" (next: 3c — composites, or 3d — restricted SQL restructuring).
 
 ---
 
@@ -444,16 +444,193 @@ re-extractions instead.
 - Extractor names a split; S4 performs the transformation; **recompose and assert equivalence to the accepted SQL**, else decline.
 - Fixes the `_find_literal` gap: `rewrite.py::_find_literal` only searches `_COMPARISONS`, so a slot outside a comparison predicate (`INTERVAL {window_months} MONTH`, `COUNT(...) / {window_months}`) is never parameterized and stays inline. This caps cross-tier matching at 8/10 regardless of key quality.
 
-### 4 — Promotion policy
+### 4 — Promotion policy — **BUILT**
 
-- **`PromotionPolicy` is wired from nowhere.** All three factories accept `policy=`; no entrypoint passes one, so production runs on hardcoded defaults. Build it from `LearningSettings`. Knobs: `routing_threshold`, `review_score_cutoff`, `auto_land_score_threshold`, `recheck_verified_only`, `prior_art_skip_threshold`, `recurrence_weight`.
-- Threshold → 1; `candidate → in_review`; landing only on human approve.
-- Inbox ranking: novelty × groundedness × session-quality. Groundedness = share of parameterization that is `rule`/catalog-resolved vs. free-floating `inline` literals (computable today). Session quality = single-shot accept vs. long struggle, with `outcome == "corrected"` negative.
-- **Novelty must be gated by groundedness.** The most novel candidate is usually the most idiosyncratic — high novelty + low groundedness is a hardcoded one-off, not a discovery. Measure novelty against *landed* artifacts, not sibling candidates, or the first sighting scores novel and its corroborations score redundant (order-dependent).
-- Soft recurrence counter at `recurrence_weight = 0` — inert at 20/day, load-bearing at 7000. Build it now; retrofitting a counter with no history behind it is worse.
-- **Rejection as negative memory.** The `BlueprintCorpus` protocol is `get / seed / increment / list` — no delete, no status write. A rejected candidate's artifact survives and keeps accruing hits, so the same declined idea returns indefinitely. **Prerequisite for loosening the gate.**
-- Migrate ~14 test files off hardcoded `PromotionPolicy(blueprint_hit_threshold=3)`.
-- **Verify this fixes the user-correction erasure** (see Known limitations) — it should, as a side effect.
+Landed as `promotion/models.py::policy_from_settings` + seven `LEARNING_PROMOTION_*` /
+`LEARNING_DRIFT_*` / `LEARNING_REPLAY_*` / `LEARNING_REVIEW_*` settings, a `route`
+decision action on the auto edge, `inbox/ranking.py`, `candidate/signals.py`
+(`SessionSignals` + `NoveltyStamp` as additive envelope stamps), a
+`recurrence_count` on `CorpusArtifact` with its own port and increment, and a shared
+`tests/learning/promotion/helpers.py::promotion_policy` builder every migrated test file
+now uses.
+
+- **`PromotionPolicy` is now wired from `LearningSettings`** at all three factories
+  (defaulted at the composition root, so an explicit `policy=` still wins). Knobs:
+  `routing_threshold`, `recurrence_weight`, `review_score_cutoff`, `scan_limit`,
+  `promotion_interval_seconds`, `drift_freshness_seconds`,
+  `replay_recheck_interval_seconds`.
+- Threshold → 1; `candidate → in_review`; landing only on human approve. Every
+  correctness guard (leakage, static validation, `depends_on`, golden replay) unchanged.
+- Inbox ranking: `novelty × groundedness² × session-quality`, applied to the review queue
+  ONLY (the rejected archive and the Phase-3 validated listing are untouched).
+- Soft recurrence counter shipped at `recurrence_weight = 0.0` and ACCRUED anyway.
+- Rejection as negative memory was already built in slice 2; re-verified here at the
+  loosened gate (`test_rejection_is_negative_memory_qa.py`).
+- **The user-correction erasure is FIXED**, as the predicted side effect. The former
+  known-limitation tripwire is now a plain passing assertion of the new behaviour with the
+  full history in its docstring.
+
+Decisions taken while building, each deliberate:
+
+* **The knobs listed in the original sketch that were NOT built.**
+  `prior_art_skip_threshold` stays on `LearningSettings` where §3b put it — the plan said
+  move them or leave them, never both, and two homes for one threshold means somebody
+  tunes the copy nothing reads. `auto_land_score_threshold` was NOT built: it is an
+  escape hatch back to the auto-landing this slice exists to remove, and building it
+  would have meant keeping the `_recheck_validated` cost problem alive behind a flag.
+  `recheck_verified_only` was NOT built: nothing is validated yet, so it is a cost lever
+  for a cost nobody is paying.
+* **`_corroboration` floors the hit count at 1.** `_read_hit_count` returns 0 when S6
+  could not mint a `canonical_key`. At T=3 that was indistinguishable from "not
+  corroborated yet"; at T=1 it would have been the one class of candidate that could
+  NEVER reach a human — the bug of this slice, in miniature. The candidate in hand IS one
+  sighting, and a keyed first sighting reads 1 only because `_seed_on_insert` wrote that
+  1 on its behalf. It changes no outcome at any threshold above 1.
+* **Novelty is stamped by S6, not computed in the inbox.** The dedup soft layer has
+  already paid for the embed and the ANN query, so measuring it there is free; measuring
+  it at list time would be an embed per row per page view, against a graph that has moved
+  on. It is derived from the GRAPH half of the union alone — never the `learning_corpus`
+  half — because a sibling candidate from a concurrent session is not something we own,
+  and counting it would score the first sighting novel and its corroborations redundant.
+* **`measured` is a first-class flag on both stamps.** "The graph could not be consulted"
+  and "nothing like this exists" are opposite claims and must never render as the same
+  number — the same reasoning `PriorArtUnavailableError` encodes one layer down. An
+  unmeasured axis contributes a constant, which preserves the ordering of the axes that
+  WERE measured, and `RankedScore.measured` says so on the wire.
+* **Groundedness enters the score TWICE.** A plain `novelty × groundedness × quality` is
+  symmetric in its first two terms, so a hardcoded one-off nothing resembles would tie
+  with a reusable template of a familiar question. Novelty is scaled by groundedness
+  before entering the product (`novelty × groundedness²`), which is what "gated by
+  groundedness" has to mean arithmetically.
+* **`review_score_cutoff` filters the LISTING, never the routing.** A routing-time cutoff
+  would be a silent terminal state — a candidate discarded for a score nobody recorded a
+  decision about. A hidden row is still stored, still `in_review`, and reappears when the
+  knob moves.
+* **The landing gate now guards the approve edge ALONE.** Gating the route edge on it
+  would park every candidate at `candidate` with reason `landing_unavailable` in any
+  deployment whose neo4j is not yet wired — the inbox would never fill, which is the exact
+  symptom this slice removes. Routing means the queue fills and each approve 503s honestly.
+* **`DecisionAction` keeps the now-dead `promote`,** and `PromotionSweep.promoted` now
+  reads 0 permanently. Removing it would leave a reader unable to tell a retired edge from
+  a broken counter; `routed` is the counter that moved.
+
+**Measured live** (read-only against the dev graph + the real embedder; the MCP rejects
+every call so the routing edge itself could not be driven end to end). 10 canon
+blueprints, `all-mpnet-base-v2`, the real `Neo4jPriorArtIndex`:
+
+| query | best cosine | novelty |
+|---|---|---|
+| an exact re-derivation of a landed intent | 0.9998 | 0.0002 |
+| a plausible NEW HR question | 0.7411 | 0.2589 |
+| a genuinely unrelated question | 0.5869 | 0.4131 |
+| total nonsense | 0.5342 | 0.4658 |
+
+The stamp discriminates correctly, and it does NOT use the top of its range: sentence
+cosines over English prose floor around 0.53, so novelty lives in ~`[0, 0.47]` and a
+PERFECT candidate scores about **0.26**. `review_score_cutoff` must therefore be set from
+measured data — a moderate-sounding 0.5 would hide the whole queue. Documented in the
+knob's own description and pinned in
+`test_the_score_does_not_use_the_top_of_its_range_is_a_known_limitation`.
+
+**Found by review + QA and fixed during the slice:**
+
+* **The unmeasured-novelty neutral inverted the whole ranking.** An unmeasured axis
+  contributes 1.0 while measured novelty tops out near 0.47, so a candidate nobody could
+  measure outranked every candidate we knew something about — permanently, and by
+  construction rather than by accident, since a writer-routed `global_knowledge` item has
+  neither a dedup verdict nor a parameterization and is therefore unmeasured on two of
+  three axes. A non-zero cutoff then removed the honest rows first. Fixed by PARTITIONING
+  the sort on `RankedScore.measured` before any score is compared, and by exempting
+  unmeasured rows from the cutoff (a cutoff judges a score; an unmeasured row has none).
+  The original "a constant preserves the ordering of the axes that were measured" was
+  true within one candidate and false across candidates — which is the only place a
+  ranking exists.
+* **A non-zero cutoff that empties a non-empty queue now WARNS.** The knob is easy to
+  misjudge precisely because the score does not use the top of its range.
+* **`ReviewInbox` re-created the split-policy trap one level down** — `policy or
+  PromotionPolicy()` silently gave a directly-constructed inbox cutoff 0.0 even when its
+  scheduler was configured. It now inherits `scheduler.policy`.
+* **The correction is CARRIED to the reviewer, not merely survived.** Routing to review is
+  what stops a corrected artifact re-landing, but it also makes a human the only remaining
+  gate — and the approve path re-runs static validation and the golden replay, neither of
+  which can see a value error. `_advance_candidate` now captures the user-correction drift
+  stamp BEFORE Guard 3 overwrites it (a passing replay is the expected outcome, so the
+  evidence is destroyed in-flight) and carries `route_reason="user_corrected"` onto the
+  envelope, the route decision and the inbox item. STICKY — never cleared by a later clean
+  cycle.
+* **`ranking.py`'s title stated the plain product** the module exists not to implement.
+* **THE APPROVE EDGE HAD NO LEAKAGE GUARD AT ALL** (QA; three strict-xfails, now plain
+  passing assertions). `_entity_scan_is_clean` was referenced exactly once in the
+  scheduler — the auto edge's Guard 0 — and this slice narrowed landing to the approve
+  edge, so the only remaining door into the corpus was the unguarded one. An empty span
+  set switches off BOTH D17 layers at once and silently: `strip_entity_bearing` becomes a
+  no-op and the landing writer's last-gate tripwire receives nothing to check, so raw
+  entity-bearing text lands in a corpus the agent recalls from.
+
+  **Filed as an accepted limitation and rejected as one on review.** A strict-xfail says
+  "we know, we accept this, tell us when it changes" — right for the scratch-join gap,
+  wrong for a live path carrying unscanned entity data into the recall corpus. Nothing has
+  leaked (no session has ever run), but "accepted limitation" was the wrong label to
+  commit.
+
+  Fixed with `_entity_scan_is_actionable` as the approve edge's Guard 2, positioned as the
+  PRECONDITION of the span capture and the strip rather than beside the structural guards.
+  **The predicate is neither `settled` nor `clean`, and the first attempt at it was
+  wrong.** A "settled" guard closes the `pending` symptom and leaves open a settled
+  finding that names no spans — a scanner asserting a leak it did not localize, which
+  `gate._decide` really does emit (`reroute` on a `user_fact` classification, `quarantine`
+  as its fallback, neither consulting whether `hits` is empty). Deriving from what the
+  strip CONSUMES gives the rule that covers both: an empty span set is safe **iff a clean
+  `pass` explains the emptiness**.
+
+  The asymmetry with the auto edge is deliberate policy, not an oversight. The auto edge
+  demands a clean `pass` because nobody is looking. The approve edge admits a LOCALIZED
+  finding, because D58b routes 100% of leakage near-misses to a human precisely so a
+  person decides — demanding a pass would make `reason=leakage_near_miss` a permanently
+  un-approvable dead end — and because a localized finding is the state in which the
+  machinery works and the reviewer is genuinely informed. It refuses an unsettled scan
+  outright: `_leakage_view` renders one as `result="pass"`, so a human "deciding with
+  their eyes open" is reading a pass for a scan that never ran.
+
+  Consequence, deliberate: both refused shapes are REJECT-ONLY (there is no re-scan action
+  in the inbox). Reject stays ungated — it writes no content and is the only terminal move
+  those candidates have.
+
+  **Enumerated rather than spot-fixed**, since QA named only the blueprint branch:
+  content-creating corpus writes are `land()` alone, reached only via `_land_and_promote`,
+  reached only from approve's two branches (blueprint and `global_knowledge`) — both
+  covered, because guards 1-4 run before the type split. `update_status`, `mark_verified`
+  and `set_status` write a status string or a bool keyed by a deterministic id and cannot
+  introduce content. `apply_retract`, `apply_verify` and `apply_promote` each require
+  `status == validated`, which only approve produces, so they INHERIT the guarantee — an
+  inheritance now pinned by a test, because it stops holding the day any other edge learns
+  to write `validated`.
+
+**Residues, named:**
+
+- A **paraphrase of a rejected idea still returns** (pinned in
+  `test_rejection_is_negative_memory_qa.py`). Negative memory is keyed; a different
+  derivation of the same question mints a different key, the graph holds no node (a
+  rejected candidate never landed), and the soft layer deliberately skips the dead
+  artifact. The only mechanism that could catch it is a cosine drop, which this codebase
+  refuses everywhere else. The honest fix is a rejection REASON in the review UI.
+- The user correction is no longer erased and IS now carried to the reviewer
+  (`route_reason`), but it is still **not counted**: there is no
+  `corrected_at`/`correction_count`, so a second correction of the same artifact is
+  indistinguishable from the first and nothing escalates. The passing replay still
+  overwrites the `suspect` drift stamp — unavoidable, since the replay genuinely ran and
+  genuinely passed.
+- The soft recurrence counter has **no per-sighting idempotency**: a re-processed
+  candidate (redelivery, re-enqueue, peer race, pipeline re-run) re-bumps every near
+  artifact, so the stored count is sightings plus redelivery noise. Harmless at weight
+  0.0; closing it needs a per-`(artifact, content_hash)` marker, a store change rather
+  than a knob change. Noted beside the knob in three places.
+- **The inbox LIMIT is applied by the store, before the ranking.** Past 100 `in_review`
+  rows the caller ranks the oldest 100, not the best 100. Identical below that; fixing it
+  properly means materializing the score and ranking server-side.
+- The new `LEARNING_PROMOTION_*` settings are **not in the Helm values** (nor are §3b's
+  judge knobs). The shipped defaults ARE the intended posture, so this is a gap in
+  discoverability, not in behaviour.
 
 ### Later, with triggers
 
@@ -461,7 +638,8 @@ re-extractions instead.
 |---|---|
 | S4 scratch handling — a `extract_column_provenance_for_template` entry point taking known-local relation names | **2b**. Unreachable today. |
 | Atomic blueprints in the learning loop | Judge verdicts skewing to `existing-plus-delta`. **Now measurable** (3b): `SELECT verdict, count(*) FROM \`learning_audit\` WHERE record_type = 'judge_verdict' GROUP BY verdict`. |
-| Guard-4 negative signal (`corrected_at`/`correction_count`) | Confirm slice 4's routing change doesn't already fix it. |
+| Guard-4 negative signal (`corrected_at`/`correction_count`) | CONFIRMED: slice 4's routing change fixes the ERASURE. What remains is the AMNESIA — nothing tells the reviewer the artifact was corrected. Trigger: a reviewer asking "why is this back in my queue?" |
+| A rejection REASON in the review UI | A paraphrase of a rejected idea still returns (slice 4 residue). |
 
 ---
 
@@ -472,6 +650,8 @@ One `strict=True` xfail remains — it flips to a CI failure the moment it is fi
 - `tests/learning/generalize/test_scratch_join_s4_limitation_qa.py::test_the_loop_can_learn_the_canon_scratch_join_blueprint` → after 2b
 
 FIXED in 3a: `tests/learning/extractor/test_slot_type_mirror_drift_qa.py::test_the_extractor_slot_type_mirror_matches_the_runtime` was the second one. It is now a plain passing parity assertion; the file keeps the full before/after history in its module docstring.
+
+FIXED in 4: QA filed THREE strict xfails in `tests/learning/promotion/test_nothing_auto_lands_qa.py` for the missing leakage guard on the approve edge. They were rejected as accepted limitations — a live path carrying unscanned entity text into the recall corpus is not something to label "known and accepted" — and all three are now plain passing assertions under their original names, with the history and the two-shapes-of-fix story in the module docstring. The count is back to one.
 
 NEW in 3a — `period_range` is withdrawn, pinned in two places rather than xfailed (both are plain passing assertions on the CURRENT behaviour, per the house convention for a named limitation):
 
@@ -498,7 +678,11 @@ Plus named `..._is_a_known_limitation` tests asserting current behaviour:
 
 **Deployment:** `scripts/learning-candidates-init.sh` must be re-run wherever the earlier two-key `idx_candidates_status_scanned` was provisioned — it no longer matches the query and would leave the rotation read doing a full sort. The script creates the replacement before dropping the old one, so there is no window without a rotation index.
 
-**User corrections are erased in ~5 minutes** (`tests/learning/promotion/test_scan_rotation_and_correction_qa.py`). `apply_user_correction` demotes `validated → candidate` with a suspect stamp; the next cycle re-runs the guards, the replay **passes** (the correction was about a value; replay is structure-only by design), `hit_count` is unchanged, and it re-promotes. Confirmed end to end, with and without a landing writer. Slice 1.5's replay cache does **not** delay it — `user_correction_stamp` writes `probes=()` and verdict reuse requires `grain_integrity` among the probes, deliberately, so a correction cannot suppress the structural probe. **The feedback path does not currently work at all.**
+**User corrections WERE erased in ~5 minutes** — FIXED in slice 4, and the test in
+`tests/learning/promotion/test_scan_rotation_and_correction_qa.py` is now a plain passing
+assertion of the fix rather than of the limitation. The description below is the history,
+kept because none of its facts changed; only the DESTINATION did. What still does not
+happen is any durable record of the correction (see slice 4's residues). `apply_user_correction` demotes `validated → candidate` with a suspect stamp; the next cycle re-runs the guards, the replay **passes** (the correction was about a value; replay is structure-only by design), `hit_count` is unchanged, and it re-promotes. Confirmed end to end, with and without a landing writer. Slice 1.5's replay cache does **not** delay it — `user_correction_stamp` writes `probes=()` and verdict reuse requires `grain_integrity` among the probes, deliberately, so a correction cannot suppress the structural probe. **The feedback path does not currently work at all.**
 
 ---
 

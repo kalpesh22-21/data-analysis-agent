@@ -34,7 +34,6 @@ from data_agent.learning.candidate.models import CandidateEnvelope, CandidateSta
 from data_agent.learning.candidate.verdicts import DriftStamp
 from data_agent.learning.promotion import (
     GRAIN_INTEGRITY,
-    PromotionPolicy,
     PromotionScheduler,
 )
 
@@ -44,17 +43,34 @@ from .helpers import (
     FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
+    promotion_policy,
     with_type,
 )
 
 KEY = "sha256:single-bp"
 DAY = 86_400.0
 
-# A 12h re-check window inside a 24h trust window (the shipped defaults).
-POLICY = PromotionPolicy(
-    blueprint_hit_threshold=3,
+# A 12h re-check window inside a 24h trust window (the shipped defaults). Built from the
+# shared production-derived builder rather than from literals, so a change to the shipped
+# routing threshold shows up here instead of being masked by a hardcoded 3.
+POLICY = promotion_policy(
     replay_recheck_interval_seconds=43_200.0,
     drift_freshness_seconds=DAY,
+)
+
+# The same policy with the corroboration gate deliberately RAISED above the shipped 1.
+#
+# Several tests here are about what happens to a candidate that is PARKED — the drift
+# verdict is cached, the cheap guards keep running, the hold write is a narrow stamp
+# rather than a full put. At the shipped threshold of 1 nothing parks: every candidate
+# clears Guard 4 on its first examination and leaves the candidate scan, so those tests
+# would silently stop exercising the behaviour they are named for. Raising the threshold
+# is the honest way to reach that state, and it says out loud that the state is now
+# reachable only under a raised threshold.
+PARKED_POLICY = promotion_policy(
+    replay_recheck_interval_seconds=43_200.0,
+    drift_freshness_seconds=DAY,
+    blueprint_hit_threshold=3,
 )
 
 
@@ -117,7 +133,9 @@ async def test_fresh_verdict_reuses_the_stamp_and_never_touches_the_warehouse():
         drift=_clean_stamp("2026-08-10T06:00:00+00:00"),  # 6h old, window is 12h
     )
     probe = FakeWarehouseProbe()
-    sched = _scheduler(store, probe=probe, clock=clock, hits={KEY: 1})
+    sched = _scheduler(
+        store, probe=probe, clock=clock, hits={KEY: 1}, policy=PARKED_POLICY
+    )
 
     sweep = await sched.run_once()
 
@@ -243,8 +261,7 @@ async def test_reuse_window_is_clamped_to_the_trust_window():
     )
     probe = FakeWarehouseProbe()
     # Misconfigured: a 30-day re-check interval inside a 24h trust window.
-    bad = PromotionPolicy(
-        blueprint_hit_threshold=3,
+    bad = promotion_policy(
         replay_recheck_interval_seconds=30 * DAY,
         drift_freshness_seconds=6 * 3600.0,  # 6h trust window
     )
@@ -275,10 +292,13 @@ async def test_unparseable_clock_degrades_to_always_replaying():
 
 
 async def test_promotion_on_a_reused_verdict_keeps_the_original_check_timestamp():
-    """A blueprint that crosses the hit threshold while its verdict is cached still
-    promotes — but the landed stamp keeps the timestamp of the probe that actually
-    ran. Re-dating it to now would claim a probe that did not happen and hand the
-    silent fast path a full trust window it did not earn."""
+    """A blueprint that crosses the corroboration threshold while its verdict is cached
+    still advances — but the stamp it carries forward keeps the timestamp of the probe
+    that actually ran. Re-dating it to now would claim a probe that did not happen and
+    hand the silent fast path a full trust window it did not earn.
+
+    (Plan §4 moved the destination to `in_review`; the stamp rule is unchanged, and it
+    still matters, because the human-approve edge reuses that verdict.)"""
     store = InMemoryCandidateStore()
     clock = Clock("2026-08-10T12:00:00+00:00")
     env = await _seed(
@@ -291,9 +311,9 @@ async def test_promotion_on_a_reused_verdict_keeps_the_original_check_timestamp(
 
     sweep = await sched.run_once()
 
-    assert sweep.decisions[0].action == "promote"
+    assert sweep.decisions[0].action == "route"
     promoted = await store.get(env.candidate_id)
-    assert promoted.status == CandidateStatus.VALIDATED
+    assert promoted.status == CandidateStatus.IN_REVIEW
     assert promoted.drift.last_drift_check_at == "2026-08-10T06:00:00+00:00"
     assert probe.calls == []
 
@@ -329,9 +349,9 @@ async def test_cheap_guards_still_run_while_the_replay_is_cached():
     sched = _scheduler(store, probe=probe, clock=clock, hits={KEY: 5}, deps=resolved)
     sweep = await sched.run_once()
 
-    assert sweep.decisions[0].action == "promote"
-    assert (await store.get(env.candidate_id)).status == CandidateStatus.VALIDATED
-    assert probe.calls == []  # promoted on the CACHED verdict; the guard was live
+    assert sweep.decisions[0].action == "route"
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+    assert probe.calls == []  # advanced on the CACHED verdict; the guard was live
 
 
 # --- the validated re-check obeys the same rate limit -------------------------
@@ -413,7 +433,8 @@ async def test_a_passing_replay_must_not_switch_off_the_demote_convergence_re_as
     # Below T, so the blueprint can NEVER re-promote and re-land: the re-assert is the
     # only thing left that could ever repair the node.
     sched = _scheduler(
-        store, probe=FakeWarehouseProbe(), clock=clock, hits={KEY: 1}, writer=writer
+        store, probe=FakeWarehouseProbe(), clock=clock, hits={KEY: 1}, writer=writer,
+        policy=PARKED_POLICY,
     )
 
     await sched.apply_user_correction(env)
@@ -602,7 +623,10 @@ async def test_a_replay_reaching_hold_records_its_verdict_without_a_full_put():
         make_blueprint_candidate(status=CandidateStatus.CANDIDATE, canonical_key=KEY),
     )
     puts_before = store.put_calls
-    sched = _scheduler(store, probe=FakeWarehouseProbe(), clock=Clock(), hits={KEY: 1})
+    sched = _scheduler(
+        store, probe=FakeWarehouseProbe(), clock=Clock(), hits={KEY: 1},
+        policy=PARKED_POLICY,
+    )
 
     sweep = await sched.run_once()
 
@@ -634,7 +658,10 @@ async def test_a_superseded_candidate_is_not_resurrected_by_its_own_verdict_stam
 
     racing = _SupersedeMidCycle()
     await racing.put(env)
-    sched = _scheduler(racing, probe=FakeWarehouseProbe(), clock=Clock(), hits={KEY: 1})
+    sched = _scheduler(
+        racing, probe=FakeWarehouseProbe(), clock=Clock(), hits={KEY: 1},
+        policy=PARKED_POLICY,
+    )
 
     await sched.run_once()
 
@@ -688,5 +715,5 @@ async def test_a_cursor_write_failure_never_changes_the_cycles_decision():
 
     sweep = await sched.run_once()
 
-    assert sweep.decisions[0].action == "promote"
-    assert (await store.get(env.candidate_id)).status == CandidateStatus.VALIDATED
+    assert sweep.decisions[0].action == "route"
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW

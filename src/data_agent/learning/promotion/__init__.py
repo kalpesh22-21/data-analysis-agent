@@ -31,7 +31,9 @@ from .models import (
     ProbeResult,
     PromotionPolicy,
     PromotionSweep,
+    RecurrenceCountReader,
     WarehouseProbe,
+    policy_from_settings,
 )
 from .replay import ReplayOutcome, golden_replay
 from .scheduler import PromotionScheduler
@@ -60,6 +62,7 @@ __all__ = [
     "PromotionPolicy",
     "PromotionScheduler",
     "PromotionSweep",
+    "RecurrenceCountReader",
     "ReplayOutcome",
     "TokenMintError",
     "TokenMinter",
@@ -68,6 +71,7 @@ __all__ = [
     "drift_from_replay",
     "golden_replay",
     "landing_id",
+    "policy_from_settings",
     "reusable_replay_verdict",
     "silent_eligible",
     "user_correction_stamp",

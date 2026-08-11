@@ -19,7 +19,7 @@ import yaml
 from data_agent.learning.candidate.memory_candidate_store import InMemoryCandidateStore
 from data_agent.learning.candidate.models import CandidateStatus
 from data_agent.learning.inbox import InboxTransitionError, ReviewInbox
-from data_agent.learning.promotion import PromotionPolicy, PromotionScheduler
+from data_agent.learning.promotion import PromotionScheduler
 from data_agent.learning.promotion.landing import landing_id
 
 from ..promotion.helpers import (
@@ -27,6 +27,7 @@ from ..promotion.helpers import (
     FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
+    promotion_policy,
     with_type,
 )
 
@@ -38,7 +39,7 @@ def _wired_inbox(store, writer=None) -> ReviewInbox:
         store,
         probe=FakeWarehouseProbe(),
         hit_counts=FakeHitCountReader({KEY: 5}),
-        policy=PromotionPolicy(blueprint_hit_threshold=3),
+        policy=promotion_policy(),
         landing_writer=writer,
         require_landing=writer is not None,
         clock=lambda: "2026-08-01T00:00:00+00:00",

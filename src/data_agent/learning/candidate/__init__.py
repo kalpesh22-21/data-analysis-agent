@@ -9,6 +9,7 @@ from .generalization import (
 )
 from .memory_candidate_store import InMemoryCandidateStore
 from .models import CandidateEnvelope, CandidateStatus, build_envelope, mint_candidate_id
+from .signals import NoveltyStamp, SessionSignals
 from .store import CandidateStore
 from .verdicts import DedupVerdict, DriftStamp, EntityHit, LeakageVerdict
 
@@ -23,7 +24,9 @@ __all__ = [
     "InMemoryCandidateStore",
     "LeakageVerdict",
     "NodeTemplate",
+    "NoveltyStamp",
     "ResultGrainStamp",
+    "SessionSignals",
     "StaticValidation",
     "build_envelope",
     "mint_candidate_id",

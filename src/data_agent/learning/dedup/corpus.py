@@ -9,6 +9,9 @@ nodes in Layer 2/3), keyed by `canonical_key`. S6 asks it two things:
   * `increment_hit_count` — on a hard-key hit, bump the EXISTING artifact's
     `hit_count` (it lives on the artifact, a cross-session aggregate — NOT on the
     envelope, §11.1). The duplicate candidate is then dropped.
+  * `increment_recurrence_count` — on a SOFT (intent-similarity) sighting, bump the
+    dormant paraphrase counter (plan §4). Same store, different event; see
+    `CorpusArtifact.recurrence_count`.
   * `set_status` — the S9 TERMINAL transitions (reject/retire) stamp the artifact dead
     so it stops surfacing as live prior art (PriorArt Slice 2).
 
@@ -49,6 +52,26 @@ class CorpusArtifact:
     # Both default to the values every pre-existing seeded artifact implicitly had.
     status: str = "extracted"
     source: str = "learning"
+    # --- the SOFT recurrence counter (plan §4). A sibling of `hit_count`, deliberately
+    # NOT a replacement for it, and it counts a different event:
+    #
+    #   hit_count        — a session minted the BYTE-IDENTICAL canonical key. Exact
+    #                      normalized-AST equality over four inputs; race-safe; the input
+    #                      to the promotion corroboration gate today.
+    #   recurrence_count — a session's INTENT came within
+    #                      `recurrence_similarity_threshold` cosine of this artifact's
+    #                      intent without producing its key. "Somebody asked this again,
+    #                      in different SQL."
+    #
+    # The hard count is the reason nothing has ever been corroborated: two analysts
+    # asking one business question through slightly different SQL mint different keys and
+    # never see each other. This counter is the loose version of the same evidence.
+    #
+    # It is DORMANT at `recurrence_weight = 0.0` (the shipped default) and is being
+    # accrued anyway, on purpose: a counter that starts counting the day someone decides
+    # to use it has no history behind it, so its first month of readings are all zeros
+    # and indistinguishable from "this never recurs".
+    recurrence_count: int = 0
 
     @property
     def is_terminal(self) -> bool:
@@ -82,6 +105,9 @@ class CorpusArtifact:
             uses_rules=tuple(doc.get("uses_rules", []) or []),
             status=str(doc.get("status") or "extracted"),
             source=str(doc.get("source") or "learning"),
+            # Every doc written before plan §4 lacks this key entirely, and 0 is the
+            # honest reading: no soft recurrence has been recorded for it.
+            recurrence_count=int(doc.get("recurrence_count") or 0),
         )
 
 
@@ -102,6 +128,20 @@ class BlueprintCorpus(Protocol):
 
     async def increment_hit_count(self, canonical_key: str) -> None:
         """Bump the hit_count of the artifact at `canonical_key` (D48 `increment`)."""
+        ...
+
+    async def increment_recurrence_count(self, canonical_key: str) -> None:
+        """Bump the SOFT recurrence counter of the artifact at `canonical_key` (plan §4).
+
+        Called by the S6 soft layer for each surviving artifact whose intent came within
+        the recurrence band of the candidate being adjudicated — a paraphrase sighting,
+        as opposed to `increment_hit_count`'s byte-identical one. Same tolerated-no-op
+        contract as `increment_hit_count`: a vanished artifact is not an error.
+
+        Deliberately its OWN method rather than a flag on `increment_hit_count`: the two
+        counts feed the SAME gate at different weights, and one call site that could
+        write either would be one place to conflate them.
+        """
         ...
 
     async def set_status(self, canonical_key: str, status: str) -> None:
@@ -132,6 +172,7 @@ class InMemoryBlueprintCorpus:
             self._by_key[art.canonical_key] = art
         # Audit trail for tests: which keys were incremented / seeded, in order.
         self.increment_calls: list[str] = []
+        self.recurrence_calls: list[str] = []
         self.seed_calls: list[str] = []
         self.status_calls: list[tuple[str, str]] = []
 
@@ -154,6 +195,15 @@ class InMemoryBlueprintCorpus:
             # a tolerated no-op, never a crash (fail-soft posture, D52).
             return
         self._by_key[canonical_key] = replace(art, hit_count=art.hit_count + 1)
+
+    async def increment_recurrence_count(self, canonical_key: str) -> None:
+        self.recurrence_calls.append(canonical_key)
+        art = self._by_key.get(canonical_key)
+        if art is None:
+            return  # a vanished artifact — tolerated no-op, mirroring hit_count
+        self._by_key[canonical_key] = replace(
+            art, recurrence_count=art.recurrence_count + 1
+        )
 
     async def set_status(self, canonical_key: str, status: str) -> None:
         self.status_calls.append((canonical_key, status))

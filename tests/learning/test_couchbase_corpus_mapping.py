@@ -109,6 +109,12 @@ def test_doc_mapping_round_trips():
         "uses_rules": ["active_employee"],
         "status": "extracted",
         "source": "learning",
+        # Plan §4's dormant soft recurrence counter. Always written as a plain int, never
+        # omitted, so every doc THIS store creates already has the path the sub-document
+        # counter increments. Docs written before the field existed lack it, which is why
+        # `increment_recurrence_count` passes `create_parents=True` — and why the
+        # pre-status legacy test below must keep loading.
+        "recurrence_count": 0,
     }
     assert CorpusArtifact.from_doc(doc) == art
 

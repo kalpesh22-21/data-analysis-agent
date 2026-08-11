@@ -52,6 +52,15 @@ def full_plane(monkeypatch):
         learning_corpus_username = "u"
         learning_corpus_password = "p"
         learning_trace_verbose = False
+        # Plan §4: the composition root builds a `PromotionPolicy` from settings, so this
+        # stub must model those fields too. Values are the shipped defaults.
+        learning_promotion_routing_threshold = 1
+        learning_promotion_recurrence_weight = 0.0
+        learning_promotion_scan_limit = 200
+        learning_promotion_interval_seconds = 300.0
+        learning_drift_freshness_seconds = 86_400.0
+        learning_replay_recheck_interval_seconds = 43_200.0
+        learning_review_score_cutoff = 0.0
 
     class _Runtime:
         mcp_url = "http://mcp"

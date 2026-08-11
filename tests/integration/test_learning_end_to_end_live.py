@@ -57,7 +57,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 import pytest
@@ -75,7 +75,7 @@ from data_agent.learning.models import (
     compute_content_hash,
 )
 from data_agent.learning.promotion.landing import landing_id
-from data_agent.learning.promotion.models import PromotionPolicy
+from data_agent.learning.promotion.models import policy_from_settings
 from data_agent.learning.promotion.token_minter import HttpTokenMinter
 from data_agent.learning.sweeper import LearningSweeper
 from data_agent.runtime.config import RuntimeSettings
@@ -489,12 +489,16 @@ async def test_learning_loop_learns_a_question_end_to_end_live(infra: _Infra) ->
     # Drive hit_count to the threshold T via the DURABLE corpus counter (the exact
     # atomic server-side +1 the S6 cross-session accrual uses; cross-session accrual
     # itself is proven by test_learning_pipeline_live). 1 seeded + 2 = 3 = T.
-    policy = PromotionPolicy(blueprint_hit_threshold=3)
+    # An EXPLICIT threshold above the shipped 1: this live test drives the
+    # corroboration gate itself (it seeds three sightings and asserts the count), which
+    # the shipped configuration cannot exercise because every candidate clears T=1 on its
+    # first sighting.
+    policy = replace(policy_from_settings(infra.settings), blueprint_hit_threshold=3)
     await infra.corpus_store.increment_hit_count(ckey)
     await infra.corpus_store.increment_hit_count(ckey)
     assert await infra.corpus_store.hit_count(ckey) == policy.blueprint_hit_threshold
 
-    scheduler, _inbox = build_promotion_write_plane(
+    scheduler, inbox = build_promotion_write_plane(
         infra.settings,
         candidate_store=infra.candidate_store,
         hit_counts=infra.corpus_store,
@@ -505,29 +509,42 @@ async def test_learning_loop_learns_a_question_end_to_end_live(infra: _Infra) ->
         model_id=_MODEL,
         policy=policy,
     )
+    # PLAN §4: the cron ROUTES to `in_review`; only a human approve lands. So this stage
+    # is now two steps, and the second one is the point — a live end-to-end that stopped
+    # at `in_review` would prove the queue fills but never that anything reaches the
+    # graph, which is what stages 4 and 5 exist for.
+    #
     # The scheduler scans candidates via an N1QL `list_by_status` (same eventually-
     # consistent GSI as the sweeper), so the just-consumed candidate can be momentarily
-    # invisible. Retry `run_once` until OUR candidate is promoted (authoritative via the
-    # KV `get` → `validated`); capture the promote DECISION on the cycle it fires.
-    promote_decision = None
-    validated = None
+    # invisible. Retry `run_once` until OUR candidate is routed (authoritative via the KV
+    # `get` → `in_review`); capture the route DECISION on the cycle it fires.
+    route_decision = None
+    routed = None
     for _ in range(30):
         promo = await scheduler.run_once()
         assert not promo.disabled
         d = next((x for x in promo.decisions if x.candidate_id == cid), None)
-        if d is not None and d.action == "promote":
-            promote_decision = d
-        validated = await infra.candidate_store.get(cid)
-        if validated is not None and validated.status == "validated":
+        if d is not None and d.action == "route":
+            route_decision = d
+        routed = await infra.candidate_store.get(cid)
+        if routed is not None and routed.status == "in_review":
             break
         await asyncio.sleep(0.5)
-    assert validated is not None and validated.status == "validated", (
-        "candidate never reached validated within the retry budget "
-        f"(status={None if validated is None else validated.status})"
+    assert routed is not None and routed.status == "in_review", (
+        "candidate never reached the review queue within the retry budget "
+        f"(status={None if routed is None else routed.status})"
     )
-    if promote_decision is not None:  # the cycle that promoted it was observed directly
-        assert promote_decision.action == "promote", promote_decision
-        assert promote_decision.to_status == "validated"
+    if route_decision is not None:  # the cycle that routed it was observed directly
+        assert route_decision.action == "route", route_decision
+        assert route_decision.to_status == "in_review"
+
+    # A human approves it — the ONE edge that lands into neo4j. This re-runs the entity
+    # strip, the depends_on guard, static validation and a REAL golden replay against
+    # live ClickHouse before anything is written.
+    validated = await inbox.approve(cid)
+    assert validated is not None and validated.status == "validated", (
+        f"approve did not validate (status={None if validated is None else validated.status})"
+    )
 
     # The :Blueprint node is really in neo4j, distinguishable as loop-landed.
     async with infra.neo4j_driver.session() as s:
@@ -542,8 +559,9 @@ async def test_learning_loop_learns_a_question_end_to_end_live(infra: _Infra) ->
     assert row["created_by"] == "learning"
     assert row["src"] == cid
     assert row["status"] == "validated"
-    print(f"[STAGE 4] PROMOTED + LANDED: replay-gated against live ClickHouse → validated; "
-          f":Blueprint {node_id} in real neo4j (created_by=learning, source={cid})")
+    print(f"[STAGE 4] ROUTED → REVIEWED → LANDED: cron routed to in_review, human approve "
+          f"replay-gated against live ClickHouse → validated; :Blueprint {node_id} in real "
+          f"neo4j (created_by=learning, source={cid})")
 
     # ================================================================= STAGE 5 — RECALL
     query_vector = (await infra.embedder.embed([_RELATED_QUESTION]))[0]
@@ -576,7 +594,27 @@ async def test_learning_loop_learns_a_question_end_to_end_live(infra: _Infra) ->
         assert not any(c.id == node_id for c in after), (
             "a demoted blueprint must no longer be recallable (the forget path)"
         )
-        print(f"[STAGE 5 BONUS] DEMOTED via scheduler → candidate; recall now EXCLUDES "
-              f"{node_id} (the loop's forget path closes)")
+
+        # PLAN §4 — and the correction STAYS applied. The next cron cycle re-runs every
+        # guard, the live replay passes again (a correction is about a VALUE, D98), and
+        # the hit count is still 3 — yet the blueprint does not come back, because the
+        # cron's only destination is the review queue. This is the live counterpart of
+        # `test_a_user_correction_is_no_longer_erased_by_the_next_cron_cycle`.
+        for _ in range(30):
+            await scheduler.run_once()
+            after_cron = await infra.candidate_store.get(cid)
+            if after_cron is not None and after_cron.status == "in_review":
+                break
+            await asyncio.sleep(0.5)
+        assert after_cron is not None and after_cron.status in ("candidate", "in_review"), (
+            f"a corrected blueprint must never auto-return to validated (status="
+            f"{None if after_cron is None else after_cron.status})"
+        )
+        still_gone = await index.recall(query_vector=query_vector, kind="blueprint", k=30)
+        assert not any(c.id == node_id for c in still_gone), (
+            "a corrected blueprint must stay un-recallable across cron cycles"
+        )
+        print(f"[STAGE 5 BONUS] DEMOTED via scheduler → candidate → re-routed to in_review; "
+              f"recall still EXCLUDES {node_id} across cron cycles (the correction sticks)")
     finally:
         await index.close()

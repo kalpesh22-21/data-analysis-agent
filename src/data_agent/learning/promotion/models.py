@@ -25,6 +25,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol
 
+from ..config import LearningSettings
+
 if TYPE_CHECKING:
     from ..candidate.models import CandidateEnvelope
 
@@ -37,7 +39,13 @@ BLUEPRINT_TYPE = "blueprint"
 # A `CandidateDecision.action` — the transition (or non-transition) the scheduler
 # applied to one candidate this cycle.
 DecisionAction = Literal[
-    "promote",  # candidate → validated (guards all passed)
+    "route",  # candidate → in_review (guards all passed; a human decides — plan §4)
+    # candidate → validated. RETIRED FROM THE AUTO PATH by plan §4 and kept in the
+    # vocabulary deliberately: `PromotionSweep.promoted` and any dashboard over it now
+    # read 0 permanently, and a reader who found the action missing entirely would have
+    # no way to tell a retired edge from a broken counter. Nothing emits it today; the
+    # `→ validated` edge is `approve`.
+    "promote",
     "hold",  # stays candidate (below threshold / replay-fail / deps unresolved / …)
     "demote",  # validated → candidate (drift suspect / replay-fail / user correction)
     "drift_clean",  # validated stays validated; drift re-stamped clean+fresh
@@ -52,11 +60,55 @@ DecisionAction = Literal[
 
 @dataclass(frozen=True)
 class PromotionPolicy:
-    """Tunable promotion knobs (config, not constants — D-OQ1 posture)."""
+    """Tunable promotion knobs (config, not constants — D-OQ1 posture).
 
-    # T for blueprints (D-OQ1 provisional). global_knowledge/schema_edit are T=∞
-    # (HUMAN_GATED_TYPES); user_knowledge auto-commits elsewhere (S8).
-    blueprint_hit_threshold: int = 3
+    **Built from `LearningSettings` by `policy_from_settings`, which the three promotion
+    factories now call by default.** Until plan §4 every factory accepted a `policy=` and
+    no entrypoint passed one, so production ran on the dataclass defaults and every knob
+    here was decorative. Anything added to this class must be reachable from an env var,
+    or it is not a knob.
+    """
+
+    # The CORROBORATION threshold. Named `blueprint_hit_threshold` for its origin (D-OQ1's
+    # hard hit count) and read from `LEARNING_PROMOTION_ROUTING_THRESHOLD`, whose default
+    # is 1. global_knowledge/schema_edit are T=∞ (HUMAN_GATED_TYPES) and never reach it;
+    # user_knowledge auto-commits elsewhere (S8).
+    #
+    # It was 3 and it was unreachable. The hard key is a SHA-256 over
+    # `(resolves, uses_rules, result_grain, canonical_ast_norm)` — exact normalized-AST
+    # equality — so three sessions had to produce a byte-identical AST for a candidate to
+    # clear it. Two analysts asking the same business question through slightly different
+    # SQL mint different keys and never corroborate each other. No candidate has ever
+    # cleared it, so nothing has ever reached a human.
+    #
+    # Lowering it is only safe BECAUSE the edge it gates changed at the same time: the
+    # auto path now ends at `in_review`, not `validated`, so what this threshold rations
+    # is a human's attention, not corpus trust. Every correctness guard (leakage, static
+    # validation, `depends_on`, golden replay) is unchanged and still runs.
+    blueprint_hit_threshold: int = 1
+    # Weight applied to the SOFT (intent-similarity) recurrence count when computing
+    # corroboration. `hit_count + recurrence_weight * recurrence_count` is compared
+    # against the threshold above.
+    #
+    # DORMANT at 0.0, deliberately and by default. At <20 sessions/day the threshold is 1
+    # and every candidate clears it on its own first sighting, so a second corroboration
+    # signal changes nothing. At ~7000/day the threshold rises and this becomes the thing
+    # that lets a paraphrase corroborate — which is the whole reason the hard count
+    # failed. The COUNTER is accrued now regardless of the weight (see
+    # `CorpusArtifact.recurrence_count`), because a counter switched on with no history
+    # behind it reads as "this never recurs" for its first month.
+    #
+    # **KNOWN BEFORE YOU RAISE THIS: the counter has no per-sighting idempotency.**
+    # `hit_count` is bumped once per hard-key HIT and the candidate is then dropped, so a
+    # redelivery of the same session collapses to one increment. The soft counter is
+    # bumped by `DedupStage._bump_recurrence` for every near artifact on every pass, and
+    # a candidate that survives dedup (`merge`, `conflict`, `insert`) can be re-processed
+    # — a queue redelivery, a re-enqueue, a peer race, a pipeline re-run — and will
+    # re-bump every one of them. So the stored count is "sightings PLUS redelivery noise",
+    # biased upward and unbounded by session count. Harmless at weight 0.0; at a non-zero
+    # weight it means a flapping session can corroborate itself. Deduplicating it needs a
+    # per-(artifact, content_hash) marker, which is a store change, not a knob change.
+    recurrence_weight: float = 0.0
     # `fresh(last_drift_check_at)` window for the silent-eligibility predicate — how
     # STALE a drift verdict may be and still be TRUSTED on the blueprint fast path.
     drift_freshness_seconds: float = 86_400.0  # 24h (provisional)
@@ -84,6 +136,17 @@ class PromotionPolicy:
     scan_limit: int = 200
     # run_forever cadence (its OWN knob, mirroring the sweeper's interval).
     promotion_interval_seconds: float = 300.0
+    # Minimum `review_score` (plan §4) an `in_review` candidate must carry to appear in
+    # the default inbox listing. 0.0 = show everything, which is the shipped posture: at
+    # <20 sessions/day a human skims the whole list in minutes and a cutoff would only
+    # hide work.
+    #
+    # Applied at LIST time, never at routing time, and that placement is the safety
+    # property. A routing-time cutoff would be a silent terminal state — a candidate
+    # discarded for a score nobody recorded a decision about. A list filter hides rows
+    # that are still there, still queryable by status, and reappear the moment the knob
+    # moves.
+    review_score_cutoff: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -123,6 +186,9 @@ class PromotionSweep:
 
     @property
     def promoted(self) -> int:
+        """Count of the retired `candidate → validated` auto edge — permanently 0 since
+        plan §4. Kept so an existing reader gets a truthful zero rather than an
+        AttributeError; `routed` is the counter that moved."""
         return self._count("promote")
 
     @property
@@ -136,6 +202,16 @@ class PromotionSweep:
     @property
     def drift_clean(self) -> int:
         return self._count("drift_clean")
+
+    @property
+    def routed(self) -> int:
+        """How many candidates this cycle were routed to the human review queue.
+
+        Its OWN counter rather than a rename of `promoted`: after plan §4 the auto path
+        ends at `in_review`, and a dashboard that kept reading `promoted` would report
+        zero forever while the loop worked perfectly. `promoted` still counts the
+        `→ validated` edge, which now happens only on a human approve."""
+        return self._count("route")
 
 
 # --- injected ports (Protocols; Layer-1 fakes = live path) --------------------
@@ -167,6 +243,23 @@ class HitCountReader(Protocol):
     promotion guard."""
 
     async def hit_count(self, canonical_key: str) -> int: ...
+
+
+class RecurrenceCountReader(Protocol):
+    """Reads the SOFT (intent-similarity) recurrence count from the corpus artifact
+    (plan §4) — the paraphrase sibling of `HitCountReader`.
+
+    Its OWN port rather than a second method on `HitCountReader`, because every existing
+    fake and production double implements that Protocol structurally: widening it would
+    turn a Protocol change into a runtime `AttributeError` at the one call site that
+    matters, in a cron nobody watches. `CouchbaseBlueprintCorpus` duck-types BOTH, and
+    the composition roots pass the SAME object as both — the two counts must address the
+    same set of artifacts or the corroboration sum is nonsense.
+
+    OPTIONAL on the scheduler. Absent ⇒ the recurrence term reads 0, which at the shipped
+    `recurrence_weight = 0.0` is arithmetically identical to having one."""
+
+    async def recurrence_count(self, canonical_key: str) -> int: ...
 
 
 class CorpusStatusWriter(Protocol):
@@ -239,6 +332,32 @@ class LandingWriter(Protocol):
     async def mark_verified(self, env: CandidateEnvelope) -> bool: ...
 
 
+def policy_from_settings(settings: LearningSettings) -> PromotionPolicy:
+    """Build the promotion policy from env-var configuration (plan §4).
+
+    THE point of this function: before it existed, `PromotionPolicy` was accepted by all
+    three promotion factories and passed by no entrypoint, so every knob on it was
+    hardcoded in a dataclass default and no operator could reach any of them. A knob that
+    cannot be turned is documentation, not configuration.
+
+    Deliberately NOT here: the coverage-judge thresholds (`LEARNING_JUDGE_*`). The plan
+    listed `prior_art_skip_threshold` among this class's knobs, but §3b put the judge's
+    settings on `LearningSettings` precisely because a knob that can silently cancel an
+    extraction had to be live from its first deploy and this class was not. They stay
+    there. Two homes for one threshold is strictly worse than one awkward home — a reader
+    who finds the wrong copy tunes a value nothing reads.
+    """
+    return PromotionPolicy(
+        blueprint_hit_threshold=settings.learning_promotion_routing_threshold,
+        recurrence_weight=settings.learning_promotion_recurrence_weight,
+        drift_freshness_seconds=settings.learning_drift_freshness_seconds,
+        replay_recheck_interval_seconds=settings.learning_replay_recheck_interval_seconds,
+        scan_limit=settings.learning_promotion_scan_limit,
+        promotion_interval_seconds=settings.learning_promotion_interval_seconds,
+        review_score_cutoff=settings.learning_review_score_cutoff,
+    )
+
+
 __all__ = [
     "BLUEPRINT_TYPE",
     "HUMAN_GATED_TYPES",
@@ -251,5 +370,7 @@ __all__ = [
     "ProbeResult",
     "PromotionPolicy",
     "PromotionSweep",
+    "RecurrenceCountReader",
     "WarehouseProbe",
+    "policy_from_settings",
 ]

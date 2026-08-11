@@ -39,7 +39,7 @@ from data_agent.learning.observability import (
     inject_current_traceparent,
     land_span,
 )
-from data_agent.learning.promotion import PromotionPolicy, PromotionScheduler
+from data_agent.learning.promotion import PromotionScheduler
 from data_agent.learning.promotion.landing import landing_id
 from data_agent.learning.summary.models import TurnSummary
 from data_agent.learning.sweeper import LearningSweeper
@@ -58,6 +58,7 @@ from .promotion.helpers import (
     FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
+    promotion_policy,
 )
 
 _KEY = "sha256:single-bp"
@@ -184,7 +185,7 @@ def _traced_scheduler(store, *, tracer, trace_verbose: bool):
         store,
         probe=FakeWarehouseProbe(),
         hit_counts=FakeHitCountReader({_KEY: 5}),
-        policy=PromotionPolicy(blueprint_hit_threshold=3),
+        policy=promotion_policy(),
         landing_writer=FakeLandingWriter(),
         require_landing=True,
         clock=lambda: "2026-07-05T00:00:00+00:00",
@@ -196,7 +197,13 @@ def _traced_scheduler(store, *, tracer, trace_verbose: bool):
 async def test_candidate_carries_traceparent_and_scheduler_continues_trace(span_exporter, tracer):
     """[traces-chained-one-trace-per-session] The extracting consume span's
     traceparent is stamped on the CandidateEnvelope (round-trips through to_doc)
-    and the scheduler's promote/land spans CONTINUE that same trace."""
+    and the scheduler's promote/land spans CONTINUE that same trace.
+
+    Driven through the HUMAN-APPROVE edge since plan §4: that is the edge that lands, so
+    it is the only one that emits a `learning.land` span. The cron's own edge is covered
+    by `test_the_route_edge_continues_the_session_trace_too` below — both matter, because
+    the whole point of the traceparent is that a session's learning story stays in ONE
+    trace no matter which edge advances it."""
     store = InMemoryCandidateStore()
 
     # Capture a traceparent from a root span, as the consumer does at extraction.
@@ -206,7 +213,7 @@ async def test_candidate_carries_traceparent_and_scheduler_continues_trace(span_
     parent_trace_id = context_from_traceparent(traceparent)  # sanity: extractable
 
     env = replace(
-        make_blueprint_candidate(status=CandidateStatus.CANDIDATE, canonical_key=_KEY),
+        make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=_KEY),
         traceparent=traceparent,
     )
     # Round-trips through the persisted doc.
@@ -215,8 +222,8 @@ async def test_candidate_carries_traceparent_and_scheduler_continues_trace(span_
 
     sched = _traced_scheduler(store, tracer=tracer, trace_verbose=False)
 
-    sweep = await sched.run_once()
-    assert sweep.decisions[0].action == "promote"
+    decision = await sched.apply_human_decision(env, "approve")
+    assert decision.action == "approve"
     assert (await store.get(env.candidate_id)).status == CandidateStatus.VALIDATED
 
     spans = _by_name(span_exporter)
@@ -227,6 +234,31 @@ async def test_candidate_carries_traceparent_and_scheduler_continues_trace(span_
     # land is nested under promote.
     assert spans["learning.land"].parent.span_id == spans["learning.promote"].context.span_id
     assert parent_trace_id is not None  # extraction produced a usable parent context
+
+
+async def test_the_route_edge_continues_the_session_trace_too(span_exporter, tracer):
+    """[traces-chained-one-trace-per-session] The plan-§4 cron edge (`candidate →
+    in_review`) is the transition that now happens to EVERY candidate, so if it did not
+    continue the session's trace, the trace would end at extraction for almost everything.
+    It emits a `learning.promote` span with `action=route` and NO land span (it lands
+    nothing)."""
+    store = InMemoryCandidateStore()
+    with tracer.start_as_current_span("consume-root"):
+        traceparent = inject_current_traceparent()
+    env = replace(
+        make_blueprint_candidate(status=CandidateStatus.CANDIDATE, canonical_key=_KEY),
+        traceparent=traceparent,
+    )
+    await store.put(env)
+    sched = _traced_scheduler(store, tracer=tracer, trace_verbose=False)
+
+    sweep = await sched.run_once()
+
+    assert sweep.decisions[0].action == "route"
+    spans = _by_name(span_exporter)
+    assert spans["learning.promote"].attributes["learning.promote.action"] == "route"
+    assert spans["learning.promote"].context.trace_id == spans["consume-root"].context.trace_id
+    assert "learning.land" not in spans
 
 
 async def test_job_and_envelope_traceparent_round_trip(span_exporter, tracer):
@@ -318,18 +350,18 @@ async def test_verbose_on_sets_human_readable_attrs(
 async def test_verbose_off_scheduler_promote_land_shape_only(span_exporter, tracer):
     """[traces-verbose-off-is-d25-shape-only] The scheduler's promote/land spans — the
     thinnest gate — carry NO entity-bearing attribute with verbose OFF (the
-    consumer-only guard above never exercises these span types)."""
+    consumer-only guard above never exercises these span types). Driven through the
+    human-approve edge, the only one that emits a land span since plan §4."""
     store = InMemoryCandidateStore()
     with tracer.start_as_current_span("consume-root"):
         traceparent = inject_current_traceparent()
-    await store.put(
-        replace(
-            make_blueprint_candidate(status=CandidateStatus.CANDIDATE, canonical_key=_KEY),
-            traceparent=traceparent,
-        )
+    env = replace(
+        make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=_KEY),
+        traceparent=traceparent,
     )
+    await store.put(env)
     sched = _traced_scheduler(store, tracer=tracer, trace_verbose=False)
-    await sched.run_once()
+    await sched.apply_human_decision(env, "approve")
 
     spans = _by_name(span_exporter)
     for name in ("learning.promote", "learning.land"):

@@ -84,6 +84,17 @@ emitted for a judge-dropped candidate exactly as it would be otherwise: it faith
 reports what DEDUP decided, and the drop is reported on the `learning.judge` span. So a
 dedup span is not a claim that the candidate survived the pipeline.
 
+**Two plan-§4 side outputs ride along, because this is the only stage that has already
+paid for the embed and the graph query.**
+
+  * `envelope.novelty` — the inbox-ranking novelty axis, computed from the GRAPH cards
+    ALONE (never the bucket half). See `_soft_layer` and `_novelty_from`.
+  * `CorpusArtifact.recurrence_count` — a DORMANT (weight 0.0) counter of paraphrase
+    sightings, bumped for each `learning_corpus` artifact inside the recurrence band.
+    See `_bump_recurrence`.
+
+Neither can change a dedup verdict, and both fail soft.
+
 The stage only adjudicates BLUEPRINTS (both keys are AST-derived). Non-blueprint targets
 pass through untouched (`dedup` stays `None`); the writer stage routes them.
 
@@ -99,6 +110,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 
 from ..candidate.models import CandidateEnvelope
+from ..candidate.signals import NoveltyStamp
 from ..candidate.verdicts import DedupVerdict
 from ..judge import CoverageJudge
 from ..observability import dedup_span
@@ -127,6 +139,18 @@ _DEFAULT_CONFLICT_THRESHOLD = 0.83
 # ever uses the single best card, and every extra card is a row neo4j sorts and a row a
 # future judge would have to be shown. Enough to survive a couple of near-ties.
 _DEFAULT_PRIOR_ART_LIMIT = 5
+
+# Cosine at/above which a candidate's intent counts as a SOFT recurrence sighting of an
+# existing artifact (plan §4). A constructor default, like the bands above; the
+# composition root passes `LearningSettings.learning_recurrence_similarity_threshold`.
+#
+# Set BELOW the merge band (0.95) and ABOVE the conflict band (0.83) on purpose. The soft
+# counter exists precisely because the hard key never fires, so it must catch the
+# paraphrase pair that mints two different canonical keys — those measure around 0.96 in
+# practice (QA measured a real one at 0.9645). Setting it at the conflict band would
+# count "vaguely related question" as a recurrence and make the counter meaningless
+# before anyone ever looks at it.
+_DEFAULT_RECURRENCE_THRESHOLD = 0.90
 
 
 class _EmbeddingClient:  # structural doc only — the injected embedder duck-types this
@@ -255,6 +279,24 @@ def _card_from_artifact(artifact: CorpusArtifact, *, similarity: float) -> Prior
     )
 
 
+def _novelty_from(graph_cards: list[PriorArtCard], *, measured: bool) -> NoveltyStamp:
+    """The plan-§4 novelty stamp from the LANDED (graph) prior-art cards.
+
+    Scored on `confidence`, not raw `similarity`, for exactly the reason
+    `_adjudicate_cards` is: a cosine taken across two embedding spaces carries no
+    information, and letting a meaningless 0.97 declare a genuinely-new blueprint
+    unoriginal would push the most valuable candidate to the bottom of the review queue.
+
+    *measured* is threaded through from whether the index was actually CONSULTED, not
+    inferred from the card list being empty. `[]` from a healthy index is the strongest
+    possible novelty claim ("nothing like this has landed"); `[]` from an index that
+    raised is no claim at all, and the two must never render as the same number."""
+    if not measured:
+        return NoveltyStamp()
+    best = max((card.confidence for card in graph_cards), default=0.0)
+    return NoveltyStamp.from_best_similarity(best, compared_against=len(graph_cards))
+
+
 class ThresholdConfigError(ValueError):
     """Raised when the soft-layer bands are ordered such that one is unreachable."""
 
@@ -273,6 +315,7 @@ class DedupStage:
         merge_threshold: float = _DEFAULT_MERGE_THRESHOLD,
         conflict_threshold: float = _DEFAULT_CONFLICT_THRESHOLD,
         prior_art_limit: int = _DEFAULT_PRIOR_ART_LIMIT,
+        recurrence_threshold: float = _DEFAULT_RECURRENCE_THRESHOLD,
         judge: CoverageJudge | None = None,
         tracer: object | None = None,
     ) -> None:
@@ -296,6 +339,7 @@ class DedupStage:
         self._merge_threshold = merge_threshold
         self._conflict_threshold = conflict_threshold
         self._prior_art_limit = max(1, prior_art_limit)
+        self._recurrence_threshold = recurrence_threshold
         # Plan §3b. Optional and default-absent: with none wired this stage behaves
         # exactly as it did before the slice, and no model is ever called from here.
         self._judge = judge
@@ -366,6 +410,16 @@ class DedupStage:
         structural = await self._structural_layer(env, hard_key=hard_key)
         if structural is not None:
             verdict, card = structural
+            # A structural hit is an IDENTITY claim against a GRAPH node — i.e. against
+            # something that has landed — so novelty is 0.0 and it is MEASURED. Stamping
+            # it here rather than leaving it `None` matters: layer 2 short-circuits the
+            # soft layer, so this is the only place a structurally-redundant candidate
+            # can be told apart from one nobody could measure (plan §4).
+            env = replace(
+                env,
+                dedup=verdict,
+                novelty=NoveltyStamp(novelty=0.0, measured=True, compared_against=1),
+            )
             if verdict.action == "redundant_with_canon":
                 # DROP without touching the corpus: there is no artifact to increment,
                 # and seeding one would record a canon blueprint as a learning artifact.
@@ -373,16 +427,16 @@ class DedupStage:
                     env, verdict, tier=card.tier, matched_status=card.status,
                     matched_origin=card.origin,
                 )
-                return StageResult(replace(env, dedup=verdict), "drop")
+                return StageResult(env, "drop")
             self._observe(
                 env, verdict, tier=card.tier, matched_status=card.status,
                 matched_origin=card.origin,
             )
-            return StageResult(replace(env, dedup=verdict), "continue")
+            return StageResult(env, "continue")
 
         # Layer 3 — the soft near-miss band.
-        verdict, card, cards = await self._soft_layer(env, hard_key=hard_key)
-        env = replace(env, dedup=verdict)
+        verdict, card, cards, novelty = await self._soft_layer(env, hard_key=hard_key)
+        env = replace(env, dedup=verdict, novelty=novelty)
 
         # Layer 3b (plan §3b) — the optional model adjudication, ambiguous band only.
         # BEFORE `_seed_on_insert`, deliberately: a candidate the judge discards must not
@@ -563,7 +617,7 @@ class DedupStage:
 
     async def _soft_layer(
         self, env: CandidateEnvelope, *, hard_key: str
-    ) -> tuple[DedupVerdict, PriorArtCard | None, list[PriorArtCard]]:
+    ) -> tuple[DedupVerdict, PriorArtCard | None, list[PriorArtCard], NoveltyStamp]:
         """Embedding near-miss adjudication on `intent` over the UNION of both soft
         sources — the neo4j prior-art index AND the `learning_corpus` bucket.
 
@@ -595,15 +649,33 @@ class DedupStage:
         Handing over the assembled list rather than a search handle is what keeps the
         judge adjudicating EXACTLY what dedup banded, and pays the embed once.
 
+        The FOURTH element is the inbox-ranking novelty stamp (plan §4), and it is
+        computed from the GRAPH half ALONE — never from the union. That asymmetry is the
+        point: novelty must be measured against what has LANDED, because measuring it
+        against sibling candidates would score the first sighting of an idea as novel and
+        each of its corroborations as redundant, an ordering-dependent answer that gets
+        the sign of the evidence backwards. It is computed here because this is the one
+        place in the pipeline that has already paid for the embed and the ANN query.
+
         Degrades to `insert` on an empty intent, both sources empty, or ANY failure —
         never a wrong merge. An index that RAISES is logged loudly and simply contributes
         nothing to the union; the bucket half still runs, which is why the fail-open path
-        is now strictly a subset of the healthy path rather than a different one."""
+        is now strictly a subset of the healthy path rather than a different one. In that
+        window the novelty stamp reports `measured=False` rather than "maximally novel":
+        a candidate we could not compare must not be ranked as a discovery."""
         intent = _text(env.payload.get("intent"))
         if not intent:
-            return DedupVerdict(hard_key, None, 0.0, "insert", "soft"), None, []
+            # Nothing to embed, so nothing to be novel WITH RESPECT TO — an unmeasured
+            # stamp, not a zero. (An intent-less blueprint is separately un-rankable.)
+            return (
+                DedupVerdict(hard_key, None, 0.0, "insert", "soft"),
+                None,
+                [],
+                NoveltyStamp(),
+            )
 
         graph_cards: list[PriorArtCard] = []
+        graph_consulted = False
         if self._prior_art is not None:
             try:
                 graph_cards = list(
@@ -619,6 +691,8 @@ class DedupStage:
                     "landed learning tier while this persists.",
                     exc_info=True,
                 )
+            else:
+                graph_consulted = True
 
         bucket_cards = await self._corpus_cards(
             intent=intent,
@@ -629,7 +703,7 @@ class DedupStage:
         )
         cards = graph_cards + bucket_cards
         verdict, matched = self._adjudicate_cards(cards, hard_key=hard_key)
-        return verdict, matched, cards
+        return verdict, matched, cards, _novelty_from(graph_cards, measured=graph_consulted)
 
     def _adjudicate_cards(
         self, cards: list[PriorArtCard], *, hard_key: str
@@ -697,6 +771,10 @@ class DedupStage:
         kept — it is the richer projection (a real tier, status, `verified`, structural
         key) where the bucket card has only a name and a cosine.
 
+        **It has ONE side effect**, and it is here rather than in the caller because this
+        is where the (artifact, cosine) pairs exist: each near-matched artifact gets its
+        dormant soft recurrence counter bumped (`_bump_recurrence`, plan §4).
+
         Never raises: a corpus-scan or embedder failure contributes `[]` (D52), so the
         graph half of the union still adjudicates."""
         try:
@@ -733,9 +811,62 @@ class DedupStage:
 
         query = vectors[0]
         cards: list[PriorArtCard] = []
+        recurred: list[CorpusArtifact] = []
         for art, vec in zip(artifacts, vectors[1:], strict=False):
-            cards.append(_card_from_artifact(art, similarity=_cosine(query, vec)))
+            similarity = _cosine(query, vec)
+            cards.append(_card_from_artifact(art, similarity=similarity))
+            if similarity >= self._recurrence_threshold:
+                recurred.append(art)
+        await self._bump_recurrence(recurred)
         return cards
+
+    async def _bump_recurrence(self, artifacts: list[CorpusArtifact]) -> None:
+        """Record a SOFT recurrence sighting against each near-matched artifact (plan §4).
+
+        **Why here.** This is the only loop in the system that already knows a candidate's
+        intent cosine against a KEYED artifact. The graph half of the union cannot be
+        counted — a `PriorArtCard` from neo4j carries no `canonical_key`, and "we cannot
+        bump a count we cannot key" is the same constraint that makes layer 2's
+        learning-tier hit a `merge` rather than an `increment`.
+
+        **What is deliberately NOT filtered.** The artifacts reaching here have already
+        been stripped of this candidate's own key and of terminal (rejected/retired)
+        artifacts by the caller, which is exactly right: a paraphrase of a declined idea
+        must not accrue evidence for re-proposing it.
+
+        **A judge-dropped candidate still counts.** The drop happens after this, and that
+        ordering is intentional — the judge drops a candidate because an artifact already
+        COVERS it, and "somebody asked this again" is true whether or not we kept the
+        candidate. Contrast `_seed_on_insert`, which is deliberately skipped for a
+        dropped candidate: that would create a NEW artifact for work nobody kept, which
+        is a different thing entirely.
+
+        **NO PER-SIGHTING IDEMPOTENCY, and this is the thing to know before the weight is
+        raised.** `increment_hit_count` fires once per hard-key hit and the candidate is
+        then DROPPED, so a redelivery collapses to one increment. Nothing here does that:
+        a candidate that survives dedup can be re-processed (a queue redelivery, a
+        re-enqueue, a peer race, a pipeline re-run) and will re-bump every near artifact
+        again. The stored count is therefore "sightings PLUS redelivery noise", biased
+        upward and not bounded by the number of distinct sessions. Harmless while the
+        weight is 0.0; at a non-zero weight a flapping session can corroborate itself.
+        Closing it needs a per-(artifact, content_hash) marker in the corpus — a store
+        change, not a knob change.
+
+        Fail-soft per artifact and in aggregate (D52): this counter is weighted 0.0
+        today, so it must never be the reason a candidate fails to be adjudicated."""
+        if not artifacts:
+            return
+        for art in artifacts:
+            try:
+                await self._corpus.increment_recurrence_count(art.canonical_key)
+            except Exception:  # noqa: BLE001 — a dormant counter may never cost a candidate
+                _logger.warning(
+                    "dedup: soft recurrence increment failed for artifact %s; the "
+                    "counter under-reports for it (it is weighted 0.0 today, so this "
+                    "changes no decision).",
+                    art.canonical_key[:23],
+                    exc_info=True,
+                )
 
     # -- bookkeeping -----------------------------------------------------------
 

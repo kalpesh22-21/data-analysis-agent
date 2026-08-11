@@ -35,14 +35,18 @@ candidate).
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from ..candidate.models import CandidateEnvelope, CandidateStatus
 from ..candidate.store import CandidateStore
 from ..promotion.mcp_export import PromotionEmit, build_promotion_emit
-from ..promotion.models import ProbeResult
+from ..promotion.models import ProbeResult, PromotionPolicy
 from ..promotion.scheduler import PromotionScheduler
 from .models import InboxItem
+from .ranking import rank_key
+
+_logger = logging.getLogger(__name__)
 
 
 class InboxTransitionError(Exception):
@@ -73,7 +77,11 @@ class ReviewInbox:
     """The `in_review` projection over a `CandidateStore` + the human transitions."""
 
     def __init__(
-        self, store: CandidateStore, *, scheduler: PromotionScheduler | None = None
+        self,
+        store: CandidateStore,
+        *,
+        scheduler: PromotionScheduler | None = None,
+        policy: PromotionPolicy | None = None,
     ) -> None:
         self._store = store
         # The SINGLE approve/reject implementation (R4). Defaulted for an unwired
@@ -81,6 +89,22 @@ class ReviewInbox:
         self._scheduler = scheduler or PromotionScheduler(
             store, probe=_NoOpProbe(), hit_counts=_ZeroHitCounts(),
         )
+        # Plan §4: the inbox needs exactly ONE knob off the promotion policy
+        # (`review_score_cutoff`).
+        #
+        # It defaults to the SCHEDULER's policy, never to a fresh `PromotionPolicy()`.
+        # The fresh-default version re-created, one level down, the exact defect this
+        # slice was written to remove: a caller who built a correctly-configured
+        # scheduler and passed it here would silently get cutoff 0.0 — a knob turned in
+        # the environment and ignored at the surface it governs. `build_review_inbox`
+        # passes it explicitly, but a direct `ReviewInbox(store, scheduler=...)` is a
+        # supported construction (both demo scripts and every test in this suite use it),
+        # and correctness must not depend on the caller remembering.
+        #
+        # `self._scheduler` is always set by the line above, and an unwired inbox's
+        # default scheduler carries a default policy — so this changes nothing for the
+        # unwired case and removes the split for the wired one.
+        self._policy = policy if policy is not None else self._scheduler.policy
 
     async def list(
         self,
@@ -93,13 +117,80 @@ class ReviewInbox:
 
         The archive view passes `status=rejected` (durable rejected rows, D29) so the
         SAME projection also serves the Archived tab (ui-inbox-type-archive contract).
-        The default (`status=in_review`, `order=asc`) is unchanged, so every existing
-        caller keeps the byte-identical review-queue view. The caller passes
-        `order="desc"` for the archive so the LIMIT trims OLD history, not present
-        rejects — the ordering is chosen explicitly here, never inferred from the
-        status string inside the store."""
+        The caller passes `order="desc"` for the archive so the LIMIT trims OLD history,
+        not present rejects — the ordering is chosen explicitly here, never inferred from
+        the status string inside the store.
+
+        **The REVIEW QUEUE — and only the review queue — is RANKED (plan §4)**, by
+        `novelty × groundedness² × session-quality` descending, MEASURED rows first,
+        arrival order breaking ties, and filtered by `review_score_cutoff`. The other two
+        listings are left exactly as they were on purpose:
+
+          * `rejected` is an ARCHIVE. Ranking history by how interesting it would have
+            been is meaningless, and reordering it would break the newest-first contract
+            the LIMIT depends on to trim old rows rather than present ones.
+          * `validated` is the Phase-3 verify/promote worklist. Its rows have already been
+            through a human once; "is this worth thirty seconds" is not the question being
+            asked of them.
+
+        **The LIMIT is applied by the store, BEFORE the ranking**, and that is a real
+        limitation rather than an oversight: the ranking inputs live inside the candidate
+        document, so ranking the whole `in_review` population would mean fetching it all.
+        With `limit=100` and a queue smaller than that (every deployment today — the store
+        is empty) the two are identical. Past 100 in_review rows the caller ranks the
+        oldest 100, not the best 100. Fixing it properly means ranking server-side, which
+        needs the score materialized; it is not worth doing before there is a queue.
+        """
         envelopes = await self._store.list_by_status(status, limit=limit, order=order)
-        return [InboxItem.from_envelope(env) for env in envelopes]
+        if status != CandidateStatus.IN_REVIEW:
+            return [InboxItem.from_envelope(env) for env in envelopes]
+        # Rank the ENVELOPES, then project — rather than projecting and then sorting the
+        # items by a re-derived key. Two reasons, and the second is the one that bites:
+        # the order and the projected score then come from ONE computation and cannot
+        # disagree, and there is no id-keyed map to join the two lists back together (a
+        # `candidate_id` read off a rehydrated doc with no type check need not even be
+        # hashable, and building that map would have been the crash site).
+        ranked = sorted(envelopes, key=rank_key)
+        items = [InboxItem.from_envelope(env) for env in ranked]
+        return self._apply_cutoff(items)
+
+    def _apply_cutoff(self, items: list[InboxItem]) -> list[InboxItem]:
+        """Drop review-queue rows below `review_score_cutoff` — MEASURED rows only.
+
+        **The exemption is the second half of the unmeasured-neutral fix.** A row whose
+        novelty or groundedness could not be measured carries a NEUTRAL 1.0 on that axis,
+        and novelty's measured ceiling against a real corpus is ~0.47. Filtering both
+        groups on one number would therefore hide the candidates we know most about and
+        keep the ones we know nothing about — the knob doing the exact opposite of what
+        its name says. A cutoff is a judgement about a score; an unmeasured row has no
+        score to judge, so it is never hidden by one. It is also never in the way: the
+        sort has already put every unmeasured row below every measured one.
+
+        The consequence, stated rather than hidden: **a queue dominated by unmeasured rows
+        cannot be trimmed with this knob.** That is a signal, not a defect — the fix is to
+        wire the prior-art index (which is what makes novelty measurable at all), not to
+        hide the rows that prove it is dark.
+
+        An operator who empties their own inbox is TOLD. Silently returning zero rows to a
+        reviewer who set a knob they misjudged is how a queue stops being read."""
+        cutoff = self._policy.review_score_cutoff
+        if cutoff <= 0.0 or not items:
+            return items
+        kept = [
+            item for item in items if item.score.measured is False or item.score.score >= cutoff
+        ]
+        if not kept:
+            _logger.warning(
+                "review_score_cutoff=%.3f hid ALL %d row(s) of a non-empty review queue. "
+                "The score is an ORDERING, not a percentage, and it does not use the top "
+                "of its range: sentence-embedding cosines floor around 0.53, so novelty "
+                "lives in roughly [0, 0.47] and a PERFECT candidate scores about 0.26. A "
+                "moderate-looking cutoff hides everything. Set it from the scores you "
+                "actually observe (they are on every item as `score`), or back to 0.0.",
+                cutoff,
+                len(items),
+            )
+        return kept
 
     async def _require(self, candidate_id: str, expected: str) -> CandidateEnvelope:
         env = await self._store.get(candidate_id)

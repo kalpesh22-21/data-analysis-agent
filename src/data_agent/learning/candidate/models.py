@@ -18,6 +18,7 @@ from typing import Any
 from ..audit.judgement import CoverageAssessment
 from ..extractor.models import ExtractedCandidate
 from ..summary.models import SessionSummary
+from .signals import NoveltyStamp, SessionSignals
 from .verdicts import DedupVerdict, DriftStamp
 
 
@@ -118,6 +119,27 @@ class CandidateEnvelope:
     # Additive, defaults None, emitted only when set so a pre-slice candidate doc
     # round-trips byte-identically (mirrors `traceparent`).
     judge: CoverageAssessment | None = None
+    # --- inbox-ranking inputs (plan §4). Two separate stamps because two different
+    # stages own them and neither can compute the other's:
+    #   * `session_signals` is stamped ONCE at `build_envelope` from the in-memory
+    #     `SessionSummary`, which is dropped immediately afterwards. Nothing downstream
+    #     can recover it.
+    #   * `novelty` is stamped by S6 dedup, the only stage that has already embedded this
+    #     candidate's intent and queried the graph.
+    # Both default `None` = "nobody looked", which every reader must keep distinct from a
+    # zero-valued measurement (see `candidate/signals.py`). Additive + emitted only when
+    # set, so a pre-slice candidate doc round-trips byte-identically.
+    session_signals: SessionSignals | None = None
+    novelty: NoveltyStamp | None = None
+    # WHY the S9 scheduler routed this candidate to `in_review`, when it knew something a
+    # reader of the routed envelope cannot reconstruct. Exactly ONE value today,
+    # `USER_CORRECTED`, and this is deliberately NOT a general-purpose slot — see
+    # `RouteReason`.
+    #
+    # STICKY: the scheduler only ever SETS it, never clears it. A negative signal that a
+    # later clean cycle can erase is not a signal; erasing it is the class of bug the
+    # correction fix itself was about.
+    route_reason: str | None = None
 
     def to_doc(self) -> dict[str, Any]:
         doc: dict[str, Any] = {
@@ -162,6 +184,15 @@ class CandidateEnvelope:
         # not run", which must stay distinguishable from a stored `new` verdict.
         if self.judge is not None:
             doc["judge"] = self.judge.to_doc()
+        # Additive + OPTIONAL, same rule as the four above: an absent key means "this
+        # stamp was never written", which the ranking treats differently from a stamp
+        # whose values happen to be zero.
+        if self.session_signals is not None:
+            doc["session_signals"] = self.session_signals.to_doc()
+        if self.novelty is not None:
+            doc["novelty"] = self.novelty.to_doc()
+        if self.route_reason is not None:
+            doc["route_reason"] = self.route_reason
         return doc
 
     @classmethod
@@ -229,6 +260,27 @@ class CandidateEnvelope:
                 if isinstance(doc.get("judge"), dict)
                 else None
             ),
+            # Same normalize-do-not-trust posture as `last_scanned_at`/`judge`: a
+            # non-dict stamp (hand edit, foreign writer) reads back as "nobody looked"
+            # rather than raising inside the cron scan or the inbox projection. The
+            # per-field coercion inside `from_doc` handles a dict with junk MEMBERS.
+            session_signals=(
+                SessionSignals.from_doc(doc["session_signals"])
+                if isinstance(doc.get("session_signals"), dict)
+                else None
+            ),
+            novelty=(
+                NoveltyStamp.from_doc(doc["novelty"])
+                if isinstance(doc.get("novelty"), dict)
+                else None
+            ),
+            # A non-str reads as absent. The downstream read is a string RENDERED into a
+            # reviewer-facing wire field, so a dict or a list here would reach the review
+            # UI as a repr — and a foreign writer must not be able to put arbitrary
+            # structure in front of a human through this path.
+            route_reason=(
+                doc["route_reason"] if isinstance(doc.get("route_reason"), str) else None
+            ),
         )
 
 
@@ -245,7 +297,13 @@ def build_envelope(
     `entity_scan.result` is `pending` — the Slice-5 leakage gate is authoritative
     (D58); S3 only records the extractor's preliminary self-check. *traceparent* (the
     extracting consume span's W3C context) is carried forward so the scheduler's
-    promote/land spans continue the SAME session trace."""
+    promote/land spans continue the SAME session trace.
+
+    THIS is the only place `session_signals` can be stamped (plan §4): the summary is an
+    in-process value that is dropped as soon as the extraction finishes, so the
+    session-quality axis of the inbox ranking is derivable here and nowhere later. Only
+    counts, one bool and one enum member are read — the stamp is entity-free by
+    construction, which it must be, because it travels to the review UI."""
     header = candidate.header
     return CandidateEnvelope(
         candidate_id=candidate_id,
@@ -266,4 +324,5 @@ def build_envelope(
         depends_on=header.depends_on,
         content_hash=summary.content_hash,
         traceparent=traceparent,
+        session_signals=SessionSignals.from_summary(summary),
     )

@@ -10,17 +10,44 @@ parallelizes cleanly against the S4 fixture.
 Contract E state machine (the edges this scheduler owns):
 
     candidate ─(static ok AND golden-replay pass AND deps resolved
-                AND (hit_count ≥ T OR human approval))──────────▶ validated
-    candidate ─(any guard fails / single session / dep unresolved)─▶ candidate  (hold)
+                AND corroboration ≥ T)──────────────────────────▶ in_review  (route)
+    candidate ─(any guard fails / dep unresolved / below T)─────▶ candidate  (hold)
     in_review ─(human approve)──────────────────────────────────▶ validated
     in_review ─(human reject)───────────────────────────────────▶ rejected
     validated ─(drift probes clean)─────────────────────────────▶ validated  (drift=clean)
     validated ─(drift suspect OR replay fails OR user correction)─▶ candidate  (demote + review flag)
 
+**THE SCHEDULER IS A ROUTER, NOT A PROMOTER (plan §4).** The auto path used to end at
+`validated`; it now ends at `in_review`, and `→ validated` happens ONLY through
+`apply_human_decision`. Three reasons, in descending order of how much they cost:
+
+  * `_recheck_validated` runs a golden replay — a JWT mint plus two live warehouse
+    queries — against every validated artifact, forever. Auto-landing at a threshold of 1
+    would put hundreds of never-recalled nodes into that loop within weeks.
+  * A landed learning-tier node is NOT recallable anyway (the recall trust gate serves
+    only `source='mcp'`), so auto-landing buys the agent nothing at all. What the
+    threshold rations is a human's attention, which is why lowering it is safe and why
+    the destination has to change at the same time.
+  * It is what makes a user correction stick. See `apply_user_correction`.
+
+Every correctness guard is unchanged and still runs on this edge: the leakage scan,
+static validation, `depends_on` resolution and the golden replay. Only the corroboration
+count and the destination changed.
+
+**But the guards that matter moved with the LANDING, not with this edge.** Narrowing
+landing to one path meant the approve edge's guard list became the only one enforcing
+anything about the corpus, and it was missing the leakage scan entirely — the auto edge's
+Guard 0 was the only reference to `_entity_scan_is_clean` in this module. QA caught it.
+`apply_human_decision` now carries `_entity_scan_is_actionable` as its own Guard 2; the
+two predicates differ deliberately (see that function). The general lesson, since it will
+recur: when a change narrows N paths to 1, the surviving path inherits the RESPONSIBILITY
+of the others but not their CODE.
+
 Load-bearing guards (D29/D98):
-  * **Replay alone NEVER promotes** (D98 layer iii): a single-session candidate
-    (`hit_count < T`, no human approval) with a GREEN replay STAYS `candidate`.
-    Replay verifies structure, not values — there is no value oracle (D17/D98).
+  * **Replay alone NEVER promotes** (D98 layer iii). This is now enforced STRUCTURALLY
+    rather than by a threshold: the auto path cannot produce `validated` at all, whatever
+    the replay said. A green replay routes to a human; the human's approve re-runs the
+    replay before anything lands.
   * **`depends_on` guard** (§11.6): a candidate whose `depends_on` references an
     unresolved artifact stays `candidate` — never promotes until it resolves.
   * **Human-gated targets** (`global_knowledge`/`schema_edit`, D58a/D18): T = ∞;
@@ -90,6 +117,7 @@ from .models import (
     LandingWriter,
     PromotionPolicy,
     PromotionSweep,
+    RecurrenceCountReader,
     WarehouseProbe,
 )
 from .replay import ReplayOutcome, golden_replay
@@ -127,6 +155,74 @@ def _parse_clock(now_iso: str) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+# The one value `CandidateEnvelope.route_reason` currently takes: this candidate is on
+# its way back to a human because a USER CORRECTED the artifact it was promoted from.
+#
+# Deliberately a narrow vocabulary rather than a free-text slot. The field is RENDERED to
+# a reviewer, and "route_reason" is the kind of name that attracts every subsequent
+# diagnostic string somebody wants in the inbox — at which point a human is reading
+# whatever the last author felt like writing.
+ROUTE_REASON_USER_CORRECTED = "user_corrected"
+
+
+def _is_user_correction_stamp(drift: DriftStamp) -> bool:
+    """True iff this drift stamp is the one `user_correction_stamp` writes.
+
+    Identified STRUCTURALLY (`suspect` + no probes + no failed probe) rather than by a
+    marker field, because that is exactly what the stamp IS: a `suspect` verdict that
+    names no probe, because no probe fired — the cause was an out-of-band human
+    correction. `reusable_replay_verdict` already keys off the same absence (it refuses to
+    reuse a stamp that does not name `grain_integrity`), so the two agree about what a
+    correction stamp is without either importing a flag from the other.
+
+    It has to be read BEFORE Guard 3, which replays and overwrites `drift` with a `clean`
+    verdict — and a passing replay is the NORMAL outcome here, because a correction is
+    about a VALUE and the replay is structure-only by design (D98). After Guard 3 the
+    evidence is gone."""
+    return drift.status == "suspect" and not drift.probes and drift.failed_probe is None
+
+
+def _entity_scan_is_actionable(env: CandidateEnvelope) -> bool:
+    """True iff this candidate's leakage verdict is one the D17 machinery can ACT on.
+
+    DERIVED FROM THE OPERATION, not from a field name. Both entity defenses on the approve
+    path consume exactly one thing — `entity_spans(env)` — and both perform the same
+    operation on it: `strip_entity_bearing` REMOVES those spans from the payload, and the
+    landing writer's last-gate tripwire RE-CHECKS that they are gone. So an EMPTY span set
+    disables both layers, and the only question that matters is whether the emptiness is
+    *explained*:
+
+        verdict shape                          entity_spans()   is the emptiness explained?
+        settled `pass`                         ()               YES — nothing was found
+        settled finding WITH hits              (spans…)         n/a — the defenses can act
+        settled finding with NO hits           ()               NO  — a leak nobody located
+        unsettled (`pending`)                  ()               NO  — nobody looked at all
+
+    Rows 3 and 4 are the same failure wearing different clothes: the verdict does not say
+    "there is nothing to remove", yet nothing is removed and nothing is checked. So the
+    rule is not "settled" and not "clean" — it is **either a clean pass, or a finding that
+    localizes itself**.
+
+    Row 3 is REACHABLE with the shipped scanner, not a hypothetical: `gate._decide`
+    returns `reroute` when the semantic classification is `user_fact` and `quarantine` as
+    its fallback, in both cases WITHOUT consulting whether `hits` is empty — so a semantic
+    scanner that judges text leaky without enumerating a span produces exactly this.
+
+    Deliberately a DIFFERENT predicate from `_entity_scan_is_clean`, which the AUTOMATIC
+    edge uses. That edge demands a clean `pass` because nobody is looking. This one admits
+    a finding, because D58b routes 100% of leakage near-misses to a human precisely so a
+    person can decide — and a LOCALIZED finding is the state in which the machinery works
+    and the reviewer is genuinely informed (`_leakage_view` shows them the result and each
+    hit's field and kind). What it refuses is approving on a span set that is empty for
+    any reason other than "there was nothing there"."""
+    scan = env.entity_scan
+    if not LeakageVerdict.is_settled(scan):
+        return False
+    if scan.get("result") == "pass":
+        return True
+    return bool(entity_spans(env))
+
+
 def _entity_scan_is_clean(env: CandidateEnvelope) -> bool:
     """True iff the S5 leakage gate SETTLED a `pass` verdict (R5). An unsettled
     (`pending`) scan or any non-`pass` result fails closed — never auto-promotable."""
@@ -144,6 +240,12 @@ class PromotionScheduler:
         *,
         probe: WarehouseProbe,
         hit_counts: HitCountReader,
+        # The SOFT (intent-similarity) recurrence count (plan §4). Optional: absent ⇒ the
+        # recurrence term reads 0, which at the shipped `recurrence_weight = 0.0` is
+        # arithmetically identical to having one wired. Pass the SAME object as
+        # `hit_counts` (`CouchbaseBlueprintCorpus` duck-types both) — the two counts are
+        # summed, so they must address the same artifacts.
+        recurrence_counts: RecurrenceCountReader | None = None,
         policy: PromotionPolicy | None = None,
         dependency_resolver: DependencyResolver | None = None,
         # S9-activation landing writer + gate (§3/§4). A blueprint becomes RECALLABLE
@@ -171,6 +273,7 @@ class PromotionScheduler:
         self._store = store
         self._probe = probe
         self._hit_counts = hit_counts
+        self._recurrence_counts = recurrence_counts
         self._policy = policy or PromotionPolicy()
         self._deps = dependency_resolver
         self._landing_writer = landing_writer
@@ -192,6 +295,14 @@ class PromotionScheduler:
         store would let the inbox read one store while this scheduler writes another
         — stale-envelope approve)."""
         return self._store
+
+    @property
+    def policy(self) -> PromotionPolicy:
+        """The policy this scheduler routes on. Exposed read-only for the SAME reason
+        `store` is: `build_review_inbox` pins the inbox to it, so the threshold that puts
+        work into the review queue and the cutoff that decides whether a human ever sees
+        that work can never end up configured independently."""
+        return self._policy
 
     # -- the cron cycle -------------------------------------------------------
 
@@ -314,6 +425,20 @@ class PromotionScheduler:
                 env, status=env.status, drift_status=env.drift.status
             )
 
+        # Capture the USER-CORRECTION signal NOW, before Guard 3 replays and overwrites
+        # `drift` with a `clean` verdict. A passing replay is the EXPECTED outcome here,
+        # not an edge case: the correction was about a VALUE and the replay is
+        # structure-only by design (D98). After Guard 3 nothing on the envelope remembers
+        # this happened.
+        #
+        # Why it has to reach the REVIEWER and not just the sweep log: routing to review
+        # is what stops the artifact silently re-landing, which makes a human the ONLY
+        # thing now standing between a corrected blueprint and the corpus. The approve
+        # path re-runs static validation and the golden replay, and NEITHER can see a
+        # value error. Without this the reviewer adjudicates the exact artifact a user
+        # flagged with strictly LESS information than the machine had a moment earlier.
+        corrected = _is_user_correction_stamp(env.drift)
+
         # Human-gated / non-blueprint targets never auto-promote here (D58a/D18):
         # global_knowledge + schema_edit are T=∞ (S7 inbox → human approve);
         # user_knowledge auto-commits in S8. Leave them as candidate.
@@ -379,58 +504,64 @@ class PromotionScheduler:
             # no and did not ask again", because only the second one has a maximum age.
             return self._hold(env, "replay_failed:cached_suspect")
 
-        # Guard 4 — hit_count ≥ T OR human approval. A GREEN replay with a
-        # single-session count is NOT enough (D98 layer iii — replay never promotes
-        # on its own): the candidate STAYS candidate.
-        count = await self._read_hit_count(env)
-        if count < self._policy.blueprint_hit_threshold:
+        # Guard 4 — CORROBORATION ≥ T. Below it the candidate STAYS `candidate` and is
+        # re-examined on the next rotation, accruing hits and soft recurrences until it
+        # crosses (or until its 90-day retention expires).
+        corroboration = await self._corroboration(env)
+        if corroboration < self._policy.blueprint_hit_threshold:
             return self._hold(env, "below_hit_threshold")
 
-        # Guard 5 — landing gate (§3/§4). A blueprint that passes EVERY guard above
-        # (including the now-REAL replay gate) still must not promote to `validated`
-        # until it can LAND in the neo4j retrieval corpus — otherwise it would be
-        # `validated` but never recallable (the silent gap). When `require_landing` is
-        # set but no writer is wired (the dormant state), HOLD `landing_unavailable`.
-        if self._landing_gate_blocks():
-            return self._hold(env, "landing_unavailable")
-
-        # All guards pass → promote, stamping the clean drift `drift` already holds
-        # (the passing replay IS the live grain_integrity probe), so it is immediately
-        # silent-eligible. When the verdict was REUSED, `drift` is the stored stamp with
-        # its ORIGINAL `last_drift_check_at` — deliberately not re-dated to now: the
-        # blueprint is promoted on evidence gathered at that earlier moment, and moving
-        # the timestamp forward would claim a probe that did not run and hand the silent
-        # fast path a full trust window it did not earn. The stamp can be at most
-        # `replay_recheck_interval_seconds` old, which the policy keeps inside
-        # `drift_freshness_seconds`, so a freshly promoted blueprint is still
-        # silent-eligible either way.
+        # All guards pass → ROUTE TO A HUMAN (plan §4). NOT `validated`: see the module
+        # docstring. Landing is deliberately NOT attempted here and the landing gate is
+        # deliberately NOT consulted — `in_review` is not a recallable state, so there is
+        # nothing to land and nothing for "not landed ⇒ not validated" to protect. The
+        # gate still guards the `→ validated` edge inside `apply_human_decision`, which
+        # is now the only edge that reaches it; a deployment with no landing writer fills
+        # its inbox and then honestly refuses each approve (a 503 in the inbox service)
+        # rather than silently parking the queue at `candidate` with no explanation.
         #
-        # With a real landing writer wired, LAND into the neo4j retrieval corpus FIRST,
-        # then CAS `validated` (§3.1); a landing failure HOLDS `landing_failed` and the
-        # candidate stays `candidate` (not landed ⇒ not validated). Without a writer
-        # (require_landing off), promote directly (today's baseline behavior — nothing
-        # to land into).
-        if self._landing_writer is not None:
-            # Capture the entity spans S5 identified BEFORE the strip (D17 last gate) —
-            # `_land_and_promote` strips, which blanks `entity_scan`, so the forbidden
-            # spans must be read from the PRE-strip envelope here.
-            return await self._land_and_promote(
-                env,
-                drift,
-                action="promote",
-                forbidden_spans=entity_spans(env),
-                verified=False,  # auto-landed → unverified until a human approves
+        # The fresh `drift` is stamped on the way through (the passing replay IS the live
+        # grain_integrity probe), so the human sees evidence the template still executes
+        # and the approve path can reuse the verdict inside the re-check window. When the
+        # verdict was REUSED, `drift` carries its ORIGINAL `last_drift_check_at` —
+        # deliberately not re-dated: moving the timestamp forward would claim a probe
+        # that did not run.
+        #
+        # `route_reason` is STICKY: `env.route_reason` is carried forward when this pass
+        # saw no correction, so a later clean cycle cannot erase the mark. A negative
+        # signal that a subsequent success wipes is not a signal — it is the same shape of
+        # bug as the erasure this whole routing change was written to fix.
+        routed = replace(
+            env,
+            status=CandidateStatus.IN_REVIEW,
+            drift=drift,
+            route_reason=(
+                ROUTE_REASON_USER_CORRECTED if corrected else env.route_reason
+            ),
+        )
+        # Keep the LANDED node's stamp coherent with the store for a candidate that was
+        # previously validated and has cycled back round (a demote, then a re-route).
+        # `in_review` is non-recallable exactly like `candidate`, so this changes no
+        # access decision — it keeps the two records from disagreeing about which state
+        # the artifact is in, and it is the same fail-open idempotent Cypher the
+        # demote-direction re-assert at the top of this method issues.
+        if env.type in _LANDED_TYPES:
+            await self._retract_corpus(
+                routed, status=CandidateStatus.IN_REVIEW, drift_status=drift.status
             )
-        with self._promote_scope(env, "promote"):
-            promoted = replace(env, status=CandidateStatus.VALIDATED, drift=drift)
-            await self._store.put(promoted)
+        with self._promote_scope(env, "route"):
+            await self._store.put(routed)
         return CandidateDecision(
             candidate_id=env.candidate_id,
             type=env.type,
-            action="promote",
+            action="route",
             from_status=env.status,
-            to_status=CandidateStatus.VALIDATED,
-            reason=None,
+            to_status=CandidateStatus.IN_REVIEW,
+            # The sweep's own copy. `reason` on a non-hold decision has been `None`
+            # everywhere until now; a re-routed correction is the first thing worth saying
+            # about a SUCCESSFUL transition, and carrying it here makes the rate countable
+            # in telemetry without joining back to the envelope.
+            reason=ROUTE_REASON_USER_CORRECTED if corrected else None,
         )
 
     # -- validated re-check (drift probes; demote on suspect/replay-fail) ------
@@ -518,15 +649,40 @@ class PromotionScheduler:
         invariants (R4): the entity strip, the current-status guard, the `depends_on`
         guard, and (for a replayable blueprint) the static + replay guards.
 
+        **SINCE PLAN §4 THIS IS THE ONLY EDGE THAT WRITES CONTENT TO THE CORPUS.** The
+        automatic edge routes to `in_review` and lands nothing, so every guard below is
+        now the sole enforcement of what it checks rather than a second opinion. The three
+        other human edges do not weaken that: `apply_retract`, `apply_verify` and
+        `apply_promote` all require `status == validated`, and approve is the only
+        transition that produces it — so they INHERIT this method's guarantees rather than
+        needing their own copies. That inheritance is asserted by
+        `test_nothing_auto_lands_qa.py`, because it stops holding the moment any other
+        edge learns to write `validated`.
+
         Approve invariants, in order:
           1. current status MUST be `in_review` (a mis-routed approve never mutates).
-          2. strip entity-bearing payload + audit spans BEFORE `validated` (D17/Q3).
-          3. `depends_on` must be resolved (§11.6/Q2) — a human cannot promote a
+          2. the leakage verdict must be ACTIONABLE — a clean `pass`, or a finding that
+             LOCALIZES itself. A human may approve over a located finding; nobody may
+             approve over a scan that never ran, nor over a scanner asserting a leak it
+             could not locate, because both leave the span set empty and thereby switch
+             off the strip AND the landing tripwire at once. See the guard for the
+             derivation and for why it is neither `settled` nor `clean`.
+          3. strip entity-bearing payload + audit spans BEFORE `validated` (D17/Q3).
+          4. `depends_on` must be resolved (§11.6/Q2) — a human cannot promote a
              blueprint whose required schema_edit has not landed.
-          4. a REPLAYABLE blueprint (has a generalization) STILL passes static +
+          5. a REPLAYABLE blueprint (has a generalization) STILL passes static +
              golden replay (human approval substitutes for the hit-count threshold,
              NOT for structural integrity — D98). A non-replayable target
              (knowledge/schema, or a blueprint with no template) approves directly.
+
+        Guards 1-4 are TYPE-AGNOSTIC and run before the blueprint/knowledge split, which
+        is what makes the leakage guard cover the `global_knowledge` landing too — that
+        branch reaches the same `_land_and_promote` with the same `forbidden_spans`.
+
+        REJECT is deliberately ungated by any of this: it writes no content (the corpus
+        write-backs on that path set a status string on an existing node), and it is the
+        ONLY action available for a candidate whose scan never settled. Gating it would
+        leave such a candidate with no terminal action at all.
         """
         if decision == "reject":
             rejected = replace(env, status=CandidateStatus.REJECTED)
@@ -559,22 +715,75 @@ class PromotionScheduler:
                 reason="approve_not_in_review",
             )
 
+        # Guard 2 — the leakage verdict must be one the D17 machinery can ACT on:
+        # a clean `pass`, or a finding that localizes itself. See
+        # `_entity_scan_is_actionable` for the derivation.
+        #
+        # THIS GUARD IS THE PRECONDITION OF THE TWO LINES BELOW IT, which is why it sits
+        # here rather than beside the other structural guards. Both defenses read
+        # `entity_spans(env)`: the capture feeds the landing writer's last-gate tripwire
+        # and `strip_entity_bearing` removes the same spans from the payload. When that
+        # set is empty for any reason OTHER than "the scan found nothing", both layers
+        # become no-ops at once — silently — and the raw payload crosses into `validated`
+        # and into a corpus the agent recalls from.
+        #
+        # It matters now in a way it did not before plan §4. The automatic edge has always
+        # carried `_entity_scan_is_clean` as its Guard 0, so `_advance_candidate` refuses
+        # these envelopes; but that edge no longer lands anything, and approve is the ONLY
+        # remaining path into the corpus. The one door left open was the unguarded one.
+        # Found by QA, whose three strict-xfails are now the passing assertions in
+        # `test_nothing_auto_lands_qa.py`.
+        #
+        # ACTIONABLE, NOT CLEAN — a deliberate asymmetry with the cron edge:
+        #
+        #   * A human MAY approve over a LOCALIZED finding. D58b routes 100% of leakage
+        #     near-misses here precisely so a person decides; demanding a clean pass would
+        #     make `reason=leakage_near_miss` a permanently un-approvable dead end, an
+        #     inbox row no action but reject could ever clear. A localized finding is also
+        #     the state in which the machinery WORKS — the spans exist, so the strip
+        #     removes them and the tripwire verifies the strip — and the reviewer is
+        #     genuinely informed: `_leakage_view` shows the real result and each hit's
+        #     field and kind.
+        #   * NOBODY may approve over an UNSETTLED scan. Unsettled means nobody looked,
+        #     machine or human, and the reviewer cannot supply the judgement the machine
+        #     did not — they are not even shown the gap, because `_leakage_view` renders
+        #     an unsettled scan as `result="pass"` (with `scanner="unsettled"`). A human
+        #     "deciding with their eyes open" is in fact reading a PASS for a scan that
+        #     never ran.
+        #   * NOBODY may approve over a finding with NO SPANS either, and this is the one
+        #     an "eyes open" argument is most likely to talk itself past. The reviewer DOES
+        #     see a non-`pass` result — but with zero hits, so neither they nor the strip
+        #     can act on it. It is a scanner asserting a leak it could not locate.
+        #
+        # CONSEQUENCE, stated rather than discovered later: both refused shapes are
+        # REJECT-ONLY for a human. There is no re-scan action in the inbox, so the only
+        # terminal move is to decline. That matches what the writer already calls an
+        # unsettled candidate (`_entity_scan_unsettled` routes it `fail_to_review`) and it
+        # is the fail-closed direction — the alternative is landing text nobody has
+        # cleared into a corpus the agent recalls from.
+        if not _entity_scan_is_actionable(env):
+            return CandidateDecision(
+                env.candidate_id, env.type, "hold", env.status, env.status,
+                reason="approve_blocked_entity_scan_not_actionable",
+            )
+
         # Capture the entity spans S5 identified BEFORE the strip blanks them (D17 last
-        # gate) — the landing writer's tripwire needs the PRE-strip spans (§3.3).
+        # gate) — the landing writer's tripwire needs the PRE-strip spans (§3.3). Now
+        # guaranteed to reflect a real verdict by Guard 2.
         forbidden_spans = entity_spans(env)
 
-        # Guard 2 — entity strip on the promotion boundary (D17). Done up front so no
+        # Guard 3 — entity strip on the promotion boundary (D17). Done up front so no
         # entity-bearing payload or audit span can cross into a validated state.
         env = strip_entity_bearing(env)
 
-        # Guard 3 — depends_on must resolve (§11.6) regardless of promotion path (Q2).
+        # Guard 4 — depends_on must resolve (§11.6) regardless of promotion path (Q2).
         if not await self._deps_resolved(env):
             return CandidateDecision(
                 env.candidate_id, env.type, "hold", env.status, env.status,
                 reason="approve_blocked_depends_on_unresolved",
             )
 
-        # Guard 4 — structural guards. A BLUEPRINT is always replayable: its
+        # Guard 5 — structural guards. A BLUEPRINT is always replayable: its
         # `generalization` MUST parse, else static + replay cannot run and human
         # approval would silently substitute for them (D98 forbids). Fail CLOSED on a
         # missing/malformed generalization (S3) — only genuinely NON-blueprint targets
@@ -660,7 +869,28 @@ class PromotionScheduler:
     ) -> CandidateDecision:
         """A user correction is a NEGATIVE signal (D29/D43): demote a `validated`
         artifact to `candidate` + review flag. Idempotent for a non-validated
-        candidate (a no-op hold)."""
+        candidate (a no-op hold).
+
+        **The correction now STICKS, and it does so as a side effect of the routing
+        change (plan §4).** It previously survived about five minutes: the demote wrote
+        `candidate`, the next cron cycle re-ran the guards, and every one of them passed —
+        the entity scan was untouched, the golden replay PASSED (a correction is about a
+        VALUE and the replay is structure-only by design, D98), and `hit_count` was
+        unchanged because a correction does not decrement it — so the artifact was
+        re-promoted to `validated` and re-landed, silently erasing the human's signal.
+
+        None of those facts changed. What changed is the DESTINATION: the next cycle now
+        routes the demoted candidate to `in_review` instead of back to `validated`, so it
+        stops being a recallable artifact and starts being a question for a human, which
+        is what a correction should produce. The landed node is stamped non-recallable on
+        the demote edge below and re-stamped on the route edge, and only a human approve
+        can put it back.
+
+        What this does NOT do, and must not be read as doing: it does not make the
+        correction a durable property of the ARTIFACT. There is still no
+        `corrected_at`/`correction_count` field, so a candidate approved by a human after
+        a correction carries no memory of it, and a SECOND correction of the same
+        artifact repeats the identical cycle rather than escalating."""
         if env.status != CandidateStatus.VALIDATED:
             return self._hold(env, "not_validated")
         demoted = replace(
@@ -854,11 +1084,16 @@ class PromotionScheduler:
 
     def _landing_gate_blocks(self) -> bool:
         """§4 dormant gate: `require_landing` is set but NO landing writer is wired. A
-        blueprint can PASS the replay gate but must not promote to `validated` when
-        there is nowhere to land it (it would be `validated` yet never recallable —
-        the silent gap). True ⇒ HOLD (`landing_unavailable`). With a real writer
-        present this is False, and `_land_and_promote` runs the land-then-status
-        sequence instead. Default OFF — today's callers are unchanged."""
+        blueprint can PASS the replay gate but must not become `validated` when there is
+        nowhere to land it (it would be `validated` yet never recallable — the silent
+        gap). True ⇒ HOLD (`landing_unavailable`). With a real writer present this is
+        False, and `_land_and_promote` runs the land-then-status sequence instead.
+
+        Consulted ONLY on the human-approve edge since plan §4. The auto path routes to
+        `in_review`, which lands nothing, so gating it here would park candidates at
+        `candidate` with a reason about a landing nobody asked for. A deployment with no
+        writer therefore fills its inbox and refuses each approve honestly (503), which
+        is a visible degrade rather than a silent stall."""
         return self._require_landing and self._landing_writer is None
 
     async def _land_and_promote(
@@ -870,8 +1105,11 @@ class PromotionScheduler:
         forbidden_spans: tuple[str, ...],
         verified: bool = False,
     ) -> CandidateDecision:
-        """The SINGLE land-then-status sequence for the `→ validated` edge (§3.1),
-        shared by the auto (`_advance_candidate`) and human-approve paths.
+        """The SINGLE land-then-status sequence for the `→ validated` edge (§3.1).
+
+        Since plan §4 there is exactly ONE caller — `apply_human_decision`'s approve —
+        because the auto path stops at `in_review`. Every invariant below is unchanged and
+        is now enforced on the only edge that can produce a recallable artifact.
 
         Order is LOAD-BEARING: land into the neo4j retrieval corpus FIRST, then write
         `status = validated` to the candidate store. Invariant "not landed ⇒ not
@@ -1064,14 +1302,74 @@ class PromotionScheduler:
                 return False
         return True
 
+    async def _corroboration(self, env: CandidateEnvelope) -> float:
+        """How much evidence there is that this idea is worth a human's time (plan §4).
+
+        `max(hit_count, 1) + recurrence_weight * recurrence_count`.
+
+        **The floor of 1 is the fix for a hole the threshold change opens, not a
+        loosening.** `_read_hit_count` returns 0 when S6 could not mint a `canonical_key`
+        (no `canonical_ast_norm`, or malformed hard-key inputs), so an unkeyable candidate
+        reads 0 sightings. At the old T=3 that was indistinguishable from "not corroborated
+        yet" and the candidate held; at T=1 it would hold FOREVER — the one subclass of
+        candidate that could never reach a human, which is the exact bug this slice
+        exists to remove. The candidate in hand IS one sighting; a keyed first sighting
+        reads 1 only because `_seed_on_insert` wrote that 1 on its behalf. The floor makes
+        the two agree.
+
+        It changes no outcome at any threshold above 1, and the reason is one step deeper
+        than `max(0, 1) = 1 < 2`: the floor can only ever bind on a candidate with NO
+        `canonical_key`, because a keyed artifact is seeded at `hit_count = 1` and the
+        counter never decreases. And an unkeyable candidate reads zero on BOTH counters —
+        `_read_recurrence_count` keys off the same missing `canonical_key` — so the floor
+        cannot combine with a recurrence term to manufacture corroboration either. That
+        second half is unexercised today (the weight is 0.0) and is the half that will
+        matter on the day it is turned up.
+
+        **The recurrence term is DORMANT at the shipped weight of 0.0** and is read
+        anyway, so the read path is exercised from the first deploy rather than being
+        switched on cold years later. With no reader wired it contributes 0 regardless.
+
+        A `float`, not an `int`: `recurrence_weight` is fractional by design (a paraphrase
+        is weaker evidence than a byte-identical re-derivation), so an int return would
+        silently floor away exactly the tuning the weight exists to express."""
+        hits = await self._read_hit_count(env)
+        weight = self._policy.recurrence_weight
+        if weight <= 0.0:
+            return float(max(hits, 1))
+        return max(hits, 1) + weight * await self._read_recurrence_count(env)
+
     async def _read_hit_count(self, env: CandidateEnvelope) -> int:
         """Read `hit_count` from the LANDED corpus artifact via the injected
         reader, keyed by the S6 `canonical_key`. No dedup verdict yet (S6 not run)
-        ⇒ no canonical_key ⇒ count 0 (cannot promote by count; human approval is
-        the alternative path)."""
+        ⇒ no canonical_key ⇒ count 0 — see `_corroboration` for what that means now."""
         if env.dedup is None or not env.dedup.canonical_key:
             return 0
         return await self._hit_counts.hit_count(env.dedup.canonical_key)
+
+    async def _read_recurrence_count(self, env: CandidateEnvelope) -> int:
+        """The SOFT paraphrase count for this candidate's artifact, or 0.
+
+        Fail-soft on ANY reader failure: this is a dormant secondary signal, and a corpus
+        hiccup must not be able to hold a candidate that its PRIMARY count already
+        corroborates. (The hard count is deliberately not treated this way — it can only
+        raise the sum, so swallowing its failure would be swallowing the gate.)"""
+        if self._recurrence_counts is None:
+            return 0
+        if env.dedup is None or not env.dedup.canonical_key:
+            return 0
+        try:
+            return await self._recurrence_counts.recurrence_count(
+                env.dedup.canonical_key
+            )
+        except Exception:  # noqa: BLE001 - a dormant signal may never block a candidate
+            _logger.warning(
+                "recurrence-count read failed for candidate %s; treating it as 0 "
+                "(the corroboration gate falls back to the hard hit count)",
+                env.candidate_id,
+                exc_info=True,
+            )
+            return 0
 
     def _hold(self, env: CandidateEnvelope, reason: str) -> CandidateDecision:
         return CandidateDecision(

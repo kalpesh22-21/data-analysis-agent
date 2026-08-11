@@ -90,6 +90,18 @@ Pinned from `learning/inbox/models.py:61-87`. These are the **real** fields — 
 | `dedup` | `.dedup` (`DedupVerdict \| None`) | serialize via `.to_doc()` or `null` |
 | `created_at` | `.created_at` | ISO-8601 string (the reviewer timestamp) |
 
+**AMENDMENT — three fields have been ADDED since this table was written**, and the JSON
+above is a snapshot rather than the live shape. The authoritative list is
+`learning/inbox/service.py::_inbox_item_to_wire` plus its exact-shape test
+(`tests/learning/inbox/test_inbox_service.py::test_list_returns_exact_wire_shape`); this
+table is not re-derived from either, so prefer them.
+
+| Field | Added by | Wire type / note |
+|---|---|---|
+| `status` | ui-inbox-type-archive | the envelope status as a plain string. The claim above that the projection carries no `status` is no longer true — the SAME projection now serves the `?status=rejected` archive and the Phase-3 `?status=validated` listing, so the row has to say which one it is. |
+| `verified` | Phase-3 inbox | bool. Distinguishes a human-VERIFIED validated learning node (promotable) from an auto-landed one. `false` for every review-queue and archive row. |
+| `score` | plan §4 (promotion policy) | object — `{score, novelty, groundedness, session_quality, novelty_measured, quality_measured, groundedness_measured}`, all floats/bools. The review-queue ORDER (`novelty × groundedness² × session-quality`, descending, arrival order breaking ties). The three axes and the three `*_measured` flags ship alongside the composite deliberately: the queue is sorted by it, so a client that could not see the components would be rendering an order it cannot explain, and an unmeasured axis must render as *unknown* rather than as a low score. Only the `in_review` listing is ranked — the archive stays newest-first and the validated listing stays oldest-first. |
+
 **`ActionResult` (approve/reject/retract response).** A minimal status projection — deliberately **not** the full envelope (no payload echoed back; the UI just refreshes the list):
 
 ```json

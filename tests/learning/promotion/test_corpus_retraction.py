@@ -17,7 +17,7 @@ import logging
 from data_agent.learning.candidate import InMemoryCandidateStore
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.inbox.inbox import ReviewInbox
-from data_agent.learning.promotion import PromotionPolicy, PromotionScheduler
+from data_agent.learning.promotion import PromotionScheduler
 from data_agent.learning.promotion.landing import CorpusLandingWriter, landing_id
 from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
 
@@ -27,6 +27,7 @@ from .helpers import (
     FakeLandingWriter,
     FakeWarehouseProbe,
     make_blueprint_candidate,
+    promotion_policy,
     with_type,
 )
 
@@ -40,7 +41,7 @@ def _scheduler(store, *, probe, writer):
         probe=probe,
         hit_counts=FakeHitCountReader({KEY: 5}),
         dependency_resolver=FakeDependencyResolver(),
-        policy=PromotionPolicy(blueprint_hit_threshold=3),
+        policy=promotion_policy(),
         landing_writer=writer,
         require_landing=True,
         clock=lambda: _CLOCK,

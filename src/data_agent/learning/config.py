@@ -226,6 +226,110 @@ class LearningSettings(BaseSettings):
         ),
     )
 
+    # --- S6 soft recurrence counter (plan §4) — the DORMANT paraphrase counter. ---
+    learning_recurrence_similarity_threshold: float = Field(
+        0.90,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Cosine at/above which a candidate's intent counts as a soft RECURRENCE "
+            "sighting of an existing learning_corpus artifact, bumping that artifact's "
+            "`recurrence_count`. Set between the conflict band (0.83) and the merge band "
+            "(0.95): the counter exists to catch the paraphrase pair that mints two "
+            "different canonical keys (measured around 0.96 in practice), and counting "
+            "'vaguely related question' as a recurrence would make it meaningless before "
+            "anyone reads it. The counter is weighted 0.0 in the promotion gate today "
+            "(LEARNING_PROMOTION_RECURRENCE_WEIGHT) and is accrued anyway, so that "
+            "turning the weight up later has history behind it."
+        ),
+    )
+
+    # --- S9 promotion policy (plan §4) — the knobs behind `PromotionPolicy`. ---
+    #
+    # Every one of these existed as a dataclass default that no entrypoint could reach:
+    # all three promotion factories accepted a `policy=` and nobody passed one. They are
+    # here so `promotion.models.policy_from_settings` can build the real thing.
+    learning_promotion_routing_threshold: int = Field(
+        1,
+        ge=1,
+        description=(
+            "Corroboration threshold T for routing a blueprint candidate to the human "
+            "review queue (`PromotionPolicy.blueprint_hit_threshold`). Was an unreachable "
+            "3: the hard hit count requires byte-identical normalized-AST equality across "
+            "sessions, which has never happened, so no candidate ever reached a human. "
+            "Safe at 1 ONLY because the edge it gates now ends at `in_review` rather than "
+            "`validated` — it rations a reviewer's attention, not corpus trust. Every "
+            "correctness guard (leakage, static validation, depends_on, golden replay) is "
+            "unchanged. Raise it with LEARNING_PROMOTION_RECURRENCE_WEIGHT when volume "
+            "makes a human unable to read the queue."
+        ),
+    )
+    learning_promotion_recurrence_weight: float = Field(
+        0.0,
+        ge=0.0,
+        description=(
+            "Weight on the SOFT recurrence count in the corroboration sum "
+            "`hit_count + weight * recurrence_count`. 0.0 (dormant) is the shipped "
+            "default: at threshold 1 every candidate clears the gate on its own first "
+            "sighting, so a second signal changes nothing. It becomes load-bearing "
+            "together with a raised routing threshold. KNOWN BEFORE YOU RAISE IT: the "
+            "underlying counter has no per-sighting idempotency — a re-processed "
+            "candidate (redelivery, re-enqueue, peer race, pipeline re-run) re-bumps "
+            "every near artifact, so the stored count is sightings PLUS redelivery "
+            "noise, biased upward. See PromotionPolicy.recurrence_weight."
+        ),
+    )
+    learning_promotion_scan_limit: int = Field(
+        200,
+        ge=1,
+        description=(
+            "Max candidates the promotion cron examines per status per cycle. The scan "
+            "ROTATES on `last_scanned_at`, so this bounds cost per cycle rather than "
+            "starving the tail."
+        ),
+    )
+    learning_promotion_interval_seconds: float = Field(
+        300.0, gt=0, description="Promotion cron cadence (`run_forever` sleep)."
+    )
+    learning_drift_freshness_seconds: float = Field(
+        86_400.0,
+        gt=0,
+        description=(
+            "How stale a D43 drift verdict may be and still be TRUSTED on the blueprint "
+            "silent fast path."
+        ),
+    )
+    learning_replay_recheck_interval_seconds: float = Field(
+        43_200.0,
+        gt=0,
+        description=(
+            "How often the scheduler will PAY for a golden replay (a JWT mint + two live "
+            "warehouse queries) on one candidate. Must stay <= "
+            "LEARNING_DRIFT_FRESHNESS_SECONDS — a verdict must never be reused for longer "
+            "than the trust window says it may be believed. The scheduler ENFORCES that "
+            "at the point of use (it takes the min), so a misconfiguration can only make "
+            "it probe more often, never trust a verdict longer."
+        ),
+    )
+    learning_review_score_cutoff: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum inbox `review_score` an in_review candidate needs to appear in the "
+            "default listing. 0.0 = no cutoff (the shipped posture — at <20 sessions/day "
+            "a human skims the whole queue). Applied at LIST time, never at routing time: "
+            "a routing-time cutoff would be a silent terminal state, whereas a hidden row "
+            "is still stored, still queryable, and reappears when the knob moves. "
+            "SET THIS FROM MEASURED DATA, NOT INTUITION: the score does not use the top "
+            "of its range. Sentence-embedding cosines over English prose have a high "
+            "floor (~0.53 between unrelated texts), so novelty lives in roughly "
+            "[0.0, 0.47] and a perfect candidate scores about 0.26 against the live "
+            "corpus. A 'moderate-sounding' 0.5 would hide the entire queue. See the "
+            "measurement table in learning/inbox/ranking.py."
+        ),
+    )
+
     # --- Extractor (Slice 3, D31/D34) — the LLM structured-output model + retry. ---
     learning_extractor_model: str = Field(
         "claude-opus-4-8",

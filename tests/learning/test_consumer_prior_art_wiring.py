@@ -45,6 +45,7 @@ def _learning_settings() -> SimpleNamespace:
         learning_candidates_username="u", learning_candidates_password="p",
         learning_corpus_username="u", learning_corpus_password="p",
         learning_dedup_merge_threshold=0.95,
+        learning_recurrence_similarity_threshold=0.90,
         learning_dedup_conflict_threshold=0.83,
         # Coverage judge (plan §3b) — a faithful stand-in for `LearningSettings`.
         learning_judge_enabled=True,
