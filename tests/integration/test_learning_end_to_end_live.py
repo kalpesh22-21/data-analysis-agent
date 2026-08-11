@@ -87,7 +87,7 @@ from data_agent.runtime.retrieval.corpus_loader import apply_schema
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex
 from data_agent.runtime.session.models import SessionDoc, TrailEntry, TurnMessage
 
-from .conftest import TOKEN_ISSUER_API_KEY, TOKEN_SERVICE_URL
+from .conftest import TENANT, TOKEN_ISSUER_API_KEY, TOKEN_SERVICE_URL
 
 _REDIS_URL = os.environ.get("LEARNING_REDIS_TEST_URL")
 _NEO4J_URI = os.environ.get("NEO4J_TEST_URI")
@@ -270,7 +270,7 @@ async def infra():
     corpus_store = CouchbaseBlueprintCorpus(settings)
     user_store = CouchbaseUserKnowledgeStore(UserKnowledgeStoreConfig(_env_file=None))
     for st in (session_store, candidate_store, audit_store, corpus_store, user_store):
-        await st._cluster.on_connect()
+        await st.connect()
 
     embedder = HttpEmbeddingClient(
         url=_EMBEDDING_URL,
@@ -292,7 +292,9 @@ async def infra():
     await apply_schema(neo4j_driver, dimension=768)
 
     mcp_client = RealMCPClient(_MCP_URL)
-    token_minter = HttpTokenMinter(TOKEN_SERVICE_URL, TOKEN_ISSUER_API_KEY)
+    token_minter = HttpTokenMinter(
+        TOKEN_SERVICE_URL, TOKEN_ISSUER_API_KEY, tenant=TENANT
+    )
 
     tag = uuid.uuid4().hex[:12]
     redis_client = aioredis.from_url(_REDIS_URL, decode_responses=True)
@@ -347,7 +349,7 @@ async def infra():
             async with neo4j_driver.session() as s:
                 await s.run("MATCH (b:Blueprint {id: $id}) DETACH DELETE b", {"id": node_id})
         for st in (session_store, candidate_store, audit_store, corpus_store, user_store):
-            await st._cluster.close()
+            await st.close()
         await neo4j_driver.close()
         await redis_client.delete(stream, dead)
         async for key in redis_client.scan_iter(match=f"{stream}:enqueued:*"):
@@ -382,7 +384,13 @@ async def _mint_bound(scope: list[str], session_id: str) -> str:
         resp = await client.post(
             TOKEN_SERVICE_URL,
             headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
-            json={"user_name": "alice", "column_scope": scope, "session_id": session_id},
+            json={
+                "user_name": "alice",
+                "column_scope": scope,
+                "session_id": session_id,
+                # Without the tenant claims the MCP 403s at auth — see conftest.TENANT.
+                "claims": TENANT.as_claims(),
+            },
         )
         resp.raise_for_status()
         return resp.json()["access_token"]

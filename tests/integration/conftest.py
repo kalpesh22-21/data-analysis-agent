@@ -16,11 +16,29 @@ from collections.abc import Awaitable, Callable
 import httpx
 import pytest
 
+from data_agent.learning.promotion.token_minter import TenantClaims
+from data_agent.runtime.config import RuntimeSettings
+
 # Endpoint/credentials for the token IdP that mints scoped JWTs for the live
 # MCP (`POST /token`, `Authorization: Bearer <issuer key>`,
 # `{"user_name": ..., "column_scope": [...]}`, `[]` == allow-all per D80(b)).
 TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
 TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
+
+# The warehouse TENANT claims every minted token must carry. The MCP maps
+# clientcode/proc_center/jti onto the paycom_* ClickHouse settings its row policies
+# read (`app/config.py::CLICKHOUSE_TENANT_SETTINGS`); a token WITHOUT them is rejected
+# `403 MISSING_TENANT_CLAIM` at auth, before any tool runs — so every live test here
+# was failing at the transport, not exercising the thing it names. Resolved through
+# `RuntimeSettings` so this reads the SAME TENANT_* env vars `ui/server.py` and the
+# learning scheduler read; the defaults are the seeded local tenant
+# (docker/clickhouse-init/hr-4tables-snake-migration.sql).
+_TENANT_SETTINGS = RuntimeSettings(_env_file=None)
+TENANT = TenantClaims(
+    clientcode=_TENANT_SETTINGS.tenant_client_code,
+    proc_center=_TENANT_SETTINGS.tenant_proc_center,
+    jti=_TENANT_SETTINGS.tenant_jti,
+)
 
 Mint = Callable[..., Awaitable[str]]
 
@@ -47,7 +65,12 @@ def mint() -> Mint:
         column_scope: list[str] | None = None,
         session_id: str | None = None,
     ) -> str:
-        body: dict = {"user_name": "alice", "column_scope": column_scope or []}
+        body: dict = {
+            "user_name": "alice",
+            "column_scope": column_scope or [],
+            # See `TENANT` above — without these the MCP 403s at auth.
+            "claims": TENANT.as_claims(),
+        }
         if session_id is not None:
             body["session_id"] = session_id
         async with httpx.AsyncClient() as client:

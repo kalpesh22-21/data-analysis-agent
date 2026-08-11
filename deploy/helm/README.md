@@ -35,6 +35,7 @@ supply their endpoints via `config` and credentials via `secrets` /
 
 - **ClickHouse** and the **MCP** (`clickhouse-api`) — `MCP_URL`
 - **Token IdP** — `JWKS_URL`, `JWT_ISSUER`, `JWT_AUDIENCE`, `TOKEN_SERVICE_URL`, `TOKEN_ISSUER_API_KEY`
+- **Warehouse tenant** — `TENANT_CLIENT_CODE`, `TENANT_PROC_CENTER`, `TENANT_JTI` (stamped into every minted token; the MCP rejects a token without them `403 MISSING_TENANT_CLAIM`)
 - **OpenAI** (or compatible) — `OPENAI_MODEL`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`
 - **Couchbase** (sessions + learning audit/candidates/corpus buckets)
 - **Neo4j** — `NEO4J_URL`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`

@@ -63,7 +63,7 @@ async def corpus():
     from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
 
     store = CouchbaseBlueprintCorpus(_settings())
-    await store._cluster.on_connect()
+    await store.connect()
     created: list[str] = []
     store._created = created  # type: ignore[attr-defined]
     yield store

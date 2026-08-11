@@ -50,6 +50,13 @@ config:
   JWT_AUDIENCE: "data-agent"
   TOKEN_SERVICE_URL: "https://idp.acme.com/token"
 
+  # The warehouse tenant this deployment reads as. Required by the MCP on EVERY
+  # call (403 MISSING_TENANT_CLAIM otherwise); TENANT_JTI is also the principal the
+  # offline golden replay runs as, so it must be one the row policies grant rows to.
+  TENANT_CLIENT_CODE: "ACME"
+  TENANT_PROC_CENTER: "PC42"
+  TENANT_JTI: "svc-data-agent"
+
   NEO4J_URL: "bolt://neo4j.data.svc.cluster.local:7687"
   NEO4J_USERNAME: "neo4j"
 

@@ -67,7 +67,7 @@ async def candidate_store():
 
     settings = _settings()
     store = CouchbaseCandidateStore(settings)
-    await store._cluster.on_connect()
+    await store.connect()
     # NOTE: list_by_status needs a primary/status index, but the writer is
     # deliberately scoped WITHOUT query_manage_index (D101 RBAC) — the index is
     # provisioned by scripts/learning-candidates-init.sh as admin, not here.
@@ -322,7 +322,7 @@ async def test_evidence_in_audit_candidate_is_ref_only_live(candidate_store):
     from data_agent.learning.audit.models import EvidenceSnapshot
 
     audit = CouchbaseAuditStore(_settings())
-    await audit._cluster.on_connect()
+    await audit.connect()
 
     sid = f"sess-{uuid.uuid4().hex[:8]}"
     ref = audit.mint_evidence_ref(sid)
@@ -348,4 +348,4 @@ async def test_evidence_in_audit_candidate_is_ref_only_live(candidate_store):
         assert _SECRET not in json.dumps(got.to_doc())
     finally:
         await audit._collection.remove(ref)
-        await audit._cluster.close()
+        await audit.close()

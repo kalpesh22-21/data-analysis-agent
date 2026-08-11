@@ -364,6 +364,33 @@ class RuntimeSettings(BaseSettings):
         "", description="Static issuer API key authorizing the offline POST /token mint (secret)."
     )
 
+    # The three warehouse TENANT claims stamped into that offline replay token. The MCP
+    # requires them on every call (`clientcode`/`proc_center`/`jti` → the paycom_*
+    # ClickHouse settings its row policies read); omitting them is a 403
+    # MISSING_TENANT_CLAIM before any tool runs, which the probe converts into a
+    # `probe_unavailable` HOLD indistinguishable from a healthy fail-closed run — i.e.
+    # a dark verification gate. See `learning/promotion/token_minter.py::TenantClaims`
+    # for WHY a background replay may take its tenant from process config (it carries
+    # no user's authority) and what a green replay therefore does NOT prove.
+    #
+    # SAME env var names as `ui/server.py`'s TENANT_* block, deliberately: one knob per
+    # tenant fact, configured once, honored by both the request path and the offline
+    # plane. Defaults match the seeded local warehouse
+    # (docker/clickhouse-init/hr-4tables-snake-migration.sql), as the UI's do.
+    tenant_client_code: str = Field(
+        "CLIENT_A", description="'clientcode' claim → ClickHouse setting paycom_client_code."
+    )
+    tenant_proc_center: str = Field(
+        "PC01", description="'proc_center' claim → ClickHouse setting paycom_proc_center."
+    )
+    tenant_jti: str = Field(
+        "TESTJTI001",
+        description=(
+            "'jti' claim → paycom_authenticated_user. The PRINCIPAL the offline replay "
+            "runs as: the employee/payroll row policies gate on this."
+        ),
+    )
+
     # --- Session / retention (D22/D44) ---
     session_ttl_seconds: int = Field(
         604_800,  # 7 days

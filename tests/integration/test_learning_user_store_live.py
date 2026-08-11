@@ -73,7 +73,7 @@ async def user_store():
     from data_agent.learning.user.couchbase_user_store import CouchbaseUserKnowledgeStore
 
     store = CouchbaseUserKnowledgeStore(_config())
-    await store._cluster.on_connect()
+    await store.connect()
     created: list[str] = []
     store._created = created  # type: ignore[attr-defined]
     yield store

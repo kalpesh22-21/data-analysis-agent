@@ -184,6 +184,13 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         and runtime_settings.mcp_url
         and runtime_settings.token_service_url
         and runtime_settings.token_issuer_api_key
+        # A blank tenant claim is as disabling as a blank mint credential: the MCP
+        # rejects every replay 403 MISSING_TENANT_CLAIM. Gate on it here so the
+        # deployment falls into the LOGGED offline posture rather than starting a
+        # write plane whose verification gate can never run.
+        and runtime_settings.tenant_client_code.strip()
+        and runtime_settings.tenant_proc_center.strip()
+        and runtime_settings.tenant_jti.strip()
         and runtime_settings.neo4j_url
         and runtime_settings.neo4j_username
         and runtime_settings.neo4j_password
@@ -221,7 +228,7 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
     from ..candidate.couchbase_candidate_store import CouchbaseCandidateStore
     from ..dedup.couchbase_corpus import CouchbaseBlueprintCorpus
     from ..factory import build_promotion_write_plane
-    from ..promotion.token_minter import HttpTokenMinter
+    from ..promotion.token_minter import HttpTokenMinter, TenantClaims
 
     candidate_store = CouchbaseCandidateStore(learning_settings)
     corpus = CouchbaseBlueprintCorpus(learning_settings)
@@ -242,6 +249,15 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         token_minter=HttpTokenMinter(
             runtime_settings.token_service_url,
             runtime_settings.token_issuer_api_key,
+            # The human `approve` path re-runs golden replay through this minter. The
+            # tenant it replays as is deployment config (TENANT_*, shared verbatim with
+            # ui/server.py) — a reviewer's approve is not a caller-authority read; see
+            # `TenantClaims` for the argument and for what it does NOT prove.
+            tenant=TenantClaims(
+                clientcode=runtime_settings.tenant_client_code,
+                proc_center=runtime_settings.tenant_proc_center,
+                jti=runtime_settings.tenant_jti,
+            ),
         ),
         neo4j_driver=neo4j_driver,
         embedding_client=HttpEmbeddingClient(

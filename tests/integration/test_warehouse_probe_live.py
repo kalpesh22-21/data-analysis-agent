@@ -4,11 +4,20 @@ JWT minted (via the live token IdP) scoped to the blueprint's `uses`.
 
 The proofs only the live stack can give (S9-activation Slice 1):
   * the grain probe runs the `COUNT(*),COUNT(DISTINCT grain)` canary through the real
-    `runQuery` choke point and returns a correct `ProbeResult` (5 rows, 5 distinct
-    EmployeeCode over the seeded `dbpcm_warehouse.employee`);
+    `runQuery` choke point and returns a `ProbeResult` whose numbers came from
+    ClickHouse (`row_count == distinct_grain_count` over the seeded
+    `dbpcm_warehouse.employee`, one row per employee_code);
   * a replay reading OUTSIDE the minted `uses` is DENIED by the real D57 column-scope
     teeth (COLUMN_SCOPE_VIOLATION) — proving the token is really scoped to `uses`
     (not an allow-all), the whole point of the MCP-via-scope reach decision (§1.1).
+
+This file could not pass until the minter learned to send the three TENANT claims
+(`conftest.TENANT`): without them the MCP rejected the connection `403
+MISSING_TENANT_CLAIM` at auth, before any tool ran. It had also drifted off the
+warehouse schema in the meantime (CamelCase `EmployeeCode`/`AnnualSalary` against a
+snake_case table) and pinned a five-row census the seed no longer has — both invisible
+while every case died at the transport. It now names real columns and asserts the
+grain INVARIANT rather than a row count, so a re-seed does not turn it red.
 
 Skip-guarded on `MCP_TEST_URL` (mirrors `tests/integration/test_mcp_scope_live.py`)
 so `uv run pytest` with no live stack stays green. Run with:
@@ -28,7 +37,7 @@ from data_agent.learning.promotion.warehouse_probe import MCPWarehouseProbe
 from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.real_client import RealMCPClient
 
-from .conftest import TOKEN_ISSUER_API_KEY, TOKEN_SERVICE_URL
+from .conftest import TENANT, TOKEN_ISSUER_API_KEY, TOKEN_SERVICE_URL
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("MCP_TEST_URL"),
@@ -36,39 +45,44 @@ pytestmark = pytest.mark.skipif(
 )
 
 _EMPLOYEE_FQ = "dbpcm_warehouse.employee"
-_EMPLOYEE_CODE_SCOPE = (f"{_EMPLOYEE_FQ}.EmployeeCode",)
+_EMPLOYEE_CODE_SCOPE = (f"{_EMPLOYEE_FQ}.employee_code",)
 
 
 def _probe() -> MCPWarehouseProbe:
     return MCPWarehouseProbe(
         mcp_client=RealMCPClient(os.environ["MCP_TEST_URL"]),
-        token_minter=HttpTokenMinter(TOKEN_SERVICE_URL, TOKEN_ISSUER_API_KEY),
+        token_minter=HttpTokenMinter(
+            TOKEN_SERVICE_URL, TOKEN_ISSUER_API_KEY, tenant=TENANT
+        ),
     )
 
 
 async def test_probe_runs_grain_probe_end_to_end() -> None:
-    """Under a token scoped to EXACTLY the blueprint's `uses` (EmployeeCode), the
-    real probe reads the column signature AND runs the grain canary → 5 rows, 5
-    distinct EmployeeCode (the seeded grain)."""
+    """Under a token scoped to EXACTLY the blueprint's `uses` (employee_code), the
+    real probe reads the column signature AND runs the grain canary against live
+    ClickHouse. The assertion is the D56 INVARIANT (one row per employee_code) plus
+    "the numbers are real", not a row census: the visible row set is whatever the
+    tenant row policies grant this principal, and pinning it made the older version
+    of this test a re-seed away from red for no added proof."""
     result = await _probe().run(
-        f"SELECT EmployeeCode FROM {_EMPLOYEE_FQ}",
-        grain_columns=("EmployeeCode",),
+        f"SELECT employee_code FROM {_EMPLOYEE_FQ}",
+        grain_columns=("employee_code",),
         column_scope=_EMPLOYEE_CODE_SCOPE,
     )
-    assert result.columns == ("EmployeeCode",)
-    assert result.row_count == 5
-    assert result.distinct_grain_count == 5
+    assert result.columns == ("employee_code",)
+    assert result.row_count > 0
+    assert result.distinct_grain_count == result.row_count
 
 
 async def test_probe_signature_only_when_grain_unverifiable() -> None:
     """No declared grain → the row-count teeth are skipped; the probe still returns
     the real column signature (proving the replay executed live)."""
     result = await _probe().run(
-        f"SELECT EmployeeCode FROM {_EMPLOYEE_FQ}",
+        f"SELECT employee_code FROM {_EMPLOYEE_FQ}",
         grain_columns=(),
         column_scope=_EMPLOYEE_CODE_SCOPE,
     )
-    assert result.columns == ("EmployeeCode",)
+    assert result.columns == ("employee_code",)
     assert result.distinct_grain_count is None
 
 
@@ -79,8 +93,8 @@ async def test_probe_out_of_uses_column_denied_by_real_scope() -> None:
     probe = _probe()
     with pytest.raises(MCPToolError) as exc_info:
         await probe.run(
-            f"SELECT AnnualSalary FROM {_EMPLOYEE_FQ}",  # NOT in the minted uses
+            f"SELECT annual_salary FROM {_EMPLOYEE_FQ}",  # NOT in the minted uses
             grain_columns=(),
-            column_scope=_EMPLOYEE_CODE_SCOPE,  # scoped to EmployeeCode only
+            column_scope=_EMPLOYEE_CODE_SCOPE,  # scoped to employee_code only
         )
     assert exc_info.value.code == "COLUMN_SCOPE_VIOLATION"

@@ -102,7 +102,10 @@ from data_agent.learning.models import (  # noqa: E402
     compute_content_hash,
 )
 from data_agent.learning.promotion.landing import landing_id  # noqa: E402
-from data_agent.learning.promotion.token_minter import HttpTokenMinter  # noqa: E402
+from data_agent.learning.promotion.token_minter import (  # noqa: E402
+    HttpTokenMinter,
+    TenantClaims,
+)
 from data_agent.learning.sweeper import LearningSweeper  # noqa: E402
 from data_agent.runtime.app import create_app  # noqa: E402
 from data_agent.runtime.config import RuntimeSettings  # noqa: E402
@@ -122,6 +125,19 @@ from _catalog import catalog_dict, catalog_handle  # noqa: E402
 
 TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
 TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
+
+_TENANT_SETTINGS = RuntimeSettings(_env_file=None)
+
+# The warehouse TENANT claims every minted token must carry. The MCP maps
+# clientcode/proc_center/jti onto the paycom_* ClickHouse settings its row policies
+# read; a token without them is rejected 403 MISSING_TENANT_CLAIM before any tool
+# runs. Resolved through `RuntimeSettings` so this reads the SAME TENANT_* env vars
+# ui/server.py and the learning scheduler read (defaults = the seeded local tenant).
+_TENANT = TenantClaims(
+    clientcode=_TENANT_SETTINGS.tenant_client_code,
+    proc_center=_TENANT_SETTINGS.tenant_proc_center,
+    jti=_TENANT_SETTINGS.tenant_jti,
+)
 
 _REDIS_URL = os.environ["LEARNING_REDIS_TEST_URL"]
 _NEO4J_URI = os.environ["NEO4J_TEST_URI"]
@@ -221,8 +237,11 @@ async def _build_infra() -> _Infra:
     audit_store = CouchbaseAuditStore(settings)
     corpus_store = CouchbaseBlueprintCorpus(settings)
     user_store = CouchbaseUserKnowledgeStore(UserKnowledgeStoreConfig(_env_file=None))
+    # Each store connects itself on first use (`CouchbaseConnectGate`); connecting
+    # up-front here only makes a bad endpoint/credential fail during setup, with the
+    # failing store named, instead of part-way through the demo.
     for st in (session_store, candidate_store, audit_store, corpus_store, user_store):
-        await st._cluster.on_connect()
+        await st.connect()
 
     embedder = HttpEmbeddingClient(
         url=_EMBEDDING_URL,
@@ -238,7 +257,9 @@ async def _build_infra() -> _Infra:
     await apply_schema(neo4j_driver, dimension=768)
 
     mcp_client = RealMCPClient(_MCP_URL)
-    token_minter = HttpTokenMinter(TOKEN_SERVICE_URL, TOKEN_ISSUER_API_KEY)
+    token_minter = HttpTokenMinter(
+        TOKEN_SERVICE_URL, TOKEN_ISSUER_API_KEY, tenant=_TENANT
+    )
 
     tag = uuid.uuid4().hex[:12]
     redis_client = aioredis.from_url(_REDIS_URL, decode_responses=True)
@@ -302,7 +323,7 @@ async def _teardown(infra: _Infra) -> None:
         infra.corpus_store,
         infra.user_store,
     ):
-        await st._cluster.close()
+        await st.close()
     await infra.neo4j_driver.close()
     await infra.redis_client.delete(infra.stream, infra.dead)
     async for key in infra.redis_client.scan_iter(match=f"{infra.stream}:enqueued:*"):
@@ -331,7 +352,14 @@ async def _mint_bound(scope: list, session_id: str) -> str:
         resp = await client.post(
             TOKEN_SERVICE_URL,
             headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
-            json={"user_name": "alice", "column_scope": scope, "session_id": session_id},
+            json={
+                "user_name": "alice",
+                "column_scope": scope,
+                "session_id": session_id,
+                # Without the tenant claims the MCP 403s every tool call
+                # (MISSING_TENANT_CLAIM) — see `_TENANT`.
+                "claims": _TENANT.as_claims(),
+            },
         )
         resp.raise_for_status()
         return resp.json()["access_token"]

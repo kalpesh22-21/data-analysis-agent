@@ -36,6 +36,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from typing import Any
 
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
 from data_agent.learning.config import LearningSettings
@@ -173,22 +174,23 @@ async def _main() -> int:
     if audit_store is not None:
         stores.append(audit_store)
 
-    # The acouchbase Cluster connects lazily; force the connect BEFORE the first
-    # read so a bad endpoint/credential fails here rather than mid-reconstruction
-    # (mirrors scripts/demo_learning_e2e_openai.py). M2: a connect failure is an
-    # INFRA error — report it in one line on stderr, close every already-connected
-    # cluster, and exit 2 (distinct from 0=found / 1=not-found), never a raw
-    # traceback (the candidate/audit creds default to "" — a common misconfig).
-    connected: list[object] = []
+    # Each store connects itself on first use (`CouchbaseConnectGate`), so this is
+    # NOT required for correctness — it is here to make a bad endpoint/credential
+    # fail HERE, attributably, rather than mid-reconstruction. M2: a connect failure
+    # is an INFRA error — report it in one line on stderr, close every
+    # already-connected cluster, and exit 2 (distinct from 0=found / 1=not-found),
+    # never a raw traceback (the candidate/audit creds default to "" — a common
+    # misconfig).
+    connected: list[Any] = []
     try:
         for store in stores:
-            await store._cluster.on_connect()
+            await store.connect()
             connected.append(store)
     except Exception as exc:  # noqa: BLE001 — surface a clean infra message, not a traceback.
         failing = type(stores[len(connected)]).__name__
         print(f"learning_trace: failed to connect {failing}: {exc}", file=sys.stderr)
         for store in connected:
-            await store._cluster.close()
+            await store.close()
         return 2
 
     try:
@@ -206,7 +208,7 @@ async def _main() -> int:
             )
     finally:
         for store in stores:
-            await store._cluster.close()
+            await store.close()
 
     return 0 if trace.session is not None else 1
 

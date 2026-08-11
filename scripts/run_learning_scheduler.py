@@ -55,7 +55,7 @@ from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
 from data_agent.learning.factory import build_promotion_plane, build_promotion_write_plane
 from data_agent.learning.observability import configure_learning_tracing, get_learning_tracer
 from data_agent.learning.promotion.models import ProbeResult
-from data_agent.learning.promotion.token_minter import HttpTokenMinter
+from data_agent.learning.promotion.token_minter import HttpTokenMinter, TenantClaims
 from data_agent.runtime.config import RuntimeSettings
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
@@ -141,6 +141,13 @@ async def _main() -> int:
         runtime_settings.mcp_url
         and runtime_settings.token_service_url
         and runtime_settings.token_issuer_api_key
+        # A blank tenant claim is as disabling as a blank mint credential: the MCP
+        # rejects every replay 403 MISSING_TENANT_CLAIM before any tool runs. Gate on
+        # it so the daemon stays in the LOGGED dormant posture (deferred probe, nothing
+        # auto-promotes) instead of running a golden-replay gate that cannot execute.
+        and runtime_settings.tenant_client_code.strip()
+        and runtime_settings.tenant_proc_center.strip()
+        and runtime_settings.tenant_jti.strip()
         and runtime_settings.neo4j_url
         and runtime_settings.neo4j_username
         and runtime_settings.neo4j_password
@@ -168,6 +175,17 @@ async def _main() -> int:
             token_minter=HttpTokenMinter(
                 runtime_settings.token_service_url,
                 runtime_settings.token_issuer_api_key,
+                # WHICH TENANT the background replay runs as. There is no caller here
+                # to resolve it from, so it is deployment config (TENANT_*, the SAME
+                # env vars ui/server.py reads). The replay carries no user's authority
+                # — it asks a structural question — but a blueprint verified against
+                # one tenant's data is verified against that tenant's data only; see
+                # `TenantClaims` for the full argument and its limits.
+                tenant=TenantClaims(
+                    clientcode=runtime_settings.tenant_client_code,
+                    proc_center=runtime_settings.tenant_proc_center,
+                    jti=runtime_settings.tenant_jti,
+                ),
             ),
             neo4j_driver=neo4j_driver,
             embedding_client=HttpEmbeddingClient(

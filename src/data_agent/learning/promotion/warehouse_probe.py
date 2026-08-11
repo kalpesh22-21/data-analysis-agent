@@ -134,9 +134,10 @@ class MCPWarehouseProbe:
 
 def _default_session_id() -> str:
     # A synthetic, non-user session id. It is LOAD-BEARING: the token is minted BOUND
-    # to it (sid_hash), and the probe sends this SAME id as X-Session-Id — the live
-    # MCP's require_sid_binding rejects a mismatch (§1.3 deviation). The probe owns both
-    # the token and the id, so there is no hijack surface.
+    # to it (sid_hash), and the probe sends this SAME id as X-Session-Id, so an MCP
+    # running require_sid_binding accepts it (that flag is config, default OFF — see
+    # token_minter.py's module docstring; §1.3 deviation). The probe owns both the
+    # token and the id, so there is no hijack surface either way.
     return f"learning-replay-{uuid.uuid4().hex}"
 
 

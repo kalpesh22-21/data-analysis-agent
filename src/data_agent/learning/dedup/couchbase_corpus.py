@@ -29,12 +29,20 @@ scheduler reads the same artifacts' `hit_count` (this store also duck-types the
 Import-guarded exactly like `couchbase_candidate_store` / `couchbase_audit_store`:
 the module imports with or without the `couchbase` SDK (so the unit suite stays
 green with zero infra); constructing the store without the SDK raises.
+
+CONNECT (2026-08-11): shares `CouchbaseConnectGate` with every other
+Couchbase-backed store — `acouchbase` refuses all ops until `on_connect()` has
+been awaited, which a sync `__init__` cannot do, so each public coroutine gates
+itself. The consumer, the promotion scheduler and the inbox service all build
+this store and none of them connected it. See `runtime/couchbase_connect.py`.
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
+
+from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
 
 from ..config import LearningSettings
 from .corpus import CorpusArtifact
@@ -85,7 +93,7 @@ def _to_doc(artifact: CorpusArtifact) -> dict[str, Any]:
     }
 
 
-class CouchbaseBlueprintCorpus:
+class CouchbaseBlueprintCorpus(CouchbaseConnectGate):
     """Real `BlueprintCorpus` backed by the dedicated `learning_corpus` bucket.
 
     Also duck-types the S9 `HitCountReader` port (`hit_count(canonical_key) -> int`)
@@ -112,6 +120,8 @@ class CouchbaseBlueprintCorpus:
         self._bucket_name = settings.learning_corpus_bucket
         bucket = self._cluster.bucket(self._bucket_name)
         self._collection = bucket.default_collection()
+        # The connect itself is async; every public coroutine awaits the gate.
+        self._init_connect_gate(self._cluster, bucket)
         self._ttl = (
             timedelta(seconds=settings.learning_corpus_ttl_seconds)
             if settings.learning_corpus_ttl_seconds > 0
@@ -119,6 +129,7 @@ class CouchbaseBlueprintCorpus:
         )
 
     async def get_by_canonical_key(self, canonical_key: str) -> CorpusArtifact | None:
+        await self._ensure_connected()
         try:
             result = await self._collection.get(_doc_id(canonical_key), GetOptions())
         except DocumentNotFoundException:
@@ -126,6 +137,7 @@ class CouchbaseBlueprintCorpus:
         return CorpusArtifact.from_doc(result.content_as[dict])
 
     async def seed_artifact(self, artifact: CorpusArtifact) -> None:
+        await self._ensure_connected()
         # INSERT-WINS idempotency (D48): `insert` fails on an existing key, so two
         # concurrent first-sightings yield EXACTLY one create; a later attempt is a
         # tolerated no-op. NEVER `upsert` — that would reset an accrued `hit_count`.
@@ -136,6 +148,7 @@ class CouchbaseBlueprintCorpus:
             return
 
     async def increment_hit_count(self, canonical_key: str) -> None:
+        await self._ensure_connected()
         # ATOMIC server-side increment (D48): a sub-document counter mutation, NOT a
         # read-modify-write. Concurrent hits each apply a server-side +1 with no lost
         # updates. A vanished doc (concurrent retire) → DocumentNotFoundException,
@@ -148,6 +161,7 @@ class CouchbaseBlueprintCorpus:
             return
 
     async def increment_recurrence_count(self, canonical_key: str) -> None:
+        await self._ensure_connected()
         # The SOFT paraphrase counter (plan §4). Atomic server-side, exactly like
         # `increment_hit_count`, and for the same reason: several concurrent sessions can
         # be near the same artifact and a read-modify-write would lose updates.
@@ -172,6 +186,7 @@ class CouchbaseBlueprintCorpus:
             return
 
     async def set_status(self, canonical_key: str, status: str) -> None:
+        await self._ensure_connected()
         # NARROW sub-document write on the ONE field (PriorArtIndex Slice 2), for the
         # same three reasons `CandidateStore.stamp_drift` is one: a full-document upsert
         # would (a) clobber a `hit_count` another worker incremented between our read and
@@ -188,6 +203,7 @@ class CouchbaseBlueprintCorpus:
             return
 
     async def list_artifacts(self) -> list[CorpusArtifact]:
+        await self._ensure_connected()
         # Default (NOT_BOUNDED) query consistency: a just-seeded artifact may not yet
         # be visible to this scan — fine for the S6 soft near-miss layer (a missed
         # near-duplicate degrades to `insert`, the fail-soft direction, D52).
@@ -209,6 +225,7 @@ class CouchbaseBlueprintCorpus:
     async def hit_count(self, canonical_key: str) -> int:
         """The S9 `HitCountReader` port: the landed artifact's cross-session
         `hit_count`, or 0 when no artifact is keyed here (nothing has accrued)."""
+        await self._ensure_connected()
         artifact = await self.get_by_canonical_key(canonical_key)
         return artifact.hit_count if artifact is not None else 0
 
@@ -219,5 +236,6 @@ class CouchbaseBlueprintCorpus:
         Duck-typed onto this store for the same reason `hit_count` is — the scheduler's
         corroboration gate weighs both counts and they must come from the ONE set of
         artifacts the dedup stage writes, not from two stores that could diverge."""
+        await self._ensure_connected()
         artifact = await self.get_by_canonical_key(canonical_key)
         return artifact.recurrence_count if artifact is not None else 0

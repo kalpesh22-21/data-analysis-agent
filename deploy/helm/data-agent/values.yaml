@@ -137,6 +137,17 @@ config:
   JWT_AUDIENCE: "data-agent"
   # -- Token service (IdP) token endpoint. EXTERNAL.
   TOKEN_SERVICE_URL: "http://token:8000/token"
+  # -- Warehouse tenant claim 'clientcode' (→ ClickHouse setting paycom_client_code).
+  #    Required by the MCP on every call; a token without it is rejected 403
+  #    MISSING_TENANT_CLAIM. Read by BOTH the UI BFF (per-request mint) and the
+  #    offline learning replay. Must be a tenant whose data this deployment reads.
+  TENANT_CLIENT_CODE: "CLIENT_A"
+  # -- Warehouse tenant claim 'proc_center' (→ paycom_proc_center).
+  TENANT_PROC_CENTER: "PC01"
+  # -- Warehouse tenant claim 'jti' (→ paycom_authenticated_user). The PRINCIPAL the
+  #    offline golden replay runs as: the employee/payroll row policies gate on it,
+  #    so the replay sees exactly this principal's employee set.
+  TENANT_JTI: "TESTJTI001"
   # -- Neo4j bolt URL (retrieval graph). EXTERNAL.
   NEO4J_URL: "bolt://neo4j:7687"
   # -- Neo4j username.

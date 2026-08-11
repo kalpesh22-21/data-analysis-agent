@@ -251,7 +251,7 @@ async def infra():
     corpus_store = CouchbaseBlueprintCorpus(settings)
     user_store = CouchbaseUserKnowledgeStore(UserKnowledgeStoreConfig(_env_file=None))
     for st in (session_store, candidate_store, audit_store, corpus_store, user_store):
-        await st._cluster.on_connect()
+        await st.connect()
 
     # Optional: wire the real l2-embedding service into the S6 soft layer when
     # EMBEDDING_TEST_URL is set. Unset ⇒ the factory's insert-only default (hard-key
@@ -312,7 +312,7 @@ async def infra():
         for ref in created_audit:
             await _rm(audit_store._collection, ref)
         for st in (session_store, candidate_store, audit_store, corpus_store, user_store):
-            await st._cluster.close()
+            await st.close()
         await redis_client.delete(stream, dead)
         async for key in redis_client.scan_iter(match=f"{stream}:enqueued:*"):
             await redis_client.delete(key)

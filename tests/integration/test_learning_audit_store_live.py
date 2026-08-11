@@ -58,7 +58,7 @@ async def audit_store():
     from data_agent.learning.audit.couchbase_audit_store import CouchbaseAuditStore
 
     store = CouchbaseAuditStore(_settings())
-    await store._cluster.on_connect()
+    await store.connect()
     created: list[str] = []
     store._created_refs = created  # type: ignore[attr-defined]
     yield store
@@ -106,7 +106,7 @@ async def test_read_missing_ref_returns_none_live(audit_store):
 async def test_short_ttl_snapshot_expires(audit_store):
     # A dedicated store with a 2s TTL proves the audit clock is honored on write.
     short = type(audit_store)(_settings(learning_audit_ttl_seconds=2))
-    await short._cluster.on_connect()
+    await short.connect()
     sid = f"sess-{uuid.uuid4().hex[:8]}"
     ref = short.mint_evidence_ref(sid)
     await short.snapshot(ref, _snapshot(ref, session_id=sid))

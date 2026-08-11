@@ -20,7 +20,11 @@ import pytest
 
 from data_agent.learning.candidate.generalization import BlueprintGeneralization
 from data_agent.learning.promotion.replay import golden_replay
-from data_agent.learning.promotion.token_minter import HttpTokenMinter, TokenMintError
+from data_agent.learning.promotion.token_minter import (
+    HttpTokenMinter,
+    TenantClaims,
+    TokenMintError,
+)
 from data_agent.learning.promotion.warehouse_probe import (
     MCPWarehouseProbe,
     WarehouseProbeError,
@@ -208,7 +212,11 @@ async def test_empty_uses_refuses_allow_all_and_holds_no_uses_scope() -> None:
 async def test_http_minter_refuses_empty_scope() -> None:
     """Defense-in-depth: even called directly, the real minter REFUSES an empty scope
     (no httpx call) rather than mint an unrestricted token."""
-    minter = HttpTokenMinter("http://token.invalid/token", "issuer-key")
+    minter = HttpTokenMinter(
+        "http://token.invalid/token",
+        "issuer-key",
+        tenant=TenantClaims(clientcode="CLIENT_A", proc_center="PC01", jti="JTI1"),
+    )
     with pytest.raises(TokenMintError):
         await minter.mint([], session_id="sess-x")
 

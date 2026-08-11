@@ -88,9 +88,10 @@ async def store():
 
     settings = _settings()
     st = CouchbaseSessionStore(settings)
-    # The async SDK connects lazily on the first KV op; a cluster-level `query`
-    # needs the connection established explicitly first.
-    await st._cluster.on_connect()
+    # The store's own methods gate themselves (`CouchbaseConnectGate`), but the DDL
+    # below bypasses them and drives the raw cluster (there is no store method for
+    # CREATE INDEX), so this fixture still connects explicitly.
+    await st.connect()
     # scan_idle_sessions runs N1QL over the sessions collection — a primary index
     # is required. IF NOT EXISTS makes this idempotent across runs.
     keyspace = (

@@ -66,6 +66,11 @@ def full_plane(monkeypatch):
         mcp_url = "http://mcp"
         token_service_url = "http://token"
         token_issuer_api_key = "k"
+        # The MCP requires these three on every call; the composition root gates
+        # write-plane readiness on them and hands them to the minter.
+        tenant_client_code = "CLIENT_A"
+        tenant_proc_center = "PC01"
+        tenant_jti = "TESTJTI001"
         neo4j_url = "bolt://neo4j:7687"
         neo4j_username = "neo4j"
         neo4j_password = "pw"
@@ -93,7 +98,10 @@ def full_plane(monkeypatch):
     monkeypatch.setattr(cand_mod, "CouchbaseCandidateStore", lambda s: InMemoryCandidateStore())
     monkeypatch.setattr(corpus_mod, "CouchbaseBlueprintCorpus", lambda s: corpus)
     monkeypatch.setattr(mcp_mod, "RealMCPClient", lambda url: object())
-    monkeypatch.setattr(minter_mod, "HttpTokenMinter", lambda url, key: object())
+    # `**kw` (not a fixed signature): the real minter takes a REQUIRED keyword-only
+    # `tenant`, and a double that pins the old two-positional shape would keep this
+    # test green while the wiring it stands in for stopped compiling.
+    monkeypatch.setattr(minter_mod, "HttpTokenMinter", lambda *a, **kw: object())
     monkeypatch.setattr(embed_mod, "HttpEmbeddingClient", lambda **k: SimpleNamespace(**k))
     monkeypatch.setattr(
         neo4j.AsyncGraphDatabase, "driver", staticmethod(lambda *a, **k: object())
@@ -168,6 +176,9 @@ def test_offline_dev_mode_deliberately_wires_no_status_writer(monkeypatch):
         mcp_url = ""
         token_service_url = ""
         token_issuer_api_key = ""
+        tenant_client_code = ""
+        tenant_proc_center = ""
+        tenant_jti = ""
         neo4j_url = ""
         neo4j_username = ""
         neo4j_password = ""

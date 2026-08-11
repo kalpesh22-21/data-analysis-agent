@@ -10,12 +10,21 @@ is independent — unlike the session-lifecycle transitions that `preserve_expir
 Import-guarded exactly like `runtime/session/couchbase_store.py`: the module
 imports with or without the `couchbase` SDK (so the unit suite stays green with
 zero infra); constructing the store without the SDK raises.
+
+CONNECT (2026-08-11): shares `CouchbaseConnectGate` with every other
+Couchbase-backed store — `acouchbase` refuses all ops until `on_connect()` has
+been awaited, and a sync `__init__` cannot do that, so each public coroutine
+gates itself. The consumer/scheduler/inbox daemons build this store and never
+connected it; nothing here had ever run from a daemon entrypoint either. See
+`runtime/couchbase_connect.py`.
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
+
+from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
 
 from ..config import LearningSettings
 from .judgement import JudgeRecord
@@ -33,7 +42,7 @@ except ImportError:  # pragma: no cover
     COUCHBASE_AVAILABLE = False
 
 
-class CouchbaseAuditStore:
+class CouchbaseAuditStore(CouchbaseConnectGate):
     """Real `AuditStore` backed by the dedicated `learning_audit` bucket."""
 
     def __init__(self, settings: LearningSettings, cluster: Any = None) -> None:
@@ -54,6 +63,8 @@ class CouchbaseAuditStore:
         bucket = self._cluster.bucket(settings.learning_audit_bucket)
         # KV-only, default scope/collection (no GSI needed — §4.1).
         self._collection = bucket.default_collection()
+        # The connect itself is async; every public coroutine awaits the gate.
+        self._init_connect_gate(self._cluster, bucket)
         self._ttl = timedelta(seconds=settings.learning_audit_ttl_seconds)
         # A SEPARATE clock for judge verdicts (plan §3b). Same bucket, different
         # question: an evidence quote is entity-bearing and SHOULD expire on the D95
@@ -72,9 +83,11 @@ class CouchbaseAuditStore:
     async def snapshot(self, ref: str, snapshot: EvidenceSnapshot) -> None:
         # Audit TTL is set FRESH on every write — the audit retention clock is
         # independent by design (D95 floor: audit_TTL ≥ max_candidate_lifetime).
+        await self._ensure_connected()
         await self._collection.upsert(ref, snapshot.to_doc(), UpsertOptions(expiry=self._ttl))
 
     async def read(self, ref: str) -> EvidenceSnapshot | None:
+        await self._ensure_connected()
         try:
             result = await self._collection.get(ref, GetOptions())
         except DocumentNotFoundException:
@@ -94,6 +107,7 @@ class CouchbaseAuditStore:
         record_judgement` states plainly that a plain upsert acks from the managed cache
         and that persistence is asynchronous.
         """
+        await self._ensure_connected()
         await self._collection.upsert(
             record.judgement_ref,
             record.to_doc(),
@@ -101,6 +115,7 @@ class CouchbaseAuditStore:
         )
 
     async def read_judgement(self, ref: str) -> JudgeRecord | None:
+        await self._ensure_connected()
         try:
             result = await self._collection.get(ref, GetOptions())
         except DocumentNotFoundException:

@@ -8,12 +8,20 @@ scoped role is load-bearing: `open_bucket` refuses any bucket but its grant, and
 
 Import-guarded exactly like `couchbase_audit_store` / `couchbase_candidate_store`:
 imports with or without the SDK; constructing without it raises.
+
+CONNECT (2026-08-11): shares `CouchbaseConnectGate` with every other
+Couchbase-backed store — `acouchbase` refuses all ops until `on_connect()` has
+been awaited, which a sync `__init__` cannot do, so each public coroutine gates
+itself. The consumer builds this store and never connected it. See
+`runtime/couchbase_connect.py`.
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
+
+from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
 
 from .config import UserKnowledgeStoreConfig
 from .models import UserKnowledgeRecord
@@ -30,7 +38,7 @@ except ImportError:  # pragma: no cover
     COUCHBASE_AVAILABLE = False
 
 
-class CouchbaseUserKnowledgeStore:
+class CouchbaseUserKnowledgeStore(CouchbaseConnectGate):
     """Real `UserKnowledgeStore` backed by the dedicated `user_knowledge` bucket."""
 
     def __init__(self, config: UserKnowledgeStoreConfig, cluster: Any = None) -> None:
@@ -51,6 +59,8 @@ class CouchbaseUserKnowledgeStore:
         self._bucket_name = config.user_knowledge_bucket
         bucket = self._cluster.bucket(self._bucket_name)
         self._collection = bucket.default_collection()
+        # The connect itself is async; every public coroutine awaits the gate.
+        self._init_connect_gate(self._cluster, bucket)
         self._ttl = (
             timedelta(seconds=config.user_knowledge_ttl_seconds)
             if config.user_knowledge_ttl_seconds > 0
@@ -69,10 +79,12 @@ class CouchbaseUserKnowledgeStore:
         return self
 
     async def commit(self, record: UserKnowledgeRecord) -> None:
+        await self._ensure_connected()
         options = UpsertOptions(expiry=self._ttl) if self._ttl is not None else UpsertOptions()
         await self._collection.upsert(record.record_id, record.to_doc(), options)
 
     async def get(self, record_id: str) -> UserKnowledgeRecord | None:
+        await self._ensure_connected()
         try:
             result = await self._collection.get(record_id, GetOptions())
         except DocumentNotFoundException:
@@ -82,6 +94,7 @@ class CouchbaseUserKnowledgeStore:
     async def list_for_user(
         self, user_id: str, *, limit: int = 100
     ) -> list[UserKnowledgeRecord]:
+        await self._ensure_connected()
         statement = (
             f"SELECT r.* FROM `{self._bucket_name}` r "
             "WHERE r.user_id = $user_id "

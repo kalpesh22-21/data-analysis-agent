@@ -11,13 +11,23 @@ Load-bearing choices (S9-design §1.3, with the Slice-1 binding deviation noted 
   * `column_scope = <blueprint.uses>` — the exact `["db.table.column", …]` grammar the
     MCP enforces (D57). The replay then reads ONLY within the declared footprint
     (D89 scope-honesty); the MCP's D57 teeth are the backstop if the mint is wrong.
+  * **The three warehouse TENANT claims** (`TenantClaims`) — required by the MCP on
+    EVERY call. Omitting them made every offline replay 403 before any tool ran, and
+    the fail-closed `probe_unavailable` HOLD that resulted is byte-identical to the
+    hold a healthy fail-closed design produces, so the gate was dark and silent for
+    the whole life of the feature. See `TenantClaims` for who the replay runs AS.
   * **Session-BOUND (deviation from §1.3).** The design assumed a session-LESS mint
-    (no `sid_hash`) so the probe could send an arbitrary `X-Session-Id`. The live MCP
-    runs `require_sid_binding=true` — an unbound token + an `X-Session-Id` header is
-    rejected 403 `SESSION_BINDING_MISMATCH` (see `test_mcp_scope_live.py::
-    test_unbound_token_with_session_header_rejected`), and `RealMCPClient` always sends
-    the header. So the probe mints a token BOUND to its OWN synthetic session id and
-    sends that SAME id — the probe owns both (no hijack surface), scope stays `uses`.
+    (no `sid_hash`) so the probe could send an arbitrary `X-Session-Id`. But
+    `RealMCPClient` ALWAYS sends the header, and an MCP running
+    `require_sid_binding=true` rejects an unbound token the moment it sees one (403
+    `SESSION_BINDING_MISMATCH`). So the probe mints a token BOUND to its OWN synthetic
+    session id and sends that SAME id — the probe owns both (no hijack surface), scope
+    stays `uses`, and the mint is correct whichever way the flag is set.
+    NOTE, because an earlier version of this docstring asserted it as fact: the flag is
+    CONFIG and defaults to FALSE (`clickhouse-api/app/config.py::require_sid_binding`),
+    and the l2 dev stack does not set it — binding is currently NOT enforced there.
+    Verified 2026-08-11: `test_mcp_scope_live.py::
+    test_unbound_token_with_session_header_rejected` fails 200-not-403 against l2-mcp.
   * A SHORT TTL bounds token exposure (the probe fires once and discards the token).
   * ANY mint failure RAISES (`TokenMintError`) — the probe lets it propagate so
     `golden_replay` degrades to a clean `probe_unavailable` HOLD (D98), never a leak.
@@ -28,6 +38,7 @@ Two implementations, one interface (the `FakeMCPClient` pattern): the real
 
 from __future__ import annotations
 
+from dataclasses import dataclass, fields
 from typing import Protocol
 
 import httpx
@@ -36,6 +47,109 @@ import httpx
 class TokenMintError(Exception):
     """The offline token mint was rejected or returned no token. RAISED so the probe
     fails closed to `probe_unavailable` (never a value, never a silent pass)."""
+
+
+@dataclass(frozen=True)
+class TenantClaims:
+    """The three warehouse tenant claims the MCP requires on EVERY call.
+
+    The MCP's `app/config.py::CLICKHOUSE_TENANT_SETTINGS` maps these claim names onto
+    the `paycom_client_code` / `paycom_proc_center` / `paycom_authenticated_user`
+    ClickHouse custom settings that the row policies read via `getSetting(...)`
+    (`docker/clickhouse-init/hr-4tables-snake-migration.sql`). `app/auth_jwt.py::
+    validate_token` fails closed on a missing or blank one — `403
+    MISSING_TENANT_CLAIM`, BEFORE any tool runs. The IdP does not supply them:
+    `app/token_service.py::_mint` stamps only sub/iss/aud/exp/user_name/column_scope/
+    sid_hash, so the CALLER must. `ui/server.py`'s `TENANT_*` block is the request-path
+    twin of this type; this is the offline plane's, and the two read the SAME env vars
+    so an operator configures one thing.
+
+    WHICH TENANT DOES AN OFFLINE REPLAY RUN AS?
+    -------------------------------------------
+    The UI resolves this per caller identity, and its comment rightly warns that
+    minting tenant claims from process-level config "would let one deployment issue
+    tokens for another tenant". That warning is about a token carrying a USER'S
+    authority. The golden replay carries none: there is no caller, no request, and no
+    user to impersonate — it is a deployment-level actor asking one structural
+    question ("does this frozen template still parse, still execute, and still
+    preserve its declared grain?"). It needs A tenant with rows, not a PARTICULAR
+    user's tenant. So process-level config is the right answer HERE, and only here.
+
+    THE LIMIT OF THAT REASONING, which a reader of a green replay must know:
+      * A blueprint verified against one tenant's data is verified against THAT
+        TENANT'S DATA ONLY. If tenants have materially different shapes (a column
+        populated for one and NULL for another, a grain unique for one and fanned out
+        for another), a green replay is weaker evidence than it looks.
+      * `jti` is not a bystander. It is the ACTOR: the employee/payroll row policies
+        gate on `user_employee_access.jti`, so the replay sees exactly the employee
+        set of the ONE configured principal — not the union every future caller sees.
+      * A misconfigured tenant does not turn the gate red. Row policies FILTER, they
+        do not error, so a wrong tenant yields zero rows; the grain teeth then read
+        `0 == 0` and pass. Replay is a STRUCTURE oracle (D98) and always was — the
+        sampled synthetic slot values usually match nothing anyway — so "it passed"
+        never meant "rows exist". Read it as: the template still parses, the schema
+        still has these columns, and the output signature is unchanged.
+
+    VALIDATION is derived from the downstream operation, not from an intent:
+      * `auth_jwt.validate_token` rejects a value that is `None` or blank-after-strip
+        → we refuse to build one. Blank config must not be allowed to reproduce, from
+        the inside, the exact silent hold this class exists to end.
+      * `clickhouse_client.tenant_settings` does `str(value)` and hands the result to
+        clickhouse-connect, which puts it on the wire as an HTTP query parameter → a
+        non-`str` (an int, a `None` from an unset settings field) and C0/C1 control
+        characters are refused. No charset allowlist beyond that: a tenant code is an
+        opaque string compared for equality by a row policy, and inventing a shape for
+        it would be a guard written from an intent rather than from the operation.
+      * Surrounding whitespace is STRIPPED, not rejected. Stripping cannot turn tenant
+        A into tenant B, and `"CLIENT_A "` would otherwise pass the IdP and the MCP
+        presence check and then match zero rows under `client_code = getSetting(...)`
+        — a silently-empty replay, which is the failure mode of this whole area.
+
+    The claim NAMES are fixed literals, not config: they are the MCP's mapping keys,
+    and the IdP rejects (422) any `claims` entry colliding with a service-controlled
+    claim. A configurable name buys nothing and can only mis-map.
+
+    Raises `ValueError` (NOT `TokenMintError`) on bad config, deliberately: every
+    `TokenMintError` on this path is swallowed into a `probe_unavailable` HOLD. This
+    must be constructed at WIRING time, where a bad value is a loud startup failure
+    rather than a promotion gate that quietly never runs.
+    """
+
+    clientcode: str
+    proc_center: str
+    jti: str
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"tenant claim {field.name!r} must be a string, got "
+                    f"{type(value).__name__}"
+                )
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError(
+                    f"tenant claim {field.name!r} is blank — the MCP would reject "
+                    "every replay 403 MISSING_TENANT_CLAIM and the promotion gate "
+                    "would hold silently (set TENANT_CLIENT_CODE / TENANT_PROC_CENTER "
+                    "/ TENANT_JTI)"
+                )
+            if any(ch < " " or ch == "\x7f" for ch in stripped):
+                raise ValueError(
+                    f"tenant claim {field.name!r} contains a control character"
+                )
+            object.__setattr__(self, field.name, stripped)
+
+    def as_claims(self) -> dict[str, str]:
+        """The `claims` object for the IdP mint body. Every value is a non-blank,
+        control-character-free `str` BY CONSTRUCTION (frozen + validated), so no
+        caller needs to re-check it."""
+        return {
+            "clientcode": self.clientcode,
+            "proc_center": self.proc_center,
+            "jti": self.jti,
+        }
 
 
 class TokenMinter(Protocol):
@@ -50,9 +164,23 @@ class HttpTokenMinter:
 
     `token_endpoint` is the FULL mint URL (e.g. `http://token:8000/token`), guarded
     by the static issuer API key. The mint is session-BOUND (§1.3 deviation): it
-    stamps a `sid_hash` for the caller-supplied synthetic `session_id` — the live MCP's
-    `require_sid_binding` rejects an unbound token the moment `X-Session-Id` is sent,
-    and `RealMCPClient` always sends it. Short-TTL by design (§1.3).
+    stamps a `sid_hash` for the caller-supplied synthetic `session_id`, because
+    `RealMCPClient` always sends `X-Session-Id` and an MCP with `require_sid_binding`
+    on rejects an unbound token that carries one (the flag defaults OFF — see the
+    module docstring). Short-TTL by design (§1.3).
+
+    `tenant` is REQUIRED and keyword-only, not defaulted. A default would let a new
+    wiring site re-open the original hole by simply not thinking about it, and the
+    resulting breakage is invisible (a 403 the probe converts into the same
+    `probe_unavailable` HOLD a healthy fail-closed run produces). Making it a
+    `TypeError` at construction means every future mint site has to answer the
+    "which tenant?" question out loud.
+
+    `transport` is a test seam (same shape as `runtime/model/embedding_client.py::
+    HttpEmbeddingClient`) so the REQUEST BODY this minter puts on the wire can be
+    asserted at Layer 1. That matters more here than usual: the omitted-claims defect
+    was a body-shape bug, and its only symptom downstream was a hold that looks
+    identical to a healthy one.
     """
 
     def __init__(
@@ -60,15 +188,19 @@ class HttpTokenMinter:
         token_endpoint: str,
         api_key: str,
         *,
+        tenant: TenantClaims,
         user_name: str = "learning-scheduler",
         ttl_seconds: int = 300,
         timeout: float = 30.0,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._endpoint = token_endpoint
         self._api_key = api_key
+        self._tenant = tenant
         self._user_name = user_name
         self._ttl_seconds = ttl_seconds
         self._timeout = timeout
+        self._transport = transport
 
     async def mint(self, column_scope: list[str], *, session_id: str) -> str:
         # BACKSTOP (D57/D80b): an EMPTY column_scope mints an ALLOW-ALL (unrestricted)
@@ -88,9 +220,15 @@ class HttpTokenMinter:
             "column_scope": list(column_scope),
             "ttl_seconds": self._ttl_seconds,
             "session_id": session_id,
+            # The three warehouse tenant claims the MCP requires on EVERY call —
+            # without them the replay is rejected 403 MISSING_TENANT_CLAIM before any
+            # tool runs and the promotion gate holds silently. See `TenantClaims`.
+            "claims": self._tenant.as_claims(),
         }
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with httpx.AsyncClient(
+                timeout=self._timeout, transport=self._transport
+            ) as client:
                 resp = await client.post(
                     self._endpoint,
                     headers={"Authorization": f"Bearer {self._api_key}"},
@@ -111,4 +249,4 @@ class HttpTokenMinter:
         return token
 
 
-__all__ = ["HttpTokenMinter", "TokenMintError", "TokenMinter"]
+__all__ = ["HttpTokenMinter", "TenantClaims", "TokenMintError", "TokenMinter"]

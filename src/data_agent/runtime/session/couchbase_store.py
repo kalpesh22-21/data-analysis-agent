@@ -30,6 +30,18 @@ correctly. After exhausting retries it raises `CASMismatchError` rather than
 silently dropping the write — a persistently-contended session fails loudly
 instead of losing data.
 
+CONNECT (2026-08-11): this store waits for its OWN connection. `acouchbase`
+starts the bootstrap in `Cluster.__init__` and refuses every op — KV and N1QL
+alike — until `on_connect()` has been awaited, which a sync `__init__` cannot
+do; that wait used to be an invisible caller obligation, honoured by three
+interactive scripts (via the private `store._cluster`) and by NEITHER daemon
+entrypoint, so `run_learning_sweeper` failed every cycle and the learning loop
+had never once run from its own entrypoint. Every public coroutine below now
+opens with `await self._ensure_connected()` (`CouchbaseConnectGate`, idempotent);
+`connect()`/`close()` are the public lifecycle for callers that want eager
+failure or explicit teardown. See `runtime/couchbase_connect.py` for the
+invariant and the introspection test that keeps method #14 honest.
+
 This module is exercised at Layer 2 only (a running Couchbase cluster is
 required); its own tests (`tests/runtime/session/test_couchbase_store.py`)
 are skipped automatically when `couchbase` is not importable or
@@ -49,6 +61,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from data_agent.runtime.config import RuntimeSettings
+from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
 
 from .models import PauseCheckpoint, SessionDoc, TrailEntry, TurnMessage
 from .store import AlreadyConsumedError, CASMismatchError
@@ -85,7 +98,7 @@ def _result_key(result_id: str) -> str:
     return f"result::{result_id}"
 
 
-class CouchbaseSessionStore:
+class CouchbaseSessionStore(CouchbaseConnectGate):
     """Real `SessionStore` backed by a Couchbase cluster."""
 
     def __init__(
@@ -111,6 +124,9 @@ class CouchbaseSessionStore:
         scope = bucket.scope(settings.couchbase_scope)
         self._sessions = scope.collection(settings.couchbase_sessions_collection)
         self._results = scope.collection(settings.couchbase_results_collection)
+        # The connect itself is async and cannot happen here; every public
+        # coroutine awaits `_ensure_connected()` before touching a handle.
+        self._init_connect_gate(self._cluster, bucket)
         self._ttl = timedelta(seconds=settings.session_ttl_seconds)
         # Injectable so a Layer-1 CAS-retry test never actually sleeps.
         self._sleep = sleep
@@ -165,6 +181,7 @@ class CouchbaseSessionStore:
         ) from last_exc
 
     async def create_session(self, session_id: str) -> SessionDoc:
+        await self._ensure_connected()
         doc, _ = await self._get_doc(session_id)
         if doc is not None:
             return doc
@@ -174,27 +191,33 @@ class CouchbaseSessionStore:
         return new_doc
 
     async def get_or_create_session(self, session_id: str) -> SessionDoc:
+        await self._ensure_connected()
         doc, _ = await self._get_doc(session_id)
         if doc is not None:
             return doc
         return await self.create_session(session_id)
 
     async def load_trail(self, session_id: str) -> list[TrailEntry]:
+        await self._ensure_connected()
         doc, _ = await self._get_doc(session_id)
         return list(doc.tool_trail) if doc is not None else []
 
     async def append_message(self, session_id: str, message: TurnMessage) -> None:
+        await self._ensure_connected()
         await self._mutate_with_cas_retry(session_id, lambda doc: doc.messages.append(message))
 
     async def append_trail_entry(self, session_id: str, entry: TrailEntry) -> None:
+        await self._ensure_connected()
         await self._mutate_with_cas_retry(session_id, lambda doc: doc.tool_trail.append(entry))
 
     async def bump_last_activity(self, session_id: str) -> None:
+        await self._ensure_connected()
         await self._mutate_with_cas_retry(session_id, lambda _doc: None)
 
     async def write_full_result(
         self, session_id: str, result_id: str, result_full: dict[str, Any]
     ) -> str:
+        await self._ensure_connected()
         result_id = result_id or str(uuid.uuid4())
         key = _result_key(result_id)
         await self._results.upsert(key, result_full, UpsertOptions(expiry=self._ttl))
@@ -208,6 +231,7 @@ class CouchbaseSessionStore:
         # never an exception. `session_id` is unused for the flat `session_results`
         # keyspace but kept in the signature to match the in-memory fake's
         # per-session scoping and the Protocol.
+        await self._ensure_connected()
         try:
             result = await self._results.get(result_full_ref, GetOptions())
         except DocumentNotFoundException:
@@ -215,11 +239,13 @@ class CouchbaseSessionStore:
         return result.content_as[dict]
 
     async def write_pause_checkpoint(self, session_id: str, checkpoint: PauseCheckpoint) -> None:
+        await self._ensure_connected()
         await self._mutate_with_cas_retry(
             session_id, lambda doc: setattr(doc, "pause_checkpoint", checkpoint)
         )
 
     async def get_session_with_cas(self, session_id: str) -> tuple[SessionDoc, Any]:
+        await self._ensure_connected()
         doc, cas = await self._get_doc(session_id)
         if doc is None:
             doc = await self.create_session(session_id)
@@ -227,6 +253,7 @@ class CouchbaseSessionStore:
         return doc, cas
 
     async def resume_checkpoint(self, session_id: str, cas: Any, answer: str) -> SessionDoc:
+        await self._ensure_connected()
         doc, _ = await self._get_doc(session_id)
         if doc is None or doc.pause_checkpoint is None or doc.pause_checkpoint.consumed:
             raise AlreadyConsumedError(f"No pending checkpoint for session {session_id!r}.")
@@ -261,7 +288,12 @@ class CouchbaseSessionStore:
         """N1QL scan for idle sessions (design §6). `META().cas` is selected so
         each returned CAS is usable directly by `transition_learning_status`'s
         CAS-guarded `replace` — the sweeper claims exactly-once off that snapshot.
+
+        N1QL is NOT exempt from the connect gate: `AsyncClusterImpl.query` calls the
+        SDK's `_ensure_connected()` exactly like a KV op does, which is why the
+        sweeper's very first read raised rather than merely returning no rows.
         """
+        await self._ensure_connected()
         keyspace = (
             f"`{self._settings.couchbase_bucket}`"
             f".`{self._settings.couchbase_scope}`"
@@ -313,6 +345,7 @@ class CouchbaseSessionStore:
         The lifecycle flag is the ONLY field written — `last_activity` is left
         untouched (D72 read-only: bumping it would resurrect the idle session).
         """
+        await self._ensure_connected()
         doc, _ = await self._get_doc(session_id)
         if doc is None:
             raise CASMismatchError(f"No session {session_id!r} to transition.")

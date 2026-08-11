@@ -55,7 +55,7 @@ async def store():
     from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 
     st = CouchbaseSessionStore(RuntimeSettings(_env_file=None))
-    await st._cluster.on_connect()
+    await st.connect()
     created: list[str] = []
     st._created = created  # type: ignore[attr-defined]
     yield st

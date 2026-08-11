@@ -37,7 +37,7 @@ from .models import (
 )
 from .replay import ReplayOutcome, golden_replay
 from .scheduler import PromotionScheduler
-from .token_minter import HttpTokenMinter, TokenMinter, TokenMintError
+from .token_minter import HttpTokenMinter, TenantClaims, TokenMinter, TokenMintError
 from .warehouse_probe import MCPWarehouseProbe, WarehouseProbeError
 
 __all__ = [
@@ -64,6 +64,7 @@ __all__ = [
     "PromotionSweep",
     "RecurrenceCountReader",
     "ReplayOutcome",
+    "TenantClaims",
     "TokenMintError",
     "TokenMinter",
     "WarehouseProbe",

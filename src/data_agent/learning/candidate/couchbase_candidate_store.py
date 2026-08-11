@@ -10,12 +10,21 @@ S9-owned bookkeeping fields.
 
 Import-guarded exactly like `couchbase_store` / `couchbase_audit_store`: imports
 with or without the SDK; constructing without it raises.
+
+CONNECT (2026-08-11): shares `CouchbaseConnectGate` with every other
+Couchbase-backed store — `acouchbase` refuses all ops (KV *and* N1QL) until
+`on_connect()` has been awaited, which a sync `__init__` cannot do, so each
+public coroutine gates itself. The consumer, the promotion scheduler and the
+inbox service all build this store and none of them connected it. See
+`runtime/couchbase_connect.py`.
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any, Literal
+
+from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
 
 from ..config import LearningSettings
 from .models import CandidateEnvelope, CandidateStatus
@@ -76,7 +85,7 @@ except ImportError:  # pragma: no cover
     COUCHBASE_AVAILABLE = False
 
 
-class CouchbaseCandidateStore:
+class CouchbaseCandidateStore(CouchbaseConnectGate):
     """Real `CandidateStore` backed by the dedicated `learning_candidates` bucket."""
 
     def __init__(self, settings: LearningSettings, cluster: Any = None) -> None:
@@ -98,9 +107,12 @@ class CouchbaseCandidateStore:
         self._bucket_name = settings.learning_candidates_bucket
         bucket = self._cluster.bucket(self._bucket_name)
         self._collection = bucket.default_collection()
+        # The connect itself is async; every public coroutine awaits the gate.
+        self._init_connect_gate(self._cluster, bucket)
         self._ttl = timedelta(seconds=settings.learning_candidates_ttl_seconds)
 
     async def put(self, envelope: CandidateEnvelope) -> None:
+        await self._ensure_connected()
         # Terminal rows persist with NO TTL (expiry=0); transient rows keep the
         # candidate TTL (ui-inbox-type-archive contract §Retention).
         expiry = (
@@ -113,6 +125,7 @@ class CouchbaseCandidateStore:
         )
 
     async def get(self, candidate_id: str) -> CandidateEnvelope | None:
+        await self._ensure_connected()
         try:
             result = await self._collection.get(candidate_id, GetOptions())
         except DocumentNotFoundException:
@@ -127,6 +140,7 @@ class CouchbaseCandidateStore:
         order: Literal["asc", "desc"] = "asc",
         order_by: Literal["created_at", "last_scanned_at"] = "created_at",
     ) -> list[CandidateEnvelope]:
+        await self._ensure_connected()
         # `created_at` ASC (default) is the small self-draining review queue; DESC
         # (newest-first) is the durable rejected archive so LIMIT trims OLD history,
         # not present rejects. `(last_scanned_at, candidate_id)` ASC is the S9 cron's
@@ -185,6 +199,7 @@ class CouchbaseCandidateStore:
 
         A document that expired or was superseded between the scan read and this write
         is a tolerated no-op — there is nothing left to rotate."""
+        await self._ensure_connected()
         await self._stamp_path(candidate_id, "last_scanned_at", at)
 
     async def stamp_drift(self, candidate_id: str, drift: DriftStamp) -> None:
@@ -196,6 +211,7 @@ class CouchbaseCandidateStore:
         `put` is an upsert. `mutate_in` defaults to REPLACE semantics, so a missing
         document raises `DocumentNotFoundException` and is swallowed as a no-op — the
         deleted candidate stays deleted."""
+        await self._ensure_connected()
         await self._stamp_path(candidate_id, "drift", drift.to_doc())
 
     async def _stamp_path(self, candidate_id: str, path: str, value: Any) -> None:
@@ -218,6 +234,7 @@ class CouchbaseCandidateStore:
             return
 
     async def supersede(self, content_hash: str) -> None:
+        await self._ensure_connected()
         # N1QL-SELECT the stale candidate ids (query_select), then KV-remove each
         # (data_writer) — avoids needing query_delete on the writer role. A doc
         # already gone (concurrent removal) is a tolerated no-op.
