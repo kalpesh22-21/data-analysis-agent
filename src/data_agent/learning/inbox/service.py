@@ -196,6 +196,17 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         and runtime_settings.neo4j_password
         and runtime_settings.embedding_api_url
     )
+    # The human `approve` path re-runs golden replay, so this service replays as a
+    # tenant too. Logged in EVERY posture for the same reason the scheduler does it: a
+    # wrong tenant filters to zero rows instead of erroring, so it is invisible in the
+    # outcome and recoverable only from a line like this one.
+    _logger.info(
+        "approve-path golden replay runs AS tenant clientcode=%s proc_center=%s jti=%s "
+        "(deployment config TENANT_*; any blank one forces the offline dev mode)",
+        runtime_settings.tenant_client_code.strip() or "<unset>",
+        runtime_settings.tenant_proc_center.strip() or "<unset>",
+        runtime_settings.tenant_jti.strip() or "<unset>",
+    )
     if not write_plane_ready:
         _logger.info(
             "inbox service running in OFFLINE dev mode (InMemoryCandidateStore) — "

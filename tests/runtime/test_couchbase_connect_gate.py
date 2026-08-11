@@ -22,7 +22,9 @@ is unimportable, since the stores refuse to construct without its options types.
 
 from __future__ import annotations
 
+import ast
 import inspect
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -194,6 +196,37 @@ _STORE_CLASSES = [
     CouchbaseUserKnowledgeStore,
 ]
 
+_SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "data_agent"
+
+
+def _callee_name(func: ast.expr) -> str | None:
+    """The bare name of whatever is being called (`Cluster` / `acouchbase.Cluster`)."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _classes_that_construct_a_cluster() -> set[str]:
+    """Every class in the source tree that builds an `acouchbase` `Cluster`.
+
+    A SOURCE scan, not an import-and-introspect one: the point is to find a store
+    nobody registered, and a store nobody registered is a store nobody imported.
+    """
+    found: set[str] = set()
+    for path in sorted(_SRC_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            if any(
+                isinstance(child, ast.Call) and _callee_name(child.func) == "Cluster"
+                for child in ast.walk(node)
+            ):
+                found.add(node.name)
+    return found
+
 
 def _public_coroutines(store_cls: type) -> list[str]:
     return sorted(
@@ -258,6 +291,34 @@ async def test_every_public_coroutine_connects_before_touching_a_handle(
         "this signature — give it real ones rather than leaving it unproven."
     )
     assert cluster.cluster_connects >= 1 and cluster.bucket_connects >= 1
+
+
+def test_every_store_in_the_source_tree_is_registered_here() -> None:
+    """`_STORE_CLASSES` is hand-written, which is the same shape of hole this module
+    argues against one granularity down.
+
+    The method list is derived, so a new METHOD that skips the gate fails above. But a
+    new CLASS that never inherits the gate at all is invisible to that enumeration —
+    it simply is not in the list, and nothing notices. So the list is checked against
+    the source tree: every class that constructs an `acouchbase` `Cluster` must be
+    registered, which is precisely the population that has the SDK's connect
+    precondition to satisfy.
+
+    Known limit, stated rather than papered over: this finds a store that CONSTRUCTS
+    its own cluster. A class handed a cluster it never builds would still slip past —
+    but every store here builds its own (the `cluster=` parameter is a test seam), so
+    that shape does not exist yet and inventing a detector for it would be a guard
+    written from imagination.
+    """
+    registered = {cls.__name__ for cls in _STORE_CLASSES}
+    discovered = _classes_that_construct_a_cluster()
+    assert discovered == registered, (
+        "the set of Couchbase-backed stores in src/ no longer matches the set proven "
+        f"here. Only in the source tree: {sorted(discovered - registered)}. Only in "
+        f"_STORE_CLASSES: {sorted(registered - discovered)}. A new store must be added "
+        "to _STORE_CLASSES (and inherit CouchbaseConnectGate) or every one of its "
+        "methods ships unproven against the SDK's connect precondition."
+    )
 
 
 def test_the_enumeration_actually_covers_every_store() -> None:

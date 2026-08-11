@@ -188,3 +188,70 @@ async def test_bump_last_activity_and_write_pause_checkpoint_are_also_cas_guarde
     for call in sessions_collection.replace.await_args_list:
         options = dict(call.args[2])
         assert options["cas"] == 7
+
+
+async def test_a_delete_racing_the_create_retries_instead_of_dereferencing_none() -> None:
+    """A doc removed between the create and the CAS re-read must not crash the caller.
+
+    `_mutate_with_cas_retry` creates the session when the first read misses, then
+    re-reads purely to get the CAS that `create_session` does not return. A concurrent
+    `remove` (or a TTL expiry) inside that window makes the re-read miss too — and the
+    loop used to walk straight into `mutate(doc)` with `doc=None`, surfacing a
+    competing-writer race as an `AttributeError` raised from inside the caller's
+    callback. It must retry instead.
+    """
+    from data_agent.runtime.session.models import SessionDoc, TurnMessage
+
+    base_doc = SessionDoc(session_id="s1", created_at="t0", last_activity="t0")
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    store, sessions_collection = _build_store(sleep=_no_sleep)
+
+    def _missing():
+        from couchbase.exceptions import DocumentNotFoundException
+
+        return DocumentNotFoundException("gone")
+
+    # attempt 1: miss -> create -> the deleter wins and the re-read misses too.
+    # attempt 2: the doc is there, and the write goes through.
+    sessions_collection.get = AsyncMock(
+        side_effect=[
+            _missing(),
+            _missing(),
+            _missing(),
+            _FakeGetResult(base_doc.to_doc(), cas=9),
+        ]
+    )
+    sessions_collection.upsert = AsyncMock(return_value=None)
+    sessions_collection.replace = AsyncMock(return_value=None)
+
+    await store.append_message(
+        "s1", TurnMessage(turn_index=0, role="user", content="hi", ts="t1")
+    )
+
+    assert sessions_collection.replace.call_count == 1
+    assert dict(sessions_collection.replace.await_args.args[2])["cas"] == 9
+
+
+async def test_a_relentless_deleter_fails_loudly_rather_than_looping() -> None:
+    """If the delete keeps winning, the write must fail in a family callers already
+    handle — never an unbounded loop and never an AttributeError."""
+    from data_agent.runtime.session.store import CASMismatchError
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    store, sessions_collection = _build_store(sleep=_no_sleep)
+
+    from couchbase.exceptions import DocumentNotFoundException
+
+    sessions_collection.get = AsyncMock(side_effect=DocumentNotFoundException("gone"))
+    sessions_collection.upsert = AsyncMock(return_value=None)
+    sessions_collection.replace = AsyncMock(return_value=None)
+
+    with pytest.raises(CASMismatchError):
+        await store.bump_last_activity("s1")
+
+    assert sessions_collection.replace.call_count == 0

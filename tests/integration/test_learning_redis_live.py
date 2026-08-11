@@ -198,3 +198,45 @@ async def test_dead_letter_after_n(queue, redis_client):
     _id, dead_fields = dead_entries[0]
     assert dead_fields["session_id"] == "poison"
     assert dead_fields["dead_letter_delivery_count"] == "6"
+
+
+async def test_idle_consume_at_the_default_block_does_not_time_out():
+    """An IDLE consumer must be silent, and only the real construction path proves it.
+
+    The defect: redis-py 8 defaults `socket_timeout` to 5s and `LEARNING_BLOCK_MS`
+    defaults to 5000, so the server-side BLOCK and the client's socket read deadline
+    fired together on the same read and the socket usually won. Measured against this
+    Redis before the fix: 5 of 5 idle cycles raised `redis.exceptions.TimeoutError`,
+    each caught by `run_forever` and logged as a traceback for a cycle in which
+    nothing was wrong.
+
+    Built via `from_settings` DELIBERATELY — the fix lives in that constructor, so a
+    queue assembled from a hand-made client (as the other tests here do) would prove
+    nothing about what the daemons run. Slow by nature: the point is to wait out the
+    full default block.
+    """
+    import time
+
+    from data_agent.learning.config import LearningSettings
+
+    settings = LearningSettings(
+        _env_file=None,
+        learning_redis_url=_REDIS_URL,
+        learning_jobs_stream=f"test:learning:idle:{uuid.uuid4().hex[:12]}",
+    )
+    assert settings.learning_block_ms == 5000  # the default that raced
+
+    queue = RedisStreamsLearningQueue.from_settings(settings)
+    await queue.ensure_group()
+    try:
+        started = time.monotonic()
+        for _ in range(2):
+            assert await queue.consume(count=10, block_ms=settings.learning_block_ms) == []
+        elapsed = time.monotonic() - started
+    finally:
+        await queue._redis.delete(settings.learning_jobs_stream)
+        await queue._redis.aclose()
+
+    # The block genuinely ran to its server-side deadline; the empty result is Redis
+    # answering, not a socket giving up early.
+    assert elapsed >= 2 * settings.learning_block_ms / 1000.0

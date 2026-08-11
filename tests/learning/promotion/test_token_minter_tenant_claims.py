@@ -122,12 +122,34 @@ def test_non_string_claim_refused() -> None:
         TenantClaims(clientcode=None, proc_center="PC01", jti="J")  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("bad", ["CLIENT\nA", "CLIENT\rA", "CLIENT\x00A"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "CLIENT\nA",  # C0
+        "CLIENT\rA",  # C0
+        "CLIENT\x00A",  # C0
+        "CLIENT\x7fA",  # DEL
+        "CLIENT\x85A",  # C1 NEL — constructed FINE while the docstring said it did not
+        "CLIENT\x9bA",  # C1 CSI
+    ],
+)
 def test_control_character_claim_refused(bad: str) -> None:
     """The value is placed on the wire as an HTTP query parameter to ClickHouse
-    (clickhouse-connect settings); a control character has no legitimate reading."""
+    (clickhouse-connect settings); a control character has no legitimate reading.
+
+    The C1 cases are regressions: the predicate was `ch < " " or ch == "\\x7f"` while
+    the docstring advertised C0 AND C1, so the range and its own description had
+    drifted apart. Fixed by using Unicode category `Cc`, which IS the advertised set."""
     with pytest.raises(ValueError, match="control character"):
         TenantClaims(clientcode=bad, proc_center="PC01", jti="J")
+
+
+def test_non_control_non_ascii_is_still_allowed() -> None:
+    """`Cc` is the whole guard: no charset allowlist. A tenant code is an opaque
+    string a row policy compares for equality, so refusing (say) an accented letter
+    would be a rule invented from an intent rather than read off the operation."""
+    tenant = TenantClaims(clientcode="CLIÉNT_Ä", proc_center="PC01", jti="J")
+    assert tenant.as_claims()["clientcode"] == "CLIÉNT_Ä"
 
 
 def test_surrounding_whitespace_is_stripped_not_rejected() -> None:

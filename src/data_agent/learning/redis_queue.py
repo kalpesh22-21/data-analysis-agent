@@ -46,6 +46,45 @@ _STREAM_MAXLEN = 100_000
 # Dedup-key retention: comfortably longer than the enqueue→process window so a
 # crash-recovery re-sweep is deduped, but self-expiring so the keyspace is bounded.
 _DEDUP_TTL_SECONDS = 86_400
+# How much longer than the server-side BLOCK the client will wait on the socket.
+# See `_socket_timeout_seconds` for why any margin at all is needed and for what
+# this number also becomes the ceiling of.
+_SOCKET_TIMEOUT_MARGIN_SECONDS = 5.0
+
+
+def _socket_timeout_seconds(block_ms: int) -> float | None:
+    """The client-wide socket read timeout that lets a blocking read finish FIRST.
+
+    WHY. A blocking `XREADGROUP ... BLOCK n` puts TWO deadlines on the SAME read:
+    the server's (return an empty reply after n ms) and the client's socket read
+    timeout. redis-py 8 defaults `socket_timeout` to 5s
+    (`connection.DEFAULT_SOCKET_TIMEOUT`) and `LEARNING_BLOCK_MS` defaults to 5000,
+    so at the SHIPPED configuration the two fire together and the socket usually
+    wins — measured against live Redis: 5 of 5 idle cycles raised
+    `redis.exceptions.TimeoutError`. The consumer's `run_forever` catches and
+    retries, so the loop "works" while logging a full traceback every idle cycle
+    for a cycle in which nothing was wrong. Noise that looks like a defect trains
+    an operator to ignore the one time it is one.
+
+    `BLOCK 0` means BLOCK FOREVER to Redis, so ANY finite socket timeout is
+    guaranteed to fire there. That configuration must therefore have no read
+    deadline at all → `None`. (`learning_block_ms` is `ge=0`, so 0 is the only
+    value that reaches this branch.)
+
+    STATED TRADE-OFF, not a side effect: `socket_timeout` is CLIENT-WIDE, so this
+    value is also the read ceiling for every NON-blocking call this queue makes
+    (XADD/XACK/XAUTOCLAIM/XPENDING/GET/SET). Accepted: those are sub-millisecond
+    ops, and a deadline of `block_ms + 5s` still catches a genuinely wedged
+    connection — it is the blocking read, not the fast ops, that sets the floor on
+    how tight the timeout may be, and one client cannot serve two floors. With
+    `block_ms=0` the fast ops get NO read deadline, which is the honest cost of
+    asking for an infinite block on the same client. `socket_connect_timeout` is a
+    SEPARATE knob and keeps its 5s default either way, so an unreachable host still
+    fails fast rather than hanging the daemon at startup.
+    """
+    if block_ms == 0:
+        return None
+    return block_ms / 1000.0 + _SOCKET_TIMEOUT_MARGIN_SECONDS
 
 
 class RedisStreamsLearningQueue:
@@ -78,11 +117,27 @@ class RedisStreamsLearningQueue:
     @classmethod
     def from_settings(cls, settings: LearningSettings) -> RedisStreamsLearningQueue:
         """Build the queue + its Redis client from `LearningSettings`.
+
         `decode_responses=True` so stream fields/ids come back as `str` (the
-        `LearningJob` (de)serialization assumes text, not bytes)."""
+        `LearningJob` (de)serialization assumes text, not bytes).
+
+        `socket_timeout` is DERIVED from `learning_block_ms` rather than left at
+        redis-py's default, because the default collides with the shipped block
+        duration and makes every idle consume cycle raise — see
+        `_socket_timeout_seconds`. This is the only place both facts are in scope,
+        which is why the derivation lives here and not at the call site.
+
+        INVARIANT this establishes for callers: `consume(block_ms=…)` must not be
+        passed a LARGER block than the one this client was built from, or the race
+        is back. Every production caller passes `settings.learning_block_ms`.
+        """
         if not REDIS_AVAILABLE:
             raise RuntimeError("The 'redis' package is not installed.")
-        client = aioredis.from_url(settings.learning_redis_url, decode_responses=True)
+        client = aioredis.from_url(
+            settings.learning_redis_url,
+            decode_responses=True,
+            socket_timeout=_socket_timeout_seconds(settings.learning_block_ms),
+        )
         return cls(
             client,
             stream=settings.learning_jobs_stream,

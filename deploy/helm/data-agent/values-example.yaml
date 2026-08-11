@@ -50,9 +50,16 @@ config:
   JWT_AUDIENCE: "data-agent"
   TOKEN_SERVICE_URL: "https://idp.acme.com/token"
 
-  # The warehouse tenant this deployment reads as. Required by the MCP on EVERY
-  # call (403 MISSING_TENANT_CLAIM otherwise); TENANT_JTI is also the principal the
-  # offline golden replay runs as, so it must be one the row policies grant rows to.
+  # The warehouse tenant this deployment reads as. YOU MUST SET ALL THREE: the chart
+  # defaults them to "" on purpose, because there is no safe default for "which
+  # tenant?" and a wrong one is invisible — row policies FILTER rather than error, so
+  # a misconfigured tenant yields zero rows and the golden replay's grain check reads
+  # 0 == 0 and passes. Leave them blank and the learning scheduler / inbox readiness
+  # gates put the deployment into its logged dormant posture instead (safe, and
+  # greppable: the scheduler logs the tenant identity it replays as at startup).
+  # Required by the MCP on EVERY call (403 MISSING_TENANT_CLAIM otherwise);
+  # TENANT_JTI is also the principal the offline golden replay runs as, so it must be
+  # one the row policies grant rows to.
   TENANT_CLIENT_CODE: "ACME"
   TENANT_PROC_CENTER: "PC42"
   TENANT_JTI: "svc-data-agent"

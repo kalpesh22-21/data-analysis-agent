@@ -153,6 +153,20 @@ async def _main() -> int:
         and runtime_settings.neo4j_password
         and runtime_settings.embedding_api_url
     )
+    # State the tenant identity ONCE, at startup, in EVERY posture. A wrong tenant has
+    # no observable consequence downstream: row policies FILTER rather than error, so a
+    # replay against the wrong tenant matches zero rows and the grain teeth read
+    # `0 == 0` and pass — a green that means nothing (see `TenantClaims`). This line is
+    # the only place that fact is recoverable, so it is logged whether the write plane
+    # is ready or not; blanks print as `<unset>` so a FORGOTTEN claim reads as a missing
+    # value rather than as a gap in the message.
+    _logger.info(
+        "offline golden replay runs AS tenant clientcode=%s proc_center=%s jti=%s "
+        "(deployment config TENANT_*; any blank one holds the write plane dormant)",
+        runtime_settings.tenant_client_code.strip() or "<unset>",
+        runtime_settings.tenant_proc_center.strip() or "<unset>",
+        runtime_settings.tenant_jti.strip() or "<unset>",
+    )
     neo4j_driver = None
     if write_plane_ready:
         from neo4j import AsyncGraphDatabase

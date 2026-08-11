@@ -137,17 +137,31 @@ config:
   JWT_AUDIENCE: "data-agent"
   # -- Token service (IdP) token endpoint. EXTERNAL.
   TOKEN_SERVICE_URL: "http://token:8000/token"
+  # The three warehouse tenant claims. DELIBERATELY BLANK IN THIS CHART — there is
+  # no safe default for "which tenant is this?", and the previous defaults were the
+  # LOCAL DEV SEED (CLIENT_A / PC01 / TESTJTI001, see
+  # docker/clickhouse-init/hr-4tables-snake-migration.sql). Shipping those meant a
+  # deployment that simply forgot to configure a tenant still MINTED one: row
+  # policies FILTER rather than error, so the golden replay would match zero rows
+  # and its grain check would read 0 == 0 and pass — every replay a silent
+  # structural pass against nobody's data. Blank instead makes the readiness gates
+  # in `scripts/run_learning_scheduler.py` and `learning/inbox/service.py` fire, and
+  # the deployment drops into its LOGGED dormant posture (nothing auto-promotes)
+  # rather than into a green that means nothing.
+  # `values-example.yaml` carries the configured shape; the code defaults in
+  # `runtime/config.py` keep the dev seed for a local `uv run`.
+  #
   # -- Warehouse tenant claim 'clientcode' (→ ClickHouse setting paycom_client_code).
   #    Required by the MCP on every call; a token without it is rejected 403
   #    MISSING_TENANT_CLAIM. Read by BOTH the UI BFF (per-request mint) and the
   #    offline learning replay. Must be a tenant whose data this deployment reads.
-  TENANT_CLIENT_CODE: "CLIENT_A"
+  TENANT_CLIENT_CODE: ""
   # -- Warehouse tenant claim 'proc_center' (→ paycom_proc_center).
-  TENANT_PROC_CENTER: "PC01"
+  TENANT_PROC_CENTER: ""
   # -- Warehouse tenant claim 'jti' (→ paycom_authenticated_user). The PRINCIPAL the
   #    offline golden replay runs as: the employee/payroll row policies gate on it,
   #    so the replay sees exactly this principal's employee set.
-  TENANT_JTI: "TESTJTI001"
+  TENANT_JTI: ""
   # -- Neo4j bolt URL (retrieval graph). EXTERNAL.
   NEO4J_URL: "bolt://neo4j:7687"
   # -- Neo4j username.

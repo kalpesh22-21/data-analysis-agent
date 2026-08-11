@@ -159,7 +159,18 @@ class CouchbaseSessionStore(CouchbaseConnectGate):
             doc, cas = await self._get_doc(session_id)
             if doc is None:
                 doc = await self.create_session(session_id)
+                # Re-read ONLY to obtain the CAS `create_session` does not return.
+                # A concurrent `remove` (or a TTL expiry) landing in that window
+                # gives back None again — and this loop must not dereference it:
+                # the old code went straight into `mutate(doc)` and turned a
+                # competing-writer race into an `AttributeError` from inside a
+                # caller's mutate callback. Retrying re-creates and re-reads; if a
+                # deleter keeps winning for the whole budget the loop exits below
+                # with `CASMismatchError`, which is the right family (we lost to a
+                # concurrent writer) and is what every caller already handles.
                 doc, cas = await self._get_doc(session_id)
+                if doc is None:
+                    continue
 
             mutate(doc)
             doc.last_activity = _now()

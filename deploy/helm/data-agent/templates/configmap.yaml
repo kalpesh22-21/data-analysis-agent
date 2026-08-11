@@ -3,7 +3,17 @@ Shared ConfigMap of NON-SECRET env, mounted into every workload via envFrom.
 Secret keys are intentionally kept out of here (see secret.yaml). The UI-only
 derived values (RUNTIME_URL / INBOX_SERVICE_URL) are computed from the release
 name when not explicitly set in .Values.config.
+
+A BLANK value is normally OMITTED from the ConfigMap, so the process falls through
+to whatever default its settings model carries. That is the right rule for almost
+everything here and the WRONG one for the tenant claims: their code defaults are the
+LOCAL DEV SEED, so omitting a blank would silently re-mint the dev tenant in a
+cluster — matching zero rows under the row policies and turning every golden replay
+into a structural pass against nobody's data. The three TENANT_* keys are therefore
+rendered even when blank, so "unset" reaches the process AS blank and trips the
+readiness gates in run_learning_scheduler.py / learning/inbox/service.py.
 */}}
+{{- $alwaysRender := list "TENANT_CLIENT_CODE" "TENANT_PROC_CENTER" "TENANT_JTI" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -14,7 +24,7 @@ data:
   {{- range $key, $val := .Values.config }}
   {{- /* RUNTIME_URL and INBOX_SERVICE_URL are handled below via helpers */}}
   {{- if and (ne $key "RUNTIME_URL") (ne $key "INBOX_SERVICE_URL") }}
-  {{- if ne (toString $val) "" }}
+  {{- if or (ne (toString $val) "") (has $key $alwaysRender) }}
   {{ $key }}: {{ $val | quote }}
   {{- end }}
   {{- end }}

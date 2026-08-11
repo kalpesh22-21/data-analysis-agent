@@ -50,7 +50,10 @@ is left as a deliberate follow-up rather than folded in here.
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 
 class CouchbaseConnectGate:
@@ -90,16 +93,33 @@ class CouchbaseConnectGate:
         with no `couchbase` package at all). The gate exists to make the LIVE path
         correct; `tests/runtime/test_couchbase_connect_gate.py` supplies a
         double that DOES implement `on_connect` so the gate itself is still proven.
+
+        That skip is fail-OPEN, so it is LOGGED (debug) with the handle's type. It is
+        unreachable with the real SDK, and if it ever does fire in production the
+        symptom lands somewhere else entirely — the next operation raising the SDK's
+        'Cannot perform operations without first establishing a connection.' — with
+        nothing at the skip site to find. One line naming the type is what makes that
+        five minutes instead of the multi-caller hunt this module was written after.
         """
         if self._connected:
             return
         for target in self._connect_targets:
             on_connect = getattr(target, "on_connect", None)
-            if on_connect is None:
-                continue
-            pending = on_connect()
+            pending = on_connect() if on_connect is not None else None
             if inspect.isawaitable(pending):
                 await pending
+                continue
+            _logger.debug(
+                "connect gate SKIPPED handle %s.%s (%s) — assumed a test double, not "
+                "the SDK. In production this means a real handle was never connected "
+                "and the next operation on it will raise 'Cannot perform operations "
+                "without first establishing a connection.'",
+                type(target).__module__,
+                type(target).__qualname__,
+                "no on_connect attribute"
+                if on_connect is None
+                else "on_connect() returned a non-awaitable",
+            )
         self._connected = True
 
     async def connect(self) -> None:

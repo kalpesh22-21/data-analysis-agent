@@ -38,6 +38,7 @@ Two implementations, one interface (the `FakeMCPClient` pattern): the real
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, fields
 from typing import Protocol
 
@@ -96,10 +97,12 @@ class TenantClaims:
         the inside, the exact silent hold this class exists to end.
       * `clickhouse_client.tenant_settings` does `str(value)` and hands the result to
         clickhouse-connect, which puts it on the wire as an HTTP query parameter → a
-        non-`str` (an int, a `None` from an unset settings field) and C0/C1 control
-        characters are refused. No charset allowlist beyond that: a tenant code is an
-        opaque string compared for equality by a row policy, and inventing a shape for
-        it would be a guard written from an intent rather than from the operation.
+        non-`str` (an int, a `None` from an unset settings field) and any character in
+        Unicode category `Cc` (C0, C1 and DEL) are refused. The category is the
+        predicate, not a hand-written range — see `__post_init__`. No charset allowlist
+        beyond that: a tenant code is an opaque string compared for equality by a row
+        policy, and inventing a shape for it would be a guard written from an intent
+        rather than from the operation.
       * Surrounding whitespace is STRIPPED, not rejected. Stripping cannot turn tenant
         A into tenant B, and `"CLIENT_A "` would otherwise pass the IdP and the MCP
         presence check and then match zero rows under `client_code = getSetting(...)`
@@ -135,7 +138,14 @@ class TenantClaims:
                     "would hold silently (set TENANT_CLIENT_CODE / TENANT_PROC_CENTER "
                     "/ TENANT_JTI)"
                 )
-            if any(ch < " " or ch == "\x7f" for ch in stripped):
+            # `unicodedata.category(ch) == "Cc"` IS the C0+C1+DEL set, exactly — the
+            # set this class claims to refuse. The predicate here used to be
+            # `ch < " " or ch == "\x7f"`, which is C0+DEL only, so a C1 character
+            # constructed fine while the docstring said otherwise. Named categories
+            # over hand-rolled ranges: the range drifted from its own description
+            # silently, and a validation whose selling point is "derived from the
+            # operation" cannot afford a predicate its prose disagrees with.
+            if any(unicodedata.category(ch) == "Cc" for ch in stripped):
                 raise ValueError(
                     f"tenant claim {field.name!r} contains a control character"
                 )
