@@ -1,6 +1,8 @@
 # Release 1 — Build Documents
 
-Implementation guides for [release-1-routing-and-intent-coverage.md](../release-1-routing-and-intent-coverage.md) (the spec). The spec says *what* and *why*; these say *where* and *how*, verified against the code at `catalog_sha 1d86876c`, branch `phase0/provenance-extractor`.
+Implementation guides for [release-1-routing-and-intent-coverage.md](../release-1-routing-and-intent-coverage.md) (the spec). The spec says *what* and *why*; these say *where* and *how*, verified against the tree at commit `bb53061` on `docs/release-1-routing-and-intent-coverage`.
+
+**All seven have been through code review.** Each ends with a corrections table; read it before editing, because several of the reverted ideas look like improvements on a cold read.
 
 | Doc | Deliverable | Spec § | Size |
 |---|---|---|---|
@@ -10,17 +12,19 @@ Implementation guides for [release-1-routing-and-intent-coverage.md](../release-
 | [04](04-evidence-validators.md) | Completion + blocking validators | §6 | M |
 | [05](05-finalization-enforcement.md) | Finalization enforcement | §7 | M |
 | [06](06-telemetry.md) | Raw routing telemetry | §8 | S |
-| [07](07-evaluation.md) | Layer-4 evaluation | §9 | M |
+| [07](07-evaluation.md) | Evaluation — scripted + **live-model** suites | §9 | L |
 
 ## Build order
 
-03 → 04 → 05 are one coupled workstream and should land together; the validators are meaningless without the state, and enforcement is meaningless without the validators. 01, 02, 06 are independent and can land in any order. 07 depends on everything.
+03 → 04 → 05 are one coupled workstream and should land together; the validators are meaningless without the state, and enforcement is meaningless without the validators. **06 is downstream of both** — its emit sites live inside them (its own header says `Depends on: 03, 05`). Only 01 and 02 are truly independent.
 
 ```
-02 ─┐
-01 ─┼─→ 03 ─→ 04 ─→ 05 ─→ 07
-06 ─┘
+01 ─┐
+02 ─┴──────────────────────────────→ 07
+    03 ─→ 04 ─→ 05 ─→ 06 ─────────→ 07
 ```
+
+07 additionally needs a runtime change of its own — the `create_app(extra_observers=…)` seam — so it is not purely a test deliverable.
 
 ## Findings from the wiring check
 
@@ -34,14 +38,25 @@ Five things the spec assumes that the code either already provides or does not. 
 
 ## Findings from the code review of 03 and 05
 
-A review pass over the two coupled documents found four defects that would each have shipped a silently-broken implementation. All are fixed; recorded here because they are the kind of thing a reader re-derives.
+A review pass over the two coupled documents found the four defects with the widest blast radius. (03's and 05's own corrections tables record ten and twelve respectively; these are the ones that would each have shipped a silently-broken implementation.) All are fixed; recorded here because they are the kind of thing a reader re-derives.
 
 6. **`analysisState` had no turn gate.** A state persists after its turn ends, so without `state.turn_index == turn_index` a stale `pending` intent from an abandoned turn refuses an unrelated later turn, burns its nudge, and writes `ENFORCEMENT_EXHAUSTED` onto the old turn's record. The predicate `live_analysis_state` is now defined once in [03 §A.1](03-analysis-state.md) and used by 03, 04 and 05. The original justification for keeping the field across turns — "`session_history` reads it" — was simply false.
 7. **The finalization nudge counter reset on every resume.** `_run_loop_body` re-enters on `askUser` and blueprint resumes while `window_count` stays frozen, so a counter local to that function makes forced re-rounds unbounded. It is now persisted on `SessionDoc`, keyed by window, and consumed **per round-trip** rather than per refused call — two `answerWithTable` calls in one batch would otherwise burn both chances without ever granting a re-round. → [05 §C](05-finalization-enforcement.md)
 8. **A forced re-round was free.** Exit #1 sits before `guard.record_iteration`, so looping back without charging the window leaves the 60-second wall clock as the only backstop — and every resume restarts it. → [05 §C.3](05-finalization-enforcement.md)
 9. **The cross-turn drop closed the rendered block but not the trail entry.** `_is_stale_assumptions_entry` is hard-coded to one tool name, while every `updateAnalysisState` call leaves a `TrailEntry` whose `args` carry the descriptions with `frozenset()` provenance — kept under any `column_scope`, in every later turn. The predicate is generalised to a tool set. → [03 §D.1](03-analysis-state.md)
 
-**One finding escalates past the docs.** Evidence-backed blocking stops the model *asserting* an unfalsifiable reason; it does not stop it *producing* a falsifiable one cheaply. `SELECT … WHERE 1=0` yields `row_count == 0` ⇒ `REQUIRED_DATA_UNAVAILABLE`; a deliberately out-of-scope column yields `NO_ACCESS`. The honest guarantee is **"the model cannot silently drop an ask"**, not "cannot evade". Whether that is acceptable is a spec-level question and is with the Lead.
+## Findings from the review of 01, 02, 04, 06 and 07
+
+A second pass over the remaining five found four more of the same class.
+
+10. **Emitting an event does not publish its payload.** `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST` (`observability/tracing.py:598`) is a strict attribute allowlist — deliberately not a type filter, because a bare `isinstance` check once leaked `loop_paused_ask_user`'s `question`. Of every payload key doc 06 proposed, **only `window` is on it**; the rest would reach Phoenix as correctly-named spans carrying nothing. Different mechanism from `OTLP_DROP_SPAN_NAMES`, which filters names one layer later. → [06](06-telemetry.md)
+11. **Enrichment changes the search card's D44 posture.** `searchBlueprints` carries safe-empty `frozenset()` provenance *because* its cards hold no column identifiers; `resolves` and `result_grain` are column names, so enriched cards would be kept in replay forever under any scope. Resolved by setting the entry's provenance to the union of the returned cards' `uses`. → [02](02-blueprint-card-enrichment.md)
+12. **The evidence trail cannot be handed in from the loop.** `_run_loop_body`'s only trail load sits *above* the round-trip loop and is reduced to signatures — a snapshot from there holds nothing from the current window, so every citation would fail as "unknown id" while looking correctly wired. The tool reads the trail itself. → [04](04-evidence-validators.md), [03 §C.1](03-analysis-state.md)
+13. **A scripted model cannot prove routing.** `ScriptedModelClient.send_turn` never reads `messages`, so a suite built on it passes identically against a hostile prompt — and deliverable 01 changes nothing but a string. Resolved by splitting into a scripted runtime-mechanics suite (CI) and a **live-model routing suite that gates the release**. → [07](07-evaluation.md)
+
+**One finding escalates past the docs**, and the second review made it worse. Evidence-backed blocking stops the model *asserting* an unfalsifiable reason; it does not stop it *producing* a falsifiable one. `SELECT … WHERE 1=0` yields `REQUIRED_DATA_UNAVAILABLE` — and `NO_ACCESS` costs **one metadata call**: `getTableSchema(<scratch_db>, <anything>)` fails closed with `SCRATCH_SESSION_VIOLATION` without touching data or locking the late-init boundary. Separately, zero rows is *also* how a correct query answers "nobody", so the block predicate fires on honest work.
+
+The guarantee, stated precisely: **every intent the model chooses to track leaves a recorded, falsifiable disposition; nothing guarantees the disposition is true, and nothing forces tracking to exist.** That sentence is what is with the Lead — see [04 §B.5](04-evidence-validators.md).
 
 ## Conventions these docs assume
 
@@ -60,6 +75,9 @@ A review pass over the two coupled documents found four defects that would each 
 - [ ] All seven deliverables merged, `uv run pytest` green, `uv run ruff check` clean.
 - [ ] `docs/02-tools-and-api.md` corrected: 12 → **15** tools, with `recordAssumptions`, `answerWithTable` and `updateAnalysisState` documented and `answerWithTable`'s terminal-exit behaviour described.
 - [ ] `docs/04-blueprints.md` F2 note corrected (table intermediates are no longer rejected pre-dispatch when a scratch client is wired).
-- [ ] Layer-4 harness runs the six cases and reports both metrics.
+- [ ] `create_app(extra_observers=…)` seam added so the harness drives the shipped composition.
+- [ ] Scripted suite green per-commit; **live-model routing suite built and gating the release**, reported as a pass-rate.
+- [ ] `tests/eval/README.md` states plainly that the scripted suite cannot fail on a bad prompt.
 - [ ] No intent ends `pending` **on any turn that reaches a terminal outcome** — asserted at Layer 1/2, not measured. Turns abandoned at a pause, or whose resume loses a CAS race, legitimately leave `pending` state behind and must be excluded, or the assertion fails against any real store.
-- [ ] Two open items resolved before ship: (a) whether enforcement exhaustion after a consumed `askUser` pause forces `USER_DECLINED_CLARIFICATION` rather than `ENFORCEMENT_EXHAUSTED`; (b) whether manufactured block evidence is an accepted risk. Both with the Lead.
+- [ ] Four open items resolved before ship, all with the Lead: (a) enforcement exhaustion after a consumed `askUser` pause forcing `USER_DECLINED_CLARIFICATION`; (b) manufactured block evidence as an accepted risk, and the guarantee sentence in 04 §B.5; (c) ⚠ narrowing the model-declarable block codes to two (04 §B.1); (d) ⚠ requiring block evidence to be distinct per intent (04 §B.3).
+- [ ] `01a-prompt-draft.md` written and reviewed — 01 is the only deliverable whose artifact is prose, and the text does not exist yet.

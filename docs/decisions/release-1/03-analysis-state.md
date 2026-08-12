@@ -141,7 +141,7 @@ Registered in `runtime/app.py` — `runtime_tools["updateAnalysisState"] = Updat
 
 > Spec §5.4 and §13 say the registry lives in `agent_loop.py`. It does not — `app.py:571` builds `runtime_tools` and passes it in. Follow the code.
 
-**`observer` and `tracer` are not optional.** 06 assigns this tool six telemetry events, and every other stateful runtime tool takes both (`app.py:589-612`).
+**`observer` and `tracer` are not optional — and this breaks the precedent above.** The two *composite* runtime tools take neither: `RecordAssumptionsTool()` (`app.py:576`) and `AnswerWithTableTool()` (`app.py:583`), and `_run_runtime_tool` emits no dispatch events on their behalf. It is the three *retrieval read tools* that take both (`app.py:589-612`). Mirroring `record_assumptions.py` literally therefore yields a silently-mute tool. Take `observer` and `tracer`, and self-emit `tool_dispatch_start`/`ok`/`error` like the read tools — 06 assigns this tool seven of its eleven events.
 
 ### C.1 Getting the turn index
 
@@ -160,7 +160,9 @@ class RuntimeTool(Protocol):
     ) -> ToolResult: ...
 ```
 
-`TurnContext` carries `turn_index` and the current turn's trail (the evidence validators in 04 need the trail anyway, and the loop has already loaded it). Six implementers, no production constraint — take the explicit signature rather than a side channel.
+`TurnContext` carries **`turn_index` only**. Six implementers, no production constraint — take the explicit signature rather than a side channel.
+
+**It must not carry the trail.** `_run_loop_body`'s only trail load is at `agent_loop.py:1664`, *above* the round-trip loop at `:1700`, and it is immediately reduced to signatures for `seen_read_calls`; every entry is appended later (`:1952`). A snapshot from there contains **nothing from the current window**, so evidence written in round 1 and cited in round 2 would fail as "unknown `tool_call_id`" — every completion and block, on every turn, landing in `ENFORCEMENT_EXHAUSTED` while looking correctly wired. The tool calls `await session_store.load_trail(session_id)` itself, filtered to `turn_index` — the same per-round-trip read `_compute_turn_provenance_union` (`:960`) and `_compute_turn_assumptions` (`:1001`) already do. §E.2's cap of 2 state calls per response bounds it at ≤2 reads per round-trip, and none on turns without a state call. See [04](04-evidence-validators.md).
 
 ### C.2 Two modes
 
@@ -343,6 +345,7 @@ Revised after review found the first draft would have shipped four silent failur
 | "Threaded exactly like `discovery_canonical`" | **D — read fresh every round-trip** | `discovery_canonical` is once-per-window; copying that lifetime means the model never sees its assigned ids |
 | Cross-turn drop cited `_is_stale_assumptions_entry` | **D.1 — generalise it** | That function is hard-coded to `recordAssumptions`; the new tool's own trail entry replays descriptions under any scope, forever |
 | Turn index from `app.py` (plan a) or re-derived (plan b) | **C.1 — `TurnContext` from the loop** | `app.py` has only the explicitly non-load-bearing `turn_index_hint`; the two endpoints use different formulas |
+| `TurnContext` carried the trail | **C.1 — tool loads the trail itself** | The loop's snapshot predates the whole window, so no citation would ever validate (found in the 04 review) |
 | Cap exemption unbounded | **E.2 — `MAX_STATE_CALLS = 2`** | Unbounded CAS writes and trail entries in the pinned region |
 | `askUser` "non-locking" and nothing more | **E.1 — dispatch state before pausing** | `askUser` short-circuits the entire batch before dispatch; the state write was silently discarded |
 | Store write as a precomputed value | **B.1 — merge callback** | Violated `_mutate_with_cas_retry`'s documented precondition; lost-update on conflict |

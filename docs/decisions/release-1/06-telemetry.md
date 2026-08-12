@@ -31,11 +31,26 @@ Shape only: counts, enums, tool names, ids the runtime generated itself.
 | `loop_evidence_reused` | `{intent_id, tool_call_id}` | 03 tool, when a `tool_call_id` already backs another intent |
 | `loop_finalization_refused` | `{exit: "answer_with_table" \| "no_tool_calls", pending_count}` | 05, both exits |
 | `loop_finalization_block_spent` | `{window}` | 05, when the per-window forced re-round is consumed. Consumed **once per round-trip**, not once per refused call |
+| `loop_zero_row_block` / `loop_zero_row_completion` | `{intent_id}` | 03 tool — the 04 §B.4 ratio: an empty result set treated as a block versus as an answer |
 | `loop_intent_force_blocked` | `{intent_id, reason_code}` | 05, all **four** forced paths (hard ceiling · `"stop"` resume · enforcement exhausted · budget cap reached during a refused round) |
 | `loop_enforcement_exhausted` | `{intent_count}` | 05 — dedicated counter, per spec §7 |
 | `loop_analysis_state_late_init_rejected` | `{proposed_count, blocking_tool_name}` | 03 boundary check. `blocking_tool_name` is which substantive tool had already run — diagnostic, and it is a tool name, not content |
 
-**The tool must be constructed with `observer` and `tracer`.** Six of the ten events above fire from `UpdateAnalysisStateTool`, and every other stateful runtime tool already takes both (`app.py:589-612`). Wired without them it silently emits nothing — see [03 §C](03-analysis-state.md).
+| `loop_analysis_state_rejected` | `{reason: "<validation_rule>", intent_count}` | 03 tool, on **every** `ANALYSIS_STATE_INVALID`. `reason` is an enum of rule names, never the offending value |
+
+Eleven events, not ten. The rejection event was missing and the README's own convention requires it — *"every new failure path emits an observer event"* — and 03 §C.3 defines nine rejection rules landing on one code. The immutability violation is the single most interesting adversarial signal in the release (it is the model attempting the evasion 03 §C.4 exists to close) and would otherwise be invisible outside a test.
+
+## ⚠ Emitting an event does not publish its payload
+
+`_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST` (`observability/tracing.py:598`) is a **strict attribute allowlist**, deliberately not a type filter — the comment explains that a bare `isinstance` check would have leaked `loop_paused_ask_user`'s `question`. It contains exactly: `window`, `tool_calls_made`, `tool_name`, `tool_call_id`, `deduped`, `guard_reason`, `dedup_target`, `note`, `database`, `table`.
+
+Of every payload key proposed above, **only `window` is on it.** Every other event would reach Phoenix as a correctly-named GUARDRAIL span carrying **zero attributes** — including `loop_intent_completed`, whose entire purpose is the one attribute it holds.
+
+**Extend the allowlist** with `intent_count`, `turn_index`, `intent_id`, `from_status`, `to_status`, `reason_code`, `evidence_tool_name`, `exit`, `pending_count`, `proposed_count`, `blocking_tool_name`, `reason`. Each addition is a deliberate D25 declaration that the key is shape-only — which is why the list is manual. **`description` must never be added.**
+
+Note this is a different mechanism from `OTLP_DROP_SPAN_NAMES`, which filters span *names* one layer later. Passing that filter says nothing about whether the attributes survived.
+
+**The tool must be constructed with `observer` and `tracer` — and that breaks the precedent 03 tells you to copy.** The two *composite* runtime tools take neither: `RecordAssumptionsTool()` (`app.py:576`) and `AnswerWithTableTool()` (`app.py:583`), and `RecordAssumptionsTool.run` is `(arguments, credentials)` only. `_run_runtime_tool` (`agent_loop.py:1120`) emits no dispatch events on their behalf either. It is the three *retrieval read tools* that take both (`app.py:589-612`). So mirroring `record_assumptions.py` literally produces a silently-mute tool: `UpdateAnalysisStateTool` must take `observer` and `tracer` **and** self-emit `tool_dispatch_start`/`ok`/`error` the way the read tools do.
 
 ## Already emitted — do not duplicate
 
