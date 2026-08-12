@@ -81,7 +81,7 @@ The hierarchy the prompt must express:
 | **Discovery** | `searchBlueprints`, `getBlueprint`, `getTableSchema`, `searchKnowledge` | Permitted first. The model is *expected* to look before it decomposes. |
 | **Substantive** | `runQuery`, `runBlueprint`, `sampleRows`, `resolveValues` | Once any of these has an entry in this turn, first-time initialization is **rejected**. |
 
-Rejection is `ANALYSIS_STATE_LATE_INIT` — non-retryable, registered in `dispatch/denial_mapping.py`, with the proposed descriptions carried in `denial_detail` (the same rendering trap as §7: `user_message` is not persisted on `TrailEntry`, and `context/budget.py::_render_entry` regenerates model-facing text from `error_code` alone). Telemetry: `analysis_state_late_init_rejected`.
+Rejection is `ANALYSIS_STATE_LATE_INIT` — non-retryable, registered in `dispatch/denial_mapping.py`, with the proposed descriptions carried in `denial_detail` (the same rendering trap as §7: `context/budget.py::_render_entry` builds it from the persisted entry — `denial_detail` if set, else `classify_denial(error_code)` — never from `ToolResult.user_message`, which has no `TrailEntry` field). Telemetry: `analysis_state_late_init_rejected`.
 
 The turn then runs unprotected — there is no state, so §7 has nothing to enforce. That is the intended consequence: the alternative is late init surviving under another name.
 
@@ -193,8 +193,8 @@ Two consequences for the implementation:
 
 While any tracked intent is `pending`, neither terminal exit may complete:
 
-- **Exit #2 — `answerWithTable`.** Return a retryable error `ToolResult` with `FINALIZATION_BLOCKED_PENDING_INTENTS`, exactly as `_answer_table_blueprint_not_run` already does for its case. Use **`denial_detail`** to name the pending intents: `user_message` never reaches the model, because `TrailEntry` has no such field and `context/budget.py::_render_entry` regenerates model-facing text from `error_code` alone. Register the code in `dispatch/denial_mapping.py`, or the model is told only the generic fallback string.
-- **Exit #1 — a model turn with no tool calls.** There is no error channel here. Do not persist the assistant answer; inject the same nudge as a synthetic tool result and re-enter the loop. **Capped at one forced re-round per budget window**, so enforcement cannot itself burn the window.
+- **Exit #2 — `answerWithTable`.** Return a retryable error `ToolResult` with `FINALIZATION_BLOCKED_PENDING_INTENTS`, exactly as `_answer_table_blueprint_not_run` already does for its case. Use **`denial_detail`** to name the pending intents: `context/budget.py::_render_entry` builds it from the persisted entry — `denial_detail` if set, else `classify_denial(error_code)` — never from `ToolResult.user_message`, which has no `TrailEntry` field. Register the code in `dispatch/denial_mapping.py`, or the model is told only the generic fallback string.
+- **Exit #1 — a model turn with no tool calls.** There is no error channel here. Do not persist the assistant answer; inject the nudge and re-enter the loop. **Capped at one forced re-round per budget window**, so enforcement cannot itself burn the window. *(Mechanism amended after review: the nudge is an ephemeral `user`-role injection, not a synthetic tool result — a standalone `tool` message is not expressible. The invariant is unchanged; see [release-1/05](release-1/05-finalization-enforcement.md) §B.2. The forced re-round must also be charged to the budget window, or it is free and only the wall clock stops it.)*
 
 **Terminal escapes.** Three, all runtime-forced, all marking every surviving `pending` intent `blocked` before allowing finalization. Without them the turn cannot terminate: both exits are reachable with pending intents and must return something.
 

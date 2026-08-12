@@ -6,6 +6,8 @@
 
 Put both in `composite/analysis_state.py` beside the tool, as pure functions over `list[TrailEntry]` — no I/O, so they unit-test without a store.
 
+Both take `turn_index` and compare it against `entry.turn_index`. Same scoping rule as [03 §A.1](03-analysis-state.md)'s `live_analysis_state`: a validator must never accept evidence from a turn other than the one being enforced.
+
 ```python
 def validate_completion_evidence(
     tool_call_id: str, trail: Sequence[TrailEntry], turn_index: int
@@ -83,6 +85,8 @@ or entry.error_code == TABLE_NOT_FOUND
 
 **`result_preview is not None` is required, not defensive.** A guard-marker entry has `result_preview=None`, and so does a denied entry — dereferencing `.row_count` would raise `AttributeError` inside the validator. The guard-marker exclusion is stated separately because that entry is `ok`, so the marker check must come before the preview check.
 
+> **What this validator does not close.** Both predicates are cheaply *manufacturable*: a query with an impossible predicate returns zero rows, and a query naming an out-of-scope column is denied on request. Evidence-backed blocking stops the model asserting an unfalsifiable reason; it does not stop it producing a falsifiable one. The guarantee to state is **"the model cannot silently drop an ask"**, not "cannot evade". Escalated to the Lead; until decided, the adversarial suite asserts the current behaviour so the hole is measured rather than assumed away.
+
 ### The three cut reasons
 
 `NO_GROUNDED_SEMANTICS`, `NO_APPLICABLE_TOOL` and `USER_DECLINED_CLARIFICATION` were specified and cut at Lead review: each proved an *attempt* rather than an outcome, which defeats the point of evidence-backed blocking. **Do not reintroduce them** — spec §10 records the rejection.
@@ -133,6 +137,8 @@ If approved it adds a **runtime-forced** code — never model-declarable, so the
 | `REQUIRED_DATA_UNAVAILABLE` citing a denied entry (`result_preview is None`) | **invalid, no raise** |
 | Model declares `BUDGET_EXHAUSTED` / `USER_STOPPED` / `ENFORCEMENT_EXHAUSTED` | **invalid** |
 | Model declares a cut reason (`NO_APPLICABLE_TOOL`) | **invalid** — not in the enum |
+| **Manufactured** `REQUIRED_DATA_UNAVAILABLE` citing `SELECT … WHERE 1=0` | **valid today** — assert it passes *and* that the transition is recorded in telemetry, so the known hole is measured |
+| **Manufactured** `NO_ACCESS` citing a deliberately out-of-scope column | **valid today** — same treatment |
 
 The two "no raise" rows are the ones a hand-written validator gets wrong.
 

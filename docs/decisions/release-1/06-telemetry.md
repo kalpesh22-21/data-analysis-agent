@@ -30,10 +30,12 @@ Shape only: counts, enums, tool names, ids the runtime generated itself.
 | `loop_metadata_evidence_completion` | `{intent_id}` | 03 tool, when evidence is a `getTableSchema`. The mitigation for §6.1's accepted trade |
 | `loop_evidence_reused` | `{intent_id, tool_call_id}` | 03 tool, when a `tool_call_id` already backs another intent |
 | `loop_finalization_refused` | `{exit: "answer_with_table" \| "no_tool_calls", pending_count}` | 05, both exits |
-| `loop_finalization_nudge_spent` | `{window}` | 05, when the per-window nudge is consumed |
-| `loop_intent_force_blocked` | `{intent_id, reason_code}` | 05, all three forced paths |
+| `loop_finalization_block_spent` | `{window}` | 05, when the per-window forced re-round is consumed. Consumed **once per round-trip**, not once per refused call |
+| `loop_intent_force_blocked` | `{intent_id, reason_code}` | 05, all **four** forced paths (hard ceiling · `"stop"` resume · enforcement exhausted · budget cap reached during a refused round) |
 | `loop_enforcement_exhausted` | `{intent_count}` | 05 — dedicated counter, per spec §7 |
 | `loop_analysis_state_late_init_rejected` | `{proposed_count, blocking_tool_name}` | 03 boundary check. `blocking_tool_name` is which substantive tool had already run — diagnostic, and it is a tool name, not content |
+
+**The tool must be constructed with `observer` and `tracer`.** Six of the ten events above fire from `UpdateAnalysisStateTool`, and every other stateful runtime tool already takes both (`app.py:589-612`). Wired without them it silently emits nothing — see [03 §C](03-analysis-state.md).
 
 ## Already emitted — do not duplicate
 

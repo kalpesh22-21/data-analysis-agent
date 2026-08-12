@@ -66,7 +66,9 @@ Use the committed corpus (`tests/fixtures/corpus/blueprints.yaml`, 11 blueprints
 
 §7 guarantees no intent ends `pending`, so this is mechanically zero. Measuring it reports the enforcement working, never the system working.
 
-Ship it as a **Layer-1/2 assertion**: after every eval run, assert no intent in any turn's final state has `status == "pending"`. A non-zero value is a runtime bug, not a quality signal. It belongs in the harness's teardown, not its report.
+Ship it as a **Layer-1/2 assertion**: after every eval run, assert no intent has `status == "pending"` **on any turn that reached a terminal outcome** (`done` or `stopped_hard_ceiling`). A non-zero value is a runtime bug, not a quality signal. It belongs in the harness's teardown, not its report.
+
+**The scoping is required, not pedantry.** Three paths legitimately leave `pending` state behind: an abandoned `askUser` pause, an abandoned budget-cap pause, and a resume that loses a CAS race (`resume()` raises before reaching any escape). Those are *non-terminated* turns, not dropped intents. An unscoped assertion fails against any real store — see [05 §F.1](../release-1/05-finalization-enforcement.md).
 
 ### Blocked / unfulfilled-intent rate
 
