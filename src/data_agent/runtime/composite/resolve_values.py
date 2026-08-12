@@ -57,6 +57,8 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
 
+    from data_agent.runtime.loop.agent_loop import TurnContext
+
 TOOL_NAME = "resolveValues"
 UNKNOWN_TARGET_CODE = "RESOLVE_VALUES_UNKNOWN_TARGET"
 # B4-parity: a last-resort code for an UNEXPECTED crash anywhere in the
@@ -153,7 +155,12 @@ class ResolveValuesComposite:
 
     # -- model tool-call path -------------------------------------------------
 
-    async def run(self, model_args: dict[str, Any], credentials: RuntimeCredentials) -> ToolResult:
+    async def run(
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn: TurnContext | None = None,
+    ) -> ToolResult:
         """Model tool-call path: validate args, resolve, wrap as a `ToolResult`.
 
         Emits one `TOOL` span for `resolveValues` (with `concept` redacted and

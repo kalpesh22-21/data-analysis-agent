@@ -63,9 +63,15 @@ def test_map_blueprint_record_uses_is_frozenset_of_byte_exact_strings() -> None:
     assert candidate.uses == frozenset(
         {"dbpcm_warehouse.payroll.Amount", "dbpcm_warehouse.employee.Department"}
     )
+    # release-1 §02: the payload gained the three card-enrichment keys. This row
+    # stores no DAG, so all three decode to `None` — the card then omits them and
+    # serialises byte-identically to before enrichment.
     assert candidate.payload == {
         "intent": "Total overtime pay by department",
         "slots_summary": "department, pay_period",
+        "resolves": None,
+        "slots": None,
+        "result_grain": None,
     }
     assert candidate.score == 0.91
 

@@ -255,3 +255,203 @@ async def test_a_relentless_deleter_fails_loudly_rather_than_looping() -> None:
         await store.bump_last_activity("s1")
 
     assert sessions_collection.replace.call_count == 0
+
+
+async def test_apply_analysis_state_recomputes_the_merge_against_the_winners_doc() -> None:
+    """THE 03 §B.1 TEST — why the store API takes the merge and not the result.
+
+    `_mutate_with_cas_retry` documents its precondition: the callback "may be
+    called more than once (once per retry) against a freshly re-read document, so
+    it must not carry any state of its own across calls". A tool that loaded the
+    state, computed a merged `AnalysisState`, and handed that OBJECT to a
+    `setattr` callback would break exactly that — on a CAS conflict the callback
+    re-runs against the fresh doc but writes a value derived from the STALE read,
+    clobbering the winner. That is the lost-update class the helper exists to
+    prevent.
+
+    Here a peer completes `i2` between the two reads. The merge, re-run against
+    the winner's doc, must preserve `i2` while applying its own change to `i1`.
+    """
+    from couchbase.exceptions import CasMismatchException
+
+    from data_agent.runtime.session.models import (
+        AnalysisState,
+        SessionDoc,
+        TrackedIntent,
+    )
+
+    def _doc(intents: tuple[TrackedIntent, ...]) -> dict:
+        return SessionDoc(
+            session_id="s1",
+            created_at="t0",
+            last_activity="t0",
+            analysis_state=AnalysisState(turn_index=2, intents=intents),
+        ).to_doc()
+
+    stale = (
+        TrackedIntent(intent_id="i1", description="a", status="pending"),
+        TrackedIntent(intent_id="i2", description="b", status="pending"),
+    )
+    # What the PEER wrote and we then re-read: i2 is already completed.
+    winner = (
+        TrackedIntent(intent_id="i1", description="a", status="pending"),
+        TrackedIntent(
+            intent_id="i2", description="b", status="completed",
+            evidence_tool_call_id="call_peer",
+        ),
+    )
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    store, sessions_collection = _build_store(sleep=_no_sleep)
+    sessions_collection.get = AsyncMock(
+        side_effect=[
+            _FakeGetResult(_doc(stale), cas=1),
+            _FakeGetResult(_doc(winner), cas=2),
+        ]
+    )
+
+    replace_calls: list[dict] = []
+
+    async def _replace(key, doc, options):  # noqa: ANN001 - test double
+        replace_calls.append({"doc": doc, "options": dict(options)})
+        if len(replace_calls) == 1:
+            raise CasMismatchException("a peer state write won")
+        return None
+
+    sessions_collection.replace = AsyncMock(side_effect=_replace)
+
+    seen_live: list[AnalysisState | None] = []
+
+    def _merge(live: AnalysisState | None) -> AnalysisState:
+        """Exactly the shape the tool uses: derive the new state FROM the state
+        handed in, never from one captured outside."""
+        seen_live.append(live)
+        assert live is not None
+        by_id = {i.intent_id: i for i in live.intents}
+        by_id["i1"] = TrackedIntent(
+            intent_id="i1", description="a", status="completed",
+            evidence_tool_call_id="call_mine",
+        )
+        return AnalysisState(
+            turn_index=2, intents=tuple(by_id[i.intent_id] for i in live.intents)
+        )
+
+    returned = await store.apply_analysis_state("s1", 2, _merge)
+
+    # The callback ran once per attempt, against each freshly re-read document.
+    assert [tuple(i.status for i in (s.intents if s else ())) for s in seen_live] == [
+        ("pending", "pending"),
+        ("pending", "completed"),
+    ]
+    written = replace_calls[-1]["doc"]["analysis_state"]["intents"]
+    assert [i["status"] for i in written] == ["completed", "completed"]
+    # The peer's evidence survived — the write did NOT clobber the winner.
+    assert written[1]["evidence_tool_call_id"] == "call_peer"
+    assert written[0]["evidence_tool_call_id"] == "call_mine"
+    # And the RETURNED state is the one actually written, not the first attempt's.
+    assert returned.intents[1].evidence_tool_call_id == "call_peer"
+
+
+async def test_apply_analysis_state_hands_the_merge_only_the_live_state() -> None:
+    """The A.1 gate lives in the store adapter, so no caller can forget it: a
+    state belonging to another turn arrives as `None`."""
+    from data_agent.runtime.session.models import (
+        AnalysisState,
+        SessionDoc,
+        TrackedIntent,
+    )
+
+    other_turn = SessionDoc(
+        session_id="s1",
+        created_at="t0",
+        last_activity="t0",
+        analysis_state=AnalysisState(
+            turn_index=1,
+            intents=(TrackedIntent(intent_id="i1", description="a", status="pending"),),
+        ),
+    ).to_doc()
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    store, sessions_collection = _build_store(sleep=_no_sleep)
+    sessions_collection.get = AsyncMock(
+        side_effect=[_FakeGetResult(other_turn, cas=1)]
+    )
+    sessions_collection.replace = AsyncMock(return_value=None)
+
+    seen: list[object] = []
+
+    def _merge(live):  # noqa: ANN001, ANN202 - test double
+        seen.append(live)
+        return AnalysisState(
+            turn_index=9,
+            intents=(TrackedIntent(intent_id="i1", description="new", status="pending"),),
+        )
+
+    await store.apply_analysis_state("s1", 9, _merge)
+    assert seen == [None]
+
+
+async def test_claim_finalization_block_checks_and_increments_in_one_cas_step() -> None:
+    """05 §C.1 in the real store: the limit check and the increment happen inside
+    ONE `_mutate_with_cas_retry` callback, so a concurrent claimant cannot also see
+    "unspent". Here a peer claims the window's block between the two reads — the
+    callback re-runs against the winner's doc and correctly reports `False`, rather
+    than writing a second claim derived from the stale read."""
+    from couchbase.exceptions import CasMismatchException
+
+    from data_agent.runtime.session.models import SessionDoc
+
+    def _doc(blocks: dict[str, int] | None) -> dict:
+        return SessionDoc(
+            session_id="s1",
+            created_at="t0",
+            last_activity="t0",
+            finalization_blocks=blocks,
+        ).to_doc()
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    store, sessions_collection = _build_store(sleep=_no_sleep)
+    sessions_collection.get = AsyncMock(
+        side_effect=[_FakeGetResult(_doc(None), cas=1), _FakeGetResult(_doc({"0:2": 1}), cas=2)]
+    )
+
+    replace_calls: list[dict] = []
+
+    async def _replace(key, doc, options):  # noqa: ANN001 - test double
+        replace_calls.append(doc)
+        if len(replace_calls) == 1:
+            raise CasMismatchException("a peer claimed it first")
+        return None
+
+    sessions_collection.replace = AsyncMock(side_effect=_replace)
+
+    claimed = await store.claim_finalization_block("s1", 0, 2)
+
+    assert claimed is False, "two claimants both got the window's single re-round"
+    # The peer's count was NOT overwritten by one derived from the stale read.
+    assert replace_calls[-1]["finalization_blocks"] == {"0:2": 1}
+
+
+async def test_claim_finalization_block_grants_the_first_caller() -> None:
+    from data_agent.runtime.session.models import SessionDoc
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    store, sessions_collection = _build_store(sleep=_no_sleep)
+    sessions_collection.get = AsyncMock(
+        return_value=_FakeGetResult(
+            SessionDoc(session_id="s1", created_at="t0", last_activity="t0").to_doc(), cas=1
+        )
+    )
+    sessions_collection.replace = AsyncMock(return_value=None)
+
+    assert await store.claim_finalization_block("s1", 0, 3) is True
+    written = sessions_collection.replace.call_args.args[1]
+    assert written["finalization_blocks"] == {"0:3": 1}

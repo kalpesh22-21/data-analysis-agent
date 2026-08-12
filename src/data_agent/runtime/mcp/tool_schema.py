@@ -112,11 +112,19 @@ SEARCH_BLUEPRINTS_TOOL_SCHEMA: dict[str, Any] = {
     "name": "searchBlueprints",
     "description": (
         "Search the blueprint library for reusable, validated analyses that match an "
-        "intent. You are usually GIVEN the 3 most relevant blueprints as thin cards "
-        "already — call this only when those 3 miss, or once you have reformulated the "
-        "intent in your own words. It re-searches for THIS user's scope and returns more "
-        "candidate cards (id, intent, slots summary, score). Then call getBlueprint(id) to "
-        "expand the one you pick. A `degraded` flag of true means semantic ranking was "
+        "intent. Call it for EVERY analytical deliverable the request contains, in your "
+        "own words — one search per deliverable, not one for the whole question — "
+        "whether or not one of the blueprint cards already offered to you fits. Those "
+        "cards were recalled from the whole question as ONE string, so on a multi-part "
+        "request they under-serve every part of it. This is normal practice, not a "
+        "fallback for when they miss. It re-searches for THIS user's scope and returns "
+        "more candidate cards. Each card carries id, intent, slots summary, score, each slot's "
+        "name/type/required, any pinned term-to-column resolutions, and the result grain — "
+        "enough to choose between candidates AND to fill runBlueprint, so you normally do "
+        "NOT need another call to decide. Call getBlueprint(id) only when you need the full "
+        "DAG (the `uses` footprint, the SQL template) or a composition summary — or when a "
+        "card carries `slots_omitted`, which means it lists only the first few slots and "
+        "the rest are on getBlueprint. A `degraded` flag of true means semantic ranking was "
         "unavailable and the order is weaker — treat scores with less confidence."
     ),
     "parameters": {
@@ -319,6 +327,118 @@ ANSWER_WITH_TABLE_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# `updateAnalysisState` (Release 1, composite/analysis_state.py) — the intent
+# ledger for a question that asks for more than one thing. Runtime-implemented,
+# intercepted in the loop, and EXEMPT from `max_tool_calls_per_iteration` (it is
+# bookkeeping, not work) though bounded at two calls per message. Declares NO
+# session_id/jwt/scope (D5); it carries no warehouse data and has no backing
+# stack, so it is always available.
+#
+# The description carries four things the runtime cannot enforce by shape and
+# the model cannot infer: that ids are assigned by the runtime, that descriptions
+# are frozen, that the late-init boundary is closed by ALL FOUR of
+# `SUBSTANTIVE_TOOLS` (naming only three here would send a blueprint-first model
+# straight into the non-retryable `ANALYSIS_STATE_LATE_INIT`, after which the turn
+# runs untracked — the asymmetric silent failure 03 §E warns about; the wording
+# tracks `prompts.py`'s tracking section, and a test asserts all four are named),
+# and — the one that would otherwise cost a wasted call every turn — that evidence
+# must come from a PRIOR message, because state calls are dispatched before
+# everything else in the batch.
+#
+# ITEM SHAPE: ONE flat object for both modes, deliberately — see the field
+# descriptions. A model that cannot omit keys fills the unused ones with
+# placeholders (`""`, or the first enum member), which is what a `oneOf` over two
+# item variants would be trying to prevent; but nothing ENFORCES a schema without
+# `strict`, which the runtime does not set and cannot set for one tool while the
+# MCP-derived schemas are non-strict. So the runtime NORMALISES that payload
+# (`composite/analysis_state.py`, "a key carrying no information is absent") and
+# this description states the same convention, rather than a stricter shape the
+# provider would treat as a hint anyway.
+UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "name": "updateAnalysisState",
+    "description": (
+        "Track the separate deliverables a question asks for, so none is silently "
+        "dropped. Use it whenever the user asks for more than one thing ('headcount "
+        "and average salary by department, and who left last month'). "
+        "FIRST call — BEFORE any substantive tool call, that is before any runQuery, "
+        "runBlueprint, sampleRows or resolveValues in this turn — list each "
+        "deliverable as an object with just a 'description': one short sentence in "
+        "the user's own terms. Do not invent ids: the runtime assigns them (i1, i2, "
+        "…) and the result of that call tells you what they are. Once one of those "
+        "four has run, a first declaration is refused and the turn goes untracked. "
+        "LATER calls — update the intents you already declared, several at a time in "
+        "ONE call. Send 'intent_id' and the new 'status', and nothing else: a "
+        "description cannot be changed and an intent cannot be added or removed. "
+        "Mark an intent 'completed' with 'evidence_tool_call_id' set to the id of the "
+        "successful runQuery, verified runBlueprint or getTableSchema that answered "
+        "it. Mark it 'blocked' only when you can show why, with a 'reason_code' of "
+        "'NO_ACCESS' (a call refused for permissions) or 'REQUIRED_DATA_UNAVAILABLE' "
+        "(a successful query that returned no rows), plus the id of that call — and a "
+        "DIFFERENT call for each blocked intent. If a query legitimately returns "
+        "nothing, that is a completed intent whose answer is 'none found', not a "
+        "blocked one. "
+        "IMPORTANT: the evidence you cite must be a call from an EARLIER message. "
+        "This tool runs before the other calls in the same message, so a call you are "
+        "making right now has not run yet — cite it in your next message. "
+        "Every item uses one object shape, so if you must send a field that does not "
+        "apply, leave it EMPTY ('') — an empty field is read as absent. On the first "
+        "call 'status' and 'reason_code' are ignored (every intent starts pending), "
+        "so leave 'status' as 'pending' there."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "intents": {
+                "type": "array",
+                "description": "The intents to declare (first call) or update (later "
+                "calls). At most 8.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "First call only. One short sentence naming "
+                            "the deliverable, in the user's own terms. Max 500 "
+                            "characters. Leave it empty on later calls — a "
+                            "description cannot be changed once declared.",
+                        },
+                        "intent_id": {
+                            "type": "string",
+                            "description": "Later calls only. The id the runtime "
+                            "assigned, e.g. 'i2'. Leave it EMPTY on the first call: "
+                            "the runtime assigns the ids and refuses one you invent.",
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "completed", "blocked"],
+                            "description": "Later calls only. The intent's new state. "
+                            "On the first call leave it as 'pending' — every intent "
+                            "starts pending and any other value there is refused.",
+                        },
+                        "evidence_tool_call_id": {
+                            "type": "string",
+                            "description": "The id of the tool call that shows this "
+                            "intent was answered, or was refused / came back empty. "
+                            "Required to complete or block an intent; it must be a "
+                            "call from an earlier message. Leave it empty on the "
+                            "first call and while an intent is still pending.",
+                        },
+                        "reason_code": {
+                            "type": "string",
+                            "enum": ["NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE"],
+                            "description": "Required when status is 'blocked', and "
+                            "ignored on every other status — leave it empty there.",
+                        },
+                    },
+                },
+            },
+        },
+        "required": ["intents"],
+    },
+}
+
+
 # The locally-authored (runtime-implemented) tool schemas, appended after the
 # live-fetched MCP tools. This tuple is the SINGLE source of truth for "these
 # names are ours" — the name-collision guard (§6.1) asserts the MCP never
@@ -332,6 +452,7 @@ _LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     RUN_BLUEPRINT_TOOL_SCHEMA,
     RECORD_ASSUMPTIONS_TOOL_SCHEMA,
     ANSWER_WITH_TABLE_TOOL_SCHEMA,
+    UPDATE_ANALYSIS_STATE_TOOL_SCHEMA,
 )
 _LOCAL_TOOL_NAMES: frozenset[str] = frozenset(s["name"] for s in _LOCAL_TOOL_SCHEMAS)
 
@@ -384,8 +505,9 @@ async def fetch_function_schemas(
         )
     schemas = [translate_tool_spec(tool) for tool in tools]
     # The locally-authored runtime tools (askUser + resolveValues + the three read
-    # tools + runBlueprint + recordAssumptions), always advertised, appended after
-    # the MCP tools (count 6 → 13).
+    # tools + runBlueprint + recordAssumptions + answerWithTable +
+    # updateAnalysisState), always advertised, appended after the MCP tools
+    # (count 6 → 15).
     schemas.extend(_LOCAL_TOOL_SCHEMAS)
     return schemas
 

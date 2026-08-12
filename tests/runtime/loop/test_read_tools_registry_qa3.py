@@ -231,7 +231,9 @@ class _RecordingTool:
     def __init__(self) -> None:
         self.ran = False
 
-    async def run(self, model_args: dict[str, Any], credentials: RuntimeCredentials) -> ToolResult:
+    async def run(
+        self, model_args: dict[str, Any], credentials: RuntimeCredentials, turn=None
+    ) -> ToolResult:
         self.ran = True
         return ToolResult(
             status="ok", tool_name="searchBlueprints", error_code=None, retryable=None,
@@ -294,7 +296,9 @@ class _ShadowRunQuery:
     def __init__(self) -> None:
         self.ran = False
 
-    async def run(self, model_args: dict[str, Any], credentials: RuntimeCredentials) -> ToolResult:
+    async def run(
+        self, model_args: dict[str, Any], credentials: RuntimeCredentials, turn=None
+    ) -> ToolResult:
         self.ran = True
         return ToolResult(
             status="ok", tool_name="runQuery", error_code=None, retryable=None,
@@ -389,7 +393,9 @@ def test_frozenset_provenance_read_entry_survives_narrowed_scope_d44() -> None:
 
 
 class _UnguardedRaisingTool:
-    async def run(self, model_args: dict[str, Any], credentials: RuntimeCredentials) -> ToolResult:
+    async def run(
+        self, model_args: dict[str, Any], credentials: RuntimeCredentials, turn=None
+    ) -> ToolResult:
         raise RuntimeError("a runtime tool that does not self-guard")
 
 
@@ -420,7 +426,9 @@ async def test_loop_wraps_a_raising_runtime_tool_turn_survives() -> None:
 
 
 class _MalformedProvenanceTool:
-    async def run(self, model_args: dict[str, Any], credentials: RuntimeCredentials) -> ToolResult:
+    async def run(
+        self, model_args: dict[str, Any], credentials: RuntimeCredentials, turn=None
+    ) -> ToolResult:
         # provenance declared frozenset[tuple[str,str]] | None, but a contract
         # violator returns a bare string.
         return ToolResult(

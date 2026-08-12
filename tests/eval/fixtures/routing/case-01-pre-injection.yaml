@@ -1,0 +1,37 @@
+# A1 case 1 — pre-injection (07 §D).
+#
+# Anchored on `bp-hires-projection` per 07 §C.1, NOT on
+# `bp-compare-employee-check-detail-two-periods`: the latter has two unresolved
+# `ref:` nodes, two scratch materializations, three required slots and a real
+# `result_grain` gate, so `authoritative` would stay False and 04's condition 4
+# would reject the evidence. The projection is genuinely complex wording, one
+# node, no scratch, and `result_grain: []` so the D56 row-count teeth are
+# vacuously skipped and the marker is earned legitimately.
+#
+# `multi_intent: false` buys the E.3 FALSE-POSITIVE check: an `analysisState`
+# initialized for a single-intent request burns 03 §E's late-init boundary and
+# adds CAS writes for nothing.
+id: case-01-pre-injection
+question: How many hires should we expect over the next six months at the current pace?
+ground_truth:
+  multi_intent: false
+  intent_count: 1
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.most_recent_hire_date
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.annual_salary
+corpus:
+  - bp-hires-projection
+  - bp-active-headcount-by-department
+  - bp-average-salary-by-department
+embedding:
+  How many hires should we expect over the next six months at the current pace?: [1.0, 0.0]
+mcp_tools: []
+mcp_script: {}
+model_script:
+  - assistant_text: I can project that from the hiring run-rate.
+expect:
+  intents_terminal: 0
+  re_derivation: false

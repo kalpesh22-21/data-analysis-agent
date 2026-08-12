@@ -198,6 +198,121 @@ class TrailEntry:
         )
 
 
+# --- analysisState (Release 1, docs/decisions/release-1/03-analysis-state.md) ---
+#
+# The closed enums live HERE, beside the dataclasses, so the tool, the evidence
+# validators, the loop's forced-block paths and the tests all share ONE
+# definition. The MODEL/RUNTIME split is STRUCTURAL, not a comment (03 §A.3):
+# `validate_block_evidence` allowlists `MODEL_REASON_CODES`, so a runtime-forced
+# code can never become model-declarable — including a future fourth one.
+INTENT_STATUSES = frozenset({"pending", "completed", "blocked"})
+# Declarable BY THE MODEL, on evidence (04 §B.1). Exactly two: both are the
+# non-retryable denials. `DATABASE_NOT_ALLOWED`/`TABLE_NOT_FOUND` were dropped on
+# review — they are `retryable=True` in `denial_mapping.py` (the codebase's own
+# "the model got the name wrong" bucket) and `TABLE_NOT_FOUND` is also how a
+# column-scope denial surfaces from `sampleRows`.
+MODEL_REASON_CODES = frozenset({"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE"})
+# Written ONLY by the runtime's forced-block paths (05 §F), never by the model.
+# `ENFORCEMENT_EXHAUSTED` means "enforcement could not establish a disposition" —
+# NOT that the system proved the intent impossible.
+RUNTIME_REASON_CODES = frozenset({"BUDGET_EXHAUSTED", "USER_STOPPED", "ENFORCEMENT_EXHAUSTED"})
+REASON_CODES = MODEL_REASON_CODES | RUNTIME_REASON_CODES
+
+# ONE forced finalization re-round per (TURN, BUDGET WINDOW) (05 §C). It lives here,
+# beside the field it bounds (`SessionDoc.finalization_blocks`) and the enums it sits
+# with, because BOTH store implementations enforce it inside their claim and the loop
+# reads it for its own accounting — a constant in `agent_loop.py` could not be
+# imported by the stores without a cycle (`agent_loop` imports `store`).
+MAX_FINALIZATION_BLOCKS_PER_WINDOW = 1
+
+
+def finalization_block_key(turn_index: int, window_count: int) -> str:
+    """The `SessionDoc.finalization_blocks` key — `"0:1"` for turn 0, window 1.
+
+    THE TURN INDEX IS LOAD-BEARING, and 05 §C.1's original "keyed by window"
+    was a defect. `finalization_blocks` is persisted on the session document and
+    never cleared at a turn boundary, but `AgentLoop.run` starts EVERY external
+    turn at `window_count=1` — so a window-only key collides across turns, and from
+    a session's SECOND block-spending turn onward the first finalization attempt of
+    every turn is refused a re-round it never had. No `loop_finalization_refused`,
+    no nudge, and `ENFORCEMENT_EXHAUSTED` written for an intent the model was never
+    asked twice about (which also silently inflates 07's headline metric).
+
+    Same class as the bug `live_analysis_state` exists to prevent: a PER-TURN value
+    persisted on the session doc with no turn gate. Keying beats clearing — a clear
+    needs a turn-boundary hook that does not exist and would have to fire on every
+    resume path without resetting the counter mid-turn.
+
+    Defined here so both store implementations and every test format it one way.
+    """
+    return f"{turn_index}:{window_count}"
+
+
+@dataclass(frozen=True)
+class TrackedIntent:
+    """One tracked deliverable of a multi-intent question (03 §A).
+
+    `intent_id` is RUNTIME-assigned (`i1`, `i2`, … in proposal order) and never
+    model-supplied; `description` is FROZEN after initialization — an update may
+    only move `status`/`evidence_tool_call_id`/`reason_code`. Both rules exist so
+    the model cannot silently DROP an ask it decided not to answer (03 §C.4);
+    neither closes manufactured evidence, which is a known-open hole.
+    """
+
+    intent_id: str
+    description: str
+    status: str  # INTENT_STATUSES
+    evidence_tool_call_id: str | None = None
+    reason_code: str | None = None
+
+    def to_doc(self) -> dict[str, Any]:
+        return {
+            "intent_id": self.intent_id,
+            "description": self.description,
+            "status": self.status,
+            "evidence_tool_call_id": self.evidence_tool_call_id,
+            "reason_code": self.reason_code,
+        }
+
+    @classmethod
+    def from_doc(cls, doc: dict[str, Any]) -> TrackedIntent:
+        return cls(
+            intent_id=doc["intent_id"],
+            description=doc["description"],
+            status=doc["status"],
+            evidence_tool_call_id=doc.get("evidence_tool_call_id"),
+            reason_code=doc.get("reason_code"),
+        )
+
+
+@dataclass(frozen=True)
+class AnalysisState:
+    """The intent ledger for ONE turn — latest-wins on a single `SessionDoc`
+    field (03 §B.2), never an append-only stream of trail entries (N rounds
+    would put N copies inside `fit_request_to_budget`'s pinned region).
+
+    It carries its own `turn_index` because the field is NOT cleared at the turn
+    boundary: everything that reads it goes through `live_analysis_state` below,
+    which makes a state from any other turn inert.
+    """
+
+    turn_index: int
+    intents: tuple[TrackedIntent, ...]
+
+    def to_doc(self) -> dict[str, Any]:
+        return {
+            "turn_index": self.turn_index,
+            "intents": [intent.to_doc() for intent in self.intents],
+        }
+
+    @classmethod
+    def from_doc(cls, doc: dict[str, Any]) -> AnalysisState:
+        return cls(
+            turn_index=int(doc["turn_index"]),
+            intents=tuple(TrackedIntent.from_doc(i) for i in doc.get("intents", [])),
+        )
+
+
 @dataclass(frozen=True)
 class PauseCheckpoint:
     """`pause_checkpoint` — the D45 exactly-once resume checkpoint.
@@ -269,6 +384,19 @@ class SessionDoc:
     # re-delivery. `None` for every session that predates the learning loop and
     # for any session not yet enqueued, so existing docs round-trip unchanged.
     learning_content_hash: str | None = None
+    # Additive (Release 1, 03 §B): the intent ledger for the turn that wrote it.
+    # NOT cleared at the turn boundary — it is inert for every later turn because
+    # every read goes through `live_analysis_state` (03 §A.1). `None` for every
+    # single-intent turn and every session that predates the feature.
+    analysis_state: AnalysisState | None = None
+    # Additive (Release 1, 05 §C.1): how many forced finalization re-rounds have
+    # been spent, keyed by BUDGET WINDOW number as a string (`{"2": 1}`). It lives
+    # on `SessionDoc` — not on `AnalysisState`, which is model-writable and
+    # unknown-key-rejecting — and it must be PERSISTED, because `_run_loop_body`
+    # is re-entered on every askUser/blueprint resume while `window_count` stands
+    # still, so a counter local to that function makes forced re-rounds unbounded.
+    # Written by 05's enforcement path; declared here as part of 03's schema work.
+    finalization_blocks: dict[str, int] | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -284,11 +412,19 @@ class SessionDoc:
             ),
             "context_summary_cache": self.context_summary_cache,
             "learning_content_hash": self.learning_content_hash,
+            "analysis_state": (
+                self.analysis_state.to_doc() if self.analysis_state else None
+            ),
+            "finalization_blocks": (
+                dict(self.finalization_blocks) if self.finalization_blocks is not None else None
+            ),
         }
 
     @classmethod
     def from_doc(cls, doc: dict[str, Any]) -> SessionDoc:
         pc_doc = doc.get("pause_checkpoint")
+        as_doc = doc.get("analysis_state")
+        fb_doc = doc.get("finalization_blocks")
         return cls(
             session_id=doc["session_id"],
             created_at=doc["created_at"],
@@ -299,4 +435,40 @@ class SessionDoc:
             pause_checkpoint=PauseCheckpoint.from_doc(pc_doc) if pc_doc else None,
             context_summary_cache=doc.get("context_summary_cache"),
             learning_content_hash=doc.get("learning_content_hash"),
+            # `.get` (not `[...]`): a document written before these fields existed
+            # loads with `None` and behaves exactly as it always did.
+            analysis_state=AnalysisState.from_doc(as_doc) if as_doc else None,
+            finalization_blocks=(
+                {str(k): int(v) for k, v in fb_doc.items()} if fb_doc else None
+            ),
         )
+
+
+def live_analysis_state(doc: SessionDoc, turn_index: int) -> AnalysisState | None:
+    """The `AnalysisState` that GOVERNS *turn_index*, or `None` (03 §A.1).
+
+    **The single most important rule in the feature.** A state persists on the
+    session doc after its turn ends, so it is HISTORY for every later turn and
+    must be invisible to anything that initializes, validates or enforces. Every
+    read in 03 (the tool + the rendered context block), 04 (the evidence
+    validators) and 05 (finalization enforcement) goes through this predicate.
+
+    Without the `state.turn_index != turn_index` gate two failures are reachable,
+    and the second is the bad one:
+
+      - **Init dies after first use.** If "a state exists" means
+        `doc.analysis_state is not None`, then from the session's second turn
+        onward every multi-intent turn is refused initialization and the feature
+        silently stops working.
+      - **A stale state blocks an unrelated turn.** Turn N is multi-intent, the
+        model calls `askUser`, the user abandons it and asks something new.
+        `AgentLoop.run` does not check for an unconsumed checkpoint, so turn N+1
+        begins with turn N's `pending` intents on the doc: enforcement refuses
+        turn N+1's finalization, burns its nudge, and writes
+        `ENFORCEMENT_EXHAUSTED` onto **turn N's** intents — corrupting the
+        abandoned turn's record and emitting bogus telemetry for the live one.
+    """
+    state = doc.analysis_state
+    if state is None or state.turn_index != turn_index:
+        return None
+    return state

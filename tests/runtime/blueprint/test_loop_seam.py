@@ -144,7 +144,9 @@ async def test_one_run_blueprint_is_one_tool_call_despite_inner_probes() -> None
 class _PausingTool:
     tool_name = "runBlueprint"
 
-    async def run(self, model_args: dict[str, Any], credentials: RuntimeCredentials):
+    async def run(
+        self, model_args: dict[str, Any], credentials: RuntimeCredentials, turn=None
+    ):
         from data_agent.runtime.dispatch.tool_dispatcher import ToolPause, ToolResult
 
         paused = ExecPaused(

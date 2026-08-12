@@ -1,0 +1,70 @@
+# A1 case 8 — a REQUIRED_DATA_UNAVAILABLE block, end to end (07 §D). Did not
+# exist in the draft.
+#
+# BOTH intents cite a ZERO-ROW `runQuery`, and that is the point. 04 §B.4: an
+# empty result set is simultaneously valid COMPLETION evidence ("nobody left last
+# month" is a correct answer) and valid BLOCK evidence, so the model chooses —
+# and `blocked` is cheaper for it (no prose, no table, no `answerWithTable`). The
+# two are mechanically indistinguishable, so the mitigation is prompt plus
+# MEASUREMENT: `loop_zero_row_completion` against `loop_zero_row_block`. The
+# RATIO is the health signal; the count on its own is not.
+id: case-08-required-data-unavailable
+question: Who left the company last month, and how many people were hired in the last six months?
+ground_truth:
+  multi_intent: true
+  intent_count: 2
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.most_recent_hire_date
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.termination_date
+corpus:
+  - bp-hires-projection
+embedding:
+  Who left the company last month, and how many people were hired in the last six months?: [1.0, 0.0]
+mcp_tools: [runQuery]
+mcp_script:
+  runQuery:
+    # q1 — a correct query whose honest answer is "nobody".
+    - columns: [employee_code]
+      rows: []
+      row_count: 0
+      truncated: false
+    # q2 — same shape, treated by the model as an absence instead.
+    - columns: [hires]
+      rows: []
+      row_count: 0
+      truncated: false
+model_script:
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: Who left the company last month
+            - description: How many people were hired in the last six months
+      - name: runQuery
+        id: q1
+        serves_intent: i1
+        args:
+          sql: SELECT employee_code FROM dbpcm_warehouse.employee WHERE employee_status = 'T'
+      - name: runQuery
+        id: q2
+        serves_intent: i2
+        args:
+          sql: SELECT count() AS hires FROM dbpcm_warehouse.employee WHERE most_recent_hire_date > now()
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s2
+        args:
+          intents:
+            - {intent_id: i1, status: completed, evidence_tool_call_id: q1}
+            - {intent_id: i2, status: blocked, reason_code: REQUIRED_DATA_UNAVAILABLE, evidence_tool_call_id: q2}
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: Nobody left last month. I could not establish the six-month hiring count.
+          sql: SELECT employee_code FROM dbpcm_warehouse.employee WHERE employee_status = 'T'
+expect:
+  intents_terminal: 2
+  re_derivation: false

@@ -1,0 +1,67 @@
+# A1 case 3 — blueprint for one intent, ad-hoc SQL for a DISTINCT residual.
+#
+# This is the case the draft's re-derivation predicate got wrong. `prompts.py`
+# says the model MAY run further queries for a DISTINCT part of the question the
+# blueprint did not answer, so a `runQuery` after an authoritative `runBlueprint`
+# is LEGAL. The test asserts `re_derivation == False` DESPITE the post-blueprint
+# `runQuery`, and asserts the rejected turn-scoped predicate would have flagged it
+# — the two must actually disagree here, or the §C.2 rewrite bought nothing.
+id: case-03-blueprint-plus-adhoc
+question: What hiring should we expect over the next 6 months, and how many people are in Support today?
+ground_truth:
+  multi_intent: true
+  intent_count: 2
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.most_recent_hire_date
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.department_name
+corpus:
+  - bp-hires-projection
+embedding:
+  What hiring should we expect over the next 6 months, and how many people are in Support today?: [1.0, 0.0]
+mcp_tools: [runQuery]
+mcp_script:
+  runQuery:
+    - columns: [hires_in_window, avg_monthly_hires, projected_next_n_hires]
+      rows: [[12, 2.0, 12]]
+      row_count: 1
+      truncated: false
+    - columns: [headcount]
+      rows: [[3]]
+      row_count: 1
+      truncated: false
+model_script:
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: Projected hires over the next 6 months
+            - description: Current headcount in Support
+      - name: runBlueprint
+        id: b1
+        serves_intent: i1
+        args:
+          id: bp-hires-projection
+          slot_bindings: {window_months: 6, horizon_months: 6}
+      - name: runQuery
+        id: q1
+        serves_intent: i2
+        args:
+          sql: SELECT count() AS headcount FROM dbpcm_warehouse.employee WHERE department_name = 'Support'
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s2
+        args:
+          intents:
+            - {intent_id: i1, status: completed, evidence_tool_call_id: b1}
+            - {intent_id: i2, status: completed, evidence_tool_call_id: q1}
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: We project about 12 hires over the next six months; Support has 3 people today.
+          sql: SELECT count() AS headcount FROM dbpcm_warehouse.employee WHERE department_name = 'Support'
+expect:
+  intents_terminal: 2
+  re_derivation: false

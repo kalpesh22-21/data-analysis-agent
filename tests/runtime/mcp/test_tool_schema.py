@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from data_agent.runtime.composite.analysis_state import SUBSTANTIVE_TOOLS
 from data_agent.runtime.mcp.client import MCPToolSpec
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.tool_schema import (
@@ -17,6 +18,7 @@ from data_agent.runtime.mcp.tool_schema import (
     RUN_BLUEPRINT_TOOL_SCHEMA,
     SEARCH_BLUEPRINTS_TOOL_SCHEMA,
     SEARCH_KNOWLEDGE_TOOL_SCHEMA,
+    UPDATE_ANALYSIS_STATE_TOOL_SCHEMA,
     ToolNameCollisionError,
     ToolSchemaCache,
     fetch_function_schemas,
@@ -125,8 +127,9 @@ async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> Non
         "runBlueprint",
         "recordAssumptions",
         "answerWithTable",
+        "updateAnalysisState",
     }
-    assert len(schemas) == 14
+    assert len(schemas) == 15
     ask_user = next(s for s in schemas if s["name"] == "askUser")
     assert ask_user == ASK_USER_TOOL_SCHEMA
     resolve_values = next(s for s in schemas if s["name"] == "resolveValues")
@@ -151,6 +154,37 @@ async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> Non
         RECORD_ASSUMPTIONS_TOOL_SCHEMA
     )
     assert set(RECORD_ASSUMPTIONS_TOOL_SCHEMA["parameters"]["required"]) == {"assumptions"}
+    # updateAnalysisState (Release 1), appended verbatim last — 14 -> 15.
+    assert next(s for s in schemas if s["name"] == "updateAnalysisState") == (
+        UPDATE_ANALYSIS_STATE_TOOL_SCHEMA
+    )
+    assert set(UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["parameters"]["required"]) == {"intents"}
+
+
+def test_update_analysis_state_description_names_every_locking_tool() -> None:
+    """Derived from `SUBSTANTIVE_TOOLS`, not from a hand-written list, so adding a
+    tool to the locking set cannot silently drift out of the model-facing text.
+
+    The description enumerated only three of the four for a while, omitting
+    `runBlueprint` — the MOST likely first substantive call in a blueprint-first
+    release. A model following it would run a blueprint, then declare, and take
+    the NON-RETRYABLE `ANALYSIS_STATE_LATE_INIT`, after which the turn runs
+    untracked and nothing errors: exactly the asymmetric silent failure 03 §E
+    warns about, live on every turn because the schema is re-sent every
+    round-trip.
+    """
+    description = UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["description"]
+    missing = sorted(tool for tool in SUBSTANTIVE_TOOLS if tool not in description)
+    assert not missing, f"the late-init boundary text does not name {missing}"
+
+
+def test_update_analysis_state_description_agrees_with_the_base_prompt() -> None:
+    """Both are re-sent every round-trip, so a disagreement between them is live
+    on every turn. They must name the same four tools for the same boundary."""
+    from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
+
+    for tool in SUBSTANTIVE_TOOLS:
+        assert tool in AGENT_SYSTEM_PROMPT, tool
 
 
 async def test_name_collision_guard_raises_when_mcp_shadows_a_local_tool() -> None:
@@ -165,10 +199,10 @@ async def test_name_collision_guard_raises_when_mcp_shadows_a_local_tool() -> No
 
 
 async def test_name_collision_guard_allows_disjoint_names() -> None:
-    # The real 6 MCP tools are disjoint from the 8 local names — no collision.
+    # The real 6 MCP tools are disjoint from the 9 local names — no collision.
     client = FakeMCPClient(tools=_FAKE_TOOLS)
     schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")
-    assert len(schemas) == 14
+    assert len(schemas) == 15
 
 
 async def test_no_credential_params_leak_in_any_schema() -> None:
@@ -185,7 +219,7 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
     cache = ToolSchemaCache(client)
 
     first = await cache.get_schemas(jwt="tok", session_id="s1")
-    assert len(first) == 14
+    assert len(first) == 15
 
     # Mutate the underlying client's tool list; without force_reload the cache
     # must not reflect the change.
@@ -208,4 +242,5 @@ async def test_tool_schema_cache_caches_until_reload() -> None:
         RUN_BLUEPRINT_TOOL_SCHEMA,
         RECORD_ASSUMPTIONS_TOOL_SCHEMA,
         ANSWER_WITH_TABLE_TOOL_SCHEMA,
+        UPDATE_ANALYSIS_STATE_TOOL_SCHEMA,
     ]

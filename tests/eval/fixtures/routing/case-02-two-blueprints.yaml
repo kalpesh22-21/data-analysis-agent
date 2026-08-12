@@ -1,0 +1,76 @@
+# A1 case 2 — two blueprint intents both complete (07 §D).
+#
+# The interesting half is NOT that the fixture says `completed` — it is that 04's
+# completion validator ACCEPTED it, which requires `authoritative is True` on
+# each cited `runBlueprint` entry, which in turn requires the D56 verify block to
+# come back clean. A fixture cannot fake that.
+#
+# `runQuery` is scripted PER TOOL NAME and consumed IN ORDER, so the queue below
+# is the executor's own dispatch sequence:
+#   b1 (grain `[Department]`) -> node SQL, then the grain probe;
+#   b2 (`result_grain: []`)   -> node SQL only, teeth skipped.
+id: case-02-two-blueprints
+question: Give me the active headcount by department and the projected hires over the next 6 months.
+ground_truth:
+  multi_intent: true
+  intent_count: 2
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.most_recent_hire_date
+corpus:
+  - bp-active-headcount-by-department
+  - bp-hires-projection
+embedding:
+  Give me the active headcount by department and the projected hires over the next 6 months.: [1.0, 0.0]
+mcp_tools: [runQuery]
+mcp_script:
+  runQuery:
+    - columns: [department, headcount]
+      rows: [[Sales, 4], [Support, 3]]
+      row_count: 2
+      truncated: false
+    - columns: [__bp_n, __bp_d]
+      rows: [[2, 2]]
+      row_count: 1
+      truncated: false
+    - columns: [hires_in_window, avg_monthly_hires, projected_next_n_hires]
+      rows: [[12, 2.0, 12]]
+      row_count: 1
+      truncated: false
+model_script:
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: Active headcount by department
+            - description: Projected hires over the next 6 months
+      - name: runBlueprint
+        id: b1
+        serves_intent: i1
+        args:
+          id: bp-active-headcount-by-department
+          slot_bindings: {}
+      - name: runBlueprint
+        id: b2
+        serves_intent: i2
+        args:
+          id: bp-hires-projection
+          slot_bindings: {window_months: 6, horizon_months: 6}
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s2
+        args:
+          intents:
+            - {intent_id: i1, status: completed, evidence_tool_call_id: b1}
+            - {intent_id: i2, status: completed, evidence_tool_call_id: b2}
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: Sales has 4 active employees and Support 3; we project about 12 more hires.
+          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+expect:
+  intents_terminal: 2
+  re_derivation: false

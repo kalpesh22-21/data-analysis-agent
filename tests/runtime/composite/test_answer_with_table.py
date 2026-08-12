@@ -470,7 +470,9 @@ class _StubBlueprintTool:
             "verify": {"grain_checked": True},
         }
 
-    async def run(self, arguments: dict, credentials: RuntimeCredentials):
+    async def run(
+        self, arguments: dict, credentials: RuntimeCredentials, turn=None
+    ):
         from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
         from data_agent.runtime.session.models import ResultPreview
 

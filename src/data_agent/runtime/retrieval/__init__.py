@@ -15,6 +15,7 @@ from .models import (
     CandidateKind,
     KnowledgeHit,
     RetrievedContext,
+    SlotSummary,
     ThinCard,
     UserMemoryItem,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "NullUserMemoryProvider",
     "RetrievalPipeline",
     "RetrievedContext",
+    "SlotSummary",
     "ThinCard",
     "UserMemoryItem",
     "UserMemoryProvider",

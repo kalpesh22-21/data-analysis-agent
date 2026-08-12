@@ -97,7 +97,10 @@ made here.
 All three are **locally-authored** schemas (like `RESOLVE_VALUES_TOOL_SCHEMA`),
 declaring **no** `session_id`/`jwt`/`scope` (D5), appended in
 `fetch_function_schemas` after `resolveValues` — taking the count **8 → 11**
-(6 MCP + askUser + resolveValues + these 3). Each returns a `ToolResult` whose
+(6 MCP + askUser + resolveValues + these 3). *(The advertised total is **15**
+today: `runBlueprint`, `recordAssumptions`, `answerWithTable` and
+`updateAnalysisState` landed after this slice — see
+[02-tools-and-api.md](../02-tools-and-api.md).)* Each returns a `ToolResult` whose
 `result_full` is a small dict wrapper (the model reads only `result_preview`,
 which the existing `_build_preview` non-tabular-dict branch carries whole).
 
@@ -106,11 +109,21 @@ which the existing `_build_preview` non-tabular-dict branch carries whole).
 - **Params:** `query: string` (required; the reformulated intent, free text),
   `k: integer` (optional; how many cards; clamped `1..RETRIEVAL_SEARCH_MAX_K`
   (default 20); absent → `RETRIEVAL_SEARCH_DEFAULT_K` (default 5)).
-- **Description guidance (when to call):** "You are usually given the 3 most
-  relevant blueprints as thin cards already. Call this only when those 3 miss or
-  you have reformulated the intent — it re-searches the blueprint library for THIS
-  user's scope and returns more candidate cards. Then call `getBlueprint(id)` to
-  expand the one you pick." (Steers the model to lean on pre-injection first — D8.)
+- **Description guidance (when to call) — SUPERSEDED by Release 1 §3/§4.** The original
+  text steered the model to lean on pre-injection first (D8) and call this only
+  "when those 3 miss or you have reformulated the intent". **That framing shipped
+  and was then removed**, from `AGENT_SYSTEM_PROMPT` (deliverable 01) and from
+  `SEARCH_BLUEPRINTS_TOOL_SCHEMA` (its follow-up), because it is wrong on a
+  multi-part request: the pre-injected cards were recalled from the **whole
+  question as ONE string**, so on a request with several deliverables they
+  under-serve every part of it. **The shipped instruction is per-deliverable
+  search as normal practice, not a fallback:** call it for EVERY analytical
+  deliverable the request contains, in the model's own words — **one search per
+  deliverable, not one for the whole question** — **whether or not** one of the
+  offered cards already fits. `getBlueprint(id)` is then needed only for the full
+  DAG (the `uses` footprint, the SQL template), a composition summary, or a card
+  carrying `slots_omitted`; the enriched card (below) otherwise carries enough to
+  choose a candidate AND fill `runBlueprint`.
 - **Return** (`result_full`):
   ```jsonc
   { "count": 2, "degraded": false,
@@ -122,6 +135,14 @@ which the existing `_build_preview` non-tabular-dict branch carries whole).
   Same `ThinCard` shape the pre-injection uses (`{id, intent, slots_summary,
   score}`) — one code path, one shape. `degraded: true` when the embedder/reranker
   degraded (recall order, no semantic rerank) so the model knows ranking is weaker.
+  **As shipped (Release 1 §4), the search card is ENRICHED** beyond this block: when
+  the blueprint stores a DAG it also carries `resolves`, a `{name, type, required}`
+  `slots` summary (plus `slots_omitted` when the per-card cap dropped some) and
+  `result_grain`. Keys are omitted when absent, so a DAG-less blueprint still
+  serialises exactly as above. `status` is deliberately NOT added — recall already
+  filters to `validated`. The enrichment also changes the entry's D44 posture: its
+  provenance is the **union of the returned cards' `uses`**, not the safe-empty
+  `frozenset()` a column-free card justified.
 - **Scope:** the transitive-USES pre-filter is applied (§3) — a card the user
   cannot run is never returned.
 

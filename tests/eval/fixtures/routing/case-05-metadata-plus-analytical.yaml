@@ -1,0 +1,72 @@
+# A1 case 5 — a metadata intent alongside an analytical one (07 §D).
+#
+# `getTableSchema` is admitted as completion evidence deliberately (04 §A "the
+# accepted trade"): it closes the metadata-intent gap without an `intent.kind`
+# field, at the cost of letting an analytical intent be completed on a schema
+# fetch. The mitigation is the `loop_metadata_evidence_completion` counter plus
+# this case — NOT a structural rule.
+#
+# EXACTLY ONE SCHEMA FETCH PER TABLE. `getTableSchema` is in
+# `IDEMPOTENT_READ_TOOLS`, so an identical repeat is not re-dispatched: it is
+# persisted as a data-free entry carrying `IDEMPOTENT_READ_ALREADY_SERVED`, which
+# passes conditions 1-4 having fetched nothing and is rejected by condition 5. A
+# second scripted fetch here would fail the case for a fixture-authoring reason.
+id: case-05-metadata-plus-analytical
+question: What columns does the employee table have, and how many employees are currently active?
+ground_truth:
+  multi_intent: true
+  intent_count: 2
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_status
+corpus:
+  - bp-active-headcount-by-department
+embedding:
+  What columns does the employee table have, and how many employees are currently active?: [1.0, 0.0]
+mcp_tools: [getTableSchema, runQuery]
+mcp_script:
+  getTableSchema:
+    - database: dbpcm_warehouse
+      table: employee
+      columns:
+        - {name: employee_code, type: String, comment: ""}
+        - {name: department_name, type: Nullable(String), comment: ""}
+        - {name: employee_status, type: Nullable(String), comment: ""}
+  runQuery:
+    - columns: [active]
+      rows: [[7]]
+      row_count: 1
+      truncated: false
+model_script:
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: The columns on the employee table
+            - description: Count of currently active employees
+      - name: getTableSchema
+        id: m1
+        serves_intent: i1
+        args: {database: dbpcm_warehouse, table: employee}
+      - name: runQuery
+        id: q1
+        serves_intent: i2
+        args:
+          sql: SELECT count() AS active FROM dbpcm_warehouse.employee WHERE employee_status = 'A'
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s2
+        args:
+          intents:
+            - {intent_id: i1, status: completed, evidence_tool_call_id: m1}
+            - {intent_id: i2, status: completed, evidence_tool_call_id: q1}
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: The employee table has employee_code, department_name and employee_status; 7 employees are active.
+          sql: SELECT count() AS active FROM dbpcm_warehouse.employee WHERE employee_status = 'A'
+expect:
+  intents_terminal: 2
+  re_derivation: false

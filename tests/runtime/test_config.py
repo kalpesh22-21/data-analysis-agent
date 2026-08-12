@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from data_agent.runtime.config import RuntimeSettings, effective_llm_hide
+from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
 
 def test_locked_defaults() -> None:
@@ -16,6 +17,22 @@ def test_locked_defaults() -> None:
     assert settings.max_budget_windows == 3
     assert settings.max_tool_calls_per_iteration == 8  # S3 hardening default
     assert settings.discovery_emulation_enabled is True
+
+
+def test_base_agent_prompt_is_wired_as_the_default() -> None:
+    """The prompt reaches the model only through this default.
+
+    `agent_system_prompt_enabled` gates it and `agent_system_prompt` carries the
+    text, so a rewrite that lands in `prompts.py` but not in the settings default
+    ships nothing. Asserted rather than assumed because it is the whole delivery
+    path for Release 1's P1 fix, and because the constant must stay non-empty: an
+    empty string is falsy and would assemble a prompt-less loop that still looks
+    enabled.
+    """
+    settings = RuntimeSettings(_env_file=None)
+    assert settings.agent_system_prompt_enabled is True
+    assert settings.agent_system_prompt == AGENT_SYSTEM_PROMPT
+    assert AGENT_SYSTEM_PROMPT.strip() != ""
 
 
 def test_history_token_budget_derivation() -> None:

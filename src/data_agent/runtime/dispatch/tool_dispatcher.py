@@ -164,7 +164,41 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def _cap_nontabular_result(raw_result: Any, max_result_tokens: int) -> tuple[Any, bool]:
+def _cap_list_under_key(
+    raw_result: dict[str, Any], key: str, max_result_tokens: int
+) -> tuple[dict[str, Any], int, int]:
+    """Keep the HEAD of `raw_result[key]` — as many leading items as fit under
+    *max_result_tokens* — and return `(capped_dict, kept_count, total_count)`.
+
+    The head is kept because both callers hand in an ordered list whose leading
+    items are the most useful ones (a schema's leading columns; a search's
+    highest-scoring cards, already score-ordered by the pipeline). The other
+    top-level keys ride along untouched, so the result stays the SAME SHAPE the
+    model expects — a dict with a (shorter) list under *key*, never a string.
+
+    No minimum-one carve-out: if not even the first item fits, the list comes
+    back empty. Forcing an over-cap item back in would reintroduce exactly the
+    unbounded cell this cap exists to prevent, and the `_truncated` marker the
+    callers add names the drop either way.
+    """
+    items = raw_result[key]
+    base = {k: v for k, v in raw_result.items() if k != key}
+    kept: list[Any] = []
+    for item in items:
+        trial = {**base, key: [*kept, item]}
+        if _estimate_tokens(json.dumps(trial, default=str)) > max_result_tokens:
+            break
+        kept.append(item)
+    return {**base, key: kept}, len(kept), len(items)
+
+
+def _cap_nontabular_result(
+    raw_result: Any,
+    max_result_tokens: int,
+    *,
+    observer: ToolObserver = _default_observer,
+    tool_name: str | None = None,
+) -> tuple[Any, bool]:
     """Bound a non-tabular tool result stored as ONE preview cell (esp. a wide
     `getTableSchema`) so it can never be a 30k-token blob that survives the
     row-count-only trail budget. Returns `(capped_value, truncated)`.
@@ -175,8 +209,21 @@ def _cap_nontabular_result(raw_result: Any, max_result_tokens: int) -> tuple[Any
         `"_truncated"` marker naming how many of how many columns were omitted, so
         the model sees a still-valid schema and knows to re-fetch/narrow if it
         needs a dropped column;
+      * a `{... "blueprints": [...]}` dict (`searchBlueprints`) keeps the HEAD of
+        the CARD list the same way — see below;
       * any other over-cap value is rendered to a string and truncated at the cap
         with a `…[truncated: N of M chars omitted]` marker (a valid string cell).
+
+    The card branch exists because release-1 §02 ENRICHED the search card (slots,
+    pinned resolutions, result grain) and made per-deliverable `searchBlueprints`
+    the default route. Corpus-scale cards at `k=20` are ~10,200 chars and stay
+    under the cap, but maximally-slotted ones reach ~25,600 chars and first cross
+    it at `k=13` — and a `searchBlueprints` result carries no top-level `columns`
+    key, so without this branch it fell through to stringify-and-truncate and the
+    model received a MANGLED JSON STRING ending in a truncation marker instead of
+    a card list, on the release's primary route. Dropping whole low-scoring cards
+    from the tail degrades a ranked list the way a ranked list should degrade; the
+    marker and the observer event below make it visible rather than silent.
 
     Under the cap the value is returned unchanged (`truncated=False`) — byte-
     identical to before this cap existed for every normal-sized schema/result.
@@ -186,20 +233,79 @@ def _cap_nontabular_result(raw_result: Any, max_result_tokens: int) -> tuple[Any
         return raw_result, False
 
     if isinstance(raw_result, dict) and isinstance(raw_result.get("columns"), list):
-        columns = raw_result["columns"]
-        total_columns = len(columns)
-        base = {k: v for k, v in raw_result.items() if k != "columns"}
-        kept: list[Any] = []
-        for column in columns:
-            trial = {**base, "columns": [*kept, column]}
-            if _estimate_tokens(json.dumps(trial, default=str)) > max_result_tokens:
-                break
-            kept.append(column)
-        omitted = total_columns - len(kept)
-        capped = {**base, "columns": kept}
+        capped, kept_count, total_columns = _cap_list_under_key(
+            raw_result, "columns", max_result_tokens
+        )
+        omitted = total_columns - kept_count
         capped["_truncated"] = (
             f"…[truncated: {omitted} of {total_columns} columns omitted — "
             f"re-fetch getTableSchema or narrow if you need an omitted column]"
+        )
+        return capped, True
+
+    if isinstance(raw_result, dict) and isinstance(raw_result.get("blueprints"), list):
+        capped, kept_count, total_cards = _cap_list_under_key(
+            raw_result, "blueprints", max_result_tokens
+        )
+        omitted = total_cards - kept_count
+        if kept_count == 0:
+            # The cap is too small for even ONE card (no minimum-one carve-out, see
+            # `_cap_list_under_key`). The kept-count phrasing below would read "the 0
+            # best matches are shown in full", which is not merely awkward — it
+            # describes a list the model can act on when there is none.
+            capped["_truncated"] = (
+                f"…[truncated: all {total_cards} blueprint cards were omitted — not "
+                f"even the highest-scoring one fits the result cap; search again with "
+                f"a smaller k, or ask an operator to raise max_tool_result_tokens]"
+            )
+        else:
+            capped["_truncated"] = (
+                f"…[truncated: the {omitted} lowest-scoring of {total_cards} blueprint "
+                f"cards were omitted to fit — the {kept_count} best matches are shown "
+                f"in full; search again with a narrower intent if none of them fits]"
+            )
+        # RECONCILE THE RIDDEN-ALONG COUNT. `count` is set by
+        # `retrieval/tools.py::SearchBlueprintsTool` to the PRE-cap card total and
+        # rides through `_cap_list_under_key`'s `base` untouched, so a truncated
+        # result told the model `count: 20` beside a 13-item `blueprints` list — a
+        # valid shape whose two signals disagree, and the model has no way to tell
+        # which one to believe. `count` now describes what is actually present and
+        # `count_total` carries what was found, so both questions have an answer.
+        # Only rewritten when the key was there to begin with (this branch is keyed
+        # on `blueprints`, not on `count`).
+        if "count" in capped:
+            capped["count_total"] = total_cards
+            capped["count"] = kept_count
+        # Degrade-not-fail, NEVER SILENTLY: the model is told by `_truncated`, the
+        # operator by this event + the server-side log. `dropped_count` /
+        # `total_count` are shape-only (D25) — no card text, id, or score.
+        #
+        # THIS EVENT DELIBERATELY DOES NOT REACH PHOENIX. `observability/tracing.py::
+        # guardrail_observer` forwards only `loop_`-prefixed events (AgentLoop
+        # stage boundaries), and this is a `tool_dispatch_*` event — the same family
+        # as `tool_dispatch_start`/`ok`/`denied`/`error`, none of which is forwarded
+        # either; the dispatcher's Phoenix surface is the `tool.<name>` span from
+        # `_emit_tool_span`. It is consumed by the SSE progress observer, the
+        # server-side log below, and any `create_app(extra_observers=…)` sink. Doc 06
+        # says "name anything that should reach Phoenix accordingly" — this one is
+        # named for the layer it belongs to, so if it should ever be traced, rename
+        # it AND add `dropped_count`/`total_count` to
+        # `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST` (both are plain counts, so D25-safe).
+        observer(
+            "tool_dispatch_cards_dropped",
+            {
+                "tool_name": tool_name,
+                "dropped_count": omitted,
+                "total_count": total_cards,
+            },
+        )
+        _logger.warning(
+            "Preview cap dropped %d of %d blueprint cards from %r (cap=%d tokens) — "
+            "raise RuntimeSettings.max_tool_result_tokens or lower the search k",
+            omitted,
+            total_cards,
+            tool_name,
+            max_result_tokens,
         )
         return capped, True
 
@@ -216,6 +322,9 @@ def _build_preview(
     raw_result: Any,
     preview_row_count: int,
     max_result_tokens: int = _DEFAULT_MAX_TOOL_RESULT_TOKENS,
+    *,
+    observer: ToolObserver = _default_observer,
+    tool_name: str | None = None,
 ) -> ResultPreview:
     """Build the `{columns, row_count, truncated, preview_rows}` preview object.
 
@@ -228,6 +337,10 @@ def _build_preview(
     additionally SIZE-capped to `max_result_tokens` (a wide getTableSchema with
     100+ columns is otherwise stored as one unbounded ~30k-token cell that the
     row-count-only trail budget never trims) — see `_cap_nontabular_result`.
+
+    *observer*/*tool_name* are used ONLY to report a size-cap degrade (the
+    blueprint-card drop) and default to the no-op observer, so every existing
+    call site is unchanged.
     """
     if isinstance(raw_result, dict) and "rows" in raw_result and "columns" in raw_result:
         rows = raw_result["rows"]
@@ -248,7 +361,9 @@ def _build_preview(
             preview_rows=[[item] for item in preview_rows],
         )
     # Small non-tabular dict (e.g. getTableSchema) — size-capped, not row-capped.
-    capped, truncated = _cap_nontabular_result(raw_result, max_result_tokens)
+    capped, truncated = _cap_nontabular_result(
+        raw_result, max_result_tokens, observer=observer, tool_name=tool_name
+    )
     return ResultPreview(columns=[], row_count=1, truncated=truncated, preview_rows=[[capped]])
 
 
@@ -423,7 +538,11 @@ class ToolDispatcher:
             tool_name, model_args, catalog, session_id=credentials.session_id
         )
         preview = _build_preview(
-            raw_result, self._preview_row_count, self._max_tool_result_tokens
+            raw_result,
+            self._preview_row_count,
+            self._max_tool_result_tokens,
+            observer=self._observer,
+            tool_name=tool_name,
         )
 
         self._observer("tool_dispatch_ok", {"tool_name": tool_name})

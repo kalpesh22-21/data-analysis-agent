@@ -162,7 +162,9 @@ WHERE node.embedding_model = $expected_model
   AND coalesce(node.drift_status, 'clean') <> 'suspect'
   AND node.source = 'mcp'
 RETURN node.id AS id, node.intent AS text, node.slots_summary AS slots_summary,
-       node.uses AS uses, score
+       node.uses AS uses, node.resolves_json AS resolves_json,
+       node.slots_json AS slots_json, node.result_grain_json AS result_grain_json,
+       score
 ORDER BY score DESC
 """
 # THE TRUST GATE (governed-corpus Phase 2). Recall serves ONLY MCP-canon nodes
@@ -171,6 +173,15 @@ ORDER BY score DESC
 # stamped `source='learning'` (the learning staging tier), MUST be excluded. Neo4j
 # is a projection of the MCP canon plus a learning-staging partition recall ignores;
 # a bare-equality miss fails CLOSED (excluded), never fail-open.
+#
+# CARD ENRICHMENT (release-1 §02): `resolves_json` / `slots_json` /
+# `result_grain_json` in the RETURN above are ALREADY stored on the node
+# (`corpus_loader._dag_properties`) — recall simply did not select them. Adding
+# them to the projection costs NO extra round-trip and no N+1: the same single
+# `queryNodes` call returns three more properties per row. A node that stored
+# none of them returns nulls, which `_decode_json` degrades to `None`, so a
+# DAG-less blueprint recalls exactly as it did before. The `WHERE` clauses above
+# are untouched — enrichment changes what is RETURNED, never what is eligible.
 
 # UI Slice 2 §1.1 row 5 — the knowledge recall-eligibility filter, WITHIN the
 # `source='mcp'` trust partition (governed-corpus Phase 2). An mcp knowledge chunk can
@@ -232,14 +243,33 @@ def map_blueprint_record(record: Mapping[str, Any]) -> Candidate:
     `frozenset[str]`, or `None` when the stored value is undetermined/corrupt
     (`_coerce_uses`, fail-closed — the scope pre-filter then drops it rather
     than fail-open, neo4j-corpus-design §0 / §8).
+
+    CARD ENRICHMENT (release-1 §02): the three DAG props recall now selects are
+    JSON-decoded into `payload` with the SAME fail-soft discipline
+    `map_blueprint_detail_record` uses — a corrupt or absent prop yields `None`,
+    never a raise, so an enriched blueprint degrades to a pre-enrichment card
+    rather than losing the whole recall row. The payload carries the RAW decoded
+    slots; the `{name, type, required}` projection and the per-card cap are
+    enforced once, downstream, in `RetrievalPipeline._to_thin_card`.
     """
     text = record["text"]
+    resolves = _decode_json(record.get("resolves_json"))
+    slots = _decode_json(record.get("slots_json"))
+    result_grain = _decode_json(record.get("result_grain_json"))
     return Candidate(
         id=record["id"],
         kind="blueprint",
         text=text,
         uses=_coerce_uses(record["uses"]),
-        payload={"intent": text, "slots_summary": record.get("slots_summary") or ""},
+        payload={
+            "intent": text,
+            "slots_summary": record.get("slots_summary") or "",
+            # Type-coerced exactly as the detail mapper does: a value that
+            # decoded to the WRONG json type is `None`, not a broken shape.
+            "resolves": resolves if isinstance(resolves, dict) else None,
+            "slots": slots if isinstance(slots, list) else None,
+            "result_grain": result_grain if isinstance(result_grain, (list, dict)) else None,
+        },
         score=record["score"],
     )
 
@@ -268,11 +298,13 @@ _CORPUS_MAPPER = {
 
 # Keyed single-blueprint fetch for `getBlueprint` (read-tools §1.2 / §4). Reads
 # the stored D87 projection PLUS the additive full-DAG JSON properties now that
-# the `runBlueprint` brick lands (runblueprint-design §1.3 / OQ-T1). The recall
-# query (`_BLUEPRINT_RECALL_QUERY`) is UNCHANGED — it selects its own explicit
-# field list, so the new properties are simply not read by recall (D87 invariant
-# preserved). No parity `WHERE embedding_model` guard: a keyed metadata read, not
-# a vector-space recall (§1.2), so a model-mismatched vector is irrelevant.
+# the `runBlueprint` brick lands (runblueprint-design §1.3 / OQ-T1). Recall
+# (`_BLUEPRINT_RECALL_QUERY`) selects its own explicit field list and now shares
+# THREE of these properties (`resolves_json`/`slots_json`/`result_grain_json`,
+# release-1 §02); the rest — `sql_template`, `uses_rules_json`, `composes_json`
+# and the lifecycle fields — remain fetch-only, which is what keeps `getBlueprint`
+# the expand step. No parity `WHERE embedding_model` guard: a keyed metadata read,
+# not a vector-space recall (§1.2), so a model-mismatched vector is irrelevant.
 #
 # THE TRUST GATE (governed-corpus Phase 2), defense-in-depth: `WHERE b.source = 'mcp'`
 # so a keyed fetch by id can never return a `source='learning'` staging blueprint (or

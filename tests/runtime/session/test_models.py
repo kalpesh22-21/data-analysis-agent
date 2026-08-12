@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 from data_agent.runtime.session.models import (
+    INTENT_STATUSES,
+    MODEL_REASON_CODES,
+    REASON_CODES,
+    RUNTIME_REASON_CODES,
+    AnalysisState,
     PauseCheckpoint,
     ResultPreview,
     SessionDoc,
+    TrackedIntent,
     TrailEntry,
     TurnMessage,
+    live_analysis_state,
 )
 
 
@@ -179,3 +186,86 @@ def test_session_doc_roundtrip_full() -> None:
     assert restored.messages == doc.messages
     assert restored.tool_trail == doc.tool_trail
     assert restored.pause_checkpoint is None
+
+
+# --- analysisState (Release 1, 03 §A/§B) ------------------------------------
+
+
+def test_analysis_state_roundtrips_on_the_session_doc() -> None:
+    state = AnalysisState(
+        turn_index=4,
+        intents=(
+            TrackedIntent(intent_id="i1", description="headcount by department", status="pending"),
+            TrackedIntent(
+                intent_id="i2",
+                description="average salary by department",
+                status="completed",
+                evidence_tool_call_id="call_7",
+            ),
+            TrackedIntent(
+                intent_id="i3",
+                description="who left last month",
+                status="blocked",
+                evidence_tool_call_id="call_9",
+                reason_code="NO_ACCESS",
+            ),
+        ),
+    )
+    doc = SessionDoc(
+        session_id="sess-1",
+        created_at="2026-08-11T00:00:00+00:00",
+        last_activity="2026-08-11T00:00:00+00:00",
+        analysis_state=state,
+        # 05 §C.1 owns the writer; 03 §B owns the field. Keyed by (TURN, WINDOW) —
+        # `models.finalization_block_key`, because `window_count` restarts at 1 on
+        # every turn while this map persists for the session.
+        finalization_blocks={"0:2": 1},
+    )
+    restored = SessionDoc.from_doc(doc.to_doc())
+    assert restored.analysis_state == state
+    assert restored.finalization_blocks == {"0:2": 1}
+
+
+def test_a_document_written_before_the_fields_existed_loads_unchanged() -> None:
+    """Both fields are additive and read with `.get`, so a legacy doc round-trips
+    byte-identically rather than raising."""
+    legacy = SessionDoc(
+        session_id="sess-1", created_at="t0", last_activity="t0"
+    ).to_doc()
+    del legacy["analysis_state"]
+    del legacy["finalization_blocks"]
+    restored = SessionDoc.from_doc(legacy)
+    assert restored.analysis_state is None
+    assert restored.finalization_blocks is None
+
+
+def test_live_analysis_state_gates_on_the_turn_index() -> None:
+    """03 §A.1 — the single most important rule. A state persists after its turn
+    ends, so it is HISTORY for every later turn and must be invisible to anything
+    that initializes, validates or enforces. Without this gate a stale `pending`
+    intent from an abandoned turn refuses an unrelated later turn AND writes that
+    turn's verdict onto the abandoned turn's record."""
+    state = AnalysisState(
+        turn_index=4,
+        intents=(TrackedIntent(intent_id="i1", description="d", status="pending"),),
+    )
+    doc = SessionDoc(
+        session_id="s", created_at="t0", last_activity="t0", analysis_state=state
+    )
+    assert live_analysis_state(doc, 4) is state
+    assert live_analysis_state(doc, 5) is None
+    assert live_analysis_state(doc, 3) is None
+    assert live_analysis_state(SessionDoc(session_id="s", created_at="t0",
+                                          last_activity="t0"), 4) is None
+
+
+def test_the_reason_code_split_is_structural() -> None:
+    """03 §A.3: a comment would let the validator drift toward accepting runtime
+    codes from the model. These are separate frozensets, and disjoint."""
+    assert MODEL_REASON_CODES == frozenset({"NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE"})
+    assert RUNTIME_REASON_CODES == frozenset(
+        {"BUDGET_EXHAUSTED", "USER_STOPPED", "ENFORCEMENT_EXHAUSTED"}
+    )
+    assert not (MODEL_REASON_CODES & RUNTIME_REASON_CODES)
+    assert REASON_CODES == MODEL_REASON_CODES | RUNTIME_REASON_CODES
+    assert INTENT_STATUSES == frozenset({"pending", "completed", "blocked"})

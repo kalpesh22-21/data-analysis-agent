@@ -166,6 +166,15 @@ class _LazyCouchbaseSessionStore:
     defers the real construction to the first awaited method (always inside a
     request, where the loop is running) and delegates every `SessionStore` call
     to it verbatim. Same pattern as `run_ui_runtime.py`'s wrapper.
+
+    MAINTENANCE: this class is a HAND-WRITTEN stand-in for the `SessionStore`
+    Protocol, and nothing in `tests/` imports this launcher (module import builds
+    the app, which reads `.env` and preflights OpenAI). A method added to the
+    Protocol and forgotten here is therefore invisible to CI and fails only against
+    the live server — which is exactly what happened twice (`read_full_result`, then
+    Release 1's `apply_analysis_state`). `tests/runtime/test_launcher_session_store_proxies.py`
+    now DERIVES the required surface from the Protocol and fails if it is missing
+    here; keep the delegation complete rather than relying on anyone noticing.
     """
 
     def __init__(self, settings: RuntimeSettings) -> None:
@@ -214,11 +223,53 @@ class _LazyCouchbaseSessionStore:
     async def write_pause_checkpoint(self, session_id: str, checkpoint: Any) -> None:
         await self._store().write_pause_checkpoint(session_id, checkpoint)
 
+    async def apply_analysis_state(self, session_id: str, turn_index: int, merge: Any) -> Any:
+        # Release 1 (03 §B.1). Missing here for the whole of Release 1's first live
+        # run: every `updateAnalysisState` call raised AttributeError on THIS class
+        # and surfaced as RUNTIME_TOOL_INTERNAL_ERROR, while the suite stayed green
+        # because nothing in `tests/` imports this launcher. `merge` is forwarded as
+        # the CALLBACK it is — never called here — so the real store's CAS retry
+        # re-invokes it against its own fresh read.
+        return await self._store().apply_analysis_state(session_id, turn_index, merge)
+
+    async def claim_finalization_block(
+        self, session_id: str, turn_index: int, window_count: int
+    ) -> bool:
+        # Release 1 (05 §C.1). Same omission, same run: without it the forced
+        # finalization re-round could not be claimed at all.
+        return await self._store().claim_finalization_block(session_id, turn_index, window_count)
+
     async def get_session_with_cas(self, session_id: str) -> Any:
         return await self._store().get_session_with_cas(session_id)
 
     async def resume_checkpoint(self, session_id: str, cas: Any, answer: str) -> Any:
         return await self._store().resume_checkpoint(session_id, cas, answer)
+
+    async def scan_idle_sessions(
+        self, *, statuses: list[str], last_activity_before: str, limit: int
+    ) -> Any:
+        return await self._store().scan_idle_sessions(
+            statuses=statuses, last_activity_before=last_activity_before, limit=limit
+        )
+
+    async def transition_learning_status(
+        self,
+        session_id: str,
+        expected_from: str,
+        to: str,
+        cas: Any,
+        *,
+        content_hash: str | None = None,
+        assert_from: bool = True,
+    ) -> Any:
+        return await self._store().transition_learning_status(
+            session_id,
+            expected_from,
+            to,
+            cas,
+            content_hash=content_hash,
+            assert_from=assert_from,
+        )
 
 
 def _build_session_store(settings: RuntimeSettings) -> tuple[Any, str]:

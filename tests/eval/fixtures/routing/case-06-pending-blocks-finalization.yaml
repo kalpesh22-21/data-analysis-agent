@@ -1,0 +1,64 @@
+# A1 case 6 — a pending intent refuses finalization, once (07 §D).
+#
+# The fixture ASKS to finalize with an intent still pending. The runtime refuses
+# (exit #2, `FINALIZATION_BLOCKED_PENDING_INTENTS`), grants exactly ONE forced
+# re-round for the budget window, and — when the second attempt still leaves the
+# intent pending — records `ENFORCEMENT_EXHAUSTED` and lets finalization proceed.
+#
+# Read `ENFORCEMENT_EXHAUSTED` as "enforcement could not establish a disposition"
+# — NOT as agent failure and NOT as proof the intent was impossible.
+id: case-06-pending-blocks-finalization
+question: Give me the headcount by department and the average tenure of the team.
+ground_truth:
+  multi_intent: true
+  intent_count: 2
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_status
+corpus:
+  - bp-active-headcount-by-department
+embedding:
+  Give me the headcount by department and the average tenure of the team.: [1.0, 0.0]
+mcp_tools: [runQuery]
+mcp_script:
+  runQuery:
+    - columns: [department, headcount]
+      rows: [[Sales, 4], [Support, 3]]
+      row_count: 2
+      truncated: false
+model_script:
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: Headcount by department
+            - description: Average tenure of the team
+      - name: runQuery
+        id: q1
+        serves_intent: i1
+        args:
+          sql: SELECT department_name AS department, count() AS headcount FROM dbpcm_warehouse.employee GROUP BY department_name
+  # Closes i1 and immediately tries to finalize with i2 still pending -> REFUSED.
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s2
+        args:
+          intents:
+            - {intent_id: i1, status: completed, evidence_tool_call_id: q1}
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: Sales has 4 people and Support 3.
+          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+  # The window's one forced re-round is spent -> ENFORCEMENT_EXHAUSTED, finalize.
+  - tool_calls:
+      - name: answerWithTable
+        id: a2
+        args:
+          answer: Sales has 4 people and Support 3.
+          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+expect:
+  intents_terminal: 2
+  re_derivation: false

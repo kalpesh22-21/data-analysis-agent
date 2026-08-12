@@ -27,7 +27,8 @@ Shape only: counts, enums, tool names, ids the runtime generated itself.
 | `loop_analysis_state_initialized` | `{intent_count, turn_index}` | 03 tool, on successful init |
 | `loop_analysis_state_transition` | `{intent_id, from_status, to_status, reason_code}` | 03 tool + 05 forcing |
 | `loop_intent_completed` | `{intent_id, evidence_tool_name}` | 03 tool. **`evidence_tool_name` is what makes `route` derivable** — `runBlueprint` ⇒ blueprint, `runQuery` ⇒ ad-hoc, `getTableSchema` ⇒ metadata |
-| `loop_metadata_evidence_completion` | `{intent_id}` | 03 tool, when evidence is a `getTableSchema`. The mitigation for §6.1's accepted trade |
+| `loop_intent_blocked` | `{intent_id, reason_code, evidence_tool_name}` | 03 tool, on every **model-declared** block. The block-side mirror of `loop_intent_completed`, and for the same reason: without `evidence_tool_name`, a `NO_ACCESS` manufactured from one `getTableSchema(<scratch_db>, …)` probe (04 §B.4's cheapest route) is **telemetrically identical** to one earned by a `runBlueprint` that hit `COLUMN_SCOPE_VIOLATION` on the user's own data — and the release keeps those holes open on the basis that they are *measured*. A separate event rather than a key on `loop_analysis_state_transition`, which 05's forcing path also emits with no evidence at all; `loop_intent_force_blocked` stays the runtime's counterpart. The evidence's `tool_call_id` is deliberately **not** emitted here — it is model-supplied |
+| `loop_metadata_evidence_completion` | `{intent_id}` | 03 tool, when evidence is a `getTableSchema`. The mitigation for §6.1's accepted trade. No block-side sibling is needed: `loop_intent_blocked.evidence_tool_name == "getTableSchema"` is the same signal, without a second event name |
 | `loop_evidence_reused` | `{intent_id, tool_call_id}` | 03 tool, when a `tool_call_id` already backs another intent |
 | `loop_finalization_refused` | `{exit: "answer_with_table" \| "no_tool_calls", pending_count}` | 05, both exits |
 | `loop_finalization_block_spent` | `{window}` | 05, when the per-window forced re-round is consumed. Consumed **once per round-trip**, not once per refused call |
@@ -38,7 +39,7 @@ Shape only: counts, enums, tool names, ids the runtime generated itself.
 
 | `loop_analysis_state_rejected` | `{reason: "<validation_rule>", intent_count}` | 03 tool, on **every** `ANALYSIS_STATE_INVALID`. `reason` is an enum of rule names, never the offending value |
 
-Eleven events, not ten. The rejection event was missing and the README's own convention requires it — *"every new failure path emits an observer event"* — and 03 §C.3 defines nine rejection rules landing on one code. The immutability violation is the single most interesting adversarial signal in the release (it is the model attempting the evasion 03 §C.4 exists to close) and would otherwise be invisible outside a test.
+Twelve events (eleven at design time, plus `loop_intent_blocked` added when the adversarial pass found the block side unmeasurable). The rejection event was missing and the README's own convention requires it — *"every new failure path emits an observer event"* — and 03 §C.3 defines nine rejection rules landing on one code. The immutability violation is the single most interesting adversarial signal in the release (it is the model attempting the evasion 03 §C.4 exists to close) and would otherwise be invisible outside a test.
 
 ## ⚠ Emitting an event does not publish its payload
 

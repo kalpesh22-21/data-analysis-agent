@@ -91,6 +91,96 @@ def test_guardrail_and_chain_spans_use_correct_kinds() -> None:
     assert kinds["budget.check"] == OpenInferenceSpanKindValues.GUARDRAIL.value
 
 
+def _observed_attributes(event: str, payload: dict) -> dict:
+    """Drive one observer event through the REAL `guardrail_observer` and return
+    the attributes that actually reached the exported span."""
+    provider, exporter = _provider_with_memory_exporter()
+    tracer = tracing.get_tracer(provider)
+    tracing.guardrail_observer(tracer)(event, payload)
+    spans = exporter.get_finished_spans()
+    assert [s.name for s in spans] == [event]
+    return dict(spans[0].attributes)
+
+
+def test_analysis_state_events_reach_phoenix_with_their_attributes() -> None:
+    """EMITTING AN EVENT DOES NOT PUBLISH ITS PAYLOAD (Release 1, doc 06).
+
+    `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST` is a strict ATTRIBUTE allowlist, so before
+    it was extended every one of these events would have reached Phoenix as a
+    correctly-named GUARDRAIL span carrying ZERO attributes — including
+    `loop_intent_completed`, whose entire purpose is the one attribute it holds.
+    """
+    cases = [
+        ("loop_analysis_state_initialized", {"intent_count": 3, "turn_index": 2}),
+        (
+            "loop_analysis_state_transition",
+            {
+                "intent_id": "i2",
+                "from_status": "pending",
+                "to_status": "blocked",
+                "reason_code": "ENFORCEMENT_EXHAUSTED",
+            },
+        ),
+        ("loop_intent_completed", {"intent_id": "i1", "evidence_tool_name": "runBlueprint"}),
+        ("loop_metadata_evidence_completion", {"intent_id": "i1"}),
+        ("loop_evidence_reused", {"intent_id": "i1", "tool_call_id": "call_q"}),
+        ("loop_finalization_refused", {"exit": "answer_with_table", "pending_count": 2}),
+        ("loop_finalization_block_spent", {"window": 2}),
+        ("loop_zero_row_block", {"intent_id": "i2"}),
+        ("loop_zero_row_completion", {"intent_id": "i1"}),
+        (
+            "loop_intent_force_blocked",
+            {"intent_id": "i2", "reason_code": "BUDGET_EXHAUSTED"},
+        ),
+        ("loop_enforcement_exhausted", {"intent_count": 1}),
+        (
+            "loop_analysis_state_late_init_rejected",
+            {"proposed_count": 3, "blocking_tool_name": "runQuery"},
+        ),
+        (
+            "loop_analysis_state_rejected",
+            {"reason": "unknown_intent_id", "intent_count": 2},
+        ),
+    ]
+    for event, payload in cases:
+        attributes = _observed_attributes(event, payload)
+        for key, value in payload.items():
+            assert attributes.get(key) == value, f"{event}.{key} did not survive the allowlist"
+
+
+def test_a_description_is_dropped_even_if_an_emitter_ever_sends_one() -> None:
+    """THE SECOND OF TWO INDEPENDENT GUARDS. The emitters never put `description`
+    on a payload (asserted by the D25 scan in
+    `tests/runtime/loop/test_analysis_state_telemetry.py`); this is what happens if
+    one ever does. `description` must NEVER be added to the allowlist — it is
+    model-authored text derived from the user's question.
+
+    The allowlist is deliberately NOT a type filter: a bare `isinstance(v, str |
+    int | float | bool)` check would let this straight through, which is exactly
+    how `loop_paused_ask_user`'s `question` leaked once."""
+    attributes = _observed_attributes(
+        "loop_analysis_state_transition",
+        {
+            "intent_id": "i1",
+            "to_status": "completed",
+            "description": "employees earning above $100,000",
+        },
+    )
+    assert attributes["intent_id"] == "i1"
+    assert "description" not in attributes
+    assert "employees earning above $100,000" not in str(attributes)
+    assert "description" not in tracing._GUARDRAIL_OBSERVER_ATTR_ALLOWLIST
+
+
+def test_the_paused_ask_user_question_is_still_dropped() -> None:
+    """The regression the allowlist exists for, re-checked after extending it."""
+    attributes = _observed_attributes(
+        "loop_paused_ask_user", {"question": "Which department did you mean?"}
+    )
+    assert "question" not in attributes
+    assert "Which department" not in str(attributes)
+
+
 def test_instrument_openai_is_idempotent() -> None:
     provider = tracing.configure_tracing(otlp_endpoint="", service_name="data-agent-runtime")
     tracing.instrument_openai(provider)

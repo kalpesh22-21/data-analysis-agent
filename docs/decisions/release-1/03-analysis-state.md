@@ -92,7 +92,7 @@ The split must be structural, not a comment, or the validator will drift toward 
 
 ## B. Persistence
 
-`SessionStore` is a `Protocol` with two implementations. Five places:
+`SessionStore` is a `Protocol` with **four** implementations — two in `src/`, two hand-written proxies in `scripts/`. Eight places:
 
 | File | Change |
 |---|---|
@@ -100,7 +100,14 @@ The split must be structural, not a comment, or the validator will drift toward 
 | `session/store.py` | New protocol methods (see the mutation contract below) |
 | `session/couchbase_store.py` | Implement over `_mutate_with_cas_retry` |
 | `session/memory_store.py` | Implement in-memory |
+| **`scripts/run_ui_runtime_real.py`** (`_LazyCouchbaseSessionStore`) | **The store the REAL server runs on.** Add the delegating method |
+| **`scripts/run_ui_runtime.py`** (`_LazyCouchbaseSessionStore`) | Same proxy, scripted launcher. Add the delegating method |
 | `tests/runtime/test_couchbase_connect_gate.py` | Auto-parametrises over every public coroutine — the new methods need `await self._ensure_connected()` first, exactly like `append_trail_entry`, or that test fails |
+| `tests/runtime/test_launcher_session_store_proxies.py` | Derives the required surface from the Protocol and fails when either `scripts/` proxy is missing a method. No edit needed — it covers a new Protocol method automatically. Do not weaken it |
+
+> **The two `scripts/` proxies are invisible to the suite.** They exist because `acouchbase` connects eagerly at construction and needs a running event loop, while each launcher builds its app at module import; each one therefore re-declares **every** `SessionStore` method by hand and forwards it. Nothing in `tests/` imports `run_ui_runtime_real.py` and nothing can (importing it reads `.env` and preflights OpenAI), so a method added to the Protocol and forgotten there passes CI and fails **only against the live server**.
+>
+> This document originally said "two implementations", and both proxies were missed. `apply_analysis_state` and `claim_finalization_block` therefore raised `AttributeError` on the real server for every call — `updateAnalysisState` returned `RUNTIME_TOOL_INTERNAL_ERROR` and `analysisState` was completely non-functional in the real runtime — while all 4760 tests passed. `read_full_result` had already been lost the same way once before. `test_launcher_session_store_proxies.py` closes the class by deriving the expected surface instead of enumerating it.
 
 ### B.1 The mutation contract — a callback, not a precomputed value
 
@@ -141,7 +148,7 @@ Registered in `runtime/app.py` — `runtime_tools["updateAnalysisState"] = Updat
 
 > Spec §5.4 and §13 say the registry lives in `agent_loop.py`. It does not — `app.py:571` builds `runtime_tools` and passes it in. Follow the code.
 
-**`observer` and `tracer` are not optional — and this breaks the precedent above.** The two *composite* runtime tools take neither: `RecordAssumptionsTool()` (`app.py:576`) and `AnswerWithTableTool()` (`app.py:583`), and `_run_runtime_tool` emits no dispatch events on their behalf. It is the three *retrieval read tools* that take both (`app.py:589-612`). Mirroring `record_assumptions.py` literally therefore yields a silently-mute tool. Take `observer` and `tracer`, and self-emit `tool_dispatch_start`/`ok`/`error` like the read tools — 06 assigns this tool seven of its eleven events.
+**`observer` and `tracer` are not optional — and this breaks the precedent above.** The two *composite* runtime tools take neither: `RecordAssumptionsTool()` (`app.py:576`) and `AnswerWithTableTool()` (`app.py:583`), and `_run_runtime_tool` emits no dispatch events on their behalf. It is the three *retrieval read tools* that take both (`app.py:589-612`). Mirroring `record_assumptions.py` literally therefore yields a silently-mute tool. Take `observer` and `tracer`, and self-emit `tool_dispatch_start`/`ok`/`error` like the read tools — 06 assigns this tool eight of its twelve events.
 
 ### C.1 Getting the turn index
 
@@ -193,6 +200,26 @@ Inferred, never model-declared.
 | Evidence fails 04's validators | `ANALYSIS_STATE_INVALID` |
 
 `ANALYSIS_STATE_INVALID` is **retryable**; `ANALYSIS_STATE_LATE_INIT` is **not** — the boundary has passed and no retry helps.
+
+#### C.3.1 Normalise before you validate — added after the first live run
+
+**The model cannot omit keys.** A real two-deliverable turn (gpt-5.5) called the tool six times and had all six rejected as `model_supplied_intent_id`, because it emits **every** property the flat item schema declares and fills the unused ones with placeholders — `""` for a string, the **first enum member** for an enum:
+
+```json
+{"description": "Active headcount by department.", "intent_id": "",
+ "evidence_tool_call_id": "", "reason_code": "NO_ACCESS", "status": "pending"}
+```
+
+That is a correct initialize. No state was created, the turn answered anyway, and the feature was **inert and silent** for the whole turn. The schema already said *"do not invent ids"* and `denial_detail` reached the model correctly; five retries did not recover it. Prose cannot fix this — the contract has to accept the only shape the model can produce.
+
+**A key carrying no information is absent.** Derived from what downstream *reads* require (README conventions; the repo's four-round spot-patching lesson), one clause per JSON type, applied **before mode inference**:
+
+1. **String with no content ⇒ absent** (`""`, whitespace, `null`), on **both** modes. 04 §B.2 already requires `evidence_tool_call_id` to be *non-empty*, so `""` was never a value; `intent_id` and `description` are `.strip()`-checked before use.
+2. **An enum the item's shape cannot read is a placeholder**, because an enum has no empty member. `status` is unreadable on a declaration (every intent starts `pending`) and `reason_code` is read only for a `blocked` intent — so both are ignored on initialize, and `reason_code` is ignored on **any** non-`blocked` update. That second half is not optional: the same serialisation puts `"reason_code": "NO_ACCESS"` on a `completed` update, which §B.2's "completed carries no reason_code" rule would reject — the identical silent failure one call later, leaving every intent `pending` until 05 forced `ENFORCEMENT_EXHAUSTED`.
+
+Only **schema-declared** fields are elided, so unknown keys stay rejected whatever they hold. Everything above still rejects a *claim* as opposed to a filler: a **non-empty** `intent_id` on initialize, a **non-`pending`** `status` on initialize (new reason `status_on_initialize`), a non-empty `description` on update, a non-empty `evidence_tool_call_id` on a `pending` intent.
+
+**The schema keeps one flat item shape.** A `oneOf` over two item variants would make the wrong shape unrepresentable only if something enforced it; nothing does without `strict`, which is not set and cannot be set for one tool while the MCP-derived schemas are non-strict. The observed failure *is* a model unioning the declared properties, which is also how models flatten `anyOf`, so the benefit is unproven against the model that failed — while a `parameters` block the provider rejects fails **all 15 tools** in every request. The description instead states the runtime's own convention ("leave what does not apply empty; `status`/`reason_code` are ignored on the first call"), so declared contract and implemented contract agree.
 
 Both need `denial_mapping.py` entries and both carry specifics in `denial_detail`, which is the only channel that reaches the model. For `LATE_INIT`, include **the proposed descriptions** (spec §5.1 asks for this): `denial_detail` renders only on non-`ok` entries and `filter_trail`'s current-turn exemption is status-gated, so it cannot outlive the turn.
 
@@ -254,6 +281,14 @@ def _is_stale_model_text_entry(entry: TrailEntry, current_turn_index: int | None
 
 Rename and widen — no production constraint. Add a D44 narrowing case to `tests/runtime/context/test_scope_narrowing_adversarial.py`.
 
+**There is a THIRD carrier, and it is not a tool name.** The exit-#2 finalization refusal (05 §B.1) is persisted as an **`answerWithTable`** entry whose `denial_detail` names every pending intent by id and description and whose `args` hold the refused draft answer — with `frozenset()` provenance, so it replayed under any scope in every later turn, imperatively instructing a later turn to call `updateAnalysisState` against dead intent ids. `answerWithTable` cannot join the tool set (its successful entries *are* the answer and must replay), so the predicate also matches a set of **error codes**:
+
+```python
+_STALE_CROSS_TURN_ERROR_CODES = frozenset({"FINALIZATION_BLOCKED_PENDING_INTENTS"})
+```
+
+Keep the two sets; do not add a third predicate if a fourth carrier appears. And note the rule the whole section rests on, because it is what makes this fix a drop rather than a `None`: **provenance answers "what columns did this read"; it is the wrong channel for "do not replay this later."** Setting the refusal's provenance to `None` would also have collapsed `_compute_turn_provenance_union` (fail-closed on any `None`) and dropped that turn's own answer from every later turn's replay.
+
 ---
 
 ## E. The late-init boundary
@@ -293,6 +328,10 @@ for tool_call in [*state_calls, *other_calls]:
 ```
 
 `MAX_STATE_CALLS = 2`. The exemption must be bounded: unbounded, N state calls in one response are N full session-doc CAS read-modify-writes and N trail entries in the pinned budget region, with `guard.exceeded` checked only *after* each call. C.2 already makes batching mandatory, so more than one per response is the model misbehaving — reject the surplus with `ANALYSIS_STATE_INVALID`.
+
+**Bound the LIST, not only the dispatches.** `MAX_STATE_CALLS` caps the state *writes* at two, but each rejected surplus call still costs an `append_trail_entry` — itself a full CAS read-modify-write, plus an entry pinned in the current-turn budget region — so a response with 20 state calls was still 18 store writes in one round-trip, while over-cap `other_calls` are simply dropped. Slice the partition at `MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS` (2): the first couple of surplus calls are still rejected *with* an entry so the model learns why, and the remainder are dropped exactly as over-cap `other_calls` are.
+
+**The `askUser` scan runs on the raw list too, for the identical reason.** Selecting `ask_user_call` from the *capped* `other_calls` — an easy consequence of introducing this partition — meant `[runQuery, runQuery, askUser]` at cap 2 dispatched both queries and never asked the user: the model's clarifying question swallowed, the turn finishing `done`. Scan `result.tool_calls`. Ordering is unaffected: `capped_tool_calls` still holds only the state calls when a pause is present, so E.1's "commit the state, then pause" is preserved.
 
 This reinstates the intent of the Lead's original §36 barrier ("commit state, then dispatch") in sequential form. §36 was dropped along with bounded concurrency; the ordering guarantee it carried was never the concurrency part. Comment it as such.
 

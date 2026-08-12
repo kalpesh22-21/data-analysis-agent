@@ -876,6 +876,12 @@ class _LazyCouchbaseSessionStore:
     (always inside a request, where the loop is running), then delegates every
     `SessionStore` call to it. Pure launcher scaffolding — no runtime behavior
     is touched (the real store is used verbatim once built).
+
+    MAINTENANCE: a hand-written stand-in for the `SessionStore` Protocol drifts
+    from it silently — a forgotten method raises AttributeError only against a live
+    Couchbase run, never in the suite. `tests/runtime/test_launcher_session_store_proxies.py`
+    derives the required surface from the Protocol and fails when this class (or
+    `run_ui_runtime_real.py`'s twin) is missing one.
     """
 
     def __init__(self, settings: RuntimeSettings) -> None:
@@ -912,14 +918,53 @@ class _LazyCouchbaseSessionStore:
     ) -> str:
         return await self._store().write_full_result(session_id, result_id, result_full)
 
+    async def read_full_result(self, session_id: str, result_full_ref: str) -> Any:
+        return await self._store().read_full_result(session_id, result_full_ref)
+
     async def write_pause_checkpoint(self, session_id: str, checkpoint: Any) -> None:
         await self._store().write_pause_checkpoint(session_id, checkpoint)
+
+    async def apply_analysis_state(self, session_id: str, turn_index: int, merge: Any) -> Any:
+        # `merge` is forwarded as the CALLBACK it is — never invoked here — so the
+        # real store's CAS retry re-runs it against its own fresh read (03 §B.1).
+        return await self._store().apply_analysis_state(session_id, turn_index, merge)
+
+    async def claim_finalization_block(
+        self, session_id: str, turn_index: int, window_count: int
+    ) -> bool:
+        return await self._store().claim_finalization_block(session_id, turn_index, window_count)
 
     async def get_session_with_cas(self, session_id: str) -> Any:
         return await self._store().get_session_with_cas(session_id)
 
     async def resume_checkpoint(self, session_id: str, cas: Any, answer: str) -> Any:
         return await self._store().resume_checkpoint(session_id, cas, answer)
+
+    async def scan_idle_sessions(
+        self, *, statuses: list[str], last_activity_before: str, limit: int
+    ) -> Any:
+        return await self._store().scan_idle_sessions(
+            statuses=statuses, last_activity_before=last_activity_before, limit=limit
+        )
+
+    async def transition_learning_status(
+        self,
+        session_id: str,
+        expected_from: str,
+        to: str,
+        cas: Any,
+        *,
+        content_hash: str | None = None,
+        assert_from: bool = True,
+    ) -> Any:
+        return await self._store().transition_learning_status(
+            session_id,
+            expected_from,
+            to,
+            cas,
+            content_hash=content_hash,
+            assert_from=assert_from,
+        )
 
 
 def build_demo_app():

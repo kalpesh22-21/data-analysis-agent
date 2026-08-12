@@ -15,11 +15,21 @@ threads or a container.
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
-from .models import PauseCheckpoint, SessionDoc, TrailEntry, TurnMessage
+from .models import (
+    MAX_FINALIZATION_BLOCKS_PER_WINDOW,
+    AnalysisState,
+    PauseCheckpoint,
+    SessionDoc,
+    TrailEntry,
+    TurnMessage,
+    finalization_block_key,
+    live_analysis_state,
+)
 from .store import AlreadyConsumedError, CASMismatchError
 
 
@@ -101,6 +111,44 @@ class InMemorySessionStore:
         doc.pause_checkpoint = checkpoint
         doc.last_activity = _now()
         self._bump_version(session_id)
+
+    async def apply_analysis_state(
+        self,
+        session_id: str,
+        turn_index: int,
+        merge: Callable[[AnalysisState | None], AnalysisState],
+    ) -> AnalysisState:
+        """In-memory counterpart of the merge-callback contract (03 §B.1).
+
+        There is no CAS retry to drive here (this fake is single-writer by
+        construction), but the ORDER matters and mirrors the real store: *merge*
+        runs FIRST against the live state and may raise, and only a merge that
+        returned normally mutates the doc — so a rejected state call leaves the
+        document byte-identical in both implementations.
+        """
+        doc = await self.get_or_create_session(session_id)
+        new_state = merge(live_analysis_state(doc, turn_index))
+        doc.analysis_state = new_state
+        doc.last_activity = _now()
+        self._bump_version(session_id)
+        return new_state
+
+    async def claim_finalization_block(
+        self, session_id: str, turn_index: int, window_count: int
+    ) -> bool:
+        """In-memory counterpart of the claim (05 §C.1). Same shape as the real
+        store: the limit is checked and the counter incremented in ONE step, so
+        two claimants for the same (turn, window) can never both succeed."""
+        doc = await self.get_or_create_session(session_id)
+        blocks = dict(doc.finalization_blocks or {})
+        key = finalization_block_key(turn_index, window_count)
+        if blocks.get(key, 0) >= MAX_FINALIZATION_BLOCKS_PER_WINDOW:
+            return False
+        blocks[key] = blocks.get(key, 0) + 1
+        doc.finalization_blocks = blocks
+        doc.last_activity = _now()
+        self._bump_version(session_id)
+        return True
 
     async def get_session_with_cas(self, session_id: str) -> tuple[SessionDoc, int]:
         doc = await self.get_or_create_session(session_id)

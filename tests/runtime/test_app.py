@@ -1153,3 +1153,140 @@ def test_history_survives_an_unreadable_blueprint_result(monkeypatch) -> None:
     assert len(turns) == 1
     assert turns[0]["answer"] == "a"          # the transcript still rebuilds
     assert turns[0]["answer_sql"] is None     # only the table reference is lost
+
+
+def test_update_analysis_state_is_wired_and_gets_the_loops_own_turn_index(
+    monkeypatch,
+) -> None:
+    """The composition-root half of 03 §C.1.
+
+    Two things are proven here that no Layer-1 loop test can: that `app.py`
+    actually registers the tool (it is registered THERE, not in `agent_loop.py`),
+    and that the `turn_index` the state is written under is the LOOP's, computed
+    inside `run()` — not `app.py`'s `turn_index_hint`, which is documented as
+    best-effort and never load-bearing, and not a re-derivation (`/turn` and
+    `/turn/resume` use different formulas).
+
+    Turn 1 is used rather than turn 0 precisely because 0 is what a broken
+    implementation would fall back to.
+    """
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *args, **kwargs: frozenset())
+    store = InMemorySessionStore()
+    model_client = ScriptedModelClient(
+        [
+            ModelTurnResult(assistant_text="first answer"),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_state",
+                        name="updateAnalysisState",
+                        arguments={
+                            "intents": [
+                                {"description": "headcount by department"},
+                                {"description": "average salary by department"},
+                            ]
+                        },
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="second answer"),
+        ]
+    )
+    mcp_client = FakeMCPClient(tools=[], scripted={})
+    app = create_app(
+        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        session_store=store,
+        mcp_client=mcp_client,
+        model_client=model_client,
+        catalog=CatalogHandle({}),
+    )
+    client = TestClient(app)
+
+    client.post("/turn", json={"message": "first question"}, headers=HEADERS)
+    response = client.post(
+        "/turn", json={"message": "two things please"}, headers=HEADERS
+    )
+    assert response.status_code == 200
+
+    import asyncio
+
+    from data_agent.runtime.session.models import live_analysis_state
+
+    doc = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        store.get_or_create_session(SESSION_ID)
+    )
+    assert doc.analysis_state is not None
+    assert doc.analysis_state.turn_index == 1
+    assert live_analysis_state(doc, 1) is not None
+    assert live_analysis_state(doc, 0) is None
+    assert [i.intent_id for i in doc.analysis_state.intents] == ["i1", "i2"]
+    # Intercepted in the loop like every other runtime tool — it must NEVER reach
+    # the MCP under its own name (there is no such MCP tool).
+    assert all(call.tool_name != "updateAnalysisState" for call in mcp_client.calls)
+
+
+def test_extra_observers_receive_loop_events_on_both_endpoints(monkeypatch) -> None:
+    """The 07 §B.1 seam: `create_app(extra_observers=…)`.
+
+    The Layer-4 harness has to read 06's routing telemetry and there was no way
+    in — the observer chain is built INSIDE the two request handlers, and SSE is
+    not a fallback (`observability/progress.py::to_progress_event` drops every
+    event it does not recognise, which is most of 06's set). Without the seam the
+    harness would hand-assemble an `AgentLoop`, duplicating `_build_agent_loop`
+    and inheriting `ContextAssembler`'s `base_system_prompt=None` default — a
+    prompt-less harness for a suite whose purpose is testing the prompt.
+
+    Asserted on BOTH endpoints because the chain is constructed twice: `/turn`
+    and `/turn/resume` each build their own, so wiring only one of them would
+    leave every resumed turn invisible to the recorder — and cases 9 and 10 of
+    the Layer-4 suite live entirely on the resume path.
+    """
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *args, **kwargs: frozenset())
+    seen: list[tuple[str, dict]] = []
+    also_seen: list[str] = []
+
+    model_client = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="c1", name="askUser", arguments={"question": "Which?"})
+                ]
+            ),
+            ModelTurnResult(assistant_text="Using Sales."),
+        ]
+    )
+    app = create_app(
+        settings=RuntimeSettings(_env_file=None, discovery_emulation_enabled=False),
+        session_store=InMemorySessionStore(),
+        mcp_client=FakeMCPClient(tools=[], scripted={}),
+        model_client=model_client,
+        catalog=CatalogHandle({}),
+        extra_observers=(
+            lambda event, payload: seen.append((event, dict(payload))),
+            lambda event, _payload: also_seen.append(event),
+        ),
+    )
+    client = TestClient(app)
+
+    first = client.post("/turn", json={"message": "Show payroll."}, headers=HEADERS)
+    assert first.status_code == 200
+    turn_events = [event for event, _ in seen]
+    assert "loop_paused_ask_user" in turn_events
+
+    before_resume = len(seen)
+    second = client.post("/turn/resume", json={"answer": "Sales"}, headers=HEADERS)
+    assert second.status_code == 200
+    resume_events = [event for event, _ in seen[before_resume:]]
+    assert "loop_turn_done" in resume_events, "the resume endpoint's chain omits extra observers"
+
+    # Several observers are all fanned out to, and the default (no seam) stays
+    # byte-identical — the parameter defaults to an empty tuple.
+    assert also_seen == [event for event, _ in seen]
+
+
+def test_create_app_without_extra_observers_is_unchanged(monkeypatch) -> None:
+    client = _build_client(
+        monkeypatch, ScriptedModelClient([ModelTurnResult(assistant_text="hi")])
+    )
+    response = client.post("/turn", json={"message": "hello"}, headers=HEADERS)
+    assert _parse_sse(response.text)[-1]["data"]["status"] == "done"

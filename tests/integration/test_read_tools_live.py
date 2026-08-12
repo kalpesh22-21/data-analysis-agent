@@ -10,7 +10,11 @@ against a LIVE neo4j + the real D71 embedding/reranker mocks. The proofs:
   4. getBlueprint under a scope that misses one column returns {found: false}
      (the non-oracle, over real USES);
   5. searchKnowledge returns a seeded chunk and is UNAFFECTED by scope;
-  6. an unreachable neo4j degrades every tool cleanly (empty / not-found).
+  6. an unreachable neo4j degrades every tool cleanly (empty / not-found);
+  7. an ENRICHED searchBlueprints card round-trips against real neo4j — the three
+     props recall now selects (`resolves_json`/`slots_json`/`result_grain_json`)
+     come back decoded and PROJECTED, and the entry's D44 provenance is the union
+     of the returned cards' `uses` (release-1 §02).
 
 Skip-guarded on NEO4J_TEST_URI + EMBEDDING_TEST_URL; the semantic-order proof
 additionally needs RERANKER_TEST_URL. `uv run pytest` with no live stack stays
@@ -35,6 +39,7 @@ import pytest
 from neo4j import AsyncGraphDatabase
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.context import scope_filter
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.model.reranker_client import HttpRerankerClient
 from data_agent.runtime.retrieval.corpus_loader import (
@@ -228,6 +233,57 @@ async def test_get_blueprint_round_trip_and_non_oracle(seeded_corpus: bool) -> N
     assert detail.result_full["status"] == "validated"
 
     assert out_of_scope.result_full == absent.result_full == {"found": False}
+
+
+# --------------------------------------------------------------------------
+# Proof 7 — an ENRICHED card round-trips against real neo4j (release-1 §02)
+# --------------------------------------------------------------------------
+
+
+_AVERAGE_SALARY_ID = "bp-average-salary-by-department"
+
+
+async def test_search_blueprints_card_enrichment_round_trips(seeded_corpus: bool) -> None:
+    """The three enrichment props are stored by `corpus_loader._dag_properties`
+    and now SELECTED by `_BLUEPRINT_RECALL_QUERY`. This is the only proof that
+    the property NAMES on the node match the ones recall reads — a typo there is
+    invisible in Layer-1 (which hands the mapper a hand-built row) and would
+    simply leave every live card un-enriched, silently."""
+    index = _index()
+    sb = SearchBlueprintsTool(pipeline=_pipeline(index), default_k=20, max_k=20)
+    try:
+        result = await sb.run({"query": "average salary by department"}, _creds(frozenset()))
+    finally:
+        await index.close()
+
+    assert result.status == "ok"
+    cards = {b["id"]: b for b in result.result_full["blueprints"]}
+    assert _AVERAGE_SALARY_ID in cards
+    card = cards[_AVERAGE_SALARY_ID]
+
+    # `resolves` — the fixture pins salary → annual_salary.
+    assert card["resolves"] == {"salary": "annual_salary"}
+    # `result_grain` — stored as a bare list, carried through as one.
+    assert card["result_grain"] == ["Department"]
+    # `slots` — PROJECTED to {name,type,required}. The stored slot carries a
+    # `binds_to` fully-qualified column path; it must not survive onto a card.
+    assert card["slots"], "the fixture blueprint declares slots"
+    for slot in card["slots"]:
+        assert set(slot) == {"name", "type", "required"}
+    assert len(card["slots"]) <= 6
+    assert "binds_to" not in str(card)
+    # `status` is deliberately absent from a search card (recall filters it).
+    assert "status" not in card
+
+    # D44: the entry's provenance is the UNION of the returned cards' `uses`,
+    # not the safe-empty frozenset() — so it drops under a later narrowing.
+    assert result.provenance is not None
+    assert result.provenance != frozenset()
+    rebuilt = {f"{db_table}.{column}" for db_table, column in result.provenance}
+    assert not scope_filter.is_provenance_in_scope(
+        result.provenance, frozenset({"dbpcm_warehouse.nothing.AtAll"})
+    )
+    assert scope_filter.is_provenance_in_scope(result.provenance, frozenset(rebuilt))
 
 
 # --------------------------------------------------------------------------

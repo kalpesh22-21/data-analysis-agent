@@ -28,6 +28,17 @@ class DenialInfo:
     user_message: str
 
 
+# The finalization refusal's code (Release 1, 05 §B.1). It lives HERE, at the
+# bottom of the dependency graph, because THREE layers need the same literal and
+# two of them cannot import each other: `loop/agent_loop.py` sets it,
+# `context/assembly.py` drops the entry carrying it from a LATER turn's replay
+# (the entry's `denial_detail` names every pending intent, and its `args` carry
+# the refused draft prose), and this table renders its fallback text. A duplicated
+# string literal in `context/` would silently stop matching the day the code is
+# renamed, and the symptom would be a cross-turn text leak, not a failure.
+FINALIZATION_BLOCKED_PENDING_INTENTS_CODE = "FINALIZATION_BLOCKED_PENDING_INTENTS"
+
+
 _DENIAL_TABLE: dict[str, DenialInfo] = {
     # COLUMN_SCOPE_VIOLATION: on the LIVE turn the dispatcher
     # (`dispatch/tool_dispatcher.py`) surfaces the MCP's author-controlled
@@ -65,6 +76,49 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
             "You referenced a blueprint you have not run in this turn, so there is no "
             "table to show. Call runBlueprint with that blueprint first, then call "
             "answerWithTable again."
+        ),
+    ),
+    # analysisState (Release 1, 03 §C.3). Both codes are set by
+    # `composite/analysis_state.py`, never by the MCP, and both ALSO carry a
+    # `denial_detail` on the result — that is the channel that names the specific
+    # rule that failed, which this table cannot. These entries are the replay
+    # fallback: without them `classify_denial` returns "Something went wrong
+    # processing that request." and the model learns nothing.
+    "ANALYSIS_STATE_INVALID": DenialInfo(
+        code="ANALYSIS_STATE_INVALID",
+        retryable=True,
+        user_message=(
+            "That analysis-state update was rejected. Send one updateAnalysisState "
+            "call listing each intent by the id you were given, with its status and "
+            "the tool call that evidences it."
+        ),
+    ),
+    # NOT retryable: the substantive work has already started, so the late-init
+    # boundary has passed and no retry of the same call can help.
+    "ANALYSIS_STATE_LATE_INIT": DenialInfo(
+        code="ANALYSIS_STATE_LATE_INIT",
+        retryable=False,
+        user_message=(
+            "The intents for this question can no longer be declared — the analysis is "
+            "already under way. Continue and answer everything the user asked."
+        ),
+    ),
+    # Finalization enforcement (Release 1, 05 §B.1). The model called
+    # `answerWithTable` — the turn's terminal exit — while intents it declared are
+    # still `pending`, so the call is turned into a RETRYABLE refusal and the turn
+    # continues. Registered here for the same reason as the two codes above: the
+    # specific text (which intents are pending) rides on `denial_detail`, and
+    # without a table entry `classify_denial`'s fallback would tell the model
+    # "Something went wrong processing that request." — which is neither true nor
+    # actionable, and it is the only thing left if the detail is ever absent.
+    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE: DenialInfo(
+        code=FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
+        retryable=True,
+        user_message=(
+            "You still have intents that are neither completed nor blocked, so this "
+            "cannot be the final answer yet. Resolve each one with "
+            "updateAnalysisState — citing the call that answered it, or the call that "
+            "shows it cannot be done — then answer again."
         ),
     ),
     "PARSE_FAILED_CLOSED": DenialInfo(

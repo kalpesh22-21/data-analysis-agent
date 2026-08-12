@@ -63,6 +63,15 @@ _EXPECTED_RETRYABLE = {
     "RETRIEVAL_TOOL_UNAVAILABLE": False,
     "RETRIEVAL_TOOL_INTERNAL_ERROR": False,
     "RUNTIME_TOOL_INTERNAL_ERROR": False,
+    # analysisState (Release 1, 03 §C.3). The split is load-bearing: a rejected
+    # UPDATE is fixable inside the same turn, but a LATE INIT is not — the
+    # substantive work has already started, so the boundary has passed and no
+    # retry of the same call can help.
+    "ANALYSIS_STATE_INVALID": True,
+    "ANALYSIS_STATE_LATE_INIT": False,
+    # Finalization enforcement (05 §B.1): retryable BY CONSTRUCTION — a
+    # non-retryable refusal would end the turn it exists to keep alive.
+    "FINALIZATION_BLOCKED_PENDING_INTENTS": True,
 }
 
 # `answerWithTable(blueprint_id=…)` naming a blueprint that never ran this turn.
@@ -72,12 +81,25 @@ _EXPECTED_RETRYABLE = {
 # model with no idea what to do differently.
 _ANSWER_TABLE_CODES = {"ANSWER_TABLE_BLUEPRINT_NOT_RUN"}
 
+# `updateAnalysisState` rejections. Registered for the same reason: both codes
+# ALSO carry a specific `denial_detail`, but `denial_detail` is per-entry while
+# this table is what a code renders as when no detail was set.
+_ANALYSIS_STATE_CODES = {"ANALYSIS_STATE_INVALID", "ANALYSIS_STATE_LATE_INIT"}
+
+# Finalization enforcement (Release 1, 05 §B.1): the refusal returned in place of a
+# terminal `answerWithTable` while declared intents are still pending. RETRYABLE —
+# the whole point is that the turn continues and the model gets one more round to
+# resolve them.
+_FINALIZATION_CODES = {"FINALIZATION_BLOCKED_PENDING_INTENTS"}
+
 _ALL_KNOWN_CODES = (
     _ALL_SEVEN_CODES
     | _GUARDRAIL_CODES
     | _COMPOSITE_CODES
     | _READ_TOOL_CODES
     | _ANSWER_TABLE_CODES
+    | _ANALYSIS_STATE_CODES
+    | _FINALIZATION_CODES
 )
 
 

@@ -595,6 +595,23 @@ def recall_span(
 # or fixed label (`database`/`table` are catalog metadata — the same scalar
 # identifiers a real `tool.<name>` span already exposes; free-form args like
 # `sql` are NEVER placed on these events by the emitter, so no literal can leak).
+#
+# EMITTING AN EVENT DOES NOT PUBLISH ITS PAYLOAD (Release 1, 06). Every key an
+# emitter sends that is not listed here is silently dropped — a correctly-named
+# GUARDRAIL span carrying nothing. The `analysisState` keys below are therefore
+# each a DELIBERATE D25 DECLARATION that the key is shape-only:
+#
+#   `intent_count` / `pending_count` / `proposed_count` — counts.
+#   `turn_index` / `window`                            — runtime-assigned numbers.
+#   `intent_id`                                        — runtime-assigned (`i1`),
+#                                                        carries no user content.
+#   `from_status` / `to_status` / `reason_code` / `exit` / `reason` — closed enums.
+#   `evidence_tool_name` / `blocking_tool_name`        — tool names.
+#
+# `description` MUST NEVER BE ADDED. It is model-authored text derived from the
+# user's question — the one field on `TrackedIntent` that carries user content —
+# and it is never placed on any of these payloads in the first place, so this list
+# is the second of two independent guards, not the only one.
 _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "window",
     "tool_calls_made",
@@ -606,6 +623,19 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "note",
     "database",
     "table",
+    # --- analysisState / finalization enforcement (Release 1, 06) ---
+    "intent_count",
+    "turn_index",
+    "intent_id",
+    "from_status",
+    "to_status",
+    "reason_code",
+    "evidence_tool_name",
+    "exit",
+    "pending_count",
+    "proposed_count",
+    "blocking_tool_name",
+    "reason",
 )
 
 

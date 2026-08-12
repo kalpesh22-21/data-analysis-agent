@@ -108,18 +108,40 @@ The agent uses a real LLM (OpenAI — D71), so e2e must not assert exact NL. Two
 - **CI (deterministic):** record/replay LLM interactions (cassette-style) + assert on **structural/behavioral invariants** (SQL shape, chips present, scope denied, span emitted), never exact prose.
 - **Nightly (live):** run the same suite against the live model to catch drift; grade with the Layer-4 result-set/LLM-judge harness rather than string equality.
 
-## Layer 4 — Eval / Canary (already specified)
+## Layer 4 — Eval / Canary
 
 The data-correctness layer from [05](05-memory-and-learning.md) §Evaluation + [10](10-observability.md):
 curated **golden Q&A with golden SQL**, graded by **result-set comparison + LLM-as-judge**, run as
-**Phoenix experiments / production canaries**. **Golden replay** doubles as blueprint regression
-(D36). This complements Layer 3: Layer 3 proves the system *behaves* per spec; Layer 4 proves the
-*answers stay correct* over time. The Phase-0 session corpus seeds the canary set.
+**Phoenix experiments / production canaries**. This complements Layer 3: Layer 3 proves the system
+*behaves* per spec; Layer 4 proves the *answers stay correct* over time. The Phase-0 session corpus
+seeds the canary set.
+
+**Built (Release 1, [07](decisions/release-1/07-evaluation.md)) — the routing suites, under `tests/eval/`:**
+
+| Suite | File | Model | Proves | Gate |
+|---|---|---|---|---|
+| A1 — runtime mechanics | `test_runtime_mechanics.py` | `ScriptedModelClient` | Given a routing decision, the runtime records, validates, enforces and terminates correctly | Per-commit |
+| A2 — routing decisions | `test_routing_live.py` | Live model, real prompt, real pre-injected cards | The prompt actually routes | **Release gate** (`RUN_LIVE_EVAL=1`), reported as a pass-rate over N runs |
+
+The split is load-bearing, not tidiness. `ScriptedModelClient.send_turn` never reads `messages`, so
+**the scripted suite cannot fail on a bad prompt** — green there means the runtime works, not that
+the agent routes. Only A2 can go red on a prompt regression, which is why it, not A1, is the gate.
+`tests/eval/README.md` states this plainly and documents the fixture format, the metrics
+(`metrics.py`) and the two wiring gates a new case will otherwise trip over.
+
+**Outstanding — answer grading (A3).** The golden Q&A half above is still **not built**: A1 and A2
+grade the *route* (which blueprint ran, whether every tracked intent reached a terminal disposition,
+whether an authoritative result was re-derived), never the *numbers*. The result-set + LLM-judge
+canary programme needs a judge, a golden set and a seeded warehouse, and is out of Release 1's scope.
+
+**Pre-existing — golden replay (D36).** `learning/promotion/replay.py`, a structure oracle on the
+promotion path, tested under `tests/learning/promotion/`. It doubles as blueprint regression, but it
+is a blueprint-regression tool rather than a question runner, and it predates the suites above.
 
 ## CI wiring
 
 - **Per-PR (fast):** Layers 1–2. Catalog PRs additionally run the D53 CI (schema lint + `explainQuery` dry-run against the patched catalog).
-- **Nightly + release (slow):** Layer 3 (Docker + Playwright, both deterministic and live modes) and Layer 4 canaries.
+- **Nightly + release (slow):** Layer 3 (Docker + Playwright, both deterministic and live modes) and Layer 4's live routing suite (`RUN_LIVE_EVAL=1`) plus the canaries once they exist. Layer 4's **scripted** half (`tests/eval/test_runtime_mechanics.py`) runs per-PR with Layers 1–2 — it needs no live infra.
 - The **`system.query_log.columns` oracle** (D62) runs as a parser-accuracy job: replay real queries, diff parser-extracted columns vs. engine-reported ⇒ track the D63 false-reject rate.
 
 ---

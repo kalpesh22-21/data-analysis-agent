@@ -79,12 +79,17 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.composite.analysis_state import (
+    MAX_STATE_CALLS,
+    surplus_state_call_rejected,
+)
+from data_agent.runtime.composite.analysis_state import TOOL_NAME as UPDATE_ANALYSIS_STATE_TOOL_NAME
 from data_agent.runtime.composite.answer_with_table import TOOL_NAME as ANSWER_TABLE_TOOL_NAME
 from data_agent.runtime.composite.answer_with_table import (
     clean_answer_text,
@@ -97,6 +102,9 @@ from data_agent.runtime.context.assembly import (
     ContextAssembler,
 )
 from data_agent.runtime.context.budget import fit_request_to_budget
+from data_agent.runtime.dispatch.denial_mapping import (
+    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
+)
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
@@ -111,10 +119,14 @@ from data_agent.runtime.hooks.answer_table import (
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
+from data_agent.runtime.sanitize import MAX_FIELD_CHARS, sanitize_text
 from data_agent.runtime.session.models import (
+    AnalysisState,
     PauseCheckpoint,
+    TrackedIntent,
     TrailEntry,
     TurnMessage,
+    live_analysis_state,
 )
 from data_agent.runtime.session.store import SessionStore
 
@@ -142,14 +154,50 @@ RUNTIME_TOOL_INTERNAL_ERROR_CODE = "RUNTIME_TOOL_INTERNAL_ERROR"
 _RUNTIME_TOOL_INTERNAL_ERROR_MESSAGE = "That tool hit an internal error. Please try again."
 
 
+@dataclass(frozen=True)
+class TurnContext:
+    """What a `RuntimeTool` may know about the turn it is running in (03 §C.1).
+
+    `turn_index` ONLY. It exists because `updateAnalysisState` must write
+    turn-scoped state, and the two alternatives are both wrong:
+
+      - Take it from `app.py`. `runtime_tools` is built in `_build_agent_loop`,
+        which has only `turn_index_hint` — documented at its own definition as
+        "best-effort … never load-bearing for correctness, purely a telemetry
+        label". Making it load-bearing introduces a TOCTOU gap against the loop's
+        own computation.
+      - Re-derive it from the store. `/turn` and `/turn/resume` use DIFFERENT
+        formulas (`messages[-1].turn_index + 1` vs `messages[-1].turn_index`), so
+        duplicating the derivation guarantees eventual disagreement.
+
+    IT MUST NOT CARRY THE TRAIL. `_run_loop_body`'s only trail load sits ABOVE
+    the round-trip loop and is immediately reduced to signatures for
+    `seen_read_calls`; every entry is appended later. A snapshot taken there
+    contains NOTHING from the current window, so evidence written in round 1 and
+    cited in round 2 would fail as "unknown tool_call_id" — every completion and
+    block, on every turn, while looking correctly wired. A tool that needs the
+    trail loads it itself, filtered to `turn_index`.
+    """
+
+    turn_index: int
+
+
 class RuntimeTool(Protocol):
     """A model-facing tool implemented in the RUNTIME (not the MCP), intercepted
     in the loop and returning an inline `ToolResult` — the `resolveValues` shape
     (read-tools-design §2). `askUser` is NOT a `RuntimeTool`: it is TERMINAL (it
-    pauses, it does not return a `ToolResult`), so it stays a hardcoded branch."""
+    pauses, it does not return a `ToolResult`), so it stays a hardcoded branch.
+
+    *turn* is passed by `_run_runtime_tool` on every dispatch. It is keyword-
+    optional so a tool that does not care about the turn simply ignores it; the
+    signature is EXPLICIT rather than a side channel because six implementers and
+    no production constraint made the honest version cheap."""
 
     async def run(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn: TurnContext | None = None,
     ) -> ToolResult: ...
 
 
@@ -399,6 +447,203 @@ def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
             f"'{blueprint_id}' first, then call answerWithTable again."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Finalization enforcement (Release 1, docs/decisions/release-1/
+# 05-finalization-enforcement.md). This is where `analysisState` gets teeth.
+#
+# THE INVARIANT IS SCOPED (05 §F.1): no intent ends `pending` on any turn that
+# reaches a TERMINAL outcome (`done` / `stopped_hard_ceiling`). A turn abandoned
+# at an `askUser`/budget-cap/blueprint pause, or whose resume loses a CAS race, is
+# a NON-TERMINATED turn and legitimately leaves its intents `pending` — an
+# unscoped assertion would fail against any real store.
+#
+# ENFORCEMENT APPLIES ONLY TO THE LIVE STATE (05 §A). Everything below reads the
+# window-local loaded through `live_analysis_state`, so a state left behind by an
+# abandoned earlier turn cannot refuse an unrelated later turn (and cannot have
+# `ENFORCEMENT_EXHAUSTED` written onto its record by one).
+# ---------------------------------------------------------------------------
+
+# `FINALIZATION_BLOCKED_PENDING_INTENTS_CODE` is imported from
+# `dispatch/denial_mapping.py` (its canonical home) and re-exported here, because
+# `context/assembly.py` needs the same literal to drop the refusal entry from a
+# LATER turn's replay and cannot import this module.
+
+# How much of the model's refused draft answer is quoted back to it in the nudge.
+# Generous: the point is that the model does not have to REGENERATE the answer it
+# just wrote (exit #1 persists nothing and D22 discards free text around tool
+# calls), so a truncated quote costs a rewrite of the tail only.
+_MAX_NUDGE_DRAFT_CHARS = 2000
+
+# How many SURPLUS `updateAnalysisState` calls (beyond `MAX_STATE_CALLS`) in one
+# model response are answered with a persisted rejection entry before the rest are
+# dropped unanswered. Two, not one: the model may legitimately be mid-correction,
+# and one rejection reads as an accident where two read as a rule. Each rejection
+# costs a full `append_trail_entry` CAS write plus an entry pinned in the
+# current-turn budget region, which is why the number is small and fixed rather
+# than "however many the model sent" (03 §E.2 bounded the state WRITES at two but
+# left the rejection WRITES unbounded).
+_MAX_SURPLUS_STATE_REJECTIONS = 2
+
+
+class _NoLiveStateToForceError(Exception):
+    """Raised from inside the force-block merge when the live state vanished
+    between the loop's read and the store's write (a concurrent turn boundary is
+    the only way). Aborts the write with nothing persisted, rather than
+    resurrecting a state the model never saw."""
+
+
+def _pending_intents(state: AnalysisState | None) -> tuple[TrackedIntent, ...]:
+    """Every intent of the LIVE state still `pending`, in declaration order.
+
+    `None` state -> empty tuple, which is the whole fast path: most turns are
+    single-intent, so the enforcement check must cost one `is None` test on a
+    local and never a store read (05 §E)."""
+    if state is None:
+        return ()
+    return tuple(intent for intent in state.intents if intent.status == "pending")
+
+
+def _describe_pending(pending: Sequence[TrackedIntent]) -> str:
+    """`i2 ('attrition by department')` for each pending intent.
+
+    The descriptions are MODEL-authored text derived from the user's question,
+    re-entering model context — so they go through the SAME structural
+    sanitisation the rendered state block uses (`runtime/sanitize.py`), or a
+    newline in one could fabricate an instruction line inside the message it lands
+    in. Same turn and same `column_scope` as the state it quotes, so there is no
+    D44 exposure AT THE POINT OF USE.
+
+    IT DOES NOT FOLLOW THAT IT CANNOT OUTLIVE THE TURN, and an earlier version of
+    this docstring claimed exactly that. On the exit-#1 path the text is ephemeral,
+    so it is true there. On the EXIT-#2 path it rides `denial_detail` on a PERSISTED
+    `answerWithTable` trail entry: `filter_trail`'s status-gated exemption keeps a
+    non-`ok` entry for its OWN turn, but nothing in `filter_trail` drops it later —
+    `frozenset()` provenance passes `is_entry_in_scope` under any scope, forever, and
+    `_render_entry` has no turn awareness. The cross-turn drop is
+    `context/assembly.py::_is_stale_model_text_entry`, which matches this entry by
+    its error code; that is what actually bounds the lifetime."""
+    return "; ".join(
+        f"{intent.intent_id} ('{sanitize_text(intent.description, MAX_FIELD_CHARS)}')"
+        for intent in pending
+    )
+
+
+def _finalization_blocked(pending: Sequence[TrackedIntent]) -> ToolResult:
+    """The refusal returned in place of a terminal `answerWithTable` while intents
+    are still pending (05 §B.1) — modelled on `_answer_table_blueprint_not_run`.
+
+    Returned BEFORE the trail entry is written, so the persisted entry IS the
+    refusal and the model reads it on the next round-trip.
+
+    IN-TURN VISIBILITY COMES FROM THE STATUS GATE, NOT FROM THE PROVENANCE.
+    `filter_trail`'s current-turn exemption keeps a `status != "ok"` entry of the
+    CURRENT turn whatever its provenance, and that is the only place this entry has
+    to survive. (05 §B.1 originally recorded the opposite — "the status gate is
+    belt-and-braces; provenance is binding" — which is inverted: `frozenset()` is
+    load-bearing only in contexts that pass no `current_turn_index`, i.e. precisely
+    the LATER turns where this entry must NOT survive. Corrected in 05 §B.1/§I.)
+
+    `provenance=frozenset()` IS STILL THE RIGHT VALUE, for a different reason: this
+    refusal is runtime-authored and reads no warehouse data, and
+    `_compute_turn_provenance_union` is fail-closed — a `None` here would collapse
+    the whole turn's union and tag the turn's own final assistant message
+    undetermined, dropping the user's answer from every later turn's replay.
+
+    WHAT BOUNDS ITS LIFETIME IS `context/assembly.py::_is_stale_model_text_entry`,
+    which drops this entry from any turn other than its own, matching on
+    `FINALIZATION_BLOCKED_PENDING_INTENTS_CODE` (the entry is persisted under
+    `answerWithTable`, whose SUCCESSFUL entries must keep replaying, so it cannot be
+    matched by tool name). Without that drop the detail below — dead intent ids and
+    an imperative to call `updateAnalysisState` against a state that no longer
+    exists — plus the refused draft prose in `args` would replay in every later turn
+    of the session, under any since-narrowed scope.
+
+    `denial_detail` NAMES THE PENDING INTENTS. `context/budget.py::_render_entry`
+    builds the model-facing text as `entry.denial_detail or
+    classify_denial(entry.error_code).user_message` and NEVER from
+    `ToolResult.user_message`, which has no `TrailEntry` field at all — a specific
+    message set only there is silently dropped.
+    """
+    detail = (
+        f"You cannot finish yet: {len(pending)} intent(s) you are tracking are still "
+        f"pending — {_describe_pending(pending)}. Resolve each one with "
+        "updateAnalysisState — completed, citing the call that answered it, or "
+        "blocked, citing the call that shows it cannot be done — then send this "
+        "answer again."
+    )
+    return ToolResult(
+        status="error",
+        tool_name=ANSWER_TABLE_TOOL_NAME,
+        error_code=FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
+        retryable=True,
+        user_message=detail,
+        provenance=frozenset(),
+        result_preview=None,
+        result_full=None,
+        denial_detail=detail,
+    )
+
+
+def _finalization_nudge(draft: str | None, pending: Sequence[TrackedIntent]) -> str:
+    """The ephemeral `user`-role message injected in place of exit #1's missing
+    error channel (05 §B.2/§B.3).
+
+    IT CARRIES THE DRAFT BACK. Exit #2's refusal preserves the model's prose for
+    free — it lives in `tool_call.arguments`, is persisted as `TrailEntry.args`,
+    and is replayed by `_render_entry`. Exit #1 preserves NOTHING: the answer is
+    not persisted (by design — a persisted nudge or draft would surface in
+    `/session/history` as something the user said) and D22 discards free text
+    around tool calls, so without this quote the model has no record it just wrote
+    a final answer and must regenerate it blind.
+    """
+    lines: list[str] = []
+    if draft and draft.strip():
+        lines.append(f"You drafted: {draft.strip()[:_MAX_NUDGE_DRAFT_CHARS]}")
+        lines.append("")
+    lines.append(
+        f"That is not your final answer yet — {len(pending)} intent(s) you are "
+        f"tracking are still pending: {_describe_pending(pending)}."
+    )
+    lines.append(
+        "Resolve each one with updateAnalysisState — completed, citing the call that "
+        "answered it, or blocked, citing the call that shows it cannot be done — then "
+        "re-send your final answer."
+    )
+    return "\n".join(lines)
+
+
+def _refreshed_analysis_state(
+    tool_result: ToolResult, turn_index: int
+) -> AnalysisState | None:
+    """The state a SUCCESSFUL `updateAnalysisState` call just wrote, read back off
+    its own result (05 §E), or `None` when there is nothing to refresh from.
+
+    The state changes mid-turn, so a once-per-window read would be wrong — but a
+    store read at each terminal exit would cost a round-trip on EVERY turn,
+    including the single-intent ones that never touch this feature. So the loop
+    loads the state ONCE at the top and refreshes the local from each state call's
+    result. 03 §E.2's partition guarantees state calls are dispatched before
+    anything else in the batch, so the local is current by the time either exit is
+    reached.
+
+    Defensive: a malformed result degrades to "no refresh" (the loaded value
+    stands) rather than raising into the dispatch loop.
+    """
+    if tool_result.status != "ok" or not isinstance(tool_result.result_full, dict):
+        return None
+    try:
+        state = AnalysisState.from_doc(tool_result.result_full)
+    except (KeyError, TypeError, ValueError):
+        _logger.warning(
+            "updateAnalysisState returned a result this loop could not read back as "
+            "state; keeping the state loaded at the top of the window"
+        )
+        return None
+    # The A.1 gate again, belt-and-braces: a state for another turn must never
+    # become the one this turn enforces on.
+    return state if state.turn_index == turn_index else None
 
 
 def _capture_terminal_sql(
@@ -693,6 +938,20 @@ class AgentLoop:
         if pause_reason == "budget_cap":
             normalized = answer.strip().lower()
             if normalized.startswith("stop"):
+                # 05 §F — the THIRD `done` return, and the one that inherits
+                # nothing: it returns from inside `resume()` BEFORE `_run_loop` is
+                # ever entered, with `tool_calls_made=0`, so it needs its own
+                # force-block call. The turn reaches a terminal outcome here, so
+                # the scoped invariant applies and every surviving `pending` intent
+                # is recorded `USER_STOPPED`. The §A turn gate applies here too —
+                # `live_analysis_state` is what stops a state left behind by an
+                # abandoned EARLIER turn being rewritten by this one's stop.
+                await self._force_block_pending_intents(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    state=live_analysis_state(updated_doc, turn_index),
+                    reason_code="USER_STOPPED",
+                )
                 return TurnOutcome(
                     status="done",
                     assistant_text=("Stopping here — here is what I found before the budget cap."),
@@ -757,6 +1016,7 @@ class AgentLoop:
         retrieval_memo: dict[tuple[str, str], Any],
         withheld_call_ids: set[str],
         discovery_canonical: list[dict[str, Any]] | None = None,
+        finalization_nudge: str | None = None,
     ) -> list[dict[str, Any]]:
         """*current_turn_index* (turn-scoped continuity, 2026-07-01): passed
         through to `ContextAssembler.assemble` so the CURRENT in-progress
@@ -808,6 +1068,25 @@ class AgentLoop:
         trimmed first. When there is no `user` message at all (a Layer-1 assemble
         with no dialogue) it falls back to the old position after the system head.
         `None`/empty (feature off / degraded) leaves the message list byte-identical.
+
+        *finalization_nudge* (05 §B.2/§D): the ephemeral `user`-role message that
+        replaces exit #1's missing error channel. It shares `discovery_canonical`'s
+        splice site and never-persisted posture but NOT its lifetime — it lives
+        EXACTLY ONE ROUND-TRIP (the caller clears it immediately after this call),
+        because a once-per-window value would repeat the nudge forever, including
+        after the intents were closed, and — being ephemeral and anchored at the
+        tail — would migrate to be the newest message on every rebuild, appearing
+        after tool results it predates.
+
+        SPLICE ORDER (05 §D.1 — this loop owns it, being the later insertion):
+        `ContextAssembler` inserts the `analysisState` block at
+        `_last_user_index`, i.e. immediately BEFORE the current question. The nudge
+        is appended at the TAIL, AFTER that — appending it first would make it the
+        last `user` message and land 03's state block after the question instead of
+        before it. A trailing `user` message is safe there: `_current_turn_start`
+        anchors on the first `user` after the last plain-assistant answer, so it
+        does not move the current-turn pin, and `fit_request_to_budget` classifies
+        it as a current-turn non-tool-pair unit, which is pinned.
         """
         assembled = await self._context_assembler.assemble(
             session_id,
@@ -880,6 +1159,14 @@ class AgentLoop:
                 while insert_at < len(canonical) and canonical[insert_at]["role"] == "system":
                     insert_at += 1
             canonical[insert_at:insert_at] = deduped_discovery
+
+        # The finalization nudge, at the TAIL (05 §D.1 — see the docstring for why
+        # the order is this way round, and §B.2 for why it is a `user` message
+        # rather than a synthetic tool result). Spliced BEFORE the fit below so it
+        # is counted and pinned like the current question it follows, never added
+        # to a request that was already fitted without it.
+        if finalization_nudge:
+            canonical.append({"role": "user", "content": finalization_nudge})
 
         # Conversation dialogue is now interleaved INTO `assembled.messages` by
         # `ContextAssembler.assemble` (it reads `doc.messages` and merges the two
@@ -982,7 +1269,7 @@ class AgentLoop:
             #
             # Keeping the assumption STRINGS out of a later turn's model context is
             # a separate rule with its own home:
-            # `context/assembly.py::_is_stale_assumptions_entry`.
+            # `context/assembly.py::_is_stale_model_text_entry`.
             if entry.status == "ok" and entry.tool_name == "recordAssumptions":
                 continue
             if entry.provenance is None:
@@ -1123,14 +1410,19 @@ class AgentLoop:
         tool_name: str,
         arguments: dict[str, Any],
         credentials: RuntimeCredentials,
+        turn: TurnContext,
     ) -> ToolResult:
         """Run one registry handler with a B4-style crash guard + a returned-
         provenance-type validation (S2), so a misbehaving runtime tool cannot
         abort the turn or persist a replay-poisoning provenance. The three read
         tools + `resolveValues` already self-guard; this is defense in depth and
-        the containment seam the future `runBlueprint` brick relies on."""
+        the containment seam the future `runBlueprint` brick relies on.
+
+        *turn* is the loop's OWN `turn_index`, threaded explicitly (03 §C.1) —
+        the only correct source. Passed to every runtime tool, ignored by the
+        ones that do not need it."""
         try:
-            result = await handler.run(arguments, credentials)
+            result = await handler.run(arguments, credentials, turn=turn)
         except Exception:
             # Never propagate the raw exception (would abort the turn) or leak
             # `str(exc)` — log server-side only, return a clean canned error.
@@ -1142,6 +1434,189 @@ class AgentLoop:
         if sanitized is not result.provenance:
             result = replace(result, provenance=sanitized)
         return result
+
+    async def _force_block_pending_intents(
+        self,
+        *,
+        session_id: str,
+        turn_index: int,
+        state: AnalysisState | None,
+        reason_code: str,
+    ) -> AnalysisState | None:
+        """Mark every surviving `pending` intent `blocked` with a RUNTIME reason
+        code, immediately before a turn reaches a terminal outcome (05 §F).
+
+        Four callers, three codes:
+
+          | hard ceiling                          | `BUDGET_EXHAUSTED`      |
+          | budget cap reached DURING a refused round | `BUDGET_EXHAUSTED`  |
+          | block counter spent, intents pending  | `ENFORCEMENT_EXHAUSTED` |
+          | budget-cap resume answered "stop"     | `USER_STOPPED`          |
+
+        `ENFORCEMENT_EXHAUSTED` MEANS "ENFORCEMENT COULD NOT ESTABLISH A
+        DISPOSITION" — **not** that the system proved the intent impossible (Lead,
+        2026-08-11). Claiming proof would overstate what the runtime knows: zero
+        rows is often the correct answer, some denial probes cost one metadata
+        call, and a user who withdraws an ask mid-clarification lands here and does
+        so legitimately under that reading.
+
+        THIS PATH WRITES THE RUNTIME CODES DIRECTLY. It must NOT be routed through
+        `validate_block_evidence`, which allowlists `MODEL_REASON_CODES` — every
+        code above would be rejected by it, by design. There is no evidence to
+        cite: `evidence_tool_call_id` stays `None`, which is exactly what
+        distinguishes a runtime-forced block from a model-declared one in the
+        ledger.
+
+        The §A turn gate is already applied by the caller (the `state` handed in is
+        the LIVE one), and again by the store, whose merge callback receives
+        `live_analysis_state(...)`. No live state, or nothing pending, is a no-op
+        with no write at all.
+
+        DEGRADE-NEVER-FAIL: this runs on terminal paths that are already returning
+        a result to the user, so a store failure here is logged and swallowed —
+        losing the forced disposition is bad, aborting the user's answer to record
+        it is worse.
+        """
+        pending = _pending_intents(state)
+        if not pending:
+            return state
+
+        forced_ids: list[str] = []
+
+        def _merge(current: AnalysisState | None) -> AnalysisState:
+            # Captured INSIDE the merge, and reset at the top of it: on a CAS
+            # retry the write lands on a different document, and telemetry
+            # reporting transitions that were never written would be quietly wrong.
+            forced_ids.clear()
+            if current is None:
+                # The live state vanished between the read and the write (only a
+                # concurrent turn boundary can do this). Refuse rather than
+                # resurrecting a state from the stale snapshot.
+                raise _NoLiveStateToForceError()
+            intents: list[TrackedIntent] = []
+            for intent in current.intents:
+                if intent.status != "pending":
+                    intents.append(intent)
+                    continue
+                forced_ids.append(intent.intent_id)
+                intents.append(
+                    replace(intent, status="blocked", reason_code=reason_code)
+                )
+            return AnalysisState(turn_index=turn_index, intents=tuple(intents))
+
+        try:
+            new_state = await self._session_store.apply_analysis_state(
+                session_id, turn_index, _merge
+            )
+        except _NoLiveStateToForceError:
+            _logger.warning(
+                "no live analysis state to force-block at turn end (session=%s, "
+                "turn=%d, reason=%s)",
+                session_id,
+                turn_index,
+                reason_code,
+            )
+            return state
+        except Exception:
+            _logger.exception(
+                "failed to force-block pending intents (session=%s, turn=%d, "
+                "reason=%s) — the turn still returns its result",
+                session_id,
+                turn_index,
+                reason_code,
+            )
+            return state
+
+        for intent_id in forced_ids:
+            # D25: ids are runtime-assigned and carry no user content;
+            # `description` is model-authored from the user's question and is NEVER
+            # emitted, on this or any other event.
+            self._observer(
+                "loop_analysis_state_transition",
+                {
+                    "intent_id": intent_id,
+                    "from_status": "pending",
+                    "to_status": "blocked",
+                    "reason_code": reason_code,
+                },
+            )
+            self._observer(
+                "loop_intent_force_blocked",
+                {"intent_id": intent_id, "reason_code": reason_code},
+            )
+        return new_state
+
+    async def _grant_forced_reround(
+        self,
+        *,
+        session_id: str,
+        turn_index: int,
+        window_count: int,
+        already_refused_this_round: bool,
+    ) -> bool:
+        """Whether a finalization refusal may proceed — ONE forced re-round per
+        budget window OF THIS TURN, CONSUMED PER ROUND-TRIP (05 §C.1/§C.2).
+
+        `turn_index` is part of the claim key, not context. `window_count` restarts
+        at 1 on every external turn while `SessionDoc.finalization_blocks` persists
+        across the whole session — see `session/models.py::finalization_block_key`
+        for what a window-only key cost.
+
+        The per-round gate is not a nicety. Exit #2's refusal happens inside the
+        per-tool-call loop, which processes up to 8 calls from ONE model response:
+        a model emitting `[answerWithTable, answerWithTable]` would otherwise burn
+        both chances in a single round-trip, force-block on the second, and
+        finalize — having been given NO re-round at all, with
+        `ENFORCEMENT_EXHAUSTED` written for intents it was never asked twice about.
+        So the second and later refusals in one batch return the same retryable
+        error but do not advance the persisted counter.
+
+        DEGRADE-NEVER-FAIL, same posture as `_force_block_pending_intents`.
+        `claim_finalization_block` is a CAS read-modify-write: it can raise
+        `CASMismatchError` after five lost retries (a concurrent resume racing this
+        turn is enough) or a transient connection error. Both would otherwise
+        propagate out of `_run_loop_body` and abort the turn AT THE MOMENT THE MODEL
+        HAS A FINISHED ANSWER — the worst possible time. In-memory and scripted
+        doubles cannot fail, so the suite is green by construction and this only
+        bites against a real store.
+
+        A FAILED CLAIM IS TREATED AS `False`: the caller force-blocks the surviving
+        intents with `ENFORCEMENT_EXHAUSTED` and finalizes. That records a
+        disposition and ends the turn. Treating it as `True` would grant a re-round
+        whose consumption was never persisted, so the next round-trip would ask the
+        store again, fail again, and re-round again — unbounded, bounded only by the
+        budget window.
+        """
+        if already_refused_this_round:
+            return True
+        try:
+            granted = await self._session_store.claim_finalization_block(
+                session_id, turn_index, window_count
+            )
+        except Exception:
+            _logger.exception(
+                "failed to claim the finalization block (session=%s, turn=%d, "
+                "window=%d) — treating the re-round as unavailable and finalizing",
+                session_id,
+                turn_index,
+                window_count,
+            )
+            # D25: shape-only. All three keys are on
+            # `observability/tracing.py::_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST`, so this
+            # actually reaches Phoenix rather than being a correctly-named span
+            # carrying nothing (README finding 10).
+            self._observer(
+                "loop_finalization_block_claim_failed",
+                {
+                    "turn_index": turn_index,
+                    "window": window_count,
+                    "reason": "store_error",
+                },
+            )
+            return False
+        if granted:
+            self._observer("loop_finalization_block_spent", {"window": window_count})
+        return granted
 
     async def _pause_from_runtime_tool(
         self,
@@ -1601,6 +2076,11 @@ class AgentLoop:
         # on every call in practice, just a credentialed one the first time.
         tools = await self._tools_provider(credentials)
 
+        # The loop's OWN turn index, handed to every runtime tool (03 §C.1). It is
+        # built here, from the parameter `run`/`resume` computed, so no tool ever
+        # re-derives it or reads `app.py`'s explicitly non-load-bearing hint.
+        turn_context = TurnContext(turn_index=turn_index)
+
         # Emulated-discovery injection (context/discovery_emulation.py): emulate
         # `listDatabases`+`listTables` ONCE per budget window, BEFORE the model loop.
         # Both run() and resume() re-enter `_run_loop`, so "once per window" is the
@@ -1661,7 +2141,20 @@ class AgentLoop:
         # `ok` idempotent-read entry of this turn is what lets the guard recognize a
         # repeat it did not itself serve in the current window.
         seen_read_calls: set[tuple[str, str]] = set()
-        for prior_entry in await self._session_store.load_trail(session_id):
+        # ONE read for the trail seed AND the live analysis state (05 §E): the
+        # session doc carries both, and `load_trail` is itself just a read of this
+        # same document, so this is that read — not an extra one.
+        session_doc = await self._session_store.get_or_create_session(session_id)
+        # FINALIZATION ENFORCEMENT reads from HERE (05 §E). The state changes
+        # mid-turn, so a once-per-window read would be wrong — but a store read at
+        # each terminal exit would cost a round-trip on EVERY turn, including the
+        # single-intent ones that never declare a state at all. So it is loaded
+        # once into this window-local and REFRESHED IN PLACE from each
+        # `updateAnalysisState` result below; 03 §E.2's partition guarantees state
+        # calls are dispatched first, so the local is current at both exits, and
+        # the fast path is an `is None` test on a local (`_pending_intents`).
+        analysis_state = live_analysis_state(session_doc, turn_index)
+        for prior_entry in session_doc.tool_trail:
             if (
                 prior_entry.turn_index == turn_index
                 and prior_entry.status == "ok"
@@ -1696,6 +2189,11 @@ class AgentLoop:
         # this turn. Folded from each SUCCESSFUL recordAssumptions call's ARGUMENTS
         # (`_accumulate_assumptions`), read at every `TurnOutcome(...)` return site.
         turn_assumptions: list[str] = list(seed_assumptions) if seed_assumptions else []
+        # The finalization nudge (05 §B.2/§D), ephemeral and NEVER persisted. It
+        # lives EXACTLY ONE ROUND-TRIP: set when an exit-#1 finalization is
+        # refused, spliced into the next rebuild, and cleared immediately after
+        # that rebuild below.
+        finalization_nudge: str | None = None
 
         while True:
             canonical_messages = await self._build_canonical_messages(
@@ -1707,16 +2205,91 @@ class AgentLoop:
                 retrieval_memo=retrieval_memo,
                 withheld_call_ids=withheld_call_ids,
                 discovery_canonical=discovery_canonical,
+                finalization_nudge=finalization_nudge,
             )
+            # ONE ROUND-TRIP ONLY (05 §D). `discovery_canonical` is computed once
+            # per window and re-spliced into every rebuild; copying THAT lifetime
+            # would repeat the nudge forever — including after the intents are
+            # closed — and, because it is ephemeral and sits at the tail, would
+            # migrate it to be the newest message on every rebuild, appearing
+            # after tool results it predates.
+            finalization_nudge = None
             # Set by a SUCCESSFUL answerWithTable in this iteration's batch; drives
             # terminal exit #2 below. Reset per iteration — a designation only ends
             # the turn it was made in.
             designated_answer_text: str | None = None
+            # The window's forced re-round is consumed PER ROUND-TRIP, not per
+            # refused call (05 §C.2) — so a `[answerWithTable, answerWithTable]`
+            # batch is refused twice and advances the persisted counter once. Reset
+            # here, beside `designated_answer_text`, for the same reason.
+            finalization_refused_this_round = False
             self._observer("loop_model_call_start", {"window": window_count})
             result = await model_client.send_turn(canonical_messages, tools)
             last_assistant_text = result.assistant_text
 
-            if not result.tool_calls:
+            # --- FINALIZATION ENFORCEMENT, terminal exit #1 (05 §B.2) ---------
+            #
+            # The model produced prose, not a tool call, so this turn is about to
+            # end `done` — and there is NO ERROR CHANNEL here: nothing to attach a
+            # denial to, because nothing was called. A synthetic tool message
+            # cannot stand alone either (`_assembled_to_canonical` only ever emits
+            # a `tool` message by expanding a trail entry into an
+            # `assistant(tool_calls) + tool` PAIR), and fabricating such a pair —
+            # which discovery emulation legitimately does — would mean naming a
+            # function the model can see in its tools list, re-splicing/deduping/
+            # pinning it on every rebuild, and routing its text through
+            # `classify_denial` anyway, all for something that should live one
+            # round-trip. So the refusal is an EPHEMERAL `user`-role injection.
+            #
+            # NOTHING IS PERSISTED on this path: not the refused answer, not the
+            # nudge. Both are within-turn control flow, and a persisted nudge would
+            # appear in `/session/history` as something the user said.
+            refused_finalization = False
+            # The fast path, and it must stay this cheap: `_pending_intents(None)`
+            # is an `is None` test on a window-local — no store read, on the
+            # overwhelming majority of turns that never declare a state at all.
+            pending_at_exit = _pending_intents(analysis_state) if not result.tool_calls else ()
+            if pending_at_exit:
+                if await self._grant_forced_reround(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    window_count=window_count,
+                    already_refused_this_round=finalization_refused_this_round,
+                ):
+                    finalization_refused_this_round = True
+                    refused_finalization = True
+                    self._observer(
+                        "loop_finalization_refused",
+                        {"exit": "no_tool_calls", "pending_count": len(pending_at_exit)},
+                    )
+                    finalization_nudge = _finalization_nudge(
+                        result.assistant_text, pending_at_exit
+                    )
+                    # CLEAR THE DRAFT. `last_assistant_text` was set above and is
+                    # returned as `assistant_text` on the hard-ceiling and
+                    # budget-cap paths — so a refused, incomplete answer could
+                    # still reach the user there while never appearing in history,
+                    # making live and history disagree on exactly the enforcement
+                    # path.
+                    last_assistant_text = None
+                else:
+                    # The window's one forced re-round is spent and the intents are
+                    # still pending. Record the disposition the runtime CAN
+                    # establish and let finalization proceed — see
+                    # `_force_block_pending_intents` for what the code does and does
+                    # not claim.
+                    analysis_state = await self._force_block_pending_intents(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        state=analysis_state,
+                        reason_code="ENFORCEMENT_EXHAUSTED",
+                    )
+                    self._observer(
+                        "loop_enforcement_exhausted",
+                        {"intent_count": len(pending_at_exit)},
+                    )
+
+            if not result.tool_calls and not refused_finalization:
                 # B1/D44 (2026-07-01 clarification) AND UI Slice 1: the union of
                 # this turn's tool-result provenance — the tag for the final
                 # assistant message (so it is scope re-filtered on replay exactly
@@ -1753,42 +2326,104 @@ class AgentLoop:
                     assumptions=turn_assumptions or None,
                 )
 
-            ask_user_call = next((tc for tc in result.tool_calls if tc.name == "askUser"), None)
-            if ask_user_call is not None:
-                question = str(ask_user_call.arguments.get("question", ""))
-                options = ask_user_call.arguments.get("options")
-                checkpoint = PauseCheckpoint(
-                    reason="askUser",
-                    pending_question={"question": question, "options": options},
-                    awaiting="user_answer",
-                    consumed=False,
-                    budget_window_count=window_count,
-                )
-                await self._session_store.write_pause_checkpoint(session_id, checkpoint)
-                self._observer("loop_paused_ask_user", {"question": question})
-                return TurnOutcome(
-                    status="paused_ask_user",
-                    assistant_text=result.assistant_text,
-                    pending_question=checkpoint.pending_question,
-                    tool_calls_made=tool_calls_made,
-                    # Best-effort partial (§1): whatever succeeded in an earlier
-                    # window of this turn; `provenance` stays `None` (the fail-closed
-                    # union is reused only on the `done` return).
-                    sql_executed=turn_sql or None,
-                    answer_sql=answer_sql,
-                    blueprint_use=blueprint_use,
-                    verification=verification,
-                    assumptions=turn_assumptions or None,
-                )
+            # A REFUSED EXIT-#1 ROUND FALLS THROUGH FROM HERE — deliberately, and
+            # this is what charges it to the budget (05 §C.3). `result.tool_calls`
+            # is empty on that path, so every step between here and
+            # `guard.record_iteration` below is inert: both partitions produce
+            # empty lists, `ask_user_call` is `None`, the dispatch loop body never
+            # runs, and `designated_answer_text` stays `None`. Control therefore
+            # reaches `record_iteration` and the existing hard-ceiling / budget-cap
+            # handling, and only then loops back for the re-round.
+            #
+            # Returning `continue` here instead would make the forced re-round
+            # FREE — no iteration, no tokens — leaving `BudgetGuard.exceeded` able
+            # to trip only on the 60-second wall clock, which every resume
+            # restarts. Anything added below that is NOT inert for an empty
+            # `tool_calls` list must be guarded explicitly.
+
+            # --- analysisState: PARTITION BEFORE CAPPING (03 §E.2) ------------
+            #
+            # `capped_tool_calls = result.tool_calls[:max_tool_calls_per_iteration]`
+            # below SILENTLY DISCARDS the overflow — no error, no trail entry, no
+            # signal to the model. Partitioning the already-capped list would
+            # therefore lose a state call that follows eight substantive ones,
+            # BEFORE any reordering could help, and the turn would run unprotected
+            # with nothing to show for it. So the partition runs on the RAW list
+            # and only the substantive remainder is capped.
+            #
+            # State calls are EXEMPT from `max_tool_calls_per_iteration` but
+            # BOUNDED at `MAX_STATE_CALLS`: unbounded, N state calls in one
+            # response are N full session-doc CAS read-modify-writes and N trail
+            # entries inside `fit_request_to_budget`'s pinned region, with
+            # `guard.exceeded` checked only AFTER each one. Batching is already
+            # mandatory, so the surplus is the model misbehaving and is rejected
+            # (with a trail entry, so it learns) inside the dispatch loop.
+            #
+            # THE EXEMPTION IS BOUNDED ON THE LIST ITSELF, not only on how many are
+            # DISPATCHED. `MAX_STATE_CALLS` caps the state WRITES at two, but every
+            # surplus call still costs a `append_trail_entry` — a full CAS
+            # read-modify-write each, plus an entry pinned in the current-turn budget
+            # region — so a degenerate response with 20 state calls was 18 store
+            # writes in one round-trip, while over-cap `other_calls` are simply
+            # dropped. The first `_MAX_SURPLUS_STATE_REJECTIONS` surplus calls are
+            # still rejected WITH an entry (the model must learn why); the rest are
+            # dropped exactly as over-cap `other_calls` are — no trail entry, no
+            # response for that call id.
+            #
+            # Dispatching them FIRST reinstates the intent of the original
+            # "commit state, then dispatch" barrier in sequential form. That
+            # barrier was dropped along with bounded concurrency, but the
+            # ORDERING guarantee it carried was never the concurrency part.
+            state_calls = [
+                tc for tc in result.tool_calls if tc.name == UPDATE_ANALYSIS_STATE_TOOL_NAME
+            ][: MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS]
+            other_calls = [
+                tc for tc in result.tool_calls if tc.name != UPDATE_ANALYSIS_STATE_TOOL_NAME
+            ][: self._max_tool_calls_per_iteration]
+
+            # SCANNED OVER THE RAW LIST, for the same reason the state partition is
+            # (03 §E.2): `other_calls` is TRUNCATED to
+            # `max_tool_calls_per_iteration`, and capping silently discards the
+            # overflow. Selecting the pause from the capped list meant a batch like
+            # `[runQuery, runQuery, askUser]` at cap 2 dispatched both queries and
+            # NEVER ASKED THE USER — the model's clarifying question swallowed by the
+            # runtime, the turn finishing `done` on a question it should have paused
+            # on. Pre-Release-1 this scan ran over `result.tool_calls`; narrowing it
+            # was an unintended consequence of introducing the partition.
+            #
+            # Selecting it here changes nothing about ORDER: `capped_tool_calls`
+            # below still holds only the state calls when a pause is present, so
+            # state is committed first and the pause is honoured after the loop
+            # (03 §E.1) — an `askUser` past the cap now pauses exactly as one before
+            # the cap always did.
+            ask_user_call = next(
+                (tc for tc in result.tool_calls if tc.name == "askUser"), None
+            )
 
             # S3: never dispatch an unbounded number of tool calls from one
             # model response — cap per iteration (RuntimeSettings-configurable,
-            # default 8). Any calls beyond the cap are simply not dispatched
-            # this round (best-partial); nothing is persisted for them, so
-            # they leave no trail entry and are not "silently denied" — the
-            # model just does not see a response for them and may re-request
-            # on the next round-trip if it still wants them.
-            capped_tool_calls = result.tool_calls[: self._max_tool_calls_per_iteration]
+            # default 8), applied to `other_calls` above. Any calls beyond the cap
+            # are simply not dispatched this round (best-partial); nothing is
+            # persisted for them, so they leave no trail entry and are not
+            # "silently denied" — the model just does not see a response for them
+            # and may re-request on the next round-trip if it still wants them.
+            #
+            # E.1: when the response ALSO pauses, only the STATE calls are
+            # dispatched and the pause is honoured below — commit the state, then
+            # pause. `askUser` short-circuits the whole response, so a batch of
+            # `updateAnalysisState` + `askUser` (the natural round-1 shape for
+            # "three asks, one ambiguous") used to discard the state write
+            # entirely: no trail entry, no tool result, and D22 discards the
+            # surrounding free text, so after the resume the model had no record
+            # it ever tried, and "clarification cannot broaden the protected set"
+            # would bite on a set that was never created. Everything OTHER than
+            # the state calls still waits for the resume, exactly as before.
+            capped_tool_calls = (
+                list(state_calls)
+                if ask_user_call is not None
+                else [*state_calls, *other_calls]
+            )
+            state_calls_dispatched = 0
             for tool_call in capped_tool_calls:
                 # Repeated-idempotent-read guard (generalizes D94): the model
                 # re-issued an identical, already-served idempotent read (e.g.
@@ -1859,9 +2494,41 @@ class AgentLoop:
                 # tool that is not wired returns a clean local unavailable error
                 # (§6), never an incoherent MCP unknown-tool denial.
                 handler = self._runtime_tools.get(tool_call.name)
-                if handler is not None:
+                if tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
+                    # 03 §E.2: the cap exemption is BOUNDED. The surplus is
+                    # REJECTED rather than dropped — it gets a trail entry through
+                    # the normal path below, so the model sees why and batches
+                    # next time, instead of silently losing a write.
+                    #
+                    # Only the FIRST `_MAX_SURPLUS_STATE_REJECTIONS` of them reach
+                    # here at all: the partition above truncates `state_calls` to
+                    # `MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS`, so the
+                    # number of store writes a single response can force is fixed,
+                    # not proportional to how many calls the model emitted.
+                    state_calls_dispatched += 1
+                    if state_calls_dispatched > MAX_STATE_CALLS:
+                        tool_result = surplus_state_call_rejected()
+                        self._observer(
+                            "loop_analysis_state_rejected",
+                            {"reason": "surplus_state_call", "intent_count": 0},
+                        )
+                    elif handler is not None:
+                        tool_result = await self._run_runtime_tool(
+                            handler,
+                            tool_call.name,
+                            tool_call.arguments,
+                            credentials,
+                            turn_context,
+                        )
+                    else:  # pragma: no cover - always wired by app.py
+                        tool_result = _runtime_tool_internal_error(tool_call.name)
+                elif handler is not None:
                     tool_result = await self._run_runtime_tool(
-                        handler, tool_call.name, tool_call.arguments, credentials
+                        handler,
+                        tool_call.name,
+                        tool_call.arguments,
+                        credentials,
+                        turn_context,
                     )
                 elif tool_call.name in _RUNTIME_TOOL_UNAVAILABLE_CODE:
                     tool_result = _runtime_tool_unavailable(
@@ -1871,6 +2538,69 @@ class AgentLoop:
                     tool_result = await self._tool_dispatcher.dispatch(
                         tool_call.name, tool_call.arguments, credentials
                     )
+
+                # REFRESH THE ENFORCEMENT LOCAL (05 §E). The state call just wrote
+                # the state and returned it in full, so the local is updated from
+                # the result rather than re-read from the store. A rejected call
+                # (or an unreadable result) leaves the loaded value standing.
+                if tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
+                    refreshed = _refreshed_analysis_state(tool_result, turn_index)
+                    if refreshed is not None:
+                        analysis_state = refreshed
+
+                # --- FINALIZATION ENFORCEMENT, terminal exit #2 (05 §B.1) -----
+                #
+                # A successful `answerWithTable` carrying non-blank prose ENDS the
+                # turn once the batch drains. Refuse it here — BEFORE the trail
+                # entry is written, so the persisted entry IS the refusal — and
+                # crucially BEFORE `_resolve_answer_sql` below, which fires the two
+                # dormant `hooks/answer_table.py` seams: a designation that is
+                # about to be refused must not fire the answer-table lifecycle,
+                # and checking afterwards would also clobber the more actionable
+                # blueprint-not-run message with this one.
+                #
+                # The full terminal condition is mirrored exactly (`ok` + a `dict`
+                # of arguments + non-blank `answer`), because a call that would NOT
+                # have terminated the turn is not a finalization and must not be
+                # refused as one.
+                if (
+                    tool_call.name == ANSWER_TABLE_TOOL_NAME
+                    and tool_result.status == "ok"
+                    and isinstance(tool_call.arguments, dict)
+                    and clean_answer_text(tool_call.arguments.get("answer")) is not None
+                ):
+                    pending_at_answer = _pending_intents(analysis_state)
+                    if pending_at_answer:
+                        if await self._grant_forced_reround(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            window_count=window_count,
+                            already_refused_this_round=finalization_refused_this_round,
+                        ):
+                            finalization_refused_this_round = True
+                            self._observer(
+                                "loop_finalization_refused",
+                                {
+                                    "exit": "answer_with_table",
+                                    "pending_count": len(pending_at_answer),
+                                },
+                            )
+                            # A RETRYABLE error, so the turn continues and the
+                            # batch drains normally: `tool_result` is no longer
+                            # `ok`, so neither `_resolve_answer_sql` below nor the
+                            # terminal-exit check fires for this call.
+                            tool_result = _finalization_blocked(pending_at_answer)
+                        else:
+                            analysis_state = await self._force_block_pending_intents(
+                                session_id=session_id,
+                                turn_index=turn_index,
+                                state=analysis_state,
+                                reason_code="ENFORCEMENT_EXHAUSTED",
+                            )
+                            self._observer(
+                                "loop_enforcement_exhausted",
+                                {"intent_count": len(pending_at_answer)},
+                            )
 
                 # answerWithTable naming a blueprint it never ran: turn the call
                 # into a retryable NUDGE rather than letting it terminate the turn
@@ -2013,6 +2743,38 @@ class AgentLoop:
                 if guard.exceeded:
                     break
 
+            # TERMINATION: pause. Honoured AFTER the state calls above have been
+            # committed (03 §E.1) and BEFORE anything else in the batch is
+            # dispatched — `capped_tool_calls` held only the state calls on this
+            # path, so every other call still waits for the resume exactly as it
+            # always did.
+            if ask_user_call is not None:
+                question = str(ask_user_call.arguments.get("question", ""))
+                options = ask_user_call.arguments.get("options")
+                checkpoint = PauseCheckpoint(
+                    reason="askUser",
+                    pending_question={"question": question, "options": options},
+                    awaiting="user_answer",
+                    consumed=False,
+                    budget_window_count=window_count,
+                )
+                await self._session_store.write_pause_checkpoint(session_id, checkpoint)
+                self._observer("loop_paused_ask_user", {"question": question})
+                return TurnOutcome(
+                    status="paused_ask_user",
+                    assistant_text=result.assistant_text,
+                    pending_question=checkpoint.pending_question,
+                    tool_calls_made=tool_calls_made,
+                    # Best-effort partial (§1): whatever succeeded in an earlier
+                    # window of this turn; `provenance` stays `None` (the fail-closed
+                    # union is reused only on the `done` return).
+                    sql_executed=turn_sql or None,
+                    answer_sql=answer_sql,
+                    blueprint_use=blueprint_use,
+                    verification=verification,
+                    assumptions=turn_assumptions or None,
+                )
+
             # TERMINAL EXIT #2 (answerWithTable). The loop's other exit is a model
             # turn with NO tool calls; this one fires when the model ended the turn
             # THROUGH a tool, carrying its final prose in the call. It is checked
@@ -2057,6 +2819,17 @@ class AgentLoop:
 
             if guard.exceeded:
                 if window_count >= self._max_budget_windows:
+                    # 05 §F: `stopped_hard_ceiling` IS a terminal outcome, so the
+                    # scoped invariant applies — every surviving `pending` intent
+                    # is recorded `BUDGET_EXHAUSTED` before the turn ends. A no-op
+                    # (no write, no telemetry) when there is no live state or
+                    # nothing pending, which is every ordinary turn.
+                    analysis_state = await self._force_block_pending_intents(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        state=analysis_state,
+                        reason_code="BUDGET_EXHAUSTED",
+                    )
                     self._observer("loop_hard_ceiling_stop", {"window": window_count})
                     return TurnOutcome(
                         status="stopped_hard_ceiling",
@@ -2070,6 +2843,25 @@ class AgentLoop:
                         blueprint_use=blueprint_use,
                         verification=verification,
                         assumptions=turn_assumptions or None,
+                    )
+                # 05 §F, fourth forced path: the budget cap reached DURING A
+                # REFUSED ROUND. §C.3 created it — the forced re-round is charged,
+                # so the charge itself can trip the cap, and the model's answer was
+                # refused a moment ago and its nudge (ephemeral) is already gone.
+                #
+                # GATED ON THE REFUSAL, deliberately. An ORDINARY budget-cap pause
+                # is NOT finalization (§G): it returns a non-`done` status with
+                # intents legitimately pending, the user may still answer
+                # "continue", and force-blocking there would write a terminal
+                # disposition onto a turn that is still running. Only the refused
+                # round gets it — and if the user answers "stop" instead, `resume()`
+                # force-blocks with `USER_STOPPED` on its own path.
+                if finalization_refused_this_round:
+                    analysis_state = await self._force_block_pending_intents(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        state=analysis_state,
+                        reason_code="BUDGET_EXHAUSTED",
                     )
                 checkpoint = PauseCheckpoint(
                     reason="budget_cap",
@@ -2104,5 +2896,6 @@ __all__ = [
     "EmulatedDiscoveryProvider",
     "RuntimeTool",
     "ToolsProvider",
+    "TurnContext",
     "TurnOutcome",
 ]

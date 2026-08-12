@@ -5,7 +5,14 @@ from __future__ import annotations
 import pytest
 
 from data_agent.runtime.session.memory_store import InMemorySessionStore
-from data_agent.runtime.session.models import PauseCheckpoint, TrailEntry, TurnMessage
+from data_agent.runtime.session.models import (
+    AnalysisState,
+    PauseCheckpoint,
+    TrackedIntent,
+    TrailEntry,
+    TurnMessage,
+    live_analysis_state,
+)
 from data_agent.runtime.session.store import AlreadyConsumedError, CASMismatchError
 
 
@@ -143,3 +150,181 @@ async def test_resume_without_pending_checkpoint_raises(store: InMemorySessionSt
     _, cas = await store.get_session_with_cas("sess-1")
     with pytest.raises(AlreadyConsumedError):
         await store.resume_checkpoint("sess-1", cas, "anything")
+
+
+# --- apply_analysis_state (Release 1, 03 §B) --------------------------------
+
+
+async def test_apply_analysis_state_is_latest_wins_on_one_field(
+    store: InMemorySessionStore,
+) -> None:
+    """Never append-only trail entries: N rounds would put N copies inside the
+    pinned region of `fit_request_to_budget` and reproduce unbounded context
+    growth in structured form."""
+    first = AnalysisState(
+        turn_index=1,
+        intents=(TrackedIntent(intent_id="i1", description="a", status="pending"),),
+    )
+    await store.apply_analysis_state("sess-1", 1, lambda _live: first)
+    second = AnalysisState(
+        turn_index=1,
+        intents=(TrackedIntent(intent_id="i1", description="a", status="completed",
+                               evidence_tool_call_id="call_1"),),
+    )
+    returned = await store.apply_analysis_state("sess-1", 1, lambda _live: second)
+
+    assert returned == second
+    doc = await store.get_or_create_session("sess-1")
+    assert doc.analysis_state == second
+
+
+async def test_the_merge_callback_receives_the_live_state_only(
+    store: InMemorySessionStore,
+) -> None:
+    """`merge` is handed `live_analysis_state(doc, turn_index)`, so a state from
+    another turn arrives as `None` — the callback never has to re-implement the
+    A.1 gate, and cannot forget to."""
+    await store.apply_analysis_state(
+        "sess-1",
+        1,
+        lambda _live: AnalysisState(
+            turn_index=1,
+            intents=(TrackedIntent(intent_id="i1", description="a", status="pending"),),
+        ),
+    )
+    seen: list[AnalysisState | None] = []
+
+    def _merge(live: AnalysisState | None) -> AnalysisState:
+        seen.append(live)
+        return AnalysisState(
+            turn_index=2,
+            intents=(TrackedIntent(intent_id="i1", description="b", status="pending"),),
+        )
+
+    await store.apply_analysis_state("sess-1", 2, _merge)
+    assert seen == [None]
+
+
+async def test_a_raising_merge_leaves_the_document_untouched(
+    store: InMemorySessionStore,
+) -> None:
+    """State-dependent validation runs INSIDE the merge and aborts the write by
+    raising, so a rejected state call persists nothing."""
+    existing = AnalysisState(
+        turn_index=1,
+        intents=(TrackedIntent(intent_id="i1", description="a", status="pending"),),
+    )
+    await store.apply_analysis_state("sess-1", 1, lambda _live: existing)
+
+    def _boom(_live: AnalysisState | None) -> AnalysisState:
+        raise ValueError("rejected")
+
+    with pytest.raises(ValueError, match="rejected"):
+        await store.apply_analysis_state("sess-1", 1, _boom)
+
+    doc = await store.get_or_create_session("sess-1")
+    assert doc.analysis_state == existing
+
+
+async def test_analysis_state_survives_a_pause_and_resume(
+    store: InMemorySessionStore,
+) -> None:
+    """`turn_index`, not the budget window, is the unit — so the state a turn
+    declared before an `askUser` pause still governs the same turn after it."""
+    await store.append_message(
+        "sess-1", TurnMessage(turn_index=3, role="user", content="two things", ts="t0")
+    )
+    await store.apply_analysis_state(
+        "sess-1",
+        3,
+        lambda _live: AnalysisState(
+            turn_index=3,
+            intents=(TrackedIntent(intent_id="i1", description="a", status="pending"),),
+        ),
+    )
+    await store.write_pause_checkpoint(
+        "sess-1",
+        PauseCheckpoint(
+            reason="askUser",
+            pending_question={"question": "which?", "options": None},
+            awaiting="user_answer",
+            consumed=False,
+            budget_window_count=1,
+        ),
+    )
+    _, cas = await store.get_session_with_cas("sess-1")
+    resumed = await store.resume_checkpoint("sess-1", cas, "the sales department")
+
+    assert live_analysis_state(resumed, 3) is not None
+    assert live_analysis_state(resumed, 4) is None
+
+
+# --- claim_finalization_block (Release 1, 05 §C.1) --------------------------
+
+
+async def test_the_finalization_block_is_claimable_once_per_window(
+    store: InMemorySessionStore,
+) -> None:
+    """"One forced re-round per budget window" is LITERAL: the counter is keyed by
+    (turn, window) on the session doc, so it survives the `_run_loop_body` re-entry
+    that every resume performs while `window_count` stands still."""
+    assert await store.claim_finalization_block("sess-1", 0, 1) is True
+    assert await store.claim_finalization_block("sess-1", 0, 1) is False
+    assert await store.claim_finalization_block("sess-1", 0, 1) is False
+
+    doc = await store.get_or_create_session("sess-1")
+    assert doc.finalization_blocks == {"0:1": 1}
+
+
+async def test_a_fresh_budget_window_gets_its_own_block(
+    store: InMemorySessionStore,
+) -> None:
+    """A budget-cap "continue" grants a new window (D55), and with it a new
+    allowance."""
+    assert await store.claim_finalization_block("sess-1", 0, 1) is True
+    assert await store.claim_finalization_block("sess-1", 0, 2) is True
+    assert await store.claim_finalization_block("sess-1", 0, 2) is False
+
+    doc = await store.get_or_create_session("sess-1")
+    assert doc.finalization_blocks == {"0:1": 1, "0:2": 1}
+
+
+async def test_a_fresh_turn_gets_its_own_block_at_the_same_window_number(
+    store: InMemorySessionStore,
+) -> None:
+    """The reason the key carries the turn index. `AgentLoop.run` starts EVERY
+    external turn at `window_count=1` while this map persists for the whole session
+    and is never cleared, so a window-only key made turn 1's window 1 collide with
+    turn 0's — killing the forced re-round from a session's second block-spending
+    turn onward."""
+    assert await store.claim_finalization_block("sess-1", 0, 1) is True
+    assert await store.claim_finalization_block("sess-1", 0, 1) is False
+
+    assert await store.claim_finalization_block("sess-1", 1, 1) is True
+    assert await store.claim_finalization_block("sess-1", 1, 1) is False
+
+    doc = await store.get_or_create_session("sess-1")
+    assert doc.finalization_blocks == {"0:1": 1, "1:1": 1}
+
+
+async def test_the_block_counter_survives_a_pause_and_resume(
+    store: InMemorySessionStore,
+) -> None:
+    """The whole reason it is persisted: an exit-#1 refusal leaves NO trail entry
+    by design, so a resume cannot reconstruct it from the trail."""
+    await store.claim_finalization_block("sess-1", 0, 1)
+    await store.write_pause_checkpoint(
+        "sess-1",
+        PauseCheckpoint(
+            reason="askUser",
+            pending_question={"question": "which?", "options": None},
+            awaiting="user_answer",
+            consumed=False,
+            budget_window_count=1,
+        ),
+    )
+    _, cas = await store.get_session_with_cas("sess-1")
+    resumed = await store.resume_checkpoint("sess-1", cas, "an answer")
+
+    assert resumed.finalization_blocks == {"0:1": 1}
+    assert await store.claim_finalization_block("sess-1", 0, 1) is False

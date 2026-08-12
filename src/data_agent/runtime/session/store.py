@@ -20,9 +20,10 @@ CAS / exactly-once resume (D45):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol
 
-from .models import PauseCheckpoint, SessionDoc, TrailEntry, TurnMessage
+from .models import AnalysisState, PauseCheckpoint, SessionDoc, TrailEntry, TurnMessage
 
 
 class AlreadyConsumedError(Exception):
@@ -87,6 +88,64 @@ class SessionStore(Protocol):
 
     async def write_pause_checkpoint(self, session_id: str, checkpoint: PauseCheckpoint) -> None:
         """Set a new pause checkpoint (unconditional write — pause creation, not resume)."""
+        ...
+
+    async def apply_analysis_state(
+        self,
+        session_id: str,
+        turn_index: int,
+        merge: Callable[[AnalysisState | None], AnalysisState],
+    ) -> AnalysisState:
+        """Read-modify-write the turn's `analysis_state`, returning the new value.
+
+        Takes the MERGE, not the result (03 §B.1). `_mutate_with_cas_retry`
+        documents its precondition plainly: the callback "may be called more than
+        once (once per retry) against a freshly re-read document, so it must not
+        carry any state of its own across calls". A caller that loads the state,
+        computes a merged `AnalysisState`, and hands that OBJECT to a `setattr`
+        callback breaks exactly that: on a CAS conflict the callback re-runs
+        against a fresh doc but writes a value derived from the STALE read,
+        clobbering the winner — the lost-update class the helper exists to
+        prevent. Passing the merge instead means the recomputation happens
+        against whatever the retry actually read.
+
+        *merge* receives the LIVE state (`live_analysis_state`, so `None` when
+        absent OR from another turn) and returns the state to persist. It runs
+        INSIDE the retry, so it is the right place for validation that depends on
+        the current state (mode, known ids, block-evidence distinctness): raising
+        from it aborts the write with nothing persisted. Validation that depends
+        only on the payload or on the trail belongs OUTSIDE, before the call.
+        """
+        ...
+
+    async def claim_finalization_block(
+        self, session_id: str, turn_index: int, window_count: int
+    ) -> bool:
+        """Claim THE forced finalization re-round for (*turn_index*, *window_count*)
+        (05 §C.1).
+
+        Returns `True` when this caller got it, `False` when that turn-and-window's
+        allowance (`MAX_FINALIZATION_BLOCKS_PER_WINDOW`) is already spent.
+
+        IT MUST BE PERSISTED, and that is the whole reason this method exists. A
+        counter local to `_run_loop_body` does NOT give "per window": that
+        function is re-entered once per `run()` AND once per resume of any kind —
+        an `askUser` resume and a `_resume_blueprint` both keep `window_count`
+        unchanged — so a local counter resets on every resume while the window
+        number stands still, and forced re-rounds become unbounded (user-paced,
+        but unbounded). An exit-#1 refusal leaves NO persisted artifact by design
+        (05 §B.2), so it cannot be reconstructed from the trail either.
+
+        Keyed by (TURN, WINDOW) on `SessionDoc.finalization_blocks` (`{"0:2": 1}`,
+        via `models.finalization_block_key`) so "one per budget window" is literal
+        WITHIN a turn, and NOT on `AnalysisState`, which is model-writable and
+        unknown-key-rejecting.
+
+        THE TURN INDEX IS NOT DECORATION. `window_count` restarts at 1 for every
+        external turn while this map persists on the document and is never cleared,
+        so a window-only key silently killed the whole mechanism from a session's
+        second block-spending turn onward — see `finalization_block_key`.
+        """
         ...
 
     async def get_session_with_cas(self, session_id: str) -> tuple[SessionDoc, Any]:

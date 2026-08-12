@@ -1,0 +1,67 @@
+# A1 case 10 — an abandoned pause, then an unrelated new turn (07 §D). Did not
+# exist in the draft.
+#
+# Turn 0 is multi-intent, pauses on `askUser`, and is NEVER resumed. Turn 1 asks
+# something else entirely. Without `live_analysis_state` (03 §A.1) turn 1 would
+# begin with turn 0's `pending` intents on the doc: enforcement would refuse an
+# unrelated single-intent turn, burn its nudge, and write `ENFORCEMENT_EXHAUSTED`
+# onto TURN 0's intents — corrupting the abandoned turn's record and emitting
+# bogus telemetry for the live one.
+#
+# It is also the case that makes 07 §E.1's SCOPING necessary rather than
+# pedantic: turn 0 legitimately ends with `pending` intents, and an unscoped
+# "no intent ends pending" assertion fails against it — and against any real
+# store, for the same reason.
+#
+# `ground_truth` describes the FIRST question (the multi-intent one); turn 1 is
+# single-intent by construction.
+id: case-10-abandoned-pause-new-turn
+question: Give me headcount by department and average salary by department.
+ground_truth:
+  multi_intent: true
+  intent_count: 2
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.annual_salary
+corpus:
+  - bp-active-headcount-by-department
+embedding:
+  Give me headcount by department and average salary by department.: [1.0, 0.0]
+  How many people work here in total?: [1.0, 0.0]
+mcp_tools: [runQuery]
+mcp_script:
+  runQuery:
+    - columns: [total]
+      rows: [[7]]
+      row_count: 1
+      truncated: false
+requests:
+  - {kind: turn, message: "Give me headcount by department and average salary by department."}
+  - {kind: turn, message: "How many people work here in total?"}
+model_script:
+  # Turn 0, round 1 — state committed, then paused. Never resumed.
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: Headcount by department
+            - description: Average salary by department
+      - name: askUser
+        id: u1
+        args:
+          question: Which department field should I group by?
+          options: [department_name, department_code]
+  # Turn 1, round 1 — a plain single-intent question, no state at all.
+  - tool_calls:
+      - name: runQuery
+        id: q1
+        args:
+          sql: SELECT count() AS total FROM dbpcm_warehouse.employee
+  # Turn 1, round 2 — finalizes on prose (terminal exit #1).
+  - assistant_text: There are 7 people in total.
+expect:
+  intents_terminal: 0
+  re_derivation: false

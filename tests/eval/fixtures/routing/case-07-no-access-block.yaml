@@ -1,0 +1,72 @@
+# A1 case 7 — a NO_ACCESS block, end to end (07 §D). Did not exist in the draft.
+#
+# The `column_scope` here is NARROWED to `bp-hires-projection`'s footprint, and it
+# does two DIFFERENT things:
+#
+#   1. IN-PROCESS — blueprint recall pre-filters on `uses ⊆ scope`, so
+#      `bp-average-salary-by-department` is dropped from the pre-injected block
+#      even though the corpus contains it. The test asserts that difference.
+#   2. AT THE MCP — query-time column-scope enforcement lives in `clickhouse-api`,
+#      not in the runtime (`RuntimeCredentials.column_scope` empty means ALLOW-ALL
+#      for execution). So the denial is SCRIPTED as the `MCPToolError` the real
+#      server raises. There is no in-process path that turns a narrow scope into a
+#      denied `runQuery` on its own.
+#
+# The dispatcher maps that error to `status="denied"` + `COLUMN_SCOPE_VIOLATION`,
+# which is what `validate_block_evidence` requires for `NO_ACCESS`.
+id: case-07-no-access-block
+question: Give me the projected hires over the next 6 months and the average salary by department.
+ground_truth:
+  multi_intent: true
+  intent_count: 2
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.most_recent_hire_date
+  - dbpcm_warehouse.employee.employee_status
+corpus:
+  - bp-hires-projection
+  - bp-average-salary-by-department
+embedding:
+  Give me the projected hires over the next 6 months and the average salary by department.: [1.0, 0.0]
+mcp_tools: [runQuery]
+mcp_script:
+  runQuery:
+    - columns: [hires_in_window, avg_monthly_hires, projected_next_n_hires]
+      rows: [[12, 2.0, 12]]
+      row_count: 1
+      truncated: false
+    - error:
+        code: COLUMN_SCOPE_VIOLATION
+        message: "[COLUMN_SCOPE_VIOLATION] annual_salary is not in this caller's column scope."
+model_script:
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: Projected hires over the next 6 months
+            - description: Average salary by department
+      - name: runBlueprint
+        id: b1
+        serves_intent: i1
+        args: {id: bp-hires-projection, slot_bindings: {window_months: 6, horizon_months: 6}}
+      - name: runQuery
+        id: q1
+        serves_intent: i2
+        args:
+          sql: SELECT department_name, avg(annual_salary) FROM dbpcm_warehouse.employee GROUP BY department_name
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s2
+        args:
+          intents:
+            - {intent_id: i1, status: completed, evidence_tool_call_id: b1}
+            - {intent_id: i2, status: blocked, reason_code: NO_ACCESS, evidence_tool_call_id: q1}
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: We project about 12 hires; I could not read salary, so I cannot give the salary breakdown.
+          sql: SELECT 1
+expect:
+  intents_terminal: 2
+  re_derivation: false

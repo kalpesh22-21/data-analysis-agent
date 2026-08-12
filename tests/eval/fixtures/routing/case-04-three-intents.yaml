@@ -1,0 +1,93 @@
+# A1 case 4 — three intents, none silently dropped (07 §D).
+#
+# Round 2 deliberately updates ONE intent of three. That is what tests the actual
+# guarantee: merge-by-id means an intent the model simply stops mentioning keeps
+# its previous disposition, so the state returned by that call still carries
+# THREE intents. A "full replace" shape would let the model answer two of three
+# and finalize cleanly, which is the evasion 03 §C.4 closes.
+id: case-04-three-intents
+question: Give me headcount by department, average salary by department, and the hires we should expect over the next 6 months.
+ground_truth:
+  multi_intent: true
+  intent_count: 3
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.annual_salary
+  - dbpcm_warehouse.employee.most_recent_hire_date
+corpus:
+  - bp-active-headcount-by-department
+  - bp-average-salary-by-department
+  - bp-hires-projection
+embedding:
+  Give me headcount by department, average salary by department, and the hires we should expect over the next 6 months.: [1.0, 0.0]
+mcp_tools: [runQuery]
+mcp_script:
+  runQuery:
+    # b1 — bp-active-headcount-by-department: node SQL, then the grain probe.
+    - columns: [department, headcount]
+      rows: [[Sales, 4], [Support, 3]]
+      row_count: 2
+      truncated: false
+    - columns: [__bp_n, __bp_d]
+      rows: [[2, 2]]
+      row_count: 1
+      truncated: false
+    # b2 — bp-average-salary-by-department: node SQL, then the grain probe.
+    - columns: [department, avg_salary, headcount]
+      rows: [[Sales, 61000.0, 4], [Support, 52000.0, 3]]
+      row_count: 2
+      truncated: false
+    - columns: [__bp_n, __bp_d]
+      rows: [[2, 2]]
+      row_count: 1
+      truncated: false
+    # b3 — bp-hires-projection: node SQL only (`result_grain: []`).
+    - columns: [hires_in_window, avg_monthly_hires, projected_next_n_hires]
+      rows: [[12, 2.0, 12]]
+      row_count: 1
+      truncated: false
+model_script:
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: Headcount by department
+            - description: Average salary by department
+            - description: Projected hires over the next 6 months
+      - name: runBlueprint
+        id: b1
+        serves_intent: i1
+        args: {id: bp-active-headcount-by-department, slot_bindings: {}}
+      - name: runBlueprint
+        id: b2
+        serves_intent: i2
+        args: {id: bp-average-salary-by-department, slot_bindings: {}}
+      - name: runBlueprint
+        id: b3
+        serves_intent: i3
+        args: {id: bp-hires-projection, slot_bindings: {window_months: 6, horizon_months: 6}}
+  # Only ONE of the three intents is named here.
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s2
+        args:
+          intents:
+            - {intent_id: i1, status: completed, evidence_tool_call_id: b1}
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s3
+        args:
+          intents:
+            - {intent_id: i2, status: completed, evidence_tool_call_id: b2}
+            - {intent_id: i3, status: completed, evidence_tool_call_id: b3}
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: Here are headcount and average salary by department, plus the six-month hiring projection.
+          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+expect:
+  intents_terminal: 3
+  re_derivation: false

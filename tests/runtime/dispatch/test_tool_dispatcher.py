@@ -195,6 +195,103 @@ async def test_small_get_table_schema_is_unchanged_no_marker() -> None:
     assert "_truncated" not in stored
 
 
+def test_over_cap_card_list_drops_whole_tail_cards_not_the_shape() -> None:
+    """The cards-aware branch (release-1 §02 defect B): a `searchBlueprints`
+    result carries no top-level `columns` key, so before this branch existed an
+    over-cap card list fell through to STRINGIFY-and-truncate and the model got a
+    mangled JSON string on the release's primary route. Now whole low-scoring
+    cards are dropped from the tail and the shape is preserved."""
+    from data_agent.runtime.dispatch.tool_dispatcher import _cap_nontabular_result
+
+    result = {
+        "count": 20,
+        "degraded": False,
+        "blueprints": [
+            {"id": f"bp-{i:02d}", "intent": "x" * 300, "score": 1.0 - i / 100}
+            for i in range(20)
+        ],
+    }
+    events: list[tuple[str, dict]] = []
+    capped, truncated = _cap_nontabular_result(
+        result,
+        500,
+        observer=lambda e, p: events.append((e, p)),
+        tool_name="searchBlueprints",
+    )
+
+    assert truncated is True
+    assert isinstance(capped, dict)  # NOT a string
+    kept = capped["blueprints"]
+    assert 0 < len(kept) < 20
+    assert kept == result["blueprints"][: len(kept)]  # head kept, whole, in order
+    assert capped["degraded"] is False  # unrelated siblings ride along untouched
+    # `count` is RECONCILED with what is actually present, and the pre-cap total
+    # moves to `count_total`. Riding the pre-cap `count` along beside a shorter list
+    # left the two signals disagreeing with no way for the model to tell which to
+    # believe.
+    assert capped["count"] == len(kept)
+    assert capped["count_total"] == 20
+    assert f"{20 - len(kept)} lowest-scoring of 20 blueprint cards" in capped["_truncated"]
+    assert len(json.dumps(capped)) // 4 <= 500 * 2  # actually bounded
+    assert events == [
+        (
+            "tool_dispatch_cards_dropped",
+            {
+                "tool_name": "searchBlueprints",
+                "dropped_count": 20 - len(kept),
+                "total_count": 20,
+            },
+        )
+    ]
+
+
+def test_card_list_under_cap_is_returned_unchanged() -> None:
+    """No-regression: under the cap the SAME object comes back, no marker, no
+    event — byte-identical to before the cards branch existed."""
+    from data_agent.runtime.dispatch.tool_dispatcher import _cap_nontabular_result
+
+    result = {"count": 1, "degraded": False, "blueprints": [{"id": "bp-1", "score": 0.9}]}
+    events: list[tuple[str, dict]] = []
+    capped, truncated = _cap_nontabular_result(
+        result, 4_000, observer=lambda e, p: events.append((e, p)), tool_name="searchBlueprints"
+    )
+    assert truncated is False
+    assert capped is result
+    assert events == []
+
+
+def test_over_cap_card_list_smaller_than_one_card_stays_a_dict() -> None:
+    """The degenerate cap: not even the first card fits. The list comes back
+    EMPTY rather than forcing an over-cap card back in (which would reintroduce
+    the unbounded cell the cap exists to prevent) — but it is still a well-formed
+    dict with a list under `blueprints`, and the marker says all N were dropped.
+
+    THE TEXT MUST BE COHERENT AT ZERO. The kept-count phrasing read "the 0 best
+    matches are shown in full", which describes a list the model can act on when
+    there is none, so the zero case has its own sentence."""
+    from data_agent.runtime.dispatch.tool_dispatcher import _cap_nontabular_result
+
+    result = {"count": 3, "blueprints": [{"id": f"bp-{i}", "intent": "x" * 400} for i in range(3)]}
+    capped, truncated = _cap_nontabular_result(result, 1, tool_name="searchBlueprints")
+    assert truncated is True
+    assert capped["blueprints"] == []
+    assert "all 3 blueprint cards were omitted" in capped["_truncated"]
+    assert "best matches are shown in full" not in capped["_truncated"]
+    # ...and the ridden-along count agrees with the empty list it describes.
+    assert capped["count"] == 0
+    assert capped["count_total"] == 3
+
+
+def test_over_cap_dict_with_neither_columns_nor_blueprints_still_stringifies() -> None:
+    """The generic branch is unchanged for every other over-cap shape."""
+    from data_agent.runtime.dispatch.tool_dispatcher import _cap_nontabular_result
+
+    capped, truncated = _cap_nontabular_result({"blob": "x" * 10_000}, 500)
+    assert truncated is True
+    assert isinstance(capped, str)
+    assert capped.endswith("chars omitted]")
+
+
 async def test_observer_is_called_at_each_stage() -> None:
     events: list[tuple[str, dict]] = []
 

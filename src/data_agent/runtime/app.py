@@ -31,7 +31,7 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -44,6 +44,7 @@ from data_agent.runtime.auth.jwt_verify import JWTVerificationError, verify_jwt
 from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
 from data_agent.runtime.catalog.export_client import build_catalog_cache
+from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.composite.record_assumptions import RecordAssumptionsTool
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
@@ -258,6 +259,25 @@ def create_app(
     # which lives on `InMemorySpanExporter`, not the `SpanExporter` base — typing
     # it to the base would force a cast/import at the route for no added safety.
     span_exporter: Any = None,
+    # Additional `ToolObserver`s folded into the per-request observer chain
+    # (Release 1, 07 §B.1). The Layer-4 eval harness reads §06's routing
+    # telemetry, and there was no way in: the chain is built INSIDE the request
+    # handlers below, and SSE is not a fallback (`observability/progress.py`'s
+    # `to_progress_event` drops every event it does not recognise, which is most
+    # of §06's set).
+    #
+    # Without this seam the harness has to hand-assemble an `AgentLoop`,
+    # duplicating `_build_agent_loop` — so Layer 4 would test a runtime that is
+    # not the shipped one and would drift silently. Worse, `ContextAssembler`
+    # takes `base_system_prompt: str | None = None` and the Layer-1 tests run
+    # promptless by default, so a hand-assembled harness can run with NO SYSTEM
+    # PROMPT AT ALL and nothing signals it — disqualifying for a suite whose
+    # purpose is testing the prompt.
+    #
+    # Observers are called for their side effects only and must not raise; they
+    # are appended AFTER the progress emitter and the tracing observer, so a slow
+    # or noisy recorder can never displace either.
+    extra_observers: Sequence[ToolObserver] = (),
 ) -> FastAPI:
     """Build the FastAPI app. All dependencies default to the real
     implementations, sourced from *settings* — pass Layer-1 fakes for any of
@@ -581,11 +601,29 @@ def create_app(
         # an answer it already wrote. The UI pages the designated query itself via
         # `POST /query/page`.
         runtime_tools["answerWithTable"] = AnswerWithTableTool()
+        # `updateAnalysisState` (Release 1, composite/analysis_state.py): ALWAYS
+        # wired — its only dependency is the session store, so it is never subject
+        # to the advertised-but-unwired `RUNTIME_TOOL_UNAVAILABLE` path. Unlike the
+        # two composite tools above it takes `observer` and `tracer` and self-emits
+        # its dispatch events, exactly like the three retrieval read tools below:
+        # `_run_runtime_tool` emits nothing on a composite tool's behalf, so
+        # copying the `RecordAssumptionsTool()` shape would leave the one feature
+        # whose telemetry IS the deliverable completely mute.
+        runtime_tools["updateAnalysisState"] = UpdateAnalysisStateTool(
+            session_store=session_store, observer=observer, tracer=tracer
+        )
         blueprint_executor: BlueprintExecutor | None = None
         if active_retrieval is not None:
             # `disable_redaction` (telemetry-only debug switch) reveals the real
             # `query` free text on these read-tool spans when set; default off
             # keeps the D25-redacted span.
+            #
+            # `max_result_tokens` is the SAME per-result preview cap the dispatcher
+            # takes. It is passed explicitly because `_build_preview` defaults it:
+            # without it these tools were pinned to the 4,000-token default however
+            # the operator configured `max_tool_result_tokens`, and the one shape
+            # that hits the cap is an enriched `searchBlueprints` card list at a
+            # large `k`.
             runtime_tools["searchBlueprints"] = SearchBlueprintsTool(
                 pipeline=active_retrieval,
                 default_k=settings.retrieval_search_default_k,
@@ -594,6 +632,7 @@ def create_app(
                 observer=observer,
                 tracer=tracer,
                 disable_redaction=settings.otlp_disable_redaction,
+                max_result_tokens=settings.max_tool_result_tokens,
             )
             runtime_tools["searchKnowledge"] = SearchKnowledgeTool(
                 pipeline=active_retrieval,
@@ -602,6 +641,7 @@ def create_app(
                 observer=observer,
                 tracer=tracer,
                 disable_redaction=settings.otlp_disable_redaction,
+                max_result_tokens=settings.max_tool_result_tokens,
             )
             runtime_tools["getBlueprint"] = GetBlueprintTool(
                 vector_index=active_retrieval.vector_index,
@@ -609,6 +649,7 @@ def create_app(
                 observer=observer,
                 tracer=tracer,
                 disable_redaction=settings.otlp_disable_redaction,
+                max_result_tokens=settings.max_tool_result_tokens,
             )
             # runBlueprint (runblueprint-design §5, Slice B): the deterministic
             # fast path. Wired ONLY when retrieval is active — it reads the SAME
@@ -734,7 +775,9 @@ def create_app(
         )
         assert x_session_id is not None  # narrowed by _extract_credentials
         emitter = ProgressEmitter()
-        agent_loop = _build_agent_loop(combine_observers(emitter.observe, _tracing_observer))
+        agent_loop = _build_agent_loop(
+            combine_observers(emitter.observe, _tracing_observer, *extra_observers)
+        )
 
         # Best-effort AGENT-span turn index (design §7): a cheap, read-only
         # peek at the next turn_index AgentLoop.run() will itself assign —
@@ -772,7 +815,9 @@ def create_app(
         turn_index_hint = doc.messages[-1].turn_index if doc.messages else 0
 
         emitter = ProgressEmitter()
-        agent_loop = _build_agent_loop(combine_observers(emitter.observe, _tracing_observer))
+        agent_loop = _build_agent_loop(
+            combine_observers(emitter.observe, _tracing_observer, *extra_observers)
+        )
 
         async def _call() -> TurnOutcome:
             with tracing.agent_span(

@@ -52,11 +52,14 @@ separately, which is a larger change than this tool.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
 from data_agent.runtime.session.models import ResultPreview
+
+if TYPE_CHECKING:
+    from data_agent.runtime.loop.agent_loop import TurnContext
 
 TOOL_NAME = "answerWithTable"
 
@@ -142,8 +145,15 @@ class AnswerWithTableTool:
     tool_name = TOOL_NAME
 
     async def run(
-        self, arguments: dict[str, Any], credentials: RuntimeCredentials
+        self,
+        arguments: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn: TurnContext | None = None,
     ) -> ToolResult:
+        # *turn* (03 §C.1): the loop threads its own `TurnContext` to every
+        # runtime tool. This one does not need it — accepted and ignored so the
+        # `RuntimeTool` protocol has ONE signature rather than two shapes the
+        # dispatch site has to tell apart.
         args = arguments if isinstance(arguments, dict) else {}
         answered = clean_answer_text(args.get("answer")) is not None
         designated = (

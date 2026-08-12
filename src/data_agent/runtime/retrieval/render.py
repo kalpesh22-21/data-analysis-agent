@@ -36,10 +36,11 @@ user-memory items. The renderer emits exactly those (sanitised), nothing more.
 
 from __future__ import annotations
 
-import unicodedata
 from typing import Any
 
-from .models import RetrievedContext
+from data_agent.runtime.sanitize import sanitize_text
+
+from .models import RetrievedContext, ThinCard
 
 # Marks the block as retrieved prior-context under the `user` role, so the model
 # reads it as candidate reference material rather than the current question.
@@ -57,25 +58,53 @@ _HEADER = (
 _MAX_FIELD_CHARS = 500
 _MAX_CHUNK_CHARS = 2000
 
-# Whitespace controls collapsed to a single space (so words never merge).
-_WS_CONTROLS = frozenset("\t\n\r\v\f")
+# The sanitiser itself now lives in `runtime/sanitize.py` (Release 1, 03 §D): the
+# `analysisState` context block interpolates MODEL-authored intent descriptions
+# into a model-facing message and needs the identical structural guarantee, so
+# there is ONE implementation rather than two that can drift. This module-local
+# alias keeps every call site below unchanged.
+_sanitize = sanitize_text
 
 
-def _sanitize(text: str, max_chars: int) -> str:
-    """Structurally sanitise one interpolated field (H2): map whitespace
-    controls to spaces, drop other C0/C1 control chars (incl. NUL), collapse
-    runs of whitespace, strip, and cap length. Deterministic."""
-    out: list[str] = []
-    for ch in text:
-        if ch in _WS_CONTROLS:
-            out.append(" ")
-        elif unicodedata.category(ch) == "Cc":  # other control chars incl. \x00
-            continue
-        else:
-            out.append(ch)
-    # Collapse whitespace runs + strip (all remaining whitespace is now spaces).
-    collapsed = " ".join("".join(out).split())
-    return collapsed[:max_chars]
+# Indent for the enrichment sub-lines rendered under a card's bullet.
+_CARD_DETAIL_INDENT = "  "
+
+
+def _card_detail_lines(card: ThinCard) -> list[str]:
+    """Render one card's release-1 §02 enrichment fields as indented sub-lines.
+
+    Every interpolated piece goes through `_sanitize` (H2) for the same reason
+    the intent does: these strings come from the same corpus, so a newline in a
+    slot name, a resolved column or a grain entry could forge a bullet or a fake
+    "## System" section inside the pre-injected block.
+
+    Per-field capping does not bound a CARD, so the slot COLLECTION is capped
+    upstream (`pipeline._MAX_CARD_SLOTS`) and the overflow is rendered here as
+    `(+K more)` — the model must never be told a 12-slot blueprint has 6.
+    """
+    lines: list[str] = []
+    if card.slots:
+        rendered: list[str] = []
+        for slot in card.slots:
+            name = _sanitize(slot.name, _MAX_FIELD_CHARS)
+            slot_type = _sanitize(slot.type, _MAX_FIELD_CHARS)
+            requirement = "required" if slot.required else "optional"
+            qualifier = f"{slot_type}, {requirement}" if slot_type else requirement
+            rendered.append(f"{name} ({qualifier})")
+        more = f" (+{card.slots_omitted} more)" if card.slots_omitted > 0 else ""
+        lines.append(f"{_CARD_DETAIL_INDENT}slots: {', '.join(rendered)}{more}")
+    if card.resolves:
+        # Sorted so the block is byte-identical across a re-derived resume
+        # regardless of the stored map's iteration order (design §6).
+        pairs = "; ".join(
+            f"{_sanitize(term, _MAX_FIELD_CHARS)} -> {_sanitize(column, _MAX_FIELD_CHARS)}"
+            for term, column in sorted(card.resolves.items())
+        )
+        lines.append(f"{_CARD_DETAIL_INDENT}resolves: {pairs}")
+    if card.result_grain:
+        grain = ", ".join(_sanitize(column, _MAX_FIELD_CHARS) for column in card.result_grain)
+        lines.append(f"{_CARD_DETAIL_INDENT}result grain: {grain}")
+    return lines
 
 
 def render_retrieved_context(context: RetrievedContext) -> dict[str, Any] | None:
@@ -99,6 +128,7 @@ def render_retrieved_context(context: RetrievedContext) -> dict[str, Any] | None
             card_id = _sanitize(card.id, _MAX_FIELD_CHARS)
             slots = f" [slots: {slots_text}]" if slots_text else ""
             lines.append(f"- {card_id}: {intent}{slots}")
+            lines.extend(_card_detail_lines(card))
 
     if context.knowledge_hits:
         lines.append("")

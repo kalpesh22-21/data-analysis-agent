@@ -1,0 +1,93 @@
+# A1 case 9 — multi-intent across an `askUser` pause (07 §D). Did not exist in
+# the draft, and with case 10 it is the only coverage of P2's ACTUAL shape: an
+# intent lost BETWEEN rounds.
+#
+# Round 1 is 03 §E.1's exact shape — `updateAnalysisState` + `askUser` in ONE
+# response. `askUser` is scanned for and honoured BEFORE `capped_tool_calls` is
+# even computed, so without the partition the state write is discarded entirely:
+# no trail entry, no tool result, and D22 discards the surrounding free text, so
+# after the resume the model has no record it ever tried. The state must COMMIT
+# BEFORE THE PAUSE.
+#
+# The second half tests 05 §C.1: the forced-re-round counter is PERSISTED, keyed
+# by budget window, so it survives a resume. `_run_loop_body` is re-entered on
+# every resume while `window_count` stands still, so a counter local to that
+# function would reset here and forced re-rounds would be unbounded. Round 3
+# spends the window's one block; round 5 — after a SECOND pause and resume — must
+# find it already spent.
+id: case-09-multi-intent-across-pause
+question: Give me headcount by department and average salary by department.
+ground_truth:
+  multi_intent: true
+  intent_count: 2
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.annual_salary
+corpus:
+  - bp-active-headcount-by-department
+embedding:
+  Give me headcount by department and average salary by department.: [1.0, 0.0]
+mcp_tools: [runQuery]
+mcp_script:
+  runQuery:
+    - columns: [department, headcount]
+      rows: [[Sales, 4], [Support, 3]]
+      row_count: 2
+      truncated: false
+requests:
+  - {kind: turn, message: "Give me headcount by department and average salary by department."}
+  - {kind: resume, answer: "Use the department_name column."}
+  - {kind: resume, answer: "Just give me what you have."}
+model_script:
+  # Round 1 — state + pause in one response (03 §E.1).
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: Headcount by department
+            - description: Average salary by department
+      - name: askUser
+        id: u1
+        args:
+          question: Which department field should I group by?
+          options: [department_name, department_code]
+  # Round 2 — after the first resume.
+  - tool_calls:
+      - name: runQuery
+        id: q1
+        serves_intent: i1
+        args:
+          sql: SELECT department_name AS department, count() AS headcount FROM dbpcm_warehouse.employee GROUP BY department_name
+  # Round 3 — closes i1, then tries to finalize with i2 pending -> REFUSED, and
+  # the window's one forced re-round is SPENT here.
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s2
+        args:
+          intents:
+            - {intent_id: i1, status: completed, evidence_tool_call_id: q1}
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: Sales has 4 and Support 3.
+          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+  # Round 4 — a second pause, so the next attempt arrives across a RESUME.
+  - tool_calls:
+      - name: askUser
+        id: u2
+        args:
+          question: Should I include contractors in the salary average?
+          options: [yes, no]
+  # Round 5 — the counter must still be spent: no second forced re-round.
+  - tool_calls:
+      - name: answerWithTable
+        id: a2
+        args:
+          answer: Sales has 4 and Support 3; I could not produce the salary breakdown.
+          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+expect:
+  intents_terminal: 2
+  re_derivation: false

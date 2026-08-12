@@ -63,7 +63,16 @@ from typing import Any
 from data_agent.runtime.config import RuntimeSettings
 from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
 
-from .models import PauseCheckpoint, SessionDoc, TrailEntry, TurnMessage
+from .models import (
+    MAX_FINALIZATION_BLOCKS_PER_WINDOW,
+    AnalysisState,
+    PauseCheckpoint,
+    SessionDoc,
+    TrailEntry,
+    TurnMessage,
+    finalization_block_key,
+    live_analysis_state,
+)
 from .store import AlreadyConsumedError, CASMismatchError
 
 _MAX_CAS_RETRIES = 5
@@ -254,6 +263,66 @@ class CouchbaseSessionStore(CouchbaseConnectGate):
         await self._mutate_with_cas_retry(
             session_id, lambda doc: setattr(doc, "pause_checkpoint", checkpoint)
         )
+
+    async def apply_analysis_state(
+        self,
+        session_id: str,
+        turn_index: int,
+        merge: Callable[[AnalysisState | None], AnalysisState],
+    ) -> AnalysisState:
+        """Merge-callback read-modify-write of `analysis_state` (03 §B.1).
+
+        *merge* is re-invoked on every CAS retry against the FRESHLY re-read doc,
+        so a concurrent state write cannot be clobbered by a value derived from a
+        stale read. `applied` is reset at the top of each invocation rather than
+        appended across them, so the returned state is always the one that was
+        actually written by the winning attempt.
+        """
+        await self._ensure_connected()
+        applied: list[AnalysisState] = []
+
+        def _mutate(doc: SessionDoc) -> None:
+            applied.clear()
+            new_state = merge(live_analysis_state(doc, turn_index))
+            doc.analysis_state = new_state
+            applied.append(new_state)
+
+        await self._mutate_with_cas_retry(session_id, _mutate)
+        return applied[-1]
+
+    async def claim_finalization_block(
+        self, session_id: str, turn_index: int, window_count: int
+    ) -> bool:
+        """CAS-guarded claim of the (turn, window)'s ONE forced re-round (05 §C.1).
+
+        The check and the increment happen inside the SAME `_mutate_with_cas_retry`
+        callback, so a concurrent claimant cannot also see "unspent": whichever
+        write lands first bumps the count, and the loser's callback re-runs against
+        the freshly re-read doc and returns `False`. `claimed` is reset at the top
+        of each invocation, never appended across retries — the same rule
+        `apply_analysis_state` follows.
+
+        A refused claim still writes (the callback is a no-op but the helper always
+        replaces the doc, bumping `last_activity`). That is a deliberate
+        simplification: one benign write on the exhausted path buys a single
+        atomic code path, and the exhausted path ends the turn anyway.
+        """
+        await self._ensure_connected()
+        claimed: list[bool] = []
+        key = finalization_block_key(turn_index, window_count)
+
+        def _mutate(doc: SessionDoc) -> None:
+            claimed.clear()
+            blocks = dict(doc.finalization_blocks or {})
+            if blocks.get(key, 0) >= MAX_FINALIZATION_BLOCKS_PER_WINDOW:
+                claimed.append(False)
+                return
+            blocks[key] = blocks.get(key, 0) + 1
+            doc.finalization_blocks = blocks
+            claimed.append(True)
+
+        await self._mutate_with_cas_retry(session_id, _mutate)
+        return claimed[-1]
 
     async def get_session_with_cas(self, session_id: str) -> tuple[SessionDoc, Any]:
         await self._ensure_connected()

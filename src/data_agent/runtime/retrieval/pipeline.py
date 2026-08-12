@@ -33,7 +33,14 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from . import scope_filter
-from .models import Candidate, KnowledgeHit, RetrievedContext, ThinCard
+from .models import (
+    Candidate,
+    KnowledgeHit,
+    RetrievedContext,
+    SlotSummary,
+    ThinCard,
+    coerce_result_grain,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -49,6 +56,71 @@ if TYPE_CHECKING:
     Observer = Callable[[str, dict[str, Any]], None]
 
 _logger = logging.getLogger(__name__)
+
+# Max slots projected onto ONE search card (release-1 §02 §Pre-injected cards).
+# `render.py::_sanitize` caps each interpolated FIELD at 500 chars, which bounds
+# every string but NOT the collection: sixteen slots at 500 chars each is bounded
+# per field and unbounded per card, on every one of `k` cards, replayed on every
+# round-trip of the turn. So the COLLECTION is capped here — the one place a card
+# is built — and the overflow COUNT travels on the card as `slots_omitted` so both
+# the renderer and the tool can say "(+K more)" instead of implying the blueprint
+# has only six slots.
+_MAX_CARD_SLOTS = 6
+
+
+def _project_resolves(raw: Any) -> dict[str, str] | None:
+    """Project a decoded `resolves` map onto the card: `{str: str}` entries only.
+
+    `resolves` pins an ambiguous term to a column NAME ("salary" →
+    "annual_salary"), which is the whole routing value — and the reason the
+    search entry's D44 provenance stops being safe-empty (see
+    `retrieval/tools.py::_cards_to_provenance`). Non-string keys/values are
+    dropped; an empty result degrades to `None` so the key is omitted entirely.
+    """
+    if not isinstance(raw, dict):
+        return None
+    projected = {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
+    return projected or None
+
+
+def _project_slots(raw: Any) -> tuple[tuple[SlotSummary, ...] | None, int]:
+    """Project decoded, AUTHORED slots onto the card. Returns `(slots, omitted)`.
+
+    THE enforcement point for the card's slot shape (release-1 §02 change 3).
+    `slots_json` stores the authored `SlotSpec` dicts including `binds_to`
+    (a fully-qualified `database.table.column` path), `enum_values`,
+    `optional_pattern` and numeric bounds. NONE of those may reach a card: they
+    are execution detail `getBlueprint` exists to serve, they would inflate every
+    card in a list of `k`, and `binds_to` is a column identifier that makes the
+    provenance problem strictly worse. Building `SlotSummary` field-by-field —
+    rather than filtering keys out of the raw dict — means a NEW authored slot
+    field is excluded by default instead of leaking until someone notices.
+
+    Fail-soft throughout: a non-list, a non-dict entry, or an entry with no usable
+    `name` is skipped rather than raised on; `required` defaults to True (the
+    `SlotSpec` default) so an unparseable flag never understates the contract.
+    """
+    if not isinstance(raw, list):
+        return None, 0
+    summaries: list[SlotSummary] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        slot_type = entry.get("type")
+        required = entry.get("required", True)
+        summaries.append(
+            SlotSummary(
+                name=name,
+                type=slot_type if isinstance(slot_type, str) else "",
+                required=required if isinstance(required, bool) else True,
+            )
+        )
+    if not summaries:
+        return None, 0
+    return tuple(summaries[:_MAX_CARD_SLOTS]), max(0, len(summaries) - _MAX_CARD_SLOTS)
 
 
 class RetrievalPipeline:
@@ -352,11 +424,28 @@ class RetrievalPipeline:
         return [c for c in candidates if (c.score or 0.0) >= floor]
 
     def _to_thin_card(self, candidate: Candidate) -> ThinCard:
+        """`Candidate` → `ThinCard` — the ONE place a card is built.
+
+        Both the pre-injected block and the `searchBlueprints` tool result flow
+        through here, so an enrichment field that is not projected here is
+        silently dropped everywhere (no error, no test failure) — and a field
+        projected too widely leaks everywhere at once. `status` is deliberately
+        not carried; see the `ThinCard` docstring for why.
+        """
+        payload = candidate.payload
+        slots, slots_omitted = _project_slots(payload.get("slots"))
         return ThinCard(
             id=candidate.id,
-            intent=str(candidate.payload.get("intent", candidate.text)),
-            slots_summary=str(candidate.payload.get("slots_summary", "")),
+            intent=str(payload.get("intent", candidate.text)),
+            slots_summary=str(payload.get("slots_summary", "")),
             score=float(candidate.score or 0.0),
+            resolves=_project_resolves(payload.get("resolves")),
+            slots=slots,
+            result_grain=coerce_result_grain(payload.get("result_grain")),
+            slots_omitted=slots_omitted,
+            # Internal only (never rendered, never serialised): the footprint the
+            # tool unions into the trail entry's D44 provenance.
+            uses=candidate.uses,
         )
 
     def _to_knowledge_hit(self, candidate: Candidate) -> KnowledgeHit:

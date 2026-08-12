@@ -25,11 +25,14 @@ caps.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
 from data_agent.runtime.session.models import ResultPreview
+
+if TYPE_CHECKING:
+    from data_agent.runtime.loop.agent_loop import TurnContext
 
 TOOL_NAME = "recordAssumptions"
 
@@ -101,8 +104,15 @@ class RecordAssumptionsTool:
     tool_name = TOOL_NAME
 
     async def run(
-        self, arguments: dict[str, Any], credentials: RuntimeCredentials
+        self,
+        arguments: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn: TurnContext | None = None,
     ) -> ToolResult:
+        # *turn* (03 §C.1): the loop threads its own `TurnContext` to every
+        # runtime tool. This one does not need it — accepted and ignored so the
+        # `RuntimeTool` protocol has ONE signature rather than two shapes the
+        # dispatch site has to tell apart.
         cleaned = clean_assumptions(
             arguments.get("assumptions") if isinstance(arguments, dict) else None
         )
@@ -145,7 +155,7 @@ class RecordAssumptionsTool:
             # strings out of a LATER turn's context, whose `column_scope` may have
             # narrowed. That rule is real, but provenance is the wrong channel for
             # it — it now lives explicitly in
-            # `context/assembly.py::_is_stale_assumptions_entry`, which drops a
+            # `context/assembly.py::_is_stale_model_text_entry`, which drops a
             # non-current-turn `recordAssumptions` entry by name.
             provenance=frozenset(),
             result_preview=confirmation,

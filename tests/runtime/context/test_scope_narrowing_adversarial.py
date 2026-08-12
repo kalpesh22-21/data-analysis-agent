@@ -56,6 +56,13 @@ async def _assemble(store: InMemorySessionStore, scope: frozenset[str]):
     return await assembler.assemble(SESSION_ID, scope)
 
 
+async def _assemble_at_turn(
+    store: InMemorySessionStore, scope: frozenset[str], *, current_turn_index: int
+):
+    assembler = ContextAssembler(store, history_token_budget=100_000)
+    return await assembler.assemble(SESSION_ID, scope, current_turn_index=current_turn_index)
+
+
 async def test_narrowing_drops_out_of_scope_entries_from_rendered_messages() -> None:
     store = InMemorySessionStore()
     # Persisted (dispatched/authorized) under a WIDE scope covering both tables.
@@ -166,3 +173,77 @@ async def test_progressive_narrowing_sequence_is_deterministic_and_reversible() 
     blob3 = json.dumps(step3.messages, default=str)
     assert "A_MARK" in blob3
     assert "B_MARK" not in blob3
+
+
+async def test_a_prior_turns_analysis_state_trail_entry_is_dropped(monkeypatch) -> None:
+    """THE 03 §D.1 LEAK — the second of two required mechanisms.
+
+    `live_analysis_state` suppresses the rendered STATE BLOCK cross-turn. That is
+    necessary but NOT sufficient: every `updateAnalysisState` call ALSO leaves a
+    `TrailEntry` whose `args` carry the intent descriptions, with `frozenset()`
+    provenance — so `is_entry_in_scope` keeps it under ANY `column_scope`, in
+    EVERY later turn, and `_render_entry` replays those args verbatim plus a
+    `result_preview` the tool's contract requires to hold the full state.
+
+    That is exactly the leak `_is_stale_assumptions_entry` existed to prevent,
+    reproduced for text derived from the user's own question — so the predicate is
+    generalised to a tool SET rather than one hard-coded name. Asserted here under
+    a NARROWED scope, which is the case that matters: the description may name a
+    value ("employees earning above $100,000") derived from a column the caller can
+    no longer see.
+    """
+    store = InMemorySessionStore()
+    leaky = TrailEntry(
+        turn_index=0,
+        tool_call_id="call_state",
+        tool_name="updateAnalysisState",
+        args={"intents": [{"description": "PRIOR_TURN_INTENT_TEXT"}]},
+        status="ok",
+        error_code=None,
+        # Determined-empty, exactly as the tool returns it (03 §C.5) — which is
+        # precisely why the scope filter alone can never drop this entry.
+        provenance=frozenset(),
+        result_preview=ResultPreview(
+            columns=["intent_id", "description", "status"],
+            row_count=1,
+            truncated=False,
+            preview_rows=[["i1", "PRIOR_TURN_INTENT_TEXT", "pending"]],
+        ),
+        result_full_ref=None,
+        ts="2026-08-11T00:00:00+00:00",
+    )
+    await store.append_trail_entry(SESSION_ID, leaky)
+
+    # In its OWN turn it renders normally — the model needs its ids back.
+    same_turn = await _assemble_at_turn(store, frozenset(), current_turn_index=0)
+    assert "PRIOR_TURN_INTENT_TEXT" in json.dumps(same_turn.messages, default=str)
+
+    # On any LATER turn, under any scope including allow-all, it is gone.
+    for scope in (frozenset(), frozenset({f"{_E}.Department"})):
+        later = await _assemble_at_turn(store, scope, current_turn_index=1)
+        blob = json.dumps(later.messages, default=str)
+        assert "PRIOR_TURN_INTENT_TEXT" not in blob, f"leaked under scope={scope!r}"
+        assert "call_state" not in blob  # and it leaves no orphaned tool message
+
+
+async def test_the_prior_turn_drop_covers_record_assumptions_too() -> None:
+    """The predicate was widened, not replaced: the original `recordAssumptions`
+    rule must still hold."""
+    store = InMemorySessionStore()
+    await store.append_trail_entry(
+        SESSION_ID,
+        TrailEntry(
+            turn_index=0,
+            tool_call_id="call_assume",
+            tool_name="recordAssumptions",
+            args={"assumptions": ["ASSUMPTION_TEXT_MARKER"]},
+            status="ok",
+            error_code=None,
+            provenance=frozenset(),
+            result_preview=None,
+            result_full_ref=None,
+            ts="2026-08-11T00:00:00+00:00",
+        ),
+    )
+    later = await _assemble_at_turn(store, frozenset(), current_turn_index=1)
+    assert "ASSUMPTION_TEXT_MARKER" not in json.dumps(later.messages, default=str)

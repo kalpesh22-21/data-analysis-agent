@@ -54,7 +54,20 @@ A second pass over the remaining five found four more of the same class.
 12. **The evidence trail cannot be handed in from the loop.** `_run_loop_body`'s only trail load sits *above* the round-trip loop and is reduced to signatures — a snapshot from there holds nothing from the current window, so every citation would fail as "unknown id" while looking correctly wired. The tool reads the trail itself. → [04](04-evidence-validators.md), [03 §C.1](03-analysis-state.md)
 13. **A scripted model cannot prove routing.** `ScriptedModelClient.send_turn` never reads `messages`, so a suite built on it passes identically against a hostile prompt — and deliverable 01 changes nothing but a string. Resolved by splitting into a scripted runtime-mechanics suite (CI) and a **live-model routing suite that gates the release**. → [07](07-evaluation.md)
 
+## Findings from the code review of the implementation
+
+Four more, found reviewing the shipped code rather than the docs. The first is finding 9's class for the third time.
+
+14. **The finalization refusal was the missed third carrier of finding 9's leak.** It is persisted as an `answerWithTable` entry — `denial_detail` naming every pending intent, `args` holding the refused draft prose, `frozenset()` provenance — so it replayed in every later turn of the session under any since-narrowed scope, telling a later turn to resolve **dead intent ids** with `updateAnalysisState`. `_is_stale_model_text_entry` now matches on error code as well as tool name. **05 §I's recorded rationale was itself inverted** ("the status gate is belt-and-braces; provenance is binding"): the status-gated current-turn exemption is provenance-blind, so `frozenset()` was load-bearing only in the later-turn contexts where the entry should not survive. → [03 §D.1](03-analysis-state.md), [05 §B.1](05-finalization-enforcement.md)
+15. **`finalization_blocks` was keyed by budget window alone**, while `window_count` restarts at 1 on every external turn and the map is never cleared — so the forced re-round was silently dead from a session's second block-spending turn onward, writing `ENFORCEMENT_EXHAUSTED` for intents never asked twice and inflating 07's headline rate. Keyed by `(turn_index, window)`. Finding 6's class, one field over. → [05 §C.1](05-finalization-enforcement.md)
+16. **An `askUser` past the per-iteration cap stopped pausing the turn** — a Release-1 regression: the scan moved onto the *capped* list when the state partition was introduced, and capping silently discards the overflow. The model's clarifying question was swallowed and the turn finished `done`. → [03 §E.2](03-analysis-state.md)
+17. **Two unbounded/uncontained paths.** `claim_finalization_block` could raise out of `_run_loop_body` with the answer in hand (now caught, reported on `loop_finalization_block_claim_failed`, treated as "no re-round"), and surplus `updateAnalysisState` calls each cost a store write with no bound on the list (now bounded at two rejections, then dropped). → [05 §B.1](05-finalization-enforcement.md), [03 §E.2](03-analysis-state.md)
+
 **One finding escalated past the docs, and the Lead has now ruled on it.** Evidence-backed blocking stops the model *asserting* an unfalsifiable reason; it does not stop it *producing* a falsifiable one. `SELECT … WHERE 1=0` yields `REQUIRED_DATA_UNAVAILABLE` — and `NO_ACCESS` costs **one metadata call**: `getTableSchema(<scratch_db>, <anything>)` fails closed with `SCRATCH_SESSION_VIOLATION` without touching data or locking the late-init boundary. Separately, zero rows is *also* how a correct query answers "nobody", so the block predicate fires on honest work.
+
+## Findings from the first live run
+
+18. **`analysisState` was completely non-functional in the real runtime, with the whole suite green.** `SessionStore` has **four** implementations, not two: besides `memory_store` and `couchbase_store`, both launchers wrap the real store in a hand-written `_LazyCouchbaseSessionStore` proxy that re-declares and forwards every method (`acouchbase` connects eagerly and needs a running loop; the launchers build their app at import). Release 1 added `apply_analysis_state` and `claim_finalization_block` to the Protocol; [03 §B](03-analysis-state.md#b-persistence) enumerated *five files* and *two implementations*, so neither proxy was touched. Every `updateAnalysisState` call on the real server raised `AttributeError` → `RUNTIME_TOOL_INTERNAL_ERROR`, and nothing in `tests/` could see it because nothing imports `scripts/`. **This is the same class as findings 6, 9 and 15**: a guard (here, a change list) derived from a hand-enumerated set rather than from what the contract requires. `read_full_result` had already been lost the same way once. Fixed by adding the methods *and* by `tests/runtime/test_launcher_session_store_proxies.py`, which derives the required surface from the Protocol and the proxy population from the source tree, so the next Protocol addition cannot be forgotten in either place. → [03 §B](03-analysis-state.md#b-persistence)
 
 ## The contract
 
@@ -79,8 +92,8 @@ The same reasoning fixes how `ENFORCEMENT_EXHAUSTED` is described. It means **"e
 ## Done criteria for the release
 
 - [ ] All seven deliverables merged, `uv run pytest` green, `uv run ruff check` clean.
-- [ ] `docs/02-tools-and-api.md` corrected: 12 → **15** tools, with `recordAssumptions`, `answerWithTable` and `updateAnalysisState` documented and `answerWithTable`'s terminal-exit behaviour described.
-- [ ] `docs/04-blueprints.md` F2 note corrected (table intermediates are no longer rejected pre-dispatch when a scratch client is wired).
+- [x] `docs/02-tools-and-api.md` corrected: 12 → **15** tools, with `recordAssumptions`, `answerWithTable` and `updateAnalysisState` documented and `answerWithTable`'s terminal-exit behaviour described.
+- [x] `docs/04-blueprints.md` F2 note corrected (table intermediates are no longer rejected pre-dispatch when a scratch client is wired).
 - [ ] `create_app(extra_observers=…)` seam added so the harness drives the shipped composition.
 - [ ] Scripted suite green per-commit; **live-model routing suite built and gating the release**, reported as a pass-rate.
 - [ ] `tests/eval/README.md` states plainly that the scripted suite cannot fail on a bad prompt.

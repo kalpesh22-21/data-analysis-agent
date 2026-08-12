@@ -274,13 +274,12 @@ becomes a **typed literal only** (F1/D10), never string-interpolated.
 
 ## Execution — `runBlueprint(id, slot_bindings)`
 
-> **Status: BUILT (D89, Session 13, Slices A/B/C).** The execution engine, the D56 verify gate, slot
-> filling, D67 `resolve_via`, and mid-DAG approval pause/resume are all built and Layer-1-green (with a
-> Layer-2 live leg green — single- and multi-node **scalar** DAGs execute end-to-end vs real neo4j +
-> ClickHouse-via-MCP). **Honest boundary:** only **scalar-converging** DAGs execute — a
-> table-intermediate DAG is **rejected pre-dispatch** (F2, deferred, gated on a `clickhouse-api`
-> scratch-write surface). Step 4's table branch below is therefore the deferred path; step 4's scalar
-> branch is what ships. See [DECISIONS.md](decisions/DECISIONS.md) D89.
+> **Status: BUILT (D89, Session 13, Slices A/B/C; F2 closed by D93).** The execution engine, the D56
+> verify gate, slot filling, D67 `resolve_via`, and mid-DAG approval pause/resume are all built and
+> Layer-1-green (with a Layer-2 live leg green — single- and multi-node **scalar** DAGs execute
+> end-to-end vs real neo4j + ClickHouse-via-MCP). **Table intermediates now execute too**, via the
+> D93 materialize-and-join path, **when a scratch client is wired** — see step 4 below for the
+> boundary and the degrade. See [DECISIONS.md](decisions/DECISIONS.md) D89.
 
 The model supplies slot values; **the runtime executes the DAG deterministically** (model never
 re-derives the SQL). Steps:
@@ -299,13 +298,44 @@ re-derives the SQL). Steps:
      binds as one escaped literal, on the same D10-safe path as a slot; a scalar-consumed node
      returning `!=1` row / wrong column count / NULL **fails closed** before the consumer runs, since
      D56 only verifies the terminal). *(Reframed from "server-side parameters" at build per D89.)*
-   - **tables (small *or* large)** → write to the **session scratch schema** and `JOIN`. **DEFERRED
-     (F2, D89):** no scratch-write surface exists yet, so a table-intermediate DAG is **rejected
-     pre-dispatch** (scalar-converging DAGs only) — this path is gated on the `clickhouse-api` Track-A
-     surface.
+   - **tables (small *or* large)** → **BUILT (F2, closed by D93).** The producer node's rows are
+     POSTed to the MCP scratch side-channel (`POST /scratch/v1/materialize`, never a model-visible
+     tool), which returns a **session-scoped** table name; the consumer's `scratch.<placeholder>`
+     `FROM`/`JOIN` token is then **AST-rewritten** to that returned name — used **verbatim**, never
+     reconstructed. All of it happens **inside the one `runBlueprint` call**, so it costs no
+     model-facing budget and the model never sees a scratch identifier. Scratch columns are excluded
+     from the persisted provenance footprint (D69/OQ-4) — the warehouse columns the nodes read are
+     already scope-checked at `runQuery` dispatch and are folded into the union as usual.
    (Same scratch infra as external uploads — one mechanism.) This **refines D11** (was size-based
    "small → inline `CTE`/`VALUES`"); inlining untrusted rows as `CTE`/`VALUES` is dropped because it
    violated the D10 "never string-interpolated" boundary.
+
+   **Gated on a wired scratch client.** The path is active only when the runtime holds a
+   `ScratchClient` (`SCRATCH_ENABLED`, default **on**; base URL derived from `MCP_URL`). With none
+   wired, the executor checks for table-consumed nodes **before any node runs** and returns
+   `ExecFailed(RUN_BLUEPRINT_UNSUPPORTED)` — "This blueprint can't run on the fast path yet — answer
+   it with the raw tools (getTableSchema / runQuery)", `retryable=False` → **raw-loop fallback**, a
+   clean and reversible degrade. **Scalar-converging DAGs are unaffected either way.**
+
+   **Every table-intermediate failure is fail-closed to the raw loop, never a partial answer.**
+   `RUN_BLUEPRINT_UNSUPPORTED` is also returned when: the producer returned **no columns**; its
+   result was **truncated** by the MCP's `runQuery` row cap (a partial scratch table would
+   silently under-count the JOIN — the exact wrong-answer class D56 exists to block); it exceeds
+   `SCRATCH_MAX_ROWS` (10,000) or `SCRATCH_MAX_COLUMNS` (256); the materialize endpoint rejects it
+   (server-side cap, bad type, any `ScratchClientError`); or a `table`-output node is consumed
+   downstream **without** a table `consumes` (a shape the loader forbids, guarded here anyway). An
+   **empty** producer result is allowed — an empty scratch table JOINs to nothing, a legitimate
+   "no rows" answer the terminal grain gate still validates. Column types are **inferred** from the
+   returned cells (Bool → Int64 → Float64 → String), and an explicit `toString(...)` cast on a join
+   key is honoured so the scratch column stays `String` and matches a `String` warehouse key.
+   Finally, a consumer whose upstream table is not in the materialized map — which is the case
+   after a **mid-DAG pause and resume**, since the checkpoint rehydrates scalar outputs only —
+   fails closed with `RUN_BLUEPRINT_SLOT_INVALID` rather than JOINing a table that no longer exists.
+
+   Two composite blueprints in the seeded corpus exercise this end-to-end:
+   `bp-earnings-by-department-via-scratch-join` (materialize per-employee earnings, JOIN departments)
+   and `bp-compare-employee-check-detail-two-periods` (two referenced detail runs materialized, then
+   `FULL OUTER JOIN`ed for per-line-item deltas).
 5. **Run each node** in dependency order. Before a node executes, the executor:
    a. evaluates `when` (if present) → on violation apply `abort` / `skip` / `ask`;
    b. handles `requires_approval` (if present) → pause via `askUser`, render `show` outputs, then
@@ -344,6 +374,11 @@ human. The runtime must survive a restart (deploy, crash, autoscale) across that
   reconnected via stored refs on a **best-effort** basis (N8): a pause is user-bounded, so if scratch
   has TTL'd away during a long pause, resume **falls back to a fresh agent loop** rather than failing
   — never a wrong answer. (No hard "scratch TTL ≥ pause window" requirement; the fallback covers it.)
+  **As built:** the checkpoint rehydrates **scalar** outputs only — there is no `scratch_ref` — so a
+  consumer whose upstream table was materialized *before* the pause fails closed with
+  `RUN_BLUEPRINT_SLOT_INVALID` on resume and the raw loop answers. The design intent (reconnect
+  best-effort, degrade never-wrong) holds; the mechanism is "re-run through the raw loop", not a
+  stored ref.
 - **Crash during active (non-paused) compute needs no checkpoint:** the path is read-only and
   idempotent, so the runtime simply **re-runs the whole turn**; orphaned scratch TTLs away.
   **Re-run is the compensation** — there is no write to undo. This is the atomicity story for a DAG
@@ -467,12 +502,12 @@ declared `uses`, table-aware) is enforced at load.
 
 ---
 
-**Status:** BUILT — single-node + scalar-converging DAGs executable (model + execution engine + D56
-verify + slot filling + D67 `resolve_via` + mid-DAG approval pause/resume + lifecycle Locked; Slice-2
-retrieval projection **Locked/built** (D87); full-DAG storage **built + executed** (D89)). **Deferred:**
-table-intermediate DAGs (F2, rejected pre-dispatch — needs a `clickhouse-api` scratch-write surface)
-and the full **authoring-time** static grain gate (D37/D37b, Phase-2 — the runtime D56 gate is the
-launch teeth).
+**Status:** BUILT — single-node, scalar-converging **and** table-intermediate DAGs executable (model +
+execution engine + D56 verify + slot filling + D67 `resolve_via` + mid-DAG approval pause/resume +
+lifecycle Locked; Slice-2 retrieval projection **Locked/built** (D87); full-DAG storage **built +
+executed** (D89); F2 table intermediates **built** via D93 materialize-and-join, gated on a wired
+scratch client and degrading cleanly to the raw loop without one). **Deferred:** the full
+**authoring-time** static grain gate (D37/D37b, Phase-2 — the runtime D56 gate is the launch teeth).
 **Open questions:**
 - **Grain ownership (correctness — proposed D37):** no grain contract today, so a wrong-grain
   blueprint (e.g. `AVG(gross_pay)` over a 1:N `payroll_fact` join, no period filter) passes every

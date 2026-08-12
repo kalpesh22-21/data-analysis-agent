@@ -40,8 +40,13 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from data_agent.runtime.dispatch.denial_mapping import (
+    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
+)
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.retrieval.render import render_retrieved_context
+from data_agent.runtime.sanitize import MAX_FIELD_CHARS, sanitize_text
+from data_agent.runtime.session.models import live_analysis_state
 from data_agent.runtime.session.store import SessionStore
 
 from . import scope_filter
@@ -59,7 +64,7 @@ if TYPE_CHECKING:
 
     from data_agent.runtime.retrieval.models import RetrievedContext
     from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
-    from data_agent.runtime.session.models import TrailEntry, TurnMessage
+    from data_agent.runtime.session.models import AnalysisState, TrailEntry, TurnMessage
 
     Observer = Callable[[str, dict[str, Any]], None]
 
@@ -273,6 +278,40 @@ class ContextAssembler:
                     observer=observer,
                 )
 
+            # 6b. analysisState (Release 1, 03 §D): the live intent ledger,
+            # rendered as ONE `user`-role block IMMEDIATELY BEFORE the current
+            # question — inserted AFTER the retrieval block so it is the last
+            # thing the model reads before the question itself.
+            #
+            # READ FRESH EVERY ROUND-TRIP, from the `doc` this method already
+            # loaded: zero extra store reads, and correct by construction. It is
+            # deliberately NOT threaded like `discovery_canonical`, which is
+            # computed ONCE PER BUDGET WINDOW and reused unchanged; the state
+            # changes WITHIN the window (every `updateAnalysisState` mutates it),
+            # so copying that lifetime would mean the model never sees the ids it
+            # was just assigned — the entire point of the initialize result.
+            #
+            # EPHEMERAL: never appended to `doc.messages`, so it cannot surface in
+            # the `/session/history` transcript as something the user said.
+            #
+            # `live_analysis_state` is what makes a PRIOR turn's state invisible
+            # here. That is necessary but NOT sufficient — the `updateAnalysisState`
+            # TRAIL ENTRY carries the same descriptions in its `args` with
+            # `frozenset()` provenance, so it is dropped separately by
+            # `_is_stale_model_text_entry` below.
+            #
+            # SPLICE SEAM FOR 05: when a finalization nudge is also present, 05
+            # owns the final ordering — locate the question, insert THIS block
+            # immediately before it, then append the nudge at the TAIL. The nudge
+            # must be appended after this insert, or it becomes the last `user`
+            # message and this block lands after the question instead of before it.
+            if current_turn_index is not None:
+                state = live_analysis_state(doc, current_turn_index)
+                if state is not None and state.intents:
+                    messages.insert(
+                        _last_user_index(messages), render_analysis_state_block(state)
+                    )
+
             # 7. base system prompt at index 0 — the SOLE `role:"system"` message.
             # Inserted last so it precedes the interleaved history + retrieval block.
             # As a static constant it keeps `assemble` byte-stable across the D45
@@ -342,7 +381,7 @@ class ContextAssembler:
             )
         }
         for entry in raw_trail:
-            if _is_stale_assumptions_entry(entry, current_turn_index):
+            if _is_stale_model_text_entry(entry, current_turn_index):
                 continue
             if id(entry) in in_scope_ids:
                 items.append(
@@ -487,17 +526,87 @@ def _last_user_index(messages: list[dict[str, Any]]) -> int:
     return len(messages)
 
 
-def _is_stale_assumptions_entry(entry: TrailEntry, current_turn_index: int | None) -> bool:
-    """True for a `recordAssumptions` entry from any turn OTHER than the current one.
+def render_analysis_state_block(state: AnalysisState) -> dict[str, Any]:
+    """Render the live `AnalysisState` as ONE `user`-role message (03 §D).
+
+    `role: "user"` (not `system`) so the base prompt stays the SOLE
+    `role: "system"` message — the head-pin that the total-request fit and the
+    send-seam base-prompt invariant both depend on. Same posture as the retrieval
+    block it sits next to.
+
+    Every `description` is structurally sanitised through the SHARED helper
+    (`runtime/sanitize.py`) before interpolation. This is model-authored text
+    re-entering model context: a newline in a description could otherwise
+    fabricate a bullet, a header, or an instruction line inside this block.
+
+    Deterministic — the same state renders byte-identically, so a D45 rebuild or
+    resume produces the same request.
+    """
+    lines = [
+        "[Analysis state — the deliverables you are tracking for the current question]",
+        "",
+        "Update these with updateAnalysisState as you resolve them. Every intent must "
+        "end completed or blocked before you give your final answer.",
+    ]
+    for intent in state.intents:
+        detail = intent.status
+        if intent.reason_code:
+            detail = f"{detail}: {intent.reason_code}"
+        if intent.evidence_tool_call_id:
+            detail = f"{detail}, evidence {intent.evidence_tool_call_id}"
+        lines.append(
+            f"- {intent.intent_id} [{detail}] "
+            f"{sanitize_text(intent.description, MAX_FIELD_CHARS)}"
+        )
+    return {"role": "user", "content": "\n".join(lines)}
+
+
+# Tools whose persisted `args` carry MODEL-AUTHORED TEXT derived from the user's
+# question. Every such entry is dropped from a LATER turn's replayed context by
+# `_is_stale_model_text_entry` below.
+#
+# `updateAnalysisState` joined `recordAssumptions` here in Release 1, and it is
+# the SECOND of two required mechanisms, not a duplicate of the first:
+# `live_analysis_state` suppresses the rendered STATE BLOCK cross-turn, but every
+# `updateAnalysisState` call ALSO leaves a `TrailEntry` whose `args` carry the
+# intent descriptions with `frozenset()` provenance — so `is_entry_in_scope` keeps
+# it under ANY `column_scope`, in EVERY later turn, and `_render_entry` replays
+# those args verbatim plus a `result_preview` that the tool's own contract
+# requires to contain the full state, descriptions included.
+_STALE_CROSS_TURN_TOOLS = frozenset({"recordAssumptions", "updateAnalysisState"})
+
+# The SAME rule, keyed on the ERROR CODE instead of the tool name — because the
+# third carrier of this text is not a tool of its own. The finalization refusal
+# (05 §B.1) is persisted as an `answerWithTable` entry, and `answerWithTable`
+# cannot join the set above: its SUCCESSFUL entries are the turn's answer and must
+# replay. What must not replay is the REFUSAL specifically, whose `denial_detail`
+# names every pending intent by id and description (`agent_loop::_describe_pending`)
+# and whose `args` carry the refused draft answer prose.
+#
+# This is the THIRD instance of one defect class in this release (README findings
+# 9 and 11). If a fourth model-authored-text channel appears, extend one of these
+# two sets — do not add a third predicate.
+_STALE_CROSS_TURN_ERROR_CODES = frozenset({FINALIZATION_BLOCKED_PENDING_INTENTS_CODE})
+
+
+def _is_stale_model_text_entry(entry: TrailEntry, current_turn_index: int | None) -> bool:
+    """True for a `_STALE_CROSS_TURN_TOOLS` / `_STALE_CROSS_TURN_ERROR_CODES` entry
+    from any turn OTHER than the current one.
 
     Such an entry is dropped from the replayed context — not because its provenance
-    is unknown (it is `frozenset()`, determined-empty: the tool reads no warehouse
-    data, see `composite/record_assumptions.py`), but because its `args` carry the
-    model's plain-English assumption sentences and those must not re-enter model
-    context on a later turn, whose `column_scope` may since have narrowed. The tool
-    contract forbids SQL/codes/column names in an assumption but NOT values, so a
+    is unknown (it is `frozenset()`, determined-empty: these tools read no warehouse
+    data, see `composite/record_assumptions.py`), but because its `args` carry
+    model-authored plain-English text and that must not re-enter model
+    context on a later turn, whose `column_scope` may since have narrowed. The
+    `recordAssumptions` contract forbids SQL/codes/column names in an assumption but
+    NOT values, so a
     sentence like "employees earning above $100,000 were excluded" could outlive the
-    caller's access to the column it was derived from.
+    caller's access to the column it was derived from. An `updateAnalysisState`
+    intent description is text derived from the user's own question and carries the
+    same exposure. The finalization refusal (matched by ERROR CODE, since it is
+    persisted under `answerWithTable`, whose successful entries must keep replaying)
+    carries BOTH: a `denial_detail` naming every pending intent, and the model's
+    refused draft answer in `args`.
 
     This states that rule directly. It was previously encoded by having the tool
     return `None` (UNDETERMINED) provenance so `filter_trail` would fail-closed drop
@@ -505,6 +614,13 @@ def _is_stale_assumptions_entry(entry: TrailEntry, current_turn_index: int | Non
     confirmation with the D94 "result withheld … Do not retry" sentinel on every
     successful call. Provenance answers "what columns did this read"; it is the
     wrong channel for "do not replay this later", so the two are now separate.
+
+    THAT IS ALSO WHY THE REFUSAL KEEPS `frozenset()` PROVENANCE rather than being
+    dropped cross-turn by a `None`. It read no warehouse data, and
+    `agent_loop::_compute_turn_provenance_union` is fail-closed: one `None` in the
+    turn collapses the union, which would tag the turn's OWN final assistant message
+    undetermined and drop the user's answer from every later turn's replay — on
+    exactly the multi-intent turns Release 1 exists to serve.
 
     Dropping the entry cannot orphan a tool message: the assistant `tool_calls` half
     and the `tool` result half are BOTH synthesized from this one entry by
@@ -514,12 +630,16 @@ def _is_stale_assumptions_entry(entry: TrailEntry, current_turn_index: int | Non
     `current_turn_index is None` (a strict replay / Layer-1 assemble with no current
     turn) drops every such entry, which is the same fail-safe direction.
 
-    The RAW trail is untouched, so the paths that legitimately need the assumptions
-    still read them: `agent_loop::_compute_turn_assumptions` (resume seeding) and
-    `session_history::project_history` (the UI's per-turn `assumptions`) both walk
-    the persisted trail, not this rendered context.
+    The RAW trail is untouched, so the paths that legitimately need this text
+    still read them: `agent_loop::_compute_turn_assumptions` (resume seeding),
+    `session_history::project_history` (the UI's per-turn `assumptions`), and the
+    `analysisState` ledger itself (a `SessionDoc` field, not a trail entry) all
+    walk the persisted document, not this rendered context.
     """
-    if entry.tool_name != "recordAssumptions":
+    if (
+        entry.tool_name not in _STALE_CROSS_TURN_TOOLS
+        and entry.error_code not in _STALE_CROSS_TURN_ERROR_CODES
+    ):
         return False
     return current_turn_index is None or entry.turn_index != current_turn_index
 

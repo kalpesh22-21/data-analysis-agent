@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
 
     from data_agent.runtime.auth.credentials import RuntimeCredentials
+    from data_agent.runtime.loop.agent_loop import TurnContext
 
 TOOL_NAME = "runBlueprint"
 
@@ -172,8 +173,15 @@ class RunBlueprintTool:
         self._disable_redaction = disable_redaction
 
     async def run(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn: TurnContext | None = None,
     ) -> ToolResult:
+        # *turn* (03 §C.1): the loop threads its own `TurnContext` to every
+        # runtime tool. This one does not need it — accepted and ignored so the
+        # `RuntimeTool` protocol has ONE signature rather than two shapes the
+        # dispatch site has to tell apart.
         self._observer("tool_dispatch_start", {"tool_name": TOOL_NAME})
         if self._tracer is None:
             result = await self._guarded(model_args, credentials)

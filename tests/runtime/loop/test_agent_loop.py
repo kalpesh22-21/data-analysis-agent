@@ -1311,7 +1311,9 @@ class _StubRuntimeTool:
     def __init__(self) -> None:
         self.calls: list[tuple[dict, RuntimeCredentials]] = []
 
-    async def run(self, model_args: dict, credentials: RuntimeCredentials) -> ToolResult:
+    async def run(
+        self, model_args: dict, credentials: RuntimeCredentials, turn=None
+    ) -> ToolResult:
         self.calls.append((model_args, credentials))
         return ToolResult(
             status="ok",
