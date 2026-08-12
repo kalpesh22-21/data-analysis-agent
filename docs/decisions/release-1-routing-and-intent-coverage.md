@@ -142,6 +142,12 @@ A new nullable field on `SessionDoc`, sibling to `pause_checkpoint` — the exis
 
 ## 6. Evidence rules
 
+> **The Release-1 contract, as approved by the Lead (2026-08-11):**
+>
+> **For every intent the model chooses to track, Release 1 guarantees a recorded, falsifiable terminal disposition. It does not guarantee that every user intent was detected, nor that a model-declared disposition is semantically true.**
+>
+> The two halves are separate problems with separate mechanisms. `analysisState` solves **state loss after detection**; the multi-intent detection-rate metric (07 §E.3) measures whether the model created the state **in the first place**. Neither substitutes for the other.
+
 Two validators. **They are not the same validator**, and reusing one for both is the most likely implementation error here.
 
 ### 6.1 Completion

@@ -170,9 +170,9 @@ Tracked intents reaching a terminal status other than `completed`, **bucketed by
 
 **Fold per `intent_id` final state, not per event.** A single forced block emits *both* `loop_analysis_state_transition` and `loop_intent_force_blocked` (06), so counting events double-counts.
 
-Reading: `NO_ACCESS` is an entitlement story, `REQUIRED_DATA_UNAVAILABLE` a data story, `ENFORCEMENT_EXHAUSTED` the agent failing to finish an ask it accepted — the one that should trend to zero.
+Reading: `NO_ACCESS` is an entitlement story, `REQUIRED_DATA_UNAVAILABLE` a data story, and `ENFORCEMENT_EXHAUSTED` means **enforcement could not establish a disposition** — not that the agent failed, and not that the intent was proved impossible. It should trend down, but it measures *undetermined* outcomes, and a user withdrawing an ask mid-clarification lands there legitimately.
 
-**Two caveats the report must carry.** `ENFORCEMENT_EXHAUSTED` currently also absorbs *user withdrawals* (spec finding 4, open with the Lead). And `REQUIRED_DATA_UNAVAILABLE` fires on any correct query whose answer is legitimately empty (04 §B4), so track `zero_row_block` against `zero_row_completion` — the ratio is the health signal, not the count.
+**One caveat the report must carry.** `REQUIRED_DATA_UNAVAILABLE` fires on any correct query whose answer is legitimately empty (04 §B.4), so track `zero_row_block` against `zero_row_completion` — the ratio is the health signal, not the count.
 
 ### E.3 Multi-intent detection rate
 

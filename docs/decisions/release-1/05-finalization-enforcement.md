@@ -147,6 +147,8 @@ Four runtime-forced paths, each marking every surviving `pending` intent `blocke
 | Hard ceiling | agent_loop.py:2059 | `BUDGET_EXHAUSTED` |
 | Budget-cap resume answered `"stop"` | `resume()`, agent_loop.py:695 | `USER_STOPPED` |
 | Block counter spent, intents still pending | this file | `ENFORCEMENT_EXHAUSTED` |
+
+**`ENFORCEMENT_EXHAUSTED` means "enforcement could not establish a disposition"** — **not** that the system proved the intent impossible (Lead, 2026-08-11). Word it that way in `denial_mapping.py`, in telemetry, and in 07's metric report. Claiming proof would overstate what the runtime knows: zero rows is often a correct answer, and some denial probes cost one metadata call (04 §B.4). A user who withdraws an ask mid-clarification also lands here, and does so legitimately under that reading.
 | Budget cap reached *during* a refused round | via C.3 | `BUDGET_EXHAUSTED` |
 
 **The `"stop"` path returns `done` from inside `resume()`**, before `_run_loop` is ever entered, with `tool_calls_made=0`. It needs its own force-block call; it inherits nothing from the loop body. Apply the §A turn gate there too.

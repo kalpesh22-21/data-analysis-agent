@@ -54,9 +54,15 @@ A second pass over the remaining five found four more of the same class.
 12. **The evidence trail cannot be handed in from the loop.** `_run_loop_body`'s only trail load sits *above* the round-trip loop and is reduced to signatures — a snapshot from there holds nothing from the current window, so every citation would fail as "unknown id" while looking correctly wired. The tool reads the trail itself. → [04](04-evidence-validators.md), [03 §C.1](03-analysis-state.md)
 13. **A scripted model cannot prove routing.** `ScriptedModelClient.send_turn` never reads `messages`, so a suite built on it passes identically against a hostile prompt — and deliverable 01 changes nothing but a string. Resolved by splitting into a scripted runtime-mechanics suite (CI) and a **live-model routing suite that gates the release**. → [07](07-evaluation.md)
 
-**One finding escalates past the docs**, and the second review made it worse. Evidence-backed blocking stops the model *asserting* an unfalsifiable reason; it does not stop it *producing* a falsifiable one. `SELECT … WHERE 1=0` yields `REQUIRED_DATA_UNAVAILABLE` — and `NO_ACCESS` costs **one metadata call**: `getTableSchema(<scratch_db>, <anything>)` fails closed with `SCRATCH_SESSION_VIOLATION` without touching data or locking the late-init boundary. Separately, zero rows is *also* how a correct query answers "nobody", so the block predicate fires on honest work.
+**One finding escalated past the docs, and the Lead has now ruled on it.** Evidence-backed blocking stops the model *asserting* an unfalsifiable reason; it does not stop it *producing* a falsifiable one. `SELECT … WHERE 1=0` yields `REQUIRED_DATA_UNAVAILABLE` — and `NO_ACCESS` costs **one metadata call**: `getTableSchema(<scratch_db>, <anything>)` fails closed with `SCRATCH_SESSION_VIOLATION` without touching data or locking the late-init boundary. Separately, zero rows is *also* how a correct query answers "nobody", so the block predicate fires on honest work.
 
-The guarantee, stated precisely: **every intent the model chooses to track leaves a recorded, falsifiable disposition; nothing guarantees the disposition is true, and nothing forces tracking to exist.** That sentence is what is with the Lead — see [04 §B.5](04-evidence-validators.md).
+## The contract
+
+> **For every intent the model chooses to track, Release 1 guarantees a recorded, falsifiable terminal disposition. It does not guarantee that every user intent was detected, nor that a model-declared disposition is semantically true.**
+
+Approved by the Lead, 2026-08-11. Two separate problems with separate mechanisms: `analysisState` solves **state loss after detection**; the detection-rate metric (07 §E.3) measures whether the model created the state **in the first place**.
+
+The same reasoning fixes how `ENFORCEMENT_EXHAUSTED` is described. It means **"enforcement could not establish a disposition"** — not that the system proved the intent impossible. Evidence that looks mechanical can be semantically ambiguous, so a code claiming proof would overstate what the runtime knows. Word it that way in `denial_mapping.py`, telemetry, and 07's report.
 
 ## Conventions these docs assume
 
@@ -79,5 +85,8 @@ The guarantee, stated precisely: **every intent the model chooses to track leave
 - [ ] Scripted suite green per-commit; **live-model routing suite built and gating the release**, reported as a pass-rate.
 - [ ] `tests/eval/README.md` states plainly that the scripted suite cannot fail on a bad prompt.
 - [ ] No intent ends `pending` **on any turn that reaches a terminal outcome** — asserted at Layer 1/2, not measured. Turns abandoned at a pause, or whose resume loses a CAS race, legitimately leave `pending` state behind and must be excluded, or the assertion fails against any real store.
-- [ ] Four open items resolved before ship, all with the Lead: (a) enforcement exhaustion after a consumed `askUser` pause forcing `USER_DECLINED_CLARIFICATION`; (b) manufactured block evidence as an accepted risk, and the guarantee sentence in 04 §B.5; (c) ⚠ narrowing the model-declarable block codes to two (04 §B.1); (d) ⚠ requiring block evidence to be distinct per intent (04 §B.3).
+- [x] ~~Narrow the model-declarable block codes to two~~ — **approved** 2026-08-11 (04 §B.1).
+- [x] ~~Require block evidence distinct per intent~~ — **approved** 2026-08-11; completion reuse stays allowed (04 §B.3).
+- [x] ~~The guarantee sentence~~ — **approved** and now the contract above (04 §B.5, spec §6).
+- [ ] One open item, and it may already be resolved: whether enforcement exhaustion after a consumed `askUser` pause should force `USER_DECLINED_CLARIFICATION`. The Lead's reframing of `ENFORCEMENT_EXHAUSTED` as *"could not establish a disposition"* makes a user withdrawal a **correct** classification rather than a mislabel, which was the whole basis of the concern. Confirm and close, or add the code.
 - [ ] `01a-prompt-draft.md` written and reviewed — 01 is the only deliverable whose artifact is prose, and the text does not exist yet.

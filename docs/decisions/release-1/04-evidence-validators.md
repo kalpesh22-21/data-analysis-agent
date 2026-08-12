@@ -1,7 +1,7 @@
 # 04 — Evidence Validators
 
 **Spec:** [§6](../release-1-routing-and-intent-coverage.md) · **Size:** M · **Depends on:** 03 · **Blocks:** 05, 07
-**Revised** 2026-08-11 after review — see [§F](#f-review-corrections). Two of the changes need Lead confirmation and are marked ⚠.
+**Revised** 2026-08-11 after review; **both flagged changes approved by the Lead the same day** — see [§F](#f-review-corrections).
 
 Everything the enforcement mechanism guarantees rests here. If these accept weak evidence, the model closes intents it did not answer and the ledger records it as done.
 
@@ -78,14 +78,16 @@ Blocklisting the three runtime codes would let any *future* runtime code become 
 
 ### B.1 The two model-declarable reasons
 
-⚠ **Narrowed on review — needs Lead confirmation.** The draft admitted four codes. Two are gone:
+✅ **Narrowed on review; approved by the Lead.** The draft admitted four codes. Two are gone — *"they are too ambiguous. `DATABASE_NOT_ALLOWED` can mean the model simply chose the wrong database, and `TABLE_NOT_FOUND` can represent either a naming mistake or `sampleRows` obscuring a scope denial. Neither is strong enough to let the model terminate an intent as genuinely blocked."*
 
 | `reason_code` | Predicate on the cited entry |
 |---|---|
 | `NO_ACCESS` | `entry.status != "ok"` **and** `entry.error_code ∈ {COLUMN_SCOPE_VIOLATION, SCRATCH_SESSION_VIOLATION}` |
 | `REQUIRED_DATA_UNAVAILABLE` | `entry.status == "ok"` **and** `entry.error_code != IDEMPOTENT_READ_ALREADY_SERVED` **and** `entry.result_preview is not None` **and** `entry.result_preview.row_count == 0` |
 
-**Why `status != "ok"` and not `status == "denied"`.** The dispatcher sets `denied` for an `MCPToolError` (`tool_dispatcher.py:381`), but the blueprint tool does not: `ExecFailed` becomes `ToolResult(status="error", …)` (`blueprint/tool.py:135`) with the inner code passed through verbatim (`executor.py:394`, `:894`). So a `runBlueprint` that hit `COLUMN_SCOPE_VIOLATION` internally persists `status="error"` — and the draft rejected it. **In a blueprint-first release, the primary route could not produce access evidence.** Keying on the code is safe because the only `ok` entry carrying an `error_code` is the guard marker, which is not in the set.
+**The error code establishes the denial, not the outer status.** Per the Lead: *"a qualifying access failure may arrive as `status="denied"` or `status="error"` when a blueprint propagates the underlying access error."* The non-`ok` gate is a sanity check; the code is what qualifies.
+
+**Why that matters concretely.** The dispatcher sets `denied` for an `MCPToolError` (`tool_dispatcher.py:381`), but the blueprint tool does not: `ExecFailed` becomes `ToolResult(status="error", …)` (`blueprint/tool.py:135`) with the inner code passed through verbatim (`executor.py:394`, `:894`). So a `runBlueprint` that hit `COLUMN_SCOPE_VIOLATION` internally persists `status="error"` — and the draft rejected it. **In a blueprint-first release, the primary route could not produce access evidence.** Keying on the code is safe because the only `ok` entry carrying an `error_code` is the guard marker, which is not in the set.
 
 **Why `DATABASE_NOT_ALLOWED` and `TABLE_NOT_FOUND` were dropped.** The draft excluded `CLICKHOUSE_QUERY_ERROR` and `CARTESIAN_JOIN_FORBIDDEN` as "the model's own mistakes" — but both dropped codes are `retryable=True` in `denial_mapping.py:77-86`, with messages *"Let me check what's accessible"* and *"Let me verify the table name"*. The codebase classifies them in the same bucket. A typo'd table name yielded a valid `REQUIRED_DATA_UNAVAILABLE`, indistinguishable in the ledger from genuine absence. Worse, `TABLE_NOT_FOUND` is also how a *scope* denial surfaces: `clickhouse-api/app/service.py:459` raises it when the caller's column scope hides every column of a `sampleRows` target — recording "the warehouse lacks this" for what is precisely "this user may not see this", inverting the one distinction governance reads.
 
@@ -106,13 +108,15 @@ status == "pending"    ⇒ both absent/None
 
 Test the omitted key, explicit `null`, `""`, and whitespace.
 
-### B.3 ⚠ Block evidence must be distinct per intent
+### B.3 ✅ Block evidence must be distinct per intent — approved
 
 Reuse is right for completion and wrong for blocking. A denial arises from one specific SQL and column set; it asserts nothing about a *different* deliverable.
 
 Cost of exploiting the draft's global reuse rule: one `getTableSchema(<scratch_db>, "x")` ⇒ `SCRATCH_SESSION_VIOLATION` ⇒ mark all eight intents `blocked`/`NO_ACCESS` citing that single id ⇒ finalization proceeds on a fully "evidenced" record.
 
-Require distinctness within a state — purely mechanical, no semantics — and emit `block_evidence_reused`. It does not stop manufacture; it raises the cost from O(1) to O(n) calls and makes bulk-blocking visible instead of hiding it behind a shared id. **Needs Lead confirmation**, since it narrows a rule that was explicitly decided as "reuse allowed".
+Require distinctness within a state — purely mechanical, no semantics — and emit `block_evidence_reused`. It does not stop manufacture; it raises the cost from O(1) to O(n) calls and makes bulk-blocking visible instead of hiding it behind a shared id.
+
+Per the Lead: *"a single denial should not be reusable to close several unrelated intents. Completion evidence may still be reusable where one result genuinely answers multiple asks, but model-declared blocking evidence is one-intent/one-evidence."* So the asymmetry is deliberate — **completion reuse stays allowed** (§A), blocking reuse does not.
 
 ### B.4 Two holes that remain open
 
@@ -126,21 +130,23 @@ Require distinctness within a state — purely mechanical, no semantics — and 
 
 Mechanically indistinguishable from manufacture, so the mitigation is prompt plus measurement: **01** should say an empty result set is `completed` with an explicit "none found" answer, never `blocked`; **06** should count `zero_row_block` against `zero_row_completion`; **07** should include a genuinely-empty case.
 
-### B.5 The honest guarantee
+### B.5 The guarantee
 
-Not "the model cannot evade". Not even quite "cannot silently drop an ask". Precisely:
+> **The Release-1 contract, as approved by the Lead (2026-08-11):**
+>
+> **For every intent the model chooses to track, Release 1 guarantees a recorded, falsifiable terminal disposition. It does not guarantee that every user intent was detected, nor that a model-declared disposition is semantically true.**
+>
+> The two halves are separate problems with separate mechanisms. `analysisState` solves **state loss after detection**; the multi-intent detection-rate metric (07 §E.3) measures whether the model created the state **in the first place**. Neither substitutes for the other.
 
-> Every intent the model **chooses to track** leaves a recorded, falsifiable disposition. Nothing guarantees the disposition is true, and nothing forces tracking to exist.
-
-Both clauses matter. Tracking is opt-in — no live state means no enforcement (05 §A), and a rejected late init leaves the turn *unprotected* by design (03 §E). And `completed` means "cited an `ok` call of the right kind", not "answered": nothing binds evidence to the intent, so an unrelated `runQuery` closes any intent and the user sees the same dropped ask, differing only in that a transition was recorded.
-
-That is the sentence the Lead should be accepting or rejecting.
+Both clauses are load-bearing. Tracking is opt-in — no live state means no enforcement (05 §A), and a rejected late init leaves the turn *unprotected* by design (03 §E). And `completed` means "cited an `ok` call of the right kind", not "answered": nothing binds evidence to the intent, so an unrelated `runQuery` closes any intent and the user sees the same dropped ask, differing only in that a transition was recorded.
 
 ### B.6 The cut reasons
 
 `NO_GROUNDED_SEMANTICS`, `NO_APPLICABLE_TOOL` and `USER_DECLINED_CLARIFICATION` were cut at Lead review: each proved an *attempt* rather than an outcome. **Do not reintroduce** — spec §10 records the rejection.
 
-Consequence, intended: an intent genuinely unanswerable but not *provably* so has no model-declared exit. It stays `pending` and 05's `ENFORCEMENT_EXHAUSTED` terminates it — the runtime records the failure rather than taking the model's word.
+Consequence, intended: an intent genuinely unanswerable but not *provably* so has no model-declared exit. It stays `pending` and 05's `ENFORCEMENT_EXHAUSTED` terminates it.
+
+**Read that code precisely.** Per the Lead: it means *"enforcement could not establish a disposition"* — **not** that the system proved the intent impossible. The escalation findings are why: evidence that looks mechanical can be semantically ambiguous (zero rows is often the correct answer), and some denial probes cost one metadata call. A code that claimed proof would be overstating what the runtime knows.
 
 `NO_APPLICABLE_TOOL` survives as an **inferred** signal: a turn that ran `searchBlueprints` and then completed the intent on `runQuery` evidence fell through to ad-hoc. Derivable from `loop_intent_completed{intent_id, evidence_tool_name}` + `tool_dispatch_ok{tool_name}` — **no fixture knowledge needed, so it works in production too**, not just in the harness.
 
@@ -205,10 +211,10 @@ The two "no raise" rows and the manufactured-evidence rows are the ones a hand-w
 |---|---|---|
 | Trail handed in from the loop | **Read at call time** | The loop's only load is above the round-trip loop and is reduced to signatures — a snapshot has nothing from this window, so every citation failed |
 | `NO_ACCESS` needs `status == "denied"` | **`status != "ok"`** | Blueprint denials surface as `status="error"` with the inner code — the primary route could not produce access evidence |
-| Four model-declarable codes | **Two** ⚠ | `DATABASE_NOT_ALLOWED`/`TABLE_NOT_FOUND` are `retryable=True` — the codebase's own "model got the name wrong" bucket — and `TABLE_NOT_FOUND` is also how a scope denial surfaces from `sampleRows` |
+| Four model-declarable codes | **Two** ✅ *(Lead-approved)* | `DATABASE_NOT_ALLOWED`/`TABLE_NOT_FOUND` are `retryable=True` — the codebase's own "model got the name wrong" bucket — and `TABLE_NOT_FOUND` is also how a scope denial surfaces from `sampleRows` |
 | Runtime codes "must be rejected" | **Allowlist** | Blocklisting makes any future runtime code model-declarable the day it lands |
 | Presence of evidence assumed | **B.2 explicit rule** | Omitting the key bypassed the mechanism entirely |
-| Reuse allowed everywhere | **Distinct for blocking** ⚠ | One `SCRATCH_SESSION_VIOLATION` could block every intent at once |
+| Reuse allowed everywhere | **Distinct for blocking** ✅ *(Lead-approved)* | One `SCRATCH_SESSION_VIOLATION` could block every intent at once |
 | Marker check "must precede" the preview check | **Null test precedes the dereference** | Ordering in an `and` chain is irrelevant; the null test is the safety property, and the draft pointed at the wrong clause |
 | Manufacture = "name an out-of-scope column" | **B.4 three metadata-only routes** | The true price is one `getTableSchema` against the scratch db |
 | Zero rows unremarked | **B.4 named as a distinct hole** | Fires on honest work, not just manufacture; skews coverage on "none found" answers |
