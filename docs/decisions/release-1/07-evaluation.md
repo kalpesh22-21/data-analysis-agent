@@ -166,7 +166,7 @@ Enforcement is *proven* at Layer 1 (05 §H). The eval teardown is a cheap redund
 
 Tracked intents reaching a terminal status other than `completed`, **bucketed by `reason_code`**.
 
-**Derive the buckets from `REASON_CODES`** (03 §A.3), not a hard-coded list — the draft named three of five, omitting `BUDGET_EXHAUSTED` and `USER_STOPPED`, and deriving means 05 §F.2's possible `USER_DECLINED_CLARIFICATION` appears automatically.
+**Derive the buckets from `REASON_CODES`** (03 §A.3), not a hard-coded list — the draft named three of five, omitting `BUDGET_EXHAUSTED` and `USER_STOPPED`. The enum is final for Release 1 at five, but deriving costs nothing and means a later addition cannot silently go uncounted.
 
 **Fold per `intent_id` final state, not per event.** A single forced block emits *both* `loop_analysis_state_transition` and `loop_intent_force_blocked` (06), so counting events double-counts.
 

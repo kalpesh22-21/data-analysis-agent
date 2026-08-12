@@ -72,7 +72,7 @@ if reason_code not in MODEL_REASON_CODES:
     return "reason_code is not one the model may declare"
 ```
 
-Blocklisting the three runtime codes would let any *future* runtime code become model-declarable the day it lands — and 05 §F.2 anticipates exactly that (`USER_DECLINED_CLARIFICATION`). The allowlist also rejects `None`, `""` and unknown strings for free.
+Blocklisting the three runtime codes would let any *future* runtime code become model-declarable the day it lands. The allowlist also rejects `None`, `""` and unknown strings for free. Nothing is queued to be added — the one code that was under consideration is now closed (§C) — which is precisely when a blocklist looks safe and quietly stops being so.
 
 **05's runtime force-block path bypasses this validator entirely.** It writes `BUDGET_EXHAUSTED` / `USER_STOPPED` / `ENFORCEMENT_EXHAUSTED` directly. An implementer routing those through `validate_block_evidence` gets them rejected by the rule above.
 
@@ -154,13 +154,13 @@ Consequence, intended: an intent genuinely unanswerable but not *provably* so ha
 
 ---
 
-## C. Open spec item
+## C. Closed — no fourth runtime code
 
-> At enforcement exhaustion, if the turn contains a consumed `askUser` pause and the intent is still pending, should the runtime force `USER_DECLINED_CLARIFICATION` rather than `ENFORCEMENT_EXHAUSTED`?
+Whether enforcement exhaustion should force `USER_DECLINED_CLARIFICATION` when the turn contains a consumed `askUser` pause was open through two review rounds. **Closed 2026-08-11: it is not added.**
 
-If approved it is a **runtime-forced** code — never model-declarable — so B's allowlist keeps this file unaffected by construction. Only 05's forcing logic and `RUNTIME_REASON_CODES` change.
+The concern it existed for was that a user withdrawing an ask mid-clarification would be recorded as agent failure. The Lead's rewording of `ENFORCEMENT_EXHAUSTED` to *"enforcement could not establish a disposition"* removes the mislabel at the source — for a withdrawal, that description is simply **correct**. A distinct code would add a reason to the enum, a forcing branch to 05, and a bucket to 07's report, to express something the existing code already expresses accurately.
 
----
+`RUNTIME_REASON_CODES` therefore stays at three, `MODEL_REASON_CODES` at two, and this validator is final for Release 1.
 
 ## D. Not a hazard — checked and cleared
 

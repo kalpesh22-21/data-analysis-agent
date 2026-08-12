@@ -169,9 +169,9 @@ So the invariant must be scoped, here and in the README and in 07:
 
 Unscoped, spec §9.2's "mechanically zero" claim and 07's Layer-1/2 assertion produce false failures against any real store.
 
-### F.2 Forward reference
+### F.2 No fourth code
 
-If the Lead approves forcing `USER_DECLINED_CLARIFICATION` when the turn contains a consumed `askUser` pause and the intent is still pending (spec finding 4, open), it lands here as a **fourth runtime-forced code** — never model-declarable, so 04's block validator is unaffected. Additive.
+A fourth runtime-forced code (`USER_DECLINED_CLARIFICATION`, for a turn whose `askUser` pause was answered and whose intent is still pending) was considered through two review rounds and **rejected 2026-08-11**. `ENFORCEMENT_EXHAUSTED` already describes that case accurately once it is read as *"enforcement could not establish a disposition"* rather than as agent failure. `RUNTIME_REASON_CODES` is final at three.
 
 ---
 

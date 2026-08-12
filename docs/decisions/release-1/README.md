@@ -88,5 +88,7 @@ The same reasoning fixes how `ENFORCEMENT_EXHAUSTED` is described. It means **"e
 - [x] ~~Narrow the model-declarable block codes to two~~ — **approved** 2026-08-11 (04 §B.1).
 - [x] ~~Require block evidence distinct per intent~~ — **approved** 2026-08-11; completion reuse stays allowed (04 §B.3).
 - [x] ~~The guarantee sentence~~ — **approved** and now the contract above (04 §B.5, spec §6).
-- [ ] One open item, and it may already be resolved: whether enforcement exhaustion after a consumed `askUser` pause should force `USER_DECLINED_CLARIFICATION`. The Lead's reframing of `ENFORCEMENT_EXHAUSTED` as *"could not establish a disposition"* makes a user withdrawal a **correct** classification rather than a mislabel, which was the whole basis of the concern. Confirm and close, or add the code.
+- [x] ~~Force `USER_DECLINED_CLARIFICATION` after a consumed `askUser` pause~~ — **rejected** 2026-08-11. `ENFORCEMENT_EXHAUSTED`, read as *"could not establish a disposition"*, already describes a user withdrawal accurately. `RUNTIME_REASON_CODES` final at three, `MODEL_REASON_CODES` at two.
+
+**No open design questions remain.** Everything left is implementation.
 - [ ] `01a-prompt-draft.md` written and reviewed — 01 is the only deliverable whose artifact is prose, and the text does not exist yet.
