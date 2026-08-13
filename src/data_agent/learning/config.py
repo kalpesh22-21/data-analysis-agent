@@ -10,6 +10,7 @@ must NOT be frozen behind an `@lru_cache`d settings singleton (see
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 
@@ -501,3 +502,45 @@ def get_learning_settings() -> LearningSettings:
     plain constructor is sufficient; the ONLY runtime-toggled value is
     `LEARNING_ENABLED`, served fresh by `learning_enabled()`."""
     return LearningSettings()
+
+
+def unrecognized_learning_env_vars(environ: dict[str, str] | None = None) -> tuple[str, ...]:
+    """Every `LEARNING_*` variable in *environ* that is NOT a settings field.
+
+    `model_config` sets `extra="ignore"` — required (the process env is full of
+    unrelated variables) and quietly dangerous: a typo'd `LEARNING_MAX_DELIVERES` is
+    accepted, dropped, and the shipped default silently applies. Nothing anywhere
+    reports it, so a knob an operator believes they turned is a knob that does not
+    exist, and the symptom shows up as behaviour nobody can explain.
+
+    Deliberately name-based and prefix-scoped: it can only ever flag a variable that
+    LOOKS like it was meant for this settings surface, so it cannot produce noise about
+    someone else's environment. `LEARNING_ENABLED` is known-good — it is the kill-switch,
+    read by `learning_enabled()` and deliberately absent from the model.
+    """
+    known = {name.upper() for name in LearningSettings.model_fields}
+    known.add("LEARNING_ENABLED")
+    source = os.environ if environ is None else environ
+    return tuple(
+        sorted(
+            name
+            for name in source
+            if name.upper().startswith("LEARNING_") and name.upper() not in known
+        )
+    )
+
+
+def warn_unrecognized_learning_env_vars(logger: logging.Logger) -> tuple[str, ...]:
+    """Log (WARNING) any `LEARNING_*` variable that this settings surface will ignore,
+    and return them. Called once at entrypoint startup — the only moment at which the
+    difference between "configured" and "believed to be configured" is still cheap."""
+    unknown = unrecognized_learning_env_vars()
+    if unknown:
+        logger.warning(
+            "IGNORING %d LEARNING_* environment variable(s) that are not settings "
+            "fields — most likely typos, and each one means the SHIPPED DEFAULT is in "
+            "effect where an override was intended: %s",
+            len(unknown),
+            ", ".join(unknown),
+        )
+    return unknown

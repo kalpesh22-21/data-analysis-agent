@@ -50,7 +50,7 @@ import asyncio
 import logging
 
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
-from data_agent.learning.config import LearningSettings
+from data_agent.learning.config import LearningSettings, warn_unrecognized_learning_env_vars
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
 from data_agent.learning.factory import build_promotion_plane, build_promotion_write_plane
 from data_agent.learning.observability import (
@@ -117,6 +117,9 @@ async def _main() -> int:
         service_name=learning_settings.learning_service_name,
         process="scheduler",
     )
+    # `extra="ignore"` accepts a typo'd LEARNING_* var and silently applies the
+    # default; say which ones this process is ignoring.
+    warn_unrecognized_learning_env_vars(_logger)
 
     candidates_ready = bool(
         learning_settings.learning_candidates_username

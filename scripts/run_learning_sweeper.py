@@ -22,7 +22,7 @@ import argparse
 import asyncio
 import logging
 
-from data_agent.learning.config import LearningSettings
+from data_agent.learning.config import LearningSettings, warn_unrecognized_learning_env_vars
 from data_agent.learning.observability import (
     configure_learning_tracing,
     get_learning_tracer,
@@ -71,6 +71,9 @@ async def _main(argv: list[str] | None = None) -> int:
         service_name=learning_settings.learning_service_name,
         process="sweeper",
     )
+    # `extra="ignore"` accepts a typo'd LEARNING_* var and silently applies the
+    # default; say which ones this process is ignoring.
+    warn_unrecognized_learning_env_vars(_logger)
 
     store = CouchbaseSessionStore(runtime_settings)
     queue = RedisStreamsLearningQueue.from_settings(learning_settings)

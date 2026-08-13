@@ -72,6 +72,7 @@
     FROM dbpcm_warehouse.employee
     WHERE employee_status = 'A' AND department_name = {department}
     GROUP BY department_name
+    ORDER BY headcount
 
 - id: bp-average-salary-by-department
   intent: Average annual salary by department

@@ -42,7 +42,7 @@ from pathlib import Path
 from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
 from data_agent.learning.audit.couchbase_audit_store import CouchbaseAuditStore
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
-from data_agent.learning.config import LearningSettings
+from data_agent.learning.config import LearningSettings, warn_unrecognized_learning_env_vars
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
 from data_agent.learning.extractor.grounding import (
     known_rule_ids_from_catalog,
@@ -91,6 +91,9 @@ async def _main() -> int:
         service_name=learning_settings.learning_service_name,
         process="consumer",
     )
+    # `extra="ignore"` accepts a typo'd LEARNING_* var and silently applies the
+    # default; say which ones this process is ignoring.
+    warn_unrecognized_learning_env_vars(_logger)
 
     store = CouchbaseSessionStore(runtime_settings)
     queue = RedisStreamsLearningQueue.from_settings(learning_settings)
