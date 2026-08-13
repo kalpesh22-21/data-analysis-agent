@@ -122,6 +122,7 @@ from data_agent.runtime.context.assembly import (
 )
 from data_agent.runtime.context.budget import fit_request_to_budget
 from data_agent.runtime.dispatch.denial_mapping import (
+    ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
     FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import (
@@ -647,6 +648,84 @@ def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
             "this turn, so there is no table to show. Call runBlueprint with "
             f"'{blueprint_id}' first, then call answerWithTable again."
         ),
+    )
+
+
+ANSWER_TABLE_EMPTY_DESIGNATION_EVENT = "loop_answer_table_empty_designation"
+
+
+def _answer_table_no_table_designated() -> ToolResult:
+    """The nudge for an `answerWithTable` that designated NOTHING — no `tables`
+    entry carrying a designation and no legacy pair to fold — on a turn that is
+    holding multi-row results it has not tabled.
+
+    WHAT THIS CLOSES, measured on two live-loop probes. `{answer: <prose>,
+    tables: []}` succeeded, carried non-blank prose, and therefore TERMINATED the
+    turn through the exit the 05 §J answer-shape gate does not watch — the gate
+    lives on exit #1 (a model turn with no tool calls) and this is exit #2. The
+    turn returned `done` with no table, no event and no log line: the user asked
+    for a breakdown, held six rows of it, and got prose. Silent in the strongest
+    sense — nothing anywhere reported it.
+
+    That is the SAME failure `_answer_table_blueprint_not_run` exists to stop, one
+    step earlier. There, the model named a table the runtime could not resolve;
+    here it named none at all. 08 §O made the second case likelier rather than
+    rarer: `tables` is now REQUIRED, so a model with nothing to put there must
+    still emit the key, and `tables: []` is exactly what a model that cannot omit a
+    declared key produces.
+
+    WHY IT IS BOUNDED BY THE SHAPE GATE'S OWN ALLOWANCE (`kind="answer_shape"`).
+    This is the same complaint the shape gate makes — *you are finishing without
+    presenting a table you are holding* — arriving through the other exit, so the
+    two must share one bound or a model could be refused twice per window for one
+    mistake. When the grant is spent the prose PASSES and the turn ends: the
+    runtime records what it can and never hard-locks a turn, the posture
+    `ENFORCEMENT_EXHAUSTED` takes for intents.
+
+    WHY IT IS SCOPED TO `multi_row_answer_calls > 0`. A turn holding no multi-row
+    result has nothing to table, and an `answerWithTable` with no table on such a
+    turn is odd but harmless — a zero-row "none found" answered in prose is
+    CORRECT, and live q6 is that case. Nudging it would charge a right answer an
+    extra round-trip and tell the model to grid a number, which is the
+    false-positive half 05 §J is most exposed to.
+
+    AND TO A NON-BLANK `answer`, mirroring the terminal condition exactly. A call
+    that would not have ended the turn is not a finalization and must not be refused
+    as one — the rule the pending-intents refusal already follows at this exit. A
+    blank-`answer` empty call terminates nothing, so nothing is silently lost;
+    refusing it would spend this window's allowance on a habit call and leave the
+    real prose finish that follows unrefusable. THAT case is covered at the other
+    end, by `answer_table_succeeded` being set from substance rather than from the
+    call — the two fixes are halves of one defect and neither is sufficient alone.
+
+    Mirrors `_answer_table_blueprint_not_run` in every mechanical respect: non-`ok`
+    so the terminal exit does not fire and `filter_trail`'s status-gated
+    current-turn exemption keeps it visible this same turn; `denial_detail` because
+    that is the channel `context/budget.py::_render_entry` actually reads;
+    registered in `dispatch/denial_mapping.py` because `classify_denial` otherwise
+    degrades to "Something went wrong processing that request."
+    """
+    detail = (
+        "Your answerWithTable named no table, so there is nothing for the user to "
+        "look at. Every table goes in `tables`, one entry per part of your answer: "
+        "`tables: [{sql: \"SELECT …\"}]` for a query you wrote, or "
+        "`tables: [{blueprint_id: \"bp-…\"}]` for a blueprint you ran this turn. "
+        "Send your answer again with the table in it."
+    )
+    return ToolResult(
+        status="error",
+        tool_name=ANSWER_TABLE_TOOL_NAME,
+        error_code=ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
+        retryable=True,
+        user_message=detail,
+        # Determined-EMPTY, like every other runtime-authored refusal here: this
+        # reads no warehouse data, and `_compute_turn_provenance_union` is
+        # fail-closed, so `None` would collapse the turn's union and drop the
+        # user's own answer from every later replay.
+        provenance=frozenset(),
+        result_preview=None,
+        result_full=None,
+        denial_detail=detail,
     )
 
 
@@ -1738,6 +1817,13 @@ class AgentLoop:
         blueprint-answered turn that paused lost its table on resume, in exactly the
         case the blueprint path exists for.
 
+        AND BOTH ARGUMENT SHAPES, which is a second thing. Persisted entries written
+        before 08 §O carry `{"sql": …}` / `{"blueprint_id": …}` at the TOP LEVEL and
+        no `tables` key at all. `resolve_designations` folds that shape in, so this
+        seed keeps working on any session document ever written — there is no
+        migration, and a resume that could not read an old entry would silently drop
+        the user's own answer table rather than fail.
+
         Resolving `blueprint_id` here needs the blueprint's `terminal_sql`, which
         lives in `result_full` behind a D46 KV pointer (the in-window path reads it
         straight off the dispatch result and never pays this cost). The
@@ -2409,14 +2495,29 @@ class AgentLoop:
         credentials: RuntimeCredentials,
         session_id: str,
         turn_index: int,
-    ) -> tuple[list[AnswerTable], str | None]:
+    ) -> tuple[list[AnswerTable], str | None, bool]:
         """Resolve ONE `answerWithTable` call into its designated answer tables.
+
+        Returns `(tables, unresolved_blueprint_id, carried_designation)`.
+
+        THE THIRD VALUE IS NOT DERIVABLE FROM THE FIRST TWO, which is why it is
+        returned rather than inferred. An empty `tables` list has two completely
+        different causes and they need opposite handling: the model NAMED NOTHING
+        (`carried_designation=False` — a defect, and the caller nudges), or it named
+        something the runtime then dropped for a reason the model cannot act on — a
+        table proven out of the caller's column scope, a duplicate, an over-cap
+        entry. Nudging the second would tell the model to fix a payload that was
+        already correct.
 
         `resolve_answer_tables` of 08 §B.4, in the place `_resolve_answer_sql` sat.
         The order is fixed and each step is there for a measured reason:
 
           1. Choose the source list — `tables` when it carries a designation, else
-             the top-level `sql`/`blueprint_id` pair (`resolve_designations`).
+             the LEGACY top-level `sql`/`blueprint_id` pair folded in as one entry
+             (`resolve_designations`). Since 08 §O `tables` is the only shape the
+             schema declares, so step 1 normally has nothing to choose; the fold is
+             there for a model working from a stale context, and for the replay
+             paths that share this resolver and read pre-§O trail entries forever.
           2. Resolve each item through the EXISTING `resolve_designation`. There is
              no second resolution path: an element of `tables` is exactly the
              mapping that function already reads, which is why multi-table costs no
@@ -2447,6 +2548,10 @@ class AgentLoop:
             "turn_index": turn_index,
         }
         designation = resolve_designations(arguments, terminal_sql_by_id(blueprint_runs))
+        # Read BEFORE anything is dropped. `designation.items` holds every entry that
+        # carried a designation at all, resolved or not — so this is "did the model
+        # name a table", which is the only question the nudge below may act on.
+        carried_designation = bool(designation.items)
 
         resolved_items: list[DesignationItem] = []
         unresolved_blueprint_id: str | None = None
@@ -2485,7 +2590,7 @@ class AgentLoop:
         if unresolved_blueprint_id is not None:
             # The whole call is refused; nothing below would be surfaced anyway, and
             # computing provenance for tables that will not ship is pure cost.
-            return [], unresolved_blueprint_id
+            return [], unresolved_blueprint_id, carried_designation
 
         finalized = finalize_designations(resolved_items)
         for _ in range(designation.dropped_unresolvable):
@@ -2523,7 +2628,14 @@ class AgentLoop:
                     ),
                 },
             )
-        return tables, None
+        elif not carried_designation:
+            # THE MODEL NAMED NO TABLE AT ALL. Emitted here, where the fact is
+            # established, rather than at the nudge site — the nudge is bounded by a
+            # per-window allowance, so counting it there would under-report the
+            # behaviour precisely once it starts repeating. Payload-free: there is
+            # nothing to count and nothing shape-only to say.
+            self._observer(ANSWER_TABLE_EMPTY_DESIGNATION_EVENT, {})
+        return tables, None, carried_designation
 
     def _observe_uncovered_intents(
         self,
@@ -2891,6 +3003,26 @@ class AgentLoop:
                 prior_entry.tool_name, prior_entry.status, prior_entry.result_preview
             ):
                 multi_row_answer_calls += 1
+            # NAME + STATUS, DELIBERATELY ASYMMETRIC with the live flag site, which
+            # since 08 §O requires a designation to have actually resolved.
+            #
+            # This walk reads PERSISTED entries and would have to re-resolve `args`
+            # to know whether one designated anything — a second reading of the
+            # designation in a third place, which is the divergence
+            # `resolve_designation` was extracted to prevent, and it would need this
+            # window's `blueprint_runs` (a D46 KV de-reference per blueprint) to
+            # answer correctly for the blueprint form. The cheap wrong answer would
+            # be to treat an unresolvable id as "no table" and re-arm the gate on a
+            # turn that HAD one.
+            #
+            # The asymmetry is safe in the direction that matters. This is the
+            # FALSE-NEGATIVE side: it can only leave the gate disarmed on a turn
+            # whose `answerWithTable` succeeded in an earlier window, and a
+            # successful entry that designated nothing is now itself refused at the
+            # live site, so it never becomes a persisted `ok` entry in the first
+            # place. Pre-§O entries all carried a designation in practice. Erring the
+            # other way — re-arming — would refuse turns that already showed their
+            # table, which is the false positive 05 §J is most exposed to.
             if prior_entry.tool_name == ANSWER_TABLE_TOOL_NAME:
                 answer_table_succeeded = True
         # Seed the guard with the emulated-discovery signatures swept above (outside
@@ -3652,6 +3784,7 @@ class AgentLoop:
                     (
                         resolved_answer_tables,
                         unresolved_blueprint,
+                        carried_designation,
                     ) = await self._resolve_answer_tables(
                         call_args,
                         blueprint_runs=blueprint_runs,
@@ -3667,6 +3800,66 @@ class AgentLoop:
                             session_id,
                         )
                         tool_result = _answer_table_blueprint_not_run(unresolved_blueprint)
+                    elif (
+                        not carried_designation
+                        and multi_row_answer_calls
+                        and clean_answer_text(call_args.get("answer")) is not None
+                    ):
+                        # THE EMPTY DESIGNATION (08 §O). The model called the table
+                        # tool, named no table, and — because the call carries prose
+                        # — would TERMINATE the turn right here, through the exit the
+                        # 05 §J shape gate does not watch. Measured live as
+                        # `status=done`, no table, no event, no log: the user asked
+                        # for a breakdown, the turn held six rows of it, and the
+                        # answer was prose. See `_answer_table_no_table_designated`.
+                        #
+                        # `multi_row_answer_calls` SCOPES IT, and the scope is the
+                        # whole of the false-positive protection: with nothing
+                        # multi-row in hand there is no table being withheld, and a
+                        # zero-row "none found" answered in prose is CORRECT (live
+                        # q6). Nudging that would charge a right answer a round-trip.
+                        #
+                        # THE NON-BLANK `answer` CHECK MIRRORS THE TERMINAL
+                        # CONDITION, for the reason the pending-intents refusal just
+                        # above states: a call that would NOT have ended the turn is
+                        # not a finalization and must not be refused as one. A
+                        # blank-`answer` empty call is a habit call, not an answer —
+                        # it does not terminate anything, so nothing is being
+                        # silently lost, and refusing it would burn this window's
+                        # allowance on it and leave the REAL prose finish that
+                        # follows unrefusable. The flag fix below is what covers that
+                        # case: it stops the empty call disarming the exit-#1 gate.
+                        #
+                        # SAME ALLOWANCE AS THE SHAPE GATE (`kind="answer_shape"`),
+                        # because it is the same complaint arriving through the other
+                        # exit — otherwise one mistake could be refused twice in a
+                        # window, once per exit. When the grant is spent the prose
+                        # PASSES and the turn ends: never a hard lock, the posture
+                        # `ENFORCEMENT_EXHAUSTED` takes for intents. The event is
+                        # emitted in `_resolve_answer_tables` either way, so the
+                        # behaviour stays visible after the allowance is gone.
+                        if await self._grant_forced_reround(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            window_count=window_count,
+                            kind="answer_shape",
+                            already_refused_this_round=finalization_refused_this_round,
+                        ):
+                            finalization_refused_this_round = True
+                            _logger.info(
+                                "answerWithTable designated no table while %d "
+                                "multi-row result(s) went untabled — nudging "
+                                "(session=%s)",
+                                multi_row_answer_calls,
+                                session_id,
+                            )
+                            self._observer(
+                                ANSWER_SHAPE_REFUSED_EVENT,
+                                {"multi_row_calls": multi_row_answer_calls},
+                            )
+                            tool_result = _answer_table_no_table_designated()
+                        else:
+                            self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
                     else:
                         self._observe_uncovered_intents(
                             analysis_state,
@@ -3815,12 +4008,29 @@ class AgentLoop:
                     and tool_result.status == "ok"
                 ):
                     # ANSWER-SHAPE GATE (05 §J): the turn HAS tabled its answer, so
-                    # the gate is done for this turn. Set on ANY successful
-                    # designation, including the blank-`answer` one that does not
-                    # terminate — the tables it designated still reach the user
-                    # through the envelope, which is the whole thing the gate is
-                    # protecting.
-                    answer_table_succeeded = True
+                    # the gate is done for this turn.
+                    #
+                    # SET FROM SUBSTANCE, NOT FROM THE CALL (08 §O). This read
+                    # `status == "ok"` alone, and a live probe showed what that
+                    # bought: a mid-turn `{answer: "", tables: []}` succeeds — the
+                    # tool is stateless and refuses nothing — disarmed the gate with
+                    # ZERO designations, and the model's later bare-prose finish then
+                    # passed unrefused. The flag is supposed to mean "the user has a
+                    # grid", so it is set only when one exists.
+                    #
+                    # `answer_tables` (the accumulator, folded just above) rather
+                    # than `resolved_answer_tables` alone, because a LATER call that
+                    # designates nothing deliberately leaves an EARLIER good set
+                    # intact (`_accumulate_answer_tables`: "a malformed retry cannot
+                    # silently drop a good table"). Reading only this call's
+                    # resolution would re-arm the gate on that retry and refuse a
+                    # turn that has its table.
+                    #
+                    # Still set for the blank-`answer` call that does not terminate,
+                    # PROVIDED it designated something: those tables reach the user
+                    # through the envelope, which is what the gate protects.
+                    if resolved_answer_tables or answer_tables:
+                        answer_table_succeeded = True
                     designated_answer_text = (
                         clean_answer_text(call_args.get("answer"))
                         if isinstance(call_args, dict)

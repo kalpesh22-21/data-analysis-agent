@@ -94,7 +94,10 @@ from openinference.semconv.trace import OpenInferenceSpanKindValues  # noqa: E40
 
 from data_agent.learning.candidate.models import mint_candidate_id  # noqa: E402
 from data_agent.learning.config import LearningSettings, learning_enabled  # noqa: E402
-from data_agent.learning.extractor.grounding import known_rule_ids_from_catalog  # noqa: E402
+from data_agent.learning.extractor.grounding import (  # noqa: E402
+    known_rule_ids_from_catalog,
+    rule_index_from_catalog,
+)
 from data_agent.learning.factory import (  # noqa: E402
     build_learning_consumer,
     build_promotion_write_plane,
@@ -639,6 +642,10 @@ async def _run() -> int:
         )
 
         # ============================================================ STAGE 3 — CONSUME (REAL LLM)
+        # ONE parse of the frozen export, projected two ways: the id SET the `rule`
+        # role is validated against, and the INDEX the unknown-id matcher reads. Both
+        # must come from the same catalog or they can disagree about what exists.
+        demo_catalog = catalog_dict()
         consumer = build_learning_consumer(
             infra.settings,
             session_store=infra.session_store,
@@ -653,7 +660,12 @@ async def _run() -> int:
             embedder=infra.embedder,
             # Rule-role grounding from the frozen catalog-export snapshot (D75 Wave 1b;
             # `databaseSchemaDocs/` is gone). Dev demo → reads the committed fixture.
-            known_rules=known_rule_ids_from_catalog(catalog_dict()),
+            known_rules=known_rule_ids_from_catalog(demo_catalog),
+            # Without this the hint machinery is INERT here (the factory says so at
+            # INFO and carries on): a plan citing a rule id that does not exist
+            # declines `missing_rule` terminally, never re-asked, even when the
+            # catalog names the same concept under another id.
+            rule_index=rule_index_from_catalog(demo_catalog),
             sampler=lambda _env: False,
         )
         # Wrap the factory-built real extractor to capture what the model emits.

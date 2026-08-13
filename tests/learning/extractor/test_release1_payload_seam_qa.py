@@ -27,9 +27,11 @@ from .helpers import (
     emit_extractor,
     evidence_item,
     make_answer_sql,
+    make_extractor,
     make_summary,
     make_tool_call,
     make_turn,
+    scripted_turn,
 )
 
 HEADCOUNT_SQL = "SELECT count(*) AS headcount FROM hr.employee WHERE department = 'Analytics'"
@@ -123,8 +125,18 @@ async def test_a_release1_session_reaches_the_model_clean(store):
     assert triage(summary).decision == "keep"
 
     # --- S3: the payload seam ------------------------------------------------
-    extractor = emit_extractor([blueprint_raw(source_refs=("q1",),
-                                              evidence=[evidence_item(tool_call_ref="q1")])])
+    # TWO turns are scripted for a one-candidate assertion because this candidate is the
+    # stock payroll plan and this session's SQL filters a different department: the
+    # predicate is uncovered, and a totality violation now earns a corrective turn (it
+    # names the predicate the plan skipped). The seam this test is about is the FIRST
+    # turn's payload; the second turn emits nothing so the extraction still ends there.
+    extractor = make_extractor(
+        [
+            scripted_turn([blueprint_raw(source_refs=("q1",),
+                                         evidence=[evidence_item(tool_call_ref="q1")])]),
+            scripted_turn([]),
+        ]
+    )
     await extractor.extract(summary, triage(summary))
     payload = _payload(extractor)
 

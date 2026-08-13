@@ -43,16 +43,18 @@ The single-table chain, end to end. Every hop below carries exactly one query, a
 ## A. The shape of the change, in one line
 
 ```
-answerWithTable(answer, sql? , blueprint_id? , tables?: [{sql?, blueprint_id?, caption?}])
+answerWithTable(answer, tables: [{sql?, blueprint_id?, caption?}])
 ```
 
 Everything else in this document is the consequences.
+
+> **Amended 2026-08-13 — §A originally read `answerWithTable(answer, sql?, blueprint_id?, tables?)`.** The transition posture of §B.3 is **retired**: the top-level pair is gone from the model-facing schema and `tables` is required. [§O](#o-amendment-2026-08-13--tables-only) is the amendment and its evidence; §B.3 is left standing as the reasoning that was correct when it was written and the measurement that overturned it.
 
 ---
 
 ## B. Decision 1 — an explicit `tables` array, singular kept as shorthand
 
-**Chosen:** `tables: [{sql | blueprint_id, caption}]`, with top-level `sql`/`blueprint_id` unchanged and still honoured.
+**Chosen:** `tables: [{sql | blueprint_id, caption}]`, with top-level `sql`/`blueprint_id` unchanged and still honoured. *(The second clause is retired — [§O](#o-amendment-2026-08-13--tables-only). `tables` is now the only carrier the model sees, and the top-level pair is read-path only.)*
 
 ### B.1 Why not derived from completed intents
 
@@ -74,6 +76,8 @@ An item of `tables` is `{sql, blueprint_id, caption}` — three strings, no enum
 The residual risk is a wholly-placeholder ITEM (`{"": "", "": "", "": ""}` → resolves to nothing, names no blueprint). Rule: **drop it, count it** (`loop_answer_table_item_dropped {reason: "unresolvable"}`). Bounded by the cap ([§F](#f-decision-5--the-cap)).
 
 ### B.3 Why the singular stays
+
+> **RETIRED 2026-08-13 by [§O](#o-amendment-2026-08-13--tables-only).** The conclusion below was overturned by a live measurement it did not have. It is kept verbatim rather than rewritten because the argument is still the right *shape* — do not break a working path for tidiness — and what killed it was evidence, not taste. The precedence rules in this section are unchanged and still describe the code: they now govern a read-path fold rather than a model-facing shorthand.
 
 `sql=`/`blueprint_id=` at the top level is the shape that succeeds **6/6**. Removing it to force one canonical path would put the working case through an untested one for tidiness. It stays, and it is not deprecated.
 
@@ -340,7 +344,7 @@ Captions, SQL and cell values never appear. `blueprint_id` is already allowliste
 
 ## M. Done when
 
-- [x] `tables: [{sql?, blueprint_id?, caption?}]` on `ANSWER_WITH_TABLE_TOOL_SCHEMA`; top-level `sql`/`blueprint_id` unchanged and still honoured.
+- [x] `tables: [{sql?, blueprint_id?, caption?}]` on `ANSWER_WITH_TABLE_TOOL_SCHEMA`; top-level `sql`/`blueprint_id` unchanged and still honoured. **Superseded 2026-08-13 by [§O](#o-amendment-2026-08-13--tables-only):** `required: ["answer", "tables"]`, `minItems: 1`, and the top-level pair removed from the schema and kept only as a read-path fold, with a regression test loading a pre-§O document and asserting replay, the resume seed, cross-turn context and pageability all still work.
 - [x] `resolve_designations` + `finalize_designations` in `composite/answer_with_table.py`, built on the **existing** `resolve_designation` — no second resolution path. (Placed beside `resolve_designation` rather than in the loop, as §B.4 sketched, because the resume seed and `project_history` must read the list the same way the loop wrote it — the exact divergence `resolve_designation` itself exists to prevent.)
 - [x] `tables`-wins-when-it-carries-a-designation precedence; empty/placeholder array falls back to the top-level pair. See §N: the doc said "yields at least one *resolvable* item", which contradicts §B.4 step 3 for an unrun blueprint named inside `tables`; the implemented test is *carries a designation*.
 - [x] Dedupe on resolved SQL; cap at `MAX_ANSWER_TABLES = MAX_INTENTS`, **imported** from `analysis_state.py`; overflow truncated with telemetry.
@@ -352,11 +356,12 @@ Captions, SQL and cell values never appear. `blueprint_id` is already allowliste
 - [x] Live and reload filter tables through the same `is_answer_table_in_scope`; a per-table drop is asserted, and §D.3's turn-wide gate limit is asserted too. **Undetermined provenance is KEPT, not dropped** — see §N.
 - [x] `answer_tables` additive on the SSE `result` frame and on `/session/history`; `answer_sql` derived from `answer_tables[0]` in exactly one place (`_answer_envelope`), and both projections share one serialisation (`AnswerTable.to_doc`).
 - [x] Resume seed (`_compute_turn_answer_tables`) and every pause path reconstruct the whole list, not the first element. **This uncovered a live defect** — `_run_loop` accepted `seed_blueprint_terminal_sql` and never forwarded it, so a blueprint completing before an approval pause was not designatable after it. Fixed, with a regression test that fails without the forward.
-- [x] Prompt bullet + identical tool-description amendment; prompt 14,227 → **14,750** against the 15,000 ceiling.
+- [x] Prompt bullet + identical tool-description amendment; prompt 14,227 → **14,750** against the 15,000 ceiling. **§O re-phrased both to the entries-only shape:** prompt 15,736 → **15,875** against the 16,000 ceiling (125 chars of headroom — thin, and the next addition should re-argue the ceiling rather than shave working instructions to fit under it); tool description 1,867 → 2,018.
 - [x] `test_the_prompt_never_instructs_re_deriving_a_blueprint_result_into_a_table` green **unchanged**, and **extended to cover `ANSWER_WITH_TABLE_TOOL_SCHEMA["description"]`**.
 - [x] eval cases 11-13 added; A2 gains L7; 07 §§C/D/G updated. The harness needed no change, as predicted.
 - [x] Three new telemetry keys added to `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST`, with a test that reads them back off the span.
 - [ ] UI: `.result-table` cloned per table, independent paging closures, first table expanded, the rest fetched on first open. *(Delivered separately; the backend change does not touch `ui/`.)*
+- [x] **§O:** a zero-table `answerWithTable` is nudged (`ANSWER_TABLE_NO_TABLE_DESIGNATED`) instead of silently terminating the turn, and `answer_table_succeeded` is set from a resolved table rather than from a successful call — the two ends of one defect, found on two live-loop probes. See §O.5.
 - [ ] **The 1/9 measurement is re-run on live multi-intent turns and reported.** Nothing else closes this — A2's L7 is the harness for it.
 
 ---
@@ -384,3 +389,95 @@ Seeded with the places the code contradicted the brief this document was written
 | §D.2: "a parse failure yields `None`, and `None` drops that table" | **Undetermined per-table provenance is KEPT; only a table PROVEN out of scope is dropped** | `is_provenance_in_scope(None, scope)` is `False` for every scope including the empty allow-all one, so dropping on `None` would delete every grid whose query the runtime's own extractor cannot parse — an uncatalogued table reference is enough — for queries `POST /query/page` executes perfectly well today. It would buy no access control doing it: §D.3 states the posture itself, that this is a **consistency** defect and not an entitlement hole, precisely because `/query/page` re-enforces scope at execution under the caller's own credentials. Fail-closed here would be a new silent failure introduced to satisfy a posture rather than a read |
 | §B.4: `resolve_answer_tables` lives "in `loop/agent_loop.py` where `_resolve_answer_sql` sits today" | **The pure resolver lives beside `resolve_designation` in `composite/answer_with_table.py`; the loop method wraps it with hooks, provenance and telemetry** | The resume seed and `project_history` must read the designation back exactly as the loop wrote it. A resolver private to the loop would give them a second reading — which is the divergence `resolve_designation` was extracted to prevent, and *"reload is the only place that regression shows"* |
 | — | **`_run_loop` never forwarded `seed_blueprint_terminal_sql` to `_run_loop_body`** | Found while widening the map. The blueprint approval-resume built the seed and `_run_loop` accepted it as a keyword, then dropped it — so `answerWithTable(blueprint_id=X)` naming the blueprint that completed BEFORE the pause resolved to nothing, and the model got "you have not run it this turn" for a blueprint it had run. Silent in both directions: `_run_loop`'s docstring argues the explicit signature mirror catches a typo'd kwarg at any CALL site, which it does — and which is exactly why an omission at the FORWARDING site went unseen |
+
+---
+
+## O. Amendment 2026-08-13 — tables-only
+
+**§B.3 is retired. The top-level `sql`/`blueprint_id` pair is removed from the model-facing schema; `tables` is the single carrier and is REQUIRED. A single-table answer is a one-entry list.**
+
+This reverses a decision this document argued for at length. What overturned it is not an argument — §B.3's argument is still sound on its own terms — but a live call that the argument did not have.
+
+### O.1 The evidence
+
+R7 q1's actual `answerWithTable` invocation:
+
+```jsonc
+{"answer": "…", "sql": "", "blueprint_id": "bp-…", "tables": []}
+```
+
+Four declared properties carrying **one field's worth of information**: two placeholder strings and an empty array beside the one value that meant anything. The model did not choose to send three designation fields; it could not do otherwise. 03 §C.3.1 measured exactly this and it is the premise §B.2 was written on — *the model emits every declared property and fills the unused ones with placeholders* — and §B.2 used it to argue the array was **safe**. It is; the normalisers handle it; nothing was refused. That was never the question.
+
+The question §B.3 got wrong is what a second carrier COSTS when keys cannot be omitted. A model with two ways to name one table must fill both on every call, and must decide which one to mean. §B.3 treated the top-level pair as a free, already-working path kept beside the new one. It was not free: it was a permanent instruction to serialise a decision the model had already made, twice, in two places, on every terminal call of every turn.
+
+**This is the same hazard class as 01a §14's `updateAnalysisState` slim-down, and the same fix.** There, `evidence_tool_call_id` and `reason_code` were retired because a model that cannot omit keys was emitting placeholders into fields enforcement then had to normalise away — six live calls rejected for it. Here, `sql` and `blueprint_id` at the top level are the same defect one tool over. That the two were found independently, five days apart, on the same measured behaviour, is the argument for reading the rule generally rather than patching each instance: **a declared property is a cost paid on every call, not an option offered.**
+
+### O.2 What §B.3's argument was right about, and what it missed
+
+> *"Removing it to force one canonical path would put the working case through an untested one for tidiness."*
+
+Right in shape, wrong in fact, for two reasons:
+
+1. **The single-table case is not going through an untested path.** `tables: [{sql}]` resolves through `resolve_designation` — the *same function*, on the *same mapping* — as the top-level pair did. §Current state point 2 and §B's load-bearing claim say so: an element of `tables` IS the mapping that function reads. There is one resolver, and it was already carrying both. The 6/6 path is one list index away from where it was, not on new code.
+2. **It was not tidiness.** Tidiness would be the only motive if the second carrier were inert. It is not inert; it is emitted, with a placeholder, on every call.
+
+### O.3 The folding rule
+
+The top-level pair does not disappear from the RUNTIME, only from the schema. `resolve_designations` keeps reading it, under the rule §B.3 already specified — unchanged, and now describing a fold rather than a shorthand:
+
+> `tables` wins when at least one of its entries **carries a designation**. Otherwise the legacy top-level `sql`/`blueprint_id` pair is folded in as **one entry**.
+
+with the corollary already stated in §B.2, now doing more work:
+
+> **A key carrying no information is ABSENT.** `sql: ""` and `blueprint_id: ""` clean to `None`, so R7 q1's payload above resolves through its blueprint id and is not refused, and placeholder legacy fields beside a real `tables` array are not a conflict — there is nothing there to conflict.
+
+**Non-empty legacy fields with an empty `tables` are FOLDED, never refused.** A stale-context model must not lose its answer over a payload detail the runtime reads perfectly well; and `tables` being required makes `tables: []` *more* likely than before, not less, since a model with nothing to put there must still emit the key. Refusing would cost the user a finished answer to enforce a shape the runtime does not need enforced.
+
+**Never a union**, unchanged from §B.3: a call carrying both gets one table.
+
+### O.4 Why the read path can never drop the fold
+
+There is **no migration and no expiry date**, and the reason is not caution:
+
+- Every `answerWithTable` trail entry persisted before this change carries the top-level shape and no `tables` key.
+- Those entries are **successful**, and a successful `answerWithTable` entry is not a fire-and-forget record. It **replays cross-turn** into model context, it **seeds a resumed window** (`_compute_turn_answer_tables`), and it **rebuilds the transcript** a reloaded browser renders (`session_history.project_history`).
+- A read path that understood only `tables` would fail **silently in all three at once**: the grid vanishes from the reload, the resume returns `answer_sql=None`, and nothing reports it. That is the defect `resolve_designation` was extracted to prevent, and *"reload is the only place that regression shows"*.
+
+Verified read-path consumers, all of which resolve through `resolve_designations` and therefore handle both shapes: `_compute_turn_answer_tables` / `_compute_turn_answer_sql` (resume seed), `session_history.project_history` (reload), `_resolve_answer_tables` (live), and `AnswerWithTableTool.run`'s own confirmation flag. `_capture_terminal_sql` reads `runBlueprint` results and never the answer args; `filter_trail`'s status-gated exemption and `POST /query/page` are both shape-blind — the first keys on status, the second takes SQL from the client.
+
+**The answer-shape gate is shape-agnostic too**, and this was checked rather than assumed: both sites that set `answer_table_succeeded` — the in-batch one and the trail-walk seed — read the tool NAME and the STATUS, never `args`. A gate that stopped recognising a legacy designation would charge a finished turn an extra round-trip and tell the model to table what it already tabled, which is the false-positive half 05 §J is most exposed to.
+
+### O.5 The defect the slim-down surfaced — a zero-table `answerWithTable`
+
+Found in review, on two live-loop probes, and fixed as part of this amendment. It PRE-DATES §O — an empty `tables` beside an empty top-level pair was always possible — but §O makes it likelier, because `tables` is now required and a model that cannot omit a declared key sends `[]`.
+
+| Probe | Call | Before |
+|---|---|---|
+| **A** | `{answer: <prose>, tables: []}` on a turn holding a 6-row result | `status=done`, no table, **zero events, zero logs**. The call succeeded, carried non-blank prose, and TERMINATED the turn through exit #2 — which the 05 §J answer-shape gate does not watch, since that gate lives on exit #1 (a model turn with no tool calls) |
+| **B** | mid-turn `{answer: "", tables: []}` | Set `answer_table_succeeded = True` with **zero designations**, disarming the gate; the model's later bare-prose finish then passed unrefused |
+
+One flag, two silent paths, and probe A is the worse one: the user asked for a breakdown, the runtime held six rows of it, and the answer was prose — with nothing anywhere reporting that a table had been lost.
+
+**Both ends are fixed, and neither half is sufficient alone.**
+
+1. **The terminal site nudges.** A successful `answerWithTable` that carries no designation at all, on a turn with `multi_row_answer_calls > 0`, becomes the retryable `ANSWER_TABLE_NO_TABLE_DESIGNATED` — modelled exactly on `_answer_table_blueprint_not_run`, which is the same failure one step later (there the model named a table that could not be resolved; here it named none).
+2. **The flag is set from substance.** `answer_table_succeeded` requires a resolved table, not merely a successful call. It reads the ACCUMULATOR rather than this call's resolution, so a later designation-free retry cannot re-arm the gate on a turn that already has its table.
+
+**Three scopes, each of which is the false-positive protection:**
+
+- `multi_row_answer_calls > 0` — a turn holding nothing multi-row has no table being withheld, and a zero-row *"none found"* answered in prose is CORRECT (live q6). Nudging it would charge a right answer a round-trip and tell the model to grid a number.
+- **Non-blank `answer`**, mirroring the terminal condition — *a call that would not have ended the turn is not a finalization and must not be refused as one*, the rule the pending-intents refusal already follows at this exit. A blank-`answer` empty call terminates nothing; refusing it would spend the window's allowance on a habit call and leave the real prose finish unrefusable. Probe B is covered by the FLAG, not by the nudge.
+- **`carried_designation`, not "zero tables resolved"** — an empty resolved list has two causes needing opposite handling. The model named nothing (nudge; it can fix that), or it named something the runtime then dropped for a reason the model cannot act on — out of scope, duplicate, over cap. Nudging the second would tell the model to fix a payload that was already correct.
+
+**It shares the shape gate's allowance** (`kind="answer_shape"`), because it is the same complaint arriving through the other exit: without sharing, one mistake could be refused twice per window, once per exit. Grant spent ⇒ **the prose passes and the turn ends** — never a hard lock, the posture `ENFORCEMENT_EXHAUSTED` takes for intents. `loop_answer_table_empty_designation` is emitted where the fact is established rather than at the nudge site, so the behaviour stays visible after the allowance is gone; counting it at the nudge would under-report it precisely once it starts repeating.
+
+**The trail-walk seed keeps its name+status test, deliberately.** Re-resolving persisted `args` there would be a third reading of the designation (the divergence `resolve_designation` exists to prevent) and would need a D46 KV de-reference per blueprint to answer correctly. The asymmetry errs false-NEGATIVE, which is the safe direction: it can only leave the gate disarmed on a turn whose `answerWithTable` succeeded in an earlier window, and such an entry can no longer be designation-free.
+
+**And it is the FOURTH instance of the cross-turn model-text class** (`context/assembly.py`, README findings 9 and 11). Its `args` carry the refused draft answer, so the code joins `_STALE_CROSS_TURN_ERROR_CODES` — the set was extended rather than a third predicate added, exactly as that module instructs. It survives its own turn, which is the whole mechanism, and no later one.
+
+### O.6 What this does not change
+
+- **Not the multi-table feature.** Everything from §B.4 down — precedence, dedupe, the cap, per-table verification, per-table provenance, the envelope, the resume seed — is untouched. This is a payload slim-down inside a shape that already existed.
+- **Not the 1/9 measurement.** §M's last open box is still open; a narrower payload is not evidence the model fills it.
+- **Not the `answer` requirement**, and `tables` becoming required is the same argument: this tool exists to deliver a table, and an `answerWithTable` with no table is a terminal call that shows the user nothing.
+- **Not `minItems: 1` into an enforcement.** These schemas are non-strict, so nothing rejects `tables: []` at the boundary. It is declared because it is the honest contract and the model reads it; the runtime's answer to an empty array is §O.3's fold, not a rejection.

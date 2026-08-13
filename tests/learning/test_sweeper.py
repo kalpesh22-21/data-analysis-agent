@@ -35,6 +35,55 @@ async def test_idle_active_session_is_claimed_and_enqueued(store, queue, sweeper
     assert queue.stream_length() == 1
 
 
+async def test_enqueue_records_queued_and_the_hash_the_message_carries(
+    store, queue, sweeper, seed_session
+):
+    """THE SWEEPER→CONSUMER CONTRACT, pinned. The consumer's claim gate is
+    `learning_status == queued`, and its idempotency check compares the delivered
+    job's `content_hash` against the session's `learning_content_hash`. Both facts
+    are established HERE, in one CAS: `pending -> queued` writes the same hash the
+    XADDed message carries. A sweeper that left the status alone, or recorded a
+    different hash, would put every delivery straight onto the consumer's skip
+    path."""
+    doc = seed_session(store, "idle-1", messages=[make_message(0, "user", "hi")])
+    expected_hash = compute_content_hash(doc)
+
+    await sweeper.run_once()
+
+    after = store._docs["idle-1"]
+    assert after.learning_status == LearningStatus.QUEUED
+    assert after.learning_content_hash == expected_hash
+    (job,) = queue._entries.values()
+    assert job.content_hash == expected_hash
+
+
+async def test_a_done_session_whose_content_changed_is_never_re_enqueued(
+    store, queue, sweeper, seed_session
+):
+    """KNOWN GAP, pinned deliberately rather than left to be rediscovered.
+
+    `SWEEPABLE_STATUSES` is `[active, pending]`, so once a session reaches `done` the
+    sweeper never looks at it again — even if the analyst came back and added turns,
+    i.e. even when its `learning_content_hash` no longer describes it. Nothing
+    re-enqueues that session, so the new turns are never learned.
+
+    This is NOT the same hole as the consumer's `done -> processing` re-entry, which
+    covers a DIFFERENT path: a message already on the stream being redelivered to a
+    session whose recorded hash moved on. Closing THIS one needs a sweeper that scans
+    `done` and compares hashes (plus a `done -> pending` edge), which is a design
+    decision, not a bug fix."""
+    doc = seed_session(store, "learned", learning_status=LearningStatus.DONE,
+                       learning_content_hash="hash-at-the-time",
+                       messages=[make_message(0, "user", "hi")])
+    assert compute_content_hash(doc) != doc.learning_content_hash  # content moved on
+
+    result = await sweeper.run_once()
+
+    assert result.scanned == 0
+    assert result.enqueued == 0
+    assert queue.stream_length() == 0
+
+
 async def test_fresh_recent_session_is_untouched(store, queue, sweeper, seed_session):
     from datetime import UTC, datetime
 

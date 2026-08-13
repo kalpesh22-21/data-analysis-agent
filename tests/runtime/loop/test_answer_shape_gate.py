@@ -214,7 +214,12 @@ async def test_a_multi_row_prose_finish_is_refused_and_the_table_lands_next_roun
                         name=ANSWER,
                         arguments={
                             "answer": "Sales has 3, Eng has 2, Ops has 1.",
-                            "sql": "SELECT Department, count() AS n FROM employee GROUP BY Department",
+                            "tables": [
+                                {
+                                    "sql": "SELECT Department, count() AS n "
+                                    "FROM employee GROUP BY Department"
+                                }
+                            ],
                         },
                     )
                 ]
@@ -410,7 +415,10 @@ async def test_a_turn_that_answered_with_a_table_is_untouched() -> None:
                     ToolCallRequest(
                         id="a1",
                         name=ANSWER,
-                        arguments={"answer": "By department:", "sql": "SELECT 1"},
+                        arguments={
+                            "answer": "By department:",
+                            "tables": [{"sql": "SELECT 1"}],
+                        },
                     )
                 ]
             ),
@@ -424,6 +432,49 @@ async def test_a_turn_that_answered_with_a_table_is_untouched() -> None:
 
     assert outcome.status == "done"
     assert outcome.answer_sql is not None
+    assert store.claims == []
+    assert not _events(events, ANSWER_SHAPE_REFUSED_EVENT)
+
+
+async def test_the_gate_is_satisfied_by_the_designation_not_by_its_shape() -> None:
+    """08 §O: the gate counts `answer_table_succeeded` on a SUCCESSFUL
+    `answerWithTable`, whatever the arguments looked like.
+
+    Its two write sites read the tool NAME and the STATUS and nothing else — the
+    in-batch one on dispatch, and the trail-walk seed that rebuilds the flag after a
+    budget cap or a resume. Neither reads `args`, so the tables-only slim-down
+    cannot have moved it. Pinned rather than assumed, because the failure would be
+    silent and expensive in exactly one direction: a gate that stopped recognising a
+    legacy-shape designation would charge a finished turn an extra round-trip and
+    tell the model to table an answer it already tabled — which is the false-positive
+    half this file exists to protect, and the half that regresses invisibly.
+
+    So the pre-08-§O top-level shape is used here ON PURPOSE, and the assertion is
+    that the gate never noticed the difference.
+    """
+    loop, store, events, _ = _build(
+        [
+            ModelTurnResult(tool_calls=[_query("q1")]),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="a1",
+                        name=ANSWER,
+                        # The retired carrier, folded by `resolve_designations`.
+                        arguments={"answer": "By department:", "sql": "SELECT 1"},
+                    )
+                ]
+            ),
+        ],
+        mcp=_rows_mcp("runQuery", 6),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="by department"
+    )
+
+    assert outcome.status == "done"
+    assert outcome.answer_sql == "SELECT 1"
     assert store.claims == []
     assert not _events(events, ANSWER_SHAPE_REFUSED_EVENT)
 
@@ -716,7 +767,12 @@ async def test_the_intents_nudge_no_longer_starves_the_shape_gate() -> None:
                         name=ANSWER,
                         arguments={
                             "answer": "Sales 3, Eng 2, Ops 1.",
-                            "sql": "SELECT Department, count() FROM employee GROUP BY Department",
+                            "tables": [
+                                {
+                                    "sql": "SELECT Department, count() "
+                                    "FROM employee GROUP BY Department"
+                                }
+                            ],
                         },
                     )
                 ]
@@ -778,3 +834,247 @@ async def test_each_turn_gets_its_own_shape_allowance() -> None:
     assert store.claims == ["answer_shape", "answer_shape", "answer_shape", "answer_shape"]
     doc = await store.get_or_create_session(SESSION_ID)
     assert doc.finalization_blocks == {"0:1:answer_shape": 1, "1:1:answer_shape": 1}
+
+
+# ---------------------------------------------------------------------------
+# THE EMPTY DESIGNATION (08 §O) — the same complaint, arriving through exit #2
+#
+# Both probes below were run against the live loop before this section existed and
+# both passed silently, which is why the section exists. The gate above watches
+# exit #1 (a model turn with NO tool calls); `answerWithTable` is exit #2, and a
+# call that designates nothing walks straight through it.
+# ---------------------------------------------------------------------------
+
+
+def _empty_answer(call_id: str = "a1", answer: str = "Sales has 3, Eng 2, Ops 1.") -> ToolCallRequest:
+    """`answerWithTable` that names NO table — the shape 08 §O made likelier, since
+    `tables` is REQUIRED and a model that cannot omit a declared key sends `[]`."""
+    return ToolCallRequest(id=call_id, name=ANSWER, arguments={"answer": answer, "tables": []})
+
+
+async def test_an_answer_with_no_table_is_nudged_and_the_table_lands_next_round() -> None:
+    """PROBE A. `{answer: <prose>, tables: []}` on a turn holding a 6-row result.
+
+    Measured on the live loop before the fix: `status=done`, no tables, and ZERO
+    events or log lines. The call succeeded (the tool is stateless and refuses
+    nothing), carried non-blank prose, and therefore TERMINATED the turn — through
+    the one exit the 05 §J gate does not watch. The user asked for a breakdown,
+    the turn held six rows of it, and the answer was prose with no grid.
+
+    This is `_answer_table_blueprint_not_run`'s failure one step earlier: there the
+    model named a table that could not be resolved, here it named none at all. So
+    it takes the same treatment — a retryable refusal, before the trail entry is
+    written, so the persisted entry IS the nudge and the model reads it next round.
+    """
+    loop, store, events, model = _build(
+        [
+            ModelTurnResult(tool_calls=[_query("q1")]),
+            ModelTurnResult(tool_calls=[_empty_answer()]),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="a2",
+                        name=ANSWER,
+                        arguments={
+                            "answer": "Sales has 3, Eng 2, Ops 1.",
+                            "tables": [{"sql": f"SELECT Department, count() FROM {_E} GROUP BY 1"}],
+                        },
+                    )
+                ]
+            ),
+        ],
+        mcp=_rows_mcp("runQuery", 6),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="headcount by department"
+    )
+
+    assert outcome.status == "done"
+    assert outcome.answer_sql is not None, "the table never landed"
+    # It shares the shape gate's allowance, so it reports through the same event.
+    assert _events(events, ANSWER_SHAPE_REFUSED_EVENT) == [{"multi_row_calls": 1}]
+    assert store.claims == ["answer_shape"]
+    # …and the empty designation itself is reported where it happened.
+    assert _events(events, "loop_answer_table_empty_designation") == [{}]
+    # The refusal is PERSISTED as the entry, so the model reads it on the rebuild.
+    trail = await store.load_trail(SESSION_ID)
+    refusals = [e for e in trail if e.error_code == "ANSWER_TABLE_NO_TABLE_DESIGNATED"]
+    assert len(refusals) == 1
+    assert refusals[0].status == "error"
+    assert "Every table goes in `tables`" in (refusals[0].denial_detail or "")
+
+
+async def test_the_empty_designation_passes_once_its_allowance_is_spent() -> None:
+    """NEVER A HARD LOCK. The allowance is shared with the shape gate, so a model
+    that empties the array twice is refused once and then let through — the same
+    posture `ENFORCEMENT_EXHAUSTED` takes for intents. The event still fires on the
+    second one, so the behaviour stays visible after the grant is gone: an
+    allowance is a bound on REFUSALS, never on reporting.
+    """
+    loop, store, events, _ = _build(
+        [
+            ModelTurnResult(tool_calls=[_query("q1")]),
+            ModelTurnResult(tool_calls=[_empty_answer("a1")]),
+            ModelTurnResult(tool_calls=[_empty_answer("a2")]),
+        ],
+        mcp=_rows_mcp("runQuery", 6),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="headcount by department"
+    )
+
+    assert outcome.status == "done"
+    assert outcome.answer_sql is None, "there was never a table to show"
+    assert outcome.assistant_text == "Sales has 3, Eng 2, Ops 1."
+    assert _events(events, ANSWER_SHAPE_REFUSED_EVENT) == [{"multi_row_calls": 1}]
+    assert _events(events, ANSWER_SHAPE_EXHAUSTED_EVENT) == [{}]
+    # Reported BOTH times — the second call was let through, not un-noticed.
+    assert _events(events, "loop_answer_table_empty_designation") == [{}, {}]
+
+
+async def test_an_empty_designation_does_not_disarm_the_gate_for_the_prose_finish() -> None:
+    """PROBE B, and the second half of the same defect.
+
+    `answer_table_succeeded` was set on ANY successful `answerWithTable`, read from
+    the tool name and status alone. So a mid-turn call with a BLANK answer and an
+    empty array — which does not terminate the turn, because the terminal condition
+    needs non-blank prose — disarmed the gate with zero designations, and the
+    model's later bare-prose finish then sailed through exit #1 unrefused. Two
+    silent paths, one flag.
+
+    The flag now means what its name says: the user has a grid. A blank-answer call
+    is used here deliberately, so the failure being tested is the FLAG and not the
+    terminal nudge (which needs non-blank prose to fire on).
+    """
+    loop, store, events, model = _build(
+        [
+            ModelTurnResult(tool_calls=[_query("q1")]),
+            # Blank `answer` — does not terminate, and designates nothing.
+            ModelTurnResult(
+                tool_calls=[ToolCallRequest(id="a1", name=ANSWER, arguments={"answer": "", "tables": []})]
+            ),
+            ModelTurnResult(assistant_text="Sales has 3, Eng 2, Ops 1."),
+            ModelTurnResult(assistant_text="Sales has 3, Eng 2, Ops 1."),
+        ],
+        mcp=_rows_mcp("runQuery", 6),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="headcount by department"
+    )
+
+    assert outcome.status == "done"
+    # THE GATE STILL FIRED on the prose finish — the empty call did not disarm it.
+    assert _events(events, ANSWER_SHAPE_REFUSED_EVENT) == [{"multi_row_calls": 1}]
+    # Two claims: refused on the first prose finish, spent on the second (the model
+    # repeated itself), which is the ordinary refuse-then-exhaust sequence.
+    assert store.claims == ["answer_shape", "answer_shape"]
+    assert _events(events, ANSWER_SHAPE_EXHAUSTED_EVENT) == [{}]
+    assert _requests_carrying_the_nudge(model), "the shape nudge never reached the model"
+
+
+async def test_a_blank_answer_call_that_designates_a_table_still_disarms_the_gate() -> None:
+    """The other side of the flag rule, so it is not read as "only terminal calls
+    count". A blank-`answer` call does not end the turn, but the tables it
+    designated DO reach the user through the envelope — which is the whole thing
+    the gate protects — so the gate is done for this turn.
+    """
+    loop, store, events, _ = _build(
+        [
+            ModelTurnResult(tool_calls=[_query("q1")]),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="a1",
+                        name=ANSWER,
+                        arguments={"answer": "", "tables": [{"sql": "SELECT 1"}]},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="Sales has 3, Eng 2, Ops 1."),
+        ],
+        mcp=_rows_mcp("runQuery", 6),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="headcount by department"
+    )
+
+    assert outcome.status == "done"
+    assert outcome.answer_sql == "SELECT 1"
+    assert not _events(events, ANSWER_SHAPE_REFUSED_EVENT)
+    assert store.claims == []
+
+
+async def test_a_turn_holding_no_multi_row_result_is_never_nudged_for_an_empty_table() -> None:
+    """THE FALSE-POSITIVE GUARD, and it is the half that regresses invisibly.
+
+    A zero-row result is a correct answer in prose — live q6, "none found" — and a
+    turn holding nothing multi-row has no table being withheld. Nudging it would
+    charge a right answer an extra round-trip and tell the model to put a number in
+    a grid, which is exactly the harm 05 §J's silent half exists to prevent. So the
+    nudge is scoped to `multi_row_answer_calls > 0` and this turn ends first time.
+    """
+    loop, store, events, model = _build(
+        [
+            ModelTurnResult(tool_calls=[_query("q1")]),
+            ModelTurnResult(tool_calls=[_empty_answer(answer="Nobody matched.")]),
+        ],
+        mcp=_rows_mcp("runQuery", 0),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="who left last month?"
+    )
+
+    assert outcome.status == "done"
+    assert outcome.assistant_text == "Nobody matched."
+    assert len(model.calls) == 2, "the empty answer must have ended the turn first time"
+    assert store.claims == []
+    assert not _events(events, ANSWER_SHAPE_REFUSED_EVENT)
+    # The event still fires — it records the shape, and the nudge decides on it.
+    assert _events(events, "loop_answer_table_empty_designation") == [{}]
+
+
+async def test_a_dropped_table_is_not_treated_as_an_empty_designation() -> None:
+    """The distinction `carried_designation` exists to make, asserted directly.
+
+    An empty resolved list has two causes needing opposite handling: the model named
+    NOTHING (nudge — it can fix that), or it named something the runtime then
+    dropped for a reason the model cannot act on. Here the designated query reads a
+    column outside the caller's scope, so the table is dropped by
+    `is_answer_table_in_scope` — the model's payload was correct and telling it to
+    "put each table in `tables`" would be a lie it cannot act on.
+    """
+    scoped = RuntimeCredentials(
+        session_id=SESSION_ID, jwt="jwt", column_scope=frozenset({f"{_E}.Department"})
+    )
+    loop, store, events, model = _build(
+        [
+            ModelTurnResult(tool_calls=[_query("q1")]),
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="a1",
+                        name=ANSWER,
+                        arguments={
+                            "answer": "By department.",
+                            "tables": [{"sql": f"SELECT Name FROM {_E}"}],
+                        },
+                    )
+                ]
+            ),
+        ],
+        mcp=_rows_mcp("runQuery", 6),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=scoped, user_message="headcount by department"
+    )
+
+    assert outcome.status == "done"
+    assert len(model.calls) == 2, "a dropped table must not be nudged as an empty one"
+    assert not _events(events, "loop_answer_table_empty_designation")
+    assert store.claims == []

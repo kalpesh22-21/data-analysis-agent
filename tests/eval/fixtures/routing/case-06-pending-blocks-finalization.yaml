@@ -51,14 +51,16 @@ model_script:
         id: a1
         args:
           answer: Sales has 4 people and Support 3.
-          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+          tables:
+            - {sql: "SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name"}
   # The window's one forced re-round is spent -> ENFORCEMENT_EXHAUSTED, finalize.
   - tool_calls:
       - name: answerWithTable
         id: a2
         args:
           answer: Sales has 4 people and Support 3.
-          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+          tables:
+            - {sql: "SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name"}
 expect:
   intents_terminal: 2
   re_derivation: false

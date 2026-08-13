@@ -29,9 +29,13 @@ with three ways to go round again, and they are deliberately not pooled:
     `emit_candidates` call at all, so nothing could be read from it. Exhausting this
     one RAISES, which is what routes the session to dead-letter.
   * a SHAPE CORRECTION (`max_shape_corrections`) — the call parsed, but a candidate
-    inside it could not be read into the typed model. The model is told which field
-    and what shape, and re-emits. Exhausting this one DECLINES, with the attempt
-    recorded on the decline.
+    inside it declined for something the extractor can state as a named, one-field fix:
+    a field that could not be read into the typed model, or (since the rule-hint family)
+    a `rule_id` the catalog can name the counterpart of. The model is told which field
+    and what it must contain, and re-emits. Exhausting this one DECLINES, with the
+    attempt recorded on the decline. The budget is SHARED across those families on
+    purpose: it bounds how many extra prompts one session may cost, and that bound must
+    not grow every time a new correctable family is added.
 
 Pooling any two would couple failures with unrelated causes: a model that cannot call
 the tool would eat the budget meant for a model that called it with a mis-shaped
@@ -78,6 +82,7 @@ from ..priorart import PriorArtIndex
 from ..summary.models import SessionSummary
 from ..triage import TriageVerdict
 from .correction import build_correction_message
+from .grounding import RuleIndex
 from .models import Decline, ExtractedCandidate, ExtractionResult
 from .prior_art import (
     DEFAULT_KINDS,
@@ -187,6 +192,12 @@ class ExtractorConfigError(ValueError):
 class ExtractorConfig:
     max_retries: int = 2
     known_rules: frozenset[str] = frozenset()
+    # The SAME catalog's rules, with the table each is declared on. Read ONLY when a
+    # `rule`-role plan cites an id `known_rules` does not contain, to decide whether the
+    # decline can name the id that was meant (`validation.py::_rule_hint`). Absent, that
+    # decline is terminal exactly as it was before the index existed — this widens what a
+    # decline can SAY, never what validation ACCEPTS.
+    rule_index: RuleIndex | None = None
     # How many `searchCorpus` CALLS (not turns — a model can request several in one
     # turn, and each is an embed plus an ANN query per corpus) one extraction may
     # spend. Small: the pre-fetch already covers the session's primary intent, so this
@@ -410,7 +421,7 @@ class LearningExtractor:
 
         kept: list[ExtractedCandidate] = []
         settled: list[Decline] = []  # substantive — judged on content, never re-asked
-        pending: list[tuple[int, Decline]] = []  # shape declines from the LAST batch
+        pending: list[tuple[int, Decline]] = []  # correctable declines from the LAST batch
         history: list[str] = []  # the correction messages already sent, in order
 
         while attempts_left > 0:
@@ -468,7 +479,7 @@ class LearningExtractor:
                 history.append(correction)
                 messages = [*messages, *_correction_messages(result, correction)]
                 _logger.info(
-                    "extractor: correcting %d shape-declined candidate(s) for session "
+                    "extractor: correcting %d declined candidate(s) for session "
                     "%s (correction %d/%d)",
                     len(pending),
                     summary.session_id,
@@ -495,19 +506,28 @@ class LearningExtractor:
     def _validate_batch(
         self, raw_candidates: list[dict], summary: SessionSummary
     ) -> tuple[list[ExtractedCandidate], list[Decline], list[tuple[int, Decline]]]:
-        """Validate one emitted array → `(kept, settled, shape-declined)`.
+        """Validate one emitted array → `(kept, settled, correctable)`.
 
         The three-way split IS the correction policy: `settled` holds the declines that
-        judged the candidate's CONTENT (no evidence, an unknown rule id, an un-covered
-        predicate) and must never be re-asked, because re-asking those is talking a
-        model out of a refusal it was right to make. The shape-declined keep their
-        position in the emitted array so the correction can name which candidate it
-        means without quoting the candidate back."""
+        judged the candidate's CONTENT (no evidence, an un-covered predicate, an unknown
+        rule id the catalog cannot name a counterpart for) and must never be re-asked,
+        because re-asking those is talking a model out of a refusal it was right to make.
+        The correctable ones keep their position in the emitted array so the correction
+        can name which candidate it means without quoting the candidate back.
+
+        The split is read off `Decline.correctable`, not off a list of reason codes, so a
+        new correctable family (`validation.py::_rule_hint` is the third) routes here the
+        day it is added rather than the day someone remembers to extend a set."""
         kept: list[ExtractedCandidate] = []
         settled: list[Decline] = []
         shape: list[tuple[int, Decline]] = []
         for index, raw in enumerate(raw_candidates):
-            outcome = to_candidate(raw, summary, known_rules=self._config.known_rules)
+            outcome = to_candidate(
+                raw,
+                summary,
+                known_rules=self._config.known_rules,
+                rule_index=self._config.rule_index,
+            )
             if isinstance(outcome, ExtractedCandidate):
                 kept.append(outcome)
             elif outcome.correctable:
@@ -584,7 +604,7 @@ def _finish(
     SURVIVED correction.
 
     Only *pending* is stamped. A substantive decline was never re-asked and must not
-    look as though it was; a shape decline that outlived the budget must carry both the
+    look as though it was; a correctable decline that outlived the budget must carry the
     count and the messages, so a human reading the inbox can tell "the model could not
     produce a valid candidate" from "the model was never asked twice" — and so the
     second reading is impossible to reach by accident, since a zero on a correctable
@@ -598,11 +618,16 @@ def _finish(
         for _index, decline in pending
     ]
     if corrected and history:
+        # The FIRST LINE of each detail, not the whole thing. Every message is one line
+        # except the totality checklist, whose remaining lines quote literals of the
+        # analyst's accepted SQL — span-worthy under the D25 verbose gate
+        # (`consumer.py::_decline_details`), not worth putting in an ungated operational
+        # log. The first line names the candidate's problem in full and quotes nothing.
         _logger.warning(
-            "extractor: %d candidate(s) for session %s still shape-declined after %d "
+            "extractor: %d candidate(s) for session %s still declined after %d "
             "correction(s): %s",
             len(corrected), summary.session_id, len(history),
-            "; ".join(d.detail for d in corrected),
+            "; ".join(d.detail.split("\n")[0] for d in corrected),
         )
     return ExtractionResult(
         candidates=tuple(kept),

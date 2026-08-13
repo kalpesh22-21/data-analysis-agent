@@ -76,7 +76,8 @@ model_script:
         id: a1
         args:
           answer: We project about 12 hires; I could not read salary, so I cannot give the salary breakdown.
-          sql: SELECT 1
+          tables:
+            - {sql: "SELECT 1"}
 expect:
   intents_terminal: 2
   re_derivation: false

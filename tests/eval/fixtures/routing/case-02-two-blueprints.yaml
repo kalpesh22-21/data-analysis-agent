@@ -83,7 +83,8 @@ model_script:
         id: a1
         args:
           answer: Sales has 4 active employees and Support 3; we project about 12 more hires.
-          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+          tables:
+            - {sql: "SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name"}
 expect:
   intents_terminal: 2
   re_derivation: false

@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -283,6 +284,57 @@ async def test_job_and_envelope_traceparent_round_trip(span_exporter, tracer):
     )
     assert env.traceparent == tp
     assert CandidateEnvelope.from_doc(env.to_doc()).traceparent == tp
+
+
+@pytest.mark.parametrize("traceparent", ["", None])
+def test_absent_traceparent_rehydrates_to_no_parent(traceparent):
+    """[traces-chained-one-trace-per-session] The REHYDRATION side is fail-open.
+
+    `""` is the case that matters in practice: a job enqueued by hand, by a test
+    harness, or by a sweeper running with no tracer carries an empty traceparent. `None`
+    from `context_from_traceparent` means "no remote parent", which
+    `span(..., context=None)` treats as a normal ROOT span — so a missing value costs
+    the cross-process CHAINING and nothing else. It must never raise: the consume path
+    calls this before it has done anything, so an exception here would take the whole
+    delivery down the transient-error arm and back into the PEL."""
+    assert context_from_traceparent(traceparent) is None
+
+
+@pytest.mark.parametrize("traceparent", ["not-a-traceparent", "00-abc-def-99", "00-" + "0" * 32])
+def test_malformed_traceparent_rehydrates_to_no_valid_parent(traceparent):
+    """Same fail-open, DIFFERENT mechanism — worth pinning because the two are easy to
+    conflate. A malformed value does NOT come back `None`: the W3C propagator does not
+    raise on garbage, it simply extracts nothing and returns an EMPTY `Context`. That
+    empty context carries no valid span context, so `start_as_current_span(context=...)`
+    still produces a ROOT span. The guarantee the consumer depends on is therefore "no
+    VALID remote parent, and no exception", not "is None"."""
+    ctx = context_from_traceparent(traceparent)
+    assert not trace.get_current_span(ctx).get_span_context().is_valid
+
+
+async def test_consume_of_a_job_with_an_empty_traceparent_still_processes(
+    store, queue, settings, seed_session, span_exporter, tracer
+):
+    """The fail-open above, end to end: a manually-enqueued job with `traceparent=""`
+    consumes normally and emits a ROOT `learning.consume` span (no remote parent)."""
+    doc = seed_session(
+        store, "sess-tp", learning_status=LearningStatus.QUEUED,
+        messages=[make_message(0, "user", "hi")],
+    )
+    await queue.enqueue(
+        LearningJob(
+            session_id=doc.session_id,
+            couchbase_doc_id=f"session::{doc.session_id}",
+            content_hash="h",
+            traceparent="",
+        )
+    )
+
+    result = await LearningConsumer(store, queue, settings, tracer=tracer).run_once()
+
+    assert result.done == 1
+    consume = _by_name(span_exporter)["learning.consume"]
+    assert consume.parent is None  # a ROOT span, not a child of nothing-in-particular
 
 
 # --- traces-verbose-off-is-d25-shape-only ------------------------------------

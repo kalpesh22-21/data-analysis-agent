@@ -51,6 +51,7 @@ from datetime import date
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.dispatch.denial_mapping import (
+    ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
     FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
 )
 from data_agent.runtime.observability import tracing
@@ -700,7 +701,19 @@ _STALE_CROSS_TURN_TOOLS = frozenset({"recordAssumptions", "updateAnalysisState"}
 # This is the THIRD instance of one defect class in this release (README findings
 # 9 and 11). If a fourth model-authored-text channel appears, extend one of these
 # two sets — do not add a third predicate.
-_STALE_CROSS_TURN_ERROR_CODES = frozenset({FINALIZATION_BLOCKED_PENDING_INTENTS_CODE})
+_STALE_CROSS_TURN_ERROR_CODES = frozenset(
+    {
+        FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
+        # The FOURTH instance, and the set was extended rather than a third
+        # predicate added, exactly as the paragraph above instructs. The
+        # empty-designation refusal (08 §O) is persisted under `answerWithTable`
+        # too, and its `args` likewise carry the model's refused draft answer —
+        # prose written from warehouse rows, under a scope that may since have
+        # narrowed. It only ever needs to survive its OWN turn: the whole point is
+        # that the model reads it on the next round-trip and sends the table.
+        ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
+    }
+)
 
 
 def _is_stale_model_text_entry(entry: TrailEntry, current_turn_index: int | None) -> bool:

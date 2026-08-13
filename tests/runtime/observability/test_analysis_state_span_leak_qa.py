@@ -104,7 +104,12 @@ def _script() -> list[ModelTurnResult]:
             assistant_text=None,
             tool_calls=[
                 ToolCallRequest(
-                    id="a1", name=ANSWER, arguments={"answer": f"{CELL_VALUE} has 12", "sql": SQL}
+                    id="a1",
+                    name=ANSWER,
+                    arguments={
+                        "answer": f"{CELL_VALUE} has 12",
+                        "tables": [{"sql": SQL}],
+                    },
                 )
             ],
         ),

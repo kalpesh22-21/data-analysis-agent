@@ -99,9 +99,7 @@ expect:
         id: a1
         args:
           answer: "…"
-          sql: ""                # the placeholder the live model actually emits
-          blueprint_id: ""       # (03 §C.3.1 — it cannot omit a declared key)
-          tables:
+          tables:                             # the ONLY carrier (08 §O)
             - {sql: "", blueprint_id: bp-…, caption: "…"}
             - {sql: "SELECT …", blueprint_id: "", caption: "…"}
 expect:
@@ -109,7 +107,11 @@ expect:
   envelope_verification_passed: null   # the AND roll-up; `null` is a real expectation
 ```
 
-**No existing assertion broke.** The fixtures ENCODED a single-table answer but nothing read it — `answer_sql` appears in no `tests/eval/*.py` — so cases 2 and 4 stay on the top-level `sql:` shorthand deliberately: it is the 6/6 path, and it now has a regression test by accident.
+**No existing assertion broke** when 08 landed: the fixtures ENCODED a single-table answer but nothing read it — `answer_sql` appears in no `tests/eval/*.py`.
+
+**08 §O then moved every fixture onto `tables`,** because the top-level `sql`/`blueprint_id` pair is no longer a shape any model is shown. A single-table case is now `tables: [{sql: "…"}]`, one entry. **Case 12 is the one deliberate exception**: it keeps the retired top-level placeholders (`sql: ""`, `blueprint_id: ""`) **beside a real array**, so the *a key carrying no information is absent* rule is exercised end to end through the real harness and not only in a unit test.
+
+That is the **tables-wins** branch. The other branch — the **fold**, a real `blueprint_id` beside an *empty* `tables`, which is R7 q1's actual serialisation — is not reachable through a routing fixture that also has to assert two tables, and is covered in unit tests instead: `test_the_r7_q1_placeholder_call_still_resolves_rather_than_refusing` for the resolution, and `test_a_pre_slim_down_document_still_replays_and_still_pages` for the whole-document replay guarantee. Naming which fixture covers which branch matters here because the two look alike and only one of them is what the live model sent.
 
 **`serves_intent` is load-bearing** — see C.2. **It is now a REAL runtime argument** (README finding 20), not a fixture-only label: the harness passes it into the scripted call's `arguments`, the runtime strips it before dispatch and persists it on `TrailEntry.serves_intent`, and §C.2's mapping is derived from that field unioned with the explicit `evidence_tool_call_id` bindings — so A2 keeps working now that a live model closes intents by tag and sends no evidence id at all. An empty `column_scope` drops every card, since blueprint recall pre-filters on `uses ⊆ scope`.
 

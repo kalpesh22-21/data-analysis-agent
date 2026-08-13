@@ -41,6 +41,7 @@ from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import (
     AnalysisState,
     TrackedIntent,
+    TrailEntry,
     TurnMessage,
 )
 from data_agent.runtime.session_history import project_history
@@ -78,7 +79,9 @@ def _init_call(call_id: str, *descriptions: str) -> ToolCallRequest:
 
 
 def _answer_call(call_id: str, answer: str = "Here is the answer.") -> ToolCallRequest:
-    return ToolCallRequest(id=call_id, name=ANSWER, arguments={"answer": answer, "sql": "SELECT 1"})
+    return ToolCallRequest(
+        id=call_id, name=ANSWER, arguments={"answer": answer, "tables": [{"sql": "SELECT 1"}]}
+    )
 
 
 def _build(script: list[ModelTurnResult], store: InMemorySessionStore) -> AgentLoop:
@@ -386,3 +389,58 @@ async def test_a_resolves_column_outside_uses_does_not_survive_a_narrowing() -> 
         "the entry stays in scope under a narrowing that removed a column its own "
         "card prints, so 'AnnualSalary' replays after the caller lost it"
     )
+
+
+async def test_a_prior_turns_empty_designation_refusal_does_not_replay_its_draft() -> None:
+    """The FOURTH instance of the same class (08 §O), pinned the day it was added
+    rather than after it leaked.
+
+    `ANSWER_TABLE_NO_TABLE_DESIGNATED` is the refusal for an `answerWithTable` that
+    named no table on a turn holding untabled multi-row results. Like the
+    finalization refusal above it is persisted under `answerWithTable` — whose
+    SUCCESSFUL entries must keep replaying, so it cannot be dropped by tool name —
+    and like it, its `args` carry the model's REFUSED DRAFT ANSWER: prose written
+    from warehouse rows read under whatever scope applied at the time.
+
+    It only ever needs to survive its own turn; that is the entire mechanism (the
+    model reads it on the next round-trip and re-sends with a table). So it joins
+    `_STALE_CROSS_TURN_ERROR_CODES`, and this asserts the drop directly — under an
+    ALLOW-ALL scope, because `frozenset()` provenance is unconditionally in scope
+    and an assertion made only under a narrowed one would pass for the wrong reason.
+    """
+    from data_agent.runtime.dispatch.denial_mapping import (
+        ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
+    )
+
+    draft = "Radiology has 41 people earning above 100000."
+    store = InMemorySessionStore()
+    await store.get_or_create_session(SESSION_ID)
+    await store.append_trail_entry(
+        SESSION_ID,
+        TrailEntry(
+            turn_index=0,
+            tool_call_id="a1",
+            tool_name=ANSWER,
+            args={"answer": draft, "tables": []},
+            status="error",
+            error_code=ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
+            provenance=frozenset(),
+            result_preview=None,
+            result_full_ref=None,
+            ts="t0",
+        ),
+    )
+    await store.append_message(
+        SESSION_ID, TurnMessage(turn_index=1, role="user", content="something else", ts="t1")
+    )
+    assembler = ContextAssembler(store, history_token_budget=100_000)
+
+    # Its OWN turn still sees it — that is what makes the nudge work at all.
+    own_turn = await assembler.assemble(SESSION_ID, frozenset(), current_turn_index=0)
+    assert ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE in json.dumps(own_turn.messages, default=str)
+
+    # A LATER turn does not, draft prose included.
+    later = await assembler.assemble(SESSION_ID, frozenset(), current_turn_index=1)
+    blob = json.dumps(later.messages, default=str)
+    assert ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE not in blob
+    assert draft not in blob

@@ -53,7 +53,11 @@ from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCan
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
 from data_agent.learning.factory import build_promotion_plane, build_promotion_write_plane
-from data_agent.learning.observability import configure_learning_tracing, get_learning_tracer
+from data_agent.learning.observability import (
+    configure_learning_tracing,
+    get_learning_tracer,
+    log_tracing_status,
+)
 from data_agent.learning.promotion.models import ProbeResult
 from data_agent.learning.promotion.token_minter import HttpTokenMinter, TenantClaims
 from data_agent.runtime.config import RuntimeSettings
@@ -106,6 +110,13 @@ async def _main() -> int:
     )
     set_global_tracer_provider(provider)
     _ = get_learning_tracer(provider)
+    # An empty OTLP_ENDPOINT builds a NO-OP provider silently; say which it is.
+    log_tracing_status(
+        _logger,
+        otlp_endpoint=learning_settings.otlp_endpoint,
+        service_name=learning_settings.learning_service_name,
+        process="scheduler",
+    )
 
     candidates_ready = bool(
         learning_settings.learning_candidates_username

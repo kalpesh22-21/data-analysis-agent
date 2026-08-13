@@ -229,6 +229,10 @@ class RedisStreamsLearningQueue:
                     job=job,
                     delivery_count=delivery_count,
                     dead_lettered=delivery_count > max_deliveries,
+                    # XAUTOCLAIM re-assigned this entry to THIS consumer after
+                    # `min_idle_ms` of idleness — the delivery-path fact the
+                    # consumer's `processing` re-entry decision reads.
+                    reclaimed=True,
                 )
             )
         return delivered

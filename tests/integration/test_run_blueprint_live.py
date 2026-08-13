@@ -224,7 +224,7 @@ async def test_narrow_scope_blueprint_is_not_found_no_data_leaks_live(
 async def test_single_node_resolve_via_earnings_runs_and_verifies_live(
     seeded_dag_corpus: bool, mint: Mint
 ) -> None:
-    # D67 end-to-end on real infra: the `earnings_only` rule maps the concept
+    # D67 end-to-end on real infra: the `gross_earnings` rule maps the concept
     # "earnings" → the earnings RegisterType code set via the REAL
     # `resolveValues.resolve()` (real embedder ranks the live DISTINCT domain
     # {EARN, DEDUCTION}, value-only), and the executor folds the ranked codes into

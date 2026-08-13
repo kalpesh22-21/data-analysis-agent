@@ -55,7 +55,7 @@ from .candidate import CandidateEnvelope, CandidateStore
 from .config import LearningSettings
 from .consumer import LearningConsumer, SummaryLoader, Triage
 from .dedup import BlueprintCorpus, DedupStage
-from .extractor import ExtractorConfig, LearningExtractor
+from .extractor import ExtractorConfig, LearningExtractor, RuleIndex
 from .generalize import GeneralizeStage
 from .inbox import ReviewInbox
 from .judge import CoverageJudge, JudgeConfig
@@ -163,6 +163,7 @@ def build_learning_consumer(
     checks: SchemaEditChecks | None = None,
     sampler: Sampler | None = None,
     known_rules: frozenset[str] = frozenset(),
+    rule_index: RuleIndex | None = None,
     tracer: object | None = None,
     summary_loader: SummaryLoader | None = None,
     triage: Triage | None = None,
@@ -296,6 +297,20 @@ def build_learning_consumer(
             "rule-role blueprint plan will decline missing_rule (MEDIUM-2). Pass the "
             "grounded catalog rule ids (load_known_rule_ids()) to enable rule-role plans."
         )
+    elif rule_index is None:
+        # Grounded ids but no index: a rule-role plan citing an id that does not exist
+        # declines missing_rule TERMINALLY, with no corrective turn, even when the
+        # catalog names the same concept under another id (the `earnings_only` /
+        # `gross_earnings` case). Safe — the decline reaches a human either way — but
+        # invisible, and the whole cost is a correct proposal thrown away over a label.
+        # Build it from the SAME catalog as `known_rules`
+        # (`rule_index_from_catalog`), which is what keeps the two views consistent.
+        _logger.info(
+            "learning consumer built with known_rules but NO rule index — an unknown "
+            "rule_id declines missing_rule terminally and is never re-asked, even when "
+            "the catalog names the concept under a different id. Pass "
+            "rule_index=rule_index_from_catalog(catalog) to enable the hinted correction."
+        )
 
     extractor = LearningExtractor(
         model_client,
@@ -303,6 +318,7 @@ def build_learning_consumer(
             max_retries=settings.learning_extractor_max_retries,
             max_shape_corrections=settings.learning_extractor_max_shape_corrections,
             known_rules=known_rules,
+            rule_index=rule_index,
         ),
         # THE SAME index instance the dedup stage gets (plan §3a). One object, two
         # readers: the extractor asks "has this been proposed before?" BEFORE the LLM

@@ -44,9 +44,16 @@ from data_agent.learning.audit.couchbase_audit_store import CouchbaseAuditStore
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
-from data_agent.learning.extractor.grounding import known_rule_ids_from_catalog
+from data_agent.learning.extractor.grounding import (
+    known_rule_ids_from_catalog,
+    rule_index_from_catalog,
+)
 from data_agent.learning.factory import build_learning_consumer
-from data_agent.learning.observability import configure_learning_tracing, get_learning_tracer
+from data_agent.learning.observability import (
+    configure_learning_tracing,
+    get_learning_tracer,
+    log_tracing_status,
+)
 from data_agent.learning.redis_queue import RedisStreamsLearningQueue
 from data_agent.learning.user.config import UserKnowledgeStoreConfig
 from data_agent.learning.user.couchbase_user_store import CouchbaseUserKnowledgeStore
@@ -77,6 +84,13 @@ async def _main() -> int:
     )
     set_global_tracer_provider(provider)
     tracer = get_learning_tracer(provider)
+    # An empty OTLP_ENDPOINT builds a NO-OP provider silently; say which it is.
+    log_tracing_status(
+        _logger,
+        otlp_endpoint=learning_settings.otlp_endpoint,
+        service_name=learning_settings.learning_service_name,
+        process="consumer",
+    )
 
     store = CouchbaseSessionStore(runtime_settings)
     queue = RedisStreamsLearningQueue.from_settings(learning_settings)
@@ -264,6 +278,11 @@ async def _main() -> int:
                 catalog_schema=build_sqlglot_schema_from_catalog(catalog),
                 embedder=embedder,
                 known_rules=known_rule_ids_from_catalog(catalog),
+                # The SAME catalog, projected a second way: which table each rule is
+                # declared on. Read only when a plan cites a rule id that does not
+                # exist, to decide whether the decline can name the id that was meant
+                # instead of dying on a label (`extractor/rule_match.py`).
+                rule_index=rule_index_from_catalog(catalog),
             )
 
         _logger.info(

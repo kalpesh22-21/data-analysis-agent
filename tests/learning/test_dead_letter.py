@@ -64,12 +64,17 @@ async def test_queue_does_not_dead_letter_before_n(store, queue, clock, seed_ses
 # --- End-to-end poison through the consumer ---------------------------------
 
 
-async def test_wedged_session_is_dead_lettered_end_to_end(store, queue, settings, clock, seed_session):
-    """A session wedged in `processing` (a prior consumer crashed mid-work) fails
-    every `queued -> processing` assert on redelivery, so the job never ACKs and
-    keeps accumulating deliveries until the queue dead-letters it and the consumer
-    CAS-marks the session `dead_letter` (transition #5)."""
-    doc = seed_session(store, "wedged", learning_status=LearningStatus.PROCESSING,
+async def test_stuck_pending_session_is_dead_lettered_end_to_end(store, queue, settings, clock, seed_session):
+    """A session stuck in `pending` (a sweeper crashed after the XADD but before the
+    `pending -> queued` CAS, and never re-swept) is REFUSED by every delivery, so the
+    job never ACKs and keeps accumulating deliveries until the queue dead-letters it
+    and the consumer CAS-marks the session `dead_letter` (transition #5, the
+    `pending -> dead_letter` edge `VALID_TRANSITIONS` documents).
+
+    This is the poison-by-attrition path for a state the consumer may NOT claim. The
+    `processing` case used to arrive here too and no longer does — see
+    `test_wedged_processing_session_is_recovered_on_reclaim`."""
+    doc = seed_session(store, "stuck", learning_status=LearningStatus.PENDING,
                        messages=[make_message(0, "user", "hi")])
     job = LearningJob.from_doc(doc, content_hash=compute_content_hash(doc))
     await queue.enqueue(job)
@@ -81,12 +86,37 @@ async def test_wedged_session_is_dead_lettered_end_to_end(store, queue, settings
     for _ in range(10):
         clock.advance(10)
         outcome = await consumer.run_once()
-        if store._docs["wedged"].learning_status == LearningStatus.DEAD_LETTER:
+        if store._docs["stuck"].learning_status == LearningStatus.DEAD_LETTER:
             break
 
-    assert store._docs["wedged"].learning_status == LearningStatus.DEAD_LETTER
+    assert store._docs["stuck"].learning_status == LearningStatus.DEAD_LETTER
     assert outcome.dead_letters == 1
     assert len(queue.dead_letters()) == 1
+    assert queue.pending_count() == 0
+    assert queue.stream_length() == 0
+
+
+async def test_wedged_processing_session_is_recovered_on_reclaim(store, queue, settings, clock, seed_session):
+    """THE REGRESSION GUARD for the silent-skip black hole. A session wedged in
+    `processing` by a crashed owner used to fail every `queued -> processing` assert,
+    silently, until it dead-lettered by attrition. It is now RECOVERED by the first
+    reclaim (the redelivery IS the recovery path) and reaches `done` — no dead
+    letter, no PEL leak."""
+    doc = seed_session(store, "wedged", learning_status=LearningStatus.PROCESSING,
+                       messages=[make_message(0, "user", "hi")])
+    job = LearningJob.from_doc(doc, content_hash=compute_content_hash(doc))
+    await queue.enqueue(job)
+    # Model a crashed consumer: the message is delivered (dc=1) but never acked.
+    await queue.consume(count=10, block_ms=0)
+
+    consumer = LearningConsumer(store, queue, settings)
+    clock.advance(10)  # past min-idle -> the entry is reclaimable
+    outcome = await consumer.run_once()
+
+    assert outcome.done == 1
+    assert outcome.dead_letters == 0
+    assert store._docs["wedged"].learning_status == LearningStatus.DONE
+    assert queue.dead_letters() == []
     assert queue.pending_count() == 0
     assert queue.stream_length() == 0
 

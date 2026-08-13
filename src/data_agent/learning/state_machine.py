@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from .models import VALID_TRANSITIONS, LearningStatus
+from .models import RECOVERY_TRANSITIONS, VALID_TRANSITIONS, LearningStatus
 
 
 class InvalidTransitionError(Exception):
@@ -75,4 +75,45 @@ async def transition(
         cas,
         content_hash=content_hash,
         assert_from=assert_from,
+    )
+
+
+async def recover_to_processing(
+    store: _TransitionableStore,
+    session_id: str,
+    expected_from: str,
+    cas: Any,
+) -> Any:
+    """RE-CLAIM a session the consumer already owns the message for, per
+    `RECOVERY_TRANSITIONS` (`processing → processing`, `done → processing`).
+
+    A SECOND, deliberately narrow entry point rather than a widening of
+    `VALID_TRANSITIONS`, for the same reason the `* → dead_letter` hatch is a
+    parameter and not a table row: the forward table is the design's ownership
+    contract and it must stay readable as one (`done` has no forward successor;
+    nothing may re-enter `processing` on the ordinary path). Recovery is a
+    different question — "this delivery is mine to run even though the session is
+    not `queued`" — and it is asked from exactly one call site.
+
+    KEEPS the CAS semantics unchanged: the store still asserts the `from` state AND
+    still replaces under the caller's *cas*, so a peer that wrote since the caller's
+    read wins and this raises `CASMismatchError` (the caller's skip path). Raises
+    `InvalidTransitionError` for any edge not in `RECOVERY_TRANSITIONS` — notably
+    `queued → processing` (that is the FORWARD edge; use `transition`) and anything
+    out of `active`/`pending`/`dead_letter`, which recovery must never manufacture.
+    """
+    if LearningStatus.PROCESSING not in RECOVERY_TRANSITIONS.get(
+        expected_from, frozenset()
+    ):
+        raise InvalidTransitionError(
+            f"Illegal learning_status RECOVERY {expected_from!r} -> "
+            f"{LearningStatus.PROCESSING!r}."
+        )
+    return await store.transition_learning_status(
+        session_id,
+        expected_from,
+        LearningStatus.PROCESSING,
+        cas,
+        content_hash=None,
+        assert_from=True,
     )

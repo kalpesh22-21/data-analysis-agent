@@ -66,7 +66,8 @@ model_script:
         id: a1
         args:
           answer: The employee table has employee_code, department_name and employee_status; 7 employees are active.
-          sql: SELECT count() AS active FROM dbpcm_warehouse.employee WHERE employee_status = 'A'
+          tables:
+            - {sql: "SELECT count() AS active FROM dbpcm_warehouse.employee WHERE employee_status = 'A'"}
 expect:
   intents_terminal: 2
   re_derivation: false

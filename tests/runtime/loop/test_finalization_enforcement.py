@@ -159,7 +159,7 @@ def _completed(intent_id: str, evidence: str) -> dict[str, Any]:
 
 def _answer_call(call_id: str, answer: str = "Here is the answer.") -> ToolCallRequest:
     return ToolCallRequest(
-        id=call_id, name=ANSWER, arguments={"answer": answer, "sql": "SELECT 1"}
+        id=call_id, name=ANSWER, arguments={"answer": answer, "tables": [{"sql": "SELECT 1"}]}
     )
 
 
@@ -360,7 +360,10 @@ async def test_the_refusal_precedes_answer_sql_resolution_and_its_hooks() -> Non
                             name=ANSWER,
                             # Names a blueprint that never ran this turn — the
                             # `ANSWER_TABLE_BLUEPRINT_NOT_RUN` shape.
-                            arguments={"answer": "Here it is.", "blueprint_id": "bp-never-ran"},
+                            arguments={
+                                "answer": "Here it is.",
+                                "tables": [{"blueprint_id": "bp-never-ran"}],
+                            },
                         )
                     ],
                 ),
@@ -401,7 +404,9 @@ async def test_a_blank_answer_is_not_a_finalization_and_is_not_refused() -> None
                 assistant_text=None,
                 tool_calls=[
                     ToolCallRequest(
-                        id="a1", name=ANSWER, arguments={"answer": "   ", "sql": "SELECT 1"}
+                        id="a1",
+                        name=ANSWER,
+                        arguments={"answer": "   ", "tables": [{"sql": "SELECT 1"}]},
                     )
                 ],
             ),

@@ -25,12 +25,27 @@ class DeliveredJob:
     XACKed it off the work stream, so the consumer must NOT process/ack it — it
     only CAS-marks the session `dead_letter` (transition #5). A normal delivery
     (from `consume`, or a still-live reclaim) has `dead_lettered=False`.
+
+    `reclaimed` marks the DELIVERY PATH: True ⟺ this delivery came from
+    `reclaim_stale` (XAUTOCLAIM of an entry idle past `min_idle_ms`), False ⟺ it
+    came from `consume` (XREADGROUP `>`, a first delivery). The consumer needs the
+    distinction to decide whether a session sitting in `processing` is a crashed
+    owner's work it may continue (`consumer._claim_decision`), and it is carried
+    EXPLICITLY rather than derived from `delivery_count > 1` because that
+    equivalence is a property of the transport (`>` only ever yields
+    `times_delivered == 1`), not of this port — a queue impl that redelivered
+    without XAUTOCLAIM would silently change the meaning of the derived form.
+    NOTE what it does NOT mean: a reclaim proves the entry was IDLE for min-idle,
+    NOT that its previous owner is dead (Redis resets idle time on delivery, not on
+    the owner's progress). The CAS is what makes re-entry safe; this flag only says
+    the transport handed us the message.
     """
 
     message_id: str
     job: LearningJob
     delivery_count: int
     dead_lettered: bool = False
+    reclaimed: bool = False
 
 
 class LearningQueue(Protocol):

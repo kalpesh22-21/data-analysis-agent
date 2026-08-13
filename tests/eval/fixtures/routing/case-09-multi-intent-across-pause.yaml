@@ -73,7 +73,8 @@ model_script:
         id: a1
         args:
           answer: Sales has 4 and Support 3.
-          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+          tables:
+            - {sql: "SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name"}
   # Round 4 — a second pause, so the next attempt arrives across a RESUME.
   - tool_calls:
       - name: askUser
@@ -87,7 +88,8 @@ model_script:
         id: a2
         args:
           answer: Sales has 4 and Support 3; I could not produce the salary breakdown.
-          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+          tables:
+            - {sql: "SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name"}
 expect:
   intents_terminal: 2
   re_derivation: false

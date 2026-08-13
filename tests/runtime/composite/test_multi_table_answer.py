@@ -210,6 +210,12 @@ def test_the_flat_schema_mis_fill_is_tolerated_item_by_item() -> None:
     exactly that, and `resolve_designation`'s own docstring records `sql=""` beside
     `blueprint_id` as the form the live model actually sends. So the placeholder
     shape is the EXPECTED serialisation here, not an edge case.
+
+    PLACEHOLDER SOUP AT THE TOP LEVEL IS NOT A CONFLICT. The legacy `sql: ""` and
+    `blueprint_id: ""` beside a real `tables` array carry no information, so by the
+    rule that a key carrying nothing is ABSENT they are simply not there: the array
+    wins and nothing is refused. This is the exact serialisation 08 §O retired the
+    top-level pair over, arriving from a model still working off a stale context.
     """
     designation = resolve_designations(
         {
@@ -229,6 +235,37 @@ def test_the_flat_schema_mis_fill_is_tolerated_item_by_item() -> None:
     assert [item.caption for item in designation.items] == ["Headcount", None]
 
 
+def test_a_non_dict_tables_entry_is_counted_as_a_drop_not_filtered_silently() -> None:
+    """`tables: ["SELECT 1"]` — a bare string where an object belongs, which is a
+    real thing a model sends.
+
+    It was filtered out ONE LINE ABOVE the counter, so it produced no
+    `loop_answer_table_item_dropped` and was indistinguishable from a call that sent
+    an empty array. That difference matters now: an empty array is a refusal
+    (`carried_designation=False`) while a malformed entry is telemetry, and the two
+    were reporting the same nothing.
+    """
+    designation = resolve_designations(
+        {"answer": "x", "tables": ["SELECT 1", 42, None, {"sql": SALARY_SQL}]}, {}
+    )
+    assert [item.sql for item in designation.items] == [SALARY_SQL]
+    assert designation.dropped_unresolvable == 3
+
+
+def test_dropped_entries_are_still_counted_when_the_legacy_pair_wins() -> None:
+    """The count survives the fallback branches, which dropped it on the floor.
+
+    An array of pure placeholders beside a legacy pair reported ZERO drops, because
+    only the `tables`-wins branch carried the number out. The entries were sent and
+    produced no table either way, so they are counted either way.
+    """
+    designation = resolve_designations(
+        {"answer": "x", "sql": SALARY_SQL, "tables": [{"sql": "", "blueprint_id": ""}]}, {}
+    )
+    assert [item.sql for item in designation.items] == [SALARY_SQL]
+    assert designation.dropped_unresolvable == 1
+
+
 def test_a_wholly_placeholder_item_is_dropped_and_counted() -> None:
     """The residual risk 08 §B.2 names: an item that designates nothing at all.
     Rule is drop-it-count-it — it cannot be a refusal, because it names no
@@ -241,31 +278,75 @@ def test_a_wholly_placeholder_item_is_dropped_and_counted() -> None:
     assert designation.dropped_unresolvable == 1
 
 
-def test_the_singular_shorthand_is_unchanged_and_not_deprecated() -> None:
-    """`sql=`/`blueprint_id=` at the top level is the shape that succeeds 6/6.
-    Removing it to force one canonical path would put the WORKING case through an
-    untested one for tidiness."""
+def test_a_single_table_answer_is_a_one_entry_tables_list() -> None:
+    """08 §O: `tables` is the ONLY carrier the model-facing schema declares, and the
+    6/6 single-deliverable case is a list of length one. This is the shape the live
+    model sends today; every legacy test below it is a READ-path guarantee."""
+    for args, expected in (
+        ({"answer": "x", "tables": [{"sql": SALARY_SQL}]}, SALARY_SQL),
+        (
+            {"answer": "x", "tables": [{"sql": "", "blueprint_id": "bp-a"}]},
+            HEADCOUNT_SQL,
+        ),
+    ):
+        designation = resolve_designations(args, {"bp-a": HEADCOUNT_SQL})
+        assert [item.sql for item in designation.items] == [expected]
+        assert designation.from_tables_array is True
+
+
+def test_a_legacy_top_level_pair_folds_into_a_one_entry_list() -> None:
+    """THE FOLD (08 §O). The top-level `sql`/`blueprint_id` pair is gone from the
+    model-facing schema, but it is READ forever, because two callers need it and
+    neither is optional: every `answerWithTable` trail entry written before the
+    change carries that shape and replays cross-turn, and a model working from a
+    stale context can still emit it.
+
+    It is FOLDED, never refused. A non-empty legacy designation with no usable
+    `tables` becomes a one-entry list — refusing it would cost the user a finished
+    answer over a payload detail the runtime reads perfectly well."""
     for args, expected in (
         ({"answer": "x", "sql": SALARY_SQL}, SALARY_SQL),
         ({"answer": "x", "sql": "", "blueprint_id": "bp-a"}, HEADCOUNT_SQL),
     ):
         designation = resolve_designations(args, {"bp-a": HEADCOUNT_SQL})
         assert [item.sql for item in designation.items] == [expected]
+        # The fold is REPORTED as what it is: the array was not the source.
         assert designation.from_tables_array is False
 
 
-def test_an_empty_tables_array_falls_back_to_the_top_level_pair() -> None:
+def test_the_r7_q1_placeholder_call_still_resolves_rather_than_refusing() -> None:
+    """The live call 08 §O was written from, verbatim.
+
+    R7 q1 sent `{"answer": …, "sql": "", "blueprint_id": "bp-…", "tables": []}` —
+    four declared properties carrying ONE field's worth of information, because the
+    model cannot omit a declared key. That payload is exactly what the schema
+    slim-down deletes, and until every in-flight context has turned over it is also
+    exactly what can still arrive. It must resolve, not refuse: the two placeholders
+    and the empty array carry nothing, so the blueprint id is the whole call."""
+    designation = resolve_designations(
+        {"answer": "…", "sql": "", "blueprint_id": "bp-a", "tables": []},
+        {"bp-a": HEADCOUNT_SQL},
+    )
+    assert [item.sql for item in designation.items] == [HEADCOUNT_SQL]
+    assert designation.dropped_unresolvable == 0
+
+
+def test_an_empty_tables_array_falls_back_to_the_legacy_pair() -> None:
     """`tables: []` is the array analogue of `""` — the same placeholder behaviour
-    one type up. Falling back (rather than unioning) is what stops a model that
-    filled the array with nothing from silently losing its table."""
+    one type up, and now the likelier one: `tables` is REQUIRED, so a model with
+    nothing to put there must still emit the key. Falling back (rather than
+    unioning) is what stops a call that filled the array with nothing from silently
+    losing its table."""
     designation = resolve_designations(
         {"answer": "x", "sql": SALARY_SQL, "tables": []}, {}
     )
     assert [item.sql for item in designation.items] == [SALARY_SQL]
 
 
-def test_tables_and_a_top_level_pair_never_union() -> None:
-    """A model that fills BOTH gets one table, not two. `tables` wins outright."""
+def test_tables_and_a_legacy_pair_never_union() -> None:
+    """A call that fills BOTH gets one table, not two. `tables` wins outright, and
+    the legacy pair is not consulted at all — it is a stale carrier, not a second
+    deliverable."""
     designation = resolve_designations(
         {"answer": "x", "sql": SALARY_SQL, "tables": [{"blueprint_id": "bp-a"}]},
         {"bp-a": HEADCOUNT_SQL},
@@ -452,7 +533,7 @@ async def test_a_verified_blueprint_plus_a_raw_sql_answer_loses_its_badge() -> N
     loop, store, _events = _build(
         [
             _run_blueprints("bp-headcount"),
-            _answer("a1", answer="See table.", sql=SALARY_SQL),
+            _answer("a1", answer="See table.", tables=[{"sql": SALARY_SQL}]),
         ],
         blueprints={"bp-headcount": (HEADCOUNT_SQL, True)},
     )
@@ -524,7 +605,7 @@ async def test_answer_sql_is_exactly_the_first_tables_projection() -> None:
 async def test_a_single_table_turn_is_byte_identical_to_before() -> None:
     """The N<=1 route is what four consumers depend on: the UI's single-panel path,
     `/session/history`, the resume seed and every pause path."""
-    loop, _store, _events = _build([_answer("a1", answer="Done.", sql=SALARY_SQL)])
+    loop, _store, _events = _build([_answer("a1", answer="Done.", tables=[{"sql": SALARY_SQL}])])
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q?")
     assert outcome.answer_sql == SALARY_SQL
     assert outcome.answer_tables == [
@@ -929,7 +1010,7 @@ def test_a_single_table_turns_history_payload_is_unchanged(monkeypatch) -> None:
     beside it, so an old client that ignores the key renders as it always did."""
     client = _history_app(
         monkeypatch,
-        ScriptedModelClient([_answer("a1", answer="One thing.", sql=SALARY_SQL)]),
+        ScriptedModelClient([_answer("a1", answer="One thing.", tables=[{"sql": SALARY_SQL}])]),
         frozenset(),
     )
     headers = {"Authorization": "Bearer t", "X-Session-Id": SESSION_ID}
@@ -1147,6 +1228,19 @@ def test_the_three_new_keys_actually_reach_the_span() -> None:
     assert captured[-1]["blueprint_table_count"] == 2
     assert captured[-1]["verified_table_count"] == 1
 
+    # The empty-designation event (08 §O) reaches the span too. It is PAYLOAD-FREE
+    # by construction — there is nothing to count and nothing shape-only to say —
+    # so what has to be true is that the `loop_` prefix filter admits it and it
+    # arrives as a correctly-named span rather than being dropped on the floor.
+    # Asserted through the real observer for the same reason the three keys above
+    # are: emitting an event and publishing it are different things.
+    observe("loop_answer_table_empty_designation", {})
+    assert len(captured) == 2, "the payload-free event never opened a span"
+    # The GUARDRAIL kind and nothing else: a correctly-classified span carrying no
+    # payload, which is the whole intent — the same shape `loop_answer_shape_
+    # exhausted` has.
+    assert captured[-1] == {"openinference.span.kind": "GUARDRAIL"}
+
 
 # ---------------------------------------------------------------------------
 # Intent coverage — a CHECK, never a source (08 §B.1)
@@ -1290,3 +1384,100 @@ async def test_a_paused_turn_resumes_with_the_whole_designated_set() -> None:
     assert [t.sql for t in tables] == [HEADCOUNT_SQL, SALARY_SQL]
     # The N=1 projection is the SAME projection the envelope applies.
     assert await loop._compute_turn_answer_sql(SESSION_ID, 0) == HEADCOUNT_SQL
+
+
+# ---------------------------------------------------------------------------
+# The pre-08-§O read path — a session document written before the slim-down
+# ---------------------------------------------------------------------------
+
+
+async def test_a_pre_slim_down_document_still_replays_and_still_pages() -> None:
+    """08 §O's ONE hard compatibility requirement, asserted end to end.
+
+    The model-facing schema no longer declares a top-level `sql`/`blueprint_id`
+    pair, but every `answerWithTable` trail entry ever persisted before that change
+    carries exactly that shape and no `tables` key at all. Those entries are
+    SUCCESSFUL, and a successful `answerWithTable` entry is not a fire-and-forget
+    record: it replays cross-turn into model context, it seeds a resumed window, and
+    it rebuilds the transcript a reloaded browser renders. There is no migration and
+    no expiry, so the read path has to understand the old shape forever.
+
+    A read path that understood only `tables` would fail SILENTLY in all three
+    places at once — the grid vanishes from the reload, the resume comes back with
+    `answer_sql=None`, and nothing anywhere reports a problem. That is the same
+    class of defect `resolve_designation` was extracted to prevent, and *reload is
+    the only place that regression shows*.
+
+    FOUR CONSUMERS, one document, all four asserted:
+      1. `project_history` — the reloaded transcript's `answer_sql`/`answer_tables`.
+      2. `_compute_turn_answer_tables` — the resume seed.
+      3. `ContextAssembler` — cross-turn replay reaching the model as a real result
+         rather than the D94 withheld sentinel.
+      4. `build_page_sql` — the reconstructed SQL is genuinely pageable, which is
+         what "the user can still scroll the grid" actually means. Reconstructing a
+         string nothing can page would satisfy 1-3 and still lose the table.
+    """
+    store = InMemorySessionStore()
+    await store.get_or_create_session(SESSION_ID)
+    await store.append_message(
+        SESSION_ID,
+        TurnMessage(turn_index=0, role="user", content="q?", ts="t0", provenance=frozenset()),
+    )
+    await store.append_message(
+        SESSION_ID,
+        TurnMessage(
+            turn_index=0, role="assistant", content="By department.", ts="t3",
+            provenance=frozenset({(_E, "department_name")}),
+        ),
+    )
+    # THE OLD SHAPE, verbatim: top-level designation, no `tables` key.
+    legacy_args = {"answer": "By department.", "sql": HEADCOUNT_SQL}
+    tool_result = await AnswerWithTableTool().run(legacy_args, _creds())
+    await store.append_trail_entry(
+        SESSION_ID,
+        TrailEntry(
+            turn_index=0, tool_call_id="a1", tool_name=ANSWER, args=legacy_args,
+            status="ok", error_code=None, provenance=tool_result.provenance,
+            result_preview=tool_result.result_preview, result_full_ref=None, ts="t2",
+        ),
+    )
+    doc = await store.get_or_create_session(SESSION_ID)
+
+    # 1. The reloaded transcript.
+    body = project_history(doc.messages, doc.tool_trail, frozenset(), None)
+    turn = body["turns"][0]
+    assert turn["answer_sql"] == HEADCOUNT_SQL
+    assert [t["sql"] for t in turn["answer_tables"]] == [HEADCOUNT_SQL]
+
+    # 2. The resume seed.
+    loop = AgentLoop(
+        model_client=ScriptedModelClient([ModelTurnResult(assistant_text="x")]),
+        tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
+        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        session_store=store,
+        tools_provider=_tools_provider,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        runtime_tools={ANSWER: AnswerWithTableTool()},
+    )
+    seeded, _runs = await loop._compute_turn_answer_tables(SESSION_ID, 0)
+    assert [t.sql for t in seeded] == [HEADCOUNT_SQL]
+
+    # 3. Cross-turn replay — read on turn 1, the turn AFTER the one that wrote it.
+    assembled = await ContextAssembler(
+        session_store=store, base_system_prompt="BASE",
+        preview_row_count=20, history_token_budget=100_000,
+    ).assemble(SESSION_ID, frozenset(), current_turn_index=1)
+    replayed = [m for m in assembled.messages if m.get("tool_name") == ANSWER]
+    assert len(replayed) == 1
+    assert "result withheld" not in json.dumps(replayed[0])
+
+    # 4. Still pageable. `POST /query/page` wraps the designated SQL rather than
+    #    splicing a LIMIT onto it, so a reconstruction that cannot be wrapped is a
+    #    table the user cannot scroll — which is the whole point of keeping it.
+    from data_agent.runtime.query_page import build_page_sql
+
+    paged = build_page_sql(turn["answer_sql"], limit=50, offset=0)
+    assert HEADCOUNT_SQL in paged
+    assert "LIMIT 50" in paged.upper()

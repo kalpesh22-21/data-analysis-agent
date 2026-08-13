@@ -69,7 +69,8 @@ model_script:
         id: a1
         args:
           answer: We project about 12 hires over the next six months; Support has 3 people today.
-          sql: SELECT count() AS headcount FROM dbpcm_warehouse.employee WHERE department_name = 'Support'
+          tables:
+            - {sql: "SELECT count() AS headcount FROM dbpcm_warehouse.employee WHERE department_name = 'Support'"}
 expect:
   intents_terminal: 2
   re_derivation: false

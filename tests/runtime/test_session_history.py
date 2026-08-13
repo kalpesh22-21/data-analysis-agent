@@ -356,24 +356,45 @@ def _turn_messages(turn: int = 0) -> list[TurnMessage]:
     ]
 
 
-def test_history_exposes_a_raw_sql_designation() -> None:
+def test_history_exposes_a_tables_designation() -> None:
+    """The shape the model sends since 08 §O: `tables`, one entry for one table."""
+    body = project_history(
+        _turn_messages(),
+        [_awt_entry(0, answer="x", tables=[{"sql": _AWT_SQL, "caption": "By dept"}])],
+        frozenset(),
+        None,
+    )
+    assert body["turns"][0]["answer_sql"] == _AWT_SQL
+    assert body["turns"][0]["answer_tables"][0]["caption"] == "By dept"
+
+
+def test_history_exposes_a_legacy_top_level_raw_sql_designation() -> None:
+    """The pre-08-§O shape, which this path reads FOREVER: there is no migration,
+    and every `answerWithTable` entry written before the slim-down is a top-level
+    pair. A reload that understood only `tables` would silently stop offering the
+    grid on every one of those turns."""
     body = project_history(_turn_messages(), [_awt_entry(0, answer="x", sql=_AWT_SQL)], frozenset(), None)
     assert body["turns"][0]["answer_sql"] == _AWT_SQL
 
 
 def test_history_resolves_a_blueprint_designation_via_the_supplied_map() -> None:
-    """The live model designates with `sql=""` beside `blueprint_id`. Reading only
+    """Blueprint designation through `tables`, plus the LEGACY top-level form that
+    the live model emitted as `sql=""` beside `blueprint_id`. Reading only
     `args["sql"]` would report `answer_sql: null` for every blueprint-answered turn —
     precisely the turns where the model was told not to copy the SQL."""
     terminal = "SELECT department, headcount FROM dbpcm_warehouse.headcount_by_dept"
-    body = project_history(
-        _turn_messages(),
-        [_awt_entry(0, answer="x", sql="", blueprint_id="bp-headcount")],
-        frozenset(),
-        None,
-        blueprint_terminal_sql={"bp-headcount": terminal},
-    )
-    assert body["turns"][0]["answer_sql"] == terminal
+    for entry in (
+        _awt_entry(0, answer="x", tables=[{"sql": "", "blueprint_id": "bp-headcount"}]),
+        _awt_entry(0, answer="x", sql="", blueprint_id="bp-headcount"),
+    ):
+        body = project_history(
+            _turn_messages(),
+            [entry],
+            frozenset(),
+            None,
+            blueprint_terminal_sql={"bp-headcount": terminal},
+        )
+        assert body["turns"][0]["answer_sql"] == terminal
 
 
 def test_an_unresolvable_blueprint_designation_reports_null_not_an_error() -> None:
@@ -381,7 +402,7 @@ def test_an_unresolvable_blueprint_designation_reports_null_not_an_error() -> No
     still renders — it just has no table, exactly as before this field existed."""
     body = project_history(
         _turn_messages(),
-        [_awt_entry(0, answer="x", blueprint_id="bp-gone")],
+        [_awt_entry(0, answer="x", tables=[{"blueprint_id": "bp-gone"}])],
         frozenset(),
         None,
         blueprint_terminal_sql={},
@@ -402,7 +423,7 @@ def test_answer_sql_is_withheld_with_the_answer() -> None:
         ),
     ]
     body = project_history(
-        messages, [_awt_entry(0, answer="x", sql=_AWT_SQL)],
+        messages, [_awt_entry(0, answer="x", tables=[{"sql": _AWT_SQL}])],
         frozenset({"dbpcm_warehouse.employee.EmployeeCode"}), None,
     )
     turn = body["turns"][0]

@@ -469,7 +469,7 @@ async def test_the_live_three_intent_failure_now_completes_with_zero_rejections(
                         arguments={
                             "answer": "Headcount and average salary by department, "
                             "plus the six-month hiring projection.",
-                            "sql": "SELECT 1",
+                            "tables": [{"sql": "SELECT 1"}],
                         },
                     ),
                 ],

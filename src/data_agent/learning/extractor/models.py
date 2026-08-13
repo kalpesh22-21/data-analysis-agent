@@ -285,20 +285,23 @@ class Decline:
     """A candidate the extractor rejected before emit (never persisted), with the
     reason code the consumer traces (fail-to-review / no-evidence / totality / …).
 
-    `correctable` splits the two kinds apart. A CORRECTABLE decline is one a reader
-    produced: the candidate could not be turned into the typed model, `detail` names
-    the field and the shape required, and the extractor may put that sentence in front
-    of the model and let it re-emit. Everything else is a rule about CONTENT judging a
-    candidate it read successfully, and re-asking is talking a model into a candidate
-    it was right to decline. Only `validation.py::_malformed` sets the flag; see it for
-    why the line sits at "did a reader fail" rather than at a list of field names.
+    `correctable` splits the two kinds apart. A CORRECTABLE decline is one whose fix the
+    extractor can NAME: a reader failed and `detail` says which field and what shape, or
+    a catalog check failed and `detail` says which id or which predicate. The extractor
+    may put that sentence in front of the model and let it re-emit. Everything else is a
+    rule about CONTENT judging a candidate it read successfully with no fix to hand, and
+    re-asking is talking a model into a candidate it was right to decline. Only
+    `validation.py::_correctable` sets the flag; see it for where the line sits and why.
 
     `corrections_attempted` / `correction_history` are the record of what was actually
     tried, and they exist so "the model could not produce a valid candidate" is
     distinguishable from "the model was never asked twice" — a zero here on a
     correctable decline means the budget was spent or disabled, not that the model
-    refused. `correction_history` is entity-free (it is the messages that were sent,
-    and those are `shape.py`-derived)."""
+    refused. `correction_history` carries whatever the DETAIL of those declines carried:
+    entity-free for the shape family, and for the two hinting families a model-authored
+    identifier or a literal of the accepted SQL (see `validation.py::_correctable`,
+    which owns that rule, and `consumer.py::ENTITY_BEARING_DECLINE_REASONS`, which
+    records which reason codes are affected)."""
 
     type: str
     reason: str

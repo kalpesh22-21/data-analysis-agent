@@ -332,16 +332,6 @@ def test_every_decline_message_names_a_path_and_a_requirement(name: str) -> None
             "missing_rule",
         ),
         (
-            "totality",
-            blueprint_raw(
-                parameterization=[
-                    p for p in payroll_parameterization()
-                    if p["locator"]["column"] != "region"
-                ]
-            ),
-            "totality_violation",
-        ),
-        (
             "malformed-optional-pattern",
             blueprint_raw(
                 parameterization=[
@@ -359,17 +349,28 @@ def test_a_judgement_about_content_is_never_correctable(
     name: str, raw: dict[str, Any], reason: str
 ) -> None:
     """The line, asserted from the other side. Each of these consults something OUTSIDE
-    the candidate — the catalog's rule ids, the accepted SQL's predicates, a SQL parser
-    — or asks for content the candidate does not contain. Re-asking any of them is
-    talking a model into a candidate it was right to decline:
+    the candidate — the catalog's rule ids, a SQL parser — or asks for content the
+    candidate does not contain, AND none of them can name the fix. Re-asking any of them
+    is talking a model into a candidate it was right to decline:
 
       * `no_evidence` is the D31 primary guard; re-asking invites an invented citation.
-      * `missing_rule` is the §7 pairing hook — "no such rule exists" is the OUTPUT a
-        human acts on, and pressure to name any id that passes destroys it.
-      * `totality_violation` would ask the model to model a filter it decided to drop.
+      * `missing_rule` here is the §7 pairing hook in its terminal form: `_decline`
+        grounds no rules at all, so the matcher has nothing to compare against and
+        cannot name a counterpart. "No such rule exists" is then the OUTPUT a human acts
+        on, and pressure to name any id that passes destroys it. (When the catalog CAN
+        name the counterpart the decline is `missing_rule_hinted` and correctable — a
+        different reason code, tested in `test_missing_rule_hint.py`.)
       * a malformed `optional_pattern` is fixed with SQL, and the extractor's contract
         is plan-not-SQL — its message also quotes the offending fragment, which must
-        not become prompt text."""
+        not become prompt text.
+
+    `totality_violation` USED TO BE ON THIS LIST, on the reasoning that re-asking would
+    "ask the model to model a filter it decided to drop". It was moved out with the
+    predicate-hint slice, and the old reasoning is worth recording because it was wrong
+    in a specific way: there is no drop role, so the model never decided to drop
+    anything, and the check knows exactly which predicates have no entry. Naming them —
+    with any catalog rule that declares them, and the three legal ways to cover one — is
+    a change of expression, not of decision. See `validation.py::_predicate_hint`."""
     out = _decline(raw)
     assert out.reason == reason, name
     assert out.correctable is False

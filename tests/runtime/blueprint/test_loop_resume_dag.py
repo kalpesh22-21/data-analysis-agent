@@ -331,7 +331,10 @@ async def test_a_blueprint_that_completed_before_the_pause_is_designatable_after
                 tool_calls=[
                     ToolCallRequest(
                         id="a1", name="answerWithTable",
-                        arguments={"answer": "Flagged 2 departments.", "blueprint_id": _BID},
+                        arguments={
+                            "answer": "Flagged 2 departments.",
+                            "tables": [{"blueprint_id": _BID}],
+                        },
                     )
                 ]
             ),

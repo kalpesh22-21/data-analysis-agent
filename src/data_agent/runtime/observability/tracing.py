@@ -401,8 +401,20 @@ def inject_current_traceparent() -> str | None:
 
 def context_from_traceparent(traceparent: str | None) -> Context | None:
     """Rehydrate a parent `Context` from a `traceparent` carried on an incoming
-    message/envelope, for `span(..., context=...)`. FAIL-OPEN: a missing or
-    malformed value ⇒ `None` (the span starts as a normal root), never a crash."""
+    message/envelope, for `span(..., context=...)`.
+
+    FAIL-OPEN, by two DIFFERENT mechanisms — stated separately because the difference
+    is invisible at the call site and easy to assert wrongly:
+
+      * MISSING (`None` or `""`, e.g. a job enqueued with no tracer, or by hand) ⇒
+        `None`, and `span(..., context=None)` starts a normal ROOT span;
+      * MALFORMED (garbage, wrong version, bad field widths) ⇒ NOT `None`. The W3C
+        propagator does not raise on garbage; it extracts nothing and returns an EMPTY
+        `Context`, which carries no valid span context, so the span is ALSO a root.
+
+    The guarantee callers depend on is therefore "no VALID remote parent and never a
+    crash" — the cost of a bad value is the cross-process CHAINING, nothing else. The
+    `except` below is belt-and-braces for a propagator that ever changes its mind."""
     if not traceparent:
         return None
     try:

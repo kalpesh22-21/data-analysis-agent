@@ -1,8 +1,9 @@
 """answer_with_table.py — the `answerWithTable` runtime tool.
 
-The model calls `answerWithTable(answer=..., sql=... | blueprint_id=...)` when its
-answer IS a table. The call is TERMINAL: it carries the final prose AND designates
-the query whose rows the user should see, so the turn ends there.
+The model calls `answerWithTable(answer=..., tables=[{sql | blueprint_id,
+caption}])` when its answer IS a table. The call is TERMINAL: it carries the final
+prose AND designates the queries whose rows the user should see, so the turn ends
+there.
 
 Why terminal. The loop's other exit is a model turn with NO tool calls. A non-
 terminal designation tool therefore cost a whole extra round-trip: the model
@@ -21,7 +22,7 @@ The safe default is unchanged. A SCALAR answer still ends the old way — a turn
 no tool calls — so a model that never calls this tool cannot hang; it falls through
 to prose with no table, exactly today's degradation.
 
-TWO WAYS TO DESIGNATE, one wire contract:
+ONE CARRIER, `tables`; TWO WAYS TO DESIGNATE INSIDE EACH ENTRY, one wire contract:
 
   * `sql=` — a raw read-only SELECT. NOT required to be one the agent already ran:
     the executed query usually carries a LIMIT the agent chose for its own reading,
@@ -38,22 +39,33 @@ TWO WAYS TO DESIGNATE, one wire contract:
     paged table from the D56 verification that gated the answer the user was given.
     An unmatched id resolves to nothing and is logged.
 
-A THIRD WAY, added by 08 (`docs/decisions/release-1/08-multi-table-answer.md`):
+WHY `tables` EXISTS (08, `docs/decisions/release-1/08-multi-table-answer.md`).
+Measured across 17 live sessions, `answerWithTable` succeeded on 6/6
+single-deliverable turns and 1/9 multi-intent ones, because the payload could name
+only ONE of the three result sets a three-part turn produces and the model answered
+the rest in prose. Two prompt-level merge rules were written to close that gap; both
+were measured live and both were REVERTED (01a §§10-11), because the instruction set
+they created was unsatisfiable rather than badly worded: *one table per answer* +
+*never re-derive a blueprint result* + *two blueprints answer two same-grain parts*
+cannot all hold. `tables` deletes the first premise, so nothing has to be merged and
+nothing re-derived.
 
-  * `tables=[{sql | blueprint_id, caption}]` — ONE table per part of a multi-part
-    answer. Measured across 17 live sessions, `answerWithTable` succeeded on 6/6
-    single-deliverable turns and 1/9 multi-intent ones, because the payload could
-    name only ONE of the three result sets a three-part turn produces and the
-    model answered the rest in prose. Two prompt-level merge rules were written to
-    close that gap; both were measured live and both were REVERTED (01a §§10-11),
-    because the instruction set they created was unsatisfiable rather than badly
-    worded: *one table per answer* + *never re-derive a blueprint result* + *two
-    blueprints answer two same-grain parts* cannot all hold. `tables` deletes the
-    first premise, so nothing has to be merged and nothing re-derived.
+An element of `tables` is EXACTLY the mapping `resolve_designation` already reads,
+so multi-table adds no second resolution path — the same function, in a loop
+(`resolve_designations` below).
 
-    An element of `tables` is EXACTLY the mapping `resolve_designation` already
-    reads, so multi-table adds no second resolution path — the same function, in a
-    loop (`resolve_designations` below).
+WHY IT IS NOW THE ONLY CARRIER (08 §O, 2026-08-13). `tables` shipped BESIDE a
+top-level `sql`/`blueprint_id` pair, kept because that pair was the shape measured
+6/6 and removing a working path for tidiness is not a trade. What retired it is not
+tidiness: 03 §C.3.1's measured failure is that the model CANNOT OMIT DECLARED KEYS,
+and R7 q1's live call was `{"answer": …, "sql": "", "blueprint_id": "bp-…",
+"tables": []}` — four declared properties carrying ONE field's worth of information,
+two placeholders and an empty array, because every declared key had to be filled with
+something. A second carrier for the same fact is a second thing to fill in wrong. The
+model-facing schema now declares `tables` alone and REQUIRES it; the top-level pair
+survives only as a read-path fold (`resolve_designations`) for trail entries written
+before the change and for a model working from a stale context. That fold has no
+expiry: old session documents are read forever.
 
 The UI receives `answer_tables` (a list) plus `answer_sql` — a DERIVED projection
 of `answer_tables[0]`, kept so every existing N<=1 consumer works untouched — and
@@ -128,7 +140,7 @@ def clean_answer_text(raw: Any) -> str | None:
 
 def clean_blueprint_id(raw: Any) -> str | None:
     """Normalize a model-supplied `blueprint_id`. Resolution against THIS turn's
-    successful runs happens in the loop (`_resolve_answer_sql`), not here."""
+    successful runs happens in the loop (`_resolve_answer_tables`), not here."""
     if not isinstance(raw, str):
         return None
     text = raw.strip()
@@ -138,14 +150,14 @@ def clean_blueprint_id(raw: Any) -> str | None:
 def resolve_designation(
     args: Any, terminal_by_id: Mapping[str, str]
 ) -> str | None:
-    """Resolve ONE `answerWithTable` call's arguments to a concrete query, or `None`.
+    """Resolve ONE designation mapping to a concrete query, or `None`.
 
     The single expression of the two-forms rule, shared by every caller so they
-    cannot drift: the agent loop (in-window and on resume) and
-    `session_history.project_history`. `sql=` wins when both are given — it is the
-    more specific instruction; otherwise `blueprint_id` is looked up in
-    *terminal_by_id*, the `blueprint_id -> terminal_sql` map of blueprints that ran
-    successfully in that turn.
+    cannot drift: one entry of `tables`, and — through `resolve_designations`'
+    legacy fold — a whole pre-08-§O call's arguments, which have the same shape.
+    `sql=` wins when both are given: it is the more specific instruction. Otherwise
+    `blueprint_id` is looked up in *terminal_by_id*, the `blueprint_id ->
+    terminal_sql` map of blueprints that ran successfully in that turn.
 
     Callers differ only in how they BUILD that map: in-window the loop reads
     `terminal_sql` straight off the dispatch result, while the resume and history
@@ -276,8 +288,11 @@ class Designation:
     """The pure read of one `answerWithTable` call's arguments."""
 
     items: tuple[DesignationItem, ...]
-    # `True` when the `tables` array was the source (08 §B.3). `False` means the
-    # top-level `sql`/`blueprint_id` pair was used — the 6/6 shorthand.
+    # `True` when the `tables` array was the source — the ONLY shape the model-facing
+    # schema declares since 08 §O. `False` with a non-empty `items` means the LEGACY
+    # top-level `sql`/`blueprint_id` pair was folded in: a persisted trail entry from
+    # before the slim-down, or a model still working from a stale context. See
+    # `resolve_designations`.
     from_tables_array: bool = False
     # Items in `tables` that carried no designation at all — the wholly-placeholder
     # item 03 §C.3.1 measured. Counted, never fatal.
@@ -317,11 +332,19 @@ def _resolve_item(item: Any, terminal_by_id: Mapping[str, str]) -> DesignationIt
 def resolve_designations(args: Any, terminal_by_id: Mapping[str, str]) -> Designation:
     """Read one `answerWithTable` call's arguments into an ORDERED item list.
 
-    THE PRECEDENCE (08 §B.3), mirroring the rule already in `resolve_designation`
+    `tables` IS THE SHAPE (08 §O). The model-facing schema declares exactly one
+    carrier and requires it, so every live call arrives as a list — a single-table
+    answer as a one-entry list. Everything below about the top-level
+    `sql`/`blueprint_id` pair is a READ-PATH FOLD for arguments that were not
+    written by today's schema.
+
+    THE PRECEDENCE (08 §B.3, kept verbatim because the fold has to behave the same
+    way the shorthand did), mirroring the rule already in `resolve_designation`
     ("`sql=` wins when both are given: it is the more specific instruction"):
 
         `tables` wins when at least one of its items CARRIES A DESIGNATION.
-        Otherwise the top-level `sql`/`blueprint_id` pair is used as one item.
+        Otherwise the legacy top-level `sql`/`blueprint_id` pair is folded in as
+        ONE item.
 
     "Carries a designation" — rather than "resolves" — is deliberate and is the one
     place the doc's wording needed sharpening to stay self-consistent. `tables:
@@ -331,37 +354,87 @@ def resolve_designations(args: Any, terminal_by_id: Mapping[str, str]) -> Design
     step 3 forbids. Under this test it stays the source, the item survives as a
     refusal, and the model gets the retryable nudge it can act on.
 
+    WHAT THE FOLD IS FOR, now that nothing is supposed to send it. Two callers, and
+    neither is optional:
+
+      1. **Replay.** Every `answerWithTable` trail entry persisted before 08 §O
+         carries `{"sql": …}` or `{"blueprint_id": …}` at the top level and no
+         `tables` at all. Those entries are SUCCESSFUL, and successful
+         `answerWithTable` entries replay cross-turn, seed a resumed window
+         (`_compute_turn_answer_tables`) and rebuild a reloaded transcript
+         (`session_history.project_history`). A read path that understood only the
+         new shape would silently drop every one of them: the table vanishes from
+         the transcript and from the resume, with nothing anywhere reporting it.
+         There is no migration and no expiry date on this — old documents are read
+         forever.
+      2. **A stale-context model.** The declared schema changes the moment the
+         process restarts, but a conversation already in flight, or a provider-side
+         cached tool list, can still produce the old serialisation. Refusing it
+         would cost the user a finished answer over a payload detail the runtime
+         can read perfectly well.
+
+    A LEGACY KEY CARRYING NO INFORMATION IS ABSENT, not an error: `sql: ""` and
+    `blueprint_id: ""` clean to `None` in `clean_answer_sql`/`clean_blueprint_id`,
+    so R7 q1's `{"answer": …, "sql": "", "blueprint_id": "bp-…", "tables": []}`
+    resolves through the blueprint id and nothing is refused. The same rule is why
+    placeholder soup BESIDE a real array (`sql: ""`, `blueprint_id: ""`,
+    `tables: [{…}]`) is not a conflict at all — there is nothing there to conflict.
+
     NEVER A UNION. A model that fills `tables: [{blueprint_id: X}]` AND `sql: <X's
     SQL>` gets ONE table, not two. Fallback rather than union is also what lets an
-    empty placeholder array (`tables: []`, the array analogue of `""`) keep its
-    top-level designation instead of silently losing it.
+    empty array (`tables: []`, the array analogue of `""` — and the exact thing a
+    model that cannot omit a required key emits when it has nothing to put there)
+    keep its legacy designation instead of silently losing it.
 
     Pure: no hooks, no store, no dedupe, no cap — see `finalize_designations`.
     """
     if not isinstance(args, dict):
         return Designation(items=())
 
-    raw_tables = args.get("tables")
-    candidates = [item for item in raw_tables if isinstance(item, dict)] if (
-        isinstance(raw_tables, list)
-    ) else []
+    raw_tables = args.get("tables") if isinstance(args.get("tables"), list) else []
+    candidates = [item for item in raw_tables if isinstance(item, dict)]
+    # A NON-DICT ENTRY IS A DROPPED ITEM, not a non-event. `["SELECT 1"]` — a bare
+    # string where an object belongs — is a real thing a model sends, and it was
+    # being filtered out one line above the counter, so it vanished with no
+    # `loop_answer_table_item_dropped` and no way to tell it from a call that sent
+    # nothing at all. Counted here so the telemetry says how many entries the model
+    # sent that produced no table, whatever shape they arrived in.
+    dropped_non_dict = len(raw_tables) - len(candidates)
     resolved = [_resolve_item(item, terminal_by_id) for item in candidates]
     designating = [
         item for item in resolved if item.sql is not None or item.named_blueprint is not None
     ]
+    # Every entry the model sent that produced no designation, counted ONCE and
+    # carried into whichever branch is taken below — the fallback paths dropped this
+    # on the floor before, so an array of pure placeholders beside a legacy pair
+    # reported nothing at all.
+    dropped_unresolvable = len(resolved) - len(designating) + dropped_non_dict
     if designating:
         return Designation(
             items=tuple(designating),
             from_tables_array=True,
-            dropped_unresolvable=len(resolved) - len(designating),
+            dropped_unresolvable=dropped_unresolvable,
         )
 
+    # THE LEGACY FOLD. `args` itself is exactly the mapping `_resolve_item` reads —
+    # a top-level `{sql, blueprint_id, caption}` IS one item's shape — so folding is
+    # reading the call as its own single entry, not a second resolution path.
     single = _resolve_item(args, terminal_by_id)
     if single.sql is None and single.named_blueprint is None:
-        # No designation at all — a prose-only `answerWithTable`. Not a drop, and
-        # deliberately not counted as one: it is an ordinary, legitimate call.
-        return Designation(items=())
-    return Designation(items=(single,))
+        # NO DESIGNATION ANYWHERE: no `tables` entry carried one and no legacy pair
+        # was present either. Reported as an empty `items`, which the loop reads
+        # back as `carried_designation=False` and turns into the retryable
+        # `ANSWER_TABLE_NO_TABLE_DESIGNATED` nudge when the turn is holding
+        # multi-row results it never tabled (`_answer_table_no_table_designated`).
+        #
+        # The absence itself is NOT counted in `dropped_unresolvable` — that counts
+        # ITEMS the model sent, and this is the absence of any usable one. (Entries
+        # it DID send that designated nothing are still counted, and carried out
+        # through here.) The two are different facts and the loop acts on them
+        # differently: a dropped item is telemetry, an empty designation is a
+        # refusal.
+        return Designation(items=(), dropped_unresolvable=dropped_unresolvable)
+    return Designation(items=(single,), dropped_unresolvable=dropped_unresolvable)
 
 
 @dataclass(frozen=True)
@@ -520,7 +593,7 @@ def is_answer_table_in_scope(
 
 
 class AnswerWithTableTool:
-    """The `answerWithTable(answer, sql | blueprint_id)` runtime tool.
+    """The `answerWithTable(answer, tables=[{sql | blueprint_id, caption}])` tool.
 
     Stateless: `run` never raises on malformed args (the loop's
     `_run_runtime_tool` also guards, defense in depth) and holds nothing itself.

@@ -102,7 +102,8 @@ model_script:
         id: a1
         args:
           answer: Here are headcount and average salary by department, plus the six-month hiring projection.
-          sql: SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name
+          tables:
+            - {sql: "SELECT department_name, count() FROM dbpcm_warehouse.employee GROUP BY department_name"}
 expect:
   intents_terminal: 3
   re_derivation: false

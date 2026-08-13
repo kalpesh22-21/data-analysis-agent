@@ -152,7 +152,7 @@ def test_an_entity_bearing_detail_is_carried_not_silently_dropped() -> None:
     DECISION.
 
     That message interpolates `pred.value` — a literal out of the analyst's accepted SQL
-    (`validation.py::_validate_totality`) — and it is the only decline detail that names a
+    (`validation.py::_predicate_hint`) — and it was the first decline detail to name a
     value. It is carried, under the D25 gate, for the reasons in `_decline_details`: this
     same span already ships `learning.accepted_sql` (the whole query, literals included)
     through the same gate, so it is not a new class of content; and excluding it by reason
@@ -176,8 +176,17 @@ def test_an_entity_bearing_detail_is_carried_not_silently_dropped() -> None:
     )
     assert rendered is not None
     assert "Analytics" in rendered
-    # And the surface is inventoried, so an auditor can find it without reading validation.
-    assert "totality_violation" in ENTITY_BEARING_DECLINE_REASONS
+    # And the surface is inventoried, so an auditor can find it without reading
+    # validation. The inventory grew with the hinting families: the two rule-id codes
+    # name a string the MODEL wrote (which a model that read the session can have
+    # derived from it), and the correspondence code names a predicate the same way
+    # `totality_violation` does.
+    assert {
+        "totality_violation",
+        "rule_predicate_mismatch",
+        "missing_rule_hinted",
+        "missing_rule",
+    } <= ENTITY_BEARING_DECLINE_REASONS
 
 
 def test_many_ordinary_details_cannot_inflate_the_span_either() -> None:

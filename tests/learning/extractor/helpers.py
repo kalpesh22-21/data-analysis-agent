@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from data_agent.learning.extractor import ExtractorConfig, LearningExtractor
+from data_agent.learning.extractor import ExtractorConfig, LearningExtractor, RuleIndex
 from data_agent.learning.extractor.schema import EXTRACTOR_TOOL_NAME, SEARCH_CORPUS_TOOL_NAME
 from data_agent.learning.priorart import PriorArtCard
 from data_agent.learning.summary.models import (
@@ -225,6 +225,7 @@ def make_extractor(
     turns: list[ModelTurnResult],
     *,
     known_rules: frozenset[str] = frozenset(),
+    rule_index: RuleIndex | None = None,
     max_retries: int = 2,
     prior_art: object | None = None,
     max_search_calls: int = 3,
@@ -241,6 +242,7 @@ def make_extractor(
         config=ExtractorConfig(
             max_retries=max_retries,
             known_rules=known_rules,
+            rule_index=rule_index,
             max_search_calls=max_search_calls,
             max_shape_corrections=max_shape_corrections,
         ),
@@ -252,11 +254,15 @@ def emit_extractor(
     candidates: list[dict[str, Any]],
     *,
     known_rules: frozenset[str] = frozenset(),
+    rule_index: RuleIndex | None = None,
     prior_art: object | None = None,
 ) -> LearningExtractor:
     """Extractor scripted to emit exactly *candidates* in one tool call."""
     return make_extractor(
-        [scripted_turn(candidates)], known_rules=known_rules, prior_art=prior_art
+        [scripted_turn(candidates)],
+        known_rules=known_rules,
+        rule_index=rule_index,
+        prior_art=prior_art,
     )
 
 

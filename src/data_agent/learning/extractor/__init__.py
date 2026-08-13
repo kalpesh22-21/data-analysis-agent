@@ -1,6 +1,12 @@
 # extractor — the grounded, structured-output candidate extractor (Track B, Slice 3;
 # D31/D34/D97/D98). Emits a PLAN only (never SQL — the AST rewrite is Slice 4).
 from .extractor import ExtractorConfig, ExtractorConfigError, LearningExtractor
+from .grounding import (
+    CatalogRule,
+    RuleIndex,
+    known_rule_ids_from_catalog,
+    rule_index_from_catalog,
+)
 from .models import (
     BlueprintPayload,
     CandidateHeader,
@@ -29,6 +35,7 @@ __all__ = [
     "SEARCH_CORPUS_TOOL_NAME",
     "BlueprintPayload",
     "CandidateHeader",
+    "CatalogRule",
     "Decline",
     "EntitySelfCheck",
     "EvidenceRef",
@@ -41,10 +48,13 @@ __all__ = [
     "ParamPlan",
     "PriorArtLookup",
     "ResultSignature",
+    "RuleIndex",
     "SchemaMismatchError",
     "SlotPlan",
     "build_extractor_tool",
     "build_search_corpus_tool",
+    "known_rule_ids_from_catalog",
     "parse_candidates",
     "render_prior_art_block",
+    "rule_index_from_catalog",
 ]

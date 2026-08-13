@@ -90,7 +90,10 @@ from neo4j import AsyncGraphDatabase  # noqa: E402
 
 from data_agent.learning.candidate.models import mint_candidate_id  # noqa: E402
 from data_agent.learning.config import LearningSettings, learning_enabled  # noqa: E402
-from data_agent.learning.extractor.grounding import known_rule_ids_from_catalog  # noqa: E402
+from data_agent.learning.extractor.grounding import (  # noqa: E402
+    known_rule_ids_from_catalog,
+    rule_index_from_catalog,
+)
 from data_agent.learning.factory import (  # noqa: E402
     build_learning_consumer,
     build_promotion_write_plane,
@@ -710,6 +713,10 @@ async def _run() -> int:
         # CONSUME with the REAL extractor. sampler=True is LOAD-BEARING: it routes a
         # clean blueprint candidate to `in_review` (reason blueprint_sampled) so it
         # lands in the HUMAN inbox instead of auto-promoting.
+        # ONE parse of the frozen export, projected two ways (the id SET the `rule`
+        # role is validated against + the INDEX the unknown-id matcher reads) — they
+        # must come from the same catalog or they can disagree about what exists.
+        demo_catalog = catalog_dict()
         consumer = build_learning_consumer(
             infra.settings,
             session_store=infra.session_store,
@@ -721,7 +728,10 @@ async def _run() -> int:
             user_store=infra.user_store,
             catalog_schema=_CATALOG,
             embedder=infra.embedder,
-            known_rules=known_rule_ids_from_catalog(catalog_dict()),
+            known_rules=known_rule_ids_from_catalog(demo_catalog),
+            # Without this the hint machinery is INERT here (the factory says so at
+            # INFO and carries on) and an unknown rule id declines terminally.
+            rule_index=rule_index_from_catalog(demo_catalog),
             sampler=lambda _env: True,  # route the blueprint to the HUMAN inbox
         )
         capturing = _CapturingExtractor(consumer._extractor)

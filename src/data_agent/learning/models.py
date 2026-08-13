@@ -45,6 +45,37 @@ VALID_TRANSITIONS: dict[str, frozenset[str]] = {
     LearningStatus.DEAD_LETTER: frozenset(),
 }
 
+# RE-ENTRY edges — the consumer's RECOVERY claim, deliberately kept OUT of
+# `VALID_TRANSITIONS` (design §3 stays the forward lifecycle: `done` still has no
+# forward successor and the sweeper/consumer still cannot ask for one).
+#
+# This is a NAMED escape hatch, the same shape as the `assert_from=False`
+# dead-letter hatch: it is reachable only through `state_machine.recover_to_processing`,
+# which is called from exactly one place (`consumer._process`, on a delivery whose
+# session is NOT `queued` but is still ours to run). Two edges, two facts:
+#
+#   `processing -> processing`  a RECLAIMED delivery (XAUTOCLAIM re-assigned a PEL
+#       entry idle past min-idle) of a session left `processing` by an owner that
+#       crashed mid-run. The redelivery IS the recovery path — XAUTOCLAIM has already
+#       transferred ownership of the MESSAGE, so the session state machine must accept
+#       the new owner or the message can never be finished by anyone. Safety is the
+#       CAS, not the state: the token comes from a FRESH read, so a still-live owner's
+#       next write loses one of the two transitions (and that loser takes the ordinary
+#       `CASMismatchError` skip path).
+#
+#   `done -> processing`  the session was processed and its content CHANGED afterwards
+#       (`learning_content_hash` != the delivered job's `content_hash`), so the work
+#       recorded at `done` no longer describes the transcript. Same-hash redeliveries
+#       never reach here — `_process`'s idempotency check ACKs them first.
+#
+# Both re-entries keep the store's from-state assertion (`assert_from=True`): the
+# state is asserted, it is simply asserted against a DIFFERENT expected value than the
+# forward table allows.
+RECOVERY_TRANSITIONS: dict[str, frozenset[str]] = {
+    LearningStatus.PROCESSING: frozenset({LearningStatus.PROCESSING}),
+    LearningStatus.DONE: frozenset({LearningStatus.PROCESSING}),
+}
+
 # The statuses the sweeper scans/claims (design §6): only sessions not yet
 # handed to a consumer are eligible, so a completed/in-flight job is never
 # re-enqueued unless its content actually changes (a later-slice concern).

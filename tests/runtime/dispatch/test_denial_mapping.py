@@ -75,6 +75,10 @@ _EXPECTED_RETRYABLE = {
     # getBlueprint-before-runBlueprint (Release 1): retryable by construction —
     # the fix is one `getBlueprint` away, inside the same turn.
     "BLUEPRINT_DEFINITION_NOT_READ": True,
+    # The empty designation (08 §O): retryable by construction, and bounded by the
+    # 05 §J shape-gate allowance rather than by this flag — a non-retryable refusal
+    # would end the turn this exists to hand back.
+    "ANSWER_TABLE_NO_TABLE_DESIGNATED": True,
 }
 
 # `answerWithTable(blueprint_id=…)` naming a blueprint that never ran this turn.
@@ -82,7 +86,16 @@ _EXPECTED_RETRYABLE = {
 # persisted on TrailEntry: every later rebuild re-derives it from `error_code`, and
 # an unregistered code would render as the generic failure string, stranding the
 # model with no idea what to do differently.
-_ANSWER_TABLE_CODES = {"ANSWER_TABLE_BLUEPRINT_NOT_RUN"}
+#
+# ANSWER_TABLE_NO_TABLE_DESIGNATED (08 §O) is the same failure one step earlier —
+# the model named NO table rather than an unresolvable one — and it exists because
+# the empty call otherwise SUCCEEDS and terminates the turn through exit #2, which
+# the 05 §J shape gate does not watch. Measured live as `done` with no table and no
+# event at all.
+_ANSWER_TABLE_CODES = {
+    "ANSWER_TABLE_BLUEPRINT_NOT_RUN",
+    "ANSWER_TABLE_NO_TABLE_DESIGNATED",
+}
 
 # `updateAnalysisState` rejections. Registered for the same reason: both codes
 # ALSO carry a specific `denial_detail`, but `denial_detail` is per-entry while

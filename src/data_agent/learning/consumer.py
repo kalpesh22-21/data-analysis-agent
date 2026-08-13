@@ -5,11 +5,21 @@ entries (dead-lettering any past N deliveries), then XREADGROUP new work. For
 each delivered job:
 
   idempotency check (already-`done` + same `content_hash` → ACK + skip)
-    → CAS `queued → processing`
+    → CLAIM decision (`_claim_decision`: the delivered session's CURRENT status ×
+      the delivery path → forward / recover / refuse / terminal)
+    → CAS `queued → processing`   (or a `processing`/`done` recovery re-entry)
     → **no-op work + trace event**   ← Slice 2 replaces this middle with the
                                         loader + triage + extractor
     → CAS `processing → done`  (records a FRESHLY computed content_hash)
     → XACK
+
+Every non-`done` outcome LOGS what it saw and emits a `learning.consume` span
+carrying the state it refused from (`learning.session_status`) and a reason code
+(`learning.skip_reason`). This is not decoration: the claim used to be a bare
+`queued → processing` CAS whose failure returned `"skip"` with no ack, no log, no
+span and no metric, so a session in any other state produced a message that was
+reclaimed and re-refused until it dead-lettered by attrition — invisibly. See
+`_claim_decision` for the table and for which states are recoverable.
 
 Ordering invariant (MEDIUM-3): NO irreversible XACK (or dead-letter move) happens
 before the session-state CAS the message represents. A CAS loss / crash at either
@@ -78,12 +88,28 @@ _TRANSCRIPT_PREVIEW_LIMIT = 500
 _DECLINE_DETAIL_LIMIT = 300
 _DECLINE_DETAILS_TOTAL_LIMIT = 2000
 
-# Decline reason codes whose detail is known to carry a value lifted from the analyst's
-# SQL rather than only a path/requirement/type. Maintained as documentation, NOT as a
-# filter — see `_decline_details` for why filtering by this list would be the wrong
-# guard. Today: `totality_violation`, whose message interpolates `pred.value`
-# (`validation.py::_validate_totality`).
-ENTITY_BEARING_DECLINE_REASONS: frozenset[str] = frozenset({"totality_violation"})
+# Decline reason codes whose detail is known to carry a value that did NOT come from a
+# path/requirement/type — a literal out of the analyst's SQL, or a string the model
+# authored from an entity-bearing session. Maintained as documentation, NOT as a filter
+# — see `_decline_details` for why filtering by this list would be the wrong guard.
+#
+#   `totality_violation`      the predicates it names carry `pred.value`, lifted from
+#                             the accepted SQL (`validation.py::_predicate_hint`).
+#   `rule_predicate_mismatch` same, plus the catalog rule's own predicate text
+#                             (which is authored, not session-derived).
+#   `missing_rule_hinted`     the rule id the MODEL wrote, which a model that read an
+#                             entity-bearing session can have derived from it
+#                             (`validation.py::_rule_hint`). The terminal `missing_rule`
+#                             interpolates the same field and is listed for the same
+#                             reason — this classification is about the field, not about
+#                             which branch printed it.
+#
+# All three are rendered through `validation.py::_quoted`/`_flattened` at their build
+# site, so what lands here is single-line and bounded — that is a safety property of the
+# ATTRIBUTE, not a substitute for this classification.
+ENTITY_BEARING_DECLINE_REASONS: frozenset[str] = frozenset(
+    {"totality_violation", "rule_predicate_mismatch", "missing_rule_hinted", "missing_rule"}
+)
 
 
 def _session_question(summary: SessionSummary) -> str | None:
@@ -183,10 +209,15 @@ def _decline_details(declines: tuple[Decline, ...]) -> str | None:
         `observability.py::judge_span` and the module docstring: with verbose ON the
         `learning-loop` Phoenix project holds session content and MUST be
         access-controlled like `learning_audit` and the session store (D51);
-      * the RIGHT fix is at the producer — that message should name the path and the
-        requirement like its neighbours and drop the value, which no human debugging a
-        totality violation needs. That belongs in `validation.py`, where it also cleans
-        the log line the same string reaches.
+      * this note used to say the RIGHT fix was at the producer — drop the value and
+        name the path like the message's neighbours. That is no longer the plan, and the
+        reversal is deliberate: `totality_violation` is now a CORRECTABLE decline whose
+        message is fed back to the model, and the predicate it names (column, operator,
+        literal) is the entire content of the fix. Dropping the value would make the
+        message unusable for the thing it now exists to do, and it would buy nothing —
+        the literal comes from the accepted SQL, which the extractor's own prompt
+        carries in full and which this same span carries in `learning.accepted_sql`.
+        `validation.py::_correctable` states the rule the message obeys instead.
 
     **Not filtered by reason code here, deliberately.** Excluding `totality_violation`
     from this attribute would be a guard keyed on a NAME — precisely the shape that has
@@ -204,6 +235,97 @@ def _decline_details(declines: tuple[Decline, ...]) -> str | None:
     if not lines:
         return None
     return " | ".join(lines)[:_DECLINE_DETAILS_TOTAL_LIMIT]
+
+
+# What one delivery may do with the session it names, given that session's CURRENT
+# `learning_status` and the DELIVERY PATH the message arrived on. The four claim kinds
+# map onto the outcome taxonomy: `forward`/`recover` run the work (→ `done`), `refuse`
+# leaves the message in the PEL (→ `skip`), `terminal` ACKs it away (→ `ack_terminal`).
+ClaimKind = Literal["forward", "recover", "refuse", "terminal"]
+
+
+def _claim_decision(status: str, *, reclaimed: bool) -> tuple[ClaimKind, str]:
+    """THE skip-path table: `(learning_status, delivery path) → (claim, reason)`.
+
+    Pure and module-level so it can be read and tested as a table rather than inferred
+    from control flow. `done` + the SAME `content_hash` never reaches here — `_process`
+    ACKs that as `dedup_skip` before asking.
+
+      status         fresh delivery                    reclaimed delivery
+      -------------- --------------------------------- --------------------------------
+      queued         forward   (queued)                 forward   (queued)
+      processing     refuse    (owner_may_be_live)      recover   (reclaimed_processing)
+      done (≠hash)   recover   (content_changed)        recover   (content_changed)
+      active         refuse    (not_yet_claimable)      refuse    (not_yet_claimable)
+      pending        refuse    (not_yet_claimable)      refuse    (not_yet_claimable)
+      dead_letter    terminal  (dead_letter)            terminal  (dead_letter)
+      <anything else> terminal (unknown_status)         terminal  (unknown_status)
+
+    WHY each row:
+
+    `processing` — a session left `processing` by an owner that crashed mid-run can be
+    finished by nobody unless a later delivery is allowed to re-enter it, and XAUTOCLAIM
+    re-assigning the message IS the transport saying "this is now yours". On a FRESH
+    delivery the same state means something else entirely: a peer picked the message up
+    seconds ago and is working. Hence the delivery path, not the state, decides.
+
+    THE DISCRIMINATOR, and why it is the delivery path and not `delivery_count > 1`:
+    the two are equivalent under both shipped queues (XREADGROUP `>` only yields
+    never-before-delivered entries, so a fresh delivery is always `delivery_count == 1`),
+    but the equivalence is a property of Redis Streams, not of the `LearningQueue` port
+    — a queue that redelivered by any other route would silently flip the meaning of the
+    derived form. `DeliveredJob.reclaimed` states the fact directly.
+
+    AND WHY NEITHER IS A STALENESS PROOF: min-idle (`LEARNING_RECLAIM_MIN_IDLE_SECONDS`,
+    300s) does NOT guarantee the previous owner is dead — Redis resets a PEL entry's
+    idle clock on DELIVERY, not on the owner's progress, so a consumer legitimately
+    grinding through a long extraction has its own message reclaimed out from under it.
+    What makes the re-entry safe is the CAS: the token comes from a fresh read taken
+    microseconds earlier, so if the live owner writes (its `processing → done`) either
+    it or this re-entry loses, and the loser takes the ordinary `CASMismatchError` skip.
+    The cost of the rare double-run is one duplicated extraction, absorbed by
+    `CandidateStore.supersede(content_hash)`; the cost of NOT re-entering is a session
+    that no delivery can ever finish.
+
+    `done` with a DIFFERENT hash — the session was processed and then gained turns, so
+    what was recorded at `done` no longer describes the transcript. This is the LIVE
+    signature behind the silent stall: the consumer records a FRESHLY computed hash at
+    `done` (MEDIUM-3), so a session that changed between enqueue and consume ends up
+    `done` with a hash the in-flight message never carried; a redelivery of that message
+    then matched neither the dedup check nor the `queued` gate and skipped forever.
+
+    `active`/`pending` — REFUSE, and deliberately WITHOUT an ack. Both are states the
+    sweeper still owns (`SWEEPABLE_STATUSES`): a `pending` session is re-detected and
+    driven to `queued` on a later sweep, at which point a reclaim of this very message
+    processes it. Acking here would drop work the sweeper is about to make claimable.
+
+    `dead_letter` and any UNRECOGNIZED status — TERMINAL, ack. Neither can become
+    `queued` again: `dead_letter` is terminal by design, and an unknown status string is
+    outside the state machine entirely (nothing in this package writes one — it means a
+    hand-edited doc or a schema skew) so no sweeper will ever pick it up. Leaving the
+    message in the PEL just re-runs this decision every reclaim until the delivery count
+    exhausts and it dead-letters by attrition — which is the CURRENT behaviour and the
+    least informative possible outcome. The ack is paired with a WARNING log and an
+    `ack_terminal` span so the discard is loud and countable rather than a slow silent
+    burn. (The alternative — CAS the session to `dead_letter` and XADD the message to
+    the dead stream — was rejected for the unknown-status case: it would overwrite the
+    very evidence an operator needs, and for `dead_letter` the session is already there.)
+    """
+    if status == LearningStatus.QUEUED:
+        return "forward", "queued"
+    if status == LearningStatus.PROCESSING:
+        if reclaimed:
+            return "recover", "reclaimed_processing"
+        return "refuse", "processing_owner_may_be_live"
+    if status == LearningStatus.DONE:
+        # Same-hash was ACKed as `dedup_skip` upstream; reaching here means the
+        # session's content changed after it was processed.
+        return "recover", "done_content_changed"
+    if status in (LearningStatus.ACTIVE, LearningStatus.PENDING):
+        return "refuse", "not_yet_claimable"
+    if status == LearningStatus.DEAD_LETTER:
+        return "terminal", "dead_letter"
+    return "terminal", "unknown_status"
 
 
 @dataclass(frozen=True)
@@ -305,6 +427,15 @@ class LearningConsumer:
             else:
                 outcome = await self._process(delivered)
         except CASMismatchError:
+            # The residual arm: `_process` handles its OWN CAS losses (logged + spanned
+            # there), so what lands here is a loss from the dead-letter path or a
+            # `get_session_with_cas` on a session that no longer exists (TTL expiry).
+            # Logged because it was the second silent skip in this file.
+            _logger.info(
+                "learning consume lost a CAS race for message %s (session %s, "
+                "delivery %d); leaving it for reclaim",
+                delivered.message_id, delivered.job.session_id, delivered.delivery_count,
+            )
             tally.skipped += 1
             return
         except Exception:  # noqa: BLE001 - MEDIUM-1: isolate transient store/queue
@@ -319,42 +450,107 @@ class LearningConsumer:
 
     async def _process(self, delivered: DeliveredJob) -> str:
         """Idempotent process of one delivery. Returns the outcome label
-        (`done` | `dedup_skip` | `skip`)."""
+        (`done` | `dedup_skip` | `skip` | `ack_terminal`)."""
         job = delivered.job
         # Rehydrate the enqueue-propagated trace context so this consume (and the
         # triage/extract spans nested under it) join the session's ONE trace. A
         # missing/malformed traceparent ⇒ None ⇒ a normal root span (fail-open).
         parent_ctx = context_from_traceparent(job.traceparent)
         doc, cas = await self._store.get_session_with_cas(job.session_id)
+        status = doc.learning_status
 
         # Idempotency (D96 §5.2): a re-delivery of an already-processed job
         # (session already `done` with the SAME recorded hash) → ACK + skip.
-        if (
-            doc.learning_status == LearningStatus.DONE
-            and doc.learning_content_hash == job.content_hash
-        ):
+        if status == LearningStatus.DONE and doc.learning_content_hash == job.content_hash:
             await self._queue.ack(delivered.message_id)
             self._emit_consume(
-                job.session_id, "dedup_skip", delivered.delivery_count, context=parent_ctx
+                job.session_id,
+                "dedup_skip",
+                delivered.delivery_count,
+                context=parent_ctx,
+                session_status=status,
+                reclaimed=delivered.reclaimed,
             )
             return "dedup_skip"
 
-        try:
-            cas = await state_machine.transition(
-                self._store, job.session_id, LearningStatus.QUEUED,
-                LearningStatus.PROCESSING, cas,
+        # May this delivery claim the session? (`_claim_decision` — the whole
+        # state × delivery-path table lives there, with the log/span vocabulary.)
+        claim, reason = _claim_decision(status, reclaimed=delivered.reclaimed)
+
+        if claim == "terminal":
+            # The state can never become `queued` again, so no future redelivery can
+            # help: ACK, or the message rides the PEL until it dead-letters by
+            # attrition (which is exactly what used to happen, silently).
+            _logger.warning(
+                "learning consume ACKing a terminal delivery for session %s: message %s "
+                "(delivery %d, reclaimed=%s) names a session in learning_status %r "
+                "(reason=%s) — nothing can move it to `queued`, so the message is "
+                "discarded rather than redelivered until it dead-letters",
+                job.session_id, delivered.message_id, delivered.delivery_count,
+                delivered.reclaimed, status, reason,
             )
+            await self._queue.ack(delivered.message_id)
+            self._emit_consume(
+                job.session_id,
+                "ack_terminal",
+                delivered.delivery_count,
+                context=parent_ctx,
+                session_status=status,
+                skip_reason=reason,
+                reclaimed=delivered.reclaimed,
+            )
+            return "ack_terminal"
+
+        if claim == "refuse":
+            self._log_skip(job.session_id, delivered, status, reason)
+            self._emit_consume(
+                job.session_id,
+                "skip",
+                delivered.delivery_count,
+                context=parent_ctx,
+                session_status=status,
+                skip_reason=reason,
+                reclaimed=delivered.reclaimed,
+            )
+            return "skip"
+
+        try:
+            if claim == "forward":
+                cas = await state_machine.transition(
+                    self._store, job.session_id, LearningStatus.QUEUED,
+                    LearningStatus.PROCESSING, cas,
+                )
+            else:  # "recover" — `processing`/`done` re-entry (models.RECOVERY_TRANSITIONS)
+                cas = await state_machine.recover_to_processing(
+                    self._store, job.session_id, status, cas
+                )
         except CASMismatchError:
-            # A peer is handling it, or the state isn't `queued` — do NOT ack;
-            # leave the message for the owner / a later reclaim. No consume span
-            # (nothing was processed).
+            # A peer wrote since our read (it owns the claim, or the session was
+            # advanced under us) — do NOT ack; leave the message for the owner / a
+            # later reclaim. This is the arm that keeps the `processing` re-entry
+            # above safe against a STILL-LIVE owner: its write bumps the CAS and this
+            # transition loses.
+            self._log_skip(job.session_id, delivered, status, "cas_lost")
+            self._emit_consume(
+                job.session_id,
+                "skip",
+                delivered.delivery_count,
+                context=parent_ctx,
+                session_status=status,
+                skip_reason="cas_lost",
+                reclaimed=delivered.reclaimed,
+            )
             return "skip"
 
         # Open the consume span (session-trace continuation, under the propagated
         # context) as the PARENT of the triage/extract spans, so a session's whole
         # journey reads as ONE trace top-to-bottom. No tracer ⇒ nullcontext (no-op).
         with self._consume_scope(
-            job.session_id, delivered.delivery_count, parent_ctx
+            job.session_id,
+            delivered.delivery_count,
+            parent_ctx,
+            session_status=status,
+            reclaimed=delivered.reclaimed,
         ) as consume:
             # --- Slice-2 work: load → triage → skip/keep (§5.1). Operates on the
             # already-loaded `doc` (fresh-hash source consistent with MEDIUM-3) and
@@ -373,18 +569,51 @@ class LearningConsumer:
             except CASMismatchError:
                 # Crash/lost race before XACK is safe: the message stays in the PEL,
                 # is reclaimed, and the `done`+same-hash dedup ACKs it next time.
+                self._log_skip(job.session_id, delivered, status, "cas_lost_at_done")
                 if consume is not None:
                     consume.set_attribute("learning.outcome", "skip")
+                    consume.set_attribute("learning.skip_reason", "cas_lost_at_done")
                 return "skip"
 
             await self._queue.ack(delivered.message_id)
             self._set_verbose_consume(consume, summary)
         return "done"
 
-    def _consume_scope(self, session_id: str, delivery_count: int, parent_ctx):
+    def _log_skip(
+        self, session_id: str, delivered: DeliveredJob, status: str, reason: str
+    ) -> None:
+        """EVERY non-processing outcome says what it saw, at INFO.
+
+        A skip is an ordinary, expected event under concurrency, so it is not a
+        warning — but it was previously not ANYTHING: no log, no span, no metric, while
+        the message sat in the PEL being reclaimed toward a dead letter. The three facts
+        here are the ones that were being discarded: the session, the state the claim
+        was refused FROM, and how many deliveries it has burned (the distance to
+        `LEARNING_MAX_DELIVERIES`, i.e. how close this is to dead-lettering)."""
+        _logger.info(
+            "learning consume SKIPPED session %s: message %s (delivery %d, "
+            "reclaimed=%s) found learning_status=%r, reason=%s — not ACKed, left in "
+            "the PEL for the owner or a later reclaim",
+            session_id, delivered.message_id, delivered.delivery_count,
+            delivered.reclaimed, status, reason,
+        )
+
+    def _consume_scope(
+        self,
+        session_id: str,
+        delivery_count: int,
+        parent_ctx,
+        *,
+        session_status: str,
+        reclaimed: bool,
+    ):
         """The consume span (default `outcome=done`, overridden to `skip` on the rare
         DONE-CAS race) OR a `nullcontext(None)` when no tracer is wired, so the
-        no-op-tracer behavior is byte-identical."""
+        no-op-tracer behavior is byte-identical.
+
+        `session_status` is the state the claim was made FROM — `queued` on the ordinary
+        path, `processing`/`done` on a recovery re-entry — so a Phoenix filter can tell
+        the two apart without reading logs."""
         if self._tracer is None:
             return nullcontext(None)
         return consume_span(
@@ -393,6 +622,8 @@ class LearningConsumer:
             outcome="done",
             delivery_count=delivery_count,
             context=parent_ctx,
+            session_status=session_status,
+            reclaimed=reclaimed,
         )
 
     def _set_verbose_consume(self, consume, summary: SessionSummary) -> None:
@@ -420,6 +651,15 @@ class LearningConsumer:
         # re-dead-letter (MEDIUM-4: kills the spurious dead-letter noise).
         if doc.learning_status in (LearningStatus.DONE, LearningStatus.DEAD_LETTER):
             await self._queue.ack(delivered.message_id)
+            self._emit_consume(
+                job.session_id,
+                "ack_terminal",
+                delivered.delivery_count,
+                context=parent_ctx,
+                session_status=doc.learning_status,
+                skip_reason="already_terminal",
+                reclaimed=delivered.reclaimed,
+            )
             return "ack_terminal"
 
         try:
@@ -429,13 +669,30 @@ class LearningConsumer:
             )
         except CASMismatchError:
             # Peer advanced it — leave in the PEL for a later reclaim.
+            self._log_skip(
+                job.session_id, delivered, doc.learning_status, "cas_lost_at_dead_letter"
+            )
+            self._emit_consume(
+                job.session_id,
+                "skip",
+                delivered.delivery_count,
+                context=parent_ctx,
+                session_status=doc.learning_status,
+                skip_reason="cas_lost_at_dead_letter",
+                reclaimed=delivered.reclaimed,
+            )
             return "skip"
 
         # Session is terminal now; complete the queue-side move. A crash before
         # this leaves the message in the PEL → reclaimed → terminal → ack_terminal.
         await self._queue.finalize_dead_letter(delivered)
         self._emit_consume(
-            job.session_id, "dead_letter", delivered.delivery_count, context=parent_ctx
+            job.session_id,
+            "dead_letter",
+            delivered.delivery_count,
+            context=parent_ctx,
+            session_status=doc.learning_status,
+            reclaimed=delivered.reclaimed,
         )
         return "dead_letter"
 
@@ -678,7 +935,15 @@ class LearningConsumer:
             pass
 
     def _emit_consume(
-        self, session_id: str, outcome: str, delivery_count: int, *, context=None
+        self,
+        session_id: str,
+        outcome: str,
+        delivery_count: int,
+        *,
+        context=None,
+        session_status: str | None = None,
+        skip_reason: str | None = None,
+        reclaimed: bool | None = None,
     ) -> None:
         if self._tracer is not None:
             with consume_span(
@@ -687,6 +952,9 @@ class LearningConsumer:
                 outcome=outcome,
                 delivery_count=delivery_count,
                 context=context,
+                session_status=session_status,
+                skip_reason=skip_reason,
+                reclaimed=reclaimed,
             ):
                 pass
 
@@ -694,8 +962,16 @@ class LearningConsumer:
         """Blocking loop (used by the entrypoint). Ensures the group exists, then
         consumes batches forever. A transient error logs + continues (MEDIUM-1);
         when disabled, `run_once` returns immediately (no blocking XREADGROUP), so
-        *sleep* paces the re-check on the consumer's OWN idle interval."""
+        *sleep* paces the re-check on the consumer's OWN idle interval.
+
+        The kill-switch STATE CHANGE is logged — once per change, never per cycle. A
+        consumer held off by `LEARNING_ENABLED` otherwise looks exactly like a healthy
+        idle one (it emits a `learning.disabled` span, which is invisible unless OTLP
+        is configured, and nothing else), so "the loop is running and doing nothing" had
+        no readable cause. Per-cycle logging is refused: at the 5s idle interval it
+        would be 17k lines a day."""
         await self._queue.ensure_group()
+        disabled_logged = False
         while True:
             try:
                 result = await self.run_once()
@@ -703,6 +979,18 @@ class LearningConsumer:
                 _logger.exception("learning consume cycle failed; retrying")
                 await sleep(self._settings.learning_consumer_idle_sleep_seconds)
                 continue
+            if result.disabled and not disabled_logged:
+                _logger.warning(
+                    "learning consumer IDLE — the LEARNING_ENABLED kill-switch is OFF, "
+                    "so nothing is being consumed (work waits in the stream; no loss). "
+                    "NB an unrecognized value counts as OFF, fail-safe: check for a "
+                    "typo in the env var or in .env. Re-checking every %ss.",
+                    self._settings.learning_consumer_idle_sleep_seconds,
+                )
+                disabled_logged = True
+            elif not result.disabled and disabled_logged:
+                _logger.info("learning consumer RESUMED — LEARNING_ENABLED is back on")
+                disabled_logged = False
             if result.disabled:
                 await sleep(self._settings.learning_consumer_idle_sleep_seconds)
 

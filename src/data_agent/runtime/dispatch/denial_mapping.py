@@ -38,6 +38,15 @@ class DenialInfo:
 # renamed, and the symptom would be a cross-turn text leak, not a failure.
 FINALIZATION_BLOCKED_PENDING_INTENTS_CODE = "FINALIZATION_BLOCKED_PENDING_INTENTS"
 
+# The empty-designation refusal's code (Release 1, 08 §O). It lives HERE for the
+# SAME three-layer reason as the code above, and it is the FOURTH instance of the
+# model-authored-text-crossing-turns class `context/assembly.py` names (README
+# findings 9 and 11 are the first two): its `args` carry the model's refused draft
+# answer prose, so `_is_stale_model_text_entry` has to drop it from every turn but
+# its own — and it can only do that by matching this literal, since the entry is
+# persisted under `answerWithTable`, whose SUCCESSFUL entries must keep replaying.
+ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE = "ANSWER_TABLE_NO_TABLE_DESIGNATED"
+
 
 _DENIAL_TABLE: dict[str, DenialInfo] = {
     # COLUMN_SCOPE_VIOLATION: on the LIVE turn the dispatcher
@@ -76,6 +85,32 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
             "You referenced a blueprint you have not run in this turn, so there is no "
             "table to show. Call runBlueprint with that blueprint first, then call "
             "answerWithTable again."
+        ),
+    ),
+    # ANSWER_TABLE_NO_TABLE_DESIGNATED (Release 1, 08 §O): the model called
+    # `answerWithTable` and named NO table at all — an empty `tables` array with
+    # nothing to fold — on a turn holding multi-row results it never presented. The
+    # call carries prose, so without this it SUCCEEDS and terminates the turn
+    # through exit #2, which the 05 §J answer-shape gate does not watch: measured
+    # live, `status=done`, no table, no event, no log. RETRYABLE and instructional,
+    # and bounded by the shape gate's own per-window allowance so one mistake cannot
+    # be refused twice.
+    #
+    # Registered here for the reason the two codes around it are: `user_message` is
+    # not persisted on `TrailEntry`, `_render_entry` re-derives it from `error_code`
+    # on every rebuild, and an unregistered code renders as the generic "Something
+    # went wrong processing that request." Unlike those two this message needs no
+    # id to name, so the table's text and the result's `denial_detail` can be — and
+    # are — the same string.
+    "ANSWER_TABLE_NO_TABLE_DESIGNATED": DenialInfo(
+        code="ANSWER_TABLE_NO_TABLE_DESIGNATED",
+        retryable=True,
+        user_message=(
+            "Your answerWithTable named no table, so there is nothing for the user "
+            "to look at. Every table goes in `tables`, one entry per part of your "
+            'answer: `tables: [{sql: "SELECT …"}]` for a query you wrote, or '
+            '`tables: [{blueprint_id: "bp-…"}]` for a blueprint you ran this turn. '
+            "Send your answer again with the table in it."
         ),
     ),
     # BLUEPRINT_DEFINITION_NOT_READ (Release 1): the model called `runBlueprint` for

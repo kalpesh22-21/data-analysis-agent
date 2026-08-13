@@ -64,7 +64,8 @@ model_script:
         id: a1
         args:
           answer: Nobody left last month. I could not establish the six-month hiring count.
-          sql: SELECT employee_code FROM dbpcm_warehouse.employee WHERE employee_status = 'T'
+          tables:
+            - {sql: "SELECT employee_code FROM dbpcm_warehouse.employee WHERE employee_status = 'T'"}
 expect:
   intents_terminal: 2
   re_derivation: false

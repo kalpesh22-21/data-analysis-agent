@@ -705,6 +705,17 @@ def test_prompt_stays_within_its_token_budget() -> None:
     waiver, but **264 chars of headroom is thin**, and per the paragraph above the
     next addition should re-argue the ceiling rather than shave working
     instructions to fit under it.
+
+    **2026-08-13, ceiling UNCHANGED at 16,000.** 15,736 -> **15,875** (+139, 08 §O,
+    the tables-only rewording): `tables` became the only designation carrier and the
+    two "Presenting a table" bullets were re-phrased from *the* table to *each
+    entry*. Not a new instruction — the same rules against a narrower payload — and
+    the redundancy in the first draft (+166) was trimmed to +139 rather than
+    argued for. **125 chars spare.** That is thinner than the 264 already called
+    thin above, so the paragraph above now applies with force: THE NEXT ADDITION
+    MUST RE-ARGUE THE CEILING. It must not be paid for by shaving working
+    instructions to fit, which is the one way this constant gets worse without
+    anyone deciding that it should.
     """
     assert len(AGENT_SYSTEM_PROMPT) <= 16_000
 

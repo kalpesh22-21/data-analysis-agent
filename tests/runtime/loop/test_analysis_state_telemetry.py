@@ -170,7 +170,8 @@ def _query_call(call_id: str) -> ToolCallRequest:
 
 def _answer_call(call_id: str) -> ToolCallRequest:
     return ToolCallRequest(
-        id=call_id, name=ANSWER, arguments={"answer": "Here it is.", "sql": "SELECT 1"}
+        id=call_id, name=ANSWER,
+        arguments={"answer": "Here it is.", "tables": [{"sql": "SELECT 1"}]},
     )
 
 

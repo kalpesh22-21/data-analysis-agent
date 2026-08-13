@@ -155,13 +155,31 @@ class LearningSweeper:
     async def run_forever(self, *, sleep) -> None:
         """Periodic loop (used by the entrypoint). *sleep* is injected
         (`asyncio.sleep`) so it is unit-drivable. Ensures the consumer group
-        exists once, then sweeps every `learning_sweep_interval_seconds`."""
+        exists once, then sweeps every `learning_sweep_interval_seconds`.
+
+        The kill-switch STATE CHANGE is logged — once per change, never per cycle (see
+        the same note on `LearningConsumer.run_forever`): a sweeper held off by
+        `LEARNING_ENABLED` enqueues nothing and, without this, says nothing about why."""
         await self._queue.ensure_group()
+        disabled_logged = False
         while True:
             try:
-                await self.run_once()
+                result = await self.run_once()
             except Exception:  # noqa: BLE001 - MEDIUM-1: a transient scan/queue
                 # error must not kill the daemon; log and retry next cycle. This
                 # is also the retry arm that makes the enqueue-ordering fix safe.
                 _logger.exception("learning sweep cycle failed; retrying next interval")
+            else:
+                if result.disabled and not disabled_logged:
+                    _logger.warning(
+                        "learning sweeper IDLE — the LEARNING_ENABLED kill-switch is "
+                        "OFF, so no session is being scanned, claimed or enqueued. NB "
+                        "an unrecognized value counts as OFF, fail-safe: check for a "
+                        "typo in the env var or in .env. Re-checking every %ss.",
+                        self._settings.learning_sweep_interval_seconds,
+                    )
+                    disabled_logged = True
+                elif not result.disabled and disabled_logged:
+                    _logger.info("learning sweeper RESUMED — LEARNING_ENABLED is back on")
+                    disabled_logged = False
             await sleep(self._settings.learning_sweep_interval_seconds)

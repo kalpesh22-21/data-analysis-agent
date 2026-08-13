@@ -116,6 +116,11 @@ class InMemoryLearningQueue:
                     job=entry.job,
                     delivery_count=entry.delivery_count,
                     dead_lettered=entry.delivery_count > max_deliveries,
+                    # Mirrors the real queue: EVERY entry that comes back from
+                    # `reclaim_stale` is a reclaimed delivery (the consumer reads
+                    # this to decide whether a `processing` session is a crashed
+                    # owner's work it may continue).
+                    reclaimed=True,
                 )
             )
         return delivered

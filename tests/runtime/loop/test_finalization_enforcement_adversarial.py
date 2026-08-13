@@ -136,7 +136,7 @@ def _update_call(call_id: str, *updates: dict[str, Any]) -> ToolCallRequest:
 
 def _answer_call(call_id: str, answer: str = "Here is the answer.") -> ToolCallRequest:
     return ToolCallRequest(
-        id=call_id, name=ANSWER, arguments={"answer": answer, "sql": "SELECT 1"}
+        id=call_id, name=ANSWER, arguments={"answer": answer, "tables": [{"sql": "SELECT 1"}]}
     )
 
 

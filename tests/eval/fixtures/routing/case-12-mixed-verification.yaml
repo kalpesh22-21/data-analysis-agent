@@ -74,6 +74,25 @@ model_script:
         id: a1
         args:
           answer: We project about 12 hires over the next six months; the Support roster is below.
+          # THE ONE FIXTURE THAT KEEPS THE RETIRED TOP-LEVEL PAIR, deliberately.
+          # 08 §O removed `sql`/`blueprint_id` from the model-facing schema, so no
+          # model should send them again — but a conversation already in flight, or
+          # a provider-side cached tool list, still can.
+          #
+          # WHICH BRANCH THIS EXERCISES: tables-WINS. Placeholder legacy fields
+          # BESIDE a real array must be read as absent (a key carrying no
+          # information is ABSENT) and the array must win outright — end to end
+          # through the real harness, not only in a unit test.
+          #
+          # It is NOT R7 q1's shape. That call was a real `blueprint_id` beside an
+          # EMPTY `tables`, which takes the other branch — the legacy FOLD — and is
+          # covered by
+          # `tests/runtime/composite/test_multi_table_answer.py
+          #  ::test_the_r7_q1_placeholder_call_still_resolves_rather_than_refusing`,
+          # alongside the whole-document replay guarantee in
+          # `::test_a_pre_slim_down_document_still_replays_and_still_pages`.
+          #
+          # Every other fixture sends today's shape.
           sql: ""
           blueprint_id: ""
           tables:

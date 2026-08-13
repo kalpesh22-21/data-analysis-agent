@@ -40,6 +40,7 @@ TWO cross-cutting concerns live in this module:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from openinference.semconv.trace import OpenInferenceSpanKindValues
@@ -115,6 +116,38 @@ def get_learning_tracer(provider: TracerProvider) -> Tracer:
     return get_tracer(provider, _TRACER_NAME)
 
 
+def log_tracing_status(
+    logger: logging.Logger, *, otlp_endpoint: str, service_name: str, process: str
+) -> None:
+    """Say AT STARTUP whether spans will actually leave this process.
+
+    `LearningSettings.otlp_endpoint` defaults to `""` and `configure_tracing` answers an
+    empty endpoint with a NO-OP provider — deliberately (zero infra required to run the
+    loop), but SILENTLY. The observed cost of the silence: a full day of live runs that
+    produced ZERO Phoenix spans, with the cause only discoverable by reading source for
+    the name of the environment variable. Every learning entrypoint calls this
+    immediately after `configure_learning_tracing` so the answer is the first thing in
+    the log, mirroring how `scripts/run_ui_runtime_real.py` prints its OTLP posture.
+
+    OFF is a WARNING, not an INFO: it is a supported configuration, but it is also the
+    configuration in which every diagnostic this package emits to a span is discarded,
+    and that must not be something an operator infers from an absence."""
+    if otlp_endpoint:
+        logger.info(
+            "learning %s tracing ON -> OTLP %s (service.name=%s, Phoenix project=%s)",
+            process, otlp_endpoint, service_name, _TRACER_NAME,
+        )
+        return
+    logger.warning(
+        "learning %s tracing OFF — OTLP_ENDPOINT is unset/empty, so the tracer is a "
+        "NO-OP provider and this process will emit ZERO spans (no learning.sweep / "
+        "enqueue / consume / triage / extract / judge in Phoenix). Set "
+        "OTLP_ENDPOINT=http://localhost:6006/v1/traces (or your collector) to turn it "
+        "on; LEARNING_SERVICE_NAME=%s sets service.name.",
+        process, service_name,
+    )
+
+
 def sweep_span(
     tracer: Tracer,
     *,
@@ -164,22 +197,43 @@ def consume_span(
     outcome: str,
     delivery_count: int,
     context: Context | None = None,
+    session_status: str | None = None,
+    skip_reason: str | None = None,
+    reclaimed: bool | None = None,
     verbose: bool = False,
     question: str | None = None,
     transcript_preview: str | None = None,
 ) -> Any:
     """One consume (design §10 `learning.consume`, CHAIN) — the parent of the
     triage/extract spans, started under the enqueue-propagated *context* so it joins
-    the session's trace. *outcome* ∈ {`done`, `dedup_skip`, `dead_letter`}.
+    the session's trace. *outcome* ∈ {`done`, `dedup_skip`, `dead_letter`, `skip`,
+    `ack_terminal`}.
 
     SHAPE-only by default. With *verbose*, ALSO carries the user `question` + a short
     `transcript_preview` of what the chat was about (D25 entity-bearing — see module
-    docstring)."""
+    docstring).
+
+    `session_status` / `skip_reason` / `reclaimed` are the SKIP-PATH attributes and they
+    are the reason a skip is now visible at all. A delivery whose session is not
+    claimable used to return silently: no span, no log, no counter, while the message
+    stayed in the PEL and was reclaimed until it dead-lettered — every step invisible.
+    The ONE fact a debugger needs is the state the claim was refused FROM
+    (`session_status`), so it is an attribute and not a message; `skip_reason` is the
+    closed-vocabulary label that makes the classes countable
+    (`consumer.py::_claim_decision` owns both vocabularies), and `reclaimed` says which
+    delivery path produced the outcome. All three are SHAPE-only: a lifecycle label, a
+    reason code, a bool — no transcript, no content, nothing to gate."""
     attrs: dict[str, Any] = {
         "session.id": session_id,
         "learning.outcome": outcome,
         "learning.delivery_count": delivery_count,
     }
+    if session_status is not None:
+        attrs["learning.session_status"] = session_status
+    if skip_reason is not None:
+        attrs["learning.skip_reason"] = skip_reason
+    if reclaimed is not None:
+        attrs["learning.reclaimed"] = reclaimed
     attrs.update(
         _verbose_attrs(
             verbose,
@@ -595,6 +649,7 @@ __all__ = [
     "inject_current_traceparent",
     "land_span",
     "learning_recall_span",
+    "log_tracing_status",
     "promote_span",
     "sweep_span",
     "triage_span",

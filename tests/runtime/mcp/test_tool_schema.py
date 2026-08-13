@@ -252,6 +252,42 @@ def test_update_analysis_state_schema_declares_exactly_three_item_properties() -
         assert retired not in description, f"retired field still taught: {retired}"
 
 
+def test_answer_with_table_declares_tables_as_the_only_designation_carrier() -> None:
+    """08 §O: `answer` + `tables`, both REQUIRED, and no top-level `sql` or
+    `blueprint_id`.
+
+    The same argument as the `updateAnalysisState` slim-down above, from the same
+    measurement (03 §C.3.1): the model CANNOT omit a declared key. R7 q1's live call
+    was `{"answer": …, "sql": "", "blueprint_id": "bp-…", "tables": []}` — four
+    declared properties carrying ONE field's worth of information, two placeholders
+    and an empty array, because every declared key has to be filled with something.
+    Two carriers for one fact is a second thing to fill in wrong, and the runtime
+    then has to guess which one the model meant.
+
+    Asserted on the PAYLOAD, because the payload is what the provider serialises:
+    prose alone cannot stop a property from being emitted. The read path keeps
+    understanding the old shape forever (`resolve_designations`), which is a
+    separate guarantee with its own tests — this one is only about what the model is
+    shown.
+    """
+    params = ANSWER_WITH_TABLE_TOOL_SCHEMA["parameters"]
+    assert set(params["properties"]) == {"answer", "tables"}
+    assert set(params["required"]) == {"answer", "tables"}
+    # The two designation fields live on the ITEM, where they name ONE table two
+    # ways and `sql` wins locally — not at the call level, where they were a second
+    # parallel carrier for the whole answer.
+    item = params["properties"]["tables"]["items"]
+    assert set(item["properties"]) == {"sql", "blueprint_id", "caption"}
+    # A single-table answer is a one-entry list, so an empty list is never the
+    # intended shape. Advisory only — these schemas are non-strict — which is why
+    # `resolve_designations` still has to handle `tables: []` rather than trust it.
+    assert params["properties"]["tables"]["minItems"] == 1
+    # And the description teaches the same thing the payload enforces.
+    description = ANSWER_WITH_TABLE_TOOL_SCHEMA["description"]
+    assert "EVERY TABLE GOES IN 'tables'" in description
+    assert "A single-table answer is ONE entry" in description
+
+
 def test_update_analysis_state_description_names_every_locking_tool() -> None:
     """Derived from `SUBSTANTIVE_TOOLS`, not from a hand-written list, so adding a
     tool to the locking set cannot silently drift out of the model-facing text.

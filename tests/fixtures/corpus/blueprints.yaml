@@ -1,6 +1,14 @@
 # Hand-authored blueprint seed corpus (neo4j-corpus-design §3.2, extended with the
 # full DAG by runblueprint-design §1.2).
 #
+# A MIRROR, kept by hand: there is no generator. The source of truth is the MCP canon
+# (`clickhouse-api/app/corpus/data/blueprints/bp-*.yaml`), and
+# `tests/runtime/retrieval/test_corpus_loader_structural_key_qa.py` asserts this file
+# matches it on every field of every shared id — so when the canon changes, edit here to
+# match rather than the other way round. (Last sync: `bp-total-earnings-by-department`'s
+# `uses_rules` id `earnings_only` → `gross_earnings`, which is what the semantic catalog
+# actually declares for `register_type = 'EARN'`.)
+#
 # `uses` strings are BYTE-EXACT `"database.table.column"` scope keys of the HR
 # warehouse the Layer-2 ClickHouse seed (docker/clickhouse-init/hr-warehouse.sql)
 # + the Semantic Catalog describe — so scope filtering against a real scope is
@@ -89,7 +97,7 @@
     GROUP BY department_name
 
 # Slice-C SINGLE-NODE `resolve_via` blueprint (D67, runblueprint-design §3.4): the
-# `earnings_only` rule maps the concept "earnings" → the earnings register_type code
+# `gross_earnings` rule maps the concept "earnings" → the earnings register_type code
 # set via the typed `resolveValues.resolve()` hook (NO model round-trip), and the
 # executor folds the ranked codes into the `{earn_codes}` predicate as a typed AST
 # IN-list (F1/D10 — never interpolated). Value-only ranking (register_type has no
@@ -112,7 +120,7 @@
   slots:
     - { name: department, type: string, required: true, binds_to: dbpcm_warehouse.employee.department_name }
   uses_rules:
-    - { id: earnings_only, resolve_via: "resolveValues(register_type, 'earnings')", table: dbpcm_warehouse.payroll, binds: earn_codes }
+    - { id: gross_earnings, resolve_via: "resolveValues(register_type, 'earnings')", table: dbpcm_warehouse.payroll, binds: earn_codes }
   result_grain: [ Department ]
   sql_template: |
     SELECT e.department_name AS department, SUM(p.amount) AS total_earnings
