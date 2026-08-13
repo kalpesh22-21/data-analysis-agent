@@ -1,0 +1,42 @@
+# Build context filter. Anything listed here can never reach the image.
+
+# Secrets — both pydantic settings classes declare `env_file=".env"`, which
+# resolves against the container's WORKDIR. A copied .env would silently
+# override the Kubernetes Secret env vars. Never ship one.
+**/.env
+**/.env.*
+
+# Local toolchain / VCS / editor state
+.venv
+.git
+.github
+.claude
+**/.DS_Store
+
+# Caches and build artifacts. Patterns here are anchored at the context root
+# unless they start with `**/`, so the recursive ones need the prefix.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.egg-info
+.pytest_cache
+.ruff_cache
+dist
+build
+
+# Not runtime assets
+docs
+test-plans
+deploy
+docker
+docker-compose.integration.yml
+skills
+system.md
+README.md
+Dockerfile
+.dockerignore
+
+# Tests are excluded EXCEPT the fixtures, which are production runtime assets
+# (see the Dockerfile note on tests/fixtures).
+tests
+!tests/fixtures
