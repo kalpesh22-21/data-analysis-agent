@@ -17,7 +17,12 @@ from data_agent.learning.audit import InMemoryAuditStore
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.judge import JUDGE_TOOL_NAME, CoverageJudge, JudgeConfig
 from data_agent.learning.priorart import InMemoryPriorArtIndex, PriorArtCard
-from data_agent.learning.summary.models import SessionSummary, ToolCallSummary, TurnSummary
+from data_agent.learning.summary.models import (
+    AnswerSql,
+    SessionSummary,
+    ToolCallSummary,
+    TurnSummary,
+)
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 
@@ -35,6 +40,7 @@ def make_summary(
     sql: str | None = CANON_SQL,
     turns: tuple[TurnSummary, ...] | None = None,
     tool_calls: tuple[ToolCallSummary, ...] | None = None,
+    answer_sqls: tuple[AnswerSql, ...] = (),
 ) -> SessionSummary:
     if turns is None:
         turns = (
@@ -71,6 +77,7 @@ def make_summary(
         askuser_exchanges=(),
         failed_fixed_sql=(),
         accepted_signal="no_correction",
+        answer_sqls=answer_sqls,
     )
 
 

@@ -223,6 +223,17 @@ def prior_art_query_text(summary: SessionSummary) -> str:
     Only `status == "ok"` calls contribute. A failed query is a shape the session
     ABANDONED; searching for it would rank the corpus against the wrong question.
 
+    ORDER IS THE POINT, because the join is TRUNCATED at `_MAX_QUERY_CHARS`: questions,
+    then the ANSWER's SQL (`summary.answer_sqls` — what `answerWithTable` designated),
+    then the remaining ok calls. The answer's query is the best disambiguator the
+    session has — it is what the user was actually shown, and since Release 1 it need
+    never have been dispatched as a `runQuery`, so it can be absent from `tool_calls`
+    altogether. Appended LAST it was exactly what fell off a busy multi-intent
+    session, leaving the corpus ranked against that session's intermediate probes.
+    For the same reason the dedupe runs in this direction: an ok call whose SQL the
+    answer already designated is dropped, never the other way round, so the surviving
+    copy is the one that is definitely in the text.
+
     ENTITY-BEARING, and knowingly so. This text is handed to the embedding endpoint —
     a strictly smaller egress than the extractor's own model call, which already ships
     the entire session, but a different endpoint. Nothing derived from it is persisted:
@@ -232,8 +243,15 @@ def prior_art_query_text(summary: SessionSummary) -> str:
     for turn in summary.turns:
         if isinstance(turn.user_nl, str) and turn.user_nl.strip():
             parts.append(turn.user_nl)
+    answered = {answer.sql for answer in summary.answer_sqls}
+    parts.extend(answer.sql for answer in summary.answer_sqls)
     for call in summary.tool_calls:
-        if call.status == "ok" and isinstance(call.sql, str) and call.sql.strip():
+        if (
+            call.status == "ok"
+            and isinstance(call.sql, str)
+            and call.sql.strip()
+            and call.sql not in answered
+        ):
             parts.append(call.sql)
     return _sanitize(" ".join(parts), limit=_MAX_QUERY_CHARS)
 

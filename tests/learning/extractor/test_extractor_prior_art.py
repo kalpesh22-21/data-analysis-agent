@@ -31,6 +31,7 @@ from .helpers import (
     PAYROLL_SQL,
     blueprint_raw,
     emit_extractor,
+    make_answer_sql,
     make_summary,
     make_tool_call,
     make_turn,
@@ -305,6 +306,43 @@ def test_a_failed_query_is_not_searched_for():
 def test_a_session_with_nothing_to_search_for_is_an_honest_empty_not_a_failure():
     summary = make_summary(turns=(), tool_calls=())
     assert prior_art_query_text(summary) == ""
+
+
+def test_the_answer_sql_is_searched_for_even_when_it_was_never_dispatched():
+    """Release 1: `answerWithTable` designates the query the user was shown, and it
+    need never have been run as a `runQuery`. Without it the pre-fetch would rank the
+    corpus against a session whose only SQL is a schema probe."""
+    summary = make_summary(
+        turns=(make_turn(user_nl="how much did Analytics earn in 2025?"),),
+        tool_calls=(make_tool_call(ref="tc1", sql=None, tool_name="answerWithTable"),),
+        answer_sqls=(make_answer_sql(PAYROLL_SQL, ref="tc1"),),
+    )
+    assert "payroll_fact" in prior_art_query_text(summary)
+
+
+def test_the_answer_sql_is_not_repeated_when_it_was_also_an_ok_call():
+    """The usual case — the model ran it and then designated it. The embedding gains
+    nothing from the same string twice."""
+    summary = make_summary(
+        turns=(),
+        tool_calls=(make_tool_call(ref="tc1", sql=PAYROLL_SQL),),
+        answer_sqls=(make_answer_sql(PAYROLL_SQL, ref="ans1"),),
+    )
+    assert prior_art_query_text(summary).count("payroll_fact") == 1
+
+
+def test_the_answer_sql_precedes_the_intermediate_queries():
+    """Order is what survives truncation (`_MAX_QUERY_CHARS`), so the best
+    disambiguator the session has goes first: questions, the ANSWER's SQL, then the
+    rest of the ok calls."""
+    summary = make_summary(
+        turns=(make_turn(user_nl="what did Analytics earn?"),),
+        tool_calls=(make_tool_call(ref="probe", sql="SELECT probe_column FROM hr.t"),),
+        answer_sqls=(make_answer_sql(PAYROLL_SQL, ref="ans1"),),
+    )
+    query = prior_art_query_text(summary)
+    assert query.index("payroll_fact") < query.index("probe_column")
+    assert query.index("what did Analytics earn") < query.index("payroll_fact")
 
 
 async def test_a_blank_query_skips_the_search_entirely():

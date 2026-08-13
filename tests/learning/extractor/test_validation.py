@@ -19,7 +19,9 @@ from data_agent.learning.extractor.validation import (
 )
 
 from .helpers import (
+    PAYROLL_SQL,
     blueprint_raw,
+    make_answer_sql,
     make_summary,
     make_tool_call,
     param_inline,
@@ -117,6 +119,39 @@ def test_unparseable_accepted_sql_is_declined_unrewritable():
     out = _validate(blueprint_raw(parameterization=[]), summary=summary)
     assert isinstance(out, Decline)
     assert out.reason == REASON_UNREWRITABLE
+
+
+def test_an_answer_designation_ref_resolves_like_a_runquery_ref():
+    """Release 1: the cited ref is the `answerWithTable` call and its query was never
+    dispatched, so `tc.sql` is None everywhere. Resolution goes through
+    `summary/refs.py::sql_by_ref`, so the plan is checked against the real SQL
+    instead of declining as if the session carried none."""
+    summary = make_summary(
+        tool_calls=(make_tool_call(ref="ans", sql=None, tool_name="answerWithTable"),),
+        answer_sqls=(make_answer_sql(PAYROLL_SQL, ref="ans"),),
+    )
+    assert isinstance(_validate(blueprint_raw(source_refs=("ans",)), summary=summary),
+                      ExtractedCandidate)
+
+
+def test_every_query_behind_a_multi_table_ref_is_checked_for_totality():
+    """One ref, two designated queries: a literal predicate in the SECOND that the
+    plan does not cover is still a filter this blueprint would silently drop.
+    Checking only the first would let it through the D97 gate unexamined."""
+    summary = make_summary(
+        tool_calls=(make_tool_call(ref="ans", sql=None, tool_name="answerWithTable"),),
+        answer_sqls=(
+            make_answer_sql(PAYROLL_SQL, ref="ans"),
+            make_answer_sql(
+                "SELECT count(*) FROM payroll.payroll_fact WHERE country = 'IE'",
+                ref="ans",
+            ),
+        ),
+    )
+    out = _validate(blueprint_raw(source_refs=("ans",)), summary=summary)
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_TOTALITY
+    assert "country" in out.detail
 
 
 def test_no_accepted_sql_for_refs_is_declined_unrewritable():

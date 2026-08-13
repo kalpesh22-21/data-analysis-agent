@@ -73,6 +73,21 @@ class FailedFixedSql:
 
 
 @dataclass(frozen=True)
+class AnswerSql:
+    """One query the FINAL answer stood on — an `answerWithTable` designation (§2.6).
+
+    NOT a `ToolCallSummary`: `answerWithTable` executes nothing, and the query it
+    designates need never have been dispatched as a `runQuery` at all, so this is
+    the only record of it. `tool_call_ref` is the `answerWithTable` call, which keeps
+    it resolvable as an S3 `EvidenceRef` like every other ref in this module.
+    """
+
+    tool_call_ref: str  # the answerWithTable call that designated this query
+    sql: str  # non-blank by construction (`loader._designations`)
+    blueprint_id: str | None  # the blueprint the MODEL associated with it, if any
+
+
+@dataclass(frozen=True)
 class SessionSummary:
     session_id: str
     user_id: str  # carried from the LearningJob reference
@@ -85,3 +100,9 @@ class SessionSummary:
     askuser_exchanges: tuple[AskUserExchange, ...]
     failed_fixed_sql: tuple[FailedFixedSql, ...]
     accepted_signal: AcceptedSignal | None  # None ⇒ no acceptance detected (§2)
+    # The final answer's SQL (§2.6), in trail order, deduped. The one DEFAULTED field
+    # here, because it is purely ADDITIVE: `()` is the honest value for a session
+    # whose answer designated no table, which is also every session recorded before
+    # `answerWithTable` carried one — so no other construction site of this dataclass
+    # has to claim anything about it.
+    answer_sqls: tuple[AnswerSql, ...] = ()

@@ -93,7 +93,8 @@ def _str_list(raw: Any) -> list[str]:
 
 
 def session_brief(summary: SessionSummary) -> str:
-    """The PRE-extraction brief: the question, the accepted SQL, the tool trail.
+    """The PRE-extraction brief: the question, the accepted SQL (both what ran and
+    what the answer designated), the tool trail.
 
     ENTITY-BEARING and knowingly so — this is the session verbatim, minus its bulk, and
     it goes to the same class of endpoint the extractor's own call already goes to. It
@@ -123,13 +124,26 @@ def session_brief(summary: SessionSummary) -> str:
         }
         for tc in summary.tool_calls[:_MAX_TOOL_CALLS]
     ]
+    # The query the FINAL answer showed the user (`answerWithTable`, incl. Release 1's
+    # multi-table form). Its own section, because it is not in `tool_calls`: the
+    # designated query need never have been dispatched as a runQuery, so a judge
+    # reading only ok calls can be asked "does the corpus already cover this session?"
+    # while never seeing the one query the session is about.
+    answer_sql = [
+        {"ref": a.tool_call_ref, "sql": _text(a.sql, _MAX_SQL_CHARS),
+         "blueprint_id": a.blueprint_id}
+        for a in summary.answer_sqls[:_MAX_LIST_ITEMS]
+    ]
     payload = {
         "session_id": summary.session_id,
         "accepted_signal": summary.accepted_signal,
         "turns": turns,
         "tool_calls": tool_calls,
+        "answer_sql": answer_sql,
         "truncated": (
-            len(summary.turns) > _MAX_TURNS or len(summary.tool_calls) > _MAX_TOOL_CALLS
+            len(summary.turns) > _MAX_TURNS
+            or len(summary.tool_calls) > _MAX_TOOL_CALLS
+            or len(summary.answer_sqls) > _MAX_LIST_ITEMS
         ),
     }
     return (

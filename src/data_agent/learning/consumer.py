@@ -110,8 +110,15 @@ def _transcript_preview(summary: SessionSummary) -> str | None:
 
 
 def _accepted_sql(summary: SessionSummary) -> str | None:
-    """The accepted SQL (the last successful runQuery). Entity-bearing —
-    verbose-gated."""
+    """The accepted SQL: the LAST query the answer designated (`answerWithTable`),
+    else the last successful runQuery. Entity-bearing — verbose-gated.
+
+    The designation wins because the span answers "what did this session accept?" and
+    that is what the user was shown — which since Release 1 need never have been
+    dispatched as a runQuery at all, so reading only ok calls left the one query that
+    mattered out of the trace and put an intermediate probe in its place."""
+    if summary.answer_sqls:
+        return summary.answer_sqls[-1].sql
     sql: str | None = None
     for tc in summary.tool_calls:
         if tc.tool_name == "runQuery" and tc.status == "ok" and tc.sql:

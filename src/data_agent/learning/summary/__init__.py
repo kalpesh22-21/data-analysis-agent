@@ -2,6 +2,7 @@
 from .loader import load_session_summary
 from .models import (
     AcceptedSignal,
+    AnswerSql,
     AskUserExchange,
     BlueprintUsage,
     FailedFixedSql,
@@ -9,9 +10,11 @@ from .models import (
     ToolCallSummary,
     TurnSummary,
 )
+from .refs import sql_by_ref
 
 __all__ = [
     "AcceptedSignal",
+    "AnswerSql",
     "AskUserExchange",
     "BlueprintUsage",
     "FailedFixedSql",
@@ -19,4 +22,5 @@ __all__ = [
     "ToolCallSummary",
     "TurnSummary",
     "load_session_summary",
+    "sql_by_ref",
 ]

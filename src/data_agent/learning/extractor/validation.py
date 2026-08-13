@@ -38,6 +38,7 @@ from typing import Any
 from data_agent.runtime.blueprint.template import TemplateBindError, validate_optional_pattern
 
 from ..summary.models import SessionSummary
+from ..summary.refs import sql_by_ref
 from .models import (
     NODE_KINDS,
     SLOT_TYPES,
@@ -931,36 +932,45 @@ def _table_compatible(plan_table: str, pred_table: str) -> bool:
 def _validate_totality(
     payload: BlueprintPayload, summary: SessionSummary
 ) -> Decline | None:
-    # Gather the accepted SQL of the cited source runQuery refs.
-    sql_by_ref = {tc.tool_call_ref: tc.sql for tc in summary.tool_calls}
+    # Gather the accepted SQL of the cited source refs — `summary/refs.py`, which
+    # resolves an `answerWithTable` ref to the SQL that call DESIGNATED as well as a
+    # runQuery ref to the SQL it ran. Without it a candidate citing the answer's ref
+    # (often the session's only ref: a designated query need never have been
+    # dispatched) declines as if the session carried no SQL at all.
+    #
+    # EVERY SQL a ref stands for is checked, not just one. A multi-table answer puts
+    # several queries behind one ref, and a predicate in the second one that no
+    # parameterization entry covers is a filter this blueprint would silently drop —
+    # exactly what this gate exists to catch.
+    resolved = sql_by_ref(summary)
     plan_locators = [p.locator for p in payload.parameterization]
     saw_any_sql = False
     for ref in payload.source_tool_call_refs:
-        sql = sql_by_ref.get(ref)
-        if not sql:
-            continue
-        saw_any_sql = True
-        predicates = literal_predicates(sql)
-        if predicates is None:
-            return Decline("blueprint", REASON_UNREWRITABLE, f"un-parseable SQL at {ref}")
-        for pred in predicates:
-            # Per-locator coverage (LOW-1): match by (column, value) so
-            # `region='NA' OR region='EU'` needs a plan entry PER predicate, and
-            # same-named columns on different (qualified) tables are distinguished
-            # by `table`. A predicate with NO covering ParamPlan → silent dropped
-            # filter → decline (fail-to-review).
-            covered = any(
-                loc.column.lower() == pred.column.lower()
-                and loc.value == pred.value
-                and _table_compatible(loc.table, pred.table)
-                for loc in plan_locators
-            )
-            if not covered:
+        for sql in resolved.get(ref, ()):
+            saw_any_sql = True
+            predicates = literal_predicates(sql)
+            if predicates is None:
                 return Decline(
-                    "blueprint", REASON_TOTALITY,
-                    f"predicate {pred.column}={pred.value!r} "
-                    f"(table {pred.table or '?'}) has no parameterization entry",
+                    "blueprint", REASON_UNREWRITABLE, f"un-parseable SQL at {ref}"
                 )
+            for pred in predicates:
+                # Per-locator coverage (LOW-1): match by (column, value) so
+                # `region='NA' OR region='EU'` needs a plan entry PER predicate, and
+                # same-named columns on different (qualified) tables are distinguished
+                # by `table`. A predicate with NO covering ParamPlan → silent dropped
+                # filter → decline (fail-to-review).
+                covered = any(
+                    loc.column.lower() == pred.column.lower()
+                    and loc.value == pred.value
+                    and _table_compatible(loc.table, pred.table)
+                    for loc in plan_locators
+                )
+                if not covered:
+                    return Decline(
+                        "blueprint", REASON_TOTALITY,
+                        f"predicate {pred.column}={pred.value!r} "
+                        f"(table {pred.table or '?'}) has no parameterization entry",
+                    )
     if not saw_any_sql:
         return Decline("blueprint", REASON_UNREWRITABLE, "no accepted SQL found for source refs")
     return None

@@ -9,7 +9,10 @@ import copy
 import pytest
 
 from data_agent.learning.summary import load_session_summary
+from data_agent.learning.summary.loader import ENFORCEMENT_ERROR_CODES
 from data_agent.learning.triage import triage
+from data_agent.runtime.context.assembly import IDEMPOTENT_READ_ALREADY_SERVED_CODE
+from data_agent.runtime.dispatch.denial_mapping import KNOWN_DENIAL_CODES
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview
 
@@ -295,6 +298,254 @@ async def test_blueprint_usage_corrected_on_trailing_correction(store):
     summary = await _load(store, doc)
     # status ok, but a correction references a later turn ⇒ corrected.
     assert summary.blueprint_usages[0].outcome == "corrected"
+
+
+# --- Release 1: enforcement denials are mechanics, not failures --------------
+
+
+def test_every_enforcement_code_is_a_code_the_runtime_actually_sets():
+    """Spelling drift guard, and the reason the two hardcoded literals are allowed to
+    stay hardcoded: the loader's set is a claim about codes another package owns, and
+    a rename there must fail HERE rather than silently switch the filter off. The
+    idempotent-read marker is exempt — it is a guard-entry marker, not a
+    `_DENIAL_TABLE` entry, and it is imported from its owner by symbol.
+
+    The other half of the invariant (no SUBSTANTIVE code is in this set) is
+    `test_loader_release1_qa.py::test_no_substantive_failure_code_is_ever_classified_
+    as_enforcement`, which states it as set disjointness."""
+    assert ENFORCEMENT_ERROR_CODES - {IDEMPOTENT_READ_ALREADY_SERVED_CODE} <= (
+        KNOWN_DENIAL_CODES
+    )
+
+
+async def test_enforcement_denied_blueprint_is_not_a_failed_fixed_pair(store):
+    """`BLUEPRINT_DEFINITION_NOT_READ` refuses runBlueprint before the executor runs
+    (getBlueprint had not run this turn). The later ok runQuery is the FIRST attempt
+    at that data, not a repair — so this is not analyst friction."""
+    doc = make_doc(
+        tool_trail=[
+            make_trail_entry(turn_index=0, tool_call_id="bp", tool_name="runBlueprint",
+                             args={"blueprint_id": "bp-headcount"}, status="denied",
+                             error_code="BLUEPRINT_DEFINITION_NOT_READ"),
+            make_trail_entry(turn_index=0, tool_call_id="ok", tool_name="runQuery",
+                             args={"sql": "SELECT count(*)"}, status="ok"),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert summary.failed_fixed_sql == ()
+
+
+async def test_enforcement_denied_blueprint_emits_no_usage(store):
+    """The blueprint never ran, so there is neither an accepted nor a corrected
+    usage to record — and `corrected_blueprint` (a negative signal about the CORPUS,
+    read by triage and `SessionSignals`) must not fire on runtime bookkeeping."""
+    doc = make_doc(
+        tool_trail=[
+            make_trail_entry(turn_index=0, tool_call_id="bp", tool_name="runBlueprint",
+                             args={"blueprint_id": "bp-headcount"}, status="denied",
+                             error_code="BLUEPRINT_DEFINITION_NOT_READ"),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert summary.blueprint_usages == ()
+    # The call itself is still in the summary — the projection stays faithful.
+    assert summary.tool_calls[0].error_code == "BLUEPRINT_DEFINITION_NOT_READ"
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    ["ANALYSIS_STATE_INVALID", "ANALYSIS_STATE_LATE_INIT",
+     "FINALIZATION_BLOCKED_PENDING_INTENTS", "ANSWER_TABLE_BLUEPRINT_NOT_RUN"],
+)
+async def test_the_other_enforcement_codes_do_not_pair_either(store, error_code):
+    doc = make_doc(
+        tool_trail=[
+            make_trail_entry(turn_index=0, tool_call_id="denied", tool_name="runQuery",
+                             args={"sql": "SELECT 1"}, status="denied",
+                             error_code=error_code),
+            make_trail_entry(turn_index=0, tool_call_id="ok", tool_name="runQuery",
+                             args={"sql": "SELECT 2"}, status="ok"),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert summary.failed_fixed_sql == ()
+
+
+async def test_a_substantive_denial_still_counts_as_a_failure(store):
+    """The split is enforcement-mechanics vs substantive failure. A scope violation
+    is the second kind: the call was really attempted and came back refused on the
+    DATA, which is exactly the friction both readers exist to record."""
+    doc = make_doc(
+        tool_trail=[
+            make_trail_entry(turn_index=0, tool_call_id="bp", tool_name="runBlueprint",
+                             args={"blueprint_id": "bp-salary"}, status="denied",
+                             error_code="COLUMN_SCOPE_VIOLATION"),
+            make_trail_entry(turn_index=0, tool_call_id="ok", tool_name="runQuery",
+                             args={"sql": "SELECT count(*)"}, status="ok"),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert len(summary.failed_fixed_sql) == 1
+    assert summary.failed_fixed_sql[0].failed_tool_call_ref == "bp"
+    assert summary.blueprint_usages[0].outcome == "corrected"
+
+
+async def test_a_legacy_denial_with_no_error_code_is_still_a_failure(store):
+    """`error_code is None` — every pre-Release-1 doc, and any MCP error whose code
+    could not be parsed — means "not enforcement", i.e. unchanged behaviour."""
+    doc = make_doc(
+        tool_trail=[
+            make_trail_entry(turn_index=0, tool_call_id="bp", tool_name="runBlueprint",
+                             args={"blueprint_id": "bp-x"}, status="denied",
+                             error_code=None),
+            make_trail_entry(turn_index=0, tool_call_id="ok", tool_name="runQuery",
+                             args={"sql": "SELECT 1"}, status="ok"),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert len(summary.failed_fixed_sql) == 1
+    assert summary.blueprint_usages[0].outcome == "corrected"
+
+
+async def test_an_enforcement_denial_then_a_real_run_records_the_real_run(store):
+    """The live shape: refused, the model reads the definition, runs it, it is
+    accepted. Exactly one usage, and it is the one that ran."""
+    doc = make_doc(
+        messages=[make_message(0, "user", "run headcount"),
+                  make_message(0, "assistant", "Done.")],
+        tool_trail=[
+            make_trail_entry(turn_index=0, tool_call_id="bp1", tool_name="runBlueprint",
+                             args={"blueprint_id": "bp-headcount"}, status="denied",
+                             error_code="BLUEPRINT_DEFINITION_NOT_READ"),
+            make_trail_entry(turn_index=0, tool_call_id="get", tool_name="getBlueprint",
+                             args={"id": "bp-headcount"}, status="ok"),
+            make_trail_entry(turn_index=0, tool_call_id="bp2", tool_name="runBlueprint",
+                             args={"blueprint_id": "bp-headcount"}, status="ok"),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert [(u.tool_call_ref, u.outcome) for u in summary.blueprint_usages] == [
+        ("bp2", "accepted")
+    ]
+    assert summary.failed_fixed_sql == ()
+
+
+# --- Release 1 §2.6: the final answer's SQL (answerWithTable) ----------------
+
+
+async def test_answer_sql_lifted_from_the_top_level_args(store):
+    doc = make_doc(
+        tool_trail=[
+            make_trail_entry(turn_index=0, tool_call_id="ans", tool_name="answerWithTable",
+                             args={"answer": "42 people.", "sql": "SELECT count(*) FROM hr.emp",
+                                   "blueprint_id": "bp-headcount"},
+                             status="ok"),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert len(summary.answer_sqls) == 1
+    answer = summary.answer_sqls[0]
+    assert answer.tool_call_ref == "ans"
+    assert answer.sql == "SELECT count(*) FROM hr.emp"
+    assert answer.blueprint_id == "bp-headcount"
+    # answerWithTable is not a _SQL_TOOLS member: the convenience field stays None.
+    assert summary.tool_calls[0].sql is None
+
+
+async def test_answer_sql_lifted_from_the_multi_table_array(store):
+    """Release 1's multi-table answer: each `tables[i].sql` is a query the user was
+    shown, and none of them need ever have been dispatched as a runQuery."""
+    doc = make_doc(
+        tool_trail=[
+            make_trail_entry(
+                turn_index=0, tool_call_id="ans", tool_name="answerWithTable",
+                args={"answer": "Two views.", "sql": "", "blueprint_id": "",
+                      "tables": [
+                          {"sql": "SELECT a FROM t", "caption": "by dept",
+                           "blueprint_id": "bp-a"},
+                          {"sql": "SELECT b FROM t", "caption": "", "blueprint_id": ""},
+                      ]},
+                status="ok",
+            ),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert [(a.sql, a.blueprint_id) for a in summary.answer_sqls] == [
+        ("SELECT a FROM t", "bp-a"),
+        ("SELECT b FROM t", None),
+    ]
+
+
+async def test_answer_sql_dedupes_and_skips_non_conforming_shapes(store):
+    """Args are model-authored JSON. A non-list `tables`, a non-mapping item, a
+    non-`str` sql and a blank placeholder are each skipped silently; a repeat of a
+    SQL already designated is dropped, keeping the first ref."""
+    doc = make_doc(
+        tool_trail=[
+            make_trail_entry(
+                turn_index=0, tool_call_id="a1", tool_name="answerWithTable",
+                args={"sql": "SELECT 1", "tables": [
+                    {"sql": "SELECT 1"},          # same SQL as the top-level pair
+                    {"sql": 17},                  # not a string
+                    {"sql": "   "},               # whitespace placeholder
+                    "not-a-mapping",
+                    {"caption": "no sql here"},
+                ]},
+                status="ok",
+            ),
+            make_trail_entry(turn_index=1, tool_call_id="a2", tool_name="answerWithTable",
+                             args={"sql": "SELECT 1", "tables": "not-a-list"}, status="ok"),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert [(a.tool_call_ref, a.sql) for a in summary.answer_sqls] == [("a1", "SELECT 1")]
+
+
+async def test_the_attributed_designation_wins_the_dedupe(store):
+    """The live placeholder shape: the model fills the `tables` array AND the flat
+    pair with the same query, and only the array entry carries the blueprint id.
+    `tables` is read first (the runtime's own precedence), so the attributed copy is
+    the one kept — the id is the only thing either copy adds over the other."""
+    doc = make_doc(
+        tool_trail=[
+            make_trail_entry(
+                turn_index=0, tool_call_id="ans", tool_name="answerWithTable",
+                args={"answer": "here", "sql": "SELECT x FROM t", "blueprint_id": "",
+                      "tables": [{"sql": "SELECT x FROM t", "caption": "",
+                                  "blueprint_id": "bp-a"}]},
+                status="ok",
+            ),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert [(a.sql, a.blueprint_id) for a in summary.answer_sqls] == [
+        ("SELECT x FROM t", "bp-a")
+    ]
+
+
+async def test_a_refused_answer_with_table_designates_nothing(store):
+    """A refused terminal call showed the user no table at all; only the retry that
+    succeeded contributes."""
+    doc = make_doc(
+        tool_trail=[
+            make_trail_entry(turn_index=0, tool_call_id="a1", tool_name="answerWithTable",
+                             args={"sql": "SELECT refused"}, status="denied",
+                             error_code="FINALIZATION_BLOCKED_PENDING_INTENTS"),
+            make_trail_entry(turn_index=0, tool_call_id="a2", tool_name="answerWithTable",
+                             args={"sql": "SELECT served"}, status="ok"),
+        ],
+    )
+    summary = await _load(store, doc)
+    assert [a.sql for a in summary.answer_sqls] == ["SELECT served"]
+
+
+async def test_a_session_with_no_answer_table_has_no_answer_sql(store):
+    doc = make_doc(
+        tool_trail=[make_trail_entry(turn_index=0, tool_call_id="c1", tool_name="runQuery",
+                                     args={"sql": "SELECT 1"}, status="ok")],
+    )
+    summary = await _load(store, doc)
+    assert summary.answer_sqls == ()
 
 
 # --- L12: full-result hydration (D46) + graceful degradation ----------------

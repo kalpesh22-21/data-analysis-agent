@@ -12,7 +12,12 @@ from typing import Any
 from data_agent.learning.extractor import ExtractorConfig, LearningExtractor
 from data_agent.learning.extractor.schema import EXTRACTOR_TOOL_NAME, SEARCH_CORPUS_TOOL_NAME
 from data_agent.learning.priorart import PriorArtCard
-from data_agent.learning.summary.models import SessionSummary, ToolCallSummary, TurnSummary
+from data_agent.learning.summary.models import (
+    AnswerSql,
+    SessionSummary,
+    ToolCallSummary,
+    TurnSummary,
+)
 from data_agent.learning.triage import TriageVerdict
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
@@ -32,13 +37,16 @@ KEEP_VERDICT = TriageVerdict(decision="keep", reason="K1", target_hints=("bluepr
 
 def make_tool_call(
     ref: str = "tc1",
-    sql: str = PAYROLL_SQL,
+    sql: str | None = PAYROLL_SQL,
     *,
     status: str = "ok",
     tool_name: str = "runQuery",
     turn_index: int = 0,
     result_columns: tuple[str, ...] = ("total_earnings",),
 ) -> ToolCallSummary:
+    """One `ToolCallSummary`. `sql=None` is the shape every non-SQL tool has —
+    `updateAnalysisState`, `recordAssumptions`, `answerWithTable` — which is what
+    the payload-exclusion tests need."""
     return ToolCallSummary(
         turn_index=turn_index, tool_call_ref=ref, tool_name=tool_name,
         args={"sql": sql}, sql=sql, status=status, error_code=None,
@@ -69,6 +77,7 @@ def make_summary(
     trace_id: str = "trace-1",
     content_hash: str = "hash-1",
     user_id: str = "user-1",
+    answer_sqls: tuple[AnswerSql, ...] = (),
 ) -> SessionSummary:
     return SessionSummary(
         session_id=session_id, user_id=user_id, scope_ref="scope-abc", trace_id=trace_id,
@@ -77,7 +86,15 @@ def make_summary(
         tool_calls=tool_calls if tool_calls is not None else (make_tool_call(),),
         blueprint_usages=(), askuser_exchanges=(), failed_fixed_sql=(),
         accepted_signal=accepted_signal,
+        answer_sqls=answer_sqls,
     )
+
+
+def make_answer_sql(
+    sql: str = PAYROLL_SQL, *, ref: str = "ans1", blueprint_id: str | None = None
+) -> AnswerSql:
+    """One `answerWithTable` designation as the S2 loader emits it (§2.6)."""
+    return AnswerSql(tool_call_ref=ref, sql=sql, blueprint_id=blueprint_id)
 
 
 # --- parameterization entry builders -----------------------------------------

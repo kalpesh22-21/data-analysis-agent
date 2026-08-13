@@ -50,6 +50,7 @@ from .extractor.helpers import (
     PAYROLL_SQL,
     blueprint_raw,
     emit_extractor,
+    make_answer_sql,
     make_summary,
     make_tool_call,
 )
@@ -92,10 +93,11 @@ def _keep_loader(summary):
     return loader
 
 
-def _keep_consumer(store, queue, settings, *, tracer, verbose: bool):
+def _keep_consumer(store, queue, settings, *, tracer, verbose: bool, summary=None):
     """A consumer wired for the KEEP extraction path (scripted extractor, in-memory
-    audit + candidate stores) with a fixed summary carrying a question + SQL."""
-    summary = replace(
+    audit + candidate stores) with a fixed summary carrying a question + SQL.
+    *summary* overrides that default for a test about what the summary carries."""
+    summary = summary or replace(
         make_summary(
             session_id="sess-chain",
             content_hash="hash-chain",
@@ -353,6 +355,39 @@ async def test_verbose_on_sets_human_readable_attrs(
     assert extract.attributes["learning.extract.intent"]
     # The consume span (parent) also carries the question under verbose.
     assert spans["learning.consume"].attributes["learning.question"]
+
+
+async def test_the_accepted_sql_attr_is_the_query_the_answer_designated(
+    store, queue, settings, seed_session, span_exporter, tracer
+):
+    """[traces-verbose-off-is-d25-shape-only] `learning.accepted_sql` answers "what did
+    this session accept?", and since Release 1 that is what `answerWithTable`
+    designated — which need never have been dispatched as a runQuery. Reading only ok
+    calls put an intermediate probe in the trace and left the real one out."""
+    answer_sql = "SELECT sum(gross_pay) FROM payroll.payroll_fact WHERE region = 'NA'"
+    summary = replace(
+        make_summary(
+            session_id="sess-chain",
+            content_hash="hash-chain",
+            tool_calls=(make_tool_call(sql="SELECT 1 -- a probe", status="ok"),),
+            answer_sqls=(make_answer_sql(answer_sql, ref="ans"),),
+        ),
+        turns=(TurnSummary(turn_index=0, user_nl="payroll for NA?",
+                           assistant_text="$92.4M", tool_call_refs=("tc1",)),),
+    )
+    seed_session(
+        store, "sess-chain",
+        messages=[make_message(0, "user", "payroll for NA?"),
+                  make_message(0, "assistant", "$92.4M")],
+        tool_trail=[make_trail_entry(tool_name="runQuery", args={"sql": PAYROLL_SQL})],
+    )
+    await LearningSweeper(store, queue, settings, tracer=tracer).run_once()
+    consumer = _keep_consumer(store, queue, settings, tracer=tracer, verbose=True,
+                              summary=summary)
+    await consumer.run_once()
+
+    extract = _by_name(span_exporter)["learning.extract"]
+    assert extract.attributes["learning.accepted_sql"] == answer_sql
 
 
 async def test_verbose_off_scheduler_promote_land_shape_only(span_exporter, tracer):

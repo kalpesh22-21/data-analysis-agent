@@ -164,6 +164,21 @@ _PRIOR_ART_RULES = (
 )
 
 
+# Tools whose trail entries are dropped from the PAYLOAD's `tool_calls` list (never
+# from the `SessionSummary` itself — that stays a faithful projection other stages
+# read).
+#
+# Derived from what the extractor uses `tool_calls` FOR: the SQL evidence a candidate
+# is built from, and the outcome narrative that says whether a call worked. These two
+# carry neither. `updateAnalysisState` is the intent ledger — `sql: null`, and
+# Release 1 models re-send the WHOLE intent list every round, with the rejected
+# attempts persisted alongside the accepted ones, so a single turn contributes many
+# near-identical entries. `recordAssumptions` echoes the model's own prose back at
+# it. What is left is token bloat in a prompt that already carries the whole session,
+# and a `status: "denied"` count that reads as friction where none happened.
+_PAYLOAD_EXCLUDED_TOOLS = frozenset({"updateAnalysisState", "recordAssumptions"})
+
+
 class ExtractorConfigError(ValueError):
     """A turn budget that makes the extractor unable to do its job."""
 
@@ -524,6 +539,17 @@ class LearningExtractor:
                  "tool_name": tc.tool_name, "sql": tc.sql, "status": tc.status,
                  "result_columns": list(tc.result_columns)}
                 for tc in summary.tool_calls
+                if tc.tool_name not in _PAYLOAD_EXCLUDED_TOOLS
+            ],
+            # The SQL the FINAL answer showed the user (`answerWithTable`, incl. the
+            # Release 1 multi-table form). Kept a section of its own rather than
+            # folded into `tool_calls`: it is the one query the session actually
+            # stood on, and it may never have been dispatched as a `runQuery`, so
+            # `tool_calls` can be missing it entirely.
+            "answer_sql": [
+                {"tool_call_ref": a.tool_call_ref, "sql": a.sql,
+                 "blueprint_id": a.blueprint_id}
+                for a in summary.answer_sqls
             ],
             "askuser_exchanges": [
                 {"question": ex.question, "answer": ex.answer}

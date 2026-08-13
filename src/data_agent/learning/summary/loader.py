@@ -10,15 +10,24 @@ unit-testable.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from typing import Any, Protocol
 
+from data_agent.runtime.composite.analysis_state import (
+    ANALYSIS_STATE_INVALID_CODE,
+    ANALYSIS_STATE_LATE_INIT_CODE,
+)
+from data_agent.runtime.context.assembly import IDEMPOTENT_READ_ALREADY_SERVED_CODE
+from data_agent.runtime.dispatch.denial_mapping import (
+    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
+)
 from data_agent.runtime.session.models import ResultPreview, SessionDoc, TrailEntry
 
 from ..models import LearningJob
 from .lexicon import CORRECTION_PHRASES, matches_any, matches_confirmation
 from .models import (
     AcceptedSignal,
+    AnswerSql,
     AskUserExchange,
     BlueprintUsage,
     FailedFixedSql,
@@ -40,11 +49,87 @@ _DATA_TOOLS = ("runQuery", "runBlueprint")
 _SQL_TOOLS = ("runQuery", "explainQuery")
 _FAILED_STATUSES = ("error", "denied")
 
+# `answerWithTable` (runtime `composite/answer_with_table.py`) — the TERMINAL call.
+# It executes nothing itself, so it is in neither list above; §2.6 is the only path
+# by which the SQL it designates reaches the summary.
+_ANSWER_TOOL = "answerWithTable"
+
+# ENFORCEMENT codes: the runtime refused (or short-circuited) the call on its own
+# mechanics, BEFORE the executor ran.
+#
+# IMPORTED where the owning module is one this offline daemon can already afford to
+# load; SPELLED OUT where it is not, naming the symbol that owns the spelling so the
+# drift is findable. The two spelled-out codes DO have exported constants — but only
+# in `loop/agent_loop.py`, which drags the whole request-path dispatch stack into the
+# learning daemons' import graph for two strings. `test_loader.py::test_every_
+# enforcement_code_is_a_code_the_runtime_actually_sets` pins them against
+# `denial_mapping.KNOWN_DENIAL_CODES`, so a rename fails a test rather than silently
+# switching the filter off.
+#
+# The line this set draws is enforcement-mechanics vs SUBSTANTIVE failure, and it is
+# DERIVED FROM WHAT THE TWO READERS BELOW INFER from a non-ok status:
+# `_failed_fixed_pairs` infers analyst friction (it feeds
+# `SessionSignals.failed_fixed_count` and the extractor's `failed_fixed_sql`
+# section — "a query came back wrong and a later one fixed it"), and
+# `_blueprint_usages` infers corpus quality (`outcome == "corrected"` feeds
+# `SessionSignals.corrected_blueprint` and triage, read as "this blueprint was
+# wrong"). A call refused before it ran is evidence for neither: nothing was
+# computed, so there is no bad SQL that got fixed and no blueprint output that got
+# corrected. Release 1 made these routine — a model trips
+# `BLUEPRINT_DEFINITION_NOT_READ` in normal operation — so counting them would put a
+# permanent negative bias on every post-Release-1 session.
+#
+# A syntax error, a `COLUMN_SCOPE_VIOLATION`, a `CLICKHOUSE_QUERY_ERROR`: the
+# opposite. The call was really attempted and the answer came back wrong, which is
+# exactly the friction both readers exist to record. Those stay failures.
+ENFORCEMENT_ERROR_CODES = frozenset(
+    {
+        # `loop/agent_loop.py::BLUEPRINT_DEFINITION_NOT_READ_CODE` (Release 1),
+        # registered in dispatch/denial_mapping.py: `runBlueprint` refused because
+        # `getBlueprint` had not run in the same turn. Retryable, and the executor
+        # never runs — the model has not seen the SQL it was about to execute.
+        "BLUEPRINT_DEFINITION_NOT_READ",
+        # `loop/agent_loop.py::ANSWER_TABLE_BLUEPRINT_NOT_RUN_CODE` (Release 1):
+        # `answerWithTable` named a blueprint it never ran, so there was no terminal
+        # SQL to resolve. Retryable.
+        "ANSWER_TABLE_BLUEPRINT_NOT_RUN",
+        # composite/analysis_state.py (Release 1): `updateAnalysisState` hygiene.
+        # Neither says anything about the data — INVALID is a mis-shaped ledger
+        # update (retryable), LATE_INIT is a declaration that arrived after the work
+        # started (not retryable). Imported: that module adds NOTHING to this
+        # process's import graph (every dependency it has is already loaded here) and
+        # its import-time work is a logger and a table of constants.
+        ANALYSIS_STATE_INVALID_CODE,
+        ANALYSIS_STATE_LATE_INIT_CODE,
+        # loop/agent_loop.py sets it, dispatch/denial_mapping.py registers it: the
+        # turn's terminal call refused while declared intents are still pending.
+        FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
+        # loop/agent_loop.py's repeated-idempotent-read guard, code owned by
+        # context/assembly.py. Persisted `status="ok"` today (and only for
+        # `read_guard.py::IDEMPOTENT_READ_TOOLS`, none of which is a `_DATA_TOOLS`
+        # member), so neither reader below currently reaches it — listed so this set
+        # is the whole enforcement vocabulary rather than the part that happens to be
+        # reachable, which is what a reader adding a tool to `_DATA_TOOLS` will
+        # assume it is.
+        IDEMPOTENT_READ_ALREADY_SERVED_CODE,
+    }
+)
+
 
 class _FullResultReader(Protocol):
     async def read_full_result(
         self, session_id: str, result_full_ref: str
     ) -> dict[str, Any] | None: ...
+
+
+def _is_enforcement_denial(tc: ToolCallSummary) -> bool:
+    """Was this call stopped by runtime mechanics rather than by the data?
+
+    `error_code` is `None` on every pre-Release-1 trail entry, and on any MCP error
+    whose `[{CODE}]` prefix could not be parsed. `None` is not in the set, so it
+    reads as "not enforcement" and keeps the pre-existing behaviour — which is the
+    conservative direction: an unclassifiable failure stays a failure."""
+    return tc.error_code in ENFORCEMENT_ERROR_CODES
 
 
 def _extract_sql(tool_name: str, args: dict[str, Any]) -> str | None:
@@ -182,9 +267,16 @@ def _build_turns(doc: SessionDoc) -> tuple[TurnSummary, ...]:
 def _failed_fixed_pairs(tool_calls: tuple[ToolCallSummary, ...]) -> tuple[FailedFixedSql, ...]:
     # §2.4: for each failed runQuery/runBlueprint, pair with the NEXT ok runQuery
     # in trail order. A failed query with no later ok runQuery is NOT a fix.
+    #
+    # An ENFORCEMENT denial is not a failed query at all (see
+    # `ENFORCEMENT_ERROR_CODES`): the query never ran, so the later ok runQuery is
+    # the FIRST attempt at that data, not a repair of a broken one. Pairing them
+    # would report SQL that was never wrong as "the analyst had to fight it".
     pairs: list[FailedFixedSql] = []
     for i, tc in enumerate(tool_calls):
         if tc.tool_name not in _DATA_TOOLS or tc.status not in _FAILED_STATUSES:
+            continue
+        if _is_enforcement_denial(tc):
             continue
         fix = next(
             (t for t in tool_calls[i + 1 :] if t.tool_name == "runQuery" and t.status == "ok"),
@@ -200,6 +292,86 @@ def _failed_fixed_pairs(tool_calls: tuple[ToolCallSummary, ...]) -> tuple[Failed
                 )
             )
     return tuple(pairs)
+
+
+def _designations(args: dict[str, Any]) -> Iterator[tuple[str, str | None]]:
+    """`(sql, blueprint_id)` for every designation in ONE `answerWithTable`'s args:
+    each `tables[i]` (Release 1's multi-table answer, 08 §B.3) and then the top-level
+    `sql`/`blueprint_id` pair — the runtime's own read order, `tables` FIRST.
+
+    That order is what makes the caller's dedupe keep the right entry. The live
+    placeholder shape is `{sql: X, blueprint_id: "", tables: [{sql: X, blueprint_id:
+    "bp-a"}]}` — the model fills BOTH the array and the flat pair with the same query
+    — and the two entries differ only in that the array one carries the attribution.
+    Yielding the flat pair first would keep the blueprint-less copy and drop the
+    `bp-a` hint, which is the only thing either entry adds over the other.
+
+    A UNION, where the runtime's `resolve_designations` applies precedence (`tables`
+    wins OUTRIGHT when any item designates). The divergence is deliberate and is
+    forced by what this loader cannot do: the runtime resolves `blueprint_id` →
+    SQL through the turn's executed queries, and we hold no such map. So
+    `tables: [{blueprint_id: X}]` alongside a top-level `sql` — a real live shape —
+    yields NOTHING under precedence and the right string under union. Over-inclusion
+    costs a duplicate evidence line; precedence-without-the-map costs the only SQL
+    the session has.
+
+    `args` is a `dict` by construction (`_build_tool_call` copies it with `dict()`),
+    but everything INSIDE it is model-authored JSON and nothing there is trusted:
+    `tables` may not be a list, an item may not be a mapping, and the live model
+    fills unused properties with `""` placeholders rather than omitting them (03
+    §C.3.1). Non-`str` and blank values are skipped."""
+    raw_tables = args.get("tables")
+    tables = raw_tables if isinstance(raw_tables, list) else []
+    for item in (*tables, args):
+        if not isinstance(item, dict):
+            continue
+        sql = item.get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            continue
+        # The blueprint id as the MODEL associated it. The runtime drops it when a
+        # `sql=` won over it (that table is not the blueprint's result, so it must
+        # not inherit the provenance badge the UI renders); nothing is badged here,
+        # and the association is precisely the hint prior-art dedup wants — "this
+        # answer restates blueprint X" — so it is kept.
+        bp_id = item.get("blueprint_id")
+        yield sql, bp_id if isinstance(bp_id, str) and bp_id.strip() else None
+
+
+def _answer_sqls(tool_calls: tuple[ToolCallSummary, ...]) -> tuple[AnswerSql, ...]:
+    """§2.6: the SQL behind every SUCCESSFUL `answerWithTable`, in trail order,
+    deduped on the SQL text (first occurrence keeps its `tool_call_ref`).
+
+    This is the ONLY route by which the final, human-facing answer's SQL reaches the
+    summary. `answerWithTable` is in neither `_SQL_TOOLS` nor `_DATA_TOOLS` — it
+    executes nothing — and a designated query need never have been dispatched as a
+    `runQuery`, so it is not recoverable from any other trail entry.
+
+    Only `status == "ok"` contributes. A refused `answerWithTable`
+    (`ANSWER_TABLE_BLUEPRINT_NOT_RUN`, `FINALIZATION_BLOCKED_PENDING_INTENTS`)
+    showed the user no table at all, and the retry that succeeded is a separate
+    entry that this pass picks up on its own.
+
+    The strictness of `_designations` is derived from the readers: the extractor
+    serializes these strings into a prompt payload and `prior_art_query_text` joins
+    them into the text it embeds. Both want a `str` and neither can do anything with
+    any other type, so a malformed item is skipped SILENTLY — this is an offline,
+    best-effort projection, and one placeholder-filled table entry must not cost the
+    session its whole summary."""
+    answers: list[AnswerSql] = []
+    seen: set[str] = set()
+    for tc in tool_calls:
+        if tc.tool_name != _ANSWER_TOOL or tc.status != "ok":
+            continue
+        for sql, blueprint_id in _designations(tc.args):
+            if sql in seen:
+                continue
+            seen.add(sql)
+            answers.append(
+                AnswerSql(
+                    tool_call_ref=tc.tool_call_ref, sql=sql, blueprint_id=blueprint_id
+                )
+            )
+    return tuple(answers)
 
 
 def _askuser_exchanges(
@@ -262,9 +434,18 @@ def _blueprint_usages(
 ) -> tuple[BlueprintUsage, ...]:
     # §2.5: a runBlueprint is `corrected` if status != ok OR a correction event
     # references a later turn; else `accepted`.
+    #
+    # An ENFORCEMENT-denied runBlueprint emits NO usage at all. Both outcomes are
+    # claims about a run that happened — `accepted` says the blueprint produced an
+    # answer nobody corrected, `corrected` says it produced a wrong one — and a
+    # refusal that never reached the executor supports neither. The alternative
+    # (emit it as `accepted`) would be the safer-looking choice and is the wrong
+    # one: it would let a blueprint that never ran once accumulate a positive usage
+    # record, which is the same conflation in the other direction. There was no
+    # usage, so there is no `BlueprintUsage`.
     usages: list[BlueprintUsage] = []
     for tc in tool_calls:
-        if tc.tool_name != "runBlueprint":
+        if tc.tool_name != "runBlueprint" or _is_enforcement_denial(tc):
             continue
         corrected = tc.status != "ok" or _trailing_correction_after(doc, tc.turn_index)
         bp_id = tc.args.get("blueprint_id")
@@ -335,6 +516,7 @@ async def load_session_summary(
     )
     turns = _build_turns(doc)
     failed_fixed = _failed_fixed_pairs(tool_calls)
+    answer_sqls = _answer_sqls(tool_calls)
     askuser = _askuser_exchanges(doc, tool_calls)
     blueprint_usages = _blueprint_usages(doc, tool_calls)
     accepted_signal = _infer_accepted_signal(doc, turns, tool_calls)
@@ -351,4 +533,5 @@ async def load_session_summary(
         askuser_exchanges=askuser,
         failed_fixed_sql=failed_fixed,
         accepted_signal=accepted_signal,
+        answer_sqls=answer_sqls,
     )
