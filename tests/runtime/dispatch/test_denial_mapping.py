@@ -72,6 +72,9 @@ _EXPECTED_RETRYABLE = {
     # Finalization enforcement (05 §B.1): retryable BY CONSTRUCTION — a
     # non-retryable refusal would end the turn it exists to keep alive.
     "FINALIZATION_BLOCKED_PENDING_INTENTS": True,
+    # getBlueprint-before-runBlueprint (Release 1): retryable by construction —
+    # the fix is one `getBlueprint` away, inside the same turn.
+    "BLUEPRINT_DEFINITION_NOT_READ": True,
 }
 
 # `answerWithTable(blueprint_id=…)` naming a blueprint that never ran this turn.
@@ -92,6 +95,13 @@ _ANALYSIS_STATE_CODES = {"ANALYSIS_STATE_INVALID", "ANALYSIS_STATE_LATE_INIT"}
 # resolve them.
 _FINALIZATION_CODES = {"FINALIZATION_BLOCKED_PENDING_INTENTS"}
 
+# The getBlueprint-before-runBlueprint gate (Release 1): `runBlueprint` for a
+# blueprint the model never expanded this turn, so it had never seen the SQL it was
+# about to execute. Registered for the same reason as the codes above — the specific
+# text (which blueprint) rides on `denial_detail`, and without a table entry
+# `classify_denial` renders the generic string on every later rebuild.
+_BLUEPRINT_DEFINITION_CODES = {"BLUEPRINT_DEFINITION_NOT_READ"}
+
 _ALL_KNOWN_CODES = (
     _ALL_SEVEN_CODES
     | _GUARDRAIL_CODES
@@ -100,6 +110,7 @@ _ALL_KNOWN_CODES = (
     | _ANSWER_TABLE_CODES
     | _ANALYSIS_STATE_CODES
     | _FINALIZATION_CODES
+    | _BLUEPRINT_DEFINITION_CODES
 )
 
 

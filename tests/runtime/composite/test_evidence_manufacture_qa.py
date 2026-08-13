@@ -70,6 +70,7 @@ async def _entry(
     row_count: int | None = 1,
     authoritative: bool = False,
     args: dict[str, Any] | None = None,
+    serves_intent: str | None = None,
 ) -> TrailEntry:
     preview = (
         None
@@ -88,6 +89,7 @@ async def _entry(
         result_full_ref=None,
         ts="2026-08-11T00:00:00+00:00",
         authoritative=authoritative,
+        serves_intent=serves_intent,
     )
     await store.append_trail_entry(SESSION_ID, entry)
     return entry
@@ -268,6 +270,12 @@ async def test_a_manufactured_block_identifies_its_evidence_tool_in_telemetry() 
             "intent_id": "i1",
             "reason_code": "NO_ACCESS",
             "evidence_tool_name": "getTableSchema",
+            # How the binding was made (06). `auto_bound` = the runtime found the
+            # one call that could have served it; a tag would read `tagged`.
+            # Manufacture is equally cheap on both paths — cheaper on this one,
+            # since the model no longer has to name anything — which is why the
+            # enum is measured, not trusted.
+            "evidence_binding": "auto_bound",
         }
     ]
     # D25: the evidence's tool_call_id is model-supplied and is NOT emitted.
@@ -301,7 +309,12 @@ async def test_an_earned_denial_is_now_distinguishable_from_the_metadata_probe()
     )
 
     assert observer.named("loop_intent_blocked") == [
-        {"intent_id": "i1", "reason_code": "NO_ACCESS", "evidence_tool_name": "runBlueprint"}
+        {
+            "intent_id": "i1",
+            "reason_code": "NO_ACCESS",
+            "evidence_tool_name": "runBlueprint",
+            "evidence_binding": "auto_bound",
+        }
     ]
 
 
@@ -334,18 +347,21 @@ async def test_the_zero_row_pair_distinguishes_the_two_readings_on_a_blueprint()
     store = InMemorySessionStore()
     observer = _Recorder()
     tool = await _initialized(store, observer, "hires last month", "leavers last month")
-    await _entry(store, "bp1", "runBlueprint", row_count=0, authoritative=True)
-    await _entry(store, "bp2", "runBlueprint", row_count=0, authoritative=True)
+    await _entry(
+        store, "bp1", "runBlueprint", row_count=0, authoritative=True, serves_intent="i1"
+    )
+    await _entry(
+        store, "bp2", "runBlueprint", row_count=0, authoritative=True, serves_intent="i2"
+    )
 
+    # ONE trail shape, TWO dispositions, and the model states neither reason: the
+    # `REQUIRED_DATA_UNAVAILABLE` on i2 is DERIVED from bp2's zero rows, which is
+    # precisely why the pair of counters is the only thing separating the two
+    # readings. The derivation cannot help here — both readings are legal.
     await _update(
         tool,
-        {"intent_id": "i1", "status": "completed", "evidence_tool_call_id": "bp1"},
-        {
-            "intent_id": "i2",
-            "status": "blocked",
-            "reason_code": "REQUIRED_DATA_UNAVAILABLE",
-            "evidence_tool_call_id": "bp2",
-        },
+        {"intent_id": "i1", "status": "completed"},
+        {"intent_id": "i2", "status": "blocked"},
     )
 
     assert observer.named("loop_zero_row_completion") == [{"intent_id": "i1"}]
@@ -353,8 +369,15 @@ async def test_the_zero_row_pair_distinguishes_the_two_readings_on_a_blueprint()
     # The completion's route stays derivable — a zero-row answer is still a
     # blueprint answer, not a fallback to ad-hoc SQL.
     assert observer.named("loop_intent_completed") == [
-        {"intent_id": "i1", "evidence_tool_name": "runBlueprint"}
+        {
+            "intent_id": "i1",
+            "evidence_tool_name": "runBlueprint",
+            "evidence_binding": "tagged",
+        }
     ]
+    assert live_analysis_state(
+        await store.get_or_create_session(SESSION_ID), TURN
+    ).intents[1].reason_code == "REQUIRED_DATA_UNAVAILABLE"
 
 
 async def test_a_zero_row_blueprint_that_failed_verification_completes_nothing() -> None:

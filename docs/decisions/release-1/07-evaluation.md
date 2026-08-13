@@ -92,7 +92,26 @@ expect:
   re_derivation: false
 ```
 
-**`serves_intent` is load-bearing** — see C.2. An empty `column_scope` drops every card, since blueprint recall pre-filters on `uses ⊆ scope`.
+**08 added a `tables:` array to `answerWithTable`'s arguments and the harness needed NO change** — `_parse_call` (`conftest.py`) validates only the four top-level keys `name`/`id`/`args`/`serves_intent` and passes `args` through opaquely, and `RoutingCase.expect` is a free-form dict. So a multi-table case is a fixture, not a loader change:
+
+```yaml
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: "…"
+          sql: ""                # the placeholder the live model actually emits
+          blueprint_id: ""       # (03 §C.3.1 — it cannot omit a declared key)
+          tables:
+            - {sql: "", blueprint_id: bp-…, caption: "…"}
+            - {sql: "SELECT …", blueprint_id: "", caption: "…"}
+expect:
+  answer_tables: 2
+  envelope_verification_passed: null   # the AND roll-up; `null` is a real expectation
+```
+
+**No existing assertion broke.** The fixtures ENCODED a single-table answer but nothing read it — `answer_sql` appears in no `tests/eval/*.py` — so cases 2 and 4 stay on the top-level `sql:` shorthand deliberately: it is the 6/6 path, and it now has a regression test by accident.
+
+**`serves_intent` is load-bearing** — see C.2. **It is now a REAL runtime argument** (README finding 20), not a fixture-only label: the harness passes it into the scripted call's `arguments`, the runtime strips it before dispatch and persists it on `TrailEntry.serves_intent`, and §C.2's mapping is derived from that field unioned with the explicit `evidence_tool_call_id` bindings — so A2 keeps working now that a live model closes intents by tag and sends no evidence id at all. An empty `column_scope` drops every card, since blueprint recall pre-filters on `uses ⊆ scope`.
 
 ### C.1 Case 1's anchor was wrong
 
@@ -114,7 +133,7 @@ re_derivation(turn) =
 
 Case 3's assertion is then `re_derivation == False` **despite** a post-blueprint `runQuery` — the interesting half, and unwritten in the draft.
 
-In A2 there is no fixture to declare `serves_intent`, so derive it from `loop_intent_completed{intent_id, evidence_tool_call_id}` — the evidence binding gives the mapping directly.
+In A2 there is no fixture to declare `serves_intent`, so derive it from the persisted trail (`metrics.serves_intent_from_trail`): `TrailEntry.serves_intent` — the call-time tag, and the only source for a tag-closed intent — unioned with the `{intent_id, evidence_tool_call_id}` bindings in the `updateAnalysisState` entries' own `args`. Not from `loop_intent_completed`, which carries a tool NAME and cannot tell two `runQuery` calls apart.
 
 ---
 
@@ -134,8 +153,11 @@ In A2 there is no fixture to declare `serves_intent`, so derive it from `loop_in
 | 8 | `REQUIRED_DATA_UNAVAILABLE` block | Scripted zero-row result; block accepted |
 | 9 | **Multi-intent across an `askUser` pause** | Round 1 emits `updateAnalysisState` + `askUser` (03 §E.1's exact shape — state must commit **before** the pause); resume; all intents terminal; **the block counter is not reset by the resume** (05 §C.1) |
 | 10 | **Abandoned pause, then a new turn** | Turn N pauses with pending intents, never resumed; turn N+1 is single-intent and finalizes; turn N's intents untouched and the teardown sweep does not fire on it (05 §A) |
+| 11 | **Two blueprints, two tables** (08) | `len(answer_tables) == 2`, each with its OWN `blueprint_use`, both badges EARNED by `blueprint_gate`, and the AND roll-up green |
+| 12 | **Mixed verification** (08) | One blueprint table + one `sql=` table; per-table blocks are `{passed: true}` and `null`, and the envelope roll-up is **`null`** — the honest-reporting assertion, and the one an OR roll-up would fail |
+| 13 | **Narrowed-scope reload** (08) | Re-reads `/session/history` under a scope excluding a column that appears ONLY on a never-executed designated `sql=`: that table alone drops, `history_answer_table_scope_dropped` fires. Then narrows a column the turn actually READ and asserts the turn-wide answer gate's dominance explicitly (08 §D.3), so a later reader does not mistake the limit for a bug |
 
-Cases 7–10 did not exist in the draft. 7 and 8 are the only end-to-end coverage of 04's block validator; 9 and 10 are the only tests of P2's actual shape — an intent lost *between rounds* — and of the scoping in F.
+Cases 7–10 did not exist in the draft; 11–13 arrived with 08. **Cases 11–13 cannot measure the thing 08 exists to fix**: `answer_tables` populating in A1 is definitionally true, because the fixture writes the array. What they prove is that the runtime carries every designated table honestly once the model sends them. 7 and 8 are the only end-to-end coverage of 04's block validator; 9 and 10 are the only tests of P2's actual shape — an intent lost *between rounds* — and of the scoping in F.
 
 **A2 (live, release gate).** The routing decisions, N runs each, reported as a rate:
 
@@ -147,6 +169,9 @@ Cases 7–10 did not exist in the draft. 7 and 8 are the only end-to-end coverag
 | L4 | Three intents | `analysisState` initialized; all three terminal |
 | L5 | Mixed metadata + analytical | Both complete |
 | L6 | Authoritative result | No `runQuery` re-deriving the same intent |
+| L7 | **Three deliverables ⇒ more than one table** (08) | The answer designates a table per part instead of describing the rest in prose |
+
+**L7 is the only thing that can prove 08.** The headline number to re-measure is **1/9** — `answerWithTable` succeeded on 6/6 single-deliverable turns and 1/9 multi-intent ones — not "does `answer_tables` populate". It reuses L4's question verbatim on purpose: L4 asks whether the three intents were TRACKED and reached a terminal disposition, L7 whether the three RESULTS reached the user as grids. The same turn failed the second while passing the first, eight times out of nine. The predicate is *more than one table*, not *exactly three*: the scalar clause survives (a part answered by a single number belongs in the prose), and one query legitimately covering two parts is one table.
 
 L1–L4 are spec §3's stated test of whether per-intent `searchBlueprints` holds. If blueprint miss-rate is high here, the Phase-2 fix is firing retrieval per declared intent.
 
@@ -171,6 +196,19 @@ Tracked intents reaching a terminal status other than `completed`, **bucketed by
 **Fold per `intent_id` final state, not per event.** A single forced block emits *both* `loop_analysis_state_transition` and `loop_intent_force_blocked` (06), so counting events double-counts.
 
 Reading: `NO_ACCESS` is an entitlement story, `REQUIRED_DATA_UNAVAILABLE` a data story, and `ENFORCEMENT_EXHAUSTED` means **enforcement could not establish a disposition** — not that the agent failed, and not that the intent was proved impossible. It should trend down, but it measures *undetermined* outcomes, and a user withdrawing an ask mid-clarification lands there legitimately.
+
+**Reading `BUDGET_EXHAUSTED` versus `ENFORCEMENT_EXHAUSTED` (changed 2026-08-12).** These two are the buckets most likely to be misread, because only one of them is a capacity story:
+
+| Bucket | What actually ran out | What to do about it |
+|---|---|---|
+| `BUDGET_EXHAUSTED` | Capacity. The turn burned **every window it was allowed** and stopped at the hard ceiling. | A ceiling is a real candidate: `max_budget_windows`, the token budget, the wall clock. |
+| `ENFORCEMENT_EXHAUSTED` | **Enforcement.** Either the forced re-round was spent with intents still pending, or the budget cap arrived *during a refused round*. | Raising a ceiling is usually the wrong move. Look at the refusal loop: what the model kept failing to close, and why. |
+
+Until 2026-08-12 the cap-during-a-refused-round path wrote `BUDGET_EXHAUSTED`, which put a **pure enforcement failure into the capacity bucket** — [05 §F.0](05-finalization-enforcement.md#f0-the-fourth-path-is-enforcement_exhausted-reversed-2026-08-12-on-measurement) has the measurement: answer computed at 25s, turn capped at 61.6s on the **wall clock**, tokens moving +385 across the final three rounds, all 36 remaining seconds spent on two rejected `updateAnalysisState` calls and one refused `answerWithTable`. More budget would have changed nothing, and the bucket said otherwise.
+
+**So `ENFORCEMENT_EXHAUSTED` will read higher than it used to, and `BUDGET_EXHAUSTED` lower — that is the correction landing, not a regression.** Any trend line crossing that date must be read as two series, not one.
+
+**To split the enforcement bucket by whether the cap was also hit**, read `loop_intent_force_blocked.budget_cap_reached` (06) — present as `True` only on the refused-round path. It is the right way to see budget pressure on these intents; the reason code is not, and no longer pretends to be.
 
 **One caveat the report must carry.** `REQUIRED_DATA_UNAVAILABLE` fires on any correct query whose answer is legitimately empty (04 §B.4), so track `zero_row_block` against `zero_row_completion` — the ratio is the health signal, not the count.
 
@@ -214,6 +252,7 @@ A2 gates on an env flag, following `tests/e2e/`'s `RUN_E2E=1`.
 - [ ] `tests/eval/README.md` states the scripted suite cannot fail on a bad prompt.
 - [ ] Re-derivation predicate is intent-scoped; case 3 passes *with* a post-blueprint `runQuery`.
 - [ ] Cases 7–10 present (two block reasons, one pause, one abandoned pause).
+- [x] Cases 11–13 present (two tables, mixed verification, narrowed-scope reload) and A2 gained **L7**; the harness needed no change (08 §H).
 - [ ] Buckets derived from `REASON_CODES`; folded per intent, not per event.
 - [ ] Detection rate reported only for A2; A1's value documented as definitionally 1.0.
 - [ ] Pending sweep scoped to terminal outcomes.

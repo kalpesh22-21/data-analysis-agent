@@ -5,6 +5,17 @@
 
 Everything the enforcement mechanism guarantees rests here. If these accept weak evidence, the model closes intents it did not answer and the ledger records it as done.
 
+> **AMENDED after the live run (README finding 20) — how the binding is MADE, not what it accepts.** Completion by citing a `tool_call_id` scored **0 successes in 9 live attempts**. The model now tags the work when it dispatches it — `runQuery(sql=…, serves_intent="i2")` — and closes the intent with `{intent_id, status}` alone; `composite/analysis_state.py::resolve_tagged_evidence` finds the tagged entry and runs it through **the two validators below, unchanged**. Every condition in this document still binds, through the same code. Two consequences to keep straight:
+> - ~~**The citation path stays and is not legacy.**~~ **Superseded 2026-08-12 (see the amendment below).** The reuse it existed to express is now the auto-bind backstop's rule 2; `loop_evidence_reused` still fires for it.
+> - **§B.3's distinctness rule is unaffected.** It is checked over the merged state after the bindings have resolved, so it holds whichever way each was made. (A pure-tag collision is not even reachable: one trail entry carries one tag. The BACKSTOP can collide, and is refused there.)
+> The presence rule in §B.2 moved rather than relaxed — "completed ⇒ a non-empty evidence string" was a payload check; it is now "completed ⇒ some qualifying call is tagged for this intent", checked against the trail, and a terminal update that resolves to nothing is refused as `unresolved_evidence`.
+
+> **AMENDED 2026-08-12 — the model supplies NEITHER field now, and §A/§B still say what they said.** The `updateAnalysisState` item schema is `{description}` on the first call and `{intent_id, status}` on every later one. This document is the reason both removals are safe, so read the change against it:
+> - **`evidence_tool_call_id` is gone.** Counting the same measurement again: 9 attempts, 9 invented ids, 0 successes, ever. It was kept above for the one shape a single-valued tag cannot express (one call, several intents); that shape is now handled by the AUTO-BIND BACKSTOP in [03 §C.3.2](03-analysis-state.md#c32-the-auto-bind-backstop--added-2026-08-12-with-the-schema-trim), whose candidate pool is built from **these validators** — so nothing is ever bound that §A or §B would refuse.
+> - **`reason_code` is gone**, and §B.7 below defines what replaced it.
+> - **§B.2's presence table is retired outright**, not relaxed: there is no field left to omit, and the obligation it encoded ("neither terminal status is reachable with no binding at all") is now enforced against the trail, where it is strictly stronger.
+> - The two validators are **unchanged, line for line**. `_missing_entry_reason`'s "belongs to an earlier turn" / "not dispatched yet" branches are no longer reachable through the tool — every id they now see was selected by the runtime from this turn's trail — and are kept because these are pure functions and that branch is what makes "evidence must come from the turn being enforced" true on the function's own terms.
+
 ## Two validators, and they are not interchangeable
 
 Reusing one for both is the most likely implementation error: the completion validator requires a successful call, while `NO_ACCESS` evidence is a **failed** one.
@@ -49,7 +60,11 @@ All of:
 | 4 | If `runBlueprint`: `entry.authoritative is True` | A blueprint can return `ok` with an unclean verify block — `_is_verified_blueprint_result` gates the marker, so this catches what condition 2 does not |
 | 5 | `entry.error_code != IDEMPOTENT_READ_ALREADY_SERVED` | Below |
 
-**Condition 5 is load-bearing.** `getTableSchema` is in `IDEMPOTENT_READ_TOOLS` (`loop/read_guard.py:30`); an identical repeat is not re-dispatched but persisted as a data-free entry with `status="ok"` and that marker (`agent_loop.py:1818`). It passes 1–4 having fetched nothing. The constant is `IDEMPOTENT_READ_ALREADY_SERVED_CODE` and lives at `context/assembly.py:100` — import it, never re-type the literal. Better: move it beside `IDEMPOTENT_READ_TOOLS` in `loop/read_guard.py`, which is where the concept belongs.
+**Condition 5 is load-bearing.** `getTableSchema` is in `IDEMPOTENT_READ_TOOLS` (`loop/read_guard.py`); an identical repeat is not re-dispatched but persisted as a data-free entry with `status="ok"` and that marker. It passes 1–4 having fetched nothing.
+
+> **The guard's contract changed after this was written, and condition 5 is UNAFFECTED — which is the point worth stating.** The guard no longer dedups unconditionally: since [README finding 23](README.md) it dedups an identical repeat *unless the first result is no longer readable*, in which case the repeat is re-dispatched for real (capped). So marker entries are now **rarer**, but nothing about them changed — a marker still means *nothing was fetched*, and it is still not evidence.
+>
+> Note this points the OPPOSITE way to the blueprint-definition gate ([02](02-blueprint-card-enrichment.md#the-partial-reversal-getblueprint-before-runblueprint)), where a dedup-guarded `getBlueprint` **does** satisfy the gate. The two are not in conflict because they ask different questions: this validator asks *"did work happen?"* (a dedup proves it did not), while the gate asks *"does the model have the definition?"* (a dedup proves it does). Anyone tempted to make them consistent should change neither. The constant is `IDEMPOTENT_READ_ALREADY_SERVED_CODE` and lives at `context/assembly.py:100` — import it, never re-type the literal. Better: move it beside `IDEMPOTENT_READ_TOOLS` in `loop/read_guard.py`, which is where the concept belongs.
 
 Since the validator holds the whole trail, it can also make the rejection actionable — locate the original by `read_guard.idempotent_read_signature(tool_name, args)` and return *"that call was deduped; cite `<original id>`"*. The loop cannot do this: `seen_read_calls` is a set of signatures with no ids.
 
@@ -95,9 +110,9 @@ The surviving two are the non-retryable ones, which is the line the draft's own 
 
 **Ordering.** The null test must precede the `.row_count` dereference — denied entries and guard markers both carry `result_preview=None`, as do error entries from `retrieval/tools.py:171` and `composite/resolve_values.py:383`. The marker clause is defence in depth, not the ordering rule; an earlier draft had this backwards, which invited a "simplification" that would `AttributeError`.
 
-### B.2 Presence is a rule, not an assumption
+### B.2 Presence is a rule, not an assumption — **retired 2026-08-12, and why that is not a weakening**
 
-Nothing in the draft required `evidence_tool_call_id` to *exist*. Omit the key and no rule fires — the whole mechanism bypassed by leaving a field out. This is the repo's own recorded lesson: derive the guard from what downstream reads require, not from the fields that happen to be sent.
+Nothing in the draft required `evidence_tool_call_id` to *exist*. Omit the key and no rule fires — the whole mechanism bypassed by leaving a field out. This is the repo's own recorded lesson: derive the guard from what downstream reads require, not from the fields that happen to be sent. The rule as written was:
 
 ```
 status == "completed"  ⇒ evidence_tool_call_id is a non-empty str
@@ -106,13 +121,22 @@ status == "blocked"    ⇒ reason_code ∈ MODEL_REASON_CODES
 status == "pending"    ⇒ both absent/None
 ```
 
-Test the omitted key, explicit `null`, `""`, and whitespace.
+**Neither field is in the schema any more, so there is nothing left to check the presence of.** What the rule was PROTECTING survives and moved:
+
+```
+status ∈ {completed, blocked}  ⇒ some call on THIS turn validates as
+                                 evidence for that status, found by tag or
+                                 by the auto-bind backstop — else refused
+status == "pending"            ⇒ nothing is recorded, whatever arrived
+```
+
+That is strictly stronger. The old form could only assert that a non-empty *string* was present; the new one has to find a call the validators accept. The five bypass shapes it was tested against (omitted, `null`, `""`, whitespace, and a string naming nothing) collapse into one shape with no bypass — and the *lesson* is unchanged, since the new guard is likewise derived from what downstream reads require rather than from what the model happens to send.
 
 ### B.3 ✅ Block evidence must be distinct per intent — approved
 
 Reuse is right for completion and wrong for blocking. A denial arises from one specific SQL and column set; it asserts nothing about a *different* deliverable.
 
-Cost of exploiting the draft's global reuse rule: one `getTableSchema(<scratch_db>, "x")` ⇒ `SCRATCH_SESSION_VIOLATION` ⇒ mark all eight intents `blocked`/`NO_ACCESS` citing that single id ⇒ finalization proceeds on a fully "evidenced" record.
+Cost of exploiting the draft's global reuse rule: one `getTableSchema(<scratch_db>, "x")` ⇒ `SCRATCH_SESSION_VIOLATION` ⇒ mark all eight intents `blocked` ⇒ finalization proceeds on a fully "evidenced" record. *(Since 2026-08-12 the model no longer cites that id — the auto-bind backstop's rule 1 hands every untagged blocked intent the same lone denial, which is the same attack with less typing. The rule is unchanged and still catches it, because it is checked over the merged state after the bindings resolve.)*
 
 Require distinctness within a state — purely mechanical, no semantics — and emit `block_evidence_reused`. It does not stop manufacture; it raises the cost from O(1) to O(n) calls and makes bulk-blocking visible instead of hiding it behind a shared id.
 
@@ -129,6 +153,17 @@ Per the Lead: *"a single denial should not be reusable to close several unrelate
 **Zero rows is an answer, not an absence.** `REQUIRED_DATA_UNAVAILABLE` fires on every *correct* query whose result is legitimately empty — "who left last month" when nobody did. That same entry is simultaneously valid *completion* evidence, so the model chooses, and `blocked` is cheaper: no prose, no table, no `answerWithTable`. This is not manufacture — it fires on honest work, and it makes coverage under-report on exactly the questions whose answer is "none", which users already distrust.
 
 Mechanically indistinguishable from manufacture, so the mitigation is prompt plus measurement: **01** should say an empty result set is `completed` with an explicit "none found" answer, never `blocked`; **06** should count `zero_row_block` against `zero_row_completion`; **07** should include a genuinely-empty case.
+
+**A ZERO-ROW CLAIM MUST COME FROM A QUERY (rule added 2026-08-12, found on review of the auto-bind backstop).** `_build_preview`'s BARE-LIST branch (`dispatch/tool_dispatcher.py`) gives `listDatabases`/`listTables` a real `row_count`, so an EMPTY listing is `status="ok"` + `row_count == 0` and this validator accepts it as `REQUIRED_DATA_UNAVAILABLE`. Under the old contract that was unreachable in practice — the model had to CITE the id, and citation had 0 successes ever — but the backstop would have bound it for free, turning *"this database has no tables"* into *"this deliverable cannot be done"* with no model claim at all. That is not this hole being re-priced; it is a NEW one the release would have opened.
+
+So `auto_bind_candidates`' blocked pool is narrowed **per derived code**:
+
+| Derived code | Auto-bind pool | Why |
+|---|---|---|
+| `NO_ACCESS` | **unrestricted** (as this validator is) | A denial is a denial whichever tool hit it, and the cheapest route above is already a metadata probe — excluding metadata tools would not close it, and would break the case where a schema fetch is genuinely what was refused. |
+| `REQUIRED_DATA_UNAVAILABLE` | **`SUBSTANTIVE_TOOLS` only** | "The data is not there" is a claim about a QUERY. A listing is discovery, not evidence of absence. |
+
+The rule is on the BACKSTOP, not on the validator, and the **tagged path is deliberately not narrowed** — same reasoning as a tagged `getTableSchema` completing an intent while an auto-bound one cannot: the trade is the model's to claim, not the runtime's to make on its behalf.
 
 ### B.5 The guarantee
 
@@ -151,6 +186,28 @@ Consequence, intended: an intent genuinely unanswerable but not *provably* so ha
 `NO_APPLICABLE_TOOL` survives as an **inferred** signal: a turn that ran `searchBlueprints` and then completed the intent on `runQuery` evidence fell through to ad-hoc. Derivable from `loop_intent_completed{intent_id, evidence_tool_name}` + `tool_dispatch_ok{tool_name}` — **no fixture knowledge needed, so it works in production too**, not just in the harness.
 
 > **Watch this one.** `_build_preview`'s non-tabular branch hard-codes `row_count=1` (`tool_dispatcher.py:250`), and `searchBlueprints` returns `{count, degraded, blueprints}` — so a zero-hit search cannot currently reach `row_count == 0`. Change either shape to a bare list and the cut reason walks back in through `REQUIRED_DATA_UNAVAILABLE`, since the block validator does not restrict `tool_name`.
+>
+> **This warning came true on a DIFFERENT tool, and the fix is §B.4's per-code narrowing.** `listDatabases`/`listTables` already take the bare-list branch, so they already reach `row_count == 0` — the validator accepts an empty listing today and the review caught it as the auto-bind backstop was about to make that reachable. Note what the narrowing does and does not do: it keeps the BACKSTOP from binding a non-substantive zero-row call, and it leaves the VALIDATOR unrestricted, so this paragraph's warning still stands for any future citation-shaped path. `searchBlueprints` becoming a bare list would be caught by the same clause, since it is not in `SUBSTANTIVE_TOOLS` either.
+
+### B.7 The reason code is DERIVED, not declared — 2026-08-12
+
+The model used to send `reason_code` and this document used to check it. Read §B.1 again and the redundancy is plain: `NO_ACCESS` was accepted only for a call refused with a code in `NO_ACCESS_ERROR_CODES`, and `REQUIRED_DATA_UNAVAILABLE` only for a successful call with `row_count == 0`. The validator *recomputed the code from the trail* and refused any disagreement — so the model's value carried no information the runtime lacked, and the only thing it could contribute was a mismatch.
+
+The runtime now asks the question backwards:
+
+```python
+def classify_block_evidence(tool_call_id, trail, turn_index) -> str | None:
+    for code in DERIVABLE_REASON_CODES:            # == sorted(MODEL_REASON_CODES)
+        if validate_block_evidence(tool_call_id, code, trail, turn_index) is None:
+            return code
+    return None                                    # proves neither — refuse the block
+```
+
+Three properties worth stating explicitly:
+
+- **There is no second implementation of §B.1 to drift.** The derivation *is* the validator, run over the closed set of codes. The two are mutually exclusive by construction (`NO_ACCESS` needs `status != "ok"`, `REQUIRED_DATA_UNAVAILABLE` needs `ok`), so at most one can match and the iteration order is irrelevant.
+- **The MODEL/RUNTIME split became structural.** `DERIVABLE_REASON_CODES` is derived from `MODEL_REASON_CODES`, so a runtime-only code (`ENFORCEMENT_EXHAUSTED`, `BUDGET_EXHAUSTED`, `USER_STOPPED`) is now *unreachable* from this path rather than rejected by an allowlist on it — and a future addition to the model-declarable enum becomes derivable without a second edit.
+- **Blocking did not get easier.** A call that merely failed — a retryable SQL error — classifies as neither, so there is nothing honest to write and the block is refused, exactly as a mislabelled `reason_code` was refused before. What changed is that the model no longer has to state a fact it was never the authority on.
 
 ---
 
@@ -184,8 +241,8 @@ The concern it existed for was that a user withdrawing an ask mid-clarification 
 | `resolveValues` / `sampleRows` / `searchBlueprints` ok | **invalid** |
 | Prior `turn_index` | **invalid** |
 | Unknown / not-yet-dispatched `tool_call_id` | **invalid**, distinct reasons |
-| Same id cited by two intents (completion) | **valid** |
-| `evidence_tool_call_id` omitted / `null` / `""` / whitespace | **invalid** |
+| Same id bound to two intents (completion) | **valid** |
+| `tool_call_id` omitted / `null` / `""` / whitespace | **invalid** (the pure-function guard; unreachable through the tool since 2026-08-12) |
 
 `tests/runtime/composite/test_evidence_validators_adversarial.py`:
 
@@ -200,7 +257,8 @@ The concern it existed for was that a user withdrawing an ask mid-clarification 
 | …citing a guard-marker entry, or a denied entry | **invalid, no raise** — the `result_preview is None` paths |
 | `runBlueprint` ok + `authoritative` + `row_count == 0` | valid for **both** validators — the B.4 ambiguity, asserted so it is measured |
 | Model declares any `RUNTIME_REASON_CODE`, or a cut reason, or `None`/`""` | **invalid** |
-| **One denial cited to block three intents** | **invalid** under B.3 |
+| **One denial blocking three intents** | **invalid** under B.3 — reached by the backstop now, not by a citation |
+| `classify_block_evidence` on a denied / zero-row / row-bearing / merely-failed call | `NO_ACCESS` / `REQUIRED_DATA_UNAVAILABLE` / `None` / `None` — B.7's derivation, asserted against the same entries the validators are |
 | Manufactured `NO_ACCESS` via `getTableSchema(<scratch_db>, …)` | **valid today** — assert it, and assert the telemetry records it |
 
 The two "no raise" rows and the manufactured-evidence rows are the ones a hand-written validator gets wrong.
@@ -213,7 +271,9 @@ The two "no raise" rows and the manufactured-evidence rows are the ones a hand-w
 | `NO_ACCESS` needs `status == "denied"` | **`status != "ok"`** | Blueprint denials surface as `status="error"` with the inner code — the primary route could not produce access evidence |
 | Four model-declarable codes | **Two** ✅ *(Lead-approved)* | `DATABASE_NOT_ALLOWED`/`TABLE_NOT_FOUND` are `retryable=True` — the codebase's own "model got the name wrong" bucket — and `TABLE_NOT_FOUND` is also how a scope denial surfaces from `sampleRows` |
 | Runtime codes "must be rejected" | **Allowlist** | Blocklisting makes any future runtime code model-declarable the day it lands |
-| Presence of evidence assumed | **B.2 explicit rule** | Omitting the key bypassed the mechanism entirely |
+| Presence of evidence assumed | **B.2 explicit rule**, then **retired 2026-08-12** | Omitting the key bypassed the mechanism entirely; there is no key left to omit, and the obligation moved to the trail where it is stronger |
+| Model declares `reason_code`, validator checks it | **B.7: runtime derives it** | The validator already recomputed the code from the trail, so the model's value could only ever disagree |
+| Citation is the escape hatch for evidence reuse | **03 §C.3.2 auto-bind rule 2** | 0 successes in 9 live attempts; the runtime can find the one call itself |
 | Reuse allowed everywhere | **Distinct for blocking** ✅ *(Lead-approved)* | One `SCRATCH_SESSION_VIOLATION` could block every intent at once |
 | Marker check "must precede" the preview check | **Null test precedes the dereference** | Ordering in an `and` chain is irrelevant; the null test is the safety property, and the draft pointed at the wrong clause |
 | Manufacture = "name an out-of-scope column" | **B.4 three metadata-only routes** | The true price is one `getTableSchema` against the scratch db |

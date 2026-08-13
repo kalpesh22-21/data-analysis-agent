@@ -7,6 +7,8 @@ This is where `analysisState` gets teeth. All of it lives in `runtime/loop/agent
 
 **Invariant (scoped — see §F):** no intent ends `pending` on any turn that reaches a terminal outcome.
 
+> **AMENDED 2026-08-12 — the enforcement's scope now extends from intent COVERAGE to answer SHAPE ([§J](#j-the-answer-shape-gate-added-2026-08-12-on-measurement)).** The unconditional "present a table" prompt rule was the last strong rule in the release with no runtime enforcement, and it failed live in **1/8 (R4)** and **3/8 (R5)** expected-table runs — twice ending in an apology that the tool could no longer be called. Same exit, same mechanism; the shape gate shipped sharing the intents allowance and was **given its own the same day**, after live traces showed the intents nudge consuming it first in 2 of 4 multi-intent runs ([§J.3](#j3-the-gate-has-its-own-per-window-allowance-revised-2026-08-12-on-measurement)).
+
 ---
 
 ## A. Enforcement applies only to the live state
@@ -151,9 +153,28 @@ Four runtime-forced paths, each marking every surviving `pending` intent `blocke
 | Hard ceiling | agent_loop.py:2059 | `BUDGET_EXHAUSTED` |
 | Budget-cap resume answered `"stop"` | `resume()`, agent_loop.py:695 | `USER_STOPPED` |
 | Block counter spent, intents still pending | this file | `ENFORCEMENT_EXHAUSTED` |
+| Budget cap reached *during* a refused round | via C.3 | `ENFORCEMENT_EXHAUSTED` **+ `budget_cap_reached` on the telemetry event** |
 
 **`ENFORCEMENT_EXHAUSTED` means "enforcement could not establish a disposition"** — **not** that the system proved the intent impossible (Lead, 2026-08-11). Word it that way in `denial_mapping.py`, in telemetry, and in 07's metric report. Claiming proof would overstate what the runtime knows: zero rows is often a correct answer, and some denial probes cost one metadata call (04 §B.4). A user who withdraws an ask mid-clarification also lands here, and does so legitimately under that reading.
-| Budget cap reached *during* a refused round | via C.3 | `BUDGET_EXHAUSTED` |
+
+### F.0 The fourth path is `ENFORCEMENT_EXHAUSTED` (reversed 2026-08-12, on measurement)
+
+This row said `BUDGET_EXHAUSTED` through two review rounds and shipped that way. **It is reversed here**, so the reasoning is recorded rather than the conclusion alone.
+
+**The evidence.** Session `s412e8424614e465bbd26d7a2a1400ebe`, trace `647416592aff2225d1903ae7c82b8396`:
+
+- the answer was **computed at 25s**; the turn capped at **61.6s**, on the **wall clock** (`max_wall_clock_seconds=60`) — not on tokens;
+- tokens moved **+385 across the final three rounds**, which is nothing;
+- those 36 seconds went entirely to **two rejected `updateAnalysisState` calls and one refused `answerWithTable`**;
+- both intents were recorded `BUDGET_EXHAUSTED`.
+
+**More budget would have changed nothing.** The turn was not short of capacity; it was going in circles inside enforcement, and the wall clock stopped it. `BUDGET_EXHAUSTED` tells whoever reads [07 §E.2](07-evaluation.md)'s buckets a **capacity story**, and sends them to raise a ceiling that is not the problem — the most expensive kind of wrong label, because acting on it looks like progress. `ENFORCEMENT_EXHAUSTED` — *"enforcement could not establish a disposition"* — is literally true here, and equally true of the ambiguous last-straw case where the cap and the refusal arrive together and the cause genuinely cannot be separated.
+
+**The capacity fact is kept, in telemetry, not on the ledger.** `_force_block_pending_intents` takes `budget_cap_reached: bool = False`; the refused-round caller is the only one that passes `True`, and it is emitted as a bare `True` on `loop_intent_force_blocked` (allowlisted in `observability/tracing.py`; a boolean is D25-safe by shape) and **omitted** on the other three paths, so their event payloads are byte-unchanged. An operator watching budget pressure still sees the cap; the intent record carries the honest cause. See [06 §telemetry](06-telemetry.md).
+
+**Scope of the reversal — one branch.** The ordinary hard ceiling keeps `BUDGET_EXHAUSTED` (there the ceiling genuinely *is* the cause: the turn exhausted every window it was allowed) and the `"stop"` resume keeps `USER_STOPPED`. Both are untouched and both are still asserted exactly, including the *absence* of the new flag. `RUNTIME_REASON_CODES` stays at three — this is a relabel, not a fourth code, and [§F.2](#f2-no-fourth-code) is unaffected.
+
+**Note the seam this sharpens rather than closes.** `test_a_budget_cap_during_a_refused_round_terminally_disposes_a_live_turn` still records that a terminal disposition lands on a turn the user may yet continue, and that the disposition is not restored when they do. Under the old label that test asserted a capacity cause and then, in its own second half, extended the budget and finalized anyway — the counter-evidence sat inside the assertion. The seam is unchanged; only the claim about *why* is now defensible.
 
 **The `"stop"` path returns `done` from inside `resume()`**, before `_run_loop` is ever entered, with `tool_calls_made=0`. It needs its own force-block call; it inherits nothing from the loop body. Apply the §A turn gate there too.
 
@@ -187,6 +208,8 @@ A fourth runtime-forced code (`USER_DECLINED_CLARIFICATION`, for a turn whose `a
 
 **Batch with both.** 03 §E.2's partition commits `updateAnalysisState` before `answerWithTable` in the same response, so the model can close its last intent and finalize in one round rather than being refused into an extra one.
 
+> **The model is now TOLD to do this** (2026-08-12, [01a §13](01a-prompt-draft.md)). The affordance existed here from the start and the prompt never mentioned it, which turned out to be the whole defect rather than a missed optimisation: measured over three live runs of one three-intent question, the model's last call was `updateAnalysisState` and it then wrote prose — **zero `answerWithTable` calls of any kind**, while a single-deliverable control on the same build finalized correctly. Closing the ledger was being read as finishing the turn. The instruction to send both in one response is in the tracking section, the table section and both tool descriptions.
+
 ---
 
 ## H. Tests
@@ -201,10 +224,10 @@ A fourth runtime-forced code (`USER_DECLINED_CLARIFICATION`, for a turn whose `a
 | One `pending`, exit #2 | `FINALIZATION_BLOCKED_PENDING_INTENTS`, retryable, `denial_detail` names it, turn continues |
 | One `pending`, exit #1 | Answer not persisted; `last_assistant_text` cleared; nudge injected with the draft; loop re-enters |
 | Nudge | Absent from `doc.messages` and `/session/history`; **present for exactly one round-trip** |
-| **Refused round** | `record_iteration` charged; a refused round can trip the cap |
+| **Refused round** | `record_iteration` charged; a refused round can trip the cap; the cap-during-refusal writes **`ENFORCEMENT_EXHAUSTED`** with `budget_cap_reached: True` on `loop_intent_force_blocked` (§F.0) |
 | Second attempt, still pending | `ENFORCEMENT_EXHAUSTED`, finalization proceeds |
 | Counter across an `askUser` resume | **Not reset** — still one per window |
-| Hard ceiling / `"stop"` resume with pending | Forced `BUDGET_EXHAUSTED` / `USER_STOPPED` |
+| Hard ceiling / `"stop"` resume with pending | Forced `BUDGET_EXHAUSTED` / `USER_STOPPED`, **unchanged by §F.0**, and the new flag asserted ABSENT on both |
 | `askUser` pause with pending | **Not** gated |
 | Batch = state update closing the last intent + `answerWithTable` | Finalizes in one response |
 | Assembly with state block + nudge | State block before the question, nudge last |
@@ -219,6 +242,108 @@ A fourth runtime-forced code (`USER_DECLINED_CLARIFICATION`, for a turn whose `a
 | **Manufactured block evidence** (`WHERE 1=0` ⇒ `REQUIRED_DATA_UNAVAILABLE`) | Permitted today — assert the telemetry, per 03 §C.4 |
 | Pending + hard ceiling + `answerWithTable` in one batch | Terminates once; no double-write |
 | Abandoned pause, then a new turn | Prior state stays `pending`; new turn unaffected |
+
+---
+
+## J. The answer-shape gate (added 2026-08-12, on measurement)
+
+**The enforcement's scope extends from INTENT COVERAGE to ANSWER SHAPE.** Everything above asks *"did you do the work you said you would?"* This section adds *"did you deliver it in the form the prompt requires?"* — same exit, same mechanism, same single grant.
+
+### J.1 The measurement
+
+[01a](01a-prompt-draft.md)'s *"Presenting a table"* rule is **unconditional**: a multi-row answer goes through `answerWithTable`. It was the only strong prompt rule in the release with **no runtime enforcement**, and live it does not hold:
+
+- **R4: 1 of 8** expected-table runs finished without the table.
+- **R5: 3 of 8**, two of them ending in an **apology**.
+
+The apology is why this is a runtime problem and not a prompt problem. Verbatim, from a turn that had every tool available and had been refused nothing:
+
+> *"the requested results are multi-row tables and must be returned through the table-rendering path, but that final table call was not made before the tool session ended."*
+
+The model is not disagreeing with the rule — it is **restating the rule correctly** and then asserting a false fact about turn mechanics: that its opportunity to call the tool has passed. Nothing had ended. **A prompt cannot correct a belief the model holds while it is holding it**; a stronger instruction is read by the same model that already believes it is out of turns. Only the runtime can say otherwise, and it says it the way §B.2 already does: refuse the bare-text finish **once** and hand back a round.
+
+### J.2 The condition
+
+At exit #1 (`not result.tool_calls`), **after** the pending-intents check, refuse when **all** hold:
+
+1. **No successful `answerWithTable` this turn.** Any successful designation satisfies this, including a blank-`answer` one — its tables still reach the user through the envelope, which is what the gate protects.
+2. **The turn's trail holds ≥1 successful `runQuery`/`runBlueprint` with `result_preview.row_count > 1`.**
+3. **The window's one forced re-round is unspent.**
+
+**`> 1`, not `>= 1`, is the whole safety margin.** A **zero-row** result is a correct prose answer ("no employees match") — 04 §B.4 already treats an empty set as an answer, not a failure — and a **single row** is a single figure. Live q6 is the regression case and answers correctly in prose today. **`sampleRows`/`getTableSchema`/the listings never count**: they are discovery, and a model that peeks at ten sample rows before answering one number is doing exactly what it was told.
+
+Both facts are **turn-scoped window-locals seeded from the persisted trail**, for the reason `seen_read_calls` is (§C.1): a budget-cap `continue`, an `askUser` resume and a mid-DAG blueprint resume each start a fresh `_run_loop_body`, and a gate that forgot the rows already in hand would go silent on exactly the long turns that produce several tables. The trail walk is turn-filtered, which is also the cross-turn protection — a multi-row query from turn 3 cannot gate turn 4's prose.
+
+### J.3 The gate has its OWN per-window allowance (revised 2026-08-12, on measurement)
+
+**This reverses the shared-grant decision below, which shipped and was measured.** The history is kept because the original reasoning was sound and the thing it got wrong was a fact about live behaviour, not an argument.
+
+**What shipped first.** One `claim_finalization_block` key, one forced re-round per window, both gates — chosen so the worst case stayed exactly what it was before the shape gate existed: **one** extra round-trip per window, never two. The cost was written down and accepted: *"a window whose grant went to the intent nudge leaves the shape gate silent."*
+
+**What the measurement showed.** That cost is not occasional; on the multi-intent questions this whole release exists for, it is the **normal** path. The two gates do not compete for one window — they fire in **sequence**:
+
+1. the model finishes in prose with an intent still pending → **intents** nudge, allowance gone;
+2. it closes the ledger and finishes in prose again, tables still untabled → shape gate qualifies, finds nothing, emits `loop_answer_shape_exhausted`, and the untabled prose goes to the user.
+
+**2 of 4 live runs** of the three-part question went exactly that way. Telemetry signature: `loop_finalization_refused=1` **+** `loop_answer_shape_exhausted=1` **+** `loop_answer_shape_refused=0` — traces `900a85a4` and `16f090db` (Phoenix `data-agent-runtime`). The gate was starved on precisely the question it was built for, and the "conservative" bound is what starved it: a single allowance can only ever serve whichever complaint arrives **first**.
+
+**Now: two independent allowances**, `intents` and `answer_shape`, selected by a required `kind` on `claim_finalization_block` and spelled into the persisted key (`"0:1:intents"`, `"0:1:answer_shape"` — `models.finalization_block_key`).
+
+- **New bound: TWO extra round-trips per window**, one per kind, still multiplied only by `max_budget_windows`. That is the honest price and it is what the sequence above costs.
+- **Precedence is unchanged** — the gate stays an `elif` on the pending-intents branch, so at most one refusal happens per round-trip and the intents refusal is byte-identical when it fires. Precedence is about *which complaint this round*, and was never what starved the gate.
+- **`loop_answer_shape_exhausted` regains a single meaning**: this gate already refused once in this window. Under the shared grant it also meant "the other gate took it", which is exactly why the starvation was hard to see in the data — the counter fired for two unrelated reasons.
+- **`already_refused_this_round` stays one flag**, not one per kind: `answer_shape` lives only at exit #1 and only in the `elif`, while the batched exit-#2 refusals the flag exists for require tool calls, so a round-trip has at most one refusing kind.
+
+**The Protocol has four implementations** — `session/couchbase_store.py`, `session/memory_store.py`, and the two hand-written proxies in `scripts/run_ui_runtime.py` / `scripts/run_ui_runtime_real.py`. `kind` is **required, with no default**, because a defaulted parameter is precisely what a hand-written proxy forwards silently and wrongly; `tests/runtime/test_launcher_session_store_proxies.py` compares signatures against the Protocol and fails for any implementation that drifts.
+
+### J.4 What the nudge says
+
+Ephemeral `user`-role injection, one round-trip, never persisted, draft carried back, `last_assistant_text` cleared — **§B.2/§B.3 unchanged**, for the same reasons. Three things it must say, in this order, because the failure was a belief and not a preference:
+
+1. **The turn is not over and `answerWithTable` is available** — *"you can and must call it in your NEXT response."*
+2. **One table per part answered** — `blueprint_id` for a blueprint's result, `sql` otherwise.
+3. **The escape hatch**: if the answer really is a single figure or an empty result, **re-send your full answer** with no tool call and it will be accepted.
+
+(3) is not decoration. The gate reads row counts, not meaning: a turn can legitimately run a multi-row query and answer one figure from it. The hatch keeps that turn correct at a cost of one round-trip instead of forcing a table nobody asked for — and it is why the draft must be carried back.
+
+**The echoed draft marks its own truncation** (` …[truncated]` past `_MAX_NUDGE_DRAFT_CHARS`), and the hatch asks for the model's *full* answer rather than for the echo verbatim. The echo is the model's ONLY surviving copy — exit #1 persists nothing and D22 discards free text around tool calls — and the slice is invisible from the inside, so an unmarked cut beside "re-send this unchanged" silently loses the tail of a long answer.
+
+### J.5 A second bare-text finish passes
+
+Grant spent ⇒ record `loop_answer_shape_exhausted` and finalize. **The runtime never hard-locks a turn**, exactly as `ENFORCEMENT_EXHAUSTED` does not — minus the ledger write, because answer shape has no ledger and the user's answer is in hand.
+
+**"Unchanged" in the nudge is an instruction, not a check.** ANY second bare-text finish passes — rephrased, expanded, or a different answer entirely. Nothing compares it to the draft, and nothing should: models rarely re-send verbatim, and a runtime that required it would hard-lock precisely the model that took the escape hatch in good faith and reworded on the way.
+
+**"Refuse once" is per WINDOW and per KIND, not per turn.** The claim key is `(turn_index, window, kind)` (§C.1, §J.3), so a budget-cap `"continue"` starts a new window with a fresh allowance of each kind and the gate can refuse again — at most once more per window, bounded overall by `max_budget_windows`. That is the same arithmetic the pending-intents refusal has always had; it is called out here because "one forced re-round" reads as per-turn and is not.
+
+### J.6 Not gated
+
+`askUser` / budget-cap / blueprint pauses, the hard ceiling, and the `"stop"` resume. The gate lives **only** on the ordinary no-tool-calls exit; a pause is not a finish, and the ceiling path never reaches the exit at all.
+
+### J.7 Tests
+
+`tests/runtime/loop/test_answer_shape_gate.py`:
+
+| Case | Expect |
+|---|---|
+| Multi-row query, bare-text finish | Refused once; nudge injected (user role, one round-trip, not persisted); `answerWithTable` next round accepted |
+| **Budget-cap resume** after two multi-row calls | `multi_row_calls: 2` — **the seeding proof**, and the only test that has it (see below) |
+| Draft longer than `_MAX_NUDGE_DRAFT_CHARS` | Echo carries ` …[truncated]`; a short draft carries no marker |
+| Same, prose again | Passes; `loop_answer_shape_exhausted`; **two claims of `answer_shape`, one allowance** |
+| Two multi-row calls | `multi_row_calls: 2` |
+| **Zero rows only** (live q6) | Untouched — no refusal, no event, **no store round-trip** |
+| Single row | Untouched |
+| `sampleRows` with 10 rows | Untouched |
+| Turn that answered via `answerWithTable` | Untouched |
+| `askUser` pause / hard ceiling holding multi-row results | Not gated |
+| Later turn of the same session | Not gated; no claim |
+| Pending intent **and** untabled rows | Intent nudge fires (precedence); on the handed-back round the ledger closes and the shape gate fires **from its own allowance** — two claims, `["intents", "answer_shape"]`, two nudges, then the table. **This is the starvation regression** (§J.3) |
+| Second turn of the session, multi-row prose | Refused on its own merits — `{"0:1:answer_shape": 1, "1:1:answer_shape": 1}`; cross-turn replay safety for the new claim |
+| `finalization_block_key` / store | Kinds are independent allowances; an unknown kind RAISES rather than minting an unbounded one |
+| Refused round reaching the budget cap | Charged (§C.3); the cap's force-block finds nothing pending, so **no ledger write and no `loop_intent_force_blocked`** |
+| `tests/runtime/observability/test_tool_span_wiring_e2e.py` | Both events survive the **real** `guardrail_observer`, and `multi_row_calls` actually exports |
+
+**The seeding proof is `test_a_budget_cap_resume_reseeds_the_count_from_the_persisted_trail`, and it has to be a dedicated test.** Window 1 runs both multi-row queries and caps; window 2 does nothing but finish in prose, and must still be refused with `multi_row_calls: 2`. An earlier draft of this section claimed the blueprint resume tests proved it — **they do not**. They resume a two-row blueprint and finish in prose, so they exercise the seed, but `ScriptedModelClient` does not raise on leftover turns: a seed regression there just leaves the helper's second turn unconsumed and the suite stays green. Those tests now assert `resume_model.calls_made == 2` so the exercise is at least *observed*; the proof lives in the dedicated test, which fails on a seeded-count regression and is the only thing that does.
 
 ---
 
@@ -238,6 +363,7 @@ A fourth runtime-forced code (`USER_DECLINED_CLARIFICATION`, for a turn whose `a
 | Counter keyed by window | **§C.1 keyed by `(turn_index, window)`** | `window_count` restarts at 1 every turn while the map persists for the session, so turn N+1's window 1 collided with turn N's — the forced re-round was silently dead from a session's second block-spending turn onward |
 | "Read at the exit" vs "byte-identical" | **§E load once, refresh from tool results** | The two were contradictory; a per-exit store read is not free |
 | Three escapes | **§F four**, incl. budget cap during a refused round | C.3 creates a new path to the cap |
+| Refused-round cap ⇒ `BUDGET_EXHAUSTED` | **§F.0 `ENFORCEMENT_EXHAUSTED`**, capacity kept as `budget_cap_reached` on `loop_intent_force_blocked` | **This reverses a decision that passed two review rounds, on measurement.** Live: answer computed at 25s, turn capped at 61.6s on the **wall clock**, tokens +385 across the final three rounds — 36 seconds spent on two rejected `updateAnalysisState` calls and one refused `answerWithTable` (`s412e8424614e465bbd26d7a2a1400ebe` / `647416592aff2225d1903ae7c82b8396`). **More budget would have changed nothing**, so the label sent 07 §E.2's reader to raise a ceiling that was not the problem. The reversal is one branch wide: the hard ceiling and the `"stop"` resume are untouched, and `RUNTIME_REASON_CODES` stays at three |
 | "No intent ever ends `pending`" | **§F.1 scoped to terminated turns** | False for abandoned pauses and CAS races; would fail 07's assertion against a real store |
 | Splice order unspecified | **§D.1 — this doc owns it** | The nudge would otherwise steal `_last_user_index` from the state block |
 | Check placed "in the same block as" the blueprint-not-run nudge | **§B.1 — before `_resolve_answer_sql`** | Otherwise it fires the answer-table hooks for a refused designation and clobbers the better message |

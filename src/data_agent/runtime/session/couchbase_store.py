@@ -66,6 +66,7 @@ from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
 from .models import (
     MAX_FINALIZATION_BLOCKS_PER_WINDOW,
     AnalysisState,
+    FinalizationBlockKind,
     PauseCheckpoint,
     SessionDoc,
     TrailEntry,
@@ -291,9 +292,19 @@ class CouchbaseSessionStore(CouchbaseConnectGate):
         return applied[-1]
 
     async def claim_finalization_block(
-        self, session_id: str, turn_index: int, window_count: int
+        self,
+        session_id: str,
+        turn_index: int,
+        window_count: int,
+        kind: FinalizationBlockKind,
     ) -> bool:
-        """CAS-guarded claim of the (turn, window)'s ONE forced re-round (05 §C.1).
+        """CAS-guarded claim of the (turn, window, kind)'s ONE forced re-round
+        (05 §C.1, §J.3).
+
+        *kind* discriminates INDEPENDENT allowances (`intents` / `answer_shape`) on
+        the one map, so two different gates refusing in the same window contend for
+        nothing — the CAS retry below only ever serialises claimants of the SAME
+        key.
 
         The check and the increment happen inside the SAME `_mutate_with_cas_retry`
         callback, so a concurrent claimant cannot also see "unspent": whichever
@@ -309,7 +320,7 @@ class CouchbaseSessionStore(CouchbaseConnectGate):
         """
         await self._ensure_connected()
         claimed: list[bool] = []
-        key = finalization_block_key(turn_index, window_count)
+        key = finalization_block_key(turn_index, window_count, kind)
 
         def _mutate(doc: SessionDoc) -> None:
             claimed.clear()

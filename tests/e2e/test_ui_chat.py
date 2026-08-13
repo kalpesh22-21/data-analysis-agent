@@ -95,6 +95,15 @@ class TestAskQuestionGetsEnrichedAnswer:
         # The ENRICHED surface a verified blueprint run produces: the blueprint
         # chip + verified badge, the SQL panel, the result table, and the data
         # lineage (provenance) panel all render.
+        #
+        # `verified-badge` is the BLOCK-level badge, and multi-table answers
+        # deliberately suppress it in favour of one badge per panel
+        # (`table-verified-badge`, 08 §C.3): one flag over a mixed set would claim
+        # a blueprint gate for grids that never went through one. This question is
+        # a single deliverable, so it stays on the N<=1 path and the block badge is
+        # the right assertion. If it ever fails while `table-verified-badge` is
+        # visible instead, the runtime started designating several tables for a
+        # one-part question — that is the finding, not a UI regression.
         expect(page.get_by_test_id("blueprint-chip").first).to_be_visible(
             timeout=_ASSERT_TIMEOUT_MS
         )
@@ -104,6 +113,10 @@ class TestAskQuestionGetsEnrichedAnswer:
         expect(page.get_by_test_id("sql-panel").first).to_be_visible(
             timeout=_ASSERT_TIMEOUT_MS
         )
+        # One panel per designated table (08 §E) — `.first` is the lead one. The
+        # panel is a collapsed <details> that now fetches its first page when it is
+        # opened rather than at render, so "visible" is the summary; it no longer
+        # waits on a round-trip to /query/page.
         expect(page.get_by_test_id("result-table").first).to_be_visible(
             timeout=_ASSERT_TIMEOUT_MS
         )

@@ -220,9 +220,15 @@ def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> Non
     # SEQUENTIAL TURN LAYOUT: every emulated pair FOLLOWS the real user question,
     # which immediately precedes the first of them.
     first_emulated = min(i for i, m in enumerate(messages) if m.get("role") == "tool") - 1
-    user_index = next(i for i, m in enumerate(messages) if m.get("role") == "user")
+    # The question is the last `user` message BEFORE the emulated pairs, not the
+    # first: the date anchor (`context/assembly.py::_turn_date_anchor`) is inserted
+    # immediately before it and is itself `role:"user"`.
+    user_index = max(
+        i for i, m in enumerate(messages) if m.get("role") == "user" and i < first_emulated
+    )
     assert first_emulated == user_index + 1
     assert messages[user_index]["content"] == "How many employees?"
+    assert messages[user_index - 1]["content"].startswith("Today's date is ")
     # The sweep dispatched exactly the two discovery tools through the real MCP —
     # ONE listTables, for the base database only.
     assert [c.tool_name for c in mcp_client.calls] == ["listDatabases", "listTables"]
@@ -597,6 +603,15 @@ def _run_blueprint_app(
 def test_run_blueprint_wired_when_retrieval_active_executes_verified(monkeypatch) -> None:
     model = ScriptedModelClient(
         [
+            # The getBlueprint-before-runBlueprint rule, through the SHIPPED
+            # composition: the model expands the blueprint, reads what it does, and
+            # runs it on the next round-trip. The runtime refuses the run without
+            # this round, so it is not decoration.
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(id="gb1", name="getBlueprint", arguments={"id": "bp-avg"})
+                ]
+            ),
             ModelTurnResult(
                 tool_calls=[
                     ToolCallRequest(
@@ -634,11 +649,12 @@ def test_run_blueprint_wired_when_retrieval_active_executes_verified(monkeypatch
     import anyio
 
     trail = anyio.run(store.load_trail, SESSION_ID)
-    assert trail[0].tool_name == "runBlueprint"
+    assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint"]
     # HANDLED by the executor through the composition root (NOT the unwired path):
-    # a verified result, not RUN_BLUEPRINT_UNAVAILABLE.
-    assert trail[0].status == "ok"
-    assert trail[0].error_code != "RUN_BLUEPRINT_UNAVAILABLE"
+    # a verified result, not RUN_BLUEPRINT_UNAVAILABLE — and never the
+    # BLUEPRINT_DEFINITION_NOT_READ refusal, since the expansion preceded it.
+    assert trail[1].status == "ok"
+    assert trail[1].error_code is None
     # The three inner runQuery probes went to the MCP; runBlueprint itself never did.
     assert [c.tool_name for c in mcp.calls] == ["runQuery", "runQuery", "runQuery"]
 

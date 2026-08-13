@@ -132,6 +132,17 @@ def test_analysis_state_events_reach_phoenix_with_their_attributes() -> None:
             "loop_intent_force_blocked",
             {"intent_id": "i2", "reason_code": "BUDGET_EXHAUSTED"},
         ),
+        # The cap-during-a-refused-round shape (05 §F). The reason code is the
+        # honest cause; `budget_cap_reached` is the capacity fact kept alongside it,
+        # and it is worthless to an operator if the allowlist eats it.
+        (
+            "loop_intent_force_blocked",
+            {
+                "intent_id": "i2",
+                "reason_code": "ENFORCEMENT_EXHAUSTED",
+                "budget_cap_reached": True,
+            },
+        ),
         ("loop_enforcement_exhausted", {"intent_count": 1}),
         (
             "loop_analysis_state_late_init_rejected",

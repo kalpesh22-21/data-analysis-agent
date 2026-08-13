@@ -1,0 +1,92 @@
+# A1 case 12 — one blueprint table and one hand-written table, on one answer.
+#
+# THE HONEST-REPORTING CASE, and the one that would have caught an OR roll-up.
+# `answer_tables[0]` is a verified blueprint result and carries `{passed: true}`;
+# `answer_tables[1]` is the model's own SQL and carries `null`, because nothing
+# verified it. The envelope's `verification` is therefore `null` — a conservative
+# AND over the designated tables.
+#
+# It is also the shape that exposed the OLDER over-claim, which multi-table did
+# not create: `_accumulate_enrichment` used to set `verification` from ANY
+# blueprint returning `status == "verified"` and never reset it, so this exact turn
+# rendered "verified ✓" over a grid nothing had checked. Computing the roll-up over
+# the DESIGNATED TABLES is what fixes that, and `null` here is the fix landing.
+#
+# NEVER `passed: false`. Absence is the only negative signal — a `false` would
+# render as a red "verification failed" badge whose real meaning is "one of these
+# is a hand-written query", which is not a failure at all.
+id: case-12-mixed-verification
+question: What hiring should we expect over the next 6 months, and can I see the Support roster?
+ground_truth:
+  multi_intent: true
+  intent_count: 2
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.most_recent_hire_date
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.department_name
+corpus:
+  - bp-hires-projection
+embedding:
+  What hiring should we expect over the next 6 months, and can I see the Support roster?: [1.0, 0.0]
+mcp_tools: [runQuery]
+mcp_script:
+  runQuery:
+    - columns: [hires_in_window, avg_monthly_hires, projected_next_n_hires]
+      rows: [[12, 2.0, 12]]
+      row_count: 1
+      truncated: false
+    - columns: [employee_code, department_name]
+      rows: [[E1, Support], [E2, Support]]
+      row_count: 2
+      truncated: false
+model_script:
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: Projected hires over the next 6 months
+            - description: The Support roster
+      - name: getBlueprint
+        id: g1
+        args: {id: bp-hires-projection}
+  - tool_calls:
+      - name: runBlueprint
+        id: b1
+        serves_intent: i1
+        args:
+          id: bp-hires-projection
+          slot_bindings: {window_months: 6, horizon_months: 6}
+      - name: runQuery
+        id: q1
+        serves_intent: i2
+        args:
+          sql: SELECT employee_code, department_name FROM dbpcm_warehouse.employee WHERE department_name = 'Support' LIMIT 50
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s2
+        args:
+          intents:
+            - {intent_id: i1, status: completed, evidence_tool_call_id: b1}
+            - {intent_id: i2, status: completed, evidence_tool_call_id: q1}
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: We project about 12 hires over the next six months; the Support roster is below.
+          sql: ""
+          blueprint_id: ""
+          tables:
+            # The blueprint's own result, by id — the runtime resolves it to that
+            # blueprint's terminal SQL and it inherits that run's badge.
+            - {sql: "", blueprint_id: bp-hires-projection, caption: "Projected hires, next 6 months"}
+            # The model's own presentation query, WITHOUT the LIMIT the reading
+            # query above carries: a designated `sql` is deliberately not required
+            # to be one the agent ran, because paging needs the un-capped shape.
+            - {sql: "SELECT employee_code, department_name FROM dbpcm_warehouse.employee WHERE department_name = 'Support'", blueprint_id: "", caption: Support roster}
+expect:
+  intents_terminal: 2
+  re_derivation: false
+  answer_tables: 2
+  # The assertion an OR roll-up would fail.
+  envelope_verification_passed: null

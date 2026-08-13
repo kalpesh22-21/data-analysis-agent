@@ -78,6 +78,27 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
             "answerWithTable again."
         ),
     ),
+    # BLUEPRINT_DEFINITION_NOT_READ (Release 1): the model called `runBlueprint` for
+    # a blueprint it never expanded with `getBlueprint` in this turn, so it was
+    # routing on the card's authored prose `intent` and had never seen the SQL it
+    # was about to execute. Refused before the executor ran. RETRYABLE and
+    # instructional — the fix is one `getBlueprint` away, inside the same turn.
+    #
+    # Registered here for the same reason as the code above: `user_message` is not
+    # persisted on `TrailEntry`, so `context/budget.py::_render_entry` re-derives it
+    # from `error_code` on every rebuild, and an unregistered code renders as the
+    # generic "Something went wrong processing that request." The result's own
+    # `denial_detail` NAMES the blueprint; this table cannot, since it sees only the
+    # code. The two are kept in step deliberately.
+    "BLUEPRINT_DEFINITION_NOT_READ": DenialInfo(
+        code="BLUEPRINT_DEFINITION_NOT_READ",
+        retryable=True,
+        user_message=(
+            "You have not read that blueprint in this turn, so you do not know what "
+            "it measures. Call getBlueprint with that blueprint id first, check what "
+            "it actually does, then run it."
+        ),
+    ),
     # analysisState (Release 1, 03 §C.3). Both codes are set by
     # `composite/analysis_state.py`, never by the MCP, and both ALSO carry a
     # `denial_detail` on the result — that is the channel that names the specific
@@ -89,8 +110,9 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         retryable=True,
         user_message=(
             "That analysis-state update was rejected. Send one updateAnalysisState "
-            "call listing each intent by the id you were given, with its status and "
-            "the tool call that evidences it."
+            "call listing each intent by the id you were given and its new status, "
+            "and nothing else — tag the call that serves an intent with "
+            "serves_intent when you make it, and the runtime finds it for you."
         ),
     ),
     # NOT retryable: the substantive work has already started, so the late-init
@@ -117,8 +139,9 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         user_message=(
             "You still have intents that are neither completed nor blocked, so this "
             "cannot be the final answer yet. Resolve each one with "
-            "updateAnalysisState — citing the call that answered it, or the call that "
-            "shows it cannot be done — then answer again."
+            "updateAnalysisState — mark it completed if a call answered it, or "
+            "blocked if a call for it was refused or came back empty — then answer "
+            "again."
         ),
     ),
     "PARSE_FAILED_CLOSED": DenialInfo(

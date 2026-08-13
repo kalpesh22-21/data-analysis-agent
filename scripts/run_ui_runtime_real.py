@@ -82,6 +82,7 @@ from data_agent.runtime.config import RuntimeSettings, effective_llm_hide
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.openai_client import build_openai_model_client
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from data_agent.runtime.session.models import FinalizationBlockKind
 
 # `_catalog` is a sibling module under `scripts/`. Put this script's own directory
 # on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND
@@ -233,11 +234,20 @@ class _LazyCouchbaseSessionStore:
         return await self._store().apply_analysis_state(session_id, turn_index, merge)
 
     async def claim_finalization_block(
-        self, session_id: str, turn_index: int, window_count: int
+        self,
+        session_id: str,
+        turn_index: int,
+        window_count: int,
+        kind: FinalizationBlockKind,
     ) -> bool:
         # Release 1 (05 §C.1). Same omission, same run: without it the forced
-        # finalization re-round could not be claimed at all.
-        return await self._store().claim_finalization_block(session_id, turn_index, window_count)
+        # finalization re-round could not be claimed at all. `kind` (05 §J.3) is
+        # REQUIRED and forwarded: it selects WHICH per-window allowance is being
+        # claimed, so a proxy that dropped it would collapse the two gates back
+        # onto one budget against the real server only.
+        return await self._store().claim_finalization_block(
+            session_id, turn_index, window_count, kind
+        )
 
     async def get_session_with_cas(self, session_id: str) -> Any:
         return await self._store().get_session_with_cas(session_id)

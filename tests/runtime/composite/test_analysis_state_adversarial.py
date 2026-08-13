@@ -59,6 +59,7 @@ async def _entry(
     status: str = "ok",
     error_code: str | None = None,
     row_count: int | None = 1,
+    serves_intent: str | None = None,
 ) -> None:
     preview = (
         None
@@ -78,6 +79,7 @@ async def _entry(
             result_preview=preview,
             result_full_ref=None,
             ts="2026-08-11T00:00:00+00:00",
+            serves_intent=serves_intent,
         ),
     )
 
@@ -167,17 +169,18 @@ async def test_the_six_rejection_live_turn_now_initializes_on_the_first_call() -
 
 async def test_an_update_tolerates_the_same_placeholders() -> None:
     """The same serialisation one call later: the unused 'description' comes back
-    as `""` and the unused enum as its first member. Neither may be read as a
-    description rewrite or as a reason code on a completed intent — that would be
-    the identical silent failure, leaving every intent pending until enforcement
-    force-blocked it."""
+    as `""`, and the two RETIRED fields come back populated because the model is
+    reading its own replayed history. None of the three may be read — a
+    description rewrite, a hallucinated evidence id, or a `NO_ACCESS` label on a
+    denial-free call would each be the identical silent failure, leaving every
+    intent pending until enforcement force-blocked it."""
     store = InMemorySessionStore()
     observer = _Recorder()
     tool = await _initialized(store, "headcount by dept", "avg salary by dept",
                               observer=observer)
-    await _entry(store, "call_q", "runQuery")
+    await _entry(store, "call_q", "runQuery", serves_intent="i1")
     await _entry(store, "call_denied", "runQuery", status="denied",
-                 error_code="COLUMN_SCOPE_VIOLATION", row_count=None)
+                 error_code="COLUMN_SCOPE_VIOLATION", row_count=None, serves_intent="i2")
 
     result = await tool.run(
         {
@@ -185,16 +188,16 @@ async def test_an_update_tolerates_the_same_placeholders() -> None:
                 {
                     "intent_id": "i1",
                     "status": "completed",
-                    "evidence_tool_call_id": "call_q",
+                    "evidence_tool_call_id": "",
                     "description": "",
                     "reason_code": "NO_ACCESS",
                 },
                 {
                     "intent_id": "i2",
                     "status": "blocked",
-                    "evidence_tool_call_id": "call_denied",
+                    "evidence_tool_call_id": "call_hallucinated",
                     "description": "   ",
-                    "reason_code": "NO_ACCESS",
+                    "reason_code": "REQUIRED_DATA_UNAVAILABLE",
                 },
             ]
         },
@@ -205,8 +208,10 @@ async def test_an_update_tolerates_the_same_placeholders() -> None:
     assert result.status == "ok", result.denial_detail
     by_id = {i["intent_id"]: i for i in result.result_full["intents"]}
     assert by_id["i1"]["status"] == "completed"
-    assert by_id["i1"]["reason_code"] is None  # elided, not recorded
-    assert by_id["i2"]["reason_code"] == "NO_ACCESS"  # read, because it is blocked
+    assert by_id["i1"]["reason_code"] is None  # dropped, not recorded
+    # DERIVED from the tagged denial — the opposite of the label that was sent.
+    assert by_id["i2"]["reason_code"] == "NO_ACCESS"
+    assert by_id["i2"]["evidence_tool_call_id"] == "call_denied"
     # Descriptions are still the frozen originals.
     assert by_id["i1"]["description"] == "headcount by dept"
     assert observer.named("loop_analysis_state_rejected") == []
@@ -214,7 +219,10 @@ async def test_an_update_tolerates_the_same_placeholders() -> None:
 
 async def test_a_pending_update_tolerates_the_placeholder_enum_too() -> None:
     """`pending` + a filler `reason_code` is not a claim that the intent is
-    blocked; the status is the claim, and it says otherwise."""
+    blocked; the status is the claim, and it says otherwise. Since the trim the
+    filler is dropped outright rather than status-gated, which is strictly
+    simpler — but the OUTCOME asserted here is the one that matters and is
+    unchanged."""
     store = InMemorySessionStore()
     tool = await _initialized(store, "a")
     result = await tool.run(
@@ -390,41 +398,68 @@ async def test_too_many_intents_is_rejected_not_capped() -> None:
     assert doc.analysis_state is None
 
 
-async def test_a_runtime_only_reason_code_from_the_model_is_rejected() -> None:
-    """The allowlist, end to end through the tool: 05 writes these directly and
-    never through this path."""
-    store = InMemorySessionStore()
-    tool = await _initialized(store, "a")
-    await _entry(store, "call_q", "runQuery", status="denied",
-                 error_code="COLUMN_SCOPE_VIOLATION", row_count=None)
+async def test_a_runtime_only_reason_code_from_the_model_is_unreachable() -> None:
+    """The MODEL/RUNTIME split, restated for a world where the model declares no
+    code at all.
+
+    It used to be an allowlist rejection. It is now STRUCTURAL and strictly
+    stronger: the field is not in the schema, anything arriving under that name is
+    dropped unread, and the derivation only ever consults `MODEL_REASON_CODES` —
+    so a runtime-only code cannot be reached from this path even by accident. 05
+    still writes them directly, which is the only way they are ever written.
+
+    The three are sent anyway, against a call that legitimately supports a block,
+    to prove they are ignored rather than honoured: the persisted code is the
+    DERIVED `NO_ACCESS` every time.
+    """
     for code in ("ENFORCEMENT_EXHAUSTED", "BUDGET_EXHAUSTED", "USER_STOPPED"):
-        await _reject(
-            tool,
-            {"intents": [{"intent_id": "i1", "status": "blocked", "reason_code": code,
-                          "evidence_tool_call_id": "call_q"}]},
+        store = InMemorySessionStore()
+        tool = await _initialized(store, "a")
+        await _entry(store, "call_q", "runQuery", status="denied",
+                     error_code="COLUMN_SCOPE_VIOLATION", row_count=None,
+                     serves_intent="i1")
+        result = await tool.run(
+            {"intents": [{"intent_id": "i1", "status": "blocked", "reason_code": code}]},
+            _credentials(),
+            turn=TurnContext(turn_index=TURN),
         )
+        assert result.status == "ok", result.denial_detail
+        assert live_analysis_state(
+            await store.get_or_create_session(SESSION_ID), TURN
+        ).intents[0].reason_code == "NO_ACCESS"
 
 
-async def test_evidence_presence_is_enforced_for_every_omission_shape() -> None:
-    """04 §B.2: omit the key and NO other rule fires — the whole mechanism is
-    bypassed by leaving a field out. Omitted, explicit null, empty and whitespace
-    are all the same failure."""
+async def test_a_terminal_status_cannot_be_reached_with_no_binding_at_all() -> None:
+    """What replaced 04 §B.2's presence rule, and the property that had to survive
+    the trim: neither terminal status is reachable without a real call behind it.
+
+    The old rule was a PAYLOAD check — "completed requires a non-empty string" —
+    which was bypassable in five shapes (omitted, null, empty, whitespace, and a
+    string naming nothing). There is no field left to omit, so the rule is now a
+    TRAIL check with one shape and no bypass: an empty turn resolves to nothing,
+    for either status, and `pending` writes no evidence whatever arrives with it.
+    """
     store = InMemorySessionStore()
     tool = await _initialized(store, "a")
-    for evidence in ({}, {"evidence_tool_call_id": None},
-                     {"evidence_tool_call_id": ""}, {"evidence_tool_call_id": "   "}):
-        await _reject(tool, {"intents": [{"intent_id": "i1", "status": "completed", **evidence}]})
-    # blocked needs BOTH halves
-    await _reject(
-        tool, {"intents": [{"intent_id": "i1", "status": "blocked",
-                            "reason_code": "NO_ACCESS"}]}
-    )
-    # pending carries neither
+    for status in ("completed", "blocked"):
+        await _reject(tool, {"intents": [{"intent_id": "i1", "status": status}]})
+    # ...and the retired names cannot smuggle one in either.
     await _entry(store, "call_q", "runQuery")
-    await _reject(
-        tool, {"intents": [{"intent_id": "i1", "status": "pending",
-                            "evidence_tool_call_id": "call_q"}]}
+    for legacy in ({"evidence_tool_call_id": "call_q"}, {"reason_code": "NO_ACCESS"}):
+        await _reject(
+            tool, {"intents": [{"intent_id": "i1", "status": "blocked", **legacy}]}
+        )
+    # `pending` is accepted and records NOTHING — the placeholder cannot make an
+    # unresolved intent look evidenced.
+    pending = await tool.run(
+        {"intents": [{"intent_id": "i1", "status": "pending",
+                      "evidence_tool_call_id": "call_q", "reason_code": "NO_ACCESS"}]},
+        _credentials(),
+        turn=TurnContext(turn_index=TURN),
     )
+    assert pending.status == "ok", pending.denial_detail
+    intent = pending.result_full["intents"][0]
+    assert (intent["evidence_tool_call_id"], intent["reason_code"]) == (None, None)
 
 
 async def test_one_denial_cannot_block_three_intents() -> None:

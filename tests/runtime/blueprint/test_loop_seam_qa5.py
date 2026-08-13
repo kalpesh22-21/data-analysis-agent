@@ -36,6 +36,7 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests._blueprint_gate import expand_blueprint
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
@@ -138,13 +139,19 @@ async def test_two_run_blueprint_calls_count_as_two_tool_calls() -> None:
         ]
     )
     loop, store = _loop(model, tool)
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint the model is about to run. Seeded as
+    # the real trail entry the gate reads, so the predicate under test is the
+    # production one (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="two depts?")
 
     assert outcome.status == "done"
     assert outcome.tool_calls_made == 2  # two model-facing calls
     assert len(mcp.calls) == 2  # two inner runQuery (one each)
     trail = await store.load_trail(SESSION_ID)
-    assert [e.tool_name for e in trail] == ["runBlueprint", "runBlueprint"]
+    # The seeded getBlueprint leads; TWO runBlueprint entries is still the claim.
+    assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint", "runBlueprint"]
 
 
 # ===========================================================================
@@ -177,6 +184,11 @@ async def test_paused_checkpoint_stores_raw_slot_value_at_rest_flag() -> None:
         ]
     )
     loop, store = _loop(model, tool)
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint the model is about to run. Seeded as
+    # the real trail entry the gate reads, so the predicate under test is the
+    # production one (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q")
 
     assert outcome.status == "paused_ask_user"
@@ -227,6 +239,11 @@ async def test_no_match_pause_question_echoes_value_into_progress_event_flag() -
         ]
     )
     loop, _store = _loop(model, tool, observer=observer)
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint the model is about to run. Seeded as
+    # the real trail entry the gate reads, so the predicate under test is the
+    # production one (tests/_blueprint_gate.py).
+    await expand_blueprint(_store, SESSION_ID, _BID)
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q")
 
     assert outcome.status == "paused_ask_user"

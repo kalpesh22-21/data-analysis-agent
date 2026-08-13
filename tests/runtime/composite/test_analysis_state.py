@@ -50,6 +50,7 @@ async def _entry(
     row_count: int | None = 1,
     authoritative: bool = False,
     turn_index: int = TURN,
+    serves_intent: str | None = None,
 ) -> None:
     preview = (
         None
@@ -70,6 +71,7 @@ async def _entry(
             result_full_ref=None,
             ts="2026-08-11T00:00:00+00:00",
             authoritative=authoritative,
+            serves_intent=serves_intent,
         ),
     )
 
@@ -129,20 +131,15 @@ async def test_update_is_batched_across_several_intents_in_one_call() -> None:
     store = InMemorySessionStore()
     tool = _tool(store)
     await tool.run(_init_args("a", "b", "c"), _credentials(), turn=TurnContext(turn_index=TURN))
-    await _entry(store, "call_q", "runQuery")
+    await _entry(store, "call_q", "runQuery", serves_intent="i1")
     await _entry(store, "call_denied", "runQuery", status="denied",
-                 error_code="COLUMN_SCOPE_VIOLATION", row_count=None)
+                 error_code="COLUMN_SCOPE_VIOLATION", row_count=None, serves_intent="i2")
 
     result = await tool.run(
         {
             "intents": [
-                {"intent_id": "i1", "status": "completed", "evidence_tool_call_id": "call_q"},
-                {
-                    "intent_id": "i2",
-                    "status": "blocked",
-                    "reason_code": "NO_ACCESS",
-                    "evidence_tool_call_id": "call_denied",
-                },
+                {"intent_id": "i1", "status": "completed"},
+                {"intent_id": "i2", "status": "blocked"},
             ]
         },
         _credentials(),
@@ -152,7 +149,11 @@ async def test_update_is_batched_across_several_intents_in_one_call() -> None:
     assert result.status == "ok"
     by_id = {i["intent_id"]: i for i in result.result_full["intents"]}
     assert by_id["i1"]["status"] == "completed"
+    # Neither the evidence nor the reason was supplied: both were resolved from the
+    # trail, and the reason CLASSIFIED off the call it resolved to.
+    assert by_id["i1"]["evidence_tool_call_id"] == "call_q"
     assert by_id["i2"]["reason_code"] == "NO_ACCESS"
+    assert by_id["i2"]["evidence_tool_call_id"] == "call_denied"
     # An intent the call did not mention keeps its previous disposition.
     assert by_id["i3"]["status"] == "pending"
 
@@ -163,11 +164,10 @@ async def test_an_unmentioned_intent_is_never_dropped() -> None:
     store = InMemorySessionStore()
     tool = _tool(store)
     await tool.run(_init_args("easy", "hard"), _credentials(), turn=TurnContext(turn_index=TURN))
-    await _entry(store, "call_q", "runQuery")
+    await _entry(store, "call_q", "runQuery", serves_intent="i1")
 
     result = await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "completed",
-                      "evidence_tool_call_id": "call_q"}]},
+        {"intents": [{"intent_id": "i1", "status": "completed"}]},
         _credentials(),
         turn=TurnContext(turn_index=TURN),
     )
@@ -232,21 +232,25 @@ async def test_a_prior_turns_substantive_call_does_not_lock_this_turn() -> None:
 
 
 async def test_evidence_must_come_from_a_prior_round_trip() -> None:
-    """State calls are dispatched FIRST, so `[runQuery, updateAnalysisState(
-    evidence=<that call>)]` can never validate. The rejection has to say so."""
+    """State calls are dispatched FIRST, so `[runQuery(serves_intent="i1"),
+    updateAnalysisState(i1 -> completed)]` can never validate: when the state call
+    runs, the tagged entry does not exist yet.
+
+    The rejection has to say NEXT MESSAGE, because the model's natural batch shape
+    is exactly this one and the fix is entirely about WHEN, not about what.
+    """
     store = InMemorySessionStore()
     tool = _tool(store)
     await tool.run(_init_args("headcount"), _credentials(), turn=TurnContext(turn_index=TURN))
 
     result = await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "completed",
-                      "evidence_tool_call_id": "call_not_yet"}]},
+        {"intents": [{"intent_id": "i1", "status": "completed"}]},
         _credentials(),
         turn=TurnContext(turn_index=TURN),
     )
     assert result.error_code == ANALYSIS_STATE_INVALID_CODE
     assert result.retryable is True
-    assert "has not run yet" in result.denial_detail
+    assert "NEXT message" in result.denial_detail
 
 
 async def test_a_missing_turn_context_refuses_rather_than_guessing() -> None:
@@ -260,22 +264,28 @@ async def test_a_missing_turn_context_refuses_rather_than_guessing() -> None:
     assert doc.analysis_state is None
 
 
-async def test_citing_a_prior_turns_call_is_diagnosed_precisely() -> None:
-    """The tool hands the validators the WHOLE trail, not one pre-filtered to the
-    turn. Both filter internally, and the unfiltered list is what lets them tell
-    "that call belongs to an earlier turn" — precisely diagnosable — from "no such
-    call anywhere", which is genuinely ambiguous. Pre-filtering collapses the two
-    into the weaker message and the model is told to do the wrong thing."""
+async def test_a_prior_turns_call_is_never_bound_as_this_turns_evidence() -> None:
+    """The turn gate, now applied where the runtime SELECTS the evidence rather
+    than where it validated a citation.
+
+    Both auto-bind pools filter on `turn_index`, so a perfectly good `runQuery`
+    from the previous turn is not a candidate — the intent is refused as if the
+    trail were empty, which is the honest reading: nothing on THIS turn served it.
+    The pre-turn call is deliberately the ONLY substantive call in the store, so a
+    turn-blind pool would auto-bind it and this test would pass state that is
+    provably wrong.
+    """
     store = InMemorySessionStore()
     await _entry(store, "call_old", "runQuery", turn_index=TURN - 1)
     tool = _tool(store)
     await tool.run(_init_args("headcount"), _credentials(), turn=TurnContext(turn_index=TURN))
 
     result = await tool.run(
-        {"intents": [{"intent_id": "i1", "status": "completed",
-                      "evidence_tool_call_id": "call_old"}]},
+        {"intents": [{"intent_id": "i1", "status": "completed"}]},
         _credentials(),
         turn=TurnContext(turn_index=TURN),
     )
     assert result.error_code == ANALYSIS_STATE_INVALID_CODE
-    assert "belongs to an earlier turn" in result.denial_detail
+    assert "nothing this turn answered it" in result.denial_detail
+    doc = await store.get_or_create_session(SESSION_ID)
+    assert live_analysis_state(doc, TURN).intents[0].status == "pending"

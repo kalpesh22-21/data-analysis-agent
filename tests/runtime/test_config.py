@@ -7,16 +7,48 @@ from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
 
 def test_locked_defaults() -> None:
-    """The orchestrator-locked tunables must match exactly (no drift)."""
+    """The orchestrator-locked tunables must match exactly (no drift).
+
+    The two loop budgets were RAISED on live measurement (2026-08-12): every
+    observed failure was the wall clock, with turns capping at ~61-73s while
+    iterations sat at ~8 of 15. The iteration ceiling moved with it so it does not
+    become the next binding constraint at 180s. The other two are unchanged and
+    that is a decision, not an omission — the largest tool-call batch observed was
+    3 of a possible 8, and `max_budget_windows` bounds `continue` GRANTS, each of
+    which is now worth three times what it was.
+
+    `max_window_token_spend` joined them the same day: the loop's token ceiling had
+    no field and borrowed `model_context_window`, comparing a per-window SPEND sum
+    against a single-request OCCUPANCY limit. Pinned here because it is what makes
+    the 25 above reachable — see the field comment for the measured derivation.
+    """
     settings = RuntimeSettings(_env_file=None)
     assert settings.session_ttl_seconds == 604_800
     assert settings.preview_row_count == 20
     assert settings.history_token_budget_ratio == 0.20
-    assert settings.max_loop_iterations == 15
-    assert settings.max_wall_clock_seconds == 60
+    assert settings.max_loop_iterations == 25
+    assert settings.max_wall_clock_seconds == 180
     assert settings.max_budget_windows == 3
+    assert settings.max_window_token_spend == 1_000_000
     assert settings.max_tool_calls_per_iteration == 8  # S3 hardening default
     assert settings.discovery_emulation_enabled is True
+
+
+def test_window_token_spend_ceiling_is_independent_of_the_context_window() -> None:
+    """The defect this field fixed: spend was measured against the context window.
+
+    They are different units and must move independently — shrinking the model's
+    context window (an occupancy fact) must not shrink how much a window may spend,
+    and vice versa.
+    """
+    settings = RuntimeSettings(_env_file=None, model_context_window=32_000)
+    assert settings.max_window_token_spend == 1_000_000
+    assert settings.request_token_budget() == int((32_000 - 16_000) * 0.8)
+    # And the spend ceiling is env-overridable on its own.
+    assert (
+        RuntimeSettings(_env_file=None, max_window_token_spend=250_000).max_window_token_spend
+        == 250_000
+    )
 
 
 def test_base_agent_prompt_is_wired_as_the_default() -> None:

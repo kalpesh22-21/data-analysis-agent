@@ -25,6 +25,8 @@ So every assertion here is deliberately something A FIXTURE CANNOT FAKE:
 
 from __future__ import annotations
 
+import json
+
 from data_agent.runtime.composite.analysis_state import ANALYSIS_STATE_INVALID_CODE
 from data_agent.runtime.context.assembly import IDEMPOTENT_READ_ALREADY_SERVED_CODE
 from data_agent.runtime.session.models import TrackedIntent
@@ -275,6 +277,29 @@ def test_case_04_partial_update_does_not_drop_the_intents_it_omits(
     assert all(i.status == "completed" for i in intents.values())
     assert harness.outcomes[-1]["status"] == "done"
 
+    # ...and all three closed on the CALL-TIME TAG: the fixture's state calls send
+    # `{intent_id, status}` with no evidence field at all, so the ids below were
+    # resolved by the runtime from `TrailEntry.serves_intent`. This is the exact
+    # shape that failed 9 times out of 9 live on the citation path (three intents,
+    # three tagged blueprint runs, closed in later rounds).
+    assert {i.intent_id: i.evidence_tool_call_id for i in intents.values()} == {
+        "i1": "b1",
+        "i2": "b2",
+        "i3": "b3",
+    }
+    assert [harness.entry(c).serves_intent for c in ("b1", "b2", "b3")] == [
+        "i1",
+        "i2",
+        "i3",
+    ]
+    assert {
+        payload["intent_id"]: payload["evidence_binding"]
+        for payload in harness.observer.payloads("loop_intent_completed")
+    } == {"i1": "tagged", "i2": "tagged", "i3": "tagged"}
+    # The tag never reached the tool's own arguments — it is a runtime concept,
+    # stripped at dispatch (a real MCP would reject the unknown argument).
+    assert all("serves_intent" not in harness.entry(c).args for c in ("b1", "b2", "b3"))
+
     report = metrics.blocked_intent_report(_turn_records(harness))
     assert report.tracked == 3
     assert report.completed == 3
@@ -352,7 +377,7 @@ def test_case_06_pending_intent_refuses_finalization_then_exhausts(
     assert [p["exit"] for p in refusals] == ["answer_with_table"]
     assert refusals[0]["pending_count"] == 1
     assert [p["window"] for p in harness.observer.payloads("loop_finalization_block_spent")] == [1]
-    assert harness.doc().finalization_blocks == {"0:1": 1}
+    assert harness.doc().finalization_blocks == {"0:1:intents": 1}
 
     assert harness.observer.count("loop_enforcement_exhausted") == 1
     forced = harness.observer.payloads("loop_intent_force_blocked")
@@ -442,14 +467,22 @@ def test_case_07_narrowed_scope_drops_a_card_and_a_denial_blocks_the_intent(
     assert harness.outcomes[-1]["status"] == "done"
 
 
-def test_case_07_one_denial_cannot_block_a_second_intent(harness_factory) -> None:
-    """04 §B.3, asserted end to end rather than at the validator.
+def test_case_07_one_denial_cannot_spread_to_a_second_intent(harness_factory) -> None:
+    """One denial must not close a SECOND deliverable — asserted end to end rather
+    than at the validator, on the real fixture trail.
 
-    Block evidence must be DISTINCT per intent. Without the rule, one
-    `getTableSchema(<scratch_db>, "x")` yields `SCRATCH_SESSION_VIOLATION` and can
-    close every tracked intent at once for O(1) calls. Here the second citation of
-    `q1` must be refused — and the refusal must leave the earlier, legitimate
-    block standing.
+    The manufacture route 04 §B.3 exists to price: one denial, cited on every
+    tracked intent, closes them all for O(1) calls. It is now closed ONE STEP
+    EARLIER than the distinctness rule, and this test asserts the earlier step
+    because it is the one this trail reaches. i1's own tagged work is a SUCCESSFUL
+    blueprint, so there is nothing on it that classifies as a block at all — the
+    model cannot re-point it at i2's denial, because it no longer names calls.
+
+    The legacy citation is sent anyway (the shape a stale-context model produces)
+    and must be DROPPED, not honoured — if it were read, this test would go green
+    for exactly the reason it exists to forbid. The distinctness rule itself, which
+    catches the untagged/backstop variant, is asserted at the unit layer in
+    `tests/runtime/composite/test_intent_tagging.py`.
     """
     harness = harness_factory("case-07-no-access-block")
     import anyio
@@ -479,8 +512,10 @@ def test_case_07_one_denial_cannot_block_a_second_intent(harness_factory) -> Non
     )
     assert result.status == "error"
     assert result.error_code == ANALYSIS_STATE_INVALID_CODE
-    assert "already the evidence" in (result.denial_detail or "")
-    assert _intents(harness)["i2"].reason_code == "NO_ACCESS"
+    assert "does not support that" in (result.denial_detail or "")
+    intents = _intents(harness)
+    assert intents["i1"].status == "completed"  # the legitimate disposition stands
+    assert intents["i2"].reason_code == "NO_ACCESS"
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +604,7 @@ def test_case_09_block_counter_is_not_reset_by_a_resume(harness_factory) -> None
 
     spent = harness.observer.payloads("loop_finalization_block_spent")
     assert [p["window"] for p in spent] == [1], "the counter was reset by a resume"
-    assert harness.doc().finalization_blocks == {"0:1": 1}
+    assert harness.doc().finalization_blocks == {"0:1:intents": 1}
     assert harness.observer.count("loop_finalization_refused") == 1
     assert harness.observer.count("loop_enforcement_exhausted") == 1
 
@@ -664,6 +699,144 @@ def test_case_10_pending_sweep_is_scoped_to_terminal_outcomes(harness_factory) -
 
 
 # ---------------------------------------------------------------------------
+# Cases 11-13 — multi-table `answerWithTable` (08 §H)
+# ---------------------------------------------------------------------------
+#
+# THE HARNESS NEEDED NO CHANGE, and that is worth recording rather than
+# rediscovering: `_parse_call` validates only the four top-level keys
+# (`name`/`id`/`args`/`serves_intent`) and passes `args` through opaquely, so a
+# `tables:` array works as-is. `RoutingCase.expect` is a free-form dict, so the new
+# expectations need no loader change either.
+#
+# WHAT THESE CANNOT PROVE. `answer_tables` populating in A1 is DEFINITIONALLY
+# TRUE — the fixture writes the array. The measurement that matters is 1/9 on live
+# multi-intent turns, and only A2's L7 can read it. What A1 proves is that the
+# runtime carries every designated table honestly once the model sends them: the
+# per-table badges are earned, and the roll-up is conservative.
+
+
+def test_case_11_two_blueprint_results_become_two_tables(harness_factory) -> None:
+    """Two intents, two blueprints, TWO tables on one answer.
+
+    The half a fixture cannot fake is the per-table `verification`: each block
+    exists only because that blueprint's D56 verify came back clean, so both being
+    green is a runtime finding. Case 2 is the same routing shape on the top-level
+    `sql:` shorthand and stays that way deliberately — it is the 6/6 path.
+    """
+    harness = harness_factory("case-11-two-tables")
+    _assert_all_terminal(harness)
+    _assert_state_writes_accepted(harness)
+
+    outcome = harness.outcomes[-1]
+    assert outcome["status"] == "done"
+    tables = outcome["answer_tables"]
+    assert len(tables) == harness.case.expect["answer_tables"] == 2
+    # Each table names its OWN blueprint — not the turn's last one.
+    assert [t["blueprint_use"]["blueprint_id"] for t in tables] == [
+        "bp-active-headcount-by-department",
+        "bp-hires-projection",
+    ]
+    assert [t["caption"] for t in tables] == [
+        "Active headcount by department",
+        "Projected hires, next 6 months",
+    ]
+    # Earned, not declared: `blueprint_gate` passed for both.
+    assert all(t["verification"]["passed"] is True for t in tables)
+    # …so the conservative AND roll-up is green.
+    assert outcome["verification"]["passed"] is True
+    # `answer_sql` stays the derived projection of the lead table, for the four
+    # consumers that only know about it.
+    assert outcome["answer_sql"] == tables[0]["sql"]
+
+
+def test_case_12_a_mixed_set_reports_per_table_and_withholds_the_roll_up(
+    harness_factory,
+) -> None:
+    """THE ASSERTION AN OR ROLL-UP WOULD FAIL, and the older over-claim it fixes.
+
+    One verified blueprint table, one hand-written table. Per table the badge is
+    exact; the envelope's is withheld, because a green badge over a set containing
+    an unverified query is a claim about something the user is looking at that
+    nothing checked. `_accumulate_enrichment` made exactly that claim — it set
+    `verification` from ANY verified blueprint in the turn and never reset it — so
+    `null` here is a correction landing, not a capability lost.
+    """
+    harness = harness_factory("case-12-mixed-verification")
+    _assert_all_terminal(harness)
+    _assert_state_writes_accepted(harness)
+
+    outcome = harness.outcomes[-1]
+    tables = outcome["answer_tables"]
+    assert len(tables) == 2
+    assert tables[0]["verification"]["passed"] is True
+    # A `sql=` table is ALWAYS null — there is nothing that verified it.
+    assert tables[1]["verification"] is None
+    assert tables[1]["blueprint_use"] is None
+    # AND, not OR.
+    assert outcome["verification"] is None
+    # ABSENCE is the only negative signal. A `passed: false` would render as a red
+    # "verification failed" badge whose real meaning is "one of these is a
+    # hand-written query", which is not a failure at all.
+    assert '"passed": false' not in json.dumps(outcome)
+
+
+def test_case_13_a_narrowed_reload_drops_one_table_and_keeps_the_rest(
+    harness_factory, monkeypatch
+) -> None:
+    """08 §D end to end — and BOTH halves of §D.3, so the limit is documented by a
+    test rather than rediscovered as a bug.
+
+    (a) Narrowing away a column that appears ONLY on a designated `sql=` — a query
+        the turn never executed, so it is in no trail entry's provenance and the
+        turn union does not cover it — drops that table alone. That closes a read-
+        path fail-open: `/session/history` used to hand back a table that simply
+        403s when the browser tries to page it.
+    (b) Narrowing away a column the turn actually READ drops the assistant message
+        on the turn-wide gate, and all N tables go with it. Per-table provenance is
+        necessary, not sufficient; loosening that gate is a D44 message-filter
+        change and is deliberately out of scope.
+    """
+    from data_agent.runtime import app as app_module
+
+    harness = harness_factory("case-13-narrowed-scope-reload")
+    outcome = harness.outcomes[-1]
+    assert len(outcome["answer_tables"]) == 2
+
+    headers = {"Authorization": "Bearer eval-jwt", "X-Session-Id": "sess-eval"}
+    full = harness.case.column_scope
+    narrowed_away = harness.case.expect["narrowed_away_column"]
+
+    # (a) Drop ONLY the never-executed table's column.
+    monkeypatch.setattr(
+        app_module, "verify_jwt", lambda *a, **k: full - {narrowed_away}
+    )
+    turn = harness.client.get("/session/history", headers=headers).json()["turns"][0]
+    assert turn["answer"] is not None, "the answer's own union is still covered"
+    assert len(turn["answer_tables"]) == 1
+    assert turn["answer_tables"][0]["blueprint_use"]["blueprint_id"] == (
+        "bp-active-headcount-by-department"
+    )
+    assert turn["answer_sql"] == turn["answer_tables"][0]["sql"]
+    assert harness.observer.count("history_answer_table_scope_dropped") == 1
+
+    # (b) Now drop a column the turn genuinely READ. The turn-wide gate dominates.
+    monkeypatch.setattr(
+        app_module,
+        "verify_jwt",
+        lambda *a, **k: full - {"dbpcm_warehouse.employee.department_name"},
+    )
+    turn = harness.client.get("/session/history", headers=headers).json()["turns"][0]
+    assert turn["answer"] is None
+    assert turn["answer_tables"] is None
+    assert turn["answer_sql"] is None
+
+    # …and the unnarrowed read is unchanged, so neither drop is a permanent loss.
+    monkeypatch.setattr(app_module, "verify_jwt", lambda *a, **k: full)
+    turn = harness.client.get("/session/history", headers=headers).json()["turns"][0]
+    assert len(turn["answer_tables"]) == 2
+
+
+# ---------------------------------------------------------------------------
 # The cross-case sweep (07 §E.1) — cheap, redundant, and scoped
 # ---------------------------------------------------------------------------
 
@@ -730,7 +903,7 @@ def test_every_fixture_declares_the_ground_truth_the_metrics_need() -> None:
     and a `serves_intent` label pointing at nothing would silently weaken the
     re-derivation predicate to "no evidence, no finding"."""
     cases = load_cases()
-    assert len(cases) == 10
+    assert len(cases) == 13
     for case in cases:
         assert case.ground_truth_intent_count >= 1, case.id
         declared = {c.id for round_ in case.model_script for c in round_.tool_calls}

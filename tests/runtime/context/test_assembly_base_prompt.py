@@ -90,7 +90,15 @@ def test_base_prompt_routes_independent_deliverables_through_blueprints_in_one_t
     # hand-written query), and independent work issued together (not one serialized
     # step per round). Without them, per-deliverable routing would slow the loop
     # down instead of speeding it up.
-    assert "One blueprint covers it: run it with runBlueprint." in AGENT_SYSTEM_PROMPT
+    #
+    # The first property used to be a bullet of its own ("One blueprint covers it:
+    # run it with runBlueprint."). Live finding 20 folded it into the two routing
+    # bullets — the single-deliverable one now says to RUN a clearly-fitting offered
+    # card, and the multi-deliverable one ends by running the blueprint that covers
+    # it — so BOTH run-instructions are asserted here instead of the deleted bullet.
+    # The property is unchanged; only where it is stated moved.
+    assert "RUN IT with runBlueprint and do not search first" in AGENT_SYSTEM_PROMPT
+    assert "Run the blueprint that covers it" in AGENT_SYSTEM_PROMPT
     assert "call them together in one response" in AGENT_SYSTEM_PROMPT
 
 

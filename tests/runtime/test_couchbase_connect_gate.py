@@ -25,7 +25,7 @@ from __future__ import annotations
 import ast
 import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, get_args, get_origin
 from unittest.mock import MagicMock
 
 import pytest
@@ -236,25 +236,57 @@ def _public_coroutines(store_cls: type) -> list[str]:
     )
 
 
+def _synthetic_value(param: inspect.Parameter) -> Any:
+    """One argument, derived from the parameter's own ANNOTATION.
+
+    `MagicMock` satisfies every shape these methods do to their inputs before
+    reaching a handle (attribute reads, `to_doc()`, `in`, `int()`, `list()`,
+    f-string interpolation) — with one exception that a mock cannot fake: a
+    parameter annotated as a `Literal` is a CLOSED ENUM, and the method may well
+    validate it before touching a handle. `claim_finalization_block(kind=...)` does
+    exactly that (an unrecognised kind would mint an unbounded allowance, so
+    `finalization_block_key` raises), and a `MagicMock` there aborted the call
+    before any Couchbase op and made this test report the connect defect it exists
+    to find.
+
+    So a `Literal` yields its FIRST member. That is still derivation from the
+    signature — the thing this module insists on — one level deeper than before, and
+    it generalises: any future closed-enum parameter is handled the day it is added.
+    """
+    annotation = param.annotation
+    if get_origin(annotation) is Literal:
+        return get_args(annotation)[0]
+    return MagicMock()
+
+
 def _synthesise_args(method: Any) -> tuple[list[Any], dict[str, Any]]:
     """Arguments from the SIGNATURE, never from a maintained table.
 
     A table of per-method arguments would be one more thing to forget, which is the
-    bug under test. `MagicMock` satisfies every shape these methods do to their
-    inputs before reaching a handle (attribute reads, `to_doc()`, `in`, `int()`,
-    `list()`, f-string interpolation); parameters with defaults are left alone.
+    bug under test. Parameters with defaults are left alone; the rest are built by
+    `_synthetic_value`.
+
+    `eval_str=True` because every module here uses `from __future__ import
+    annotations`, so without it each annotation is the STRING `"FinalizationBlockKind"`
+    and no `Literal` is ever recognised. It falls back to the unevaluated signature
+    if a name cannot be resolved, which degrades to the old MagicMock-only behaviour
+    rather than failing the whole parametrisation.
     """
+    try:
+        signature = inspect.signature(method, eval_str=True)
+    except (NameError, TypeError):  # an annotation this module cannot resolve
+        signature = inspect.signature(method)
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
-    for name, param in inspect.signature(method).parameters.items():
+    for name, param in signature.parameters.items():
         if name == "self" or param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
             continue
         if param.default is not param.empty:
             continue
         if param.kind is param.KEYWORD_ONLY:
-            kwargs[name] = MagicMock()
+            kwargs[name] = _synthetic_value(param)
         else:
-            args.append(MagicMock())
+            args.append(_synthetic_value(param))
     return args, kwargs
 
 

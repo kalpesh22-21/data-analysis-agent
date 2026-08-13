@@ -50,6 +50,7 @@ from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import live_analysis_state
 from data_agent.runtime.session.store import CASMismatchError
+from tests._blueprint_gate import expand_blueprint
 
 SESSION_ID = "sess-r1-seams"
 _E = "dbpcm_warehouse.employee"
@@ -243,6 +244,8 @@ async def test_the_window_local_state_governs_after_a_blueprint_mid_dag_resume()
         store=store,
         blueprint_mcp=FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]}),
     )
+    # The getBlueprint-before-runBlueprint gate (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     paused = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="two things")
     assert paused.status == "paused_ask_user"
     # 03 §E.1: the state call was committed BEFORE the pause.
@@ -294,6 +297,8 @@ async def test_a_resumed_blueprint_entry_is_valid_completion_evidence() -> None:
         store=store,
         blueprint_mcp=FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]}),
     )
+    # The getBlueprint-before-runBlueprint gate (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="one thing")
 
     async def _cite_the_resumed_entry() -> ModelTurnResult:
@@ -329,7 +334,81 @@ async def test_a_resumed_blueprint_entry_is_valid_completion_evidence() -> None:
     assert [(i.status, i.reason_code) for i in state.intents] == [("completed", None)]
     # And the route is derivable from the telemetry: blueprint, not ad-hoc.
     assert _events(events, "loop_intent_completed") == [
-        {"intent_id": "i1", "evidence_tool_name": "runBlueprint"}
+        {
+            "intent_id": "i1",
+            "evidence_tool_name": "runBlueprint",
+            "evidence_binding": "auto_bound",
+        }
+    ]
+
+
+async def test_the_intent_tag_survives_a_mid_dag_blueprint_pause() -> None:
+    """The 03/04 × blueprint seam, second half: CALL-TIME TAGGING across a pause.
+
+    A pausing tool writes NO trail entry — the entry is minted by
+    `_resume_blueprint` under a FRESH `tool_call_id` once the user answers — so the
+    `serves_intent` the model put on the original `runBlueprint` call has nowhere to
+    live across the pause unless it rides the checkpoint. Without that, the intent
+    the blueprint was run for could be closed only by CITING that fresh uuid, which
+    is precisely the binding a live model does not manage (9 attempts, 0
+    successes). Here the model closes it the primary way — `{intent_id, status}` —
+    and the runtime resolves the resumed entry.
+    """
+    store = InMemorySessionStore()
+    tagged_blueprint = ToolCallRequest(
+        id="c1",
+        name="runBlueprint",
+        arguments={"id": _BID, "slot_bindings": {}, "serves_intent": "i1"},
+    )
+    loop, _s, _e = _build(
+        [
+            ModelTurnResult(
+                assistant_text=None,
+                tool_calls=[_init_call("s1", HEADCOUNT, ATTRITION), tagged_blueprint],
+            )
+        ],
+        store=store,
+        blueprint_mcp=FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]}),
+    )
+    # The getBlueprint-before-runBlueprint gate (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
+    paused = await loop.run(
+        session_id=SESSION_ID, credentials=_creds(), user_message="two things"
+    )
+    assert paused.status == "paused_ask_user"
+    checkpoint = (await store.get_or_create_session(SESSION_ID)).pause_checkpoint
+    assert checkpoint is not None and checkpoint.serves_intent == "i1"
+
+    resumed_loop, _s2, events = _build(
+        [
+            ModelTurnResult(
+                assistant_text=None,
+                tool_calls=[
+                    # No evidence field at all — the tag does the work.
+                    _update_call("s2", {"intent_id": "i1", "status": "completed"}),
+                ],
+            ),
+            ModelTurnResult(assistant_text="done"),
+            ModelTurnResult(assistant_text="done"),
+        ],
+        store=store,
+        blueprint_mcp=_resume_mcp(),
+    )
+    await resumed_loop.resume(session_id=SESSION_ID, credentials=_creds(), answer="approve")
+
+    trail = await store.load_trail(SESSION_ID)
+    resumed = [e for e in trail if e.tool_name == "runBlueprint" and e.args.get("resumed")]
+    assert resumed and resumed[-1].serves_intent == "i1"
+    state = live_analysis_state(await store.get_or_create_session(SESSION_ID), 0)
+    completed = {i.intent_id: i for i in state.intents}["i1"]
+    assert completed.status == "completed"
+    assert completed.evidence_tool_call_id == resumed[-1].tool_call_id
+    assert _events(events, "loop_intent_completed") == [
+        {
+            "intent_id": "i1",
+            "evidence_tool_name": "runBlueprint",
+            "evidence_binding": "tagged",
+        }
     ]
 
 
@@ -352,11 +431,13 @@ async def test_a_blueprint_resume_does_not_hand_out_a_second_forced_reround() ->
         store=store,
         blueprint_mcp=FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]}),
     )
+    # The getBlueprint-before-runBlueprint gate (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     paused = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="one thing")
     assert paused.status == "paused_ask_user"
     assert _events(events, "loop_finalization_block_spent") == [{"window": 1}]
     doc = await store.get_or_create_session(SESSION_ID)
-    assert doc.finalization_blocks == {"0:1": 1}
+    assert doc.finalization_blocks == {"0:1:intents": 1}
 
     resumed_loop, _s2, resume_events = _build(
         [ModelTurnResult(assistant_text=None, tool_calls=[_answer_call("a2")])],
@@ -371,7 +452,7 @@ async def test_a_blueprint_resume_does_not_hand_out_a_second_forced_reround() ->
     # No second re-round was granted, and the counter did not advance again.
     assert not _events(resume_events, "loop_finalization_refused")
     assert not _events(resume_events, "loop_finalization_block_spent")
-    assert (await store.get_or_create_session(SESSION_ID)).finalization_blocks == {"0:1": 1}
+    assert (await store.get_or_create_session(SESSION_ID)).finalization_blocks == {"0:1:intents": 1}
     assert _events(resume_events, "loop_enforcement_exhausted") == [{"intent_count": 1}]
     state = live_analysis_state(await store.get_or_create_session(SESSION_ID), 0)
     assert [(i.status, i.reason_code) for i in state.intents] == [
@@ -391,13 +472,23 @@ async def test_a_budget_cap_during_a_refused_round_terminally_disposes_a_live_tu
     still running and the user may answer "continue". The fourth path is gated on
     `finalization_refused_this_round` — but a budget-cap pause is a budget-cap
     pause either way, so the gate means a REFUSED round writes a TERMINAL
-    disposition (`BUDGET_EXHAUSTED`) onto a turn that is still alive.
+    disposition onto a turn that is still alive.
 
     The consequence, asserted here rather than assumed: after the user answers
     "continue" and is granted a fresh window, nothing is pending any more, so
     enforcement no longer applies and the model finalizes freely — with every
-    intent recorded `BUDGET_EXHAUSTED` even though the budget was extended and the
+    intent already terminally disposed even though the budget was extended and the
     work could have been done. The ledger and the answer disagree.
+
+    RETARGETED 2026-08-12 to `ENFORCEMENT_EXHAUSTED` (05 §F, reversed on live
+    evidence). **This is the same seam, sharpened, not a weakened assertion** — and
+    the retarget makes the seam this test exists to expose read *more* honestly.
+    The old code claimed a capacity cause; the resume half below then extends the
+    budget and finalizes anyway, which was the evidence AGAINST that claim sitting
+    inside the test that asserted it. What survives the resume is the honest fact:
+    enforcement never established a disposition for this intent. Measured live at
+    `s412e8424614e465bbd26d7a2a1400ebe` — answer at 25s, cap at 61.6s on the wall
+    clock, +385 tokens across the final three rounds.
     """
     store = InMemorySessionStore()
     loop, _s, events = _build(
@@ -416,7 +507,19 @@ async def test_a_budget_cap_during_a_refused_round_terminally_disposes_a_live_tu
         {"exit": "answer_with_table", "pending_count": 1}
     ]
     state = live_analysis_state(await store.get_or_create_session(SESSION_ID), 0)
-    assert [(i.status, i.reason_code) for i in state.intents] == [("blocked", "BUDGET_EXHAUSTED")]
+    assert [(i.status, i.reason_code) for i in state.intents] == [
+        ("blocked", "ENFORCEMENT_EXHAUSTED")
+    ]
+    # The cap WAS reached — that fact is preserved, in telemetry, on the same event
+    # that carries the disposition. An operator watching budget pressure still sees
+    # it; the intent record no longer misattributes the cause to it.
+    assert _events(events, "loop_intent_force_blocked") == [
+        {
+            "intent_id": "i1",
+            "reason_code": "ENFORCEMENT_EXHAUSTED",
+            "budget_cap_reached": True,
+        }
+    ]
 
     # The user grants more budget. The disposition is NOT restored, and the next
     # window finalizes with no enforcement at all.
@@ -434,7 +537,9 @@ async def test_a_budget_cap_during_a_refused_round_terminally_disposes_a_live_tu
     assert outcome.assistant_text == "Done."
     assert not _events(resume_events, "loop_finalization_refused")
     final = live_analysis_state(await store.get_or_create_session(SESSION_ID), 0)
-    assert [(i.status, i.reason_code) for i in final.intents] == [("blocked", "BUDGET_EXHAUSTED")]
+    assert [(i.status, i.reason_code) for i in final.intents] == [
+        ("blocked", "ENFORCEMENT_EXHAUSTED")
+    ]
 
 
 async def test_two_answers_in_one_batch_with_the_counter_spent_terminate_once() -> None:
@@ -822,7 +927,7 @@ async def test_a_second_turn_gets_its_own_forced_reround() -> None:
     )
     await turn_zero.run(session_id=SESSION_ID, credentials=_creds(), user_message="first ask")
     assert _events(zero_events, "loop_finalization_block_spent") == [{"window": 1}]
-    assert (await store.get_or_create_session(SESSION_ID)).finalization_blocks == {"0:1": 1}
+    assert (await store.get_or_create_session(SESSION_ID)).finalization_blocks == {"0:1:intents": 1}
 
     # A brand-new, unrelated question. It declares its own intents and makes its
     # FIRST finalization attempt with one still pending — it has never been given a

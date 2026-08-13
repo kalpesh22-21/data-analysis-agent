@@ -49,6 +49,9 @@ mcp_script:
       row_count: 1
       truncated: false
 model_script:
+  # Round 1 — declare all three intents and EXPAND all three blueprints in ONE
+  # response. This is the shape the round-trip claim rests on: three deliverables
+  # cost two round-trips (expand-all, then run-all), not six.
   - tool_calls:
       - name: updateAnalysisState
         id: s1
@@ -57,6 +60,17 @@ model_script:
             - description: Headcount by department
             - description: Average salary by department
             - description: Projected hires over the next 6 months
+      - name: getBlueprint
+        id: g1
+        args: {id: bp-active-headcount-by-department}
+      - name: getBlueprint
+        id: g2
+        args: {id: bp-average-salary-by-department}
+      - name: getBlueprint
+        id: g3
+        args: {id: bp-hires-projection}
+  # Round 2 — run all three.
+  - tool_calls:
       - name: runBlueprint
         id: b1
         serves_intent: i1
@@ -69,20 +83,21 @@ model_script:
         id: b3
         serves_intent: i3
         args: {id: bp-hires-projection, slot_bindings: {window_months: 6, horizon_months: 6}}
-  # Only ONE of the three intents is named here.
+  # Only ONE of the three intents is named here. Closed by its TAG alone — no
+  # `evidence_tool_call_id` — which is the primary path since call-time tagging.
   - tool_calls:
       - name: updateAnalysisState
         id: s2
         args:
           intents:
-            - {intent_id: i1, status: completed, evidence_tool_call_id: b1}
+            - {intent_id: i1, status: completed}
   - tool_calls:
       - name: updateAnalysisState
         id: s3
         args:
           intents:
-            - {intent_id: i2, status: completed, evidence_tool_call_id: b2}
-            - {intent_id: i3, status: completed, evidence_tool_call_id: b3}
+            - {intent_id: i2, status: completed}
+            - {intent_id: i3, status: completed}
       - name: answerWithTable
         id: a1
         args:

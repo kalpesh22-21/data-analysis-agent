@@ -370,6 +370,32 @@ def _l5_metadata_and_analytical(run: LiveRun) -> tuple[bool, str]:
     return True, ""
 
 
+def _l7_three_deliverables_three_tables(run: LiveRun) -> tuple[bool, str]:
+    """08's headline measurement, and the ONLY thing that can prove the fix.
+
+    The number being re-measured is **1/9** — `answerWithTable` succeeded on 6/6
+    single-deliverable turns and 1/9 multi-intent ones, because the payload could
+    name only ONE of the three result sets a three-part turn produces. A1 cannot
+    read this: `answer_tables` populating there is definitionally true, since the
+    fixture writes the `tables` array. Every claim in 08 §G is a claim about a LIVE
+    model reading a prompt, so only this can fail on a bad one.
+
+    The predicate is deliberately "more than one table", not "exactly three": the
+    scalar clause survives (a part answered by a single number belongs in the
+    prose), and one query legitimately covering two parts is one table. The failure
+    being measured is the turn that produces three result sets and ships ONE grid.
+    """
+    tables = run.outcome.get("answer_tables") or []
+    if not tables:
+        return False, "no answerWithTable designation at all — the turn answered in prose"
+    if len(tables) < 2:
+        return (
+            False,
+            f"{len(tables)} table for a three-part question — the other parts went to prose",
+        )
+    return True, ""
+
+
 def _l6_no_re_derivation(run: LiveRun) -> tuple[bool, str]:
     if not run.blueprint_ids():
         return False, "no authoritative blueprint result to re-derive in the first place"
@@ -444,6 +470,19 @@ LIVE_CASES: tuple[LiveCase, ...] = (
         predicate=_l6_no_re_derivation,
         note="an authoritative result is not re-derived with fresh SQL",
     ),
+    LiveCase(
+        id="L7",
+        # Deliberately L4's question verbatim. L4 asks whether the three intents
+        # were TRACKED and reached a terminal disposition; L7 asks whether the
+        # three RESULTS reached the user as grids. The same turn failed the second
+        # while passing the first, 8 times out of 9, which is the whole of 08.
+        question=(
+            "I need three things: active headcount by department, average annual "
+            "salary by department, and new hires per month over the last six months."
+        ),
+        predicate=_l7_three_deliverables_three_tables,
+        note="three deliverables => more than one table on the answer (re-measures 1/9)",
+    ),
 )
 
 
@@ -517,5 +556,5 @@ def test_live_suite_is_collectable_without_a_live_model() -> None:
     """Nothing above may need a network call, an API key or an env var AT IMPORT
     TIME — the module has to import and collect cleanly on every ordinary
     `uv run pytest`, and only then skip."""
-    assert len(LIVE_CASES) == 6
-    assert {c.id for c in LIVE_CASES} == {"L1", "L2", "L3", "L4", "L5", "L6"}
+    assert len(LIVE_CASES) == 7
+    assert {c.id for c in LIVE_CASES} == {"L1", "L2", "L3", "L4", "L5", "L6", "L7"}

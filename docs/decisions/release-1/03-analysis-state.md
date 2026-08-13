@@ -7,6 +7,10 @@ The largest deliverable. Five sub-parts: the data model, persistence, the tool, 
 
 Nothing is in production, so no migration or backwards-compatibility constraint applies to any schema, signature or helper named here.
 
+> **AMENDED after the live run (README finding 20).** `TrailEntry` gains `serves_intent: str | None` — the CALL-TIME intent tag, the primary way an intent is completed — and `PauseCheckpoint` gains the same field so the tag survives a blueprint pause (a pausing tool writes no trail entry; the entry is minted on resume under a fresh id). Both are additive, `.get`-read, and default `None`. **The §B change list applies in full: four `SessionStore` implementations, not two.** Neither field needed a proxy edit — both launcher proxies forward whole objects — but that is a property to CHECK, not to assume; `tests/runtime/test_launcher_session_store_proxies.py` derives the surface either way. The loop strips the tag from the arguments before dispatch (the MCP rejects an argument its schema does not declare) and validates it against the live state, dropping an unknown one with `loop_intent_tag_dropped` rather than failing the call.
+
+> **AMENDED 2026-08-12 — the model-facing schema shrinks to three properties.** The item shape is now exactly `{description}` on the first call and `{intent_id, status}` on every later one. `evidence_tool_call_id` and `reason_code` are **removed from the tool schema** and derived by the runtime; the PERSISTED `TrackedIntent` keeps both fields unchanged, and 05's force-block paths keep writing `ENFORCEMENT_EXHAUSTED` / `BUDGET_EXHAUSTED` / `USER_STOPPED` into `reason_code` runtime-side. Three consequences, each detailed below: §C.3 loses the presence and reason-code payload rules and gains a tolerant-drop rule; §C.3.2 states the AUTO-BIND BACKSTOP that replaces citation; and the derived reason code is defined in [04 §B.7](04-evidence-validators.md). Citation had 9 live attempts and 0 successes across every session measured; `reason_code` was a second copy of a fact 04 §B already recomputed from the trail, so it could disagree and could not add.
+
 ---
 
 ## A. Data model
@@ -191,13 +195,16 @@ Inferred, never model-declared.
 | Object with expected keys; **unknown keys rejected, not ignored** | `ANALYSIS_STATE_INVALID` |
 | Bounds per A.4 | `ANALYSIS_STATE_INVALID` |
 | `status` ∈ `INTENT_STATUSES` | `ANALYSIS_STATE_INVALID` |
-| `reason_code` ∈ `MODEL_REASON_CODES` when model-declared | `ANALYSIS_STATE_INVALID` |
+| ~~`reason_code` ∈ `MODEL_REASON_CODES` when model-declared~~ | **Retired 2026-08-12** — the model declares no reason code, so there is none to allowlist. The MODEL/RUNTIME split is now structural: the derivation only ever consults `MODEL_REASON_CODES` (04 §B.7), so a runtime-only code is unreachable from this path rather than rejected by it. |
+| `evidence_tool_call_id` / `reason_code` arriving from stale replay | **DROPPED silently**, empty or not (§C.3.2). Not `unknown_item_key`. |
 | Update references an unknown `intent_id` | `ANALYSIS_STATE_INVALID` |
 | Update adds, deletes, or rewrites `intent_id`/`description` | `ANALYSIS_STATE_INVALID` |
 | Model supplies `intent_id` on initialize | `ANALYSIS_STATE_INVALID` |
 | Initialize while live state exists | `ANALYSIS_STATE_INVALID` |
 | Initialize after the substantive boundary | `ANALYSIS_STATE_LATE_INIT` *(non-retryable)* |
 | Evidence fails 04's validators | `ANALYSIS_STATE_INVALID` |
+| No qualifying call exists for a terminal update | `ANALYSIS_STATE_INVALID` *(`unresolved_evidence`)* |
+| Several could have served it and none is tagged | `ANALYSIS_STATE_INVALID` *(`ambiguous_evidence`)* |
 
 `ANALYSIS_STATE_INVALID` is **retryable**; `ANALYSIS_STATE_LATE_INIT` is **not** — the boundary has passed and no retry helps.
 
@@ -214,12 +221,39 @@ That is a correct initialize. No state was created, the turn answered anyway, an
 
 **A key carrying no information is absent.** Derived from what downstream *reads* require (README conventions; the repo's four-round spot-patching lesson), one clause per JSON type, applied **before mode inference**:
 
-1. **String with no content ⇒ absent** (`""`, whitespace, `null`), on **both** modes. 04 §B.2 already requires `evidence_tool_call_id` to be *non-empty*, so `""` was never a value; `intent_id` and `description` are `.strip()`-checked before use.
-2. **An enum the item's shape cannot read is a placeholder**, because an enum has no empty member. `status` is unreadable on a declaration (every intent starts `pending`) and `reason_code` is read only for a `blocked` intent — so both are ignored on initialize, and `reason_code` is ignored on **any** non-`blocked` update. That second half is not optional: the same serialisation puts `"reason_code": "NO_ACCESS"` on a `completed` update, which §B.2's "completed carries no reason_code" rule would reject — the identical silent failure one call later, leaving every intent `pending` until 05 forced `ENFORCEMENT_EXHAUSTED`.
+1. **String with no content ⇒ absent** (`""`, whitespace, `null`), on **both** modes. `intent_id` and `description` are `.strip()`-checked before use, so `""` was never a value in either.
+2. **An enum the item's shape cannot read is a placeholder**, because an enum has no empty member. `status` is unreadable on a declaration (every intent starts `pending`), so it is ignored on initialize. *(Until 2026-08-12 this clause also covered `reason_code` on any non-`blocked` update — the same live serialisation put `"reason_code": "NO_ACCESS"` on a `completed` one. That field is now dropped outright, one step earlier, so the status-gated half is gone rather than relaxed.)*
+3. **A retired field is absent whatever it holds** (added 2026-08-12). `evidence_tool_call_id` and `reason_code` are no longer declared, so anything arriving under those names is stale replay of the model's own earlier calls — and the runtime derives both facts. Dropping is the only behaviour that cannot cost an answer: rejecting fails a correct update over a field the model was shown by its own history, and *reading* one lets a mismatch (a `NO_ACCESS` label on a zero-row call) into the ledger the validators exist to keep honest.
 
-Only **schema-declared** fields are elided, so unknown keys stay rejected whatever they hold. Everything above still rejects a *claim* as opposed to a filler: a **non-empty** `intent_id` on initialize, a **non-`pending`** `status` on initialize (new reason `status_on_initialize`), a non-empty `description` on update, a non-empty `evidence_tool_call_id` on a `pending` intent.
+Only **schema-declared or retired** fields are elided, so unknown keys stay rejected whatever they hold. Everything above still rejects a *claim* as opposed to a filler: a **non-empty** `intent_id` on initialize, a **non-`pending`** `status` on initialize (new reason `status_on_initialize`), a non-empty `description` on update.
 
-**The schema keeps one flat item shape.** A `oneOf` over two item variants would make the wrong shape unrepresentable only if something enforced it; nothing does without `strict`, which is not set and cannot be set for one tool while the MCP-derived schemas are non-strict. The observed failure *is* a model unioning the declared properties, which is also how models flatten `anyOf`, so the benefit is unproven against the model that failed — while a `parameters` block the provider rejects fails **all 15 tools** in every request. The description instead states the runtime's own convention ("leave what does not apply empty; `status`/`reason_code` are ignored on the first call"), so declared contract and implemented contract agree.
+**The schema keeps one flat item shape.** A `oneOf` over two item variants would make the wrong shape unrepresentable only if something enforced it; nothing does without `strict`, which is not set and cannot be set for one tool while the MCP-derived schemas are non-strict. The observed failure *is* a model unioning the declared properties, which is also how models flatten `anyOf`, so the benefit is unproven against the model that failed — while a `parameters` block the provider rejects fails **all 15 tools** in every request. The description instead states the runtime's own convention ("leave what does not apply empty; `status` is ignored on the first call"), so declared contract and implemented contract agree. The 2026-08-12 trim from five properties to three is the *other* half of the same reasoning: the cheapest way to stop a model filling a field with a placeholder is not to declare the field.
+
+#### C.3.2 The auto-bind backstop — added 2026-08-12 with the schema trim
+
+An intent is closed by the CALL-TIME TAG (`serves_intent`). When the model closes one and **no call this turn carries its tag**, the runtime binds the evidence itself rather than refusing bookkeeping the model has no way to satisfy — a call that already ran cannot be retro-tagged, and this release's own measurement is that a rejected bookkeeping call costs the user an answer.
+
+Rules, in order, over the calls that would **validate** as evidence for the requested status:
+
+| | Condition | Outcome |
+|---|---|---|
+| 1 | exactly one candidate is UNTAGGED | bind it; emit `loop_analysis_state_auto_bound{intent_id}` |
+| 2 | else exactly one candidate exists at all | bind it; emit `loop_analysis_state_auto_bound{intent_id}` |
+| 3 | else | refuse (`ambiguous_evidence`), naming `serves_intent` as the fix |
+
+**The pool is defined by the validators, never by a hand-written list** — binding something 04 would refuse is the one way the backstop could quietly weaken the guarantee it exists to preserve. On top of that it is narrowed by TOOL, per status and (for a block) per derived code:
+
+| Status / derived code | Pool | Why |
+|---|---|---|
+| `completed` | `SUBSTANTIVE_TOOLS` ∩ what `validate_completion_evidence` accepts — i.e. `runQuery` + `runBlueprint` | `getTableSchema` is admitted as completion evidence only as an ACCEPTED TRADE (04 §A); auto-binding a schema fetch to an analytical intent would spend that trade without the model claiming it. A metadata intent closed on a schema fetch still works — **tagged**, which is the primary path anyway. |
+| `blocked` ⇒ `NO_ACCESS` | unrestricted, matching `validate_block_evidence` | A denial is a denial whichever tool hit it. |
+| `blocked` ⇒ `REQUIRED_DATA_UNAVAILABLE` | `SUBSTANTIVE_TOOLS` only | An EMPTY `listTables` is `ok` + `row_count == 0` (`_build_preview`'s bare-list branch), so without this an empty listing is a free block. A listing is discovery, not evidence of absence — see [04 §B.4](04-evidence-validators.md). |
+
+The derived reason code is classified off the bound call (04 §B.7). **The TAGGED path is not narrowed** in either case: there the model has explicitly claimed the call for the intent, and the trade is the model's to claim rather than the runtime's to make on its behalf.
+
+**Rule 2 is what replaced citation.** 04 §A permits one call answering SEVERAL intents; a single-valued tag cannot express that, and the citation field that could never worked. Now the call is tagged for the first intent, the second has no untagged candidate, and rule 2 binds the same id to both. 04 §B.3's distinctness rule still refuses the same for BLOCKING, checked over the merged state — which is exactly why the backstop does not need to see the other intents in the batch.
+
+**A re-affirmation is a no-op.** An intent already in the requested terminal status, already carrying evidence, keeps it and is not re-resolved. Live models re-send the whole intent list every round; the trail grows, so a bind that was unambiguous in round 2 can be ambiguous in round 4, and that refusal would take the other intents in the same batch down with it. A status *change* misses this branch and is resolved in full.
 
 Both need `denial_mapping.py` entries and both carry specifics in `denial_detail`, which is the only channel that reaches the model. For `LATE_INIT`, include **the proposed descriptions** (spec §5.1 asks for this): `denial_detail` renders only on non-`ok` entries and `filter_trail`'s current-turn exemption is status-gated, so it cannot outlive the turn.
 
@@ -344,11 +378,12 @@ This reinstates the intent of the Lead's original §36 barrier ("commit state, t
 | `tests/runtime/session/test_models.py` | Round-trip both new fields; unknown key rejected; enum split |
 | `tests/runtime/session/test_memory_store.py`, `test_couchbase_store.py` | `apply_analysis_state` latest-wins; **merge callback re-runs correctly on a simulated CAS conflict**; survives pause/resume; `_ensure_connected` gate |
 | `tests/runtime/composite/test_analysis_state.py` | Init assigns sequential ids and returns them; update batched; mode inferred via `live_analysis_state` |
-| `tests/runtime/composite/test_analysis_state_adversarial.py` | Immutability: add / delete / rewrite description / model-supplied id / second init — each rejected · unknown key · unknown id · runtime-only reason code from the model · over-length description **rejected not truncated** · **manufactured block evidence** (`WHERE 1=0` ⇒ `REQUIRED_DATA_UNAVAILABLE`) recorded as known-permitted, with the telemetry assertion |
+| `tests/runtime/composite/test_analysis_state_adversarial.py` | Immutability: add / delete / rewrite description / model-supplied id / second init — each rejected · unknown key · unknown id · a runtime-only reason code from the model **ignored rather than rejected** (2026-08-12: it is unreachable, not refused) · over-length description **rejected not truncated** · **manufactured block evidence** (`WHERE 1=0` ⇒ `REQUIRED_DATA_UNAVAILABLE`) recorded as known-permitted, with the telemetry assertion |
+| `tests/runtime/composite/test_intent_tagging.py` | The tag, and everything the 2026-08-12 trim rests on: auto-bind rules 1/2/3 · the pool holds only calls the validators accept · `getTableSchema` is tagged evidence but never auto-bound · both reason codes derived, and a call proving neither refused · the two retired names dropped empty **and** populated, in both modes · a re-affirmed disposition is a no-op |
 | `tests/runtime/loop/test_analysis_state_loop.py` | **Partition happens before the cap** (8 substantive + trailing state call ⇒ state call still dispatched) · state dispatched first regardless of array position · **`updateAnalysisState` + `askUser` in one batch ⇒ state committed, then pause** · late-init rejected after `runQuery`, permitted after `getTableSchema` · >2 state calls ⇒ surplus rejected |
 | `tests/runtime/context/test_assembly.py` | State renders as `user`, before the question, sanitised · **state is re-read every round-trip, so ids appear on the round after initialize** · prior-turn state not rendered · base prompt still sole `system` message |
 | `tests/runtime/context/test_scope_narrowing_adversarial.py` | **A prior turn's `updateAnalysisState` trail entry is dropped under a narrowed scope** (the D.1 leak) |
-| `tests/runtime/mcp/test_tool_schema.py` | Count 14 → 15 — update the assertions at :129, :171, :188 and the name set at :111-127 |
+| `tests/runtime/mcp/test_tool_schema.py` | Count 14 → 15 — update the assertions at :129, :171, :188 and the name set at :111-127 · **the item object declares exactly `{description, intent_id, status}`**, asserted on the payload and not only on the prose |
 
 The partition-before-cap and ordering tests matter most: they are the difference between protection engaging and silently not engaging.
 

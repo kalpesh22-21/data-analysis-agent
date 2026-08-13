@@ -120,12 +120,14 @@ SEARCH_BLUEPRINTS_TOOL_SCHEMA: dict[str, Any] = {
         "fallback for when they miss. It re-searches for THIS user's scope and returns "
         "more candidate cards. Each card carries id, intent, slots summary, score, each slot's "
         "name/type/required, any pinned term-to-column resolutions, and the result grain — "
-        "enough to choose between candidates AND to fill runBlueprint, so you normally do "
-        "NOT need another call to decide. Call getBlueprint(id) only when you need the full "
-        "DAG (the `uses` footprint, the SQL template) or a composition summary — or when a "
-        "card carries `slots_omitted`, which means it lists only the first few slots and "
-        "the rest are on getBlueprint. A `degraded` flag of true means semantic ranking was "
-        "unavailable and the order is weaker — treat scores with less confidence."
+        "enough to CHOOSE between candidates and to fill runBlueprint, so you do NOT need a "
+        "getBlueprint on every candidate to decide. A card carries no SQL, though, and its "
+        "`intent` is authored prose: once you have picked one you MUST call getBlueprint(id) "
+        "on it and read what it actually does before runBlueprint — the runtime refuses a "
+        "runBlueprint for an id you have not expanded in this turn. Call getBlueprint too "
+        "when a card carries `slots_omitted`, which means it lists only the first few slots "
+        "and the rest are on getBlueprint. A `degraded` flag of true means semantic ranking "
+        "was unavailable and the order is weaker — treat scores with less confidence."
     ),
     "parameters": {
         "type": "object",
@@ -149,14 +151,21 @@ GET_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
     "name": "getBlueprint",
     "description": (
         "Expand one blueprint by id (from a thin card or a searchBlueprints result). "
-        "Returns the blueprint's intent, the tables/columns it reads (its `uses` "
-        "footprint), its status (validated/drift), and its `slots` — each slot's name, "
-        "type, plain-English meaning, and whether it is required or optional. READ the "
-        "`slots` to know what to fill before you run it. For a composed blueprint it "
-        "also returns a `composition` summary (a step count and a note): that blueprint "
-        "is still ONE atomic runBlueprint call — the runtime chains its internal steps. "
-        "If the blueprint does not exist or is not available to you, this returns "
-        "`found: false` — re-search with searchBlueprints."
+        "CALL THIS BEFORE EVERY runBlueprint, in the SAME turn: a card carries no SQL, so "
+        "until you expand a blueprint you are trusting its authored `intent` line to "
+        "describe the query it will run, and the runtime refuses a runBlueprint for an id "
+        "you have not expanded this turn (an expansion from an earlier turn does not "
+        "count). Returns the blueprint's intent, the tables/columns it reads (its `uses` "
+        "footprint), its `result_grain`, its status (validated/drift), its `slots` — each "
+        "slot's name, type, plain-English meaning, and whether it is required or optional — "
+        "and the SQL it runs: a `sql_template` for a single-step blueprint, or a "
+        "`composition` summary (a step count and a note) for a composed one, which is still "
+        "ONE atomic runBlueprint call because the runtime chains its internal steps. READ "
+        "what it returns and check the blueprint measures what THIS deliverable asked for "
+        "before you run it; if it does not, pick another or query it yourself. You may "
+        "batch: getBlueprint for several blueprints in one response, then runBlueprint for "
+        "them in the next. If the blueprint does not exist or is not available to you, this "
+        "returns `found: false` — re-search with searchBlueprints."
     ),
     "parameters": {
         "type": "object",
@@ -193,6 +202,34 @@ SEARCH_KNOWLEDGE_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# --- call-time intent tagging (Release 1, composite/analysis_state.py) -------
+#
+# ONE optional string property, added to EXACTLY THREE tools: `runQuery`,
+# `getTableSchema` (both live-fetched from the MCP and augmented below) and
+# `runBlueprint` (locally authored, so it carries it inline). Those three are
+# `INTENT_TAGGABLE_TOOLS` — the same three whose results 04 §A accepts as
+# completion evidence and whose failures 04 §B.1 accepts for blocking, so a tag
+# anywhere else could never resolve to anything and would be a path to nowhere.
+#
+# It is a RUNTIME concept and is STRIPPED before dispatch
+# (`analysis_state.split_serves_intent`): the MCP server never sees it. The
+# description tells the model when it is meaningful, because an optional parameter
+# with no stated purpose is one a model fills with a placeholder.
+SERVES_INTENT_PARAM: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "Optional. The id of the tracked intent this call is for, e.g. 'i2' — the "
+        "runtime uses it to close that intent when you later mark it completed or "
+        "blocked, which is why it needs nothing else from you then. Only meaningful "
+        "when you have declared intents with updateAnalysisState; leave it empty "
+        "otherwise."
+    ),
+}
+# The two MCP-advertised tools the tag is injected into. `runBlueprint` is not
+# here: it is locally authored and declares the property directly.
+_INTENT_TAGGABLE_MCP_TOOLS: frozenset[str] = frozenset({"runQuery", "getTableSchema"})
+
+
 # `runBlueprint` (runblueprint-design §5.1) — the deterministic fast-path
 # execution tool: run one stored, validated blueprint by id with the model's
 # raw slot values. The runtime resolves/binds each slot (never the model),
@@ -206,7 +243,11 @@ RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
     "name": "runBlueprint",
     "description": (
         "Execute a stored, validated blueprint (from a getBlueprint result) by id to "
-        "answer the user's question the fast, deterministic way. Fill `slot_bindings` "
+        "answer the user's question the fast, deterministic way. CALL getBlueprint ON "
+        "THAT ID FIRST, in this same turn, and read what the blueprint actually does: a "
+        "runBlueprint for an id you have not expanded this turn is REFUSED (retryable — "
+        "expand it, then run it), and an expansion from an earlier turn does not count. "
+        "Fill `slot_bindings` "
         "with the raw values from the conversation and the user's own words (use the "
         "blueprint's `slots` and `resolves` to know what each slot means) — the runtime "
         "validates and binds them safely; you never write SQL or codes. An OPTIONAL slot "
@@ -232,6 +273,10 @@ RUN_BLUEPRINT_TOOL_SCHEMA: dict[str, Any] = {
                 "scope-safe value. Omit a slot to leave it unfilled (a required one will "
                 "pause to ask).",
             },
+            # Injected below on the two MCP-backed taggable tools; written out here
+            # because `runBlueprint` is locally authored. Same object either way —
+            # see `SERVES_INTENT_PARAM`.
+            "serves_intent": SERVES_INTENT_PARAM,
         },
         "required": ["id", "slot_bindings"],
     },
@@ -297,6 +342,16 @@ ANSWER_WITH_TABLE_TOOL_SCHEMA: dict[str, Any] = {
         "pass 'blueprint_id' when a blueprint you ran THIS TURN produced the answer; the "
         "runtime then reuses that blueprint's own final query, so you need not copy its "
         "SQL. If you pass both, 'sql' is used. "
+        "ONE TABLE PER PART. If you answered three parts, send three tables in "
+        "'tables': [{blueprint_id: \"…\"}, {blueprint_id: \"…\"}, {sql: \"…\"}], in the "
+        "order you answered them, each with a short 'caption' naming its part. Send the "
+        "result you ALREADY produced for each part — a blueprint result goes in as its "
+        "blueprint_id, unchanged. If one query you ran already covered two parts, that is "
+        "one table, not two. A part whose answer is a single number still belongs in your "
+        "prose, not in a grid of its own. "
+        "CLOSING YOUR LAST INTENT IS NOT THE END OF THE TURN: send updateAnalysisState "
+        "closing what remains and this call in the SAME response — state calls run "
+        "first, so one response does both. "
         "Do NOT copy the table's rows into 'answer' — the user can already see them. "
         "Describe what the table shows and call out what matters: the shape, the "
         "outliers, the trend, the total. Quoting two or three individual figures is fine. "
@@ -321,6 +376,42 @@ ANSWER_WITH_TABLE_TOOL_SCHEMA: dict[str, Any] = {
                 "description": "The id of a blueprint you ran successfully this turn whose "
                 "result is the answer. Omit if you are passing sql.",
             },
+            # 08. THREE STRINGS, NO ENUM — deliberately, and 03 §C.3.1 is why: a
+            # model that cannot omit keys fills the unused ones with placeholders
+            # (`""` for a string, the FIRST MEMBER for an enum). For three strings
+            # the placeholder serialisation is `{"sql": "", "blueprint_id": "bp-x",
+            # "caption": ""}`, which `clean_answer_sql`/`clean_blueprint_id` already
+            # normalise — that exact shape is the one the live model was observed
+            # emitting at the top level, so the normalisers are already load-bearing
+            # on it. An enum here would silently resolve to its first member instead.
+            "tables": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "sql": {
+                            "type": "string",
+                            "description": "The read-only SELECT whose rows are this "
+                            "part's answer, without a LIMIT clause. Omit if you are "
+                            "passing blueprint_id.",
+                        },
+                        "blueprint_id": {
+                            "type": "string",
+                            "description": "The id of a blueprint you ran successfully "
+                            "this turn whose result is this part's answer. Omit if you "
+                            "are passing sql.",
+                        },
+                        "caption": {
+                            "type": "string",
+                            "description": "A short label naming the part this table "
+                            "answers, in the user's own terms. No SQL, no column names.",
+                        },
+                    },
+                },
+                "description": "One entry per part of your answer, in the order you "
+                "answered them. Use this when the question asked for more than one "
+                "thing; for a single table just pass sql or blueprint_id above.",
+            },
         },
         "required": ["answer"],
     },
@@ -341,16 +432,32 @@ ANSWER_WITH_TABLE_TOOL_SCHEMA: dict[str, Any] = {
 # straight into the non-retryable `ANALYSIS_STATE_LATE_INIT`, after which the turn
 # runs untracked — the asymmetric silent failure 03 §E warns about; the wording
 # tracks `prompts.py`'s tracking section, and a test asserts all four are named),
-# and — the one that would otherwise cost a wasted call every turn — that evidence
-# must come from a PRIOR message, because state calls are dispatched before
-# everything else in the batch.
+# and — the one that would otherwise cost a wasted call every turn — that the TAG
+# must belong to a call from a PRIOR message, because state calls are dispatched
+# before everything else in the batch.
 #
-# ITEM SHAPE: ONE flat object for both modes, deliberately — see the field
-# descriptions. A model that cannot omit keys fills the unused ones with
-# placeholders (`""`, or the first enum member), which is what a `oneOf` over two
-# item variants would be trying to prevent; but nothing ENFORCES a schema without
-# `strict`, which the runtime does not set and cannot set for one tool while the
-# MCP-derived schemas are non-strict. So the runtime NORMALISES that payload
+# ITEM SHAPE (2026-08-12): THREE PROPERTIES, TWO OF THEM PER MODE.
+# `evidence_tool_call_id` and `reason_code` were REMOVED — the runtime derives
+# both. Citation had 9 live attempts and 9 hallucinated ids across every session
+# ever measured, and a model that will not copy a 24-character opaque id will not
+# start; the one shape it was kept for (ONE call closing TWO deliverables) is now
+# handled by the auto-bind backstop, which is why this description tells the model
+# to just mark the second one completed. `reason_code` went for a different
+# reason: the validator ALREADY refused any block whose evidence did not prove the
+# declared code, so the model's value was a second copy of a fact the trail
+# carried — capable of disagreeing, incapable of adding anything.
+#
+# The two removed names are still TOLERATED on the wire and silently dropped
+# (`analysis_state._LEGACY_ITEM_KEYS`), because the model's own earlier calls are
+# replayed to it verbatim and a mid-conversation deploy would otherwise start
+# refusing correct updates.
+#
+# ONE flat object for both modes, deliberately — see the field descriptions. A
+# model that cannot omit keys fills the unused ones with placeholders (`""`, or
+# the first enum member), which is what a `oneOf` over two item variants would be
+# trying to prevent; but nothing ENFORCES a schema without `strict`, which the
+# runtime does not set and cannot set for one tool while the MCP-derived schemas
+# are non-strict. So the runtime NORMALISES that payload
 # (`composite/analysis_state.py`, "a key carrying no information is absent") and
 # this description states the same convention, rather than a stricter shape the
 # provider would treat as a hint anyway.
@@ -364,27 +471,42 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
         "FIRST call — BEFORE any substantive tool call, that is before any runQuery, "
         "runBlueprint, sampleRows or resolveValues in this turn — list each "
         "deliverable as an object with just a 'description': one short sentence in "
-        "the user's own terms. Do not invent ids: the runtime assigns them (i1, i2, "
-        "…) and the result of that call tells you what they are. Once one of those "
-        "four has run, a first declaration is refused and the turn goes untracked. "
+        "the user's own terms, and no other field. Do not invent ids: the runtime "
+        "assigns them (i1, i2, …) and the result of that call tells you what they "
+        "are. Once one of those four has run, a first declaration is refused and the "
+        "turn goes untracked. "
+        "DOING THE WORK — pass 'serves_intent' with an intent's id (e.g. 'i2') on the "
+        "runQuery, runBlueprint or getTableSchema you run for it. That tag is how the "
+        "intent is closed later, so tag the call when you make it. "
         "LATER calls — update the intents you already declared, several at a time in "
-        "ONE call. Send 'intent_id' and the new 'status', and nothing else: a "
+        "ONE call. Send 'intent_id' and the new 'status', and NOTHING ELSE: a "
         "description cannot be changed and an intent cannot be added or removed. "
-        "Mark an intent 'completed' with 'evidence_tool_call_id' set to the id of the "
-        "successful runQuery, verified runBlueprint or getTableSchema that answered "
-        "it. Mark it 'blocked' only when you can show why, with a 'reason_code' of "
-        "'NO_ACCESS' (a call refused for permissions) or 'REQUIRED_DATA_UNAVAILABLE' "
-        "(a successful query that returned no rows), plus the id of that call — and a "
-        "DIFFERENT call for each blocked intent. If a query legitimately returns "
-        "nothing, that is a completed intent whose answer is 'none found', not a "
-        "blocked one. "
-        "IMPORTANT: the evidence you cite must be a call from an EARLIER message. "
-        "This tool runs before the other calls in the same message, so a call you are "
-        "making right now has not run yet — cite it in your next message. "
+        "Mark an intent 'completed' once a call you tagged with its id has succeeded. "
+        "You never name the call: the runtime looks up the work you tagged for that "
+        "intent, and if you tagged nothing it uses the one call that could have served "
+        "it. Marking it completed records that you bound that work to this "
+        "deliverable, not that the figure is right; check the work yourself. Mark it "
+        "'blocked' when a call for it was refused for permissions or came back with no "
+        "rows — the runtime reads which of those happened off that call, so there is "
+        "no reason to state; tag a DIFFERENT call for each blocked intent. If a query "
+        "legitimately returns nothing, that is a completed intent whose answer is "
+        "'none found', not a blocked one. "
+        "IF ONE CALL ANSWERS TWO DELIVERABLES: tag it with one of them and simply mark "
+        "the other completed too — a tag names a single intent, so the runtime binds "
+        "that same call to the second one. "
+        "IMPORTANT: tag in the round you do the work and close the intent in a LATER "
+        "message. This tool runs before the other calls in the same message, so a call "
+        "you are making right now has not run yet and cannot close anything until your "
+        "next message. "
+        "CLOSING YOUR LAST INTENT IS NOT THE END OF THE TURN: the answer still has to "
+        "be sent. When the answer is a table, send both in the SAME response — this "
+        "call closing what remains, and answerWithTable beside it; this tool runs "
+        "first, so one response does both. An ordinary written answer cannot share a "
+        "response with a tool call, so there close the intents first and send it next. "
         "Every item uses one object shape, so if you must send a field that does not "
         "apply, leave it EMPTY ('') — an empty field is read as absent. On the first "
-        "call 'status' and 'reason_code' are ignored (every intent starts pending), "
-        "so leave 'status' as 'pending' there."
+        "call 'status' is ignored (every intent starts pending), so leave it as "
+        "'pending' there."
     ),
     "parameters": {
         "type": "object",
@@ -415,20 +537,6 @@ UPDATE_ANALYSIS_STATE_TOOL_SCHEMA: dict[str, Any] = {
                             "description": "Later calls only. The intent's new state. "
                             "On the first call leave it as 'pending' — every intent "
                             "starts pending and any other value there is refused.",
-                        },
-                        "evidence_tool_call_id": {
-                            "type": "string",
-                            "description": "The id of the tool call that shows this "
-                            "intent was answered, or was refused / came back empty. "
-                            "Required to complete or block an intent; it must be a "
-                            "call from an earlier message. Leave it empty on the "
-                            "first call and while an intent is still pending.",
-                        },
-                        "reason_code": {
-                            "type": "string",
-                            "enum": ["NO_ACCESS", "REQUIRED_DATA_UNAVAILABLE"],
-                            "description": "Required when status is 'blocked', and "
-                            "ignored on every other status — leave it empty there.",
                         },
                     },
                 },
@@ -477,6 +585,38 @@ def translate_tool_spec(tool: MCPToolSpec) -> dict[str, Any]:
     }
 
 
+def augment_with_serves_intent(schema: dict[str, Any]) -> dict[str, Any]:
+    """Add the optional `serves_intent` property to a TRANSLATED MCP schema.
+
+    A POST-TRANSLATION step, deliberately separate from `translate_tool_spec`: the
+    MCP stays the single source of truth for parameter SHAPE (this module's whole
+    premise), and this is the one runtime-owned addition on top of it — visible as
+    such rather than blended into the translation.
+
+    NON-MUTATING. `MCPToolSpec.input_schema` is the client's own object and the
+    translated schemas are cached by `ToolSchemaCache`, so this rebuilds
+    `parameters`/`properties` rather than writing into either. A schema whose
+    `parameters`/`properties` are not dicts (nothing the live MCP produces, but the
+    shape is not ours to assume) is returned UNCHANGED — the tag is an
+    optimisation for the model, never a precondition for calling the tool.
+    """
+    if schema.get("name") not in _INTENT_TAGGABLE_MCP_TOOLS:
+        return schema
+    parameters = schema.get("parameters")
+    if not isinstance(parameters, dict):
+        return schema
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        return schema
+    return {
+        **schema,
+        "parameters": {
+            **parameters,
+            "properties": {**properties, "serves_intent": SERVES_INTENT_PARAM},
+        },
+    }
+
+
 async def fetch_function_schemas(
     mcp_client: MCPClient, *, jwt: str, session_id: str
 ) -> list[dict[str, Any]]:
@@ -503,7 +643,11 @@ async def fetch_function_schemas(
             f"tools: {sorted(collisions)}. Rename the local tool or the MCP tool — a "
             "name collision would silently shadow one of them in the loop."
         )
-    schemas = [translate_tool_spec(tool) for tool in tools]
+    # Translate verbatim, then add the ONE runtime-owned parameter
+    # (`serves_intent`) to the two taggable MCP tools. The augmentation is applied
+    # here, at the single fetch seam, so `ToolSchemaCache` caches the augmented
+    # shape and no caller can accidentally advertise the un-augmented one.
+    schemas = [augment_with_serves_intent(translate_tool_spec(tool)) for tool in tools]
     # The locally-authored runtime tools (askUser + resolveValues + the three read
     # tools + runBlueprint + recordAssumptions + answerWithTable +
     # updateAnalysisState), always advertised, appended after the MCP tools

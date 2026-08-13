@@ -359,6 +359,8 @@
   .result-panel[hidden],
   .blueprint-chip[hidden],
   .verified-badge[hidden],
+  .table-blueprint-chip[hidden],
+  .table-verified-badge[hidden],
   .table-pager[hidden],
   .result-table-caption[hidden] {
     display: none;
@@ -479,6 +481,61 @@
     margin-top: var(--space-2);
     font-size: 0.8rem;
     color: var(--color-text-dim);
+  }
+
+  /* --- Multi-table answers (08 §E) --- */
+  /* One collapsible panel per designated answer table, stacked. A stack of
+     labelled disclosures stays readable at the cap (8) in a way a row of
+     side-by-side grids would not: every panel names its own table in the
+     summary, and only the panels the user opens fetch any rows. */
+  .answer-tables {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  /* No designated table → no panel, and no stray flex gap in the turn block. */
+  .answer-tables:empty {
+    display: none;
+  }
+
+  /* The container takes over the width/alignment the single inline panel used
+     to carry; the panels inside it fill the container instead of re-applying
+     92% of an already-92% box. */
+  .turn-block .answer-tables {
+    align-self: flex-start;
+    max-width: 92%;
+  }
+
+  /* `align-self: stretch` undoes the flex-start the shared `.turn-block
+     .result-panel` rule applies: inside the container the panels must line up
+     with each other, not each shrink to its own summary text — eight ragged
+     boxes is the "unreadable stack" this layout is meant to avoid. */
+  .turn-block .answer-tables .result-panel {
+    align-self: stretch;
+    max-width: 100%;
+    margin-top: 0;
+  }
+
+  /* The gap hangs off the CHIP/BADGE, not the title: both are display:none when
+     the table carries no blueprint / no verification block, so a lone bare panel
+     keeps the exact summary width it had before these existed. */
+  .table-blueprint-chip,
+  .table-verified-badge {
+    margin-left: var(--space-2);
+  }
+
+  /* Multi-table only: bound each grid so one long expanded table cannot bury
+     the panels under it. N=1 keeps its unbounded grid, exactly as before. */
+  .answer-tables.multi .table-scroll {
+    max-height: 22rem;
+    overflow-y: auto;
+  }
+
+  /* The scroll box is focusable so it can be scrolled from the keyboard. */
+  .table-scroll:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
   }
 
   .prov-empty {
@@ -694,21 +751,9 @@
         <div class="sql-blocks"></div>
       </details>
 
-      <details class="result-table result-panel" data-testid="result-table" hidden>
-        <summary>Results</summary>
-        <div class="table-scroll">
-          <table class="result-grid">
-            <thead class="result-table-head"></thead>
-            <tbody class="result-table-body"></tbody>
-          </table>
-        </div>
-        <div class="result-table-caption result-caption" hidden></div>
-        <div class="table-pager" hidden>
-          <button type="button" class="pager-prev" disabled>Previous</button>
-          <span class="pager-status"></span>
-          <button type="button" class="pager-next" disabled>Next</button>
-        </div>
-      </details>
+      <!-- One panel per designated answer table, cloned from #answer-table-template
+           (08 §E). Empty when the turn designated nothing. -->
+      <div class="answer-tables" data-testid="answer-tables"></div>
 
       <details class="provenance-panel result-panel" data-testid="provenance-panel" hidden>
         <summary>Data lineage</summary>
@@ -720,6 +765,35 @@
         <div class="per-sql-list"></div>
       </details>
     </div>
+  </template>
+
+  <!-- One answer table, cloned once per entry of `answer_tables` into a turn
+       block's `.answer-tables` container (08 §E). This used to be a singleton
+       subtree inside #turn-template, found by root.querySelector(".result-table")
+       — which is exactly why a turn could only ever page ONE grid. Cloning it
+       gives every table its own nodes AND its own `offset` closure, so paging
+       one grid cannot page another. Same nodes, same classes, same testid as
+       the singleton it replaces, so the N=1 panel is unchanged. -->
+  <template id="answer-table-template">
+    <details class="result-table result-panel" data-testid="result-table">
+      <summary>
+        <span class="result-table-title">Results</span>
+        <span class="table-blueprint-chip static-chip" data-testid="table-blueprint-chip" hidden></span>
+        <span class="table-verified-badge badge" data-testid="table-verified-badge" hidden></span>
+      </summary>
+      <div class="table-scroll" role="region" tabindex="0">
+        <table class="result-grid">
+          <thead class="result-table-head"></thead>
+          <tbody class="result-table-body"></tbody>
+        </table>
+      </div>
+      <div class="result-table-caption result-caption" hidden></div>
+      <div class="table-pager" hidden>
+        <button type="button" class="pager-prev" disabled>Previous</button>
+        <span class="pager-status" role="status"></span>
+        <button type="button" class="pager-next" disabled>Next</button>
+      </div>
+    </details>
   </template>
 </main>
 
@@ -770,6 +844,7 @@
     errorMessage: document.getElementById("error-message"),
     transcript: document.getElementById("transcript"),
     turnTemplate: document.getElementById("turn-template"),
+    answerTableTemplate: document.getElementById("answer-table-template"),
     uploadFileInput: document.getElementById("upload-file-input"),
     uploadAnalyzeButton: document.getElementById("upload-analyze-button"),
     uploadColumnList: document.getElementById("upload-column-list"),
@@ -953,53 +1028,153 @@
   // regardless, so this is a display choice, not a limit.
   var PAGE_SIZE = 50;
 
-  // Field 2 (2026-08) — `answer_sql: string | null`: the ONE query the model
-  // designated as its answer via `answerWithTable`. This replaced `result_table`,
-  // which shipped a fixed ~20-row preview the user could not page past.
+  // Field 2 (2026-08) — the query/queries the model designated as its answer via
+  // `answerWithTable`. This replaced `result_table`, which shipped a fixed ~20-row
+  // preview the user could not page past.
   //
-  // The rows are NOT on the result event any more — we fetch them a page at a time
-  // from `POST /api/query/page`, which proxies the runtime's `/query/page`. The BFF
-  // attaches the JWT server-side (D82/D5: the browser never holds a token), and the
-  // runtime re-parses and re-runs the SQL through the SAME scope-enforced dispatch
-  // path the agent uses. So echoing `answer_sql` back from the browser grants
-  // nothing: a tampered query can only reach what this session's own scope allows.
-  function renderAnswerTable(root, answerSql) {
-    var panel = root.querySelector(".result-table");
-    var head = root.querySelector(".result-table-head");
-    var body = root.querySelector(".result-table-body");
-    var caption = root.querySelector(".result-table-caption");
-    var pager = root.querySelector(".table-pager");
-    var prev = root.querySelector(".pager-prev");
-    var next = root.querySelector(".pager-next");
-    var status = root.querySelector(".pager-status");
+  // 2026-08-12 (08 §E) — the designation went from ONE query to a LIST. The result
+  // envelope now carries `answer_tables: [{sql, caption, blueprint_use, verification}]`
+  // (cap 8, every field but `sql` nullable) and KEEPS `answer_sql`/`blueprint_use`/
+  // `verification` populated as derived projections of `answer_tables[0]`, so an old
+  // session, an old envelope and a new single-table turn all land on the same
+  // one-panel path below.
+  //
+  // The rows are NOT on the result event — we fetch them a page at a time from
+  // `POST /api/query/page`, which proxies the runtime's `/query/page`. That endpoint
+  // takes ONE `sql`, so N tables are N independent calls, each with its own offset;
+  // paging needed no server change at all. The BFF attaches the JWT server-side
+  // (D82/D5: the browser never holds a token), and the runtime re-parses and re-runs
+  // the SQL through the SAME scope-enforced dispatch path the agent uses. So echoing
+  // a designated SQL back from the browser grants nothing: a tampered query can only
+  // reach what this session's own scope allows.
 
-    clearNode(head);
-    clearNode(body);
-    if (!answerSql) {
-      // No designated table — a scalar answer, or a model that did not call the
-      // tool. Both are "no grid", which is the correct default for a single value.
-      panel.hidden = true;
-      pager.hidden = true;
-      caption.hidden = true;
+  // Mirrors the runtime's MAX_ANSWER_TABLES (= MAX_INTENTS, 08 §F). The runtime
+  // truncates first; this is the browser's own belt, so a malformed envelope cannot
+  // make it open an unbounded number of panels.
+  var MAX_ANSWER_TABLES = 8;
+
+  // Id source, so each cloned grid can be labelled by its own summary.
+  var answerTableSeq = 0;
+
+  // Normalize the envelope into the list the renderer walks: `answer_tables` wins
+  // when it yields at least one entry with a `sql`, otherwise the legacy scalar
+  // `answer_sql` is the single entry. Same list-wins-when-non-empty precedence the
+  // runtime applies to the tool args (08 §B.3), so the N<=1 path is reached
+  // identically whether the runtime sent the list, the scalar, or both.
+  //
+  // An entry with no `sql` is dropped: the runtime resolves `blueprint_id` to its
+  // terminal SQL before the wire, so a sql-less entry is nothing the browser can page.
+  function normalizeAnswerTables(data) {
+    var out = [];
+    if (data && Array.isArray(data.answer_tables)) {
+      data.answer_tables.forEach(function (entry) {
+        if (!entry || !entry.sql) return;
+        out.push({
+          sql: entry.sql,
+          caption: entry.caption || null,
+          blueprint_use: entry.blueprint_use || null,
+          verification: entry.verification || null,
+        });
+      });
+    }
+    if (out.length === 0 && data && data.answer_sql) {
+      // Legacy / derived single table. Its blueprint + verification claims are the
+      // turn-level ones, which the block-level chip and badge render exactly as
+      // they do today — so this entry deliberately carries none of its own.
+      out.push({ sql: data.answer_sql, caption: null, blueprint_use: null, verification: null });
+    }
+    return out.length > MAX_ANSWER_TABLES ? out.slice(0, MAX_ANSWER_TABLES) : out;
+  }
+
+  // Clone one answer-table panel into `container` and hand back its nodes. Every
+  // renderer below works on this handle instead of root.querySelector(".result-table"),
+  // which is what made the panel a singleton and the paging state shared.
+  function cloneTablePanel(container, title) {
+    var frag = els.answerTableTemplate.content.cloneNode(true);
+    var panel = frag.querySelector(".result-table");
+    var titleEl = panel.querySelector(".result-table-title");
+    var scroll = panel.querySelector(".table-scroll");
+    var grid = panel.querySelector(".result-grid");
+
+    answerTableSeq += 1;
+    var titleId = "answer-table-title-" + answerTableSeq;
+    titleEl.id = titleId;
+    titleEl.textContent = title;
+    // Name the grid and its scroll box after this panel's own title, so eight
+    // grids in one turn are distinguishable to a screen reader instead of being
+    // eight anonymous "Results" tables.
+    grid.setAttribute("aria-labelledby", titleId);
+    scroll.setAttribute("aria-labelledby", titleId);
+
+    container.appendChild(panel);
+    return {
+      panel: panel,
+      chip: panel.querySelector(".table-blueprint-chip"),
+      badge: panel.querySelector(".table-verified-badge"),
+      head: panel.querySelector(".result-table-head"),
+      body: panel.querySelector(".result-table-body"),
+      caption: panel.querySelector(".result-table-caption"),
+      pager: panel.querySelector(".table-pager"),
+      prev: panel.querySelector(".pager-prev"),
+      next: panel.querySelector(".pager-next"),
+      status: panel.querySelector(".pager-status"),
+      title: title,
+    };
+  }
+
+  // Per-table "verified ✓" badge, driven ONLY by that table's own block — never by
+  // a turn-level flag, which at N>1 would claim a blueprint gate over grids that
+  // never went through one (08 §C). Same rule as the block-level badge: absence is
+  // information, never a warning. There is no `passed: false`, so a missing block
+  // renders nothing rather than a red state.
+  function renderTableVerification(badge, verification) {
+    if (!verification || verification.passed !== true) {
+      badge.hidden = true;
+      badge.textContent = "";
+      badge.removeAttribute("title");
       return;
     }
+    badge.textContent = "verified ✓";
+    badge.setAttribute(
+      "title",
+      verification.grain_checked === false
+        ? "verified (grain not checked)"
+        : "verified via blueprint gate"
+    );
+    badge.hidden = false;
+  }
 
+  // A panel's summary label: the model's own `caption` when it sent one, else
+  // "Results" at N=1 (unchanged) and a positional label when there are several
+  // grids that would otherwise be indistinguishable while collapsed.
+  function tableTitle(table, index, total) {
+    if (table.caption) return cellText(table.caption);
+    if (total <= 1) return "Results";
+    return "Table " + (index + 1) + " of " + total;
+  }
+
+  // Wire ONE cloned panel to `POST /api/query/page`. `offset` lives in this
+  // closure, per panel — that is the whole point of the clone: paging one grid
+  // must not page another, or page the wrong one.
+  function wireTablePaging(panelEls, sql, autoOpen) {
     var offset = 0;
+    var loaded = false;
 
     function setBusy(busy) {
-      prev.disabled = busy || offset === 0;
-      next.disabled = busy;
+      panelEls.prev.disabled = busy || offset === 0;
+      panelEls.next.disabled = busy;
     }
 
     function load() {
+      loaded = true;
       setBusy(true);
-      status.textContent = "loading…";
+      panelEls.status.textContent = "loading…";
       fetch("/api/query/page", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: sessionId,
-          sql: answerSql,
+          sql: sql,
           limit: PAGE_SIZE,
           offset: offset,
         }),
@@ -1011,48 +1186,89 @@
         })
         .then(function (res) {
           if (!res.ok) {
-            // A denial (403) or an unparseable query (400) is shown in place of the
-            // grid rather than swallowed — the user should see why the table is
-            // missing, not an empty panel.
-            clearNode(head);
-            clearNode(body);
-            caption.textContent =
+            // A denial (403) or an unparseable query (400) is shown in place of THIS
+            // grid rather than swallowed — the user should see why this table is
+            // missing, not an empty panel, and the other panels are unaffected.
+            clearNode(panelEls.head);
+            clearNode(panelEls.body);
+            panelEls.caption.textContent =
               "Could not load the table: " + cellText(res.payload.error || "unknown error");
-            caption.hidden = false;
-            pager.hidden = true;
-            panel.hidden = false;
+            panelEls.caption.hidden = false;
+            panelEls.pager.hidden = true;
             return;
           }
           var rows = Array.isArray(res.payload.rows) ? res.payload.rows : [];
-          fillGrid(head, body, res.payload.columns, rows);
-          caption.hidden = true;
-          caption.textContent = "";
+          fillGrid(panelEls.head, panelEls.body, res.payload.columns, rows);
+          panelEls.caption.hidden = true;
+          panelEls.caption.textContent = "";
           var first = rows.length === 0 ? offset : offset + 1;
-          status.textContent = "rows " + first + "–" + (offset + rows.length);
-          prev.disabled = offset === 0;
+          panelEls.status.textContent = "rows " + first + "–" + (offset + rows.length);
+          panelEls.prev.disabled = offset === 0;
           // `has_more` is a hint derived from a full page, not a total count —
           // there is no row count to show without a second aggregate query.
-          next.disabled = res.payload.has_more !== true;
-          pager.hidden = false;
-          panel.hidden = false;
+          panelEls.next.disabled = res.payload.has_more !== true;
+          panelEls.pager.hidden = false;
         })
         .catch(function () {
-          caption.textContent = "Could not load the table.";
-          caption.hidden = false;
-          pager.hidden = true;
-          panel.hidden = false;
+          panelEls.caption.textContent = "Could not load the table.";
+          panelEls.caption.hidden = false;
+          panelEls.pager.hidden = true;
         });
     }
 
-    prev.onclick = function () {
+    panelEls.prev.setAttribute("aria-label", "Previous page of " + panelEls.title);
+    panelEls.next.setAttribute("aria-label", "Next page of " + panelEls.title);
+    panelEls.prev.onclick = function () {
       offset = Math.max(0, offset - PAGE_SIZE);
       load();
     };
-    next.onclick = function () {
+    panelEls.next.onclick = function () {
       offset = offset + PAGE_SIZE;
       load();
     };
-    load();
+
+    // Lazy first fetch (08 §E). The panel has always been a collapsed <details>,
+    // but it used to fetch at render regardless. Fetching on first open instead
+    // makes N=8 cost ONE query at render (the lead table, opened below) rather
+    // than eight concurrent warehouse queries nobody has looked at yet.
+    panelEls.panel.addEventListener("toggle", function () {
+      if (panelEls.panel.open && !loaded) load();
+    });
+    if (autoOpen) {
+      // `load()` marks itself loaded synchronously, so the `toggle` this queues
+      // cannot fire a second request.
+      load();
+      panelEls.panel.open = true;
+    }
+  }
+
+  // Render every designated answer table into the turn block's container: one
+  // cloned panel each, each with its own paging closure.
+  function renderAnswerTables(root, tables) {
+    var container = root.querySelector(".answer-tables");
+    clearNode(container);
+    container.classList.remove("multi");
+    // No designated table — a scalar answer, or a model that did not call the
+    // tool. Both are "no grid", which is the correct default for a single value.
+    if (!tables || tables.length === 0) return;
+
+    var multi = tables.length > 1;
+    if (multi) container.classList.add("multi");
+
+    tables.forEach(function (table, index) {
+      var panelEls = cloneTablePanel(container, tableTitle(table, index, tables.length));
+      // Per-panel chip + badge only when there are several. At N<=1 the
+      // block-level pair carries the same claims and renders exactly as today; a
+      // turn-level claim sitting above per-table ones is redundant when they agree
+      // and contradictory when they do not (08 §C.3).
+      if (multi) {
+        fillBlueprintChip(panelEls.chip, table.blueprint_use);
+        renderTableVerification(panelEls.badge, table.verification);
+      }
+      // The lead table of a multi-table answer opens (and so fetches) at render;
+      // the rest — and a lone table, as before — wait to be opened.
+      wireTablePaging(panelEls, table.sql, multi && index === 0);
+    });
   }
 
   // HISTORY path — `result_table: {columns, preview_rows, row_count, truncated} | null`.
@@ -1060,41 +1276,41 @@
   // `preview_rows` (row-arrays of scalars). Truncation caption when the preview
   // is a subset of `row_count`. null / no rows → hide.
   function renderResultTable(root, table) {
-    var resultTable = root.querySelector(".result-table");
-    var head = root.querySelector(".result-table-head");
-    var body = root.querySelector(".result-table-body");
-    var caption = root.querySelector(".result-table-caption");
-    var pager = root.querySelector(".table-pager");
-    clearNode(head);
-    clearNode(body);
-    if (pager) pager.hidden = true;  // history rows are static — nothing to page
+    var container = root.querySelector(".answer-tables");
+    clearNode(container);
+    container.classList.remove("multi");
     var rows = table && Array.isArray(table.preview_rows) ? table.preview_rows : null;
-    if (!table || !rows || rows.length === 0) {
-      resultTable.hidden = true;
-      caption.hidden = true;
-      caption.textContent = "";
-      return;
-    }
+    // No preview → no panel at all (the container collapses), which is what
+    // `hidden` used to buy on the singleton subtree.
+    if (!table || !rows || rows.length === 0) return;
 
-    fillGrid(head, body, Array.isArray(table.columns) ? table.columns : [], rows);
-
+    var panelEls = cloneTablePanel(container, "Results");
+    fillGrid(
+      panelEls.head,
+      panelEls.body,
+      Array.isArray(table.columns) ? table.columns : [],
+      rows
+    );
+    // History rows are static — nothing to page, so the pager stays hidden as the
+    // template ships it.
     var shown = rows.length;
     var rowCount = typeof table.row_count === "number" ? table.row_count : shown;
     if (table.truncated === true || shown < rowCount) {
-      caption.textContent = "showing " + shown + " of " + rowCount + " rows";
-      caption.hidden = false;
-    } else {
-      caption.textContent = "";
-      caption.hidden = true;
+      panelEls.caption.textContent = "showing " + shown + " of " + rowCount + " rows";
+      panelEls.caption.hidden = false;
     }
-
-    resultTable.hidden = false;
   }
 
   // Field 3 — `blueprint_use: {blueprint_id, slots} | null`: a single chip
   // `Using blueprint {id} · {k}={v} · …`. null → no chip.
   function renderBlueprintChip(root, blueprintUse) {
-    var chip = root.querySelector(".blueprint-chip");
+    fillBlueprintChip(root.querySelector(".blueprint-chip"), blueprintUse);
+  }
+
+  // The chip's text, on whichever chip node it belongs to — the block-level one
+  // at N<=1, or a panel's own at N>1 (08 §C.3: the chip follows the badge's
+  // shape, per table plus the envelope's primary).
+  function fillBlueprintChip(chip, blueprintUse) {
     if (!blueprintUse || !blueprintUse.blueprint_id) {
       chip.hidden = true;
       chip.textContent = "";
@@ -1218,17 +1434,25 @@
     renderAssumptions(block, data.assumptions);
     // `sql` was renamed `sql_executed` (every query the turn RAN — the audit list).
     renderSql(block, data.sql_executed);
-    // The answer table: prefer the model-designated `answer_sql` (paged from the
-    // runtime, live AND on reload — `/session/history` returns it too). Fall back to
-    // a static `result_table` preview only for history turns that designated
-    // nothing, which is all older sessions have.
-    if (data.answer_sql) {
-      renderAnswerTable(block, data.answer_sql);
+    // The answer tables: prefer the model-designated `answer_tables` / `answer_sql`
+    // (paged from the runtime, live AND on reload — `/session/history` returns them
+    // too). Fall back to a static `result_table` preview only for history turns that
+    // designated nothing, which is all older sessions have.
+    var answerTables = normalizeAnswerTables(data);
+    if (answerTables.length > 0) {
+      renderAnswerTables(block, answerTables);
     } else {
       renderResultTable(block, data.result_table || null);
     }
-    renderBlueprintChip(block, data.blueprint_use);
-    renderVerification(block, data.verification);
+    // With several tables the block-level chip and badge are suppressed and each
+    // panel wears its own (08 §C.3): one flag over a mixed set claims a blueprint
+    // gate — and a blueprint — for grids that never went through one. The envelope's
+    // pair are projections of `answer_tables[0]`, so at the block level they would
+    // be table 1's claims worn by the whole turn. At N<=1 this is the unchanged
+    // single-chip / single-badge path.
+    var multiTable = answerTables.length > 1;
+    renderBlueprintChip(block, multiTable ? null : data.blueprint_use);
+    renderVerification(block, multiTable ? null : data.verification);
     renderProvenance(block, data.provenance);
     renderPerSqlBreakdown(block, data.tool_calls);
   }
@@ -1273,10 +1497,14 @@
       assistant_text: turn.answer,
       assumptions: turn.assumptions,
       sql_executed: collectSql(toolCalls),
-      // `/session/history` resolves this for BOTH designation forms, including
+      // `/session/history` resolves these for BOTH designation forms, including
       // `blueprint_id`, so a reloaded blueprint answer pages the same table it did
       // live. `pickResultTable` is the fallback for turns that designated nothing.
+      // `answer_tables` is the multi-table list and MUST be forwarded beside
+      // `answer_sql` — a reloaded multi-table turn otherwise silently drops back to
+      // one grid, and reload is the only place that regression shows.
       answer_sql: turn.answer_sql,
+      answer_tables: turn.answer_tables,
       result_table: pickResultTable(toolCalls),
       provenance: turn.provenance_union,
       tool_calls: toolCalls,

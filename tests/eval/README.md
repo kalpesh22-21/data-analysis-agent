@@ -130,9 +130,11 @@ requests:                     # optional; defaults to one turn with `question`
   - {kind: turn, message: "…"}
   - {kind: resume, answer: "…"}
 model_script:                 # A1 only; A2 has none
-  - tool_calls:
+  - tool_calls:                                               # round 1
       - {name: updateAnalysisState, id: s1, args: {…}}
-      - {name: runBlueprint, id: b1, serves_intent: i1, args: {…}}
+      - {name: getBlueprint, id: g1, args: {id: bp-…}}        # REQUIRED, see below
+  - tool_calls:                                               # round 2
+      - {name: runBlueprint, id: b1, serves_intent: i1, args: {…}}  # tag -> args
 expect:
   intents_terminal: 3
   re_derivation: false
@@ -144,10 +146,32 @@ Things that will bite:
   and raises `AssertionError` when a tool is called more often than scripted. It
   also serves the tool **catalogue** from `mcp_tools` — a `getTableSchema` missing
   from that list is an unknown tool.
+* **Every `runBlueprint` needs a `getBlueprint` for the same id in an EARLIER round
+  of the same turn.** The runtime refuses an unexpanded run
+  (`BLUEPRINT_DEFINITION_NOT_READ`) before the executor is reached, so the fixture's
+  scripted `runQuery` queue is never consumed and the case fails with an error event
+  rather than a routing result. A card carries no SQL — the rule exists so the model
+  reads what it is about to execute; see
+  [release-1/02](../../docs/decisions/release-1/02-blueprint-card-enrichment.md#the-partial-reversal-getblueprint-before-runblueprint).
+  Two consequences for fixture authoring:
+    - `getBlueprint` is a RUNTIME tool, so it needs **no** `mcp_tools` entry and **no**
+      `mcp_script` response — but the blueprint must be in the case's `corpus`, or the
+      expansion returns `{found: false}` (the non-oracle) and the run stays refused.
+    - Expand in ONE round and run in the next, not `[getBlueprint(x), runBlueprint(x)]`
+      in one response: the gate is satisfied only by a definition the model has already
+      SEEN, and a same-response pair is refused. Cases 2, 4 and 7 are written in the
+      batched shape on purpose — N deliverables cost 2 round-trips, not 2N.
 * A blueprint with a non-empty `result_grain` costs **two** `runQuery` responses:
   the node SQL, then the D56 grain probe (`{__bp_n, __bp_d}`, which must agree or
   `authoritative` is never earned). A blueprint with `result_grain: []` costs one.
-* `serves_intent` is **load-bearing**. Re-derivation is intent-scoped (below).
+* `serves_intent` is **load-bearing**, and it is now a **real runtime argument**,
+  not a fixture-only label. `build_model` injects it into the tool call's
+  `arguments` for `runQuery`/`runBlueprint`/`getTableSchema`; the runtime validates
+  it against the live `analysisState`, **strips it before dispatch** (the MCP would
+  reject an argument its schema does not declare) and persists it on
+  `TrailEntry.serves_intent`. A fixture tag naming an intent that does not exist is
+  dropped — the call still runs, the entry is untagged, and
+  `loop_intent_tag_dropped` fires.
 * The corpus is loaded through the real `load_seed_fixtures` +
   `resolve_blueprint_references`, so a fixture cannot drift from the seeded corpus
   and `ref:` nodes are inlined exactly as the hydrator inlines them.
@@ -178,11 +202,24 @@ post-blueprint `runQuery`, and asserts that the rejected turn-scoped predicate
 would have flagged it — so the two can never quietly collapse into one answer.
 
 In A2 there is no fixture to declare `serves_intent`, so it is reconstructed from
-the `updateAnalysisState` **trail entries**, whose `args` carry the model's own
-`{intent_id, evidence_tool_call_id}` bindings. Not from `loop_intent_completed`
-(06 gives it `evidence_tool_name`, and a tool *name* cannot tell two `runQuery`
-calls apart) and not from the final `AnalysisState` (latest-wins, so a rebound
-evidence id — precisely the re-derivation shape — has already been overwritten).
+the trail, from **two** sources unioned (`metrics.serves_intent_from_trail`):
+
+1. `TrailEntry.serves_intent` — the call-time tag the model itself put on the
+   call. The primary path, and the *only* source for a tag-closed intent, whose
+   state call carries no `evidence_tool_call_id` at all.
+2. The `updateAnalysisState` **trail entries**, whose `args` carry the model's own
+   `{intent_id, evidence_tool_call_id}` bindings — explicit citations, which are
+   still valid and are the only way one call completes several intents (04 §A).
+
+Not from `loop_intent_completed` (06 gives it `evidence_tool_name`, and a tool
+*name* cannot tell two `runQuery` calls apart) and not from the final
+`AnalysisState` (latest-wins, so a rebound evidence id — precisely the
+re-derivation shape — has already been overwritten).
+
+**Case 4 closes all three intents by tag alone** (`{intent_id, status}`, no
+evidence field), which is the exact shape that failed 9 times out of 9 against a
+live model on the citation path. Case 3 keeps explicit citations, so the suite
+exercises both bindings.
 
 ## Metrics (`metrics.py`)
 

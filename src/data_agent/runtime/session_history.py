@@ -27,16 +27,28 @@ KV de-reference happens on the read path.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from data_agent.runtime.composite.answer_with_table import (
     TOOL_NAME as ANSWER_TABLE_TOOL_NAME,
 )
-from data_agent.runtime.composite.answer_with_table import resolve_designation
+from data_agent.runtime.composite.answer_with_table import (
+    AnswerTable,
+    BlueprintRun,
+    enrich_table,
+    finalize_designations,
+    is_answer_table_in_scope,
+    resolve_designations,
+    terminal_sql_by_id,
+)
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
 from data_agent.runtime.context.scope_filter import filter_messages, filter_trail
 from data_agent.runtime.session.models import PauseCheckpoint, TrailEntry, TurnMessage
+
+
+def _noop_observer(event: str, payload: dict[str, Any]) -> None:  # pragma: no cover - default
+    return None
 
 
 def _project_provenance(
@@ -73,6 +85,8 @@ def project_history(
     column_scope: frozenset[str],
     pause_checkpoint: PauseCheckpoint | None,
     blueprint_terminal_sql: Mapping[str, str] | None = None,
+    blueprint_runs: Mapping[str, BlueprintRun] | None = None,
+    observer: Callable[[str, dict[str, Any]], None] = _noop_observer,
 ) -> dict[str, Any]:
     """Project the persisted `messages`/`tool_trail` into the §1.1 transcript
     shape under *column_scope*, applying the two D44 filters first.
@@ -135,12 +149,54 @@ def project_history(
     # LAST designation wins, matching the loop. `blueprint_terminal_sql` is supplied
     # by the caller because resolving a `blueprint_id` needs a D46 KV de-reference,
     # which this pure projection cannot do — see `GET /session/history` in `app.py`.
-    answer_sql_by_turn: dict[int, str] = {}
+    #
+    # 08: the whole SET, not just the primary. `answer_sql` stays and is the SAME
+    # projection the loop's envelope applies (`answer_tables[0].sql`), computed here
+    # from the reconstructed list rather than resolved a second way — so a reloaded
+    # transcript and the live turn cannot disagree about which table is the lead.
+    runs: Mapping[str, BlueprintRun] = blueprint_runs or {
+        # Back-compat for the `blueprint_terminal_sql` callers (tests and any
+        # caller that has only the SQL): a run with no verification and no slots,
+        # which renders as a table with no badge and no chip rather than a wrong one.
+        bp_id: BlueprintRun(terminal_sql=sql)
+        for bp_id, sql in (blueprint_terminal_sql or {}).items()
+    }
+    terminal_by_id = terminal_sql_by_id(runs)
+    answer_tables_by_turn: dict[int, list[AnswerTable]] = {}
+    scope_dropped_by_turn: dict[int, int] = {}
     for entry in trail:
-        if entry.status == "ok" and entry.tool_name == ANSWER_TABLE_TOOL_NAME:
-            resolved = resolve_designation(entry.args, blueprint_terminal_sql or {})
-            if resolved is not None:
-                answer_sql_by_turn[entry.turn_index] = resolved
+        if entry.status != "ok" or entry.tool_name != ANSWER_TABLE_TOOL_NAME:
+            continue
+        finalized = finalize_designations(
+            resolve_designations(entry.args, terminal_by_id).items
+        )
+        if not finalized.tables:
+            continue
+        persisted = entry.answer_table_provenance
+        kept: list[AnswerTable] = []
+        dropped = 0
+        for index, table in enumerate(finalized.tables):
+            # POSITIONALLY PARALLEL to what was persisted. A length mismatch means
+            # the reconstruction no longer lines up with what was captured (an
+            # expired blueprint `result_full` is enough), so the positional read is
+            # abandoned rather than mis-attributed — `None` then means undetermined,
+            # and `is_answer_table_in_scope` says what that costs.
+            provenance = (
+                persisted[index]
+                if persisted is not None and len(persisted) == len(finalized.tables)
+                else None
+            )
+            enriched = enrich_table(table, runs, provenance=provenance)
+            if is_answer_table_in_scope(enriched.provenance, column_scope):
+                kept.append(enriched)
+            else:
+                dropped += 1
+        # LAST designation wins, matching the loop, and over the whole set.
+        answer_tables_by_turn[entry.turn_index] = kept
+        scope_dropped_by_turn[entry.turn_index] = dropped
+    for dropped in scope_dropped_by_turn.values():
+        if dropped:
+            observer("history_answer_table_scope_dropped", {"table_count": dropped})
 
     turns: list[dict[str, Any]] = []
     for turn_index in sorted(turn_order):
@@ -164,8 +220,22 @@ def project_history(
                 "assumptions": assumptions,
                 # Withheld with the answer, exactly like `assumptions`: if the answer
                 # did not survive the scope filter, neither does the query behind it.
+                # §D.3, stated so a later reader does not mistake it for a bug: the
+                # answer-survival gate is TURN-WIDE and deliberately so, because the
+                # turn's provenance union already contains every table's columns. A
+                # narrowing that excludes one table's columns drops the assistant
+                # message, and all N tables go with it. Per-table provenance closes
+                # the OTHER half — a designated `sql=` that was never executed, whose
+                # columns appear in no trail entry's provenance at all.
                 "answer_sql": (
-                    answer_sql_by_turn.get(turn_index) if assistant is not None else None
+                    (answer_tables_by_turn.get(turn_index) or [None])[0].sql
+                    if assistant is not None and answer_tables_by_turn.get(turn_index)
+                    else None
+                ),
+                "answer_tables": (
+                    [table.to_doc() for table in answer_tables_by_turn[turn_index]]
+                    if assistant is not None and answer_tables_by_turn.get(turn_index)
+                    else None
                 ),
                 "tool_calls": [
                     _project_tool_call(entry) for entry in tools_by_turn.get(turn_index, [])

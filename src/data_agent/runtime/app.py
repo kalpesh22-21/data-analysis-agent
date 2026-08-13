@@ -45,7 +45,11 @@ from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
 from data_agent.runtime.catalog.export_client import build_catalog_cache
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
-from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
+from data_agent.runtime.composite.answer_with_table import (
+    AnswerWithTableTool,
+    BlueprintRun,
+    blueprint_run_from_result,
+)
 from data_agent.runtime.composite.record_assumptions import RecordAssumptionsTool
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.config import (
@@ -194,6 +198,13 @@ def _outcome_to_dict(outcome: TurnOutcome) -> dict[str, Any]:
         "answer_sql": outcome.answer_sql,
         "blueprint_use": outcome.blueprint_use,
         "verification": outcome.verification,
+        # 08: EVERY table the model designated, one per part of a multi-part answer,
+        # each with its own `caption`, `blueprint_use` chip and `verification` badge
+        # and each paged independently through `POST /query/page`. ADDITIVE — the
+        # three keys above keep their meaning and are derived from `answer_tables[0]`
+        # in the loop, so an old client that ignores this key renders exactly as it
+        # did (the posture `assumptions` shipped with).
+        "answer_tables": outcome.answer_tables,
         "provenance": (
             sorted(f"{db}.{col}" for db, col in outcome.provenance)
             if outcome.provenance is not None
@@ -696,10 +707,16 @@ def create_app(
             max_loop_iterations=settings.max_loop_iterations,
             max_wall_clock_seconds=settings.max_wall_clock_seconds,
             max_budget_windows=settings.max_budget_windows,
-            token_budget=settings.model_context_window,
+            # Per-window SPEND ceiling (2026-08-12 fix): Σ(prompt + completion)
+            # across the window's round-trips. This used to be
+            # `settings.model_context_window` — a spend sum measured against an
+            # OCCUPANCY limit, which is the wrong unit and tripped windows at ~6-14
+            # rounds. Spend now has its own field.
+            max_token_spend=settings.max_window_token_spend,
             # Total-request fit budget (2026-08 fix): the FULL canonical request is
             # fit to (model_context_window - response_token_reserve) before every
             # send_turn so the leading base prompt is never front-truncated out.
+            # THIS is the occupancy ceiling; the spend ceiling above is not.
             request_token_budget=settings.request_token_budget(),
             max_tool_calls_per_iteration=settings.max_tool_calls_per_iteration,
             observer=observer,
@@ -859,7 +876,11 @@ def create_app(
         # session (typically 0-2), and a missing/expired ref simply leaves that id
         # unresolved — the turn then reports `answer_sql: null`, exactly as it did
         # before this existed.
-        blueprint_terminal_sql: dict[str, str] = {}
+        # 08 §C.3: the SAME two keys of the SAME `result_full` the in-window
+        # `_capture_terminal_sql` reads, through the SAME constructor — so a
+        # reloaded table's badge is the badge the live turn showed, and a blueprint
+        # id can never be paired with another run's verification.
+        blueprint_runs: dict[str, BlueprintRun] = {}
         for entry in doc.tool_trail:
             if (
                 entry.status != "ok"
@@ -884,17 +905,23 @@ def create_app(
                     exc_info=True,
                 )
                 continue
-            if isinstance(result_full, dict):
-                bp_id = result_full.get("blueprint_id")
-                terminal_sql = result_full.get("terminal_sql")
-                if isinstance(bp_id, str) and isinstance(terminal_sql, str) and terminal_sql:
-                    blueprint_terminal_sql[bp_id] = terminal_sql
+            captured = blueprint_run_from_result(
+                result_full, slots=entry.args.get("slot_bindings") or {}
+            )
+            if captured is not None:
+                blueprint_runs[captured[0]] = captured[1]
         body = project_history(
             doc.messages,
             doc.tool_trail,
             credentials.column_scope,
             doc.pause_checkpoint,
-            blueprint_terminal_sql=blueprint_terminal_sql,
+            blueprint_runs=blueprint_runs,
+            # 08 §D.3: `history_answer_table_scope_dropped` makes the gap between
+            # "the answer survived the scope filter" and "its tables survived it"
+            # visible rather than inferred. The guardrail observer only spans
+            # `loop_*` events, so in production this reaches whatever extra
+            # observers are wired; the harness records it directly.
+            observer=combine_observers(_tracing_observer, *extra_observers),
         )
         return JSONResponse(content={"session_id": x_session_id, **body})
 

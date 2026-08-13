@@ -370,6 +370,11 @@ async def test_dispatched_tool_call_persists_trail_entry_and_full_result() -> No
                 ]
             ),
             ModelTurnResult(assistant_text="Here are the employee codes."),
+            # The two-row result trips the ANSWER-SHAPE GATE (05 §J): the first
+            # prose finish is refused once and handed back a round. This test is
+            # about trail persistence, so it simply answers in prose again — the
+            # window's one grant is spent, and the second finish passes.
+            ModelTurnResult(assistant_text="Here are the employee codes."),
         ]
     )
     raw_result = {
@@ -515,7 +520,10 @@ async def test_emulated_discovery_pairs_injected_after_the_current_question() ->
 
     # THE POINT: every emulated pair FOLLOWS the real user question, and the
     # question immediately precedes the first of them — nothing sits between.
-    user_index = next(i for i, m in enumerate(messages) if m.get("role") == "user")
+    # The question is the LAST `user` message, not the first: the date anchor
+    # (`context/assembly.py::_turn_date_anchor`) is inserted immediately before it
+    # and is itself `role:"user"`.
+    user_index = max(i for i, m in enumerate(messages) if m.get("role") == "user")
     assert messages[user_index]["content"] == "How many?"
     first_emulated = min(
         i for i, m in enumerate(messages) if m["role"] == "assistant" and m.get("tool_calls")
@@ -525,12 +533,14 @@ async def test_emulated_discovery_pairs_injected_after_the_current_question() ->
     # Full expected order, so a future reordering cannot pass by accident.
     assert [m["role"] for m in messages] == [
         "system",
-        "user",
+        "user",  # the date anchor
+        "user",  # the question
         "assistant",
         "tool",
         "assistant",
         "tool",
     ]
+    assert messages[1]["content"].startswith("Today's date is ")
 
 
 async def test_emulated_discovery_stays_anchored_at_the_first_question_on_later_turns() -> None:
@@ -565,9 +575,11 @@ async def test_emulated_discovery_stays_anchored_at_the_first_question_on_later_
         "assistant",  # emulated listTables
         "tool",
         "assistant",  # A0
+        "user",  # the date anchor, immediately before the current question
         "user",  # Q1
     ]
     assert messages[1]["content"] == "Q0?"
+    assert messages[-2]["content"].startswith("Today's date is ")
     assert messages[-1]["content"] == "Q1?"
     # Nothing emulated trails the current question.
     assert not any(m.get("tool_calls") for m in messages[7:])

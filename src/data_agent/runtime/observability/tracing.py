@@ -631,11 +631,64 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     "to_status",
     "reason_code",
     "evidence_tool_name",
+    # HOW the evidence binding was established — `tagged` (the model named the
+    # intent on the call, call-time tagging) or `auto_bound` (the model named
+    # nothing and the runtime bound the one call that could have served it,
+    # 03 §C.3.2). A closed two-member enum, so route derivation can read its own
+    # provenance, and `auto_bound` is the weaker of the two by construction.
+    # `declared` — the model citing a `tool_call_id` itself — was RETIRED with the
+    # field on 2026-08-12 and can no longer be produced. The TAG VALUE itself is
+    # never an attribute: a valid one is a runtime-assigned `intent_id` (already
+    # allowlisted above, and emitted as `intent_id`), while a dropped one is
+    # arbitrary model text and is reported by RULE NAME on
+    # `loop_intent_tag_dropped.reason` instead (D25).
+    "evidence_binding",
     "exit",
     "pending_count",
     "proposed_count",
     "blocking_tool_name",
     "reason",
+    # The blueprint the getBlueprint-before-run gate refused
+    # (`loop_blueprint_definition_not_read`). D25-safe: a blueprint id is
+    # CORPUS-AUTHORED, never user content — the same class as the table/database
+    # identifiers already allowlisted above. Neither the blueprint's SQL nor the
+    # user's question is ever placed on the span.
+    "blueprint_id",
+    # --- trim-aware re-fetch exemption (loop/agent_loop.py) ---
+    # How many re-fetches this signature has already been granted in the window, and
+    # the cap. Both are small integers about the LOOP'S OWN decisions — no read
+    # arguments, no result content. `loop_trimmed_read_refetch_capped` is the event
+    # worth alerting on (a turn re-reading what the budget keeps dropping), and it
+    # says nothing without these two.
+    "refetch_count",
+    "refetch_cap",
+    # --- the refused-round cap (05 §F) ---
+    # `loop_intent_force_blocked.budget_cap_reached` — a bare `True`, present ONLY
+    # on the cap-during-a-refused-round path and omitted everywhere else. The
+    # disposition on that path is `ENFORCEMENT_EXHAUSTED` because enforcement, not
+    # capacity, is what ran out; this flag keeps the capacity fact visible to an
+    # operator watching budget pressure without putting it on the intent record.
+    # D25-safe by shape: a boolean cannot carry user content.
+    "budget_cap_reached",
+    # --- multi-table answerWithTable (08 §L) ---
+    # `loop_answer_tables_designated` — how many tables the model designated, how
+    # many of them are a blueprint's result, and how many carry a D56 badge. Three
+    # small counts about the LOOP'S OWN bookkeeping. The captions, the SQL and the
+    # cell values never appear on any of these payloads in the first place, so this
+    # list is the second of two independent guards. `table_count` is shared with
+    # `history_answer_table_scope_dropped`.
+    "table_count",
+    "blueprint_table_count",
+    "verified_table_count",
+    # --- the answer-shape gate (05 §J) ---
+    # `loop_answer_shape_refused.multi_row_calls` — how many successful multi-row
+    # `runQuery`/`runBlueprint` calls the turn was holding when it tried to finish in
+    # bare prose. A count of the LOOP'S OWN bookkeeping: not the row counts
+    # themselves, not the SQL, not a cell. Without it the event cannot distinguish
+    # "one untabled result" from "five", which is the difference between a model
+    # that forgot a table and one that abandoned the format entirely.
+    # (`loop_answer_shape_exhausted` carries no payload at all.)
+    "multi_row_calls",
 )
 
 

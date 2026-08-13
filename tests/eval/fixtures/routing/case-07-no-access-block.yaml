@@ -39,6 +39,11 @@ mcp_script:
         code: COLUMN_SCOPE_VIOLATION
         message: "[COLUMN_SCOPE_VIOLATION] annual_salary is not in this caller's column scope."
 model_script:
+  # Round 1 — declare the intents and expand the ONE blueprint that survives the
+  # scope pre-filter. `bp-average-salary-by-department` is not expandable here:
+  # `getBlueprint` is a non-oracle, so an out-of-scope id returns `{found: false}`
+  # exactly as a missing one does — which is why intent i2 goes the raw-query route
+  # and earns its NO_ACCESS denial from the MCP.
   - tool_calls:
       - name: updateAnalysisState
         id: s1
@@ -46,6 +51,11 @@ model_script:
           intents:
             - description: Projected hires over the next 6 months
             - description: Average salary by department
+      - name: getBlueprint
+        id: g1
+        args: {id: bp-hires-projection}
+  # Round 2 — the blueprint for i1, the ad-hoc (and denied) query for i2.
+  - tool_calls:
       - name: runBlueprint
         id: b1
         serves_intent: i1

@@ -225,8 +225,13 @@ async def test_total_request_budget_pins_base_prompt_and_bounds_every_send_turn(
         )
         assert outcome.status == "done"
 
-    # Two send_turn calls per external turn (one fat query, one answer).
-    assert len(model.calls) == 2 * n_turns
+    # THREE send_turn calls per external turn: one fat query, one answer, and one
+    # re-answer. The fat result is multi-row, so the first prose finish trips the
+    # ANSWER-SHAPE GATE (05 §J) and is handed back a round; this model answers in
+    # prose again, the window's one grant is spent, and the second finish passes.
+    # The extra round-trip is itself in scope here — it carries the nudge at the
+    # tail, and the budget assertions below run over it like every other call.
+    assert len(model.calls) == 3 * n_turns
 
     # A single fat result is genuinely ~30k tokens — so a raw untrimmed request
     # with several of them dwarfs the budget (the scenario the fix must contain).

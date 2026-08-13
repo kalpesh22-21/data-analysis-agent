@@ -30,6 +30,7 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests._blueprint_gate import expand_blueprint
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
@@ -125,6 +126,11 @@ async def test_one_run_blueprint_is_one_tool_call_despite_inner_probes() -> None
         ]
     )
     loop, store = _loop(model, runtime_tools={"runBlueprint": tool})
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint the model is about to run. Seeded as
+    # the real trail entry the gate reads, so the predicate under test is the
+    # production one (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="avg salary in Sales?")
 
@@ -132,7 +138,9 @@ async def test_one_run_blueprint_is_one_tool_call_despite_inner_probes() -> None
     assert outcome.tool_calls_made == 1  # ONE model-facing call...
     assert len(mcp.calls) == 3  # ...despite THREE inner runQuery probes
     trail = await store.load_trail(SESSION_ID)
-    assert [e.tool_name for e in trail] == ["runBlueprint"]
+    # The seeded getBlueprint leads; the point of the assertion is unchanged —
+    # ONE runBlueprint entry despite three inner runQuery probes.
+    assert [e.tool_name for e in trail] == ["getBlueprint", "runBlueprint"]
     assert trail[0].status == "ok"
 
 
@@ -184,6 +192,11 @@ async def test_slot_askuser_pauses_the_turn_via_the_seam() -> None:
         ]
     )
     loop, store = _loop(model, runtime_tools={"runBlueprint": _PausingTool()})
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint the model is about to run. Seeded as
+    # the real trail entry the gate reads, so the predicate under test is the
+    # production one (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="avg salary?")
 
@@ -198,9 +211,10 @@ async def test_slot_askuser_pauses_the_turn_via_the_seam() -> None:
     assert cp.blueprint_id == _BID
     assert cp.slot_bindings_json == '{"department": "S"}'
     assert cp.consumed is False
-    # No trail entry was persisted for the paused (un-completed) tool call.
+    # No trail entry was persisted for the paused (un-completed) tool call — the
+    # seeded getBlueprint expansion is the only entry there is.
     trail = await store.load_trail(SESSION_ID)
-    assert trail == []
+    assert [e.tool_name for e in trail] == ["getBlueprint"]
 
 
 async def test_pause_checkpoint_round_trips_blueprint_fields() -> None:
@@ -215,6 +229,11 @@ async def test_pause_checkpoint_round_trips_blueprint_fields() -> None:
         ]
     )
     loop, store = _loop(model, runtime_tools={"runBlueprint": _PausingTool()})
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint the model is about to run. Seeded as
+    # the real trail entry the gate reads, so the predicate under test is the
+    # production one (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="q")
 
     # Force a full doc round-trip to prove the wire encoding carries the new fields.

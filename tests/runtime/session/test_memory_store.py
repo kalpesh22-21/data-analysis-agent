@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import (
     AnalysisState,
     PauseCheckpoint,
+    SessionDoc,
     TrackedIntent,
     TrailEntry,
     TurnMessage,
@@ -259,6 +262,61 @@ async def test_analysis_state_survives_a_pause_and_resume(
     assert live_analysis_state(resumed, 4) is None
 
 
+async def test_the_intent_tag_survives_a_pause_and_resume_and_the_couchbase_wire(
+    store: InMemorySessionStore,
+) -> None:
+    """The call-time tag is the PRIMARY completion binding, so it has to outlive a
+    pause: `updateAnalysisState` re-reads the trail from the document on every call,
+    and an intent tagged in the round before an `askUser` is normally closed in the
+    round after it.
+
+    Both `SessionStore` implementations are covered. The in-memory store is driven
+    directly; `CouchbaseSessionStore` persists `SessionDoc.to_doc()` and parses the
+    document back, so the JSON round-trip below is exactly its wire path — asserted
+    here rather than only in the live-cluster tests, which are skipped by default.
+    """
+    tagged = TrailEntry(
+        turn_index=3,
+        tool_call_id="call_b1",
+        tool_name="runBlueprint",
+        args={"id": "bp-headcount", "slot_bindings": {}},
+        status="ok",
+        error_code=None,
+        provenance=frozenset(),
+        result_preview=None,
+        result_full_ref=None,
+        ts="2026-08-12T00:00:00+00:00",
+        authoritative=True,
+        serves_intent="i1",
+    )
+    await store.append_message(
+        "sess-tag", TurnMessage(turn_index=3, role="user", content="two things", ts="t0")
+    )
+    await store.append_trail_entry("sess-tag", tagged)
+    await store.write_pause_checkpoint(
+        "sess-tag",
+        PauseCheckpoint(
+            reason="askUser",
+            pending_question={"question": "which?", "options": None},
+            awaiting="user_answer",
+            consumed=False,
+            budget_window_count=1,
+            serves_intent="i1",
+        ),
+    )
+    _, cas = await store.get_session_with_cas("sess-tag")
+    resumed = await store.resume_checkpoint("sess-tag", cas, "the sales department")
+
+    assert [e.serves_intent for e in resumed.tool_trail] == ["i1"]
+    assert resumed.pause_checkpoint.serves_intent == "i1"
+
+    # The Couchbase wire: dict -> JSON -> dict -> dataclass.
+    on_the_wire = json.loads(json.dumps(resumed.to_doc()))
+    restored = SessionDoc.from_doc(on_the_wire)
+    assert [e.serves_intent for e in restored.tool_trail] == ["i1"]
+    assert restored.pause_checkpoint.serves_intent == "i1"
+
+
 # --- claim_finalization_block (Release 1, 05 §C.1) --------------------------
 
 
@@ -268,12 +326,49 @@ async def test_the_finalization_block_is_claimable_once_per_window(
     """"One forced re-round per budget window" is LITERAL: the counter is keyed by
     (turn, window) on the session doc, so it survives the `_run_loop_body` re-entry
     that every resume performs while `window_count` stands still."""
-    assert await store.claim_finalization_block("sess-1", 0, 1) is True
-    assert await store.claim_finalization_block("sess-1", 0, 1) is False
-    assert await store.claim_finalization_block("sess-1", 0, 1) is False
+    assert await store.claim_finalization_block("sess-1", 0, 1, "intents") is True
+    assert await store.claim_finalization_block("sess-1", 0, 1, "intents") is False
+    assert await store.claim_finalization_block("sess-1", 0, 1, "intents") is False
 
     doc = await store.get_or_create_session("sess-1")
-    assert doc.finalization_blocks == {"0:1": 1}
+    assert doc.finalization_blocks == {"0:1:intents": 1}
+
+
+async def test_each_block_kind_has_its_own_allowance(
+    store: InMemorySessionStore,
+) -> None:
+    """05 §J.3. The two gates that can refuse a finish hold INDEPENDENT per-window
+    allowances, and this is the store-level statement of it: spending `intents`
+    leaves `answer_shape` untouched, and vice versa.
+
+    They shared one allowance for a release. Live, that meant the pending-intents
+    nudge took it first on multi-intent questions and the answer-shape gate was
+    starved in 2 of 4 runs — the two gates fire in SEQUENCE on those turns (prose
+    with intents pending, then prose with tables untabled), not in competition, so
+    one allowance could only ever serve the first.
+    """
+    assert await store.claim_finalization_block("sess-1", 0, 1, "intents") is True
+    assert await store.claim_finalization_block("sess-1", 0, 1, "intents") is False
+    # The OTHER kind, same turn and window, is untouched by that.
+    assert await store.claim_finalization_block("sess-1", 0, 1, "answer_shape") is True
+    assert await store.claim_finalization_block("sess-1", 0, 1, "answer_shape") is False
+
+    doc = await store.get_or_create_session("sess-1")
+    assert doc.finalization_blocks == {"0:1:intents": 1, "0:1:answer_shape": 1}
+
+
+async def test_an_unknown_block_kind_is_refused_rather_than_minting_an_allowance(
+    store: InMemorySessionStore,
+) -> None:
+    """The kind becomes part of a PERSISTED key, so an unrecognised one would not
+    fail — it would quietly mint a brand-new, unbounded allowance that no bound
+    applies to. `finalization_block_key` validates instead, and the loop's claim
+    wrapper treats any exception as "no re-round available"."""
+    with pytest.raises(ValueError, match="unknown finalization block kind"):
+        await store.claim_finalization_block("sess-1", 0, 1, "not_a_kind")  # type: ignore[arg-type]
+
+    doc = await store.get_or_create_session("sess-1")
+    assert not doc.finalization_blocks
 
 
 async def test_a_fresh_budget_window_gets_its_own_block(
@@ -281,12 +376,12 @@ async def test_a_fresh_budget_window_gets_its_own_block(
 ) -> None:
     """A budget-cap "continue" grants a new window (D55), and with it a new
     allowance."""
-    assert await store.claim_finalization_block("sess-1", 0, 1) is True
-    assert await store.claim_finalization_block("sess-1", 0, 2) is True
-    assert await store.claim_finalization_block("sess-1", 0, 2) is False
+    assert await store.claim_finalization_block("sess-1", 0, 1, "intents") is True
+    assert await store.claim_finalization_block("sess-1", 0, 2, "intents") is True
+    assert await store.claim_finalization_block("sess-1", 0, 2, "intents") is False
 
     doc = await store.get_or_create_session("sess-1")
-    assert doc.finalization_blocks == {"0:1": 1, "0:2": 1}
+    assert doc.finalization_blocks == {"0:1:intents": 1, "0:2:intents": 1}
 
 
 async def test_a_fresh_turn_gets_its_own_block_at_the_same_window_number(
@@ -297,14 +392,14 @@ async def test_a_fresh_turn_gets_its_own_block_at_the_same_window_number(
     and is never cleared, so a window-only key made turn 1's window 1 collide with
     turn 0's — killing the forced re-round from a session's second block-spending
     turn onward."""
-    assert await store.claim_finalization_block("sess-1", 0, 1) is True
-    assert await store.claim_finalization_block("sess-1", 0, 1) is False
+    assert await store.claim_finalization_block("sess-1", 0, 1, "intents") is True
+    assert await store.claim_finalization_block("sess-1", 0, 1, "intents") is False
 
-    assert await store.claim_finalization_block("sess-1", 1, 1) is True
-    assert await store.claim_finalization_block("sess-1", 1, 1) is False
+    assert await store.claim_finalization_block("sess-1", 1, 1, "intents") is True
+    assert await store.claim_finalization_block("sess-1", 1, 1, "intents") is False
 
     doc = await store.get_or_create_session("sess-1")
-    assert doc.finalization_blocks == {"0:1": 1, "1:1": 1}
+    assert doc.finalization_blocks == {"0:1:intents": 1, "1:1:intents": 1}
 
 
 async def test_the_block_counter_survives_a_pause_and_resume(
@@ -312,7 +407,7 @@ async def test_the_block_counter_survives_a_pause_and_resume(
 ) -> None:
     """The whole reason it is persisted: an exit-#1 refusal leaves NO trail entry
     by design, so a resume cannot reconstruct it from the trail."""
-    await store.claim_finalization_block("sess-1", 0, 1)
+    await store.claim_finalization_block("sess-1", 0, 1, "intents")
     await store.write_pause_checkpoint(
         "sess-1",
         PauseCheckpoint(
@@ -326,5 +421,5 @@ async def test_the_block_counter_survives_a_pause_and_resume(
     _, cas = await store.get_session_with_cas("sess-1")
     resumed = await store.resume_checkpoint("sess-1", cas, "an answer")
 
-    assert resumed.finalization_blocks == {"0:1": 1}
-    assert await store.claim_finalization_block("sess-1", 0, 1) is False
+    assert resumed.finalization_blocks == {"0:1:intents": 1}
+    assert await store.claim_finalization_block("sess-1", 0, 1, "intents") is False

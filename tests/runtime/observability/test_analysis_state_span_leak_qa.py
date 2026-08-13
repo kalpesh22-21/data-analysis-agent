@@ -30,7 +30,9 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import (
+    EVIDENCE_BINDINGS,
     REJECTION_REASONS,
+    TAG_DROP_REASONS,
     UpdateAnalysisStateTool,
 )
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
@@ -224,8 +226,14 @@ _SHAPE_EVENTS = frozenset(
         "loop_analysis_state_transition",
         "loop_analysis_state_rejected",
         "loop_analysis_state_late_init_rejected",
+        "loop_intent_blocked",
         "loop_intent_completed",
         "loop_intent_force_blocked",
+        # Call-time intent tagging. `loop_intent_tag_dropped` is the one event in
+        # the family that fires on a value the model INVENTED, so it is scanned
+        # here specifically: it must carry the rule name and the tool name, and
+        # never the tag itself.
+        "loop_intent_tag_dropped",
         "loop_metadata_evidence_completion",
         "loop_zero_row_block",
         "loop_zero_row_completion",
@@ -263,6 +271,15 @@ _ALLOWED_STRINGS = (
     INTENT_STATUSES
     | REASON_CODES
     | REJECTION_REASONS
+    # Call-time intent tagging: `evidence_binding` (how the binding was
+    # established) and `loop_intent_tag_dropped.reason` (why a tag was dropped).
+    # BOTH are imported closed enums for the same reason every other set here is —
+    # the guard has to be structural. The dropped TAG VALUE is deliberately absent
+    # from every payload: a valid tag is a runtime-assigned `intent_id` and matches
+    # `_INTENT_ID` below, but an invalid one is arbitrary model text, so it is
+    # reported by rule name only.
+    | EVIDENCE_BINDINGS
+    | TAG_DROP_REASONS
     | _TOOL_NAMES
     | frozenset({"answer_with_table", "no_tool_calls"})  # the two exits
 )

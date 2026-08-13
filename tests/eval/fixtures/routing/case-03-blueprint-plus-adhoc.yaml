@@ -32,6 +32,8 @@ mcp_script:
       row_count: 1
       truncated: false
 model_script:
+  # Round 1 — declare the intents and expand the blueprint (the runtime refuses a
+  # runBlueprint for an id this turn has not expanded).
   - tool_calls:
       - name: updateAnalysisState
         id: s1
@@ -39,6 +41,12 @@ model_script:
           intents:
             - description: Projected hires over the next 6 months
             - description: Current headcount in Support
+      - name: getBlueprint
+        id: g1
+        args: {id: bp-hires-projection}
+  # Round 2 — the blueprint and the ad-hoc residual, in that order. The ORDER is
+  # load-bearing: the re-derivation predicate needs the query to follow the run.
+  - tool_calls:
       - name: runBlueprint
         id: b1
         serves_intent: i1

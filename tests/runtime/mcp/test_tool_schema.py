@@ -6,7 +6,10 @@ import json
 
 import pytest
 
-from data_agent.runtime.composite.analysis_state import SUBSTANTIVE_TOOLS
+from data_agent.runtime.composite.analysis_state import (
+    INTENT_TAGGABLE_TOOLS,
+    SUBSTANTIVE_TOOLS,
+)
 from data_agent.runtime.mcp.client import MCPToolSpec
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.tool_schema import (
@@ -18,9 +21,11 @@ from data_agent.runtime.mcp.tool_schema import (
     RUN_BLUEPRINT_TOOL_SCHEMA,
     SEARCH_BLUEPRINTS_TOOL_SCHEMA,
     SEARCH_KNOWLEDGE_TOOL_SCHEMA,
+    SERVES_INTENT_PARAM,
     UPDATE_ANALYSIS_STATE_TOOL_SCHEMA,
     ToolNameCollisionError,
     ToolSchemaCache,
+    augment_with_serves_intent,
     fetch_function_schemas,
     translate_tool_spec,
 )
@@ -159,6 +164,92 @@ async def test_fetch_function_schemas_includes_all_6_plus_runtime_tools() -> Non
         UPDATE_ANALYSIS_STATE_TOOL_SCHEMA
     )
     assert set(UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["parameters"]["required"]) == {"intents"}
+
+
+async def test_serves_intent_is_advertised_on_exactly_the_taggable_tools() -> None:
+    """Call-time intent tagging adds ONE optional parameter, to exactly the three
+    tools whose results 04 §A accepts as completion evidence. Advertising it
+    anywhere else would be a path to nowhere: a tag on a fourth tool could never
+    resolve to anything, and the model would spend calls learning that.
+
+    Derived from `INTENT_TAGGABLE_TOOLS`, not a hand-written list, so the schema
+    surface and the resolver cannot drift apart.
+    """
+    client = FakeMCPClient(tools=_FAKE_TOOLS)
+    schemas = await fetch_function_schemas(client, jwt="tok", session_id="s1")
+    assert len(schemas) == 15, "the augmentation must not add or drop a tool"
+
+    advertised = {
+        schema["name"]
+        for schema in schemas
+        if "serves_intent" in (schema.get("parameters") or {}).get("properties", {})
+    }
+    assert advertised == set(INTENT_TAGGABLE_TOOLS)
+    for schema in schemas:
+        properties = (schema.get("parameters") or {}).get("properties", {})
+        if "serves_intent" in properties:
+            assert properties["serves_intent"] == SERVES_INTENT_PARAM
+            # OPTIONAL — a tag is a convenience, never a precondition for running
+            # the tool.
+            assert "serves_intent" not in (schema["parameters"].get("required") or [])
+
+
+def test_the_augmentation_does_not_mutate_the_mcps_own_schema() -> None:
+    """`MCPToolSpec.input_schema` belongs to the client and the translated list is
+    CACHED by `ToolSchemaCache`, so the augmentation rebuilds rather than writing
+    into either. A mutating version would leak `serves_intent` into whatever else
+    shares that object — including a `force_reload` comparison."""
+    spec = next(t for t in _FAKE_TOOLS if t.name == "runQuery")
+    before = json.loads(json.dumps(spec.input_schema))
+    augmented = augment_with_serves_intent(translate_tool_spec(spec))
+    assert "serves_intent" in augmented["parameters"]["properties"]
+    assert spec.input_schema == before, "the MCP's own schema object was mutated"
+
+
+def test_the_augmentation_degrades_on_a_schema_shape_it_does_not_recognise() -> None:
+    """The tag is an optimisation for the model, never a precondition. A schema
+    whose `parameters`/`properties` are not dicts (nothing the live MCP produces,
+    but the shape is not ours to assume) comes back untouched rather than raising
+    at startup and taking the whole tool catalogue with it."""
+    odd = MCPToolSpec(name="runQuery", description="", input_schema={"type": "string"})
+    schema = translate_tool_spec(odd)
+    assert augment_with_serves_intent(schema) == schema
+
+
+def test_update_analysis_state_description_teaches_the_one_binding_path() -> None:
+    """The tool description is re-sent every round-trip and is the model's only
+    other source of the contract. There is now exactly ONE binding path — the tag
+    (citation scored 0/9 live and was retired, 01a §14) — and the description has
+    to say what replaced the citation escape hatch, because 04 §A's reuse
+    allowance is unreachable to a model that does not know it may close a second
+    intent on the same call."""
+    description = UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["description"]
+    assert "serves_intent" in description
+    assert "You never name the call" in description
+    assert "IF ONE CALL ANSWERS TWO DELIVERABLES" in description
+    assert "simply mark the other completed too" in description
+    # The ordering caveat still applies to the tag.
+    assert "has not run yet" in description
+
+
+def test_update_analysis_state_schema_declares_exactly_three_item_properties() -> None:
+    """01a §14: `{description}` on the first call, `{intent_id, status}` on later
+    ones, and NOTHING ELSE.
+
+    Asserted on the payload, not just the prose, because the payload is what the
+    provider serialises: a model that cannot omit keys emits every property this
+    object declares, so each retired one is a placeholder the runtime has to
+    normalise away on every single call. The two names are also asserted absent
+    from the DESCRIPTION — the model reads that as instructions, and an
+    instruction to send a field the schema does not declare is how the 0/9
+    citation path stayed alive for as long as it did.
+    """
+    items = UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["parameters"]["properties"]["intents"]["items"]
+    assert set(items["properties"]) == {"description", "intent_id", "status"}
+    description = UPDATE_ANALYSIS_STATE_TOOL_SCHEMA["description"]
+    for retired in ("evidence_tool_call_id", "reason_code", "NO_ACCESS",
+                    "REQUIRED_DATA_UNAVAILABLE"):
+        assert retired not in description, f"retired field still taught: {retired}"
 
 
 def test_update_analysis_state_description_names_every_locking_tool() -> None:

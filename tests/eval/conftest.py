@@ -38,6 +38,7 @@ from fastapi.testclient import TestClient
 
 from data_agent.runtime import app as app_module
 from data_agent.runtime.app import create_app
+from data_agent.runtime.composite.analysis_state import INTENT_TAGGABLE_TOOLS
 from data_agent.runtime.config import RuntimeSettings
 from data_agent.runtime.mcp.client import MCPToolError, MCPToolSpec
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
@@ -107,13 +108,22 @@ class RecordingObserver:
 
 @dataclass(frozen=True)
 class ScriptedCall:
-    """One scripted tool call, plus the fixture's `serves_intent` declaration.
+    """One scripted tool call, plus its `serves_intent` tag.
 
     `serves_intent` is LOAD-BEARING (07 §C.2): the re-derivation predicate is
     INTENT-scoped, not turn-scoped, and without the per-call intent label the
     turn-scoped form flags case 3 — which `prompts.py` explicitly permits ("You
     MAY run further queries only for a DISTINCT part of the user's question that
     the blueprint did not answer").
+
+    IT IS NO LONGER FIXTURE-ONLY. When 07 was written, `serves_intent` was a
+    harness concept that lived on the fixture's tool call and was stripped before
+    dispatch. Call-time intent tagging made it a REAL model-facing argument on
+    `runQuery`/`runBlueprint`/`getTableSchema`, so `build_model` now passes it into
+    the tool call's ARGUMENTS and the runtime does the stripping and the
+    validation. The fixture key is unchanged; what changed is that the label is now
+    measured off the persisted `TrailEntry.serves_intent` rather than believed
+    because a YAML file said so.
     """
 
     name: str
@@ -354,13 +364,32 @@ def build_mcp(case: RoutingCase) -> FakeMCPClient:
     )
 
 
+def _scripted_arguments(call: ScriptedCall) -> dict[str, Any]:
+    """The arguments the scripted model "sends" — the fixture's `args` plus the
+    `serves_intent` TAG when the tool takes one.
+
+    The tag rides the arguments because that is where a real model puts it: the
+    schemas for `runQuery`, `runBlueprint` and `getTableSchema` advertise it, and
+    the runtime strips it at the dispatch boundary. Injecting it here (rather than
+    letting the harness carry it out of band, as it did when the field was
+    fixture-only) is what makes the A1 fixtures exercise the REAL mechanism —
+    including the strip, the validation against the live state, and the persistence
+    onto `TrailEntry.serves_intent` that A2's derivation depends on.
+    """
+    if call.serves_intent and call.name in INTENT_TAGGABLE_TOOLS:
+        return {**call.args, "serves_intent": call.serves_intent}
+    return dict(call.args)
+
+
 def build_model(case: RoutingCase) -> ScriptedModelClient:
     return ScriptedModelClient(
         [
             ModelTurnResult(
                 assistant_text=round_.assistant_text,
                 tool_calls=[
-                    ToolCallRequest(id=c.id, name=c.name, arguments=dict(c.args))
+                    ToolCallRequest(
+                        id=c.id, name=c.name, arguments=_scripted_arguments(c)
+                    )
                     for c in round_.tool_calls
                 ],
             )
@@ -381,13 +410,23 @@ def eval_settings(**overrides: Any) -> RuntimeSettings:
     THE BASE PROMPT IS NOT OVERRIDDEN. `agent_system_prompt_enabled` stays at its
     shipped default, so `ContextAssembler` gets the real prompt. A1 cannot FAIL on
     a bad prompt (see README), but it must not run without one either.
+
+    THE BUDGET IS PINNED HERE ON PURPOSE, and it tracks the shipped defaults (raised
+    2026-08-12 to 25 iterations / 180s on live wall-clock evidence; the per-window
+    token SPEND ceiling added the same day). Pinned so a config edit cannot silently
+    change what A1 measures; tracking the shipped values so A1 measures the runtime
+    that ships. None of these bind in this harness — the scripted model returns
+    instantly, reports no `usage` at all (so spend stays 0), and no case scripts more
+    than a handful of rounds — so a case that NEEDS a cap must override it explicitly
+    and say why.
     """
     defaults: dict[str, Any] = {
         "_env_file": None,
         "discovery_emulation_enabled": False,
-        "max_loop_iterations": 15,
-        "max_wall_clock_seconds": 60,
+        "max_loop_iterations": 25,
+        "max_wall_clock_seconds": 180,
         "max_budget_windows": 3,
+        "max_window_token_spend": 1_000_000,
     }
     defaults.update(overrides)
     return RuntimeSettings(**defaults)

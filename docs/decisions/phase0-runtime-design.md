@@ -729,6 +729,12 @@ one confused/adversarial session. Not specified by D47/D55; needs a concrete num
   values exist yet anywhere in the spec. Propose starting defaults (e.g. 15 iterations / a token
   budget tied to the model's context window / 60s wall-clock per window) as `RuntimeSettings`
   fields, explicitly labeled provisional pending real Phase-0 traffic.
+  **ANSWERED 2026-08-12 on live traffic — and the token half of the suggestion above was WRONG,
+  as a unit.** The per-window token counter sums each round-trip's prompt + completion, so it
+  measures SPEND; the model's context window is an OCCUPANCY limit (`max(context_k)`, enforced
+  per-request by `fit_request_to_budget`). Tying the one to the other made the ceiling quadratic
+  in round count and ended windows at 6-14 rounds. Shipped values: 25 iterations / 180s /
+  `max_window_token_spend=1_000_000` per window. See release-1/README.md finding 30.
 - **OQ-I (`SESSION_TTL` value).** Already an open parameter per D44/06; this design's Couchbase doc
   shape (§6) is agnostic to the value but needs one to configure `RuntimeSettings.session_ttl_seconds`.
 - **OQ-J (MCP connection pooling).** §3.1 opens a `ClientSession` per dispatched call for

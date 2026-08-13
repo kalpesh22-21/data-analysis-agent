@@ -33,6 +33,7 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from tests._blueprint_gate import expand_blueprint
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
@@ -134,6 +135,8 @@ async def test_slot_value_absent_from_every_span_and_progress_event() -> None:
         observer=capturing_observer,
         runtime_tools={"runBlueprint": tool},
     )
+    # The getBlueprint-before-runBlueprint gate (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_credentials(), user_message="avg salary?")
     assert outcome.status == "done"

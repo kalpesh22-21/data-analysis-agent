@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from data_agent.runtime.session.models import (
     INTENT_STATUSES,
     MODEL_REASON_CODES,
@@ -14,6 +16,7 @@ from data_agent.runtime.session.models import (
     TrackedIntent,
     TrailEntry,
     TurnMessage,
+    finalization_block_key,
     live_analysis_state,
 )
 
@@ -85,6 +88,73 @@ def test_trail_entry_authoritative_roundtrips() -> None:
     restored = TrailEntry.from_doc(doc)
     assert restored.authoritative is True
     assert restored == entry
+
+
+def test_trail_entry_serves_intent_roundtrips() -> None:
+    """The call-time intent tag is the PRIMARY completion binding, so it has to
+    survive the wire: `updateAnalysisState` resolves an intent's evidence by reading
+    this field off the persisted trail, and the trail is re-read from the document
+    on every state call (and after every pause/resume)."""
+    entry = TrailEntry(
+        turn_index=3,
+        tool_call_id="call_q1",
+        tool_name="runQuery",
+        args={"sql": "SELECT 1"},
+        status="ok",
+        error_code=None,
+        provenance=frozenset(),
+        result_preview=None,
+        result_full_ref=None,
+        ts="2026-08-12T00:00:00+00:00",
+        serves_intent="i2",
+    )
+    doc = entry.to_doc()
+    assert doc["serves_intent"] == "i2"
+    # The tag lives on its OWN field, never inside `args` — those are dispatched to
+    # the MCP, which rejects an argument its schema does not declare.
+    assert "serves_intent" not in doc["args"]
+    restored = TrailEntry.from_doc(doc)
+    assert restored.serves_intent == "i2"
+    assert restored == entry
+
+
+def test_trail_entry_legacy_doc_without_serves_intent_loads_as_none() -> None:
+    """Additive: a document written before tagging existed loads untagged, which is
+    exactly "this call was not bound to any intent"."""
+    legacy_doc = {
+        "turn_index": 0,
+        "tool_call_id": "call_legacy",
+        "tool_name": "runQuery",
+        "args": {"sql": "SELECT 1"},
+        "status": "ok",
+        "error_code": None,
+        "provenance": [],
+        "result_preview": None,
+        "result_full_ref": None,
+        "ts": "2026-07-01T00:00:00+00:00",
+    }
+    assert TrailEntry.from_doc(legacy_doc).serves_intent is None
+
+
+def test_pause_checkpoint_carries_the_intent_tag() -> None:
+    """A pausing `runBlueprint` writes NO trail entry — the entry is minted by
+    `_resume_blueprint` under a fresh id after the answer comes back. Without the
+    tag on the checkpoint it dies at the pause, and the intent that blueprint was
+    run for becomes closable only by citing an id the model never chose."""
+    checkpoint = PauseCheckpoint(
+        reason="blueprint_slot",
+        pending_question={"question": "which department?"},
+        awaiting="user_answer",
+        consumed=False,
+        blueprint_id="bp-headcount",
+        serves_intent="i1",
+    )
+    restored = PauseCheckpoint.from_doc(checkpoint.to_doc())
+    assert restored.serves_intent == "i1"
+    assert restored == checkpoint
+    legacy = checkpoint.to_doc()
+    del legacy["serves_intent"]
+    assert PauseCheckpoint.from_doc(legacy).serves_intent is None
 
 
 def test_trail_entry_legacy_doc_without_authoritative_loads_as_false() -> None:
@@ -216,14 +286,16 @@ def test_analysis_state_roundtrips_on_the_session_doc() -> None:
         created_at="2026-08-11T00:00:00+00:00",
         last_activity="2026-08-11T00:00:00+00:00",
         analysis_state=state,
-        # 05 §C.1 owns the writer; 03 §B owns the field. Keyed by (TURN, WINDOW) —
-        # `models.finalization_block_key`, because `window_count` restarts at 1 on
-        # every turn while this map persists for the session.
-        finalization_blocks={"0:2": 1},
+        # 05 §C.1 owns the writer; 03 §B owns the field. Keyed by
+        # (TURN, WINDOW, KIND) — `models.finalization_block_key`, because
+        # `window_count` restarts at 1 on every turn while this map persists for the
+        # session, and because the two gates that can refuse a finish hold separate
+        # allowances (05 §J.3).
+        finalization_blocks={"0:2:intents": 1},
     )
     restored = SessionDoc.from_doc(doc.to_doc())
     assert restored.analysis_state == state
-    assert restored.finalization_blocks == {"0:2": 1}
+    assert restored.finalization_blocks == {"0:2:intents": 1}
 
 
 def test_a_document_written_before_the_fields_existed_loads_unchanged() -> None:
@@ -269,3 +341,26 @@ def test_the_reason_code_split_is_structural() -> None:
     assert not (MODEL_REASON_CODES & RUNTIME_REASON_CODES)
     assert REASON_CODES == MODEL_REASON_CODES | RUNTIME_REASON_CODES
     assert INTENT_STATUSES == frozenset({"pending", "completed", "blocked"})
+
+
+def test_the_finalization_block_key_spells_out_every_kind() -> None:
+    """05 §J.3. The map now holds allowances of more than one kind, so every key
+    names its own — including `intents`, which was the only kind for a release and
+    could have kept an unsuffixed key for free. It does not: an unsuffixed key reads
+    as "some allowance" in a map that holds several, and nothing is in production, so
+    the migration cost of spelling it out is zero.
+    """
+    assert finalization_block_key(0, 1, "intents") == "0:1:intents"
+    assert finalization_block_key(3, 2, "answer_shape") == "3:2:answer_shape"
+    # Distinct keys is the whole mechanism — one map, two independent budgets.
+    assert finalization_block_key(0, 1, "intents") != finalization_block_key(0, 1, "answer_shape")
+
+
+def test_an_unknown_finalization_block_kind_is_rejected_at_the_key() -> None:
+    """This is the ONE place a persisted allowance key is minted, so it is the one
+    place that can stop a typo'd or stale kind from creating an eighth budget that
+    no `MAX_FINALIZATION_BLOCKS_PER_WINDOW` applies to. Raising is safe: the loop's
+    claim wrapper catches everything and treats it as "no re-round available"."""
+    for bad in ("Intents", "answer-shape", "", "answer_shape "):
+        with pytest.raises(ValueError, match="unknown finalization block kind"):
+            finalization_block_key(0, 1, bad)  # type: ignore[arg-type]

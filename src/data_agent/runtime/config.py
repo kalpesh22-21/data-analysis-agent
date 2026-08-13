@@ -4,12 +4,29 @@ Mirrors `clickhouse-api`'s `app/config.py` Settings pattern (pydantic-settings,
 uppercased env vars, `.env` file support, `extra="ignore"`). Every field maps
 1-to-1 to an environment variable of the same name.
 
-Tunable defaults below are LOCKED per the orchestrator's Pass-A brief (not
+Tunable defaults below were LOCKED per the orchestrator's Pass-A brief (not
 independently re-derived): session_ttl_seconds=604800 (7 days),
 preview_row_count=20, history_token_budget_ratio=0.20, max_loop_iterations=15,
 max_wall_clock_seconds=60, max_budget_windows=3. See docs/decisions/
 phase0-runtime-design.md §11 (OQ-D/G/H/I) for the provenance of these numbers
-— they are explicitly provisional pending real Phase-0 traffic.
+— they were explicitly provisional pending real Phase-0 traffic.
+
+**The loop budget has since been raised on that traffic** (Release 1, 2026-08-12):
+`max_wall_clock_seconds` 60 -> 180 and `max_loop_iterations` 15 -> 25. Live turns
+were capping on the WALL CLOCK at ~61-73s with iterations sitting at ~8 of 15 — the
+blueprint-definition gate added a round-trip per blueprint, and a multi-intent turn
+now legitimately needs 8+ rounds. `max_tool_calls_per_iteration` (8) and
+`max_budget_windows` (3) are unchanged; see their own field comments for why.
+
+`max_window_token_spend=1_000_000` was ADDED in the same pass (2026-08-12) and is
+what makes 25 a reachable round count. `BudgetGuard`'s token ceiling had no field
+of its own and borrowed `model_context_window` (128k), so a per-window SUM of
+whole replayed requests was compared against a single-request OCCUPANCY limit —
+quadratic in round count, ending windows at 6-14 rounds with the real context at
+12-31% of the window. Occupancy is not that counter's concern (a single request is
+bounded by `request_token_budget()` at the send seam); SPEND is, and spend now has
+its own explicit ceiling, derived from measured full-window spend in the field's
+own comment. See docs/decisions/release-1/README.md finding 30.
 """
 
 from __future__ import annotations
@@ -438,16 +455,92 @@ class RuntimeSettings(BaseSettings):
     )
 
     # --- Agent loop / budget caps (D47/D55, OQ-H) ---
+    #
+    # RAISED 2026-08-12 ON LIVE MEASUREMENT, and the direction of the evidence is
+    # what makes the pair of changes coherent: every observed failure was the WALL
+    # CLOCK, never iterations and never tokens. Turns capped at ~61-73s with
+    # iterations at ~8 of 15. Two things made a multi-intent turn legitimately
+    # longer than the 60s this was set to before any traffic existed: the
+    # blueprint-definition gate (finding 22) costs a getBlueprint round-trip per
+    # blueprint, and intent tracking adds declare/close rounds around the work.
     max_loop_iterations: int = Field(
-        15, ge=1, description="Max model<->tool round-trips per budget window."
+        25,
+        ge=1,
+        description=(
+            "Max model<->tool round-trips per budget window. Raised 15 -> 25 with "
+            "the wall clock below, so the round ceiling does not become the next "
+            "binding constraint at 180s."
+        ),
     )
     max_wall_clock_seconds: int = Field(
-        60, ge=1, description="Max wall-clock seconds per budget window."
+        180,
+        ge=1,
+        description=(
+            "Max wall-clock seconds per budget window. Raised 60 -> 180: live "
+            "multi-intent turns capped here (~61-73s) while iterations sat at ~8 "
+            "of 15, so the wall clock — not rounds, not tokens — was what ended "
+            "them."
+        ),
     )
     max_budget_windows: int = Field(
         3,
         ge=1,
-        description="Hard outer ceiling on 'continue' budget-window grants per turn (OQ-D).",
+        description=(
+            "Hard outer ceiling on 'continue' budget-window grants per turn "
+            "(OQ-D). UNCHANGED at 3 alongside the 180s window: this bounds how "
+            "many times a turn may be granted a FRESH window after a user "
+            "'continue', and each grant is now worth 3x what it was, so 3 windows "
+            "is a longer leash than it was, not a shorter one."
+        ),
+    )
+    # ADDED 2026-08-12. `BudgetGuard`'s token ceiling used to be fed
+    # `model_context_window` — a per-window SUM of whole replayed requests measured
+    # against a single-request OCCUPANCY limit, so it went quadratic in round count
+    # and ended windows at 6-14 rounds with the real context at 12-31% of the
+    # window. Occupancy was never this counter's job (fit_request_to_budget enforces
+    # it per request, verified: at a 10.5k-token-per-result payload the last of 25
+    # requests measured 89,229 against the 89,600 budget). What the counter really
+    # measures is SPEND, so spend gets its own ceiling here.
+    #
+    # 1,000,000 = `max_loop_iterations` (25) x 40,000 tokens of average request.
+    # Measured full-window spend, driving the real loop and real assembly for the
+    # full 25 rounds (scratch probe_full_window_spend.py):
+    #     per-result   135 tok ->   177,345   (mean request  7.1k)
+    #     per-result   765 tok ->   366,345   (mean request 14.7k)
+    #     per-result 2,165 tok ->   786,345   (mean request 31.5k)
+    #     per-result 4,265 tok -> 1,350,990   (mean request 54.0k)
+    #     per-result 7,065 tok -> 1,605,048   (requests plateaued at the fit budget)
+    #     per-result 10,565 tok-> 1,856,965   (requests plateaued at the fit budget)
+    # The top of the ORDINARY range (2,165 tok/result is already fatter than live
+    # traces) spends 786,345 for a full window, so 1M clears it by ~27% and leaves
+    # the just-raised iteration/wall-clock caps as the binding constraints on every
+    # payload size actually observed. The bottom of the RUNAWAY range spends
+    # 1.35M+, where `fit_request_to_budget` is already dropping trail units every
+    # round — the extra spend is re-sending context, not doing analysis — so those
+    # windows pause at ~round 21 of 25. The ceiling-free maximum the other caps
+    # permit is 25 x (89,600 + 16,000) = 2.64M per window, x3 windows per turn.
+    #
+    # Counts CACHED prompt tokens at full weight (see loop/budget_guard.py): the
+    # discount is priced in HERE instead — ~1M counted tokens is ~$0.75-1.00 at
+    # gpt-4.1 blended rates precisely because live traces are ~94% cache-read,
+    # where 1M of fresh input would be $2.00.
+    #
+    # Tripping this is a FEATURE, not a failure: it returns `paused_budget_cap` and
+    # asks the user "continue, refine, or stop?" — a "continue" grants a fresh
+    # window (`max_budget_windows`). Raising `max_loop_iterations` should prompt a
+    # look at this number; it is deliberately NOT derived from it, so a round-count
+    # change cannot silently multiply spend.
+    max_window_token_spend: int = Field(
+        1_000_000,
+        gt=0,
+        description=(
+            "Max cumulative token SPEND (sum of prompt + completion over every "
+            "model round-trip, cached prompt tokens included at full weight) per "
+            "budget window. NOT an occupancy limit — a single request is bounded "
+            "by request_token_budget(). Derived as max_loop_iterations x 40k mean "
+            "request: measured full-window spend is 786k for the fattest ordinary "
+            "payload and 1.35M+ once requests plateau against the fit budget."
+        ),
     )
     max_tool_calls_per_iteration: int = Field(
         8,
@@ -456,7 +549,10 @@ class RuntimeSettings(BaseSettings):
             "S3 (2026-07-01 hardening fix): cap on how many of one model "
             "response's tool_calls are dispatched per loop iteration, so a "
             "single pathological/adversarial response requesting hundreds of "
-            "calls cannot overshoot the budget window unbounded."
+            "calls cannot overshoot the budget window unbounded. UNCHANGED at 8: "
+            "the largest batch observed live was 3, so there is no evidence this "
+            "binds. (updateAnalysisState is exempt from this cap and separately "
+            "bounded — see loop/agent_loop.py's partition.)"
         ),
     )
 

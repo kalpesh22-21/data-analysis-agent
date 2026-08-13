@@ -33,7 +33,7 @@ Everything here serves exactly two defects. Anything that does not is out of sco
 
 ## 3. Prompt rewrite
 
-**File:** `src/data_agent/runtime/prompts.py` — `AGENT_SYSTEM_PROMPT` (currently 11,297 chars ≈ 2,824 tokens, re-sent every round-trip).
+**File:** `src/data_agent/runtime/prompts.py` — `AGENT_SYSTEM_PROMPT` (11,297 chars ≈ 2,824 tokens when this spec was written, re-sent every round-trip; **13,383 as shipped**, under a ratified `<= 15_000` ceiling — see [01a §7](release-1/01a-prompt-draft.md)).
 
 **Remove** the "Sizing the request" and "Planning a complicated request" sections entirely. Semantic complexity is the wrong routing criterion: a linguistically complex question may map to one validated blueprint.
 

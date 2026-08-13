@@ -418,7 +418,7 @@ async def test_claim_finalization_block_checks_and_increments_in_one_cas_step() 
 
     store, sessions_collection = _build_store(sleep=_no_sleep)
     sessions_collection.get = AsyncMock(
-        side_effect=[_FakeGetResult(_doc(None), cas=1), _FakeGetResult(_doc({"0:2": 1}), cas=2)]
+        side_effect=[_FakeGetResult(_doc(None), cas=1), _FakeGetResult(_doc({"0:2:intents": 1}), cas=2)]
     )
 
     replace_calls: list[dict] = []
@@ -431,11 +431,76 @@ async def test_claim_finalization_block_checks_and_increments_in_one_cas_step() 
 
     sessions_collection.replace = AsyncMock(side_effect=_replace)
 
-    claimed = await store.claim_finalization_block("s1", 0, 2)
+    claimed = await store.claim_finalization_block("s1", 0, 2, "intents")
 
     assert claimed is False, "two claimants both got the window's single re-round"
     # The peer's count was NOT overwritten by one derived from the stale read.
-    assert replace_calls[-1]["finalization_blocks"] == {"0:2": 1}
+    assert replace_calls[-1]["finalization_blocks"] == {"0:2:intents": 1}
+
+
+async def test_two_claims_of_different_kinds_are_both_granted_across_a_cas_retry() -> None:
+    """05 §J.3's central property, and the one the mechanism gives away for free —
+    which is exactly why it needs asserting.
+
+    Two claimants of DIFFERENT kinds contend for the same `(turn, window)`. They are
+    independent allowances, so BOTH must be granted; and because they live in ONE
+    map on ONE document, the loser's CAS retry must re-run its callback against the
+    WINNER'S doc and preserve the winner's key.
+
+    Simulated exactly as the same-kind test does, with the interleave inverted: the
+    `answer_shape` claimant reads the pre-race doc, loses the replace, re-reads a doc
+    that now carries `intents`, and writes BOTH keys.
+
+    The regression this guards is a lost update, and it would be silent: any future
+    optimisation that cached the read document across retries (or built the new
+    `finalization_blocks` outside the callback) would still return `True` for both
+    claims while dropping one key — the counters would look right and one gate would
+    quietly get a second re-round it was never granted.
+    """
+    from couchbase.exceptions import CasMismatchException
+
+    from data_agent.runtime.session.models import SessionDoc
+
+    def _doc(blocks: dict[str, int] | None, cas: int) -> _FakeGetResult:
+        return _FakeGetResult(
+            SessionDoc(
+                session_id="s1",
+                created_at="t0",
+                last_activity="t0",
+                finalization_blocks=blocks,
+            ).to_doc(),
+            cas=cas,
+        )
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    store, sessions_collection = _build_store(sleep=_no_sleep)
+    # Read 1: the `answer_shape` claimant sees an empty map (the race is on).
+    # Read 2: its retry sees the `intents` claimant's committed write.
+    sessions_collection.get = AsyncMock(
+        side_effect=[_doc(None, cas=1), _doc({"0:1:intents": 1}, cas=2)]
+    )
+
+    replace_calls: list[dict] = []
+
+    async def _replace(key, doc, options):  # noqa: ANN001 - test double
+        replace_calls.append(doc)
+        if len(replace_calls) == 1:
+            raise CasMismatchException("the intents claimant committed first")
+        return None
+
+    sessions_collection.replace = AsyncMock(side_effect=_replace)
+
+    assert await store.claim_finalization_block("s1", 0, 1, "answer_shape") is True, (
+        "a claim of one kind was denied by another kind's claim in the same window"
+    )
+    # BOTH keys survive: the retry rebuilt from the winner's doc rather than from
+    # the stale read it started with.
+    assert replace_calls[-1]["finalization_blocks"] == {
+        "0:1:intents": 1,
+        "0:1:answer_shape": 1,
+    }
 
 
 async def test_claim_finalization_block_grants_the_first_caller() -> None:
@@ -452,6 +517,6 @@ async def test_claim_finalization_block_grants_the_first_caller() -> None:
     )
     sessions_collection.replace = AsyncMock(return_value=None)
 
-    assert await store.claim_finalization_block("s1", 0, 3) is True
+    assert await store.claim_finalization_block("s1", 0, 3, "intents") is True
     written = sessions_collection.replace.call_args.args[1]
-    assert written["finalization_blocks"] == {"0:3": 1}
+    assert written["finalization_blocks"] == {"0:3:intents": 1}

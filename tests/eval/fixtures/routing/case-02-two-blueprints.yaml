@@ -40,6 +40,11 @@ mcp_script:
       row_count: 1
       truncated: false
 model_script:
+  # Round 1 — declare the intents and EXPAND both blueprints. The runtime refuses a
+  # runBlueprint for an id this turn has not expanded (a card carries no SQL), and
+  # `getBlueprint` is not in the late-init locking set, so it batches with the state
+  # call. Two deliverables still cost TWO round-trips, not four: both expansions go
+  # in this response and both runs in the next.
   - tool_calls:
       - name: updateAnalysisState
         id: s1
@@ -47,6 +52,14 @@ model_script:
           intents:
             - description: Active headcount by department
             - description: Projected hires over the next 6 months
+      - name: getBlueprint
+        id: g1
+        args: {id: bp-active-headcount-by-department}
+      - name: getBlueprint
+        id: g2
+        args: {id: bp-hires-projection}
+  # Round 2 — run them both.
+  - tool_calls:
       - name: runBlueprint
         id: b1
         serves_intent: i1

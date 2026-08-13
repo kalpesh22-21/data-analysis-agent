@@ -267,23 +267,39 @@ def serves_intent_from_trail(
 ) -> dict[str, set[str]]:
     """`tool_call_id -> {intent_id}`, reconstructed from the persisted trail.
 
-    Every `updateAnalysisState` call leaves a `TrailEntry` whose `args` carry the
-    model's own `{intent_id, evidence_tool_call_id}` bindings, so the FULL history
-    of which call served which intent is recoverable with no fixture knowledge —
-    which is what makes this usable in A2 and in production.
+    TWO SOURCES, UNIONED, because the runtime has two ways to bind evidence:
+
+      1. `TrailEntry.serves_intent` — the CALL-TIME TAG the model put on the call
+         itself. The primary path since call-time tagging landed, and the direct
+         one: no inference, the model said which intent the call was for while it
+         was making it. It is also the ONLY source for a tagged call, since a
+         tag-closed intent sends no `evidence_tool_call_id` at all.
+      2. Every `updateAnalysisState` call leaves a `TrailEntry` whose `args` carry
+         the model's own `{intent_id, evidence_tool_call_id}` bindings — the
+         explicit citations, which remain valid and are the only way ONE call
+         completes SEVERAL intents (04 §A).
+
+    Both are recoverable with no fixture knowledge, which is what makes this usable
+    in A2 and in production.
 
     `loop_intent_completed` is NOT the source: 06 gives it
-    `{intent_id, evidence_tool_name}`, and the tool NAME cannot identify which of
-    two `runQuery` calls closed the intent. The final `AnalysisState` is not the
-    source either: it is latest-wins, so a binding that was later replaced — which
-    is precisely the re-derivation shape — has already been overwritten there.
+    `{intent_id, evidence_tool_name, evidence_binding}`, and the tool NAME cannot
+    identify which of two `runQuery` calls closed the intent. The final
+    `AnalysisState` is not the source either: it is latest-wins, so a binding that
+    was later replaced — which is precisely the re-derivation shape — has already
+    been overwritten there.
 
-    Only `ok` entries count: a rejected state call persisted a denial, not a
-    binding.
+    Only `ok` entries count for source 2: a rejected state call persisted a denial,
+    not a binding. Source 1 needs no such filter — the loop only ever persists a
+    tag it has already validated against the live state.
     """
     mapping: dict[str, set[str]] = {}
     for entry in trail:
-        if entry.turn_index != turn_index or entry.tool_name != "updateAnalysisState":
+        if entry.turn_index != turn_index:
+            continue
+        if entry.serves_intent:
+            mapping.setdefault(entry.tool_call_id, set()).add(entry.serves_intent)
+        if entry.tool_name != "updateAnalysisState":
             continue
         if entry.status != "ok":
             continue

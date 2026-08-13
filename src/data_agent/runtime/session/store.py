@@ -23,7 +23,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol
 
-from .models import AnalysisState, PauseCheckpoint, SessionDoc, TrailEntry, TurnMessage
+from .models import (
+    AnalysisState,
+    FinalizationBlockKind,
+    PauseCheckpoint,
+    SessionDoc,
+    TrailEntry,
+    TurnMessage,
+)
 
 
 class AlreadyConsumedError(Exception):
@@ -119,13 +126,26 @@ class SessionStore(Protocol):
         ...
 
     async def claim_finalization_block(
-        self, session_id: str, turn_index: int, window_count: int
+        self,
+        session_id: str,
+        turn_index: int,
+        window_count: int,
+        kind: FinalizationBlockKind,
     ) -> bool:
-        """Claim THE forced finalization re-round for (*turn_index*, *window_count*)
-        (05 §C.1).
+        """Claim THE forced finalization re-round of *kind* for (*turn_index*,
+        *window_count*) (05 §C.1, §J.3).
 
         Returns `True` when this caller got it, `False` when that turn-and-window's
-        allowance (`MAX_FINALIZATION_BLOCKS_PER_WINDOW`) is already spent.
+        allowance for that KIND (`MAX_FINALIZATION_BLOCKS_PER_WINDOW`) is spent.
+
+        *kind* IS PART OF THE KEY, NOT A LABEL. `intents` and `answer_shape` hold
+        INDEPENDENT per-window allowances, so a turn refused for pending intents can
+        still be refused once for answer shape in the same window. They shared one
+        allowance until 2026-08-12; live measurement showed the intents nudge
+        consuming it first in 2 of 4 three-part runs and starving the shape gate
+        (05 §J.3). It is REQUIRED, with no default: this Protocol has four
+        implementations, two of them hand-written proxies in `scripts/`, and a
+        defaulted parameter is exactly what a proxy forwards silently and wrongly.
 
         IT MUST BE PERSISTED, and that is the whole reason this method exists. A
         counter local to `_run_loop_body` does NOT give "per window": that
@@ -136,10 +156,10 @@ class SessionStore(Protocol):
         but unbounded). An exit-#1 refusal leaves NO persisted artifact by design
         (05 §B.2), so it cannot be reconstructed from the trail either.
 
-        Keyed by (TURN, WINDOW) on `SessionDoc.finalization_blocks` (`{"0:2": 1}`,
-        via `models.finalization_block_key`) so "one per budget window" is literal
-        WITHIN a turn, and NOT on `AnalysisState`, which is model-writable and
-        unknown-key-rejecting.
+        Keyed by (TURN, WINDOW, KIND) on `SessionDoc.finalization_blocks`
+        (`{"0:2:intents": 1}`, via `models.finalization_block_key`) so "one per
+        budget window" is literal WITHIN a turn AND within a kind, and NOT on
+        `AnalysisState`, which is model-writable and unknown-key-rejecting.
 
         THE TURN INDEX IS NOT DECORATION. `window_count` restarts at 1 for every
         external turn while this map persists on the document and is never cleared,

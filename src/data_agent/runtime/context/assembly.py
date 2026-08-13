@@ -10,13 +10,22 @@
                    interleave by turn"). `stream_rank` (user=0, trail=1, assistant=2) is
                    only a tie-break for identical `ts`; `ts` (`_now_iso()`,
                    lexicographically sortable) drives real order.
-    4. retrieval — the retrieved thin-cards/knowledge block is inserted as ONE
+    4. anchor    — `Today's date is YYYY-MM-DD.` as ONE `user`-role message. The
+                   date is read from the current turn's own first `user` message
+                   `ts`, NOT from the clock, so a D45 rebuild and a next-morning
+                   resume both re-derive the same bytes; see `_turn_date_anchor`.
+    4b. retrieval — the retrieved thin-cards/knowledge block is inserted as ONE
                    `user`-role message IMMEDIATELY BEFORE the LAST `user` message
                    (the current question — or, on an askUser resume, the
                    clarification answer). It reads as this question's context and
                    stays inside the current turn, which `fit_request_to_budget` pins
                    as a whole (from the current turn's FIRST `user` message through
                    the end), so neither the question nor this block is dropped.
+    4c. state    — the live `analysisState` ledger, same posture (03 §D).
+
+                   All three insert at the same index, so the resulting frame is the
+                   REVERSE of the insert order:
+                   `anchor -> retrieval -> state -> question`.
     5. base      — the base system prompt is inserted at index 0, the SOLE
                    `role:"system"` message.
 
@@ -38,6 +47,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import date
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.dispatch.denial_mapping import (
@@ -103,11 +113,26 @@ _WITHHELD_PROVENANCE_SENTINEL = (
 # it is PII-safe under any scope, and it fills the dangling repeat call's tool-slot
 # so the model stops re-fetching.
 IDEMPOTENT_READ_ALREADY_SERVED_CODE = "IDEMPOTENT_READ_ALREADY_SERVED"
+# REWORDED with the trim-aware re-fetch exemption (`loop/agent_loop.py`), which
+# changed what this text is allowed to claim.
+#
+# It used to say the result "is already available to you" whatever the state of the
+# window — and that was sometimes FALSE: the guard fired on the persisted trail, so a
+# result the budget had since trimmed out (or that D44 had replaced with a withheld
+# sentinel) got this nudge anyway, telling the model to use something it could not
+# read and offering no way to recover it. The loop now declines to dedup exactly
+# those cases, so "it is in the messages above" is warranted, and the nudge says the
+# stronger, now-true thing plus WHERE to look.
+#
+# The closing instruction is also tool-agnostic now. It used to say "proceed to
+# runQuery or give your answer", which was written when the guarded set was
+# schema-shaped; `getBlueprint` joined it, and for that read the correct next step is
+# `runBlueprint`, not `runQuery`.
 _REPEATED_IDEMPOTENT_READ_NUDGE = (
-    "Duplicate read: you already requested this exact call this turn, so its result "
-    "is already available to you (this response is not a new fetch). Re-requesting it "
-    "does nothing — use the result you already have and proceed to runQuery or give "
-    "your answer."
+    "Duplicate read: you already made this exact call this turn, and its result is in "
+    "the messages above (this response is not a new fetch). Re-requesting it does "
+    "nothing — find that earlier result, use it, and take the next step of your "
+    "analysis."
 )
 
 
@@ -259,7 +284,28 @@ class ContextAssembler:
                 observer=observer,
             )
 
-            # 6. retrieval (design §3.3): render this turn's retrieved thin-cards/
+            # 6. THE DATE ANCHOR (issues-stack B2), FIRST of the three
+            # before-the-question inserts. See `_turn_date_anchor` for where the date
+            # comes from and why it is not `date.today()`.
+            #
+            # ORDER IS PRODUCED BY INSERTION ORDER, NOT BY ARITHMETIC. All three
+            # blocks insert at `_last_user_index(messages)`, so each one lands
+            # immediately before the question and pushes the previous ones EARLIER —
+            # meaning the final frame is exactly the reverse of the insert sequence:
+            #
+            #     anchor -> retrieval cards -> analysis state -> the question
+            #
+            # The anchor therefore goes first to end up OUTERMOST. This block sat
+            # between retrieval and the question for one review round while the
+            # comments claimed otherwise; the fix is the ordering, not the comment,
+            # because the retrieval cards and the state ledger are both things the
+            # anchor frames rather than the other way round.
+            if current_turn_index is not None:
+                anchor = _turn_date_anchor(raw_messages, current_turn_index)
+                if anchor is not None:
+                    messages.insert(_last_user_index(messages), anchor)
+
+            # 6a. retrieval (design §3.3): render this turn's retrieved thin-cards/
             # knowledge as ONE `user`-role block and insert it IMMEDIATELY BEFORE the
             # current-turn question (the last `user` message), so the current question
             # stays the last `user` message (fit's tail-pin) and the block reads as
@@ -524,6 +570,74 @@ def _last_user_index(messages: list[dict[str, Any]]) -> int:
         if messages[index].get("role") == "user":
             return index
     return len(messages)
+
+
+DATE_ANCHOR_PREFIX = "Today's date is "
+
+
+def _turn_date_anchor(
+    raw_messages: Sequence[TurnMessage], current_turn_index: int
+) -> dict[str, Any] | None:
+    """`Today's date is YYYY-MM-DD.` as ONE `user`-role message, or `None`.
+
+    WHY THIS EXISTS. The model has no grounded present. Every "last 6 months",
+    "this quarter", "who left last month" resolves against training-frozen time,
+    and the answer is wrong in a way nothing in the pipeline can detect — the SQL
+    parses, the query runs, the grain verifies, and the window is simply the wrong
+    window.
+
+    WHY IT IS NOT IN `AGENT_SYSTEM_PROMPT`. That constant is module-level and D45
+    requires every per-round-trip rebuild and every resume to re-derive
+    byte-identical messages; a date evaluated at import time would be stale for the
+    life of the process, and one evaluated per call would break the invariant its
+    own docstring states. The anchor is per-TURN data, so it belongs where the rest
+    of the per-turn context is assembled.
+
+    WHY THE DATE COMES FROM THE TURN'S OWN FIRST `user` MESSAGE, NOT `date.today()`.
+    That timestamp is written ONCE, when the turn opens (`agent_loop._now_iso()`),
+    and is then persisted — so it is identical on round-trip 1 and round-trip 9, and
+    identical again after a budget-window rebuild or an `askUser` pause that resumes
+    the next morning. `date.today()` would satisfy none of that: it re-evaluates on
+    every rebuild, so a turn spanning midnight would silently change what "today"
+    means half way through, and the D45 byte-stability tests would be asserting
+    something no longer true. Reading a value the turn already carries also means
+    nothing has to be threaded through `assemble`'s callers.
+
+    `role: "user"` (not `system`) so the base prompt stays the SOLE `role:"system"`
+    message — the head-pin the total-request fit and the send-seam base-prompt
+    invariant both depend on. Same posture as the retrieval and analysis-state
+    blocks it sits beside.
+
+    Reads the RAW messages, not the scope-filtered ones: `role == "user"` messages
+    always carry `frozenset()` provenance and are never dropped, so the two are the
+    same list here — but the raw stream is the one that cannot become empty for a
+    reason unrelated to dates.
+
+    Returns `None` when the turn has no `user` message yet (a Layer-1 harness
+    assembling against a hand-built document; the loop always writes one before it
+    assembles), and when the stored `ts` is not a readable date. Degrade quietly in
+    both cases: an absent anchor is exactly the pre-anchor behaviour, and refusing
+    to assemble a turn over a cosmetic field would trade a soft limitation for a
+    hard failure.
+
+    NO ANCHOR IS BETTER THAN A WRONG ONE. A slice alone would happily render
+    `Today's date is not-a-dat.` from a malformed stamp — a confidently stated
+    falsehood about the one fact this exists to ground, which is worse than the
+    silence it replaced. So the slice is VALIDATED, not trusted.
+    """
+    for message in raw_messages:
+        if message.turn_index == current_turn_index and message.role == "user":
+            # `ts` is produced by `_now_iso()` (`datetime.now(UTC).isoformat()`), so
+            # the first 10 characters ARE the ISO date — the slice is the cheap
+            # path, and `date.fromisoformat` is the guard that keeps a hand-built
+            # or corrupted stamp from being rendered as if it were one.
+            day = message.ts[:10]
+            try:
+                date.fromisoformat(day)
+            except (TypeError, ValueError):
+                return None
+            return {"role": "user", "content": f"{DATE_ANCHOR_PREFIX}{day}."}
+    return None
 
 
 def render_analysis_state_block(state: AnalysisState) -> dict[str, Any]:

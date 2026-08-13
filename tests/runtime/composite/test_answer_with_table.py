@@ -29,6 +29,7 @@ from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import TrailEntry, TurnMessage
+from tests._blueprint_gate import expand_blueprint
 
 SESSION_ID = "sess-answer-with-table"
 CATALOG = CatalogHandle({"db.t": {"c": "String"}})
@@ -520,6 +521,8 @@ async def test_a_blueprint_id_resolves_to_that_blueprints_terminal_sql() -> None
             "runBlueprint": _StubBlueprintTool("bp-hires-per-month", terminal),
         },
     )
+    # The getBlueprint-before-runBlueprint gate (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, "bp-hires-per-month")
 
     outcome = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="hires?")
 

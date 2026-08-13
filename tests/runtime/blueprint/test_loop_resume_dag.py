@@ -20,6 +20,7 @@ import pytest
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
+from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
@@ -29,6 +30,7 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import AlreadyConsumedError, InMemorySessionStore
+from tests._blueprint_gate import expand_blueprint
 
 _E = "dbpcm_warehouse.employee"
 CATALOG = CatalogHandle(
@@ -44,6 +46,27 @@ def _creds() -> RuntimeCredentials:
 
 def _rq(columns: list[str], rows: list[list[Any]]) -> dict[str, Any]:
     return {"columns": columns, "rows": rows, "row_count": len(rows), "truncated": False}
+
+
+def _prose_resume_script(text: str) -> list[ModelTurnResult]:
+    """A resume script whose model finishes in bare prose — TWICE.
+
+    The blueprint these tests resume returns TWO rows, so the first prose finish
+    trips the ANSWER-SHAPE GATE (05 §J): the runtime refuses it once, nudges, and
+    hands back a round. These tests are about RESUME mechanics — exactly-once node
+    execution, the `authoritative` marker, enrichment survival across the pause —
+    not about answer shape, so the model simply re-sends the same prose; the
+    window's one shared grant is then spent and the second finish passes.
+
+    The gate's own behaviour is covered in
+    `tests/runtime/loop/test_answer_shape_gate.py`, INCLUDING the trail seeding this
+    helper depends on (`test_a_budget_cap_resume_reseeds_the_count_from_the_persisted_trail`).
+    This helper does not prove the seed by itself: `ScriptedModelClient` does not
+    raise on leftover turns, so a seed regression would simply leave the second turn
+    unconsumed and every test here would stay green. Callers that want the claim
+    asserted must say `assert resume_model.calls_made == 2` — one of them does.
+    """
+    return [ModelTurnResult(assistant_text=text), ModelTurnResult(assistant_text=text)]
 
 
 def _detail() -> BlueprintDetail:
@@ -116,6 +139,9 @@ async def test_approval_pause_then_restart_resume_completes() -> None:
     )
     run_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]})  # node 0 only
     loop1 = _make_loop(store, run_model, run_mcp)
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint about to run (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
 
     paused = await loop1.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
     assert paused.status == "paused_ask_user"
@@ -131,7 +157,7 @@ async def test_approval_pause_then_restart_resume_completes() -> None:
 
     # --- process 2 (RESTART): a fresh loop + executor, shared store only ----
     resume_model = ScriptedModelClient(
-        [ModelTurnResult(assistant_text="Flagged 2 departments above the average.")]
+        _prose_resume_script("Flagged 2 departments above the average.")
     )
     resume_mcp = FakeMCPClient(
         scripted={
@@ -146,6 +172,12 @@ async def test_approval_pause_then_restart_resume_completes() -> None:
     done = await loop2.resume(session_id=SESSION_ID, credentials=_creds(), answer="approve")
     assert done.status == "done"
     assert done.assistant_text == "Flagged 2 departments above the average."
+    # BOTH scripted turns were consumed, so `_prose_resume_script`'s claim is real:
+    # the resumed blueprint's two rows DID reach the answer-shape gate through the
+    # persisted trail, and the first prose finish was refused. `ScriptedModelClient`
+    # does not raise on leftover turns, so without this the helper's second turn
+    # could go unused and the docstring would quietly become fiction.
+    assert resume_model.calls_made == 2
 
     # node 0 was NOT re-run on resume — only node 1 + the grain probe (exactly-once).
     assert len(resume_mcp.calls) == 2
@@ -177,11 +209,14 @@ async def test_verified_resume_persists_authoritative_marker() -> None:
     )
     run_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]})
     loop1 = _make_loop(store, run_model, run_mcp)
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint about to run (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     paused = await loop1.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
     assert paused.status == "paused_ask_user"
 
     resume_model = ScriptedModelClient(
-        [ModelTurnResult(assistant_text="Flagged 2 departments above the average.")]
+        _prose_resume_script("Flagged 2 departments above the average.")
     )
     resume_mcp = FakeMCPClient(
         scripted={
@@ -222,11 +257,14 @@ async def test_approval_resume_final_outcome_carries_enrichment() -> None:
     )
     run_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]})
     loop1 = _make_loop(store, run_model, run_mcp)
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint about to run (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     paused = await loop1.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
     assert paused.status == "paused_ask_user"
 
     resume_model = ScriptedModelClient(
-        [ModelTurnResult(assistant_text="Flagged 2 departments above the average.")]
+        _prose_resume_script("Flagged 2 departments above the average.")
     )
     resume_mcp = FakeMCPClient(
         scripted={
@@ -250,6 +288,78 @@ async def test_approval_resume_final_outcome_carries_enrichment() -> None:
     # Lineage also survives: the runBlueprint trail entry is persisted before the
     # loop re-enters, so the provenance union on the resumed answer is determined.
     assert done.provenance is not None
+
+
+async def test_a_blueprint_that_completed_before_the_pause_is_designatable_after_it() -> None:
+    """REGRESSION (found while building 08). The approval-resume built its
+    `blueprint_id -> terminal_sql` seed carefully, `_run_loop` accepted it as a
+    keyword — and then simply did not forward it to `_run_loop_body`.
+
+    So the map was discarded on every resume and an `answerWithTable(blueprint_id=X)`
+    naming the blueprint that completed BEFORE the pause resolved to nothing: the
+    model got the retryable "you have not run it this turn" nudge for a blueprint it
+    HAD run, and the user lost the table on exactly the verified, approval-gated
+    path the seed was written for.
+
+    Silent in both directions. `_run_loop`'s own docstring argues that mirroring the
+    signature explicitly catches a typo'd kwarg at any CALL site — which it does,
+    and which is why an omission at the FORWARDING site went unnoticed.
+    """
+    store = InMemorySessionStore()
+
+    run_model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="c1", name="runBlueprint",
+                        arguments={"id": _BID, "slot_bindings": {}},
+                    )
+                ]
+            ),
+        ]
+    )
+    loop1 = _make_loop(store, run_model, FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]}))
+    await expand_blueprint(store, SESSION_ID, _BID)
+    paused = await loop1.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
+    assert paused.status == "paused_ask_user"
+
+    # After the approval the model designates the blueprint's own result.
+    resume_model = ScriptedModelClient(
+        [
+            ModelTurnResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        id="a1", name="answerWithTable",
+                        arguments={"answer": "Flagged 2 departments.", "blueprint_id": _BID},
+                    )
+                ]
+            ),
+            ModelTurnResult(assistant_text="THIS MUST NOT BE REACHED."),
+        ]
+    )
+    resume_mcp = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["department"], [["Sales"], ["Eng"]]),
+                _rq(["__bp_n", "__bp_d"], [[2, 2]]),
+            ]
+        }
+    )
+    loop2 = _make_loop(store, resume_model, resume_mcp)
+    loop2._runtime_tools = {**loop2._runtime_tools, "answerWithTable": AnswerWithTableTool()}
+
+    done = await loop2.resume(session_id=SESSION_ID, credentials=_creds(), answer="approve")
+
+    assert done.status == "done"
+    # It RESOLVED — no nudge, no second round-trip, and a real pageable query.
+    assert len(resume_model.calls) == 1
+    assert done.answer_sql
+    assert done.answer_tables[0]["blueprint_use"] == {"blueprint_id": _BID, "slots": {}}
+    entry = [
+        e for e in await store.load_trail(SESSION_ID) if e.tool_name == "answerWithTable"
+    ][0]
+    assert entry.status == "ok"
 
 
 def _make_loop_ex(
@@ -305,6 +415,9 @@ async def test_in_loop_pause_carries_partial_enrichment_from_prior_query() -> No
         ]
     )
     loop = _make_loop_ex(store, model, bp_mcp, loop_mcp)
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint about to run (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
 
     paused = await loop.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
 
@@ -331,6 +444,9 @@ async def test_double_resume_is_rejected_exactly_once() -> None:
     )
     run_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]})
     loop1 = _make_loop(store, run_model, run_mcp)
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint about to run (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     await loop1.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
 
     resume_mcp = FakeMCPClient(
@@ -343,7 +459,7 @@ async def test_double_resume_is_rejected_exactly_once() -> None:
     )
     loop2 = _make_loop(
         store,
-        ScriptedModelClient([ModelTurnResult(assistant_text="done")]),
+        ScriptedModelClient(_prose_resume_script("done")),
         resume_mcp,
     )
     await loop2.resume(session_id=SESSION_ID, credentials=_creds(), answer="approve")
@@ -366,6 +482,9 @@ async def test_approval_deny_stops_cleanly_and_model_answers_from_raw_loop() -> 
     )
     run_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]})
     loop1 = _make_loop(store, run_model, run_mcp)
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint about to run (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     await loop1.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
 
     resume_mcp = FakeMCPClient(scripted={"runQuery": []})  # deny → nothing dispatches
@@ -404,6 +523,9 @@ async def test_resume_executor_crash_is_contained_and_loop_continues() -> None:
     )
     run_mcp = FakeMCPClient(scripted={"runQuery": [_rq(["n"], [[42]])]})
     loop1 = _make_loop(store, run_model, run_mcp)
+    # The getBlueprint-before-runBlueprint gate: this turn must already hold a
+    # successful expansion of the blueprint about to run (tests/_blueprint_gate.py).
+    await expand_blueprint(store, SESSION_ID, _BID)
     await loop1.run(session_id=SESSION_ID, credentials=_creds(), user_message="flag depts")
 
     # Restart with a RAISING executor + a model that answers from the raw loop.

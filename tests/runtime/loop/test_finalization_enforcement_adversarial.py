@@ -36,7 +36,11 @@ from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
-from data_agent.runtime.session.models import ResultPreview, live_analysis_state
+from data_agent.runtime.session.models import (
+    FinalizationBlockKind,
+    ResultPreview,
+    live_analysis_state,
+)
 from data_agent.runtime.session.store import CASMismatchError
 
 SESSION_ID = "sess-finalization-adversarial"
@@ -193,7 +197,7 @@ async def test_two_answers_in_one_batch_are_refused_twice_and_spend_one_block() 
     assert [e.tool_call_id for e in refusals] == ["a1", "a2"], "both calls must be refused"
     assert len(_events(events, "loop_finalization_refused")) == 2
     # ...and the counter advanced exactly ONCE.
-    assert doc.finalization_blocks == {"0:1": 1}
+    assert doc.finalization_blocks == {"0:1:intents": 1}
     assert _events(events, "loop_finalization_block_spent") == [{"window": 1}]
     # No premature exhaustion INSIDE the batch: both refusals land before the next
     # model round-trip, and the eventual `ENFORCEMENT_EXHAUSTED` comes only after
@@ -268,7 +272,16 @@ async def test_dropping_the_hard_intent_does_not_let_the_turn_finalize() -> None
 async def test_completing_an_intent_on_a_search_result_is_rejected_and_still_refused() -> None:
     """04 §A condition 3: `searchBlueprints` is not evidence that an intent was
     ANSWERED. The state update is rejected, the intent stays `pending`, and the
-    finalization in the same batch is refused."""
+    finalization in the same batch is refused.
+
+    STRUCTURAL SINCE 01a §14, not a validation failure. The model cannot name a
+    call any more, and `searchBlueprints` is neither taggable (`serves_intent` is
+    advertised on three tools, and it is not one) nor in the auto-bind pool (which
+    is built from the calls the validators ACCEPT). So the search result is not
+    refused as evidence — it is never a candidate, and the intent reads as
+    unanswered, which is what it is. The legacy citation is left in the payload on
+    purpose: it must be dropped, not honoured.
+    """
     loop, store, events, _ = _build(
         [
             ModelTurnResult(
@@ -303,7 +316,7 @@ async def test_completing_an_intent_on_a_search_result_is_rejected_and_still_ref
     doc = await store.get_or_create_session(SESSION_ID)
     rejected = next(e for e in doc.tool_trail if e.tool_call_id == "s2")
     assert rejected.error_code == ANALYSIS_STATE_INVALID_CODE
-    assert "searchBlueprints" in rejected.denial_detail
+    assert "nothing this turn answered it" in rejected.denial_detail
     refusal = next(e for e in doc.tool_trail if e.tool_call_id == "a1")
     assert refusal.error_code == FINALIZATION_BLOCKED_PENDING_INTENTS_CODE
     assert _events(events, "loop_finalization_refused") == [
@@ -452,7 +465,11 @@ class _ClaimRaisingStore(InMemorySessionStore):
         self.claim_attempts = 0
 
     async def claim_finalization_block(
-        self, session_id: str, turn_index: int, window_count: int
+        self,
+        session_id: str,
+        turn_index: int,
+        window_count: int,
+        kind: FinalizationBlockKind,
     ) -> bool:
         self.claim_attempts += 1
         raise CASMismatchError("five CAS retries lost to a concurrent resume")

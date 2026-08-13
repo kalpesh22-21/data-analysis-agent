@@ -31,7 +31,7 @@ Provenance representation (load-bearing, D44/D63):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -125,6 +125,55 @@ def _provenance_from_doc(doc: list[list[str]] | None) -> frozenset[tuple[str, st
     return frozenset((pair[0], pair[1]) for pair in doc)
 
 
+def _answer_table_provenance_item(item: Any) -> frozenset[tuple[str, str]] | None:
+    """One table position's USES set, or `None` when this position's payload is not
+    a well-formed list of `[db_table, column]` pairs.
+
+    THE TOTALITY HAS TO REACH THE PAIRS, not just the outer list. The outer
+    `isinstance` check below was already there and reads as if it covers the field,
+    but the conversion it guarded indexed `pair[0]`/`pair[1]` blind: a document
+    holding `[[["a"]]]` — one table, one pair, one element — raised `IndexError`
+    out of `TrailEntry.from_doc`, out of `SessionDoc.from_doc`, and out of EVERY
+    subsequent read of that session. One malformed inner pair bricked the whole
+    conversation, which is precisely the outcome the docstring promised could not
+    happen.
+
+    `None` for the position is the right degrade, and it is not a loophole: this
+    field is an additive optimisation that lets a scope narrowing on reload drop
+    the out-of-scope tables individually instead of all of them, and `None` means
+    "no per-table lineage here", which the reader already handles as the legacy
+    case. The cost of a malformed entry stays inside its own table position.
+    """
+    if not isinstance(item, list):
+        return None
+    if not all(isinstance(pair, list | tuple) and len(pair) == 2 for pair in item):
+        return None
+    return frozenset((pair[0], pair[1]) for pair in item)
+
+
+def _answer_table_provenance_from_doc(
+    doc: Any,
+) -> tuple[frozenset[tuple[str, str]] | None, ...] | None:
+    """Load `TrailEntry.answer_table_provenance` (08 §D.2).
+
+    Total on any shape: a legacy document has no such key (`None`), anything that is
+    not a list is treated the same way, and a malformed table POSITION degrades to
+    `None` on its own (`_answer_table_provenance_item`) rather than raising into a
+    store read — the field is an additive optimisation of the read path, so a
+    malformed one must cost the per-table filter, never the session.
+
+    Its sibling `_provenance_from_doc` is deliberately left strict. `TrailEntry.
+    provenance` is not an optimisation: it is what `scope_filter` reads to decide
+    whether an entry may be shown at all, `None` there means UNDETERMINED and is
+    treated fail-closed, and silently manufacturing that value from a malformed
+    payload would turn a corrupt document into a quiet scope decision. Loud is
+    correct there; total is correct here.
+    """
+    if not isinstance(doc, list):
+        return None
+    return tuple(_answer_table_provenance_item(item) for item in doc)
+
+
 @dataclass(frozen=True)
 class TrailEntry:
     """One tool-call record in `tool_trail` (design §6)."""
@@ -160,6 +209,42 @@ class TrailEntry:
     # turn, so a prior-turn denial never replays at all. The detail can only render
     # inside the turn whose scope produced it.
     denial_detail: str | None = None
+    # `serves_intent` (additive, Release 1 call-time intent tagging): the
+    # `intent_id` of the tracked intent this call was made FOR, as the model named
+    # it at the moment it dispatched the work. `None` (the default) for every
+    # untagged call, every non-taggable tool, and every document written before the
+    # field existed — so legacy docs load byte-identically.
+    #
+    # It is the PRIMARY way an intent is completed (04, as amended): the model tags
+    # the call, then closes the intent with `{intent_id, status}` alone and the
+    # runtime resolves the evidence from this field. Requiring it to cite an opaque
+    # 24-char `tool_call_id` after the fact failed 9 attempts out of 9 against a
+    # live model — it named the blueprint id, the tool NAME, a hallucinated id, and
+    # finally `""`, while the real ids sat in its context the whole time.
+    #
+    # The value is ALWAYS a runtime-assigned id (`i1`, `i2`, …): the loop validates
+    # the tag against the live `AnalysisState` before persisting it and drops
+    # anything else (see `composite/analysis_state.py::split_serves_intent`), so no
+    # model-authored free text can land here and D25-safe telemetry may carry it.
+    serves_intent: str | None = None
+    # `answer_table_provenance` (additive, 08 §D.2): the D44 USES set of EACH query
+    # a successful `answerWithTable` designated, positionally parallel to the
+    # tables `resolve_designations` reads back out of `args`. `None` (the default)
+    # for every entry of every other tool and for every document written before the
+    # field existed — the third time this additive-with-`None` pattern is used
+    # (`authoritative`, `denial_detail`, `serves_intent`), so legacy docs load
+    # byte-identically.
+    #
+    # IT IS NOT THIS ENTRY'S PROVENANCE, and the distinction is load-bearing.
+    # `provenance` stays `frozenset()` (determined-empty: the call reads no
+    # warehouse data), and this field must NEVER be folded into
+    # `_compute_turn_provenance_union` — that union is fail-closed, so a single
+    # unparseable designated query would collapse it to `None` and drop the turn's
+    # whole answer from every later replay. It exists so a scope narrowing can drop
+    # the out-of-scope TABLES instead of the whole answer, read through
+    # `answer_with_table.is_answer_table_in_scope` by the live path and by
+    # `session_history.project_history` alike.
+    answer_table_provenance: tuple[frozenset[tuple[str, str]] | None, ...] | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -175,6 +260,12 @@ class TrailEntry:
             "ts": self.ts,
             "authoritative": self.authoritative,
             "denial_detail": self.denial_detail,
+            "serves_intent": self.serves_intent,
+            "answer_table_provenance": (
+                None
+                if self.answer_table_provenance is None
+                else [_provenance_to_doc(item) for item in self.answer_table_provenance]
+            ),
         }
 
     @classmethod
@@ -195,6 +286,10 @@ class TrailEntry:
             # `.get` (not `[...]`): a document written before this field existed
             # loads with `None` and renders exactly as it always did.
             denial_detail=doc.get("denial_detail"),
+            serves_intent=doc.get("serves_intent"),
+            answer_table_provenance=_answer_table_provenance_from_doc(
+                doc.get("answer_table_provenance")
+            ),
         )
 
 
@@ -225,9 +320,28 @@ REASON_CODES = MODEL_REASON_CODES | RUNTIME_REASON_CODES
 # imported by the stores without a cycle (`agent_loop` imports `store`).
 MAX_FINALIZATION_BLOCKS_PER_WINDOW = 1
 
+# WHAT a forced re-round was claimed FOR (05 §C.1, §J.3). Two independent gates
+# refuse a finish, and as of 2026-08-12 they hold SEPARATE per-window allowances:
+#
+#   `intents`      — pending intents at either terminal exit (05 §B).
+#   `answer_shape` — a bare-text finish holding untabled multi-row results (05 §J).
+#
+# They shared ONE allowance for exactly one release, and live measurement killed it:
+# on three-part questions the intents nudge consumed the window's only grant in 2 of
+# 4 runs, leaving the shape gate able to emit `loop_answer_shape_exhausted` and
+# nothing else — starved on precisely the multi-deliverable question it was built
+# for. A closed enum rather than a free string because it becomes part of a
+# PERSISTED key: an unrecognised value would mint a brand-new, unbounded allowance
+# and no test would see it.
+FinalizationBlockKind = Literal["intents", "answer_shape"]
+FINALIZATION_BLOCK_KINDS: tuple[FinalizationBlockKind, ...] = ("intents", "answer_shape")
 
-def finalization_block_key(turn_index: int, window_count: int) -> str:
-    """The `SessionDoc.finalization_blocks` key — `"0:1"` for turn 0, window 1.
+
+def finalization_block_key(
+    turn_index: int, window_count: int, kind: FinalizationBlockKind
+) -> str:
+    """The `SessionDoc.finalization_blocks` key — `"0:1:intents"` for turn 0,
+    window 1, the pending-intents allowance.
 
     THE TURN INDEX IS LOAD-BEARING, and 05 §C.1's original "keyed by window"
     was a defect. `finalization_blocks` is persisted on the session document and
@@ -243,9 +357,27 @@ def finalization_block_key(turn_index: int, window_count: int) -> str:
     needs a turn-boundary hook that does not exist and would have to fire on every
     resume path without resetting the counter mid-turn.
 
+    THE KIND IS THE SAME ARGUMENT ONE LEVEL DOWN (05 §J.3). Two gates that share a
+    key share an allowance, and sharing measured badly — so the kind joins the key
+    rather than the gates queueing for one counter. Every kind is spelled into the
+    key, including `intents`: an unsuffixed key would read as "some allowance" in a
+    map that now holds several, and the migration cost is zero because nothing is in
+    production.
+
+    `kind` is VALIDATED here rather than trusted. This is the single point where a
+    persisted allowance key is minted, so an unrecognised kind — a typo at a call
+    site, a stale caller after a rename — must not quietly create an eighth
+    unbounded budget. Raising is safe for the runtime: `_grant_forced_reround`
+    treats any exception from the claim as "no re-round available" and finalizes.
+
     Defined here so both store implementations and every test format it one way.
     """
-    return f"{turn_index}:{window_count}"
+    if kind not in FINALIZATION_BLOCK_KINDS:
+        raise ValueError(
+            f"unknown finalization block kind {kind!r}; expected one of "
+            f"{FINALIZATION_BLOCK_KINDS}"
+        )
+    return f"{turn_index}:{window_count}:{kind}"
 
 
 @dataclass(frozen=True)
@@ -335,6 +467,14 @@ class PauseCheckpoint:
     slot_bindings_json: str | None = None  # the raw model-proposed slot_bindings (deterministic re-fill)
     completed_nodes_json: str | None = None  # [{order, output_scalar}] — SCALAR outputs only (Slice C)
     awaiting_node: int | None = None  # the node order to resume at (Slice C)
+    # The `serves_intent` tag of the `runBlueprint` call that paused (additive,
+    # call-time intent tagging). A pausing tool writes NO trail entry — the entry is
+    # written by `_resume_blueprint` under a FRESH `tool_call_id` after the answer
+    # comes back — so without carrying the tag here it is lost at the pause, and the
+    # intent that blueprint was run for could only be closed by citing an id the
+    # model never chose. `None` for every askUser/budget-cap pause and every
+    # untagged call.
+    serves_intent: str | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -347,6 +487,7 @@ class PauseCheckpoint:
             "slot_bindings_json": self.slot_bindings_json,
             "completed_nodes_json": self.completed_nodes_json,
             "awaiting_node": self.awaiting_node,
+            "serves_intent": self.serves_intent,
         }
 
     @classmethod
@@ -364,6 +505,7 @@ class PauseCheckpoint:
             slot_bindings_json=doc.get("slot_bindings_json"),
             completed_nodes_json=doc.get("completed_nodes_json"),
             awaiting_node=int(awaiting_node) if awaiting_node is not None else None,
+            serves_intent=doc.get("serves_intent"),
         )
 
 

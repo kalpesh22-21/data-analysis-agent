@@ -444,6 +444,37 @@ class ToolDispatcher:
             return self._catalog
         return await self._catalog(credentials)
 
+    async def capture_sql_provenance(
+        self, sql: str, credentials: RuntimeCredentials
+    ) -> frozenset[tuple[str, str]] | None:
+        """The D44 USES set of a query that is NOT being dispatched (08 §D.2).
+
+        `answerWithTable` may designate a query the agent never ran — that is the
+        documented contract, because the executed query usually carries a LIMIT the
+        agent chose for its own reading and paging needs the un-capped shape. Such
+        a query therefore appears in no trail entry's provenance, so the turn union
+        does not cover it and the read path cannot tell whether the table it is
+        offering is still in scope.
+
+        SAME extractor, SAME catalog, SAME `capture_provenance` entry point as a
+        real `runQuery` dispatch, so the two can never disagree about one query.
+        Reads NOTHING and dispatches NOTHING: it parses a string. Degrades to
+        `None` (undetermined) rather than raising — see
+        `answer_with_table.is_answer_table_in_scope` for what `None` then means.
+        """
+        try:
+            catalog = await self._resolve_catalog(credentials)
+            return await capture_provenance(
+                "runQuery", {"sql": sql}, catalog, session_id=credentials.session_id
+            )
+        except Exception:
+            _logger.warning(
+                "could not capture provenance for a designated answer table — "
+                "treating it as undetermined",
+                exc_info=True,
+            )
+            return None
+
     async def dispatch(
         self,
         tool_name: str,

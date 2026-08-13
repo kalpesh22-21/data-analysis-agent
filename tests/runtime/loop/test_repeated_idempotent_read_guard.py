@@ -721,11 +721,16 @@ async def test_guard_event_payload_is_legible_and_marks_the_dedup() -> None:
     payload = guard_events[0]
     assert payload["tool_name"] == "getTableSchema"
     assert payload["deduped"] is True
-    assert payload["guard_reason"] == "already_served_this_turn"
+    # UPDATED with the trim-aware exemption: "already served" is no longer on its
+    # own sufficient for the guard to fire — the result must ALSO still be readable.
+    # The reason string says so, because a trace that claimed the old reason would
+    # misdescribe the decision the loop actually made.
+    assert payload["guard_reason"] == "already_served_and_still_readable"
     assert payload["database"] == "dbpcm_warehouse"
     assert payload["table"] == "employee"
     assert payload["dedup_target"] == "dbpcm_warehouse.employee"
     assert "duplicate getTableSchema(dbpcm_warehouse.employee)" in payload["note"]
+    assert "still readable above" in payload["note"]
     assert "not re-dispatched" in payload["note"]
 
 

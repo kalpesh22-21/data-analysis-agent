@@ -38,9 +38,28 @@ TWO WAYS TO DESIGNATE, one wire contract:
     paged table from the D56 verification that gated the answer the user was given.
     An unmatched id resolves to nothing and is logged.
 
-Either way the UI receives ONE field — `answer_sql` — and pages it through
-`POST /query/page`. The blueprint path is resolved server-side precisely so the UI
-never re-executes a DAG: for a composed blueprint that would re-run every node and
+A THIRD WAY, added by 08 (`docs/decisions/release-1/08-multi-table-answer.md`):
+
+  * `tables=[{sql | blueprint_id, caption}]` — ONE table per part of a multi-part
+    answer. Measured across 17 live sessions, `answerWithTable` succeeded on 6/6
+    single-deliverable turns and 1/9 multi-intent ones, because the payload could
+    name only ONE of the three result sets a three-part turn produces and the
+    model answered the rest in prose. Two prompt-level merge rules were written to
+    close that gap; both were measured live and both were REVERTED (01a §§10-11),
+    because the instruction set they created was unsatisfiable rather than badly
+    worded: *one table per answer* + *never re-derive a blueprint result* + *two
+    blueprints answer two same-grain parts* cannot all hold. `tables` deletes the
+    first premise, so nothing has to be merged and nothing re-derived.
+
+    An element of `tables` is EXACTLY the mapping `resolve_designation` already
+    reads, so multi-table adds no second resolution path — the same function, in a
+    loop (`resolve_designations` below).
+
+The UI receives `answer_tables` (a list) plus `answer_sql` — a DERIVED projection
+of `answer_tables[0]`, kept so every existing N<=1 consumer works untouched — and
+pages EACH table through `POST /query/page`, one request per table with its own
+offset. The blueprint path is resolved server-side precisely so the UI never
+re-executes a DAG: for a composed blueprint that would re-run every node and
 re-materialise scratch on every scroll.
 
 KNOWN LIMIT: a scratch-backed composed blueprint's terminal SQL references a
@@ -51,17 +70,30 @@ separately, which is a larger change than this tool.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.composite.analysis_state import MAX_INTENTS
+from data_agent.runtime.context.scope_filter import is_provenance_in_scope
 from data_agent.runtime.dispatch.tool_dispatcher import ToolResult
+from data_agent.runtime.sanitize import MAX_FIELD_CHARS, sanitize_text
 from data_agent.runtime.session.models import ResultPreview
 
 if TYPE_CHECKING:
     from data_agent.runtime.loop.agent_loop import TurnContext
 
 TOOL_NAME = "answerWithTable"
+
+# 08 §F. EQUAL to `MAX_INTENTS`, and IMPORTED rather than re-declared so the two
+# can never drift. A cap BELOW `MAX_INTENTS` would re-create through the payload
+# exactly the conflict this feature exists to dissolve: a 5-intent turn under a
+# 4-table ceiling is told it cannot show a table for every part, and the only move
+# left is to merge two results into one query — premise (1) of the unsatisfiable
+# triple, returning by the back door. Tied to `MAX_INTENTS`, the ceiling can never
+# be the thing that forces a merge.
+MAX_ANSWER_TABLES = MAX_INTENTS
 
 # Lenient safety caps (not a contract — DoS/absurdity guards). Over-long input is
 # truncated rather than rejected, matching `record_assumptions.py`'s posture: the
@@ -132,6 +164,361 @@ def resolve_designation(
     return terminal_by_id.get(blueprint_id) if blueprint_id is not None else None
 
 
+# ---------------------------------------------------------------------------
+# Multi-table designation (08)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BlueprintRun:
+    """What one SUCCESSFUL `runBlueprint` of this turn leaves behind for the
+    answer-table machinery: the query whose rows ARE its result, whether the D56
+    gate verified it, and the slots it was run with.
+
+    ONE RECORD, CAPTURED AT ONE SITE (`agent_loop._capture_terminal_sql`), because
+    the alternative — a `blueprint_id -> terminal_sql` map beside a separate
+    `blueprint_id -> verification` map — allows a table's SQL and its badge to be
+    paired from DIFFERENT runs of the same blueprint later. Here they cannot be:
+    they are read out of one `result_full` at the moment it is in hand.
+    """
+
+    terminal_sql: str
+    # `{"passed": True, "method": "blueprint_gate", "grain_checked": bool}` when the
+    # D56 gate verified this run, else `None`. NEVER `{"passed": False}` — see
+    # `rollup_verification`.
+    verification: dict[str, Any] | None = None
+    slots: dict[str, Any] = field(default_factory=dict)
+
+
+def blueprint_verification(result_full: Any) -> dict[str, Any] | None:
+    """The D56 verification block for one `runBlueprint` `result_full`, or `None`.
+
+    The SINGLE constructor of that dict — shared by the turn-level enrichment
+    accumulator and by per-table designation, so the two can never describe the
+    same run differently. `None` (not `{"passed": False}`) is the only negative
+    form: absence reads as *no claim*, which is what an unverified result is.
+    """
+    if not isinstance(result_full, dict) or result_full.get("status") != "verified":
+        return None
+    return {
+        "passed": True,
+        "method": "blueprint_gate",
+        # None-safe: a `verify: None` must not AttributeError.
+        "grain_checked": bool((result_full.get("verify") or {}).get("grain_checked")),
+    }
+
+
+def blueprint_run_from_result(
+    result_full: Any, *, slots: Mapping[str, Any] | None = None
+) -> tuple[str, BlueprintRun] | None:
+    """`(blueprint_id, BlueprintRun)` for a SUCCESSFUL blueprint `result_full`, or
+    `None` when the payload carries no usable terminal SQL.
+
+    The terminal SQL is exposed explicitly rather than inferred as "the last
+    element of `result_full["sql"]`": rehydrated nodes are appended to that list
+    FIRST on a D45 resume, so the positional assumption is not safe.
+    """
+    if not isinstance(result_full, dict):
+        return None
+    blueprint_id = result_full.get("blueprint_id")
+    terminal_sql = result_full.get("terminal_sql")
+    if not isinstance(blueprint_id, str) or not isinstance(terminal_sql, str):
+        return None
+    if not terminal_sql.strip():
+        return None
+    return blueprint_id, BlueprintRun(
+        terminal_sql=terminal_sql,
+        verification=blueprint_verification(result_full),
+        slots=dict(slots or {}),
+    )
+
+
+def terminal_sql_by_id(runs: Mapping[str, BlueprintRun]) -> dict[str, str]:
+    """The `blueprint_id -> terminal_sql` projection `resolve_designation` takes.
+
+    A pure projection of the one captured map, NOT a second source — which is why
+    the pairing hazard `BlueprintRun` exists to close stays closed.
+    """
+    return {blueprint_id: run.terminal_sql for blueprint_id, run in runs.items()}
+
+
+@dataclass(frozen=True)
+class DesignationItem:
+    """One element of the model's designation, resolved as far as pure code can.
+
+    `sql is None` with `named_blueprint` set is the REFUSAL case: the model named a
+    blueprint that did not run successfully this turn, and there is nothing to
+    resolve it to. It is deliberately carried here rather than dropped, because
+    dropping it would silently lose a deliverable's table — the exact failure
+    multi-table exists to fix.
+    """
+
+    sql: str | None
+    caption: str | None = None
+    # Set ONLY when `sql` came FROM that blueprint's terminal SQL. A raw `sql=`
+    # table has no blueprint behind it and therefore no chip and no badge.
+    blueprint_id: str | None = None
+    # What the model named, resolved or not. Drives the retryable nudge.
+    named_blueprint: str | None = None
+
+
+@dataclass(frozen=True)
+class DesignatedTable:
+    """One resolved, deduped, in-cap answer table."""
+
+    sql: str
+    caption: str | None = None
+    blueprint_id: str | None = None
+
+
+@dataclass(frozen=True)
+class Designation:
+    """The pure read of one `answerWithTable` call's arguments."""
+
+    items: tuple[DesignationItem, ...]
+    # `True` when the `tables` array was the source (08 §B.3). `False` means the
+    # top-level `sql`/`blueprint_id` pair was used — the 6/6 shorthand.
+    from_tables_array: bool = False
+    # Items in `tables` that carried no designation at all — the wholly-placeholder
+    # item 03 §C.3.1 measured. Counted, never fatal.
+    dropped_unresolvable: int = 0
+
+
+def _resolve_item(item: Any, terminal_by_id: Mapping[str, str]) -> DesignationItem:
+    """Resolve ONE designation mapping through the EXISTING `resolve_designation`.
+
+    The flat-schema mis-fill (03 §C.3.1) is handled by construction: the live model
+    emits every declared property and fills the unused ones with placeholders, so
+    `{"sql": "", "blueprint_id": "bp-x", "caption": ""}` is the shape that actually
+    arrives. `clean_answer_sql`/`clean_blueprint_id` already map empty and
+    whitespace to `None`, and `resolve_designation`'s docstring records that this
+    exact serialisation is what the live model sends — the normalisers were written
+    against it and are already load-bearing on it.
+    """
+    raw_sql = clean_answer_sql(item.get("sql")) if isinstance(item, dict) else None
+    named = clean_blueprint_id(item.get("blueprint_id")) if isinstance(item, dict) else None
+    resolved = resolve_designation(item, terminal_by_id)
+    raw_caption = item.get("caption") if isinstance(item, dict) else None
+    caption = (
+        sanitize_text(raw_caption, MAX_FIELD_CHARS) or None
+        if isinstance(raw_caption, str)
+        else None
+    )
+    return DesignationItem(
+        sql=resolved,
+        caption=caption,
+        # A `sql=` that won over a `blueprint_id` is a raw table: it is NOT that
+        # blueprint's result, so it inherits neither the chip nor the badge.
+        blueprint_id=named if (resolved is not None and raw_sql is None) else None,
+        named_blueprint=named,
+    )
+
+
+def resolve_designations(args: Any, terminal_by_id: Mapping[str, str]) -> Designation:
+    """Read one `answerWithTable` call's arguments into an ORDERED item list.
+
+    THE PRECEDENCE (08 §B.3), mirroring the rule already in `resolve_designation`
+    ("`sql=` wins when both are given: it is the more specific instruction"):
+
+        `tables` wins when at least one of its items CARRIES A DESIGNATION.
+        Otherwise the top-level `sql`/`blueprint_id` pair is used as one item.
+
+    "Carries a designation" — rather than "resolves" — is deliberate and is the one
+    place the doc's wording needed sharpening to stay self-consistent. `tables:
+    [{blueprint_id: X}]` where X never ran carries a designation that RESOLVES to
+    nothing; under a resolves-only test it would fall back to an empty top-level
+    pair and the model would silently lose its table, which is precisely what §B.4
+    step 3 forbids. Under this test it stays the source, the item survives as a
+    refusal, and the model gets the retryable nudge it can act on.
+
+    NEVER A UNION. A model that fills `tables: [{blueprint_id: X}]` AND `sql: <X's
+    SQL>` gets ONE table, not two. Fallback rather than union is also what lets an
+    empty placeholder array (`tables: []`, the array analogue of `""`) keep its
+    top-level designation instead of silently losing it.
+
+    Pure: no hooks, no store, no dedupe, no cap — see `finalize_designations`.
+    """
+    if not isinstance(args, dict):
+        return Designation(items=())
+
+    raw_tables = args.get("tables")
+    candidates = [item for item in raw_tables if isinstance(item, dict)] if (
+        isinstance(raw_tables, list)
+    ) else []
+    resolved = [_resolve_item(item, terminal_by_id) for item in candidates]
+    designating = [
+        item for item in resolved if item.sql is not None or item.named_blueprint is not None
+    ]
+    if designating:
+        return Designation(
+            items=tuple(designating),
+            from_tables_array=True,
+            dropped_unresolvable=len(resolved) - len(designating),
+        )
+
+    single = _resolve_item(args, terminal_by_id)
+    if single.sql is None and single.named_blueprint is None:
+        # No designation at all — a prose-only `answerWithTable`. Not a drop, and
+        # deliberately not counted as one: it is an ordinary, legitimate call.
+        return Designation(items=())
+    return Designation(items=(single,))
+
+
+@dataclass(frozen=True)
+class FinalizedDesignation:
+    tables: tuple[DesignatedTable, ...]
+    dropped_duplicate: int = 0
+    dropped_over_cap: int = 0
+
+
+def finalize_designations(items: Sequence[DesignationItem]) -> FinalizedDesignation:
+    """Dedupe on resolved SQL (first-occurrence order, the `turn_sql` discipline)
+    and cap at `MAX_ANSWER_TABLES`.
+
+    OVERFLOW TRUNCATES, IT DOES NOT REFUSE — and this is the one place 03 §A.4's
+    "REJECT, never truncate" precedent deliberately does not transfer. There,
+    truncating rewrote a FROZEN `description` that enforcement depended on, so a
+    clipped value was a corrupted one. Here the cap equals `MAX_INTENTS`, so
+    exceeding it means the model designated more tables than it can possibly have
+    intents — duplication or nonsense, not a legitimate request being clipped. And
+    refusing would cost the user a finished answer over the model's own
+    bookkeeping.
+
+    Items that resolved to nothing are skipped: the caller decides whether they are
+    a refusal (the loop, which can nudge) or simply absent (a replay, which cannot).
+    """
+    tables: list[DesignatedTable] = []
+    seen: set[str] = set()
+    dropped_duplicate = 0
+    dropped_over_cap = 0
+    for item in items:
+        if item.sql is None:
+            continue
+        if item.sql in seen:
+            dropped_duplicate += 1
+            continue
+        seen.add(item.sql)
+        if len(tables) >= MAX_ANSWER_TABLES:
+            dropped_over_cap += 1
+            continue
+        tables.append(
+            DesignatedTable(sql=item.sql, caption=item.caption, blueprint_id=item.blueprint_id)
+        )
+    return FinalizedDesignation(
+        tables=tuple(tables),
+        dropped_duplicate=dropped_duplicate,
+        dropped_over_cap=dropped_over_cap,
+    )
+
+
+@dataclass(frozen=True)
+class AnswerTable:
+    """One designated answer table, fully enriched — what the wire carries.
+
+    `provenance` is NOT on the wire and is NOT this entry's provenance: it is the
+    D44 USES set of the designated query, persisted separately on the
+    `answerWithTable` `TrailEntry` (`answer_table_provenance`) so a scope narrowing
+    can drop out-of-scope tables individually. It must NEVER enter
+    `_compute_turn_provenance_union`, which is fail-closed: one unparseable
+    designated query would collapse the whole turn's union to `None` and drop the
+    user's own answer from every later replay.
+    """
+
+    sql: str
+    caption: str | None = None
+    blueprint_use: dict[str, Any] | None = None
+    verification: dict[str, Any] | None = None
+    provenance: frozenset[tuple[str, str]] | None = None
+
+    def to_doc(self) -> dict[str, Any]:
+        return {
+            "sql": self.sql,
+            "caption": self.caption,
+            "blueprint_use": dict(self.blueprint_use) if self.blueprint_use else None,
+            "verification": dict(self.verification) if self.verification else None,
+        }
+
+
+def enrich_table(
+    table: DesignatedTable,
+    runs: Mapping[str, BlueprintRun],
+    *,
+    provenance: frozenset[tuple[str, str]] | None = None,
+) -> AnswerTable:
+    """Attach the per-table chip + badge, both read from the SAME `BlueprintRun`
+    that supplied the table's SQL.
+
+    A raw `sql=` table gets neither: there is nothing that verified it, and no
+    blueprint produced it.
+    """
+    run = runs.get(table.blueprint_id) if table.blueprint_id is not None else None
+    if run is None:
+        return AnswerTable(sql=table.sql, caption=table.caption, provenance=provenance)
+    return AnswerTable(
+        sql=table.sql,
+        caption=table.caption,
+        blueprint_use={"blueprint_id": table.blueprint_id, "slots": dict(run.slots)},
+        verification=dict(run.verification) if run.verification else None,
+        provenance=provenance,
+    )
+
+
+def rollup_verification(tables: Sequence[AnswerTable]) -> dict[str, Any] | None:
+    """The envelope's `verification`: a CONSERVATIVE **AND** over the DESIGNATED
+    tables only (08 §C.3).
+
+    Green only if EVERY designated table is verified and there is at least one.
+    An OR roll-up would be the over-claim restated; computing it over "any
+    blueprint that ran anywhere in the turn" — which is what the turn-level
+    accumulator does — is an over-claim of a second, older kind: a verified
+    blueprint for part 1 plus a hand-written query for part 2 badges an unverified
+    grid green, and has done since the field existed.
+
+    NEVER `passed: False`. Absence stays the only negative signal. A `False` would
+    render as a red "verification failed" badge whose actual meaning is "one of
+    these is a hand-written query" — which is not a failure at all, and would be
+    read as one.
+    """
+    if not tables:
+        return None
+    if any(table.verification is None for table in tables):
+        return None
+    return {
+        "passed": True,
+        "method": "blueprint_gate",
+        "grain_checked": all(
+            bool((table.verification or {}).get("grain_checked")) for table in tables
+        ),
+    }
+
+
+def is_answer_table_in_scope(
+    provenance: frozenset[tuple[str, str]] | None, column_scope: frozenset[str]
+) -> bool:
+    """Is this designated table still offerable under *column_scope*? (08 §D)
+
+    ONE predicate, read by the live path and by `session_history.project_history`,
+    for the reason `resolve_designation` itself exists: reading a designation one
+    way live and another way on reload silently dropped every blueprint
+    designation once, and *reload is the only place that regression shows*.
+
+    UNDETERMINED PROVENANCE (`None`) IS KEPT, and that is a deliberate refinement of
+    08 §D.2's "`None` drops that table". §D.3 states the posture this sits in: the
+    gap being closed is a CONSISTENCY defect, not an entitlement hole, because
+    `POST /query/page` re-enforces column scope at execution under the caller's own
+    credentials — nothing out of scope was ever readable. Dropping on `None` would
+    therefore buy no access control while silently deleting every grid whose query
+    the runtime's own extractor cannot parse (an uncatalogued table is enough), for
+    queries `/query/page` executes perfectly well today. Fail-closed here would be
+    a new silent failure introduced to satisfy a posture, which is the defect class
+    this release has spent itself finding. A table PROVEN out of scope is still
+    dropped.
+    """
+    if provenance is None:
+        return True
+    return is_provenance_in_scope(provenance, column_scope)
+
+
 class AnswerWithTableTool:
     """The `answerWithTable(answer, sql | blueprint_id)` runtime tool.
 
@@ -156,10 +543,10 @@ class AnswerWithTableTool:
         # dispatch site has to tell apart.
         args = arguments if isinstance(arguments, dict) else {}
         answered = clean_answer_text(args.get("answer")) is not None
-        designated = (
-            clean_answer_sql(args.get("sql")) is not None
-            or clean_blueprint_id(args.get("blueprint_id")) is not None
-        )
+        # Reported off the SAME precedence the loop resolves with (`tables` first,
+        # then the top-level pair), so the confirmation can never claim a
+        # designation the loop did not make, or deny one it did.
+        designated = bool(resolve_designations(args, {}).items)
         # A tiny confirmation. In the normal (terminal) case the model never sees
         # it — the turn ends on this call — but it is still persisted to the trail,
         # so it must be a real, honest result rather than a placeholder. It
@@ -191,10 +578,25 @@ class AnswerWithTableTool:
 
 
 __all__ = [
+    "MAX_ANSWER_TABLES",
     "TOOL_NAME",
+    "AnswerTable",
     "AnswerWithTableTool",
-    "resolve_designation",
+    "BlueprintRun",
+    "Designation",
+    "DesignationItem",
+    "DesignatedTable",
+    "FinalizedDesignation",
+    "blueprint_run_from_result",
+    "blueprint_verification",
     "clean_answer_sql",
     "clean_answer_text",
     "clean_blueprint_id",
+    "enrich_table",
+    "finalize_designations",
+    "is_answer_table_in_scope",
+    "resolve_designation",
+    "resolve_designations",
+    "rollup_verification",
+    "terminal_sql_by_id",
 ]

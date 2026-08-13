@@ -4,6 +4,8 @@
 
 ## Current state (verified)
 
+*Pre-rewrite baseline, recorded before this doc was executed. For the shipped text and size see [01a](01a-prompt-draft.md).*
+
 `src/data_agent/runtime/prompts.py` — `AGENT_SYSTEM_PROMPT`, a module-level constant, **11,297 chars ≈ 2,824 tokens**, re-sent on every round-trip.
 
 Nine sections in order: *Sizing the request · Planning a complicated request · Operating procedure · Understanding blueprints · Trust boundary · Scope and sensitive data · Asking vs. assuming · Presenting a table · Answering.*
@@ -58,13 +60,15 @@ Spec §3 uses **deliverable**; §5/§7/§9 and the state field use **intent**. S
 
 ## Token budget
 
-Removing two sections and adding one shorter routing block plus ~6 state lines should land **net neutral to slightly smaller**. Measure it: the prompt is re-sent every round-trip and the loop's per-window token ceiling is `model_context_window`, so growth is multiplied by round count.
+Removing two sections and adding one shorter routing block plus ~6 state lines should land **net neutral to slightly smaller**. Measure it: the prompt is re-sent every round-trip and is charged to the loop's per-window token SPEND ceiling (`max_window_token_spend`) every time, so growth is multiplied by round count.
 
 ```
 uv run python -c "from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT as P; print(len(P), len(P)//4)"
 ```
 
-Record before/after in the PR, and add a hard assertion — `len(AGENT_SYSTEM_PROMPT) <= 11_297` — rather than relying on "net neutral to slightly smaller".
+Record before/after in the PR, and add a hard assertion rather than relying on "net neutral to slightly smaller".
+
+**As shipped the assertion is `len(AGENT_SYSTEM_PROMPT) <= 15_000`**, not the `<= 11_297` this section originally specified. Three live findings landed after the rewrite (01a §5 finding 19, §6 the citation→tagging fix, §7 the direct-use routing path), each an instruction the runtime cannot enforce and the prompt is the only carrier of, taking it to 12,084 chars; the getBlueprint-before-runBlueprint rule (01a §8) then took it to 13,308, and the re-fetch-escape rewording (01a §9) to **13,383**, and that one the runtime DOES enforce — the prompt buys the model getting it right first time rather than learning it from a refusal. The ceiling was ratified at 15,000 by the user — deliberately above the current size, so the remaining routing/tracking work has room to land instead of being paid for by deleting working instructions. See [01a §7](01a-prompt-draft.md) for the ratification and the full history of the number.
 
 ## Edge cases
 

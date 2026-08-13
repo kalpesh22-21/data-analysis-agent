@@ -78,14 +78,24 @@ EXPECTED_KEYS: dict[str, set[str]] = {
         "to_status",
         "reason_code",
     },
-    "loop_intent_completed": {"intent_id", "evidence_tool_name"},
+    # `evidence_binding` (call-time tagging): HOW the binding was established —
+    # `tagged` (the model named the intent on the call) or `auto_bound` (the model
+    # named nothing and the runtime found the one call that could have served it).
+    # Route derivation reads `evidence_tool_name`; this says how much to trust the
+    # join, and `auto_bound` is the weaker of the two by construction.
+    "loop_intent_completed": {"intent_id", "evidence_tool_name", "evidence_binding"},
     # The block-side mirror. `evidence_tool_name` is what separates a NO_ACCESS
     # earned on the user's own data from one manufactured by a single
     # `getTableSchema(<scratch_db>, …)` probe (04 §B.4) — without it the two are
     # telemetrically identical, and the release's mitigation for that hole IS
     # measurement. Distinct from `loop_intent_force_blocked`, which is 05's
     # runtime-forced counterpart and has no evidence at all.
-    "loop_intent_blocked": {"intent_id", "reason_code", "evidence_tool_name"},
+    "loop_intent_blocked": {
+        "intent_id",
+        "reason_code",
+        "evidence_tool_name",
+        "evidence_binding",
+    },
     "loop_evidence_reused": {"intent_id", "tool_call_id"},
     "loop_zero_row_block": {"intent_id"},
     "loop_zero_row_completion": {"intent_id"},
@@ -410,6 +420,7 @@ async def test_the_zero_row_pair_is_emitted_for_the_ratio() -> None:
             "intent_id": "i2",
             "reason_code": "REQUIRED_DATA_UNAVAILABLE",
             "evidence_tool_name": "runQuery",
+            "evidence_binding": "auto_bound",
         }
     ]
 

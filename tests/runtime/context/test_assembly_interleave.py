@@ -37,6 +37,14 @@ def _ts(n: int) -> str:
     return f"2026-07-01T00:00:{n:02d}+00:00"
 
 
+# The DATE ANCHOR render item, which lands immediately before the current
+# question on every assemble that is given a `current_turn_index`. Named rather
+# than spelled out at each call site so these lists stay about ORDER, which is
+# what they exist to lock — and derived from `_ts` so the date and the fixture
+# clock cannot drift apart.
+_ANCHOR = f"user:Today's date is {_ts(0)[:10]}."
+
+
 def _msg(turn: int, role: str, content: str, ts: str, provenance=_IN_SCOPE) -> TurnMessage:
     # User messages carry no warehouse data (always kept); assistant messages are
     # provenance-tagged like the trail. Default in-scope so the merge-order tests
@@ -133,6 +141,7 @@ async def test_three_turn_interleave_including_askuser_midturn_answer() -> None:
         "user:u1",  # the askUser answer — BETWEEN t1a and t1b, by ts (the win)
         "tool:t1b",
         "assistant:a1",
+        _ANCHOR,  # inserted immediately before the current question
         "user:q2",
         "tool:t2",
     ]
@@ -152,10 +161,16 @@ async def test_offpath_pure_interleaved_history_no_injection() -> None:
     assembler = ContextAssembler(store, history_token_budget=10_000_000)  # base=None, retrieval=None
     assembled = await assembler.assemble("s", _SCOPE, current_turn_index=1)
 
+    # "Nothing is injected" means nothing OPTIONAL: the date anchor is
+    # unconditional whenever the turn is identified, because a model with no
+    # grounded present silently mis-resolves every relative window (issues-stack
+    # B2). It is `role:"user"`, so the no-system-message guarantee below is exactly
+    # as strong as it was.
     assert [_ident(m) for m in assembled.messages] == [
         "user:q0",
         "tool:c0",
         "assistant:a0",
+        _ANCHOR,
         "user:q1",
         "tool:c1",
     ]
@@ -179,7 +194,7 @@ async def test_scope_filter_applied_to_both_streams_no_orphan() -> None:
     assembled = await assembler.assemble("s", _SCOPE, current_turn_index=1)
 
     idents = [_ident(m) for m in assembled.messages]
-    assert idents == ["user:q0", "user:q1", "tool:t1"]
+    assert idents == ["user:q0", _ANCHOR, "user:q1", "tool:t1"]
     assert "tool:t0" not in idents  # out-of-scope tool dropped...
     assert "assistant:a0" not in idents  # ...along with the answer derived from it
     assert assembled.dropped_by_scope_count == 1  # only the trail counts here
@@ -201,6 +216,7 @@ async def test_current_turn_sentinel_lands_in_its_ts_slot() -> None:
     assembled = await assembler.assemble("s", _SCOPE, current_turn_index=0)
 
     assert [_ident(m) for m in assembled.messages] == [
+        _ANCHOR,  # before the ONLY user message, which is this turn's question
         "user:q0",
         "tool:x",
         "tool:s*",  # the sentinel, in its ts slot BETWEEN x and y
@@ -228,7 +244,7 @@ async def test_colliding_ts_tie_break_is_deterministic_by_stream_rank() -> None:
 
     idents = [_ident(m) for m in first.messages]
     # user(rank 0) -> trail(rank 1, in insertion order cB then cA) -> assistant(rank 2).
-    assert idents == ["user:q0", "tool:cB", "tool:cA", "assistant:a0"]
+    assert idents == [_ANCHOR, "user:q0", "tool:cB", "tool:cA", "assistant:a0"]
     # Deterministic across rebuilds (D45 byte-stability under a colliding ts).
     assert [_ident(m) for m in second.messages] == idents
 

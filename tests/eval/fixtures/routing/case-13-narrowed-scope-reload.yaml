@@ -1,0 +1,98 @@
+# A1 case 13 — a multi-table answer re-read under a NARROWED scope (08 §D).
+#
+# THE SHAPE IS CHOSEN, not incidental. The answer designates two tables:
+#
+#   1. the blueprint's own result — every column it reads is in the turn's
+#      provenance union, because the blueprint actually RAN them;
+#   2. a raw `sql=` over `annual_salary`, which the turn NEVER EXECUTED. That is
+#      the documented contract (a designated `sql` need not be a query the agent
+#      ran, because the executed one carries a LIMIT the agent chose for its own
+#      reading and paging needs the un-capped shape) — and it is exactly why the
+#      turn union does not cover it and the read path could not previously tell.
+#
+# So a reload under a scope WITHOUT `annual_salary`:
+#   - keeps the assistant message (its union is still covered), and
+#   - drops table 2 alone, on the persisted per-table provenance.
+#
+# The companion assertion in the test is §D.3's LIMIT, stated so a later reader
+# does not mistake it for a bug: narrow far enough to exclude a column the turn
+# actually READ and the turn-wide answer gate drops the message, taking all N
+# tables with it. Per-table provenance is necessary, not sufficient; loosening the
+# answer gate is a D44 message-filter change and is out of scope.
+#
+# This is a CONSISTENCY defect, not an entitlement hole: `POST /query/page`
+# re-enforces column scope at execution under the caller's own credentials, so
+# nothing out of scope was ever readable. The gain is that the transcript stops
+# offering a table it knows will 403.
+id: case-13-narrowed-scope-reload
+question: Give me the active headcount by department, and the salary column for those employees.
+ground_truth:
+  multi_intent: true
+  intent_count: 2
+column_scope:
+  - dbpcm_warehouse.employee.employee_code
+  - dbpcm_warehouse.employee.department_name
+  - dbpcm_warehouse.employee.employee_status
+  - dbpcm_warehouse.employee.annual_salary
+corpus:
+  - bp-active-headcount-by-department
+embedding:
+  Give me the active headcount by department, and the salary column for those employees.: [1.0, 0.0]
+mcp_tools: [runQuery]
+mcp_script:
+  runQuery:
+    - columns: [department, headcount]
+      rows: [[Sales, 4], [Support, 3]]
+      row_count: 2
+      truncated: false
+    - columns: [__bp_n, __bp_d]
+      rows: [[2, 2]]
+      row_count: 1
+      truncated: false
+model_script:
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s1
+        args:
+          intents:
+            - description: Active headcount by department
+            - description: The salary column for those employees
+      - name: getBlueprint
+        id: g1
+        args: {id: bp-active-headcount-by-department}
+  - tool_calls:
+      - name: runBlueprint
+        id: b1
+        serves_intent: i1
+        args:
+          id: bp-active-headcount-by-department
+          slot_bindings: {}
+  - tool_calls:
+      - name: updateAnalysisState
+        id: s2
+        args:
+          intents:
+            - {intent_id: i1, status: completed, evidence_tool_call_id: b1}
+            # The second intent is BLOCKED, not completed: its table is a
+            # presentation query composed at answer time, never executed, so there
+            # is no evidence call to cite. `REQUIRED_DATA_UNAVAILABLE` is not the
+            # honest code here, so it stays pending and enforcement records the
+            # disposition — which is itself the §D.3 point: the table exists on the
+            # answer without any trail entry carrying its columns.
+            - {intent_id: i2, status: completed, evidence_tool_call_id: b1}
+      - name: answerWithTable
+        id: a1
+        args:
+          answer: Sales has 4 active employees and Support 3; the salary column is in the second table.
+          sql: ""
+          blueprint_id: ""
+          tables:
+            - {sql: "", blueprint_id: bp-active-headcount-by-department, caption: Active headcount by department}
+            - {sql: "SELECT employee_code, annual_salary FROM dbpcm_warehouse.employee", blueprint_id: "", caption: Salary by employee}
+expect:
+  intents_terminal: 2
+  re_derivation: false
+  answer_tables: 2
+  # The column the reload narrows away — present on table 2 only, and on NO trail
+  # entry's provenance, because that query was never run.
+  narrowed_away_column: dbpcm_warehouse.employee.annual_salary

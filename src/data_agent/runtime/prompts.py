@@ -24,6 +24,51 @@ model's own notes are not: D22 discards the model's free text around a tool call
 `loop/agent_loop.py::_tool_trail_entry_to_canonical`), so a decomposition the
 model merely "remembers" does not survive the round.
 
+The tracking section teaches CALL-TIME TAGGING as the way an intent is closed:
+tag the runQuery/runBlueprint/getTableSchema with `serves_intent` when you make
+it, then close the intent with `{intent_id, status}` alone. The earlier "cite the
+tool_call_id" instruction is GONE (2026-08-12), along with the model-declared
+`reason_code`: citation was the primary path and failed 9 live attempts out of 9,
+because a model will not reliably copy a 24-character opaque id, and the one
+shape it was retained for — one call answering two deliverables — is now the
+runtime's auto-bind backstop, so the bullet says to mark the second one completed
+and stop there. The block reason is derived from the tagged call, which the
+validator already required it to prove.
+
+That section CLOSES on the rule that closing the last intent is not the end of the
+turn (01a §13). Measured: three live runs of one three-intent question ended on
+`updateAnalysisState` and then wrote prose — `answer_tables: 0`, all intents
+`completed`, no `answerWithTable` call of ANY kind — while a single-deliverable
+control on the same build ended on `answerWithTable`. So the model is told to send
+both in one response, which 03 §E.2's partition makes safe (state calls dispatch
+first) and 05 §G already relied on. The multi-row rule is NOT restated there; the
+bullet points at `## Presenting a table`, which owns it, and that section carries
+the matching cross-reference.
+
+There is deliberately NO instruction here about merging several deliverables into
+one table. Two versions of a same-grain merge rule were written and both were
+REVERTED after live measurement: each one pushed the model off blueprints and
+onto hand-written SQL, and the turn then timed out with no answer at all. The
+cause is not wording — `answerWithTable` carries ONE query, one table per answer
+plus "never re-derive a blueprint result" plus two blueprints answering two
+same-grain parts is an unsatisfiable instruction set, and the model resolves it
+by dropping the blueprints. Do not re-add such a rule; the fix is a multi-table
+`answerWithTable`, scoped separately. Evidence and full reasoning:
+`docs/decisions/release-1/01a-prompt-draft.md` §§10-11 (both marked REVERTED).
+
+`## What runQuery accepts` states what the MCP's SQL guard actually admits, and
+exists because the model kept reaching for SQL metadata discovery that is closed:
+one live metadata question burned 3 of its 11 round-trips on `SHOW TABLES`, a
+`system.tables` SELECT and a hand-built literal table list, then hit the 60s wall
+clock with no answer. The tools were used too — the prompt was simply silent on
+the SQL path being shut. It leads with the positive route (listTables /
+getTableSchema) for that reason. The closed paths are real and verified in
+`clickhouse-api`: `SHOW`/`DESCRIBE`/`EXPLAIN` pass the statement-prefix allowlist
+(`app/security.py:123`) and are then rejected by provenance extraction, which
+admits only SELECT/WITH/UNION (`app/sqlparse/provenance.py:739-758`); `system.*`
+is denied by keyword (`app/security.py:170`) and is excluded from the catalog
+(`app/catalog.py:58`). No error code is named — those arrive via `denial_detail`.
+
 Determinism (D45): this is a module-level constant, so every per-round-trip
 rebuild and every resume re-derives byte-identical messages. It is inserted
 AFTER `budget.render_messages`/compaction, so it is never subject to the
@@ -47,21 +92,39 @@ AGENT_SYSTEM_PROMPT = (
     '(which tables or columns exist, what a field means). "Deliverable" and '
     '"intent" mean the same thing here. Most requests have one. Take each in '
     "turn:\n"
-    "- Analytical: read the blueprint cards already offered to you above BEFORE "
-    "fetching any schema — they are validated analyses in your access scope, and "
-    "often one IS the answer.\n"
-    "- Whether or not an offered card fits, call searchBlueprints for THAT "
-    "deliverable in your own words: one search per deliverable, not one for the "
-    "whole question. The offered cards were recalled from the whole question as "
-    "one string, so on a multi-part request they under-serve every part of it. "
-    "This is normal practice, not a fallback for when they miss.\n"
-    "- One blueprint covers it: run it with runBlueprint. Several blueprints "
-    "cover INDEPENDENT deliverables: call them together in one response.\n"
+    "- Analytical, ONE deliverable: the blueprint cards already offered to you "
+    "above were recalled from this question as a whole — for a single ask, exactly "
+    "the right query. Read them BEFORE fetching any schema; if one clearly covers "
+    "it, RUN IT with runBlueprint and do not search first.\n"
+    "- Analytical, SEVERAL deliverables, or no offered card clearly fits: call "
+    "searchBlueprints for THAT deliverable in your own words, whether or not an "
+    "offered card fits — one search per deliverable, not one for the whole "
+    "question, since cards recalled from the whole question under-serve every part "
+    "of a multi-part request. This is normal practice, not a fallback for when "
+    "they miss. Run the blueprint that covers it; when several cover INDEPENDENT "
+    "deliverables, call them together in one response.\n"
     "- None fits: ground the deliverable in the catalog (getTableSchema) and "
     "institutional knowledge (searchKnowledge), then query it — one query is "
     "usually enough; do not plan around obvious steps.\n"
     "- Metadata: blueprint search does not apply. Ground and answer it with "
-    "listTables/getTableSchema.\n"
+    "listTables/getTableSchema, never with SQL.\n"
+    "Whichever blueprint you land on, offered or searched: call getBlueprint on it "
+    "and read what it actually does BEFORE you run it — see Understanding "
+    "blueprints.\n"
+    "\n"
+    "## What runQuery accepts\n"
+    "Metadata comes from the tools, never from SQL: which tables exist -> "
+    "listTables; what columns a table has and what one MEANS -> getTableSchema. "
+    "There is no SQL route to it — SHOW TABLES, DESCRIBE/DESC and any read of a "
+    "`system.` table are all rejected, and do not hand-build a table list out of "
+    "literals instead.\n"
+    "runQuery takes ONE read-only statement over warehouse tables: a SELECT, or a "
+    "WITH ... SELECT. Joins, subqueries, CTEs and UNION are fine, and the server "
+    "adds a LIMIT if you omit one. Writes, DDL, SET/SETTINGS/FORMAT clauses and "
+    "external table functions (url, file, s3, remote, merge, view) are rejected.\n"
+    "A rejected query costs a full round-trip and the turn is bounded by a wall "
+    "clock, so guessing at what the guard allows is expensive: a few rejects can "
+    "end a turn with no answer at all.\n"
     "\n"
     "## Tracking a multi-part request\n"
     "When the request holds MORE THAN ONE deliverable, declare them all with "
@@ -72,18 +135,29 @@ AGENT_SYSTEM_PROMPT = (
     "A single-deliverable request: do NOT call it at all.\n"
     "- Declare only the user's ORIGINAL asks, in their own terms, one entry each; "
     "steps you invent along the way are not deliverables. They are frozen once "
-    "declared: later calls change only status, evidence and reason.\n"
-    "- Batched with other calls, emit updateAnalysisState FIRST.\n"
-    "- To complete an intent, cite the tool_call_id of a runQuery, an "
-    "authoritative runBlueprint, or a getTableSchema that produced its answer — "
-    "nothing else counts as evidence, and it must come from an EARLIER response; "
-    "a call issued in the same batch does not exist yet.\n"
+    "declared: later calls change only status and reason.\n"
+    "- TAG THE WORK AS YOU DO IT: pass `serves_intent` with the intent's id on the "
+    "runQuery, authoritative runBlueprint or getTableSchema you run for it — "
+    "nothing else counts as evidence — then close it with just intent_id and "
+    "status; the tagged call IS the evidence.\n"
+    "- Batched with other calls, emit updateAnalysisState FIRST: a call in the same "
+    "batch has not run yet, so close the intent in a LATER one.\n"
+    "- One call answering TWO deliverables: tag it for one and mark the other "
+    "completed too; the runtime binds that same call to both.\n"
     "- AN EMPTY RESULT SET IS AN ANSWER, NOT AN ABSENCE. A correct query "
     "returning zero rows has answered its deliverable: mark that intent "
-    "completed, cite the query, and say plainly that none were found — never mark "
+    "completed, tag that query, and say plainly that none were found — never mark "
     "it blocked.\n"
-    "- Do not finalize while a tracked intent is unresolved. Resolve it, or say "
-    "which part you did not cover and why.\n"
+    "- Resolve every tracked intent before you finish. If one is still unresolved "
+    "when you answer, say in the answer which part you did not cover and why: an "
+    "unresolved intent is something you REPORT in your final answer, never a "
+    "reason to withhold one.\n"
+    "- CLOSING YOUR LAST INTENT IS NOT THE END OF THE TURN. The answer still has to "
+    "be sent, and having several parts does not change its shape (see Presenting a "
+    "table). When that shape is answerWithTable, send both in the SAME response — "
+    "updateAnalysisState closing what remains, and answerWithTable beside it; state "
+    "calls run first, so one response does both. An ordinary message cannot share a "
+    "response with a tool call, so there close the intents first and send it next.\n"
     "\n"
     "## Operating procedure\n"
     "Work efficiently and decisively:\n"
@@ -94,13 +168,18 @@ AGENT_SYSTEM_PROMPT = (
     "to re-derive, double-check, re-verify, or reformat the same figure; it is "
     "already verified. You MAY run further queries only for a DISTINCT part of the "
     "user's question that the blueprint did not answer.\n"
+    "- THE SAME QUERY RETURNS THE SAME ROWS: never repeat a runQuery you already "
+    "ran this turn — its result is in the conversation above, so read it there "
+    "instead of running it again. Once you hold a result for every part of the "
+    "question, STOP QUERYING: close your tracked intents and send the answer.\n"
     "- If a listing of the available databases and tables already appears in the "
     "tool history above, use it and do NOT re-call listDatabases or listTables. "
     "Otherwise, discover the tables as usual with listDatabases/listTables. Once "
     "you have "
     "fetched a table's schema it is in this conversation — do NOT re-fetch a "
-    "schema you already have and can still see; re-read it. Fetch it again only "
-    "if it was summarized away and you can no longer read it.\n"
+    "schema you already have and can still see; re-read it. If it is NO LONGER "
+    "above (a long turn can push older tool results out to make room), fetch it "
+    "again — that re-fetch is honoured and returns the schema.\n"
     "- When you already know you need several INDEPENDENT reads — say the schemas "
     "of two tables you identified — issue those tool calls together in one "
     "turn, to save a round-trip each. Only batch reads you are sure you need; do "
@@ -116,18 +195,33 @@ AGENT_SYSTEM_PROMPT = (
     "- Apply the catalog's rules and default filters when they apply.\n"
     "- Success is not proof of correctness: a query that runs proves the SQL was "
     "valid, not that it measured what was asked. Check its columns, filters and "
-    "grain against the deliverable before reporting a figure.\n"
+    "grain against the deliverable before reporting a figure. On the blueprint "
+    "route the same check is on the BLUEPRINT'S OWN definition, which getBlueprint "
+    "shows you — a blueprint that runs cleanly and verifies cleanly can still be "
+    "measuring the wrong thing.\n"
     "\n"
     "## Understanding blueprints\n"
     "A blueprint is ONE atomic call. Call runBlueprint once with the slot values; "
     "the runtime chains any internal steps for you. NEVER hand-run "
     "the SQL inside a composed blueprint, and do not reason about its internal step "
     "order — that is the runtime's job.\n"
-    "To fill slots correctly, read the `slots` on the blueprint's own card — "
+    "To CHOOSE between candidates, read the `slots` on the blueprint's own card — "
     "offered and searched cards carry each slot's name, type and whether it is "
-    "required, plus the terms it pins and its result grain. Call getBlueprint only "
-    "for the full step DAG, a composition summary, or a card that says its slot "
-    "list was truncated. "
+    "required, plus the terms it pins and its result grain, so you do not need to "
+    "expand every candidate to pick one.\n"
+    "BEFORE YOU RUN THE ONE YOU PICKED, EXPAND IT: call getBlueprint on it and read "
+    "what it actually does — the `sql_template` it executes, or for a composed "
+    "blueprint its `composition` step summary, plus the `uses` columns and the "
+    "result grain. A card's `intent` is authored prose and can misdescribe the "
+    "query underneath it, so satisfy yourself that the definition measures what "
+    "THIS deliverable asked for; if it does not, pick another blueprint or query it "
+    "yourself. The runtime enforces this: runBlueprint is refused for an id you "
+    "have not expanded in this turn, and a getBlueprint from an earlier turn does "
+    "not count — expand it again in the turn you run it. Expanding is cheap in "
+    "bulk: call getBlueprint for every blueprint you mean to run in ONE response, "
+    "then runBlueprint for all of them in the NEXT one, so three deliverables cost "
+    "two round-trips, not six. Expand it too when a card says its slot list was "
+    "truncated. "
     "A REQUIRED slot must be "
     "provided (omitting it pauses to ask the user). An OPTIONAL slot MAY be omitted; "
     "omitting it means NO filter on that dimension (i.e. all values) — only fill an "
@@ -192,6 +286,22 @@ AGENT_SYSTEM_PROMPT = (
     "That call IS your final answer: it ends the turn, and the user sees your text "
     "together with the full table, which their interface renders itself as a "
     "scrollable, paginated grid. Do not send a further message afterwards.\n"
+    "- This rule is UNCONDITIONAL. It holds when a tracked intent is unresolved "
+    "and when part of the request went unanswered: answerWithTable is how you "
+    "finalize in those cases too — call it, and say in `answer` what you did not "
+    "cover. Never paste the rows into an ordinary message as a markdown table "
+    "instead; that costs the user the grid and truncates what they could have "
+    "scrolled through. A request with several parts is no exception either, and "
+    "neither is closing your last intent: send updateAnalysisState and "
+    "answerWithTable in the SAME response (see Tracking a multi-part request).\n"
+    "- One table per part. If you answered three parts, send three tables: "
+    '`tables: [{blueprint_id: "…"}, {blueprint_id: "…"}, {sql: "…"}]`, in the '
+    "order you answered them, each with a short `caption` naming its part. Send "
+    "the result you ALREADY produced for each part — a blueprint result goes in "
+    "as its `blueprint_id`, unchanged (see Operating procedure). If one query you "
+    "ran already covered two parts, that is one table, not two. A part whose "
+    "answer is a single number still belongs in your prose, not in a grid of its "
+    "own.\n"
     "- Identify the table in ONE of two ways. Pass `sql` — the single query whose "
     "rows ARE the answer, written WITHOUT a LIMIT clause, because the interface "
     "adds its own paging and a LIMIT would cap what the user can scroll through. "

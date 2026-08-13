@@ -103,3 +103,47 @@ Enrichment breaks that premise. `resolves` is term → **column name** (`salary:
 - [ ] New fields sanitised + capped in `render.py`.
 - [ ] Fake index parity.
 - [ ] `searchBlueprints` tool description amended.
+
+---
+
+## The partial reversal: `getBlueprint` before `runBlueprint`
+
+*Added after 02 shipped. **Decided by the user**, recorded here because 02 is the deliverable it partially reverses — and it is a partial reversal, not a full one.*
+
+### What the user decided
+
+**Before running a blueprint the model must call `getBlueprint(id)` and read the blueprint's SQL.** The runtime enforces it: a `runBlueprint` for an id this turn has not expanded is refused with `BLUEPRINT_DEFINITION_NOT_READ` — retryable, before the executor runs, naming the blueprint and the fix in `denial_detail`.
+
+### Why
+
+**A card carries no SQL.** That was a deliberate 02 decision and it stands for *choosing*: `intent`, `slots`, `resolves` and `result_grain` are enough to judge applicability. But it means the model has been **deciding to execute an analysis on the strength of an authored prose `intent` string**. If that string misdescribes the query stored underneath it — a corpus-authoring property no runtime check touches — the model runs the wrong analysis and reports the figure confidently.
+
+**The D56 grain gate does not catch this, and it is easy to think it does.** `verification: {method: blueprint_gate, grain_checked: true}` verifies that the RESULT SHAPE matches the blueprint's OWN declared `result_grain`. It answers *"did this blueprint do what it says it does"*. It cannot answer *"does what it says it does answer the question the user asked"* — the deliverable is nowhere in that check. A blueprint can run cleanly, verify cleanly, earn `authoritative`, and be measuring the wrong thing.
+
+The prompt already carried the general rule — *"Success is not proof of correctness: a query that runs proves the SQL was valid, not that it measured what was asked"* — but on the blueprint route it had **no object**: there was nothing for the model to check the deliverable against. The gate is what gives that line something to bite on, and the prompt now says so explicitly.
+
+### What 02 still saves, and what it no longer saves
+
+| | Before the rule | After the rule |
+|---|---|---|
+| Choosing among `k` search hits | 0 `getBlueprint` (the enrichment) | **0 `getBlueprint` — unchanged** |
+| Running the one you picked | 0 `getBlueprint` | **1 `getBlueprint`** |
+| A 4-deliverable request, 5 candidates each | 0 | **4** (one per blueprint actually run, not 20) |
+
+**02's saving was never mostly about the run.** Its stated problem was *"each thin candidate today costs a `getBlueprint` round-trip to evaluate, so a four-deliverable request can spend four extra round-trips just deciding"* — evaluation, per candidate, across the whole result set. That saving is untouched: `slots`, `resolves` and `result_grain` are still on the card, the model still picks without expanding anything, and the enrichment is still what makes per-deliverable search affordable. **Do not read this section as "02 was pointless."** What is reversed is one sentence of 02 §Changes item 6 — that `getBlueprint` is needed *only* for the full DAG, a composition summary, or `slots_omitted`.
+
+**And the round-trip cost is not per deliverable.** The gate is satisfied by any successful `getBlueprint` earlier in the turn, and the model may batch: `[getBlueprint(a), getBlueprint(b), getBlueprint(c)]` in one response, `[runBlueprint(a), runBlueprint(b), runBlueprint(c)]` in the next. **Three deliverables cost two round-trips, not six.** Measured, not asserted: `tests/runtime/loop/test_blueprint_definition_gate.py::test_batched_expand_then_run_costs_two_round_trips_for_n_deliverables` counts model calls at N=2 and N=3, and the A1 fixtures (cases 2, 3, 4, 7) were rewritten into exactly that shape.
+
+### Two accepted costs, stated so they are not rediscovered as bugs
+
+**1. Turn-scoping means a follow-up turn re-expands.** A `getBlueprint` from an earlier turn does **not** satisfy the gate. That is deliberate: context is rebuilt per turn and trimmed by `fit_request_to_budget`, so a definition fetched in turn 1 may have been summarized away by turn 5, and the rule is about what the model can read *now*, not what it once read. The cost lands on a real and common shape — *"now show me just Engineering's average"*, previously 2 tool calls (`runBlueprint` + answer) — which now pays one extra `getBlueprint` per turn. Accepted.
+
+**2. A composed blueprint does not show its SQL.** `getBlueprint`'s FOUND path exposes `sql_template` for a single-node blueprint but replaces a composed blueprint's `composes` DAG with a `composition` summary (a step count and a note) — deliberately, since per-node SQL and `$0.x` refs invite the model to hand-run steps. So for a composed blueprint the model reads the intent, the slots, the `uses` footprint, the `result_grain` and the step count, **but not the per-node SQL**. The prompt is worded to match rather than to promise SQL that is not there. Whether composed blueprints should expose a read-only rendering of their SQL is a **follow-up question**, not something to change in passing: the hiding is load-bearing against a different failure.
+
+### Mechanism, for a reader who has to touch it
+
+- **Gate:** `loop/agent_loop.py::_run_loop_body`, in the per-tool-call dispatch loop, before `_maybe_start_summary` and before dispatch. Predicate: `tool_call.name == "runBlueprint"` and the tool is wired and `clean_blueprint_id(args["id"]) not in blueprint_definitions_read`.
+- **`blueprint_definitions_read`** is seeded from the persisted trail (turn-scoped, `status == "ok"`, `tool_name == "getBlueprint"`) so it survives the D45 per-round-trip rebuild and a budget-window `continue` resume, and is folded from the current response only **after** the batch drains — a `[getBlueprint(x), runBlueprint(x)]` pair in one message is refused, because the result of the first call does not reach the model until the next round-trip.
+- **Resumes are structurally ungated.** A mid-DAG checkpoint resume re-enters `blueprint_executor.resume(...)` directly from `_resume_blueprint` and writes its own trail entry; it never reaches the dispatch site. That is correct — a resume continues an already-gated invocation — and it is pinned by a test so a refactor cannot silently start gating it.
+- **`getBlueprint` was added to `IDEMPOTENT_READ_TOOLS`** at the same time (it is a keyed fetch by id, and the new rule makes it the most repeated read of a blueprint turn). A dedup-guarded repeat **satisfies** the gate: being deduped means the definition is already in context. That is the opposite of [04](04-evidence-validators.md) condition 5, which rejects the same marker as completion evidence — the two gates ask different questions.
+- **One exemption to the dedup guard, and it is load-bearing.** The guard's premise is "the already-served result is in the history above", which is true of the trail but not of the rendered window after `fit_request_to_budget` trims. So a `getBlueprint` repeat is re-dispatched for real when the entry that served it is no longer in the rebuilt window — otherwise the gate would pass on a definition the model can no longer read. **The same exposure exists for `getTableSchema` and is NOT fixed here** (the prompt tells the model to re-fetch a schema "only if it was summarized away", an instruction the guard makes unfollowable) — a pre-existing defect, reported separately.

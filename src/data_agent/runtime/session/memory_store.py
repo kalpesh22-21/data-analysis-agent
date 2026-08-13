@@ -23,6 +23,7 @@ from typing import Any
 from .models import (
     MAX_FINALIZATION_BLOCKS_PER_WINDOW,
     AnalysisState,
+    FinalizationBlockKind,
     PauseCheckpoint,
     SessionDoc,
     TrailEntry,
@@ -134,14 +135,20 @@ class InMemorySessionStore:
         return new_state
 
     async def claim_finalization_block(
-        self, session_id: str, turn_index: int, window_count: int
+        self,
+        session_id: str,
+        turn_index: int,
+        window_count: int,
+        kind: FinalizationBlockKind,
     ) -> bool:
-        """In-memory counterpart of the claim (05 §C.1). Same shape as the real
-        store: the limit is checked and the counter incremented in ONE step, so
-        two claimants for the same (turn, window) can never both succeed."""
+        """In-memory counterpart of the claim (05 §C.1, §J.3). Same shape as the
+        real store: the limit is checked and the counter incremented in ONE step, so
+        two claimants for the same (turn, window, kind) can never both succeed — and
+        two claimants for DIFFERENT kinds never contend at all, which is the point of
+        the kind being in the key."""
         doc = await self.get_or_create_session(session_id)
         blocks = dict(doc.finalization_blocks or {})
-        key = finalization_block_key(turn_index, window_count)
+        key = finalization_block_key(turn_index, window_count, kind)
         if blocks.get(key, 0) >= MAX_FINALIZATION_BLOCKS_PER_WINDOW:
             return False
         blocks[key] = blocks.get(key, 0) + 1

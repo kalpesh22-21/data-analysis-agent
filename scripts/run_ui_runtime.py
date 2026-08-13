@@ -111,6 +111,7 @@ from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
+from data_agent.runtime.session.models import FinalizationBlockKind
 
 # The real l2-token container (docker-compose.integration.yml), already
 # running — see docker-compose.integration.yml's `token` service. We only
@@ -930,9 +931,17 @@ class _LazyCouchbaseSessionStore:
         return await self._store().apply_analysis_state(session_id, turn_index, merge)
 
     async def claim_finalization_block(
-        self, session_id: str, turn_index: int, window_count: int
+        self,
+        session_id: str,
+        turn_index: int,
+        window_count: int,
+        kind: FinalizationBlockKind,
     ) -> bool:
-        return await self._store().claim_finalization_block(session_id, turn_index, window_count)
+        # `kind` (05 §J.3) selects WHICH per-window allowance is claimed; a proxy
+        # that dropped it would collapse the two gates onto one budget live only.
+        return await self._store().claim_finalization_block(
+            session_id, turn_index, window_count, kind
+        )
 
     async def get_session_with_cas(self, session_id: str) -> Any:
         return await self._store().get_session_with_cas(session_id)

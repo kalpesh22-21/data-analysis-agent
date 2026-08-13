@@ -39,6 +39,7 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import (
     AnalysisState,
+    FinalizationBlockKind,
     TrackedIntent,
     TurnMessage,
     live_analysis_state,
@@ -86,10 +87,14 @@ class CountingStore(InMemorySessionStore):
         return await super().get_or_create_session(session_id)
 
     async def claim_finalization_block(
-        self, session_id: str, turn_index: int, window_count: int
+        self,
+        session_id: str,
+        turn_index: int,
+        window_count: int,
+        kind: FinalizationBlockKind,
     ) -> bool:
         self.claims += 1
-        return await super().claim_finalization_block(session_id, turn_index, window_count)
+        return await super().claim_finalization_block(session_id, turn_index, window_count, kind)
 
     async def apply_analysis_state(self, session_id, turn_index, merge):  # type: ignore[no-untyped-def]
         self.analysis_state_writes += 1
@@ -532,12 +537,41 @@ async def test_a_refused_round_is_charged_to_the_budget() -> None:
     # The refused draft must NOT reach the user on the pause path (§B.3).
     assert outcome.assistant_text is None
     # 05 §F, fourth forced path: the cap was reached DURING a refused round.
+    #
+    # RETARGETED 2026-08-12, and the reasoning is the whole point of the change.
+    # This used to assert `BUDGET_EXHAUSTED` on both the record and the event. It
+    # is now `ENFORCEMENT_EXHAUSTED`, because on this path more budget changes
+    # nothing: measured live (`s412e8424614e465bbd26d7a2a1400ebe` /
+    # `647416592aff2225d1903ae7c82b8396`) the answer existed at 25s and the turn
+    # capped at 61.6s on the WALL CLOCK, tokens moving +385 across the final three
+    # rounds — every one of those 36 seconds spent on two rejected
+    # `updateAnalysisState` calls and one refused `answerWithTable`.
+    # `BUDGET_EXHAUSTED` told 07 §E.2's reader a capacity story and pointed them at
+    # a ceiling that was not the problem.
+    #
+    # NOT WEAKENED: the assertion is still exact on both the ledger and the event,
+    # and it now additionally pins `budget_cap_reached` — the capacity fact, kept
+    # in telemetry where it informs, off the intent record where it misattributes.
     doc = await store.get_or_create_session(SESSION_ID)
     state = live_analysis_state(doc, 0)
     assert [i.status for i in state.intents] == ["blocked"]
-    assert [i.reason_code for i in state.intents] == ["BUDGET_EXHAUSTED"]
+    assert [i.reason_code for i in state.intents] == ["ENFORCEMENT_EXHAUSTED"]
     assert _events(events, "loop_intent_force_blocked") == [
-        {"intent_id": "i1", "reason_code": "BUDGET_EXHAUSTED"}
+        {
+            "intent_id": "i1",
+            "reason_code": "ENFORCEMENT_EXHAUSTED",
+            "budget_cap_reached": True,
+        }
+    ]
+    # The ledger carries the cause and NOTHING else: the capacity flag is telemetry
+    # only, so it must not have leaked onto the state transition event either.
+    assert _events(events, "loop_analysis_state_transition") == [
+        {
+            "intent_id": "i1",
+            "from_status": "pending",
+            "to_status": "blocked",
+            "reason_code": "ENFORCEMENT_EXHAUSTED",
+        }
     ]
 
 
@@ -571,7 +605,7 @@ async def test_the_second_attempt_is_enforcement_exhausted_and_finalization_proc
     # from a model-declared block in the ledger.
     assert all(i.evidence_tool_call_id is None for i in state.intents)
     assert _events(events, "loop_enforcement_exhausted") == [{"intent_count": 2}]
-    assert doc.finalization_blocks == {"0:1": 1}
+    assert doc.finalization_blocks == {"0:1:intents": 1}
 
 
 async def test_the_counter_is_not_reset_by_an_ask_user_resume() -> None:
@@ -603,7 +637,7 @@ async def test_the_counter_is_not_reset_by_an_ask_user_resume() -> None:
         "the resumed window granted a SECOND forced re-round — the counter reset"
     )
     doc = await store.get_or_create_session(SESSION_ID)
-    assert doc.finalization_blocks == {"0:1": 1}
+    assert doc.finalization_blocks == {"0:1:intents": 1}
     assert len(_events(events, "loop_finalization_block_spent")) == 1
     assert _events(events, "loop_enforcement_exhausted") == [{"intent_count": 1}]
 
@@ -613,7 +647,14 @@ async def test_the_counter_is_not_reset_by_an_ask_user_resume() -> None:
 
 async def test_the_hard_ceiling_force_blocks_with_budget_exhausted() -> None:
     """`stopped_hard_ceiling` IS a terminal outcome, so the scoped invariant
-    applies there too."""
+    applies there too.
+
+    UNCHANGED by the 2026-08-12 relabel, deliberately, and asserted so. The refused
+    -round branch moved to `ENFORCEMENT_EXHAUSTED` because the cap was not the
+    cause there; HERE the hard ceiling genuinely is the cause — the turn exhausted
+    every window it was allowed. `budget_cap_reached` is likewise absent: it exists
+    to carry a capacity fact the reason code no longer states, and on this path the
+    reason code states it."""
     loop, store, events, _ = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),
@@ -640,12 +681,22 @@ async def test_the_hard_ceiling_force_blocks_with_budget_exhausted() -> None:
             "reason_code": "BUDGET_EXHAUSTED",
         }
     ]
+    # Exact, so the new flag cannot spread here by default.
+    assert _events(events, "loop_intent_force_blocked") == [
+        {"intent_id": "i1", "reason_code": "BUDGET_EXHAUSTED"}
+    ]
 
 
 async def test_a_stop_answer_at_the_budget_cap_force_blocks_with_user_stopped() -> None:
     """05 §F — the THIRD `done` return, and the one that inherits nothing: it
     returns from inside `resume()` before `_run_loop` is ever entered, so it needs
-    its own force-block call."""
+    its own force-block call.
+
+    UNCHANGED by the 2026-08-12 relabel: the user said stop, and that is a cause
+    the runtime knows exactly. The `loop_intent_force_blocked` assertion below is
+    exact, so `budget_cap_reached` cannot appear here either — this resume DOES
+    happen at a budget cap, and the flag still has no business on it, because the
+    reason code is not a guess enforcement had to fall back to."""
     loop, store, events, _ = _build(
         [
             ModelTurnResult(assistant_text=None, tool_calls=[_init_call("s1", HEADCOUNT)]),

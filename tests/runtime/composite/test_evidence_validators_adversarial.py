@@ -14,6 +14,8 @@ KNOWN-OPEN rather than pretending it is closed:
 from __future__ import annotations
 
 from data_agent.runtime.composite.analysis_state import (
+    DERIVABLE_REASON_CODES,
+    classify_block_evidence,
     validate_block_evidence,
     validate_completion_evidence,
 )
@@ -263,3 +265,69 @@ def test_manufactured_required_data_unavailable_via_where_1_equals_0_is_permitte
         )
     ]
     assert validate_block_evidence("call_empty", "REQUIRED_DATA_UNAVAILABLE", trail, TURN) is None
+
+
+
+# ---------------------------------------------------------------------------
+# The derivation (04 §B.7) — asserted against the SAME entries as the validator
+# ---------------------------------------------------------------------------
+
+
+def test_the_derived_reason_code_is_the_one_whose_validator_accepts() -> None:
+    """04 §B.7. The model no longer declares a reason code; the runtime classifies
+    the bound call.
+
+    Every row here is an entry the validator table above already covers, read the
+    other way round — which is the whole claim: the derivation is the validator
+    inverted, not a second implementation of §B.1 that can drift from it. The two
+    `None` rows are the ones that matter most: a call that merely FAILED and a call
+    that RETURNED ROWS each prove neither code, so the block is refused rather than
+    falling back to a plausible-looking label.
+    """
+    cases = [
+        (_entry("d1", "runQuery", status="denied",
+                error_code="COLUMN_SCOPE_VIOLATION", row_count=None), "NO_ACCESS"),
+        (_entry("d2", "runBlueprint", status="error",
+                error_code="SCRATCH_SESSION_VIOLATION", row_count=None), "NO_ACCESS"),
+        (_entry("e1", "runQuery", row_count=0), "REQUIRED_DATA_UNAVAILABLE"),
+        (_entry("r1", "runQuery", row_count=7), None),
+        (_entry("f1", "runQuery", status="error",
+                error_code="PARSE_FAILED_CLOSED", row_count=None), None),
+        (_entry("t1", "sampleRows", status="denied",
+                error_code="TABLE_NOT_FOUND", row_count=None), None),
+    ]
+    trail = [entry for entry, _ in cases]
+    for entry, expected in cases:
+        derived = classify_block_evidence(entry.tool_call_id, trail, TURN)
+        assert derived == expected, entry.tool_call_id
+        # ...and the inverse holds: the derived code is EXACTLY the one the
+        # validator accepts, and every other declarable code is refused.
+        for code in DERIVABLE_REASON_CODES:
+            accepted = validate_block_evidence(entry.tool_call_id, code, trail, TURN) is None
+            assert accepted == (code == derived), (entry.tool_call_id, code)
+
+
+def test_the_derivation_cannot_reach_a_runtime_only_code() -> None:
+    """The MODEL/RUNTIME split, now structural rather than an allowlist rejection.
+
+    `DERIVABLE_REASON_CODES` is derived from `MODEL_REASON_CODES`, so 05's forced
+    codes are not candidates at all — there is no input that makes this function
+    return one. A future fourth model-declarable code would become derivable with
+    no second edit, which is the point of deriving the tuple rather than listing it.
+    """
+    assert set(DERIVABLE_REASON_CODES) == MODEL_REASON_CODES
+    assert not set(DERIVABLE_REASON_CODES) & RUNTIME_REASON_CODES
+
+
+def test_a_deduped_guard_marker_is_not_classified_as_absent_data() -> None:
+    """The guard marker is `status="ok"` with `result_preview=None` — it fetched
+    NOTHING. Classifying it as `REQUIRED_DATA_UNAVAILABLE` would turn the read
+    dedup into a free block, so the derivation must return `None` and let the
+    refusal name the original call."""
+    args = {"database": "dbpcm_warehouse", "table": "employee"}
+    trail = [
+        _entry("s1", "getTableSchema", args=args),
+        _entry("s2", "getTableSchema", args=args, row_count=None,
+               error_code=IDEMPOTENT_READ_ALREADY_SERVED_CODE),
+    ]
+    assert classify_block_evidence("s2", trail, TURN) is None

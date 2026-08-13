@@ -220,8 +220,15 @@ authored + Layer-1/2-proven but **not yet demo-wired** (all folded into Item 3's
 - **3 deferred Layer-3 scenarios** (see Next brick + `tests/e2e/README.md`) — the remaining Phase-0 gap.
 - `pytest-playwright` is a dev dep; the live OpenAI key is in a **gitignored `.env`** (`OPENAI_API_KEY`).
   The runtime's **defensive** D44 check stays as belt-and-suspenders now the MCP enforces scope too (OQ-4).
-- Phase-0 runtime provisional tunables (`RuntimeSettings`): budget caps (15 iter / 60s / 3 windows),
-  `SESSION_TTL`=7d, N=20 preview rows, history budget 20% — all set to defaults pending real traffic.
+- Phase-0 runtime provisional tunables (`RuntimeSettings`): budget caps (~~15 iter / 60s~~ **25 iter /
+  180s** / 3 windows), `SESSION_TTL`=7d, N=20 preview rows, history budget 20% — set to defaults
+  pending real traffic. **Release 1 (2026-08-12) is the first of those to be re-set ON traffic:**
+  live turns capped on the **wall clock** at ~61-73s with iterations at ~8 of 15, so 60s → **180s**
+  and 15 → **25** (the `getBlueprint` gate costs a round-trip per blueprint, and multi-intent turns
+  need 8+ rounds). `max_tool_calls_per_iteration`=8 unchanged — largest observed batch was 3.
+  25 is now actually reachable: `BudgetGuard`'s token ceiling used to sum whole requests against
+  `model_context_window` (an occupancy limit) and bound at 6-14 rounds; spend now has its own
+  ceiling, **`max_window_token_spend`=1,000,000** per window — see release-1/README.md finding 30.
   **Session 9 adds:** `resolve_values_similarity_weight`=0.7 / `query_limit`=200 / `top_k`=10 (provisional).
 - **`resolveValues` follow-ups (D77/D85):** ~~the custom embedding API contract is still an OQ~~
   **resolved Session 9b** — the `~/Development/SQL/mocks` contracts are authoritative; production
