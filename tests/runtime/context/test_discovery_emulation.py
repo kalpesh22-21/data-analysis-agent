@@ -76,8 +76,17 @@ class _StubDispatcher:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def dispatch(
-        self, tool_name: str, model_args: dict[str, Any], credentials: RuntimeCredentials
+        self,
+        tool_name: str,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        *,
+        emit_progress: bool = True,
     ) -> ToolResult:
+        # The sweep is synthetic context replay, not work the user asked for, so
+        # neither dispatch may emit UI progress (see the progress test at the end
+        # of this file). Asserted here so EVERY scripted path enforces it.
+        assert emit_progress is False, "the discovery sweep leaked UI progress"
         self.calls.append((tool_name, dict(model_args)))
         db = model_args.get("database")
         return self._responses[(tool_name, db)]
@@ -441,3 +450,45 @@ async def test_cache_evicts_fifo_at_max_size() -> None:
     assert builds == 3
     await cache.get_or_build("a", _build)  # evicted -> re-sweeps
     assert builds == 4
+
+
+# --- UI progress: the sweep is not user-visible work -------------------------
+
+
+async def test_the_sweep_emits_no_ui_progress_events() -> None:
+    """Ratified decision: emulated discovery is synthetic context replay the model
+    never asked for, run before the turn's first round-trip. Left ungated it opened
+    every turn with "running listDatabases…" / "running listTables…" — work the
+    user did not request, named in tool vocabulary, and contradicting the progress
+    summarizer's own phrasing for those tools ("checking what data is available").
+
+    Asserted over the REAL `ToolDispatcher` (the stub above pins the flag itself),
+    and on what the UI would RENDER, so a refactor of how the gate is spelled
+    cannot quietly reopen it.
+    """
+    from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
+    from data_agent.runtime.mcp.fake_client import FakeMCPClient
+    from data_agent.runtime.observability.progress import to_progress_event
+    from data_agent.runtime.provenance.catalog_handle import CatalogHandle
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    mcp = FakeMCPClient(
+        scripted={
+            "listDatabases": [[{"name": "dbpcm_warehouse"}]],
+            "listTables": [[{"database": "dbpcm_warehouse", "name": "employee"}]],
+        }
+    )
+    dispatcher = ToolDispatcher(
+        mcp, CatalogHandle({}), observer=lambda e, p: events.append((e, dict(p)))
+    )
+
+    discovery = await build_emulated_discovery(
+        dispatcher, _CREDS, base_database="dbpcm_warehouse"
+    )
+
+    # The sweep really ran (both round-trips), and injected both entries.
+    assert [c.tool_name for c in mcp.calls] == ["listDatabases", "listTables"]
+    assert len(discovery.entries) == 2
+    # ...and produced nothing the UI would show.
+    assert [name for name, _payload in events if name.startswith("tool_dispatch_")] == []
+    assert all(to_progress_event(name, payload) is None for name, payload in events)

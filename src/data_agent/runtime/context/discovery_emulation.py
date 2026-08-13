@@ -263,7 +263,15 @@ async def build_emulated_discovery(
     event with `degraded: true` so a silent MCP blip is observable.
     """
     try:
-        db_result = await dispatcher.dispatch("listDatabases", {}, credentials)
+        # `emit_progress=False` on BOTH sweep dispatches (ratified): this is
+        # synthetic context replay the model never asked for, run before the turn's
+        # first round-trip. Narrating it painted "running listDatabases…" /
+        # "running listTables…" at turn start — work the user did not request, named
+        # in tool vocabulary, and contradicting the progress summarizer's own static
+        # phrasing for those tools ("checking what data is available"). The
+        # `discovery_emulated` observer event below is the operator signal and is
+        # unaffected, as are spans, scope enforcement and every degrade path.
+        db_result = await dispatcher.dispatch("listDatabases", {}, credentials, emit_progress=False)
         if db_result.status != "ok":
             _logger.warning(
                 "emulated discovery: listDatabases not ok (status=%s) — injecting nothing",
@@ -296,7 +304,9 @@ async def build_emulated_discovery(
             )
         else:
             args = {"database": base_database}
-            table_result = await dispatcher.dispatch("listTables", args, credentials)
+            table_result = await dispatcher.dispatch(
+                "listTables", args, credentials, emit_progress=False
+            )
             if table_result.status != "ok":
                 _logger.warning(
                     "emulated discovery: listTables(%s) not ok (status=%s) — injecting the "

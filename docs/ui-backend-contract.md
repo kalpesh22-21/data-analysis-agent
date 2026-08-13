@@ -162,6 +162,10 @@ interface ProgressEvent {
 
 > **One exception to the label table:** when `progress_summary_enabled` is on server-side, an *additional* progress event may arrive whose `step` is a free-form LLM-authored sentence ("Querying overtime pay by department for January"). It is **not** from the table and **may contain concrete parameter values**. Its `shape` is still allowlist-governed. Render `step` as untrusted text.
 
+**No internal database structure in `step`.** Neither the table above nor the summary channel ever names a database, table or column, nor carries SQL: the summarizer is shown only per-tool **allowlisted** arguments (business values — a department, a period, a search phrase — never `sql`/`database`/`table`/`column`, and nothing at all for a tool that is not explicitly listed), and a produced line that repeats a withheld identifier anyway is replaced by a static safe line. See `observability/progress_summarizer.py`.
+
+**A composite tool is ONE step, and setup is no step at all.** Nested dispatches made on the runtime's own initiative emit **no** `tool start`/`ok`/`denied` events (`ToolDispatcher.dispatch(emit_progress=False)`); denials and errors still propagate to the result exactly as before. Three places do this: `runBlueprint`'s internal nodes/slot probes/grain probe (the UI sees one `running runBlueprint…`, not a `running runQuery…` per node), `resolveValues`'s inner lookup query (narrated once, under `resolveValues`), and the emulated discovery sweep at turn start (`listDatabases`/`listTables` replay the model never asked for — no progress at all).
+
 **PII rule (D25):** `progress` never carries cell values, SQL text, row data, the JWT, or the column scope — *except* the opt-in summary channel above, which may carry tool-argument values (never results).
 
 ### 4.2 `TurnResult` — SSE `result` (the main payload)

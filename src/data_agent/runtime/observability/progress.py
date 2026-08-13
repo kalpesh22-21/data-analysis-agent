@@ -86,6 +86,14 @@ class ProgressEvent:
 # of the feature, and why it is gated off by default. Only the `shape` (here just
 # the machine-readable `tool_name`) is still governed by `_SHAPE_ALLOWLIST`; the
 # value-bearing text lives in `step`, never in `shape`. See docs/08-ui.md.
+#
+# WHAT KEEPS THIS SAFE IS AT THE OTHER END. Because the text is used verbatim, the
+# guard cannot live here — it lives in `progress_summarizer.py`, which shows the
+# small model only a per-tool ALLOWLISTED projection of the arguments (no `sql`,
+# no database/table/column, nothing at all for an unlisted tool) and replaces a
+# line that repeats a withheld identifier with a static safe one. The relaxation
+# admits BUSINESS values (a period, a department); it never admits internal
+# database structure.
 _PROGRESS_SUMMARY_EVENT = "tool_progress_summary"
 
 

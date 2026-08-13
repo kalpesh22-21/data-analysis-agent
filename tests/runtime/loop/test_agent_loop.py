@@ -426,8 +426,16 @@ class _StubDiscoveryDispatcher:
         self._responses = responses
 
     async def dispatch(
-        self, tool_name: str, model_args: dict, credentials: RuntimeCredentials
+        self,
+        tool_name: str,
+        model_args: dict,
+        credentials: RuntimeCredentials,
+        *,
+        emit_progress: bool = True,
     ) -> ToolResult:
+        # The emulated sweep is synthetic context replay, never user-visible work
+        # (tests/runtime/context/test_discovery_emulation.py).
+        assert emit_progress is False, "the discovery sweep leaked UI progress"
         return self._responses[(tool_name, model_args.get("database"))]
 
 

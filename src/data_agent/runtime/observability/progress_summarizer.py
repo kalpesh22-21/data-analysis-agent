@@ -14,6 +14,22 @@ VALUE-RICH — it MAY include concrete parameters drawn from the tool arguments
 progress" rule for the progress-summary channel and is why the feature is
 opt-in. The machine-readable tool name stays in the progress event's `shape`.
 
+WHAT THE RELAXATION IS *NOT*: it admits BUSINESS values, never internal database
+structure. This line goes into the progress event's `step` VERBATIM
+(`progress.py`'s `_PROGRESS_SUMMARY_EVENT` branch bypasses the `shape`
+allowlist by design), so anything the small model is shown can reach the UI. The
+guard is therefore at the INPUT, and it is default-deny: `_project_args` passes
+only the arguments explicitly allowlisted per tool (`_ARG_ALLOWLIST`) and NOTHING
+at all for an unlisted tool — `runQuery`'s `sql`, `listTables`'s `database`,
+`getTableSchema`'s `table` and every other physical identifier never reach the
+prompt, so the model cannot narrate one. The produced line then faces two
+deterministic checks, either of which drops it in favour of the tool's static
+`_STATIC_LINES` phrasing: `_looks_structural` (the line is SHAPED like database
+structure — a qualified or quoted identifier, or SQL — whatever its provenance,
+which is what covers the allowlisted FREE-TEXT arguments the schema-aware main
+model authored) and `_leaks_identifiers` (the line repeats an identifier-looking
+token drawn from the WITHHELD raw arguments).
+
 Fail-soft everywhere (load-bearing): `summarize` returns `None` on ANY error,
 timeout, or empty output — a flaky/slow summarizer must never break a turn nor
 delay a tool. Token cost is bounded: each argument value is truncated before it
@@ -29,16 +45,115 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
 
 _SYSTEM_PROMPT = (
     "You write a single short present-tense progress line (max ~12 words) for a "
-    "data-analysis assistant's UI, describing what it is doing with this tool call. "
-    "You MAY include specific parameters from the arguments. No preamble, no quotes, "
-    "no trailing period, no fluff. Output only the line."
+    "data-analysis assistant's UI, describing in plain business English what the "
+    "assistant is doing. Write for a business user who has never seen the database: "
+    "the line MUST NOT contain SQL, table names, column names, database names, or "
+    "any other internal identifier. You MAY include business-level parameters that "
+    "appear in the arguments you are given (a department, a period, a search "
+    "phrase). No preamble, no quotes, no trailing period, no fluff. Output only "
+    "the line."
 )
+
+# --- the input guard: which arguments a tool may show the summarizer --------
+#
+# DEFAULT-DENY. A tool absent from this map contributes its NAME ONLY, so a tool
+# added later leaks nothing until someone decides what of it is safe to narrate.
+# Every entry below is an argument whose VALUE is business language or a corpus
+# identifier — never a database, table or column name, and never SQL.
+#
+# Deliberately absent (name-only), with the physical identifiers they carry:
+#   runQuery / explainQuery   -> `sql`
+#   listTables / getTableSchema / sampleRows -> `database`, `table`
+#   listDatabases             -> nothing to say beyond "what data is available"
+#   answerWithTable           -> `tables[].sql`, plus the whole written answer
+#   updateAnalysisState       -> intent bookkeeping, nothing to narrate
+_ARG_ALLOWLIST: dict[str, frozenset[str]] = {
+    # The D25 relaxation's intended case: slot VALUES are business values (a
+    # department, a period) and the blueprint id is a corpus identifier authored
+    # in business language — neither names anything physical.
+    "runBlueprint": frozenset({"id", "slot_bindings"}),
+    "getBlueprint": frozenset({"id"}),
+    # The model's own search phrase, written in the user's language.
+    "searchBlueprints": frozenset({"query"}),
+    "searchKnowledge": frozenset({"query"}),
+    # `concept` is the natural-language concept being resolved; `table`/`column`
+    # are withheld by omission.
+    "resolveValues": frozenset({"concept"}),
+    "askUser": frozenset({"question"}),
+    "recordAssumptions": frozenset({"assumptions"}),
+}
+
+# The deterministic fallback when the produced line is rejected by
+# `_leaks_identifiers` — same register as `progress.py`'s `_STEP_LABELS`, but
+# phrased for a business reader and carrying no tool name.
+_STATIC_LINES: dict[str, str] = {
+    "runQuery": "running a query against the warehouse",
+    "explainQuery": "checking a query before running it",
+    "sampleRows": "looking at a sample of the data",
+    "listDatabases": "checking what data is available",
+    "listTables": "checking what data is available",
+    "getTableSchema": "checking what data is available",
+    "runBlueprint": "running a saved analysis",
+    "getBlueprint": "reading a saved analysis",
+    "searchBlueprints": "looking for a matching saved analysis",
+    "searchKnowledge": "looking up background knowledge",
+    "resolveValues": "matching your wording to the stored values",
+    "askUser": "putting a question back to you",
+    "recordAssumptions": "noting the assumptions behind the answer",
+    "answerWithTable": "putting the answer together",
+    "updateAnalysisState": "tracking the parts of your question",
+}
+_GENERIC_STATIC_LINE = "working on your question"
+
+# Identifier-looking material extracted from the WITHHELD raw arguments. Simple
+# substring matching by design (not a SQL parser): the projection above is the
+# real guard, this is a cheap second layer, and a false positive only costs the
+# static line.
+_DOTTED_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)+")
+_SQL_SOURCE_IDENTIFIER = re.compile(
+    r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+[`\"]?([A-Za-z_][A-Za-z0-9_$.]*)", re.IGNORECASE
+)
+_BARE_IDENTIFIER = re.compile(r"\A[A-Za-z_][A-Za-z0-9_$]*\Z")
+# Short tokens ("id", "n", "sum") collide with ordinary English, and a false
+# positive silently downgrades every line for that tool — so only tokens this
+# long or longer are matched.
+_MIN_TOKEN_CHARS = 4
+
+# --- the UNCONDITIONAL structural check ------------------------------------
+#
+# The two layers above are both provenance-based: the projection withholds args,
+# and `_forbidden_tokens` only looks for what was WITHHELD. That leaves a real
+# hole, because the allowlisted values are authored by the schema-aware MAIN
+# model: a `resolveValues` concept, a `searchBlueprints` query, a slot value or a
+# recorded assumption can itself name `dbpcm_warehouse.employee`, pass the
+# projection (it is allowlisted), be echoed by the summarizer, and be exempt from
+# the withheld-token scan (it was not withheld). So the SHAPE of the produced
+# line is checked too, whatever its provenance — a progress line for a business
+# reader never contains a qualified identifier, a quoted identifier, or SQL.
+#
+# Both sides of the dot must be 2+ chars, which is what keeps "e.g."/"i.e."/"U.S."
+# out of it; a digit-leading right side ("Q1.2026") is not an identifier either.
+# Quoting is covered separately because backticks defeat the dotted pattern
+# entirely (`db`.`table`) — and a backtick has no business in a progress line.
+_STRUCTURAL_DOTTED = re.compile(
+    r"[`\"]?[A-Za-z_][A-Za-z0-9_$]+[`\"]?\s*\.\s*[`\"]?[A-Za-z_][A-Za-z0-9_$]+"
+)
+_QUOTED_IDENTIFIER = re.compile(r"[`\"][A-Za-z_][A-Za-z0-9_$]*[`\"]|`")
+# A SQL source keyword AS WRITTEN IN SQL (upper case) is structural on its own —
+# it catches `... FROM employee`, whose target is an ordinary-looking word. The
+# same keyword in LOWER case is ordinary English ("pulling headcount from last
+# month") and is deliberately NOT matched; a lower-case fragment that really is
+# SQL ("joining employee_master") is caught by the standalone-token rule instead.
+_SQL_SOURCE_KEYWORDS = ("FROM", "JOIN", "INTO", "UPDATE", "TABLE")
+_UPPERCASE_SQL_SOURCE = re.compile(rf"\b(?:{'|'.join(_SQL_SOURCE_KEYWORDS)})\b\s+\S")
+_WORD_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
 
 # Per-argument-value truncation bound (characters) applied BEFORE serialization,
 # so a huge `sql` string or a long list argument cannot blow up the prompt token
@@ -74,6 +189,117 @@ def _compact_args(arguments: dict[str, Any]) -> str:
     return blob
 
 
+def _project_args(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """The arguments the summarizer prompt may see — allowlisted per tool,
+    EMPTY for any tool not in `_ARG_ALLOWLIST` (default-deny)."""
+    allowed = _ARG_ALLOWLIST.get(tool_name)
+    if not allowed:
+        return {}
+    return {key: value for key, value in arguments.items() if key in allowed}
+
+
+def _collect_strings(value: Any, out: list[str]) -> None:
+    """Flatten every string reachable in *value* into *out* (keys included — a
+    dict KEY can itself be a column name, e.g. a `slot_bindings` entry)."""
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                out.append(key)
+            _collect_strings(item, out)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _collect_strings(item, out)
+
+
+def _forbidden_tokens(tool_name: str, arguments: dict[str, Any]) -> set[str]:
+    """Identifier-looking tokens drawn from the arguments this tool WITHHELD.
+
+    Only the withheld ones: an allowlisted value (a department, a search phrase)
+    is exactly what the line is allowed to repeat, so scanning for it would
+    reject every good line for `runBlueprint`.
+    """
+    allowed = _ARG_ALLOWLIST.get(tool_name, frozenset())
+    withheld = [value for key, value in arguments.items() if key not in allowed]
+    strings: list[str] = []
+    for value in withheld:
+        _collect_strings(value, strings)
+
+    tokens: set[str] = set()
+    for text in strings:
+        for dotted in _DOTTED_IDENTIFIER.findall(text):
+            tokens.add(dotted)
+            tokens.update(dotted.split("."))
+        for source in _SQL_SOURCE_IDENTIFIER.findall(text):
+            tokens.add(source)
+            tokens.update(source.split("."))
+        # A whole value that IS an identifier — `listTables(database=...)`,
+        # `getTableSchema(table=...)`, `sampleRows(table=...)`.
+        if _BARE_IDENTIFIER.match(text):
+            tokens.add(text)
+    return {token.lower() for token in tokens if len(token) >= _MIN_TOKEN_CHARS}
+
+
+def _leaks_identifiers(line: str, forbidden: set[str]) -> bool:
+    """True when *line* repeats any withheld identifier (case-insensitive)."""
+    lowered = line.lower()
+    return any(token in lowered for token in forbidden)
+
+
+def _is_identifier_shaped(token: str) -> bool:
+    """True when *token* looks like a physical identifier rather than a word.
+
+    `employee_master`, `dbpcm_warehouse.employee`, `EmployeeMaster`, `AnnualSalary`
+    — an underscore, a dot, or camel/Pascal casing (BOTH cases present, so an
+    ordinary capitalised word "January" and an acronym "OPEX" are not matched). A
+    plain word ("payroll", "department", "from") is NOT identifier-shaped:
+    flagging those would downgrade every good line the channel exists to produce.
+
+    KNOWN, ACCEPTED FALSE POSITIVE: a business value that is genuinely
+    inner-capitalised ("McKinsey", "DeVries") reads as identifier-shaped and costs
+    that line its static fallback. The trade is deliberate — this rule is what
+    catches the warehouse's PascalCase column names (`AnnualSalary`,
+    `EmployeeCode`), and a downgraded line is a far cheaper failure than a leaked
+    column name.
+    """
+    token = token.strip('`"')
+    if len(token) < _MIN_TOKEN_CHARS:
+        return False
+    if "_" in token or "." in token:
+        return True
+    has_upper = any(char.isupper() for char in token[1:])
+    has_lower = any(char.islower() for char in token)
+    return has_upper and has_lower
+
+
+def _looks_structural(line: str) -> bool:
+    """True when *line* itself is shaped like database structure — UNCONDITIONAL,
+    independent of where the material came from.
+
+    This is the layer that covers the allowlisted free-text arguments (a
+    `concept`, a search `query`, a slot value, a recorded assumption): those are
+    written by the schema-aware main model, reach the summarizer legitimately, and
+    are invisible to the withheld-token scan.
+    """
+    if _QUOTED_IDENTIFIER.search(line):
+        return True
+    if _STRUCTURAL_DOTTED.search(line):
+        return True
+    if _UPPERCASE_SQL_SOURCE.search(line):
+        return True
+    # Any standalone token that is identifier-shaped — `payroll_detail`,
+    # `EmployeeMaster` — with no SQL keyword needed in front of it.
+    return any(_is_identifier_shaped(token) for token in _WORD_TOKEN.findall(line))
+
+
+def _static_line(tool_name: str) -> str:
+    """The safe, deterministic line for *tool_name* — used when the model's line
+    is rejected. Never contains the tool name (`progress.py`'s instant template
+    label already carries that)."""
+    return _STATIC_LINES.get(tool_name, _GENERIC_STATIC_LINE)
+
+
 class ProgressSummarizer:
     """One-shot tool-call → progress-line summarizer over a cheap `ModelClient`."""
 
@@ -95,11 +321,14 @@ class ProgressSummarizer:
             return None
 
     async def _summarize(self, tool_name: str, arguments: dict[str, Any]) -> str | None:
+        # THE GUARD, before anything is built: the model only ever sees the
+        # allowlisted arguments for this tool (nothing at all for an unlisted one).
+        projected = _project_args(tool_name, arguments)
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": f"Tool: {tool_name}. Arguments: {_compact_args(arguments)}",
+                "content": f"Tool: {tool_name}. Arguments: {_compact_args(projected)}",
             },
         ]
         # B3: never mutate the shared client's fallback stickiness directly.
@@ -109,7 +338,19 @@ class ProgressSummarizer:
         # Strip a wrapping pair of quotes the model sometimes adds despite the prompt.
         if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
             text = text[1:-1].strip()
-        return text or None
+        if not text:
+            return None
+        # Second layer, deterministic, two independent checks — either one replaces
+        # the line with this tool's static phrasing rather than emitting it:
+        #   - SHAPE: the line itself looks like database structure, whatever its
+        #     provenance (this is what covers the allowlisted free-text args, which
+        #     the schema-aware main model authored);
+        #   - PROVENANCE: the line repeats an identifier out of the WITHHELD args.
+        if _looks_structural(text) or _leaks_identifiers(
+            text, _forbidden_tokens(tool_name, arguments)
+        ):
+            return _static_line(tool_name)
+        return text
 
 
 __all__ = ["ProgressSummarizer"]

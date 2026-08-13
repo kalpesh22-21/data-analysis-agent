@@ -298,8 +298,15 @@ class ResolveValuesComposite:
             return self._target_error(exc.message)
 
         sql = sql_builder.build_sql(target, period=period, limit=self._query_limit)
+        # `emit_progress=False`: this composite already emits its OWN
+        # `tool_dispatch_*` events under `tool_name=resolveValues` (above and
+        # below), which is the one step the user asked for. The inner runQuery is
+        # an implementation detail of it — left ungated the UI painted a second
+        # "running runQuery…" line inside the first, advertising that the lookup is
+        # SQL over an internal table. Spans and control flow are unaffected; the
+        # inner denial/error is still passed through verbatim below.
         inner = await self._tool_dispatcher.dispatch(
-            "runQuery", {"sql": sql, "limit": None}, credentials
+            "runQuery", {"sql": sql, "limit": None}, credentials, emit_progress=False
         )
 
         if inner.status != "ok":

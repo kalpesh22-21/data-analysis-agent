@@ -124,9 +124,18 @@ class FakeDispatcher:
         self.calls: list[_Recorded] = []
 
     async def dispatch(
-        self, tool_name: str, model_args: dict[str, Any], credentials: RuntimeCredentials
+        self,
+        tool_name: str,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        *,
+        emit_progress: bool = True,
     ) -> ToolResult:
         assert tool_name == "runQuery"
+        # A blueprint is ONE step in the UI: every internal dispatch must gate the
+        # `tool_dispatch_*` progress events (see test_executor_progress_gate.py).
+        # Asserted here so EVERY scripted path in this file enforces it too.
+        assert emit_progress is False, "blueprint-internal dispatch leaked UI progress"
         self.calls.append(_Recorded(sql=model_args["sql"]))
         assert self._results, "FakeDispatcher ran out of scripted results"
         return self._results.pop(0)

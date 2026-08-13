@@ -131,9 +131,17 @@ class FakeDispatcher:
         self.calls: list[_Recorded] = []
 
     async def dispatch(
-        self, tool_name: str, model_args: dict[str, Any], credentials: RuntimeCredentials
+        self,
+        tool_name: str,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        *,
+        emit_progress: bool = True,
     ) -> ToolResult:
         assert tool_name == "runQuery"
+        # See test_executor.py's FakeDispatcher: a blueprint-internal dispatch must
+        # never emit the UI progress events (test_executor_progress_gate.py).
+        assert emit_progress is False, "blueprint-internal dispatch leaked UI progress"
         self.calls.append(_Recorded(sql=model_args["sql"]))
         assert self._results, "FakeDispatcher ran out of scripted results"
         return self._results.pop(0)

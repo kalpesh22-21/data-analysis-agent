@@ -480,8 +480,37 @@ class ToolDispatcher:
         tool_name: str,
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
+        *,
+        emit_progress: bool = True,
     ) -> ToolResult:
-        self._observer("tool_dispatch_start", {"tool_name": tool_name})
+        """Dispatch one tool call. `emit_progress=False` silences the
+        `tool_dispatch_start`/`ok`/`denied`/`error` OBSERVER events for THIS call
+        and nothing else.
+
+        Why it exists: `blueprint/executor.py` runs every node of a composed
+        blueprint through this same choke point, and those events are UI progress
+        labels (`observability/progress.py::_STEP_LABELS`) — so a single
+        `runBlueprint` painted the user a "running runQuery…" line per internal
+        node, exposing that the answer is assembled from queries over internal
+        tables. The user asked for ONE analysis; the internal steps are not their
+        business. The OUTER `runBlueprint` dispatch from the agent loop still emits
+        normally, so the turn is never silent.
+
+        SCOPE, deliberately narrow — this gates the OBSERVER channel only:
+          - `_emit_tool_span` (Phoenix/OTel, via `redaction.tool_span_args`) is
+            UNAFFECTED: every inner node still gets its own `tool.runQuery` span,
+            because an operator debugging a blueprint needs exactly that.
+          - `tool_dispatch_cards_dropped` (from `_build_preview`) is UNAFFECTED: it
+            is an operator degrade signal with no `_STEP_LABELS` entry, so it never
+            reached the UI to begin with.
+          - control flow is UNAFFECTED: denials and errors return the same
+            `ToolResult` and propagate exactly as with progress on.
+        """
+        # One local, resolved once: the four progress events below route through it,
+        # so a future event added to this method cannot silently escape the gate by
+        # forgetting to check the flag — it has to pick an observer.
+        emit = self._observer if emit_progress else _default_observer
+        emit("tool_dispatch_start", {"tool_name": tool_name})
 
         try:
             raw_result = await self._mcp_client.call_tool(
@@ -520,9 +549,7 @@ class ToolDispatcher:
             if denial.code == "COLUMN_SCOPE_VIOLATION" and exc.message:
                 denial_detail = exc.message
             user_message = denial_detail or denial.user_message
-            self._observer(
-                "tool_dispatch_denied", {"tool_name": tool_name, "error_code": denial.code}
-            )
+            emit("tool_dispatch_denied", {"tool_name": tool_name, "error_code": denial.code})
             self._emit_tool_span(tool_name, model_args, status="denied", error_code=denial.code)
             return ToolResult(
                 status="denied",
@@ -546,7 +573,7 @@ class ToolDispatcher:
                 tool_name,
                 credentials.session_id,
             )
-            self._observer(
+            emit(
                 "tool_dispatch_error",
                 {"tool_name": tool_name, "error_code": INTERNAL_TRANSPORT_ERROR_CODE},
             )
@@ -576,7 +603,7 @@ class ToolDispatcher:
             tool_name=tool_name,
         )
 
-        self._observer("tool_dispatch_ok", {"tool_name": tool_name})
+        emit("tool_dispatch_ok", {"tool_name": tool_name})
         self._emit_tool_span(
             tool_name, model_args, status="ok", error_code=None, result_preview=preview
         )

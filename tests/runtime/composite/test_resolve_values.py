@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.resolve_values import (
@@ -49,12 +50,23 @@ def _composite(
     vectors: dict[str, list[float]] | None = None,
     embed_fail: bool = False,
     embedding: bool = True,
+    observer: Any = None,
 ) -> tuple[ResolveValuesComposite, FakeMCPClient]:
     mcp = FakeMCPClient(scripted=scripted or {})
-    dispatcher = ToolDispatcher(mcp, CATALOG)
+    # The SAME observer on both, exactly as `app.py` wires them: the composite
+    # emits its own `resolveValues` progress events, the dispatcher would emit the
+    # inner `runQuery` ones (gated — see the progress test at the end of the file).
+    dispatcher = (
+        ToolDispatcher(mcp, CATALOG, observer=observer)
+        if observer is not None
+        else ToolDispatcher(mcp, CATALOG)
+    )
     embedding_client = (
         FakeEmbeddingClient(vectors, dim=2, fail=embed_fail) if embedding else None
     )
+    kwargs: dict[str, Any] = {}
+    if observer is not None:
+        kwargs["observer"] = observer
     composite = ResolveValuesComposite(
         tool_dispatcher=dispatcher,
         catalog=CATALOG,
@@ -62,6 +74,7 @@ def _composite(
         query_limit=200,
         top_k=10,
         similarity_weight=0.7,
+        **kwargs,
     )
     return composite, mcp
 
@@ -439,3 +452,60 @@ async def test_mismatched_length_vectors_degrade_to_freq_only() -> None:
     assert tool_result.status == "ok"
     assert tool_result.result_full["degraded"] is True
     assert [r["value"] for r in tool_result.result_full["values"]] == ["common", "rare"]
+
+
+# --- UI progress: the inner runQuery is an implementation detail -------------
+
+
+class _RecordingObserver:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def __call__(self, event: str, payload: dict) -> None:
+        self.events.append((event, dict(payload)))
+
+
+async def test_the_inner_run_query_emits_no_ui_progress_of_its_own() -> None:
+    """`resolveValues` is ONE step to the user. Its inner `runQuery` runs through
+    the shared dispatcher, whose `tool_dispatch_*` events are UI progress labels —
+    left ungated the UI painted "running runQuery…" inside "running
+    resolveValues…", advertising that the lookup is SQL over an internal table.
+
+    The composite's OWN start/ok events are unaffected: the step the model asked
+    for is still narrated.
+    """
+    observer = _RecordingObserver()
+    result = _run_query_result(["EarnCode", "EarnDescription", "freq"], [["PTO", "x", 10]])
+    composite, mcp = _composite(scripted={"runQuery": [result]}, observer=observer)
+
+    tool_result = await composite.run(
+        {"table": _T, "column": "EarnCode", "concept": "leave"}, _credentials()
+    )
+
+    assert tool_result.status == "ok"
+    assert [c.tool_name for c in mcp.calls] == ["runQuery"]  # it really did run
+    dispatch_events = [
+        (event, payload) for event, payload in observer.events if event.startswith("tool_dispatch_")
+    ]
+    assert dispatch_events, "the composite's own progress events must still fire"
+    assert {payload["tool_name"] for _event, payload in dispatch_events} == {TOOL_NAME}
+
+
+async def test_an_inner_denial_still_reports_under_the_composite_tool_name() -> None:
+    """Control flow unchanged: the inner denial is passed through and narrated as
+    `resolveValues`, never as a silent step and never as `runQuery`."""
+    observer = _RecordingObserver()
+    composite, _mcp = _composite(
+        scripted={"runQuery": [MCPToolError("COLUMN_SCOPE_VIOLATION", "denied")]},
+        observer=observer,
+    )
+
+    tool_result = await composite.run(
+        {"table": _T, "column": "EarnCode", "concept": "leave"}, _credentials()
+    )
+
+    assert tool_result.status == "denied"
+    denials = [
+        payload for event, payload in observer.events if event == "tool_dispatch_denied"
+    ]
+    assert [payload["tool_name"] for payload in denials] == [TOOL_NAME]

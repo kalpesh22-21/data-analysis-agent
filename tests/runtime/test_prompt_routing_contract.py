@@ -566,6 +566,86 @@ def test_the_prompt_never_instructs_sql_based_metadata_discovery() -> None:
         )
 
 
+def test_metadata_answers_are_business_language_never_physical_identifiers() -> None:
+    """The no-schema-disclosure contract, in the bullet where the model decides.
+
+    Metadata questions stay a legitimate deliverable and `listTables`/
+    `getTableSchema` stay their grounding route — what changed is the ANSWER
+    contract: those tools ground the MODEL, and the user-facing text describes the
+    data in business terms. The prompt is the only carrier of this rule (nothing in
+    the runtime inspects answer prose), so it is asserted rather than assumed.
+    """
+    routing = AGENT_SYSTEM_PROMPT[
+        AGENT_SYSTEM_PROMPT.index("## Routing the request") : AGENT_SYSTEM_PROMPT.index(
+            "## What runQuery accepts"
+        )
+    ]
+    # The grounding route is UNCHANGED — this rule must not read as "stop looking".
+    assert "listTables/getTableSchema, never with SQL" in routing
+    assert "those tools ground YOU, they are not the answer" in routing
+    # ...and the answer contract.
+    assert "ANSWER IT IN BUSINESS TERMS" in routing
+    assert "Never put a database, table or column name, DDL, or a schema dump in the answer" in (
+        routing
+    )
+    # The explicit-ask case, which is where a model with only the general rule
+    # tends to comply with the user instead.
+    assert "Asked outright for the physical schema or the table list" in routing
+    assert "do not expose internal database structure" in routing
+
+
+def test_trust_boundary_forbids_surfacing_internal_database_structure() -> None:
+    """The general rule behind the metadata bullet, in the section that owns
+    disclosure limits (which previously covered PII only).
+
+    Scoped to ANSWER TEXT on purpose: `answerWithTable`'s `tables[].sql` is the D56
+    transparency channel and is explicitly exempted, so this rule cannot be read as
+    withholding the SQL the interface shows beside the grid.
+    """
+    boundary = AGENT_SYSTEM_PROMPT[
+        AGENT_SYSTEM_PROMPT.index("## Trust boundary") : AGENT_SYSTEM_PROMPT.index(
+            "## Scope and sensitive data"
+        )
+    ]
+    assert "Internal database structure is implementation detail, not an answer" in boundary
+    assert "never belong in your answer text" in boundary
+    assert "translate them into the user's own business language" in boundary
+    # The carve-out for the structured transparency channel.
+    assert "The structured fields of a tool call are unaffected" in boundary
+    # ...and the table contract it defers to is still intact (D56, out of scope).
+    table = AGENT_SYSTEM_PROMPT[AGENT_SYSTEM_PROMPT.index("## Presenting a table") :]
+    assert "Give it `sql`" in table
+
+
+def test_the_coverage_caveat_names_what_was_blocked_in_business_terms() -> None:
+    """The seam between the two rules, found on review.
+
+    `## Scope and sensitive data` requires the model to name what it could NOT
+    access — and the runtime hands it exactly the material the no-structure rule
+    forbids: a `COLUMN_SCOPE_VIOLATION` rides `denial_detail`, whose text is an
+    author-controlled string that NAMES the out-of-scope column(s)
+    (`dispatch/tool_dispatcher.py`). Without this amendment the prompt instructed
+    the model to print that column name in its answer.
+
+    The caveat itself is unchanged — an honest coverage statement is the point;
+    only its vocabulary is constrained.
+    """
+    section = AGENT_SYSTEM_PROMPT[
+        AGENT_SYSTEM_PROMPT.index("## Scope and sensitive data") : AGENT_SYSTEM_PROMPT.index(
+            "## Asking vs. assuming"
+        )
+    ]
+    # The caveat survives.
+    assert "state that the result covers only what you could access" in section
+    assert "name what you could not" in section
+    assert "never imply coverage you do not have" in section.lower()
+    # ...in business vocabulary, with the denial-text source named so the rule is
+    # actionable at the moment the model is holding one.
+    assert "IN BUSINESS TERMS" in section
+    assert "a denial message can quote the internal field it blocked" in section
+    assert "not the column name" in section
+
+
 def test_the_cost_of_a_rejected_query_is_stated() -> None:
     """The motivation, without which the rule reads as trivia (01a §12).
 
@@ -716,8 +796,30 @@ def test_prompt_stays_within_its_token_budget() -> None:
     MUST RE-ARGUE THE CEILING. It must not be paid for by shaving working
     instructions to fit, which is the one way this constant gets worse without
     anyone deciding that it should.
+
+    **2026-08-13, ceiling RE-ARGUED and raised to 17,000 — RATIFIED by the user.**
+    15,875 -> **16,631**
+    (+756) for the no-schema-disclosure contract: the metadata routing bullet now
+    says what the ANSWER may contain (business terms, never a database/table/column
+    name, DDL, or a schema dump, with the explicit-request case named), and
+    `## Trust boundary` gains the general rule that internal database structure is
+    implementation detail to be translated, not surfaced. The paragraph above
+    demanded the ceiling be re-argued rather than the addition shaved, so it is:
+    125 chars of headroom could not hold a 756-char contract, the prompt is the ONLY
+    carrier of it (no runtime filter inspects answer prose), and the alternative —
+    deleting working instructions — is what the 15,000 ratification forbade. 17,000
+    restores ~370 chars of headroom, deliberately modest so the next addition faces
+    the same argument rather than a blank cheque.
+
+    16,631 -> **16,778** (+147) on review: `## Scope and sensitive data` told the
+    model to "name what you could not" access, and a `COLUMN_SCOPE_VIOLATION`
+    denial quotes the blocked column VERBATIM (`dispatch/tool_dispatcher.py`'s
+    `denial_detail` carve-out) — so the coverage caveat was a standing instruction
+    to print a physical column name, contradicting the rule added above it. The
+    amendment keeps the caveat and constrains its vocabulary. **222 chars spare**;
+    the paragraph above still governs the next addition.
     """
-    assert len(AGENT_SYSTEM_PROMPT) <= 16_000
+    assert len(AGENT_SYSTEM_PROMPT) <= 17_000
 
 
 def test_the_prompt_draft_doc_matches_the_shipped_constant_byte_for_byte() -> None:

@@ -214,6 +214,45 @@ async def test_raising_observer_on_summary_emit_does_not_break_turn() -> None:
     assert loop._summary_tasks == set()
 
 
+async def test_a_raising_summarizer_does_not_break_the_turn() -> None:
+    """`ProgressSummarizer.summarize` swallows its own failures, but the loop must
+    not DEPEND on that: this task is fire-and-forget, so an exception escaping any
+    summarizer implementation would surface as an un-retrieved task exception (and,
+    with a stricter handler, as a failed turn). The guard in `_summarize_and_emit`
+    is asserted with a summarizer that raises outright."""
+
+    class _RaisingSummarizer:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def summarize(self, tool_name: str, arguments: dict) -> str | None:
+            self.calls.append(tool_name)
+            raise RuntimeError("summarizer exploded")
+
+    events: list[tuple[str, dict]] = []
+    summarizer = _RaisingSummarizer()
+    loop, _store = _build_loop(
+        model_client=_query_then_done(),
+        mcp_client=_run_query_mcp(),
+        observer=lambda e, p: events.append((e, dict(p))),
+        progress_summarizer=summarizer,
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="show codes"
+    )
+    await asyncio.sleep(0)
+
+    assert outcome.status == "done"
+    assert outcome.assistant_text == "All done."
+    assert summarizer.calls == ["runQuery"]
+    # Nothing was emitted — not even a fallback line (the failure is silent).
+    assert "tool_progress_summary" not in [e for e, _ in events]
+    # The instant template label still carried the turn.
+    assert "tool_dispatch_start" in [e for e, _ in events]
+    assert loop._summary_tasks == set()
+
+
 async def test_no_summarizer_means_no_summary_events_and_no_calls() -> None:
     events: list[tuple[str, dict]] = []
     loop, _store = _build_loop(

@@ -388,8 +388,16 @@ class BlueprintExecutor:
         self._observer("blueprint_step", {"blueprint_id": blueprint_id, "step": "executing"})
 
         # 5. Dispatch the node query through the runQuery choke point (D57/D64/D5).
+        # `emit_progress=False`: a blueprint is ONE call from the user's side, so its
+        # internal runQuery must not paint a "running runQuery…" line on the UI
+        # progress stream (that stream is what the user reads; the internal step
+        # structure — and the fact that it is SQL over internal tables — is not
+        # theirs to see). Spans, scope enforcement and control flow are unchanged.
         node = await self._tool_dispatcher.dispatch(
-            "runQuery", {"sql": node_sql, "limit": self._query_limit}, credentials
+            "runQuery",
+            {"sql": node_sql, "limit": self._query_limit},
+            credentials,
+            emit_progress=False,
         )
         if node.status != "ok":
             # Inner denial/error passes through verbatim (§5.4) — the tool relabels
@@ -716,7 +724,10 @@ class BlueprintExecutor:
                 {"blueprint_id": bid, "step": "executing_node", "node": node.order},
             )
             result = await self._tool_dispatcher.dispatch(
-                "runQuery", {"sql": node_sql, "limit": self._query_limit}, credentials
+                "runQuery",
+                {"sql": node_sql, "limit": self._query_limit},
+                credentials,
+                emit_progress=False,  # internal DAG node — see `_execute_single`
             )
             if result.status != "ok":
                 return ExecFailed(
@@ -1015,7 +1026,10 @@ class BlueprintExecutor:
             .sql(dialect="clickhouse")
         )
         probe = await self._tool_dispatcher.dispatch(
-            "runQuery", {"sql": probe_sql, "limit": None}, credentials
+            "runQuery",
+            {"sql": probe_sql, "limit": None},
+            credentials,
+            emit_progress=False,  # internal domain probe — see `_execute_single`
         )
         if probe.status != "ok":
             return None, []  # a denied/errored probe read nothing → contributes nothing
@@ -1137,7 +1151,10 @@ class BlueprintExecutor:
 
         probe_sql = _grain_probe_sql(node_sql, grain_cols)
         probe = await self._tool_dispatcher.dispatch(
-            "runQuery", {"sql": probe_sql, "limit": None}, credentials
+            "runQuery",
+            {"sql": probe_sql, "limit": None},
+            credentials,
+            emit_progress=False,  # internal grain probe — see `_execute_single`
         )
         if probe.status != "ok":
             return None  # a denied/errored grain probe → fail-closed at the caller
