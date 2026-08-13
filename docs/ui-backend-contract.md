@@ -186,12 +186,23 @@ interface TurnResult {
 
   // --- additive, best-effort, nullable on EVERY status ---
   sql_executed: string[] | null;      // every query the turn RAN (audit list)
-  answer_sql: string | null;          // the ONE query whose rows ARE the answer
+  answer_sql: string | null;          // COMPAT: answer_tables[0].sql (see §4.2.2)
+  answer_tables: AnswerTableEntry[] | null;  // EVERY designated answer table (§4.2.2)
 
-  blueprint_use: BlueprintUse | null;
-  verification: Verification | null;
+  blueprint_use: BlueprintUse | null; // COMPAT: derived from answer_tables[0]
+  verification: Verification | null;  // COMPAT: derived from answer_tables[0]
   provenance: string[] | null;        // "database.table.column", sorted + deduped
   assumptions: string[] | null;
+}
+```
+
+```ts
+// One designated answer table — one grid per entry, in answer order.
+interface AnswerTableEntry {
+  sql: string;                        // page THIS string via §4.4, verbatim
+  caption: string | null;             // model-authored label for this part
+  blueprint_use: BlueprintUse | null; // per-table chip (null on a hand-written query)
+  verification: Verification | null;  // per-table badge (same semantics as §4.2.4)
 }
 ```
 
@@ -229,16 +240,18 @@ Every query the turn **actually ran**, in execution order, deduped preserving fi
 
 Not the same thing as `answer_sql`: this is *what ran*, that is *what the answer is*. A turn commonly has several entries here and one (or zero) there. Queries issued **inside** `resolveValues` do not appear — the list is per model-issued tool call.
 
-#### 4.2.2 `answer_sql` — the answer table
-*(replaced `result_table` in 2026-08. `result_table` is **gone from the live result**, not nulled — a client keying on it will get `undefined`, deliberately, so the change fails loudly rather than silently rendering an empty grid. `GET /session/history` still returns it per tool call; see §7.2.)*
+#### 4.2.2 `answer_tables` — the answer tables (plural since 2026-08-13)
+*(`result_table` was replaced by `answer_sql` in 2026-08; `answer_tables` then generalized it to a LIST — one entry per part of a multi-part answer ("headcount by department AND average salary by department" ⇒ two grids). ADDITIVE: `answer_sql`/`blueprint_use`/`verification` keep their old meaning as projections of `answer_tables[0]`, so a client that predates the list renders exactly what it used to — the first table.)*
 
-**The rows are no longer on the result event.** `answer_sql` is a single query string; you fetch its rows yourself, a page at a time, from `POST /query/page` (§4.4). That is the whole rendering contract for the answer table.
+**The rows are not on the result event.** Each entry carries a query string; you fetch its rows yourself, a page at a time, from `POST /query/page` (§4.4) — one paged grid **per entry**, rendered in array order, labeled by its `caption`. Per-entry `blueprint_use`/`verification` carry that table's own chip and badge (a turn can mix a blueprint-backed table with a hand-written one).
 
-Why it changed: `result_table` was a fixed ~20-row preview the user could not page past, and the *runtime* picked it ("the last successful query"), which is wrong exactly when a turn resolves values or probes a code space before answering. Now the **model** designates which query is the answer, and the UI renders the full result with real paging.
+Why the model designates: the old `result_table` was a fixed ~20-row preview the *runtime* picked ("the last successful query"), which is wrong exactly when a turn probes a code space before answering. The **model** designates which queries are the answer, and the UI renders full results with real paging.
 
-`answer_sql` is `null` when:
+`answer_tables` is `null` (never `[]`) when:
 - the answer is a **scalar or single row** — correct, render prose only, a one-cell grid helps nobody; or
-- the model simply did not designate one. The designation is **advisory** (the model calls an `answerWithTable` tool); a table-shaped answer with `answer_sql: null` is possible and must degrade to prose, not to an error.
+- the model did not designate any. The designation is **advisory** (the model calls an `answerWithTable` tool); a table-shaped answer with `answer_tables: null` is possible and must degrade to prose, not to an error.
+
+**Prefer `answer_tables`; treat `answer_sql` as legacy.** New clients should not read `answer_sql`/top-level `blueprint_use`/`verification` at all — they are first-table projections kept for old clients and can only under-represent a multi-part answer.
 
 Rows returned by §4.4 **may contain real cell values** — the caller's own scope-filtered answer data over an authenticated session. This is the deliberate asymmetry with `progress` (§4.1). Render every cell via `textContent` / auto-escaping — warehouse text, never trusted markup.
 
@@ -267,10 +280,10 @@ Model-declared, **plain-English** sentences ("'Active employees' was taken to me
 
 | `status` | What to expect |
 |---|---|
-| `done` (blueprint path) | all six enrichment fields populated |
+| `done` (blueprint path) | all enrichment fields populated |
 | `done` (raw loop) | `sql_executed` + `provenance` populated; `blueprint_use` and `verification` **null** |
-| `done` (table answer) | `answer_sql` non-null → page it via §4.4 |
-| `done` (scalar answer) | `answer_sql` **null** — expected, not an error |
+| `done` (table answer) | `answer_tables` non-null (1..N entries) → page each via §4.4 |
+| `done` (scalar answer) | `answer_tables` **null** — expected, not an error |
 | `done` (pure chat) | all may be null; `provenance` may be `[]` |
 | `paused_ask_user` | usually all null; `pending_question` non-null → **render the prompt and call `/turn/resume`** |
 | `paused_budget_cap` | partial; `pending_question` = `{question, options:["continue","refine","stop"]}` |
@@ -374,7 +387,8 @@ interface HistoryTurn {
   answer: string | null;             // null == withheld-by-scope OR paused OR none yet
   provenance_union: string[] | null; // same 3-valued encoding as TurnResult.provenance
   assumptions: string[] | null;
-  answer_sql: string | null;         // page it via §4.4, exactly like the live field
+  answer_sql: string | null;         // COMPAT: answer_tables[0].sql, like the live field
+  answer_tables: AnswerTableEntry[] | null;  // same shape + semantics as §4.2.2
   tool_calls: HistoryToolCall[];
 }
 
@@ -402,10 +416,13 @@ Only **successful, in-scope** tool calls appear — denials and errors carry und
 
 `tool_calls[]` is per-SQL; the live `result` event is union-only. That asymmetry is intentional and frozen.
 
-**History carries `answer_sql` too**, so a reloaded transcript pages the same table
-the live turn showed — send it to §4.4 exactly as you would the live field. Both
-designation forms resolve, including `blueprint_id`. It is withheld with the answer:
-if `answer` is null by scope, so is `answer_sql`.
+**History carries `answer_tables` too**, so a reloaded transcript pages the same
+tables the live turn showed — send each entry's `sql` to §4.4 exactly as you would
+live. Both designation forms resolve, including `blueprint_id`. Withholding is
+**per-table**: each entry carries its own provenance server-side, so a scope
+narrowing drops individual out-of-scope tables from the list while the rest keep
+rendering; if the `answer` itself is withheld, `answer_tables` (and the legacy
+`answer_sql`) go with it.
 
 History still ALSO carries per-tool-call `result_table` previews, which the live
 `result` event no longer does. Prefer `answer_sql` when present and treat
@@ -635,7 +652,7 @@ Upstream status codes and bodies propagate **as-is** — a non-2xx from the runt
 6. **Never persist or expose the JWT client-side.** The browser holds only `session_id`.
 7. **Resume is exactly-once.** Disable the resume control after firing; on `409`/`AlreadyConsumedError`, re-fetch history rather than retrying.
 8. **Rebuild the transcript from history on load**, then append live turns — do not merge both sources for the same turn.
-9. **Render the answer table from `answer_sql`, not from the result event.** The rows are not in the payload — fetch them from §4.4. `answer_sql: null` is the normal scalar case; degrade to prose rather than showing an error or an empty grid.
+9. **Render the answer tables from `answer_tables`, not from the result event.** The rows are not in the payload — fetch each entry's `sql` from §4.4, one grid per entry in array order, labeled by `caption`. `answer_tables: null` is the normal scalar case; degrade to prose rather than showing an error or an empty grid. Do not read the legacy first-table projections (`answer_sql`, top-level `blueprint_use`/`verification`) in a new client.
 10. **Long turns are normal.** A turn does retrieval + multiple LLM round-trips + queries. Keep the SSE read timeout unbounded (the reference BFF sets `read=None`) and drive perceived latency from `progress` events.
 
 ---
@@ -647,8 +664,8 @@ Upstream status codes and bodies propagate **as-is** — a non-2xx from the runt
 | **No CORS anywhere** | a browser cannot call the runtime/inbox/clickhouse-api directly; a same-origin proxy is mandatory |
 | **No pagination** on `/session/history` or `GET /inbox` | whole-session and top-100 payloads; large sessions are large responses |
 | **`runBlueprint` history `sql` is always `null`** | node SQL lives behind a KV pointer that the read path deliberately does not dereference; the live `result` event *does* carry it |
-| **A scratch-backed `answer_sql` expires** | composed blueprints that materialise into `scratch.*` produce a session-scoped, TTL'd answer table; paging it later or from another session fails (§4.4) |
-| **`answer_sql` is advisory** | the model may not designate one for a genuinely tabular answer; there is no server-side fallback, so plan for prose-only |
+| **A scratch-backed answer table expires** | composed blueprints that materialise into `scratch.*` produce a session-scoped, TTL'd answer table; paging it later or from another session fails (§4.4) |
+| **`answer_tables` is advisory, with a runtime backstop** | the runtime refuses a bare-prose finish once per window when the turn holds untabled multi-row results and nudges the model toward `answerWithTable` — but it never hard-locks, so a genuinely tabular answer can still arrive with `answer_tables: null`; plan for prose-only |
 | **`verification` only exists on the blueprint path** | there is no raw-loop verification gate; absence is not failure |
 | **`blueprint_use.slots` are raw model inputs** | may differ from post-resolution bound values |
 | **In-memory session→JWT map** in the reference BFF | single-process only; a real deployment needs shared storage |
@@ -659,19 +676,37 @@ Upstream status codes and bodies propagate **as-is** — a non-2xx from the runt
 
 ## 12. Worked examples
 
-**Blueprint-answered TABLE turn** — note the answer text DESCRIBES the table instead of
-listing it, and the rows come from `POST /query/page`, not from this payload:
+**Multi-part TABLE turn** — note the answer text DESCRIBES the tables instead of
+listing them, the rows come from `POST /query/page` per entry, and the legacy
+top-level fields are just `answer_tables[0]` again:
 ```json
 {
   "status": "done",
-  "assistant_text": "Headcount is split evenly across 3 departments.",
+  "assistant_text": "Headcount and average salary are shown by department in the two tables.",
   "pending_question": null,
-  "tool_calls_made": 1,
-  "sql_executed": ["SELECT department, count(*) FROM hr.employees GROUP BY department"],
+  "tool_calls_made": 2,
+  "sql_executed": [
+    "SELECT department, count(*) FROM hr.employees GROUP BY department",
+    "SELECT department, avg(base_salary) FROM hr.employees GROUP BY department"
+  ],
+  "answer_tables": [
+    {
+      "sql": "SELECT department, count(*) AS headcount FROM hr.employees GROUP BY department",
+      "caption": "Active headcount by department",
+      "blueprint_use": { "blueprint_id": "headcount_by_dept", "slots": {} },
+      "verification": { "passed": true, "method": "blueprint_gate", "grain_checked": true }
+    },
+    {
+      "sql": "SELECT department, avg(base_salary) AS avg_salary FROM hr.employees GROUP BY department",
+      "caption": "Average salary by department",
+      "blueprint_use": null,
+      "verification": null
+    }
+  ],
   "answer_sql": "SELECT department, count(*) AS headcount FROM hr.employees GROUP BY department",
-  "blueprint_use": { "blueprint_id": "headcount_by_dept", "slots": { "period": "2026-05" } },
+  "blueprint_use": { "blueprint_id": "headcount_by_dept", "slots": {} },
   "verification": { "passed": true, "method": "blueprint_gate", "grain_checked": true },
-  "provenance": ["hr.employees.department", "hr.employees.id"],
+  "provenance": ["hr.employees.base_salary", "hr.employees.department", "hr.employees.id"],
   "assumptions": ["'Headcount' was taken to mean currently-employed staff."]
 }
 ```
@@ -685,6 +720,7 @@ because a single number needs no grid. This is the common case, not a degraded o
   "pending_question": null,
   "tool_calls_made": 2,
   "sql_executed": ["SELECT avg(base_salary) FROM hr.employees WHERE department = 'Sales'"],
+  "answer_tables": null,
   "answer_sql": null,
   "blueprint_use": null,
   "verification": null,
@@ -700,7 +736,7 @@ because a single number needs no grid. This is the common case, not a degraded o
   "assistant_text": null,
   "pending_question": { "question": "Did you mean base salary or gross pay?", "options": ["base salary", "gross pay"] },
   "tool_calls_made": 1,
-  "sql_executed": null, "answer_sql": null, "blueprint_use": null,
+  "sql_executed": null, "answer_tables": null, "answer_sql": null, "blueprint_use": null,
   "verification": null, "provenance": null, "assumptions": null
 }
 ```
@@ -721,7 +757,7 @@ POST /api/query/page   {… "offset":2}
   "assistant_text": null,
   "pending_question": { "question": "…", "options": ["continue", "refine", "stop"] },
   "tool_calls_made": 12,
-  "sql_executed": ["…"], "answer_sql": null, "blueprint_use": null,
+  "sql_executed": ["…"], "answer_tables": null, "answer_sql": null, "blueprint_use": null,
   "verification": null, "provenance": null, "assumptions": null
 }
 ```
