@@ -2,11 +2,17 @@
 # This is a YAML-formatted file.
 # Every value is documented inline. See deploy/helm/README.md for the big picture.
 #
-# IMPORTANT: All of the first-party workloads (runtime, ui, learning-sweeper,
-# learning-consumer, inbox) run from ONE image built from this repo. External
-# backing services (ClickHouse, MCP/clickhouse-api, token IdP, OpenAI,
-# Couchbase, Neo4j, Redis, embedding/reranker APIs) are NOT deployed by this
-# chart — provision them separately and point to them via `config` + `secrets`.
+# IMPORTANT: All of the first-party workloads in THIS chart (runtime, ui,
+# hydrator) run from ONE image built from this repo. External backing services
+# (ClickHouse, MCP/clickhouse-api, token IdP, OpenAI, Couchbase, Neo4j,
+# embedding/reranker APIs) are NOT deployed by this chart — provision them
+# separately and point to them via `config` + `secrets`.
+#
+# THE OFFLINE LEARNING PLANE LIVES IN A SEPARATE CHART:
+# `deploy/helm/data-agent-learning` (learning sweeper/consumer/scheduler, the
+# review-inbox service, and the reviewer UI). It ships the SAME image and shares
+# the same Couchbase cluster + tenant identity — see the shared-secret note on
+# `secrets` below before installing the two side by side.
 
 # -- Override the chart name portion of resource names.
 nameOverride: ""
@@ -120,6 +126,10 @@ config:
   # -- Model context window (tokens) the runtime plans against.
   MODEL_CONTEXT_WINDOW: "128000"
   # -- Couchbase connection string (primary session store). EXTERNAL.
+  #    SHARED WITH THE LEARNING CHART: the learning sweeper scans THIS bucket for
+  #    idle sessions, so `data-agent-learning` must point at the same cluster,
+  #    bucket and credentials. A mismatch is silent — the sweeper just never finds
+  #    a session to learn from.
   COUCHBASE_CONNECTION_STRING: "couchbase://couchbase"
   # -- Couchbase username.
   COUCHBASE_USERNAME: "data_agent"
@@ -150,6 +160,14 @@ config:
   # rather than into a green that means nothing.
   # `values-example.yaml` carries the configured shape; the code defaults in
   # `runtime/config.py` keep the dev seed for a local `uv run`.
+  #
+  # TWO CHARTS, ONE TENANT. The learning chart (`data-agent-learning`) carries the
+  # SAME three keys, because its offline golden replay mints its own token and must
+  # replay as the tenant this agent reads as. Setting them in only one chart — or to
+  # different values in the two — is SILENT: row policies filter rather than error, so
+  # the replay simply matches a different (or empty) row set and its grain check still
+  # passes. Wire BOTH charts to the SAME `secrets.existingSecret` (see the note on
+  # `secrets` below) and keep the two `config` blocks' TENANT_* values identical.
   #
   # -- Warehouse tenant claim 'clientcode' (→ ClickHouse setting paycom_client_code).
   #    Required by the MCP on every call; a token without it is rejected 403
@@ -183,44 +201,18 @@ config:
   # -- Session TTL in seconds.
   SESSION_TTL_SECONDS: "3600"
 
-  # --- learning (sweeper + consumer) ---
-  # -- Redis URL backing the learning job stream. EXTERNAL.
-  LEARNING_REDIS_URL: "redis://redis:6379/0"
-  # -- Redis stream key for learning jobs.
-  LEARNING_JOBS_STREAM: "learning:jobs"
-  # -- Redis consumer group name.
-  LEARNING_CONSUMER_GROUP: "learning-consumers"
-  # -- Idle threshold (seconds) before the sweeper enqueues a session.
-  LEARNING_IDLE_THRESHOLD_SECONDS: "900"
-  # -- Sweeper scan interval (seconds).
-  LEARNING_SWEEP_INTERVAL_SECONDS: "60"
-  # -- Master enable flag for the learning loop.
-  LEARNING_ENABLED: "true"
-  # -- Extractor model used by the consumer.
-  LEARNING_EXTRACTOR_MODEL: "gpt-4o"
-  # -- Couchbase connection string for the learning AUDIT bucket. EXTERNAL.
-  LEARNING_AUDIT_CONNECTION_STRING: "couchbase://couchbase"
-  LEARNING_AUDIT_BUCKET: "learning_audit"
-  LEARNING_AUDIT_USERNAME: "learning_audit"
-  # -- Couchbase connection string for the learning CANDIDATES bucket. EXTERNAL.
-  LEARNING_CANDIDATES_CONNECTION_STRING: "couchbase://couchbase"
-  LEARNING_CANDIDATES_BUCKET: "learning_candidates"
-  LEARNING_CANDIDATES_USERNAME: "learning_candidates"
-  # -- Couchbase connection string for the learning CORPUS bucket. EXTERNAL.
-  LEARNING_CORPUS_CONNECTION_STRING: "couchbase://couchbase"
-  LEARNING_CORPUS_BUCKET: "learning_corpus"
-  LEARNING_CORPUS_USERNAME: "learning_corpus"
-
   # --- ui (backend-for-frontend) ---
   # -- Max upload size (bytes) accepted by the UI BFF. Default 8 MiB.
   UPLOAD_MAX_BYTES: "8388608"
   # -- RUNTIME_URL for the UI. Leave empty to auto-derive the in-cluster runtime
   #    Service URL from the release name. Override to point elsewhere.
   RUNTIME_URL: ""
-  # -- INBOX_SERVICE_URL for the UI BFF proxy. Leave empty to auto-derive the
-  #    in-cluster inbox Service URL from the release name (used when
-  #    components.inbox.enabled=true).
-  INBOX_SERVICE_URL: ""
+  # NOTE: this chart deliberately sets NO `REVIEW_INBOX_ENABLED` and NO
+  # `INBOX_SERVICE_URL`. `ui/server.py` carries the reviewer surface (GET /inbox,
+  # /api/inbox/*) in the same app, gated OFF unless REVIEW_INBOX_ENABLED=1 — so
+  # here every inbox route 404s and the agent UI cannot reach the review queue.
+  # The reviewer surface is deployed by the `data-agent-learning` chart, which runs
+  # the SAME image with the flag on and its own Ingress.
 
 # ---------------------------------------------------------------------------
 # Secret configuration.
@@ -232,6 +224,14 @@ config:
 #
 # For dev/testing you may inline values under `secrets.data` — they will be
 # base64-encoded into a chart-managed Secret. NEVER commit real secrets here.
+#
+# RECOMMENDED WITH THE LEARNING CHART: point BOTH `data-agent` and
+# `data-agent-learning` at the SAME `existingSecret`. `COUCHBASE_PASSWORD`,
+# `NEO4J_PASSWORD` and the tenant identity they authenticate are the same identity
+# in both planes — the learning replay reads the agent's warehouse as the agent's
+# tenant. Two independently-edited Secrets drift, and the drift is SILENT: the
+# warehouse row policies FILTER rather than error, so the learning plane keeps
+# running and verifies promotions against the wrong (or an empty) row set.
 # ---------------------------------------------------------------------------
 secrets:
   # -- Name of a pre-existing Secret to use instead of the chart-managed one.
@@ -251,11 +251,6 @@ secrets:
     TOKEN_ISSUER_API_KEY: ""
     EMBEDDING_API_KEY: ""
     RERANKER_API_KEY: ""
-    LEARNING_EXTRACTOR_API_KEY: ""
-    LEARNING_AUDIT_PASSWORD: ""
-    LEARNING_CANDIDATES_PASSWORD: ""
-    LEARNING_CORPUS_PASSWORD: ""
-    REVIEWER_TOKEN: ""
 
 # ---------------------------------------------------------------------------
 # Per-workload configuration.
@@ -323,21 +318,6 @@ components:
       enabled: false
       minAvailable: 1
 
-  # ----- learning-sweeper: periodic idle-scan daemon (DO NOT scale) -----
-  # Replica count is hardcoded to 1 in the template: this is a periodic
-  # idle-scan sweeper; running >1 replica would double-enqueue.
-  learningSweeper:
-    enabled: true
-    image: {}
-    resources: {}
-    nodeSelector: {}
-    tolerations: []
-    affinity: {}
-    podAnnotations: {}
-    podSecurityContext: {}
-    securityContext: {}
-    env: []
-
   # ----- hydrator: singleton neo4j seeder daemon (DO NOT scale) -----
   # Replica count is hardcoded to 1 in the template: this is the SINGLETON graph seeder
   # that owns the destructive nuke/rebuild; running >1 replica would race the graph write
@@ -353,65 +333,6 @@ components:
     podSecurityContext: {}
     securityContext: {}
     env: []
-
-  # ----- learning-scheduler: cron-scanned promotion daemon (DO NOT scale) -----
-  # Replica count is hardcoded to 1 in the template: this is the single promotion
-  # writer (§7.2); running >1 replica would double-promote / double-land the same
-  # candidate. No replicaCount/autoscaling knobs by design.
-  learningScheduler:
-    enabled: true
-    image: {}
-    resources: {}
-    nodeSelector: {}
-    tolerations: []
-    affinity: {}
-    podAnnotations: {}
-    podSecurityContext: {}
-    securityContext: {}
-    env: []
-
-  # ----- learning-consumer: Redis Streams consumer group (scalable) -----
-  learningConsumer:
-    enabled: true
-    # -- Each replica is a distinct Redis Streams consumer; safe to scale.
-    replicaCount: 1
-    image: {}
-    resources: {}
-    nodeSelector: {}
-    tolerations: []
-    affinity: {}
-    podAnnotations: {}
-    podSecurityContext: {}
-    securityContext: {}
-    env: []
-    autoscaling:
-      # -- Enable an HPA for the consumer Deployment.
-      enabled: false
-      minReplicas: 2
-      maxReplicas: 8
-      targetCPUUtilizationPercentage: 70
-      targetMemoryUtilizationPercentage: 0
-
-  # ----- inbox: review-inbox HTTP service (OPTIONAL, off by default) -----
-  inbox:
-    # -- Disabled by default; the app is dormant unless REVIEW_INBOX_ENABLED=1
-    #    (this chart sets that env automatically when enabled).
-    enabled: false
-    replicaCount: 1
-    image: {}
-    resources: {}
-    nodeSelector: {}
-    tolerations: []
-    affinity: {}
-    podAnnotations: {}
-    podSecurityContext: {}
-    securityContext: {}
-    env: []
-    service:
-      type: ClusterIP
-      # -- Inbox HTTP port (matches INBOX_SERVICE_PORT set by the chart).
-      port: 8100
-      annotations: {}
 
 # ---------------------------------------------------------------------------
 # Ingress for the UI backend-for-frontend. Standard helm-create style.

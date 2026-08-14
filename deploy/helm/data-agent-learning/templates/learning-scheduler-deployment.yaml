@@ -4,9 +4,9 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "data-agent.componentFullname" $cmpArgs }}
+  name: {{ include "data-agent-learning.componentFullname" $cmpArgs }}
   labels:
-    {{- include "data-agent.componentLabels" $cmpArgs | nindent 4 }}
+    {{- include "data-agent-learning.componentLabels" $cmpArgs | nindent 4 }}
 spec:
   # Fixed single replica: this is the cron-scanned PROMOTION scheduler (the single
   # promotion writer, §7.2). >1 replica would double-promote / double-land the same
@@ -15,14 +15,14 @@ spec:
   replicas: 1
   selector:
     matchLabels:
-      {{- include "data-agent.componentSelectorLabels" $cmpArgs | nindent 6 }}
+      {{- include "data-agent-learning.componentSelectorLabels" $cmpArgs | nindent 6 }}
   # Background daemon with no readiness gate — recreate rather than rolling.
   strategy:
     type: Recreate
   template:
     metadata:
       annotations:
-        {{- include "data-agent.checksumAnnotations" $ | nindent 8 }}
+        {{- include "data-agent-learning.checksumAnnotations" $ | nindent 8 }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -30,28 +30,30 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       labels:
-        {{- include "data-agent.componentSelectorLabels" $cmpArgs | nindent 8 }}
+        {{- include "data-agent-learning.componentSelectorLabels" $cmpArgs | nindent 8 }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "data-agent.serviceAccountName" . }}
+      serviceAccountName: {{ include "data-agent-learning.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
       securityContext:
         {{- toYaml (mergeOverwrite (deepCopy .Values.podSecurityContext) ($c.podSecurityContext | default dict)) | nindent 8 }}
       containers:
         - name: learning-scheduler
-          image: {{ include "data-agent.image" (dict "root" $ "component" $c) }}
-          imagePullPolicy: {{ include "data-agent.imagePullPolicy" (dict "root" $ "component" $c) }}
-          # Cron-scanned promotion scheduler (no HTTP server).
+          image: {{ include "data-agent-learning.image" (dict "root" $ "component" $c) }}
+          imagePullPolicy: {{ include "data-agent-learning.imagePullPolicy" (dict "root" $ "component" $c) }}
+          # Cron-scanned promotion scheduler (no HTTP server). Its golden replay mints
+          # a token as TENANT_* and reads the warehouse through the MCP, so those keys
+          # must name the SAME tenant the data-agent release serves.
           command:
             - python
             - scripts/run_learning_scheduler.py
           securityContext:
             {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) ($c.securityContext | default dict)) | nindent 12 }}
           envFrom:
-            {{- include "data-agent.envFrom" $ | nindent 12 }}
+            {{- include "data-agent-learning.envFrom" $ | nindent 12 }}
           {{- with concat (.Values.env | default list) ($c.env | default list) }}
           env:
             {{- toYaml . | nindent 12 }}

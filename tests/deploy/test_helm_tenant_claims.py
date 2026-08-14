@@ -1,4 +1,4 @@
-"""The chart must not mint a tenant nobody chose.
+"""Neither chart may mint a tenant nobody chose.
 
 `TENANT_CLIENT_CODE` / `TENANT_PROC_CENTER` / `TENANT_JTI` decide which warehouse
 tenant the offline golden replay runs as. Their `runtime/config.py` defaults are the
@@ -16,6 +16,12 @@ Two things therefore have to hold together, and only one of them is the values f
      and an omitted env var is not a blank one — the process would fall through to
      the dev-seed code default and the gate would stay dark. Blanking the values
      without this second half is a fix that changes nothing.
+
+Both of those now have to hold TWICE. The two-chart split gave the learning plane its
+own ConfigMap, and the processes that actually READ these claims — the promotion
+scheduler and the review inbox — live in that second chart. A tenant fix applied only
+to `data-agent` would leave the exact silent-green it was written to prevent, in the
+one chart that replays.
 """
 
 from __future__ import annotations
@@ -27,50 +33,61 @@ from pathlib import Path
 import pytest
 import yaml
 
-_CHART = Path(__file__).resolve().parents[2] / "deploy" / "helm" / "data-agent"
+_HELM_DIR = Path(__file__).resolve().parents[2] / "deploy" / "helm"
+_AGENT_CHART = _HELM_DIR / "data-agent"
+_LEARNING_CHART = _HELM_DIR / "data-agent-learning"
+# Both charts, because the claims must be blank-but-present in both.
+_CHARTS = (_AGENT_CHART, _LEARNING_CHART)
 _TENANT_KEYS = ("TENANT_CLIENT_CODE", "TENANT_PROC_CENTER", "TENANT_JTI")
 
 pytestmark = pytest.mark.skipif(shutil.which("helm") is None, reason="Requires the 'helm' binary.")
 
 
-def _config_map(*values_files: Path) -> dict[str, str]:
-    args = ["helm", "template", "t", str(_CHART)]
+def _config_map(chart: Path, *values_files: Path) -> dict[str, str]:
+    args = ["helm", "template", "t", str(chart)]
     for path in values_files:
         args += ["-f", str(path)]
     rendered = subprocess.run(args, capture_output=True, text=True, check=True).stdout
     for doc in yaml.safe_load_all(rendered):
         if doc and doc.get("kind") == "ConfigMap":
             return doc.get("data") or {}
-    raise AssertionError("the chart rendered no ConfigMap")
+    raise AssertionError(f"{chart.name} rendered no ConfigMap")
 
 
-def test_the_chart_ships_no_tenant_and_says_so_out_loud() -> None:
+@pytest.mark.parametrize("chart", _CHARTS, ids=lambda c: c.name)
+def test_the_chart_ships_no_tenant_and_says_so_out_loud(chart: Path) -> None:
     """Present but blank — NOT absent. An absent key is indistinguishable, to the
     process, from a key nobody configured, and pydantic then supplies the dev seed."""
-    data = _config_map()
+    data = _config_map(chart)
     for key in _TENANT_KEYS:
         assert key in data, (
-            f"{key} is missing from the rendered ConfigMap. A blank value omitted from "
-            "the ConfigMap leaves the env var UNSET, so the process falls back to the "
-            "dev-seed default in runtime/config.py and the readiness gate never fires — "
-            "the exact silent-green this blanking exists to prevent."
+            f"{key} is missing from {chart.name}'s rendered ConfigMap. A blank value "
+            "omitted from the ConfigMap leaves the env var UNSET, so the process falls "
+            "back to the dev-seed default in runtime/config.py and the readiness gate "
+            "never fires — the exact silent-green this blanking exists to prevent."
         )
         assert data[key] == ""
 
 
-def test_a_configured_deployment_still_gets_its_tenant() -> None:
+@pytest.mark.parametrize("chart", _CHARTS, ids=lambda c: c.name)
+def test_a_configured_deployment_still_gets_its_tenant(chart: Path) -> None:
     """The blank default must not be a wall: values-example.yaml is the contract, and
-    setting the three keys must reach the ConfigMap unchanged."""
-    data = _config_map(_CHART / "values-example.yaml")
+    setting the three keys must reach the ConfigMap unchanged.
+
+    Both example files carry the SAME triple on purpose: the learning plane replays as
+    the tenant the agent served, and a divergence between the two releases is invisible
+    for the same reason a wrong tenant is."""
+    data = _config_map(chart, chart / "values-example.yaml")
     assert data["TENANT_CLIENT_CODE"] == "ACME"
     assert data["TENANT_PROC_CENTER"] == "PC42"
     assert data["TENANT_JTI"] == "svc-data-agent"
 
 
-def test_blank_omission_still_applies_to_everything_else() -> None:
+@pytest.mark.parametrize("chart", _CHARTS, ids=lambda c: c.name)
+def test_blank_omission_still_applies_to_everything_else(chart: Path) -> None:
     """The always-render carve-out is for the tenant claims ONLY. Other blanks stay
     omitted so their code defaults keep working (that IS the right rule elsewhere)."""
-    data = _config_map()
+    data = _config_map(chart)
     assert "CATALOG_API_URL" not in data  # blank in values.yaml, deliberately omitted
     assert "OTLP_ENDPOINT" not in data
 

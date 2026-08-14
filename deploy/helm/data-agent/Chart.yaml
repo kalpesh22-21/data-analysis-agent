@@ -1,18 +1,21 @@
 apiVersion: v2
 name: data-agent
 description: >-
-  Helm chart for the data-agent HR data-analysis agent (Python/FastAPI).
-  Deploys the first-party workloads that all run from a SINGLE application
-  image built from this repo: the core agent runtime API, the UI
-  backend-for-frontend, the learning sweeper + consumer background daemons,
-  and an optional review-inbox HTTP service. External backing services
-  (ClickHouse, MCP, token IdP, OpenAI, Couchbase, Neo4j, Redis, embedding /
-  reranker APIs) are NOT deployed by this chart — they are external infra and
-  must be provisioned separately and pointed to via config values + secrets.
+  Helm chart for the data-agent HR data-analysis agent (Python/FastAPI) — the
+  ONLINE plane. Deploys the first-party workloads that all run from a SINGLE
+  application image built from this repo: the core agent runtime API, the agent
+  UI backend-for-frontend, and the singleton neo4j hydrator daemon. The OFFLINE
+  learning plane (sweeper, consumer, promotion scheduler, review inbox, reviewer
+  UI) is a separate chart, data-agent-learning, shipping the same image.
+  External backing services (ClickHouse, MCP, token IdP, OpenAI, Couchbase,
+  Neo4j, embedding / reranker APIs) are NOT deployed by this chart — they are
+  external infra and must be provisioned separately and pointed to via config
+  values + secrets.
 type: application
 
 # Chart version — bump on every chart change (SemVer).
-version: 0.1.0
+# 0.2.0: split the offline learning plane out into the data-agent-learning chart.
+version: 0.2.0
 
 # The application version this chart deploys by default. Used as the default
 # container image tag when `image.tag` is not overridden.

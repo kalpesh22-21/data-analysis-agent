@@ -7,14 +7,14 @@
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: {{ include "data-agent.componentFullname" $cmpArgs }}
+  name: {{ include "data-agent-learning.componentFullname" $cmpArgs }}
   labels:
-    {{- include "data-agent.componentLabels" $cmpArgs | nindent 4 }}
+    {{- include "data-agent-learning.componentLabels" $cmpArgs | nindent 4 }}
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: {{ include "data-agent.componentFullname" $cmpArgs }}
+    name: {{ include "data-agent-learning.componentFullname" $cmpArgs }}
   minReplicas: {{ $c.autoscaling.minReplicas }}
   maxReplicas: {{ $c.autoscaling.maxReplicas }}
   metrics:

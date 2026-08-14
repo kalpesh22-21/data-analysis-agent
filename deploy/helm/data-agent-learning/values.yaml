@@ -1,0 +1,554 @@
+# Default values for data-agent-learning (the OFFLINE learning plane).
+# This is a YAML-formatted file.
+# Every value is documented inline. See deploy/helm/README.md for the big picture.
+#
+# IMPORTANT: All of the workloads in this chart (learning-sweeper,
+# learning-consumer, learning-scheduler, inbox, inbox-ui) run from the SAME image
+# the sibling `data-agent` chart deploys — one image, different launch commands.
+# External backing services (ClickHouse, MCP/clickhouse-api, token IdP, OpenAI,
+# Couchbase, Neo4j, Redis, embedding APIs) are NOT deployed by this chart —
+# provision them separately and point to them via `config` + `secrets`.
+#
+# THIS CHART READS THE AGENT'S DATA. The sweeper scans the `data-agent` release's
+# Couchbase SESSION bucket for idle sessions, and the scheduler/inbox replay
+# against the warehouse as the agent's tenant. It therefore has to agree with the
+# `data-agent` release on: COUCHBASE_* (session bucket), NEO4J_* (retrieval
+# graph), EMBEDDING_*, MCP_URL, the token-service wiring and the TENANT_* triple.
+# Wire both releases to ONE `secrets.existingSecret` (see `secrets` below).
+
+# -- Override the chart name portion of resource names.
+nameOverride: ""
+# -- Override the full name of resources (defaults to <release>-data-agent-learning).
+fullnameOverride: ""
+
+image:
+  # -- Container image repository for ALL workloads. This is the SAME image the
+  #    data-agent chart uses (repo-root Dockerfile); keep the two releases on the
+  #    same tag unless you are deliberately staging a rollout.
+  repository: ghcr.io/example/data-agent
+  # -- Image tag. Defaults to the chart appVersion when left empty.
+  tag: ""
+  # -- Image pull policy (IfNotPresent | Always | Never).
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for private registries (list of {name: <secret>}).
+imagePullSecrets: []
+#  - name: regcred
+
+serviceAccount:
+  # -- Create a dedicated ServiceAccount used by all pods.
+  create: true
+  # -- Name of the ServiceAccount. Generated from the fullname when empty.
+  name: ""
+  # -- Annotations to add to the ServiceAccount (e.g. IRSA / workload identity).
+  annotations: {}
+  # -- Automount the ServiceAccount API token into pods. Default false: no
+  #    workload talks to the Kubernetes API, so the token is not needed. Also
+  #    enforced at the pod level so the posture holds when create=false.
+  automount: false
+
+# -- Global pod annotations applied to every workload (merged with the
+#    config/secret checksum annotations and any per-component podAnnotations).
+podAnnotations: {}
+
+# -- Global pod-level securityContext (fsGroup etc.). Sensible non-root defaults.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Global container-level securityContext. Hardened by default; the app runs
+#    read-only-root with an emptyDir mounted at /tmp for scratch writes.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Global default resource requests/limits. Override per component under
+#    `components.<name>.resources`. Empty by default so the chart installs on
+#    small clusters; SET THESE in production (see values-example.yaml).
+resources: {}
+#  requests:
+#    cpu: 100m
+#    memory: 256Mi
+#  limits:
+#    cpu: "1"
+#    memory: 1Gi
+
+# -- Global scheduling controls; each is overridable per component.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Global extra environment variables (list of core-v1 EnvVar), applied to
+#    every workload. Explicit `env` entries always take precedence over values
+#    from envFrom (ConfigMap/Secret), regardless of ordering. Per-component
+#    `env` is concatenated after these. Example:
+#    - name: LOG_LEVEL
+#      value: info
+env: []
+
+# ---------------------------------------------------------------------------
+# Non-secret configuration -> rendered into a shared ConfigMap and mounted via
+# `envFrom` into every workload. 1:1 with the app's pydantic-settings fields
+# (uppercased env-var names, `learning/config.py` + the shared half of
+# `runtime/config.py`). Leave a value empty ("") to omit it and fall back to the
+# application's built-in default.
+#
+# A TYPO IN A `LEARNING_*` KEY IS NOT AN ERROR: the settings model sets
+# extra="ignore", so a misspelled key is dropped and the shipped default applies.
+# Each entrypoint logs the ignored names at startup
+# (`warn_unrecognized_learning_env_vars`) — grep for it after a config change.
+# ---------------------------------------------------------------------------
+config:
+
+  # === SHARED WITH THE data-agent RELEASE — keep these in sync ==============
+  # Every key in this block also exists in the data-agent chart's `config`. They
+  # name the same external systems and the same tenant identity; divergence is
+  # not an error anywhere, it is just a learning plane quietly working on the
+  # wrong data.
+
+  # -- URL of the MCP (clickhouse-api) service. EXTERNAL. Used by the promotion
+  #    scheduler's + inbox's golden replay.
+  MCP_URL: "http://clickhouse-api:8000/mcp"
+  # -- Path to the catalog-export JSON snapshot. Empty = the committed repo
+  #    fixture (tests/fixtures/catalog_export.json).
+  #
+  #    THE LEARNING PLANE ALWAYS READS THE SNAPSHOT, never the live MCP export.
+  #    Its entrypoints hold no per-request MCP JWT, so `scripts/_catalog.py`
+  #    resolves the catalog through `RuntimeSettings.catalog_fixture_file()`,
+  #    which consults THIS key and nothing else — `CATALOG_SOURCE` and
+  #    `CATALOG_API_URL` are deliberately absent from this chart because no
+  #    learning workload would read them. To refresh against the live catalog,
+  #    dump the MCP's `GET /catalog/export` body to a mounted file and point this
+  #    at it; a stale snapshot means the extractor grounds rule ids against an old
+  #    schema.
+  CATALOG_FIXTURE_PATH: ""
+  # -- Couchbase connection string for the AGENT'S SESSION bucket. EXTERNAL.
+  #    The sweeper scans this bucket for idle sessions to learn from — it MUST be
+  #    the same cluster/bucket/credentials the data-agent release writes sessions
+  #    to. Point it at an empty or wrong bucket and the loop is simply idle: no
+  #    error, no sessions, nothing learned.
+  COUCHBASE_CONNECTION_STRING: "couchbase://couchbase"
+  # -- Couchbase username for the session bucket.
+  COUCHBASE_USERNAME: "data_agent"
+  # -- Couchbase session bucket (must match the data-agent release).
+  COUCHBASE_BUCKET: "data_agent"
+  # -- Neo4j bolt URL (retrieval graph). EXTERNAL. A validated blueprint LANDS
+  #    here — same graph the agent recalls from, so it must be the agent's.
+  NEO4J_URL: "bolt://neo4j:7687"
+  # -- Neo4j username.
+  NEO4J_USERNAME: "neo4j"
+  # -- Embedding API base URL. EXTERNAL. Backs dedup, the prior-art index and the
+  #    landing writer's vectors.
+  EMBEDDING_API_URL: "http://embedding:8080/embed"
+  # -- Embedding model name. MUST match the data-agent release: vectors written
+  #    by one model and searched by another compare as noise.
+  EMBEDDING_MODEL: "text-embedding-3-small"
+  # -- Token service (IdP) token endpoint. EXTERNAL. The offline replay mints its
+  #    own JWT here.
+  TOKEN_SERVICE_URL: "http://token:8000/token"
+  # -- OTLP traces endpoint. Empty disables OTLP export.
+  OTLP_ENDPOINT: ""
+
+  # The three warehouse tenant claims. DELIBERATELY BLANK IN THIS CHART — there is
+  # no safe default for "which tenant is this?", and the previous defaults were the
+  # LOCAL DEV SEED (CLIENT_A / PC01 / TESTJTI001, see
+  # docker/clickhouse-init/hr-4tables-snake-migration.sql). Shipping those meant a
+  # deployment that simply forgot to configure a tenant still MINTED one: row
+  # policies FILTER rather than error, so the golden replay would match zero rows
+  # and its grain check would read 0 == 0 and pass — every replay a silent
+  # structural pass against nobody's data. Blank instead makes the readiness gates
+  # in `scripts/run_learning_scheduler.py` and `learning/inbox/service.py` fire, and
+  # the deployment drops into its LOGGED dormant posture (nothing auto-promotes)
+  # rather than into a green that means nothing.
+  #
+  # SET THESE TO THE SAME VALUES AS THE data-agent RELEASE. This plane replays the
+  # analyst's work as a tenant; if it replays as a DIFFERENT one than the agent
+  # served, the replay reads a different row set and still passes, so the drift has
+  # no symptom until a promoted blueprint is wrong for everybody. The recommended
+  # mechanism is one shared `secrets.existingSecret` plus identical TENANT_* here.
+  #
+  # -- Warehouse tenant claim 'clientcode' (→ ClickHouse setting paycom_client_code).
+  #    Required by the MCP on every call; a token without it is rejected 403
+  #    MISSING_TENANT_CLAIM.
+  TENANT_CLIENT_CODE: ""
+  # -- Warehouse tenant claim 'proc_center' (→ paycom_proc_center).
+  TENANT_PROC_CENTER: ""
+  # -- Warehouse tenant claim 'jti' (→ paycom_authenticated_user). The PRINCIPAL the
+  #    offline golden replay runs as: the employee/payroll row policies gate on it,
+  #    so the replay sees exactly this principal's employee set.
+  TENANT_JTI: ""
+
+  # === LEARNING PLANE ONLY =================================================
+
+  # --- transport (sweeper -> consumer) ---
+  # -- Redis URL backing the learning job stream. EXTERNAL. Owned by this plane
+  #    alone (the agent never touches it).
+  LEARNING_REDIS_URL: "redis://redis:6379/0"
+  # -- Redis stream key for learning jobs.
+  LEARNING_JOBS_STREAM: "learning:jobs"
+  # -- Terminal parking stream for poison jobs (past LEARNING_MAX_DELIVERIES).
+  LEARNING_DEAD_LETTER_STREAM: "learning:jobs:dead"
+  # -- Redis consumer group name (shared by every learning-consumer replica).
+  LEARNING_CONSUMER_GROUP: "learning-consumers"
+  # -- Dead-letter threshold: past N deliveries a job goes to the dead-letter stream.
+  LEARNING_MAX_DELIVERIES: "5"
+
+  # --- sweeper cadence ---
+  # -- Idle threshold (seconds) before the sweeper enqueues a session. Keep the
+  #    §6 TTL invariant: the agent's SESSION_TTL_SECONDS must exceed this plus
+  #    P95(dwell + processing), or a session expires before it is learned from.
+  LEARNING_IDLE_THRESHOLD_SECONDS: "900"
+  # -- Sweeper scan interval (seconds).
+  LEARNING_SWEEP_INTERVAL_SECONDS: "60"
+  # -- Max idle sessions scanned/claimed per sweep cycle.
+  LEARNING_SCAN_LIMIT: "200"
+  # -- Master kill-switch for the learning loop. Read FRESH every cycle by every
+  #    daemon (never cached), so flipping it takes effect without a restart.
+  #    Unrecognized values are treated as DISABLED (fail-safe).
+  LEARNING_ENABLED: "true"
+
+  # --- extractor (the consumer's LLM call) ---
+  # -- Extractor model used by the consumer's structured-output call.
+  LEARNING_EXTRACTOR_MODEL: "gpt-4o"
+  # -- Optional OpenAI-compatible base URL for the extractor model client.
+  LEARNING_EXTRACTOR_BASE_URL: ""
+  # -- Retries on a malformed (non-tool-call) extractor response.
+  LEARNING_EXTRACTOR_MAX_RETRIES: "2"
+  # -- CORRECTIVE turns for a candidate that PARSED but could not be READ (the
+  #    model is told which field and re-emits). A separate budget from
+  #    MAX_RETRIES on purpose. 0 disables it. A climbing correction rate is a
+  #    PROMPT defect, not a model one.
+  LEARNING_EXTRACTOR_MAX_SHAPE_CORRECTIONS: "2"
+
+  # --- coverage judge (cancels extraction when the corpus already has the work) ---
+  # -- Master switch for the judge. Off ⇒ never built, loop behaves as before.
+  LEARNING_JUDGE_ENABLED: "true"
+  # -- SHADOW MODE — the safe rollout. The judge runs and records every verdict
+  #    (`would_drop=true`, `shadow=true`) but NOTHING is ever dropped. Run this
+  #    first, read the distribution, then turn it off. Not the same as a high
+  #    confidence bar, and not the same as JUDGE_ENABLED=false (which records
+  #    nothing at all).
+  LEARNING_JUDGE_SHADOW_MODE: "false"
+  # -- Model id for the judge. Empty ⇒ reuse the extractor's client. The
+  #    economics favour a smaller model: the judge sees a bounded brief, while
+  #    the call it cancels carries the whole session transcript.
+  LEARNING_JUDGE_MODEL: ""
+  # -- PRE-extraction drop bar (higher: least-informed place to drop).
+  LEARNING_JUDGE_PRE_DROP_CONFIDENCE: "0.90"
+  # -- POST-extraction drop bar (lower: the judge has seen the template + grain).
+  LEARNING_JUDGE_POST_DROP_CONFIDENCE: "0.75"
+  # -- Bottom of the ambiguous prior-art band (below it, no model call at all).
+  LEARNING_JUDGE_BAND_LOW: "0.70"
+  # -- Top of the ambiguous band (post-extraction only). Must be >= band low.
+  LEARNING_JUDGE_BAND_HIGH: "0.97"
+  # -- Hard ceiling on one judge call; on expiry it fails OPEN and extraction runs.
+  LEARNING_JUDGE_TIMEOUT_SECONDS: "30"
+  # -- Retention for judge verdict rows (3 years). Deliberately much longer than
+  #    the evidence TTL below: a verdict row is scalars, and the questions it
+  #    answers accumulate over quarters.
+  LEARNING_JUDGE_RECORD_TTL_SECONDS: "94608000"
+
+  # --- promotion policy (the learning-scheduler's knobs) ---
+  # These were dataclass defaults no entrypoint could reach until they were
+  # surfaced here; the values below match the code defaults in learning/config.py.
+  #
+  # -- Corroboration threshold T for routing a blueprint candidate to the HUMAN
+  #    review queue. 1 is safe ONLY because the edge it gates ends at `in_review`,
+  #    not `validated` — it rations reviewer attention, not corpus trust. Every
+  #    correctness guard (leakage, static validation, depends_on, golden replay)
+  #    is unaffected. Raise it when queue volume outgrows a human.
+  LEARNING_PROMOTION_ROUTING_THRESHOLD: "1"
+  # -- Weight on the SOFT recurrence count in `hit_count + weight * recurrence`.
+  #    0.0 (dormant) is the shipped default: at threshold 1 a second signal
+  #    changes nothing. BEFORE RAISING IT: the counter has no per-sighting
+  #    idempotency, so a redelivered candidate re-bumps and the stored count is
+  #    biased upward.
+  LEARNING_PROMOTION_RECURRENCE_WEIGHT: "0.0"
+  # -- Max candidates the promotion cron examines per status per cycle. The scan
+  #    ROTATES on last_scanned_at, so this bounds cost, it does not starve a tail.
+  LEARNING_PROMOTION_SCAN_LIMIT: "200"
+  # -- Promotion cron cadence (seconds).
+  LEARNING_PROMOTION_INTERVAL_SECONDS: "300"
+  # -- How stale a drift verdict may be and still be TRUSTED on the blueprint
+  #    silent fast path (seconds; default 24h).
+  LEARNING_DRIFT_FRESHNESS_SECONDS: "86400"
+  # -- How often the scheduler will PAY for a golden replay (a JWT mint + two live
+  #    warehouse queries) on one candidate. Must stay <= the drift freshness
+  #    above; the scheduler enforces that at the point of use (it takes the min),
+  #    so a misconfiguration can only make it probe MORE often, never trust a
+  #    verdict for longer than the window allows.
+  LEARNING_REPLAY_RECHECK_INTERVAL_SECONDS: "43200"
+  # -- Minimum inbox `review_score` an in_review candidate needs to appear in the
+  #    DEFAULT listing (applied at LIST time, never at routing time — a hidden row
+  #    is still stored and reappears when the knob moves). SET FROM MEASURED DATA:
+  #    novelty lives in roughly [0.0, 0.47] and a strong candidate scores ~0.26, so
+  #    a "moderate-sounding" 0.5 would hide the ENTIRE queue. 0.0 = no cutoff.
+  LEARNING_REVIEW_SCORE_CUTOFF: "0.0"
+
+  # --- learning-owned Couchbase buckets (separate RBAC + retention clocks) ---
+  # These are the learning plane's OWN buckets — not shared with the agent. Each
+  # has its own RBAC user scoped to it alone.
+  #
+  # -- Couchbase connection string for the learning AUDIT bucket. EXTERNAL.
+  LEARNING_AUDIT_CONNECTION_STRING: "couchbase://couchbase"
+  LEARNING_AUDIT_BUCKET: "learning_audit"
+  LEARNING_AUDIT_USERNAME: "learning_audit"
+  # -- Audit retention floor (90 days): audit_TTL >= max candidate lifetime.
+  LEARNING_AUDIT_TTL_SECONDS: "7776000"
+  # -- Couchbase connection string for the learning CANDIDATES bucket. EXTERNAL.
+  LEARNING_CANDIDATES_CONNECTION_STRING: "couchbase://couchbase"
+  LEARNING_CANDIDATES_BUCKET: "learning_candidates"
+  LEARNING_CANDIDATES_USERNAME: "learning_candidates"
+  # -- Candidate retention (90 days). MUST outlive the review-inbox dwell, or a
+  #    candidate expires out from under the reviewer looking at it.
+  LEARNING_CANDIDATES_TTL_SECONDS: "7776000"
+  # -- Couchbase connection string for the learning CORPUS bucket. EXTERNAL.
+  LEARNING_CORPUS_CONNECTION_STRING: "couchbase://couchbase"
+  LEARNING_CORPUS_BUCKET: "learning_corpus"
+  LEARNING_CORPUS_USERNAME: "learning_corpus"
+  # -- Corpus retention: 0 = NO EXPIRY. A landed artifact and its cross-session
+  #    hit_count must outlive every candidate and session. Do not set this.
+  LEARNING_CORPUS_TTL_SECONDS: "0"
+
+  # --- observability ---
+  # -- OTel service.name / Phoenix project for the learning daemons.
+  LEARNING_SERVICE_NAME: "learning-loop"
+  # -- Verbose tracing (DEFAULT TRUE): the learning spans carry human-readable
+  #    content — the user question, accepted SQL, learned intent, evidence quotes.
+  #    The `learning-loop` and `learning-sessions` Phoenix projects are therefore
+  #    ENTITY-BEARING and must be access-controlled like the audit store. Set
+  #    "false" for shape-only telemetry (counters/labels/session ids only).
+  LEARNING_TRACE_VERBOSE: "true"
+
+  # --- reviewer UI (backend-for-frontend) ---
+  # -- INBOX_SERVICE_URL for the reviewer UI's BFF proxy. Leave empty to
+  #    auto-derive the in-cluster inbox Service URL from THIS release's name
+  #    (correct, because the inbox Service is rendered by this same chart).
+  #    Override only to reach an inbox in another namespace/release.
+  INBOX_SERVICE_URL: ""
+  # NOTE: this chart sets NO `RUNTIME_URL`. The reviewer UI runs the whole
+  # `ui/server.py` app, so the agent-chat routes exist on the pod — but they are
+  # not routed by this chart's Ingress (see `ingress` below) and, without
+  # RUNTIME_URL, they have nowhere to proxy to. The agent chat surface belongs to
+  # the data-agent release.
+
+# ---------------------------------------------------------------------------
+# Secret configuration.
+#
+# In PRODUCTION prefer `existingSecret`: create the Secret out-of-band (sealed
+# secrets / external-secrets / vault) with the KEYS listed below, then set
+# `secrets.existingSecret: <name>`. When `existingSecret` is set the
+# chart-managed Secret is NOT rendered and pods reference the named Secret.
+#
+# STRONGLY RECOMMENDED: point this at the SAME Secret as the `data-agent`
+# release, extended with the learning-only keys. `COUCHBASE_PASSWORD`,
+# `NEO4J_PASSWORD`, `TOKEN_ISSUER_API_KEY` and `EMBEDDING_API_KEY` authenticate
+# the SAME identity in both planes, and the tenant that identity reads as is the
+# same tenant. Two hand-maintained Secrets drift, and the drift is SILENT: the
+# warehouse row policies FILTER rather than error, so a learning plane holding a
+# stale credential/tenant keeps running and verifies promotions against the wrong
+# (or an empty) row set — a green that means nothing.
+#
+# For dev/testing you may inline values under `secrets.data` — they will be
+# base64-encoded into a chart-managed Secret. NEVER commit real secrets here.
+# ---------------------------------------------------------------------------
+secrets:
+  # -- Name of a pre-existing Secret to use instead of the chart-managed one.
+  #    When set, `secrets.data` is ignored and NOT rendered.
+  existingSecret: ""
+  # -- Inline secret values (only used when existingSecret is empty). Keys map
+  #    1:1 to env-var names. Empty-string values are SKIPPED (not injected), so
+  #    the app falls back to any ambient/default value rather than seeing "".
+  data:
+    # --- shared with the data-agent release ---
+    COUCHBASE_PASSWORD: ""
+    NEO4J_PASSWORD: ""
+    TOKEN_ISSUER_API_KEY: ""
+    EMBEDDING_API_KEY: ""
+    # --- learning plane only ---
+    # API key for the extractor/judge model client. EMPTY ⇒ the extractor is
+    # DORMANT: the consumer runs, drains the stream and extracts nothing.
+    LEARNING_EXTRACTOR_API_KEY: ""
+    LEARNING_AUDIT_PASSWORD: ""
+    LEARNING_CANDIDATES_PASSWORD: ""
+    LEARNING_CORPUS_PASSWORD: ""
+    # The ONE shared bearer token guarding every inbox route. The reviewer UI
+    # holds it server-side and attaches it on the proxy hop — the browser never
+    # sees it. Unset ⇒ the inbox service FAILS CLOSED (503 on every route) rather
+    # than collapsing to a passing empty-string compare.
+    REVIEWER_TOKEN: ""
+
+# ---------------------------------------------------------------------------
+# Per-workload configuration.
+#
+# Each component may override: enabled, replicaCount, image, resources,
+# nodeSelector, tolerations, affinity, podAnnotations, podSecurityContext,
+# securityContext, and env (extra). Anything left null/empty falls back to the
+# global values above.
+# ---------------------------------------------------------------------------
+components:
+
+  # ----- learning-sweeper: periodic idle-scan daemon (DO NOT scale) -----
+  # Replica count is hardcoded to 1 in the template: this is a periodic
+  # idle-scan sweeper; running >1 replica would double-enqueue.
+  learningSweeper:
+    enabled: true
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+
+  # ----- learning-consumer: Redis Streams consumer group (scalable) -----
+  learningConsumer:
+    enabled: true
+    # -- Each replica is a distinct Redis Streams consumer; safe to scale.
+    replicaCount: 1
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+    autoscaling:
+      # -- Enable an HPA for the consumer Deployment.
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 8
+      targetCPUUtilizationPercentage: 70
+      targetMemoryUtilizationPercentage: 0
+
+  # ----- learning-scheduler: cron-scanned promotion daemon (DO NOT scale) -----
+  # Replica count is hardcoded to 1 in the template: this is the single promotion
+  # writer (§7.2); running >1 replica would double-promote / double-land the same
+  # candidate. No replicaCount/autoscaling knobs by design.
+  learningScheduler:
+    enabled: true
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+
+  # ----- inbox: review-inbox HTTP service -----
+  # ENABLED BY DEFAULT in this chart (it was optional in the combined chart):
+  # human review is the point of the learning plane, and with the inbox off
+  # nothing a candidate reaches is reachable. The chart injects
+  # REVIEW_INBOX_ENABLED=1, INBOX_SERVICE_HOST=0.0.0.0 and INBOX_SERVICE_PORT.
+  # Its Service is ClusterIP and must stay that way: the ONLY authentication on
+  # these routes is the shared REVIEWER_TOKEN.
+  inbox:
+    enabled: true
+    replicaCount: 1
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+    service:
+      type: ClusterIP
+      # -- Inbox HTTP port (matches INBOX_SERVICE_PORT set by the chart).
+      port: 8100
+      annotations: {}
+    podDisruptionBudget:
+      # -- Enable a PodDisruptionBudget for the inbox Deployment. Worth turning on
+      #    together with replicaCount > 1: a node drain that takes the last inbox
+      #    pod leaves the reviewer UI proxying into nothing (502 on every action).
+      enabled: false
+      minAvailable: 1
+      # maxUnavailable: 1   # set one of minAvailable / maxUnavailable
+
+  # ----- inbox-ui: the REVIEWER surface (gets the optional Ingress) -----
+  # Runs the SAME `ui/server.py` app the data-agent chart runs as its agent UI,
+  # with REVIEW_INBOX_ENABLED=1 so GET /inbox and /api/inbox/* exist. Zero
+  # application changes: one app, deployed twice, with different env.
+  #
+  # BE AWARE: the agent-chat routes (GET /, /api/session*, /api/turn*, …) are
+  # present on this pod too — they cannot be compiled out. They are simply not
+  # published: this chart's Ingress defaults to the inbox paths only. Anyone who
+  # port-forwards to the pod, or who widens `ingress.hosts[].paths`, reaches
+  # them. There is no RUNTIME_URL configured here, so they have no agent to talk
+  # to, but treat pod-level access to this Deployment as reviewer-level access.
+  inboxUi:
+    enabled: true
+    replicaCount: 1
+    image: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    env: []
+    service:
+      type: ClusterIP
+      port: 3000
+      annotations: {}
+    podDisruptionBudget:
+      enabled: false
+      minAvailable: 1
+
+# ---------------------------------------------------------------------------
+# Ingress for the REVIEWER UI (inbox-ui).
+#
+# THE PATH LIST IS THE FENCE. The pod behind this Ingress serves the whole
+# `ui/server.py` app, agent-chat routes included; what keeps this release from
+# publishing a second door into the agent is that only the inbox paths are
+# routed. The defaults below are the reviewer surface and nothing else:
+#   /inbox      — the reviewer page (ui/static/inbox.html, served inline; the app
+#                 mounts no /static directory, so no asset path is needed)
+#   /api/inbox  — the BFF proxy the page calls (list, health, actions)
+# Add `/` here and you have published the agent chat UI from the learning
+# release. If you need both surfaces on one host, do it in the data-agent
+# release, which owns the chat side.
+# ---------------------------------------------------------------------------
+ingress:
+  # -- Enable an Ingress in front of the inbox-ui Service.
+  enabled: false
+  # -- IngressClass name (e.g. nginx, traefik).
+  className: ""
+  # -- Ingress annotations. Put your reviewer authn here (OIDC/forward-auth/IP
+  #    allowlist): the app itself authenticates only the UI→inbox hop, not the
+  #    human, so the browser-facing surface is as protected as this Ingress is.
+  annotations: {}
+    # kubernetes.io/tls-acme: "true"
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: data-agent-inbox.example.com
+      paths:
+        - path: /inbox
+          pathType: Prefix
+        - path: /api/inbox
+          pathType: Prefix
+  # -- TLS configuration (list of {secretName, hosts[]}).
+  tls: []
+    # - secretName: data-agent-inbox-tls
+    #   hosts:
+    #     - data-agent-inbox.example.com

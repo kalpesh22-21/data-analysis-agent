@@ -1,0 +1,38 @@
+apiVersion: v2
+name: data-agent-learning
+description: >-
+  Helm chart for the data-agent OFFLINE LEARNING PLANE. Deploys the workloads
+  that turn finished analyst sessions into reviewed corpus artifacts, all from
+  the SAME single application image the data-agent chart uses: the learning
+  sweeper (idle-session scan), the learning consumer (Redis Streams worker), the
+  learning scheduler (single promotion writer), the review-inbox HTTP service,
+  and the reviewer UI (ui/server.py with REVIEW_INBOX_ENABLED=1). The online
+  plane — agent runtime, agent UI, neo4j hydrator — lives in the sibling
+  data-agent chart. External backing services (ClickHouse, MCP, token IdP,
+  OpenAI, Couchbase, Neo4j, Redis, embedding APIs) are NOT deployed by this
+  chart; provision them separately and point to them via config + secrets.
+type: application
+
+# Chart version — bump on every chart change (SemVer).
+version: 0.1.0
+
+# The application version this chart deploys by default. Used as the default
+# container image tag when `image.tag` is not overridden. Tracks the data-agent
+# chart's appVersion: both charts deploy the SAME image.
+appVersion: "0.1.0"
+
+# Tested against Kubernetes 1.24+ (uses networking.k8s.io/v1 Ingress,
+# autoscaling/v2 HPA, policy/v1 PodDisruptionBudget).
+kubeVersion: ">=1.24.0-0"
+
+home: https://github.com/example/data-agent
+sources:
+  - https://github.com/example/data-agent
+maintainers:
+  - name: data-agent maintainers
+keywords:
+  - hr
+  - data-analysis
+  - agent
+  - learning
+  - fastapi

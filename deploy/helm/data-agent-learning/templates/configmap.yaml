@@ -1,8 +1,8 @@
 {{/*
 Shared ConfigMap of NON-SECRET env, mounted into every workload via envFrom.
-Secret keys are intentionally kept out of here (see secret.yaml). The UI-only
-derived value RUNTIME_URL is computed from the release name when not explicitly
-set in .Values.config.
+Secret keys are intentionally kept out of here (see secret.yaml). The reviewer-UI
+derived value INBOX_SERVICE_URL is computed from the release name when not
+explicitly set in .Values.config.
 
 A BLANK value is normally OMITTED from the ConfigMap, so the process falls through
 to whatever default its settings model carries. That is the right rule for almost
@@ -17,20 +17,20 @@ readiness gates in run_learning_scheduler.py / learning/inbox/service.py.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "data-agent.configMapName" . }}
+  name: {{ include "data-agent-learning.configMapName" . }}
   labels:
-    {{- include "data-agent.labels" . | nindent 4 }}
+    {{- include "data-agent-learning.labels" . | nindent 4 }}
 data:
   {{- range $key, $val := .Values.config }}
-  {{- /* RUNTIME_URL is handled below via the helper */}}
-  {{- if ne $key "RUNTIME_URL" }}
+  {{- /* INBOX_SERVICE_URL is handled below via the helper */}}
+  {{- if ne $key "INBOX_SERVICE_URL" }}
   {{- if or (ne (toString $val) "") (has $key $alwaysRender) }}
   {{ $key }}: {{ $val | quote }}
   {{- end }}
   {{- end }}
   {{- end }}
-  {{- if .Values.components.runtime.enabled }}
-  RUNTIME_URL: {{ include "data-agent.runtimeUrl" . | quote }}
-  {{- else if .Values.config.RUNTIME_URL }}
-  RUNTIME_URL: {{ .Values.config.RUNTIME_URL | quote }}
+  {{- if .Values.components.inbox.enabled }}
+  INBOX_SERVICE_URL: {{ include "data-agent-learning.inboxServiceUrl" . | quote }}
+  {{- else if .Values.config.INBOX_SERVICE_URL }}
+  INBOX_SERVICE_URL: {{ .Values.config.INBOX_SERVICE_URL | quote }}
   {{- end }}

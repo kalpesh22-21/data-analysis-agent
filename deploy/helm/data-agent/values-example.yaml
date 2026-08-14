@@ -1,21 +1,29 @@
 # ---------------------------------------------------------------------------
-# values-example.yaml — a realistic PRODUCTION-style override for data-agent.
+# values-example.yaml — a realistic PRODUCTION-style override for data-agent
+# (the ONLINE plane: runtime + agent UI + hydrator).
 #
 # This file doubles as documentation of a real deployment. It:
 #   * pins a concrete image repo + tag (build/push your own — see README)
 #   * points every workload at real external service endpoints
-#   * exposes the UI via an Ingress with TLS
+#   * exposes the agent UI via an Ingress with TLS
 #   * sets resource requests/limits per component
-#   * enables the learning-consumer HPA and scales the consumer to 2
+#   * enables the runtime HPA + PDBs
 #   * references a pre-created Secret (existingSecret) instead of inline secrets
 #
 # Install with:
 #   helm upgrade --install data-agent deploy/helm/data-agent \
 #     -f deploy/helm/data-agent/values-example.yaml
+#
+# The offline learning plane is a SECOND release from a SECOND chart:
+#   helm upgrade --install data-agent-learning deploy/helm/data-agent-learning \
+#     -f deploy/helm/data-agent-learning/values-example.yaml
+# Both must agree on the Couchbase session bucket, the Neo4j graph and the
+# TENANT_* triple — see the shared-secret note in deploy/helm/README.md.
 # ---------------------------------------------------------------------------
 
 image:
-  # Your built-and-pushed application image (all workloads share it).
+  # Your built-and-pushed application image (all workloads share it — and it is
+  # the SAME image the data-agent-learning chart deploys).
   repository: ghcr.io/acme/data-agent
   tag: "1.4.2"
   pullPolicy: IfNotPresent
@@ -33,11 +41,17 @@ serviceAccount:
 # ---- External service endpoints (all EXTERNAL infra, not deployed here) ----
 config:
   MCP_URL: "http://clickhouse-api.data.svc.cluster.local:8000/mcp"
+  CATALOG_SOURCE: "mcp"
+  # Set CATALOG_API_URL explicitly when the MCP sits behind a path-routed
+  # ingress — the derivation from MCP_URL DISCARDS the path prefix.
+  CATALOG_API_URL: ""
   SCRATCH_ENABLED: "true"
   OPENAI_MODEL: "gpt-4o"
   OPENAI_BASE_URL: "https://api.openai.com/v1"
   MODEL_CONTEXT_WINDOW: "128000"
 
+  # Session store. The learning chart's sweeper scans THIS bucket for idle
+  # sessions — keep the two charts pointed at the same cluster + bucket.
   COUCHBASE_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
   COUCHBASE_USERNAME: "data_agent"
   COUCHBASE_BUCKET: "data_agent"
@@ -54,12 +68,12 @@ config:
   # defaults them to "" on purpose, because there is no safe default for "which
   # tenant?" and a wrong one is invisible — row policies FILTER rather than error, so
   # a misconfigured tenant yields zero rows and the golden replay's grain check reads
-  # 0 == 0 and passes. Leave them blank and the learning scheduler / inbox readiness
-  # gates put the deployment into its logged dormant posture instead (safe, and
-  # greppable: the scheduler logs the tenant identity it replays as at startup).
-  # Required by the MCP on EVERY call (403 MISSING_TENANT_CLAIM otherwise);
-  # TENANT_JTI is also the principal the offline golden replay runs as, so it must be
-  # one the row policies grant rows to.
+  # 0 == 0 and passes. Required by the MCP on EVERY call (403 MISSING_TENANT_CLAIM
+  # otherwise).
+  #
+  # SET THE SAME THREE VALUES in the data-agent-learning chart: its offline golden
+  # replay mints its own token and must replay as this same principal. Divergence
+  # between the two charts is silent for exactly the reason above.
   TENANT_CLIENT_CODE: "ACME"
   TENANT_PROC_CENTER: "PC42"
   TENANT_JTI: "svc-data-agent"
@@ -74,28 +88,14 @@ config:
   RETRIEVAL_ENABLED: "true"
   SESSION_TTL_SECONDS: "3600"
 
-  # Learning loop backing services.
-  LEARNING_REDIS_URL: "redis://redis-master.data.svc.cluster.local:6379/0"
-  LEARNING_JOBS_STREAM: "learning:jobs"
-  LEARNING_CONSUMER_GROUP: "learning-consumers"
-  LEARNING_IDLE_THRESHOLD_SECONDS: "900"
-  LEARNING_SWEEP_INTERVAL_SECONDS: "60"
-  LEARNING_ENABLED: "true"
-  LEARNING_EXTRACTOR_MODEL: "gpt-4o"
-  LEARNING_AUDIT_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
-  LEARNING_AUDIT_BUCKET: "learning_audit"
-  LEARNING_AUDIT_USERNAME: "learning_audit"
-  LEARNING_CANDIDATES_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
-  LEARNING_CANDIDATES_BUCKET: "learning_candidates"
-  LEARNING_CANDIDATES_USERNAME: "learning_candidates"
-  LEARNING_CORPUS_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
-  LEARNING_CORPUS_BUCKET: "learning_corpus"
-  LEARNING_CORPUS_USERNAME: "learning_corpus"
+  # Hydrator daemon (singleton neo4j seeder). HYDRATOR_ENABLED is the kill-switch
+  # it re-reads every cycle; the poll interval is its MCP export re-check cadence.
+  HYDRATOR_ENABLED: "true"
+  HYDRATOR_POLL_INTERVAL_SECONDS: "60"
 
   UPLOAD_MAX_BYTES: "8388608"
-  # RUNTIME_URL / INBOX_SERVICE_URL left empty -> auto-derived from release name.
+  # RUNTIME_URL left empty -> auto-derived from the release name.
   RUNTIME_URL: ""
-  INBOX_SERVICE_URL: ""
 
 # ---- Secrets: reference a Secret you created out-of-band ----
 # Create it first, e.g.:
@@ -103,15 +103,15 @@ config:
 #     --from-literal=OPENAI_API_KEY=... \
 #     --from-literal=COUCHBASE_PASSWORD=... \
 #     --from-literal=NEO4J_PASSWORD=... \
+#     --from-literal=MCP_SERVICE_KEY=... \
 #     --from-literal=TOKEN_ISSUER_API_KEY=... \
 #     --from-literal=EMBEDDING_API_KEY=... \
-#     --from-literal=RERANKER_API_KEY=... \
-#     --from-literal=LEARNING_EXTRACTOR_API_KEY=... \
-#     --from-literal=LEARNING_AUDIT_PASSWORD=... \
-#     --from-literal=LEARNING_CANDIDATES_PASSWORD=... \
-#     --from-literal=LEARNING_CORPUS_PASSWORD=... \
-#     --from-literal=REVIEWER_TOKEN=...
+#     --from-literal=RERANKER_API_KEY=...
 # The chart-managed Secret is NOT rendered when existingSecret is set.
+#
+# Point the data-agent-learning release at this SAME Secret (it needs
+# COUCHBASE_PASSWORD / NEO4J_PASSWORD / TOKEN_ISSUER_API_KEY / EMBEDDING_API_KEY
+# too, plus its own learning-only keys) so the shared credentials cannot drift.
 secrets:
   existingSecret: data-agent-secrets
 
@@ -148,36 +148,18 @@ components:
       enabled: true
       minAvailable: 1
 
-  learningSweeper:
-    # Keep at 1 replica (periodic idle-scan sweeper).
+  hydrator:
+    # Singleton seeder — pinned to 1 replica by the template, no knob to raise it.
+    # Every runtime pod's /ready gate depends on this daemon having seeded neo4j.
     resources:
       requests:
-        cpu: 50m
-        memory: 128Mi
+        cpu: 100m
+        memory: 256Mi
       limits:
-        cpu: 250m
-        memory: 512Mi
-
-  learningConsumer:
-    replicaCount: 2            # scale the Redis Streams consumer group to 2
-    resources:
-      requests:
-        cpu: 200m
-        memory: 512Mi
-      limits:
-        cpu: "1"
+        cpu: 500m
         memory: 1Gi
-    autoscaling:
-      enabled: true            # enable the consumer HPA
-      minReplicas: 2
-      maxReplicas: 6
-      targetCPUUtilizationPercentage: 75
 
-  inbox:
-    # Enable if you run the human review-inbox flow.
-    enabled: false
-
-# ---- Expose the UI via Ingress + TLS ----
+# ---- Expose the agent UI via Ingress + TLS ----
 ingress:
   enabled: true
   className: nginx

@@ -4,18 +4,18 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "data-agent.componentFullname" $cmpArgs }}
+  name: {{ include "data-agent-learning.componentFullname" $cmpArgs }}
   labels:
-    {{- include "data-agent.componentLabels" $cmpArgs | nindent 4 }}
+    {{- include "data-agent-learning.componentLabels" $cmpArgs | nindent 4 }}
 spec:
   replicas: {{ $c.replicaCount }}
   selector:
     matchLabels:
-      {{- include "data-agent.componentSelectorLabels" $cmpArgs | nindent 6 }}
+      {{- include "data-agent-learning.componentSelectorLabels" $cmpArgs | nindent 6 }}
   template:
     metadata:
       annotations:
-        {{- include "data-agent.checksumAnnotations" $ | nindent 8 }}
+        {{- include "data-agent-learning.checksumAnnotations" $ | nindent 8 }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -23,21 +23,23 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       labels:
-        {{- include "data-agent.componentSelectorLabels" $cmpArgs | nindent 8 }}
+        {{- include "data-agent-learning.componentSelectorLabels" $cmpArgs | nindent 8 }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "data-agent.serviceAccountName" . }}
+      serviceAccountName: {{ include "data-agent-learning.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
       securityContext:
         {{- toYaml (mergeOverwrite (deepCopy .Values.podSecurityContext) ($c.podSecurityContext | default dict)) | nindent 8 }}
       containers:
         - name: inbox
-          image: {{ include "data-agent.image" (dict "root" $ "component" $c) }}
-          imagePullPolicy: {{ include "data-agent.imagePullPolicy" (dict "root" $ "component" $c) }}
-          # Review-inbox HTTP service.
+          image: {{ include "data-agent-learning.image" (dict "root" $ "component" $c) }}
+          imagePullPolicy: {{ include "data-agent-learning.imagePullPolicy" (dict "root" $ "component" $c) }}
+          # Review-inbox HTTP service. Authenticates its callers on the shared
+          # REVIEWER_TOKEN, which the reviewer UI holds server-side and attaches on
+          # the proxy hop — the browser never sees it.
           command:
             - python
             - scripts/run_inbox_service.py
@@ -48,7 +50,7 @@ spec:
               containerPort: {{ $c.service.port }}
               protocol: TCP
           envFrom:
-            {{- include "data-agent.envFrom" $ | nindent 12 }}
+            {{- include "data-agent-learning.envFrom" $ | nindent 12 }}
           # Per-workload env: activate the dormant inbox app and bind it to all
           # interfaces (code default is 127.0.0.1, unreachable in-cluster).
           env:
@@ -61,15 +63,23 @@ spec:
             {{- with concat (.Values.env | default list) ($c.env | default list) }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          # TCP probes, NOT `httpGet /inbox/health`. Every inbox route — health
+          # included — sits behind the `_require_reviewer` dependency, so a request
+          # without an `X-Reviewer-Token` header answers 401 (or 503 when the token is
+          # unconfigured). The kubelet sends no such header and treats anything >=400 as
+          # a FAILED probe, so an httpGet here could never pass: the pod would never
+          # become Ready, the Service would have no endpoints, and the reviewer UI would
+          # 502 forever. Putting the token in `httpHeaders` is not the fix either — that
+          # writes a live credential into the pod spec in plaintext, readable by anyone
+          # with `get pod`. A TCP probe answers the question a probe can honestly ask
+          # here: is the server accepting connections?
           readinessProbe:
-            httpGet:
-              path: /inbox/health
+            tcpSocket:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            httpGet:
-              path: /inbox/health
+            tcpSocket:
               port: http
             initialDelaySeconds: 15
             periodSeconds: 20

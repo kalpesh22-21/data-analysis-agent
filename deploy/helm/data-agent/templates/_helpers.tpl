@@ -53,11 +53,31 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Join the chart fullname with a suffix, truncating the FULLNAME rather than the
+RESULT so the suffix always survives.
+
+This ordering is the whole point. `printf "%s-%s" fullname suffix | trunc 63`
+cuts from the RIGHT, which eats the one part of the name that distinguishes one
+object from another: at a long-but-legal release name every component collapses
+onto the same truncated string, and two Deployments sharing a name is not a
+render curiosity — one silently overwrites the other and never runs. Budgeting
+`63 - len(suffix) - 1` for the base keeps every generated name distinct AND
+inside the 63-char DNS limit.
+
+Usage: {{ include "data-agent.suffixedName" (dict "root" $ "suffix" "config") }}
+*/}}
+{{- define "data-agent.suffixedName" -}}
+{{- $suffix := .suffix -}}
+{{- $budget := int (sub 62 (len $suffix)) -}}
+{{- printf "%s-%s" (include "data-agent.fullname" .root | trunc $budget | trimSuffix "-") $suffix -}}
+{{- end }}
+
+{{/*
 Per-component fully qualified name.
 Usage: {{ include "data-agent.componentFullname" (dict "root" $ "component" "runtime") }}
 */}}
 {{- define "data-agent.componentFullname" -}}
-{{- printf "%s-%s" (include "data-agent.fullname" .root) .component | trunc 63 | trimSuffix "-" }}
+{{- include "data-agent.suffixedName" (dict "root" .root "suffix" .component) }}
 {{- end }}
 
 {{/*
@@ -93,7 +113,7 @@ Create the name of the service account to use.
 Name of the shared ConfigMap holding non-secret env.
 */}}
 {{- define "data-agent.configMapName" -}}
-{{- printf "%s-config" (include "data-agent.fullname" .) }}
+{{- include "data-agent.suffixedName" (dict "root" . "suffix" "config") }}
 {{- end }}
 
 {{/*
@@ -105,7 +125,7 @@ Secret is NOT rendered); otherwise the chart-managed Secret name is used.
 {{- if .Values.secrets.existingSecret }}
 {{- .Values.secrets.existingSecret }}
 {{- else }}
-{{- printf "%s-secret" (include "data-agent.fullname" .) }}
+{{- include "data-agent.suffixedName" (dict "root" . "suffix" "secret") }}
 {{- end }}
 {{- end }}
 
@@ -142,13 +162,12 @@ Default RUNTIME_URL derived from the release name, overridable via
 {{- end }}
 
 {{/*
-Default INBOX_SERVICE_URL derived from the release name (points the UI BFF at
-the in-cluster inbox Service), overridable via `config.INBOX_SERVICE_URL`.
+There is deliberately NO inboxServiceUrl helper here. The review-inbox service
+is deployed by the SEPARATE `data-agent-learning` chart, whose release name this
+chart cannot know — so an auto-derivation from THIS release name would point at
+a Service that does not exist. The reviewer UI (which needs it) is deployed by
+that chart, beside the inbox it derives from.
 */}}
-{{- define "data-agent.inboxServiceUrl" -}}
-{{- $default := printf "http://%s:%d" (include "data-agent.componentFullname" (dict "root" . "component" "inbox")) (int .Values.components.inbox.service.port) -}}
-{{- default $default .Values.config.INBOX_SERVICE_URL -}}
-{{- end }}
 
 {{/*
 Shared envFrom wiring: the non-secret ConfigMap + the (chart-managed or

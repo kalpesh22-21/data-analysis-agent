@@ -1,0 +1,54 @@
+{{/*
+Ingress for the REVIEWER UI.
+
+The pod behind it runs the whole `ui/server.py` app, so the agent-chat routes
+(GET /, /api/session*, /api/turn*, /api/history, /api/query/page, /api/upload*)
+EXIST on it — they are simply not routed here. This path list is the fence: it
+defaults to the inbox surface only (`/inbox` + `/api/inbox`), so publishing the
+reviewer UI does not publish a second, unintended door into the agent. Widening
+`ingress.hosts[].paths` (e.g. to `/`) opens that door; see values.yaml.
+*/}}
+{{- if and .Values.ingress.enabled .Values.components.inboxUi.enabled -}}
+{{- $cmpArgs := dict "root" $ "component" "inbox-ui" -}}
+{{- $svcName := include "data-agent-learning.componentFullname" $cmpArgs -}}
+{{- $svcPort := .Values.components.inboxUi.service.port -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $svcName }}
+  labels:
+    {{- include "data-agent-learning.componentLabels" $cmpArgs | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tls }}
+  tls:
+    {{- range .Values.ingress.tls }}
+    - hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ .secretName }}
+    {{- end }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ $svcName }}
+                port:
+                  number: {{ $svcPort }}
+          {{- end }}
+    {{- end }}
+{{- end }}

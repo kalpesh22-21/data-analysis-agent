@@ -1,0 +1,37 @@
+{{- if .Values.components.inboxUi.enabled -}}
+{{- $cmpArgs := dict "root" $ "component" "inbox-ui" -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "data-agent-learning.suffixedName" (dict "root" . "suffix" "test-connection") | quote }}
+  labels:
+    {{- include "data-agent-learning.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: wget
+      image: busybox:1.36
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+      command: ["wget"]
+      # Hits the reviewer PAGE (GET /inbox), not `GET /`: the page is 200 only when
+      # REVIEW_INBOX_ENABLED=1 reached the pod, so this test proves the surface this
+      # release exists for is actually live — where `/` would pass either way.
+      # The inbox SERVICE itself is deliberately not probed here: every one of its
+      # routes requires the reviewer token, so an unauthenticated wget could only ever
+      # assert a 401.
+      args:
+        - "--spider"
+        - "-S"
+        - "http://{{ include "data-agent-learning.componentFullname" $cmpArgs }}:{{ .Values.components.inboxUi.service.port }}/inbox"
+{{- end }}

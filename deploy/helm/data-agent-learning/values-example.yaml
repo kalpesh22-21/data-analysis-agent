@@ -1,0 +1,235 @@
+# ---------------------------------------------------------------------------
+# values-example.yaml — a realistic PRODUCTION-style override for
+# data-agent-learning (the OFFLINE learning plane).
+#
+# This file doubles as documentation of a real deployment. It:
+#   * pins the SAME image repo + tag the data-agent release runs
+#   * points every workload at real external service endpoints
+#   * repeats the data-agent release's shared config (session bucket, graph,
+#     embeddings, MCP, tenant) — these MUST agree
+#   * exposes the reviewer UI via an Ingress with TLS, inbox paths ONLY
+#   * sets resource requests/limits per component
+#   * enables the learning-consumer HPA and scales the consumer to 2
+#   * references a pre-created Secret (existingSecret) — ideally the same one the
+#     data-agent release uses
+#
+# Install with:
+#   helm upgrade --install data-agent-learning deploy/helm/data-agent-learning \
+#     -f deploy/helm/data-agent-learning/values-example.yaml
+# ---------------------------------------------------------------------------
+
+image:
+  # The SAME image the data-agent release runs (one image, eight workloads: 3
+  # Deployments in the data-agent chart + 5 here).
+  repository: ghcr.io/acme/data-agent
+  tag: "1.4.2"
+  pullPolicy: IfNotPresent
+
+# Pull secret for the private registry (must exist in the namespace).
+imagePullSecrets:
+  - name: ghcr-pull
+
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/data-agent-learning
+
+config:
+  # ---- Shared with the data-agent release: copy these, do not invent them ----
+  MCP_URL: "http://clickhouse-api.data.svc.cluster.local:8000/mcp"
+  # The learning plane reads the catalog SNAPSHOT, never the live export (no MCP
+  # JWT). Empty = the committed fixture; point it at a mounted, freshly-dumped
+  # export to track schema changes.
+  CATALOG_FIXTURE_PATH: ""
+
+  # The AGENT's session bucket — this is what the sweeper scans.
+  COUCHBASE_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
+  COUCHBASE_USERNAME: "data_agent"
+  COUCHBASE_BUCKET: "data_agent"
+
+  NEO4J_URL: "bolt://neo4j.data.svc.cluster.local:7687"
+  NEO4J_USERNAME: "neo4j"
+
+  EMBEDDING_API_URL: "http://embedding.ml.svc.cluster.local:8080/embed"
+  EMBEDDING_MODEL: "text-embedding-3-small"
+
+  TOKEN_SERVICE_URL: "https://idp.acme.com/token"
+  OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4317"
+
+  # The tenant the offline golden replay runs as. MUST be identical to the
+  # data-agent release's TENANT_* triple: a divergence is invisible (row policies
+  # filter rather than error, so the replay reads a different row set and its
+  # grain check still passes). Blank ⇒ the write plane stays dormant, which is
+  # the safe posture, not a working one.
+  TENANT_CLIENT_CODE: "ACME"
+  TENANT_PROC_CENTER: "PC42"
+  TENANT_JTI: "svc-data-agent"
+
+  # ---- Learning plane only ----
+  LEARNING_REDIS_URL: "redis://redis-master.data.svc.cluster.local:6379/0"
+  LEARNING_JOBS_STREAM: "learning:jobs"
+  LEARNING_DEAD_LETTER_STREAM: "learning:jobs:dead"
+  LEARNING_CONSUMER_GROUP: "learning-consumers"
+  LEARNING_MAX_DELIVERIES: "5"
+
+  # Keep LEARNING_IDLE_THRESHOLD_SECONDS well under the data-agent release's
+  # SESSION_TTL_SECONDS (3600 there), or sessions expire before they are learned.
+  LEARNING_IDLE_THRESHOLD_SECONDS: "900"
+  LEARNING_SWEEP_INTERVAL_SECONDS: "60"
+  LEARNING_SCAN_LIMIT: "200"
+  LEARNING_ENABLED: "true"
+
+  LEARNING_EXTRACTOR_MODEL: "gpt-4o"
+  LEARNING_EXTRACTOR_BASE_URL: "https://api.openai.com/v1"
+  LEARNING_EXTRACTOR_MAX_RETRIES: "2"
+  LEARNING_EXTRACTOR_MAX_SHAPE_CORRECTIONS: "2"
+
+  # Judge rollout: run SHADOW first (records what it would have dropped, drops
+  # nothing), read the distribution, then set this to "false".
+  LEARNING_JUDGE_ENABLED: "true"
+  LEARNING_JUDGE_SHADOW_MODE: "true"
+  LEARNING_JUDGE_MODEL: "gpt-4o-mini"
+  LEARNING_JUDGE_PRE_DROP_CONFIDENCE: "0.90"
+  LEARNING_JUDGE_POST_DROP_CONFIDENCE: "0.75"
+  LEARNING_JUDGE_BAND_LOW: "0.70"
+  LEARNING_JUDGE_BAND_HIGH: "0.97"
+  LEARNING_JUDGE_TIMEOUT_SECONDS: "30"
+  LEARNING_JUDGE_RECORD_TTL_SECONDS: "94608000"
+
+  LEARNING_PROMOTION_ROUTING_THRESHOLD: "1"
+  LEARNING_PROMOTION_RECURRENCE_WEIGHT: "0.0"
+  LEARNING_PROMOTION_SCAN_LIMIT: "200"
+  LEARNING_PROMOTION_INTERVAL_SECONDS: "300"
+  LEARNING_DRIFT_FRESHNESS_SECONDS: "86400"
+  # Must stay <= LEARNING_DRIFT_FRESHNESS_SECONDS.
+  LEARNING_REPLAY_RECHECK_INTERVAL_SECONDS: "43200"
+  # Leave at 0.0 until you have measured the score distribution in your corpus.
+  LEARNING_REVIEW_SCORE_CUTOFF: "0.0"
+
+  LEARNING_AUDIT_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
+  LEARNING_AUDIT_BUCKET: "learning_audit"
+  LEARNING_AUDIT_USERNAME: "learning_audit"
+  LEARNING_AUDIT_TTL_SECONDS: "7776000"
+  LEARNING_CANDIDATES_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
+  LEARNING_CANDIDATES_BUCKET: "learning_candidates"
+  LEARNING_CANDIDATES_USERNAME: "learning_candidates"
+  LEARNING_CANDIDATES_TTL_SECONDS: "7776000"
+  LEARNING_CORPUS_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
+  LEARNING_CORPUS_BUCKET: "learning_corpus"
+  LEARNING_CORPUS_USERNAME: "learning_corpus"
+  LEARNING_CORPUS_TTL_SECONDS: "0"
+
+  LEARNING_SERVICE_NAME: "learning-loop"
+  # The learning spans carry the analyst's question, SQL and evidence quotes.
+  # Leave true only if the OTLP backend is access-controlled like the audit store.
+  LEARNING_TRACE_VERBOSE: "true"
+
+  # INBOX_SERVICE_URL left empty -> auto-derived from this release's inbox Service.
+  INBOX_SERVICE_URL: ""
+
+# ---- Secrets: reference a Secret you created out-of-band ----
+# Best practice is to EXTEND the data-agent release's Secret with the
+# learning-only keys and point both releases at it, so the shared credentials and
+# the tenant they authenticate cannot drift:
+#   kubectl create secret generic data-agent-secrets \
+#     --from-literal=COUCHBASE_PASSWORD=... \
+#     --from-literal=NEO4J_PASSWORD=... \
+#     --from-literal=TOKEN_ISSUER_API_KEY=... \
+#     --from-literal=EMBEDDING_API_KEY=... \
+#     --from-literal=LEARNING_EXTRACTOR_API_KEY=... \
+#     --from-literal=LEARNING_AUDIT_PASSWORD=... \
+#     --from-literal=LEARNING_CANDIDATES_PASSWORD=... \
+#     --from-literal=LEARNING_CORPUS_PASSWORD=... \
+#     --from-literal=REVIEWER_TOKEN=... \
+#     ...plus the data-agent-only keys (OPENAI_API_KEY, MCP_SERVICE_KEY, ...)
+# Unused keys in a shared Secret are harmless: each pod only reads what it needs.
+secrets:
+  existingSecret: data-agent-secrets
+
+# ---- Per-workload sizing ----
+components:
+  learningSweeper:
+    # Pinned to 1 replica by the template (a second one double-enqueues).
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 512Mi
+
+  learningConsumer:
+    replicaCount: 2            # ignored because autoscaling is enabled below
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 75
+
+  learningScheduler:
+    # Pinned to 1 replica by the template (the single promotion writer).
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+  inbox:
+    replicaCount: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+
+  inboxUi:
+    replicaCount: 2
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+
+# ---- Expose the REVIEWER UI via Ingress + TLS ----
+# The paths are the fence: /inbox and /api/inbox only. The pod also serves the
+# agent-chat routes (same app), and adding `/` here would publish them from this
+# release. The app authenticates the UI→inbox hop, NOT the human — put your
+# reviewer authn in the annotations below.
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Example: front the reviewer surface with your SSO forward-auth.
+    nginx.ingress.kubernetes.io/auth-url: "https://sso.acme.com/oauth2/auth"
+    nginx.ingress.kubernetes.io/auth-signin: "https://sso.acme.com/oauth2/start?rd=$escaped_request_uri"
+  hosts:
+    - host: data-agent-inbox.acme.com
+      paths:
+        - path: /inbox
+          pathType: Prefix
+        - path: /api/inbox
+          pathType: Prefix
+  tls:
+    - secretName: data-agent-inbox-tls
+      hosts:
+        - data-agent-inbox.acme.com

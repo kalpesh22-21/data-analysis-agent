@@ -1,0 +1,105 @@
+{{- $c := .Values.components.inboxUi -}}
+{{- if $c.enabled }}
+{{- $cmpArgs := dict "root" $ "component" "inbox-ui" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "data-agent-learning.componentFullname" $cmpArgs }}
+  labels:
+    {{- include "data-agent-learning.componentLabels" $cmpArgs | nindent 4 }}
+spec:
+  replicas: {{ $c.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "data-agent-learning.componentSelectorLabels" $cmpArgs | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "data-agent-learning.checksumAnnotations" $ | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with $c.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "data-agent-learning.componentSelectorLabels" $cmpArgs | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "data-agent-learning.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      securityContext:
+        {{- toYaml (mergeOverwrite (deepCopy .Values.podSecurityContext) ($c.podSecurityContext | default dict)) | nindent 8 }}
+      containers:
+        - name: inbox-ui
+          image: {{ include "data-agent-learning.image" (dict "root" $ "component" $c) }}
+          imagePullPolicy: {{ include "data-agent-learning.imagePullPolicy" (dict "root" $ "component" $c) }}
+          # The reviewer UI is the SAME `ui/server.py` app the data-agent chart runs as
+          # its agent UI — one image, one entrypoint, zero application changes. What
+          # makes this copy the REVIEWER surface is the env below: REVIEW_INBOX_ENABLED=1
+          # un-404s GET /inbox + /api/inbox/*, and INBOX_SERVICE_URL (ConfigMap, derived
+          # from this release's inbox Service) points the proxy at the inbox.
+          command:
+            - uvicorn
+            - ui.server:app
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "3000"
+          securityContext:
+            {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) ($c.securityContext | default dict)) | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          envFrom:
+            {{- include "data-agent-learning.envFrom" $ | nindent 12 }}
+          env:
+            # Activates the dormant reviewer surface. Without it every inbox route
+            # 404s (the same flag the inbox service enforces on its own routes).
+            - name: REVIEW_INBOX_ENABLED
+              value: "1"
+            {{- with concat (.Values.env | default list) ($c.env | default list) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # Probe the REVIEWER page, not `GET /`. `/` is the agent chat shell, which
+          # this pod serves whether or not the inbox gate is on — probing it would
+          # report a pod READY whose only reason to exist (the inbox surface) is
+          # 404ing. `/inbox` is 200 only when REVIEW_INBOX_ENABLED=1, so a
+          # misconfiguration keeps the pod out of the Service instead of hiding.
+          readinessProbe:
+            httpGet:
+              path: /inbox
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /inbox
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml (default .Values.resources $c.resources) | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with (default .Values.nodeSelector $c.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.affinity $c.affinity) }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.tolerations $c.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -10,22 +10,25 @@ Workloads enabled in this release:
 {{- if .Values.components.hydrator.enabled }}
   - hydrator          (singleton neo4j seeder daemon, no Service)
 {{- end }}
-{{- if .Values.components.learningSweeper.enabled }}
-  - learning-sweeper  (background daemon, no Service)
-{{- end }}
-{{- if .Values.components.learningConsumer.enabled }}
-  - learning-consumer (background daemon, no Service)
-{{- end }}
-{{- if .Values.components.inbox.enabled }}
-  - inbox             (review-inbox HTTP service, Service on :{{ .Values.components.inbox.service.port }})
-{{- end }}
+
+The offline learning plane (learning-sweeper, learning-consumer,
+learning-scheduler, the review-inbox service and the reviewer UI) is a SEPARATE
+release: deploy/helm/data-agent-learning. Nothing in this release runs it.
 
 {{- if .Values.components.ui.enabled }}
 
 Reach the UI:
 {{- if .Values.ingress.enabled }}
 {{- range .Values.ingress.hosts }}
-  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}{{ (first .paths).path }}
+{{- $host := .host }}
+{{- /* `first` on a nil/empty `paths` panics, and the panic ERRORS the whole
+       install — a host entry with no paths is odd but not a reason to fail.
+       Guard the LIST first, then take its head. */}}
+{{- with .paths }}
+{{- with first . }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host }}{{ .path }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- else }}
   The UI Service is ClusterIP (no Ingress). Port-forward to reach it locally:
