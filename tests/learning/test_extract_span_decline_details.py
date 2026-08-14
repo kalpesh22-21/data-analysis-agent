@@ -54,14 +54,22 @@ def _tracer_and_exporter():
     return provider.get_tracer("learning-loop-test"), exporter
 
 
-def _emit(*, verbose: bool, details: str | None) -> dict:
+def _emit(
+    *,
+    verbose: bool,
+    details: str | None,
+    candidate_count: int = 0,
+    review_count: int = 0,
+    decline_reasons: tuple[str, ...] = ("bad_role",),
+) -> dict:
     tracer, exporter = _tracer_and_exporter()
     with extract_span(
         tracer,
         session_id="sess-1",
-        candidate_count=0,
+        candidate_count=candidate_count,
         decline_count=1,
-        decline_reasons=("bad_role",),
+        decline_reasons=decline_reasons,
+        review_count=review_count,
         verbose=verbose,
         decline_details=details,
     ):
@@ -94,6 +102,47 @@ def test_no_detail_means_no_key_even_with_verbose_on() -> None:
     than setting an empty string — a session that declined nothing must not look like a
     session whose declines had nothing to say."""
     assert "learning.extract.decline_details" not in _emit(verbose=True, details=None)
+
+
+# --- the three-way outcome ------------------------------------------------------------
+
+
+def test_a_declined_session_that_parked_a_review_item_says_so() -> None:
+    """[X-declined-to-review] The third branch. A session whose merit-passed candidate
+    died on the parameterization form produced NO candidate and did NOT vanish, and
+    those are different facts — `declined` for both is what made the loss invisible for
+    a whole day of live sessions."""
+    attrs = _emit(
+        verbose=False,
+        details=None,
+        review_count=1,
+        decline_reasons=("totality_violation",),
+    )
+    assert attrs["learning.extract.outcome"] == "declined_to_review"
+    assert attrs["learning.extract.review_count"] == 1
+    # The D97 §7 counts are NOT inflated: nothing was extracted.
+    assert attrs["learning.extract.candidate_count"] == 0
+    # And the reason still rides in the existing attribute, so every Phoenix group-by
+    # written before this branch existed keeps working.
+    assert attrs["learning.extract.decline_reasons"] == "totality_violation"
+
+
+def test_a_plain_decline_is_still_plainly_declined() -> None:
+    """[X-declined-to-review] The control: no review item, no new label, and the new
+    count present as an explicit zero rather than absent — a missing attribute and a
+    zero read the same in a dashboard only until someone filters on it."""
+    attrs = _emit(verbose=False, details=None)
+    assert attrs["learning.extract.outcome"] == "declined"
+    assert attrs["learning.extract.review_count"] == 0
+
+
+def test_extraction_wins_over_a_parked_sibling() -> None:
+    """[X-declined-to-review] A session that extracted something AND parked a declined
+    sibling reads `extracted`: the label answers "did the loop produce anything?", and
+    the count is on the same span for the sessions where it did not."""
+    attrs = _emit(verbose=False, details=None, candidate_count=1, review_count=1)
+    assert attrs["learning.extract.outcome"] == "extracted"
+    assert attrs["learning.extract.review_count"] == 1
 
 
 # --- the renderer ---------------------------------------------------------------------

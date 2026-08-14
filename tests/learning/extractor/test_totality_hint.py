@@ -360,6 +360,11 @@ async def test_a_budget_already_spent_on_shape_leaves_the_hint_on_the_decline() 
     decline = result.declines[0]
     assert decline.corrections_attempted == 2  # it was asked — about something else
     assert "'EARN' as rule 'gross_earnings' on dbpcm_warehouse.payroll" in decline.detail
+    # And it carries the payload it was judged on, which is what makes this decline
+    # completable by a human instead of merely readable: the consumer builds the review
+    # candidate out of exactly this (`build_declined_envelope`). The live trace's
+    # complaint was that the corrected payloads "are not recorded anywhere".
+    assert decline.raw_payload == _UNCOVERED
 
 
 # --- the landing gate: does the cited rule actually declare this predicate? ---------

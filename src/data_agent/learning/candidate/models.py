@@ -16,8 +16,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..audit.judgement import CoverageAssessment
-from ..extractor.models import ExtractedCandidate
+from ..extractor.models import Decline, ExtractedCandidate
+from ..extractor.shape import ShapeError, as_int, as_object, as_text, require
 from ..summary.models import SessionSummary
+from .decline import DeclineBlock, EvidencePointer, ValidationSnapshot
 from .signals import NoveltyStamp, SessionSignals
 from .verdicts import DedupVerdict, DriftStamp
 
@@ -32,6 +34,13 @@ class CandidateStatus:
     QUARANTINED = "quarantined"
     REJECTED = "rejected"
     RETIRED = "retired"
+    # FAIL-TO-REVIEW (`docs/decisions/learning-declined-candidate-review.md`): the judge
+    # said the work was worth extracting and the parameterization form could not be
+    # filled in. SEPARATE from `in_review` because the reviewer's task is a different
+    # one: complete the form, not judge the idea — and because the count is the metric
+    # that measures how often the form is unfillable, which folding it into `in_review`
+    # would destroy.
+    NEEDS_PARAMETERIZATION = "needs_parameterization"
     # Phase-3 terminal state (governed-corpus inbox PROMOTE): a verified learning node
     # whose MCP-format YAML has been emitted for a manual PR into the MCP corpus repo.
     # Terminal — it drops out of the inbox validated listing. Caveat: if the human
@@ -50,6 +59,20 @@ def mint_candidate_id(content_hash: str, ordinal: int) -> str:
     the same candidate docs rather than duplicating them — best-effort idempotency
     until the D48 `canonical_key` dedup lands in Slice 6."""
     return f"candidate::{content_hash}::{ordinal}"
+
+
+def mint_review_candidate_id(content_hash: str, ordinal: int) -> str:
+    """The same deterministic key for a DECLINED candidate routed to review.
+
+    A SEPARATE ordinal namespace, and it is load-bearing rather than tidy. Kept
+    candidates are minted from `enumerate(result.candidates)` while a decline's natural
+    ordinal is its index in the RAW emitted array — two different counts over the same
+    batch, so `candidate::<hash>::1` could name a kept candidate and a declined one at
+    once and the later `put` would silently overwrite the earlier. The prefix makes that
+    collision unexpressible. Supersede is unaffected either way — both stores sweep on
+    the `content_hash` FIELD, not on the key — so a re-processed session still replaces
+    its stale review item."""
+    return f"candidate::{content_hash}::review-{ordinal}"
 
 
 @dataclass(frozen=True)
@@ -116,6 +139,14 @@ class CandidateEnvelope:
     # (`post_extraction_ref`) is what actually prevents the second model call. Do not
     # read this field as the idempotency mechanism.
     #
+    # ONE EXCEPTION, and it is the reason this comment is not simply "the post-extraction
+    # verdict": a fail-to-review candidate (`build_declined_envelope`) stamps the
+    # PRE-extraction assessment here — the judgement that said the work was worth
+    # extracting at all, which is precisely what distinguishes this row from a decline
+    # that was supposed to die. Same shape, same question ("is this already covered?"),
+    # asked one stage earlier; a reader who needs to tell them apart has `status` and
+    # `decline`.
+    #
     # Additive, defaults None, emitted only when set so a pre-slice candidate doc
     # round-trips byte-identically (mirrors `traceparent`).
     judge: CoverageAssessment | None = None
@@ -140,6 +171,19 @@ class CandidateEnvelope:
     # later clean cycle can erase is not a signal; erasing it is the class of bug the
     # correction fix itself was about.
     route_reason: str | None = None
+    # --- fail-to-review (status `needs_parameterization`) -------------------------
+    # Set together or not at all: `decline` is WHY the form could not be filled in, and
+    # `revalidation` is WHAT the completed form is re-checked against. Both are absent on
+    # every other candidate in the store, which is what keeps them a marker as well as a
+    # payload — `writer/routing.py::derive_inbox_reason` reads the presence of `decline`,
+    # and the completion path refuses without `revalidation` rather than re-validating
+    # against a session shape it invented. See `candidate/decline.py`.
+    #
+    # CLEARED on successful completion: a completed candidate is an ordinary one, and a
+    # decline block left on it would keep the inbox rendering a form that has already
+    # been filled in.
+    decline: DeclineBlock | None = None
+    revalidation: ValidationSnapshot | None = None
 
     def to_doc(self) -> dict[str, Any]:
         doc: dict[str, Any] = {
@@ -193,6 +237,13 @@ class CandidateEnvelope:
             doc["novelty"] = self.novelty.to_doc()
         if self.route_reason is not None:
             doc["route_reason"] = self.route_reason
+        # Additive + OPTIONAL, same rule as every field above: absent means this is not a
+        # fail-to-review item, which is exactly what every candidate written before this
+        # slice is.
+        if self.decline is not None:
+            doc["decline"] = self.decline.to_doc()
+        if self.revalidation is not None:
+            doc["revalidation"] = self.revalidation.to_doc()
         return doc
 
     @classmethod
@@ -281,6 +332,11 @@ class CandidateEnvelope:
             route_reason=(
                 doc["route_reason"] if isinstance(doc.get("route_reason"), str) else None
             ),
+            # Both own their own normalize-do-not-trust rules (a bad shape reads as
+            # ABSENT, never raises) — see `candidate/decline.py`, which states why the
+            # snapshot in particular must read as missing rather than as empty.
+            decline=DeclineBlock.from_doc(doc.get("decline")),
+            revalidation=ValidationSnapshot.from_doc(doc.get("revalidation")),
         )
 
 
@@ -325,4 +381,149 @@ def build_envelope(
         content_hash=summary.content_hash,
         traceparent=traceparent,
         session_signals=SessionSignals.from_summary(summary),
+    )
+
+
+def _payload_of(raw: dict[str, Any]) -> dict[str, Any]:
+    payload = raw.get("payload")
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _confidence_of(raw: dict[str, Any]) -> float:
+    value = raw.get("confidence")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def _depends_on_of(raw: dict[str, Any]) -> tuple[str, ...]:
+    value = raw.get("depends_on")
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _evidence_pointers(raw: dict[str, Any]) -> tuple[EvidencePointer, ...]:
+    """The citations, as (turn_ref, tool_call_ref) pairs — never the quotes (D51).
+
+    Reads the RAW array rather than a typed model because there is no typed model to
+    read: this candidate never became an `ExtractedCandidate`. An item this cannot read
+    is skipped, matching `validation.py::_evidence`'s partial tolerance — evidence is a
+    `>= 1` gate, and one malformed citation among three must not cost the review item.
+
+    THROUGH THE SAME READERS the validator uses, not through hand-written isinstance
+    checks, and that is a derived guard rather than a stylistic preference: `as_int`
+    accepts the `"0"` a real model emits, so a stricter reader here would drop citations
+    validation had already accepted — and the completion path would then re-validate a
+    candidate with fewer citations than the one that declined, failing D31's evidence
+    gate for a reason nobody could see."""
+    items = raw.get("evidence")
+    if not isinstance(items, list):
+        return ()
+    out: list[EvidencePointer] = []
+    for idx, item in enumerate(items):
+        at = f"candidate.evidence[{idx}]"
+        try:
+            obj = as_object(item, at=at, requirement="an evidence object")
+            out.append(
+                EvidencePointer(
+                    turn_ref=require(
+                        obj, "turn_ref", as_int, at=at, requirement="the turn index"
+                    ),
+                    tool_call_ref=require(
+                        obj, "tool_call_ref", as_text, at=at, requirement="the tool call id"
+                    ),
+                )
+            )
+        except ShapeError:
+            continue
+    return tuple(out)
+
+
+def _self_check(raw: dict[str, Any]) -> tuple[bool, list[str]]:
+    """The model's OWN entity attestation, as it wrote it.
+
+    Read from the raw candidate rather than defaulted, because a hardcoded `False` is not
+    a neutral value here — it is an assertion, in the field a reviewer and the S5 gate
+    both read as "the extractor looked and found nothing". A model that said
+    `contains_entities: true` about a candidate it could not parameterize has told us
+    something, and erasing it makes the review row claim the opposite of what was
+    emitted. Preliminary either way: the S5 gate is authoritative and overwrites this
+    whole doc with its settled verdict (`consumer.py::_scan_declined`)."""
+    esc = raw.get("entity_self_check")
+    if not isinstance(esc, dict):
+        return False, []
+    found = esc.get("found")
+    return (
+        bool(esc.get("contains_entities", False)),
+        [item for item in found if isinstance(item, str)] if isinstance(found, list) else [],
+    )
+
+
+def build_declined_envelope(
+    decline: Decline,
+    summary: SessionSummary,
+    *,
+    candidate_id: str,
+    evidence_refs: tuple[str, ...] = (),
+    judge: CoverageAssessment | None = None,
+    traceparent: str | None = None,
+) -> CandidateEnvelope:
+    """Assemble the FAIL-TO-REVIEW envelope for a merit-passed candidate that died on
+    the parameterization form (`docs/decisions/learning-declined-candidate-review.md`).
+
+    A SIBLING of `build_envelope`, deliberately not a mode of it. `build_envelope` takes
+    an `ExtractedCandidate` — a value that exists only because every validation passed —
+    and this one exists precisely because they did not, so its input is the raw JSON the
+    model emitted and every field is read defensively. Contorting one constructor to
+    serve both would put "was this validated?" behind a parameter, in the one place where
+    the answer decides what may be trusted.
+
+    `entity_scan` is left at the S3 `pending` self-check because THIS FUNCTION IS NOT THE
+    GATE: the caller runs the real leakage stage over the result and stamps the settled
+    verdict before persisting (`consumer.py::_persist_declined_for_review`). A decline
+    must not become a side door around the entity scan, and leaving the sentinel here
+    means a caller that forgets fails CLOSED — an unsettled scan withholds the decline
+    detail at the wire and blocks every approve path (`writer/routing.py`,
+    `promotion/scheduler.py::_entity_scan_is_actionable`).
+
+    `evidence_refs` are the MINTED audit keys, exactly as for a kept candidate: the caller
+    snapshots the entity-bearing quotes into `learning_audit` first
+    (`consumer.py::_snapshot_quotes`) and passes the refs here, so a review item's
+    citations are auditable and a candidate that lands through completion has a durable
+    evidence record. They default to `()` for the additive case — an envelope written
+    before that was wired, which the completion path still has to be able to re-validate
+    from its snapshot's pointers alone."""
+    raw = decline.raw_payload or {}
+    contains_entities, found = _self_check(raw)
+    return CandidateEnvelope(
+        candidate_id=candidate_id,
+        type=decline.type,
+        status=CandidateStatus.NEEDS_PARAMETERIZATION,
+        payload=_payload_of(raw),
+        source_session=summary.session_id,
+        source_trace=summary.trace_id,
+        evidence_refs=evidence_refs,
+        extractor_rationale=str(raw.get("rationale", "")),
+        entity_scan={
+            "result": "pending",
+            "hits": found,
+            "self_check_contains_entities": contains_entities,
+        },
+        confidence=_confidence_of(raw),
+        proposed_action=str(raw.get("proposed_action", "new")),
+        depends_on=_depends_on_of(raw),
+        content_hash=summary.content_hash,
+        traceparent=traceparent,
+        judge=judge,
+        session_signals=SessionSignals.from_summary(summary),
+        decline=DeclineBlock(
+            reason=decline.reason,
+            detail=decline.detail,
+            corrections_attempted=decline.corrections_attempted,
+            correction_history=decline.correction_history,
+        ),
+        revalidation=ValidationSnapshot.from_summary(
+            summary, evidence=_evidence_pointers(raw)
+        ),
     )

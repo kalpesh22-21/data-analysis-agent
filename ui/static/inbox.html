@@ -321,6 +321,74 @@
     font-family: ui-monospace, SFMono-Regular, monospace;
   }
 
+  /* --- Fail-to-review (needs_parameterization) --- */
+  .item-decline {
+    border: 1px solid var(--color-warn-border);
+    background: var(--color-warn-bg);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .decline-line {
+    font-size: 0.8rem;
+    color: var(--color-warn-text);
+  }
+
+  .decline-line .code {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    color: var(--color-text);
+  }
+
+  pre.decline-detail {
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    margin: 0;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .complete-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .complete-form textarea {
+    width: 100%;
+    min-height: 8rem;
+    box-sizing: border-box;
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8rem;
+    line-height: 1.4;
+  }
+
+  .complete-form button.action-complete {
+    align-self: flex-start;
+  }
+
+  .complete-options {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+  }
+
   .item-actions {
     display: flex;
     flex-wrap: wrap;
@@ -385,6 +453,7 @@
     <div class="inbox-controls">
       <div class="status-toggle" data-testid="inbox-status-toggle" role="group" aria-label="Inbox status">
         <button type="button" class="status-btn is-active" data-status="in_review" aria-pressed="true">Review queue</button>
+        <button type="button" class="status-btn" data-status="needs_parameterization" aria-pressed="false">Needs parameterization</button>
         <button type="button" class="status-btn" data-status="rejected" aria-pressed="false">Archived</button>
       </div>
       <div class="type-tabs" data-testid="inbox-tabs" role="tablist" aria-label="Candidate type"></div>
@@ -745,6 +814,196 @@
     return wrap;
   }
 
+  // The fail-to-review block: why the form could not be filled in, and what the
+  // machine already knew. `detail` names the uncovered predicates and the catalog
+  // rules that declare them — it is the reviewer's whole task — but the server
+  // WITHHOLDS it unless the leakage scan came back a clean pass, so a withheld
+  // detail is announced rather than rendered as an empty card.
+  function renderDecline(item) {
+    var decline = item.decline;
+    if (!decline) return null;
+    var wrap = document.createElement("div");
+    wrap.className = "item-decline";
+    wrap.setAttribute("data-testid", "inbox-decline");
+
+    var head = document.createElement("p");
+    head.className = "decline-line";
+    head.setAttribute("data-testid", "inbox-decline-reason");
+    var reasonLabel = document.createElement("span");
+    reasonLabel.textContent = "declined ";
+    head.appendChild(reasonLabel);
+    var reasonCode = document.createElement("span");
+    reasonCode.className = "code";
+    reasonCode.textContent = decline.reason || "(unknown)";
+    head.appendChild(reasonCode);
+    var attempts = document.createElement("span");
+    var n = decline.corrections_attempted || 0;
+    attempts.textContent =
+      " after " + n + " corrective round" + (n === 1 ? "" : "s");
+    head.appendChild(attempts);
+    wrap.appendChild(head);
+
+    if (decline.judge_covered_by || decline.judge_verdict) {
+      var judge = document.createElement("p");
+      judge.className = "decline-line";
+      judge.setAttribute("data-testid", "inbox-decline-judge");
+      var jLabel = document.createElement("span");
+      jLabel.textContent = "prior-art judge: " + (decline.judge_verdict || "n/a");
+      judge.appendChild(jLabel);
+      if (decline.judge_covered_by) {
+        var covered = document.createElement("span");
+        covered.className = "code";
+        covered.textContent = " closest: " + decline.judge_covered_by;
+        judge.appendChild(covered);
+      }
+      wrap.appendChild(judge);
+    }
+
+    if (decline.detail_withheld) {
+      var held = document.createElement("p");
+      held.className = "decline-line";
+      held.setAttribute("data-testid", "inbox-decline-withheld");
+      held.textContent =
+        "the predicate detail is withheld — the entity scan did not settle a clean " +
+        "pass on this candidate, so its text is not shown here";
+      wrap.appendChild(held);
+    } else if (decline.detail) {
+      var detail = document.createElement("pre");
+      detail.className = "decline-detail";
+      detail.setAttribute("data-testid", "inbox-decline-detail");
+      // textContent only — the detail carries literals lifted from the analyst's
+      // SQL, and it is never HTML (contract §4).
+      detail.textContent = decline.detail;
+      wrap.appendChild(detail);
+    }
+    return wrap;
+  }
+
+  // The completion form: the reviewer writes the missing parameterization entries
+  // and the server RE-VALIDATES them against the accepted SQL. Nothing here is a
+  // shortcut — a form that still does not cover every predicate comes back declined
+  // with the fresh reason, and the row stays put.
+  function renderCompleteForm(item, node) {
+    var form = document.createElement("div");
+    form.className = "complete-form";
+    form.setAttribute("data-testid", "inbox-complete-form");
+
+    var label = document.createElement("p");
+    label.className = "item-field-label";
+    label.textContent = "parameterization entries (JSON array)";
+    form.appendChild(label);
+
+    var area = document.createElement("textarea");
+    area.setAttribute("data-testid", "inbox-complete-entries");
+    area.setAttribute("aria-label", "parameterization entries as a JSON array");
+    area.placeholder =
+      '[{"locator": {"table": "db.table", "column": "col", "value": "X"}, ' +
+      '"role": "inline", "why": "defines the metric"}]';
+    form.appendChild(area);
+
+    var options = document.createElement("label");
+    options.className = "complete-options";
+    var replace = document.createElement("input");
+    replace.type = "checkbox";
+    replace.setAttribute("data-testid", "inbox-complete-replace");
+    options.appendChild(replace);
+    var optText = document.createElement("span");
+    optText.textContent =
+      "replace the whole parameterization array (default: append to what the model wrote)";
+    options.appendChild(optText);
+    form.appendChild(options);
+
+    var submit = document.createElement("button");
+    submit.type = "button";
+    // Deliberately NOT `action-btn`: that class is the two-step confirm family
+    // `resetConfirm`/`disableActions` sweep inside an actions row, and this button
+    // lives in the form and fires on the first click (the reviewer already committed
+    // by typing the entries).
+    submit.className = "action-complete";
+    submit.dataset.action = "complete";
+    submit.setAttribute("data-testid", "inbox-complete");
+    submit.textContent = "Re-validate & complete";
+    submit.addEventListener("click", function () {
+      performCompletion(item.candidate_id, area.value, replace.checked, node, form, submit);
+    });
+    form.appendChild(submit);
+    return form;
+  }
+
+  // POST the completed form. Three outcomes, three different things to do:
+  //   completed — the candidate re-entered the pipeline; drop the row and refresh.
+  //   declined  — the form is still incomplete; show the FRESH detail in place, and
+  //               leave the row (and the reviewer's text) exactly where they are.
+  //   HTTP err  — the usual banner (503 = this deployment cannot re-validate).
+  function performCompletion(candidateId, raw, replaceAll, node, form, submit) {
+    clearError();
+    var entries;
+    try {
+      entries = JSON.parse(raw && raw.trim() ? raw : "[]");
+    } catch (err) {
+      showError("INVALID_JSON", "entries must be a JSON array: " + String(err));
+      return;
+    }
+    if (!Array.isArray(entries)) {
+      showError("INVALID_JSON", "entries must be a JSON ARRAY of parameterization objects.");
+      return;
+    }
+    submit.disabled = true;
+    fetch("/api/inbox/" + encodeURIComponent(candidateId) + "/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entries: entries, replace: replaceAll }),
+    })
+      .then(function (response) {
+        return response.text().then(function (text) {
+          var parsed = null;
+          try {
+            parsed = JSON.parse(text);
+          } catch (err) {
+            parsed = null;
+          }
+          if (!response.ok) {
+            var reason = parsed && (parsed.reason || parsed.detail);
+            showError("HTTP_" + response.status, reason || text || response.statusText);
+            submit.disabled = false;
+            return;
+          }
+          if (parsed && parsed.outcome === "declined") {
+            renderFreshDecline(form, parsed.decline);
+            submit.disabled = false;
+            return;
+          }
+          node.parentNode && node.parentNode.removeChild(node);
+          loadInbox();
+        });
+      })
+      .catch(function (err) {
+        showError("NETWORK", String(err));
+        submit.disabled = false;
+      });
+  }
+
+  // Show the decline the SERVER just produced, next to the form that produced it.
+  // Replaces any previous one so two rounds never read as two problems.
+  function renderFreshDecline(form, decline) {
+    var previous = form.querySelector('[data-testid="inbox-complete-decline"]');
+    if (previous) form.removeChild(previous);
+    var block = document.createElement("pre");
+    block.className = "decline-detail";
+    block.setAttribute("data-testid", "inbox-complete-decline");
+    if (!decline) {
+      block.textContent = "still declined (no detail available)";
+    } else if (decline.detail_withheld) {
+      block.textContent =
+        "still declined: " + (decline.reason || "unknown") +
+        " — the detail is withheld because the entity scan did not settle a clean pass";
+    } else {
+      block.textContent =
+        "still declined: " + (decline.reason || "unknown") + "\n" + (decline.detail || "");
+    }
+    form.appendChild(block);
+  }
+
   function renderDedup(item) {
     var dedup = item.dedup;
     if (!dedup || !dedup.canonical_key) return null;
@@ -782,11 +1041,14 @@
     header.appendChild(type);
     // Archived (terminal) items carry a REJECTED status badge (contract
     // §Frontend). Its presence also drives the read-only, no-actions path below.
-    if (item.status === "rejected") {
+    // A fail-to-review item carries its own badge: the task is to COMPLETE the form,
+    // not to judge the idea, and the two must not look alike in a queue.
+    if (item.status === "rejected" || item.status === "needs_parameterization") {
       var status = document.createElement("span");
       status.className = "item-status";
       status.setAttribute("data-testid", "inbox-status");
-      status.textContent = "REJECTED";
+      status.textContent =
+        item.status === "rejected" ? "REJECTED" : "NEEDS PARAMETERIZATION";
       header.appendChild(status);
     }
     li.appendChild(header);
@@ -824,6 +1086,36 @@
     // (contract §Actions). The service also guards this; the hide is UX.
     if (item.status === "rejected") return li;
 
+    // Fail-to-review: the decline is the task, so it goes ABOVE the actions, and the
+    // form comes with it. Reject stays available (a form with no honest answer must
+    // still be clearable); approve does not exist for this status — the server
+    // refuses it, and offering it would invite a reviewer to try to skip validation.
+    if (item.status === "needs_parameterization") {
+      var declineBlock = renderDecline(item);
+      if (declineBlock) li.appendChild(declineBlock);
+      var completeActions = document.createElement("div");
+      completeActions.className = "item-actions";
+      completeActions.setAttribute("data-testid", "inbox-actions");
+      li.appendChild(renderCompleteForm(item, li));
+      completeActions.appendChild(
+        makeActionButton(
+          item.candidate_id, "reject", "Reject", li, completeActions, false
+        )
+      );
+      var completeCancel = document.createElement("button");
+      completeCancel.type = "button";
+      completeCancel.className = "action-cancel";
+      completeCancel.setAttribute("data-testid", "inbox-cancel");
+      completeCancel.textContent = "Cancel";
+      completeCancel.hidden = true;
+      completeCancel.addEventListener("click", function () {
+        resetConfirm(completeActions);
+      });
+      completeActions.appendChild(completeCancel);
+      li.appendChild(completeActions);
+      return li;
+    }
+
     // Actions.
     var actions = document.createElement("div");
     actions.className = "item-actions";
@@ -858,7 +1150,9 @@
   }
 
   function emptyMessage() {
-    var where = state.status === "rejected" ? "the archive" : "the review queue";
+    var where = "the review queue";
+    if (state.status === "rejected") where = "the archive";
+    else if (state.status === "needs_parameterization") where = "the parameterization queue";
     return "No " + typeLabel(state.activeType).toLowerCase() + " in " + where;
   }
 
@@ -872,10 +1166,18 @@
     updateStatusToggle();
     updateTabs(counts);
 
-    els.countLine.textContent =
-      state.status === "rejected"
-        ? (total === 1 ? "1 archived item" : total + " archived items")
-        : (total === 1 ? "1 item awaiting review" : total + " items awaiting review");
+    if (state.status === "rejected") {
+      els.countLine.textContent =
+        total === 1 ? "1 archived item" : total + " archived items";
+    } else if (state.status === "needs_parameterization") {
+      els.countLine.textContent =
+        total === 1
+          ? "1 item needing parameterization"
+          : total + " items needing parameterization";
+    } else {
+      els.countLine.textContent =
+        total === 1 ? "1 item awaiting review" : total + " items awaiting review";
+    }
 
     clearNode(els.list);
     // Active-type items first (stable), so the first DOM row is always the first

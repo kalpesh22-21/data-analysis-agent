@@ -128,8 +128,17 @@ def _schema_edit_reason(env: CandidateEnvelope) -> str:
 
 
 def derive_inbox_reason(env: CandidateEnvelope) -> str:
-    """The `InboxItem.reason` for an `in_review` envelope. Precedence matches
+    """The `InboxItem.reason` for an inbox-listable envelope. Precedence matches
     `route_candidate`; a clean blueprint in `in_review` is `blueprint_sampled`."""
+    # FAIL-TO-REVIEW first, ahead of the type split, because it is the only reason here
+    # that describes HOW the row got into the queue rather than what kind of thing it is:
+    # the consumer persists it directly (`_persist_declined_for_review`), so it never
+    # passed through `route_candidate` at all and every rule below would be answering a
+    # question nobody asked of it. Keyed on the decline BLOCK, not on the status string:
+    # the block is what the reviewer's task is made of, and a row carrying one is a form
+    # to complete whatever else is true about it.
+    if env.decline is not None:
+        return "needs_parameterization"
     if env.type == "global_knowledge":
         return "knowledge_pre_gate"
     if env.type == "schema_edit":
@@ -148,7 +157,16 @@ def derive_inbox_reason(env: CandidateEnvelope) -> str:
 
 def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> RoutingDecision:
     """Decide the terminal status + control + inbox reason for one enriched
-    candidate. Pure: reads only the envelope + the sampling coin flip."""
+    candidate. Pure: reads only the envelope + the sampling coin flip.
+
+    A FAIL-TO-REVIEW envelope (`decline` set, `status=needs_parameterization`) never
+    reaches here and cannot be mislabelled by it: the consumer persists it directly
+    without running the pipeline, and the completion path rebuilds a CLEAN envelope —
+    decline block cleared, entity scan reset — before re-running the stages, precisely so
+    the candidate that reaches this function is an ordinary one. The `global_knowledge` /
+    `schema_edit` branch below delegates to `derive_inbox_reason`, which would return
+    `needs_parameterization` for a decline-bearing envelope; that is the correct answer if
+    one ever arrives, not a mislabel."""
     if env.type in ("global_knowledge", "schema_edit"):
         # Both are human pre-gated → ALWAYS in_review, NEVER auto-landed. A
         # `schema_edit` without the PR-stage marker (R8) still fail-closes to review

@@ -1,8 +1,14 @@
 # Declined-candidate review — making "fail-to-review" true
 
-**Status: APPROVED DIRECTION, NOT BUILT.** Decided 2026-08-13 by the Lead after the
-deductions-ratio investigation (below). Revisit when the learning plane is next
-scheduled; nothing in the runtime depends on this.
+**Status: BUILT** (2026-08-13), to the design sketch below. Decided by the Lead after
+the deductions-ratio investigation (below). Where the implementation lives:
+`consumer.py::_persist_declined_for_review` (the route + its two conditions),
+`candidate/decline.py` (what persists), `inbox/completion.py` (the human completion →
+full re-validation → the normal stage pipeline), and the `needs_parameterization` status
+across the candidate store, the inbox service and `ui/static/inbox.html`.
+
+The two OPEN QUESTIONS below are still open: `missing_rule` does NOT route to review
+(its §7 count question is unsettled), and the hint-vocabulary work remains deferred.
 
 ## The evidence that forced this document
 
@@ -95,9 +101,12 @@ unfillable forms; the review route makes the tail survivable regardless.
 ## Open questions for the revisit
 
 - Should `missing_rule` (terminal, no hint) also route to review? Leaning yes — same
-  merit-passed logic — but it needs the §7 count kept separate.
+  merit-passed logic — but it needs the §7 count kept separate. **Still open**: the
+  built route takes `totality_violation` and `rule_predicate_mismatch` only.
 - Does the inbox (UI Slice 2, currently dormant) need a new card type, or does the
-  existing verify/promote surface stretch?
+  existing verify/promote surface stretch? **Answered: a new card.** The row carries a
+  decline block and a completion form; the detail is withheld at the wire unless the
+  persisted leakage verdict is a clean `pass`.
 - The empty-`why` placeholder theory: cheap to verify by recording corrected-payload
   *shapes* (D25: keys only, no values) on the extract span before building anything.
 

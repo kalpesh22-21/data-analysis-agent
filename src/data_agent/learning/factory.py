@@ -57,7 +57,7 @@ from .consumer import LearningConsumer, SummaryLoader, Triage
 from .dedup import BlueprintCorpus, DedupStage
 from .extractor import ExtractorConfig, LearningExtractor, RuleIndex
 from .generalize import GeneralizeStage
-from .inbox import ReviewInbox
+from .inbox import ParameterizationCompleter, ReviewInbox
 from .judge import CoverageJudge, JudgeConfig
 from .leakage import (
     LeakageGateStage,
@@ -343,30 +343,20 @@ def build_learning_consumer(
     # The FROZEN write-router order (D102 §7.1). The SAME `candidate_store` /
     # `user_store` instances thread through the stages that need them and the
     # consumer — a split-brain store would strand candidates (§1).
-    stages: tuple[CandidateStage, ...] = (
-        GeneralizeStage(catalog_schema=catalog_schema),
-        LeakageGateStage(
-            candidate_store=candidate_store,
-            semantic_scanner=semantic_scanner,
-            user_store=user_store,
-            tracer=tracer,
-        ),
-        DedupStage(
-            blueprint_corpus,
-            embedder,
-            prior_art=prior_art,
-            merge_threshold=settings.learning_dedup_merge_threshold,
-            conflict_threshold=settings.learning_dedup_conflict_threshold,
-            recurrence_threshold=settings.learning_recurrence_similarity_threshold,
-            # THE SAME judge instance the consumer screens sessions with — one object,
-            # two stages. A split would let the two halves of one candidate's lifetime
-            # run under different thresholds and write to different audit stores.
-            judge=judge,
-            tracer=tracer,
-        ),
-        SchemaEditPRStage(git_client=git_client, checks=checks),
-        UserKnowledgeCommitStage(store=user_store),
-        WriterStage(sampler=sampler),
+    stages = build_write_router_stages(
+        settings,
+        candidate_store=candidate_store,
+        blueprint_corpus=blueprint_corpus,
+        catalog_schema=catalog_schema,
+        embedder=embedder,
+        user_store=user_store,
+        prior_art=prior_art,
+        judge=judge,
+        semantic_scanner=semantic_scanner,
+        git_client=git_client,
+        checks=checks,
+        sampler=sampler,
+        tracer=tracer,
     )
 
     _logger.info(
@@ -387,6 +377,85 @@ def build_learning_consumer(
         judge=judge,
         **loader_triage,
     )
+
+
+def build_write_router_stages(
+    settings: LearningSettings,
+    *,
+    candidate_store: CandidateStore,
+    blueprint_corpus: BlueprintCorpus,
+    catalog_schema: dict[str, dict[str, str]],
+    embedder: Embedder,
+    user_store: UserKnowledgeStore | None = None,
+    prior_art: PriorArtIndex | None = None,
+    judge: CoverageJudge | None = None,
+    semantic_scanner: SemanticEntityScanner | None = None,
+    git_client: GitPullRequestClient | None = None,
+    checks: SchemaEditChecks | None = None,
+    sampler: Sampler | None = None,
+    tracer: object | None = None,
+    include_target_specific: bool = True,
+) -> tuple[CandidateStage, ...]:
+    """The FROZEN write-router order (D102 §7.1), assembled in ONE place.
+
+    Two callers assemble this pipeline now — `build_learning_consumer` for freshly
+    extracted candidates, and the inbox service for a candidate a human finished filling
+    in (`inbox/completion.py`) — and the ORDER is the thing that must not fork. A second
+    hand-written tuple somewhere else is how `leakage` ends up after `dedup` in one
+    process and before it in another, with nothing failing until a leak lands.
+
+    `include_target_specific=False` omits `schema_edit_pr` and `user_commit`. That is a
+    STATEMENT ABOUT THE CANDIDATE, not a convenience: both stages handle-then-stop their
+    own target type, and the completion path only ever re-runs a `blueprint` (a
+    `needs_parameterization` candidate is one by construction — its decline reasons are
+    blueprint-only checks), so neither stage would do anything except require a git
+    client and a per-user store the completion plane has no reason to hold. The four that
+    remain — generalize → leakage → dedup → writer — are exactly the ones the decision
+    doc requires a completed candidate to pass, in the same relative order."""
+    stages: list[CandidateStage] = [
+        GeneralizeStage(catalog_schema=catalog_schema),
+        LeakageGateStage(
+            candidate_store=candidate_store,
+            semantic_scanner=(
+                semantic_scanner
+                if semantic_scanner is not None
+                else NullSemanticEntityScanner()
+            ),
+            user_store=user_store,
+            tracer=tracer,
+        ),
+        DedupStage(
+            blueprint_corpus,
+            embedder,
+            prior_art=prior_art,
+            merge_threshold=settings.learning_dedup_merge_threshold,
+            conflict_threshold=settings.learning_dedup_conflict_threshold,
+            recurrence_threshold=settings.learning_recurrence_similarity_threshold,
+            # THE SAME judge instance the consumer screens sessions with — one object,
+            # two stages. A split would let the two halves of one candidate's lifetime
+            # run under different thresholds and write to different audit stores.
+            judge=judge,
+            tracer=tracer,
+        ),
+    ]
+    if include_target_specific:
+        if user_store is None:
+            raise LearningWiringError(
+                "the target-specific stages need a user-knowledge store (the S8 "
+                "auto-commit stage commits per-user facts through it); pass one, or "
+                "build the blueprint-only pipeline with include_target_specific=False"
+            )
+        stages.append(
+            SchemaEditPRStage(
+                git_client=(
+                    git_client if git_client is not None else _NullGitPullRequestClient()
+                ),
+                checks=checks if checks is not None else AllPassChecks(),
+            )
+        )
+        stages.append(UserKnowledgeCommitStage(store=user_store))
+    stages.append(WriterStage(sampler=sampler))
+    return tuple(stages)
 
 
 def _build_judge(
@@ -544,6 +613,7 @@ def build_promotion_plane(
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
     tracer: object | None = None,
+    completer: ParameterizationCompleter | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the S9 promotion plane — the scheduler + the review inbox — from ONE
     `candidate_store` instance. The inbox's `approve` reads that store and DELEGATES
@@ -583,7 +653,10 @@ def build_promotion_plane(
         tracer=tracer,
     )
     inbox = build_review_inbox(
-        candidate_store, scheduler=scheduler, policy=scheduler.policy
+        candidate_store,
+        scheduler=scheduler,
+        policy=scheduler.policy,
+        completer=completer,
     )
     return scheduler, inbox
 
@@ -603,6 +676,7 @@ def build_promotion_write_plane(
     policy: PromotionPolicy | None = None,
     clock: Callable[[], str] | None = None,
     tracer: object | None = None,
+    completer: ParameterizationCompleter | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the FULLY-ACTIVATED S9 promotion WRITE plane (S9-activation Slice 2,
     §4) — the scheduler + inbox with the REAL warehouse probe, dependency resolver,
@@ -641,6 +715,7 @@ def build_promotion_write_plane(
         policy=policy,
         clock=clock,
         tracer=tracer,
+        completer=completer,
     )
 
 
@@ -697,6 +772,7 @@ def build_review_inbox(
     *,
     scheduler: PromotionScheduler,
     policy: PromotionPolicy | None = None,
+    completer: ParameterizationCompleter | None = None,
 ) -> ReviewInbox:
     """Wire the writer↔inbox↔scheduler linkage: the S7 writer routes to `in_review`,
     the inbox projects those rows, and a human `approve` DELEGATES to the injected
@@ -717,10 +793,22 @@ def build_review_inbox(
     # routing threshold and the review cutoff are two ends of one decision, and a fresh
     # default here would silently apply a cutoff of 0.0 to a deployment that configured
     # one — a knob turned in the env and ignored at the surface it governs.
+    # *completer* is the fail-to-review completion plane (optional, default absent — an
+    # inbox without one refuses a completion 503 rather than pretending). It takes the
+    # SAME `candidate_store` for the same reason the scheduler does: it re-validates the
+    # envelope this inbox read and writes the result back, and a split would put the
+    # completed candidate in a store nobody lists.
+    if completer is not None and completer.store is not candidate_store:
+        raise LearningWiringError(
+            "review inbox and its parameterization completer must share ONE candidate "
+            "store (the inbox reads it; the completer re-validates and writes back to "
+            "it). Build both from one store."
+        )
     return ReviewInbox(
         candidate_store,
         scheduler=scheduler,
         policy=policy if policy is not None else scheduler.policy,
+        completer=completer,
     )
 
 
@@ -774,4 +862,5 @@ __all__ = [
     "build_promotion_scheduler",
     "build_promotion_write_plane",
     "build_review_inbox",
+    "build_write_router_stages",
 ]

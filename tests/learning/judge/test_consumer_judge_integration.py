@@ -147,12 +147,19 @@ async def test_a_judge_that_raises_never_costs_the_session() -> None:
             raise RuntimeError("judge exploded")
 
     consumer = _consumer(_BoomJudge(), _extractor())
-    assert await consumer._judged_covered(_SUMMARY) is False
+    judged = await consumer._judge_session(_SUMMARY)
+    assert judged.drop is False
+    # `not_judged`, not `proceeded`: a judge that exploded screened nothing, and the
+    # fail-to-review route keys on the positive verdict (`consumer.py::
+    # _persist_declined_for_review`). Fail-open must not manufacture merit.
+    assert judged.outcome == "not_judged"
 
 
 async def test_no_judge_wired_is_the_pre_slice_path() -> None:
     consumer = _consumer(None, _extractor())
-    assert await consumer._judged_covered(_SUMMARY) is False
+    judged = await consumer._judge_session(_SUMMARY)
+    assert judged.drop is False
+    assert judged.outcome == "not_judged"
 
 
 async def test_the_would_extract_stub_path_never_calls_the_judge() -> None:

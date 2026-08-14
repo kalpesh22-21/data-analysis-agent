@@ -119,6 +119,11 @@ def test_list_returns_exact_wire_shape(enabled: None) -> None:
         # Plan §4: what the SCHEDULER knew when it routed, which nothing downstream can
         # reconstruct. `"user_corrected"` or null.
         "route_reason",
+        # Fail-to-review: the decline a reviewer is being asked to fix. Part of the EXACT
+        # shape (null on every other row) rather than a key that appears only on
+        # `needs_parameterization` items — a client cannot branch on a field it cannot
+        # know exists, and the whole slice is about a surface that said nothing.
+        "decline",
     }
     assert set(item["score"]) == {
         "score",

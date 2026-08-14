@@ -541,6 +541,27 @@ def _evidence(raw: dict[str, Any]) -> tuple[EvidenceRef, ...]:
     return tuple(refs)
 
 
+def read_evidence(raw: dict[str, Any]) -> tuple[EvidenceRef, ...]:
+    """The citations of a raw candidate, or `()` when none can be read. NEVER raises.
+
+    The public face of `_evidence`, for the one caller that needs the citations of a
+    candidate that never became an `ExtractedCandidate`: `consumer.py` snapshots a
+    fail-to-review candidate's quotes into `learning_audit` exactly as it does for a kept
+    one. It goes through THIS reader rather than a second hand-written one so the set of
+    citations the audit record covers is precisely the set validation accepted — a
+    stricter private reader would silently omit the `"0"` turn_ref a real model emits,
+    and an audit trail with fewer citations than the candidate is worse than none,
+    because it looks complete."""
+    try:
+        return _evidence(raw)
+    except ShapeError:
+        # The all-bad case, which `_evidence` re-raises so the extractor can route it to
+        # the correctable side. Here there is nothing to correct: the candidate has
+        # already declined, and a review item with no auditable citation is a degraded
+        # row, not a failed request.
+        return ()
+
+
 def _header(
     raw: dict[str, Any], candidate_type: str, evidence: tuple[EvidenceRef, ...]
 ) -> CandidateHeader:

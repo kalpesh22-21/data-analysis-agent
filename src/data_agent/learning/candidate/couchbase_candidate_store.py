@@ -35,6 +35,16 @@ from .verdicts import DriftStamp
 # reviewer view, validated/retired are settled records, and PROMOTED must survive so the
 # Phase-3 idempotent re-emit (regenerate the MCP YAML for a lost/abandoned PR) always has
 # its candidate — none may be TTL-evicted. Every other (transient) status keeps the TTL.
+#
+# `needs_parameterization` is deliberately NOT here, and the tradeoff is worth stating
+# because it is a loss: a fail-to-review item nobody completes within
+# `learning_candidates_ttl_seconds` (90 days) EXPIRES, and the blueprint it would have
+# become is gone again. It sits on the transient side anyway because it is the same kind
+# of thing as `in_review` — an unfinished work item, not a settled record — and giving it
+# a different retention posture from the queue it renders next to would be a rule with
+# one member and no principle. A queue nobody drains in 90 days is a staffing signal, and
+# the honest fix is to drain it or to raise the TTL, not to make one row immortal.
+
 _TERMINAL_STATUSES = frozenset(
     {
         CandidateStatus.REJECTED,

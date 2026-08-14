@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -49,13 +49,17 @@ from .candidate import (
     CandidateEnvelope,
     CandidateStore,
     InMemoryCandidateStore,
+    build_declined_envelope,
     build_envelope,
     mint_candidate_id,
+    mint_review_candidate_id,
 )
 from .config import LearningSettings, learning_enabled
 from .extractor import ExtractedCandidate, LearningExtractor
-from .extractor.models import BlueprintPayload, Decline
-from .judge import CoverageJudge
+from .extractor.models import BlueprintPayload, Decline, EvidenceRef
+from .extractor.validation import REASON_RULE_MISMATCH, REASON_TOTALITY, read_evidence
+from .judge import OUTCOME_PROCEEDED, CoverageJudge, JudgeOutcomeResult
+from .leakage import settle_entity_scan
 from .models import LearningStatus, compute_content_hash
 from .observability import (
     consume_span,
@@ -67,7 +71,7 @@ from .observability import (
     triage_span,
 )
 from .queue import DeliveredJob, LearningQueue
-from .stage import CandidateStage, StageContext
+from .stage import CandidateStage, StageContext, run_pipeline
 from .summary import SessionSummary, load_session_summary
 from .triage import TriageVerdict
 from .triage import triage as _default_triage
@@ -107,8 +111,48 @@ _DECLINE_DETAILS_TOTAL_LIMIT = 2000
 # All three are rendered through `validation.py::_quoted`/`_flattened` at their build
 # site, so what lands here is single-line and bounded — that is a safety property of the
 # ATTRIBUTE, not a substitute for this classification.
+#
+# **THE SPAN IS NO LONGER THE ONLY LANDING SURFACE, and this is the note that says so.**
+# Since the fail-to-review slice, the detail of a `totality_violation` /
+# `rule_predicate_mismatch` decline on a MERIT-PASSED candidate is also DURABLY PERSISTED
+# — onto `CandidateEnvelope.decline` in the `learning_candidates` store — because the
+# text IS the reviewer's task (`docs/decisions/learning-declined-candidate-review.md`).
+# Three things make that a decided posture rather than a drift:
+#
+#   * the leakage scan runs over the envelope BEFORE it is persisted, so a decline is not
+#     a side door around the entity gate (`_persist_declined_for_review`);
+#   * `learning_candidates` is the access-controlled store (D101) that already holds the
+#     candidate payload's raw locator values — this adds no new class of content to it;
+#   * the WIRE layer withholds the detail unless the persisted leakage verdict is a clean
+#     `pass` (`inbox/models.py::InboxItem.decline_view`), so the browser-facing surface is
+#     narrower than the stored one, not equal to it.
+#
+# The two reasons that do NOT route to review (`missing_rule_hinted`, `missing_rule`)
+# keep the span as their only surface.
 ENTITY_BEARING_DECLINE_REASONS: frozenset[str] = frozenset(
     {"totality_violation", "rule_predicate_mismatch", "missing_rule_hinted", "missing_rule"}
+)
+
+# The decline reasons that route a MERIT-PASSED candidate to a human instead of the bin
+# (`docs/decisions/learning-declined-candidate-review.md`).
+#
+# Both members say the same thing about the candidate: the IDEA survived every judgement
+# of its content and the FORM could not be filled in. `totality_violation` means a
+# predicate of the accepted SQL has no entry; `rule_predicate_mismatch` means an entry
+# cites a rule the catalog says is a different filter. A human fixes either in seconds.
+#
+# WHAT IS DELIBERATELY ABSENT, because the temptation is to add it:
+#
+#   * `missing_rule` — terminal, and its whole value is as the §7 signal that a human
+#     must ADD a rule to the catalog. Routing it here would answer it with the wrong
+#     action (complete a form that has no legal completion) and blur the count the
+#     pairing work is prioritized from. The decision doc leaves it open; it stays out
+#     until that count question is settled.
+#   * every merit-failed reason (`no_evidence`, `no_acceptance`, `unrewritable_sql`,
+#     `role_inconsistent`, `malformed_candidate`) — these are supposed to die, and a
+#     review queue that fills with them stops being read.
+REVIEW_ROUTED_DECLINE_REASONS: frozenset[str] = frozenset(
+    {REASON_TOTALITY, REASON_RULE_MISMATCH}
 )
 
 
@@ -713,14 +757,35 @@ class LearningConsumer:
             # Back-compat: no extractor wired ⇒ the S2 `would_extract` stub.
             self._emit_extract_stub(summary.session_id, verdict.target_hints)
             return summary
-        if await self._judged_covered(summary):
+        judged = await self._judge_session(summary)
+        if judged.drop:
+            # The judge has already written the durable audit record (it refuses to drop
+            # without one) and logged the drop with its reason and covered-by ref. The
+            # extract span is emitted with zero candidates and a machine-readable decline
+            # reason so the loop's own telemetry shows a session that produced nothing AND
+            # why, rather than a silent gap between triage and nothing.
+            self._emit_extract(
+                summary,
+                candidate_count=0,
+                decline_reasons=("judge_prior_art_covered",),
+                target_hints=(),
+            )
             return summary
-        await self._run_extractor(summary, verdict)
+        await self._run_extractor(summary, verdict, judged)
         return summary
 
-    async def _judged_covered(self, summary: SessionSummary) -> bool:
+    async def _judge_session(self, summary: SessionSummary) -> JudgeOutcomeResult:
         """Ask the coverage judge whether this session's work already exists (plan
-        §3b). `True` ⇒ SKIP extraction entirely.
+        §3b). `drop=True` ⇒ the caller must SKIP extraction entirely.
+
+        **Returns the whole result, not a bool, and the difference is a slice.** The
+        `outcome` label is the only record of WHY a judgement did not drop — it proceeded
+        on merit, or it never ran (no cards, below the floor, unavailable, failed) — and
+        the fail-to-review route is allowed for exactly one of those values
+        (`proceeded`). Collapsing them to `drop=False` at this boundary, which is what
+        this method used to do, would leave the extractor's declines with no way to tell
+        "a model said this work is genuinely new" from "nobody was asked", and a review
+        queue that cannot tell them apart is a queue of unscreened declines.
 
         Placed after the extractor-present check on purpose: with no extractor there is
         no call to cancel, so paying a judge to cancel nothing would be pure cost — and
@@ -733,10 +798,13 @@ class LearningConsumer:
         through the consumer's blanket handler. The direction matters — a wrong keep
         costs one extraction and lands in a review queue; a wrong drop is invisible.
         """
+        # `not_judged` — the default — is the honest label for BOTH no-judge postures
+        # (none wired, or one that raised): nobody screened this session, which is
+        # exactly what the fail-to-review route must not mistake for a positive verdict.
         if self._judge is None:
-            return False
+            return JudgeOutcomeResult()
         try:
-            outcome = await self._judge.screen_session(summary)
+            return await self._judge.screen_session(summary)
         except Exception:  # noqa: BLE001 - the judge may never cost a session
             _logger.warning(
                 "learning: the coverage judge raised for session %s — extracting "
@@ -745,27 +813,24 @@ class LearningConsumer:
                 summary.session_id,
                 exc_info=True,
             )
-            return False
-        if not outcome.drop:
-            return False
-        # The judge has already written the durable audit record (it refuses to drop
-        # without one) and logged the drop with its reason and covered-by ref. The
-        # extract span is emitted with zero candidates and a machine-readable decline
-        # reason so the loop's own telemetry shows a session that produced nothing AND
-        # why, rather than a silent gap between triage and nothing.
-        self._emit_extract(
-            summary,
-            candidate_count=0,
-            decline_reasons=("judge_prior_art_covered",),
-            target_hints=(),
-        )
-        return True
+            return JudgeOutcomeResult()
 
-    async def _run_extractor(self, summary: SessionSummary, verdict: TriageVerdict) -> None:
+    async def _run_extractor(
+        self,
+        summary: SessionSummary,
+        verdict: TriageVerdict,
+        judged: JudgeOutcomeResult | None = None,
+    ) -> None:
         """S3: extract candidates → snapshot each candidate's evidence into
         `learning_audit` (the FIRST real evidence writes) → persist the candidate
         envelope (carrying only `evidence_ref`s) at `status=extracted`. A candidate
-        with no evidence never reaches here (rejected at emit, D31)."""
+        with no evidence never reaches here (rejected at emit, D31).
+
+        *judged* is the PRE-extraction judgement (`_judge_session`), carried in because it
+        is the only thing that can say a decline belongs in front of a human rather than
+        in the bin — see `_persist_declined_for_review`. Defaulted `None` so the S3-era
+        callers (and every test that drives this method directly) keep the pre-slice
+        behaviour: no judgement, no review route."""
         result = await self._extractor.extract(summary, verdict)
         # MEDIUM-3: drop any candidates a PRIOR attempt (redelivery before `done`)
         # wrote for this session, so the store never holds a mixed set from two
@@ -795,6 +860,9 @@ class LearningConsumer:
                 intent, slots = _blueprint_verbose(candidate.payload)
             if await self._run_stages(envelope, summary, verdict) == "halt":
                 break
+        review_count = await self._persist_declined_for_review(
+            result.declines, summary, verdict, judged, traceparent
+        )
         decline_reasons = tuple(d.reason for d in result.declines)
         self._emit_extract(
             summary,
@@ -802,11 +870,138 @@ class LearningConsumer:
             decline_reasons=decline_reasons,
             target_hints=verdict.target_hints,
             correction_count=result.corrections,
+            review_count=review_count,
             intent=intent,
             slots=slots,
             rationale=rationale,
             decline_details=_decline_details(result.declines),
         )
+
+    async def _persist_declined_for_review(
+        self,
+        declines: tuple[Decline, ...],
+        summary: SessionSummary,
+        verdict: TriageVerdict,
+        judged: JudgeOutcomeResult | None,
+        traceparent: str | None,
+    ) -> int:
+        """Persist a MERIT-PASSED, form-failed decline for a human to complete. Returns
+        how many were written (0 or 1).
+
+        THE BUG THIS CLOSES is silent loss, and it is worth stating precisely because the
+        code reads like an addition rather than a fix. `validation.py`'s stated doctrine
+        is that a decline "routes to review, never a bad landing" — but a terminal decline
+        after corrections wrote NOTHING durable: no candidate, no inbox row, no audit
+        record beyond a span. One traced session proved a blueprint the corpus wanted
+        evaporating three times over two days
+        (`docs/decisions/learning-declined-candidate-review.md`). Precision was never the
+        problem; recall was being eaten by a form that sometimes has no fillable answer.
+
+        TWO CONDITIONS, and both are necessary:
+
+          * the pre-extraction judge said `proceeded` — a POSITIVE statement that a model
+            looked at the corpus and found this work new. Every other outcome, including
+            the `skipped_*` ones, means nobody screened it, and a review queue filled with
+            unscreened declines is a queue that stops being read. `judged is None` (the S3
+            callers, the tests that drive `_run_extractor` directly) is the same answer.
+          * the reason is one a human can act on (`REVIEW_ROUTED_DECLINE_REASONS`).
+
+        ONE PERSIST PER EXTRACTION, taking the LAST qualifying decline. The bound is the
+        decision doc's (§6) and it is about the queue, not about storage: a session that
+        produces several unfillable forms is a prompt problem, and putting each of them in
+        front of a person is how the surface earns its own neglect. The count is on the
+        span either way, and the LAST one is the model's final word.
+
+        THE LEAKAGE SCAN RUNS FIRST, over the built envelope, using the SAME wired stage
+        instance the extraction pipeline uses — never a private scanner, so the gate a
+        declined candidate passes can never drift from the one a kept candidate passes.
+        With no stage wired the envelope keeps its `pending` sentinel and every downstream
+        surface fails closed on it (the wire withholds the detail, the approve guards
+        refuse); that is a degraded review item, not a leak.
+
+        THE EVIDENCE IS SNAPSHOTTED, exactly as it is for a kept candidate. This row is a
+        durable candidate now, and a candidate whose citations resolve to nothing is one
+        no reviewer can audit and no landing can be traced back — the D31 evidence
+        contract does not become optional because the form was incomplete. The quotes go
+        to `learning_audit` and only the minted refs travel on the envelope (D51/D17),
+        which is the same split every other candidate obeys."""
+        if judged is None or judged.outcome != OUTCOME_PROCEEDED:
+            return 0
+        eligible = [
+            d
+            for d in declines
+            if d.reason in REVIEW_ROUTED_DECLINE_REASONS and d.raw_payload is not None
+        ]
+        if not eligible:
+            return 0
+        if len(eligible) > 1:
+            _logger.info(
+                "learning: session %s produced %d review-routable declines; persisting "
+                "the last one only (one review item per extraction — see the decision "
+                "doc §6). Reasons: %s",
+                summary.session_id, len(eligible), ", ".join(d.reason for d in eligible),
+            )
+        decline = eligible[-1]
+        envelope = build_declined_envelope(
+            decline,
+            summary,
+            # A namespace of its own so a declined item can never collide with a kept
+            # sibling minted from a different count over the same batch.
+            candidate_id=mint_review_candidate_id(summary.content_hash, 0),
+            evidence_refs=await self._snapshot_quotes(
+                read_evidence(decline.raw_payload or {}), summary
+            ),
+            judge=judged.assessment,
+            traceparent=traceparent,
+        )
+        envelope = await self._scan_declined(envelope, summary, verdict)
+        await self._candidates.put(envelope)
+        _logger.info(
+            "learning: session %s declined %s after %d correction(s) but the judge "
+            "passed it on merit — persisted %s at status=%s for a human to complete "
+            "the parameterization",
+            summary.session_id, decline.reason, decline.corrections_attempted,
+            envelope.candidate_id, envelope.status,
+        )
+        return 1
+
+    async def _scan_declined(
+        self,
+        envelope: CandidateEnvelope,
+        summary: SessionSummary,
+        verdict: TriageVerdict,
+    ) -> CandidateEnvelope:
+        """Stamp the settled leakage verdict onto a fail-to-review envelope.
+
+        Runs the WIRED gate's SCAN — `leakage.settle_entity_scan`, which calls
+        `LeakageGateStage.scan` rather than `process`, so what comes back is a verdict and
+        nothing else. Two consequences are deliberately not taken:
+
+          * the stage's ROUTING (a `reject` sets `status=rejected`) — written for a
+            candidate flowing toward a landing, where this one is flowing toward a form.
+            A quarantine must leave the row exactly where a reviewer will find it;
+          * the stage's WRITES. `_apply` commits a per-user knowledge record on a
+            `reroute`, and doing that here would take an entity out of a candidate that
+            FAILED validation, may never be completed, and may be rejected outright, and
+            commit it to a user's durable store with nothing to retract it. On the
+            validated path that commit is the gate doing its job; here it would be the
+            gate doing a job nobody asked for.
+
+        No leakage stage wired ⇒ the `pending` sentinel survives and is persisted as-is.
+        Logged at WARNING because it is invisible otherwise and it degrades a real
+        reviewer surface: every consumer of an unsettled scan fails closed."""
+        if not any(getattr(s, "stage_id", "") == "leakage" for s in self._stages):
+            _logger.warning(
+                "learning: no leakage stage wired — the fail-to-review candidate for "
+                "session %s is persisted with an UNSETTLED entity scan; its decline "
+                "detail is withheld at the wire and it cannot be approved until a "
+                "deployment with the gate re-processes the session",
+                summary.session_id,
+            )
+        entity_scan = await settle_entity_scan(
+            self._stages, envelope, StageContext(summary=summary, verdict=verdict)
+        )
+        return replace(envelope, entity_scan=entity_scan)
 
     async def _run_stages(
         self,
@@ -824,44 +1019,42 @@ class LearningConsumer:
         semantics (see `stage.StageControl`): `continue` → next stage; `route_inbox`
         → stop + persist; `drop` → stop, do NOT persist; `halt` → stop + persist,
         then skip the remaining candidates. An UNKNOWN control string is a
-        programming error and raises (never a silent route_inbox)."""
+        programming error and raises (never a silent route_inbox).
+
+        The loop itself lives in `stage.run_pipeline`, shared with the inbox's
+        parameterization-completion path — which re-runs the SAME pipeline over a
+        candidate a human finished filling in, and must not be able to disagree with this
+        one about what a control means. What stays here is the consumer's own half: the
+        store to persist into, and the halt that skips the remaining candidates."""
         if not self._stages:
             return "continue"
-        ctx = StageContext(summary=summary, verdict=verdict)
-        env = envelope
-        persist = True
-        control: str = "continue"
-        for stage in self._stages:
-            outcome = await stage.process(env, ctx)
-            env = outcome.envelope
-            control = outcome.control
-            if control == "continue":
-                continue
-            if control in ("route_inbox", "halt"):
-                persist = True
-            elif control == "drop":
-                # The stage committed the candidate elsewhere (or discarded it);
-                # do not persist the enriched envelope here.
-                persist = False
-            else:
-                raise ValueError(
-                    f"stage {getattr(stage, 'stage_id', stage)!r} returned an "
-                    f"unknown control {control!r} (expected one of continue, "
-                    f"route_inbox, drop, halt)"
-                )
-            break
-        if persist:
-            await self._candidates.put(env)
-        return "halt" if control == "halt" else "continue"
+        outcome = await run_pipeline(
+            self._stages, envelope, StageContext(summary=summary, verdict=verdict)
+        )
+        if outcome.persist:
+            await self._candidates.put(outcome.envelope)
+        return "halt" if outcome.control == "halt" else "continue"
 
     async def _snapshot_evidence(
         self, candidate: ExtractedCandidate, summary: SessionSummary
     ) -> tuple[str, ...]:
+        """Snapshot a VALIDATED candidate's cited quotes (D51/D95)."""
+        return await self._snapshot_quotes(candidate.header.evidence, summary)
+
+    async def _snapshot_quotes(
+        self, evidence: tuple[EvidenceRef, ...], summary: SessionSummary
+    ) -> tuple[str, ...]:
         """Snapshot each cited evidence quote into `learning_audit` (D51/D95) and
         return the minted `evidence_ref`s. The entity-bearing quote lives ONLY in
-        the audit store; the candidate carries only the refs (D17)."""
+        the audit store; the candidate carries only the refs (D17).
+
+        Takes the CITATIONS rather than the candidate, because a fail-to-review row has
+        no `ExtractedCandidate` to take them off — it exists precisely because validation
+        did not produce one — and its citations still have to be auditable. One
+        implementation for both, so the audit record of a review item is the same record
+        a kept candidate gets, minted the same way, keyed the same way."""
         refs: list[str] = []
-        for ev in candidate.header.evidence:
+        for ev in evidence:
             ref = self._audit.mint_evidence_ref(summary.session_id)
             await self._audit.snapshot(
                 ref,
@@ -909,6 +1102,7 @@ class LearningConsumer:
         decline_reasons: tuple[str, ...],
         target_hints: tuple[str, ...],
         correction_count: int = 0,
+        review_count: int = 0,
         intent: str | None = None,
         slots: str | None = None,
         rationale: str | None = None,
@@ -925,6 +1119,7 @@ class LearningConsumer:
             decline_reasons=decline_reasons,
             target_hints=target_hints,
             correction_count=correction_count,
+            review_count=review_count,
             verbose=verbose,
             accepted_sql=_accepted_sql(summary) if verbose else None,
             intent=intent if verbose else None,

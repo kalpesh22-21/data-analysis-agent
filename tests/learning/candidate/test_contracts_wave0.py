@@ -76,6 +76,60 @@ def test_old_s3_doc_without_new_keys_still_parses():
     parsed = CandidateEnvelope.from_doc(doc)
     assert parsed.dedup is None
     assert parsed.drift == DriftStamp()
+    # The fail-to-review stamps are absent from every doc written before that slice, and
+    # ABSENT is the load-bearing value: their presence is what marks a row as a form to
+    # complete (`writer/routing.py::derive_inbox_reason` keys on it), so an old doc that
+    # read back with an empty block would put a task in front of a reviewer that nobody
+    # ever recorded.
+    assert "decline" not in doc and "revalidation" not in doc
+    assert parsed.decline is None
+    assert parsed.revalidation is None
+
+
+def test_the_fail_to_review_stamps_round_trip_and_normalize_rather_than_raise():
+    """Both new fields follow the store's rule: emitted only when set, and a MALFORMED
+    stored value reads as ABSENT rather than raising inside a queue worker or an inbox
+    projection. The snapshot in particular must read as missing rather than as empty —
+    an empty `sql_by_ref` would make every re-validation decline `unrewritable_sql`, a
+    misdiagnosis blaming the model's SQL for a storage fault."""
+    from data_agent.learning.candidate.decline import (
+        DeclineBlock,
+        EvidencePointer,
+        ValidationSnapshot,
+    )
+
+    env = _base_envelope(
+        status=CandidateStatus.NEEDS_PARAMETERIZATION,
+        decline=DeclineBlock(
+            reason="totality_violation",
+            detail="two predicates have no entry",
+            corrections_attempted=2,
+            correction_history=("first", "second"),
+        ),
+        revalidation=ValidationSnapshot(
+            session_id="sess-1",
+            user_id="user-1",
+            trace_id="trace-1",
+            content_hash="hash-x",
+            accepted_signal="no_correction",
+            sql_by_ref={"tc1": ("SELECT 1 WHERE a = 'b'",)},
+            evidence=(EvidencePointer(turn_ref=0, tool_call_ref="tc1"),),
+        ),
+    )
+    assert CandidateEnvelope.from_doc(env.to_doc()) == env
+
+    junk = env.to_doc()
+    junk["decline"] = "totality_violation"  # a string where the block belongs
+    junk["revalidation"] = ["tc1"]
+    parsed = CandidateEnvelope.from_doc(junk)
+    assert parsed.decline is None
+    assert parsed.revalidation is None
+
+    # A block with no reason is not a decline anyone can act on, so it reads as absent
+    # too — the same rule, applied to the field that carries the meaning.
+    reasonless = env.to_doc()
+    reasonless["decline"] = {"detail": "something happened"}
+    assert CandidateEnvelope.from_doc(reasonless).decline is None
 
 
 # --- each stage's field round-trips with the OTHER fields at default ----------

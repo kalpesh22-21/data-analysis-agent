@@ -17,6 +17,7 @@ Slug: PA-inbox-service-stamps-terminal-artifacts.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -61,6 +62,11 @@ def full_plane(monkeypatch):
         learning_drift_freshness_seconds = 86_400.0
         learning_replay_recheck_interval_seconds = 43_200.0
         learning_review_score_cutoff = 0.0
+        # The fail-to-review completion plane re-runs the write-router stages, so this
+        # stub must model the dedup bands the composition root reads. Shipped defaults.
+        learning_dedup_merge_threshold = 0.95
+        learning_dedup_conflict_threshold = 0.83
+        learning_recurrence_similarity_threshold = 0.90
 
     class _Runtime:
         mcp_url = "http://mcp"
@@ -79,6 +85,17 @@ def full_plane(monkeypatch):
         embedding_api_key = ""
         embedding_model = "all-mpnet-base-v2"
         embedding_timeout_seconds = 10.0
+
+        # The fail-to-review completion plane grounds itself in the SAME frozen catalog
+        # export the consumer reads, so this double models the resolver the real settings
+        # expose. Pointed at the committed fixture (not a stub path) so the service builds
+        # a REAL completer here — a double that returned nothing would make this fixture
+        # exercise the fail-open branch and quietly stop covering the wiring.
+        @staticmethod
+        def catalog_fixture_file():
+            return (
+                Path(__file__).resolve().parents[2] / "fixtures" / "catalog_export.json"
+            )
 
     import data_agent.learning.config as learning_config
     import data_agent.runtime.config as runtime_config

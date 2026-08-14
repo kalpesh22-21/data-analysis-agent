@@ -311,6 +311,20 @@ def extract_stub_span(
     )
 
 
+def _extract_outcome(candidate_count: int, review_count: int) -> str:
+    """The extract span's three-way outcome.
+
+    ORDER MATTERS: a session that both extracted a candidate and parked a declined
+    sibling for review reads as `extracted`, because the question this label answers is
+    "did the loop produce anything?" and the answer is yes. `review_count` is on the same
+    span for the sessions where it did not."""
+    if candidate_count:
+        return "extracted"
+    if review_count:
+        return "declined_to_review"
+    return "declined"
+
+
 def extract_span(
     tracer: Tracer,
     *,
@@ -320,6 +334,7 @@ def extract_span(
     decline_reasons: tuple[str, ...] = (),
     target_hints: tuple[str, ...] = (),
     correction_count: int = 0,
+    review_count: int = 0,
     verbose: bool = False,
     accepted_sql: str | None = None,
     intent: str | None = None,
@@ -353,11 +368,22 @@ def extract_span(
     of the analyst's own query. It is gated with `accepted_sql`, alongside which it adds
     no new class of content; `consumer.py::_decline_details` owns that argument and the
     bounding. A session that produced nothing and says nothing about why is the exact
-    hole this attribute closes."""
+    hole this attribute closes.
+
+    `review_count` is the fail-to-review candidates this extraction PERSISTED for a
+    human to complete (`docs/decisions/learning-declined-candidate-review.md`), and it is
+    its own number for the reason the decision doc gives: it measures how often the
+    parameterization form turns out to be unfillable, which is exactly the quantity that
+    disappears if it is folded into `candidate_count`. So `candidate_count` stays 0 on
+    these sessions — nothing was extracted — and the third `outcome` value is what makes
+    the two kinds of "declined" separable in a group-by. The reason codes are UNCHANGED
+    and still appear in `decline_reasons`, so every existing Phoenix query keeps working
+    and simply gains a way to split the outcome it was already counting."""
     attrs: dict[str, Any] = {
         "session.id": session_id,
-        "learning.extract.outcome": "extracted" if candidate_count else "declined",
+        "learning.extract.outcome": _extract_outcome(candidate_count, review_count),
         "learning.extract.candidate_count": candidate_count,
+        "learning.extract.review_count": review_count,
         "learning.extract.decline_count": decline_count,
         "learning.extract.decline_reasons": ",".join(decline_reasons),
         "learning.extract.target_hints": ",".join(target_hints),

@@ -26,11 +26,13 @@ Run:
 
 from __future__ import annotations
 
+import json
 import os
 import urllib.parse
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -86,11 +88,21 @@ UPLOAD_MAX_BYTES = int(os.environ.get("UPLOAD_MAX_BYTES", str(8 * 1024 * 1024)))
 # gated OFF unless REVIEW_INBOX_ENABLED=1 (mirrors UI_TEST_AFFORDANCES).
 INBOX_SERVICE_URL = os.environ.get("INBOX_SERVICE_URL", "http://localhost:8100")
 REVIEWER_TOKEN = os.environ.get("REVIEWER_TOKEN", "")
-_INBOX_ACTIONS = frozenset({"approve", "reject", "retract"})
+# `complete` is the fail-to-review action (the reviewer fills in the missing
+# parameterization entries); it is the ONLY one that carries a request body.
+_INBOX_ACTIONS = frozenset({"approve", "reject", "retract", "complete"})
 # The only `?status=` values the list surface accepts (ui-inbox-type-archive contract
-# §List API): the live review queue and the durable rejected archive. Anything else is
-# rejected at the BFF (400, not proxied); the inbox service validates it again.
-_INBOX_LIST_STATUSES = frozenset({"in_review", "rejected"})
+# §List API): the live review queue, the durable rejected archive, and the fail-to-review
+# work list. Anything else is rejected at the BFF (400, not proxied); the inbox service
+# validates it again.
+_INBOX_LIST_STATUSES = frozenset({"in_review", "rejected", "needs_parameterization"})
+# Cap on the ONE inbox body the BFF forwards (the `complete` action's parameterization
+# entries). Small on purpose and separate from `UPLOAD_MAX_BYTES`: this is a form a human
+# types, and the largest legitimate one is a few dozen JSON objects. The reviewer is
+# authenticated and the surface is internal, so this is not a defence against an
+# adversary — it is the same rule the upload route already follows, that no request may
+# make the BFF buffer an unbounded amount of memory on a caller's say-so.
+INBOX_BODY_MAX_BYTES = int(os.environ.get("INBOX_BODY_MAX_BYTES", str(256 * 1024)))
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _INDEX_HTML = _STATIC_DIR / "index.html"
@@ -395,18 +407,46 @@ def _require_inbox_enabled() -> None:
         raise HTTPException(status_code=404, detail="Not found.")
 
 
-async def _proxy_inbox(method: str, path: str) -> JSONResponse:
+async def _read_bounded_body(request: Request, cap: int) -> bytes | None:
+    """The request body, or `None` when it exceeds *cap*.
+
+    Streamed rather than `await request.body()`, for the reason the upload route already
+    documents: `body()` buffers an unbounded amount for a chunked (no-`Content-Length`)
+    request, so the cap has to be enforced WHILE reading, not after. The header check
+    first is only a cheap early exit for the honest client."""
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > cap:
+        return None
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > cap:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _proxy_inbox(
+    method: str, path: str, json_body: Any | None = None
+) -> JSONResponse:
     """Proxy a JSON (non-streaming) inbox request to the inbox service, attaching the
     server-held `X-Reviewer-Token` on the hop (the browser never sees it — same
     pattern as the TOKEN_ISSUER_API_KEY the mint uses). The service's status code +
     JSON body are propagated as-is so a `4xx`/`5xx` (unknown id, illegal transition,
     landing-plane `503`) reaches the browser's error branch unchanged. A JSON,
-    non-streaming sibling of `_proxy_stream`."""
+    non-streaming sibling of `_proxy_stream`.
+
+    *json_body* is forwarded VERBATIM when present (the fail-to-review `complete`
+    action's parameterization entries). The BFF does not inspect or reshape it: the
+    inbox service validates it, and behind it the extractor's own readers do — a second
+    schema here would be a second vocabulary for the same mistake, and the one that
+    names the fix is the one furthest down."""
     headers = {"X-Reviewer-Token": REVIEWER_TOKEN}
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.request(
-                method, f"{INBOX_SERVICE_URL}{path}", headers=headers
+                method, f"{INBOX_SERVICE_URL}{path}", headers=headers, json=json_body
             )
         except httpx.HTTPError as exc:
             raise HTTPException(
@@ -442,7 +482,11 @@ async def inbox_list(status: str | None = None) -> JSONResponse:
         return await _proxy_inbox("GET", "/inbox")
     if status not in _INBOX_LIST_STATUSES:
         raise HTTPException(
-            status_code=400, detail="status must be one of {'in_review', 'rejected'}."
+            status_code=400,
+            detail=(
+                "status must be one of {'in_review', 'rejected', "
+                "'needs_parameterization'}."
+            ),
         )
     query = urllib.parse.urlencode({"status": status})
     return await _proxy_inbox("GET", f"/inbox?{query}")
@@ -455,15 +499,35 @@ async def inbox_health() -> JSONResponse:
 
 
 @app.post("/api/inbox/{candidate_id}/{action}")
-async def inbox_action(candidate_id: str, action: str) -> JSONResponse:
+async def inbox_action(
+    candidate_id: str, action: str, request: Request
+) -> JSONResponse:
     _require_inbox_enabled()
     if action not in _INBOX_ACTIONS:
         raise HTTPException(status_code=404, detail="Not found.")
+    # Only `complete` carries a body. Read it here rather than typing it: the shape is
+    # the inbox service's contract (and, under it, the extractor's readers), and a model
+    # here would reject reviewer input with a message that names no fix. What IS enforced
+    # here is the size, because that is the BFF's own resource and nobody downstream can
+    # give it back.
+    body: Any | None = None
+    if action == "complete":
+        raw = await _read_bounded_body(request, INBOX_BODY_MAX_BYTES)
+        if raw is None:
+            raise HTTPException(
+                status_code=413, detail="Completion body exceeds the maximum allowed size."
+            )
+        try:
+            body = json.loads(raw) if raw else None
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="complete requires a JSON body."
+            ) from None
     # Percent-encode the decoded id before re-interpolating it into the upstream path
     # (candidate ids carry `::` and could carry other reserved chars) so it is passed as
     # a single, unambiguous path segment — never able to inject extra path structure.
     safe_id = urllib.parse.quote(candidate_id, safe="")
-    return await _proxy_inbox("POST", f"/inbox/{safe_id}/{action}")
+    return await _proxy_inbox("POST", f"/inbox/{safe_id}/{action}", body)
 
 
 # --- upload BFF (UI Slice 4, §4) ---------------------------------------------

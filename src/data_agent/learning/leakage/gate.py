@@ -167,6 +167,34 @@ class LeakageGateStage:
         if env.type not in _GLOBAL_TYPES:
             return StageResult(envelope=env, control="continue")
 
+        verdict, text_by_field = await self.scan(env)
+        return await self._apply(env, ctx, verdict, text_by_field)
+
+    async def scan(
+        self, env: CandidateEnvelope
+    ) -> tuple[LeakageVerdict, dict[str, str]]:
+        """SCAN ONLY: both layers, the decision, the span — and NOTHING that writes.
+
+        Split out of `process` because a second caller needs the verdict WITHOUT the
+        consequences (`consumer.py::_scan_declined` and `inbox/completion.py`, which stamp
+        a settled verdict on a candidate that has not passed validation and is not flowing
+        toward a landing). The split is a refactor, not a new policy: `process` is this
+        method plus `_apply`, so the two callers cannot drift about what a leak IS —
+        which is the whole reason the declined path runs the WIRED gate instead of
+        assembling its own scanner.
+
+        WHY IT MATTERS THAT THIS ONE IS PURE. `_apply` has a side effect: a `reroute`
+        verdict COMMITS a per-user knowledge record (`_commit_user_fact`). On the
+        validated path that is the gate doing its job — the fact was lifted from a
+        candidate that passed every check. On the DECLINED path the same call would
+        commit a per-user fact scraped out of a candidate that failed validation and may
+        never be completed or may be rejected outright, and nothing would ever retract
+        it. So the declined path takes the verdict and leaves the consequences here.
+
+        `env.type` is NOT re-checked: the caller is either `process` (which checked) or a
+        caller that wants a verdict for a global candidate it already knows the type of.
+        A non-global type simply scans no fields and comes back `pass`, which is the same
+        answer `process` gives by skipping."""
         text_by_field = _scanned_fields(env.type, env.payload)
         regex_hits = entities.scan_fields(text_by_field)
 
@@ -198,8 +226,7 @@ class LeakageGateStage:
                 scanner=scanner_label,
             ):
                 pass
-
-        return await self._apply(env, ctx, verdict, text_by_field)
+        return verdict, text_by_field
 
     @staticmethod
     def _decide(
@@ -282,6 +309,45 @@ class LeakageGateStage:
             evidence_refs=env.evidence_refs,
         )
         await self.user_store.commit(record)
+
+
+# The S3 sentinel a candidate carries before the gate has settled anything. Written here
+# rather than at each caller so "unsettled" has one spelling: every downstream guard
+# (`writer/routing.py::_entity_scan_unsettled`, `promotion/scheduler.py::
+# _entity_scan_is_actionable`, `inbox/models.py::_leakage_cleared`) fails CLOSED on it.
+PENDING_ENTITY_SCAN: dict = {
+    "result": "pending",
+    "hits": [],
+    "self_check_contains_entities": False,
+}
+
+
+async def settle_entity_scan(
+    stages: tuple, env: CandidateEnvelope, ctx: StageContext
+) -> dict:
+    """Return the `entity_scan` doc for an envelope on a NON-LANDING path: the wired
+    gate's settled verdict, or the `pending` sentinel when no gate is wired.
+
+    THE ONE PLACE the two non-landing callers share, so the rule cannot fork:
+    `consumer.py::_persist_declined_for_review` (a decline being parked for review) and
+    `inbox/completion.py::_still_declined` (a reviewer's merged payload going back into
+    the queue). Both stamp a verdict on a candidate that has NOT passed validation, so
+    both need the gate's judgement and neither may have its consequences — see
+    `LeakageGateStage.scan`.
+
+    The gate is found by `stage_id` in the pipeline the caller was BUILT with, never
+    constructed here: a privately-built scanner would be a second definition of what a
+    leak is, and the two would drift on the first threshold change.
+
+    NO GATE WIRED ⇒ the sentinel, deliberately, and never a fabricated `pass`. The
+    resulting row is degraded — its decline detail is withheld at the wire and it can be
+    approved by nobody — which is the correct shape for a deployment that scanned
+    nothing, and is loudly logged by the caller."""
+    stage = next((s for s in stages if getattr(s, "stage_id", "") == "leakage"), None)
+    if stage is None:
+        return dict(PENDING_ENTITY_SCAN)
+    verdict, _text_by_field = await stage.scan(env)
+    return verdict.to_doc()
 
 
 def _dedup_hits(hits: tuple[EntityHit, ...]) -> tuple[EntityHit, ...]:

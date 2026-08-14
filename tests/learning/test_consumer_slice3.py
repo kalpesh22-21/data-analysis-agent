@@ -117,6 +117,14 @@ async def test_persistent_mismatch_dead_letters_not_false_done(store, queue, set
 
 
 async def test_decline_completes_done_not_dead_letter(store, queue, settings, seed_session):
+    """A MERIT-FAILED decline writes nothing, and the session still completes.
+
+    `no_evidence` is the D31 primary guard: the candidate cited nothing, so there is no
+    artifact to review and nothing a human could complete. This is the behaviour the
+    fail-to-review slice deliberately left alone — only a merit-PASSED decline whose
+    parameterization form could not be filled in becomes a durable review item
+    (`test_consumer_fail_to_review.py`), and it takes a `proceeded` judge verdict to get
+    there. Neither holds here: no judge screened this session at all."""
     audit = InMemoryAuditStore()
     candidates = InMemoryCandidateStore()
     summary = make_summary(session_id="sess-1")
@@ -132,7 +140,7 @@ async def test_decline_completes_done_not_dead_letter(store, queue, settings, se
     assert result.done == 1
     assert result.dead_letters == 0
     assert store._docs["sess-1"].learning_status == LearningStatus.DONE
-    # A declined candidate is never snapshotted or persisted.
+    # A merit-failed declined candidate is never snapshotted or persisted.
     assert audit.snapshot_calls == 0
     assert candidates.put_calls == 0
 

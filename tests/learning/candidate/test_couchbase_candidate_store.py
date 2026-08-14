@@ -98,6 +98,13 @@ async def test_put_terminal_status_writes_with_no_ttl(status):
         CandidateStatus.CANDIDATE,
         CandidateStatus.IN_REVIEW,
         CandidateStatus.QUARANTINED,
+        # DELIBERATELY on the transient side, and it is a decided tradeoff rather than an
+        # omission: a fail-to-review item nobody completes within the TTL expires, and
+        # the blueprint it would have become is lost again. It sits here because it is
+        # the same kind of thing as `in_review` — an unfinished work item, not a settled
+        # record — and a queue nobody drains in 90 days is a staffing signal, not a
+        # reason to make one row immortal. See `_TERMINAL_STATUSES`.
+        CandidateStatus.NEEDS_PARAMETERIZATION,
     ],
 )
 async def test_put_transient_status_keeps_candidate_ttl(status):

@@ -282,8 +282,18 @@ class ExtractedCandidate:
 
 @dataclass(frozen=True)
 class Decline:
-    """A candidate the extractor rejected before emit (never persisted), with the
-    reason code the consumer traces (fail-to-review / no-evidence / totality / …).
+    """A candidate the extractor rejected before emit, with the reason code the
+    consumer traces (fail-to-review / no-evidence / totality / …).
+
+    MOSTLY not persisted — and the exception is the whole point of the one field that
+    carries content. A decline whose reason says the candidate was WRONG (no evidence,
+    no acceptance, un-parseable SQL) is supposed to die here: it names no artifact worth
+    keeping. A decline that says the FORM COULD NOT BE FILLED IN is different in kind,
+    because the artifact behind it may be one the corpus demonstrably wants — and the
+    live case that forced this said so three times over, then evaporated three times
+    (`docs/decisions/learning-declined-candidate-review.md`). `consumer.py` routes that
+    narrow class to the candidate store for a human to complete; every other reason keeps
+    the old behaviour exactly.
 
     `correctable` splits the two kinds apart. A CORRECTABLE decline is one whose fix the
     extractor can NAME: a reader failed and `detail` says which field and what shape, or
@@ -309,6 +319,22 @@ class Decline:
     correctable: bool = False
     corrections_attempted: int = 0
     correction_history: tuple[str, ...] = ()
+    # The RAW candidate envelope this decline was judged on — the model's LAST attempt,
+    # verbatim, as `parse_candidates` read it out of the tool call.
+    #
+    # Present ONLY for a decline that survived correction (`extractor.py::_finish` pairs
+    # it by the emitted array's index); every other decline carries `None`, including a
+    # substantive one from the same batch, because a candidate that was never re-asked
+    # has no "last attempt" distinct from its first and nothing downstream may treat the
+    # two as interchangeable.
+    #
+    # UNVALIDATED BY CONSTRUCTION: it is exactly the JSON that FAILED validation, so
+    # every reader normalizes rather than trusts (`candidate/models.py::
+    # build_declined_envelope` is the only one today). It is kept whole rather than
+    # narrowed to `payload` because the fields outside it — confidence, proposed_action,
+    # depends_on — are what a review item needs to render as a candidate rather than as
+    # a fragment.
+    raw_payload: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

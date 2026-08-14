@@ -8,8 +8,14 @@ caller-driven transitions in the write router:
     approve  → in_review → validated   (knowledge becomes retrievable; blueprint
                                          confirmed; schema_edit opens the D53 PR — the
                                          human MERGE is the real gate, out of scope here)
-    reject   → in_review → rejected     (archived as a NEGATIVE training signal — D29;
+    reject   → in_review | needs_parameterization → rejected
+                                        (archived as a NEGATIVE training signal — D29;
                                          NOT a delete: the row stays for the S9 learner)
+    complete → needs_parameterization → extracted → (the write router decides)
+                                        (fail-to-review: the human fills in the missing
+                                         parameterization entries and the candidate
+                                         RE-VALIDATES and re-runs the pipeline — no
+                                         bypass; see `completion.py`)
     retract  → validated → retired      (a post-promotion pull-from-index; the physical
                                          index removal + D25 exposure trace are S10, §11.4)
     verify   → validated → validated    (Phase-3: flip `verified=true` on the landed node
@@ -43,6 +49,7 @@ from ..candidate.store import CandidateStore
 from ..promotion.mcp_export import PromotionEmit, build_promotion_emit
 from ..promotion.models import ProbeResult, PromotionPolicy
 from ..promotion.scheduler import PromotionScheduler
+from .completion import CompletionResult, ParameterizationCompleter
 from .models import InboxItem
 from .ranking import rank_key
 
@@ -82,8 +89,16 @@ class ReviewInbox:
         *,
         scheduler: PromotionScheduler | None = None,
         policy: PromotionPolicy | None = None,
+        completer: ParameterizationCompleter | None = None,
     ) -> None:
         self._store = store
+        # The fail-to-review completion plane. OPTIONAL and default-absent, so an inbox
+        # built without one behaves exactly as it did before the slice — except that a
+        # completion attempt is refused LOUDLY (503) instead of silently doing nothing.
+        # It is not folded into the scheduler: the scheduler owns transitions of a
+        # candidate that already passed validation, and this one owns re-running the
+        # validation itself.
+        self._completer = completer
         # The SINGLE approve/reject implementation (R4). Defaulted for an unwired
         # inbox; production injects the wired scheduler.
         self._scheduler = scheduler or PromotionScheduler(
@@ -132,6 +147,11 @@ class ReviewInbox:
           * `validated` is the Phase-3 verify/promote worklist. Its rows have already been
             through a human once; "is this worth thirty seconds" is not the question being
             asked of them.
+          * `needs_parameterization` is a WORK list, not a judgement queue. Every row on
+            it has already been ruled worth extracting (that is the entry condition), so
+            ranking them by how worth-reviewing they look would sort on a question that
+            was answered before they were written, and a cutoff would hide work a machine
+            already said should be done.
 
         **The LIMIT is applied by the store, BEFORE the ranking**, and that is a real
         limitation rather than an oversight: the ranking inputs live inside the candidate
@@ -221,12 +241,73 @@ class ReviewInbox:
         return await self._store.get(candidate_id)
 
     async def reject(self, candidate_id: str) -> CandidateEnvelope:
-        """Human reject: `in_review → rejected`. A NEGATIVE signal, NOT a delete —
-        the row is retained for the S9 learner (D29). Delegates to the single path."""
-        await self._require(candidate_id, CandidateStatus.IN_REVIEW)
-        env = await self._store.get(candidate_id)
+        """Human reject: `in_review | needs_parameterization → rejected`. A NEGATIVE
+        signal, NOT a delete — the row is retained for the S9 learner (D29). Delegates to
+        the single path.
+
+        `needs_parameterization` is accepted for the reason the scheduler already states
+        about reject in general: it writes no content, so gating it would leave a row with
+        NO terminal action at all — completable only by a human who may have decided the
+        form has no honest answer, and otherwise clearable only by waiting out a 90-day
+        TTL. A queue whose rows cannot be cleared stops being read.
+
+        RACE, stated because it is real and unclosed here: the guard reads the envelope
+        and `apply_human_decision` writes it back, so a completion that finishes in
+        between is overwritten by this reject. That direction is the SAFE one — the
+        human's "no" wins over a machine's re-validation, and nothing lands — where the
+        opposite direction (a completion resurrecting a rejected row) is refused by
+        `completion.py::_guarded_put`. Both windows only close properly with a CAS on the
+        candidate store, which the port does not have; that is a store change, not an
+        inbox one."""
+        env = await self._require_one_of(
+            candidate_id,
+            (CandidateStatus.IN_REVIEW, CandidateStatus.NEEDS_PARAMETERIZATION),
+        )
         await self._scheduler.apply_human_decision(env, "reject")
         return await self._store.get(candidate_id)
+
+    async def _require_one_of(
+        self, candidate_id: str, expected: tuple[str, ...]
+    ) -> CandidateEnvelope:
+        env = await self._store.get(candidate_id)
+        if env is None:
+            raise InboxTransitionError(f"candidate {candidate_id!r} not found")
+        if env.status not in expected:
+            raise InboxTransitionError(
+                f"candidate {candidate_id!r} is {env.status!r}, expected one of "
+                f"{sorted(expected)!r}"
+            )
+        return env
+
+    async def complete_parameterization(
+        self,
+        candidate_id: str,
+        *,
+        entries: list,
+        replace_all: bool = False,
+    ) -> CompletionResult:
+        """FILL IN the form of a `needs_parameterization` candidate and put it back
+        through the pipeline (`docs/decisions/learning-declined-candidate-review.md` §4).
+
+        Guarded on `needs_parameterization` specifically — NOT on `in_review` — so this
+        can never be used as a second, unvalidated route into an ordinary review item's
+        payload. Approve is guarded the other way round (`in_review` only), so the two
+        surfaces cannot be crossed: nobody approves a form that has not been completed,
+        and nobody rewrites the payload of a candidate awaiting judgement.
+
+        Returns the `CompletionResult` rather than an envelope, because "the form is
+        still incomplete" is an outcome the caller must be able to SHOW, not an error to
+        map to a status code."""
+        env = await self._require(candidate_id, CandidateStatus.NEEDS_PARAMETERIZATION)
+        if self._completer is None:
+            raise InboxTransitionError(
+                f"completion_unavailable: no validation plane is wired for "
+                f"{candidate_id!r}, so the completed parameterization cannot be "
+                "re-validated against the accepted SQL"
+            )
+        return await self._completer.complete(
+            env, entries=entries, replace_all=replace_all
+        )
 
     async def retract(self, candidate_id: str) -> CandidateEnvelope:
         """Retract a promoted artifact: `validated → retired` (a leak/drift pull).

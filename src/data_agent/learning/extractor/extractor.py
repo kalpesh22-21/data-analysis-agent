@@ -423,6 +423,12 @@ class LearningExtractor:
         settled: list[Decline] = []  # substantive — judged on content, never re-asked
         pending: list[tuple[int, Decline]] = []  # correctable declines from the LAST batch
         history: list[str] = []  # the correction messages already sent, in order
+        # The LAST batch the model emitted, in its emitted order — which is what makes
+        # `pending`'s indices resolvable to the payload each decline was judged on. Bound
+        # before the loop so both `_finish` call sites can read it: the second one is
+        # reached only after a correction (hence after a parse), but a name that exists
+        # on one path and not the other is a trap for the next edit, not a saving.
+        raw_candidates: list[dict] = []
 
         while attempts_left > 0:
             tools = [build_extractor_tool()]
@@ -488,7 +494,7 @@ class LearningExtractor:
                 )
                 continue
 
-            return _finish(kept, settled, pending, history, summary)
+            return _finish(kept, settled, pending, history, summary, raw_candidates)
 
         if history:
             # See ONE ASYMMETRY above: a correction was issued and the model then
@@ -499,7 +505,7 @@ class LearningExtractor:
                 "%d correction(s) — returning the %d candidate(s) already validated",
                 summary.session_id, len(history), len(kept),
             )
-            return _finish(kept, settled, pending, history, summary)
+            return _finish(kept, settled, pending, history, summary, raw_candidates)
         assert last_exc is not None
         raise last_exc
 
@@ -599,23 +605,43 @@ def _finish(
     pending: list[tuple[int, Decline]],
     history: list[str],
     summary: SessionSummary,
+    raw_candidates: list[dict],
 ) -> ExtractionResult:
-    """Assemble the result, stamping the correction record onto the declines that
-    SURVIVED correction.
+    """Assemble the result, stamping the correction record — and the payload it was
+    judged on — onto the declines that SURVIVED correction.
 
     Only *pending* is stamped. A substantive decline was never re-asked and must not
     look as though it was; a correctable decline that outlived the budget must carry the
     count and the messages, so a human reading the inbox can tell "the model could not
     produce a valid candidate" from "the model was never asked twice" — and so the
     second reading is impossible to reach by accident, since a zero on a correctable
-    decline now means the budget was disabled or already spent elsewhere."""
+    decline now means the budget was disabled or already spent elsewhere.
+
+    THE PAYLOAD IS STAMPED HERE, at the one place that holds both halves. `pending`
+    carries each decline's index into the array the model LAST emitted, and that pairing
+    exists nowhere else — `ExtractionResult` has never carried the raw output, and by the
+    time the consumer sees a decline the batch is gone. Stamping it in `_finish` also
+    covers both exits from the turn loop, including the one where the model stopped
+    returning parseable calls after a correction (the asymmetry documented in
+    `_drive_turns`), which is exactly the run whose last attempt is most worth keeping.
+
+    Index-bounded rather than assumed: `pending` and *raw_candidates* come from the same
+    batch by construction, but an out-of-range index would be a crash in a queue worker,
+    and the honest degrade (a decline with no payload — the pre-slice shape) costs a
+    review item, not a session."""
     corrected = [
         replace(
             decline,
             corrections_attempted=len(history),
             correction_history=tuple(history),
+            raw_payload=(
+                dict(raw_candidates[index])
+                if 0 <= index < len(raw_candidates)
+                and isinstance(raw_candidates[index], dict)
+                else None
+            ),
         )
-        for _index, decline in pending
+        for index, decline in pending
     ]
     if corrected and history:
         # The FIRST LINE of each detail, not the whole thing. Every message is one line

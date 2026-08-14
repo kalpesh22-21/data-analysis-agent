@@ -49,6 +49,13 @@ from data_agent.runtime.blueprint.models import BlueprintParseError
 from ..candidate.memory_candidate_store import InMemoryCandidateStore
 from ..candidate.models import CandidateStatus
 from ..promotion.scheduler import PromotionScheduler
+from .completion import (
+    CompletionInputError,
+    CompletionRaceError,
+    CompletionResult,
+    CompletionUnavailableError,
+    ParameterizationCompleter,
+)
 from .inbox import InboxTransitionError, ReviewInbox, _NoOpProbe, _ZeroHitCounts
 from .models import InboxItem
 
@@ -63,21 +70,45 @@ class PromoteRequest(BaseModel):
     doc_id: str | None = None
     title: str | None = None
 
+
+class CompleteParameterizationRequest(BaseModel):
+    """The fail-to-review COMPLETE body (`docs/decisions/
+    learning-declined-candidate-review.md` §4).
+
+    `entries` is the parameterization the reviewer wrote: appended to what the model
+    already produced by default (the `totality_violation` case — entries are missing), or
+    REPLACING the whole array with `replace=true` (the `rule_predicate_mismatch` case — an
+    entry is wrong and no append can fix it).
+
+    Typed as loosely as the payload it becomes: every entry goes through the SAME readers
+    and the SAME D97 totality walk as model output, so validating its shape twice — once
+    in pydantic, once in `extractor/validation.py` — would give the reviewer two different
+    error vocabularies for one mistake, and only one of them names the fix."""
+
+    entries: list[dict[str, Any]] = []
+    replace: bool = False
+
 _logger = logging.getLogger(__name__)
 
 WritePlaneMode = Literal["full", "offline"]
 
 # The statuses the list surface exposes: the live review queue, the durable rejected
-# archive, and (Phase-3) the VALIDATED set of auto-landed learning nodes awaiting a
-# human verify/promote. Every validated candidate in the store is `source='learning'`
-# by construction (the MCP canon never enters `learning_candidates`), so `status=
-# validated` IS the promotable-learning listing. Any other value is a 400 — the inbox
-# never lets a caller enumerate arbitrary lifecycle states.
+# archive, (Phase-3) the VALIDATED set of auto-landed learning nodes awaiting a
+# human verify/promote, and the fail-to-review work list. Every validated candidate in
+# the store is `source='learning'` by construction (the MCP canon never enters
+# `learning_candidates`), so `status=validated` IS the promotable-learning listing. Any
+# other value is a 400 — the inbox never lets a caller enumerate arbitrary lifecycle
+# states.
+#
+# `needs_parameterization` is a candidate the judge passed on merit whose
+# parameterization form could not be filled in; its rows are completed, not adjudicated
+# (`docs/decisions/learning-declined-candidate-review.md`).
 _LISTABLE_STATUSES = frozenset(
     {
         CandidateStatus.IN_REVIEW,
         CandidateStatus.REJECTED,
         CandidateStatus.VALIDATED,
+        CandidateStatus.NEEDS_PARAMETERIZATION,
     }
 )
 
@@ -120,6 +151,12 @@ def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
         # `*_measured` distinguishes a real zero from an absent stamp; the UI is expected
         # to render an unmeasured axis as unknown rather than as a low score.
         "score": item.score.to_doc(),
+        # Fail-to-review only (null on every other row): the decline the reviewer is being
+        # asked to fix. The DETAIL — which names predicates and their literal values — is
+        # carried only when the persisted leakage verdict is a clean `pass`;
+        # `InboxItem.decline_view` owns that rule and states why the wire surface is
+        # narrower than the store.
+        "decline": item.decline_view(),
     }
 
 
@@ -132,6 +169,25 @@ def _action_result(env: Any) -> dict[str, Any]:
         "type": env.type,
         "status": env.status,
         "reason": None,
+    }
+
+
+def _completion_result(result: CompletionResult) -> dict[str, Any]:
+    """The fail-to-review COMPLETE response.
+
+    Carries the same four `ActionResult` fields every other action returns, plus the
+    `outcome` the caller branches on and — when the form is still incomplete — the fresh
+    decline. The decline is projected through the SAME `InboxItem` rule that governs the
+    list surface, so the withholding of an entity-bearing detail cannot differ between
+    the row a reviewer is reading and the response to the edit they just made."""
+    item = InboxItem.from_envelope(result.envelope)
+    return {
+        "candidate_id": result.envelope.candidate_id,
+        "type": result.envelope.type,
+        "status": result.envelope.status,
+        "reason": None,
+        "outcome": result.outcome,
+        "decline": item.decline_view(),
     }
 
 
@@ -153,10 +209,83 @@ def _map_transition_error(exc: InboxTransitionError) -> HTTPException:
     # landing-plane outage (e.g. neo4j down) — BOTH are infra, not reviewer, errors.
     if "landing_unavailable" in message or "landing_failed" in message:
         return HTTPException(status_code=503, detail="landing plane unavailable")
+    # Same class, different plane: this deployment cannot RE-VALIDATE a completed
+    # parameterization (no catalog / no pipeline wired), which is infra missing, not a
+    # reviewer mistake. 503 so the page says "unavailable here" rather than implying the
+    # form was wrong.
+    if "completion_unavailable" in message:
+        return HTTPException(
+            status_code=503, detail="parameterization completion unavailable"
+        )
     return HTTPException(status_code=409, detail=message)
 
 
 # --- default (env-driven) construction ---------------------------------------
+
+
+def _build_completer(
+    learning_settings: Any,
+    runtime_settings: Any,
+    *,
+    candidate_store: Any,
+    corpus: Any,
+    embedding_client: Any,
+) -> ParameterizationCompleter | None:
+    """Build the fail-to-review completion plane, or `None` when the catalog cannot be
+    read.
+
+    THE CATALOG COMES FROM THE SAME PLACE THE CONSUMER'S DOES — the frozen
+    `GET /catalog/export` snapshot (`RuntimeSettings.catalog_fixture_file()`,
+    overridable with `CATALOG_FIXTURE_PATH`) — and that is the load-bearing detail. The
+    completer re-runs the extractor's own validation, so its `known_rules` / `rule_index`
+    must be the SAME grounding the extraction was judged against: a completer holding a
+    different catalog would accept rule ids the extractor could not, or decline ones it
+    would have taken, and the review queue and the loop would be arguing about which
+    rules the deployment has.
+
+    FAIL-OPEN on a missing/unreadable snapshot: no completer, and a completion attempt
+    answers 503 ("unavailable in this deployment") instead of re-validating against an
+    empty catalog — which would decline every rule-role entry a reviewer wrote and blame
+    them for it. Logged loudly, because a reviewer facing that 503 has no other way to
+    learn the cause."""
+    import json
+
+    from ..extractor.grounding import known_rule_ids_from_catalog, rule_index_from_catalog
+    from ..factory import build_write_router_stages
+
+    try:
+        path = runtime_settings.catalog_fixture_file()
+        with path.open(encoding="utf-8") as fh:
+            catalog = json.load(fh)["catalog"]
+    except (OSError, ValueError, KeyError, TypeError):
+        _logger.warning(
+            "inbox service: the semantic catalog snapshot could not be read, so "
+            "fail-to-review COMPLETION is disabled (every attempt 503s). It must be the "
+            "SAME catalog the extractor is grounded against — point CATALOG_FIXTURE_PATH "
+            "at a GET /catalog/export dump.",
+            exc_info=True,
+        )
+        return None
+
+    from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
+
+    return ParameterizationCompleter(
+        store=candidate_store,
+        known_rules=known_rule_ids_from_catalog(catalog),
+        rule_index=rule_index_from_catalog(catalog),
+        # The BLUEPRINT half of the frozen write-router order. `needs_parameterization`
+        # is a blueprint-only status (its decline reasons are blueprint-only checks), so
+        # the two target-specific stages would do nothing but demand collaborators this
+        # process has no other use for — see `build_write_router_stages`.
+        stages=build_write_router_stages(
+            learning_settings,
+            candidate_store=candidate_store,
+            blueprint_corpus=corpus,
+            catalog_schema=build_sqlglot_schema_from_catalog(catalog),
+            embedder=embedding_client,
+            include_target_specific=False,
+        ),
+    )
 
 
 def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
@@ -243,6 +372,12 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
 
     candidate_store = CouchbaseCandidateStore(learning_settings)
     corpus = CouchbaseBlueprintCorpus(learning_settings)
+    embedding_client = HttpEmbeddingClient(
+        url=runtime_settings.embedding_api_url,
+        api_key=runtime_settings.embedding_api_key,
+        model=runtime_settings.embedding_model,
+        timeout_seconds=runtime_settings.embedding_timeout_seconds,
+    )
     neo4j_driver = AsyncGraphDatabase.driver(
         runtime_settings.neo4j_url,
         auth=(runtime_settings.neo4j_username, runtime_settings.neo4j_password),
@@ -271,13 +406,17 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
             ),
         ),
         neo4j_driver=neo4j_driver,
-        embedding_client=HttpEmbeddingClient(
-            url=runtime_settings.embedding_api_url,
-            api_key=runtime_settings.embedding_api_key,
-            model=runtime_settings.embedding_model,
-            timeout_seconds=runtime_settings.embedding_timeout_seconds,
-        ),
+        embedding_client=embedding_client,
         model_id=runtime_settings.embedding_model,
+        # The fail-to-review completion plane: re-validation + the blueprint half of the
+        # write router, over the SAME candidate store this inbox reads.
+        completer=_build_completer(
+            learning_settings,
+            runtime_settings,
+            candidate_store=candidate_store,
+            corpus=corpus,
+            embedding_client=embedding_client,
+        ),
         # PriorArt Slice 2 — THE process where humans actually reject. `reject` and
         # `retract` reach the scheduler through THIS service, not through
         # `run_learning_scheduler.py`, so omitting this made the whole
@@ -391,6 +530,42 @@ def create_inbox_app(
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc
         return _action_result(env)
+
+    @app.post("/inbox/{candidate_id}/complete", dependencies=guard)
+    async def complete(
+        candidate_id: str, body: CompleteParameterizationRequest | None = None
+    ) -> dict[str, Any]:
+        """FAIL-TO-REVIEW COMPLETE: the reviewer supplies the missing parameterization
+        entries, the candidate RE-VALIDATES in full, and — if it passes — re-runs the
+        write-router pipeline. Requires `status=needs_parameterization`.
+
+        **A still-incomplete form answers 200, not 4xx**, with `outcome="declined"` and
+        the fresh decline. It is not a client error: the reviewer sent a well-formed
+        attempt, and the pipeline's answer ("these predicates are still uncovered") is the
+        RESULT they need to see in order to make the next one. Mapping it to a 409 would
+        put the one sentence that names the fix into an error banner and lose the
+        structure. The 4xx/5xx codes stay for what they mean elsewhere here: 404 unknown
+        id, 409 wrong status, 422 an `entries` value that is not a parameterization array
+        at all, 503 no validation plane in this deployment."""
+        req = body or CompleteParameterizationRequest()
+        try:
+            result = await inbox.complete_parameterization(
+                candidate_id, entries=req.entries, replace_all=req.replace
+            )
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        except CompletionUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail="parameterization completion unavailable"
+            ) from exc
+        except CompletionRaceError as exc:
+            # 409, like every other "the row is not in the state you think it is" — but
+            # with the reason surfaced verbatim, because the reviewer did nothing wrong
+            # and the only useful next step is to re-read the row.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except CompletionInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _completion_result(result)
 
     @app.post("/inbox/{candidate_id}/verify", dependencies=guard)
     async def verify(candidate_id: str) -> dict[str, Any]:

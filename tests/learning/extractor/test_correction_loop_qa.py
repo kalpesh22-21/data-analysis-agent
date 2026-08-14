@@ -258,6 +258,57 @@ async def test_the_final_decline_records_that_correction_was_attempted_and_what_
     assert result.corrections == _CORRECTIONS
 
 
+async def test_the_final_decline_carries_the_payload_it_was_judged_on() -> None:
+    """Fail-to-review needs the model's LAST attempt, and this is the only place both
+    halves exist at once: `pending` holds each decline's index into the array the model
+    last emitted, and that array is gone by the time the consumer sees the result.
+
+    The pairing is by INDEX, so it is asserted against the second candidate of a
+    two-candidate batch — an off-by-one that always picked the first would pass a
+    single-candidate test forever."""
+    first = _bad_grain(intent="first candidate")
+    second = _bad_grain(intent="second candidate")
+    extractor = make_extractor([scripted_turn([first, second]) for _ in range(3)])
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert len(result.declines) == 2
+    assert [d.raw_payload["payload"]["intent"] for d in result.declines] == [
+        "first candidate",
+        "second candidate",
+    ]
+    # A COPY, not the emitted dict: the raw array belongs to the parse and nothing
+    # downstream may mutate it through the decline.
+    assert result.declines[0].raw_payload is not first
+
+
+async def test_an_unasked_substantive_decline_carries_no_payload() -> None:
+    """A candidate that was never re-asked has no "last attempt" distinct from its
+    first, and the fail-to-review route must not be able to treat the two alike — a
+    merit-failed decline is supposed to die, and it dies with nothing attached."""
+    extractor = make_extractor([scripted_turn([blueprint_raw(evidence=[])])])
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert [d.reason for d in result.declines] == ["no_evidence"]
+    assert result.declines[0].raw_payload is None
+
+
+async def test_the_payload_survives_the_model_going_silent_after_a_correction() -> None:
+    """The SECOND `_finish` call site — the asymmetric exit where the model stops
+    returning parseable calls after a correction. It is the run whose last attempt is
+    most worth keeping, and it is reached by a different path, so it is asserted
+    separately rather than assumed to share the first one's behaviour."""
+    extractor = make_extractor(
+        [scripted_turn([_bad_grain(intent="the last attempt")])]
+        + [malformed_turn() for _ in range(_RETRIES + 1)]
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert len(result.declines) == 1
+    assert result.declines[0].raw_payload["payload"]["intent"] == "the last attempt"
+
+
 async def test_a_disabled_budget_declines_with_a_zero_that_means_never_asked() -> None:
     """The other side of the same distinction, and the pre-slice behaviour: with
     `max_shape_corrections=0` the shape decline is terminal, one turn is spent, and the

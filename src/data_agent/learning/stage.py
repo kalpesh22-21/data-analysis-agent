@@ -75,3 +75,53 @@ class CandidateStage(Protocol):
     async def process(
         self, env: CandidateEnvelope, ctx: StageContext
     ) -> StageResult: ...
+
+
+@dataclass(frozen=True)
+class PipelineOutcome:
+    """What running the pipeline over ONE envelope decided: the enriched envelope,
+    whether the caller must persist it, and the control the last stage returned."""
+
+    envelope: CandidateEnvelope
+    persist: bool
+    control: StageControl
+
+
+async def run_pipeline(
+    stages: tuple[CandidateStage, ...], env: CandidateEnvelope, ctx: StageContext
+) -> PipelineOutcome:
+    """Run *stages* in order over *env* and report what to do with the result.
+
+    THE CONTROL SEMANTICS LIVE HERE, in one function, because there are now two callers
+    and they must not be able to drift: the consumer running a freshly-extracted
+    candidate, and the inbox's completion path re-running a candidate a human finished
+    filling in. A second hand-written copy of this loop would be a second place for
+    `drop` to mean "persist anyway".
+
+    An UNKNOWN control string RAISES. It is a programming error in a stage, and the
+    alternative — treating it as `route_inbox`, or as `continue` — silently routes a
+    candidate on a decision nobody made. This function deliberately does NOT persist:
+    the store belongs to the caller (the consumer's is the shared singleton the stages
+    were built from), and a runner that wrote would have to be told which store."""
+    persist = True
+    control: StageControl = "continue"
+    for stage in stages:
+        outcome = await stage.process(env, ctx)
+        env = outcome.envelope
+        control = outcome.control
+        if control == "continue":
+            continue
+        if control in ("route_inbox", "halt"):
+            persist = True
+        elif control == "drop":
+            # The stage committed the candidate elsewhere (or discarded it); the
+            # enriched envelope must NOT be persisted here.
+            persist = False
+        else:
+            raise ValueError(
+                f"stage {getattr(stage, 'stage_id', stage)!r} returned an "
+                f"unknown control {control!r} (expected one of continue, "
+                f"route_inbox, drop, halt)"
+            )
+        break
+    return PipelineOutcome(envelope=env, persist=persist, control=control)
