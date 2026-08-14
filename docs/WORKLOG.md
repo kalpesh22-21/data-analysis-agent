@@ -1403,3 +1403,16 @@ server-side/unit coverage noted), and **nothing pushed** (data-agent has no remo
   `D44-parse-fail-drops-entry`.
 </content>
 </invoke>
+
+## 2026-08-14 — fail-to-review shipped (`c96a077`)
+
+G7 (detected-issues stack) closed: merit-passed candidates declined on
+totality/parameterization now persist as `needs_parameterization` per
+`docs/decisions/learning-declined-candidate-review.md`. Built by
+backend-developer, reviewed (1 blocker + 2 majors found and fixed, incl. a
+real leakage-gate side-effect bug: `reroute` committed a user fact from a
+validation-failed candidate), QA'd (81 new test functions; snapshot-guard
+bug found and fixed), and live-verified end to end on the canonical session
+`sd8f2a14f21db4dcaae5ed02a266aa1a7` — landed in the inbox, and a human
+completion moved it to `in_review` through the full pipeline.
+Suite 5549 passed / 15 skipped / 1 xfailed.
