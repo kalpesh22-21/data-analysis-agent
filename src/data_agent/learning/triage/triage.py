@@ -15,9 +15,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from ..summary.loader import DATA_TOOLS
 from ..summary.models import SessionSummary
 
-_DATA_TOOLS = ("runQuery", "runBlueprint")
+# `DATA_TOOLS` — the tools whose successful call makes a turn an ANSWER turn (§2.1) —
+# is imported from the summary loader, not restated. The two modules must agree by
+# construction: the loader uses it to decide which turns become `AnswerSql`/failed-fix
+# entries, and K1/K4 below decide whether a session is worth extracting AT ALL on the
+# same predicate. A tool added to one list and not the other means triage KEEPS a
+# session the summary carries no answer SQL for (wasted extractor cost, guaranteed
+# decline) or SKIPS one it does. The import direction is forced: this package already
+# imports `..summary`, and the loader does not import triage.
 
 
 @dataclass(frozen=True)
@@ -31,7 +39,7 @@ class TriageVerdict:
 
 def _has_ok_data_call(summary: SessionSummary) -> bool:
     return any(
-        tc.tool_name in _DATA_TOOLS and tc.status == "ok" for tc in summary.tool_calls
+        tc.tool_name in DATA_TOOLS and tc.status == "ok" for tc in summary.tool_calls
     )
 
 
@@ -85,7 +93,7 @@ def _skip_reason(summary: SessionSummary) -> str:
     if not _has_any_tool_call(summary):
         return "skip_no_tool_calls"  # greeting-/chat-only
 
-    data_calls = [tc for tc in summary.tool_calls if tc.tool_name in _DATA_TOOLS]
+    data_calls = [tc for tc in summary.tool_calls if tc.tool_name in DATA_TOOLS]
     if any(tc.status == "ok" for tc in data_calls):
         # A successful data query but no acceptance and no K2–K4 signal.
         return "skip_no_acceptance"

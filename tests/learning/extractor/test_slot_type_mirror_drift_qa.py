@@ -44,6 +44,14 @@ omits `binds_to`) instead of hard-rejected. What used to be
 `test_the_realistic_fallback_type_is_accepted_with_no_warning` are replaced by their
 positive counterparts below.
 
+**Later (the Tier-1 dedup):** the mirror is GONE — `extractor/models.py` now imports
+`SLOT_TYPES`/`NODE_KINDS` from `runtime/blueprint/models.py` and re-exports them under
+the same names. The decoupling rationale ("the extractor package must not import the
+request-path blueprint module") had already lapsed on its own: `extractor/validation.py`
+imports `runtime.blueprint.template` and `generalize/canonical.py` imports
+`runtime.blueprint.structural_key`. D58c only forbids the OTHER direction. The parity
+assertion below is kept, and tightened to `is`, as a tripwire against re-mirroring.
+
 **Still pinned, one hop further out:** `test_windowed_replay_sampling_qa.py` covers
 what golden replay does with these types, which is the next thing that keys off them.
 """
@@ -107,10 +115,19 @@ def _validate_slot_of_type(slot_type: str, **slot_kwargs: Any):
 
 
 def test_the_extractor_slot_type_mirror_matches_the_runtime() -> None:
-    """THE guard this file exists for. Set EQUALITY, not a subset: a type the
-    extractor knows and the runtime does not is un-landable, and a type the runtime
-    knows and the extractor does not is un-learnable. Both are silent."""
-    assert EXTRACTOR_SLOT_TYPES == RUNTIME_SLOT_TYPES
+    """THE guard this file exists for, now one notch stronger than it was.
+
+    It began as set EQUALITY, not a subset: a type the extractor knows and the runtime
+    does not is un-landable, and a type the runtime knows and the extractor does not is
+    un-learnable. Both are silent.
+
+    The mirror has since been REPLACED by a downward import — `extractor/models.py`
+    re-exports `runtime.blueprint.models.SLOT_TYPES` — so the assertion is IDENTITY.
+    That is deliberately stricter than the property under test: equality is what
+    actually matters, but equality is also what a freshly re-introduced local
+    frozenset would satisfy on the day it was written, drifting only later. `is`
+    fails the moment someone re-mirrors, which is the failure this file exists for."""
+    assert EXTRACTOR_SLOT_TYPES is RUNTIME_SLOT_TYPES
 
 
 def test_the_windowed_types_are_the_ones_that_were_missing() -> None:

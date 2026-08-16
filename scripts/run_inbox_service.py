@@ -22,14 +22,28 @@ import os
 
 import uvicorn
 
+from data_agent.learning.config import LearningSettings
+from data_agent.learning.entrypoint import configure_daemon_process
 from data_agent.learning.inbox.service import create_inbox_app
+
+_logger = logging.getLogger(__name__)
 
 # Built at import time so `uvicorn scripts.run_inbox_service:app` also works.
 app = create_inbox_app()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    # The SAME startup preamble the sweeper/consumer/scheduler run. This process is a
+    # learning-plane daemon like the others and had NEITHER half of it: no tracing
+    # posture line and no LEARNING_* typo warning, so a mistyped variable here applied
+    # the shipped default in total silence. With `OTLP_ENDPOINT` unset (the default)
+    # `configure_learning_tracing` still builds a NO-OP provider, so this changes
+    # nothing for an operator who has not asked for tracing.
+    #
+    # NOTE: it does NOT run under `uvicorn scripts.run_inbox_service:app`, which
+    # bypasses `main()` entirely — the `app` above is built at import time for exactly
+    # that entry path. That gap is pre-existing and is a property of having two ways in.
+    configure_daemon_process("inbox", LearningSettings(), _logger)
     # Loopback by default: the service holds the write plane and its only intended
     # caller is the co-located BFF proxy — bind wider (0.0.0.0) only deliberately.
     host = os.environ.get("INBOX_SERVICE_HOST", "127.0.0.1")

@@ -27,6 +27,7 @@ from typing import Any
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
+from ._transport import side_channel_headers
 from .client import MCPToolError, MCPToolSpec
 
 # Matches the `[{CODE}] message` marker that `clickhouse-api`'s
@@ -100,7 +101,10 @@ class RealMCPClient:
         self._mcp_url = mcp_url
 
     def _headers(self, jwt: str, session_id: str) -> dict[str, str]:
-        return {"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id}
+        # The D5 binding, shared with every HTTP side channel (`_transport.py`). The
+        # tool plane and the side channels sit behind the SAME `JWTAuthMiddleware`, so
+        # one spelling of the header pair is the point.
+        return side_channel_headers(jwt, session_id)
 
     async def call_tool(
         self,

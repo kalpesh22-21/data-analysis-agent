@@ -26,19 +26,21 @@ from typing import Any, Protocol
 
 import httpx
 
+from ._transport import SideChannelError, error_from_response
+from ._transport import side_channel_headers as _headers
 
-class ScratchClientError(Exception):
+
+class ScratchClientError(SideChannelError):
     """A scratch materialize/drop call was rejected or failed.
 
     Carries the endpoint's stable *code* (e.g. ``SCRATCH_TOO_LARGE``,
     ``SCRATCH_SESSION_MISSING``) when available, so the executor can fail-closed
     to the raw loop without leaking internals.
-    """
 
-    def __init__(self, code: str | None, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
+    The ``(code, message)`` shape comes from ``_transport.SideChannelError``. It stays
+    its OWN class because the consequence is specific: this one fails the composite
+    node back to the raw loop rather than degrading a cached artifact.
+    """
 
 
 class ScratchClientProtocol(Protocol):
@@ -54,12 +56,6 @@ class ScratchClientProtocol(Protocol):
     ) -> str: ...
 
     async def drop(self, table: str, *, jwt: str, session_id: str) -> None: ...
-
-
-def _headers(jwt: str, session_id: str) -> dict[str, str]:
-    # The SAME header pair the read plane sends (D5/D92): the JWT authenticates
-    # WHO, the X-Session-Id supplies the session binding that NAMES the table.
-    return {"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id}
 
 
 class ScratchClient:
@@ -113,17 +109,8 @@ class ScratchClient:
             raise _error_from_response(resp)
 
 
-def _error_from_response(resp: httpx.Response) -> ScratchClientError:
-    code: str | None = None
-    message = f"scratch endpoint returned HTTP {resp.status_code}"
-    try:
-        body = resp.json()
-        if isinstance(body, dict):
-            code = body.get("code")
-            message = body.get("error") or message
-    except Exception:  # noqa: BLE001 - a non-JSON error body is still an error
-        pass
-    return ScratchClientError(code, message)
+def _error_from_response(resp: httpx.Response) -> SideChannelError:
+    return error_from_response(resp, error_class=ScratchClientError, description="scratch endpoint")
 
 
 @dataclass

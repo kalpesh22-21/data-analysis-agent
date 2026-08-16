@@ -61,14 +61,16 @@ def _validate(composes: Any):
 
 
 def test_extractor_node_kinds_mirror_matches_the_runtime():
-    """`extractor/models.py` keeps a LOCAL `NODE_KINDS` (so the extractor package does
-    not import the request-path blueprint module). The gate above is only as correct
-    as that mirror — and the sibling `SLOT_TYPES` mirror has ALREADY drifted narrower
-    than the runtime's, so the mirror pattern demonstrably needs a test."""
+    """The gate above is only as correct as `extractor/models.py::NODE_KINDS`, which
+    USED to be a hand-kept mirror of the runtime's set — and the sibling `SLOT_TYPES`
+    mirror demonstrably drifted narrower than the runtime's. It is now a downward
+    IMPORT re-exported under the same name, so `is` holds and drift is unrepresentable.
+    Kept as the tripwire: if someone re-declares a local frozenset here, equality would
+    still pass on the day of the change and this does not."""
     from data_agent.learning.extractor.models import NODE_KINDS
     from data_agent.runtime.blueprint.models import NODE_KINDS as RUNTIME_NODE_KINDS
 
-    assert NODE_KINDS == RUNTIME_NODE_KINDS
+    assert NODE_KINDS is RUNTIME_NODE_KINDS
 
 
 def test_wellformed_composite_still_extracts():

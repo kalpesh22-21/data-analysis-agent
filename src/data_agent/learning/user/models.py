@@ -9,12 +9,9 @@ deterministically off the candidate id so a re-commit UPSERTs (idempotent, D17).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+from data_agent.timeutil import now_iso as _now
 
 
 def mint_record_id(user_id: str, candidate_id: str) -> str:

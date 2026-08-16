@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 from opentelemetry import trace
@@ -121,10 +122,28 @@ class FakeVectorIndex:
 # Per-corpus (vector index name, node label) — `recall(kind=...)` selects the
 # index by name so each corpus is a clean top-k with NO post-filter on `kind`
 # (neo4j-corpus-design §1.2 / §2.2). An unknown kind → `[]` (never raises).
-_CORPUS_INDEX: dict[str, str] = {
-    "blueprint": "blueprint_intent_vec",
-    "knowledge": "knowledge_text_vec",
-}
+#
+# PUBLIC because it names PHYSICAL neo4j objects, not this reader's private policy: the
+# indexes are created once by the hydrator and read by every reader. The learning
+# plane's prior-art reader (`learning/priorart/neo4j_index.py`) imports this rather than
+# mirroring it — a rename in one map and not the other queries an index that does not
+# exist, which neo4j answers with an ERROR, i.e. a permanent `PriorArtUnavailableError`
+# and a permanently fail-open loop. `_CORPUS_INDEX` stays as the module-local spelling.
+#
+# READ-ONLY (`MappingProxyType`) because it is now SHARED ACROSS PLANES rather than
+# module-private. Both readers only ever subscript it, and a process-wide mutable dict
+# reachable from two packages is a mutation one importer could make and the other would
+# silently inherit — for a value that decides which physical index a query hits. The
+# proxy makes that a `TypeError` at the write, not a mystery at the read. Both module
+# aliases point at the SAME proxy object, so the identity guard in
+# `tests/learning/priorart/test_neo4j_prior_art_index.py` still holds.
+CORPUS_INDEX_BY_KIND: Mapping[str, str] = MappingProxyType(
+    {
+        "blueprint": "blueprint_intent_vec",
+        "knowledge": "knowledge_text_vec",
+    }
+)
+_CORPUS_INDEX = CORPUS_INDEX_BY_KIND
 _CORPUS_LABEL: dict[str, str] = {
     "blueprint": "Blueprint",
     "knowledge": "KnowledgeChunk",
@@ -321,12 +340,22 @@ RETURN b.id AS id, b.intent AS intent, b.slots_summary AS slots_summary,
 """
 
 
-# Readiness probe (singleton-hydrator redesign): the `:CorpusMeta` freshness singleton
-# the hydrator stamps on a completed corpus seed. Its presence is the graph-ready signal
-# the runtime `/ready` handler reads (mirrors `corpus_loader._READ_CORPUS_META`).
-_GRAPH_READY_QUERY = """
+# THE read of the `:CorpusMeta` freshness singleton the hydrator stamps on a completed
+# corpus seed. Two callers, one query, and they have to agree on the node's identity or
+# they disagree about whether the corpus is loaded:
+#
+#   * here, as the readiness probe (singleton-hydrator redesign) — its presence is the
+#     graph-ready signal the runtime `/ready` handler reads;
+#   * `corpus_loader`, as the B1 no-op fast path (skip embed+write when the sha already
+#     matches), next to the `MERGE` that writes it.
+#
+# It lives in THIS module, the lighter of the two, because `corpus_loader` pulls yaml and
+# the sqlglot optimizer while `vector_index` sits on the request path and in
+# `retrieval/__init__`. The dependency therefore runs loader -> index.
+READ_CORPUS_META_QUERY = """
 MATCH (m:CorpusMeta {id: 'singleton'}) RETURN m.corpus_sha AS corpus_sha
 """
+_GRAPH_READY_QUERY = READ_CORPUS_META_QUERY
 
 
 def _decode_json(raw: Any) -> Any:

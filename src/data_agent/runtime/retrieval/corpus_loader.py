@@ -74,6 +74,7 @@ from data_agent.runtime.blueprint.template import (
     validate_optional_pattern,
 )
 from data_agent.runtime.blueprint.when import WhenClauseError, validate_when
+from data_agent.runtime.retrieval.vector_index import READ_CORPUS_META_QUERY
 
 if TYPE_CHECKING:
     from neo4j import AsyncDriver, AsyncManagedTransaction
@@ -727,9 +728,12 @@ RETURN name, options['indexConfig']['vector.dimensions'] AS dimensions
 # `:CorpusMeta` singleton — the process-wide corpus freshness stamp. Read powers the
 # B1 no-op fast path (skip embed+write when the sha already matches); the upsert lands
 # the new sha atomically with the node upserts + GC in one txn. Mirrors `:CatalogMeta`.
-_READ_CORPUS_META = """
-MATCH (m:CorpusMeta {id: 'singleton'}) RETURN m.corpus_sha AS corpus_sha
-"""
+#
+# The READ is shared with `vector_index`'s `/ready` graph-readiness probe (see that
+# module for why it is the definition site) — the writer here and the probe there must
+# key the singleton identically or `/ready` reports a corpus this loader considers
+# unseeded, or vice versa. Only the read is shared: this module is the sole WRITER.
+_READ_CORPUS_META = READ_CORPUS_META_QUERY
 
 _UPSERT_CORPUS_META = """
 MERGE (m:CorpusMeta {id: 'singleton'})

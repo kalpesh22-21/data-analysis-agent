@@ -45,7 +45,15 @@ _DEFAULT_READ_BACKOFF_SECONDS = 0.05
 
 # Tool names whose successful call makes a turn an "answer turn" (§2.1) and which
 # are lift/fix candidates.
-_DATA_TOOLS = ("runQuery", "runBlueprint")
+#
+# PUBLIC because the triage gate imports it: S2 uses this set to decide which turns
+# become `AnswerSql`/failed-fix entries, and `triage.py`'s K1/K4 use the SAME set to
+# decide whether a session is worth extracting AT ALL. A tool added to one list and not
+# the other means triage KEEPS a session the summary carries no answer SQL for (wasted
+# extractor cost, a guaranteed decline) or SKIPS one it does. `_DATA_TOOLS` stays as the
+# module-local spelling, which the rest of this file already uses.
+DATA_TOOLS = ("runQuery", "runBlueprint")
+_DATA_TOOLS = DATA_TOOLS
 _SQL_TOOLS = ("runQuery", "explainQuery")
 _FAILED_STATUSES = ("error", "denied")
 

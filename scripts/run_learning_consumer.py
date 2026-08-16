@@ -42,25 +42,20 @@ from pathlib import Path
 from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
 from data_agent.learning.audit.couchbase_audit_store import CouchbaseAuditStore
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
-from data_agent.learning.config import LearningSettings, warn_unrecognized_learning_env_vars
+from data_agent.learning.config import LearningSettings
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
+from data_agent.learning.entrypoint import configure_daemon_process
 from data_agent.learning.extractor.grounding import (
     known_rule_ids_from_catalog,
     rule_index_from_catalog,
 )
 from data_agent.learning.factory import build_learning_consumer
-from data_agent.learning.observability import (
-    configure_learning_tracing,
-    get_learning_tracer,
-    log_tracing_status,
-)
 from data_agent.learning.redis_queue import RedisStreamsLearningQueue
 from data_agent.learning.user.config import UserKnowledgeStoreConfig
 from data_agent.learning.user.couchbase_user_store import CouchbaseUserKnowledgeStore
 from data_agent.runtime.config import get_runtime_settings
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.model.openai_client import build_openai_model_client
-from data_agent.runtime.observability.tracing import set_global_tracer_provider
 from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 
 # `_catalog` is a sibling module under `scripts/`. Put this script's own directory
@@ -73,27 +68,10 @@ _logger = logging.getLogger(__name__)
 
 
 async def _main() -> int:
-    logging.basicConfig(level=logging.INFO)
     runtime_settings = get_runtime_settings()
     learning_settings = LearningSettings()
     user_config = UserKnowledgeStoreConfig()
-
-    provider = configure_learning_tracing(
-        otlp_endpoint=learning_settings.otlp_endpoint,
-        service_name=learning_settings.learning_service_name,
-    )
-    set_global_tracer_provider(provider)
-    tracer = get_learning_tracer(provider)
-    # An empty OTLP_ENDPOINT builds a NO-OP provider silently; say which it is.
-    log_tracing_status(
-        _logger,
-        otlp_endpoint=learning_settings.otlp_endpoint,
-        service_name=learning_settings.learning_service_name,
-        process="consumer",
-    )
-    # `extra="ignore"` accepts a typo'd LEARNING_* var and silently applies the
-    # default; say which ones this process is ignoring.
-    warn_unrecognized_learning_env_vars(_logger)
+    tracer = configure_daemon_process("consumer", learning_settings, _logger)
 
     store = CouchbaseSessionStore(runtime_settings)
     queue = RedisStreamsLearningQueue.from_settings(learning_settings)

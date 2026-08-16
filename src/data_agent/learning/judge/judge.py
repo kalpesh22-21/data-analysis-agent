@@ -68,9 +68,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
+from data_agent.timeutil import now_iso as _now
 
 from ..audit.judgement import (
     DROPPABLE_VERDICT,
@@ -730,10 +730,6 @@ class CoverageJudge:
 
 
 # --- pure helpers -------------------------------------------------------------------
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def _intent_of(env: CandidateEnvelope) -> str:

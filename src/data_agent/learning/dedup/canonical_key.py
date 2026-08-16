@@ -16,10 +16,11 @@ The key is the SHA-256 of the canonical JSON of EXACTLY, in this order:
                           and the whole point of the freeze is that S4 produces the
                           exact string S6 hashes. Treat it as a byte-stable token.
 
-`canonical_json` mirrors the D96 §5 convention (`sort_keys`, no insignificant
-whitespace, UTF-8, `ensure_ascii=False`) so the hash is deterministic across
-processes and Python runs. The returned key carries a `sha256:` prefix, matching
-the corpus `canonical_key` convention.
+The serializer is the SHARED `data_agent.canonical.canonical_json` (D96 §5:
+`sort_keys`, no insignificant whitespace, UTF-8, `ensure_ascii=False`) so the hash
+is deterministic across processes and Python runs AND comparable with the
+`structural_key` digests minted on the runtime side. The returned key carries a
+`sha256:` prefix, matching the corpus `canonical_key` convention.
 
 Single-writer-per-key by construction: two candidates with identical
 `(resolves, uses_rules, result_grain, canonical_ast_norm)` hash to the SAME key, so
@@ -31,14 +32,10 @@ change this function.
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-
-def _canonical_json(obj: Any) -> str:
-    """Canonical JSON (D96 §5): sorted keys, UTF-8, no insignificant whitespace."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+from data_agent.canonical import canonical_json as _canonical_json
 
 
 def _normalized_grain(result_grain: Mapping[str, Any]) -> dict[str, Any]:

@@ -17,8 +17,9 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
 from typing import Any
+
+from data_agent.timeutil import now_iso as _now
 
 from .models import (
     MAX_FINALIZATION_BLOCKS_PER_WINDOW,
@@ -32,10 +33,6 @@ from .models import (
     live_analysis_state,
 )
 from .store import AlreadyConsumedError, CASMismatchError
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 class InMemorySessionStore:

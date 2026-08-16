@@ -48,6 +48,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolResult,
     _build_preview,
     _default_observer,
+    resolve_catalog,
 )
 from data_agent.runtime.model.embedding_client import EmbeddingClient, EmbeddingError
 from data_agent.runtime.observability import tracing
@@ -147,11 +148,9 @@ class ResolveValuesComposite:
         self._disable_redaction = disable_redaction
 
     async def _resolve_catalog(self, credentials: RuntimeCredentials) -> CatalogHandle:
-        """Resolve THIS turn's `CatalogHandle` — a fixed handle passes through; a
-        provider is awaited with the turn's credentials (D75 Wave 1b)."""
-        if isinstance(self._catalog, CatalogHandle):
-            return self._catalog
-        return await self._catalog(credentials)
+        """This tool's catalog for THIS turn — see `tool_dispatcher.resolve_catalog`,
+        which owns the `CatalogHandle | CatalogProvider` branch for every holder."""
+        return await resolve_catalog(self._catalog, credentials)
 
     # -- model tool-call path -------------------------------------------------
 

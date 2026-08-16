@@ -46,6 +46,11 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
+from data_agent.runtime.mcp._transport import (
+    SideChannelError,
+    auth_headers,
+    error_from_response,
+)
 from data_agent.runtime.provenance.catalog_handle import (
     CatalogHandle,
     SemanticCatalogHandle,
@@ -64,18 +69,17 @@ _EMPTY_CATALOG_HANDLE = CatalogHandle({})
 _EMPTY_SEMANTIC_HANDLE = SemanticCatalogHandle({})
 
 
-class CatalogClientError(Exception):
+class CatalogClientError(SideChannelError):
     """A `/catalog/export` fetch was rejected or returned an unusable body.
 
     Carries the endpoint's stable *code* (when the JSON error body supplies one)
     so the cache can log it; the cache degrades fail-closed on ANY error, so this
     is never surfaced to the model/client.
-    """
 
-    def __init__(self, code: str | None, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
+    The `(code, message)` shape comes from `mcp/_transport.py::SideChannelError`. It
+    stays its OWN class because the consequence is specific: this one degrades to an
+    EMPTY `CatalogHandle`, which is not what a corpus or scratch failure does.
+    """
 
 
 class CatalogClient(Protocol):
@@ -88,13 +92,6 @@ class CatalogClient(Protocol):
         degrade fail-closed.
         """
         ...
-
-
-def _headers(jwt: str, session_id: str) -> dict[str, str]:
-    # The SAME header pair the read plane + scratch side-channel send (D5): the JWT
-    # authenticates WHO; X-Session-Id carries the session binding. Neither is ever
-    # reflected into a handle or a model-visible message.
-    return {"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id}
 
 
 class HttpCatalogClient:
@@ -121,10 +118,13 @@ class HttpCatalogClient:
 
     def _auth_headers(self, *, jwt: str, session_id: str) -> dict[str, str]:
         """The auth headers for one fetch — the static service key when configured,
-        else the per-request Bearer/session pair. Branches on `self._service_key`."""
-        if self._service_key:
-            return {"X-Service-Key": self._service_key}
-        return _headers(jwt, session_id)
+        else the per-request Bearer/session pair.
+
+        The BRANCH lives in `mcp/_transport.py::auth_headers` (one implementation for
+        every side channel); this method stays as the per-client seam that binds it to
+        THIS client's normalized `_service_key`, which is what
+        `tests/runtime/test_service_key_clients.py` asserts against."""
+        return auth_headers(service_key=self._service_key, jwt=jwt, session_id=session_id)
 
     async def fetch_export(self, *, jwt: str = "", session_id: str = "") -> dict[str, Any]:
         try:
@@ -172,17 +172,10 @@ class FixtureCatalogClient:
         return body
 
 
-def _error_from_response(resp: httpx.Response) -> CatalogClientError:
-    code: str | None = None
-    message = f"catalog export endpoint returned HTTP {resp.status_code}"
-    try:
-        body = resp.json()
-        if isinstance(body, dict):
-            code = body.get("code")
-            message = body.get("error") or message
-    except ValueError:
-        pass
-    return CatalogClientError(code, message)
+def _error_from_response(resp: httpx.Response) -> SideChannelError:
+    return error_from_response(
+        resp, error_class=CatalogClientError, description="catalog export endpoint"
+    )
 
 
 class CatalogCache:

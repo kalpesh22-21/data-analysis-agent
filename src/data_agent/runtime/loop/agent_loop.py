@@ -89,7 +89,6 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
@@ -130,6 +129,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolObserver,
     ToolPause,
     ToolResult,
+    _default_observer,
 )
 from data_agent.runtime.hooks.answer_table import (
     AnswerTableEvent,
@@ -151,6 +151,7 @@ from data_agent.runtime.session.models import (
     live_analysis_state,
 )
 from data_agent.runtime.session.store import SessionStore
+from data_agent.timeutil import now_iso
 
 from .budget_guard import new_budget_window
 from .read_guard import IDEMPOTENT_READ_TOOLS, idempotent_read_signature
@@ -386,18 +387,18 @@ def _trimmed_read_refetch_event(
     return payload
 
 
-def _now_iso() -> str:
-    # Wall-clock `ts` is now the CONTEXT ORDERER (context/assembly.py merges the two
-    # streams by `(turn_index, ts, stream_rank)`), not just a display stamp. It need
-    # not be perfectly monotonic: `turn_index` dominates the sort, so any clock
-    # skew/backward step can only misorder items WITHIN a single turn — never across
-    # turns, and never in a way that breaks assistant/tool pairing (that is enforced
-    # structurally downstream), so there is no API-400 risk from a ts wobble.
-    return datetime.now(UTC).isoformat()
-
-
-def _default_observer(event: str, payload: dict[str, Any]) -> None:
-    return None
+# The shared wall-clock stamp (`data_agent/timeutil.py`), aliased to the name this
+# module's ~6 call sites already use. The stamp MUST be the same string format the
+# session store writes, because the two are merged and sorted together — which is why
+# it is one function and not one per writer.
+#
+# Wall-clock `ts` is now the CONTEXT ORDERER (context/assembly.py merges the two
+# streams by `(turn_index, ts, stream_rank)`), not just a display stamp. It need
+# not be perfectly monotonic: `turn_index` dominates the sort, so any clock
+# skew/backward step can only misorder items WITHIN a single turn — never across
+# turns, and never in a way that breaks assistant/tool pairing (that is enforced
+# structurally downstream), so there is no API-400 risk from a ts wobble.
+_now_iso = now_iso
 
 
 def _first_user_question(messages: list[TurnMessage], turn_index: int) -> str | None:

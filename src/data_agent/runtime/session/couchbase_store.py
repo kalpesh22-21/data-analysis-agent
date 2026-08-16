@@ -57,11 +57,12 @@ import asyncio
 import uuid
 from collections.abc import Callable
 from dataclasses import replace as dc_replace
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 from data_agent.runtime.config import RuntimeSettings
 from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
+from data_agent.timeutil import now_iso as _now
 
 from .models import (
     MAX_FINALIZATION_BLOCKS_PER_WINDOW,
@@ -94,10 +95,6 @@ try:  # pragma: no cover - exercised only when the couchbase SDK is installed
     COUCHBASE_AVAILABLE = True
 except ImportError:  # pragma: no cover
     COUCHBASE_AVAILABLE = False
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def _session_key(session_id: str) -> str:

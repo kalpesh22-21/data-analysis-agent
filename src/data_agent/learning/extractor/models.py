@@ -17,28 +17,36 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-CandidateType = Literal["blueprint", "global_knowledge", "user_knowledge", "schema_edit"]
-AcceptedSignal = Literal["no_correction", "thumbs_up", "explicit_confirm"]
-Role = Literal["slot", "rule", "inline"]
-
-# Mirror of blueprint/models.py SLOT_TYPES + NODE_KINDS (kept local so the
-# extractor package does not import the request-path blueprint module; Stage-4
-# maps these 1:1 onto SlotSpec/Node).
+# THE definitions, imported DOWNWARD (D58c permits learning -> runtime; it forbids
+# only runtime -> learning) and RE-EXPORTED under their historical names here so the
+# extractor package's own importers are unaffected. Stage-4 maps them 1:1 onto
+# SlotSpec/Node.
 #
-# PARITY IS ENFORCED, not remembered: `tests/learning/extractor/
-# test_slot_type_mirror_drift_qa.py` asserts set-equality with the runtime for BOTH
-# mirrors. It has to be, because this one drifted. The mirror shipped without
-# `relative_window`/`period_range` (D41/D49) and the gap was invisible for two
-# reasons at once: `schema.py::SLOT_TYPE_ENUM` is derived from this set, so the tool
-# schema never OFFERED the correct type, and a compliant model therefore reached for
-# `period`/`string` instead — which extract CLEANLY. Three of the ten canon
-# blueprints (`bp-hires-per-month`, `bp-hires-projection`, `bp-hires-in-range`) were
-# un-relearnable as a result. The parity test is the only thing that makes a mirror
-# safe; add one with the mirror, never after it.
-SLOT_TYPES: frozenset[str] = frozenset(
-    {"string", "entity", "enum", "period", "as_of_date", "list",
-     "relative_window", "period_range"}
-)
+# These used to be hand-kept MIRRORS, on the rationale that the extractor package
+# should not import the request-path blueprint module — a rationale that had already
+# lapsed (`extractor/validation.py` imports `runtime.blueprint.template`, and
+# `generalize/canonical.py` imports `runtime.blueprint.structural_key`) and that the
+# mirror did not survive anyway. `SLOT_TYPES` shipped without
+# `relative_window`/`period_range` (D41/D49) and the gap was invisible for two reasons
+# at once: `schema.py::SLOT_TYPE_ENUM` is derived from this set, so the tool schema
+# never OFFERED the correct type, and a compliant model therefore reached for
+# `period`/`string` instead — which extract CLEANLY. Three of the ten canon blueprints
+# (`bp-hires-per-month`, `bp-hires-projection`, `bp-hires-in-range`) were un-relearnable
+# as a result. A parity test caught it after the fact; the import makes the drift
+# unrepresentable. `tests/learning/extractor/test_slot_type_mirror_drift_qa.py` now
+# asserts IDENTITY with the runtime and stays as the tripwire against re-mirroring.
+from data_agent.runtime.blueprint.models import NODE_KINDS as NODE_KINDS
+from data_agent.runtime.blueprint.models import SLOT_TYPES as SLOT_TYPES
+
+# The acceptance type is S2's — it is the summary loader that DERIVES the signal and the
+# extractor that consumes it — so it is defined next to the producer and re-exported here
+# under its historical name. The direction is forced: this package already imports
+# `..summary.models` (extractor/validation.py, extractor/prior_art.py), so summary
+# importing back would cycle.
+from ..summary.models import AcceptedSignal as AcceptedSignal
+
+CandidateType = Literal["blueprint", "global_knowledge", "user_knowledge", "schema_edit"]
+Role = Literal["slot", "rule", "inline"]
 
 # The two WINDOWED types, and the ONE thing that makes them structurally different
 # from every other slot: they consume no warehouse column DOMAIN, so
@@ -82,9 +90,6 @@ WINDOWED_SLOT_TYPES: frozenset[str] = frozenset({"relative_window", "period_rang
 # wrong silently inverts a date filter, which is the D56 wrong-answer class. Tracked in
 # the plan doc; pinned by `test_period_range_withdrawn_qa.py`.
 UNSUPPORTED_SLOT_TYPES: frozenset[str] = frozenset({"period_range"})
-
-NODE_KINDS: frozenset[str] = frozenset({"query", "approval"})
-
 
 @dataclass(frozen=True)
 class EvidenceRef:

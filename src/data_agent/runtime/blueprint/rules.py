@@ -33,6 +33,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .template import SLOT_TOKEN
+
 # `resolveValues(Column, 'concept')` / `resolveValues(Column, "concept")` — the
 # authored `resolve_via` micro-syntax (D67). Whitespace-tolerant; the concept is
 # a quoted string (single or double). Anything else → not a resolvable rule.
@@ -43,7 +45,14 @@ _RESOLVE_VIA = re.compile(
         \s*\)\s*$""",
     re.VERBOSE,
 )
-_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# The bind-site token scanner used by `rule_slot_tokens` below. It is `template.py`'s
+# `SLOT_TOKEN` — the ONE definition of what a `{slot}` bind site looks like, exported
+# from there precisely so nobody re-derives it. This module used to carry an identical
+# `re.compile`, and identical is the whole problem: the tokens this finds in a rule
+# predicate are matched against the tokens the BINDER will substitute, so a regex that
+# drifts by one character makes a rule declare slots the binder never fills (or miss
+# ones it does) — a silently under-parameterized query, not a parse error.
+_PLACEHOLDER = SLOT_TOKEN
 
 # D67 concept-subset selection (locked decision: margin/gap-cut + low-confidence
 # floor). `resolveValues` returns a ranked (value, score) list DESCENDING by

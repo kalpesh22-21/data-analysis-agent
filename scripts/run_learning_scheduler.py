@@ -50,20 +50,15 @@ import asyncio
 import logging
 
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
-from data_agent.learning.config import LearningSettings, warn_unrecognized_learning_env_vars
+from data_agent.learning.config import LearningSettings
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
+from data_agent.learning.entrypoint import configure_daemon_process
 from data_agent.learning.factory import build_promotion_plane, build_promotion_write_plane
-from data_agent.learning.observability import (
-    configure_learning_tracing,
-    get_learning_tracer,
-    log_tracing_status,
-)
 from data_agent.learning.promotion.models import ProbeResult
 from data_agent.learning.promotion.token_minter import HttpTokenMinter, TenantClaims
 from data_agent.runtime.config import RuntimeSettings
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
-from data_agent.runtime.observability.tracing import set_global_tracer_provider
 
 _logger = logging.getLogger(__name__)
 
@@ -101,25 +96,10 @@ class _DeferredDependencyResolver:
 
 
 async def _main() -> int:
-    logging.basicConfig(level=logging.INFO)
     learning_settings = LearningSettings()
-
-    provider = configure_learning_tracing(
-        otlp_endpoint=learning_settings.otlp_endpoint,
-        service_name=learning_settings.learning_service_name,
-    )
-    set_global_tracer_provider(provider)
-    _ = get_learning_tracer(provider)
-    # An empty OTLP_ENDPOINT builds a NO-OP provider silently; say which it is.
-    log_tracing_status(
-        _logger,
-        otlp_endpoint=learning_settings.otlp_endpoint,
-        service_name=learning_settings.learning_service_name,
-        process="scheduler",
-    )
-    # `extra="ignore"` accepts a typo'd LEARNING_* var and silently applies the
-    # default; say which ones this process is ignoring.
-    warn_unrecognized_learning_env_vars(_logger)
+    # The scheduler does not thread a tracer into its components — it relies on the
+    # process-global provider this installs — so the return value is discarded.
+    configure_daemon_process("scheduler", learning_settings, _logger)
 
     candidates_ready = bool(
         learning_settings.learning_candidates_username

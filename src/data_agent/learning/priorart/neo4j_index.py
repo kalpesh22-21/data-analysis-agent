@@ -56,6 +56,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.blueprint.structural_key import normalize_structural_grain
+from data_agent.runtime.retrieval.vector_index import CORPUS_INDEX_BY_KIND
 
 from .index import PriorArtUnavailableError
 from .models import (
@@ -76,14 +77,15 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Mirrors `vector_index._CORPUS_INDEX` — same two native vector indexes, same names.
-# Duplicated rather than imported because the two readers must be free to diverge
-# (this one may grow a corpus recall never serves), and the cost of the duplication is
-# bounded by `test_prior_art_index_names_match_recall` in the unit suite.
-_KIND_INDEX: dict[str, str] = {
-    "blueprint": "blueprint_intent_vec",
-    "knowledge": "knowledge_text_vec",
-}
+# THE index-name map, imported from recall rather than mirrored. It was duplicated on
+# the argument that the two readers must be free to diverge (this one may one day grow a
+# corpus recall never serves) — but the names are PHYSICAL neo4j objects created once by
+# the hydrator, so divergence is not a degree of freedom either reader has: a rename here
+# and not there queries an index that does not exist, which neo4j answers with an error,
+# i.e. a permanent `PriorArtUnavailableError` and a permanently fail-open loop. If this
+# reader ever does serve a corpus recall does not, that is a new entry in the shared map
+# (an index the hydrator must create), not a second map.
+_KIND_INDEX = CORPUS_INDEX_BY_KIND
 
 # How many extra rows to pull from the index per requested result. `$k` is applied
 # INSIDE the vector index before the terminal-status `WHERE`, so without over-fetching a

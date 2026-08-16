@@ -96,7 +96,9 @@ import logging
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import datetime
+
+from data_agent.timeutil import now_iso as _now_iso
 
 from ..candidate.generalization import BlueprintGeneralization
 from ..candidate.models import CandidateEnvelope, CandidateStatus
@@ -132,10 +134,6 @@ _logger = logging.getLogger(__name__)
 # `source='mcp'`), so the demote/re-stamp keeps the STAGING node's status coherent for a
 # future Phase-3 promotion — it is no longer what gates the node out of live recall.
 _LANDED_TYPES: frozenset[str] = frozenset({BLUEPRINT_TYPE, "global_knowledge"})
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def _parse_clock(now_iso: str) -> datetime | None:

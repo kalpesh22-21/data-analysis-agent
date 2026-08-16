@@ -40,9 +40,11 @@ Two normalizations are load-bearing:
 Like the frozen key's, the rendered string is a hash INPUT and is never re-parsed, and
 its byte-stability rests on the pinned sqlglot version.
 
-`canonical_json` + the `sha256:` prefix mirror `compute_canonical_key` exactly (D96 §5:
+`canonical_json` + the `sha256:` prefix match `compute_canonical_key` exactly (D96 §5:
 sorted keys, no insignificant whitespace, UTF-8, `ensure_ascii=False`), so the digest is
-deterministic across processes and Python runs.
+deterministic across processes and Python runs. The serializer is no longer duplicated
+per-key: both keys import the one `data_agent.canonical.canonical_json`, which this
+module RE-EXPORTS (it is in `__all__` and callers import it from here).
 
 **Why this module lives under `runtime/blueprint/` and not next to the frozen key.**
 The two writers that must agree byte-for-byte are `runtime/retrieval/corpus_loader.py`
@@ -58,7 +60,6 @@ there is exactly one here.
 from __future__ import annotations
 
 import hashlib
-import json
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
@@ -67,6 +68,8 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.normalize import normalize
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+
+from data_agent.canonical import canonical_json
 
 from .template import SLOT_TOKEN
 
@@ -101,14 +104,6 @@ def structural_key_recipe() -> str:
     backfilling every already-landed node — the keys are only re-derivable from a seed
     that the learning tier does not keep."""
     return f"r{_RECIPE_REVISION}+sqlglot{sqlglot.__version__}"
-
-
-def canonical_json(obj: Any) -> str:
-    """Canonical JSON (D96 §5): sorted keys, UTF-8, no insignificant whitespace.
-
-    Byte-identical to `learning/dedup/canonical_key.py::_canonical_json` — the two keys
-    must share one serialization convention or their digests are incomparable."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def canonical_ast_norm_one(sql_template: str) -> str:

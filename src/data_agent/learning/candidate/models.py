@@ -12,8 +12,9 @@ nothing promotes it (that is Slice 9).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any
+
+from data_agent.timeutil import now_iso as _now
 
 from ..audit.judgement import CoverageAssessment
 from ..extractor.models import Decline, ExtractedCandidate
@@ -47,10 +48,6 @@ class CandidateStatus:
     # never merges the PR, the neo4j node stays `source='learning'` (excluded from
     # recall) while the candidate stays `promoted`; the emit is optimistic.
     PROMOTED = "promoted"
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 def mint_candidate_id(content_hash: str, ordinal: int) -> str:

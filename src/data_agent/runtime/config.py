@@ -40,10 +40,25 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
 from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
-# Recognized truthy spellings for the hydrator kill-switch (case-insensitive).
-# Anything else (including unset → default) resolves per the rules in
-# `hydrator_enabled` (mirrors `learning/config.py::_TRUTHY`).
-_TRUTHY = {"1", "true", "yes", "on"}
+# Recognized truthy spellings for a kill-switch env var (case-insensitive). Anything
+# else (including unset → default) resolves per the rules in the switch's own reader —
+# `hydrator_enabled` below, and `learning/config.py::learning_enabled` on the offline
+# plane, which imports this set rather than restating it.
+#
+# ONE set for BOTH switches, and the reason is operator-facing rather than internal:
+# they are flipped by the same person from the same deployment config, so an operator
+# who finds `on` works for one must find it works for the other. Divergence would not
+# raise anywhere — the odd spelling out just reads as FALSE, and a fail-safe kill switch
+# reading false silently halts a plane. It is defined on the RUNTIME side because D58c
+# forbids `runtime/` importing the offline package, so the shared direction can only run
+# inward-to-outward. `_TRUTHY` stays as the module-local spelling.
+#
+# NOTE for editors: `tests/learning/test_kill_switch.py` enforces D58c by TEXT-scanning
+# every file under `runtime/` for the offline package path and that switch's env-var
+# name. Neither may be spelled here, in a comment or otherwise. That bluntness is the
+# point — do not relax the scan to accommodate prose.
+TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+_TRUTHY = TRUTHY_ENV_VALUES
 
 # Headroom multiplier on the request fit budget. The shared chars/4 token
 # estimator (context/budget.py::_estimate_tokens) UNDER-counts real tokens on

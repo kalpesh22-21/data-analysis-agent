@@ -10,10 +10,10 @@ the doc (§5), used to make enqueue and consume idempotent.
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any
 
+from data_agent.canonical import canonical_json as _canonical_json
 from data_agent.runtime.session.models import SessionDoc
 
 
@@ -80,12 +80,6 @@ RECOVERY_TRANSITIONS: dict[str, frozenset[str]] = {
 # handed to a consumer are eligible, so a completed/in-flight job is never
 # re-enqueued unless its content actually changes (a later-slice concern).
 SWEEPABLE_STATUSES: list[str] = [LearningStatus.ACTIVE, LearningStatus.PENDING]
-
-
-def _canonical_json(obj: Any) -> str:
-    """Canonical JSON per D96 §5: sorted keys, UTF-8, no insignificant
-    whitespace. Deterministic across processes and Python runs."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def compute_content_hash(doc: SessionDoc) -> str:

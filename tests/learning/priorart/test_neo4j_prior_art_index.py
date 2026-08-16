@@ -212,14 +212,16 @@ async def test_results_are_truncated_to_the_requested_limit_after_mapping():
 
 
 async def test_the_prior_art_index_names_match_recall():
-    """The two readers keep their OWN index-name map (they must be free to diverge), so
-    a rename in one and not the other would silently make prior art query a
-    nonexistent index — which neo4j answers with an error, i.e. a permanent
-    `PriorArtUnavailableError` and a permanently fail-open loop."""
+    """The two readers USED to keep their own index-name map, and a rename in one and
+    not the other would silently make prior art query a nonexistent index — which neo4j
+    answers with an error, i.e. a permanent `PriorArtUnavailableError` and a permanently
+    fail-open loop. They now share `CORPUS_INDEX_BY_KIND`, so this asserts IDENTITY and
+    survives as the tripwire against someone re-introducing a local map (which would
+    pass an equality check on the day it was written and drift afterwards)."""
     from data_agent.learning.priorart.neo4j_index import _KIND_INDEX
-    from data_agent.runtime.retrieval.vector_index import _CORPUS_INDEX
+    from data_agent.runtime.retrieval.vector_index import CORPUS_INDEX_BY_KIND
 
-    assert _KIND_INDEX == _CORPUS_INDEX
+    assert _KIND_INDEX is CORPUS_INDEX_BY_KIND
 
 
 # --- PA-neo4j-untrusted-props -------------------------------------------------

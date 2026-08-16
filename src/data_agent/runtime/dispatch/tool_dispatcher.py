@@ -69,6 +69,23 @@ ToolObserver = Callable[[str, dict[str, Any]], None]
 # into a handle or message (D5).
 CatalogProvider = Callable[[RuntimeCredentials], Awaitable["CatalogHandle"]]
 
+
+async def resolve_catalog(
+    catalog: CatalogHandle | CatalogProvider, credentials: RuntimeCredentials
+) -> CatalogHandle:
+    """Resolve THIS turn's `CatalogHandle` — a fixed handle passes through; a provider
+    is awaited with the turn's credentials (D75 Wave 1b).
+
+    Lives here, beside the `CatalogProvider` alias it destructures, because BOTH
+    holders of a `CatalogHandle | CatalogProvider` have to agree on what the union
+    means. `ToolDispatcher` and `ResolveValuesTool` each carried a verbatim copy; the
+    `isinstance` branch IS the contract of the union, so a third holder should call
+    this rather than re-derive which arm is which."""
+    if isinstance(catalog, CatalogHandle):
+        return catalog
+    return await catalog(credentials)
+
+
 _logger = logging.getLogger(__name__)
 
 # B4: a raw transport exception (connection refusal, timeout, malformed
@@ -438,11 +455,8 @@ class ToolDispatcher:
             pass
 
     async def _resolve_catalog(self, credentials: RuntimeCredentials) -> CatalogHandle:
-        """Resolve THIS turn's `CatalogHandle` — a fixed handle passes through; a
-        provider is awaited with the turn's credentials (D75 Wave 1b)."""
-        if isinstance(self._catalog, CatalogHandle):
-            return self._catalog
-        return await self._catalog(credentials)
+        """This dispatcher's catalog for THIS turn — see `resolve_catalog` above."""
+        return await resolve_catalog(self._catalog, credentials)
 
     async def capture_sql_provenance(
         self, sql: str, credentials: RuntimeCredentials

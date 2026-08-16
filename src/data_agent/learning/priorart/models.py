@@ -38,8 +38,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from data_agent.runtime.retrieval.models import CandidateKind
+
 # The artifact kinds a prior-art search covers — the two vector-indexed neo4j corpora.
-PriorArtKind = Literal["blueprint", "knowledge"]
+# It is not a parallel vocabulary: it is recall's `CandidateKind` under a local name,
+# because prior art reads the SAME two indexes recall does (`vector_index.py::
+# CORPUS_INDEX_BY_KIND`), and a kind either side knew about alone would be a lookup
+# against an index that does not exist. Aliased rather than re-declared so the two can
+# never drift apart. Importing `runtime.retrieval.models` costs nothing this package
+# cares about — it pulls no sqlglot and no neo4j, which is the import budget
+# `priorart/__init__.py` documents.
+PriorArtKind = CandidateKind
 
 # The trust partitions a card can come from.
 #   mcp        — the git-versioned MCP canon. The agent ALREADY recalls this.

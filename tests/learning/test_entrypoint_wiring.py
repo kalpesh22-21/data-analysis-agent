@@ -72,15 +72,69 @@ def test_tracing_off_warns_and_names_the_env_var(caplog):
 
 
 @pytest.mark.parametrize(
-    "script", ["run_learning_sweeper.py", "run_learning_consumer.py", "run_learning_scheduler.py"]
+    "script",
+    [
+        "run_learning_sweeper.py",
+        "run_learning_consumer.py",
+        "run_learning_scheduler.py",
+        "run_inbox_service.py",
+    ],
 )
 def test_every_learning_entrypoint_reports_its_tracing_posture(script):
-    """Static guard: an entrypoint that configures learning tracing must also say
-    whether it is ON. Checked as source rather than by running each daemon, because
-    two of the three need Couchbase/Redis to reach their first log line."""
+    """Static guard: every learning-plane entrypoint must run the shared startup
+    preamble, which is what configures tracing AND says whether it is ON. Checked as
+    source rather than by running each daemon, because most of them need
+    Couchbase/Redis to reach their first log line.
+
+    This used to scan for `configure_learning_tracing(` + `log_tracing_status(`
+    directly, back when each script carried its own ~20-line copy of the block. The
+    copies are gone; asserting on the call to `configure_daemon_process` is the same
+    guard one level up, and `test_the_daemon_preamble_does_all_four_things` below
+    holds the helper itself to the full contract.
+
+    `run_inbox_service.py` is in the list as of the dedup — it is a learning-plane
+    daemon that had NEITHER the tracing posture line nor the env-var typo warning."""
     source = (_SCRIPTS / script).read_text(encoding="utf-8")
-    assert "configure_learning_tracing(" in source
-    assert "log_tracing_status(" in source
+    assert "configure_daemon_process(" in source
+
+
+def test_the_daemon_preamble_does_all_four_things(caplog, monkeypatch):
+    """The contract the per-script guard above now delegates to. All four steps are
+    diagnostics-or-wiring that fail SILENTLY when omitted, which is why they are pinned
+    behaviourally rather than by reading source.
+
+    `basicConfig` is asserted as a CALL rather than by inspecting root-logger handlers,
+    and that is deliberate: `basicConfig` is a documented no-op once the root logger has
+    any handler, and under pytest it always does (caplog installs one). A handler-state
+    assertion would therefore pass or fail on the harness rather than on the code. The
+    claim being pinned is "the preamble configures logging before it logs" — patching
+    the function states exactly that and nothing more."""
+    from types import SimpleNamespace
+
+    from data_agent.learning import entrypoint
+
+    basic_config_calls: list[dict] = []
+    installed: list[object] = []
+    monkeypatch.setattr(logging, "basicConfig", lambda **kw: basic_config_calls.append(kw))
+    monkeypatch.setattr(entrypoint, "set_global_tracer_provider", installed.append)
+    monkeypatch.setenv("LEARNING_MAX_DELIVERES", "3")  # a plausible typo
+    settings = SimpleNamespace(otlp_endpoint="", learning_service_name="learning-loop")
+    logger = logging.getLogger("test.daemon.preamble")
+
+    with caplog.at_level(logging.INFO, logger="test.daemon.preamble"):
+        tracer = entrypoint.configure_daemon_process("inbox", settings, logger)
+
+    # 1. logging configured, at INFO, so the three lines below are actually visible
+    assert basic_config_calls == [{"level": logging.INFO}]
+    # 2. the provider became the process-global one (+ a tracer is returned for
+    #    callers that thread one into their components)
+    assert len(installed) == 1
+    assert tracer is not None
+    messages = [r.getMessage() for r in caplog.records]
+    # 3. tracing posture, named for THIS process
+    assert any("tracing OFF" in m and "inbox" in m for m in messages)
+    # 4. the ignored-env-var warning
+    assert any("LEARNING_MAX_DELIVERES" in m for m in messages)
 
 
 # --- the sweeper's --once flag ------------------------------------------------
@@ -131,9 +185,10 @@ def _patch_sweeper_entrypoint(module) -> _FakeQueue:
         learning_sweep_interval_seconds=60.0,
         learning_idle_threshold_seconds=1800,
     )
-    module.configure_learning_tracing = lambda **k: object()
-    module.set_global_tracer_provider = lambda p: None
-    module.get_learning_tracer = lambda p: None
+    # One patch where there used to be three: the whole tracing preamble is now a
+    # single call the script makes (`learning/entrypoint.py`), covered on its own by
+    # `test_the_daemon_preamble_does_all_four_things`.
+    module.configure_daemon_process = lambda *a, **k: None
     module.CouchbaseSessionStore = lambda *a, **k: object()
     module.RedisStreamsLearningQueue = SimpleNamespace(from_settings=lambda s: queue)
     module.LearningSweeper = _FakeSweeper

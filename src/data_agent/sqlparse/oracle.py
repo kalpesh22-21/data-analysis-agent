@@ -52,25 +52,42 @@ length — enough shape for a human to triage, no raw values.  The reject `reaso
 is masked the same way because sqlglot parse errors can echo a fragment of the
 offending SQL.
 
-`_mask_sql` deliberately MIRRORS the D25 masking contract of
-`data_agent.runtime.observability.redaction.mask_sql` (and, transitively,
-clickhouse-api's `app/security.py::_mask_string_literals`) rather than importing
-it: `sqlparse` is a low-level parsing layer and must not depend upward on the
-`runtime` package (importing `runtime.observability.redaction` cold also trips a
-pre-existing import cycle in that package).  Mirroring — not importing — the mask
-is the same choice `redaction.py` itself makes against clickhouse-api.
+Masking is `data_agent.runtime.observability.redaction.mask_sql`, IMPORTED.  It used
+to be a local re-implementation of the same three regexes, on two arguments that no
+longer hold:
+
+  * "importing `runtime.observability.redaction` cold trips a pre-existing import
+    cycle" — that cycle (`redaction -> context -> dispatch -> redaction`) was fixed at
+    the source: `redaction.py::hash_scope` now imports `compute_scope_hash` lazily,
+    inside the function, precisely so the module is cold-importable.  Verified: the
+    import here is clean.
+  * "`sqlparse` is a low-level parsing layer and must not depend upward on `runtime`" —
+    true of the sqlparse LIBRARY, and still respected: `sqlparse/__init__.py` exports
+    only `provenance`, and nothing on the request path reaches this module.  This
+    oracle is an offline measurement harness that merely lives in the package; it
+    already depends on far more than a regex.
+
+The copy was worth removing because the mask is a SECURITY contract, not a formatting
+detail: the whole D25 claim of this oracle is that a rejected sample carries no raw
+values.  Two implementations of that claim means one of them can be tightened (a new
+literal form, say a dollar-quoted or hex literal) while the other keeps emitting the
+values it no longer masks — and the copy that silently under-masks is this one, whose
+output is written to disk for human triage.
+
+`redaction.mask_sql` in turn mirrors clickhouse-api's `app/security.py::
+_mask_string_literals`; that one IS a cross-repo mirror and stays a mirror.
 """
 
 from __future__ import annotations
 
 import hashlib
-import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
 import sqlglot.errors
 
+from data_agent.runtime.observability.redaction import mask_sql as _mask_sql
 from data_agent.sqlparse.provenance import (
     ProvenanceExtractionError,
     extract_column_provenance,
@@ -78,21 +95,6 @@ from data_agent.sqlparse.provenance import (
 
 _DEFAULT_PREVIEW_CHARS = 240
 _DEFAULT_SAMPLE_LIMIT = 25
-
-# D25 literal-masking regexes — mirror redaction.py / clickhouse-api security.py.
-_SINGLE_QUOTED_STRING = re.compile(r"'(?:[^'\\]|\\.|\\'|'')*'")
-_DOUBLE_QUOTED_STRING = re.compile(r'"(?:[^"\\]|\\.|"")*"')
-_NUMERIC_LITERAL = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w])")
-
-
-def _mask_sql(sql: str) -> str:
-    """Mask string/numeric literals (D25).  Mirrors `redaction.mask_sql` exactly:
-    string contents become empty quotes, numeric literals become 0; keywords,
-    identifiers, and punctuation are preserved."""
-    masked = _SINGLE_QUOTED_STRING.sub("''", sql)
-    masked = _DOUBLE_QUOTED_STRING.sub('""', masked)
-    masked = _NUMERIC_LITERAL.sub("0", masked)
-    return masked
 
 
 class Outcome(StrEnum):

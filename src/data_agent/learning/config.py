@@ -17,9 +17,19 @@ import socket
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from data_agent.runtime.config import TRUTHY_ENV_VALUES
+
 # Recognized truthy spellings for the kill-switch (case-insensitive). Anything
 # else (including unset → default) resolves per the rules in `learning_enabled`.
-_TRUTHY = {"1", "true", "yes", "on"}
+#
+# Shared with the runtime's `HYDRATOR_ENABLED` switch rather than restated — see
+# `runtime/config.py::TRUTHY_ENV_VALUES` for why the two must accept the same spellings
+# and why the definition lives on that side. This does NOT weaken the separation this
+# module's docstring is about: the SETTINGS SURFACES stay separate (own env vars, own
+# `BaseSettings` classes, no shared `@lru_cache`d singleton) — only the spelling table
+# an operator types against is shared. The marginal import cost is two modules; the
+# learning package already loads far more of `runtime/` than this.
+_TRUTHY = TRUTHY_ENV_VALUES
 
 
 class _KillSwitchSettings(BaseSettings):
