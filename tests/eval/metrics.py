@@ -325,6 +325,90 @@ def _intents_for(mapping: Mapping[str, Any], call_id: str) -> set[str]:
     return set(value)
 
 
+@dataclass(frozen=True)
+class ReDerivationJudgement:
+    """The re-derivation reading, WITH the "nothing to judge" case split out.
+
+    `re_derivation` collapses three different worlds into `False`:
+
+      1. an authoritative blueprint answered an intent and NO later `runQuery`
+         touched that intent — the real pass;
+      2. no authoritative `runBlueprint` ran at all — there was never anything to
+         re-derive;
+      3. authoritative blueprints ran but NOTHING BOUND THEM TO AN INTENT (no
+         `updateAnalysisState` citation, no call-time `serves_intent` tag), so the
+         `∃ b` in the definition is vacuous.
+
+    Worlds 2 and 3 are not evidence of good behaviour — they are the absence of
+    evidence, and a predicate that reports them as a pass is reporting a
+    measurement it never made. `re_derived is None` says so; the caller decides
+    what an unjudgeable turn means for ITS case (a single-intent turn, where the
+    runtime is right not to track anything, can fall back to
+    `re_derivation_turn_scoped`, which is exact when there is only one intent).
+    """
+
+    re_derived: bool | None
+    detail: str = ""
+
+    @property
+    def judgeable(self) -> bool:
+        return self.re_derived is not None
+
+
+def re_derivation_judgement(
+    trail: Sequence[TrailEntry],
+    serves_intent: Mapping[str, Any],
+    *,
+    turn_index: int,
+) -> ReDerivationJudgement:
+    """`re_derivation`, with the vacuous cases reported rather than swallowed.
+
+    The predicate itself is unchanged — see `re_derivation` for the definition and
+    for why it is INTENT-scoped and ordered by trail position.
+    """
+    scoped = [e for e in trail if e.turn_index == turn_index]
+    blueprints = [
+        (position, entry)
+        for position, entry in enumerate(scoped)
+        if entry.tool_name == "runBlueprint" and entry.authoritative is True
+    ]
+    if not blueprints:
+        return ReDerivationJudgement(
+            None,
+            "no authoritative runBlueprint in the turn — there was nothing to re-derive, "
+            "so re-derivation was not judged",
+        )
+    queries = [
+        (position, entry)
+        for position, entry in enumerate(scoped)
+        if entry.tool_name == "runQuery"
+    ]
+    bound = 0
+    for b_position, b_entry in blueprints:
+        b_intents = _intents_for(serves_intent, b_entry.tool_call_id)
+        if not b_intents:
+            continue
+        bound += 1
+        for q_position, q_entry in queries:
+            if q_position <= b_position:
+                continue
+            overlap = b_intents & _intents_for(serves_intent, q_entry.tool_call_id)
+            if overlap:
+                return ReDerivationJudgement(
+                    True,
+                    "a runQuery re-derived intent(s) "
+                    f"{sorted(overlap)} an authoritative blueprint had answered",
+                )
+    if not bound:
+        return ReDerivationJudgement(
+            None,
+            "turn was untracked (no intent binding on any authoritative runBlueprint — "
+            "no updateAnalysisState citation and no call-time serves_intent tag) — "
+            "cannot judge re-derivation",
+        )
+    return ReDerivationJudgement(False)
+
+
 def re_derivation(
     trail: Sequence[TrailEntry],
     serves_intent: Mapping[str, Any],
@@ -349,28 +433,15 @@ def re_derivation(
     loop, while `_now_iso()` is explicitly not guaranteed monotonic within a turn
     (`agent_loop._now_iso`'s own comment), so two calls in one batch can share a
     stamp.
+
+    ⚠ THE BOOLEAN CANNOT DISTINGUISH "no re-derivation" FROM "nothing to judge" —
+    an untracked turn is `False` here by vacuity. `re_derivation_judgement` splits
+    the two; this stays a plain bool because the A1 fixtures and `test_metrics`
+    assert against a declared expectation where the turn is tracked BY
+    CONSTRUCTION, and because "did it happen" is the shape production telemetry
+    wants.
     """
-    scoped = [e for e in trail if e.turn_index == turn_index]
-    blueprints = [
-        (position, entry)
-        for position, entry in enumerate(scoped)
-        if entry.tool_name == "runBlueprint" and entry.authoritative is True
-    ]
-    queries = [
-        (position, entry)
-        for position, entry in enumerate(scoped)
-        if entry.tool_name == "runQuery"
-    ]
-    for b_position, b_entry in blueprints:
-        b_intents = _intents_for(serves_intent, b_entry.tool_call_id)
-        if not b_intents:
-            continue
-        for q_position, q_entry in queries:
-            if q_position <= b_position:
-                continue
-            if b_intents & _intents_for(serves_intent, q_entry.tool_call_id):
-                return True
-    return False
+    return re_derivation_judgement(trail, serves_intent, turn_index=turn_index).re_derived is True
 
 
 def re_derivation_turn_scoped(trail: Sequence[TrailEntry], *, turn_index: int) -> bool:
@@ -481,6 +552,7 @@ __all__ = [
     "DetectionObservation",
     "DetectionRate",
     "PassRate",
+    "ReDerivationJudgement",
     "TurnRecord",
     "ZeroRowRatio",
     "blocked_intent_report",
@@ -489,6 +561,7 @@ __all__ = [
     "multi_intent_detection",
     "pending_on_terminal_turns",
     "re_derivation",
+    "re_derivation_judgement",
     "re_derivation_turn_scoped",
     "serves_intent_from_trail",
     "zero_row_ratio",

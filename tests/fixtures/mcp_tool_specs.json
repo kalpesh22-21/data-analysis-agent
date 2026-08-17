@@ -1,0 +1,142 @@
+{
+  "_source": "clickhouse-api/app/mcp_server.py — the FastMCP `tools/list` payload",
+  "_why": "A2 ships these to the live model verbatim (mcp/tool_schema.py::translate_tool_spec). Before this fixture existed the A2 double advertised description=\"\" and an EMPTY parameter schema for all six tools, so the model was told runQuery() takes no `sql` and getTableSchema() takes no table — an unrunnable, blueprint-only arena.",
+  "_regenerate": "cd <clickhouse-api repo> && .venv/bin/python -c \"import asyncio, json; from app.mcp_server import mcp; print(json.dumps([{'name': t.name, 'description': t.description, 'input_schema': t.inputSchema} for t in asyncio.run(mcp.list_tools())], indent=2, ensure_ascii=False))\" — paste the result under \"tools\". Same DEV-only, sibling-repo idiom as scripts/regen_catalog_fixture.py. Never fetched at test time: A2 must not need a live MCP.",
+  "_drift_guard": "tests/_tool_specs_fixture.py::fixture_tool_specs is the only reader. If clickhouse-api adds/removes a tool or edits a parameter, regenerate — a stale fixture silently lies to the model in exactly the way this file exists to stop.",
+  "tools": [
+    {
+      "name": "listDatabases",
+      "description": "Return the list of ClickHouse databases this server is configured to expose. Results respect the ALLOWED_DATABASES server allowlist — databases outside that list are never returned. Call this first to discover which databases are available before listing tables.",
+      "input_schema": {
+        "properties": {},
+        "title": "list_databasesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "listTables",
+      "description": "Return all tables (and their storage engines) inside the specified database. Call listDatabases first if you are unsure which databases are available. The 'database' parameter must be a database name returned by listDatabases.",
+      "input_schema": {
+        "properties": {
+          "database": {
+            "description": "The database to list tables from",
+            "title": "Database",
+            "type": "string"
+          }
+        },
+        "required": [
+          "database"
+        ],
+        "title": "list_tablesArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "getTableSchema",
+      "description": "Return the column schema for the specified table, merged with the curated Semantic Catalog (description, synonyms, units, known values, grain, primary key, join keys, measures, rules, and disambiguation guidance) when the table is catalogued. ALWAYS call this before writing a SELECT query against an unfamiliar table. Knowing the schema tells you exact column names, types (e.g. UInt64, Nullable(String), DateTime64(3)), and descriptive comments — preventing type-mismatch errors and helping you write correct WHERE clauses and aggregations. Columns and catalog entries outside your permitted access scope are omitted.",
+      "input_schema": {
+        "properties": {
+          "database": {
+            "description": "The database containing the table",
+            "title": "Database",
+            "type": "string"
+          },
+          "table": {
+            "description": "The table to describe",
+            "title": "Table",
+            "type": "string"
+          }
+        },
+        "required": [
+          "database",
+          "table"
+        ],
+        "title": "get_table_schemaArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "sampleRows",
+      "description": "Return a small sample of raw rows from the specified table so you can inspect actual data values, formats, and nullability before writing analytical queries. Default sample size is 5 rows; maximum is 50. Call getTableSchema first to know the column names, then use sampleRows to understand real data distributions. If the table has any column outside your permitted access scope, the call is rejected outright (no partial row projection) — use runQuery with an explicit in-scope column list instead.",
+      "input_schema": {
+        "properties": {
+          "database": {
+            "description": "The database containing the table",
+            "title": "Database",
+            "type": "string"
+          },
+          "table": {
+            "description": "The table to sample",
+            "title": "Table",
+            "type": "string"
+          },
+          "limit": {
+            "default": 5,
+            "description": "Number of sample rows to return (1–50, default 5)",
+            "maximum": 50,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "database",
+          "table"
+        ],
+        "title": "sample_rowsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "runQuery",
+      "description": "Execute a read-only SQL query (SELECT or WITH) against ClickHouse and return results in a compact {columns, rows, row_count, truncated} format. The server enforces read-only mode, execution time limits, and row caps. If 'truncated' is true, the result was capped at the server MAX_RESPONSE_ROWS limit — narrow your query with a more selective WHERE clause or reduce your LIMIT. Always call getTableSchema before writing a query against an unfamiliar table. SHOW and DESCRIBE are rejected here — use listTables and getTableSchema for metadata instead. explainQuery can validate a well-formed, in-scope query's plan before you run it, but it enforces the same scope/session/scratch guardrails — it will not bypass a validation, column-scope, or scratch-session rejection. INSERT, UPDATE, DELETE, DDL, and external table functions are blocked.",
+      "input_schema": {
+        "properties": {
+          "sql": {
+            "description": "Read-only SELECT or WITH statement (not SHOW / DESCRIBE — use listTables / getTableSchema)",
+            "title": "Sql",
+            "type": "string"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "maximum": 10000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional row limit (1–10000). Capped at the server MAX_RESPONSE_ROWS regardless.",
+            "title": "Limit"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "title": "run_queryArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "explainQuery",
+      "description": "Run EXPLAIN on a SQL statement and return the query execution plan without executing it. Use this to validate SQL syntax and inspect the query plan BEFORE calling runQuery, especially for complex queries. If EXPLAIN succeeds the query is syntactically valid and safe to run. explainQuery enforces the SAME scope, session, and scratch-isolation guardrails as runQuery — it is NOT an escape hatch: a query that fails those gates (column-scope, scratch-session, or provenance-parse) is rejected here too, so do not retry a gate-rejected query through explainQuery. EXPLAIN is fast and cheap — it does not read actual data rows.",
+      "input_schema": {
+        "properties": {
+          "sql": {
+            "description": "SQL statement to pass through EXPLAIN",
+            "title": "Sql",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "title": "explain_queryArguments",
+        "type": "object"
+      }
+    }
+  ]
+}

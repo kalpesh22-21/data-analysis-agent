@@ -398,6 +398,91 @@ def test_one_evidence_id_can_serve_several_intents() -> None:
 
 
 # ---------------------------------------------------------------------------
+# §C.2 — "nothing to judge" is not "nothing happened"
+#
+# `re_derivation` answers `False` in three different worlds, and only one of them
+# is a pass. These pin the split, because the vacuous worlds are exactly the ones
+# a predicate silently clears — A2's L1/L6 were passing on world 3 for as long as
+# the live suite has existed.
+# ---------------------------------------------------------------------------
+
+
+def test_no_authoritative_blueprint_is_unjudgeable_not_a_pass() -> None:
+    """World 2: nothing authoritative ran, so there was nothing to re-derive. The
+    bool cannot say that, and a case whose premise is an authoritative result must
+    not read the absence of one as good behaviour."""
+    trail = [
+        _entry("b1", "runBlueprint", authoritative=False),
+        _entry("q1", "runQuery"),
+    ]
+    judgement = metrics.re_derivation_judgement(trail, {"b1": "i1", "q1": "i1"}, turn_index=0)
+    assert judgement.re_derived is None
+    assert judgement.judgeable is False
+    assert "no authoritative runBlueprint" in judgement.detail
+    assert metrics.re_derivation(trail, {"b1": "i1", "q1": "i1"}, turn_index=0) is False
+
+
+def test_an_unbound_authoritative_blueprint_is_unjudgeable_not_a_pass() -> None:
+    """World 3, the one that mattered: the blueprint IS authoritative, a `runQuery`
+    followed it, and NOTHING bound either to an intent — no `updateAnalysisState`
+    citation, no call-time tag. The `∃ b` is vacuous, so the intent-scoped
+    predicate has no reading to give, and reporting `False` claims a measurement
+    that was never made."""
+    trail = [
+        _entry("b1", "runBlueprint", authoritative=True),
+        _entry("q1", "runQuery"),
+    ]
+    judgement = metrics.re_derivation_judgement(trail, {}, turn_index=0)
+    assert judgement.re_derived is None
+    assert judgement.judgeable is False
+    assert "untracked" in judgement.detail
+    # The turn-scoped form DOES have a reading here, which is why a single-intent
+    # A2 case can fall back to it (`_re_derivation_detail`): with one intent there
+    # is no distinct residual for the query to be legitimately serving.
+    assert metrics.re_derivation_turn_scoped(trail, turn_index=0) is True
+
+
+def test_a_bound_overlapping_query_is_judged_true_and_names_the_intent() -> None:
+    trail = _blueprint_then_query("i1")
+    mapping = metrics.serves_intent_from_trail(trail, 0)
+    judgement = metrics.re_derivation_judgement(trail, mapping, turn_index=0)
+    assert judgement.re_derived is True
+    assert judgement.judgeable is True
+    assert "i1" in judgement.detail
+
+
+def test_a_bound_non_overlapping_query_is_judged_false_with_no_detail() -> None:
+    """The real pass: the binding exists, so the predicate ran, and the query
+    served a DISTINCT intent — the legal blueprint+residual shape."""
+    trail = _blueprint_then_query("i2")
+    mapping = metrics.serves_intent_from_trail(trail, 0)
+    judgement = metrics.re_derivation_judgement(trail, mapping, turn_index=0)
+    assert judgement.re_derived is False
+    assert judgement.judgeable is True
+    assert judgement.detail == ""
+
+
+def test_the_bool_is_exactly_the_judgement_being_true() -> None:
+    """`re_derivation` is now a projection of the judgement, and the two must never
+    drift: every caller that kept the bool (A1's fixtures, production telemetry)
+    keeps asking "did it happen", and only that."""
+    cases: list[tuple[list[TrailEntry], dict[str, Any]]] = [
+        ([_entry("b1", "runBlueprint", authoritative=False), _entry("q1", "runQuery")],
+         {"b1": "i1", "q1": "i1"}),
+        ([_entry("b1", "runBlueprint", authoritative=True), _entry("q1", "runQuery")], {}),
+        (_blueprint_then_query("i1"), {"b1": "i1", "q1": "i1"}),
+        (_blueprint_then_query("i2"), {"b1": "i1", "q1": "i2"}),
+        ([_entry("q1", "runQuery"), _entry("b1", "runBlueprint", authoritative=True)],
+         {"b1": "i1", "q1": "i1"}),
+    ]
+    for trail, mapping in cases:
+        judgement = metrics.re_derivation_judgement(trail, mapping, turn_index=0)
+        assert metrics.re_derivation(trail, mapping, turn_index=0) == (
+            judgement.re_derived is True
+        )
+
+
+# ---------------------------------------------------------------------------
 # The inferred corpus-gap signal
 # ---------------------------------------------------------------------------
 

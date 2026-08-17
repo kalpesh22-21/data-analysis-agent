@@ -57,7 +57,7 @@ module skips, so an ordinary `uv run pytest` costs no live model calls. Tuning:
 |---|---|---|
 | `RUN_LIVE_EVAL` | unset | Required. A2 skips without it. |
 | `LIVE_EVAL_RUNS` | `3` | Runs per case. |
-| `LIVE_EVAL_MIN_PASS_RATE` | `0.67` | The gate. |
+| `LIVE_EVAL_MIN_PASS_RATE` | `2/3 - 1e-9` | The gate. **Not `0.67`** — at `LIVE_EVAL_RUNS=3` a case with one red run reaches 2/3 = 0.6666…, which is *below* 0.67, so the literal value made the gate "3/3 or fail" while the docstring promised that one red run is noise. |
 
 **A2 is reported as a pass-rate over N runs, not a boolean.** The model is
 non-deterministic and a single red run is noise; a boolean gate would flap.
@@ -72,6 +72,10 @@ tests/eval/
   test_routing_live.py         A2
   metrics.py                   the metrics + the scoped pending sweep
   test_metrics.py              the metric code is code
+
+tests/
+  _tool_specs_fixture.py       loader for the frozen MCP tools/list payload (A2)
+  fixtures/mcp_tool_specs.json the payload itself — the real six tool schemas
 ```
 
 ## What the harness stands up
@@ -98,6 +102,34 @@ prompt, that is disqualifying.
 * Blueprint recall pre-filters on `uses ⊆ column_scope`, so an **empty
   `column_scope` drops every card**. Empty means *allow-all* for query execution
   and *match nothing* for blueprint recall. They are not the same switch.
+
+### A2's tool catalogue is the real one, and that is load-bearing
+
+`translate_tool_spec` copies an `MCPToolSpec`'s `description` and `input_schema`
+**verbatim** into the function declaration the model sees. A2's double used to
+advertise all six MCP tools with `description=""` and
+`{"type": "object", "properties": {}}`, which told the live model that
+`runQuery()` takes no `sql` and `getTableSchema()` takes no table — so A2 was a
+**blueprint-only arena** and every case needing ad-hoc SQL or a real schema read
+was unwinnable for a harness reason, not a routing one.
+
+The specs now come from `tests/fixtures/mcp_tool_specs.json` via
+`tests/_tool_specs_fixture.py` — the MCP's own `tools/list` payload, frozen and
+committed, regenerated from a local clone of `clickhouse-api` exactly as
+`scripts/regen_catalog_fixture.py` regenerates the catalog export. Never fetched
+at test time. A harness may double the transport; it may not lie about the
+contract. The handlers answer in the shapes the real server answers in
+(`getTableSchema` returns the catalogued columns with their real types and
+comments; an unknown table raises `TABLE_NOT_FOUND`, as `app/service.py` does).
+
+**A case's residual must be genuinely uncovered.** L3 grades "blueprint for its
+part, ad-hoc for the rest", so its residual has to be something *no* seeded
+blueprint answers — otherwise a correctly blueprint-first model answers both
+halves from the corpus and the case goes red for being right. Its residual is
+headcount **by employment status** (every seeded blueprint groups by department,
+month, or payroll line item), kept inside the corpus footprint so
+`is_answer_table_in_scope` cannot drop the table and turn the case into a scope
+measurement.
 
 ### Column scope is enforced in two different places
 
@@ -215,6 +247,30 @@ Not from `loop_intent_completed` (06 gives it `evidence_tool_name`, and a tool
 *name* cannot tell two `runQuery` calls apart) and not from the final
 `AnalysisState` (latest-wins, so a rebound evidence id — precisely the
 re-derivation shape — has already been overwritten).
+
+### An untracked turn is not a pass
+
+`re_derivation` returns `False` in three different worlds: nothing was
+re-derived, no authoritative `runBlueprint` ran at all, or one ran and **nothing
+bound it to an intent** — so the `∃ b` is vacuous. The last two are the absence
+of evidence, and a predicate reporting them as a pass reports a measurement it
+never made. `metrics.re_derivation_judgement` returns `re_derived is None` for
+them, with the reason; `re_derivation` stays a bool on top of it (A1's fixtures
+and `test_metrics` bind intents by construction, and production telemetry wants
+"did it happen").
+
+The A2 predicates then decide what unjudgeable means for *their* case. On a
+**single-intent** turn the runtime is right not to track anything (03 §E: state
+for a single-intent request is the false positive E.3 counts), and with one
+intent the rejected turn-scoped form is not an approximation — any `runQuery`
+after the authoritative blueprint *is* a re-derivation of it — so L1/L6 fall back
+to it and say so in the detail. On a **multi-intent** turn (L3) that fallback is
+exactly the wrong predicate, so an unjudgeable turn fails as unjudgeable.
+
+The same rule applies to state: `no analysisState was initialized`,
+`analysisState was initialized with NO intents` and `intents still pending: […]`
+are three different findings, and L4/L5 report them as three (the first is the
+model-never-declares-intents defect, which is not "an intent was left hanging").
 
 **Case 4 closes all three intents by tag alone** (`{intent_id, status}`, no
 evidence field), which is the exact shape that failed 9 times out of 9 against a

@@ -17,7 +17,8 @@ may stay committed fixtures — what must be real is the model and the prompt.
 
 REPORTED AS A PASS-RATE OVER N RUNS, NOT A BOOLEAN. The model is
 non-deterministic and a single red run is noise. `LIVE_EVAL_RUNS` (default 3) and
-`LIVE_EVAL_MIN_PASS_RATE` (default 0.67) tune it.
+`LIVE_EVAL_MIN_PASS_RATE` (default two-thirds, i.e. "one red run of three is
+tolerated" — see `MIN_PASS_RATE`, it is NOT 0.67) tune it.
 
     RUN_LIVE_EVAL=1 uv run pytest tests/eval/test_routing_live.py -q -s
 
@@ -38,7 +39,7 @@ from fastapi.testclient import TestClient
 from data_agent.runtime import app as app_module
 from data_agent.runtime.app import create_app
 from data_agent.runtime.config import RuntimeSettings
-from data_agent.runtime.mcp.client import MCPToolSpec
+from data_agent.runtime.mcp.client import MCPToolError, MCPToolSpec
 from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
@@ -46,6 +47,7 @@ from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import AnalysisState, TrailEntry
 from tests._catalog_fixture import fixture_catalog, fixture_catalog_handle
+from tests._tool_specs_fixture import fixture_tool_specs
 
 from . import metrics
 from .conftest import (
@@ -65,7 +67,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 RUNS = int(os.environ.get("LIVE_EVAL_RUNS", "3"))
-MIN_PASS_RATE = float(os.environ.get("LIVE_EVAL_MIN_PASS_RATE", "0.67"))
+
+# THE FLOOR IS TWO-THIRDS, NOT `0.67`. The docstring's tolerance — "a single red
+# run is noise" — is what the number has to encode, and at the default RUNS=3 the
+# only rate a case with one red run can reach is 2/3 = 0.6666…, which is BELOW
+# 0.67. The literal `0.67` therefore made the gate "3/3 or fail" while claiming to
+# tolerate one red run, and L6 failed on exactly that arithmetic (2/3 = 67% < 67%).
+# The epsilon absorbs the float division; the env override is unchanged, and
+# anything a deployment sets there wins verbatim.
+MIN_PASS_RATE = float(os.environ.get("LIVE_EVAL_MIN_PASS_RATE", str(2 / 3 - 1e-9)))
 
 _BASE_DATABASE = "dbpcm_warehouse"
 _SESSION_PREFIX = "sess-live-eval"
@@ -88,6 +98,14 @@ class LiveEvalMCPClient:
     Schemas and table lists come from the committed catalog export, so the model
     sees the real HR warehouse shape. Query results are synthetic and fixed —
     A2 grades the ROUTE, not the numbers. Grading the numbers is A3, deferred.
+
+    THE TOOL CATALOGUE IS THE REAL ONE (`tests/_tool_specs_fixture.py`). It used to
+    be six names with `description=""` and an EMPTY `input_schema`, and
+    `mcp/tool_schema.py::translate_tool_spec` ships `description`/`input_schema`
+    VERBATIM to the model — so the model was told `runQuery()` takes no `sql` and
+    `getTableSchema()` takes no table. Every case needing ad-hoc SQL or a real
+    schema read was unwinnable, and A2 was silently a blueprint-only arena. A
+    harness may double the transport; it may not lie about the contract.
     """
 
     def __init__(self) -> None:
@@ -104,19 +122,12 @@ class LiveEvalMCPClient:
         return handler(args)
 
     async def list_tools(self, *, jwt: str, session_id: str) -> list[MCPToolSpec]:
-        return [
-            MCPToolSpec(
-                name=name, description="", input_schema={"type": "object", "properties": {}}
-            )
-            for name in (
-                "listDatabases",
-                "listTables",
-                "getTableSchema",
-                "runQuery",
-                "sampleRows",
-                "explainQuery",
-            )
-        ]
+        """The MCP's REAL `tools/list`, from the committed fixture.
+
+        Frozen, never fetched: A2 must not need a live MCP. See
+        `tests/fixtures/mcp_tool_specs.json` for the regen recipe and the drift
+        guard."""
+        return fixture_tool_specs()
 
     # -- handlers ---------------------------------------------------------
 
@@ -143,17 +154,64 @@ class LiveEvalMCPClient:
             for table in self._tables()
         ]
 
-    def _getTableSchema(self, args: dict[str, Any]) -> dict[str, Any]:  # noqa: N802
-        database = args.get("database", _BASE_DATABASE)
-        table = args.get("table", "")
-        entry = self._catalog.get(f"{database}.{table}") or {}
+    def _entry(self, database: str, table: str) -> dict[str, Any]:
+        """The catalog entry for `database.table`, or the MCP's own TABLE_NOT_FOUND.
+
+        The real server raises `TableNotFoundError` for a table `system.columns`
+        does not know (`clickhouse-api/app/service.py`), and the runtime's denial
+        mapping already understands that code. Returning an empty envelope instead
+        would tell the model the table exists and has no columns — a lie it cannot
+        recover from."""
+        entry = self._catalog.get(f"{database}.{table}")
+        if entry is None:
+            raise MCPToolError(
+                "TABLE_NOT_FOUND",
+                f"[TABLE_NOT_FOUND] Table '{database}.{table}' not found or has no "
+                "columns. Check the database and table names with listTables.",
+            )
+        return entry
+
+    def _visible_columns(self, entry: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        """`[(name, spec)]` minus `mcp_projection.hidden_columns`.
+
+        The overlay drops those UNCONDITIONALLY on every transport (the RLS
+        physical columns `client_code`/`proc_center`), so a double that emitted
+        them would invite SQL the real server rejects."""
+        hidden = set((entry.get("mcp_projection") or {}).get("hidden_columns") or ())
         columns = entry.get("columns") or {}
+        return [
+            (name, spec if isinstance(spec, dict) else {})
+            for name, spec in columns.items()
+            if name not in hidden
+        ]
+
+    def _getTableSchema(self, args: dict[str, Any]) -> dict[str, Any]:  # noqa: N802
+        """The merged catalog+introspection shape `svc_get_table_schema` returns.
+
+        NOT a column-name list. The previous version rendered `type` as `str(spec)`
+        — the whole catalog dict stringified into the type field — and truncated at
+        40 columns, which is how L5's metadata half was "answered" by a schema read
+        that carried no usable schema. Every documented column, its real ClickHouse
+        type, and the catalog description as the `comment`."""
+        database = str(args.get("database") or _BASE_DATABASE)
+        table = str(args.get("table") or "")
+        entry = self._entry(database, table)
         return {
             "database": database,
             "table": table,
+            "catalogued": True,
+            "description": entry.get("description"),
+            "grain": entry.get("grain"),
+            "primary_key": entry.get("primary_key"),
+            "join_keys": entry.get("join_keys"),
+            "rules": entry.get("rules"),
             "columns": [
-                {"name": name, "type": str(spec), "comment": ""}
-                for name, spec in list(columns.items())[:40]
+                {
+                    "name": name,
+                    "type": str(spec.get("type") or ""),
+                    "comment": str(spec.get("description") or ""),
+                }
+                for name, spec in self._visible_columns(entry)
             ],
         }
 
@@ -177,10 +235,24 @@ class LiveEvalMCPClient:
             "truncated": False,
         }
 
-    def _sampleRows(self, _args: dict[str, Any]) -> dict[str, Any]:  # noqa: N802
+    def _sampleRows(self, args: dict[str, Any]) -> dict[str, Any]:  # noqa: N802
+        """Two synthetic rows over the REQUESTED table's real visible columns.
+
+        Now that the schema advertises `database`/`table`, the model names them —
+        and a sample that answered `payroll` with `employee_code, department_name`
+        would be the same class of lie the tool specs were. The VALUES stay
+        synthetic (A2 grades the route, not the numbers); only the SHAPE is real.
+
+        EVERY visible column, uncapped: `svc_sample_rows` projects the introspected
+        set minus `mcp_projection.hidden_columns` and returns all of it, so a cap
+        here would be a shape the real server never produces — the model would plan
+        against a narrower table than it will actually get."""
+        database = str(args.get("database") or _BASE_DATABASE)
+        table = str(args.get("table") or "")
+        names = [name for name, _spec in self._visible_columns(self._entry(database, table))]
         return {
-            "columns": ["employee_code", "department_name"],
-            "rows": [["E1", "Sales"], ["E2", "Support"]],
+            "columns": names,
+            "rows": [[f"{name}-1" for name in names], [f"{name}-2" for name in names]],
             "row_count": 2,
             "truncated": False,
         }
@@ -255,14 +327,70 @@ class LiveRun:
             if isinstance(e.args, dict) and e.args.get("id")
         }
 
+    def authoritative_blueprint_ids(self) -> set[str]:
+        """The blueprints whose result the D56 gate VERIFIED.
+
+        `blueprint_ids` is "the call did not error", which is a weaker claim: a
+        successful-but-unverified run is not an authoritative result, and
+        `metrics.re_derivation` only ever considers authoritative ones."""
+        return {
+            str(e.args.get("id"))
+            for e in self.succeeded("runBlueprint")
+            if isinstance(e.args, dict) and e.args.get("id") and e.authoritative is True
+        }
+
+    def blueprint_attempts(self) -> list[str]:
+        """`["<id>:<status>[:unverified]"]` for EVERY `runBlueprint` call.
+
+        So "no blueprint result" can say WHICH of the three worlds it was: the
+        model never called one, it called one that was denied, or it ran one the
+        D56 gate would not certify."""
+        return [
+            f"{e.args.get('id') if isinstance(e.args, dict) else '?'}:{e.status}"
+            + ("" if e.authoritative is True or e.status != "ok" else ":unverified")
+            for e in self.trail
+            if e.tool_name == "runBlueprint"
+        ]
+
     def evidence_tool_names(self) -> set[str]:
+        """Every tool NAME bound to a tracked intent, from BOTH binding sources.
+
+        `AnalysisState.intent.evidence_tool_call_id` alone under-reports: an intent
+        closed by a CALL-TIME `serves_intent` tag carries no
+        `evidence_tool_call_id` at all (`metrics.serves_intent_from_trail`'s source
+        1), so a correctly-tagged turn looked like a turn with no evidence — which
+        is a harness misreport, not a routing miss. The union is what "which tool
+        answered which intent" actually means today."""
         by_id = {e.tool_call_id: e for e in self.trail}
         names = set()
         for intent in (self.state.intents if self.state else ()):
             entry = by_id.get(intent.evidence_tool_call_id or "")
             if entry is not None:
                 names.add(entry.tool_name)
+        tracked = {intent.intent_id for intent in (self.state.intents if self.state else ())}
+        for call_id, intents in self.serves_intent.items():
+            entry = by_id.get(call_id)
+            if entry is not None and entry.status == "ok" and (intents & tracked):
+                names.add(entry.tool_name)
         return names
+
+    def designation_counts(self) -> list[tuple[int, int, int]]:
+        """`[(table_count, blueprint_table_count, verified_table_count)]`, one per
+        `loop_answer_tables_designated` (06 §L).
+
+        Reported, never gated. With faithful tool specs the model can designate a
+        table by RAW SQL instead of by `blueprint_id`, which keeps `table_count` up
+        while collapsing `verified_table_count` to 0 — a regression invisible to
+        every predicate here, so it is printed beside every case's rate."""
+        return [
+            (
+                int(payload.get("table_count") or 0),
+                int(payload.get("blueprint_table_count") or 0),
+                int(payload.get("verified_table_count") or 0),
+            )
+            for name, payload in self.events
+            if name == "loop_answer_tables_designated"
+        ]
 
 
 def _run_live(question: str, run_index: int) -> LiveRun:
@@ -317,17 +445,66 @@ def _run_live(question: str, run_index: int) -> LiveRun:
 # ---------------------------------------------------------------------------
 
 
-def _all_terminal(run: LiveRun) -> bool:
-    return run.state is not None and all(
-        intent.status in metrics.TERMINAL_INTENT_STATUSES for intent in run.state.intents
-    )
+def _not_terminal_detail(run: LiveRun) -> str:
+    """"" if every tracked intent reached a terminal disposition, else WHY NOT.
+
+    THREE DISTINCT WORLDS, three distinct details. `_all_terminal` used to return a
+    bare `False` for all of them, so "not every intent reached a terminal
+    disposition" was printed for a turn that never initialized an `analysisState`
+    at all — the one that is a real, separate runtime defect (the model never
+    declares intents) reported as if intents had been left hanging. `_l4` already
+    split the first two; this is that split, made shareable."""
+    if run.state is None:
+        return "no analysisState was initialized"
+    if not run.state.intents:
+        return "analysisState was initialized with NO intents"
+    unfinished = [
+        f"{intent.intent_id}:{intent.status}"
+        for intent in run.state.intents
+        if intent.status not in metrics.TERMINAL_INTENT_STATUSES
+    ]
+    if unfinished:
+        return f"intents still pending: {unfinished}"
+    return ""
+
+
+def _re_derivation_detail(run: LiveRun, *, single_intent: bool) -> str:
+    """"" if the turn did not re-derive an authoritative result, else WHY.
+
+    An UNJUDGEABLE turn is not a pass. `metrics.re_derivation` returns `False` when
+    nothing bound a blueprint run to an intent, so an untracked turn used to clear
+    this check by vacuity — the predicate reported a measurement it never made.
+
+    On a turn whose ground truth is a SINGLE intent the runtime is RIGHT not to
+    track anything (03 §E: initializing state for a single-intent request is the
+    false positive the detection metric counts), so there the turn-scoped form is
+    not an approximation — with one intent, any `runQuery` after the authoritative
+    blueprint IS a re-derivation of it. On a multi-intent turn it is the rejected
+    predicate (§C.2: it flags the legal blueprint+residual shape), so an
+    unjudgeable multi-intent turn is reported as unjudgeable and fails."""
+    judgement = metrics.re_derivation_judgement(run.trail, run.serves_intent, turn_index=0)
+    if judgement.re_derived is True:
+        return judgement.detail
+    if judgement.re_derived is None:
+        if not single_intent:
+            return judgement.detail
+        if metrics.re_derivation_turn_scoped(run.trail, turn_index=0):
+            return (
+                "a runQuery followed the authoritative blueprint on a single-intent "
+                f"turn ({judgement.detail}; judged turn-scoped, which is exact for one intent)"
+            )
+    return ""
 
 
 def _l1_projection_routed_to_its_blueprint(run: LiveRun) -> tuple[bool, str]:
     if "bp-hires-projection" not in run.blueprint_ids():
-        return False, f"no successful bp-hires-projection run (blueprints={run.blueprint_ids()})"
-    if metrics.re_derivation(run.trail, run.serves_intent, turn_index=0):
-        return False, "a runQuery re-derived the intent the blueprint answered"
+        return (
+            False,
+            f"no successful bp-hires-projection run (runBlueprint={run.blueprint_attempts()})",
+        )
+    detail = _re_derivation_detail(run, single_intent=True)
+    if detail:
+        return False, detail
     return True, ""
 
 
@@ -340,11 +517,17 @@ def _l2_two_blueprints(run: LiveRun) -> tuple[bool, str]:
 
 def _l3_blueprint_plus_residual(run: LiveRun) -> tuple[bool, str]:
     if not run.blueprint_ids():
-        return False, "the blueprint half was answered with ad-hoc SQL"
+        return (
+            False,
+            f"the blueprint half was answered with ad-hoc SQL (runBlueprint={run.blueprint_attempts()})",
+        )
     if not run.succeeded("runQuery"):
         return False, "the residual half never ran a query"
-    if metrics.re_derivation(run.trail, run.serves_intent, turn_index=0):
-        return False, "the ad-hoc query re-derived the blueprint's own intent"
+    # Two intents by ground truth, so the turn-scoped fallback is NOT available:
+    # this is the exact shape (blueprint + distinct residual) it wrongly flags.
+    detail = _re_derivation_detail(run, single_intent=False)
+    if detail:
+        return False, detail
     return True, ""
 
 
@@ -353,15 +536,16 @@ def _l4_three_intents_tracked_and_terminal(run: LiveRun) -> tuple[bool, str]:
         return False, "no analysisState was initialized for a three-intent request"
     if len(run.state.intents) < 3:
         return False, f"tracked {len(run.state.intents)} intents, expected 3"
-    if not _all_terminal(run):
-        pending = [i.intent_id for i in run.state.intents if i.status == "pending"]
-        return False, f"intents still pending at a terminal outcome: {pending}"
+    detail = _not_terminal_detail(run)
+    if detail:
+        return False, f"at a terminal outcome: {detail}"
     return True, ""
 
 
 def _l5_metadata_and_analytical(run: LiveRun) -> tuple[bool, str]:
-    if not _all_terminal(run):
-        return False, "not every intent reached a terminal disposition"
+    detail = _not_terminal_detail(run)
+    if detail:
+        return False, detail
     names = run.evidence_tool_names()
     if "getTableSchema" not in names:
         return False, f"the metadata intent was not answered from schema ({names})"
@@ -397,10 +581,19 @@ def _l7_three_deliverables_three_tables(run: LiveRun) -> tuple[bool, str]:
 
 
 def _l6_no_re_derivation(run: LiveRun) -> tuple[bool, str]:
-    if not run.blueprint_ids():
-        return False, "no authoritative blueprint result to re-derive in the first place"
-    if metrics.re_derivation(run.trail, run.serves_intent, turn_index=0):
-        return False, "a runQuery re-derived an intent an authoritative blueprint answered"
+    # AUTHORITATIVE, not merely successful — which is what this failure message
+    # always claimed, and what `metrics.re_derivation` actually quantifies over. A
+    # run the D56 gate did not certify is not a result anything can re-derive, and
+    # letting it satisfy the premise made the rest of the predicate vacuous.
+    if not run.authoritative_blueprint_ids():
+        return (
+            False,
+            "no authoritative blueprint result to re-derive in the first place "
+            f"(runBlueprint={run.blueprint_attempts()})",
+        )
+    detail = _re_derivation_detail(run, single_intent=True)
+    if detail:
+        return False, detail
     return True, ""
 
 
@@ -436,12 +629,27 @@ LIVE_CASES: tuple[LiveCase, ...] = (
     ),
     LiveCase(
         id="L3",
+        # THE RESIDUAL MUST HAVE NO CORPUS COVERAGE, or the case flaps for being
+        # right. The old residual — "which single department has the most people in
+        # it right now" — is exactly `bp-active-headcount-by-department` (its result
+        # ordered by headcount), so a blueprint-first model answered BOTH halves
+        # from blueprints, ran no `runQuery`, and failed a case measuring ad-hoc
+        # routing while behaving correctly. Grouping headcount BY EMPLOYMENT STATUS
+        # is covered by nothing in `tests/fixtures/corpus/blueprints.yaml`: every
+        # seeded blueprint groups by department, month, or payroll line item, and
+        # `employee_status` appears only as a FILTER inside them.
+        #
+        # It stays inside `_full_scope()` (employee.employee_code +
+        # employee.employee_status are both in the corpus footprint) on purpose: an
+        # out-of-scope residual would have its answer table dropped by
+        # `is_answer_table_in_scope` at designation time, which would make this case
+        # measure the scope filter instead of the route.
         question=(
             "How many new hires did we have per month over the last six months, "
-            "and which single department has the most people in it right now?"
+            "and separately, how many employees are there in each employment status?"
         ),
         predicate=_l3_blueprint_plus_residual,
-        note="blueprint for its part, ad-hoc only for the residual",
+        note="blueprint for the hires half, ad-hoc runQuery for the uncovered residual",
     ),
     LiveCase(
         id="L4",
@@ -496,13 +704,22 @@ def test_routing_case_pass_rate(case: LiveCase, capsys) -> None:
     was answered with ad-hoc SQL, 2 of 3 runs" is.
     """
     rate = metrics.PassRate(case.id)
+    designations: list[tuple[int, int, int]] = []
     for index in range(RUNS):
         run = _run_live(case.question, index)
         ok, detail = case.predicate(run)
         rate.record(ok, detail)
+        designations.extend(run.designation_counts())
 
     with capsys.disabled():
         print(f"\n[A2] {rate.line()}  — {case.note}")
+        # REPORTED, NOT GATED. `answerWithTable` designating by raw `sql` instead of
+        # `blueprint_id` keeps `tables` up while `verified` goes to 0, and no
+        # predicate here can see it. Printing it is how the next slice finds out.
+        print(
+            "      answer_tables (table/blueprint/verified per designation): "
+            f"{designations or 'none'}"
+        )
         for failure in rate.failures:
             print(f"      red: {failure}")
 

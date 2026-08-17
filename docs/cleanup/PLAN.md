@@ -11,9 +11,15 @@ Work log: [WORKLOG.md](WORKLOG.md) — one entry per slice, appended as work lan
   - **V0 — offline suite:** `uv run pytest -q` must be green (same failures as
     baseline at worst; no new reds).
   - **V1 — live 7-question gate:** with the l2 stack up (incl. Phoenix :6006),
-    `RUN_LIVE_EVAL=1 OTLP_ENDPOINT=http://localhost:6006/v1/traces
+    `RUN_LIVE_EVAL=1 OPENAI_MODEL=gpt-5.5
+    OTLP_ENDPOINT=http://localhost:6006/v1/traces
     OTLP_PROJECT_NAME=cleanup-eval OTLP_DISABLE_REDACTION=1 uv run pytest
     tests/eval/test_routing_live.py -q -s`.
+    `OPENAI_MODEL=gpt-5.5` is REQUIRED (user, 2026-08-17): RuntimeSettings
+    defaults to gpt-4.1, so an unpinned run gates a different model than the
+    real server (whose preflight picks gpt-5.5). Baselines recorded before
+    2026-08-17 were on gpt-4.1 and are retired once the post-harness-slice
+    re-baseline lands.
     The OTLP vars export every eval turn to Phoenix project **`cleanup-eval`**
     (http://localhost:6006) for human monitoring — added 2026-08-17 at user
     request; wiring smoke-verified. `OTLP_DISABLE_REDACTION=1` (user request,
