@@ -245,13 +245,37 @@ def seed_corpus() -> dict[str, BlueprintSeed]:
 
 
 def blueprint_detail(seed: BlueprintSeed) -> BlueprintDetail:
+    """The keyed `getBlueprint` projection of one seed — the eval's stand-in for
+    `vector_index.map_blueprint_detail_record`.
+
+    IT IS A HAND-COPIED FIELD LIST, AND THAT IS THE HAZARD. Every field
+    `BlueprintSeed` and `BlueprintDetail` SHARE must be assigned from the seed here
+    or the eval serves a detail the corpus does not describe — silently, because a
+    `BlueprintDetail` with a defaulted field constructs and renders perfectly well.
+    That is not hypothetical: J7's `window_anchor` was added to both dataclasses and
+    to the fixtures but not to this list, so the A2 live eval served anchor-less
+    details, the executor stamped no anchor on any result, and NOT ONE live L3
+    payload carried the window note the feature exists to deliver.
+
+    `test_harness_field_drift.py` is the tripwire: it derives the shared-field set
+    from the two dataclasses and fails when this constructor drops one. Add the
+    field here; do not weaken the tripwire.
+
+    `hit_count` is the one deliberate literal — `BlueprintSeed` has no such field
+    (it is graph-side runtime state), so there is nothing to copy.
+    """
     return BlueprintDetail(
         id=seed.id,
         intent=seed.intent,
         slots_summary=seed.slots_summary,
         uses=frozenset(seed.uses),
-        status="validated",
-        drift_status="clean",
+        # FROM THE SEED, not the literals `"validated"`/`"clean"` these used to be.
+        # The seed carries both, every committed fixture declares them explicitly, and
+        # a hardcoded pair means a fixture marked `deprecated`/`suspect` would still be
+        # served to the model as clean canon — the same silent-divergence class as the
+        # dropped `window_anchor`, just one that has not bitten yet.
+        status=seed.status,
+        drift_status=seed.drift_status,
         hit_count=0,
         catalog_sha=seed.catalog_sha or "",
         resolves=dict(seed.resolves) if seed.resolves else None,
@@ -260,6 +284,11 @@ def blueprint_detail(seed: BlueprintSeed) -> BlueprintDetail:
         sql_template=seed.sql_template,
         composes=[dict(c) for c in (seed.composes or [])] or None,
         result_grain=seed.result_grain,
+        # J7 — the window-anchor declaration. `getBlueprint` renders it as the
+        # model-facing note and `blueprint/executor.py` stamps it onto the result;
+        # both read it off THIS object, so dropping it here disables the feature for
+        # the whole eval while every other assertion keeps passing.
+        window_anchor=seed.window_anchor,
     )
 
 
