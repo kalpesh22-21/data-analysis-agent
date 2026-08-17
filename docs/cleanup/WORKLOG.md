@@ -226,3 +226,47 @@ rebuilt l2-mcp, re-seeded corpus):
 
 Verification stack state: l2-mcp rebuilt from canon a1d39da; neo4j corpus
 re-seeded (11 blueprints, model all-mpnet-base-v2); RLS seed fresh.
+
+---
+
+## #7 — J7(b) window_anchor + Tier 4 Wave A + harness field-drop fix (2026-08-17)
+
+Three landings, then a HOLD (user):
+
+- **J7(b)** `25429a8` (+ clickhouse-api `11258a9`, sidecars regenerated in the
+  same commit — review blocker: the B1 sha fast path would otherwise skip the
+  re-seed and the field would never reach the graph). Blueprints declare
+  `window_anchor: data|calendar`; threaded YAML→seed→neo4j (retraction-safe)→
+  detail→executor stamp (both paths)→runBlueprint window_note→TrailEntry→
+  canonical rendering→getBlueprint gloss + 1 prompt line (16,929/17,000).
+  56 new tests. l2-mcp rebuilt, corpus re-seeded with anchors.
+- **Eval conftest field-drop** `6b30465` (tests-only, mutation-verified):
+  conftest.blueprint_detail hand-copied a field list and dropped
+  window_anchor (so the first "conclusive" L3 run never delivered the note —
+  invalidated) plus status/drift_status (latent). Fixed + a derived
+  SHARED_FIELDS tripwire (never hand-enumerated).
+- **Tier 4 Wave A** `ae17803`: JsonPostClient base (embedding/reranker
+  byte-identical wire), all 4 hand-rolled POST /token onto HttpTokenMinter
+  (ttl_seconds None-omits; keyword-only allow_unscoped for the two deliberate
+  D80b allow-all callers; blank TENANT_* now fails the session mint loudly,
+  naming the one env var; transport failures pinned 502),
+  scripts/_e2e_harness.py (−838 duplicated demo lines, env reads lazy),
+  src/data_agent/untrusted.py (strictest-variant coercers; audit floats
+  deliberately unclamped — forensic record). −798 duplicated lines, +43 tests.
+  Suite after all landings: **5682 passed, 225 skipped, 1 xfailed**; ruff clean.
+
+**L3 final verdict (user-requested live verification):** with delivery fixed,
+all 3 runs carried the anchor note in the model payload (vs 0/3 before the
+conftest fix — clean attribution). Behaviour moved 1-of-3: one clean pass
+(blueprint kept as i1 evidence), two runs re-derived DESPITE reading the
+note (one calendar-anchored query; one completed i1 with its own runQuery
+evidence). Conclusion: J7(b) delivery chain proven; a static semantic note
+is insufficient against the model's calendar reading of "last six months".
+Follow-ups queued in ISSUES.md J7 (surface the concrete anchor date; or the
+product decision that a both-windows answer is ideal and the
+no-re-derivation contract needs an exception shape). L3 stands red 1/3 with
+understood cause.
+
+**Issues stack committed to `docs/cleanup/ISSUES.md`** (source of truth
+going forward). **Wave B (T4.1/T4.2/T4.4) and Tier 5 are HELD** per user;
+the G1/G2 robustness slice remains built-but-unlanded in its worktree.

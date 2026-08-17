@@ -152,5 +152,12 @@ helpers) → **T5.5 single `finish()`** (7 `TurnOutcome` sites) →
 | Tier 1 drift hazards | done, reviewed, V0+V1 green | #2 |
 | Tier 2 deletions | done, reviewed, V0+V1+V2 green (−1208 LOC) | #3 |
 | Tier 3 Couchbase seam | done, reviewed, V0+V1+V2 green (proxies deleted) | #4 |
-| Eval harness fidelity (K1 F1/F2/F3 + G3) | built in worktree; L3 3/3; review pending | — |
-| L5 runtime fix (G1/G2) | partial work quarantined (worktree escape); relaunch pending | — |
+| Eval harness fidelity + gpt-5.5 gate | done, reviewed, landed 3d6d6d1; re-baseline: all green except L3 | #5 |
+| J3 hires re-key + J6a empty badge | done, reviewed ×2, live-verified, 90f1908+3df9e76 (+ ch-api a1d39da) | #6 |
+| J7(b) window_anchor | done, reviewed, landed 25429a8 (+ ch-api 11258a9); delivery proven, behaviour 1/3 — follow-up queued (ISSUES.md J7) | #7 |
+| Tier 4 Wave A (T4.3/4.5/4.6/4.7) | done, reviewed, landed ae17803 | #7 |
+| Eval conftest field-drop fix | done (tests-only, mutation-verified), 6b30465 | #7 |
+| **Tier 4 Wave B (T4.1 compiler, T4.2 executor, T4.4 span envelope)** | **HELD (user, 2026-08-17)** | — |
+| **Tier 5 loop decomposition** | **HELD** | — |
+| G1/G2 L5 robustness slice | built+contained in worktree, unlanded; optional post-5.5 | — |
+| Issues stack | committed to docs/cleanup/ISSUES.md (source of truth going forward) | — |
