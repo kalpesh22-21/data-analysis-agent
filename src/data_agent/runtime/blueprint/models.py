@@ -59,6 +59,73 @@ def slot_type_gloss(type_: Any) -> str:
     return GENERIC_SLOT_TYPE_GLOSS
 
 
+# --- J7: the window-anchor DECLARATION -------------------------------------
+#
+# A windowed blueprint ("hires over the last N months") has to anchor its window
+# somewhere, and the two sane choices answer DIFFERENT questions. `bp-hires-per-month`
+# counts back from `max(hire_date)` — the latest data on record — deliberately, so the
+# fixture does not decay to empty as wall-clock time passes. The user asking for "the
+# last six months" means SIX CALENDAR MONTHS, and since the date-anchor injection the
+# model has a grounded "today" to check that against. It ran the blueprint, saw a window
+# ending in 2021, judged the result unresponsive, and re-derived the whole thing with its
+# own `toDate(today)`-anchored SQL — completing the intent on unverified evidence.
+#
+# Nothing was wrong with the blueprint. What was missing is that the blueprint never SAID
+# which anchor it uses, so the model had to infer it from the rows and inferred "broken".
+# The fix is a DECLARATION, not a behaviour change: the blueprint states its anchor, the
+# runtime surfaces the statement (`retrieval/tools.py` on `getBlueprint`, the tool-result
+# note on `runBlueprint`), and the model presents the result honestly instead of
+# re-deriving it.
+#
+# ONE gloss per anchor, and `WINDOW_ANCHORS` is DERIVED from this map rather than written
+# beside it. That is the derive-the-guard rule applied to the thing that actually reads
+# the value: every surfacing site looks the anchor up in this dict, so an anchor with no
+# gloss would be an anchor that renders as nothing. Deriving the closed set from the gloss
+# map makes "accepted at load" and "renderable to the model" the SAME set by construction
+# (the SLOT_TYPES/SLOT_TYPE_GLOSS pair below has to be held together by a parity test
+# because it was written the other way round).
+WINDOW_ANCHOR_GLOSS: dict[str, str] = {
+    "data": (
+        "this blueprint's window counts back from the latest data on record, not "
+        "from today's date."
+    ),
+    "calendar": (
+        "this blueprint's window is bound to the calendar dates you supply, not to "
+        "the latest data on record."
+    ),
+}
+WINDOW_ANCHORS: frozenset[str] = frozenset(WINDOW_ANCHOR_GLOSS)
+
+# The DATA-anchored anchor value, named once. Three modules test for it (the executor
+# stamps the result, the tool derives the note, the loader mirror-checks); a hand-copied
+# `"data"` in each is the shape `_TABLE_CONSUME_REF` drifted in three times.
+DATA_WINDOW_ANCHOR = "data"
+
+# The one line appended to a data-anchored blueprint's model-facing tool result. It says
+# what the window IS and what to do about it, in that order — a note that only described
+# the anchor would leave the model to decide for itself whether the result is responsive,
+# which is exactly the decision it got wrong. It does NOT touch the `authoritative` /
+# empty-result notes (J6a): those answer "may I trust this", this answers "how do I
+# describe it", and collapsing them would make one of the two unsayable.
+DATA_ANCHORED_RESULT_NOTE = (
+    "Window is data-anchored: it counts back from the latest data on record, not "
+    "from today's date. Present it as 'as of the latest data' — do not re-derive "
+    "with a calendar-anchored query."
+)
+
+
+def window_anchor_declaration(anchor: Any) -> str | None:
+    """The model-facing `"<anchor> — <gloss>"` line for a declared window anchor, or
+    `None` when the blueprint declares none (the default: no claim, nothing rendered).
+
+    Total on any input: an unglossed/malformed value yields `None` rather than raising or
+    printing a bare enum. A blueprint cannot LOAD with such a value (`Blueprint.parse`
+    rejects it), so this branch is read-side depth against a corrupt stored property."""
+    if not isinstance(anchor, str) or anchor not in WINDOW_ANCHOR_GLOSS:
+        return None
+    return f"{anchor} — {WINDOW_ANCHOR_GLOSS[anchor]}"
+
+
 NODE_KINDS: frozenset[str] = frozenset({"query", "approval"})  # D59c (`guard` cut)
 # The kind a node has when it declares none — an ordinary query step, gating nothing.
 # ONE definition, used by the dataclass default, `Node.parse`'s `.get` fallback, and the
@@ -386,6 +453,11 @@ class Blueprint:
     sql_template: str | None = None
     composes: tuple[Node, ...] = ()
     result_grain: ResultGrain = field(default_factory=ResultGrain)
+    # J7 — the OPTIONAL window-anchor declaration (`WINDOW_ANCHORS`). `None` is the
+    # default and means the blueprint makes NO claim about its window: nothing is
+    # surfaced and behaviour is identical to before the field existed, which is what
+    # keeps it additive for the eight non-windowed blueprints in the corpus.
+    window_anchor: str | None = None
 
     def slot(self, name: str) -> SlotSpec | None:
         return next((s for s in self.slots if s.name == name), None)
@@ -407,6 +479,7 @@ class Blueprint:
         sql_template: Any = None,
         composes: Any = None,
         result_grain: Any = None,
+        window_anchor: Any = None,
     ) -> Blueprint:
         resolves_map: dict[str, str] = {}
         if resolves is not None:
@@ -454,6 +527,21 @@ class Blueprint:
             seen_names.add(spec.name)
         if sql_template is not None and not isinstance(sql_template, str):
             raise BlueprintParseError("'sql_template' must be a string")
+        # J7: absent means NO CLAIM, and is the only tolerated absence — a PRESENT value
+        # outside the closed set is an authoring error and is rejected here rather than
+        # dropped. Dropping it would be the worse failure of the two: a blueprint that
+        # typed `window_anchor: date` would load looking declared, surface nothing, and
+        # the model would go back to inferring the anchor from the rows. `isinstance`
+        # FIRST — `x not in <frozenset>` hashes x, and an unhashable stored value would
+        # raise a TypeError that escapes every `except BlueprintParseError` on the read
+        # path (the same guard every closed-set test in this module takes).
+        if window_anchor is not None and (
+            not isinstance(window_anchor, str) or window_anchor not in WINDOW_ANCHORS
+        ):
+            raise BlueprintParseError(
+                f"'window_anchor' must be one of {sorted(WINDOW_ANCHORS)} when declared, "
+                f"got {window_anchor!r}"
+            )
         nodes = tuple(Node.parse(n) for n in (composes or []))
         rules = tuple(uses_rules or ())
         return cls(
@@ -465,4 +553,5 @@ class Blueprint:
             sql_template=sql_template,
             composes=nodes,
             result_grain=ResultGrain.parse(result_grain),
+            window_anchor=window_anchor,
         )

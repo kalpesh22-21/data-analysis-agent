@@ -161,6 +161,19 @@ class ToolResult:
     # the model is told only the generic string. `denial_detail` is the persisted
     # channel that actually arrives.
     denial_detail: str | None = None
+    # `window_note` (additive, J7): the one-line honesty note for a blueprint whose
+    # window is DATA-anchored — it counts back from the latest data on record, not from
+    # today's date. Set ONLY by `runBlueprint`, and only for a blueprint that DECLARES
+    # `window_anchor: data`; `None` for every other tool, every other blueprint, and
+    # every error/pause outcome.
+    #
+    # A SEPARATE field rather than more text on the `authoritative` note, because the two
+    # answer different questions and occur in any combination: may I TRUST this result
+    # (`authoritative`), and how do I DESCRIBE the window it covers (this). Like
+    # `denial_detail`, it has to be persisted to arrive at all — `TrailEntry` is the only
+    # channel to the model, and `context/budget.py::_render_entry` drops anything the
+    # entry does not carry.
+    window_note: str | None = None
 
 
 # Default per-result token cap for the stored preview (RuntimeSettings.

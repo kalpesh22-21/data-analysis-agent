@@ -104,6 +104,14 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
     # byte-identical to before — the key is simply absent).
     if entry.authoritative:
         rendered["authoritative"] = True
+    # J7: the data-anchored window note, carried through on the same terms — emitted only
+    # when the entry has one, so a runQuery/denial/non-windowed blueprint entry is
+    # byte-identical to before. It is deliberately NOT folded into the `authoritative`
+    # branch above: the two are independent (a blueprint that failed verify still ran a
+    # data-anchored window), and nesting them would silently drop the note on exactly the
+    # results the model is most likely to second-guess.
+    if entry.window_note:
+        rendered["window_note"] = entry.window_note
     return rendered
 
 

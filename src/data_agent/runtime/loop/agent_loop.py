@@ -1210,6 +1210,16 @@ def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]
                     "Verified blueprint result — authoritative; do not re-derive with "
                     "additional queries."
                 )
+        # J7 — the data-anchored window note, on its OWN key beside `note` rather than
+        # appended to it. Three reasons it does not share: it is independent of
+        # `authoritative` (an unverified blueprint's window is anchored the same way), the
+        # J6a empty-result branch above is a careful sentence that string-concatenation
+        # would blur, and a distinct key is what lets a test assert one is present without
+        # asserting the other's exact wording. The runtime never sets both keys to
+        # overlapping claims: `note` says whether to TRUST the rows, `window_note` says
+        # what period they COVER.
+        if entry.get("window_note"):
+            content["window_note"] = entry["window_note"]
         tool_message = {
             "role": "tool",
             "tool_call_id": tool_call_id,
@@ -2397,6 +2407,10 @@ class AgentLoop:
             ts=_now_iso(),
             authoritative=tool_result.authoritative,
             denial_detail=tool_result.denial_detail,
+            # J7: a resumed blueprint's window is anchored the same way an unpaused
+            # one's is, so the note has to survive the pause too — dropping it here is
+            # exactly how the resume path lost the `authoritative` marker before.
+            window_note=tool_result.window_note,
             # The tag survives the pause on the checkpoint, so the intent this
             # blueprint was run for closes by tag exactly as an unpaused one does.
             serves_intent=checkpoint.serves_intent,
@@ -3935,6 +3949,10 @@ class AgentLoop:
                     ts=_now_iso(),
                     authoritative=tool_result.authoritative,
                     denial_detail=tool_result.denial_detail,
+                    # J7 — set only by a `runBlueprint` whose blueprint DECLARES a
+                    # data-anchored window; `None` for every other call, so every other
+                    # entry serialises byte-identically.
+                    window_note=tool_result.window_note,
                     # The validated tag (or `None`). Persisted on the entry rather
                     # than left in `args`, so it survives replay/resume and is
                     # readable by `updateAnalysisState` without re-parsing

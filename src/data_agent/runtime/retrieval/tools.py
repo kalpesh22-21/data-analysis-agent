@@ -39,7 +39,7 @@ import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from data_agent.runtime.blueprint.models import slot_type_gloss
+from data_agent.runtime.blueprint.models import slot_type_gloss, window_anchor_declaration
 from data_agent.runtime.dispatch.tool_dispatcher import (
     _DEFAULT_MAX_TOOL_RESULT_TOKENS,
     ToolObserver,
@@ -806,6 +806,19 @@ class GetBlueprintTool(_ReadTool):
         if detail.composes:
             result_full["composition"] = _composition_annotation(detail.composes)
         _put_if_present(result_full, "result_grain", detail.result_grain)
+        # J7 — the blueprint's window-anchor DECLARATION, rendered as one self-describing
+        # line (`"data — this blueprint's window counts back from …"`). This is the read
+        # the whole field exists for: `getBlueprint` is what the model consults BEFORE
+        # running, and the prompt already tells it to check the blueprint's own definition
+        # against the deliverable. Without the declaration, "counts back from the latest
+        # data" is only visible as an anchor subquery inside `sql_template` — which a
+        # composed blueprint does not even expose — so a model asked a calendar question
+        # had no way to know which blueprint answers it. A blueprint that declares no
+        # anchor omits the key entirely (`_put_if_present` + a `None` gloss), so the
+        # FOUND shape is byte-identical to before for the other eight.
+        _put_if_present(
+            result_full, "window_anchor", window_anchor_declaration(detail.window_anchor)
+        )
         # S1: provenance is the blueprint's SCOPED uses footprint (NOT the
         # safe-empty frozenset()) — this is the same class of info getTableSchema
         # exposes (column identifiers) and, like it, must drop from D44 replay

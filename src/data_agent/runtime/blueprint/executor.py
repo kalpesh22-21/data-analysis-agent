@@ -451,6 +451,7 @@ class BlueprintExecutor:
             "terminal_sql": node_sql,
             "verify": _verify_block(verify_out, row_count),
         }
+        _stamp_window_anchor(result_full, blueprint)
         preview = _build_preview(node.result_full, self._preview_row_count)
         return ExecCompleted(
             result_full=result_full,
@@ -950,6 +951,7 @@ class BlueprintExecutor:
             "terminal_sql": terminal_sql,
             "verify": _verify_block(verify_out, row_count),
         }
+        _stamp_window_anchor(result_full, blueprint)
         preview = _build_preview(terminal_result, self._preview_row_count)
         return ExecCompleted(
             result_full=result_full,
@@ -1172,7 +1174,25 @@ def _parse_detail(detail: BlueprintDetail) -> Blueprint:
         sql_template=detail.sql_template,
         composes=detail.composes,
         result_grain=detail.result_grain,
+        window_anchor=detail.window_anchor,
     )
+
+
+def _stamp_window_anchor(result_full: dict[str, Any], blueprint: Blueprint) -> None:
+    """Record the EXECUTED blueprint's window-anchor declaration on the result (J7).
+
+    ONE writer for both finish paths (single-node and DAG `_finalize`) so the two cannot
+    describe the same blueprint's window differently — the same reason `_verify_block` is
+    a shared builder. The key is written only when the blueprint declares an anchor, so a
+    result for any of the other blueprints is byte-identical to before.
+
+    This is the value the model-facing note is DERIVED from (`tool.window_note_for_result`)
+    rather than a second copy of the note: `result_full` is persisted behind a D46 KV
+    pointer and re-read on the D45 resume path, so storing the raw declaration lets a
+    resumed run re-derive the identical note instead of carrying prose through the
+    checkpoint."""
+    if blueprint.window_anchor is not None:
+        result_full["window_anchor"] = blueprint.window_anchor
 
 
 def _is_present(raw: Any) -> bool:

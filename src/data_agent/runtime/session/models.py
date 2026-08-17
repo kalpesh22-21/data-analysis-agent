@@ -245,6 +245,18 @@ class TrailEntry:
     # `answer_with_table.is_answer_table_in_scope` by the live path and by
     # `session_history.project_history` alike.
     answer_table_provenance: tuple[frozenset[tuple[str, str]] | None, ...] | None = None
+    # `window_note` (additive, J7): the honesty note for a DATA-anchored blueprint window
+    # ("it counts back from the latest data on record, not from today's date"). `None`
+    # (the default) for every other entry and every document written before the field
+    # existed — the fourth use of this additive-with-`None` pattern (`authoritative`,
+    # `denial_detail`, `serves_intent`), so legacy docs load byte-identically.
+    #
+    # PERSISTED, not re-derived at render: the note is a fact about the blueprint that
+    # RAN, and `_render_entry` cannot see the corpus. Persisting it is what makes a D45
+    # replay re-emit the identical tool message — the same argument that put
+    # `authoritative` on this dataclass. It is scope-inert: a closed-vocabulary sentence
+    # about a window anchor, carrying no column identifier and no warehouse value.
+    window_note: str | None = None
 
     def to_doc(self) -> dict[str, Any]:
         return {
@@ -266,6 +278,7 @@ class TrailEntry:
                 if self.answer_table_provenance is None
                 else [_provenance_to_doc(item) for item in self.answer_table_provenance]
             ),
+            "window_note": self.window_note,
         }
 
     @classmethod
@@ -289,6 +302,12 @@ class TrailEntry:
             serves_intent=doc.get("serves_intent"),
             answer_table_provenance=_answer_table_provenance_from_doc(
                 doc.get("answer_table_provenance")
+            ),
+            # `.get` + a string test: a pre-J7 document has no key (`None`), and a
+            # non-string one loads as `None` rather than as a value the renderer would
+            # print at the model verbatim.
+            window_note=(
+                doc.get("window_note") if isinstance(doc.get("window_note"), str) else None
             ),
         )
 

@@ -158,6 +158,12 @@ class BlueprintDetail:
     sql_template: str | None = None
     composes: list[dict[str, Any]] | None = None
     result_grain: list[str] | dict[str, Any] | None = None
+    # J7 — the blueprint's OPTIONAL window-anchor declaration (`"data"` | `"calendar"`),
+    # carried as the stored string. `None` means the blueprint declares none, which is
+    # every blueprint that is not windowed and every one authored before the field
+    # existed — the tool then omits it and the result shape is unchanged. Unlike the DAG
+    # fields this is NOT JSON: a closed enum stored as a plain neo4j property.
+    window_anchor: str | None = None
 
 
 @dataclass(frozen=True)

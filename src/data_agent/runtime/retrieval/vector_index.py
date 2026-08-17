@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from opentelemetry import trace
 
+from data_agent.runtime.blueprint.models import WINDOW_ANCHORS
 from data_agent.runtime.composite.ranking import cosine
 
 from .models import BlueprintDetail, Candidate
@@ -336,7 +337,8 @@ RETURN b.id AS id, b.intent AS intent, b.slots_summary AS slots_summary,
        b.hit_count AS hit_count, b.catalog_sha AS catalog_sha,
        b.resolves_json AS resolves_json, b.slots_json AS slots_json,
        b.uses_rules_json AS uses_rules_json, b.sql_template AS sql_template,
-       b.composes_json AS composes_json, b.result_grain_json AS result_grain_json
+       b.composes_json AS composes_json, b.result_grain_json AS result_grain_json,
+       b.window_anchor AS window_anchor
 """
 
 
@@ -369,6 +371,16 @@ def _decode_json(raw: Any) -> Any:
     except (ValueError, TypeError):
         _logger.warning("skipping malformed blueprint DAG JSON property", exc_info=True)
         return None
+
+
+def _coerce_window_anchor(raw: Any) -> str | None:
+    """Coerce a stored `window_anchor` property to a DECLARED anchor, else `None` (J7).
+
+    Fail-soft in the same direction as `_decode_json`: absent, null, non-string or
+    outside `WINDOW_ANCHORS` all mean "this blueprint declares no anchor", which is the
+    pre-J7 behaviour for every blueprint. Never raises — a corrupt property must not fail
+    the keyed fetch."""
+    return raw if isinstance(raw, str) and raw in WINDOW_ANCHORS else None
 
 
 def map_blueprint_detail_record(record: Mapping[str, Any]) -> BlueprintDetail:
@@ -404,6 +416,13 @@ def map_blueprint_detail_record(record: Mapping[str, Any]) -> BlueprintDetail:
         sql_template=sql_template if isinstance(sql_template, str) else None,
         composes=composes if isinstance(composes, list) else None,
         result_grain=result_grain if isinstance(result_grain, (list, dict)) else None,
+        # J7: coerced against the CLOSED anchor set, not merely type-checked. The write
+        # side already rejects an unknown anchor (`_validate_blueprint_dag`), so this is
+        # the read-side backstop for a hand-edited/foreign-written node — and the guard is
+        # derived from what the value is FOR: every surfacing site glosses the anchor out
+        # of `WINDOW_ANCHOR_GLOSS`, so a value with no gloss has nothing to say and is
+        # dropped to "undeclared" rather than printed raw at the model.
+        window_anchor=_coerce_window_anchor(record.get("window_anchor")),
     )
 
 

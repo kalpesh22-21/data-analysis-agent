@@ -44,6 +44,7 @@ from .executor import (
     ExecOutcome,
     ExecPaused,
 )
+from .models import DATA_ANCHORED_RESULT_NOTE, DATA_WINDOW_ANCHOR
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
@@ -85,6 +86,25 @@ def _is_verified_blueprint_result(result_full: Any) -> bool:
     return bool(verify.get("grain_ok")) and bool(verify.get("signature_ok"))
 
 
+def window_note_for_result(result_full: Any) -> str | None:
+    """The model-facing window note for an executed blueprint's result, or `None` (J7).
+
+    Emitted ONLY for a `window_anchor: "data"` result. A `calendar` blueprint needs no
+    note: its window is the dates the caller supplied, so the model's own reading of the
+    result is already right, and a note there would be a line of prompt on every run
+    buying nothing. The narrow trigger is the point — this note exists to stop ONE
+    specific failure (a data-anchored window read as a stale calendar window, then
+    silently re-derived), not to annotate windows in general.
+
+    Fail-closed on any surprise (a non-dict, a missing/unknown anchor) → `None`, so the
+    tool result is unchanged for every blueprint that does not declare `data`."""
+    if not isinstance(result_full, dict):
+        return None
+    if result_full.get("window_anchor") != DATA_WINDOW_ANCHOR:
+        return None
+    return DATA_ANCHORED_RESULT_NOTE
+
+
 def blueprint_outcome_to_tool_result(outcome: ExecOutcome) -> ToolResult | None:
     """The SINGLE `ExecOutcome` → `ToolResult` mapping, shared by
     `RunBlueprintTool._execute` (a first call) AND the loop's mid-DAG resume path
@@ -111,6 +131,14 @@ def blueprint_outcome_to_tool_result(outcome: ExecOutcome) -> ToolResult | None:
             # signature ok); an ExecCompleted whose verify block is not clean
             # (poisoned/legacy shape) does NOT earn the marker.
             authoritative=_is_verified_blueprint_result(outcome.result_full),
+            # J7: derived HERE, in the shared mapper, for the same reason `authoritative`
+            # is — a resumed mid-DAG blueprint must return a byte-identical result to a
+            # non-paused run, and the note silently going missing on the resume path is
+            # precisely the drift this dedup exists to prevent. Independent of
+            # `authoritative`: a blueprint whose verify block is not clean still ran a
+            # data-anchored window, and describing THAT honestly does not depend on
+            # whether the rows earned the trusted marker.
+            window_note=window_note_for_result(outcome.result_full),
         )
     if isinstance(outcome, ExecPaused):
         # §2.5 pause seam: surface a `ToolPause` the loop honors (writes the
@@ -265,4 +293,5 @@ __all__ = [
     "TOOL_NAME",
     "RunBlueprintTool",
     "blueprint_outcome_to_tool_result",
+    "window_note_for_result",
 ]

@@ -175,6 +175,8 @@ AGENT_SYSTEM_PROMPT = (
     "to re-derive, double-check, re-verify, or reformat the same figure; it is "
     "already verified. You MAY run further queries only for a DISTINCT part of the "
     "user's question that the blueprint did not answer.\n"
+    "- A DATA-ANCHORED blueprint window ends at the latest data on record, not "
+    'today: report it "as of the latest data", never re-run it calendar-anchored.\n'
     "- THE SAME QUERY RETURNS THE SAME ROWS: never repeat a runQuery you already "
     "ran this turn — its result is in the conversation above, so read it there "
     "instead of running it again. Once you hold a result for every part of the "

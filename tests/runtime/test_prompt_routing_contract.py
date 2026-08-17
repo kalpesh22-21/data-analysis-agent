@@ -818,6 +818,21 @@ def test_prompt_stays_within_its_token_budget() -> None:
     to print a physical column name, contradicting the rule added above it. The
     amendment keeps the caveat and constrains its vocabulary. **222 chars spare**;
     the paragraph above still governs the next addition.
+
+    **2026-08-17, ceiling UNCHANGED at 17,000.** 16,778 -> **16,929** (+151, J7, the
+    data-anchored-window line). Its live evidence: `bp-hires-per-month` anchors its
+    trailing window on `max(hire_date)`, the model now has a grounded "today", and it
+    judged the resulting 2021 window unresponsive and re-derived the whole answer with
+    its own calendar-anchored SQL — completing the intent on unverified evidence.
+
+    The first draft of the line ran 201 chars and left 21 spare, which is no headroom at
+    all. It was TRIMMED to 151 rather than paid for with a raise, because most of the
+    work here is done by surfaces the runtime controls and can therefore say at length:
+    `getBlueprint` renders the blueprint's own `window_anchor` declaration, and a
+    data-anchored run carries a note on its tool result. The prompt carries only the
+    standing rule those two are instances of, which is the part no runtime check can
+    enforce. **71 chars spare** — thinner than the 125 already called thin above, so the
+    re-argue paragraph applies with full force to whatever comes next.
     """
     assert len(AGENT_SYSTEM_PROMPT) <= 17_000
 

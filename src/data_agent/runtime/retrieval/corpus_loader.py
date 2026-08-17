@@ -143,6 +143,14 @@ class BlueprintSeed:
     sql_template: str | None = None
     composes: list[dict[str, Any]] = field(default_factory=list)
     result_grain: list[str] | dict[str, Any] | None = None
+    # J7 — the OPTIONAL window-anchor declaration (`blueprint.models.WINDOW_ANCHORS`:
+    # `"data"` | `"calendar"`). Meaningful only for a WINDOWED blueprint; `None` (the
+    # default) means the blueprint makes no claim, nothing is stored, and the read path
+    # surfaces nothing — so every existing seed and every non-windowed canon YAML is
+    # byte-identical to before. Stored as a plain string property (not `*_json`): it is a
+    # closed enum, and `_validate_blueprint_dag` rejects anything outside the set at
+    # WRITE, so a stored value is always renderable.
+    window_anchor: str | None = None
 
 
 @dataclass(frozen=True)
@@ -584,6 +592,7 @@ SET b.name = $id,
     b.sql_template = $sql_template,
     b.composes_json = $composes_json,
     b.result_grain_json = $result_grain_json,
+    b.window_anchor = $window_anchor,
     b.structural_key = $structural_key,
     b.structural_key_recipe = $structural_key_recipe
 """
@@ -2025,6 +2034,11 @@ def _dag_properties(bp: BlueprintSeed) -> dict[str, Any]:
         "sql_template": bp.sql_template,
         "composes_json": json.dumps(bp.composes) if bp.composes else None,
         "result_grain_json": (json.dumps(bp.result_grain) if bp.result_grain is not None else None),
+        # J7: `or None` so an undeclared anchor writes `null` — neo4j REMOVES a
+        # null-valued SET, which is what makes a re-seed that DROPS the declaration
+        # actually clear the stale property instead of leaving the old claim behind. The
+        # same rule `structural_key` follows two lines down, for the same reason.
+        "window_anchor": bp.window_anchor or None,
         "structural_key": key,
         "structural_key_recipe": structural_key_recipe() if key else None,
     }
@@ -2352,6 +2366,11 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
             sql_template=bp.sql_template,
             composes=bp.composes,
             result_grain=bp.result_grain,
+            # J7: threaded so the closed-set check runs at WRITE, for every write path
+            # (fixture seed, MCP-export hydration, the learning landing writer all reach
+            # here from `load_corpus`'s pre-write pass). The read side then never has to
+            # ask whether a stored anchor is renderable.
+            window_anchor=bp.window_anchor,
         )
     except BlueprintParseError as exc:
         raise CorpusLoadError(f"blueprint {bp.id}: malformed DAG — {exc}") from exc

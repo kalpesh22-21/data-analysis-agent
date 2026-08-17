@@ -226,6 +226,14 @@
   slots:
     - { name: window_months, type: relative_window, required: true, min_value: 1, max_value: 36 }
   result_grain: [ month ]
+  # J7 — DECLARE the anchor the template below actually uses. The window counts back from
+  # `max(hire_date)`, so on a warehouse whose latest hire is 2021 a "last 6 months" run
+  # answers about 2021, not about today. That is correct and deliberate (see the anchor
+  # note below), but it was UNSTATED: the model, which now has a grounded "today", read
+  # the 2021 rows as a broken result and re-derived the whole answer with its own
+  # calendar-anchored SQL. The declaration is surfaced by `getBlueprint` and on the run
+  # result, so the model presents "as of the latest data" instead of re-deriving.
+  window_anchor: data
   # Anchor the trailing window on the DATA (the latest hire month present), not the
   # wall clock — so the fixture doesn't decay to empty as real time passes. The
   # window yields N whole months PLUS the current partial (latest) bucket (harmless
@@ -264,6 +272,16 @@
   slots:
     - { name: hire_window, type: period_range, required: true }
   result_grain: [ month ]
+  # J7 — `calendar`, and the contrast with its two siblings is the reason to declare it
+  # rather than leave it silent. This blueprint has NO anchor of its own: both bounds are
+  # the explicit ISO dates the caller binds, so the window is exactly the calendar period
+  # asked for. That makes it the RIGHT blueprint for a calendar question ("hires in the
+  # last six months", "hires in Q1"), and the declaration is how the model can tell —
+  # otherwise the only signal is a `period_range` slot type, which says how to FILL it,
+  # not what the window means. The gloss is written to be true of this shape ("bound to
+  # the calendar dates you supply"), NOT as a claim that the window is anchored on today:
+  # nothing here reads the clock.
+  window_anchor: calendar
   # exclude_not_hired_default: drop 'N' (pre-hire) records. `OR IS NULL` matters —
   # employee_status is Nullable(String), a bare `!= 'N'` drops NULL rows.
   sql_template: |
@@ -297,6 +315,12 @@
     - { name: window_months,  type: relative_window, required: true, min_value: 2, max_value: 36 }
     - { name: horizon_months, type: relative_window, required: true, min_value: 1, max_value: 24 }
   result_grain: []
+  # J7 — `data`, same anchor and same reason as bp-hires-per-month (the trailing window
+  # counts back from `max(hire_date)`). It matters MORE here, not less: the output is a
+  # forward PROJECTION, so an unstated anchor means a run-rate measured over 2021 gets
+  # reported as "the next N months from today" with nothing in the result to contradict
+  # it. The declaration makes the base period sayable.
+  window_anchor: data
   # Run-rate projection: avg monthly hires over the trailing window, projected forward.
   # Denominator/span alignment: the anchor is shifted FORWARD one month (addMonths(...,1))
   # before subtracting {window_months}, so the window spans EXACTLY N monthly buckets

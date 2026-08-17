@@ -285,6 +285,24 @@ async def test_occupancy_is_protected_with_no_spend_ceiling_at_all() -> None:
     If this passes with `max_token_spend=None`, the spend counter was never what
     protected occupancy, and giving it a spend-shaped ceiling cannot have weakened
     occupancy. `fit_request_to_budget` is what holds the line.
+
+    THE NON-VACUITY CHECK IS SATURATION, NOT A FRACTION. It used to read
+    `max(requests) > 0.9 * budget`, which held by **26 tokens** out of 89,600 — the
+    trail is packed in whole ~10.6k-token result UNITS, so the residual headroom is
+    whatever the last unit could not use, and 0.9 only happened to sit on the right
+    side of that. Any change that grows the fixed overhead by more than those 26
+    tokens (the J7 prompt line, +38, is what found this) knocks one whole unit out of
+    the request and drops it to ~0.88 — with the packer behaving perfectly.
+
+    So the property is stated the way the packing actually guarantees it: the leftover
+    budget is smaller than ONE MORE UNIT, i.e. the packer took everything that fit.
+    That is a DIFFERENT, packing-native property — saturation within one result unit,
+    robust to fixed-overhead drift — and explicitly NOT a stronger one. It is weaker on
+    magnitude: with a ~10.6k unit it admits a request at ~0.88 x budget, which the old
+    `0.9` rejected. That is the point. The magnitude floor was never the claim being
+    made; "the packer took everything that fit" is, and unlike a fraction it stays true
+    for ANY fixed overhead — so the next prompt line does not have to be argued against
+    an accident of arithmetic in an unrelated test.
     """
     model = _NeverTerminating()
     loop, _store = _build(model, mult=150, max_token_spend=None)  # ~10.5k tok/result
@@ -297,9 +315,23 @@ async def test_occupancy_is_protected_with_no_spend_ceiling_at_all() -> None:
         f"a request reached {max(model.requests)} tokens, over the "
         f"{SHIPPED_REQUEST_BUDGET} occupancy budget"
     )
-    # The request really was pressed against the budget (so the assertion above is
-    # not vacuous), while cumulative spend ran to many times the context window.
-    assert max(model.requests) > 0.9 * SHIPPED_REQUEST_BUDGET
+    # The packing quantum, MEASURED from the run itself rather than hard-coded: the
+    # first rounds are still under budget, so each one grows the request by exactly one
+    # result unit. Hard-coding it would re-introduce the same staleness this replaces.
+    result_unit = model.requests[1] - model.requests[0]
+    assert result_unit > 0
+    # A unit that dominated the budget would make `headroom < result_unit` true for
+    # almost any request size, so the saturation claim below would say nothing.
+    assert result_unit < SHIPPED_REQUEST_BUDGET // 2, (
+        f"a {result_unit}-token result unit against a {SHIPPED_REQUEST_BUDGET} budget "
+        f"leaves the saturation check with nothing to exclude — lower `mult`"
+    )
+    headroom = SHIPPED_REQUEST_BUDGET - max(model.requests)
+    assert headroom < result_unit, (
+        f"{headroom} tokens of budget went unused with a {result_unit}-token result "
+        f"unit available — the request was not packed to the budget, so the "
+        f"{SHIPPED_REQUEST_BUDGET} assertion above proves nothing"
+    )
     assert model.spend > 10 * CONTEXT_WINDOW
 
 
