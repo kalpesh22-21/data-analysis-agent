@@ -111,7 +111,7 @@ class ReviewInbox:
         # The fresh-default version re-created, one level down, the exact defect this
         # slice was written to remove: a caller who built a correctly-configured
         # scheduler and passed it here would silently get cutoff 0.0 — a knob turned in
-        # the environment and ignored at the surface it governs. `build_review_inbox`
+        # the environment and ignored at the surface it governs. `build_promotion_plane`
         # passes it explicitly, but a direct `ReviewInbox(store, scheduler=...)` is a
         # supported construction (both demo scripts and every test in this suite use it),
         # and correctness must not depend on the caller remembering.

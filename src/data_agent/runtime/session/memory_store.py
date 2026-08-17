@@ -52,7 +52,7 @@ class InMemorySessionStore:
     def _bump_version(self, session_id: str) -> None:
         self._versions[session_id] = self._versions.get(session_id, 0) + 1
 
-    async def create_session(self, session_id: str) -> SessionDoc:
+    async def get_or_create_session(self, session_id: str) -> SessionDoc:
         if session_id in self._docs:
             return self._docs[session_id]
         now = _now()
@@ -60,11 +60,6 @@ class InMemorySessionStore:
         self._docs[session_id] = doc
         self._versions[session_id] = 0
         return doc
-
-    async def get_or_create_session(self, session_id: str) -> SessionDoc:
-        if session_id not in self._docs:
-            return await self.create_session(session_id)
-        return self._docs[session_id]
 
     async def load_trail(self, session_id: str) -> list[TrailEntry]:
         doc = self._docs.get(session_id)

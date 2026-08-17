@@ -21,7 +21,6 @@ from data_agent.learning.candidate import InMemoryCandidateStore
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.factory import (
     build_promotion_plane,
-    build_promotion_scheduler,
 )
 from data_agent.learning.promotion import PromotionPolicy, policy_from_settings
 
@@ -98,11 +97,11 @@ def test_the_recheck_interval_default_sits_inside_the_trust_window():
 def test_a_factory_with_no_policy_uses_the_configured_one_not_the_dataclass_default(
     monkeypatch,
 ):
-    """The defect, restated as the fix. `build_promotion_scheduler(settings, ...)` with no
+    """The defect, restated as the fix. `build_promotion_plane(settings, ...)` with no
     `policy=` must resolve settings — before plan §4 it fell through to
     `PromotionScheduler`'s own `PromotionPolicy()`, which is exactly how an env var came
     to have no effect."""
-    scheduler = build_promotion_scheduler(
+    scheduler, _inbox = build_promotion_plane(
         _settings(monkeypatch, LEARNING_PROMOTION_ROUTING_THRESHOLD="9"),
         candidate_store=InMemoryCandidateStore(),
         probe=FakeWarehouseProbe(),
@@ -114,7 +113,7 @@ def test_a_factory_with_no_policy_uses_the_configured_one_not_the_dataclass_defa
 def test_an_explicitly_injected_policy_still_wins(monkeypatch):
     """Tests and demos pass a policy directly; settings must not override it."""
     pinned = promotion_policy(blueprint_hit_threshold=42)
-    scheduler = build_promotion_scheduler(
+    scheduler, _inbox = build_promotion_plane(
         _settings(monkeypatch, LEARNING_PROMOTION_ROUTING_THRESHOLD="9"),
         candidate_store=InMemoryCandidateStore(),
         probe=FakeWarehouseProbe(),
@@ -144,7 +143,7 @@ def test_the_inbox_shares_the_schedulers_policy(monkeypatch):
 def test_a_directly_constructed_inbox_inherits_its_schedulers_policy(monkeypatch):
     """The SAME defect one level down, and it is the level a caller actually hits.
 
-    `build_review_inbox` passes the policy explicitly, but `ReviewInbox(store,
+    `build_promotion_plane` passes the policy explicitly, but `ReviewInbox(store,
     scheduler=...)` is a supported construction — both demo scripts and every test in this
     suite use it. With a `policy or PromotionPolicy()` default, a caller who built a
     correctly-configured scheduler and handed it over silently got cutoff 0.0: a knob
@@ -154,7 +153,7 @@ def test_a_directly_constructed_inbox_inherits_its_schedulers_policy(monkeypatch
     from data_agent.learning.inbox import ReviewInbox
 
     store = InMemoryCandidateStore()
-    scheduler = build_promotion_scheduler(
+    scheduler, _plane_inbox = build_promotion_plane(
         _settings(monkeypatch, LEARNING_REVIEW_SCORE_CUTOFF="0.35"),
         candidate_store=store,
         probe=FakeWarehouseProbe(),

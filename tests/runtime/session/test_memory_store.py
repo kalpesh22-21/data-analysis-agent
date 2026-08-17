@@ -24,9 +24,9 @@ def store() -> InMemorySessionStore:
     return InMemorySessionStore()
 
 
-async def test_create_session_is_idempotent(store: InMemorySessionStore) -> None:
-    doc1 = await store.create_session("sess-1")
-    doc2 = await store.create_session("sess-1")
+async def test_get_or_create_session_is_idempotent(store: InMemorySessionStore) -> None:
+    doc1 = await store.get_or_create_session("sess-1")
+    doc2 = await store.get_or_create_session("sess-1")
     assert doc1.session_id == doc2.session_id == "sess-1"
     assert doc1.created_at == doc2.created_at
 
@@ -56,7 +56,7 @@ async def test_append_trail_entry_and_load_trail(store: InMemorySessionStore) ->
 
 
 async def test_append_message_bumps_last_activity(store: InMemorySessionStore) -> None:
-    doc0 = await store.create_session("sess-1")
+    doc0 = await store.get_or_create_session("sess-1")
     initial_activity = doc0.last_activity
     await store.append_message(
         "sess-1", TurnMessage(turn_index=0, role="user", content="hi", ts="2026-07-01T00:00:00+00:00")

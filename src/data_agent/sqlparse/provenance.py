@@ -612,7 +612,8 @@ def extract_column_provenance(
         raises ProvenanceExtractionError (D63: fail-closed).
     catalog_schema:
         Dict keyed at ``database.table`` granularity (D69/OQ-3), mapping to
-        {column: type_string}.  Produced by catalog.loader.load_catalog_from_dir().
+        {column: type_string}.  Produced by
+        catalog.loader.build_sqlglot_schema_from_catalog().
     session_id:
         Optional session identifier for scratch-table isolation checks (D64/OQ-4).
         When supplied, any scratch table reference whose name does not match

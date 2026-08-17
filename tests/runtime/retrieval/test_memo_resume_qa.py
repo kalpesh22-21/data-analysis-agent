@@ -72,7 +72,7 @@ def _pipeline(embedder: FakeEmbeddingClient, index: FakeVectorIndex | None = Non
 async def test_scope_change_busts_memo_and_re_embeds() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient({_Q: [1.0, 0.0]})
-    assembler = ContextAssembler(store, history_token_budget=100_000, retrieval=_pipeline(embedder))
+    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
     memo: dict = {}
     await assembler.assemble("s", frozenset({"db.t.a"}), user_message=_Q, retrieval_memo=memo)
     await assembler.assemble("s", frozenset(), user_message=_Q, retrieval_memo=memo)  # scope changed
@@ -85,7 +85,7 @@ async def test_scope_change_busts_memo_and_re_embeds() -> None:
 async def test_same_scope_same_question_hits_memo_once() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient({_Q: [1.0, 0.0]})
-    assembler = ContextAssembler(store, history_token_budget=100_000, retrieval=_pipeline(embedder))
+    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
     memo: dict = {}
     scope = frozenset({"db.t.a"})
     await assembler.assemble("s", scope, user_message=_Q, retrieval_memo=memo)
@@ -104,8 +104,8 @@ async def test_empty_retrieval_is_byte_identical_to_none() -> None:
     # A pipeline over an EMPTY index returns an empty RetrievedContext → render
     # None → nothing prepended. Must byte-match the retrieval=None assembler.
     empty_pipeline = _pipeline(FakeEmbeddingClient({_Q: [1.0, 0.0]}), index=FakeVectorIndex([]))
-    with_empty = ContextAssembler(store, history_token_budget=100_000, retrieval=empty_pipeline)
-    plain = ContextAssembler(store, history_token_budget=100_000)
+    with_empty = ContextAssembler(store, retrieval=empty_pipeline)
+    plain = ContextAssembler(store)
     empty_ctx = await with_empty.assemble("s", frozenset(), user_message=_Q, retrieval_memo={})
     none_ctx = await plain.assemble("s", frozenset(), user_message=_Q)
     assert empty_ctx.messages == none_ctx.messages
@@ -115,8 +115,8 @@ async def test_empty_retrieval_is_byte_identical_to_none() -> None:
 async def test_index_failure_retrieval_is_byte_identical_to_none() -> None:
     store = InMemorySessionStore()
     failing = _pipeline(FakeEmbeddingClient({_Q: [1.0, 0.0]}), index=FakeVectorIndex(fail=True))
-    with_fail = ContextAssembler(store, history_token_budget=100_000, retrieval=failing)
-    plain = ContextAssembler(store, history_token_budget=100_000)
+    with_fail = ContextAssembler(store, retrieval=failing)
+    plain = ContextAssembler(store)
     fail_ctx = await with_fail.assemble("s", frozenset(), user_message=_Q, retrieval_memo={})
     none_ctx = await plain.assemble("s", frozenset(), user_message=_Q)
     assert fail_ctx.messages == none_ctx.messages
@@ -160,7 +160,7 @@ async def _ask_user_tools(_c: RuntimeCredentials) -> list[dict]:
 
 
 def _ask_user_loop(store, embedder) -> AgentLoop:
-    assembler = ContextAssembler(store, history_token_budget=100_000, retrieval=_pipeline(embedder))
+    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
     model = ScriptedModelClient(
         [
             ModelTurnResult(
@@ -213,7 +213,7 @@ async def _plain_tools(_c: RuntimeCredentials) -> list[dict]:
 
 
 def _done_loop(store, embedder) -> AgentLoop:
-    assembler = ContextAssembler(store, history_token_budget=100_000, retrieval=_pipeline(embedder))
+    assembler = ContextAssembler(store, retrieval=_pipeline(embedder))
     model = ScriptedModelClient([ModelTurnResult(assistant_text="done")])
     return AgentLoop(
         model_client=model,

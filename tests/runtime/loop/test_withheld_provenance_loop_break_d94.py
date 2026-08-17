@@ -109,7 +109,7 @@ class _RetryUntilSentinelModel:
 def _build_loop(model: Any, mcp: FakeMCPClient) -> tuple[AgentLoop, InMemorySessionStore]:
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,

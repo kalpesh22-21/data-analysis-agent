@@ -4,7 +4,7 @@ integration level (QA hardening pass).
 `tests/runtime/context/test_scope_filter.py` already proves `filter_trail`'s
 pure-function semantics exhaustively; this file proves the SAME property one
 layer up, through the full D50 pipeline (`SessionStore.load_trail` ->
-`scope_filter.filter_trail` -> `budget.compact_trail` -> `render_messages`),
+`scope_filter.filter_trail` -> interleave -> `budget._render_entry`),
 which is what `AgentLoop` actually depends on. Scenario: entries are
 persisted (as if authorized/dispatched) under a WIDE scope, then the SAME
 session is re-assembled under a NARROWED scope — simulating a user's
@@ -52,14 +52,14 @@ def _entry(
 
 
 async def _assemble(store: InMemorySessionStore, scope: frozenset[str]):
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     return await assembler.assemble(SESSION_ID, scope)
 
 
 async def _assemble_at_turn(
     store: InMemorySessionStore, scope: frozenset[str], *, current_turn_index: int
 ):
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     return await assembler.assemble(SESSION_ID, scope, current_turn_index=current_turn_index)
 
 

@@ -1,33 +1,30 @@
 """CatalogHandle — a read-only, shared, immutable handle around the Semantic Catalog schema.
 
-`data_agent.catalog.build_sqlglot_schema()` is pure/deploy-coupled (D53) and is
-called **once** at process startup; the resulting dict is handed to
+`catalog/loader.py`'s projections are pure/deploy-coupled (D53) and are applied
+**once** per catalog load (`load_catalog_handles_from_export`, from the MCP
+`/catalog/export` payload); the resulting dict is handed to
 `ContextAssembler`/`ToolDispatcher` as a read-only handle — never a mutable
 global. The same handle is reused for every session and request (design §2).
 
 `SemanticCatalogHandle` (runblueprint-design F3/§4.2) is its grain/measures/temporal
 sibling: the runtime `CatalogHandle` carries only `{column: type}`, but the D56
 verify gate needs GRAIN and the D65 temporal gate needs TEMPORAL DIMENSIONS — both
-live only in `load_semantic_catalog()` (the full YAML overlay). This handle surfaces
-per-table `grain`, `grain_verifiable`, `temporal`, and per-measure `{column, agg,
-defined_over}` to the runtime as a read-only, deploy-coupled, immutable view built
-once at startup — mirroring `CatalogHandle`.
+live only in the FULL catalog overlay (`load_semantic_catalog_from_catalog`). This
+handle surfaces per-table `grain`, `grain_verifiable`, `temporal`, and per-measure
+`{column, agg, defined_over}` to the runtime as a read-only, deploy-coupled,
+immutable view built once per load — mirroring `CatalogHandle`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from data_agent.catalog import build_sqlglot_schema
 from data_agent.catalog.loader import (
     build_sqlglot_schema_from_catalog,
-    load_description_cols,
     load_description_cols_from_catalog,
-    load_semantic_catalog,
     load_semantic_catalog_from_catalog,
 )
 
@@ -84,15 +81,10 @@ class CatalogHandle:
         return f"{database}.{table}" in self._schema
 
 
-def load_catalog_handle(schema_dir: Path | str | None = None) -> CatalogHandle:
-    """Build the process-wide `CatalogHandle` from `databaseSchemaDocs/` (called once at startup)."""
-    return CatalogHandle(build_sqlglot_schema(schema_dir), load_description_cols(schema_dir))
-
-
 def load_catalog_handle_from_catalog(catalog: dict[str, Any]) -> CatalogHandle:
     """Build a `CatalogHandle` from a parsed catalog dict (the MCP `/catalog/export`
-    `catalog` value, or any `{db.table: <entry>}` mapping). Same projections as the
-    dir path — the schema `{col: type}` plus the authored description-col linkage."""
+    `catalog` value, or any `{db.table: <entry>}` mapping): the schema `{col: type}`
+    plus the authored description-col linkage."""
     return CatalogHandle(
         build_sqlglot_schema_from_catalog(catalog),
         load_description_cols_from_catalog(catalog),
@@ -127,7 +119,7 @@ class SemanticCatalogHandle:
     """Immutable, read-only per-table `grain`/`grain_verifiable`/`temporal`/`measures`
     view over the full Semantic Catalog overlay (F3/§4.2).
 
-    Built ONCE at startup from `load_semantic_catalog()`; deploy-coupled + immutable,
+    Built ONCE per catalog load from the full overlay; deploy-coupled + immutable,
     exactly like `CatalogHandle`. Read-only: it is consumed by the D56 verify
     assertion (the result-grain probe) and the D65 temporal gate — never mutated.
     """
@@ -185,12 +177,6 @@ def _table_grain(entry: Mapping[str, Any]) -> TableGrain:
     )
 
 
-def load_semantic_catalog_handle(schema_dir: Path | str | None = None) -> SemanticCatalogHandle:
-    """Build the process-wide `SemanticCatalogHandle` from `databaseSchemaDocs/`
-    (called once at startup, mirroring `load_catalog_handle`, F3)."""
-    return SemanticCatalogHandle(load_semantic_catalog(schema_dir))
-
-
 def load_semantic_catalog_handle_from_catalog(catalog: dict[str, Any]) -> SemanticCatalogHandle:
     """Build a `SemanticCatalogHandle` from a parsed catalog dict (the MCP export's
     `catalog` value). The export IS the full overlay, so this is the identity view
@@ -205,10 +191,9 @@ def load_catalog_handles_from_export(
     `/catalog/export` payload (`{"catalog_sha": ..., "catalog": {...}}`).
 
     This is the single entry point the runtime `CatalogCache` (and the shared test
-    fixture) use to rebuild the two immutable handles from the MCP export instead of
-    re-parsing `databaseSchemaDocs/`. The export's `catalog` value carries the
-    verbatim per-table entries, so the description-col linkage the `CatalogHandle`
-    exposes is derived from the SAME entries — nothing is dropped versus the dir path."""
+    fixture) use to build the two immutable handles from the MCP export. The export's
+    `catalog` value carries the verbatim per-table entries, so the description-col
+    linkage the `CatalogHandle` exposes is derived from the SAME entries."""
     catalog = export["catalog"]
     return (
         load_catalog_handle_from_catalog(catalog),
@@ -221,9 +206,7 @@ __all__ = [
     "Measure",
     "SemanticCatalogHandle",
     "TableGrain",
-    "load_catalog_handle",
     "load_catalog_handle_from_catalog",
     "load_catalog_handles_from_export",
-    "load_semantic_catalog_handle",
     "load_semantic_catalog_handle_from_catalog",
 ]

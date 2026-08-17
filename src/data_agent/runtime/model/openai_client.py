@@ -8,15 +8,13 @@ has fallen back, every subsequent `send_turn` call within that turn stays on
 Chat Completions.
 
 Per-turn stickiness, not per-instance (B3 fix, 2026-07-01): `begin_turn()` —
-called once per external turn by `loop/agent_loop.py::_begin_model_turn` (and
-by `context/llm_summarizer.py` before each summarization call) — returns a
-FRESH `OpenAIModelClient` handle with its own independent
-`_fell_back_this_turn` flag, rather than mutating `self`. This matters because
-`app.py`'s composition root constructs exactly ONE `OpenAIModelClient` and
-shares it across every concurrent `/turn` request AND the summarizer's
-background calls; if `begin_turn()` mutated shared instance state, two
-interleaved turns (or a turn and a concurrent summarization) could stomp each
-other's Responses-vs-Chat stickiness mid-turn. Every caller MUST use the
+called once per external turn by `loop/agent_loop.py` (via
+`model/client.py::begin_turn_client`) — returns a FRESH `OpenAIModelClient`
+handle with its own independent `_fell_back_this_turn` flag, rather than
+mutating `self`. This matters because `app.py`'s composition root constructs
+exactly ONE `OpenAIModelClient` and shares it across every concurrent `/turn`
+request; if `begin_turn()` mutated shared instance state, two interleaved turns
+could stomp each other's Responses-vs-Chat stickiness mid-turn. Every caller MUST use the
 handle `begin_turn()` returns for the rest of that turn's `send_turn` calls —
 `model/client.py::begin_turn_client()` is the single shared call site that
 enforces this.
@@ -261,15 +259,13 @@ class OpenAIModelClient:
 
         Deliberately does NOT mutate `self._fell_back_this_turn` — `self` may
         be a single process-wide singleton shared across many concurrent
-        `/turn` requests (`app.py`'s composition root) and the context
-        summarizer's background calls (`context/llm_summarizer.py`); mutating
-        shared instance state here would let one turn's fallback stomp
-        another's mid-turn. The returned object is a cheap wrapper reusing the
-        SAME underlying `AsyncOpenAI` transport client/model/retry config —
-        only the turn-local `_fell_back_this_turn` flag is fresh. Callers
-        (`loop/agent_loop.py::_begin_model_turn`, `context/llm_summarizer.py`)
-        must use the RETURNED handle for every `send_turn` call within that
-        turn, not `self` directly.
+        `/turn` requests (`app.py`'s composition root); mutating shared
+        instance state here would let one turn's fallback stomp another's
+        mid-turn. The returned object is a cheap wrapper reusing the SAME
+        underlying `AsyncOpenAI` transport client/model/retry config — only the
+        turn-local `_fell_back_this_turn` flag is fresh. Callers (the loop, via
+        `model/client.py::begin_turn_client`) must use the RETURNED handle for
+        every `send_turn` call within that turn, not `self` directly.
         """
         return OpenAIModelClient(
             self._client,

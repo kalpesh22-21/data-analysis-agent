@@ -30,7 +30,7 @@ async def test_create_and_load_session_round_trips(settings: RuntimeSettings) ->
     from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 
     store = CouchbaseSessionStore(settings)
-    doc = await store.create_session("layer2-sess-1")
+    doc = await store.get_or_create_session("layer2-sess-1")
     assert doc.session_id == "layer2-sess-1"
 
 
@@ -91,7 +91,7 @@ async def test_analysis_state_round_trips_and_merges_against_real_couchbase(
 
     store = CouchbaseSessionStore(settings)
     session_id = "layer2-sess-analysis-state"
-    await store.create_session(session_id)
+    await store.get_or_create_session(session_id)
 
     declared = await store.apply_analysis_state(
         session_id,

@@ -9,5 +9,4 @@
 # app.py (the composition root / HTTP entrypoint). Every Pass-A module that
 # Pass B plugs into documents its seam explicitly in its own docstring:
 #   - dispatch/tool_dispatcher.py: `observer` callback param (no-op default)
-#   - context/budget.py: `summarizer` callable dependency (identity default)
 #   - mcp/client.py, session/store.py: Protocols Pass B's AgentLoop consumes

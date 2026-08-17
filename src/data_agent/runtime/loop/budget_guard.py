@@ -110,20 +110,4 @@ class BudgetGuard:
         )
 
 
-def new_budget_window(
-    *,
-    max_iterations: int,
-    max_wall_clock_seconds: float,
-    max_token_spend: int | None = None,
-    clock: Callable[[], float] = time.monotonic,
-) -> BudgetGuard:
-    """Construct a fresh `BudgetGuard` — the D55 "fresh window on continue" seam."""
-    return BudgetGuard(
-        max_iterations=max_iterations,
-        max_wall_clock_seconds=max_wall_clock_seconds,
-        max_token_spend=max_token_spend,
-        clock=clock,
-    )
-
-
-__all__ = ["BudgetGuard", "BudgetUsage", "new_budget_window"]
+__all__ = ["BudgetGuard", "BudgetUsage"]

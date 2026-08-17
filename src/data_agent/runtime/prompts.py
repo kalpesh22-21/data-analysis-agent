@@ -70,9 +70,10 @@ is denied by keyword (`app/security.py:170`) and is excluded from the catalog
 (`app/catalog.py:58`). No error code is named — those arrive via `denial_detail`.
 
 Determinism (D45): this is a module-level constant, so every per-round-trip
-rebuild and every resume re-derives byte-identical messages. It is inserted
-AFTER `budget.render_messages`/compaction, so it is never subject to the
-history-token-budget trimming — it always leads the message list.
+rebuild and every resume re-derives byte-identical messages. `assemble` inserts
+it LAST, at index 0, and `budget.fit_request_to_budget` pins the leading
+`system` run as the undroppable head — so it always leads the message list and
+is never trimmed.
 
 Its rendered text and the rationale for each section are reviewed in
 `docs/decisions/release-1/01a-prompt-draft.md`.

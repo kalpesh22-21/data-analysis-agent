@@ -8,7 +8,7 @@ shapes the reconstructor's `_read_session` must handle:
   * `ReadOnlySessionStore`  — exposes the private `_get_doc` accessor (the PRIMARY,
     truly read-only path: `(None, None)` on miss, never create-on-miss). It ALSO
     carries the real Couchbase footgun methods (`get_session_with_cas`,
-    `create_session`) that CREATE on miss and record into `write_calls`, so a test
+    `get_or_create_session`) that CREATE on miss and record into `write_calls`, so a test
     can prove the reconstructor took the read-only path and mutated nothing.
   * `CasOnlySessionStore` — exposes ONLY the public `get_session_with_cas` (no
     `_get_doc`), to cover the fallback branch. Read-only: returns the doc, never
@@ -136,7 +136,7 @@ class ReadOnlySessionStore:
     """Session-store fake exposing the read-only `_get_doc` accessor (primary path).
 
     `_get_doc` is a pure dict lookup: `(deepcopy, cas)` on hit, `(None, None)` on
-    miss — it NEVER creates. The `get_session_with_cas` / `create_session` methods
+    miss — it NEVER creates. The `get_session_with_cas` / `get_or_create_session` methods
     reproduce the real Couchbase create-on-miss footgun and record into
     `write_calls`, so a test can assert the reconstructor never touched them.
     """
@@ -165,8 +165,8 @@ class ReadOnlySessionStore:
             )
         return copy.deepcopy(self._docs[session_id]), self._cas
 
-    async def create_session(self, session_id: str) -> SessionDoc:
-        self.write_calls.append(("create_session", session_id))
+    async def get_or_create_session(self, session_id: str) -> SessionDoc:
+        self.write_calls.append(("get_or_create_session", session_id))
         doc = SessionDoc(session_id=session_id, created_at=TS, last_activity=TS)
         self._docs[session_id] = doc
         return doc

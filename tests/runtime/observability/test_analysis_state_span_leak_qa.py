@@ -168,7 +168,7 @@ async def _run_turn() -> tuple[list[Any], list[tuple[str, dict[str, Any]]]]:
     loop = AgentLoop(
         model_client=ScriptedModelClient(_script()),
         tool_dispatcher=ToolDispatcher(mcp, CATALOG, observer=observer, tracer=tracer),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,

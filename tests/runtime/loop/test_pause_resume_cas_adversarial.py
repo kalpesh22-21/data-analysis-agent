@@ -93,7 +93,7 @@ class _YieldingCasStore:
 
 def _build_loop(*, model_client, mcp_client, store) -> AgentLoop:
     dispatcher = ToolDispatcher(mcp_client, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     return AgentLoop(
         model_client=model_client,
         tool_dispatcher=dispatcher,

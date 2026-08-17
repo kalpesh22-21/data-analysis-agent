@@ -165,8 +165,8 @@ class CouchbaseSessionStore(CouchbaseConnectGate):
         for attempt in range(_MAX_CAS_RETRIES):
             doc, cas = await self._get_doc(session_id)
             if doc is None:
-                doc = await self.create_session(session_id)
-                # Re-read ONLY to obtain the CAS `create_session` does not return.
+                doc = await self._create_session(session_id)
+                # Re-read ONLY to obtain the CAS `_create_session` does not return.
                 # A concurrent `remove` (or a TTL expiry) landing in that window
                 # gives back None again — and this loop must not dereference it:
                 # the old code went straight into `mutate(doc)` and turned a
@@ -198,7 +198,10 @@ class CouchbaseSessionStore(CouchbaseConnectGate):
             f"{_MAX_CAS_RETRIES} retries under sustained concurrent writes."
         ) from last_exc
 
-    async def create_session(self, session_id: str) -> SessionDoc:
+    async def _create_session(self, session_id: str) -> SessionDoc:
+        """Create (or return the already-present) session document. Internal: the
+        SessionStore seam exposes only `get_or_create_session` — this is the shared
+        create-on-miss body the paths below reuse once their own `_get_doc` missed."""
         await self._ensure_connected()
         doc, _ = await self._get_doc(session_id)
         if doc is not None:
@@ -213,7 +216,7 @@ class CouchbaseSessionStore(CouchbaseConnectGate):
         doc, _ = await self._get_doc(session_id)
         if doc is not None:
             return doc
-        return await self.create_session(session_id)
+        return await self._create_session(session_id)
 
     async def load_trail(self, session_id: str) -> list[TrailEntry]:
         await self._ensure_connected()
@@ -336,7 +339,7 @@ class CouchbaseSessionStore(CouchbaseConnectGate):
         await self._ensure_connected()
         doc, cas = await self._get_doc(session_id)
         if doc is None:
-            doc = await self.create_session(session_id)
+            doc = await self._create_session(session_id)
             _, cas = await self._get_doc(session_id)
         return doc, cas
 

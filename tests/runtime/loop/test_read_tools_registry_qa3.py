@@ -57,7 +57,7 @@ def _build(
 ) -> tuple[AgentLoop, InMemorySessionStore]:
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,
@@ -160,7 +160,7 @@ async def test_mixed_runtime_and_mcp_calls_order_and_counts() -> None:
         }
     )
     dispatcher = ToolDispatcher(mcp, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     composite = ResolveValuesComposite(
         tool_dispatcher=dispatcher, catalog=CATALOG, embedding_client=FakeEmbeddingClient(dim=2)
     )

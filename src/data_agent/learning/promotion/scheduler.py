@@ -297,7 +297,7 @@ class PromotionScheduler:
     @property
     def policy(self) -> PromotionPolicy:
         """The policy this scheduler routes on. Exposed read-only for the SAME reason
-        `store` is: `build_review_inbox` pins the inbox to it, so the threshold that puts
+        `store` is: `build_promotion_plane` pins the inbox to it, so the threshold that puts
         work into the review queue and the cutoff that decides whether a human ever sees
         that work can never end up configured independently."""
         return self._policy

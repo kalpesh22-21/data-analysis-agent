@@ -119,7 +119,7 @@ def _build(
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=max_loop_iterations,
@@ -371,7 +371,7 @@ async def test_the_refusal_precedes_answer_sql_resolution_and_its_hooks() -> Non
             ]
         ),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=_observe),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,
@@ -739,7 +739,7 @@ async def test_a_stop_answer_does_not_rewrite_an_earlier_turns_state() -> None:
             [ModelTurnResult(assistant_text=None, tool_calls=[_query_call("q1")])]
         ),
         tool_dispatcher=ToolDispatcher(_query_mcp(), CATALOG, observer=_observe),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=1,

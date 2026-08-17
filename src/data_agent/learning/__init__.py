@@ -38,8 +38,6 @@ from .factory import (
     LearningWiringError,
     build_learning_consumer,
     build_promotion_plane,
-    build_promotion_scheduler,
-    build_review_inbox,
 )
 from .judge import CoverageJudge, JudgeConfig
 from .memory_queue import InMemoryLearningQueue
@@ -90,8 +88,6 @@ __all__ = [
     "TriageVerdict",
     "build_learning_consumer",
     "build_promotion_plane",
-    "build_promotion_scheduler",
-    "build_review_inbox",
     "compute_content_hash",
     "get_learning_settings",
     "learning_enabled",

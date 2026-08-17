@@ -129,7 +129,7 @@ async def test_three_turn_interleave_including_askuser_midturn_answer() -> None:
     await store.append_message("s", _msg(2, "user", "q2", _ts(9)))
     await store.append_trail_entry("s", _tool(2, "t2", _ts(10)))
 
-    assembler = ContextAssembler(store, history_token_budget=10_000_000)
+    assembler = ContextAssembler(store)
     assembled = await assembler.assemble("s", _SCOPE, current_turn_index=2)
 
     assert [_ident(m) for m in assembled.messages] == [
@@ -158,7 +158,7 @@ async def test_offpath_pure_interleaved_history_no_injection() -> None:
     await store.append_message("s", _msg(1, "user", "q1", _ts(4)))
     await store.append_trail_entry("s", _tool(1, "c1", _ts(5)))
 
-    assembler = ContextAssembler(store, history_token_budget=10_000_000)  # base=None, retrieval=None
+    assembler = ContextAssembler(store)  # base=None, retrieval=None
     assembled = await assembler.assemble("s", _SCOPE, current_turn_index=1)
 
     # "Nothing is injected" means nothing OPTIONAL: the date anchor is
@@ -190,7 +190,7 @@ async def test_scope_filter_applied_to_both_streams_no_orphan() -> None:
     await store.append_message("s", _msg(1, "user", "q1", _ts(4)))
     await store.append_trail_entry("s", _tool(1, "t1", _ts(5)))
 
-    assembler = ContextAssembler(store, history_token_budget=10_000_000)
+    assembler = ContextAssembler(store)
     assembled = await assembler.assemble("s", _SCOPE, current_turn_index=1)
 
     idents = [_ident(m) for m in assembled.messages]
@@ -212,7 +212,7 @@ async def test_current_turn_sentinel_lands_in_its_ts_slot() -> None:
     await store.append_trail_entry("s", _tool(0, "s", _ts(3), provenance=None))  # stranded → sentinel
     await store.append_trail_entry("s", _tool(0, "y", _ts(4)))  # in scope
 
-    assembler = ContextAssembler(store, history_token_budget=10_000_000)
+    assembler = ContextAssembler(store)
     assembled = await assembler.assemble("s", _SCOPE, current_turn_index=0)
 
     assert [_ident(m) for m in assembled.messages] == [
@@ -238,7 +238,7 @@ async def test_colliding_ts_tie_break_is_deterministic_by_stream_rank() -> None:
     await store.append_message("s", _msg(0, "user", "q0", same))
     await store.append_trail_entry("s", _tool(0, "cA", same))
 
-    assembler = ContextAssembler(store, history_token_budget=10_000_000)
+    assembler = ContextAssembler(store)
     first = await assembler.assemble("s", _SCOPE, current_turn_index=0)
     second = await assembler.assemble("s", _SCOPE, current_turn_index=0)
 
@@ -268,7 +268,7 @@ async def test_pairing_atomic_after_interleave_and_after_fit() -> None:
     await store.append_message("s", _msg(3, "user", "q3", _ts(13)))
     await store.append_trail_entry("s", _tool(3, "c3", _ts(14), sql=f"SELECT 3{pad}"))
 
-    assembler = ContextAssembler(store, history_token_budget=10_000_000)
+    assembler = ContextAssembler(store)
     assembled = await assembler.assemble("s", _SCOPE, current_turn_index=3)
     canonical = _assembled_to_canonical(assembled.messages)
 

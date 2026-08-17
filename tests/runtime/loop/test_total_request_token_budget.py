@@ -185,12 +185,11 @@ async def test_total_request_budget_pins_base_prompt_and_bounds_every_send_turn(
     model = _PerTurnModel()
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(_FatMCP(), CATALOG)
-    # history_token_budget HIGH so trail compaction does not pre-shrink the trail —
-    # we are exercising the SEPARATE total-request fit, which must bound the whole
-    # request even when the trail replays verbatim and grows unbounded.
+    # No trail compaction pre-shrinks the trail (Phase 1 bypasses it) — we are
+    # exercising the total-request fit, which must bound the whole request even
+    # when the trail replays verbatim and grows unbounded.
     assembler = ContextAssembler(
         store,
-        history_token_budget=10_000_000,
         base_system_prompt=AGENT_SYSTEM_PROMPT,
     )
     loop = AgentLoop(
@@ -293,8 +292,7 @@ async def test_total_request_budget_bounds_a_runaway_single_turn() -> None:
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(_FatMCP(), CATALOG)
     assembler = ContextAssembler(
-        store,
-        history_token_budget=10_000_000,  # HIGH: exercise the total-request fit, not compaction.
+        store,  # HIGH: exercise the total-request fit, not compaction.
         base_system_prompt=AGENT_SYSTEM_PROMPT,
     )
     loop = AgentLoop(

@@ -68,7 +68,7 @@ def _loop(
 
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp_client, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     composite = ResolveValuesComposite(
         tool_dispatcher=dispatcher,
         catalog=CATALOG,

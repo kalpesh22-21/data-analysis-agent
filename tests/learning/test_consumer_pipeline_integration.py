@@ -31,9 +31,8 @@ from data_agent.learning.factory import (
     LearningWiringError,
     build_learning_consumer,
     build_promotion_plane,
-    build_promotion_scheduler,
-    build_review_inbox,
 )
+from data_agent.learning.inbox import ParameterizationCompleter
 from data_agent.learning.memory_queue import InMemoryLearningQueue
 from data_agent.learning.models import LearningJob, LearningStatus, compute_content_hash
 from data_agent.learning.user import InMemoryUserKnowledgeStore
@@ -403,15 +402,19 @@ def test_promotion_plane_pins_one_candidate_store(settings):
     assert inbox._store is candidates
 
 
-def test_review_inbox_rejects_split_store(settings):
-    """Wiring the inbox to a DIFFERENT store than its scheduler is refused fail-fast
-    (a stale-envelope split-brain — the class the plane builder prevents)."""
-    scheduler = build_promotion_scheduler(
-        settings, candidate_store=InMemoryCandidateStore(),
-        probe=_NoOpProbe(), hit_counts=_ZeroHits(),
-    )
-    with pytest.raises(LearningWiringError):
-        build_review_inbox(InMemoryCandidateStore(), scheduler=scheduler)
+def test_a_completer_on_another_store_is_refused_fail_fast(settings):
+    """The plane takes the store ONCE, so an inbox/scheduler split cannot be expressed —
+    the one split still expressible is a completer holding a different store, and it is
+    refused fail-fast (a stale-envelope split-brain: the completer would re-validate the
+    envelope the inbox read and write the result where nothing lists it)."""
+    with pytest.raises(LearningWiringError, match="ONE candidate store"):
+        build_promotion_plane(
+            settings,
+            candidate_store=InMemoryCandidateStore(),
+            probe=_NoOpProbe(),
+            hit_counts=_ZeroHits(),
+            completer=ParameterizationCompleter(store=InMemoryCandidateStore()),
+        )
 
 
 # --- S1 invariants still hold with the stages wired --------------------------

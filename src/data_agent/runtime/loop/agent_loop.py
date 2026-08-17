@@ -153,7 +153,7 @@ from data_agent.runtime.session.models import (
 from data_agent.runtime.session.store import SessionStore
 from data_agent.timeutil import now_iso
 
-from .budget_guard import new_budget_window
+from .budget_guard import BudgetGuard
 from .read_guard import IDEMPOTENT_READ_TOOLS, idempotent_read_signature
 
 if TYPE_CHECKING:
@@ -1349,7 +1349,13 @@ class AgentLoop:
             session_id,
             TurnMessage(turn_index=turn_index, role="user", content=user_message, ts=_now_iso()),
         )
-        turn_model_client = self._begin_model_turn()
+        # B3: ONE per-turn-scoped `ModelClient` handle, used for every `send_turn`
+        # of this external turn (across all budget-window resumes) — never
+        # `self._model_client` directly, whose Responses/Chat fallback stickiness
+        # (D71 §4.2) is shared state across concurrent turns/sessions and would
+        # otherwise let one turn stomp another's mid-turn. See
+        # `model/client.py::begin_turn_client`.
+        turn_model_client = begin_turn_client(self._model_client)
         return await self._run_loop(
             session_id=session_id,
             credentials=credentials,
@@ -1447,7 +1453,8 @@ class AgentLoop:
         seed_answer_tables, seed_blueprint_runs = await self._compute_turn_answer_tables(
             session_id, turn_index
         )
-        turn_model_client = self._begin_model_turn()
+        # B3 per-turn handle — see `model/client.py::begin_turn_client`.
+        turn_model_client = begin_turn_client(self._model_client)
         return await self._run_loop(
             session_id=session_id,
             credentials=credentials,
@@ -1459,19 +1466,6 @@ class AgentLoop:
             seed_answer_tables=seed_answer_tables,
             seed_blueprint_runs=seed_blueprint_runs,
         )
-
-    def _begin_model_turn(self) -> ModelClient:
-        """Return a per-turn-scoped `ModelClient` handle (B3): Responses/Chat
-        fallback stickiness (D71 §4.2), if the underlying client tracks any,
-        must live on THIS returned handle — never on `self._model_client`'s
-        own shared instance state — so that concurrent turns/sessions sharing
-        one `AgentLoop`'s (and, in `app.py`, one process-wide `ModelClient`
-        singleton's) fallback stickiness can never stomp each other mid-turn.
-        Every `send_turn` call for the rest of this external turn (across any
-        number of budget-window resumes) must go through the SAME handle
-        returned here, not `self._model_client` directly.
-        """
-        return begin_turn_client(self._model_client)
 
     async def _build_canonical_messages(
         self,
@@ -1880,16 +1874,6 @@ class AgentLoop:
                 for index, table in enumerate(finalized.tables)
             ]
         return designated, blueprint_runs
-
-    async def _compute_turn_answer_sql(self, session_id: str, turn_index: int) -> str | None:
-        """`_compute_turn_answer_tables`'s N=1 projection — the primary table's SQL.
-
-        Kept as its own name because that is what it means; it is deliberately the
-        SAME projection `_answer_envelope` applies (`answer_tables[0].sql`) rather
-        than a second reconstruction, so the seed and the envelope cannot disagree.
-        """
-        tables, _runs = await self._compute_turn_answer_tables(session_id, turn_index)
-        return tables[0].sql if tables else None
 
     def _maybe_start_summary(self, tool_name: str, arguments: dict[str, Any]) -> None:
         """Fire a FIRE-AND-FORGET progress-summary task for one tool CALL (opt-in).
@@ -2412,7 +2396,8 @@ class AgentLoop:
             session_id, turn_index
         )
         seed_blueprint_runs = {**trail_runs, **seed_blueprint_runs}
-        turn_model_client = self._begin_model_turn()
+        # B3 per-turn handle — see `model/client.py::begin_turn_client`.
+        turn_model_client = begin_turn_client(self._model_client)
         return await self._run_loop(
             session_id=session_id,
             credentials=credentials,
@@ -2840,7 +2825,7 @@ class AgentLoop:
         # `listDatabases`+`listTables` ONCE per budget window, BEFORE the model loop.
         # Both run() and resume() re-enter `_run_loop`, so "once per window" is the
         # right cadence. It is computed HERE — next to `_tools_provider`, DELIBERATELY
-        # ABOVE `new_budget_window(...)` — so its 1 + N MCP round-trips run OUTSIDE the
+        # ABOVE the `BudgetGuard(...)` below — so its 1 + N MCP round-trips run OUTSIDE the
         # budget window's wall clock and never consume `max_wall_clock_seconds` (nor
         # re-charge it on every `continue` resume): this injected context is "never
         # budgeted". Two effects, both ephemeral (never persisted):
@@ -2884,7 +2869,10 @@ class AgentLoop:
                     emulated_served_call_ids[emulated_sig] = rendered_entry["tool_call_id"]
                 emulation_read_signatures = emulation.read_signatures
 
-        guard = new_budget_window(
+        # A FRESH window per `_run_loop` entry — the D55 "fresh window on continue"
+        # seam: both run() and resume() re-enter here, so a granted continue starts
+        # its iteration/token/wall-clock counters from zero.
+        guard = BudgetGuard(
             max_iterations=self._max_loop_iterations,
             max_wall_clock_seconds=self._max_wall_clock_seconds,
             max_token_spend=self._max_token_spend,

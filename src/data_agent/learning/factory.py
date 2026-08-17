@@ -37,9 +37,10 @@ Three load-bearing invariants this root enforces:
      under `learning/`.
 
 The S9 promotion scheduler is NOT a consumer stage (§7.2): it is a separate
-cron-scanned process. `build_promotion_scheduler` assembles it, and `build_review_inbox`
-wires the writer↔inbox↔scheduler linkage so a human approve runs the ONE guarded
-`apply_human_decision` path (R4).
+cron-scanned process. `build_promotion_plane` assembles it TOGETHER with the review
+inbox from one candidate store — that pairing is the writer↔inbox↔scheduler linkage,
+so a human approve runs the ONE guarded `apply_human_decision` path (R4) over the
+same store the inbox read.
 """
 
 from __future__ import annotations
@@ -205,7 +206,13 @@ def build_learning_consumer(
     slice. `judge_model_client` overrides which model answers (the economics favour a
     smaller one); omitted, the extractor's client is reused.
     """
-    loader_triage = _loader_triage_kwargs(summary_loader, triage)
+    # Only override the consumer's OWN defaults when a loader/triage is supplied
+    # (tests inject a scripted loader; production uses the consumer's defaults).
+    loader_triage: dict[str, Callable[..., Awaitable] | Triage] = {}
+    if summary_loader is not None:
+        loader_triage["summary_loader"] = summary_loader
+    if triage is not None:
+        loader_triage["triage"] = triage
 
     if model_client is None:
         # Unconfigured extraction ⇒ the S2 stub with an EMPTY pipeline (dormant,
@@ -289,13 +296,14 @@ def build_learning_consumer(
     if not known_rules:
         # MEDIUM-2 regression guard: with no grounded catalog rule ids, EVERY
         # rule-role blueprint plan declines `missing_rule` (the entrypoint's
-        # `load_known_rule_ids()` is what fixes this). Safe (a decline routes to
-        # review, never a bad landing) but invisible — warn loudly so the
-        # entrypoint-adoption slice wires the real rule set.
+        # `known_rule_ids_from_catalog(catalog)` over the MCP export is what fixes
+        # this). Safe (a decline routes to review, never a bad landing) but
+        # invisible — warn loudly so the entrypoint wires the real rule set.
         _logger.warning(
             "learning consumer built WITH extraction but known_rules is EMPTY — every "
             "rule-role blueprint plan will decline missing_rule (MEDIUM-2). Pass the "
-            "grounded catalog rule ids (load_known_rule_ids()) to enable rule-role plans."
+            "grounded catalog rule ids (known_rule_ids_from_catalog()) to enable "
+            "rule-role plans."
         )
     elif rule_index is None:
         # Grounded ids but no index: a rule-role plan citing an id that does not exist
@@ -621,7 +629,7 @@ def build_promotion_plane(
     store, so taking the store once here is what pins the shared singleton: a split
     (inbox on one store, scheduler on another) would read a stale envelope and
     CAS-write the wrong one. Prefer this over the two thin builders below when wiring
-    both — it makes the split impossible to express.
+    both — it is the ONLY builder for either half, so the split cannot be expressed.
 
     *corpus_status* (PriorArt Slice 2) is the `learning_corpus` write-side port the
     TERMINAL transitions stamp so a rejected/retired artifact stops surfacing as live
@@ -633,26 +641,45 @@ def build_promotion_plane(
     *tracer* (optional) wires the scheduler's promote/land span seam; `trace_verbose`
     is read off `settings.learning_trace_verbose` (D25 gate).
 
-    *policy* is optional and is built from *settings* when omitted (plan §4) — see
-    `build_promotion_scheduler`. The SAME policy object is handed to the inbox, because
-    `review_score_cutoff` and the routing threshold are two ends of one decision about how
-    much a reviewer is asked to look at, and reading them from two objects would let a
-    deployment route work into a queue its own cutoff then hides."""
-    scheduler = build_promotion_scheduler(
-        settings,
-        candidate_store=candidate_store,
+    **The POLICY is built from *settings* when the caller omits it (plan §4).** Before
+    this slice `policy=None` fell through to `PromotionScheduler`'s own
+    `PromotionPolicy()` default, and since no entrypoint ever passed one, every knob on
+    that class was a hardcoded constant wearing a config's clothes. Defaulting HERE — at
+    the composition root, which is the only place that legitimately reads settings —
+    means an operator's `LEARNING_PROMOTION_*` vars take effect without any entrypoint
+    change, while an explicit `policy=` (tests, demos) still wins. The SAME policy object
+    is handed to the inbox, because `review_score_cutoff` and the routing threshold are
+    two ends of one decision about how much a reviewer is asked to look at, and reading
+    them from two objects would let a deployment route work into a queue its own cutoff
+    then hides.
+
+    *completer* is the fail-to-review completion plane (optional, default absent — an
+    inbox without one refuses a completion 503 rather than pretending). It takes the SAME
+    `candidate_store` for the same reason the scheduler does: it re-validates the envelope
+    the inbox read and writes the result back, and a split would put the completed
+    candidate in a store nobody lists."""
+    extra = {} if clock is None else {"clock": clock}
+    scheduler = PromotionScheduler(
+        candidate_store,
         probe=probe,
         hit_counts=hit_counts,
         recurrence_counts=recurrence_counts,
+        policy=policy if policy is not None else policy_from_settings(settings),
         dependency_resolver=dependency_resolver,
         landing_writer=landing_writer,
         require_landing=require_landing,
         corpus_status=corpus_status,
-        policy=policy,
-        clock=clock,
         tracer=tracer,
+        trace_verbose=settings.learning_trace_verbose,
+        **extra,
     )
-    inbox = build_review_inbox(
+    if completer is not None and completer.store is not candidate_store:
+        raise LearningWiringError(
+            "review inbox and its parameterization completer must share ONE candidate "
+            "store (the inbox reads it; the completer re-validates and writes back to "
+            "it). Build both from one store."
+        )
+    inbox = ReviewInbox(
         candidate_store,
         scheduler=scheduler,
         policy=scheduler.policy,
@@ -719,99 +746,6 @@ def build_promotion_write_plane(
     )
 
 
-def build_promotion_scheduler(
-    settings: LearningSettings,
-    *,
-    candidate_store: CandidateStore,
-    probe: WarehouseProbe,
-    hit_counts: HitCountReader,
-    recurrence_counts: RecurrenceCountReader | None = None,
-    dependency_resolver: DependencyResolver | None = None,
-    landing_writer: LandingWriter | None = None,
-    require_landing: bool = False,
-    corpus_status: CorpusStatusWriter | None = None,
-    policy: PromotionPolicy | None = None,
-    clock: Callable[[], str] | None = None,
-    tracer: object | None = None,
-) -> PromotionScheduler:
-    """Assemble the S9 promotion scheduler alone — the SEPARATE cron-scanned process
-    (§7.2), NOT a consumer stage. Its warehouse probe, hit-count reader, and
-    dependency resolver are injected (Layer-1 fakes = live path). Launched by its own
-    entrypoint via `run_forever(sleep=asyncio.sleep)` (or `run_once` from a cron).
-    When wiring the inbox too, prefer `build_promotion_plane` (pins the shared store).
-
-    **The POLICY is built from *settings* when the caller omits it (plan §4).** Before
-    this slice `policy=None` fell through to `PromotionScheduler`'s own
-    `PromotionPolicy()` default, and since no entrypoint ever passed one, every knob on
-    that class was a hardcoded constant wearing a config's clothes. Defaulting HERE — at
-    the composition root, which is the only place that legitimately reads settings —
-    means an operator's `LEARNING_PROMOTION_*` vars take effect without any entrypoint
-    change, while an explicit `policy=` (tests, demos) still wins.
-
-    *tracer* (optional) wires the promote/land span seam; `trace_verbose` is read off
-    `settings.learning_trace_verbose` (the D25 gate)."""
-    extra = {} if clock is None else {"clock": clock}
-    return PromotionScheduler(
-        candidate_store,
-        probe=probe,
-        hit_counts=hit_counts,
-        recurrence_counts=recurrence_counts,
-        policy=policy if policy is not None else policy_from_settings(settings),
-        dependency_resolver=dependency_resolver,
-        landing_writer=landing_writer,
-        require_landing=require_landing,
-        corpus_status=corpus_status,
-        tracer=tracer,
-        trace_verbose=settings.learning_trace_verbose,
-        **extra,
-    )
-
-
-def build_review_inbox(
-    candidate_store: CandidateStore,
-    *,
-    scheduler: PromotionScheduler,
-    policy: PromotionPolicy | None = None,
-    completer: ParameterizationCompleter | None = None,
-) -> ReviewInbox:
-    """Wire the writer↔inbox↔scheduler linkage: the S7 writer routes to `in_review`,
-    the inbox projects those rows, and a human `approve` DELEGATES to the injected
-    scheduler's single `apply_human_decision` guarded path (R4) — so every approve
-    enforces the identical strip + deps + static/replay guards.
-
-    FAIL-FAST on a split store: the inbox reads `candidate_store` while `approve`
-    CAS-writes through `scheduler` — if those are different instances the approve
-    reads a stale envelope from one store and validates it in another. Assert the
-    scheduler was built from the SAME store (its read-only `store` property)."""
-    if candidate_store is not scheduler.store:
-        raise LearningWiringError(
-            "review inbox and its promotion scheduler must share ONE candidate store "
-            "(the inbox reads it; the scheduler CAS-writes it on approve). Build both "
-            "from one store — prefer build_promotion_plane(...)."
-        )
-    # Default to the SCHEDULER's policy rather than to a fresh `PromotionPolicy()`: the
-    # routing threshold and the review cutoff are two ends of one decision, and a fresh
-    # default here would silently apply a cutoff of 0.0 to a deployment that configured
-    # one — a knob turned in the env and ignored at the surface it governs.
-    # *completer* is the fail-to-review completion plane (optional, default absent — an
-    # inbox without one refuses a completion 503 rather than pretending). It takes the
-    # SAME `candidate_store` for the same reason the scheduler does: it re-validates the
-    # envelope this inbox read and writes the result back, and a split would put the
-    # completed candidate in a store nobody lists.
-    if completer is not None and completer.store is not candidate_store:
-        raise LearningWiringError(
-            "review inbox and its parameterization completer must share ONE candidate "
-            "store (the inbox reads it; the completer re-validates and writes back to "
-            "it). Build both from one store."
-        )
-    return ReviewInbox(
-        candidate_store,
-        scheduler=scheduler,
-        policy=policy if policy is not None else scheduler.policy,
-        completer=completer,
-    )
-
-
 def _require_full_pipeline(
     *,
     audit_store: AuditStore | None,
@@ -840,27 +774,12 @@ def _require_full_pipeline(
         )
 
 
-def _loader_triage_kwargs(
-    summary_loader: SummaryLoader | None, triage: Triage | None
-) -> dict[str, Callable[..., Awaitable] | Triage]:
-    """Only override the consumer's own defaults when a loader/triage is supplied
-    (tests inject a scripted loader; production uses the consumer's defaults)."""
-    kwargs: dict[str, object] = {}
-    if summary_loader is not None:
-        kwargs["summary_loader"] = summary_loader
-    if triage is not None:
-        kwargs["triage"] = triage
-    return kwargs  # type: ignore[return-value]
-
-
 __all__ = [
     "Embedder",
     "LearningWiringError",
     "Sampler",
     "build_learning_consumer",
     "build_promotion_plane",
-    "build_promotion_scheduler",
     "build_promotion_write_plane",
-    "build_review_inbox",
     "build_write_router_stages",
 ]

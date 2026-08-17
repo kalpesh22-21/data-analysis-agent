@@ -126,7 +126,7 @@ async def test_slot_value_absent_from_every_span_and_progress_event() -> None:
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=capturing_observer, tracer=tracer),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000, tracer=tracer),
+        context_assembler=ContextAssembler(store, tracer=tracer),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,

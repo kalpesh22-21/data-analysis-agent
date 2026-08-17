@@ -136,7 +136,7 @@ async def test_tool_never_raises_on_malformed_args() -> None:
 def _build_loop(model: ScriptedModelClient) -> tuple[AgentLoop, InMemorySessionStore]:
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(FakeMCPClient(), CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,
@@ -581,7 +581,6 @@ async def test_successful_call_reaches_the_model_as_its_real_confirmation() -> N
         session_store=store,
         base_system_prompt="BASE",
         preview_row_count=20,
-        history_token_budget=100_000,
     ).assemble(session_id, frozenset(), current_turn_index=0)
 
     rendered = [m for m in assembled.messages if m.get("tool_name") == "recordAssumptions"]
@@ -626,7 +625,7 @@ async def _store_with_assumptions_at_turn0() -> InMemorySessionStore:
 def _assemble(store: InMemorySessionStore, current_turn_index: int | None):
     return ContextAssembler(
         session_store=store, base_system_prompt="BASE",
-        preview_row_count=20, history_token_budget=100_000,
+        preview_row_count=20,
     ).assemble(SESSION_ID, frozenset(), current_turn_index=current_turn_index)
 
 

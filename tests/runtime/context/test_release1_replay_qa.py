@@ -88,7 +88,7 @@ def _build(script: list[ModelTurnResult], store: InMemorySessionStore) -> AgentL
     return AgentLoop(
         model_client=ScriptedModelClient(script),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,
@@ -202,7 +202,7 @@ async def test_the_assembled_request_is_byte_identical_across_two_rebuilds() -> 
     await store.append_message(
         SESSION_ID, TurnMessage(turn_index=1, role="user", content="next question", ts="t")
     )
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
 
     one = await assembler.assemble(SESSION_ID, frozenset(), current_turn_index=1)
     two = await assembler.assemble(SESSION_ID, frozenset(), current_turn_index=1)
@@ -245,7 +245,7 @@ async def test_a_prior_turns_finalization_refusal_does_not_replay_the_descriptio
     await store.append_message(
         SESSION_ID, TurnMessage(turn_index=1, role="user", content="something else", ts="t")
     )
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
 
     narrowed = await assembler.assemble(
         SESSION_ID, frozenset({f"{_E}.EmployeeCode"}), current_turn_index=1
@@ -278,7 +278,7 @@ async def test_the_refusal_is_dropped_cross_turn_even_under_an_allow_all_scope()
     await store.append_message(
         SESSION_ID, TurnMessage(turn_index=1, role="user", content="something else", ts="t")
     )
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
 
     wide = await assembler.assemble(SESSION_ID, frozenset(), current_turn_index=1)
 
@@ -320,7 +320,7 @@ async def test_the_same_refusal_is_correctly_kept_within_its_own_turn() -> None:
     read to know why it was refused."""
     store = InMemorySessionStore()
     await _refused_turn(store)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
 
     same_turn = await assembler.assemble(SESSION_ID, frozenset(), current_turn_index=0)
 
@@ -433,7 +433,7 @@ async def test_a_prior_turns_empty_designation_refusal_does_not_replay_its_draft
     await store.append_message(
         SESSION_ID, TurnMessage(turn_index=1, role="user", content="something else", ts="t1")
     )
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
 
     # Its OWN turn still sees it — that is what makes the nudge work at all.
     own_turn = await assembler.assemble(SESSION_ID, frozenset(), current_turn_index=0)

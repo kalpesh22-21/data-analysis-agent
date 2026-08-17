@@ -193,9 +193,7 @@ async def test_base_prompt_is_first_message() -> None:
     store = InMemorySessionStore()
     await store.append_trail_entry("s1", _entry("c1", "SELECT Department FROM employee"))
 
-    assembler = ContextAssembler(
-        store, history_token_budget=100_000, base_system_prompt=AGENT_SYSTEM_PROMPT
-    )
+    assembler = ContextAssembler(store, base_system_prompt=AGENT_SYSTEM_PROMPT)
     scope = frozenset({f"{_E}.Department"})
     assembled = await assembler.assemble("s1", scope)
 
@@ -206,7 +204,6 @@ async def test_base_prompt_precedes_retrieval_block() -> None:
     store = InMemorySessionStore()
     assembler = ContextAssembler(
         store,
-        history_token_budget=100_000,
         base_system_prompt=AGENT_SYSTEM_PROMPT,
         retrieval=_StubRetrieval(),
     )
@@ -229,10 +226,8 @@ async def test_disabled_toggle_reproduces_promptless_messages() -> None:
     await store.append_trail_entry("s1", _entry("c1", "SELECT Department FROM employee"))
     scope = frozenset({f"{_E}.Department"})
 
-    with_none = await ContextAssembler(
-        store, history_token_budget=100_000, base_system_prompt=None
-    ).assemble("s1", scope)
-    baseline = await ContextAssembler(store, history_token_budget=100_000).assemble("s1", scope)
+    with_none = await ContextAssembler(store, base_system_prompt=None).assemble("s1", scope)
+    baseline = await ContextAssembler(store).assemble("s1", scope)
 
     assert with_none.messages == baseline.messages
     assert all(m.get("content") != AGENT_SYSTEM_PROMPT for m in with_none.messages)
@@ -242,9 +237,7 @@ async def test_d45_rebuild_is_byte_identical() -> None:
     store = InMemorySessionStore()
     await store.append_trail_entry("s1", _entry("c1", "SELECT Department FROM employee"))
     scope = frozenset({f"{_E}.Department"})
-    assembler = ContextAssembler(
-        store, history_token_budget=100_000, base_system_prompt=AGENT_SYSTEM_PROMPT
-    )
+    assembler = ContextAssembler(store, base_system_prompt=AGENT_SYSTEM_PROMPT)
 
     first = await assembler.assemble("s1", scope)
     second = await assembler.assemble("s1", scope)
@@ -253,25 +246,23 @@ async def test_d45_rebuild_is_byte_identical() -> None:
     assert second.messages[0]["content"] == AGENT_SYSTEM_PROMPT
 
 
-async def test_base_prompt_survives_history_budget_trimming() -> None:
+async def test_base_prompt_survives_a_long_history() -> None:
     store = InMemorySessionStore()
     # Many entries; the base prompt must still lead and be the sole system message.
-    # Phase 1 bypasses the history-token compaction (the whole trail interleaves
-    # verbatim; the downstream total-request fit is the sole bound), so the
-    # history_token_budget=1 no longer triggers a summary — but the base-prompt
-    # invariant is unchanged.
+    # Phase 1 bypasses history compaction (the whole trail interleaves verbatim;
+    # the downstream total-request fit is the sole bound), so no summary is ever
+    # produced here — the base-prompt invariant is unchanged either way.
     for i in range(30):
         await store.append_trail_entry(
             "s1", _entry(f"c{i}", f"SELECT Department FROM employee WHERE id = {i}", turn_index=i)
         )
     scope = frozenset({f"{_E}.Department"})
-    assembler = ContextAssembler(
-        store, history_token_budget=1, base_system_prompt=AGENT_SYSTEM_PROMPT
-    )
+    assembler = ContextAssembler(store, base_system_prompt=AGENT_SYSTEM_PROMPT)
     assembled = await assembler.assemble("s1", scope)
 
     assert assembled.messages[0] == {"role": "system", "content": AGENT_SYSTEM_PROMPT}
-    assert assembled.compaction_applied is False
+    # All 30 entries interleave verbatim — nothing was folded into a summary.
+    assert len([m for m in assembled.messages if m.get("role") == "tool"]) == 30
     # The base prompt appears exactly once, and it is the sole system message.
     assert sum(m.get("content") == AGENT_SYSTEM_PROMPT for m in assembled.messages) == 1
     assert sum(m["role"] == "system" for m in assembled.messages) == 1

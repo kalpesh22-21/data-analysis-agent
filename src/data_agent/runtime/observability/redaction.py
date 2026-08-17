@@ -1,4 +1,8 @@
-"""Redactor — PII/secret redaction for telemetry (D25, design §7).
+"""Redaction — PII/secret redaction for telemetry (D25, design §7).
+
+Module-level functions, no object: `observability/tracing.py` and
+`observability/progress.py` call `hash_scope` / `mask_sql` /
+`redact_tool_args` / `tool_span_args` directly.
 
 Non-negotiable redaction rules (D25 / docs/10-observability.md):
   - Never log the JWT or the raw `column_scope` list — only a stable hash
@@ -135,18 +139,4 @@ def tool_span_args(
     return dict(args) if disable_redaction else redact_tool_args(tool_name, args)
 
 
-class Redactor:
-    """Bundles the redaction rules above behind one object — the seam
-    `observability/tracing.py` and `observability/progress.py` depend on."""
-
-    def hash_scope(self, column_scope: frozenset[str]) -> str:
-        return hash_scope(column_scope)
-
-    def mask_sql(self, sql: str) -> str:
-        return mask_sql(sql)
-
-    def redact_tool_args(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-        return redact_tool_args(tool_name, args)
-
-
-__all__ = ["Redactor", "hash_scope", "mask_sql", "redact_tool_args", "tool_span_args"]
+__all__ = ["hash_scope", "mask_sql", "redact_tool_args", "tool_span_args"]

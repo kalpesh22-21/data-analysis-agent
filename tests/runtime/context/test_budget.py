@@ -1,15 +1,13 @@
-"""Unit tests for context/budget.py — D46/D50 compaction + preview rendering (Layer 1)."""
+"""Unit tests for context/budget.py — preview-only entry rendering + the
+total-request token budget (Layer 1)."""
 
 from __future__ import annotations
 
 from data_agent.runtime.context.budget import (
     _SUMMARY_CONTEXT_PREFIX,
-    SummaryCache,
     _render_entry,
-    compact_trail,
     estimate_message_tokens,
     fit_request_to_budget,
-    render_messages,
 )
 from data_agent.runtime.dispatch.denial_mapping import classify_denial
 from data_agent.runtime.retrieval.render import _USER_CONTEXT_PREFIX as _RETRIEVAL_CONTEXT_PREFIX
@@ -41,146 +39,29 @@ def _entry(tool_call_id: str, sql: str, preview_rows: list[list] | None = None) 
     )
 
 
-def test_small_trail_fits_entirely_verbatim_no_compaction() -> None:
-    entries = [_entry("c1", "SELECT 1"), _entry("c2", "SELECT 2")]
-    result = compact_trail(entries, token_budget=10_000, scope_hash="h1")
-    assert result.verbatim == entries
-    assert result.summarized == []
-    assert result.summary_text is None
-
-
-def test_overflow_keeps_recent_verbatim_and_summarizes_older() -> None:
-    # A budget large enough for a few newest entries but not all: the newest
-    # survive verbatim (they each fit under the budget), the oldest overflow into
-    # the summary, and no entry is lost.
-    entries = [_entry(f"c{i}", f"SELECT {i} FROM some_wide_table_name_padding") for i in range(8)]
-    result = compact_trail(entries, token_budget=200, scope_hash="h1")
-    # The newest entry survives verbatim (it fits well under the budget).
-    assert result.verbatim[-1] == entries[-1]
-    # Overflow genuinely happened: some older entries were summarized, not all kept.
-    assert result.summarized
-    assert len(result.verbatim) < len(entries)
-    assert result.summary_text is not None
-    seen_ids = {e.tool_call_id for e in result.summarized} | {
-        e.tool_call_id for e in result.verbatim
-    }
-    assert seen_ids == {e.tool_call_id for e in entries}
-
-
-def test_single_over_budget_entry_is_summarized_not_forced_verbatim() -> None:
-    """Part 3 fix: when the NEWEST entry ALONE exceeds `token_budget` it must NOT
-    be force-kept verbatim (the old `if verbatim` guard admitted it regardless of
-    size, so one un-truncated ~30k getTableSchema survived verbatim and blew the
-    budget). It now falls into `summarized` — kept in a bounded form, not verbatim."""
-    giant_sql = "SELECT " + ("padding_col, " * 4000)  # far over any tiny budget
-    entry = _entry("giant", giant_sql)
-    result = compact_trail([entry], token_budget=50, scope_hash="h1")
-    # NOT kept verbatim — the whole point of the fix.
-    assert result.verbatim == []
-    # ...but still kept in a bounded form (folded into the summary).
-    assert [e.tool_call_id for e in result.summarized] == ["giant"]
-    assert result.summary_text is not None
-
-
-def test_over_budget_newest_does_not_drag_in_older_verbatim() -> None:
-    """With a giant NEWEST entry over budget, the walk stops at it (newest-first),
-    so nothing is force-kept verbatim and the older small entry is summarized too —
-    the compacted verbatim set is bounded by the budget (here: empty)."""
-    older_small = _entry("old", "SELECT 1")
-    giant_new = _entry("new", "SELECT " + ("x, " * 4000))
-    result = compact_trail([older_small, giant_new], token_budget=50, scope_hash="h1")
-    assert result.verbatim == []
-    assert {e.tool_call_id for e in result.summarized} == {"old", "new"}
-
-
-def test_sql_preserved_verbatim_for_kept_entries() -> None:
-    entries = [_entry("c1", "SELECT very_specific_column FROM table_x")]
-    result = compact_trail(entries, token_budget=10_000, scope_hash="h1")
-    assert result.verbatim[0].args["sql"] == "SELECT very_specific_column FROM table_x"
-
-
-def test_summarizer_receives_full_entries_including_sql() -> None:
-    captured: list = []
-
-    def spy_summarizer(entries):
-        captured.extend(entries)
-        return "summary"
-
-    entries = [_entry(f"c{i}", f"SELECT {i}") for i in range(5)]
-    compact_trail(entries, token_budget=1, scope_hash="h1", summarizer=spy_summarizer)
-    # Whatever got compacted must have been handed to the summarizer with SQL intact.
-    for e in captured:
-        assert e.args["sql"].startswith("SELECT")
-
-
-def test_cache_miss_then_hit() -> None:
-    cache = SummaryCache()
-    calls = {"n": 0}
-
-    def counting_summarizer(entries):
-        calls["n"] += 1
-        return f"summary-{calls['n']}"
-
-    entries = [_entry(f"c{i}", f"SELECT {i} FROM padding_table_name") for i in range(5)]
-
-    first = compact_trail(
-        entries, token_budget=1, scope_hash="h1", summarizer=counting_summarizer, cache=cache
-    )
-    assert first.cache_hit is False
-    assert calls["n"] == 1
-
-    second = compact_trail(
-        entries, token_budget=1, scope_hash="h1", summarizer=counting_summarizer, cache=cache
-    )
-    assert second.cache_hit is True
-    assert second.summary_text == first.summary_text
-    assert calls["n"] == 1  # summarizer NOT called again on cache hit
-
-
-def test_cache_miss_for_different_scope_hash() -> None:
-    cache = SummaryCache()
-    entries = [_entry(f"c{i}", f"SELECT {i} FROM padding_table_name") for i in range(5)]
-
-    first = compact_trail(entries, token_budget=1, scope_hash="scope-a", cache=cache)
-    second = compact_trail(entries, token_budget=1, scope_hash="scope-b", cache=cache)
-    assert first.cache_hit is False
-    assert second.cache_hit is False  # different scope_hash -> different cache key
-
-
-def test_render_messages_preview_truncated_flag() -> None:
+def test_render_entry_preview_truncated_flag() -> None:
     entry = _entry("c1", "SELECT * FROM big_table", preview_rows=[["r1"], ["r2"], ["r3"]])
-    result = compact_trail([entry], token_budget=10_000, scope_hash="h1")
-    messages = render_messages(result, preview_row_count=2)
-    tool_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
+    tool_msg = _render_entry(entry, 2)
     assert tool_msg["result_preview"]["truncated"] is True
     assert len(tool_msg["result_preview"]["preview_rows"]) == 2
 
 
-def test_render_messages_no_truncation_when_preview_fits() -> None:
+def test_render_entry_no_truncation_when_preview_fits() -> None:
     entry = _entry("c1", "SELECT * FROM small_table", preview_rows=[["r1"]])
-    result = compact_trail([entry], token_budget=10_000, scope_hash="h1")
-    messages = render_messages(result, preview_row_count=20)
-    tool_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
+    tool_msg = _render_entry(entry, 20)
     assert tool_msg["result_preview"]["truncated"] is False
     assert len(tool_msg["result_preview"]["preview_rows"]) == 1
 
 
-def test_render_messages_summary_prepended() -> None:
-    entries = [_entry(f"c{i}", f"SELECT {i} FROM padding_table_name") for i in range(5)]
-    result = compact_trail(entries, token_budget=1, scope_hash="h1")
-    messages = render_messages(result)
-    # The summary is a NON-system (`user`) message so it never competes with the
-    # base prompt; the raw summary text is preserved, only prefixed as prior-context.
-    assert messages[0]["role"] == "user"
-    assert messages[0]["content"] == _SUMMARY_CONTEXT_PREFIX + result.summary_text
+def test_render_entry_preserves_sql_verbatim() -> None:
+    entry = _entry("c1", "SELECT very_specific_column FROM table_x")
+    assert _render_entry(entry, 20)["args"]["sql"] == "SELECT very_specific_column FROM table_x"
 
 
-def test_render_messages_never_exposes_more_than_preview() -> None:
+def test_render_entry_never_exposes_more_than_preview() -> None:
     """budget.py must never surface anything beyond the stored preview (D46 preview-only)."""
     entry = _entry("c1", "SELECT * FROM huge_table", preview_rows=[["r1"], ["r2"]])
-    result = compact_trail([entry], token_budget=10_000, scope_hash="h1")
-    messages = render_messages(result, preview_row_count=100)
-    tool_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
+    tool_msg = _render_entry(entry, 100)
     # Only the two rows that were ever stored are ever exposed - no way to grow back.
     assert len(tool_msg["result_preview"]["preview_rows"]) == 2
 
@@ -205,9 +86,7 @@ def test_render_entry_includes_static_denial_user_message_for_non_ok_status() ->
         result_full_ref=None,
         ts="2026-07-01T00:00:00+00:00",
     )
-    result = compact_trail([entry], token_budget=10_000, scope_hash="h1")
-    messages = render_messages(result)
-    tool_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
+    tool_msg = _render_entry(entry, 20)
     assert tool_msg["user_message"] == "That query didn't run correctly. Let me fix it and try again."
 
 
@@ -229,9 +108,7 @@ def test_render_entry_resolve_values_unknown_target_uses_specific_message() -> N
         result_full_ref=None,
         ts="2026-07-01T00:00:00+00:00",
     )
-    result = compact_trail([entry], token_budget=10_000, scope_hash="h1")
-    messages = render_messages(result)
-    tool_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
+    tool_msg = _render_entry(entry, 20)
     assert tool_msg["user_message"] == (
         "That table or column isn't available. Check the exact name with "
         "getTableSchema and try again."
@@ -240,11 +117,7 @@ def test_render_entry_resolve_values_unknown_target_uses_specific_message() -> N
 
 
 def test_render_entry_user_message_is_none_for_ok_status() -> None:
-    entry = _entry("c1", "SELECT 1")
-    result = compact_trail([entry], token_budget=10_000, scope_hash="h1")
-    messages = render_messages(result)
-    tool_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
-    assert tool_msg["user_message"] is None
+    assert _render_entry(_entry("c1", "SELECT 1"), 20)["user_message"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -538,10 +411,8 @@ def test_render_entry_surfaces_authoritative_verified_blueprint_flag() -> None:
         authoritative=True,
     )
     plain = _entry("c1", "SELECT 1")
-    result = compact_trail([verified, plain], token_budget=10_000, scope_hash="h1")
-    messages = render_messages(result)
-    bp_msg = next(m for m in messages if m.get("tool_call_id") == "bp1")
-    query_msg = next(m for m in messages if m.get("tool_call_id") == "c1")
+    bp_msg = _render_entry(verified, 20)
+    query_msg = _render_entry(plain, 20)
     assert bp_msg["authoritative"] is True
     assert "authoritative" not in query_msg
 

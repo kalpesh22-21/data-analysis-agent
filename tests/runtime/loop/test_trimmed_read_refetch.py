@@ -104,7 +104,7 @@ def _loop(
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=ToolDispatcher(mcp, CATALOG),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=20,
@@ -519,7 +519,7 @@ async def test_emulated_discovery_pairs_are_readable_so_a_re_call_is_still_dedup
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=ToolDispatcher(mcp, CATALOG),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=20,

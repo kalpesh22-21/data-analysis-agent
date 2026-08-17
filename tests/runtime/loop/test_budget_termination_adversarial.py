@@ -84,7 +84,7 @@ def _build_loop(
     clock=None,
 ) -> AgentLoop:
     dispatcher = ToolDispatcher(mcp_client, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     kwargs = dict(
         model_client=model_client,
         tool_dispatcher=dispatcher,

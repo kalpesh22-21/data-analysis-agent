@@ -91,7 +91,7 @@ def _build_loop(
 ) -> tuple[AgentLoop, InMemorySessionStore]:
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,
@@ -696,7 +696,7 @@ async def test_guard_event_payload_is_legible_and_marks_the_dedup() -> None:
     mcp = FakeMCPClient(scripted={"getTableSchema": [_schema_response() for _ in range(20)]})
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,

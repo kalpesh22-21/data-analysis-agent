@@ -136,7 +136,7 @@ async def test_successful_call_reaches_the_model_as_its_real_confirmation() -> N
     )
     assembled = await ContextAssembler(
         session_store=store, base_system_prompt="BASE",
-        preview_row_count=20, history_token_budget=100_000,
+        preview_row_count=20,
     ).assemble(SESSION_ID, frozenset(), current_turn_index=0)
 
     rendered = [m for m in assembled.messages if m.get("tool_name") == "answerWithTable"]
@@ -156,7 +156,7 @@ def _build_loop(
         AgentLoop(
             model_client=model,
             tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
-            context_assembler=ContextAssembler(store, history_token_budget=100_000),
+            context_assembler=ContextAssembler(store),
             session_store=store,
             tools_provider=_tools_provider,
             max_loop_iterations=15,
@@ -178,7 +178,7 @@ def _loop_over(store: InMemorySessionStore) -> AgentLoop:
     return AgentLoop(
         model_client=ScriptedModelClient([ModelTurnResult(assistant_text="x")]),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,
@@ -532,7 +532,7 @@ async def test_a_blueprint_id_resolves_to_that_blueprints_terminal_sql() -> None
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,
@@ -555,7 +555,7 @@ async def test_a_blueprint_id_resolves_to_that_blueprints_terminal_sql() -> None
 
 
 async def test_a_blueprint_designation_survives_a_pause_and_resume() -> None:
-    """REGRESSION. `_compute_turn_answer_sql` reseeds a resumed window from the trail,
+    """REGRESSION. `_compute_turn_answer_tables` reseeds a resumed window from the trail,
     and it originally read only `args["sql"]` — silently dropping every BLUEPRINT
     designation. That is the form the live model actually emits: observed in a real
     turn it sent `sql=""` next to `blueprint_id`, which cleans to `None`. So a
@@ -600,7 +600,8 @@ async def test_a_blueprint_designation_survives_a_pause_and_resume() -> None:
     ))
 
     loop = _loop_over(store)
-    assert await loop._compute_turn_answer_sql(SESSION_ID, 0) == terminal
+    tables, _runs = await loop._compute_turn_answer_tables(SESSION_ID, 0)
+    assert [t.sql for t in tables] == [terminal]
 
 
 async def test_a_raw_sql_designation_still_reseeds() -> None:
@@ -614,7 +615,8 @@ async def test_a_raw_sql_designation_still_reseeds() -> None:
         provenance=frozenset(), result_preview=None, result_full_ref=None, ts="t",
     ))
     loop = _loop_over(store)
-    assert await loop._compute_turn_answer_sql(SESSION_ID, 0) == _ANSWER_SQL
+    tables, _runs = await loop._compute_turn_answer_tables(SESSION_ID, 0)
+    assert [t.sql for t in tables] == [_ANSWER_SQL]
 
 
 async def test_a_tables_designation_reseeds_the_same_way() -> None:
@@ -628,4 +630,5 @@ async def test_a_tables_designation_reseeds_the_same_way() -> None:
         provenance=frozenset(), result_preview=None, result_full_ref=None, ts="t",
     ))
     loop = _loop_over(store)
-    assert await loop._compute_turn_answer_sql(SESSION_ID, 0) == _ANSWER_SQL
+    tables, _runs = await loop._compute_turn_answer_tables(SESSION_ID, 0)
+    assert [t.sql for t in tables] == [_ANSWER_SQL]

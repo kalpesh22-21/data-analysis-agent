@@ -10,7 +10,7 @@ and `tests/runtime/context/test_budget.py`.
 
 from __future__ import annotations
 
-from data_agent.runtime.loop.budget_guard import BudgetGuard, new_budget_window
+from data_agent.runtime.loop.budget_guard import BudgetGuard
 
 
 class _FakeClock:
@@ -85,11 +85,11 @@ def test_usage_snapshot_reports_current_counters() -> None:
     assert usage.max_wall_clock_seconds == 60
 
 
-def test_new_budget_window_is_independent_from_prior_window() -> None:
+def test_a_fresh_guard_is_independent_from_the_prior_window() -> None:
     clock = _FakeClock()
-    first = new_budget_window(max_iterations=1, max_wall_clock_seconds=60, clock=clock)
+    first = BudgetGuard(max_iterations=1, max_wall_clock_seconds=60, clock=clock)
     first.record_iteration()
     assert first.exceeded is True
 
-    second = new_budget_window(max_iterations=1, max_wall_clock_seconds=60, clock=clock)
+    second = BudgetGuard(max_iterations=1, max_wall_clock_seconds=60, clock=clock)
     assert second.exceeded is False  # fresh window (D55) — no carryover from `first`

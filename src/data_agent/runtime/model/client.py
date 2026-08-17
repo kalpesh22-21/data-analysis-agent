@@ -78,9 +78,8 @@ class ModelClient(Protocol):
 
         `OpenAIModelClient` tracks Responses/Chat fallback stickiness (D71
         §4.2); when ONE `ModelClient` instance is shared across concurrent
-        `/turn` requests (as `app.py`'s composition root does — and across
-        the context-summarizer's background calls, `context/llm_summarizer.py`),
-        mutating that stickiness as *shared instance state* lets one turn's
+        `/turn` requests (as `app.py`'s composition root does), mutating
+        that stickiness as *shared instance state* lets one turn's
         fallback stomp another's. `begin_turn()` must therefore return a
         FRESH, independent handle whenever the implementation carries any
         such per-turn state (`OpenAIModelClient.begin_turn()` returns a new
@@ -105,9 +104,9 @@ def begin_turn_client(model_client: ModelClient) -> ModelClient:
     Calls `model_client.begin_turn()` if the client implements it (duck-typed
     — not every `ModelClient` double needs to; a minimal test stub with only
     `send_turn` is a valid degenerate case), else returns *model_client*
-    unchanged. The single call site both `loop/agent_loop.py` and
-    `context/llm_summarizer.py` use, so the "never share per-turn state"
-    contract is enforced identically everywhere a `ModelClient` is invoked.
+    unchanged. The single place `loop/agent_loop.py` obtains a turn handle, so
+    the "never share per-turn state" contract is enforced identically
+    everywhere a `ModelClient` is invoked.
     """
     begin_turn = getattr(model_client, "begin_turn", None)
     if callable(begin_turn):

@@ -31,8 +31,7 @@
 
 Phase 1 deliberately BYPASSES compaction (no summary): every in-scope turn
 interleaves verbatim and `fit_request_to_budget` (downstream, in
-`loop/agent_loop.py`) is the sole size bound. The compaction machinery in
-`context/budget.py` is retained but no longer invoked here.
+`loop/agent_loop.py`) is the sole size bound.
 
 D44 fail-closed folding (design §5): each current-turn `ok`+`None`-provenance
 entry that `filter_trail` dropped is re-materialised as a non-data-bearing
@@ -61,12 +60,7 @@ from data_agent.runtime.session.models import live_analysis_state
 from data_agent.runtime.session.store import SessionStore
 
 from . import scope_filter
-from .budget import (
-    Summarizer,
-    SummaryCache,
-    _render_entry,
-    default_summarizer,
-)
+from .budget import _render_entry
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -143,10 +137,6 @@ class AssembledContext:
 
     messages: list[dict[str, Any]]
     dropped_by_scope_count: int
-    # Always `False` in Phase 1 — the interleave path bypasses compaction (no
-    # summary). Retained for the CHAIN span / caller-shape stability; a later phase
-    # that reintroduces a compaction summary will set it True again.
-    compaction_applied: bool
     # Slice-1 retrieval: shape-only counts of the pre-injected block (design
     # §12 "AssembledContext may gain retrieved_counts for the span"); `(0, 0)`
     # whenever retrieval did not run (unconfigured / no user_message) — the
@@ -155,40 +145,31 @@ class AssembledContext:
 
 
 class ContextAssembler:
-    """Wires `SessionStore` + the budget/summarizer dependencies into the D50 pipeline."""
+    """Wires `SessionStore` + the render/retrieval dependencies into the D50 pipeline."""
 
     def __init__(
         self,
         session_store: SessionStore,
         *,
-        history_token_budget: int,
         preview_row_count: int = 20,
-        summarizer: Summarizer = default_summarizer,
-        cache: SummaryCache | None = None,
         retrieval: RetrievalPipeline | None = None,
         base_system_prompt: str | None = None,
         tracer: Tracer | None = None,
     ) -> None:
         self._session_store = session_store
-        # PHASE-1 INERT (retained, UNREAD by `assemble`): `history_token_budget`,
-        # `summarizer` and `cache` drove the D46 compaction that Phase 1 bypasses —
-        # `assemble` no longer calls `compact_trail_async`, so none of these three
-        # affect the assembled request today (the downstream `fit_request_to_budget`
-        # is the sole size bound). They are kept on the constructor so the phase that
-        # reintroduces a compaction summary can re-wire them without a signature
-        # change; do NOT assume setting `history_token_budget` shrinks history now.
-        self._history_token_budget = history_token_budget
+        # Phase 1 bypasses D46 compaction: there is no history token budget, no
+        # summarizer and no summary cache here — `assemble` interleaves every
+        # in-scope turn verbatim and the downstream `fit_request_to_budget`
+        # (loop/agent_loop.py) is the sole size bound.
         self._preview_row_count = preview_row_count
-        self._summarizer = summarizer
-        self._cache = cache if cache is not None else SummaryCache()
         # Always-present base instruction (`prompts.AGENT_SYSTEM_PROMPT`, wired
         # from settings by `app.py`). When set, `assemble` prepends it as the
         # FIRST `role:"system"` message AFTER retrieval pre-injection, so the
         # model always sees: base prompt -> retrieval cards -> history. It is a
-        # static constant inserted post-compaction, so it is BOTH exempt from
-        # the history-token-budget trimming AND byte-stable across a D45 rebuild/
-        # resume. `None` (Layer-1 tests, or the disabled toggle) reproduces the
-        # exact prompt-less message list.
+        # static constant, so it is byte-stable across a D45 rebuild/resume, and
+        # the downstream `fit_request_to_budget` pins it as the undroppable head.
+        # `None` (Layer-1 tests, or the disabled toggle) reproduces the exact
+        # prompt-less message list.
         self._base_system_prompt = base_system_prompt
         # Slice-1 retrieval (design §3.3): an OPTIONAL pre-loop stage. When
         # `None` (Layer-1 history-only tests, unconfigured deploy) `assemble`
@@ -198,9 +179,8 @@ class ContextAssembler:
         self._retrieval = retrieval
         # B5: optional — when wired (app.py's composition root), assemble()
         # emits one CHAIN span per call recording only non-sensitive shape
-        # counters (trail entries loaded, dropped-by-scope count, compaction
-        # hit/miss — design §7's CHAIN row); `None` (Layer-1 tests) means no
-        # span is ever created.
+        # counters (trail entries loaded, dropped-by-scope count — design §7's
+        # CHAIN row); `None` (Layer-1 tests) means no span is ever created.
         self._tracer = tracer
 
     async def assemble(
@@ -273,7 +253,7 @@ class ContextAssembler:
             )
             in_scope_messages = scope_filter.filter_messages(raw_messages, column_scope)
 
-            # 3/4/5. Phase 1: NO compaction (summary_text = None). Interleave the two
+            # 3/4/5. Phase 1: NO compaction (no summary). Interleave the two
             # in-scope streams verbatim by (turn_index, ts, stream_rank), folding the
             # D94 withheld/idempotent-read sentinels into their chronological slot.
             messages = self._interleave(
@@ -370,7 +350,12 @@ class ContextAssembler:
             dropped_by_scope_count = len(raw_trail) - len(in_scope_trail)
             if current_span is not None:
                 current_span.set_attribute("dropped_by_scope_count", dropped_by_scope_count)
-                # Phase 1 bypasses compaction — no summary is ever produced.
+                # Phase 1 bypasses compaction — no summary is ever produced, so this
+                # is a constant `False`. KEPT deliberately: it is an OUTWARD telemetry
+                # surface (design §7's CHAIN row, read in Phoenix), and dropping the
+                # attribute would silently change what a dashboard/query sees. The
+                # in-process `AssembledContext.compaction_applied` field it used to
+                # mirror had no readers at all and was removed.
                 current_span.set_attribute("compaction_applied", False)
                 current_span.set_attribute("retrieved_blueprints", retrieved_counts[0])
                 current_span.set_attribute("retrieved_knowledge", retrieved_counts[1])
@@ -378,7 +363,6 @@ class ContextAssembler:
         return AssembledContext(
             messages=messages,
             dropped_by_scope_count=dropped_by_scope_count,
-            compaction_applied=False,
             retrieved_counts=retrieved_counts,
         )
 
@@ -775,7 +759,7 @@ def _build_withheld_sentinel_message(entry: TrailEntry) -> dict[str, Any]:
     """Build the render-shape tool message carrying the D94 sentinel (Part 1).
 
     The explicit `withheld_sentinel` flag (never set by the ordinary
-    `budget.render_messages` shape) signals
+    `budget._render_entry` shape) signals
     `loop/agent_loop.py::_tool_trail_entry_to_canonical` to use this verbatim,
     data-free text as the tool result instead of a rendered payload — an explicit
     marker so a future `_render_entry` field can never silently reroute a normal

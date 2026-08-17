@@ -8,14 +8,13 @@ traces) claimed the BASE prompt is WIPED from what the model receives WHEN the
 budget-cap guardrail trips after many iterations. This test drives the REAL
 `AgentLoop` through EVERY phase that report implicates — mid-loop iterations,
 the last call before `paused_budget_cap`, the first call of each resumed budget
-window, and calls after history compaction has fired — and asserts the base
-prompt is present, at index 0, byte-identical on ALL of them.
+window — and asserts the base prompt is present, at index 0, byte-identical on
+ALL of them.
 
-It also proves (belt-and-suspenders) that the history-summarizer subcall IS a
-base-prompt-less call (its system text is `_SUMMARIZER_SYSTEM_PROMPT`, never
-`AGENT_SYSTEM_PROMPT`) — i.e. the base-prompt-less turns that appear under the
-same high-iteration/compaction pressure are the fire-and-forget summarizer
-subcalls, NOT the main loop.
+Phase 1 bypasses trail compaction entirely (there is no summarizer subcall any
+more), so each test also pins that NO main-loop call ever carries a
+compaction-summary block: what the model sees is the verbatim interleave plus
+the base prompt, and the base prompt is its SOLE `role: "system"` message.
 """
 
 from __future__ import annotations
@@ -26,10 +25,6 @@ from typing import Any
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.context.budget import _SUMMARY_CONTEXT_PREFIX
-from data_agent.runtime.context.llm_summarizer import (
-    _SUMMARIZER_SYSTEM_PROMPT,
-    build_llm_summarizer,
-)
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
@@ -83,22 +78,6 @@ class _RecordingLoopModel:
         return self
 
 
-class _RecordingSummarizerModel:
-    """History-summarizer model double: records every payload and returns a
-    one-line summary. Base-prompt-less by construction (the summarizer builds its
-    own `_SUMMARIZER_SYSTEM_PROMPT` message list)."""
-
-    def __init__(self) -> None:
-        self.calls: list[list[dict[str, Any]]] = []
-
-    async def send_turn(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]):
-        self.calls.append(copy.deepcopy(messages))
-        return ModelTurnResult(assistant_text="summarized older tool-call history")
-
-    def begin_turn(self) -> _RecordingSummarizerModel:
-        return self
-
-
 class _FatRunQueryMCP:
     """MCP double returning a fat `runQuery` result for unbounded calls, so trail
     entries carry real token weight and history compaction actually triggers."""
@@ -121,15 +100,9 @@ class _FatRunQueryMCP:
 
 async def test_base_prompt_is_messages0_on_every_main_loop_call_through_cap_resume_and_compaction() -> None:
     main_model = _RecordingLoopModel()
-    summarizer_model = _RecordingSummarizerModel()
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(_FatRunQueryMCP(), CATALOG)
-    assembler = ContextAssembler(
-        store,
-        history_token_budget=400,  # LOW -> compaction fires after a couple entries
-        base_system_prompt=AGENT_SYSTEM_PROMPT,
-        summarizer=build_llm_summarizer(summarizer_model),
-    )
+    assembler = ContextAssembler(store, base_system_prompt=AGENT_SYSTEM_PROMPT)
     loop = AgentLoop(
         model_client=main_model,
         tool_dispatcher=dispatcher,
@@ -155,17 +128,15 @@ async def test_base_prompt_is_messages0_on_every_main_loop_call_through_cap_resu
     # Exactly one main-loop send_turn per iteration per window (no hidden calls).
     assert len(main_model.calls) == _EXPECTED_MAIN_CALLS
 
-    # Phase 1 bypasses compaction: the trail interleaves VERBATIM (no summary), so
-    # the request grows across the run and `compact_trail` is never invoked — the
-    # base-prompt invariant below is what this regression guards, and it must hold on
-    # EVERY call regardless of how large the verbatim history has grown.
-    assert not summarizer_model.calls, "Phase 1 must not invoke the history summarizer"
-    compaction_indices: list[int] = []
-
     # ---- THE INVARIANT: base prompt is messages[0] on EVERY main-loop call. ----
     # Covers (a) first call, (b) every mid-loop iteration, (c) the last call before
-    # each paused_budget_cap, (d) the first call of each resumed window, and
-    # (e) every post-compaction call — all 18 calls, no exceptions.
+    # each paused_budget_cap and (d) the first call of each resumed window — all 18
+    # calls, no exceptions.
+    #
+    # Phase 1 bypasses compaction: the trail interleaves VERBATIM (no summary), so
+    # the request grows across the run — the base-prompt invariant must hold on EVERY
+    # call regardless of how large the verbatim history has grown, and no call ever
+    # carries a compaction-summary block.
     for i, msgs in enumerate(main_model.calls):
         assert msgs, f"main-loop call[{i}] had an empty message list"
         assert msgs[0]["role"] == "system", (
@@ -175,6 +146,9 @@ async def test_base_prompt_is_messages0_on_every_main_loop_call_through_cap_resu
             f"main-loop call[{i}] dropped the base prompt from messages[0]: "
             f"got {msgs[0]['content']!r:.120}"
         )
+        assert not any(
+            str(m.get("content", "")).startswith(_SUMMARY_CONTEXT_PREFIX) for m in msgs
+        ), f"main-loop call[{i}] carried a compaction summary (Phase 1 emits none)"
 
     # Explicit spot-checks on the phases the bug report named, by index:
     #   window 1 = calls 0..5, window 2 = 6..11, window 3 = 12..17.
@@ -184,20 +158,8 @@ async def test_base_prompt_is_messages0_on_every_main_loop_call_through_cap_resu
         [0]  # (a) first ever call
         + window_first_call_indices  # (d) first call of each resumed window
         + window_last_call_indices  # (c) last call before each cap / ceiling
-        + compaction_indices  # (e) post-compaction calls
     ):
         assert main_model.calls[idx][0]["content"] == AGENT_SYSTEM_PROMPT
-
-    # ---- The summarizer subcalls ARE the base-prompt-less ones (misattribution
-    # proof): every history-summarizer send_turn leads with its OWN system prompt,
-    # never AGENT_SYSTEM_PROMPT, and carries no tools. These are what a trace at the
-    # cap surfaces — not a main-loop call.
-    for i, msgs in enumerate(summarizer_model.calls):
-        assert msgs[0]["role"] == "system"
-        assert msgs[0]["content"] == _SUMMARIZER_SYSTEM_PROMPT
-        assert msgs[0]["content"] != AGENT_SYSTEM_PROMPT, (
-            f"summarizer call[{i}] unexpectedly carried the base prompt"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -273,15 +235,9 @@ class _MultiTurnModel:
 
 async def test_base_prompt_survives_across_n_real_turns_with_history_replay_compaction_and_later_cap() -> None:
     model = _MultiTurnModel()
-    summarizer_model = _RecordingSummarizerModel()
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(_FatRunQueryMCP(), CATALOG)
-    assembler = ContextAssembler(
-        store,
-        history_token_budget=500,  # LOW -> accumulated cross-turn trail compacts fast
-        base_system_prompt=AGENT_SYSTEM_PROMPT,
-        summarizer=build_llm_summarizer(summarizer_model),
-    )
+    assembler = ContextAssembler(store, base_system_prompt=AGENT_SYSTEM_PROMPT)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,
@@ -325,10 +281,9 @@ async def test_base_prompt_survives_across_n_real_turns_with_history_replay_comp
     assert max_replayed >= 6, "later turns did not replay a large accumulated history"
 
     # (suspect 3) Phase 1 bypasses compaction: the accumulated cross-turn trail
-    # interleaves VERBATIM (no summary) — `compact_trail` is never invoked. The
-    # cross-turn base-prompt invariant below is what this multi-turn regression
-    # guards, independent of compaction.
-    assert not summarizer_model.calls, "Phase 1 must not invoke the history summarizer"
+    # interleaves VERBATIM (no summary). The cross-turn base-prompt invariant below
+    # is what this multi-turn regression guards, independent of compaction (the
+    # no-summary-block assertion lives in the per-call sweep further down).
 
     # ---- THE INVARIANT across EVERY main-loop call of EVERY turn. ----
     for i, (label, it, msgs) in enumerate(model.calls):
@@ -405,14 +360,11 @@ class _StubRetrieval:
 
 async def test_base_prompt_is_sole_system_message_with_retrieval_wired_through_cap_and_compaction() -> None:
     main_model = _RecordingLoopModel()
-    summarizer_model = _RecordingSummarizerModel()
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(_FatRunQueryMCP(), CATALOG)
     assembler = ContextAssembler(
         store,
-        history_token_budget=400,  # LOW -> compaction fires
         base_system_prompt=AGENT_SYSTEM_PROMPT,
-        summarizer=build_llm_summarizer(summarizer_model),
         retrieval=_StubRetrieval(),  # production wiring: retrieval cards block present
     )
     loop = AgentLoop(
@@ -436,8 +388,7 @@ async def test_base_prompt_is_sole_system_message_with_retrieval_wired_through_c
     # The run really did traverse cap -> resume -> ... -> hard ceiling.
     assert statuses == ["paused_budget_cap", "paused_budget_cap", "stopped_hard_ceiling"]
     assert len(main_model.calls) == _EXPECTED_MAIN_CALLS
-    # Phase 1 bypasses compaction — the summarizer is never invoked.
-    assert not summarizer_model.calls, "Phase 1 must not invoke the history summarizer"
+    # Phase 1 bypasses compaction — no summary block ever appears (asserted per call).
 
     saw_retrieval_card = False
     for i, msgs in enumerate(main_model.calls):

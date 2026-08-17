@@ -896,9 +896,6 @@ class _LazyCouchbaseSessionStore:
             self._inner = CouchbaseSessionStore(self._settings)
         return self._inner
 
-    async def create_session(self, session_id: str) -> Any:
-        return await self._store().create_session(session_id)
-
     async def get_or_create_session(self, session_id: str) -> Any:
         return await self._store().get_or_create_session(session_id)
 

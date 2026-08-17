@@ -54,7 +54,7 @@ def _credentials(scope: frozenset[str] = frozenset()) -> RuntimeCredentials:
 
 def _build_loop(model: ScriptedModelClient, mcp: FakeMCPClient, store: InMemorySessionStore) -> AgentLoop:
     dispatcher = ToolDispatcher(mcp, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     return AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,

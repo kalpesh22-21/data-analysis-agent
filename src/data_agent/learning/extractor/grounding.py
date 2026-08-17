@@ -3,7 +3,7 @@
 Slice 3 grounds the `rule` role ONLY: it needs the set of EXISTING catalog rule
 ids so a `rule`-role plan referencing a non-existent rule fails to review
 (D97 §4.2 / §7 missing-rule pairing). The rule ids live in the semantic catalog's
-per-table `rules[*].id` (D67); `load_known_rule_ids` enumerates them.
+per-table `rules[*].id` (D67); `known_rule_ids_from_catalog` enumerates them.
 
 **Two views of the same parse, and why the second one exists.** `known_rule_ids_from_
 catalog` answers "does this id exist?" — the membership test `_validate_roles` runs.
@@ -138,20 +138,8 @@ def rule_index_from_catalog(catalog: dict) -> RuleIndex:
 def known_rule_ids_from_catalog(catalog: dict) -> frozenset[str]:
     """Return the set of catalog rule ids (`rules[*].id`) from a parsed catalog dict.
 
-    The catalog dict has the shape `load_semantic_catalog()` returns and the MCP
-    `/catalog/export` serves — one `{db.table: <entry>}` mapping. Empty if no rules
-    are declared, which keeps the `rule` role inert (fail-to-review, the SAFE
-    direction) rather than silently accepting an unresolved rule."""
+    The catalog dict has the shape the MCP `/catalog/export` serves — one
+    `{db.table: <entry>}` mapping. Empty if no rules are declared, which keeps the
+    `rule` role inert (fail-to-review, the SAFE direction) rather than silently
+    accepting an unresolved rule."""
     return rule_index_from_catalog(catalog).ids()
-
-
-def load_known_rule_ids(schema_dir: str | None = None) -> frozenset[str]:
-    """Return the set of existing catalog rule ids (semantic-catalog `rules[*].id`).
-
-    Reads the dir-based semantic catalog (retained for the offline/dir path) and
-    projects it via `known_rule_ids_from_catalog`. Empty if the catalog declares no
-    rules or cannot be loaded — in which case the `rule` role is inert (every
-    `rule`-role plan declines `missing_rule`), the SAFE direction."""
-    from data_agent.catalog.loader import load_semantic_catalog
-
-    return known_rule_ids_from_catalog(load_semantic_catalog(schema_dir))

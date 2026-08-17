@@ -88,9 +88,7 @@ def _pipeline(embedder: FakeEmbeddingClient) -> RetrievalPipeline:
 
 async def test_assemble_prepends_retrieval_user_message() -> None:
     store = InMemorySessionStore()
-    assembler = ContextAssembler(
-        store, history_token_budget=100_000, retrieval=_pipeline(FakeEmbeddingClient())
-    )
+    assembler = ContextAssembler(store, retrieval=_pipeline(FakeEmbeddingClient()))
     assembled = await assembler.assemble(
         SESSION_ID, frozenset(), user_message=_Q, retrieval_memo={}
     )
@@ -107,7 +105,7 @@ async def test_unconfigured_retrieval_is_byte_identical() -> None:
     store = InMemorySessionStore()
     await _seed_history(store, n=40)
     scope = frozenset({f"{_COL[0]}.{_COL[1]}"})
-    plain = ContextAssembler(store, history_token_budget=200)  # retrieval=None
+    plain = ContextAssembler(store)  # retrieval=None
     with_user_msg = await plain.assemble(SESSION_ID, scope, user_message=_Q, user_id="u1")
     without = await plain.assemble(SESSION_ID, scope)
     assert len(without.messages) > 1  # guard: history is genuinely present
@@ -119,7 +117,7 @@ async def test_configured_retrieval_but_no_user_message_does_not_run() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
     assembler = ContextAssembler(
-        store, history_token_budget=100_000, retrieval=_pipeline(embedder)
+        store, retrieval=_pipeline(embedder)
     )
     assembled = await assembler.assemble(SESSION_ID, frozenset())  # no user_message
     assert embedder.calls == []  # retrieval never ran
@@ -130,7 +128,7 @@ async def test_memo_prevents_re_embedding_within_a_turn() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
     assembler = ContextAssembler(
-        store, history_token_budget=100_000, retrieval=_pipeline(embedder)
+        store, retrieval=_pipeline(embedder)
     )
     memo: dict = {}
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q, retrieval_memo=memo)
@@ -142,7 +140,7 @@ async def test_no_memo_re_embeds_each_call() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
     assembler = ContextAssembler(
-        store, history_token_budget=100_000, retrieval=_pipeline(embedder)
+        store, retrieval=_pipeline(embedder)
     )
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q)
     await assembler.assemble(SESSION_ID, frozenset(), user_message=_Q)
@@ -162,7 +160,7 @@ async def test_loop_embeds_once_per_turn_across_iterations() -> None:
     store = InMemorySessionStore()
     embedder = FakeEmbeddingClient()
     assembler = ContextAssembler(
-        store, history_token_budget=100_000, retrieval=_pipeline(embedder)
+        store, retrieval=_pipeline(embedder)
     )
     # Two round-trips: a tool call, then a tool-call-free response.
     model = ScriptedModelClient(

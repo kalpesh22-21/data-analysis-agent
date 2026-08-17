@@ -144,7 +144,7 @@ def _build(
     loop = AgentLoop(
         model_client=ScriptedModelClient(turns),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=_observe),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,
@@ -1326,7 +1326,7 @@ async def test_a_completed_intent_whose_result_went_untabled_is_reported() -> No
             ]
         ),
         tool_dispatcher=ToolDispatcher(mcp, CATALOG, observer=_observe),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,
@@ -1372,7 +1372,7 @@ async def test_a_paused_turn_resumes_with_the_whole_designated_set() -> None:
     loop = AgentLoop(
         model_client=ScriptedModelClient([ModelTurnResult(assistant_text="x")]),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,
@@ -1382,8 +1382,8 @@ async def test_a_paused_turn_resumes_with_the_whole_designated_set() -> None:
     )
     tables, _runs = await loop._compute_turn_answer_tables(SESSION_ID, 0)
     assert [t.sql for t in tables] == [HEADCOUNT_SQL, SALARY_SQL]
-    # The N=1 projection is the SAME projection the envelope applies.
-    assert await loop._compute_turn_answer_sql(SESSION_ID, 0) == HEADCOUNT_SQL
+    # The PRIMARY table is the first one — the projection the envelope applies.
+    assert tables[0].sql == HEADCOUNT_SQL
 
 
 # ---------------------------------------------------------------------------
@@ -1453,7 +1453,7 @@ async def test_a_pre_slim_down_document_still_replays_and_still_pages() -> None:
     loop = AgentLoop(
         model_client=ScriptedModelClient([ModelTurnResult(assistant_text="x")]),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,
@@ -1467,7 +1467,7 @@ async def test_a_pre_slim_down_document_still_replays_and_still_pages() -> None:
     # 3. Cross-turn replay — read on turn 1, the turn AFTER the one that wrote it.
     assembled = await ContextAssembler(
         session_store=store, base_system_prompt="BASE",
-        preview_row_count=20, history_token_budget=100_000,
+        preview_row_count=20,
     ).assemble(SESSION_ID, frozenset(), current_turn_index=1)
     replayed = [m for m in assembled.messages if m.get("tool_name") == ANSWER]
     assert len(replayed) == 1

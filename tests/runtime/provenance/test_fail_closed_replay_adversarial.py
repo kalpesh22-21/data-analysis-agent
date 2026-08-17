@@ -105,7 +105,7 @@ async def test_run_query_extractor_rejection_dropped_from_replay_under_every_sco
         store, mcp, CATALOG, tool_name="runQuery", args={"sql": _UNPARSEABLE_SQL}, call_id="call_bad_sql"
     )
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     for scope in (
         frozenset(),  # allow-all — the widest possible scope
         frozenset({f"{_E}.EmployeeCode"}),
@@ -136,7 +136,7 @@ async def test_sample_rows_uncatalogued_table_produces_none_and_is_dropped() -> 
     )
     assert entry.provenance is None
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     # Allow-all scope — the single most permissive replay condition — must
     # still drop this entry.
     assembled = await assembler.assemble(SESSION_ID, frozenset())
@@ -174,7 +174,7 @@ async def test_get_table_schema_is_safe_empty_and_replayable_under_any_scope() -
     assert is_entry_in_scope(entry, frozenset()) is True
     assert is_entry_in_scope(entry, frozenset({f"{_E}.Department"})) is True
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     assembled = await assembler.assemble(SESSION_ID, frozenset({f"{_E}.Department"}))
     blob = json.dumps(assembled.messages, default=str)
     assert "call_schema_ok" in blob
@@ -196,7 +196,7 @@ async def test_denied_tool_call_never_persists_fabricated_provenance() -> None:
     assert entry.status == "denied"
     assert entry.provenance is None
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     assembled = await assembler.assemble(SESSION_ID, frozenset())
     blob = json.dumps(assembled.messages, default=str)
     assert "call_denied" not in blob

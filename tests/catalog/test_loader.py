@@ -1,31 +1,24 @@
 """
-Unit tests for the Semantic Catalog loader's `load_semantic_catalog()` (D42, D53, D83/D84).
+Unit tests for the Semantic Catalog projections (D42, D53, D83/D84).
 
-Layer: 1 — Unit (pure logic; reads real databaseSchemaDocs/*.yaml fixtures plus
-temp-dir YAML fixtures for edge cases; no ClickHouse connection required).
+Layer: 1 — Unit (pure logic; driven from the committed export fixture
+`tests/fixtures/catalog_export.json` — the MCP `/catalog/export` payload — via the
+in-memory cores `load_semantic_catalog_from_catalog` /
+`build_sqlglot_schema_from_catalog`; no ClickHouse connection required).
 
-`load_semantic_catalog()` is a superset of `build_sqlglot_schema()`: same parse,
-keying, and file-skip rules (`_load_raw_table_entries()`), but returns the full
-per-table semantic entry instead of the `{col: type}` projection.
-
-D75 Wave 1b: the shape/value assertions are now driven from the committed export
-fixture `tests/fixtures/catalog_export.json` (the MCP `/catalog/export` payload) via
-the in-memory cores `load_semantic_catalog_from_catalog` / `build_sqlglot_schema_from_catalog`,
-since `databaseSchemaDocs/` is deleted. The DEFAULT_DATABASE-fallback and file-skip
-edge cases still exercise the dir-reading path against small temp-dir YAML fixtures
-(those functions are retained, implemented in terms of the same cores).
+`load_semantic_catalog_from_catalog()` is a superset of
+`build_sqlglot_schema_from_catalog()`: same keying, but the full per-table semantic
+entry instead of the `{col: type}` projection. `databaseSchemaDocs/` (and the
+dir-reading loaders that parsed it) is gone — the catalog is sourced from the MCP
+export only.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from data_agent.catalog import (
-    DEFAULT_DATABASE,
     build_sqlglot_schema_from_catalog,
-    load_semantic_catalog,
     load_semantic_catalog_from_catalog,
 )
 from tests._catalog_fixture import fixture_catalog
@@ -38,9 +31,7 @@ _E = "dbpcm_warehouse.employee"
 _P = "dbpcm_warehouse.payroll"
 _CE = "dbpcm_warehouse.candidate_education"
 
-# Expected table keys, one per *.yaml file in databaseSchemaDocs/ that declares
-# a top-level `table` + `columns` block (AUTHORING_NOTES.md is not a YAML file
-# and is correctly excluded by the *.yaml glob).
+# Expected table keys — one per table entry in the frozen MCP export fixture.
 EXPECTED_TABLE_KEYS = frozenset(
     [
         "dbpcm_warehouse.accrual_events",
@@ -214,68 +205,7 @@ def test_case_preservation_table_and_database_keys() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. DEFAULT_DATABASE fallback (temp-dir fixture — no real YAML omits `database`)
-# ---------------------------------------------------------------------------
-
-
-def test_default_database_fallback(tmp_path: Path) -> None:
-    yaml_text = """
-table: widget
-description: A widget table with no explicit database key.
-grain: [ WidgetId ]
-columns:
-  WidgetId: { type: Int32, description: Widget identifier. }
-  WidgetName: { type: Nullable(String), description: Widget name. }
-"""
-    (tmp_path / "widget.yaml").write_text(yaml_text, encoding="utf-8")
-
-    catalog = load_semantic_catalog(tmp_path)
-    expected_key = f"{DEFAULT_DATABASE}.widget"
-    assert expected_key in catalog
-    assert catalog[expected_key]["database"] == DEFAULT_DATABASE
-    assert catalog[expected_key]["columns"]["WidgetId"]["type"] == "Int32"
-
-
-# ---------------------------------------------------------------------------
-# 6. File-skip: YAML lacking `table`/`columns` is skipped without crashing
-# ---------------------------------------------------------------------------
-
-
-def test_file_without_table_and_columns_is_skipped(tmp_path: Path) -> None:
-    # Valid table file.
-    (tmp_path / "good.yaml").write_text(
-        """
-database: dbpcm_warehouse
-table: good_table
-columns:
-  Id: { type: Int32, description: Identifier. }
-""",
-        encoding="utf-8",
-    )
-    # Rules-only file with no `table` key at all.
-    (tmp_path / "rules_only.yaml").write_text(
-        """
-rules:
-  - { id: some_rule, predicate: "1 = 1", applies_when: always, description: A global rule. }
-""",
-        encoding="utf-8",
-    )
-    # `table` present but no `columns` block — also must be skipped.
-    (tmp_path / "table_no_columns.yaml").write_text(
-        """
-database: dbpcm_warehouse
-table: incomplete_table
-description: Declares a table but no columns block.
-""",
-        encoding="utf-8",
-    )
-
-    catalog = load_semantic_catalog(tmp_path)
-    assert set(catalog.keys()) == {"dbpcm_warehouse.good_table"}
-
-
-# ---------------------------------------------------------------------------
-# 7. Alignment regression — load_semantic_catalog and build_sqlglot_schema
+# 7. Alignment regression — the semantic overlay and the sqlglot schema
 #    must never silently drift (same tables, same columns, same types).
 # ---------------------------------------------------------------------------
 
@@ -303,7 +233,7 @@ def test_semantic_catalog_and_sqlglot_schema_column_pairs_match() -> None:
 
 
 def test_semantic_catalog_column_types_match_sqlglot_schema() -> None:
-    """Per-column `type` in load_semantic_catalog must equal build_sqlglot_schema's type string."""
+    """Per-column `type` in the overlay must equal the sqlglot schema's type string."""
     semantic = load_semantic_catalog_from_catalog(_CATALOG)
     sqlglot_schema = build_sqlglot_schema_from_catalog(_CATALOG)
 

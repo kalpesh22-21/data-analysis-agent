@@ -63,7 +63,6 @@ from data_agent.runtime.context.discovery_emulation import (
     EmulatedDiscoveryCache,
     build_emulated_discovery,
 )
-from data_agent.runtime.context.llm_summarizer import build_llm_summarizer
 from data_agent.runtime.dispatch.tool_dispatcher import (
     CatalogProvider,
     ToolDispatcher,
@@ -490,12 +489,9 @@ def create_app(
         catalog_provider = _catalog_provider
 
     tool_schema_cache = ToolSchemaCache(mcp_client)
-    summarizer = build_llm_summarizer(model_client)
     context_assembler = ContextAssembler(
         session_store,
-        history_token_budget=settings.history_token_budget(),
         preview_row_count=settings.preview_row_count,
-        summarizer=summarizer,
         retrieval=active_retrieval,
         base_system_prompt=settings.effective_agent_system_prompt(),
         tracer=tracer,

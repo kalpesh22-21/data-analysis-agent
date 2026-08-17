@@ -8,7 +8,6 @@ import pytest
 
 from data_agent.runtime.context.scope_filter import compute_scope_hash
 from data_agent.runtime.observability.redaction import (
-    Redactor,
     hash_scope,
     mask_sql,
     redact_tool_args,
@@ -99,14 +98,15 @@ def test_redact_tool_args_resolve_values_masks_period_literals_keeps_column() ->
     assert args["period"]["start"] == "2026-01-01"
 
 
-def test_redactor_class_delegates_to_module_functions() -> None:
-    redactor = Redactor()
+def test_the_three_entry_points_agree_on_the_same_rules() -> None:
+    """The module's three entry points are ONE convention: `hash_scope` is
+    `compute_scope_hash`, and `redact_tool_args` masks a `sql` arg with exactly
+    `mask_sql` (no second, divergent masking path)."""
     scope = frozenset({"a.b.c"})
-    assert redactor.hash_scope(scope) == hash_scope(scope)
-    assert redactor.mask_sql("SELECT 1") == mask_sql("SELECT 1")
-    assert redactor.redact_tool_args("runQuery", {"sql": "SELECT 1"}) == redact_tool_args(
-        "runQuery", {"sql": "SELECT 1"}
-    )
+    assert hash_scope(scope) == compute_scope_hash(scope)
+    assert mask_sql("SELECT 1") == "SELECT 0"
+    sql = "SELECT * FROM t WHERE x = 'secret' LIMIT 20"
+    assert redact_tool_args("runQuery", {"sql": sql}) == {"sql": mask_sql(sql)}
 
 
 def test_redaction_never_carries_jwt_substring() -> None:

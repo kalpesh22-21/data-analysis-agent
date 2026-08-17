@@ -73,7 +73,7 @@ def _build_loop(
     store = store or InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp_client, CATALOG)
     assembler = ContextAssembler(
-        store, history_token_budget=100_000, base_system_prompt=base_system_prompt
+        store, base_system_prompt=base_system_prompt
     )
     loop = AgentLoop(
         model_client=model_client,
@@ -872,7 +872,7 @@ async def test_tool_calls_are_capped_per_iteration_never_unbounded() -> None:
     )
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,
@@ -1113,7 +1113,7 @@ def _resolve_loop(
     )
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp_client, catalog)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     composite = ResolveValuesComposite(
         tool_dispatcher=dispatcher,
         catalog=catalog,
@@ -1232,7 +1232,7 @@ async def test_resolve_values_respects_per_iteration_cap() -> None:
     )
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp, catalog)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     composite = ResolveValuesComposite(
         tool_dispatcher=dispatcher, catalog=catalog, embedding_client=FakeEmbeddingClient(dim=2)
     )
@@ -1355,7 +1355,7 @@ def _registry_loop(
 ) -> tuple[AgentLoop, InMemorySessionStore]:
     store = InMemorySessionStore()
     dispatcher = ToolDispatcher(mcp_client, CATALOG)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     loop = AgentLoop(
         model_client=model_client,
         tool_dispatcher=dispatcher,

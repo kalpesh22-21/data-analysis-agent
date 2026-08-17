@@ -369,7 +369,7 @@ async def test_connect_is_awaited_once_however_many_calls_are_made() -> None:
     """Idempotent: the gate is on the hot path of every op, so it must not re-await
     the SDK once connected."""
     store, cluster = _build(CouchbaseSessionStore)
-    await store.create_session("s1")
+    await store.get_or_create_session("s1")
     await store.get_or_create_session("s1")
     await store.load_trail("s1")
     assert cluster.cluster_connects == 1
@@ -383,10 +383,10 @@ async def test_a_failed_connect_is_not_cached_as_success() -> None:
     cluster.connect_error = RuntimeError("cluster is down")
 
     with pytest.raises(RuntimeError, match="cluster is down"):
-        await store.create_session("s1")
+        await store.get_or_create_session("s1")
 
     cluster.connect_error = None
-    doc = await store.create_session("s1")
+    doc = await store.get_or_create_session("s1")
     assert doc.session_id == "s1"
     assert cluster.cluster_connects == 2
 

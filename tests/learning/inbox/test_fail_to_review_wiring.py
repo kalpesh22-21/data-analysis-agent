@@ -37,7 +37,7 @@ from data_agent.learning.config import LearningSettings
 from data_agent.learning.extractor.models import Decline
 from data_agent.learning.factory import (
     LearningWiringError,
-    build_review_inbox,
+    build_promotion_plane,
     build_write_router_stages,
 )
 from data_agent.learning.inbox import ParameterizationCompleter, ReviewInbox
@@ -63,14 +63,18 @@ def _settings() -> LearningSettings:
     return LearningSettings(_env_file=None)
 
 
-def _scheduler(store, *, cutoff: float = 0.0) -> PromotionScheduler:
-    """A minimally-wired scheduler. The promotion plane has its own suite; what these
-    tests need from it is its POLICY."""
-    return PromotionScheduler(
-        store,
+def _plane(
+    store, *, cutoff: float = 0.0, completer: ParameterizationCompleter | None = None
+) -> tuple[PromotionScheduler, ReviewInbox]:
+    """A minimally-wired promotion plane. The plane has its own suite; what these tests
+    need from it is its POLICY and the inbox it builds over the SAME store."""
+    return build_promotion_plane(
+        _settings(),
+        candidate_store=store,
         probe=_NoOpProbe(),
         hit_counts=_ZeroHitCounts(),
         policy=PromotionPolicy(review_score_cutoff=cutoff),
+        completer=completer,
     )
 
 
@@ -115,24 +119,18 @@ async def test_an_inbox_and_a_completer_on_different_stores_is_refused_at_build(
     must fail at BUILD, because at request time it looks like success."""
     inbox_store = InMemoryCandidateStore()
     other_store = InMemoryCandidateStore()
-    scheduler = _scheduler(inbox_store)
 
     with pytest.raises(LearningWiringError, match="ONE candidate store"):
-        build_review_inbox(
-            inbox_store,
-            scheduler=scheduler,
-            completer=ParameterizationCompleter(store=other_store),
-        )
+        _plane(inbox_store, completer=ParameterizationCompleter(store=other_store))
 
 
 async def test_one_store_builds_and_keeps_the_policy_cutoff() -> None:
     """The control for the guard above, plus the knob the surrounding code cares about:
     a correctly-wired completer must not cost the inbox the scheduler's policy."""
     store = InMemoryCandidateStore()
-    scheduler = _scheduler(store, cutoff=0.42)
 
-    inbox = build_review_inbox(
-        store, scheduler=scheduler, completer=ParameterizationCompleter(store=store)
+    _scheduler, inbox = _plane(
+        store, cutoff=0.42, completer=ParameterizationCompleter(store=store)
     )
 
     assert inbox._policy.review_score_cutoff == 0.42
@@ -290,7 +288,7 @@ async def test_the_review_score_cutoff_can_never_hide_a_form() -> None:
     )
     inbox = ReviewInbox(
         store,
-        scheduler=_scheduler(store, cutoff=0.9),
+        scheduler=_plane(store, cutoff=0.9)[0],
     )
 
     forms = await inbox.list(status=CandidateStatus.NEEDS_PARAMETERIZATION)
@@ -315,7 +313,7 @@ async def test_the_same_cutoff_still_trims_the_review_queue() -> None:
     )
     inbox = ReviewInbox(
         store,
-        scheduler=_scheduler(store, cutoff=0.9),
+        scheduler=_plane(store, cutoff=0.9)[0],
     )
 
     assert await inbox.list(status=CandidateStatus.IN_REVIEW) == []

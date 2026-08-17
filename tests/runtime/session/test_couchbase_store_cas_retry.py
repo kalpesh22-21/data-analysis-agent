@@ -194,7 +194,7 @@ async def test_a_delete_racing_the_create_retries_instead_of_dereferencing_none(
     """A doc removed between the create and the CAS re-read must not crash the caller.
 
     `_mutate_with_cas_retry` creates the session when the first read misses, then
-    re-reads purely to get the CAS that `create_session` does not return. A concurrent
+    re-reads purely to get the CAS that `_create_session` does not return. A concurrent
     `remove` (or a TTL expiry) inside that window makes the re-read miss too — and the
     loop used to walk straight into `mutate(doc)` with `doc=None`, surfacing a
     competing-writer race as an `AttributeError` raised from inside the caller's

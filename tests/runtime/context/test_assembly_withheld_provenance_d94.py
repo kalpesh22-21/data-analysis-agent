@@ -119,7 +119,7 @@ async def test_sentinel_injected_for_current_turn_ok_none_runquery() -> None:
     )
     await store.append_trail_entry("sess-1", stranded)
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     assembled = await assembler.assemble("sess-1", frozenset(), current_turn_index=0)
 
     hits = _sentinel_messages(assembled.messages, "call_rq")
@@ -141,7 +141,7 @@ async def test_sentinel_injected_for_current_turn_ok_none_runblueprint() -> None
     )
     await store.append_trail_entry("sess-1", stranded)
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     assembled = await assembler.assemble("sess-1", frozenset(), current_turn_index=0)
 
     hits = _sentinel_messages(assembled.messages, "call_bp")
@@ -180,7 +180,7 @@ async def test_sentinel_leaks_no_data_under_empty_scope() -> None:
     )
     await store.append_trail_entry("sess-1", stranded)
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     # Empty scope == allow-all, yet an undetermined (None) entry is STILL dropped.
     assembled = await assembler.assemble("sess-1", frozenset(), current_turn_index=0)
 
@@ -204,7 +204,7 @@ async def test_sentinel_leaks_no_data_under_narrow_scope() -> None:
     )
     await store.append_trail_entry("sess-1", stranded)
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     narrow = frozenset({f"{_E}.EmployeeCode"})
     assembled = await assembler.assemble("sess-1", narrow, current_turn_index=0)
 
@@ -229,7 +229,7 @@ async def test_sentinel_message_carries_only_id_toolname_args_and_content() -> N
             result_preview=_secret_preview(),
         ),
     )
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     assembled = await assembler.assemble("sess-1", frozenset(), current_turn_index=0)
 
     sentinel = _sentinel_messages(assembled.messages, "call_x")[0]
@@ -273,7 +273,7 @@ async def test_cross_turn_ok_none_gets_no_sentinel_and_no_event() -> None:
         ),
     )
     events, observer = _events_collector()
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     assembled = await assembler.assemble(
         "sess-1", frozenset(), current_turn_index=1, withheld_call_ids=set(), observer=observer
     )
@@ -308,7 +308,7 @@ async def test_out_of_scope_populated_provenance_entry_is_not_sentineled() -> No
         ),
     )
     events, observer = _events_collector()
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     narrow = frozenset({f"{_E}.EmployeeCode"})
     assembled = await assembler.assemble(
         "sess-1", narrow, current_turn_index=0, withheld_call_ids=set(), observer=observer
@@ -335,7 +335,7 @@ async def test_event_payload_shape_runquery() -> None:
         _entry("call_rq", None, tool_name="runQuery", args={"sql": f"SELECT {_SECRET}"}, turn_index=2),
     )
     events, observer = _events_collector()
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     await assembler.assemble(
         "sess-1", frozenset(), current_turn_index=2, withheld_call_ids=set(), observer=observer
     )
@@ -367,7 +367,7 @@ async def test_event_payload_carries_blueprint_id_on_runblueprint_path() -> None
         ),
     )
     events, observer = _events_collector()
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     await assembler.assemble(
         "sess-1", frozenset(), current_turn_index=0, withheld_call_ids=set(), observer=observer
     )
@@ -384,7 +384,7 @@ async def test_event_deduped_once_per_tool_call_id_per_turn_across_rebuilds() ->
     store = InMemorySessionStore()
     await store.append_trail_entry("sess-1", _entry("call_dup", None, turn_index=0))
     events, observer = _events_collector()
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
 
     withheld_call_ids: set[str] = set()
     # Three round-trip rebuilds within the SAME turn, sharing the turn-local memo.
@@ -409,7 +409,7 @@ async def test_event_fires_once_per_distinct_stranded_call() -> None:
     await store.append_trail_entry("sess-1", _entry("call_a", None, turn_index=0))
     await store.append_trail_entry("sess-1", _entry("call_b", None, turn_index=0))
     events, observer = _events_collector()
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
 
     await assembler.assemble(
         "sess-1", frozenset(), current_turn_index=0, withheld_call_ids=set(), observer=observer
@@ -426,7 +426,7 @@ async def test_event_fires_once_per_distinct_stranded_call() -> None:
 async def test_repeated_assemble_does_not_accumulate_duplicate_sentinels() -> None:
     store = InMemorySessionStore()
     await store.append_trail_entry("sess-1", _entry("call_dup", None, turn_index=0))
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
 
     withheld_call_ids: set[str] = set()
     for _ in range(4):
@@ -460,7 +460,7 @@ async def test_normal_ok_entry_renders_as_json_not_sentinel() -> None:
     )
     await store.append_trail_entry("sess-1", normal)
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     scope = frozenset({f"{_E}.Department"})
     assembled = await assembler.assemble("sess-1", scope, current_turn_index=0)
 
@@ -506,7 +506,7 @@ async def test_mixed_trail_normal_survives_and_stranded_gets_sentinel() -> None:
                result_preview=_secret_preview()),
     )
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     scope = frozenset({f"{_E}.Department"})
     assembled = await assembler.assemble("sess-1", scope, current_turn_index=0)
 
@@ -562,7 +562,7 @@ async def test_multicall_turn_withheld_call_keeps_its_args_for_correlation() -> 
         ),
     )
 
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     scope = frozenset({f"{_E}.Department"})
     assembled = await assembler.assemble("sess-1", scope, current_turn_index=0)
     canonical = _assembled_to_canonical(assembled.messages)

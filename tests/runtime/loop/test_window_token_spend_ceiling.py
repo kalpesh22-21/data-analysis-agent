@@ -163,12 +163,11 @@ def _build(
     runtime_tools: dict[str, Any] | None = None,
 ) -> tuple[AgentLoop, InMemorySessionStore]:
     store = store or InMemorySessionStore()
+    # No trail compaction pre-shrinks the request (Phase 1 bypasses it): the point is
+    # what the loop SPENDS replaying a full trail, and what the request fit does
+    # about occupancy.
     assembler = ContextAssembler(
         store,
-        # HIGH so trail compaction does not pre-shrink the request: the point is
-        # what the loop SPENDS replaying a full trail, and what the request fit
-        # does about occupancy.
-        history_token_budget=10_000_000,
         base_system_prompt=AGENT_SYSTEM_PROMPT,
     )
     loop = AgentLoop(
@@ -369,7 +368,7 @@ async def test_a_spend_triggered_hard_ceiling_still_force_blocks_pending_intents
         ]
     )
     events: list[tuple[str, dict[str, Any]]] = []
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),

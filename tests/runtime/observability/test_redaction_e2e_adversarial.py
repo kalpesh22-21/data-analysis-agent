@@ -141,7 +141,7 @@ async def test_progress_emitter_wired_into_a_real_turn_never_carries_pii() -> No
         ]
     )
     dispatcher = ToolDispatcher(mcp, CATALOG, observer=observer)
-    assembler = ContextAssembler(store, history_token_budget=100_000)
+    assembler = ContextAssembler(store)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,

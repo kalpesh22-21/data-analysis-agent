@@ -17,7 +17,7 @@ would discard constrain something the chosen one does not — see its docstring 
 why the strict rewrite cannot be relied on to catch that.
 
 Wiring (NOT done here — a one-line registration at the composition root, D102 §7.1):
-    stages=(GeneralizeStage(catalog_schema=load_catalog_from_dir(...)), ...)
+    stages=(GeneralizeStage(catalog_schema=build_sqlglot_schema_from_catalog(...)), ...)
 """
 
 from __future__ import annotations

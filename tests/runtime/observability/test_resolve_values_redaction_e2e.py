@@ -87,7 +87,7 @@ async def test_concept_absent_from_every_span_and_progress_event() -> None:
         observer=capturing_observer,
         tracer=tracer,
     )
-    assembler = ContextAssembler(store, history_token_budget=100_000, tracer=tracer)
+    assembler = ContextAssembler(store, tracer=tracer)
     model = ScriptedModelClient(
         [
             ModelTurnResult(

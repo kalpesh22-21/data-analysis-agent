@@ -76,3 +76,56 @@ Verification:
 - ruff clean; `ruff format --check` set byte-identical to baseline.
 - V2: skipped per protocol (pure-dedup slice, no loop/dispatch/session/wiring
   semantics touched; V0+V1 green).
+
+---
+
+## #3 — Tier 2: deletions, pure subtraction (2026-08-16/17)
+
+Removed production-dead code per PLAN Tier 2. **93 files, −1208 net LOC**
+(549 insertions / 1764 deletions). Built in an isolated worktree, reviewed
+(verdict: APPROVE, no blockers; deletion safety independently re-verified by
+the reviewer; 3 nits applied), landed here.
+
+Deleted: (T2.1) the dead compaction limb in `context/budget.py`
+(compact_trail/render_messages/CompactionResult/SummaryCache + transitive
+helpers), the whole `llm_summarizer.py` module + its `app.py` wiring, 3 inert
+`ContextAssembler` params, `AssembledContext.compaction_applied` field (the
+CHAIN **span attribute** kept — outward telemetry); (T2.2) `Redactor` class;
+(T2.3) the dead `databaseSchemaDocs/` dir-path loader chain
+(catalog/loader.py, catalog_handle.py entry points, grounding
+.load_known_rule_ids) + stale docstrings; (T2.4) factory shims
+`build_promotion_scheduler`/`build_review_inbox` folded into
+`build_promotion_plane` (policy default + split-store guard preserved
+verbatim), `_loader_triage_kwargs` inlined; (T2.5)
+`SessionStore.create_session` dropped from the Protocol, both impls, and both
+script proxies (couchbase keeps a private `_create_session`);
+`_compute_turn_answer_sql`, `new_budget_window`, `_begin_model_turn` inlined;
+4 package `__init__` re-export shims reduced to docstrings.
+
+Follow-ups queued in detected-issues stack L1–L3 (dead
+`history_token_budget` config, permanently-None `SessionDoc
+.context_summary_cache`, decision-doc drift naming deleted APIs).
+
+Verification:
+- V0: **5564 passed, 225 skipped, 1 xfailed** (Tier-1 5587; −23 fully
+  reconciled: 28 dead-path tests deleted, 10 added, −4 proxy-Protocol
+  parametrizations, −1 connect-gate case).
+- V1: **no case below baseline** — L1/L2/L4/L6/L7 3/3; L3 **1/3** (above its
+  0/3 baseline — first-ever L3 pass, still under the 67% gate = expected red);
+  L5 0/3 (= baseline, known K2).
+- V2 (required: slice touches app.py/loop/session store): **PASS.**
+  Stack: re-applied the daily RLS seed (hr-demo-expansion.sql — the K/trap
+  "no data while healthy" hit first attempt exactly as documented; l2-cb
+  restarted, healthcheck still reports unhealthy due to a stale compose
+  healthcheck probe but the cluster + all 5 buckets answer). Real runtime
+  :8000 (gpt-5.5 preflight OK, CouchbaseSessionStore lazy-connect, OTLP →
+  Phoenix `data-agent-runtime`) + BFF :3000.
+  - L2-style question through the BFF: correct 3-department answer, **2
+    answer_tables** (headcount + avg salary), clean SQL, entitlement caveat.
+  - L5-style question: correct columns-summary + "7 currently active", 5 tool
+    calls, business-terms answer (no raw identifiers — I1 posture held).
+  - Phoenix: fresh spans landed (Response OK, tool.updateAnalysisState,
+    loop_intent_completed, loop_analysis_state_transition).
+  - Couchbase: session doc `session::s309b…` persisted in
+    `agent_sessions._default.sessions`.
+  Services shut down after verification.

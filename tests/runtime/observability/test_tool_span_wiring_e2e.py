@@ -159,7 +159,7 @@ async def test_ask_user_question_never_appears_in_any_span_attribute() -> None:
         ]
     )
     dispatcher = ToolDispatcher(mcp, CATALOG, observer=guardrail_observer, tracer=tracer)
-    assembler = ContextAssembler(store, history_token_budget=100_000, tracer=tracer)
+    assembler = ContextAssembler(store, tracer=tracer)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,
@@ -258,7 +258,7 @@ async def test_repeated_read_guard_span_is_legible_and_distinct_from_first_dispa
     )
     model = _RepeatSchemaModel()
     dispatcher = ToolDispatcher(mcp, CATALOG, observer=guardrail_observer, tracer=tracer)
-    assembler = ContextAssembler(store, history_token_budget=100_000, tracer=tracer)
+    assembler = ContextAssembler(store, tracer=tracer)
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=dispatcher,
@@ -428,7 +428,7 @@ async def test_the_answer_shape_events_survive_the_real_guardrail_observer() -> 
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=ToolDispatcher(mcp, CATALOG, observer=observer, tracer=tracer),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000, tracer=tracer),
+        context_assembler=ContextAssembler(store, tracer=tracer),
         session_store=store,
         tools_provider=_query_tools_provider,
         max_loop_iterations=15,

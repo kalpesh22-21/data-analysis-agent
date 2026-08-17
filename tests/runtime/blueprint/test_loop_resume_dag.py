@@ -112,7 +112,7 @@ def _make_loop(
     loop = AgentLoop(
         model_client=model,
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,
@@ -385,7 +385,7 @@ def _make_loop_ex(
     return AgentLoop(
         model_client=model,
         tool_dispatcher=ToolDispatcher(loop_mcp, CATALOG),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,
@@ -541,7 +541,7 @@ async def test_resume_executor_crash_is_contained_and_loop_continues() -> None:
     loop2 = AgentLoop(
         model_client=resume_model,
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG),
-        context_assembler=ContextAssembler(store, history_token_budget=100_000),
+        context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
         max_loop_iterations=15,

@@ -46,10 +46,6 @@ class CASMismatchError(Exception):
 class SessionStore(Protocol):
     """The persistence seam `context/assembly.py` and Pass B's `AgentLoop` depend on."""
 
-    async def create_session(self, session_id: str) -> SessionDoc:
-        """Create (or return the existing) session document for *session_id*."""
-        ...
-
     async def get_or_create_session(self, session_id: str) -> SessionDoc:
         """Load *session_id*, creating a fresh document if none exists yet."""
         ...
