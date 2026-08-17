@@ -91,24 +91,42 @@ class _StubBlueprintTool:
 
     tool_name = "runBlueprint"
 
-    def __init__(self, registry: dict[str, tuple[str, bool]]) -> None:
+    def __init__(
+        self,
+        registry: dict[str, tuple[str, bool]],
+        *,
+        empty: frozenset[str] = frozenset(),
+    ) -> None:
         self._registry = registry
+        # J6: which blueprints come back with ZERO rows. A separate set rather
+        # than a third tuple element so every existing call site is unchanged —
+        # emptiness is orthogonal to whether the gate ran.
+        self._empty = empty
 
     async def run(
         self, arguments: dict, credentials: RuntimeCredentials, turn: Any = None
     ) -> ToolResult:
         blueprint_id = arguments.get("id")
         terminal_sql, verified = self._registry[blueprint_id]
+        is_empty = blueprint_id in self._empty
+        rows: list[list[Any]] = [] if is_empty else [["1"]]
+        verify: dict[str, Any] | None = None
+        if verified:
+            # Mirrors `executor._verify_block` exactly, including the honest
+            # `grain_checked: False` an empty result carries.
+            verify = {"grain_checked": not is_empty}
+            if is_empty:
+                verify["empty_result"] = True
         result_full = {
             "blueprint_id": blueprint_id,
             "status": "verified" if verified else "unverified",
             "sql": [terminal_sql],
             "terminal_sql": terminal_sql,
             "columns": ["x"],
-            "row_count": 1,
+            "row_count": len(rows),
             "truncated": False,
-            "preview_rows": [["1"]],
-            "verify": {"grain_checked": True} if verified else None,
+            "preview_rows": rows,
+            "verify": verify,
         }
         return ToolResult(
             status="ok",
@@ -118,7 +136,7 @@ class _StubBlueprintTool:
             user_message=None,
             provenance=frozenset({(_E, "department_name")}),
             result_preview=ResultPreview(
-                columns=["x"], row_count=1, truncated=False, preview_rows=[["1"]]
+                columns=["x"], row_count=len(rows), truncated=False, preview_rows=rows
             ),
             result_full=result_full,
         )
@@ -128,6 +146,7 @@ def _build(
     turns: list[ModelTurnResult],
     *,
     blueprints: dict[str, tuple[str, bool]] | None = None,
+    empty_blueprints: frozenset[str] = frozenset(),
 ) -> tuple[AgentLoop, InMemorySessionStore, list[tuple[str, dict[str, Any]]]]:
     store = InMemorySessionStore()
     events: list[tuple[str, dict[str, Any]]] = []
@@ -140,7 +159,9 @@ def _build(
         STATE: UpdateAnalysisStateTool(session_store=store, observer=_observe),
     }
     if blueprints:
-        runtime_tools["runBlueprint"] = _StubBlueprintTool(blueprints)
+        runtime_tools["runBlueprint"] = _StubBlueprintTool(
+            blueprints, empty=empty_blueprints
+        )
     loop = AgentLoop(
         model_client=ScriptedModelClient(turns),
         tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=_observe),
@@ -1193,6 +1214,84 @@ async def test_designation_telemetry_is_emitted_with_shape_only_counts() -> None
         if event.startswith("loop_answer_table"):
             assert "Headcount" not in json.dumps(payload)
             assert SALARY_SQL not in json.dumps(payload)
+
+
+async def test_an_empty_blueprint_table_is_counted_but_not_as_verified() -> None:
+    """J6, through the loop.
+
+    A blueprint DID produce this table, so it counts in `table_count` and
+    `blueprint_table_count` — dropping it there would under-report the blueprint
+    path. What it must NOT do is count as VERIFIED: the D56 grain teeth
+    (`row_count == distinct_grain_count`) compared 0 to 0 and proved nothing, and
+    the runtime has stopped claiming otherwise on the badge. An observer reading
+    `verified_table_count` is reading that same claim, so the two must agree — a
+    count computed from "a verification block is present" would keep reporting a
+    verification rate no other surface still asserts.
+    """
+    loop, store, events = _build(
+        [
+            _run_blueprints("bp-headcount"),
+            _answer("a1", answer="None found.", tables=[{"blueprint_id": "bp-headcount"}]),
+        ],
+        blueprints={"bp-headcount": (HEADCOUNT_SQL, True)},
+        empty_blueprints=frozenset({"bp-headcount"}),
+    )
+    await expand_blueprint(store, SESSION_ID, "bp-headcount")
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_creds(), user_message="q?"
+    )
+
+    assert _payloads(events, "loop_answer_tables_designated") == [
+        {"table_count": 1, "blueprint_table_count": 1, "verified_table_count": 0}
+    ]
+    # The table itself is still offered — the answer "there are none" needs its
+    # (empty) grid, and the chip still names the blueprint that produced it.
+    assert outcome.answer_tables is not None
+    table = outcome.answer_tables[0]
+    assert table["blueprint_use"]["blueprint_id"] == "bp-headcount"
+    assert table["verification"] == {
+        "passed": False,
+        "method": "blueprint_gate",
+        "grain_checked": False,
+        "empty_result": True,
+        "status": "empty — unverifiable",
+    }
+    # N=1: the UI renders the ENVELOPE's badge, so the roll-up must carry the same
+    # state rather than collapsing to silence.
+    assert outcome.verification == table["verification"]
+
+
+async def test_a_verified_table_beside_an_empty_one_counts_only_the_verified() -> None:
+    """The mixture. One real verification claim survives in the count; the
+    envelope roll-up claims nothing, because neither "verified" nor "empty"
+    describes the pair."""
+    loop, store, events = _build(
+        [
+            _run_blueprints("bp-headcount", "bp-salary"),
+            _answer(
+                "a1",
+                answer="x",
+                tables=[{"blueprint_id": "bp-headcount"}, {"blueprint_id": "bp-salary"}],
+            ),
+        ],
+        blueprints={
+            "bp-headcount": (HEADCOUNT_SQL, True),
+            "bp-salary": (SALARY_SQL, True),
+        },
+        empty_blueprints=frozenset({"bp-salary"}),
+    )
+    await expand_blueprint(store, SESSION_ID, "bp-headcount")
+    await expand_blueprint(store, SESSION_ID, "bp-salary")
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_creds(), user_message="q?"
+    )
+
+    assert _payloads(events, "loop_answer_tables_designated") == [
+        {"table_count": 2, "blueprint_table_count": 2, "verified_table_count": 1}
+    ]
+    assert outcome.answer_tables[0]["verification"]["passed"] is True
+    assert outcome.answer_tables[1]["verification"]["empty_result"] is True
+    assert outcome.verification is None
 
 
 def test_the_three_new_keys_actually_reach_the_span() -> None:

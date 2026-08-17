@@ -110,6 +110,7 @@ from data_agent.runtime.composite.answer_with_table import (
     enrich_table,
     finalize_designations,
     is_answer_table_in_scope,
+    is_zero_row_count,
     resolve_designations,
     rollup_verification,
     terminal_sql_by_id,
@@ -1182,10 +1183,33 @@ def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]
         # never carries the flag, so those tool messages are byte-identical to before.
         if entry.get("authoritative"):
             content["authoritative"] = True
-            content["note"] = (
-                "Verified blueprint result — authoritative; do not re-derive with "
-                "additional queries."
-            )
+            # J6: an EMPTY blueprint result is still the authoritative answer for
+            # its intent ("there are none" is an answer, and re-deriving it with
+            # ad-hoc runQuerys is the loop this marker exists to prevent) — but it
+            # was NOT verified. The D56 grain teeth are `row_count ==
+            # distinct_grain_count`, which at zero rows is `0 == 0` and passes for
+            # every blueprint ever written. Telling the model "verified" there is
+            # the same over-claim the badge just stopped making, aimed at the one
+            # reader that will repeat it in prose. The no-re-derivation instruction
+            # is UNCHANGED; only the word "verified" is withdrawn.
+            #
+            # `is_zero_row_count` (not `== 0`) is the slice's shared bool-exclusion
+            # predicate: `isinstance(True, int)`, so a poisoned `row_count: false`
+            # would otherwise read as an empty result and retract the claim over a
+            # value that says nothing about the row count. Same rule the badge
+            # applies, from the same function.
+            if is_zero_row_count((entry.get("result_preview") or {}).get("row_count")):
+                content["note"] = (
+                    "Blueprint result — authoritative; do not re-derive with "
+                    "additional queries. It returned NO ROWS, so nothing was "
+                    "verified: report the empty result as the answer, and do not "
+                    "describe it as verified."
+                )
+            else:
+                content["note"] = (
+                    "Verified blueprint result — authoritative; do not re-derive with "
+                    "additional queries."
+                )
         tool_message = {
             "role": "tool",
             "tool_call_id": tool_call_id,
@@ -2609,8 +2633,15 @@ class AgentLoop:
                     "blueprint_table_count": sum(
                         1 for t in tables if t.blueprint_use is not None
                     ),
+                    # J6: what an observer means by "verified" is the CLAIM, not the
+                    # presence of a block. A blueprint that returned zero rows now
+                    # carries an explicit `empty — unverifiable` block (`passed:
+                    # False`), and counting it here would keep reporting a
+                    # verification rate the runtime is no longer claiming. It still
+                    # counts in `table_count` and `blueprint_table_count` — a
+                    # blueprint DID produce it.
                     "verified_table_count": sum(
-                        1 for t in tables if t.verification is not None
+                        1 for t in tables if (t.verification or {}).get("passed") is True
                     ),
                 },
             )

@@ -1125,9 +1125,13 @@
   // Per-table "verified ✓" badge, driven ONLY by that table's own block — never by
   // a turn-level flag, which at N>1 would claim a blueprint gate over grids that
   // never went through one (08 §C). Same rule as the block-level badge: absence is
-  // information, never a warning. There is no `passed: false`, so a missing block
-  // renders nothing rather than a red state.
+  // information, never a warning — a missing block renders nothing rather than a
+  // red state. `empty_result` is the one non-green state that IS rendered (J6).
   function renderTableVerification(badge, verification) {
+    if (verification && verification.empty_result === true) {
+      renderEmptyVerification(badge);
+      return;
+    }
     if (!verification || verification.passed !== true) {
       badge.hidden = true;
       badge.textContent = "";
@@ -1140,6 +1144,25 @@
       verification.grain_checked === false
         ? "verified (grain not checked)"
         : "verified via blueprint gate"
+    );
+    badge.hidden = false;
+  }
+
+  // J6 — the "empty — unverifiable" chip, shared by both badge renderers so the
+  // per-table and block-level surfaces cannot describe the same state differently.
+  //
+  // NOT A WARNING, and not the "failed" state that still does not exist: a
+  // blueprint ran and came back with zero rows, so the D56 grain check (`row_count
+  // === distinct_grain_count`) compared 0 to 0 and proved nothing. The empty answer
+  // itself is fine and is what the prose reports; what is being withdrawn is the
+  // claim that anything was verified. Rendering nothing here would be the quieter
+  // lie — the grid would sit under the same silence a hand-written query gets,
+  // when a blueprint demonstrably ran.
+  function renderEmptyVerification(badge) {
+    badge.textContent = "empty — unverifiable";
+    badge.setAttribute(
+      "title",
+      "The blueprint returned no rows, so the grain check had nothing to verify."
     );
     badge.hidden = false;
   }
@@ -1325,11 +1348,16 @@
     chip.hidden = false;
   }
 
-  // Field 4 — `verification: {passed, method, grain_checked} | null`: a passive
-  // "verified ✓" badge only when passed===true. null → render nothing (absence
-  // is information — never a warning). No "failed" state exists.
+  // Field 4 — `verification: {passed, method, grain_checked, empty_result?,
+  // status?} | null`: a passive "verified ✓" badge only when passed===true. null →
+  // render nothing (absence is information — never a warning). No "failed" state
+  // exists. `empty_result === true` (J6) is the one explicit non-green state.
   function renderVerification(root, verification) {
     var badge = root.querySelector(".verified-badge");
+    if (verification && verification.empty_result === true) {
+      renderEmptyVerification(badge);
+      return;
+    }
     if (!verification || verification.passed !== true) {
       badge.hidden = true;
       badge.textContent = "";

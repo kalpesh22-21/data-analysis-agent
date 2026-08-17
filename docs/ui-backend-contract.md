@@ -190,7 +190,7 @@ interface TurnResult {
   answer_tables: AnswerTableEntry[] | null;  // EVERY designated answer table (§4.2.2)
 
   blueprint_use: BlueprintUse | null; // COMPAT: derived from answer_tables[0]
-  verification: Verification | null;  // COMPAT: derived from answer_tables[0]
+  verification: Verification | null;  // COMPAT: conservative AND roll-up over answer_tables (§4.2.4)
   provenance: string[] | null;        // "database.table.column", sorted + deduped
   assumptions: string[] | null;
 }
@@ -227,9 +227,11 @@ interface BlueprintUse {
 }
 
 interface Verification {
-  passed: boolean;                       // effectively always true when present — see §4.2.4
+  passed: boolean;                       // true, EXCEPT on the empty case — see §4.2.4
   method: "blueprint_gate";              // the only value that exists
   grain_checked: boolean;
+  empty_result?: true;                   // present only when the blueprint returned 0 rows
+  status?: "empty — unverifiable";       // display string, present only alongside empty_result
 }
 ```
 
@@ -260,9 +262,12 @@ Rows returned by §4.4 **may contain real cell values** — the caller's own sco
 
 #### 4.2.4 `verification` — read this before designing the badge
 - Non-null **only** for a successful blueprint answer.
-- `passed` is therefore **effectively always `true` when present**: a *failed* gate never returns a blueprint answer, it silently degrades to the raw loop, which emits `verification: null`.
+- A *failed* gate never returns a blueprint answer — it silently degrades to the raw loop, which emits `verification: null`.
 - So: **`null` means "not verifiably verified", not "verification failed".** Render nothing on null. Never render a warning, never pause, never prompt.
 - `grain_checked: false` means the grain probe was vacuously skipped — optionally a subtler tick.
+- **`passed: false` has exactly one meaning: `empty_result` (2026-08, J6).** The blueprint ran and returned **zero rows**, so the grain check — `row_count === distinct_grain_count` — compared `0` to `0` and proved nothing. The block then carries `empty_result: true`, `status: "empty — unverifiable"` and `grain_checked: false`. Render the `status` string (a neutral chip, same styling as `verified ✓` — **not** an error colour): the empty answer is a fine answer, it is only the *verification claim* that is withdrawn. There is still **no failure state**; do not add one.
+- The distinction that matters: `null` = "nothing gated this table" (a hand-written query); `empty_result` = "a blueprint gated it and had nothing to gate". Rendering the second as the first is the over-claim's quieter twin — a grid the runtime knows came from a blueprint sitting under the same silence a raw query gets.
+- **Roll-up rule for the top-level (legacy roll-up field).** Green only when **every** designated table is verified; `empty — unverifiable` only when **every** designated table is empty; **`null` for any mixture** (verified + empty, or blueprint + hand-written). Per-table blocks in `answer_tables[i].verification` are exact and are what a new client should render.
 
 #### 4.2.5 `provenance` — three-valued
 | Wire | Meaning | UI |

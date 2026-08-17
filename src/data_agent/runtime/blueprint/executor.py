@@ -449,16 +449,7 @@ class BlueprintExecutor:
             # `composite/answer_with_table.py`). Kept separate from `sql` above,
             # which is the full transparency list and is NOT ordered by terminality.
             "terminal_sql": node_sql,
-            "verify": {
-                "grain_ok": verify_out.grain_ok,
-                "grain_checked": verify_out.grain_checked,
-                # n4: Slice B does not check a result SIGNATURE yet (no declared
-                # signature is stored), so `signature_ok` is vacuously True — flag
-                # `signature_checked: False` so the D56 LLM-review input is honest
-                # (mirrors `grain_checked`), never implying a check that did not run.
-                "signature_ok": verify_out.signature_ok,
-                "signature_checked": False,
-            },
+            "verify": _verify_block(verify_out, row_count),
         }
         preview = _build_preview(node.result_full, self._preview_row_count)
         return ExecCompleted(
@@ -957,12 +948,7 @@ class BlueprintExecutor:
             # `sql`": rehydrated nodes (D45 exactly-once resume) are appended to
             # `node_sqls` FIRST, so that positional assumption is not safe.
             "terminal_sql": terminal_sql,
-            "verify": {
-                "grain_ok": verify_out.grain_ok,
-                "grain_checked": verify_out.grain_checked,
-                "signature_ok": verify_out.signature_ok,
-                "signature_checked": False,
-            },
+            "verify": _verify_block(verify_out, row_count),
         }
         preview = _build_preview(terminal_result, self._preview_row_count)
         return ExecCompleted(
@@ -1209,6 +1195,43 @@ def _unpack_result(raw: Any) -> tuple[list[str], list[list[Any]], int, bool]:
     row_count = int(row_count) if isinstance(row_count, int) and not isinstance(row_count, bool) else len(rows)
     truncated = bool(raw.get("truncated", False))
     return columns, rows, row_count, truncated
+
+
+def _verify_block(verify_out: VerifyOutcome, row_count: int) -> dict[str, Any]:
+    """The `result_full["verify"]` block — ONE builder for BOTH the single-node and
+    the DAG finalize path, so the two can never describe the same gate differently.
+
+    J6 — AN EMPTY RESULT IS UNVERIFIABLE, NOT VERIFIED. The D56 grain teeth are
+    `row_count == distinct_grain_count`; at zero rows that is `0 == 0`, which passes
+    for every blueprint ever written, correct or not. The check did not catch
+    anything because there was nothing to catch — so it is reported as NOT having
+    run (`grain_checked: False`, the same honesty rule §4.2's skip already follows)
+    plus an explicit `empty_result: True` marker, which is what lets the badge say
+    *empty — unverifiable* instead of *verified ✓*.
+
+    DELIBERATELY UNTOUCHED: `grain_ok` stays as the gate computed it (vacuously
+    True). It — with `signature_ok` — is what `tool._is_verified_blueprint_result`
+    reads to set the `authoritative` marker, and an empty blueprint result IS still
+    the authoritative answer for its intent ("there are none" is an answer). Only
+    the VERIFICATION CLAIM is withdrawn here, never the no-re-derivation rule.
+
+    On a NON-empty result the returned dict is byte-identical to what it has always
+    been: `empty_result` is emitted only when it is true.
+    """
+    block: dict[str, Any] = {
+        "grain_ok": verify_out.grain_ok,
+        "grain_checked": verify_out.grain_checked,
+        # n4: Slice B does not check a result SIGNATURE yet (no declared signature
+        # is stored), so `signature_ok` is vacuously True — flag
+        # `signature_checked: False` so the D56 LLM-review input is honest (mirrors
+        # `grain_checked`), never implying a check that did not run.
+        "signature_ok": verify_out.signature_ok,
+        "signature_checked": False,
+    }
+    if row_count == 0:
+        block["grain_checked"] = False
+        block["empty_result"] = True
+    return block
 
 
 def _union_provenance(

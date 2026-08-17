@@ -196,10 +196,48 @@ class BlueprintRun:
 
     terminal_sql: str
     # `{"passed": True, "method": "blueprint_gate", "grain_checked": bool}` when the
-    # D56 gate verified this run, else `None`. NEVER `{"passed": False}` — see
-    # `rollup_verification`.
+    # D56 gate verified this run; the explicit `empty_result`/`status` block when it
+    # came back with ZERO rows (J6 — nothing to verify); `None` when no blueprint
+    # verified this table at all. See `blueprint_verification`.
     verification: dict[str, Any] | None = None
     slots: dict[str, Any] = field(default_factory=dict)
+
+
+# J6: the human-readable state of an empty blueprint result's badge. A display
+# string on the wire (the shape's only one) because the badge is read by more than
+# the browser — the persisted trail, `GET /session/history` and the D56 review
+# input all carry this dict, and "unverifiable" is not derivable from `passed:
+# false` alone (a raw-loop table has no dict at all, which is a different thing).
+VERIFICATION_EMPTY_STATUS = "empty — unverifiable"
+
+
+def is_zero_row_count(row_count: Any) -> bool:
+    """Is *row_count* a genuine integer zero? (J6)
+
+    THE ONE PLACE the bool exclusion is written. `isinstance(True, int)` is True in
+    Python, so a bare `row_count == 0` reads a poisoned/legacy `row_count: false`
+    as an empty result and retracts a verification claim over a value that says
+    nothing about the row count. Both J6 sites read a row count off an untrusted
+    JSON payload — the rehydrated `result_full` here, the rendered `result_preview`
+    in `loop/agent_loop.py::_tool_trail_entry_to_canonical` — so the rule lives in
+    one function rather than being spelled out twice and drifting once.
+    """
+    return isinstance(row_count, int) and not isinstance(row_count, bool) and row_count == 0
+
+
+def _is_empty_blueprint_result(result_full: Mapping[str, Any]) -> bool:
+    """Did this blueprint return ZERO rows? (J6)
+
+    Read TWO ways on purpose. `verify.empty_result` is what the executor writes
+    today; `row_count == 0` is the underlying fact, and is what catches a
+    `result_full` PERSISTED BEFORE this change and rehydrated from the D46 KV on
+    `GET /session/history` — that record has no marker, and re-deriving from the
+    row count is the difference between a reloaded transcript telling the truth and
+    it reproducing the exact over-claim this fixes.
+    """
+    if (result_full.get("verify") or {}).get("empty_result") is True:
+        return True
+    return is_zero_row_count(result_full.get("row_count"))
 
 
 def blueprint_verification(result_full: Any) -> dict[str, Any] | None:
@@ -207,11 +245,33 @@ def blueprint_verification(result_full: Any) -> dict[str, Any] | None:
 
     The SINGLE constructor of that dict — shared by the turn-level enrichment
     accumulator and by per-table designation, so the two can never describe the
-    same run differently. `None` (not `{"passed": False}`) is the only negative
-    form: absence reads as *no claim*, which is what an unverified result is.
+    same run differently. `None` (not `{"passed": False}`) is the negative form for
+    a table NOTHING verified: absence reads as *no claim*, which is what an
+    unverified (raw-loop / hand-written) result is.
+
+    J6 — THE ONE PLACE `passed: False` IS EMITTED: a blueprint whose result is
+    EMPTY. The grain teeth are `row_count == distinct_grain_count`, so at zero rows
+    they read `0 == 0` and pass for every blueprint alive; a structurally-empty
+    blueprint therefore shipped a 0-row grid wearing a full "verified ✓" badge.
+    That claim is withdrawn here and replaced with an EXPLICIT state
+    (`empty_result: True` + `status: "empty — unverifiable"`) rather than with
+    `None`, because `None` means "a hand-written query, no gate involved" — which
+    would lose the fact that a blueprint ran and came back with nothing. The rows
+    are still the authoritative answer for the intent (see
+    `tool._is_verified_blueprint_result`); it is the VERIFICATION claim, and only
+    that, which is retracted.
     """
     if not isinstance(result_full, dict) or result_full.get("status") != "verified":
         return None
+    if _is_empty_blueprint_result(result_full):
+        return {
+            "passed": False,
+            "method": "blueprint_gate",
+            # The teeth did not meaningfully run — see `executor._verify_block`.
+            "grain_checked": False,
+            "empty_result": True,
+            "status": VERIFICATION_EMPTY_STATUS,
+        }
     return {
         "passed": True,
         "method": "blueprint_gate",
@@ -547,14 +607,35 @@ def rollup_verification(tables: Sequence[AnswerTable]) -> dict[str, Any] | None:
     blueprint for part 1 plus a hand-written query for part 2 badges an unverified
     grid green, and has done since the field existed.
 
-    NEVER `passed: False`. Absence stays the only negative signal. A `False` would
-    render as a red "verification failed" badge whose actual meaning is "one of
-    these is a hand-written query" — which is not a failure at all, and would be
-    read as one.
+    ABSENCE, NOT `passed: False`, IS THE SIGNAL FOR "one of these is a hand-written
+    query" — that is not a failure at all and a `False` would be read as one.
+
+    J6 adds the one state that is neither: EVERY designated table backed by an
+    EMPTY blueprint result rolls up to the same explicit *empty — unverifiable*
+    block the per-table badge carries. It is propagated rather than flattened to
+    `None` because the UI renders the ENVELOPE's badge at N<=1 — and N=1 is exactly
+    the confirmed case (one designated table, zero rows). Flattening would make the
+    fix invisible in the situation it exists for.
+
+    A MIXED set (some verified, some empty) rolls up to `None`. "Empty" would
+    over-state it — part of the answer has rows — and "verified" would be the
+    original over-claim restated. No claim is the honest reading, and it is the
+    same answer this function already gives for any other mixture.
     """
     if not tables:
         return None
     if any(table.verification is None for table in tables):
+        return None
+    empty = [bool((table.verification or {}).get("empty_result")) for table in tables]
+    if all(empty):
+        return {
+            "passed": False,
+            "method": "blueprint_gate",
+            "grain_checked": False,
+            "empty_result": True,
+            "status": VERIFICATION_EMPTY_STATUS,
+        }
+    if any(empty):
         return None
     return {
         "passed": True,
@@ -653,6 +734,7 @@ class AnswerWithTableTool:
 __all__ = [
     "MAX_ANSWER_TABLES",
     "TOOL_NAME",
+    "VERIFICATION_EMPTY_STATUS",
     "AnswerTable",
     "AnswerWithTableTool",
     "BlueprintRun",
@@ -668,6 +750,7 @@ __all__ = [
     "enrich_table",
     "finalize_designations",
     "is_answer_table_in_scope",
+    "is_zero_row_count",
     "resolve_designation",
     "resolve_designations",
     "rollup_verification",

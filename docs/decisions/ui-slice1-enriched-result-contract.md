@@ -242,6 +242,13 @@ Parse the `result` SSE event's `data` JSON. All 5 new keys are **optional** — 
   quiet **"verified ✓"**. Null → **render nothing** (absence is itself information — never a
   warning, never a pause, never a prompt). `grain_checked===false` may render a subtler tick if the
   design wants to distinguish grain-verified from grain-skipped; optional.
+  - **AMENDED 2026-08 (J6).** One additional state exists: `{passed: false, empty_result: true,
+    status: "empty — unverifiable", grain_checked: false}`, emitted when the blueprint returned
+    **zero rows** — the grain check `row_count === distinct_grain_count` then compares `0` to `0`
+    and proves nothing, so the *verified* claim is withdrawn. Render `status` as a neutral chip
+    (same styling as the tick, never an error colour). This does **not** introduce a failure
+    state and does not change `null`'s meaning. Live surface: `docs/ui-backend-contract.md`
+    §4.2.4, which supersedes this record for the wire shape.
 - **`provenance: string[] | null`** → lineage panel: a list of `database.table.column` chips
   (already sorted). Null → hide the panel (undetermined). `[]` → optional "no tables read" note.
 

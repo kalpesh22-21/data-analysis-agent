@@ -27,6 +27,7 @@ import pathlib
 import re
 
 from data_agent.runtime.composite.analysis_state import MAX_INTENTS
+from data_agent.runtime.composite.answer_with_table import VERIFICATION_EMPTY_STATUS
 
 _INDEX = pathlib.Path(__file__).resolve().parents[2] / "ui" / "static" / "index.html"
 _HTML = _INDEX.read_text(encoding="utf-8")
@@ -86,6 +87,46 @@ class TestHistoryReloadForwardsTheList:
         body = match.group(1)
         assert "answer_sql: turn.answer_sql," in body
         assert "answer_tables: turn.answer_tables," in body
+
+
+class TestTheEmptyUnverifiableBadge:
+    """J6 — a blueprint that returned ZERO rows carries `passed: false` +
+    `empty_result: true`, and BOTH badge renderers hid on `passed !== true`.
+
+    This is the silent-breakage class this module exists for: the wire carries a
+    new, honest state and the page renders nothing for it — the grid then sits
+    under exactly the silence a hand-written query gets, which is the opposite of
+    what the change was for. Structural, because there is no JS unit harness.
+    """
+
+    def test_both_renderers_handle_empty_result_before_the_passed_check(self) -> None:
+        for name in ("renderVerification", "renderTableVerification"):
+            match = re.search(rf"function {name}\((.*?)\n  \}}", _HTML, re.S)
+            assert match is not None, f"{name} is missing or was renamed"
+            body = match.group(1)
+            empty_at = body.find("empty_result === true")
+            passed_at = body.find("passed !== true")
+            assert empty_at != -1, f"{name} does not handle the empty_result state"
+            assert passed_at != -1, f"{name} lost its passed check"
+            assert empty_at < passed_at, (
+                f"{name} checks passed!==true first, so an empty_result block "
+                "hides the badge instead of rendering the chip"
+            )
+
+    def test_the_chip_text_is_the_status_string_the_runtime_emits(self) -> None:
+        """The wire carries a display string; the browser renders one. Two places
+        that must say the same thing, and only one of them can import the
+        constant — the same tie `MAX_ANSWER_TABLES` has below."""
+        match = re.search(r"function renderEmptyVerification\((.*?)\n  \}", _HTML, re.S)
+        assert match is not None, "renderEmptyVerification is missing or was renamed"
+        assert f'badge.textContent = "{VERIFICATION_EMPTY_STATUS}";' in match.group(1)
+
+    def test_the_empty_chip_reuses_the_neutral_badge_styling(self) -> None:
+        """It is not a failure state and must not be coloured as one. Both badge
+        nodes carry the shared, deliberately neutral `.badge` pill; a dedicated
+        error class here would render the retraction as an alarm."""
+        assert 'class="verified-badge badge"' in _HTML
+        assert 'class="table-verified-badge badge"' in _HTML
 
 
 class TestTheCapMatchesTheRuntime:
