@@ -106,7 +106,6 @@ from data_agent.runtime.composite.answer_with_table import (
     blueprint_run_from_result,
     blueprint_verification,
     clean_answer_text,
-    clean_blueprint_id,
     enrich_table,
     finalize_designations,
     is_answer_table_in_scope,
@@ -154,6 +153,7 @@ from data_agent.runtime.session.models import (
 from data_agent.runtime.session.store import SessionStore
 from data_agent.timeutil import now_iso
 
+from .blueprint_gate import BlueprintGate
 from .budget_guard import BudgetGuard
 from .read_guard import ReadGuard, idempotent_read_signature, repeated_read_guard_event
 
@@ -604,67 +604,11 @@ def _answer_table_no_table_designated() -> ToolResult:
     )
 
 
-BLUEPRINT_DEFINITION_NOT_READ_CODE = "BLUEPRINT_DEFINITION_NOT_READ"
-
-
-def _blueprint_definition_not_read(blueprint_id: str) -> ToolResult:
-    """The refusal for `runBlueprint(id=X)` where X was never expanded with a
-    successful `getBlueprint` earlier in this turn (the getBlueprint-before-run
-    rule, recorded in `docs/decisions/release-1/02-blueprint-card-enrichment.md`).
-
-    WHY THE GATE EXISTS. A blueprint card carries `intent`, `slots`, `resolves` and
-    `result_grain` — and NO SQL. So the model has been choosing and running
-    blueprints on the strength of an AUTHORED PROSE `intent` string; when that
-    string misdescribes the query underneath it, the model runs the wrong analysis
-    and reports it confidently. The D56 grain gate does not catch this: it verifies
-    the result SHAPE matches the declared `result_grain`, never that the blueprint
-    answers the question that was asked. Reading the definition is the only step
-    that can, and it is the concrete practice the prompt's "Success is not proof of
-    correctness" line implies for the blueprint route.
-
-    RETRYABLE, and the fix is one call away — so the turn continues, the model
-    expands the blueprint on the next round-trip and runs it on the one after. It
-    may batch: `getBlueprint` for several blueprints in one response, `runBlueprint`
-    for all of them in the next, so an N-deliverable request costs 2 round-trips,
-    not 2N.
-
-    `denial_detail` NAMES THE BLUEPRINT and the exact fix. It has to:
-    `context/budget.py::_render_entry` builds the model-facing text as
-    `entry.denial_detail or classify_denial(entry.error_code).user_message` and
-    never from `ToolResult.user_message` (`TrailEntry` has no such field), and the
-    denial table sees only the code, so its text can say "that blueprint" but never
-    which one. The two strings are kept in step deliberately —
-    `BLUEPRINT_DEFINITION_NOT_READ` is registered in `dispatch/denial_mapping.py`
-    for the case where the detail is ever absent. D25: `blueprint_id` is
-    corpus-authored, never user content, so naming it is safe.
-
-    `provenance=frozenset()` (determined-empty), matching
-    `_answer_table_blueprint_not_run` and `_finalization_blocked`: this refusal
-    reads no warehouse data, and `_compute_turn_provenance_union` is fail-closed, so
-    a `None` here would collapse the whole turn's union and drop the user's own
-    answer from every later turn's replay. It is deliberately NOT added to
-    `context/assembly.py::_STALE_CROSS_TURN_ERROR_CODES`: the only model-authored
-    text on the entry is the `slot_bindings` in its `args`, and a SUCCESSFUL
-    `runBlueprint` entry already replays exactly those cross-turn, so the refusal
-    exposes nothing its successful twin does not.
-    """
-    detail = (
-        f"You have not read blueprint '{blueprint_id}' in this turn, so you do not "
-        "know what it actually measures — a card's intent line is authored prose, "
-        f"the SQL is the analysis. Call getBlueprint('{blueprint_id}') first, then "
-        "run it, and check what it does answers what was asked before you do."
-    )
-    return ToolResult(
-        status="error",
-        tool_name="runBlueprint",
-        error_code=BLUEPRINT_DEFINITION_NOT_READ_CODE,
-        retryable=True,
-        user_message=detail,
-        provenance=frozenset(),
-        result_preview=None,
-        result_full=None,
-        denial_detail=detail,
-    )
+# The blueprint-definition gate — its refusal ToolResult, its error code
+# (`BLUEPRINT_DEFINITION_NOT_READ_CODE`) and the `BlueprintGate` that decides —
+# now lives in `loop/blueprint_gate.py`. The gate is imported at the top of this
+# file; the loop keeps only the EFFECTS (the `_maybe_start_summary` skip, the
+# dispatch-chain short-circuit, the trail entry the refusal is written into).
 
 
 # ---------------------------------------------------------------------------
@@ -2816,25 +2760,17 @@ class AgentLoop:
         # prior `ok` idempotent-read entry of this turn is what lets it recognize a
         # repeat it did not itself serve in the current window.
         read_guard = ReadGuard(self._observer)
-        # The blueprint-definition gate: every blueprint id this turn has already
-        # EXPANDED with a successful `getBlueprint`. `runBlueprint` for an id that is
-        # NOT in here is refused before the executor runs
-        # (`_blueprint_definition_not_read`).
-        #
-        # Seeded from the persisted trail for the same two reasons the read guard
-        # is: the D45 per-round-trip rebuild would otherwise reset it on every
-        # `send_turn`, and a budget-window `continue` resume starts a fresh
-        # `_run_loop` window with an empty in-memory set — a model that expanded the
-        # blueprint before the cap would then be refused for work it had done.
-        #
-        # TURN-SCOPED, like every other memory in this release. A `getBlueprint` from
-        # an EARLIER turn does not satisfy the gate: context is rebuilt per turn and
-        # trimmed by `fit_request_to_budget`, so a definition fetched in turn 1 may
-        # have been trimmed out by turn 5, and the rule is about what the model
-        # can read RIGHT NOW. The cost is real and accepted — a follow-up turn that
-        # re-runs the same blueprint with a different slot value ("now just
-        # Engineering") pays one extra `getBlueprint` per turn.
-        blueprint_definitions_read: set[str] = set()
+        # The blueprint-definition gate, `loop/blueprint_gate.py`: it holds every
+        # blueprint id this turn has already EXPANDED with a successful
+        # `getBlueprint`, and `runBlueprint` for an id that is NOT in it is refused
+        # before the executor runs. Turn-window-local like the guard above, and
+        # seeded from the persisted trail below for the same two reasons — the D45
+        # per-round-trip rebuild would otherwise reset it on every `send_turn`, and a
+        # budget-window `continue` resume starts a fresh `_run_loop` window with an
+        # empty in-memory set, so a model that expanded the blueprint before the cap
+        # would be refused for work it had done. TURN-SCOPED (the walk below is
+        # turn-filtered); see the class docstring for why that cost is accepted.
+        blueprint_gate = BlueprintGate(self._observer)
         # ONE read for the trail seed AND the live analysis state (05 §E): the
         # session doc carries both, and `load_trail` is itself just a read of this
         # same document, so this is that read — not an extra one.
@@ -2892,9 +2828,7 @@ class AgentLoop:
                 # cannot make a `runBlueprint` succeed anyway (the executor re-fetches
                 # the definition and fails on its own merits). The gate's job is
                 # "did you look", not "did you find".
-                expanded_id = clean_blueprint_id(prior_entry.args.get("id"))
-                if expanded_id is not None:
-                    blueprint_definitions_read.add(expanded_id)
+                blueprint_gate.observe_prior_definition_read(prior_entry.args.get("id"))
             # ANSWER-SHAPE GATE (05 §J), seeded from the same walk. `status == "ok"`
             # is guaranteed by the skip above, and is passed explicitly anyway so the
             # predicate reads the same at both of its call sites.
@@ -3000,12 +2934,13 @@ class AgentLoop:
             # terminal exit #2 below. Reset per iteration — a designation only ends
             # the turn it was made in.
             designated_answer_text: str | None = None
-            # Blueprint ids expanded by a SUCCESSFUL `getBlueprint` in THIS response.
-            # Held apart from `blueprint_definitions_read` until the batch drains
-            # (folded in below the dispatch loop) — see the fold site for why a
-            # same-response `[getBlueprint(x), runBlueprint(x)]` pair must NOT pass
-            # the gate. Reset per iteration, beside `designated_answer_text`.
-            expanded_this_round: set[str] = set()
+            # Start the blueprint gate's response batch: it stages the ids expanded
+            # by a `getBlueprint` in THIS response and holds them apart from the
+            # committed set until the batch drains (`commit_round`, below the
+            # dispatch loop) — see that site for why a same-response
+            # `[getBlueprint(x), runBlueprint(x)]` pair must NOT pass the gate.
+            # Reset per iteration, beside `designated_answer_text`.
+            blueprint_gate.begin_round()
             # The window's forced re-round is consumed PER ROUND-TRIP, not per
             # refused call (05 §C.2) — so a `[answerWithTable, answerWithTable]`
             # batch is refused twice and advances the persisted counter once. Reset
@@ -3366,9 +3301,7 @@ class AgentLoop:
                     # work actually happen?" — and a dedup answers yes to the first
                     # and no to the second.
                     if tool_call.name == "getBlueprint":
-                        deduped_id = clean_blueprint_id(call_args.get("id"))
-                        if deduped_id is not None:
-                            expanded_this_round.add(deduped_id)
+                        blueprint_gate.note_definition_in_context(call_args.get("id"))
                     tool_calls_made += 1
                     guard_entry = TrailEntry(
                         turn_index=turn_index,
@@ -3410,8 +3343,9 @@ class AgentLoop:
                 # SUCCESSFUL `getBlueprint` for the same id. A card carries no SQL,
                 # so without this the model routes on an authored prose `intent`
                 # string and can run — and confidently report — an analysis that
-                # measures something else entirely. See
-                # `_blueprint_definition_not_read` for the full rationale.
+                # measures something else entirely. See `loop/blueprint_gate.py` for
+                # the full rationale; the decision and its event are ITS, and only
+                # the effects below are the loop's.
                 #
                 # DECIDED HERE, BEFORE `_maybe_start_summary` AND BEFORE DISPATCH, so
                 # the executor never runs, no inner `runQuery` is issued, and the
@@ -3442,27 +3376,8 @@ class AgentLoop:
                 # `RUN_BLUEPRINT_UNAVAILABLE` → raw-loop fallback (§6) with a loop.
                 handler = self._runtime_tools.get(tool_call.name)
                 gate_refusal: ToolResult | None = None
-                if (
-                    tool_call.name == "runBlueprint"
-                    and handler is not None
-                    and isinstance(call_args, dict)
-                ):
-                    gated_blueprint_id = clean_blueprint_id(call_args.get("id"))
-                    if (
-                        gated_blueprint_id is not None
-                        and gated_blueprint_id not in blueprint_definitions_read
-                    ):
-                        gate_refusal = _blueprint_definition_not_read(gated_blueprint_id)
-                        self._observer(
-                            "loop_blueprint_definition_not_read",
-                            {
-                                "tool_name": "runBlueprint",
-                                # D25: corpus-authored, never user content. No SQL and
-                                # no question text is placed on the span.
-                                "blueprint_id": gated_blueprint_id,
-                                "reason": "no_get_blueprint_this_turn",
-                            },
-                        )
+                if tool_call.name == "runBlueprint" and handler is not None:
+                    gate_refusal = blueprint_gate.check_run_blueprint(call_args)
 
                 # LLM-generated progress summary (opt-in, `progress_summary_enabled`):
                 # fire the value-rich present-tense line CONCURRENTLY, BEFORE dispatch
@@ -3886,17 +3801,15 @@ class AgentLoop:
                     read_guard.record_served(read_decision, tool_call.id)
 
                 # Record a SUCCESSFUL `getBlueprint` so the blueprint-definition gate
-                # lets that id run. Staged in the per-response set, not folded into
-                # `blueprint_definitions_read` until the batch drains (see the fold
-                # below the loop).
+                # lets that id run. STAGED in the gate's per-response set, not
+                # committed until the batch drains (see `commit_round` below the
+                # loop).
                 if (
                     tool_call.name == "getBlueprint"
                     and tool_result.status == "ok"
                     and isinstance(call_args, dict)
                 ):
-                    expanded_id = clean_blueprint_id(call_args.get("id"))
-                    if expanded_id is not None:
-                        expanded_this_round.add(expanded_id)
+                    blueprint_gate.note_definition_in_context(call_args.get("id"))
 
                 # S3: also check the budget INSIDE the per-tool-call loop (not
                 # only once per outer iteration) so a slow batch of capped
@@ -3905,18 +3818,13 @@ class AgentLoop:
                 if guard.exceeded:
                     break
 
-            # BLUEPRINT-DEFINITION GATE, the fold. Ids expanded in THIS response
-            # become runnable from the NEXT one — deliberately not mid-batch. The
-            # rule is that the model has READ the definition, and the result of a
-            # `getBlueprint` issued in this response does not reach the model until
-            # the next round-trip: a `[getBlueprint(x), runBlueprint(x)]` pair in one
-            # message would satisfy a mid-batch fold while the model was still blind
-            # to the SQL, which is the whole failure the gate exists to stop. The
-            # refusal costs exactly the round-trip the model owed anyway, and the
-            # BATCHED shape is unaffected — `[getBlueprint(a), getBlueprint(b)]` then
-            # `[runBlueprint(a), runBlueprint(b)]` is still 2 round-trips for 2
-            # deliverables, not 2 per deliverable.
-            blueprint_definitions_read |= expanded_this_round
+            # BLUEPRINT-DEFINITION GATE, the fold. HERE, once the batch has drained,
+            # and deliberately not mid-batch: ids expanded in THIS response become
+            # runnable only from the NEXT one, because the result of a `getBlueprint`
+            # issued in this response does not reach the model until the next
+            # round-trip. See `BlueprintGate.commit_round` for the full rationale —
+            # the position of this call is the half of it that lives here.
+            blueprint_gate.commit_round()
 
             # TERMINATION: pause. Honoured AFTER the state calls above have been
             # committed (03 §E.1) and BEFORE anything else in the batch is

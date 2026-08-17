@@ -158,6 +158,6 @@ helpers) → **T5.5 single `finish()`** (7 `TurnOutcome` sites) →
 | Tier 4 Wave A (T4.3/4.5/4.6/4.7) | done, reviewed, landed ae17803 | #7 |
 | Eval conftest field-drop fix | done (tests-only, mutation-verified), 6b30465 | #7 |
 | **Tier 4 Wave B (T4.1 compiler, T4.2 executor, T4.4 span envelope)** | **HELD (user, 2026-08-17)** | — |
-| Tier 5 loop decomposition | un-held (user go, 2026-08-17); T5.1 done (reviewed, V0+V1+V2 green); T5.2 next | #8 |
+| Tier 5 loop decomposition | T5.1 done (#8); T5.2 done (reviewed, V0+V1+V2 green); T5.3a next (re-scoped, see #9) | #8,#9 |
 | G1/G2 L5 robustness slice | built+contained in worktree, unlanded; optional post-5.5 | — |
 | Issues stack | committed to docs/cleanup/ISSUES.md (source of truth going forward) | — |

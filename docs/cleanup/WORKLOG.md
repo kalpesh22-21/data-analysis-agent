@@ -312,3 +312,40 @@ conflict: Tier 2's BudgetGuard rename), targeted + full suites re-run green.
 Lesson: pin/verify the worktree base in every builder brief; treat
 "pre-existing failure" claims from a worktree as unverified until reproduced
 on the real base.
+
+## #9 — T5.2: BlueprintGate extraction (2026-08-17)
+
+- **T5.2** extracted the blueprint-definition gate from `_run_loop_body` into
+  `runtime/loop/blueprint_gate.py` (window-scoped `BlueprintGate` + the moved
+  refusal builder + `BLUEPRINT_DEFINITION_NOT_READ_CODE`). Interface:
+  `observe_prior_definition_read / begin_round / note_definition_in_context /
+  check_run_blueprint → ToolResult|None / commit_round`. Builder verified the
+  membership test is committed-set-only (same-batch get→run still refused) and
+  unified the two staging sites after proving same semantics; raw-id hooks
+  preserve the original decline/ok asymmetry. Body keeps: shared trail walk
+  (dual dispatch comment intact), unwired-tool carve-out, summary skip,
+  refusal short-circuit, fold position. `_MAX_SURPLUS_STATE_REJECTIONS`
+  deliberately stayed (03 §E.2 machinery, not this gate). 20 new unit tests.
+- Review: APPROVE, 0 blockers, 0 suggestions; AST-verified refusal
+  byte-identity; 2 comment nits folded in (loader.py cross-ref, test
+  docstring impossible-path claim).
+- V0 **5727 passed / 225 skipped / 1 xfailed**, ruff clean.
+  V1: **1 failed (L3) / 8 passed, 18:24** — L3 1/3 is the ACCEPTED red
+  (J7 calendar re-derivation, understood cause; T5.1's 3/3 was variance).
+  All other cases 3/3 incl. L7. No dip below baseline.
+  V2: L2 live — both getBlueprints before both runBlueprints, 2 verified
+  tables, correct figures; L6 live — getBlueprint→runBlueprint, verified,
+  no re-derivation; fresh traces in `data-agent-runtime` (22:32).
+- The worktree-base trap fired again and was CAUGHT by the brief's pinning
+  step (worktree spawned at 9558e9e; builder reset to 20c7c48 before work).
+  Patch applied to main with zero conflicts.
+
+Next: T5.3 re-scoped per explorer deep-map — the finalization machinery is
+four decision sites sharing two allowances + shared mutable analysis_state +
+a store-writing method with callers outside the body. T5.3a extracts the
+pure helpers (`loop/finalization.py`), an `AnswerShapeCounter`
+(multi_row_answer_calls + answer_table_succeeded — the only cleanly-owned
+state), and a thin `FinalizationGate` (per-round refused flag + allowance
+claims). `_force_block_pending_intents`, terminal exits, analysis_state
+ownership, tool_result assignments, nudge splice/clear all STAY until
+T5.5 finish(). Eight ordering invariants documented in the builder brief.

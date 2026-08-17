@@ -30,11 +30,8 @@ from data_agent.runtime.context.assembly import (
 )
 from data_agent.runtime.dispatch.denial_mapping import classify_denial
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolPause, ToolResult
-from data_agent.runtime.loop.agent_loop import (
-    BLUEPRINT_DEFINITION_NOT_READ_CODE,
-    AgentLoop,
-    TurnContext,
-)
+from data_agent.runtime.loop.agent_loop import AgentLoop, TurnContext
+from data_agent.runtime.loop.blueprint_gate import BLUEPRINT_DEFINITION_NOT_READ_CODE
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient

@@ -92,7 +92,7 @@ _ANSWER_TOOL = "answerWithTable"
 # exactly the friction both readers exist to record. Those stay failures.
 ENFORCEMENT_ERROR_CODES = frozenset(
     {
-        # `loop/agent_loop.py::BLUEPRINT_DEFINITION_NOT_READ_CODE` (Release 1),
+        # `loop/blueprint_gate.py::BLUEPRINT_DEFINITION_NOT_READ_CODE` (Release 1),
         # registered in dispatch/denial_mapping.py: `runBlueprint` refused because
         # `getBlueprint` had not run in the same turn. Retryable, and the executor
         # never runs — the model has not seen the SQL it was about to execute.
