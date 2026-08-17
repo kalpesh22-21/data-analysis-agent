@@ -180,3 +180,49 @@ scratchpad (g1-partial.diff), file restored from HEAD, rerun clean. Lesson:
 after resuming a stalled worktree agent, verify its cwd containment before
 letting live verification run; serialize live-eval workloads (API/CPU
 contention turned a 4-min gate into 25 min and produced flaky reds).
+
+---
+
+## #5 — Harness fidelity + gpt-5.5 gate (2026-08-17)
+
+Committed `3d6d6d1`. The A2 live gate had been lying to the model (empty MCP
+tool schemas → blueprint-only arena) and gating gpt-4.1 while the real
+server runs gpt-5.5. Fixed: committed byte-exact tool-spec fixture (reviewer
+re-ran the regen recipe and diffed), real getTableSchema/sampleRows shapes,
+L3 residual re-worded to a genuinely uncovered aggregate, three-valued
+re_derivation (unjudgeable ≠ pass), state-None reported distinctly,
+MIN_PASS_RATE default fixed (0.67 > 2/3 made the documented one-red-run
+tolerance unreachable). V1 protocol now pins OPENAI_MODEL=gpt-5.5 + OTLP
+export to Phoenix `cleanup-eval` with redaction off (user requests).
+
+Official gpt-5.5 re-baseline: L1/L2/L4/L5/L6/L7 3/3, multi-intent 3/3;
+**L5 3/3 — gpt-5.5 declares intents unprompted; K2 resolved by model**
+(G1/G2 slice built + contained in its worktree, ready but UNLANDED —
+optional robustness now). L3 1/3: new failure mode, the intent-scoped
+re-derivation metric (live for the first time) flags the model re-deriving
+the hires intent alongside its residual — needs a trace read; queued.
+
+## #6 — J3 + J6(a): hires blueprints + empty-result honesty (2026-08-17)
+
+`90f1908` (+ clickhouse-api `a1d39da`) and `3df9e76`. Both reviewed
+(APPROVE ×2), both live-verified through the real stack (REAL_RETRIEVAL=1,
+rebuilt l2-mcp, re-seeded corpus):
+
+- **J3**: bp-hires-per-month / bp-hires-in-range / bp-hires-projection
+  re-keyed most_recent_hire_date (all-NULL) → hire_date, canon + mirror in
+  lockstep (drift guards green); sidecars regenerated (incidentally
+  repairing a pre-existing stale manifest entry — parity gate never ran
+  against live dirs; follow-up in J3b). Live: "hires per month last six
+  months" now answers **3 new hires, March 2021** (predicted exactly from
+  seed data) vs structurally-empty before. Rehire reading (original hire
+  date) accepted; caveat + catalog-ambiguity retarget + parity-gate test
+  bundled into J3b (issues stack).
+- **J6(a)**: empty blueprint results no longer wear a verified badge —
+  wire carries `{passed:false, empty_result:true, status:"empty —
+  unverifiable"}`; pre-J6 persisted sessions re-read honestly; model-facing
+  note withdraws "verified" but keeps authoritative + no-re-derivation
+  (option (b) explicitly rejected by user). Live: empty 2023 hires window
+  returned the new badge end-to-end.
+
+Verification stack state: l2-mcp rebuilt from canon a1d39da; neo4j corpus
+re-seeded (11 blueprints, model all-mpnet-base-v2); RLS seed fresh.
