@@ -21,11 +21,11 @@ from data_agent.learning.candidate import (
     mint_candidate_id,
 )
 from data_agent.learning.candidate.couchbase_candidate_store import (
-    COUCHBASE_AVAILABLE,
     CouchbaseCandidateStore,
 )
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.extractor.validation import to_candidate
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 
 from ..extractor.helpers import blueprint_raw, make_summary
 

@@ -36,8 +36,8 @@ import uuid
 import pytest
 
 from data_agent.learning.user.config import UserKnowledgeStoreConfig
-from data_agent.learning.user.couchbase_user_store import COUCHBASE_AVAILABLE
 from data_agent.learning.user.models import UserKnowledgeRecord, mint_record_id
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 
 pytestmark = pytest.mark.skipif(
     not COUCHBASE_AVAILABLE or not os.environ.get("RUN_COUCHBASE_TESTS"),

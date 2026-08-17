@@ -34,7 +34,7 @@ from data_agent.learning.consumer import LearningConsumer
 from data_agent.learning.models import LearningJob, LearningStatus, compute_content_hash
 from data_agent.learning.summary import load_session_summary
 from data_agent.runtime.config import RuntimeSettings
-from data_agent.runtime.session.couchbase_store import COUCHBASE_AVAILABLE
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 from data_agent.runtime.session.models import SessionDoc, TrailEntry, TurnMessage
 
 _REDIS_URL = os.environ.get("LEARNING_REDIS_TEST_URL")

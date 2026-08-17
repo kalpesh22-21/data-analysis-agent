@@ -19,9 +19,10 @@ questions against real ClickHouse:
       ClickHouse under the caller's JWT scope (D57/D80 enforced by the MCP).
     - `session_store` -> the REAL `CouchbaseSessionStore` (live l2-cb bucket
       `agent_sessions`), so sessions PERSIST across restarts and feed the
-      learning loop. Constructed lazily (the `acouchbase` cluster connects
-      eagerly and needs a running event loop, but this app is built at module
-      import before uvicorn's loop is up — see `_LazyCouchbaseSessionStore`).
+      learning loop. Built directly here at module import: the store's `__init__`
+      does no I/O and needs no event loop (the `acouchbase` cluster is constructed
+      by its first `_ensure_connected()`), so uvicorn's loop being absent at
+      `app = build_real_app()` time is not a problem.
       Set `REAL_SESSION_STORE=memory` (or if the `couchbase` SDK is unimportable)
       to fall back to the in-memory store instead.
     - `catalog`       -> the REAL `CatalogHandle` rebuilt from the frozen
@@ -82,7 +83,6 @@ from data_agent.runtime.config import RuntimeSettings, effective_llm_hide
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.openai_client import build_openai_model_client
 from data_agent.runtime.session.memory_store import InMemorySessionStore
-from data_agent.runtime.session.models import FinalizationBlockKind
 
 # `_catalog` is a sibling module under `scripts/`. Put this script's own directory
 # on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND
@@ -158,130 +158,15 @@ def _pick_openai_model(api_key: str) -> str:
     raise SystemExit(f"No OpenAI model candidate worked: {last_err}")
 
 
-class _LazyCouchbaseSessionStore:
-    """Construct the real `CouchbaseSessionStore` on FIRST async use.
-
-    The `acouchbase` cluster connects EAGERLY at construction and requires a
-    RUNNING event loop, but this launcher builds the app at module import
-    (`app = build_real_app()`), before uvicorn's loop is up. This thin proxy
-    defers the real construction to the first awaited method (always inside a
-    request, where the loop is running) and delegates every `SessionStore` call
-    to it verbatim. Same pattern as `run_ui_runtime.py`'s wrapper.
-
-    MAINTENANCE: this class is a HAND-WRITTEN stand-in for the `SessionStore`
-    Protocol, and nothing in `tests/` imports this launcher (module import builds
-    the app, which reads `.env` and preflights OpenAI). A method added to the
-    Protocol and forgotten here is therefore invisible to CI and fails only against
-    the live server — which is exactly what happened twice (`read_full_result`, then
-    Release 1's `apply_analysis_state`). `tests/runtime/test_launcher_session_store_proxies.py`
-    now DERIVES the required surface from the Protocol and fails if it is missing
-    here; keep the delegation complete rather than relying on anyone noticing.
-    """
-
-    def __init__(self, settings: RuntimeSettings) -> None:
-        self._settings = settings
-        self._inner: Any = None
-
-    def _store(self) -> Any:
-        if self._inner is None:
-            from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
-
-            self._inner = CouchbaseSessionStore(self._settings)
-        return self._inner
-
-    async def get_or_create_session(self, session_id: str) -> Any:
-        return await self._store().get_or_create_session(session_id)
-
-    async def load_trail(self, session_id: str) -> Any:
-        return await self._store().load_trail(session_id)
-
-    async def append_message(self, session_id: str, message: Any) -> None:
-        await self._store().append_message(session_id, message)
-
-    async def append_trail_entry(self, session_id: str, entry: Any) -> None:
-        await self._store().append_trail_entry(session_id, entry)
-
-    async def bump_last_activity(self, session_id: str) -> None:
-        await self._store().bump_last_activity(session_id)
-
-    async def write_full_result(
-        self, session_id: str, result_id: str, result_full: dict[str, Any]
-    ) -> str:
-        return await self._store().write_full_result(session_id, result_id, result_full)
-
-    async def read_full_result(self, session_id: str, result_full_ref: str) -> Any:
-        # The read-back half of `write_full_result`. It was missing while the write
-        # half was present, so every caller of the read path hit an AttributeError
-        # here rather than in the real store — `GET /session/history` 500'd once it
-        # started de-referencing blueprint results. A hand-maintained proxy silently
-        # drifts from the protocol it stands in for; add new SessionStore methods
-        # here too.
-        return await self._store().read_full_result(session_id, result_full_ref)
-
-    async def write_pause_checkpoint(self, session_id: str, checkpoint: Any) -> None:
-        await self._store().write_pause_checkpoint(session_id, checkpoint)
-
-    async def apply_analysis_state(self, session_id: str, turn_index: int, merge: Any) -> Any:
-        # Release 1 (03 §B.1). Missing here for the whole of Release 1's first live
-        # run: every `updateAnalysisState` call raised AttributeError on THIS class
-        # and surfaced as RUNTIME_TOOL_INTERNAL_ERROR, while the suite stayed green
-        # because nothing in `tests/` imports this launcher. `merge` is forwarded as
-        # the CALLBACK it is — never called here — so the real store's CAS retry
-        # re-invokes it against its own fresh read.
-        return await self._store().apply_analysis_state(session_id, turn_index, merge)
-
-    async def claim_finalization_block(
-        self,
-        session_id: str,
-        turn_index: int,
-        window_count: int,
-        kind: FinalizationBlockKind,
-    ) -> bool:
-        # Release 1 (05 §C.1). Same omission, same run: without it the forced
-        # finalization re-round could not be claimed at all. `kind` (05 §J.3) is
-        # REQUIRED and forwarded: it selects WHICH per-window allowance is being
-        # claimed, so a proxy that dropped it would collapse the two gates back
-        # onto one budget against the real server only.
-        return await self._store().claim_finalization_block(
-            session_id, turn_index, window_count, kind
-        )
-
-    async def get_session_with_cas(self, session_id: str) -> Any:
-        return await self._store().get_session_with_cas(session_id)
-
-    async def resume_checkpoint(self, session_id: str, cas: Any, answer: str) -> Any:
-        return await self._store().resume_checkpoint(session_id, cas, answer)
-
-    async def scan_idle_sessions(
-        self, *, statuses: list[str], last_activity_before: str, limit: int
-    ) -> Any:
-        return await self._store().scan_idle_sessions(
-            statuses=statuses, last_activity_before=last_activity_before, limit=limit
-        )
-
-    async def transition_learning_status(
-        self,
-        session_id: str,
-        expected_from: str,
-        to: str,
-        cas: Any,
-        *,
-        content_hash: str | None = None,
-        assert_from: bool = True,
-    ) -> Any:
-        return await self._store().transition_learning_status(
-            session_id,
-            expected_from,
-            to,
-            cas,
-            content_hash=content_hash,
-            assert_from=assert_from,
-        )
-
-
 def _build_session_store(settings: RuntimeSettings) -> tuple[Any, str]:
     """Prefer the real Couchbase store; fall back to in-memory on request or if
-    the SDK is unavailable. Returns (store, human-readable choice)."""
+    the SDK is unavailable. Returns (store, human-readable choice).
+
+    Constructed DIRECTLY: `CouchbaseSessionStore.__init__` does no I/O and touches
+    no event loop, so building it here — at module import, before uvicorn's loop —
+    is safe; the cluster is built by the store's first `_ensure_connected()`. This
+    used to need a hand-written lazy proxy that re-declared every `SessionStore`
+    method and drifted from the Protocol twice."""
     if os.environ.get("REAL_SESSION_STORE") == "memory":
         return InMemorySessionStore(), "InMemorySessionStore (REAL_SESSION_STORE=memory)"
     try:
@@ -291,7 +176,9 @@ def _build_session_store(settings: RuntimeSettings) -> tuple[Any, str]:
             InMemorySessionStore(),
             "InMemorySessionStore (couchbase SDK not importable)",
         )
-    return _LazyCouchbaseSessionStore(settings), "CouchbaseSessionStore (l2-cb, lazy-connect)"
+    from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
+
+    return CouchbaseSessionStore(settings), "CouchbaseSessionStore (l2-cb, lazy-connect)"
 
 
 def build_real_app():

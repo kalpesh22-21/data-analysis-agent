@@ -12,7 +12,7 @@ import os
 import pytest
 
 from data_agent.runtime.config import RuntimeSettings
-from data_agent.runtime.session.couchbase_store import COUCHBASE_AVAILABLE
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 
 pytestmark = pytest.mark.skipif(
     not COUCHBASE_AVAILABLE or not os.environ.get("RUN_COUCHBASE_TESTS"),

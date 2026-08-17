@@ -14,57 +14,50 @@ Couchbase-backed store — `acouchbase` refuses all ops until `on_connect()` has
 been awaited, which a sync `__init__` cannot do, so each public coroutine gates
 itself. The consumer builds this store and never connected it. See
 `runtime/couchbase_connect.py`.
+
+CONSTRUCTION (2026-08-17): also shared, via `CouchbaseStoreBase` — the SDK guard,
+the `Cluster`/bucket/collection graph and the TTL are built there from this store's
+own config, and (with no `cluster=` injected) not until the first
+`_ensure_connected()`. `__init__` does no I/O.
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import Any
 
-from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
+from data_agent.runtime.couchbase_connect import (
+    CouchbaseStoreBase,
+    get_or_none,
+)
 
 from .config import UserKnowledgeStoreConfig
 from .models import UserKnowledgeRecord
 from .store import UserKnowledgeAccessError
 
+# The availability flag + the shared SDK symbols live in `couchbase_connect`; these
+# are the extra types only this store reads/writes with.
 try:  # pragma: no cover - exercised only when the couchbase SDK is installed
-    from acouchbase.cluster import Cluster
-    from couchbase.auth import PasswordAuthenticator
-    from couchbase.exceptions import DocumentNotFoundException
-    from couchbase.options import ClusterOptions, GetOptions, QueryOptions, UpsertOptions
-
-    COUCHBASE_AVAILABLE = True
+    from couchbase.options import QueryOptions, UpsertOptions
 except ImportError:  # pragma: no cover
-    COUCHBASE_AVAILABLE = False
+    pass
 
 
-class CouchbaseUserKnowledgeStore(CouchbaseConnectGate):
+class CouchbaseUserKnowledgeStore(CouchbaseStoreBase):
     """Real `UserKnowledgeStore` backed by the dedicated `user_knowledge` bucket."""
 
     def __init__(self, config: UserKnowledgeStoreConfig, cluster: Any = None) -> None:
-        if not COUCHBASE_AVAILABLE:
-            raise RuntimeError(
-                "The 'couchbase' package is not installed. "
-                "Install it (see pyproject.toml) to use CouchbaseUserKnowledgeStore."
-            )
         self._config = config
-        self._cluster = cluster or Cluster(
-            config.user_knowledge_connection_string,
-            ClusterOptions(
-                PasswordAuthenticator(
-                    config.user_knowledge_username, config.user_knowledge_password
-                )
-            ),
-        )
-        self._bucket_name = config.user_knowledge_bucket
-        bucket = self._cluster.bucket(self._bucket_name)
-        self._collection = bucket.default_collection()
-        # The connect itself is async; every public coroutine awaits the gate.
-        self._init_connect_gate(self._cluster, bucket)
-        self._ttl = (
-            timedelta(seconds=config.user_knowledge_ttl_seconds)
-            if config.user_knowledge_ttl_seconds > 0
-            else None
+        # KV-only default collection = the base's default `_bind_collections`. A
+        # non-positive TTL means NO expiry here (`ttl_none_when_not_positive`), which
+        # the writes below turn into options built without `expiry=`.
+        self._init_couchbase_store(
+            cluster=cluster,
+            connection_string=config.user_knowledge_connection_string,
+            username=config.user_knowledge_username,
+            password=config.user_knowledge_password,
+            bucket=config.user_knowledge_bucket,
+            ttl_seconds=config.user_knowledge_ttl_seconds,
+            ttl_none_when_not_positive=True,
         )
 
     def bucket(self) -> str:
@@ -85,11 +78,8 @@ class CouchbaseUserKnowledgeStore(CouchbaseConnectGate):
 
     async def get(self, record_id: str) -> UserKnowledgeRecord | None:
         await self._ensure_connected()
-        try:
-            result = await self._collection.get(record_id, GetOptions())
-        except DocumentNotFoundException:
-            return None
-        return UserKnowledgeRecord.from_doc(result.content_as[dict])
+        result = await get_or_none(self._collection, record_id)
+        return None if result is None else UserKnowledgeRecord.from_doc(result.content_as[dict])
 
     async def list_for_user(
         self, user_id: str, *, limit: int = 100

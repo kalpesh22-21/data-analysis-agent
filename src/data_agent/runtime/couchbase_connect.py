@@ -1,5 +1,14 @@
-"""CouchbaseConnectGate — the ONE place a Couchbase-backed store waits for its
-own connection, so no caller has to know the SDK's lifecycle.
+"""How a Couchbase-backed store is BUILT and CONNECTED — the one home for both.
+
+Two things live here, in dependency order:
+
+  * `CouchbaseConnectGate` — the ONE place a store waits for its own connection,
+    so no caller has to know the SDK's lifecycle (the bulk of this docstring).
+  * `CouchbaseStoreBase` — the ONE place a store's `Cluster`/bucket/collection
+    handles are constructed, along with the SDK import guard, the TTL
+    normalisation and the `get_or_none` KV-read idiom. It builds ON the gate:
+    construction is DEFERRED to the gate's first await (see below), which is
+    what makes a store constructible outside a running event loop.
 
 WHY this exists. `acouchbase.Cluster.__init__` *starts* the bootstrap but does
 not finish it, and the SDK then refuses EVERY operation until someone awaits
@@ -37,21 +46,40 @@ INVARIANTS this mixin establishes:
      handle reports connected, so a store built against a down cluster retries
      on the next call instead of being permanently poisoned.
 
-What this gate deliberately does NOT do: it does not make CONSTRUCTION safe
-outside a running event loop. `Cluster.__init__` reaches for the running loop
-(`ClientAdapter._get_loop` raises `RuntimeError('Event loop is not running.')`),
-which is why `scripts/run_ui_runtime_real.py` and `scripts/run_ui_runtime.py`
-wrap the session store in a lazy-construction proxy. Deferring the `Cluster(...)`
-call into this gate as well would make those proxies redundant, but it would also
-move a bad-connection-string failure from server boot to the first request, so it
-is left as a deliberate follow-up rather than folded in here.
+CONSTRUCTION is gated too (2026-08-17). `Cluster.__init__` reaches for the running
+loop (`ClientAdapter._get_loop` raises `RuntimeError('Event loop is not running.')`),
+so a store built at module import — which is exactly what `uvicorn module:app` and
+both UI launchers do — used to raise before it could serve anything. That was worked
+around OUTSIDE the store, by two hand-written ~110-line lazy proxies in `scripts/`
+that re-declared every `SessionStore` method, drifted from the Protocol twice, and
+needed their own AST test to keep honest. `CouchbaseStoreBase` below folds the
+deferral into the gate instead: `__init__` does NO I/O and touches NO loop, and the
+FIRST `_ensure_connected()` builds the cluster and opens the handles.
+
+The cost that deferral was once declined for is real and stands: a bad connection
+string or credential now surfaces on the first request rather than at boot. That is
+what `connect()` is for — a caller that wants boot-time failure awaits it once
+(inside its loop) and gets the same attributable error the eager construction gave.
+A failed lazy build is not cached (`_cluster` is assigned only on success), so the
+retry posture matches invariant 3 below.
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
+from datetime import timedelta
 from typing import Any
+
+try:  # pragma: no cover - exercised only when the couchbase SDK is installed
+    from acouchbase.cluster import Cluster
+    from couchbase.auth import PasswordAuthenticator
+    from couchbase.exceptions import DocumentNotFoundException
+    from couchbase.options import ClusterOptions, GetOptions
+
+    COUCHBASE_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    COUCHBASE_AVAILABLE = False
 
 _logger = logging.getLogger(__name__)
 
@@ -60,10 +88,11 @@ class CouchbaseConnectGate:
     """Mixin giving a Couchbase-backed store `_ensure_connected` / `connect` /
     `close`.
 
-    The subclass builds its own `Cluster` and bucket in `__init__` (the SDK's
-    handle graph is sync to construct) and then registers them here via
-    `_init_connect_gate`. Everything asynchronous — the actual connect — is
-    deferred to the first awaited method.
+    The subclass (in practice `CouchbaseStoreBase`) registers its `Cluster` and
+    bucket here via `_init_connect_gate` once they exist — at `__init__` when a
+    ready cluster was injected, otherwise at the first `_ensure_connected()`.
+    Everything asynchronous — the actual connect — is deferred to the first
+    awaited method.
     """
 
     _connect_targets: tuple[Any, ...]
@@ -142,6 +171,11 @@ class CouchbaseConnectGate:
         store is spent — `close` is for process shutdown, not for pooling.
         """
         self._connected = False
+        if not self._connect_targets:
+            # A lazily-built store that was never awaited has no cluster to
+            # release — closing it is a no-op, not an error. (Registration and
+            # construction happen together, so empty targets means "never built".)
+            return
         cluster, _bucket = self._connect_targets
         closer = getattr(cluster, "close", None)
         if closer is None:
@@ -149,3 +183,134 @@ class CouchbaseConnectGate:
         pending = closer()
         if inspect.isawaitable(pending):
             await pending
+
+
+def couchbase_ttl(seconds: int, *, none_when_not_positive: bool = False) -> timedelta | None:
+    """The `expiry=` value for a store's writes, from its configured seconds.
+
+    Two semantics exist in this codebase and they are NOT interchangeable, so the
+    choice is a parameter rather than a rule:
+
+      * default — a bare `timedelta`, always applied (sessions, candidates, audit).
+      * `none_when_not_positive=True` — a non-positive setting means "no expiry at
+        all" and yields `None`, which the caller turns into options built WITHOUT
+        `expiry=` (user knowledge, blueprint corpus). Passing `timedelta(0)` there
+        would mean the opposite of what those stores intend for `0`, since the SDK
+        reads a zero expiry as "clear the TTL".
+    """
+    if none_when_not_positive and seconds <= 0:
+        return None
+    return timedelta(seconds=seconds)
+
+
+async def get_or_none(collection: Any, key: str) -> Any | None:
+    """One KV read: the SDK `GetResult`, or `None` when the document is absent.
+
+    "Missing is not exceptional" is the shape every store's read wants (a purged or
+    TTL-expired document is a normal answer), so it is written once here instead of
+    six times. Returns the RESULT, not the content: callers need `content_as[dict]`,
+    and `CouchbaseSessionStore` also needs `result.cas`.
+
+    Caller obligation: `await self._ensure_connected()` FIRST — this touches a handle
+    (invariant 1). It is a free function, not a method, precisely so it cannot be
+    mistaken for a gated entry point.
+    """
+    try:
+        return await collection.get(key, GetOptions())
+    except DocumentNotFoundException:
+        return None
+
+
+class CouchbaseStoreBase(CouchbaseConnectGate):
+    """The construction half of a Couchbase-backed store: cluster, bucket, TTL.
+
+    Five stores (sessions, candidates, audit, user knowledge, blueprint corpus)
+    repeated the same `__init__` body — availability guard, `cluster or Cluster(...)`
+    with a `PasswordAuthenticator`, bucket + collection derivation, `_init_connect_gate`,
+    TTL — against five different settings objects. The differences are all DATA
+    (credentials, bucket name, TTL semantics) except one: which collections the store
+    opens, which is `_bind_collections`.
+
+    The `cluster=` parameter every store exposes is a TEST SEAM (unit suites inject a
+    fake handle graph), and that path stays EAGER: an injected cluster is already
+    constructed, so its collections are derived in `__init__` exactly as before —
+    a fake whose `collection()` is a one-shot `side_effect` still sees the same two
+    calls, in the same order, at the same moment. Only the settings-derived cluster
+    is deferred, because only it needs a running event loop.
+    """
+
+    # `_cluster` is None between `__init__` and the first connect on the lazy path.
+    _cluster: Any
+    _bucket_name: str
+    _ttl: timedelta | None
+
+    def _init_couchbase_store(
+        self,
+        *,
+        cluster: Any,
+        connection_string: str,
+        username: str,
+        password: str,
+        bucket: str,
+        ttl_seconds: int,
+        ttl_none_when_not_positive: bool = False,
+    ) -> None:
+        """Called from a store's `__init__`, AFTER it has set the attributes its own
+        `_bind_collections` reads (its settings object). Does no I/O when *cluster* is
+        None: it only records what the first connect will need."""
+        if not COUCHBASE_AVAILABLE:
+            raise RuntimeError(
+                "The 'couchbase' package is not installed. "
+                f"Install it (see pyproject.toml) to use {type(self).__name__}."
+            )
+        self._bucket_name = bucket
+        self._connection_string = connection_string
+        self._username = username
+        self._password = password
+        self._ttl = couchbase_ttl(ttl_seconds, none_when_not_positive=ttl_none_when_not_positive)
+        # Empty until the handles exist; `close()` reads this as "never built".
+        self._connect_targets = ()
+        self._connected = False
+        self._cluster = cluster
+        if cluster is not None:
+            self._open_handles()
+
+    def _bind_collections(self, bucket: Any) -> None:
+        """Open the collections this store works in. Default: the bucket's default
+        collection (KV-only stores). Overridden by stores with named scopes."""
+        self._collection = bucket.default_collection()
+
+    def _open_handles(self) -> None:
+        """Derive bucket + collections from `self._cluster` and register the connect
+        targets. Synchronous — the SDK's handle graph is sync to construct; only the
+        connect is async."""
+        bucket = self._cluster.bucket(self._bucket_name)
+        self._bind_collections(bucket)
+        self._init_connect_gate(self._cluster, bucket)
+
+    async def _ensure_connected(self) -> None:
+        """The gate, plus the lazy CONSTRUCTION step in front of it.
+
+        No `await` separates the None-check from the assignment, so two concurrent
+        first-callers cannot both build a cluster: the whole block runs to completion
+        before the event loop can switch.
+
+        `_cluster` ends up non-None only when the WHOLE build succeeded — cluster and
+        handles. A partial build must not be kept: with `_cluster` set but
+        `_connect_targets` still empty, the gate below would find nothing to await,
+        declare itself connected, and every later call would `AttributeError` on a
+        collection that was never bound, with `close()` leaking the cluster it could
+        no longer see. So a failure anywhere in here unwinds to "never built" and the
+        next call retries — the same posture invariant 3 gives a failed connect.
+        """
+        if self._cluster is None:
+            self._cluster = Cluster(
+                self._connection_string,
+                ClusterOptions(PasswordAuthenticator(self._username, self._password)),
+            )
+            try:
+                self._open_handles()
+            except BaseException:
+                self._cluster = None
+                raise
+        await super()._ensure_connected()

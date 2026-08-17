@@ -145,4 +145,6 @@ helpers) → **T5.5 single `finish()`** (7 `TurnOutcome` sites) →
 | 0 baseline | done (L3/L5 pre-existing reds, diagnosed → issues stack K1/K2) | #1 |
 | Tier 1 drift hazards | done, reviewed, V0+V1 green | #2 |
 | Tier 2 deletions | done, reviewed, V0+V1+V2 green (−1208 LOC) | #3 |
-| Eval harness fidelity (K1 F1/F2/F3 + G3) | proposed, awaiting user go | — |
+| Tier 3 Couchbase seam | done, reviewed, V0+V1+V2 green (proxies deleted) | #4 |
+| Eval harness fidelity (K1 F1/F2/F3 + G3) | built in worktree; L3 3/3; review pending | — |
+| L5 runtime fix (G1/G2) | partial work quarantined (worktree escape); relaunch pending | — |

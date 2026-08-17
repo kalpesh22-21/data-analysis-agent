@@ -15,11 +15,11 @@ import pytest
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.dedup.corpus import CorpusArtifact
 from data_agent.learning.dedup.couchbase_corpus import (
-    COUCHBASE_AVAILABLE,
     CouchbaseBlueprintCorpus,
     _doc_id,
     _to_doc,
 )
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 
 pytestmark = pytest.mark.skipif(
     not COUCHBASE_AVAILABLE, reason="Requires the 'couchbase' package for exception types."

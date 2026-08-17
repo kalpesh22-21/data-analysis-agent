@@ -17,55 +17,52 @@ been awaited, and a sync `__init__` cannot do that, so each public coroutine
 gates itself. The consumer/scheduler/inbox daemons build this store and never
 connected it; nothing here had ever run from a daemon entrypoint either. See
 `runtime/couchbase_connect.py`.
+
+CONSTRUCTION (2026-08-17): also shared, via `CouchbaseStoreBase` — the SDK guard,
+the `Cluster`/bucket/collection graph, and the TTL are built there from this
+store's own settings, and (with no `cluster=` injected) not until the first
+`_ensure_connected()`. `__init__` does no I/O.
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import Any
 
-from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
+from data_agent.runtime.couchbase_connect import (
+    CouchbaseStoreBase,
+    couchbase_ttl,
+    get_or_none,
+)
 
 from ..config import LearningSettings
 from .judgement import JudgeRecord
 from .models import EvidenceSnapshot
 from .store import mint_evidence_ref
 
+# The availability flag + the shared SDK symbols live in `couchbase_connect`; this
+# is the extra type only this store writes with.
 try:  # pragma: no cover - exercised only when the couchbase SDK is installed
-    from acouchbase.cluster import Cluster
-    from couchbase.auth import PasswordAuthenticator
-    from couchbase.exceptions import DocumentNotFoundException
-    from couchbase.options import ClusterOptions, GetOptions, UpsertOptions
-
-    COUCHBASE_AVAILABLE = True
+    from couchbase.options import UpsertOptions
 except ImportError:  # pragma: no cover
-    COUCHBASE_AVAILABLE = False
+    pass
 
 
-class CouchbaseAuditStore(CouchbaseConnectGate):
+class CouchbaseAuditStore(CouchbaseStoreBase):
     """Real `AuditStore` backed by the dedicated `learning_audit` bucket."""
 
     def __init__(self, settings: LearningSettings, cluster: Any = None) -> None:
-        if not COUCHBASE_AVAILABLE:
-            raise RuntimeError(
-                "The 'couchbase' package is not installed. "
-                "Install it (see pyproject.toml) to use CouchbaseAuditStore."
-            )
         self._settings = settings
-        self._cluster = cluster or Cluster(
-            settings.learning_audit_connection_string,
-            ClusterOptions(
-                PasswordAuthenticator(
-                    settings.learning_audit_username, settings.learning_audit_password
-                )
-            ),
+        # KV-only, default scope/collection (no GSI needed — §4.1) = the base's
+        # default `_bind_collections`. No I/O here: with no injected cluster the
+        # handles are built by the first `_ensure_connected()`.
+        self._init_couchbase_store(
+            cluster=cluster,
+            connection_string=settings.learning_audit_connection_string,
+            username=settings.learning_audit_username,
+            password=settings.learning_audit_password,
+            bucket=settings.learning_audit_bucket,
+            ttl_seconds=settings.learning_audit_ttl_seconds,
         )
-        bucket = self._cluster.bucket(settings.learning_audit_bucket)
-        # KV-only, default scope/collection (no GSI needed — §4.1).
-        self._collection = bucket.default_collection()
-        # The connect itself is async; every public coroutine awaits the gate.
-        self._init_connect_gate(self._cluster, bucket)
-        self._ttl = timedelta(seconds=settings.learning_audit_ttl_seconds)
         # A SEPARATE clock for judge verdicts (plan §3b). Same bucket, different
         # question: an evidence quote is entity-bearing and SHOULD expire on the D95
         # 90-day audit floor, while a verdict row is scalars plus one capped reason and
@@ -73,9 +70,7 @@ class CouchbaseAuditStore(CouchbaseConnectGate):
         # have erased the dataset roughly as fast as the skew signal it carries
         # accumulates — the composable-blueprint question is answered by months of rows,
         # not by 90 days of them.
-        self._judgement_ttl = timedelta(
-            seconds=settings.learning_judge_record_ttl_seconds
-        )
+        self._judgement_ttl = couchbase_ttl(settings.learning_judge_record_ttl_seconds)
 
     def mint_evidence_ref(self, session_id: str) -> str:
         return mint_evidence_ref(session_id)
@@ -88,11 +83,8 @@ class CouchbaseAuditStore(CouchbaseConnectGate):
 
     async def read(self, ref: str) -> EvidenceSnapshot | None:
         await self._ensure_connected()
-        try:
-            result = await self._collection.get(ref, GetOptions())
-        except DocumentNotFoundException:
-            return None
-        return EvidenceSnapshot.from_doc(result.content_as[dict])
+        result = await get_or_none(self._collection, ref)
+        return None if result is None else EvidenceSnapshot.from_doc(result.content_as[dict])
 
     async def record_judgement(self, record: JudgeRecord) -> None:
         """Upsert one coverage judgement (plan §3b) under its content-derived key.
@@ -116,8 +108,5 @@ class CouchbaseAuditStore(CouchbaseConnectGate):
 
     async def read_judgement(self, ref: str) -> JudgeRecord | None:
         await self._ensure_connected()
-        try:
-            result = await self._collection.get(ref, GetOptions())
-        except DocumentNotFoundException:
-            return None
-        return JudgeRecord.from_doc(result.content_as[dict])
+        result = await get_or_none(self._collection, ref)
+        return None if result is None else JudgeRecord.from_doc(result.content_as[dict])

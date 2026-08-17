@@ -17,6 +17,11 @@ Couchbase-backed store — `acouchbase` refuses all ops (KV *and* N1QL) until
 public coroutine gates itself. The consumer, the promotion scheduler and the
 inbox service all build this store and none of them connected it. See
 `runtime/couchbase_connect.py`.
+
+CONSTRUCTION (2026-08-17): also shared, via `CouchbaseStoreBase` — the SDK guard,
+the `Cluster`/bucket/collection graph and the TTL are built there from this store's
+own settings, and (with no `cluster=` injected) not until the first
+`_ensure_connected()`. `__init__` does no I/O.
 """
 
 from __future__ import annotations
@@ -24,7 +29,10 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any, Literal
 
-from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
+from data_agent.runtime.couchbase_connect import (
+    CouchbaseStoreBase,
+    get_or_none,
+)
 
 from ..config import LearningSettings
 from .models import CandidateEnvelope, CandidateStatus
@@ -77,49 +85,32 @@ _SORT_KEYS: dict[str, tuple[str, ...]] = {
     "last_scanned_at": ("last_scanned_at", "candidate_id"),
 }
 
+# The availability flag + the shared SDK symbols live in `couchbase_connect`; these
+# are the extra types only this store writes with.
 try:  # pragma: no cover - exercised only when the couchbase SDK is installed
-    from acouchbase.cluster import Cluster
-    from couchbase.auth import PasswordAuthenticator
     from couchbase.exceptions import DocumentNotFoundException
-    from couchbase.options import (
-        ClusterOptions,
-        GetOptions,
-        MutateInOptions,
-        QueryOptions,
-        UpsertOptions,
-    )
+    from couchbase.options import MutateInOptions, QueryOptions, UpsertOptions
     from couchbase.subdocument import upsert as sd_upsert
-
-    COUCHBASE_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    COUCHBASE_AVAILABLE = False
+    pass
 
 
-class CouchbaseCandidateStore(CouchbaseConnectGate):
+class CouchbaseCandidateStore(CouchbaseStoreBase):
     """Real `CandidateStore` backed by the dedicated `learning_candidates` bucket."""
 
     def __init__(self, settings: LearningSettings, cluster: Any = None) -> None:
-        if not COUCHBASE_AVAILABLE:
-            raise RuntimeError(
-                "The 'couchbase' package is not installed. "
-                "Install it (see pyproject.toml) to use CouchbaseCandidateStore."
-            )
         self._settings = settings
-        self._cluster = cluster or Cluster(
-            settings.learning_candidates_connection_string,
-            ClusterOptions(
-                PasswordAuthenticator(
-                    settings.learning_candidates_username,
-                    settings.learning_candidates_password,
-                )
-            ),
+        # KV + N1QL over the bucket's default collection = the base's default
+        # `_bind_collections`. No I/O here: with no injected cluster the handles are
+        # built by the first `_ensure_connected()`.
+        self._init_couchbase_store(
+            cluster=cluster,
+            connection_string=settings.learning_candidates_connection_string,
+            username=settings.learning_candidates_username,
+            password=settings.learning_candidates_password,
+            bucket=settings.learning_candidates_bucket,
+            ttl_seconds=settings.learning_candidates_ttl_seconds,
         )
-        self._bucket_name = settings.learning_candidates_bucket
-        bucket = self._cluster.bucket(self._bucket_name)
-        self._collection = bucket.default_collection()
-        # The connect itself is async; every public coroutine awaits the gate.
-        self._init_connect_gate(self._cluster, bucket)
-        self._ttl = timedelta(seconds=settings.learning_candidates_ttl_seconds)
 
     async def put(self, envelope: CandidateEnvelope) -> None:
         await self._ensure_connected()
@@ -136,11 +127,8 @@ class CouchbaseCandidateStore(CouchbaseConnectGate):
 
     async def get(self, candidate_id: str) -> CandidateEnvelope | None:
         await self._ensure_connected()
-        try:
-            result = await self._collection.get(candidate_id, GetOptions())
-        except DocumentNotFoundException:
-            return None
-        return CandidateEnvelope.from_doc(result.content_as[dict])
+        result = await get_or_none(self._collection, candidate_id)
+        return None if result is None else CandidateEnvelope.from_doc(result.content_as[dict])
 
     async def list_by_status(
         self,

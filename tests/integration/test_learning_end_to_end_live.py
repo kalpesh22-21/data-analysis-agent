@@ -63,7 +63,6 @@ import httpx
 import pytest
 from neo4j import AsyncGraphDatabase
 
-from data_agent.learning.candidate.couchbase_candidate_store import COUCHBASE_AVAILABLE
 from data_agent.learning.candidate.models import mint_candidate_id
 from data_agent.learning.candidate.verdicts import LeakageVerdict
 from data_agent.learning.config import LearningSettings, learning_enabled
@@ -79,6 +78,7 @@ from data_agent.learning.promotion.models import policy_from_settings
 from data_agent.learning.promotion.token_minter import HttpTokenMinter
 from data_agent.learning.sweeper import LearningSweeper
 from data_agent.runtime.config import RuntimeSettings
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient

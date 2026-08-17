@@ -34,7 +34,8 @@ import pytest
 
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.dedup.corpus import CorpusArtifact
-from data_agent.learning.dedup.couchbase_corpus import COUCHBASE_AVAILABLE, _doc_id
+from data_agent.learning.dedup.couchbase_corpus import _doc_id
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 
 pytestmark = pytest.mark.skipif(
     not COUCHBASE_AVAILABLE or not os.environ.get("RUN_COUCHBASE_TESTS"),

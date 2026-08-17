@@ -129,3 +129,54 @@ Verification:
   - Couchbase: session doc `session::s309b…` persisted in
     `agent_sessions._default.sessions`.
   Services shut down after verification.
+
+---
+
+## #4 — Tier 3: the Couchbase seam (2026-08-17)
+
+Fixed the missing seam that forced hand-written SessionStore proxies into
+scripts/, then shared the construction boilerplate across all 5 Couchbase
+stores. 26 files; net ≈ −100 LOC. Reviewed (APPROVE; 1 suggestion applied —
+half-built-store poisoning fixed with a fails-without-fix test; 2 nits:
+demo-launcher SDK-missing misconfig now fails at boot instead of first
+request — strictly better, noted here; stale proxy memory retired).
+
+- `CouchbaseStoreBase` (runtime/couchbase_connect.py): `Cluster(...)`
+  construction deferred into `_ensure_connected()` — `__init__` does no I/O,
+  needs no event loop; injected-cluster (test/fake) path stays eager,
+  byte-compatible. Race-safe (no await between check and registration,
+  verified against acouchbase 4.6.2 source); failed build leaves the store
+  retriable; `_cluster` assigned only when handles bind (review hardening).
+- Both `_LazyCouchbaseSessionStore` proxies deleted (~228 lines); launchers
+  construct the real store directly. AST proxy test replaced by
+  tests/runtime/test_launcher_session_store.py (Protocol-derived surface,
+  anti-vacuity, per-store "no cluster at construction / built on first
+  await" cases).
+- All 5 stores (session/candidate/audit/user/corpus) converted; public
+  signatures unchanged; 3 TTL variants preserved; `get_or_none` KV helper;
+  availability-error text identical (verified). Config-side
+  `CouchbaseBucketSettings` collapse deliberately skipped (env-var risk).
+
+Verification:
+- V0: **5550 passed, 225 skipped, 1 xfailed** (−14 vs Tier-2, reconciled:
+  −59 proxy test, +31 launcher test, +14 gate tests).
+- V1: first run invalidated — a parallel agent had contaminated the main
+  checkout's agent_loop.py mid-run (quarantined; see below) and its live
+  eval runs contended (24:43 vs ~4:00). Clean rerun after containment:
+  **L2 3/3, L4 3/3, multi-intent 2/3** — all at baseline; L1/L6/L7 3/3 and
+  L3 0/3, L5 0/3 from the invalidated run stand (L3/L5 = known K1/K2).
+- V2 (mandatory — session store): **PASS.** run_ui_runtime_real constructed
+  CouchbaseSessionStore directly at import, no loop (the deleted proxies'
+  whole reason to exist); first request lazily built the cluster; turn 1
+  answered with 2 verified-shape tables; session doc persisted; turn 2
+  answered from replayed Couchbase history with **0 tool calls**; Phoenix
+  `data-agent-runtime` spans carried real SQL (OTLP_DISABLE_REDACTION=1 per
+  user request).
+
+Process incident, recorded: the parallel L5-fix agent (G1/G2) escaped its
+worktree after a stall-resume and edited the MAIN checkout's agent_loop.py
+during Tier-3's V1. Contained: agent stopped, partial diff quarantined to
+scratchpad (g1-partial.diff), file restored from HEAD, rerun clean. Lesson:
+after resuming a stalled worktree agent, verify its cwd containment before
+letting live verification run; serialize live-eval workloads (API/CPU
+contention turned a 4-min gate into 25 min and produced flaky reds).

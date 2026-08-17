@@ -56,7 +56,6 @@ from dataclasses import dataclass
 
 import pytest
 
-from data_agent.learning.candidate.couchbase_candidate_store import COUCHBASE_AVAILABLE
 from data_agent.learning.candidate.models import mint_candidate_id
 from data_agent.learning.candidate.verdicts import LeakageVerdict
 from data_agent.learning.config import LearningSettings
@@ -67,6 +66,7 @@ from data_agent.learning.models import LearningJob, LearningStatus, compute_cont
 from data_agent.learning.triage import TriageVerdict
 from data_agent.learning.user.models import mint_record_id
 from data_agent.runtime.config import RuntimeSettings
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
 from data_agent.runtime.session.models import SessionDoc, TrailEntry, TurnMessage

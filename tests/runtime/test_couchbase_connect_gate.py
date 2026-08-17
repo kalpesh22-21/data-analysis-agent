@@ -31,7 +31,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from data_agent.learning.audit.couchbase_audit_store import (
-    COUCHBASE_AVAILABLE,
     CouchbaseAuditStore,
 )
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
@@ -40,6 +39,7 @@ from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
 from data_agent.learning.user.config import UserKnowledgeStoreConfig
 from data_agent.learning.user.couchbase_user_store import CouchbaseUserKnowledgeStore
 from data_agent.runtime.config import RuntimeSettings
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 
 pytestmark = pytest.mark.skipif(
@@ -177,15 +177,28 @@ class _FakeCollection:
         self._cluster.docs.pop(key, None)
 
 
-def _build(store_cls: type) -> tuple[Any, _FakeCluster]:
-    """Construct one store of each kind against a fresh fake cluster."""
-    cluster = _FakeCluster()
+def _build(store_cls: type, cluster: Any = None) -> tuple[Any, _FakeCluster]:
+    """Construct one store of each kind against a fresh fake cluster.
+
+    Passing `cluster=None` builds the store the way PRODUCTION does — no injected
+    handle graph, so its cluster is built lazily at the first connect.
+    """
+    cluster = _FakeCluster() if cluster is None else cluster
     if store_cls is CouchbaseSessionStore:
         return CouchbaseSessionStore(RuntimeSettings(_env_file=None), cluster=cluster), cluster
     if store_cls is CouchbaseUserKnowledgeStore:
         config = UserKnowledgeStoreConfig(_env_file=None)
         return CouchbaseUserKnowledgeStore(config, cluster=cluster), cluster
     return store_cls(LearningSettings(_env_file=None), cluster=cluster), cluster
+
+
+def _build_unwired(store_cls: type) -> Any:
+    """The same store with NO cluster injected — the production construction."""
+    if store_cls is CouchbaseSessionStore:
+        return CouchbaseSessionStore(RuntimeSettings(_env_file=None))
+    if store_cls is CouchbaseUserKnowledgeStore:
+        return CouchbaseUserKnowledgeStore(UserKnowledgeStoreConfig(_env_file=None))
+    return store_cls(LearningSettings(_env_file=None))
 
 
 _STORE_CLASSES = [
@@ -198,6 +211,10 @@ _STORE_CLASSES = [
 
 _SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "data_agent"
 
+# The shared construction/connect machinery in `runtime/couchbase_connect.py` — not
+# stores themselves, and the discriminator the source scan below uses to find stores.
+_STORE_MACHINERY = {"CouchbaseStoreBase"}
+
 
 def _callee_name(func: ast.expr) -> str | None:
     """The bare name of whatever is being called (`Cluster` / `acouchbase.Cluster`)."""
@@ -208,11 +225,21 @@ def _callee_name(func: ast.expr) -> str | None:
     return None
 
 
-def _classes_that_construct_a_cluster() -> set[str]:
-    """Every class in the source tree that builds an `acouchbase` `Cluster`.
+def _base_names(node: ast.ClassDef) -> set[str]:
+    return {_callee_name(base) for base in node.bases} - {None}  # type: ignore[operator]
+
+
+def _couchbase_backed_classes() -> set[str]:
+    """Every store class in the source tree that owns a Couchbase handle graph.
 
     A SOURCE scan, not an import-and-introspect one: the point is to find a store
     nobody registered, and a store nobody registered is a store nobody imported.
+
+    Two signals, because the construction moved: a class that calls `Cluster(...)`
+    itself, and a class that inherits `CouchbaseStoreBase` (which now builds the
+    cluster on its behalf — that inheritance IS the store's declaration that it has
+    the SDK's connect precondition to satisfy). The base itself is excluded: it is
+    the shared machinery, not a store, and it is proven through all five of them.
     """
     found: set[str] = set()
     for path in sorted(_SRC_ROOT.rglob("*.py")):
@@ -220,10 +247,13 @@ def _classes_that_construct_a_cluster() -> set[str]:
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
                 continue
-            if any(
+            if node.name in _STORE_MACHINERY:
+                continue
+            builds_cluster = any(
                 isinstance(child, ast.Call) and _callee_name(child.func) == "Cluster"
                 for child in ast.walk(node)
-            ):
+            )
+            if builds_cluster or _base_names(node) & _STORE_MACHINERY:
                 found.add(node.name)
     return found
 
@@ -332,23 +362,22 @@ def test_every_store_in_the_source_tree_is_registered_here() -> None:
     The method list is derived, so a new METHOD that skips the gate fails above. But a
     new CLASS that never inherits the gate at all is invisible to that enumeration —
     it simply is not in the list, and nothing notices. So the list is checked against
-    the source tree: every class that constructs an `acouchbase` `Cluster` must be
-    registered, which is precisely the population that has the SDK's connect
+    the source tree: every class that owns a Couchbase handle graph — by constructing
+    an `acouchbase` `Cluster` or by inheriting the base that constructs one for it —
+    must be registered, which is precisely the population that has the SDK's connect
     precondition to satisfy.
 
-    Known limit, stated rather than papered over: this finds a store that CONSTRUCTS
-    its own cluster. A class handed a cluster it never builds would still slip past —
-    but every store here builds its own (the `cluster=` parameter is a test seam), so
-    that shape does not exist yet and inventing a detector for it would be a guard
-    written from imagination.
+    The old known limit (a class handed a cluster it never builds would slip past)
+    closed when construction moved into `CouchbaseStoreBase`: such a class must
+    inherit the base to get its handles, and the inheritance is what is detected.
     """
     registered = {cls.__name__ for cls in _STORE_CLASSES}
-    discovered = _classes_that_construct_a_cluster()
+    discovered = _couchbase_backed_classes()
     assert discovered == registered, (
         "the set of Couchbase-backed stores in src/ no longer matches the set proven "
         f"here. Only in the source tree: {sorted(discovered - registered)}. Only in "
         f"_STORE_CLASSES: {sorted(registered - discovered)}. A new store must be added "
-        "to _STORE_CLASSES (and inherit CouchbaseConnectGate) or every one of its "
+        "to _STORE_CLASSES (and inherit CouchbaseStoreBase) or every one of its "
         "methods ships unproven against the SDK's connect precondition."
     )
 
@@ -411,3 +440,158 @@ async def test_close_releases_the_cluster_and_marks_the_store_unconnected() -> N
     await store.close()
     assert cluster.closes == 1
     assert store._connected is False
+
+
+# --------------------------------------------------------------------------
+# CONSTRUCTION is deferred too (`CouchbaseStoreBase`)
+#
+# `Cluster.__init__` reaches for the RUNNING event loop, so a store built at module
+# import — which is what `uvicorn scripts.run_ui_runtime:app` does — used to raise
+# `RuntimeError('Event loop is not running.')` before it could serve anything. The
+# workaround lived outside the store (two hand-written lazy `SessionStore` proxies in
+# `scripts/`, which drifted from the Protocol twice and needed their own AST test).
+# These cases pin the seam that replaced them. They are deliberately SYNCHRONOUS where
+# the point is "no loop": a sync test function has no running loop, which is the exact
+# condition the launchers construct under.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("store_cls", _STORE_CLASSES, ids=lambda cls: cls.__name__)
+def test_construction_builds_no_cluster_and_needs_no_event_loop(
+    store_cls: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`__init__` does NO I/O: it must not call `Cluster(...)` at all."""
+    from data_agent.runtime import couchbase_connect
+
+    def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError(
+            f"{store_cls.__name__}.__init__ constructed a Cluster. That reaches for the "
+            "running event loop, so the store can no longer be built at module import "
+            "and every launcher needs a lazy proxy again."
+        )
+
+    monkeypatch.setattr(couchbase_connect, "Cluster", _refuse)
+    store = _build_unwired(store_cls)
+    assert store._cluster is None
+    assert store._connect_targets == ()
+
+
+@pytest.mark.parametrize("store_cls", _STORE_CLASSES, ids=lambda cls: cls.__name__)
+async def test_the_first_await_builds_the_cluster_exactly_once(
+    store_cls: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deferred, not dropped: the first gated call constructs the cluster from the
+    store's own settings, opens its handles, and connects — and later calls reuse it."""
+    from data_agent.runtime import couchbase_connect
+
+    cluster = _FakeCluster()
+    built: list[str] = []
+
+    def _factory(connection_string: str, _options: Any) -> _FakeCluster:
+        built.append(connection_string)
+        return cluster
+
+    monkeypatch.setattr(couchbase_connect, "Cluster", _factory)
+    store = _build_unwired(store_cls)
+
+    await store.connect()
+    assert built == ["couchbase://localhost"]
+    assert cluster.cluster_connects == 1 and cluster.bucket_connects == 1
+
+    await store.connect()
+    assert built == ["couchbase://localhost"], "the cluster was rebuilt on a later call"
+
+
+async def test_a_half_built_store_is_not_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cluster survived but opening its handles did not (a missing bucket/scope,
+    or a transient SDK error): the store must unwind to "never built".
+
+    Keeping it would be worse than the original failure — `_cluster` set with
+    `_connect_targets` still empty makes the gate find nothing to await, mark itself
+    connected, and then `AttributeError` on an unbound collection for the rest of the
+    process, while `close()` silently leaks the cluster it can no longer see.
+    """
+    from data_agent.runtime import couchbase_connect
+
+    cluster = _FakeCluster()
+    monkeypatch.setattr(couchbase_connect, "Cluster", lambda *_a, **_k: cluster)
+    store = _build_unwired(CouchbaseSessionStore)
+
+    real_open_handles = store._open_handles
+    failures: list[int] = []
+
+    def _open_handles_failing_once() -> None:
+        if not failures:
+            failures.append(1)
+            raise RuntimeError("bucket 'agent_sessions' does not exist")
+        real_open_handles()
+
+    monkeypatch.setattr(store, "_open_handles", _open_handles_failing_once)
+
+    with pytest.raises(RuntimeError, match="does not exist"):
+        await store.get_or_create_session("s1")
+    assert store._cluster is None, "a half-built store was cached"
+    assert store._connect_targets == ()
+    assert store._connected is False
+
+    # ... and the next call rebuilds from scratch and works.
+    doc = await store.get_or_create_session("s1")
+    assert doc.session_id == "s1"
+    assert cluster.connected is True
+
+
+async def test_a_failed_lazy_build_is_retried_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same posture as a failed connect (invariant 3): a store built while the endpoint
+    is unreachable must recover on the next call, not be poisoned for the process."""
+    from data_agent.runtime import couchbase_connect
+
+    cluster = _FakeCluster()
+    attempts: list[int] = []
+
+    def _factory(_connection_string: str, _options: Any) -> _FakeCluster:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("bad connection string")
+        return cluster
+
+    monkeypatch.setattr(couchbase_connect, "Cluster", _factory)
+    store = _build_unwired(CouchbaseSessionStore)
+
+    with pytest.raises(RuntimeError, match="bad connection string"):
+        await store.get_or_create_session("s1")
+
+    doc = await store.get_or_create_session("s1")
+    assert doc.session_id == "s1"
+    assert len(attempts) == 2
+
+
+async def test_closing_a_store_that_never_connected_is_a_no_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown must not resurrect (or trip over) a cluster that was never built — a
+    launcher that starts and stops without serving a request closes exactly this store."""
+    from data_agent.runtime import couchbase_connect
+
+    def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("close() built a Cluster")
+
+    monkeypatch.setattr(couchbase_connect, "Cluster", _refuse)
+    store = _build_unwired(CouchbaseSessionStore)
+
+    await store.close()
+    assert store._connected is False
+
+
+def test_an_injected_cluster_still_opens_its_handles_eagerly() -> None:
+    """The `cluster=` seam keeps its ORIGINAL timing: handles are derived in `__init__`.
+
+    Unit suites inject one-shot fakes (`collection.side_effect = [sessions, results]`)
+    and read the collections back straight after constructing the store, so moving that
+    derivation behind the first await would break them — and, less visibly, would change
+    which object a test asserts against. Only the settings-derived cluster is deferred,
+    because only it needs a running loop.
+    """
+    store, cluster = _build(CouchbaseSessionStore)
+    assert store._cluster is cluster
+    assert store._connect_targets == (cluster, cluster.bucket("any"))
+    assert store._sessions is cluster.bucket("any").default_collection()

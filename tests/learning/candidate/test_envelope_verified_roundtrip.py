@@ -13,12 +13,12 @@ from dataclasses import replace
 import pytest
 
 from data_agent.learning.candidate.couchbase_candidate_store import (
-    COUCHBASE_AVAILABLE,
     CouchbaseCandidateStore,
 )
 from data_agent.learning.candidate.memory_candidate_store import InMemoryCandidateStore
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.config import LearningSettings
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 
 
 def _env(**over) -> CandidateEnvelope:

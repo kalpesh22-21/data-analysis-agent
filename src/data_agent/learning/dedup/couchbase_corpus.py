@@ -35,33 +35,33 @@ Couchbase-backed store — `acouchbase` refuses all ops until `on_connect()` has
 been awaited, which a sync `__init__` cannot do, so each public coroutine gates
 itself. The consumer, the promotion scheduler and the inbox service all build
 this store and none of them connected it. See `runtime/couchbase_connect.py`.
+
+CONSTRUCTION (2026-08-17): also shared, via `CouchbaseStoreBase` — the SDK guard,
+the `Cluster`/bucket/collection graph and the TTL are built there from this store's
+own settings, and (with no `cluster=` injected) not until the first
+`_ensure_connected()`. `__init__` does no I/O.
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import Any
 
-from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
+from data_agent.runtime.couchbase_connect import (
+    CouchbaseStoreBase,
+    get_or_none,
+)
 
 from ..config import LearningSettings
 from .corpus import CorpusArtifact
 
+# The availability flag + the shared SDK symbols live in `couchbase_connect`; these
+# are the extra types only this store writes with.
 try:  # pragma: no cover - exercised only when the couchbase SDK is installed
     import couchbase.subdocument as subdoc
-    from acouchbase.cluster import Cluster
-    from couchbase.auth import PasswordAuthenticator
     from couchbase.exceptions import DocumentExistsException, DocumentNotFoundException
-    from couchbase.options import (
-        ClusterOptions,
-        GetOptions,
-        InsertOptions,
-        QueryOptions,
-    )
-
-    COUCHBASE_AVAILABLE = True
+    from couchbase.options import InsertOptions, QueryOptions
 except ImportError:  # pragma: no cover
-    COUCHBASE_AVAILABLE = False
+    pass
 
 
 def _doc_id(canonical_key: str) -> str:
@@ -93,7 +93,7 @@ def _to_doc(artifact: CorpusArtifact) -> dict[str, Any]:
     }
 
 
-class CouchbaseBlueprintCorpus(CouchbaseConnectGate):
+class CouchbaseBlueprintCorpus(CouchbaseStoreBase):
     """Real `BlueprintCorpus` backed by the dedicated `learning_corpus` bucket.
 
     Also duck-types the S9 `HitCountReader` port (`hit_count(canonical_key) -> int`)
@@ -102,39 +102,24 @@ class CouchbaseBlueprintCorpus(CouchbaseConnectGate):
     """
 
     def __init__(self, settings: LearningSettings, cluster: Any = None) -> None:
-        if not COUCHBASE_AVAILABLE:
-            raise RuntimeError(
-                "The 'couchbase' package is not installed. "
-                "Install it (see pyproject.toml) to use CouchbaseBlueprintCorpus."
-            )
         self._settings = settings
-        self._cluster = cluster or Cluster(
-            settings.learning_corpus_connection_string,
-            ClusterOptions(
-                PasswordAuthenticator(
-                    settings.learning_corpus_username,
-                    settings.learning_corpus_password,
-                )
-            ),
-        )
-        self._bucket_name = settings.learning_corpus_bucket
-        bucket = self._cluster.bucket(self._bucket_name)
-        self._collection = bucket.default_collection()
-        # The connect itself is async; every public coroutine awaits the gate.
-        self._init_connect_gate(self._cluster, bucket)
-        self._ttl = (
-            timedelta(seconds=settings.learning_corpus_ttl_seconds)
-            if settings.learning_corpus_ttl_seconds > 0
-            else None
+        # KV-only default collection = the base's default `_bind_collections`. A
+        # non-positive TTL means NO expiry here (`ttl_none_when_not_positive`), which
+        # `seed_artifact` turns into `InsertOptions()` with no `expiry=`.
+        self._init_couchbase_store(
+            cluster=cluster,
+            connection_string=settings.learning_corpus_connection_string,
+            username=settings.learning_corpus_username,
+            password=settings.learning_corpus_password,
+            bucket=settings.learning_corpus_bucket,
+            ttl_seconds=settings.learning_corpus_ttl_seconds,
+            ttl_none_when_not_positive=True,
         )
 
     async def get_by_canonical_key(self, canonical_key: str) -> CorpusArtifact | None:
         await self._ensure_connected()
-        try:
-            result = await self._collection.get(_doc_id(canonical_key), GetOptions())
-        except DocumentNotFoundException:
-            return None
-        return CorpusArtifact.from_doc(result.content_as[dict])
+        result = await get_or_none(self._collection, _doc_id(canonical_key))
+        return None if result is None else CorpusArtifact.from_doc(result.content_as[dict])
 
     async def seed_artifact(self, artifact: CorpusArtifact) -> None:
         await self._ensure_connected()

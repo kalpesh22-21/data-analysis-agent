@@ -42,6 +42,12 @@ opens with `await self._ensure_connected()` (`CouchbaseConnectGate`, idempotent)
 failure or explicit teardown. See `runtime/couchbase_connect.py` for the
 invariant and the introspection test that keeps method #14 honest.
 
+CONSTRUCTION (2026-08-17): `__init__` performs NO I/O and touches NO event loop.
+Given a `cluster=` (the unit suites' fake handle graph) it derives its collections
+immediately as before; otherwise the `Cluster` itself is built by the first
+`_ensure_connected()`. That is what lets a launcher build this store at module
+import, and it is why the two hand-written lazy proxies in `scripts/` are gone.
+
 This module is exercised at Layer 2 only (a running Couchbase cluster is
 required); its own tests (`tests/runtime/session/test_couchbase_store.py`)
 are skipped automatically when `couchbase` is not importable or
@@ -57,11 +63,10 @@ import asyncio
 import uuid
 from collections.abc import Callable
 from dataclasses import replace as dc_replace
-from datetime import timedelta
 from typing import Any
 
 from data_agent.runtime.config import RuntimeSettings
-from data_agent.runtime.couchbase_connect import CouchbaseConnectGate
+from data_agent.runtime.couchbase_connect import CouchbaseStoreBase, get_or_none
 from data_agent.timeutil import now_iso as _now
 
 from .models import (
@@ -80,21 +85,14 @@ from .store import AlreadyConsumedError, CASMismatchError
 _MAX_CAS_RETRIES = 5
 _CAS_RETRY_BACKOFF_SECONDS = 0.02
 
+# The availability flag + the shared SDK symbols live in `couchbase_connect`; these
+# are the extra types only this store writes with. Same guard posture: the module
+# stays importable with no `couchbase` package installed (the constructor refuses).
 try:  # pragma: no cover - exercised only when the couchbase SDK is installed
-    from acouchbase.cluster import Cluster
-    from couchbase.auth import PasswordAuthenticator
-    from couchbase.exceptions import CasMismatchException, DocumentNotFoundException
-    from couchbase.options import (
-        ClusterOptions,
-        GetOptions,
-        QueryOptions,
-        ReplaceOptions,
-        UpsertOptions,
-    )
-
-    COUCHBASE_AVAILABLE = True
+    from couchbase.exceptions import CasMismatchException
+    from couchbase.options import QueryOptions, ReplaceOptions, UpsertOptions
 except ImportError:  # pragma: no cover
-    COUCHBASE_AVAILABLE = False
+    pass
 
 
 def _session_key(session_id: str) -> str:
@@ -105,7 +103,7 @@ def _result_key(result_id: str) -> str:
     return f"result::{result_id}"
 
 
-class CouchbaseSessionStore(CouchbaseConnectGate):
+class CouchbaseSessionStore(CouchbaseStoreBase):
     """Real `SessionStore` backed by a Couchbase cluster."""
 
     def __init__(
@@ -115,33 +113,32 @@ class CouchbaseSessionStore(CouchbaseConnectGate):
         *,
         sleep: Callable[[float], Any] = asyncio.sleep,
     ) -> None:
-        if not COUCHBASE_AVAILABLE:
-            raise RuntimeError(
-                "The 'couchbase' package is not installed. "
-                "Install it (see pyproject.toml) to use CouchbaseSessionStore."
-            )
         self._settings = settings
-        self._cluster = cluster or Cluster(
-            settings.couchbase_connection_string,
-            ClusterOptions(
-                PasswordAuthenticator(settings.couchbase_username, settings.couchbase_password)
-            ),
+        # NO I/O and NO event loop here (`CouchbaseStoreBase`): with no injected
+        # cluster the SDK handles are built by the first `_ensure_connected()`, so
+        # this store can be constructed at module import — which is how uvicorn
+        # loads `scripts/run_ui_runtime*.py`'s `app`.
+        self._init_couchbase_store(
+            cluster=cluster,
+            connection_string=settings.couchbase_connection_string,
+            username=settings.couchbase_username,
+            password=settings.couchbase_password,
+            bucket=settings.couchbase_bucket,
+            ttl_seconds=settings.session_ttl_seconds,
         )
-        bucket = self._cluster.bucket(settings.couchbase_bucket)
-        scope = bucket.scope(settings.couchbase_scope)
-        self._sessions = scope.collection(settings.couchbase_sessions_collection)
-        self._results = scope.collection(settings.couchbase_results_collection)
-        # The connect itself is async and cannot happen here; every public
-        # coroutine awaits `_ensure_connected()` before touching a handle.
-        self._init_connect_gate(self._cluster, bucket)
-        self._ttl = timedelta(seconds=settings.session_ttl_seconds)
         # Injectable so a Layer-1 CAS-retry test never actually sleeps.
         self._sleep = sleep
 
+    def _bind_collections(self, bucket: Any) -> None:
+        """TWO collections in a NAMED scope (sessions + full results), unlike the
+        KV-only learning stores' single default collection."""
+        scope = bucket.scope(self._settings.couchbase_scope)
+        self._sessions = scope.collection(self._settings.couchbase_sessions_collection)
+        self._results = scope.collection(self._settings.couchbase_results_collection)
+
     async def _get_doc(self, session_id: str) -> tuple[SessionDoc | None, Any]:
-        try:
-            result = await self._sessions.get(_session_key(session_id), GetOptions())
-        except DocumentNotFoundException:
+        result = await get_or_none(self._sessions, _session_key(session_id))
+        if result is None:
             return None, None
         return SessionDoc.from_doc(result.content_as[dict]), result.cas
 
@@ -253,11 +250,8 @@ class CouchbaseSessionStore(CouchbaseConnectGate):
         # keyspace but kept in the signature to match the in-memory fake's
         # per-session scoping and the Protocol.
         await self._ensure_connected()
-        try:
-            result = await self._results.get(result_full_ref, GetOptions())
-        except DocumentNotFoundException:
-            return None
-        return result.content_as[dict]
+        result = await get_or_none(self._results, result_full_ref)
+        return None if result is None else result.content_as[dict]
 
     async def write_pause_checkpoint(self, session_id: str, checkpoint: PauseCheckpoint) -> None:
         await self._ensure_connected()

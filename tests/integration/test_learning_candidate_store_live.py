@@ -31,9 +31,9 @@ import uuid
 
 import pytest
 
-from data_agent.learning.candidate.couchbase_candidate_store import COUCHBASE_AVAILABLE
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.config import LearningSettings
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 
 pytestmark = pytest.mark.skipif(
     not COUCHBASE_AVAILABLE or not os.environ.get("RUN_COUCHBASE_TESTS"),

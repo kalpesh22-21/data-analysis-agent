@@ -32,7 +32,6 @@ import pytest
 
 from data_agent.learning.candidate import InMemoryCandidateStore
 from data_agent.learning.candidate.couchbase_candidate_store import (
-    COUCHBASE_AVAILABLE,
     CouchbaseCandidateStore,
 )
 from data_agent.learning.candidate.memory_candidate_store import _sort_key
@@ -45,6 +44,7 @@ from data_agent.learning.promotion import (
 )
 from data_agent.learning.promotion.drift import _is_fresh
 from data_agent.learning.promotion.scheduler import _parse_clock
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 
 from .helpers import (
     FakeDependencyResolver,

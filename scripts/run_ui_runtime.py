@@ -111,7 +111,6 @@ from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
 from data_agent.runtime.session.memory_store import InMemorySessionStore
-from data_agent.runtime.session.models import FinalizationBlockKind
 
 # The real l2-token container (docker-compose.integration.yml), already
 # running — see docker-compose.integration.yml's `token` service. We only
@@ -866,115 +865,32 @@ _COUCHBASE_USERNAME = "admin"
 _COUCHBASE_PASSWORD = "password"
 
 
-class _LazyCouchbaseSessionStore:
-    """Construct the real `CouchbaseSessionStore` on FIRST async use (D45 launcher).
+def _build_session_store(settings: RuntimeSettings) -> Any:
+    """In-memory by default; the REAL Couchbase store under DEMO_SESSION_STORE=couchbase.
 
-    The `acouchbase` Cluster connects EAGERLY at construction and requires a
-    RUNNING event loop — but this launcher builds the app at module import
-    (`app = build_demo_app()`), before uvicorn's loop is up, so a direct
-    `CouchbaseSessionStore(settings)` there raises "Event loop is not running".
-    This thin proxy defers the real construction to the first awaited method
-    (always inside a request, where the loop is running), then delegates every
-    `SessionStore` call to it. Pure launcher scaffolding — no runtime behavior
-    is touched (the real store is used verbatim once built).
+    Restart durability (D45, Slice 2) is the ONLY scenario that needs a real,
+    out-of-process store — an InMemorySessionStore loses a paused checkpoint on process
+    restart by design, so it cannot demonstrate durability. Every other scenario keeps
+    the in-memory store.
 
-    MAINTENANCE: a hand-written stand-in for the `SessionStore` Protocol drifts
-    from it silently — a forgotten method raises AttributeError only against a live
-    Couchbase run, never in the suite. `tests/runtime/test_launcher_session_store_proxies.py`
-    derives the required surface from the Protocol and fails when this class (or
-    `run_ui_runtime_real.py`'s twin) is missing one.
+    The real store is constructed DIRECTLY even though this runs BEFORE uvicorn's event
+    loop exists (`app = build_demo_app()` at module import): `CouchbaseSessionStore
+    .__init__` does no I/O and touches no loop — its `acouchbase` cluster is built by
+    the first `_ensure_connected()`, inside a request. That is what retired the
+    hand-written lazy `SessionStore` proxy this launcher used to carry.
+
+    Extracted (mirrors `run_ui_runtime_real.py`'s namesake) so the choice is testable
+    without building the whole app — see `tests/runtime/test_launcher_session_store.py`.
     """
+    if os.environ.get("DEMO_SESSION_STORE") != "couchbase":
+        return InMemorySessionStore()
 
-    def __init__(self, settings: RuntimeSettings) -> None:
-        self._settings = settings
-        self._inner: Any = None
+    from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 
-    def _store(self) -> Any:
-        if self._inner is None:
-            from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
-
-            self._inner = CouchbaseSessionStore(self._settings)
-        return self._inner
-
-    async def get_or_create_session(self, session_id: str) -> Any:
-        return await self._store().get_or_create_session(session_id)
-
-    async def load_trail(self, session_id: str) -> Any:
-        return await self._store().load_trail(session_id)
-
-    async def append_message(self, session_id: str, message: Any) -> None:
-        await self._store().append_message(session_id, message)
-
-    async def append_trail_entry(self, session_id: str, entry: Any) -> None:
-        await self._store().append_trail_entry(session_id, entry)
-
-    async def bump_last_activity(self, session_id: str) -> None:
-        await self._store().bump_last_activity(session_id)
-
-    async def write_full_result(
-        self, session_id: str, result_id: str, result_full: dict[str, Any]
-    ) -> str:
-        return await self._store().write_full_result(session_id, result_id, result_full)
-
-    async def read_full_result(self, session_id: str, result_full_ref: str) -> Any:
-        return await self._store().read_full_result(session_id, result_full_ref)
-
-    async def write_pause_checkpoint(self, session_id: str, checkpoint: Any) -> None:
-        await self._store().write_pause_checkpoint(session_id, checkpoint)
-
-    async def apply_analysis_state(self, session_id: str, turn_index: int, merge: Any) -> Any:
-        # `merge` is forwarded as the CALLBACK it is — never invoked here — so the
-        # real store's CAS retry re-runs it against its own fresh read (03 §B.1).
-        return await self._store().apply_analysis_state(session_id, turn_index, merge)
-
-    async def claim_finalization_block(
-        self,
-        session_id: str,
-        turn_index: int,
-        window_count: int,
-        kind: FinalizationBlockKind,
-    ) -> bool:
-        # `kind` (05 §J.3) selects WHICH per-window allowance is claimed; a proxy
-        # that dropped it would collapse the two gates onto one budget live only.
-        return await self._store().claim_finalization_block(
-            session_id, turn_index, window_count, kind
-        )
-
-    async def get_session_with_cas(self, session_id: str) -> Any:
-        return await self._store().get_session_with_cas(session_id)
-
-    async def resume_checkpoint(self, session_id: str, cas: Any, answer: str) -> Any:
-        return await self._store().resume_checkpoint(session_id, cas, answer)
-
-    async def scan_idle_sessions(
-        self, *, statuses: list[str], last_activity_before: str, limit: int
-    ) -> Any:
-        return await self._store().scan_idle_sessions(
-            statuses=statuses, last_activity_before=last_activity_before, limit=limit
-        )
-
-    async def transition_learning_status(
-        self,
-        session_id: str,
-        expected_from: str,
-        to: str,
-        cas: Any,
-        *,
-        content_hash: str | None = None,
-        assert_from: bool = True,
-    ) -> Any:
-        return await self._store().transition_learning_status(
-            session_id,
-            expected_from,
-            to,
-            cas,
-            content_hash=content_hash,
-            assert_from=assert_from,
-        )
+    return CouchbaseSessionStore(settings)
 
 
 def build_demo_app():
-    use_couchbase = os.environ.get("DEMO_SESSION_STORE") == "couchbase"
     settings = RuntimeSettings(
         jwks_url=_JWKS_URL,
         jwt_issuer=_TOKEN_ISSUER,
@@ -1049,15 +965,9 @@ def build_demo_app():
     # ToolDispatcher as production and are content-routed by DemoMCPClient.
     retrieval = build_retrieval_pipeline(settings)
 
-    # Restart durability (D45, Slice 2): the ONLY scenario that needs a real,
-    # out-of-process store — an InMemorySessionStore loses a paused checkpoint on
-    # process restart by design, so it cannot demonstrate durability. Selected via
-    # DEMO_SESSION_STORE=couchbase; every other scenario keeps the in-memory store.
-    session_store: Any
-    if use_couchbase:
-        session_store = _LazyCouchbaseSessionStore(settings)
-    else:
-        session_store = InMemorySessionStore()
+    # Restart durability (D45, Slice 2) vs the default in-memory store — see
+    # `_build_session_store`.
+    session_store: Any = _build_session_store(settings)
 
     # Observability + PII (D25, Slice 2): install an in-process InMemorySpanExporter
     # + the runtime's `GET /_test/spans` route (NOT a Phoenix container) when

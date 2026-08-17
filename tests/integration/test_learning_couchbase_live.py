@@ -42,7 +42,7 @@ import pytest
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.models import LearningStatus, compute_content_hash
 from data_agent.runtime.config import RuntimeSettings
-from data_agent.runtime.session.couchbase_store import COUCHBASE_AVAILABLE
+from data_agent.runtime.couchbase_connect import COUCHBASE_AVAILABLE
 from data_agent.runtime.session.models import SessionDoc, TrailEntry, TurnMessage
 from data_agent.runtime.session.store import CASMismatchError
 
