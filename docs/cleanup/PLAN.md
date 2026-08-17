@@ -12,12 +12,17 @@ Work log: [WORKLOG.md](WORKLOG.md) — one entry per slice, appended as work lan
     baseline at worst; no new reds).
   - **V1 — live 7-question gate:** with the l2 stack up (incl. Phoenix :6006),
     `RUN_LIVE_EVAL=1 OTLP_ENDPOINT=http://localhost:6006/v1/traces
-    OTLP_PROJECT_NAME=cleanup-eval uv run pytest
+    OTLP_PROJECT_NAME=cleanup-eval OTLP_DISABLE_REDACTION=1 uv run pytest
     tests/eval/test_routing_live.py -q -s`.
     The OTLP vars export every eval turn to Phoenix project **`cleanup-eval`**
     (http://localhost:6006) for human monitoring — added 2026-08-17 at user
-    request; wiring smoke-verified. V2 runs already export to project
-    `data-agent-runtime` via the launcher.
+    request; wiring smoke-verified. `OTLP_DISABLE_REDACTION=1` (user request,
+    2026-08-17): spans carry REAL tool args (SQL with literals), result
+    previews, and LLM Q/A — the `cleanup-eval` project is therefore
+    entity-bearing; local-dev Phoenix only, do not point at a shared
+    collector. Telemetry-only: MCP scope/PII enforcement unaffected (D25).
+    V2 runs export to project `data-agent-runtime` via the launcher; for V2
+    set `OTLP_DISABLE_REDACTION=1` in the launcher env too (same caveat).
     This runs the 7 questions L1–L7 (the Arize Phoenix question set) against the
     REAL model + real prompt + whole AgentLoop, reported as pass-rates.
     Gate: every case ≥ `LIVE_EVAL_MIN_PASS_RATE` (default 0.67) and no case
