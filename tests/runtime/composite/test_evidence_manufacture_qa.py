@@ -21,8 +21,11 @@ the denial was obtained until `loop_intent_blocked{evidence_tool_name}` was adde
 scratch probe and an earned blueprint denial — are asserted below.
 
 Also here: the zero-row ambiguity on a `runBlueprint`, which is the shape that
-fires on honest work in a blueprint-first release (the live warehouse has NULL
-`most_recent_hire_date`, so every hires blueprint returns zero rows).
+fires on honest work in a blueprint-first release (a narrow window, an empty
+tenant, a filter nobody in scope matches — historically also issues-stack J3,
+where the hires blueprints keyed off the all-NULL `most_recent_hire_date` and so
+returned zero rows structurally; they are re-keyed to `hire_date` now, but the
+ambiguity they exposed is not specific to that bug).
 """
 
 from __future__ import annotations
@@ -339,11 +342,12 @@ async def test_a_zero_row_authoritative_blueprint_is_valid_for_both_dispositions
 
 async def test_the_zero_row_pair_distinguishes_the_two_readings_on_a_blueprint() -> None:
     """The blueprint variant of the ratio. It matters more than the `runQuery` one
-    in a BLUEPRINT-FIRST release: the live warehouse has NULL
-    `most_recent_hire_date`, so every hires blueprint returns zero rows on honest
-    work — and `blocked` is the cheaper disposition for the model (no prose, no
-    table, no `answerWithTable`). If the two counters ever collapsed into one, the
-    skew this exists to detect would become invisible."""
+    in a BLUEPRINT-FIRST release: a blueprint returns zero rows on plenty of honest
+    work (a narrow window, a filter nobody in scope matches — and, until the J3
+    re-key to `hire_date`, every hires blueprint, structurally) — and `blocked` is
+    the cheaper disposition for the model (no prose, no table, no
+    `answerWithTable`). If the two counters ever collapsed into one, the skew this
+    exists to detect would become invisible."""
     store = InMemorySessionStore()
     observer = _Recorder()
     tool = await _initialized(store, observer, "hires last month", "leavers last month")

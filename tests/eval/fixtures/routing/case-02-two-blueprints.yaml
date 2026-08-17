@@ -18,7 +18,7 @@ column_scope:
   - dbpcm_warehouse.employee.employee_code
   - dbpcm_warehouse.employee.department_name
   - dbpcm_warehouse.employee.employee_status
-  - dbpcm_warehouse.employee.most_recent_hire_date
+  - dbpcm_warehouse.employee.hire_date
 corpus:
   - bp-active-headcount-by-department
   - bp-hires-projection

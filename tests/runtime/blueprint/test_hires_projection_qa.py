@@ -52,13 +52,13 @@ _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "corpus"
 _BP_ID = "bp-hires-projection"
 
 _E = "dbpcm_warehouse.employee"
-_HIRE_COL = f"{_E}.most_recent_hire_date"
+_HIRE_COL = f"{_E}.hire_date"
 _CODE_COL = f"{_E}.employee_code"
 _USES = frozenset({_HIRE_COL, _CODE_COL})
 
 # The catalog the executor binds/scope-checks against (mirrors the seeded schema).
 CATALOG = CatalogHandle(
-    {_E: {"employee_code": "String", "most_recent_hire_date": "Nullable(DateTime64(6))"}}
+    {_E: {"employee_code": "String", "hire_date": "Nullable(DateTime64(6))"}}
 )
 
 

@@ -33,7 +33,7 @@ _FIXTURE_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "cor
 _BP_ID = "bp-hires-projection"
 _E = "dbpcm_warehouse.employee"
 _CODE = f"{_E}.employee_code"
-_HIRE = f"{_E}.most_recent_hire_date"
+_HIRE = f"{_E}.hire_date"
 _STATUS = f"{_E}.employee_status"
 
 

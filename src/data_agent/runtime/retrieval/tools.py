@@ -462,7 +462,7 @@ def _grain_printed_columns(value: Any) -> set[str]:
     case fold on the strength of it — and the seed corpus bears it out: 6 of the
     11 seeds declare `result_grain: [Department]` over a footprint whose column
     is `employee.department_name`, and the two hires blueprints declare `[month]`
-    for `toStartOfMonth(most_recent_hire_date)`.
+    for `toStartOfMonth(hire_date)`.
 
     So requiring a BARE grain entry to be covered would make 8 of the 11 real
     blueprints undetermined — and undetermined is dropped from replay ALWAYS
