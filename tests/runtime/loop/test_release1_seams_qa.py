@@ -36,11 +36,11 @@ from data_agent.runtime.blueprint.tool import RunBlueprintTool
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
-from data_agent.runtime.loop.agent_loop import (
+from data_agent.runtime.dispatch.denial_mapping import (
     FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-    AgentLoop,
 )
+from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
+from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
@@ -788,7 +788,7 @@ async def test_a_surplus_state_call_cannot_launder_a_pending_intent_past_the_ans
     """Three state calls plus an answer, in the worst order. The THIRD state call is
     the one that would close the last intent — and it is the surplus, rejected by
     `MAX_STATE_CALLS`. The answer must therefore still be refused, not finalized on
-    a write that never landed. (`_refreshed_analysis_state` returning `None` for a
+    a write that never landed. (`refreshed_analysis_state` returning `None` for a
     rejected call is what makes the enforcement local hold its ground.)"""
     store = InMemorySessionStore()
     loop, _s, events = _build(

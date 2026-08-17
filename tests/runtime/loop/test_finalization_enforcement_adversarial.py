@@ -25,10 +25,12 @@ from data_agent.runtime.composite.analysis_state import (
 )
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler
+from data_agent.runtime.dispatch.denial_mapping import (
+    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
+)
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
 from data_agent.runtime.loop.agent_loop import (
     _MAX_SURPLUS_STATE_REJECTIONS,
-    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
     AgentLoop,
 )
 from data_agent.runtime.mcp.fake_client import FakeMCPClient

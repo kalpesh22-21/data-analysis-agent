@@ -95,7 +95,7 @@ def _blueprint_definition_not_read(blueprint_id: str) -> ToolResult:
     corpus-authored, never user content, so naming it is safe.
 
     `provenance=frozenset()` (determined-empty), matching
-    `_answer_table_blueprint_not_run` and `_finalization_blocked`: this refusal
+    `_answer_table_blueprint_not_run` and `finalization_blocked`: this refusal
     reads no warehouse data, and `_compute_turn_provenance_union` is fail-closed, so
     a `None` here would collapse the whole turn's union and drop the user's own
     answer from every later turn's replay. It is deliberately NOT added to

@@ -22,11 +22,11 @@ from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler, render_analysis_state_block
-from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
-from data_agent.runtime.loop.agent_loop import (
+from data_agent.runtime.dispatch.denial_mapping import (
     FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-    AgentLoop,
 )
+from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
+from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
@@ -228,7 +228,7 @@ async def test_a_prior_turns_finalization_refusal_does_not_replay_the_descriptio
 
     03 §D.1's cross-turn drop was keyed on `tool_name` alone, and the finalization
     refusal is persisted under `answerWithTable` — whose SUCCESSFUL entries must keep
-    replaying, so it could not simply join that set. `_finalization_blocked` builds a
+    replaying, so it could not simply join that set. `finalization_blocked` builds a
     `denial_detail` naming every pending intent, the entry's `frozenset()` provenance
     passes `is_entry_in_scope` under any scope forever, and `_render_entry` has no
     turn awareness. Measured before the fix: turn 1 assembled under the NARROWED

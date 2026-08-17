@@ -36,11 +36,11 @@ from data_agent.runtime.composite.answer_with_table import (
     rollup_verification,
 )
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
-from data_agent.runtime.loop.agent_loop import (
+from data_agent.runtime.dispatch.denial_mapping import (
     FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-    AgentLoop,
 )
+from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
+from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient

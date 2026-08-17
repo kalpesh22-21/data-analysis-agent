@@ -25,13 +25,13 @@ from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import UpdateAnalysisStateTool
 from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler
-from data_agent.runtime.dispatch.denial_mapping import classify_denial
+from data_agent.runtime.dispatch.denial_mapping import (
+    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
+    classify_denial,
+)
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.hooks.answer_table import AnswerTableHooks
-from data_agent.runtime.loop.agent_loop import (
-    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-    AgentLoop,
-)
+from data_agent.runtime.loop.agent_loop import AgentLoop
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient

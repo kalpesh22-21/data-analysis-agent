@@ -29,11 +29,10 @@ from data_agent.runtime.context.assembly import (
     ContextAssembler,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
-from data_agent.runtime.loop.agent_loop import (
+from data_agent.runtime.loop.agent_loop import AgentLoop, TurnContext
+from data_agent.runtime.loop.finalization import (
     ANSWER_SHAPE_EXHAUSTED_EVENT,
     ANSWER_SHAPE_REFUSED_EVENT,
-    AgentLoop,
-    TurnContext,
 )
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest

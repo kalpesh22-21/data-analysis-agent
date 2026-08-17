@@ -120,10 +120,6 @@ from data_agent.runtime.context.assembly import (
     ContextAssembler,
 )
 from data_agent.runtime.context.budget import fit_request_to_budget
-from data_agent.runtime.dispatch.denial_mapping import (
-    ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
-    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-)
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
@@ -139,12 +135,9 @@ from data_agent.runtime.hooks.answer_table import (
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
 from data_agent.runtime.observability.progress_summarizer import ProgressSummarizer
 from data_agent.runtime.observability.redaction import hash_scope
-from data_agent.runtime.sanitize import MAX_FIELD_CHARS, sanitize_text
 from data_agent.runtime.session.models import (
     AnalysisState,
-    FinalizationBlockKind,
     PauseCheckpoint,
-    ResultPreview,
     TrackedIntent,
     TrailEntry,
     TurnMessage,
@@ -155,6 +148,18 @@ from data_agent.timeutil import now_iso
 
 from .blueprint_gate import BlueprintGate
 from .budget_guard import BudgetGuard
+from .finalization import (
+    ANSWER_SHAPE_EXHAUSTED_EVENT,
+    ANSWER_SHAPE_REFUSED_EVENT,
+    AnswerShapeCounter,
+    FinalizationGate,
+    answer_shape_nudge_text,
+    answer_table_no_table_designated,
+    finalization_blocked,
+    finalization_nudge_text,
+    pending_intents,
+    refreshed_analysis_state,
+)
 from .read_guard import ReadGuard, idempotent_read_signature, repeated_read_guard_event
 
 if TYPE_CHECKING:
@@ -526,82 +531,11 @@ def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
     )
 
 
+# The empty-designation event. It stays HERE, unlike the refusal it accompanies
+# (`answer_table_no_table_designated`, now in `loop/finalization.py`): it is emitted
+# inside `_resolve_answer_tables` below, on BOTH the refused and the allowance-spent
+# paths, so it belongs to the resolution rather than to the decision.
 ANSWER_TABLE_EMPTY_DESIGNATION_EVENT = "loop_answer_table_empty_designation"
-
-
-def _answer_table_no_table_designated() -> ToolResult:
-    """The nudge for an `answerWithTable` that designated NOTHING — no `tables`
-    entry carrying a designation and no legacy pair to fold — on a turn that is
-    holding multi-row results it has not tabled.
-
-    WHAT THIS CLOSES, measured on two live-loop probes. `{answer: <prose>,
-    tables: []}` succeeded, carried non-blank prose, and therefore TERMINATED the
-    turn through the exit the 05 §J answer-shape gate does not watch — the gate
-    lives on exit #1 (a model turn with no tool calls) and this is exit #2. The
-    turn returned `done` with no table, no event and no log line: the user asked
-    for a breakdown, held six rows of it, and got prose. Silent in the strongest
-    sense — nothing anywhere reported it.
-
-    That is the SAME failure `_answer_table_blueprint_not_run` exists to stop, one
-    step earlier. There, the model named a table the runtime could not resolve;
-    here it named none at all. 08 §O made the second case likelier rather than
-    rarer: `tables` is now REQUIRED, so a model with nothing to put there must
-    still emit the key, and `tables: []` is exactly what a model that cannot omit a
-    declared key produces.
-
-    WHY IT IS BOUNDED BY THE SHAPE GATE'S OWN ALLOWANCE (`kind="answer_shape"`).
-    This is the same complaint the shape gate makes — *you are finishing without
-    presenting a table you are holding* — arriving through the other exit, so the
-    two must share one bound or a model could be refused twice per window for one
-    mistake. When the grant is spent the prose PASSES and the turn ends: the
-    runtime records what it can and never hard-locks a turn, the posture
-    `ENFORCEMENT_EXHAUSTED` takes for intents.
-
-    WHY IT IS SCOPED TO `multi_row_answer_calls > 0`. A turn holding no multi-row
-    result has nothing to table, and an `answerWithTable` with no table on such a
-    turn is odd but harmless — a zero-row "none found" answered in prose is
-    CORRECT, and live q6 is that case. Nudging it would charge a right answer an
-    extra round-trip and tell the model to grid a number, which is the
-    false-positive half 05 §J is most exposed to.
-
-    AND TO A NON-BLANK `answer`, mirroring the terminal condition exactly. A call
-    that would not have ended the turn is not a finalization and must not be refused
-    as one — the rule the pending-intents refusal already follows at this exit. A
-    blank-`answer` empty call terminates nothing, so nothing is silently lost;
-    refusing it would spend this window's allowance on a habit call and leave the
-    real prose finish that follows unrefusable. THAT case is covered at the other
-    end, by `answer_table_succeeded` being set from substance rather than from the
-    call — the two fixes are halves of one defect and neither is sufficient alone.
-
-    Mirrors `_answer_table_blueprint_not_run` in every mechanical respect: non-`ok`
-    so the terminal exit does not fire and `filter_trail`'s status-gated
-    current-turn exemption keeps it visible this same turn; `denial_detail` because
-    that is the channel `context/budget.py::_render_entry` actually reads;
-    registered in `dispatch/denial_mapping.py` because `classify_denial` otherwise
-    degrades to "Something went wrong processing that request."
-    """
-    detail = (
-        "Your answerWithTable named no table, so there is nothing for the user to "
-        "look at. Every table goes in `tables`, one entry per part of your answer: "
-        "`tables: [{sql: \"SELECT …\"}]` for a query you wrote, or "
-        "`tables: [{blueprint_id: \"bp-…\"}]` for a blueprint you ran this turn. "
-        "Send your answer again with the table in it."
-    )
-    return ToolResult(
-        status="error",
-        tool_name=ANSWER_TABLE_TOOL_NAME,
-        error_code=ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
-        retryable=True,
-        user_message=detail,
-        # Determined-EMPTY, like every other runtime-authored refusal here: this
-        # reads no warehouse data, and `_compute_turn_provenance_union` is
-        # fail-closed, so `None` would collapse the turn's union and drop the
-        # user's own answer from every later replay.
-        provenance=frozenset(),
-        result_preview=None,
-        result_full=None,
-        denial_detail=detail,
-    )
 
 
 # The blueprint-definition gate — its refusal ToolResult, its error code
@@ -625,18 +559,14 @@ def _answer_table_no_table_designated() -> ToolResult:
 # window-local loaded through `live_analysis_state`, so a state left behind by an
 # abandoned earlier turn cannot refuse an unrelated later turn (and cannot have
 # `ENFORCEMENT_EXHAUSTED` written onto its record by one).
+#
+# THE DECISION LAYER LIVES IN `loop/finalization.py`: the two refusals, the two
+# nudges, `pending_intents`/`refreshed_analysis_state`, the answer-shape events and
+# the two window-scoped objects (`AnswerShapeCounter`, `FinalizationGate`). What
+# stays below is the ENFORCEMENT ITSELF — the exits, their precedence, the
+# `tool_result` rewrites, the nudge's one-round-trip lifecycle and the force-block
+# writes, all of which are the loop's own effects and control flow.
 # ---------------------------------------------------------------------------
-
-# `FINALIZATION_BLOCKED_PENDING_INTENTS_CODE` is imported from
-# `dispatch/denial_mapping.py` (its canonical home) and re-exported here, because
-# `context/assembly.py` needs the same literal to drop the refusal entry from a
-# LATER turn's replay and cannot import this module.
-
-# How much of the model's refused draft answer is quoted back to it in the nudge.
-# Generous: the point is that the model does not have to REGENERATE the answer it
-# just wrote (exit #1 persists nothing and D22 discards free text around tool
-# calls), so a truncated quote costs a rewrite of the tail only.
-_MAX_NUDGE_DRAFT_CHARS = 2000
 
 # How many SURPLUS `updateAnalysisState` calls (beyond `MAX_STATE_CALLS`) in one
 # model response are answered with a persisted rejection entry before the rest are
@@ -648,266 +578,12 @@ _MAX_NUDGE_DRAFT_CHARS = 2000
 # left the rejection WRITES unbounded).
 _MAX_SURPLUS_STATE_REJECTIONS = 2
 
-# The tools whose SUCCESSFUL result IS an answer's rows, for the ANSWER-SHAPE gate
-# (05 §J). Deliberately just two: `sampleRows`, `getTableSchema` and the listings
-# are DISCOVERY — a model that peeks at ten sample rows and then answers a single
-# figure in prose is behaving correctly, and counting those would refuse it.
-_DATA_ANSWER_TOOLS = frozenset({"runBlueprint", "runQuery"})
-
-# The answer-shape gate's two events, NAMED because the `loop_` prefix is
-# load-bearing rather than a convention: `observability/tracing.py::
-# guardrail_observer` drops every event that lacks it, SILENTLY, so a misnamed
-# event fires perfectly in every raw-recorder unit test and reaches production
-# telemetry never (06, and the `loop_analysis_state_auto_bound` near-miss that
-# shipped that way for a review round). Exported so the span test can assert the
-# real observer's output against the same symbol the emit site uses.
-ANSWER_SHAPE_REFUSED_EVENT = "loop_answer_shape_refused"
-ANSWER_SHAPE_EXHAUSTED_EVENT = "loop_answer_shape_exhausted"
-
-
-def _is_multi_row_answer_call(
-    tool_name: str, status: str, preview: ResultPreview | None
-) -> bool:
-    """Whether one call is a SUCCESSFUL, data-returning call that produced MORE
-    THAN ONE ROW — the fact the answer-shape gate (05 §J) counts.
-
-    `row_count > 1`, not `>= 1`, and the strictness is the whole safety margin:
-
-      - **zero rows** is a legitimate prose answer ("no employees match"), and
-        04 §B.4 already treats an empty result as an answer rather than a failure;
-      - **one row** is a single figure ("headcount is 412"), which the prompt does
-        not ask to be tabled and which live q6 answers correctly in prose.
-
-    Refusing either would turn a correct turn into an extra round-trip and a
-    confusing instruction to table something that is not a table.
-    """
-    return (
-        tool_name in _DATA_ANSWER_TOOLS
-        and status == "ok"
-        and preview is not None
-        and preview.row_count > 1
-    )
-
 
 class _NoLiveStateToForceError(Exception):
     """Raised from inside the force-block merge when the live state vanished
     between the loop's read and the store's write (a concurrent turn boundary is
     the only way). Aborts the write with nothing persisted, rather than
     resurrecting a state the model never saw."""
-
-
-def _pending_intents(state: AnalysisState | None) -> tuple[TrackedIntent, ...]:
-    """Every intent of the LIVE state still `pending`, in declaration order.
-
-    `None` state -> empty tuple, which is the whole fast path: most turns are
-    single-intent, so the enforcement check must cost one `is None` test on a
-    local and never a store read (05 §E)."""
-    if state is None:
-        return ()
-    return tuple(intent for intent in state.intents if intent.status == "pending")
-
-
-def _describe_pending(pending: Sequence[TrackedIntent]) -> str:
-    """`i2 ('attrition by department')` for each pending intent.
-
-    The descriptions are MODEL-authored text derived from the user's question,
-    re-entering model context — so they go through the SAME structural
-    sanitisation the rendered state block uses (`runtime/sanitize.py`), or a
-    newline in one could fabricate an instruction line inside the message it lands
-    in. Same turn and same `column_scope` as the state it quotes, so there is no
-    D44 exposure AT THE POINT OF USE.
-
-    IT DOES NOT FOLLOW THAT IT CANNOT OUTLIVE THE TURN, and an earlier version of
-    this docstring claimed exactly that. On the exit-#1 path the text is ephemeral,
-    so it is true there. On the EXIT-#2 path it rides `denial_detail` on a PERSISTED
-    `answerWithTable` trail entry: `filter_trail`'s status-gated exemption keeps a
-    non-`ok` entry for its OWN turn, but nothing in `filter_trail` drops it later —
-    `frozenset()` provenance passes `is_entry_in_scope` under any scope, forever, and
-    `_render_entry` has no turn awareness. The cross-turn drop is
-    `context/assembly.py::_is_stale_model_text_entry`, which matches this entry by
-    its error code; that is what actually bounds the lifetime."""
-    return "; ".join(
-        f"{intent.intent_id} ('{sanitize_text(intent.description, MAX_FIELD_CHARS)}')"
-        for intent in pending
-    )
-
-
-def _finalization_blocked(pending: Sequence[TrackedIntent]) -> ToolResult:
-    """The refusal returned in place of a terminal `answerWithTable` while intents
-    are still pending (05 §B.1) — modelled on `_answer_table_blueprint_not_run`.
-
-    Returned BEFORE the trail entry is written, so the persisted entry IS the
-    refusal and the model reads it on the next round-trip.
-
-    IN-TURN VISIBILITY COMES FROM THE STATUS GATE, NOT FROM THE PROVENANCE.
-    `filter_trail`'s current-turn exemption keeps a `status != "ok"` entry of the
-    CURRENT turn whatever its provenance, and that is the only place this entry has
-    to survive. (05 §B.1 originally recorded the opposite — "the status gate is
-    belt-and-braces; provenance is binding" — which is inverted: `frozenset()` is
-    load-bearing only in contexts that pass no `current_turn_index`, i.e. precisely
-    the LATER turns where this entry must NOT survive. Corrected in 05 §B.1/§I.)
-
-    `provenance=frozenset()` IS STILL THE RIGHT VALUE, for a different reason: this
-    refusal is runtime-authored and reads no warehouse data, and
-    `_compute_turn_provenance_union` is fail-closed — a `None` here would collapse
-    the whole turn's union and tag the turn's own final assistant message
-    undetermined, dropping the user's answer from every later turn's replay.
-
-    WHAT BOUNDS ITS LIFETIME IS `context/assembly.py::_is_stale_model_text_entry`,
-    which drops this entry from any turn other than its own, matching on
-    `FINALIZATION_BLOCKED_PENDING_INTENTS_CODE` (the entry is persisted under
-    `answerWithTable`, whose SUCCESSFUL entries must keep replaying, so it cannot be
-    matched by tool name). Without that drop the detail below — dead intent ids and
-    an imperative to call `updateAnalysisState` against a state that no longer
-    exists — plus the refused draft prose in `args` would replay in every later turn
-    of the session, under any since-narrowed scope.
-
-    `denial_detail` NAMES THE PENDING INTENTS. `context/budget.py::_render_entry`
-    builds the model-facing text as `entry.denial_detail or
-    classify_denial(entry.error_code).user_message` and NEVER from
-    `ToolResult.user_message`, which has no `TrailEntry` field at all — a specific
-    message set only there is silently dropped.
-    """
-    detail = (
-        f"You cannot finish yet: {len(pending)} intent(s) you are tracking are still "
-        f"pending — {_describe_pending(pending)}. Resolve each one with "
-        "updateAnalysisState — completed, citing the call that answered it, or "
-        "blocked, citing the call that shows it cannot be done — then send this "
-        "answer again."
-    )
-    return ToolResult(
-        status="error",
-        tool_name=ANSWER_TABLE_TOOL_NAME,
-        error_code=FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-        retryable=True,
-        user_message=detail,
-        provenance=frozenset(),
-        result_preview=None,
-        result_full=None,
-        denial_detail=detail,
-    )
-
-
-def _finalization_nudge(draft: str | None, pending: Sequence[TrackedIntent]) -> str:
-    """The ephemeral `user`-role message injected in place of exit #1's missing
-    error channel (05 §B.2/§B.3).
-
-    IT CARRIES THE DRAFT BACK. Exit #2's refusal preserves the model's prose for
-    free — it lives in `tool_call.arguments`, is persisted as `TrailEntry.args`,
-    and is replayed by `_render_entry`. Exit #1 preserves NOTHING: the answer is
-    not persisted (by design — a persisted nudge or draft would surface in
-    `/session/history` as something the user said) and D22 discards free text
-    around tool calls, so without this quote the model has no record it just wrote
-    a final answer and must regenerate it blind.
-    """
-    lines: list[str] = []
-    if draft and draft.strip():
-        lines.append(f"You drafted: {draft.strip()[:_MAX_NUDGE_DRAFT_CHARS]}")
-        lines.append("")
-    lines.append(
-        f"That is not your final answer yet — {len(pending)} intent(s) you are "
-        f"tracking are still pending: {_describe_pending(pending)}."
-    )
-    lines.append(
-        "Resolve each one with updateAnalysisState — completed, citing the call that "
-        "answered it, or blocked, citing the call that shows it cannot be done — then "
-        "re-send your final answer."
-    )
-    return "\n".join(lines)
-
-
-def _answer_shape_nudge(draft: str | None, multi_row_calls: int) -> str:
-    """The ephemeral `user`-role message injected when a turn tries to finish in
-    bare prose while holding multi-row results it never tabled (05 §J).
-
-    IT CORRECTS A BELIEF ABOUT TURN MECHANICS, which is the only thing the runtime
-    can correct here and the reason a prompt rule alone was not enough. Live, the
-    worst failure mode was not the model deciding prose was better — it was the
-    model APOLOGISING for being unable to call the tool any more: *"the requested
-    results are multi-row tables and must be returned through the table-rendering
-    path, but that final table call was not made before the tool session ended."*
-    Nothing had refused it and nothing had ended; it believed the turn was over. So
-    the first line this message has to say is that it is not, and that the tool is
-    still there.
-
-    IT CARRIES THE DRAFT BACK for the same reason `_finalization_nudge` does —
-    exit #1 persists nothing and D22 discards free text around tool calls — and
-    here the draft is doubly load-bearing, because the escape hatch below asks the
-    model to send that answer again if the gate was wrong about its shape.
-
-    WHICH IS WHY THE TRUNCATION IS MARKED. This echo is the model's ONLY surviving
-    copy of what it wrote, and the slice at `_MAX_NUDGE_DRAFT_CHARS` is invisible
-    from the inside: an unmarked cut plus an instruction to re-send "unchanged"
-    reads as "re-send exactly this", and the tail of a long answer is lost silently.
-    The marker plus "your FULL answer" tells the model the echo is a reminder, not
-    the artefact. (The pending-intents nudge has the same slice and the same
-    exposure; it is left alone here because its instruction is to resolve intents
-    and re-send, not to reproduce a quoted string, and this section does not touch
-    its wording.)
-
-    THE ESCAPE HATCH IS NOT DECORATION. The gate reads row counts, not meaning: a
-    turn can legitimately run a multi-row query and answer a single figure from it
-    (a count over a grouped read, a "yes, three of them" narrative). Offering the
-    re-send is what keeps that turn correct at a cost of one round-trip, instead of
-    forcing a table nobody asked for.
-    """
-    lines: list[str] = []
-    if draft and draft.strip():
-        stripped = draft.strip()
-        echo = stripped[:_MAX_NUDGE_DRAFT_CHARS]
-        if len(echo) < len(stripped):
-            echo += " …[truncated]"
-        lines.append(f"You drafted: {echo}")
-        lines.append("")
-    lines.append(
-        f"That answer is not finished. This turn produced {multi_row_calls} multi-row "
-        "result(s), and a multi-row answer must be delivered through answerWithTable."
-    )
-    lines.append(
-        "The turn is NOT over and answerWithTable is still available to you: you can "
-        "and must call it in your NEXT response."
-    )
-    lines.append(
-        "Pass one table per part you answered — blueprint_id for a result a blueprint "
-        "produced, sql otherwise — and keep the prose you just wrote as the answer."
-    )
-    lines.append(
-        "If your answer really is a single figure or an empty result, re-send your "
-        "full answer with no tool call and it will be accepted."
-    )
-    return "\n".join(lines)
-
-
-def _refreshed_analysis_state(
-    tool_result: ToolResult, turn_index: int
-) -> AnalysisState | None:
-    """The state a SUCCESSFUL `updateAnalysisState` call just wrote, read back off
-    its own result (05 §E), or `None` when there is nothing to refresh from.
-
-    The state changes mid-turn, so a once-per-window read would be wrong — but a
-    store read at each terminal exit would cost a round-trip on EVERY turn,
-    including the single-intent ones that never touch this feature. So the loop
-    loads the state ONCE at the top and refreshes the local from each state call's
-    result. 03 §E.2's partition guarantees state calls are dispatched before
-    anything else in the batch, so the local is current by the time either exit is
-    reached.
-
-    Defensive: a malformed result degrades to "no refresh" (the loaded value
-    stands) rather than raising into the dispatch loop.
-    """
-    if tool_result.status != "ok" or not isinstance(tool_result.result_full, dict):
-        return None
-    try:
-        state = AnalysisState.from_doc(tool_result.result_full)
-    except (KeyError, TypeError, ValueError):
-        _logger.warning(
-            "updateAnalysisState returned a result this loop could not read back as "
-            "state; keeping the state loaded at the top of the window"
-        )
-        return None
-    # The A.1 gate again, belt-and-braces: a state for another turn must never
-    # become the one this turn enforces on.
-    return state if state.turn_index == turn_index else None
 
 
 def _capture_terminal_sql(
@@ -1869,7 +1545,7 @@ class AgentLoop:
         losing the forced disposition is bad, aborting the user's answer to record
         it is worse.
         """
-        pending = _pending_intents(state)
+        pending = pending_intents(state)
         if not pending:
             return state
 
@@ -1940,109 +1616,6 @@ class AgentLoop:
                 force_blocked["budget_cap_reached"] = True
             self._observer("loop_intent_force_blocked", force_blocked)
         return new_state
-
-    async def _grant_forced_reround(
-        self,
-        *,
-        session_id: str,
-        turn_index: int,
-        window_count: int,
-        kind: FinalizationBlockKind,
-        already_refused_this_round: bool,
-    ) -> bool:
-        """Whether a finalization refusal may proceed — ONE forced re-round per
-        budget window OF THIS TURN PER KIND, CONSUMED PER ROUND-TRIP (05 §C.1/§C.2,
-        §J.3).
-
-        TWO INDEPENDENT ALLOWANCES, SELECTED BY `kind`:
-
-          `intents`      | the pending-intents refusals, exits #1 and #2 (§B)
-          `answer_shape` | the untabled-multi-row refusal, exit #1 only (§J)
-
-        THEY SHARED ONE ALLOWANCE UNTIL 2026-08-12, AND THAT WAS A MEASURED DEFECT.
-        The sharing was deliberate — it bounded the worst case at one extra
-        round-trip per window — but on the multi-intent questions this release
-        exists for, the two gates fire in sequence rather than in competition: the
-        model finishes with intents pending (intents nudge, grant gone), closes the
-        ledger, then finishes in prose again with its tables still untabled. Live, 2
-        of 4 three-part runs went exactly that way and the shape gate could only
-        emit `loop_answer_shape_exhausted` — starved on the question it was built
-        for (traces `900a85a4`, `16f090db`). Splitting the allowance raises the
-        worst case to TWO extra round-trips per window, still bounded by
-        `max_budget_windows`, and makes the common sequence terminate correctly.
-
-        PRECEDENCE IS NOT EXPRESSED HERE. The call site keeps the shape gate as an
-        `elif` on the pending-intents branch, so at most one refusal happens per
-        round-trip; this function only knows which allowance is being asked for.
-
-        `turn_index` is part of the claim key, not context; so is `kind`. `window_count` restarts
-        at 1 on every external turn while `SessionDoc.finalization_blocks` persists
-        across the whole session — see `session/models.py::finalization_block_key`
-        for what a window-only key cost.
-
-        The per-round gate is not a nicety. Exit #2's refusal happens inside the
-        per-tool-call loop, which processes up to 8 calls from ONE model response:
-        a model emitting `[answerWithTable, answerWithTable]` would otherwise burn
-        both chances in a single round-trip, force-block on the second, and
-        finalize — having been given NO re-round at all, with
-        `ENFORCEMENT_EXHAUSTED` written for intents it was never asked twice about.
-        So the second and later refusals in one batch return the same retryable
-        error but do not advance the persisted counter.
-
-        `already_refused_this_round` STAYS ONE FLAG ACROSS BOTH KINDS, and does not
-        need to be per-kind: the two kinds cannot both refuse in one round-trip.
-        `answer_shape` lives only at exit #1 (`not result.tool_calls`) and only in
-        the `elif` of the pending-intents branch, while the batched exit-#2 refusals
-        the flag exists for require tool calls. A round-trip therefore has at most
-        one refusing kind, and the flag means what it always meant.
-
-        DEGRADE-NEVER-FAIL, same posture as `_force_block_pending_intents`.
-        `claim_finalization_block` is a CAS read-modify-write: it can raise
-        `CASMismatchError` after five lost retries (a concurrent resume racing this
-        turn is enough) or a transient connection error. Both would otherwise
-        propagate out of `_run_loop_body` and abort the turn AT THE MOMENT THE MODEL
-        HAS A FINISHED ANSWER — the worst possible time. In-memory and scripted
-        doubles cannot fail, so the suite is green by construction and this only
-        bites against a real store.
-
-        A FAILED CLAIM IS TREATED AS `False`: the caller force-blocks the surviving
-        intents with `ENFORCEMENT_EXHAUSTED` and finalizes. That records a
-        disposition and ends the turn. Treating it as `True` would grant a re-round
-        whose consumption was never persisted, so the next round-trip would ask the
-        store again, fail again, and re-round again — unbounded, bounded only by the
-        budget window.
-        """
-        if already_refused_this_round:
-            return True
-        try:
-            granted = await self._session_store.claim_finalization_block(
-                session_id, turn_index, window_count, kind
-            )
-        except Exception:
-            _logger.exception(
-                "failed to claim the %s finalization block (session=%s, turn=%d, "
-                "window=%d) — treating the re-round as unavailable and finalizing",
-                kind,
-                session_id,
-                turn_index,
-                window_count,
-            )
-            # D25: shape-only. All three keys are on
-            # `observability/tracing.py::_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST`, so this
-            # actually reaches Phoenix rather than being a correctly-named span
-            # carrying nothing (README finding 10).
-            self._observer(
-                "loop_finalization_block_claim_failed",
-                {
-                    "turn_index": turn_index,
-                    "window": window_count,
-                    "reason": "store_error",
-                },
-            )
-            return False
-        if granted:
-            self._observer("loop_finalization_block_spent", {"window": window_count})
-        return granted
 
     async def _pause_from_runtime_tool(
         self,
@@ -2782,28 +2355,39 @@ class AgentLoop:
         # once into this window-local and REFRESHED IN PLACE from each
         # `updateAnalysisState` result below; 03 §E.2's partition guarantees state
         # calls are dispatched first, so the local is current at both exits, and
-        # the fast path is an `is None` test on a local (`_pending_intents`).
+        # the fast path is an `is None` test on a local (`pending_intents`).
         analysis_state = live_analysis_state(session_doc, turn_index)
-        # --- ANSWER-SHAPE GATE state (05 §J) --------------------------------
+        # --- ANSWER-SHAPE GATE state (05 §J), `loop/finalization.py` ---------
         #
         # How many SUCCESSFUL multi-row `runQuery`/`runBlueprint` calls this TURN has
-        # made, and whether any `answerWithTable` has succeeded in it. Both are
-        # TURN-scoped facts held in window-locals, so both are seeded from the
-        # persisted trail for the reason the read guard is: a budget-cap
-        # `continue`, an `askUser` resume and a mid-DAG blueprint resume each start a
-        # fresh `_run_loop_body` with empty in-memory sets, and a gate that forgot the
-        # rows the model already has would go silent on exactly the long turns that
-        # produce several tables.
+        # made, and whether any `answerWithTable` has put a table in front of the
+        # user. Both are TURN-scoped facts held in this window-scoped counter, so
+        # both are seeded — from the trail walk below for the reason the read guard
+        # is seeded (a budget-cap `continue`, an `askUser` resume and a mid-DAG
+        # blueprint resume each start a fresh `_run_loop_body` with an empty counter,
+        # and a gate that forgot the rows the model already has would go silent on
+        # exactly the long turns that produce several tables), and from
+        # `seed_answer_tables` for the blueprint approval-resume path, whose
+        # designation was made before the pause.
         #
         # THE TRAIL WALK IS ALREADY TURN-FILTERED (`prior_entry.turn_index !=
-        # turn_index` skips above), which is also the cross-turn replay protection: a
+        # turn_index` skips below), which is also the cross-turn replay protection: a
         # multi-row query from turn 3 cannot make turn 4's prose answer a defect, and
-        # the `claim_finalization_block` key is `(turn_index, window)` too, so a stale
+        # the `claim_finalization_block` key is `(turn_index, window, kind)` too, so a stale
         # refusal cannot be replayed onto a later turn.
-        multi_row_answer_calls = 0
-        # `seed_answer_tables` covers the blueprint approval-resume path, whose
-        # designation was made before the pause; the trail walk covers everything else.
-        answer_table_succeeded = bool(seed_answer_tables)
+        answer_shape = AnswerShapeCounter(bool(seed_answer_tables))
+        # The finalization block allowance (05 §C.1/§C.2, §J.3), also
+        # `loop/finalization.py`: the per-round-trip refusal flag and the persisted
+        # per-window claim behind all four refusal sites below. Its three ids are
+        # constant for this whole window, so they are handed over once here rather
+        # than repeated at every call site.
+        finalization_gate = FinalizationGate(
+            self._session_store,
+            self._observer,
+            session_id=session_id,
+            turn_index=turn_index,
+            window_count=window_count,
+        )
         for prior_entry in session_doc.tool_trail:
             if prior_entry.turn_index != turn_index or prior_entry.status != "ok":
                 continue
@@ -2829,35 +2413,16 @@ class AgentLoop:
                 # the definition and fails on its own merits). The gate's job is
                 # "did you look", not "did you find".
                 blueprint_gate.observe_prior_definition_read(prior_entry.args.get("id"))
-            # ANSWER-SHAPE GATE (05 §J), seeded from the same walk. `status == "ok"`
-            # is guaranteed by the skip above, and is passed explicitly anyway so the
-            # predicate reads the same at both of its call sites.
-            if _is_multi_row_answer_call(
+            # ANSWER-SHAPE GATE (05 §J), seeded from the same walk — BOTH of its
+            # facts, in one call. `status == "ok"` is guaranteed by the skip above,
+            # and is passed explicitly anyway so the multi-row predicate reads the
+            # same at both of its call sites. The `answerWithTable` half of that seed
+            # is deliberately ASYMMETRIC with the live site (name alone here,
+            # substance there); `AnswerShapeCounter.observe_prior_entry` carries the
+            # rationale, which is about what a persisted entry can cheaply be asked.
+            answer_shape.observe_prior_entry(
                 prior_entry.tool_name, prior_entry.status, prior_entry.result_preview
-            ):
-                multi_row_answer_calls += 1
-            # NAME + STATUS, DELIBERATELY ASYMMETRIC with the live flag site, which
-            # since 08 §O requires a designation to have actually resolved.
-            #
-            # This walk reads PERSISTED entries and would have to re-resolve `args`
-            # to know whether one designated anything — a second reading of the
-            # designation in a third place, which is the divergence
-            # `resolve_designation` was extracted to prevent, and it would need this
-            # window's `blueprint_runs` (a D46 KV de-reference per blueprint) to
-            # answer correctly for the blueprint form. The cheap wrong answer would
-            # be to treat an unresolvable id as "no table" and re-arm the gate on a
-            # turn that HAD one.
-            #
-            # The asymmetry is safe in the direction that matters. This is the
-            # FALSE-NEGATIVE side: it can only leave the gate disarmed on a turn
-            # whose `answerWithTable` succeeded in an earlier window, and a
-            # successful entry that designated nothing is now itself refused at the
-            # live site, so it never becomes a persisted `ok` entry in the first
-            # place. Pre-§O entries all carried a designation in practice. Erring the
-            # other way — re-arming — would refuse turns that already showed their
-            # table, which is the false positive 05 §J is most exposed to.
-            if prior_entry.tool_name == ANSWER_TABLE_TOOL_NAME:
-                answer_table_succeeded = True
+            )
         # Seed the guard with the emulated-discovery signatures swept above (outside
         # the budget window) so a model re-call of listDatabases/listTables is served
         # locally, not re-dispatched to the MCP — together with the pointers to the
@@ -2945,7 +2510,7 @@ class AgentLoop:
             # refused call (05 §C.2) — so a `[answerWithTable, answerWithTable]`
             # batch is refused twice and advances the persisted counter once. Reset
             # here, beside `designated_answer_text`, for the same reason.
-            finalization_refused_this_round = False
+            finalization_gate.begin_round()
             self._observer("loop_model_call_start", {"window": window_count})
             result = await model_client.send_turn(canonical_messages, tools)
             last_assistant_text = result.assistant_text
@@ -2968,25 +2533,18 @@ class AgentLoop:
             # nudge. Both are within-turn control flow, and a persisted nudge would
             # appear in `/session/history` as something the user said.
             refused_finalization = False
-            # The fast path, and it must stay this cheap: `_pending_intents(None)`
+            # The fast path, and it must stay this cheap: `pending_intents(None)`
             # is an `is None` test on a window-local — no store read, on the
             # overwhelming majority of turns that never declare a state at all.
-            pending_at_exit = _pending_intents(analysis_state) if not result.tool_calls else ()
+            pending_at_exit = pending_intents(analysis_state) if not result.tool_calls else ()
             if pending_at_exit:
-                if await self._grant_forced_reround(
-                    session_id=session_id,
-                    turn_index=turn_index,
-                    window_count=window_count,
-                    kind="intents",
-                    already_refused_this_round=finalization_refused_this_round,
-                ):
-                    finalization_refused_this_round = True
+                if await finalization_gate.may_refuse("intents"):
                     refused_finalization = True
                     self._observer(
                         "loop_finalization_refused",
                         {"exit": "no_tool_calls", "pending_count": len(pending_at_exit)},
                     )
-                    finalization_nudge = _finalization_nudge(
+                    finalization_nudge = finalization_nudge_text(
                         result.assistant_text, pending_at_exit
                     )
                     # CLEAR THE DRAFT. `last_assistant_text` was set above and is
@@ -3012,11 +2570,7 @@ class AgentLoop:
                         "loop_enforcement_exhausted",
                         {"intent_count": len(pending_at_exit)},
                     )
-            elif (
-                not result.tool_calls
-                and multi_row_answer_calls
-                and not answer_table_succeeded
-            ):
+            elif not result.tool_calls and answer_shape.armed:
                 # --- THE ANSWER-SHAPE GATE (05 §J) --------------------------
                 #
                 # The model is ending the turn in bare prose while holding
@@ -3047,21 +2601,14 @@ class AgentLoop:
                 # Separate allowances make that sequence terminate; the price is a
                 # worst case of TWO extra round-trips per window, still bounded by
                 # `max_budget_windows`.
-                if await self._grant_forced_reround(
-                    session_id=session_id,
-                    turn_index=turn_index,
-                    window_count=window_count,
-                    kind="answer_shape",
-                    already_refused_this_round=finalization_refused_this_round,
-                ):
-                    finalization_refused_this_round = True
+                if await finalization_gate.may_refuse("answer_shape"):
                     refused_finalization = True
                     self._observer(
                         ANSWER_SHAPE_REFUSED_EVENT,
-                        {"multi_row_calls": multi_row_answer_calls},
+                        {"multi_row_calls": answer_shape.multi_row_calls},
                     )
-                    finalization_nudge = _answer_shape_nudge(
-                        result.assistant_text, multi_row_answer_calls
+                    finalization_nudge = answer_shape_nudge_text(
+                        result.assistant_text, answer_shape.multi_row_calls
                     )
                     # CLEAR THE DRAFT, for the reason the pending-intents path
                     # clears it: `last_assistant_text` is returned as
@@ -3451,7 +2998,7 @@ class AgentLoop:
                 # the result rather than re-read from the store. A rejected call
                 # (or an unreadable result) leaves the loaded value standing.
                 if tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
-                    refreshed = _refreshed_analysis_state(tool_result, turn_index)
+                    refreshed = refreshed_analysis_state(tool_result, turn_index)
                     if refreshed is not None:
                         analysis_state = refreshed
 
@@ -3476,16 +3023,9 @@ class AgentLoop:
                     and isinstance(call_args, dict)
                     and clean_answer_text(call_args.get("answer")) is not None
                 ):
-                    pending_at_answer = _pending_intents(analysis_state)
+                    pending_at_answer = pending_intents(analysis_state)
                     if pending_at_answer:
-                        if await self._grant_forced_reround(
-                            session_id=session_id,
-                            turn_index=turn_index,
-                            window_count=window_count,
-                            kind="intents",
-                            already_refused_this_round=finalization_refused_this_round,
-                        ):
-                            finalization_refused_this_round = True
+                        if await finalization_gate.may_refuse("intents"):
                             self._observer(
                                 "loop_finalization_refused",
                                 {
@@ -3497,7 +3037,7 @@ class AgentLoop:
                             # batch drains normally: `tool_result` is no longer
                             # `ok`, so neither `_resolve_answer_tables` below nor
                             # the terminal-exit check fires for this call.
-                            tool_result = _finalization_blocked(pending_at_answer)
+                            tool_result = finalization_blocked(pending_at_answer)
                         else:
                             analysis_state = await self._force_block_pending_intents(
                                 session_id=session_id,
@@ -3552,7 +3092,7 @@ class AgentLoop:
                         tool_result = _answer_table_blueprint_not_run(unresolved_blueprint)
                     elif (
                         not carried_designation
-                        and multi_row_answer_calls
+                        and answer_shape.multi_row_calls
                         and clean_answer_text(call_args.get("answer")) is not None
                     ):
                         # THE EMPTY DESIGNATION (08 §O). The model called the table
@@ -3561,9 +3101,9 @@ class AgentLoop:
                         # 05 §J shape gate does not watch. Measured live as
                         # `status=done`, no table, no event, no log: the user asked
                         # for a breakdown, the turn held six rows of it, and the
-                        # answer was prose. See `_answer_table_no_table_designated`.
+                        # answer was prose. See `answer_table_no_table_designated`.
                         #
-                        # `multi_row_answer_calls` SCOPES IT, and the scope is the
+                        # `answer_shape.multi_row_calls` SCOPES IT, and the scope is the
                         # whole of the false-positive protection: with nothing
                         # multi-row in hand there is no table being withheld, and a
                         # zero-row "none found" answered in prose is CORRECT (live
@@ -3588,26 +3128,19 @@ class AgentLoop:
                         # `ENFORCEMENT_EXHAUSTED` takes for intents. The event is
                         # emitted in `_resolve_answer_tables` either way, so the
                         # behaviour stays visible after the allowance is gone.
-                        if await self._grant_forced_reround(
-                            session_id=session_id,
-                            turn_index=turn_index,
-                            window_count=window_count,
-                            kind="answer_shape",
-                            already_refused_this_round=finalization_refused_this_round,
-                        ):
-                            finalization_refused_this_round = True
+                        if await finalization_gate.may_refuse("answer_shape"):
                             _logger.info(
                                 "answerWithTable designated no table while %d "
                                 "multi-row result(s) went untabled — nudging "
                                 "(session=%s)",
-                                multi_row_answer_calls,
+                                answer_shape.multi_row_calls,
                                 session_id,
                             )
                             self._observer(
                                 ANSWER_SHAPE_REFUSED_EVENT,
-                                {"multi_row_calls": multi_row_answer_calls},
+                                {"multi_row_calls": answer_shape.multi_row_calls},
                             )
-                            tool_result = _answer_table_no_table_designated()
+                            tool_result = answer_table_no_table_designated()
                         else:
                             self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
                     else:
@@ -3730,10 +3263,9 @@ class AgentLoop:
                 # in-window count and the trail seed can never disagree about what
                 # happened. Counted AFTER the finalization/blueprint-not-run rewrites
                 # of `tool_result`, so a refused call (now non-`ok`) is not counted.
-                if _is_multi_row_answer_call(
+                answer_shape.note_call(
                     tool_call.name, tool_result.status, tool_result.result_preview
-                ):
-                    multi_row_answer_calls += 1
+                )
                 # recordAssumptions (docs/decisions/ui-assumptions-contract.md):
                 # fold a SUCCESSFUL call's plain-English assumptions into the
                 # turn accumulator, same discipline as the enrichment above.
@@ -3784,7 +3316,7 @@ class AgentLoop:
                     # PROVIDED it designated something: those tables reach the user
                     # through the envelope, which is what the gate protects.
                     if resolved_answer_tables or answer_tables:
-                        answer_table_succeeded = True
+                        answer_shape.note_answer_succeeded()
                     designated_answer_text = (
                         clean_answer_text(call_args.get("answer"))
                         if isinstance(call_args, dict)
@@ -3972,8 +3504,8 @@ class AgentLoop:
                 # telemetry event, where it informs without misattributing.
                 # The hard-ceiling branch ABOVE is untouched and still writes
                 # `BUDGET_EXHAUSTED`: there the ceiling genuinely is the cause.
-                if finalization_refused_this_round:
-                    # `finalization_refused_this_round` is now set by the ANSWER-SHAPE
+                if finalization_gate.refused_this_round:
+                    # The gate's round flag is now set by the ANSWER-SHAPE
                     # gate too (05 §J) — which is correct and needs no branch here:
                     # that gate only fires when NOTHING is pending, so
                     # `_force_block_pending_intents` finds no pending intent, writes
@@ -4020,8 +3552,6 @@ class AgentLoop:
 
 
 __all__ = [
-    "ANSWER_SHAPE_EXHAUSTED_EVENT",
-    "ANSWER_SHAPE_REFUSED_EVENT",
     "AgentLoop",
     "EmulatedDiscoveryProvider",
     "RuntimeTool",

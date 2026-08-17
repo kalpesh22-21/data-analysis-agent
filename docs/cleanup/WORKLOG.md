@@ -349,3 +349,35 @@ state), and a thin `FinalizationGate` (per-round refused flag + allowance
 claims). `_force_block_pending_intents`, terminal exits, analysis_state
 ownership, tool_result assignments, nudge splice/clear all STAY until
 T5.5 finish(). Eight ordering invariants documented in the builder brief.
+
+## #10 — T5.3a: finalization decision layer extracted (2026-08-17)
+
+- **T5.3a** (re-scoped from T5.3 per the deep-map; the full gate is four
+  decision sites + shared analysis_state + a method resume() also calls):
+  `runtime/loop/finalization.py` (~709 lines) now holds the moved pure
+  helpers (pending_intents, finalization_blocked,
+  answer_table_no_table_designated, the two nudge builders — renamed *_text
+  to dodge a real local-shadowing UnboundLocalError — refreshed_analysis_state,
+  the shape events), `AnswerShapeCounter` (multi_row_answer_calls +
+  answer_table_succeeded; trail-seed asymmetry preserved with rationale),
+  and `FinalizationGate` (per-round refused flag + may_refuse(kind), which
+  absorbed _grant_forced_reround incl. the one-flag-for-both-kinds and
+  no-store-call-no-event short-circuit semantics). Body keeps: both gate
+  emissions, the if/elif precedence, tool_result rewrites, nudge
+  set/splice/clear, force-block, terminal exits, budget branches.
+  `agent_loop.py` 4031→3561. 37 new unit tests. All 8 ordering invariants
+  from the map verified by review.
+- Review: APPROVE, 0 blockers; all moved helpers AST-identical; fixes
+  folded: docstring caller-count (my brief's error — force-block has ONE
+  caller outside the body, resume()'s USER_STOPPED, not three; T5.5 scoped
+  against the real number), stale claim-key comment → (turn_index, window,
+  kind), defensive status=="ok" guard in observe_prior_entry.
+- V0 **5764 passed / 225 skipped / 1 xfailed**, ruff clean.
+  V1: **9 passed, 17:28 — ALL cases green** (L3 2/3 above floor, L4 3/3,
+  L7 3/3, multi-intent 3/3, 0 false positives).
+  V2: L4's three-intent question live — 3 searches → 3 getBlueprints →
+  3 runBlueprints → done; 2 designated verified tables + prose (L7
+  re-measure variance, shape contract satisfied); no refusal loop; fresh
+  traces in `data-agent-runtime` (23:19).
+- Base trap caught again by the pinning step (worktree spawned at 9558e9e,
+  reset to 7f2d51f). Patch applied to main with zero conflicts.

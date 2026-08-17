@@ -679,7 +679,7 @@ _STALE_CROSS_TURN_TOOLS = frozenset({"recordAssumptions", "updateAnalysisState"}
 # (05 §B.1) is persisted as an `answerWithTable` entry, and `answerWithTable`
 # cannot join the set above: its SUCCESSFUL entries are the turn's answer and must
 # replay. What must not replay is the REFUSAL specifically, whose `denial_detail`
-# names every pending intent by id and description (`agent_loop::_describe_pending`)
+# names every pending intent by id and description (`loop/finalization.py::_describe_pending`)
 # and whose `args` carry the refused draft answer prose.
 #
 # This is the THIRD instance of one defect class in this release (README findings

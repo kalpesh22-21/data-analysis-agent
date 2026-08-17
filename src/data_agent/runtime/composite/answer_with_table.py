@@ -485,7 +485,7 @@ def resolve_designations(args: Any, terminal_by_id: Mapping[str, str]) -> Design
         # was present either. Reported as an empty `items`, which the loop reads
         # back as `carried_designation=False` and turns into the retryable
         # `ANSWER_TABLE_NO_TABLE_DESIGNATED` nudge when the turn is holding
-        # multi-row results it never tabled (`_answer_table_no_table_designated`).
+        # multi-row results it never tabled (`answer_table_no_table_designated`).
         #
         # The absence itself is NOT counted in `dropped_unresolvable` — that counts
         # ITEMS the model sent, and this is the absence of any usable one. (Entries
