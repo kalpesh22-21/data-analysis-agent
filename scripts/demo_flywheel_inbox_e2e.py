@@ -4,13 +4,13 @@ Track-B learning FLYWHEEL against the LIVE stack (real OpenAI + l2-mcp +
 Couchbase + Neo4j + ClickHouse, all already UP).
 
 This is NOT a pytest test (the real LLM is nondeterministic) — it is a DEMO
-driver, a sibling of `scripts/demo_learning_e2e_openai.py` (whose infra wiring it
-reuses verbatim: `_load_openai_key`, the live-env block, `_build_infra`,
-`_teardown`, `_CATALOG`, `_mint_bound`, `_park_foreign_idle_sessions`,
-`_pick_openai_model`, `_print_model_emission`) and of
-`scripts/run_ui_runtime_real.py` (whose `create_app` runtime wiring it drives
-in-process). It walks THREE parts, each failing HONESTLY (print + return) if the
-real model does not cooperate — a valid real-LLM outcome, not a hard error:
+driver, a sibling of `scripts/demo_learning_e2e_openai.py` (with which it shares
+its whole live rig — the env block, `build_infra`, `teardown`, the catalog, the
+mint, the sweep helper, the model preflight, the emission printer — through
+`scripts/_e2e_harness.py`) and of `scripts/run_ui_runtime_real.py` (whose
+`create_app` runtime wiring it drives in-process). It walks THREE parts, each
+failing HONESTLY (print + return) if the real model does not cooperate — a valid
+real-LLM outcome, not a hard error:
 
   PART A — a LIVE runtime turn: ask -> rectify intent -> a real session trail.
   PART B — learn from that live session, then HUMAN-ACCEPT via the review inbox
@@ -29,67 +29,53 @@ Run (from the repo root, the l2 stack UP):
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
+
+# `_e2e_harness` + `_catalog` are SIBLING modules under `scripts/`. Put this script's
+# own directory on `sys.path` so the imports resolve BOTH when run as
+# `python scripts/x.py` AND when the file is loaded by path (importlib
+# `spec_from_file_location`, e.g. tests).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # --------------------------------------------------------------------------- env
 # Load OPENAI_API_KEY from .env (strip surrounding quotes) and set the FULL live
 # env block the E2E test documents, BEFORE any settings object is constructed.
-# (Copied EXACTLY from demo_learning_e2e_openai.py.)
 
-_REPO = Path(__file__).resolve().parent.parent
-
-
-def _load_openai_key() -> str:
-    env_path = _REPO / ".env"
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("OPENAI_API_KEY="):
-            val = line.split("=", 1)[1].strip()
-            if (val.startswith('"') and val.endswith('"')) or (
-                val.startswith("'") and val.endswith("'")
-            ):
-                val = val[1:-1]
-            return val
-    raise SystemExit("OPENAI_API_KEY not found in .env")
-
-
-_OPENAI_KEY = _load_openai_key()
-
-os.environ.update(
-    {
-        "LEARNING_ENABLED": "1",
-        "RUN_COUCHBASE_TESTS": "1",
-        "COUCHBASE_CONNECTION_STRING": "couchbase://localhost",
-        "COUCHBASE_USERNAME": "admin",
-        "COUCHBASE_PASSWORD": "password",
-        "LEARNING_CANDIDATES_USERNAME": "learning_candidates_writer",
-        "LEARNING_CANDIDATES_PASSWORD": "candidates-writer-pass",
-        "LEARNING_AUDIT_USERNAME": "learning_audit_writer",
-        "LEARNING_AUDIT_PASSWORD": "audit-writer-pass",
-        "LEARNING_CORPUS_USERNAME": "learning_corpus_writer",
-        "LEARNING_CORPUS_PASSWORD": "corpus-writer-pass",
-        "USER_KNOWLEDGE_USERNAME": "user_knowledge_writer",
-        "USER_KNOWLEDGE_PASSWORD": "user-writer-pass",
-        "LEARNING_REDIS_TEST_URL": "redis://localhost:6379/0",
-        "NEO4J_TEST_URI": "bolt://localhost:7687",
-        "NEO4J_TEST_USER": "neo4j",
-        "NEO4J_TEST_PASSWORD": "testpassword",
-        "EMBEDDING_TEST_URL": "http://localhost:18003/embed",
-        "MCP_TEST_URL": "http://localhost:18090/mcp",
-    }
+from _catalog import catalog_dict, catalog_handle  # noqa: E402
+from _e2e_harness import (  # noqa: E402
+    CATALOG,
+    DEPT_COL,
+    EMBEDDING_MODEL,
+    OLD_TS,
+    SALARY_COL,
+    CapturingExtractor,
+    Infra,
+    apply_live_env,
+    build_infra,
+    embedding_url,
+    load_openai_key,
+    mcp_url,
+    mint_bound_token,
+    neo4j_auth,
+    neo4j_uri,
+    park_foreign_idle_sessions,
+    parse_sse,
+    pick_openai_model_async,
+    print_model_emission,
+    teardown,
 )
 
+_OPENAI_KEY = load_openai_key()
+
+apply_live_env()
+
 import httpx  # noqa: E402
-import openai  # noqa: E402
-from neo4j import AsyncGraphDatabase  # noqa: E402
 
 from data_agent.learning.candidate.models import mint_candidate_id  # noqa: E402
-from data_agent.learning.config import LearningSettings, learning_enabled  # noqa: E402
+from data_agent.learning.config import learning_enabled  # noqa: E402
 from data_agent.learning.extractor.grounding import (  # noqa: E402
     known_rule_ids_from_catalog,
     rule_index_from_catalog,
@@ -99,53 +85,17 @@ from data_agent.learning.factory import (  # noqa: E402
     build_promotion_write_plane,
 )
 from data_agent.learning.inbox.inbox import InboxTransitionError  # noqa: E402
-from data_agent.learning.models import (  # noqa: E402
-    SWEEPABLE_STATUSES,
-    LearningStatus,
-    compute_content_hash,
-)
+from data_agent.learning.models import LearningStatus, compute_content_hash  # noqa: E402
 from data_agent.learning.promotion.landing import landing_id  # noqa: E402
-from data_agent.learning.promotion.token_minter import (  # noqa: E402
-    HttpTokenMinter,
-    TenantClaims,
-)
 from data_agent.learning.sweeper import LearningSweeper  # noqa: E402
 from data_agent.runtime.app import create_app  # noqa: E402
 from data_agent.runtime.config import RuntimeSettings  # noqa: E402
-from data_agent.runtime.mcp.real_client import RealMCPClient  # noqa: E402
-from data_agent.runtime.model.embedding_client import HttpEmbeddingClient  # noqa: E402
 from data_agent.runtime.model.openai_client import build_openai_model_client  # noqa: E402
-from data_agent.runtime.retrieval.corpus_loader import apply_schema  # noqa: E402
 from data_agent.runtime.retrieval.vector_index import Neo4jVectorIndex  # noqa: E402
 
-# `_catalog` is a sibling module under `scripts/`. Put this script's own directory
-# on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND
-# when the file is loaded by path (importlib `spec_from_file_location`, e.g. tests).
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _catalog import catalog_dict, catalog_handle  # noqa: E402
-
 # --------------------------------------------------------------------------- consts
-
-TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
-TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
-
-_TENANT_SETTINGS = RuntimeSettings(_env_file=None)
-
-# The warehouse TENANT claims every minted token must carry. The MCP maps
-# clientcode/proc_center/jti onto the paycom_* ClickHouse settings its row policies
-# read; a token without them is rejected 403 MISSING_TENANT_CLAIM before any tool
-# runs. Resolved through `RuntimeSettings` so this reads the SAME TENANT_* env vars
-# ui/server.py and the learning scheduler read (defaults = the seeded local tenant).
-_TENANT = TenantClaims(
-    clientcode=_TENANT_SETTINGS.tenant_client_code,
-    proc_center=_TENANT_SETTINGS.tenant_proc_center,
-    jti=_TENANT_SETTINGS.tenant_jti,
-)
-
-_REDIS_URL = os.environ["LEARNING_REDIS_TEST_URL"]
-_NEO4J_URI = os.environ["NEO4J_TEST_URI"]
-_EMBEDDING_URL = os.environ["EMBEDDING_TEST_URL"]
-_MCP_URL = os.environ["MCP_TEST_URL"]
+# The live-stack wiring (env block, stores, queue, mint, teardown, model preflight)
+# lives in `_e2e_harness`; what stays here is what THIS demo is about.
 
 # Runtime JWT verification against the live l2-token JWKS (mirrors
 # run_ui_runtime_real.py). The MCP still enforces scope/session live (D57/D80).
@@ -153,13 +103,6 @@ _JWKS_URL = "http://localhost:19000/.well-known/jwks.json"
 _TOKEN_ISSUER = "http://token:8000/"
 _TOKEN_AUDIENCE = "clickhouse-api"
 _PHOENIX_OTLP = os.environ.get("OTLP_ENDPOINT", "http://localhost:6006/v1/traces")
-
-_MODEL = "all-mpnet-base-v2"  # the embedding model id (corpus stamp / recall parity key)
-_OLD_TS = "2000-01-01T00:00:00+00:00"
-
-_TABLE = "dbpcm_warehouse.employee"
-_SALARY_COL = f"{_TABLE}.AnnualSalary"
-_DEPT_COL = f"{_TABLE}.Department"
 
 # PART A: ask, then rectify intent, in ONE session -> a real correction trail.
 _QUESTION_A = "what is the total annual salary for the Sales department?"
@@ -171,308 +114,20 @@ _RECTIFY_A = "actually, I want the AVERAGE annual salary per employee in Sales, 
 # PART C: the VARIANT — same shape, DIFFERENT filter — should autoplay the learned bp.
 _QUESTION_C = "what is the average annual salary per employee in the Engineering department?"
 
-_CATALOG = {
-    _TABLE: {
-        "ClientCode": "String",
-        "EmployeeCode": "String",
-        "Department": "String",
-        "EmployeeName": "String",
-        "EmployeeStatus": "String",
-        "AnnualSalary": "Decimal(18, 6)",
-    }
-}
-
-# OpenAI model candidates, tried in order until one answers (account may 404 some).
-_MODEL_CANDIDATES = ("gpt-5.5", "gpt-4o", "gpt-4.1", "gpt-4o-mini")
-
-
-class _CapturingExtractor:
-    """Transparent wrapper around the real `LearningExtractor` that records the
-    `ExtractionResult` the model produced so the demo can PRINT what the LLM
-    actually emitted (candidates + declines)."""
-
-    def __init__(self, inner: object) -> None:
-        self._inner = inner
-        self.last_result = None
-
-    async def extract(self, summary, verdict):  # noqa: ANN001
-        result = await self._inner.extract(summary, verdict)
-        self.last_result = result
-        return result
-
-
-@dataclass
-class _Infra:
-    settings: LearningSettings
-    session_store: object
-    candidate_store: object
-    audit_store: object
-    corpus_store: object
-    user_store: object
-    queue: object
-    embedder: object
-    neo4j_driver: object
-    mcp_client: object
-    token_minter: object
-    redis_client: object
-    stream: str
-    dead: str
-    created_sessions: list
-    created_candidates: list
-    created_corpus: list
-    created_neo4j_ids: list
-
-
-async def _build_infra() -> _Infra:
-    import redis.asyncio as aioredis
-
-    from data_agent.learning.audit.couchbase_audit_store import CouchbaseAuditStore
-    from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
-    from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
-    from data_agent.learning.redis_queue import RedisStreamsLearningQueue
-    from data_agent.learning.user.config import UserKnowledgeStoreConfig
-    from data_agent.learning.user.couchbase_user_store import CouchbaseUserKnowledgeStore
-    from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
-
-    settings = LearningSettings(_env_file=None)
-    session_store = CouchbaseSessionStore(RuntimeSettings(_env_file=None))
-    candidate_store = CouchbaseCandidateStore(settings)
-    audit_store = CouchbaseAuditStore(settings)
-    corpus_store = CouchbaseBlueprintCorpus(settings)
-    user_store = CouchbaseUserKnowledgeStore(UserKnowledgeStoreConfig(_env_file=None))
-    # Each store connects itself on first use (`CouchbaseConnectGate`); connecting
-    # up-front here only makes a bad endpoint/credential fail during setup, with the
-    # failing store named, instead of part-way through the demo.
-    for st in (session_store, candidate_store, audit_store, corpus_store, user_store):
-        await st.connect()
-
-    embedder = HttpEmbeddingClient(
-        url=_EMBEDDING_URL,
-        api_key=os.environ.get("EMBEDDING_TEST_API_KEY", ""),
-        model=_MODEL,
-        timeout_seconds=30.0,
-    )
-
-    neo4j_driver = AsyncGraphDatabase.driver(
-        _NEO4J_URI,
-        auth=(os.environ["NEO4J_TEST_USER"], os.environ["NEO4J_TEST_PASSWORD"]),
-    )
-    await apply_schema(neo4j_driver, dimension=768)
-
-    mcp_client = RealMCPClient(_MCP_URL)
-    token_minter = HttpTokenMinter(
-        TOKEN_SERVICE_URL, TOKEN_ISSUER_API_KEY, tenant=_TENANT
-    )
-
-    tag = uuid.uuid4().hex[:12]
-    redis_client = aioredis.from_url(_REDIS_URL, decode_responses=True)
-    stream = f"demo:flywheel:jobs:{tag}"
-    dead = f"demo:flywheel:jobs:dead:{tag}"
-    queue = RedisStreamsLearningQueue(
-        redis_client,
-        stream=stream,
-        group="learning-workers",
-        consumer_name=f"worker-demo-{tag}",
-        dead_letter_stream=dead,
-    )
-    await queue.ensure_group()
-
-    return _Infra(
-        settings=settings,
-        session_store=session_store,
-        candidate_store=candidate_store,
-        audit_store=audit_store,
-        corpus_store=corpus_store,
-        user_store=user_store,
-        queue=queue,
-        embedder=embedder,
-        neo4j_driver=neo4j_driver,
-        mcp_client=mcp_client,
-        token_minter=token_minter,
-        redis_client=redis_client,
-        stream=stream,
-        dead=dead,
-        created_sessions=[],
-        created_candidates=[],
-        created_corpus=[],
-        created_neo4j_ids=[],
-    )
-
-
-async def _teardown(infra: _Infra) -> None:
-    from couchbase.exceptions import DocumentNotFoundException
-
-    from data_agent.learning.dedup.couchbase_corpus import _doc_id as _corpus_doc_id
-
-    async def _rm(coll, key):
-        try:
-            await coll.remove(key)
-        except DocumentNotFoundException:
-            pass
-
-    for sid in infra.created_sessions:
-        await _rm(infra.session_store._sessions, f"session::{sid}")
-    for cid in infra.created_candidates:
-        await _rm(infra.candidate_store._collection, cid)
-    for ckey in infra.created_corpus:
-        await _rm(infra.corpus_store._collection, _corpus_doc_id(ckey))
-    for node_id in infra.created_neo4j_ids:
-        async with infra.neo4j_driver.session() as s:
-            await s.run("MATCH (b:Blueprint {id: $id}) DETACH DELETE b", {"id": node_id})
-    for st in (
-        infra.session_store,
-        infra.candidate_store,
-        infra.audit_store,
-        infra.corpus_store,
-        infra.user_store,
-    ):
-        await st.close()
-    await infra.neo4j_driver.close()
-    await infra.redis_client.delete(infra.stream, infra.dead)
-    async for key in infra.redis_client.scan_iter(match=f"{infra.stream}:enqueued:*"):
-        await infra.redis_client.delete(key)
-    await infra.redis_client.aclose()
-
-
-async def _park_foreign_idle_sessions(infra: _Infra, keep_sid: str) -> int:
-    idle = await infra.session_store.scan_idle_sessions(
-        statuses=SWEEPABLE_STATUSES,
-        last_activity_before="2099-01-01T00:00:00+00:00",
-        limit=500,
-    )
-    parked = 0
-    for doc, _cas in idle:
-        if doc.session_id == keep_sid:
-            continue
-        doc.learning_status = LearningStatus.DONE
-        await infra.session_store._upsert_doc(doc.session_id, doc)
-        parked += 1
-    return parked
-
-
-async def _mint_bound(scope: list, session_id: str) -> str:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            TOKEN_SERVICE_URL,
-            headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
-            json={
-                "user_name": "alice",
-                "column_scope": scope,
-                "session_id": session_id,
-                # Without the tenant claims the MCP 403s every tool call
-                # (MISSING_TENANT_CLAIM) — see `_TENANT`.
-                "claims": _TENANT.as_claims(),
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["access_token"]
-
-
-async def _pick_openai_model() -> str:
-    """Return the first candidate model the account can actually call (Responses
-    API). A 404 model / no-access error moves to the next; anything else re-raised."""
-    client = openai.AsyncOpenAI(api_key=_OPENAI_KEY)
-    last_err = None
-    candidates = (os.environ["DEMO_MODEL"],) if os.environ.get("DEMO_MODEL") else _MODEL_CANDIDATES
-    for model in candidates:
-        try:
-            await client.responses.create(model=model, input=[{"role": "user", "content": "ping"}])
-            print(f"[MODEL] preflight OK on {model!r} (OpenAI Responses API)")
-            return model
-        except openai.NotFoundError as exc:
-            print(f"[MODEL] {model!r} unavailable (404) — trying next: {exc}")
-            last_err = exc
-        except Exception as exc:  # noqa: BLE001
-            print(f"[MODEL] {model!r} errored ({type(exc).__name__}): {exc} — trying next")
-            last_err = exc
-    raise SystemExit(f"No OpenAI model candidate worked: {last_err}")
-
-
-def _print_model_emission(result) -> None:  # noqa: ANN001
-    print("\n" + "=" * 70)
-    print(">>> WHAT THE REAL OpenAI MODEL EMITTED (raw ExtractionResult)")
-    print("=" * 70)
-    if result is None:
-        print("  (extractor was never invoked — triage did not reach KEEP?)")
-        return
-    print(f"  candidates: {len(result.candidates)}   declines: {len(result.declines)}")
-    for i, cand in enumerate(result.candidates):
-        h = cand.header
-        print(
-            f"\n  --- candidate[{i}] type={h.type} confidence={h.confidence} "
-            f"proposed_action={h.proposed_action}"
-        )
-        print(f"      rationale: {h.rationale}")
-        print(
-            f"      entity_self_check: contains_entities={h.entity_self_check.contains_entities} "
-            f"found={list(h.entity_self_check.found)}"
-        )
-        payload = cand.payload
-        if hasattr(payload, "intent"):
-            print(f"      intent (entity-free, embedded): {payload.intent!r}")
-            print(f"      kind: {payload.kind}   resolves: {payload.resolves}")
-            print(f"      accepted_signal: {payload.accepted_signal}")
-            print("      parameterization (the slot plan the model chose):")
-            for p in payload.parameterization:
-                loc = p.locator
-                slot = p.slot
-                slot_desc = (
-                    f"slot(name={slot.name!r}, type={slot.type}, binds_to={slot.binds_to}, "
-                    f"required={slot.required})"
-                    if slot is not None
-                    else f"role={p.role} rule_id={p.rule_id} why={p.why}"
-                )
-                print(
-                    f"        - locator(table={loc.table}, column={loc.column}, "
-                    f"value={loc.value!r}) role={p.role} -> {slot_desc}"
-                )
-            if payload.result_signature is not None:
-                print(f"      result_signature: {payload.result_signature}")
-            if payload.notes:
-                print(f"      notes: {payload.notes}")
-        else:
-            print(f"      payload: {payload}")
-    for d in result.declines:
-        print(f"\n  --- DECLINE type={d.type} reason={d.reason} detail={d.detail!r}")
-    print("=" * 70 + "\n")
-
-
 # --------------------------------------------------------------------------- runtime
 
 
-def _parse_sse(text: str) -> tuple[list[dict], dict | None, dict | None]:
-    """Return (progress_events, result_dict, error_dict) parsed from the SSE body
-    the runtime `/turn` + `/turn/resume` endpoints stream (mirrors
-    demo_runtime_turn_traced.py::_parse_sse)."""
-    progress: list[dict] = []
-    result: dict | None = None
-    error: dict | None = None
-    event = None
-    for line in text.splitlines():
-        if line.startswith("event:"):
-            event = line[len("event:") :].strip()
-        elif line.startswith("data:"):
-            payload = json.loads(line[len("data:") :].strip())
-            if event == "progress":
-                progress.append(payload)
-            elif event == "result":
-                result = payload
-            elif event == "error":
-                error = payload
-    return progress, result, error
-
-
-def _build_runtime_app(infra: _Infra, model: str):
+def _build_runtime_app(infra: Infra, model: str):
     """Build the REAL in-process runtime `AgentLoop` (via `create_app`) EXACTLY as
     `run_ui_runtime_real.py` wires it, with retrieval turned ON so a landed
     blueprint is recallable. The SAME live Couchbase session store + RealMCPClient
-    that `_build_infra` opened are reused (one event loop, one bucket) so the
+    that `build_infra` opened are reused (one event loop, one bucket) so the
     session a runtime turn writes is the SAME doc the learning sweeper later reads.
     `create_app` builds the Neo4jVectorIndex + RetrievalPipeline + runBlueprint
     executor itself from these settings (retrieval_enabled + neo4j_url + embedder)."""
     settings = RuntimeSettings(
         _env_file=None,
-        mcp_url=_MCP_URL,
+        mcp_url=mcp_url(),
         openai_api_key=_OPENAI_KEY,
         openai_model=model,
         openai_base_url="",
@@ -490,18 +145,18 @@ def _build_runtime_app(infra: _Infra, model: str):
         max_wall_clock_seconds=60,
         max_budget_windows=3,
         # Retrieval ON: recall the just-landed blueprint. embedding_model MUST equal
-        # the corpus/landing stamp (_MODEL) or recall parity-filters to an empty set.
+        # the corpus/landing stamp (EMBEDDING_MODEL) or recall parity-filters to an empty set.
         retrieval_enabled=True,
         scratch_enabled=False,
-        neo4j_url=_NEO4J_URI,
-        neo4j_username=os.environ["NEO4J_TEST_USER"],
-        neo4j_password=os.environ["NEO4J_TEST_PASSWORD"],
-        embedding_api_url=_EMBEDDING_URL,
-        embedding_model=_MODEL,
+        neo4j_url=neo4j_uri(),
+        neo4j_username=neo4j_auth()[0],
+        neo4j_password=neo4j_auth()[1],
+        embedding_api_url=embedding_url(),
+        embedding_model=EMBEDDING_MODEL,
     )
     print(
-        f"[RUNTIME] create_app(retrieval=ON, mcp={_MCP_URL}, model={model!r}, "
-        f"embedding_model={_MODEL!r})"
+        f"[RUNTIME] create_app(retrieval=ON, mcp={mcp_url()}, model={model!r}, "
+        f"embedding_model={EMBEDDING_MODEL!r})"
     )
     return create_app(
         settings=settings,
@@ -524,7 +179,7 @@ async def _drive_turn(
         json={"message": message},
         timeout=180.0,
     )
-    _progress, result, error = _parse_sse(resp.text)
+    _progress, result, error = parse_sse(resp.text)
     if error is not None:
         print(f"  [SSE error] {error}")
     return result
@@ -540,7 +195,7 @@ async def _drive_resume(
         json={"answer": answer},
         timeout=180.0,
     )
-    _progress, result, error = _parse_sse(resp.text)
+    _progress, result, error = parse_sse(resp.text)
     if error is not None:
         print(f"  [SSE error] {error}")
     return result
@@ -609,8 +264,8 @@ async def _run() -> int:
     if not learning_enabled():
         raise SystemExit("LEARNING_ENABLED must be truthy")
 
-    model = await _pick_openai_model()
-    infra = await _build_infra()
+    model = await pick_openai_model_async(_OPENAI_KEY)
+    infra = await build_infra(stream_prefix="demo:flywheel")
 
     tag = uuid.uuid4().hex[:10]
     sid_a = f"flywheel-a-{tag}"  # underscore-free (D5/couchbase key + JWT-bound)
@@ -629,7 +284,7 @@ async def _run() -> int:
         print("# [PART A] a LIVE runtime turn: ask -> rectify intent -> verify")
         print("#" * 72)
 
-        jwt_a = await _mint_bound([_SALARY_COL, _DEPT_COL], sid_a)
+        jwt_a = await mint_bound_token([SALARY_COL, DEPT_COL], sid_a)
         infra.created_sessions.append(sid_a)
 
         print(f"\n[STAGE A1] POST /turn  session={sid_a!r}  q={_QUESTION_A!r}")
@@ -684,10 +339,10 @@ async def _run() -> int:
         # Idle the session so it is sweepable (last_activity excludes the content
         # hash — mutating it is safe). learning_status is 'active' on a fresh
         # runtime session, so it is claimable.
-        doc_a.last_activity = _OLD_TS
+        doc_a.last_activity = OLD_TS
         doc_a.learning_status = LearningStatus.ACTIVE
         await infra.session_store._upsert_doc(sid_a, doc_a)
-        parked = await _park_foreign_idle_sessions(infra, sid_a)
+        parked = await park_foreign_idle_sessions(infra, sid_a)
         print(f"[STAGE B1] idled session for sweep; parked {parked} foreign idle session(s)")
 
         sweeper = LearningSweeper(infra.session_store, infra.queue, infra.settings)
@@ -726,7 +381,7 @@ async def _run() -> int:
             candidate_store=infra.candidate_store,
             blueprint_corpus=infra.corpus_store,
             user_store=infra.user_store,
-            catalog_schema=_CATALOG,
+            catalog_schema=CATALOG,
             embedder=infra.embedder,
             known_rules=known_rule_ids_from_catalog(demo_catalog),
             # Without this the hint machinery is INERT here (the factory says so at
@@ -734,14 +389,14 @@ async def _run() -> int:
             rule_index=rule_index_from_catalog(demo_catalog),
             sampler=lambda _env: True,  # route the blueprint to the HUMAN inbox
         )
-        capturing = _CapturingExtractor(consumer._extractor)
+        capturing = CapturingExtractor(consumer._extractor)
         consumer._extractor = capturing
         consumed = await consumer.run_once()
         print(
             f"[STAGE B3] CONSUMED (done={consumed.done}) with the REAL {model!r} extractor "
             "(sampler=True -> in_review)"
         )
-        _print_model_emission(capturing.last_result)
+        print_model_emission(capturing.last_result)
 
         # Register EVERY produced candidate ordinal for teardown (declines make none).
         result = capturing.last_result
@@ -761,7 +416,7 @@ async def _run() -> int:
             token_minter=infra.token_minter,
             neo4j_driver=infra.neo4j_driver,
             embedding_client=infra.embedder,
-            model_id=_MODEL,
+            model_id=EMBEDDING_MODEL,
             # PriorArt Slice 2: the SAME corpus object as `hit_counts`, so a
             # reject/retract in this demo stamps the artifact terminal and the
             # flywheel actually demonstrates that a declined idea stops
@@ -872,7 +527,7 @@ async def _run() -> int:
         print("# [PART C] a VARIANT question AUTOPLAYS the blueprint through the RUNTIME")
         print("#" * 72)
 
-        jwt_c = await _mint_bound([_SALARY_COL, _DEPT_COL], sid_c)
+        jwt_c = await mint_bound_token([SALARY_COL, DEPT_COL], sid_c)
         infra.created_sessions.append(sid_c)
 
         print(f"\n[STAGE C1] POST /turn  session={sid_c!r}  q={_QUESTION_C!r}")
@@ -913,9 +568,9 @@ async def _run() -> int:
         print("\n[STAGE C3] deterministic recall backstop (Neo4jVectorIndex.recall):")
         query_vector = (await infra.embedder.embed([_QUESTION_C]))[0]
         index = Neo4jVectorIndex(
-            url=_NEO4J_URI,
-            auth=(os.environ["NEO4J_TEST_USER"], os.environ["NEO4J_TEST_PASSWORD"]),
-            expected_model=_MODEL,
+            url=neo4j_uri(),
+            auth=neo4j_auth(),
+            expected_model=EMBEDDING_MODEL,
             timeout_seconds=15.0,
         )
         try:
@@ -944,7 +599,7 @@ async def _run() -> int:
                 "blueprint + inbox state (session/candidate/corpus/neo4j left in place)."
             )
         else:
-            await _teardown(infra)
+            await teardown(infra)
             print("\n[TEARDOWN] cleaned created session/candidate/corpus/neo4j artifacts.")
 
 

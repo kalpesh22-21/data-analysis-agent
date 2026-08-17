@@ -34,6 +34,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from data_agent.untrusted import as_str_list
+
 from ..candidate.models import CandidateEnvelope
 from ..summary.models import SessionSummary
 
@@ -86,10 +88,9 @@ def _text(raw: Any, limit: int) -> str | None:
 def _str_list(raw: Any) -> list[str]:
     """A rehydrated JSON list-of-str as a bounded list. A bare `str` is REJECTED rather
     than iterated — `list("abc")` fabricates three entries and raises nothing, the same
-    char-explosion class guarded at every other untrusted-JSON boundary in this loop."""
-    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
-        return []
-    return [item for item in raw[:_MAX_LIST_ITEMS] if isinstance(item, str)]
+    char-explosion class `untrusted.as_str_list` guards at every other untrusted-JSON
+    boundary in this loop."""
+    return as_str_list(raw, max_items=_MAX_LIST_ITEMS)
 
 
 def session_brief(summary: SessionSummary) -> str:

@@ -903,7 +903,16 @@ def _json_or_none(value: Any) -> str | None:
 
 def _str_list(value: Any) -> list[str]:
     """Coerce a value into a list of strings (dropping a non-list to `[]`), for the
-    array-of-primitive node props (`grain`, `synonyms`). Casing is preserved (D70)."""
+    array-of-primitive node props (`grain`, `synonyms`). Casing is preserved (D70).
+
+    TODO (cleanup wave B): replace with `data_agent.untrusted.as_str_list`. This is the
+    WEAK copy of that guard — `str(item)` writes the literal `"None"` onto a node for a
+    JSON null, and a member that is a dict lands as its repr, both of which then read as
+    real grain/synonym content. The shared coercer SKIPS non-`str` members instead. The
+    change is behavioural (a catalog export with a null in `grain` currently seeds
+    `"None"`), so it belongs in a slice that owns this file rather than in the dedup
+    pass that created `untrusted.py`.
+    """
     if not isinstance(value, list):
         return []
     return [str(item) for item in value]

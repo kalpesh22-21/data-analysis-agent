@@ -56,6 +56,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
+from data_agent.untrusted import as_float, as_str_list
+
 from ..priorart import PriorArtCard, PriorArtIndex, PriorArtKind, PriorArtUnavailableError
 from ..summary.models import SessionSummary
 
@@ -440,34 +442,34 @@ def _score(card: PriorArtCard) -> float:
     same false positive `bool` was rejected for, without a ceiling. `1e308` also pastes
     312 characters of digits into a token-budgeted prompt. Out of range ⇒ 0.0, the
     bottom, matching `neo4j_index._float`'s "unusable for ranking" posture.
+
+    Guards 2 and 3 ARE `untrusted.as_float(lo=0.0, hi=1.0)` — the same call
+    `neo4j_index._float` makes, so the two ends of this pipe cannot drift on what counts
+    as a usable score. Guard 1 stays here: it is specific to `PriorArtCard.confidence`
+    being COMPUTED rather than stored, so the failure is in the access, not the value.
     """
     try:
         value = card.confidence
     except Exception:  # noqa: BLE001 - a mis-typed card scores bottom, never crashes
         return 0.0
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return 0.0
-    try:
-        score = float(value)
-    except (OverflowError, ValueError):  # an int too large to be a float
-        return 0.0
-    # NaN fails both comparisons, so this rejects it without a separate isnan test.
-    if not (0.0 <= score <= 1.0):
-        return 0.0
-    return score
+    return as_float(value, lo=0.0, hi=1.0)
 
 
 def _str_list(raw: Any) -> list[str]:
     """A card's tuple-of-str field as a bounded list of sanitized strings.
 
-    A bare `str` is REJECTED rather than iterated: `", ".join("abc")` is `"a, b, c"`,
-    which manufactures three rule ids that no registry has heard of and does it without
-    raising. Same char-explosion class `neo4j_index._rule_ids` guards, at the other end
-    of the pipe."""
-    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
-        return []
+    The CONTAINER gate is `untrusted.as_str_list`: a bare `str` is REJECTED rather than
+    iterated, because `", ".join("abc")` is `"a, b, c"`, which manufactures three rule
+    ids that no registry has heard of and does it without raising. Same char-explosion
+    class `neo4j_index._rule_ids` guards, at the other end of the pipe.
+
+    The per-item cap is `_sanitize`, NOT the shared coercer's `max_chars`: these items
+    are rendered into the fenced prior-art block, so they need this module's flattening
+    and de-fencing, which belong to the block's delimiter rather than to the value.
+    Sanitizing to `""` drops the item — a member that renders as nothing is not a name.
+    """
     out: list[str] = []
-    for item in raw[:_MAX_LIST_ITEMS]:
+    for item in as_str_list(raw, max_items=_MAX_LIST_ITEMS):
         text = _sanitize(item, limit=_MAX_LIST_ITEM_CHARS)
         if text:
             out.append(text)

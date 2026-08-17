@@ -50,6 +50,24 @@ class TokenMintError(Exception):
     fails closed to `probe_unavailable` (never a value, never a silent pass)."""
 
 
+# Claim field -> the ONE env var that sets it. Both readers of these claims
+# (`RuntimeSettings.tenant_*` and `ui/server.py`'s TENANT_* block) read the SAME names
+# on purpose, so a blank value has exactly one knob to name. Naming all three in every
+# message made the reader diff the message against their own config to find out which
+# one they missed — the error knows which field is blank, so it says.
+#
+# The mapping is hand-written because `clientcode -> TENANT_CLIENT_CODE` is not a
+# mechanical transform, and it is read with `.get(..., <generic>)`: a future claim field
+# whose env var nobody added here must degrade to the old vaguer sentence, never to a
+# `KeyError` raised from inside a validator whose whole job is to fail legibly.
+_CLAIM_ENV_VARS = {
+    "clientcode": "TENANT_CLIENT_CODE",
+    "proc_center": "TENANT_PROC_CENTER",
+    "jti": "TENANT_JTI",
+}
+_CLAIM_ENV_FALLBACK = "TENANT_CLIENT_CODE / TENANT_PROC_CENTER / TENANT_JTI"
+
+
 @dataclass(frozen=True)
 class TenantClaims:
     """The three warehouse tenant claims the MCP requires on EVERY call.
@@ -135,8 +153,8 @@ class TenantClaims:
                 raise ValueError(
                     f"tenant claim {field.name!r} is blank — the MCP would reject "
                     "every replay 403 MISSING_TENANT_CLAIM and the promotion gate "
-                    "would hold silently (set TENANT_CLIENT_CODE / TENANT_PROC_CENTER "
-                    "/ TENANT_JTI)"
+                    "would hold silently (set "
+                    f"{_CLAIM_ENV_VARS.get(field.name, _CLAIM_ENV_FALLBACK)})"
                 )
             # `unicodedata.category(ch) == "Cc"` IS the C0+C1+DEL set, exactly — the
             # set this class claims to refuse. The predicate here used to be
@@ -191,6 +209,18 @@ class HttpTokenMinter:
     asserted at Layer 1. That matters more here than usual: the omitted-claims defect
     was a body-shape bug, and its only symptom downstream was a hold that looks
     identical to a healthy one.
+
+    TWO PARAMETERS EXIST FOR THE REQUEST PATH, both defaulted to the offline plane's
+    posture so no learning-plane wiring site changes by adopting them:
+      * `ttl_seconds=None` OMITS the field, deferring to the IdP's own configured
+        default (`token_service.settings.token_ttl_seconds`). The short-TTL default
+        (300) is right for a probe that fires once and discards the token; a UI
+        session's JWT has to outlive a conversation, and hardcoding the IdP's default
+        here would silently pin a value the deployment can change.
+      * `allow_unscoped=True` disables the allow-all backstop below. The backstop is
+        about the LEARNING plane (see `mint`); a request-path caller whose entitlement
+        legitimately resolves to allow-all (D80b: `[]` == no column restriction) has
+        to say so explicitly, at its own wiring site, in one word a reviewer can grep.
     """
 
     def __init__(
@@ -200,9 +230,10 @@ class HttpTokenMinter:
         *,
         tenant: TenantClaims,
         user_name: str = "learning-scheduler",
-        ttl_seconds: int = 300,
+        ttl_seconds: int | None = 300,
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        allow_unscoped: bool = False,
     ) -> None:
         self._endpoint = token_endpoint
         self._api_key = api_key
@@ -211,6 +242,7 @@ class HttpTokenMinter:
         self._ttl_seconds = ttl_seconds
         self._timeout = timeout
         self._transport = transport
+        self._allow_unscoped = allow_unscoped
 
     async def mint(self, column_scope: list[str], *, session_id: str) -> str:
         # BACKSTOP (D57/D80b): an EMPTY column_scope mints an ALLOW-ALL (unrestricted)
@@ -218,23 +250,29 @@ class HttpTokenMinter:
         # mint rather than run a model/extraction-derived replay SQL against live
         # ClickHouse with no scope. golden_replay short-circuits on empty `uses` before
         # reaching here; this is the defense-in-depth second gate.
-        if not column_scope:
+        # `allow_unscoped=True` is the request path's explicit opt-out: there, allow-all
+        # is a RESOLVED ENTITLEMENT (`ui/entitlements.py`), not an absent scope.
+        if not column_scope and not self._allow_unscoped:
             raise TokenMintError(
                 "refusing to mint an allow-all token (empty column_scope)"
             )
         # `session_id` binds the token (sid_hash) to the synthetic session the probe
         # also sends as X-Session-Id — required by the live MCP's require_sid_binding
         # (§1.3 deviation). `column_scope` is EXACTLY the blueprint's `uses` footprint.
-        body = {
+        body: dict[str, object] = {
             "user_name": self._user_name,
             "column_scope": list(column_scope),
-            "ttl_seconds": self._ttl_seconds,
             "session_id": session_id,
             # The three warehouse tenant claims the MCP requires on EVERY call —
             # without them the replay is rejected 403 MISSING_TENANT_CLAIM before any
             # tool runs and the promotion gate holds silently. See `TenantClaims`.
             "claims": self._tenant.as_claims(),
         }
+        if self._ttl_seconds is not None:
+            # Omitted (not sent as null) when unset: the IdP treats a missing
+            # `ttl_seconds` as "use my configured default", and an absent key is the
+            # body every hand-rolled mint site posted before they moved here.
+            body["ttl_seconds"] = self._ttl_seconds
         try:
             async with httpx.AsyncClient(
                 timeout=self._timeout, transport=self._transport

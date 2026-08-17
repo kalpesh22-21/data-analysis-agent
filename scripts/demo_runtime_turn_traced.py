@@ -51,144 +51,43 @@ import sys
 import uuid
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parent.parent
+# `_e2e_harness` is a SIBLING module under `scripts/`. Put this script's own directory
+# on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND when
+# the file is loaded by path (importlib `spec_from_file_location`, e.g. tests).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _e2e_harness import (  # noqa: E402
+    PHOENIX_GRAPHQL,
+    PHOENIX_OTLP,
+    PHOENIX_UI,
+    load_openai_key,
+    mint_bound_token,
+    parse_sse,
+    pick_openai_model_async,
+    span_attrs,
+)
 
-def _load_openai_key() -> str:
-    env_path = _REPO / ".env"
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("OPENAI_API_KEY="):
-            val = line.split("=", 1)[1].strip()
-            if (val.startswith('"') and val.endswith('"')) or (
-                val.startswith("'") and val.endswith("'")
-            ):
-                val = val[1:-1]
-            return val
-    raise SystemExit("OPENAI_API_KEY not found in .env")
-
-
-_OPENAI_KEY = _load_openai_key()
+_OPENAI_KEY = load_openai_key()
 
 # The runtime reads the OTLP endpoint from settings; export the online turn's
 # spans to Phoenix. Set BEFORE any RuntimeSettings is constructed.
-_PHOENIX_OTLP = "http://localhost:6006/v1/traces"
-_PHOENIX_UI = "http://localhost:6006"
-_PHOENIX_GRAPHQL = "http://localhost:6006/graphql"
-os.environ["OTLP_ENDPOINT"] = _PHOENIX_OTLP
+os.environ["OTLP_ENDPOINT"] = PHOENIX_OTLP
 
 import httpx  # noqa: E402
-import openai  # noqa: E402
 
 from data_agent.runtime.app import create_app  # noqa: E402
 from data_agent.runtime.config import RuntimeSettings  # noqa: E402
 from data_agent.runtime.observability import tracing  # noqa: E402
 from data_agent.runtime.session.memory_store import InMemorySessionStore  # noqa: E402
 
-# The live l2-token IdP + l2-mcp (docker-compose.integration.yml), mirroring
-# tests/integration/conftest.py + scripts/run_ui_runtime.py.
-TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
-TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
+# The live l2-mcp (docker-compose.integration.yml); the l2-token IdP endpoints and the
+# tenant claims the mint carries live in `_e2e_harness`.
 _JWKS_URL = "http://localhost:19000/.well-known/jwks.json"
 _TOKEN_ISSUER = "http://token:8000/"
 _TOKEN_AUDIENCE = "clickhouse-api"
 _MCP_URL = os.environ.get("MCP_TEST_URL", "http://localhost:18090/mcp")
 
 _QUESTION = "How many employees are in the Sales department?"
-_MODEL_CANDIDATES = ("gpt-5.5", "gpt-4o", "gpt-4.1", "gpt-4o-mini")
-
-
-async def _pick_openai_model() -> str:
-    """First candidate the account can actually call (Responses API); 404 -> next."""
-    client = openai.AsyncOpenAI(api_key=_OPENAI_KEY)
-    last_err = None
-    candidates = (os.environ["DEMO_MODEL"],) if os.environ.get("DEMO_MODEL") else _MODEL_CANDIDATES
-    for model in candidates:
-        try:
-            await client.responses.create(model=model, input=[{"role": "user", "content": "ping"}])
-            print(f"[MODEL] preflight OK on {model!r} (OpenAI Responses API)")
-            return model
-        except openai.NotFoundError as exc:
-            print(f"[MODEL] {model!r} unavailable (404) — trying next: {exc}")
-            last_err = exc
-        except Exception as exc:  # noqa: BLE001
-            print(f"[MODEL] {model!r} errored ({type(exc).__name__}): {exc} — trying next")
-            last_err = exc
-    raise SystemExit(f"No OpenAI model candidate worked: {last_err}")
-
-
-async def _mint(scope: list[str], session_id: str) -> str:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            TOKEN_SERVICE_URL,
-            headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
-            json={
-                "user_name": "alice",
-                "column_scope": scope,
-                "session_id": session_id,
-                # The warehouse TENANT claims. `app/token_service.py::_mint` stamps
-                # only sub/iss/aud/exp/user_name/column_scope/sid_hash itself, so
-                # without these the l2-mcp auth middleware rejects EVERY request
-                # with 403 MISSING_TENANT_CLAIM ("Token missing required tenant
-                # claim 'clientcode'") and this demo cannot make a single tool call.
-                # The names are the l2-mcp CLICKHOUSE_TENANT_SETTINGS map's inputs
-                # (clientcode -> paycom_client_code etc., app/config.py:181); the
-                # values match the seeded warehouse tenant (CLIENT_A/PC01) and the
-                # test principal the RLS row policies key on (TESTJTI001, see
-                # docker/clickhouse-init/hr-4tables-snake-migration.sql).
-                "claims": {
-                    "clientcode": "CLIENT_A",
-                    "proc_center": "PC01",
-                    "jti": "TESTJTI001",
-                },
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["access_token"]
-
-
-def _parse_sse(text: str) -> tuple[list[dict], dict | None, dict | None]:
-    """Return (progress_events, result_dict, error_dict) parsed from the SSE body."""
-    progress: list[dict] = []
-    result: dict | None = None
-    error: dict | None = None
-    event = None
-    for line in text.splitlines():
-        if line.startswith("event:"):
-            event = line[len("event:") :].strip()
-        elif line.startswith("data:"):
-            payload = json.loads(line[len("data:") :].strip())
-            if event == "progress":
-                progress.append(payload)
-            elif event == "result":
-                result = payload
-            elif event == "error":
-                error = payload
-    return progress, result, error
-
-
-def _flatten(d: dict, prefix: str = "") -> dict:
-    out: dict = {}
-    for key, value in d.items():
-        dotted = f"{prefix}{key}"
-        if isinstance(value, dict):
-            out.update(_flatten(value, dotted + "."))
-        else:
-            out[dotted] = value
-    return out
-
-
-def _span_attrs(node) -> dict:  # noqa: ANN001
-    raw = node.get("attributes")
-    if raw is None:
-        return {}
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (ValueError, TypeError):
-            return {}
-    return _flatten(raw) if isinstance(raw, dict) else {}
-
 
 _LLM_CONTENT_KEYS = (
     "llm.input_messages",
@@ -207,7 +106,7 @@ async def _confirm_phoenix(trace_id: str | None, *, hide_content: bool) -> None:
         "} } } }"
     )
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(_PHOENIX_GRAPHQL, json={"query": query})
+        resp = await client.post(PHOENIX_GRAPHQL, json={"query": query})
         resp.raise_for_status()
         data = resp.json()
     projects = data.get("data", {}).get("projects", {}).get("edges", [])
@@ -219,7 +118,7 @@ async def _confirm_phoenix(trace_id: str | None, *, hide_content: bool) -> None:
         print("  project 'data-agent-runtime' NOT found. Projects present:")
         for edge in projects:
             print(f"    - {edge['node']['name']} (traces={edge['node']['traceCount']})")
-        print(f"  Open the Phoenix UI to inspect: {_PHOENIX_UI}")
+        print(f"  Open the Phoenix UI to inspect: {PHOENIX_UI}")
         return
     spans = [e["node"] for e in target["spans"]["edges"]]
     print(
@@ -244,7 +143,7 @@ async def _confirm_phoenix(trace_id: str | None, *, hide_content: bool) -> None:
     if chosen is None:
         print(
             "  no `agent.turn` trace found yet (ingestion lag?). "
-            f"Open {_PHOENIX_UI} (project: data-agent-runtime)."
+            f"Open {PHOENIX_UI} (project: data-agent-runtime)."
         )
         return
 
@@ -260,7 +159,7 @@ async def _confirm_phoenix(trace_id: str | None, *, hide_content: bool) -> None:
     def _print(node_id, depth):  # noqa: ANN001
         for s in children.get(node_id, []):
             indent = "    " + "  " * depth
-            attrs = _span_attrs(s)
+            attrs = span_attrs(s)
             extra = ""
             if s["name"].startswith("tool."):
                 extra = f"  (status={attrs.get('tool.status')})"
@@ -283,7 +182,7 @@ async def _confirm_phoenix(trace_id: str | None, *, hide_content: bool) -> None:
         f"({'DEFAULT (content hidden)' if hide_content else 'OPT-IN reveal (content shown)'})"
     )
     for s in llm:
-        attrs = _span_attrs(s)
+        attrs = span_attrs(s)
         blob = json.dumps(attrs)
         present = [k for k in _LLM_CONTENT_KEYS if k in attrs]
         carries_question = _QUESTION in blob
@@ -294,19 +193,19 @@ async def _confirm_phoenix(trace_id: str | None, *, hide_content: bool) -> None:
             f"non-content shape kept: model_name={attrs.get('llm.model_name')!r} "
             f"total_tokens={attrs.get('llm.token_count.total')}"
         )
-    print(f"\n  Open the Phoenix UI: {_PHOENIX_UI}  (project: data-agent-runtime)")
+    print(f"\n  Open the Phoenix UI: {PHOENIX_UI}  (project: data-agent-runtime)")
     print("=" * 70)
 
 
 async def _run() -> int:
-    model = await _pick_openai_model()
+    model = await pick_openai_model_async(_OPENAI_KEY)
 
     settings = RuntimeSettings(
         _env_file=None,
         mcp_url=_MCP_URL,
         openai_api_key=_OPENAI_KEY,
         openai_model=model,
-        otlp_endpoint=_PHOENIX_OTLP,
+        otlp_endpoint=PHOENIX_OTLP,
         otlp_project_name="data-agent-runtime",
         # D25 opt-in reveal (like the learning-loop verbose gate): this DIAGNOSTIC
         # demo defaults to SHOWING the LLM prompt/completion on the span so the
@@ -344,10 +243,12 @@ async def _run() -> int:
         tracing.configure_tracing = _real_configure  # type: ignore[assignment]
 
     provider = captured["provider"]
-    print(f"[TRACE] Phoenix OTLP exporter -> {_PHOENIX_OTLP} (project=data-agent-runtime)")
+    print(f"[TRACE] Phoenix OTLP exporter -> {PHOENIX_OTLP} (project=data-agent-runtime)")
 
     sid = f"runtime-turn-{uuid.uuid4().hex[:16]}"
-    jwt = await _mint([], sid)  # allow-all, session-bound
+    # Allow-all (D80b `[]`), session-bound: this demo drives ONE count question and
+    # the MCP still enforces the tenant claims + row policies the token carries.
+    jwt = await mint_bound_token([], sid, allow_unscoped=True)
 
     # Capture the traceId of THIS turn's agent.turn root by wrapping agent_span.
     trace_id_holder: dict[str, str] = {}
@@ -385,7 +286,7 @@ async def _run() -> int:
     finally:
         tracing.agent_span = _real_agent_span  # type: ignore[assignment]
 
-    progress, result, error = _parse_sse(resp.text)
+    progress, result, error = parse_sse(resp.text)
     print(f"[TURN] HTTP {resp.status_code}; progress steps: {[p.get('step') for p in progress]}")
 
     print("\n" + "=" * 70)

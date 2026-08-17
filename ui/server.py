@@ -40,6 +40,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from ui.entitlements import resolve_caller_identity, resolve_column_scope
 
+from data_agent.learning.promotion.token_minter import (
+    HttpTokenMinter,
+    TenantClaims,
+    TokenMintError,
+)
+
 RUNTIME_URL = os.environ.get("RUNTIME_URL", "http://localhost:8000")
 TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
 TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
@@ -178,31 +184,48 @@ async def _mint_jwt(user_name: str, column_scope: list[str], session_id: str) ->
     whose `X-Session-Id` header does not hash to that claim, closing the
     session-hijack gap. Every JWT this BFF mints is for exactly one `session_id`
     and is sent with the matching `X-Session-Id` header, so the binding always
-    holds for BFF-minted traffic."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            response = await client.post(
-                TOKEN_SERVICE_URL,
-                headers={"Authorization": f"Bearer {TOKEN_ISSUER_API_KEY}"},
-                json={
-                    "user_name": user_name,
-                    "column_scope": column_scope,
-                    "session_id": session_id,
-                    # Required by the MCP — see TENANT_* above. Omitting them is a
-                    # 403 MISSING_TENANT_CLAIM on every tool call.
-                    "claims": {
-                        "clientcode": TENANT_CLIENT_CODE,
-                        "proc_center": TENANT_PROC_CENTER,
-                        "jti": TENANT_JTI,
-                    },
-                },
-            )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise HTTPException(
-                status_code=502, detail=f"Token service unreachable: {exc}"
-            ) from exc
-    return response.json()["access_token"]
+    holds for BFF-minted traffic.
+
+    The transport is `HttpTokenMinter` — the SAME mint client the offline promotion
+    plane uses — so the `POST /token` body (tenant claims, scope, sid binding) has
+    ONE implementation rather than a request-path copy that drifts from it. Two of
+    its knobs are set for THIS plane: `ttl_seconds=None` (the IdP's own configured
+    lifetime governs a UI session, not the probe's deliberately short 300s) and
+    `allow_unscoped=True` (an entitlement of `[]` is a RESOLVED D80b allow-all here,
+    not the absent scope the offline backstop refuses). The minter is built per call
+    because `user_name` is the per-request caller identity; it does no I/O to build."""
+    # Required by the MCP — see TENANT_* above. Omitting them is a 403
+    # MISSING_TENANT_CLAIM on every tool call. `TenantClaims` refuses a blank or
+    # control-character value HERE rather than letting it reach the wire, where its
+    # only symptom is that same 403 on every question. Reported as a 500 naming the
+    # env var (NOT the 502 below, which means "the token service is unreachable"):
+    # this is deployment misconfiguration, and a blank TENANT_* is the shipped Helm
+    # default, so an operator who never set them must be told which knob is missing.
+    try:
+        tenant = TenantClaims(
+            clientcode=TENANT_CLIENT_CODE,
+            proc_center=TENANT_PROC_CENTER,
+            jti=TENANT_JTI,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Tenant claims misconfigured: {exc}"
+        ) from exc
+    minter = HttpTokenMinter(
+        TOKEN_SERVICE_URL,
+        TOKEN_ISSUER_API_KEY,
+        tenant=tenant,
+        user_name=user_name,
+        ttl_seconds=None,
+        timeout=10.0,
+        allow_unscoped=True,
+    )
+    try:
+        return await minter.mint(list(column_scope), session_id=session_id)
+    except TokenMintError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Token service unreachable: {exc}"
+        ) from exc
 
 
 @app.get("/")

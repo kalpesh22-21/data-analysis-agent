@@ -40,11 +40,11 @@ fed back to the model on the corrective turn and recorded on the final decline.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, get_args
 
 from data_agent.runtime.blueprint.template import TemplateBindError, validate_optional_pattern
 
-from ..summary.models import SessionSummary
+from ..summary.models import AcceptedSignal, SessionSummary
 from ..summary.refs import sql_by_ref
 from .grounding import CatalogRule, RuleIndex
 from .models import (
@@ -127,7 +127,11 @@ REASON_MALFORMED = "malformed_candidate"
 
 # The D34 acceptance domain (`thumbs_up` is declared but never emitted by S2 —
 # it may still legitimately appear on a candidate the extractor forwards).
-_ACCEPTED_SIGNAL_DOMAIN = frozenset({"no_correction", "thumbs_up", "explicit_confirm"})
+#
+# DERIVED from the `AcceptedSignal` Literal that defines it, not re-typed: this was the
+# fourth copy of the same three strings, and a hand-written mirror of a closed set is a
+# gate that silently stops matching the moment the set gains a member.
+_ACCEPTED_SIGNAL_DOMAIN = frozenset(get_args(AcceptedSignal))
 
 CANDIDATE_TYPES: tuple[str, ...] = (
     "blueprint",

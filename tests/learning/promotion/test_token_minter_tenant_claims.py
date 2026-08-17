@@ -103,6 +103,38 @@ async def test_empty_scope_still_refuses_before_any_request() -> None:
     assert calls == []
 
 
+async def test_empty_scope_mints_only_when_the_caller_opts_in_explicitly() -> None:
+    """`allow_unscoped=True` is the REQUEST path's opt-out (D80b: a resolved entitlement
+    of `[]` means "no column restriction", not "no scope was computed"). It exists so
+    `ui/server.py` can share this transport; the default above is what every learning
+    -plane site keeps."""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"access_token": "jwt-x"})
+
+    token = await _minter(handler, allow_unscoped=True).mint([], session_id="ui-1")
+
+    assert token == "jwt-x"
+    assert seen[0]["column_scope"] == []
+
+
+async def test_ttl_none_omits_the_field_so_the_idp_default_applies() -> None:
+    """A request-path session token must outlive a conversation, and the IdP already
+    owns that number (`token_ttl_seconds`). Omitted, NOT null: an absent key is the
+    exact body the hand-rolled mint sites posted."""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"access_token": "jwt-x"})
+
+    await _minter(handler, ttl_seconds=None).mint(_SCOPE, session_id="ui-2")
+
+    assert "ttl_seconds" not in seen[0]
+
+
 # --- TenantClaims validation (derived from the downstream reads) ------------------
 
 

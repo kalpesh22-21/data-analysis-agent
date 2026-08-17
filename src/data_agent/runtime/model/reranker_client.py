@@ -35,9 +35,13 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
+
+from ._json_post import JsonPostClient
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     import httpx
     from opentelemetry.trace import Tracer
 
@@ -93,7 +97,7 @@ class FakeRerankerClient:
         ]
 
 
-class HttpRerankerClient:
+class HttpRerankerClient(JsonPostClient):
     """Real `RerankerClient` — POSTs to the custom reranker API (D71).
 
     Wire contract (resolved against the SQL-repo mocks):
@@ -105,7 +109,16 @@ class HttpRerankerClient:
     `model` is not a request parameter (the endpoint serves a single fixed
     cross-encoder) — it is retained solely as the RERANKER span's
     `reranker.model` attribute so traces stay coherent (D24).
+
+    The constructor, the bearer header, the traced POST and the fail-closed error
+    ladder come from `JsonPostClient`; only the payload, the `{"scores": [...]}`
+    parse and the span differ from the embedding client. `__init__` is restated
+    solely to keep `model` OPTIONAL here (the reranker span tolerates an unnamed
+    model; the embedding client requires one).
     """
+
+    _error_class: ClassVar[type[Exception]] = RerankerError
+    _failure_prefix: ClassVar[str] = "Rerank request failed"
 
     def __init__(
         self,
@@ -117,18 +130,25 @@ class HttpRerankerClient:
         transport: httpx.AsyncBaseTransport | None = None,
         tracer: Tracer | None = None,
     ) -> None:
-        self._url = url
-        self._api_key = api_key
-        self._model = model
-        self._timeout_seconds = timeout_seconds
-        self._transport = transport
-        self._tracer = tracer
+        super().__init__(
+            url=url,
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            transport=transport,
+            tracer=tracer,
+        )
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        return headers
+    def _span(self, count: int) -> AbstractContextManager[Any]:
+        from data_agent.runtime.observability import tracing
+
+        return tracing.rerank_span(self._tracer, model=self._model, document_count=count)
+
+    def _decode(self, body: Any) -> list[float]:
+        return self._validate_scores(self._parse_scores(body))
+
+    def _count_mismatch_message(self, got: int, expected: int) -> str:
+        return f"Reranker API returned {got} scores for {expected} documents."
 
     @staticmethod
     def _parse_scores(body: Any) -> list[Any]:
@@ -161,48 +181,15 @@ class HttpRerankerClient:
         return normalized
 
     async def rerank(self, query: str, documents: list[str]) -> list[float]:
-        import httpx
-
         # Empty documents -> [] with NO network call (matches the mock, which
         # returns {"scores": []} for an empty batch).
         if not documents:
             return []
 
-        payload = {"query": query, "documents": list(documents)}
-        try:
-            async with httpx.AsyncClient(
-                timeout=self._timeout_seconds, transport=self._transport
-            ) as client:
-                if self._tracer is not None:
-                    from data_agent.runtime.observability import tracing
-
-                    with tracing.rerank_span(
-                        self._tracer, model=self._model, document_count=len(documents)
-                    ):
-                        response = await client.post(
-                            self._url, json=payload, headers=self._headers()
-                        )
-                else:
-                    response = await client.post(
-                        self._url, json=payload, headers=self._headers()
-                    )
-                response.raise_for_status()
-                body = response.json()
-                # Parse + shape/count/content validation ALL inside the try so a
-                # JSON-parseable-but-malformed body degrades via RerankerError,
-                # never a raw KeyError/TypeError.
-                scores = self._validate_scores(self._parse_scores(body))
-                if len(scores) != len(documents):
-                    raise RerankerError(
-                        f"Reranker API returned {len(scores)} scores "
-                        f"for {len(documents)} documents."
-                    )
-        except RerankerError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - any transport/parse failure degrades
-            raise RerankerError(f"Rerank request failed: {type(exc).__name__}") from exc
-
-        return scores
+        return await self._post(
+            payload={"query": query, "documents": list(documents)},
+            expected_count=len(documents),
+        )
 
 
 __all__ = [

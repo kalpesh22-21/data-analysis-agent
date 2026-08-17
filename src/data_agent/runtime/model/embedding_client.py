@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
+
+from ._json_post import JsonPostClient
 
 if TYPE_CHECKING:
-    import httpx
-    from opentelemetry.trace import Tracer
+    from contextlib import AbstractContextManager
 
 
 class EmbeddingError(Exception):
@@ -87,7 +88,7 @@ class FakeEmbeddingClient:
         return [self._vectors.get(text) or _hash_vector(text, self._dim) for text in texts]
 
 
-class HttpEmbeddingClient:
+class HttpEmbeddingClient(JsonPostClient):
     """Real `EmbeddingClient` — POSTs to the custom embedding API (D71, design §3.1).
 
     Wire contract (OQ-1, resolved against the SQL-repo mocks):
@@ -100,30 +101,25 @@ class HttpEmbeddingClient:
     `model` is not a request parameter (the endpoint serves a single fixed model)
     — it is retained solely as the EMBEDDING span's `embedding.model` attribute so
     traces stay coherent about which embedder produced the vectors (D24).
+
+    The constructor, the bearer header, the traced POST and the fail-closed error
+    ladder come from `JsonPostClient`; only the payload, the bare-array parse and
+    the span differ from the reranker client.
     """
 
-    def __init__(
-        self,
-        *,
-        url: str,
-        api_key: str,
-        model: str,
-        timeout_seconds: float = 10.0,
-        transport: httpx.AsyncBaseTransport | None = None,
-        tracer: Tracer | None = None,
-    ) -> None:
-        self._url = url
-        self._api_key = api_key
-        self._model = model
-        self._timeout_seconds = timeout_seconds
-        self._transport = transport
-        self._tracer = tracer
+    _error_class: ClassVar[type[Exception]] = EmbeddingError
+    _failure_prefix: ClassVar[str] = "Embedding request failed"
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        return headers
+    def _span(self, count: int) -> AbstractContextManager[Any]:
+        from data_agent.runtime.observability import tracing
+
+        return tracing.embedding_span(self._tracer, model=self._model, input_count=count)
+
+    def _decode(self, body: Any) -> list[list[float]]:
+        return self._validate_vectors(self._parse_vectors(body))
+
+    def _count_mismatch_message(self, got: int, expected: int) -> str:
+        return f"Embedding API returned {got} vectors for {expected} inputs."
 
     @staticmethod
     def _parse_vectors(body: Any) -> list[Any]:
@@ -164,49 +160,14 @@ class HttpEmbeddingClient:
         return normalized
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        import httpx
-
         # Empty input -> [] with NO network call (matches the mock, which returns
         # [] for an empty batch; also keeps the count check below trivially true).
         if not texts:
             return []
 
-        payload = {"input_text": list(texts)}
-        try:
-            async with httpx.AsyncClient(
-                timeout=self._timeout_seconds, transport=self._transport
-            ) as client:
-                if self._tracer is not None:
-                    from data_agent.runtime.observability import tracing
-
-                    with tracing.embedding_span(
-                        self._tracer, model=self._model, input_count=len(texts)
-                    ):
-                        response = await client.post(
-                            self._url, json=payload, headers=self._headers()
-                        )
-                else:
-                    response = await client.post(
-                        self._url, json=payload, headers=self._headers()
-                    )
-                response.raise_for_status()
-                body = response.json()
-                # Parse + shape/count/content validation ALL inside the try so a
-                # JSON-parseable-but-malformed body degrades via EmbeddingError,
-                # never a raw KeyError/TypeError that bypasses the composite's
-                # degrade path (which catches only EmbeddingError).
-                vectors = self._validate_vectors(self._parse_vectors(body))
-                if len(vectors) != len(texts):
-                    raise EmbeddingError(
-                        f"Embedding API returned {len(vectors)} vectors "
-                        f"for {len(texts)} inputs."
-                    )
-        except EmbeddingError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - any transport/parse failure degrades
-            raise EmbeddingError(f"Embedding request failed: {type(exc).__name__}") from exc
-
-        return vectors
+        return await self._post(
+            payload={"input_text": list(texts)}, expected_count=len(texts)
+        )
 
 
 __all__ = [

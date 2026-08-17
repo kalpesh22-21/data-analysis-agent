@@ -75,7 +75,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import openai
 import uvicorn
 
 from data_agent.runtime.app import create_app
@@ -84,13 +83,13 @@ from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.openai_client import build_openai_model_client
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 
-# `_catalog` is a sibling module under `scripts/`. Put this script's own directory
-# on `sys.path` so the import resolves BOTH when run as `python scripts/x.py` AND
-# when the file is loaded by path (importlib `spec_from_file_location`, e.g. tests).
+# `_catalog` + `_e2e_harness` are sibling modules under `scripts/`. Put this script's
+# own directory on `sys.path` so the imports resolve BOTH when run as
+# `python scripts/x.py` AND when the file is loaded by path (importlib
+# `spec_from_file_location`, e.g. tests).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _catalog import catalog_handle  # noqa: E402
-
-_REPO = Path(__file__).resolve().parent.parent
+from _e2e_harness import load_openai_key, pick_openai_model  # noqa: E402
 
 # --- The live l2 stack (docker-compose.integration.yml), already running. We
 # only READ its JWKS / call its MCP / write its Couchbase — nothing is modified.
@@ -115,47 +114,12 @@ _NEO4J_USERNAME = "neo4j"
 _NEO4J_PASSWORD = "testpassword"
 _EMBEDDING_API_URL = "http://localhost:18003/embed"
 
-# Model preflight candidates (mirrors demo_runtime_turn_traced.py): the first
-# the account can actually call on the Responses API wins.
-_MODEL_CANDIDATES = ("gpt-5.5", "gpt-4o", "gpt-4.1", "gpt-4o-mini")
-
-
-def _load_openai_key() -> str:
-    """Read + strip the OPENAI_API_KEY from `.env` (quotes tolerated)."""
-    env_path = _REPO / ".env"
-    for raw in env_path.read_text().splitlines():
-        line = raw.strip()
-        if line.startswith("OPENAI_API_KEY="):
-            val = line.split("=", 1)[1].strip()
-            if (val.startswith('"') and val.endswith('"')) or (
-                val.startswith("'") and val.endswith("'")
-            ):
-                val = val[1:-1]
-            return val
-    raise SystemExit("OPENAI_API_KEY not found in .env")
-
-
-def _pick_openai_model(api_key: str) -> str:
-    """First candidate the account can call on the Responses API (sync preflight).
-
-    Run once at startup (before uvicorn's loop) so a persistent server does not
-    have to re-select per turn. `DEMO_MODEL` short-circuits the list.
-    """
-    client = openai.OpenAI(api_key=api_key)
-    candidates = (os.environ["DEMO_MODEL"],) if os.environ.get("DEMO_MODEL") else _MODEL_CANDIDATES
-    last_err: Exception | None = None
-    for model in candidates:
-        try:
-            client.responses.create(model=model, input=[{"role": "user", "content": "ping"}])
-            print(f"[run_ui_runtime_real] model preflight OK: {model!r}")
-            return model
-        except openai.NotFoundError as exc:
-            print(f"[run_ui_runtime_real] {model!r} unavailable (404) — trying next")
-            last_err = exc
-        except Exception as exc:  # noqa: BLE001 - preflight is best-effort selection
-            print(f"[run_ui_runtime_real] {model!r} errored ({type(exc).__name__}) — trying next")
-            last_err = exc
-    raise SystemExit(f"No OpenAI model candidate worked: {last_err}")
+# The `.env` key read and the Responses-API model preflight are `_e2e_harness
+# .load_openai_key` / `.pick_openai_model` — the SYNC preflight, which is what this
+# launcher needs: it selects once at startup, before uvicorn's event loop exists, so a
+# persistent server never re-selects per turn. `DEMO_MODEL` short-circuits the
+# candidate list ("gpt-5.5", "gpt-4o", "gpt-4.1", "gpt-4o-mini").
+_PREFLIGHT_LABEL = "[run_ui_runtime_real]"
 
 
 def _build_session_store(settings: RuntimeSettings) -> tuple[Any, str]:
@@ -182,8 +146,8 @@ def _build_session_store(settings: RuntimeSettings) -> tuple[Any, str]:
 
 
 def build_real_app():
-    api_key = _load_openai_key()
-    model = _pick_openai_model(api_key)
+    api_key = load_openai_key()
+    model = pick_openai_model(api_key, label=_PREFLIGHT_LABEL)
 
     retrieval_on = os.environ.get("REAL_RETRIEVAL") == "1"
     # Access-controlled TELEMETRY DEBUG switch (default OFF = D25 shape-only). When

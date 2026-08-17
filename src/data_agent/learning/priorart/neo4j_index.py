@@ -57,6 +57,7 @@ from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.blueprint.structural_key import normalize_structural_grain
 from data_agent.runtime.retrieval.vector_index import CORPUS_INDEX_BY_KIND
+from data_agent.untrusted import as_bool_or_none, as_float, as_str
 
 from .index import PriorArtUnavailableError
 from .models import (
@@ -183,19 +184,16 @@ def _tier(raw: Any) -> str:
 
 
 def _str(raw: Any) -> str:
-    """A stored property as a `str`, or `""` when it is anything else.
-
-    NOT `str(raw)`: coercing would turn a null into the literal `"None"` and a list into
-    its repr, both of which then flow into joins, comparisons and (eventually) prompts
-    looking like real content."""
-    return raw if isinstance(raw, str) else ""
+    """A stored property as a `str`, or `""` when it is anything else
+    (`untrusted.as_str` — never `str(raw)`, which would turn a null into `"None"`)."""
+    return as_str(raw)
 
 
 def _bool_or_none(raw: Any) -> bool | None:
     """A stored `verified` flag as a tri-state. Only a real bool is a verdict; anything
     else — including a string `"true"` from a foreign writer — is "the node does not
     say" (see `PriorArtCard.verified`)."""
-    return raw if isinstance(raw, bool) else None
+    return as_bool_or_none(raw)
 
 
 def _float(raw: Any) -> float:
@@ -212,17 +210,14 @@ def _float(raw: Any) -> float:
       * OUT OF RANGE or unconvertible. The score is a cosine, so anything outside
         `[0, 1]` is a broken signal rather than a weak one. `float(10**400)` raises
         `OverflowError`; `inf` outranks every genuine hit and would let a hand-edited
-        node top the list; `nan` fails both comparisons here and is rejected by the
-        same test. Only a hand edit or a foreign writer can put such a value on a node,
+        node top the list; `nan` fails both comparisons and is rejected by the same
+        test. Only a hand edit or a foreign writer can put such a value on a node,
         which is exactly the population the `unsourced` tier exists to flag.
+
+    All three are `untrusted.as_float`; the `[0, 1]` bounds are what makes them a
+    RANKING guard rather than a type check.
     """
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return 0.0
-    try:
-        value = float(raw)
-    except (OverflowError, ValueError):  # an int too large to be a float
-        return 0.0
-    return value if 0.0 <= value <= 1.0 else 0.0
+    return as_float(raw, lo=0.0, hi=1.0)
 
 
 def _rule_ids(raw: Any) -> tuple[str, ...]:

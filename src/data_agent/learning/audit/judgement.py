@@ -58,6 +58,8 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from data_agent.untrusted import as_float
+
 # --- the verdict vocabulary -------------------------------------------------------
 #
 # THE dataset. Three values, chosen so the distribution answers one question:
@@ -419,13 +421,17 @@ class JudgeRecord:
 
 def _float(raw: Any) -> float:
     """A stored numeric as a float, or 0.0. `bool` is excluded because it is an `int`
-    subclass and a stored `true` would read as a threshold of 1.0."""
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return 0.0
-    try:
-        return float(raw)
-    except (OverflowError, ValueError):
-        return 0.0
+    subclass and a stored `true` would read as a threshold of 1.0.
+
+    DELIBERATELY UNBOUNDED, unlike `priorart/neo4j_index.py::_float`'s `[0, 1]`. The
+    three fields this reads (`threshold`, `best_similarity`, `authorizing_similarity`)
+    are the FORENSIC record of a judgement that already happened — nothing re-ranks or
+    re-thresholds on them; they are read back for audit, telemetry and QA. Replacing a
+    stored out-of-range number with a plausible in-range 0.0 would make the audit row
+    say something that never happened, which is the opposite of what an audit row is
+    for. The ranking path, where a broken score DOES change an outcome, passes bounds.
+    """
+    return as_float(raw)
 
 
 __all__ = [
