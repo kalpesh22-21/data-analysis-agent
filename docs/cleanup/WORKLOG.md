@@ -270,3 +270,45 @@ understood cause.
 **Issues stack committed to `docs/cleanup/ISSUES.md`** (source of truth
 going forward). **Wave B (T4.1/T4.2/T4.4) and Tier 5 are HELD** per user;
 the G1/G2 robustness slice remains built-but-unlanded in its worktree.
+
+## #8 — T5.1: ReadGuard extraction (2026-08-17)
+
+Tier 5 un-held by user ("Lets start Tier 5"); Wave B stays held. First loop
+slice, strictly behaviour-identical:
+
+- **T5.1** extracted the repeated-idempotent-read guard + trim-aware re-fetch
+  exemption from `_run_loop_body` into a window-scoped `ReadGuard` class in
+  `runtime/loop/read_guard.py` (73→~440 lines, still a stdlib-only leaf).
+  The guard owns the seven formerly-loop-local state vars (seen signatures,
+  serving pointers, exemption counts, per-round served set, emulation seeds);
+  interface: `observe_prior_read / seed_emulation / begin_round / classify →
+  ReadDecision / record_served`. The body keeps the effects: single shared
+  tool_trail walk, marker TrailEntry build + append-then-emit ordering,
+  `expanded_this_round` fold for deduped getBlueprint (the T5.1↔T5.2
+  coupling), `tool_calls_made`, budget break/continue. The four pure event
+  helpers moved verbatim (payload keys allowlist-pinned, unchanged).
+  `agent_loop.py` 4326→~4080; `_run_loop_body` 1484→~1410. +25 unit tests
+  through the new interface (incl. post-cap event repetition, per-review).
+- Review: APPROVE, 0 blockers; polish applied (public
+  `repeated_read_guard_event`, AbstractSet contract + honest `.update()`,
+  two stale comment pointers, the post-cap repetition test).
+- V0 **5707 passed / 225 skipped / 1 xfailed**, ruff clean.
+  V1 (gpt-5.5, cleanup-eval): **9 passed, 17:40** — L1–L6 3/3 (L3 3/3 this
+  run — first fully green L3; the anchor note carried all three runs; not
+  attributable to this behaviour-identical slice, but recorded), L7 2/3
+  (prose-answer flake, ≥ floor), multi-intent 3/3, 0 false positives.
+  V2 (mandatory for Tier 5): real runtime :8000 (retrieval ON, gpt-5.5,
+  memory session store — l2-cb still unhealthy after restart) + BFF :3000;
+  L2 live → 2 blueprint-verified tables; L6 live → getBlueprint→runBlueprint,
+  no re-derivation, verified table; fresh traces in Phoenix
+  `data-agent-runtime` (21:58).
+
+Process trap, recorded: the builder's isolated worktree was created from
+`phase0/provenance-extractor` (the repo's registered main), NOT the cleanup
+branch — 13 commits stale. Symptoms that unmasked it: 2 "pre-existing"
+canon-parity failures (stale pre-J3 fixture) and ~102 fewer collected tests.
+Recovery: patch export + `git apply --3way` onto `0f8836a` (one import
+conflict: Tier 2's BudgetGuard rename), targeted + full suites re-run green.
+Lesson: pin/verify the worktree base in every builder brief; treat
+"pre-existing failure" claims from a worktree as unverified until reproduced
+on the real base.

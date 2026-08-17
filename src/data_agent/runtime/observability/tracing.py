@@ -666,7 +666,7 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     # identifiers already allowlisted above. Neither the blueprint's SQL nor the
     # user's question is ever placed on the span.
     "blueprint_id",
-    # --- trim-aware re-fetch exemption (loop/agent_loop.py) ---
+    # --- trim-aware re-fetch exemption (loop/read_guard.py) ---
     # How many re-fetches this signature has already been granted in the window, and
     # the cap. Both are small integers about the LOOP'S OWN decisions — no read
     # arguments, no result content. `loop_trimmed_read_refetch_capped` is the event

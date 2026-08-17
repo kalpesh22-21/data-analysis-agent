@@ -155,7 +155,7 @@ from data_agent.runtime.session.store import SessionStore
 from data_agent.timeutil import now_iso
 
 from .budget_guard import BudgetGuard
-from .read_guard import IDEMPOTENT_READ_TOOLS, idempotent_read_signature
+from .read_guard import ReadGuard, idempotent_read_signature, repeated_read_guard_event
 
 if TYPE_CHECKING:
     from data_agent.runtime.context.discovery_emulation import EmulatedDiscovery
@@ -195,8 +195,8 @@ class TurnContext:
         duplicating the derivation guarantees eventual disagreement.
 
     IT MUST NOT CARRY THE TRAIL. `_run_loop_body`'s only trail load sits ABOVE
-    the round-trip loop and is immediately reduced to signatures for
-    `seen_read_calls`; every entry is appended later. A snapshot taken there
+    the round-trip loop and is immediately reduced to signatures inside the
+    `ReadGuard`; every entry is appended later. A snapshot taken there
     contains NOTHING from the current window, so evidence written in round 1 and
     cited in round 2 would fail as "unknown tool_call_id" — every completion and
     block, on every turn, while looking correctly wired. A tool that needs the
@@ -251,141 +251,14 @@ TurnStatus = Literal["done", "paused_ask_user", "paused_budget_cap", "stopped_ha
 _BUDGET_CAP_QUESTION = "This is taking a while — continue, refine, or stop?"
 _BUDGET_CAP_OPTIONS = ["continue", "refine", "stop"]
 
-# The repeated-idempotent-read guard primitives (`IDEMPOTENT_READ_TOOLS` +
-# `idempotent_read_signature`) now live in `loop/read_guard.py` — a neutral leaf
-# shared with `context/discovery_emulation.py` so that module no longer reaches
-# into this one's private namespace at runtime. Imported at the top of this file.
-
-
-def _read_target_attrs(
-    tool_name: str, arguments: Mapping[str, Any]
-) -> tuple[str, dict[str, Any]]:
-    """`(human-readable target, catalog-safe span attributes)` for one guarded
-    idempotent read — the single D25 decision about what a read's IDENTITY may
-    appear as on a span, shared by the guard event and the re-fetch-exemption event
-    so the two can never diverge on that question.
-
-    Only CATALOG-SAFE IDENTIFIER args are surfaced: `database`/`table` (the same
-    scalars a real `tool.<name>` dispatch span already exposes) and `getBlueprint`'s
-    corpus-authored `id`. Free-form args — notably `explainQuery`'s `sql` — are
-    deliberately NEVER placed on a span, so an `explainQuery` read identifies as the
-    empty target rather than by its query text. That is the intended trade: a
-    less-specific span beats a query literal in the telemetry backend.
-    """
-    database = arguments.get("database")
-    table = arguments.get("table")
-    db = database if isinstance(database, str) and database else None
-    tbl = table if isinstance(table, str) and table else None
-    # `getBlueprint`'s only argument is `id` — matched on the TOOL NAME rather than
-    # on the presence of an `id` key, so a future guarded tool that happens to take
-    # an `id` cannot start leaking a free-form value onto the span by accident.
-    blueprint_id = arguments.get("id") if tool_name == "getBlueprint" else None
-    bp = blueprint_id if isinstance(blueprint_id, str) and blueprint_id else None
-    if db and tbl:
-        target = f"{db}.{tbl}"
-    elif tbl:
-        target = tbl
-    elif db:
-        target = db
-    elif bp:
-        target = bp
-    else:
-        target = ""
-    attrs: dict[str, Any] = {}
-    if db:
-        attrs["database"] = db
-    if tbl:
-        attrs["table"] = tbl
-    if bp:
-        attrs["blueprint_id"] = bp
-    return target, attrs
-
-
-def _repeated_read_guard_event(
-    tool_name: str, tool_call_id: str, arguments: Mapping[str, Any]
-) -> dict[str, Any]:
-    """Build the self-describing `loop_repeated_idempotent_read_guarded` observer
-    payload so the exported GUARDRAIL span reads unambiguously in a trace: it was a
-    SECOND, duplicate read that was deduped — NOT the first fetch being blocked.
-
-    `deduped=True` + `guard_reason` + a human-readable `note` make the span
-    self-explain next to the real `tool.<name>` span of the first, dispatched call.
-    `guard_reason` now says `already_served_and_still_readable`, not merely
-    `already_served_this_turn`: since the trim-aware exemption landed, "already
-    served" is no longer sufficient for the guard to fire, and a trace that still
-    claimed it would misdescribe the decision that was actually made."""
-    dedup_target, attrs = _read_target_attrs(tool_name, arguments)
-    payload: dict[str, Any] = {
-        "tool_name": tool_name,
-        "tool_call_id": tool_call_id,
-        "deduped": True,
-        "guard_reason": "already_served_and_still_readable",
-        "dedup_target": dedup_target,
-        "note": (
-            f"duplicate {tool_name}({dedup_target}) — already served this turn and its "
-            "result is still readable above; not re-dispatched"
-        ),
-    }
-    payload.update(attrs)
-    return payload
-
-
-# How many times ONE read signature may be re-fetched past the repeated-read guard
-# because its result is no longer readable, per budget window.
-#
-# TWO, matching `_MAX_SURPLUS_STATE_REJECTIONS`'s reasoning: the first exemption
-# covers the ordinary case (the pair aged out of the pinned window once), the second
-# covers a genuine second trim later in a long turn. A THIRD would mean the item is
-# being trimmed as fast as it is re-added — at which point re-adding it cannot help,
-# because the budget has already judged that bulk droppable twice, and paying an MCP
-# round-trip to reinstate it makes the turn worse rather than better. Beyond the cap
-# the guard resumes and the model gets the cheap nudge instead.
-#
-# It is per WINDOW, not per turn: a budget-cap `continue` resume enters a fresh
-# `_run_loop_body` with a fresh allowance, exactly as the finalization re-round does.
-# The worst case is therefore `max_budget_windows × 2` re-fetches of one signature
-# per turn — bounded, and far from the dozens the guard was built to stop.
-_MAX_TRIMMED_READ_REFETCHES = 2
-
-
-def _trimmed_read_refetch_event(
-    tool_name: str,
-    arguments: Mapping[str, Any],
-    *,
-    granted: int,
-    reason: str,
-) -> dict[str, Any]:
-    """Payload for `loop_trimmed_read_refetch_allowed` / `..._capped` — the
-    counterpart to `_repeated_read_guard_event`, for the decision NOT to dedup.
-
-    `refetch_count` is the number ALREADY granted for this signature in this window,
-    so `0` on the first exemption and `_MAX_TRIMMED_READ_REFETCHES` on the event that
-    reports the cap biting. **The capped event is the signal worth alerting on**: it
-    means a turn is thrashing — re-reading something the budget keeps dropping — and
-    the real problem is upstream in pinning/summarisation/budget policy, not here.
-
-    Same D25 posture as the guard event (`_read_target_attrs`): catalog-safe
-    identifiers only, never `explainQuery`'s SQL."""
-    target, attrs = _read_target_attrs(tool_name, arguments)
-    payload: dict[str, Any] = {
-        "tool_name": tool_name,
-        "deduped": False,
-        "dedup_target": target,
-        "reason": reason,
-        "refetch_count": granted,
-        "refetch_cap": _MAX_TRIMMED_READ_REFETCHES,
-        "note": (
-            f"{tool_name}({target}) was already served this turn, but its result is no "
-            "longer readable in the rebuilt window"
-            + (
-                "; re-dispatched"
-                if granted < _MAX_TRIMMED_READ_REFETCHES
-                else "; re-fetch cap reached, deduping instead (the turn is thrashing)"
-            )
-        ),
-    }
-    payload.update(attrs)
-    return payload
+# The repeated-idempotent-read guard now lives WHOLE in `loop/read_guard.py` — a
+# neutral, stdlib-only leaf shared with `context/discovery_emulation.py` so that
+# module no longer reaches into this one's private namespace at runtime. That is
+# the home of `IDEMPOTENT_READ_TOOLS`, `idempotent_read_signature`, the window-
+# scoped `ReadGuard` (state + decision) and both event payload builders. What stays
+# HERE are the guard's EFFECTS, which need the session store and the trail model:
+# the data-free marker `TrailEntry`, its append, and the `loop_repeated_idempotent_
+# read_guarded` emission that must follow it. Imported at the top of this file.
 
 
 # The shared wall-clock stamp (`data_agent/timeutil.py`), aliased to the name this
@@ -2876,18 +2749,17 @@ class AgentLoop:
         # budgeted". Two effects, both ephemeral (never persisted):
         #   1. `discovery_canonical` — the synthetic assistant/tool pairs, threaded
         #      into every per-round-trip rebuild below as the earliest tool history.
-        #   2. `emulation_read_signatures` — merged into `seen_read_calls` below to
-        #      seed the repeated-idempotent-read guard so a model RE-call of either
-        #      tool is served locally (the "already served" nudge) instead of hitting
-        #      the MCP.
+        #   2. `emulation_read_signatures` — seeded into the `ReadGuard` below so a
+        #      model RE-call of either tool is served locally (the "already served"
+        #      nudge) instead of hitting the MCP.
         # Degrade-not-fail: any failure → no pairs + no seed, and the model falls
         # back to calling the two tools itself. D5: the sweep goes through the
         # dispatcher (credentials attached only at the MCP transport boundary),
         # never through the context assembler.
         discovery_canonical: list[dict[str, Any]] = []
         emulation_read_signatures: set[tuple[str, str]] = set()
-        # `signature -> tool_call_id` for the emulated pairs, merged into
-        # `served_read_call_ids` below (see the loop that fills it for why).
+        # `signature -> tool_call_id` for the emulated pairs, seeded into the
+        # `ReadGuard` below (see the loop that fills it for why).
         emulated_served_call_ids: dict[tuple[str, str], str] = {}
         if self._discovery_emulation_provider is not None:
             emulation: EmulatedDiscovery | None = None
@@ -2934,21 +2806,22 @@ class AgentLoop:
         # diagnostic — same lifecycle as `retrieval_memo` (fresh per window,
         # not persisted) so the event fires at most once per stranded call.
         withheld_call_ids: set[str] = set()
-        # Repeated-idempotent-read guard (generalizes D94): the set of already-
-        # served idempotent-read signatures for THIS turn. Turn-window-local like
-        # the memos above, BUT seeded from the persisted trail so it survives both
-        # the D45 per-round-trip rebuild (the set would otherwise reset every
-        # `send_turn`) AND a budget-window `continue` resume (a fresh `_run_loop`
-        # window starts here with an empty in-memory set). Seeding from every prior
-        # `ok` idempotent-read entry of this turn is what lets the guard recognize a
+        # Repeated-idempotent-read guard (generalizes D94), `loop/read_guard.py`: it
+        # holds the already-served read signatures for THIS turn plus the pointers
+        # and exemption counts the trim-aware re-fetch escape needs. Turn-window-local
+        # like the memos above, BUT seeded from the persisted trail below so it
+        # survives both the D45 per-round-trip rebuild (its state would otherwise
+        # reset every `send_turn`) AND a budget-window `continue` resume (a fresh
+        # `_run_loop` window starts here with an empty guard). Seeding from every
+        # prior `ok` idempotent-read entry of this turn is what lets it recognize a
         # repeat it did not itself serve in the current window.
-        seen_read_calls: set[tuple[str, str]] = set()
+        read_guard = ReadGuard(self._observer)
         # The blueprint-definition gate: every blueprint id this turn has already
         # EXPANDED with a successful `getBlueprint`. `runBlueprint` for an id that is
         # NOT in here is refused before the executor runs
         # (`_blueprint_definition_not_read`).
         #
-        # Seeded from the persisted trail for the same two reasons `seen_read_calls`
+        # Seeded from the persisted trail for the same two reasons the read guard
         # is: the D45 per-round-trip rebuild would otherwise reset it on every
         # `send_turn`, and a budget-window `continue` resume starts a fresh
         # `_run_loop` window with an empty in-memory set — a model that expanded the
@@ -2962,16 +2835,6 @@ class AgentLoop:
         # re-runs the same blueprint with a different slot value ("now just
         # Engineering") pays one extra `getBlueprint` per turn.
         blueprint_definitions_read: set[str] = set()
-        # `read signature -> the tool_call_id of the entry that SERVED it` (latest
-        # wins), for every guarded idempotent read — the pointer the trim-aware
-        # re-fetch exemption below tests for readability. Seeded from the same trail
-        # walk as `seen_read_calls`, so the two can never disagree about what was
-        # served. A guard-marker entry is never recorded as a pointer: it carries no
-        # data, so it is not where the result lives.
-        served_read_call_ids: dict[tuple[str, str], str] = {}
-        # How many trim-aware re-fetch exemptions each signature has been GRANTED in
-        # this budget window (the oscillation cap, `_MAX_TRIMMED_READ_REFETCHES`).
-        read_refetch_exemptions: dict[tuple[str, str], int] = {}
         # ONE read for the trail seed AND the live analysis state (05 §E): the
         # session doc carries both, and `load_trail` is itself just a read of this
         # same document, so this is that read — not an extra one.
@@ -2990,7 +2853,7 @@ class AgentLoop:
         # How many SUCCESSFUL multi-row `runQuery`/`runBlueprint` calls this TURN has
         # made, and whether any `answerWithTable` has succeeded in it. Both are
         # TURN-scoped facts held in window-locals, so both are seeded from the
-        # persisted trail for the reason `seen_read_calls` is: a budget-cap
+        # persisted trail for the reason the read guard is: a budget-cap
         # `continue`, an `askUser` resume and a mid-DAG blueprint resume each start a
         # fresh `_run_loop_body` with empty in-memory sets, and a gate that forgot the
         # rows the model already has would go silent on exactly the long turns that
@@ -3008,16 +2871,18 @@ class AgentLoop:
         for prior_entry in session_doc.tool_trail:
             if prior_entry.turn_index != turn_index or prior_entry.status != "ok":
                 continue
-            if prior_entry.tool_name in IDEMPOTENT_READ_TOOLS:
-                prior_sig = idempotent_read_signature(
-                    prior_entry.tool_name, prior_entry.args
-                )
-                seen_read_calls.add(prior_sig)
-                # A guard-marker entry is data-free — the READ it deduped is where
-                # the result lives, so the marker must not become the pointer the
-                # readability test follows.
-                if prior_entry.error_code != IDEMPOTENT_READ_ALREADY_SERVED_CODE:
-                    served_read_call_ids[prior_sig] = prior_entry.tool_call_id
+            # Repeated-idempotent-read guard seed. Non-read entries are ignored
+            # inside `observe_prior_read` — "what counts as a read" is the guard's
+            # question, not this walk's. `data_free` marks the guard's OWN marker
+            # entry: it proves the signature was served, but the READ it deduped is
+            # where the result lives, so it must not become the pointer the
+            # readability test follows.
+            read_guard.observe_prior_read(
+                prior_entry.tool_name,
+                prior_entry.args,
+                prior_entry.tool_call_id,
+                data_free=prior_entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE,
+            )
             # NOT an `elif`: `getBlueprint` is BOTH a guarded idempotent read and the
             # thing the blueprint-definition gate is keyed on, so it seeds both.
             if prior_entry.tool_name == "getBlueprint":
@@ -3061,15 +2926,11 @@ class AgentLoop:
                 answer_table_succeeded = True
         # Seed the guard with the emulated-discovery signatures swept above (outside
         # the budget window) so a model re-call of listDatabases/listTables is served
-        # locally, not re-dispatched to the MCP. Empty when the feature is off/degraded.
-        #
-        seen_read_calls |= emulation_read_signatures
-        # ...and point those signatures at the synthetic entries that serve them, or
-        # the trim-aware exemption below would find no readable source and re-dispatch
-        # to the MCP the very calls the sweep exists to avoid. The emulated pairs are
-        # pinned by `fit_request_to_budget` (invariant 7), so they stay readable and
-        # the guard keeps deduping a model re-call exactly as it did before.
-        served_read_call_ids.update(emulated_served_call_ids)
+        # locally, not re-dispatched to the MCP — together with the pointers to the
+        # synthetic entries that serve them, or the trim-aware exemption would find no
+        # readable source and re-dispatch the very calls the sweep exists to avoid.
+        # Both empty when the feature is off/degraded.
+        read_guard.seed_emulation(emulation_read_signatures, emulated_served_call_ids)
         # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §3):
         # turn-window-local accumulators for the enriched `result` event, same
         # lifecycle as the memos above (fresh per window, not persisted).
@@ -3126,11 +2987,15 @@ class AgentLoop:
             # migrate it to be the newest message on every rebuild, appearing
             # after tool results it predates.
             finalization_nudge = None
-            # Every tool result the model can actually READ this round-trip — after
-            # `fit_request_to_budget` has had its say, and with data-free sentinels
-            # excluded (see `_CanonicalRequest`). The trim-aware re-fetch exemption
-            # below asks this set whether an already-served read is still legible.
-            readable_tool_call_ids = request.readable_tool_call_ids
+            # Hand the guard every tool result the model can actually READ this
+            # round-trip — after `fit_request_to_budget` has had its say, and with
+            # data-free sentinels excluded (see `_CanonicalRequest`). That set is what
+            # the trim-aware re-fetch exemption asks whether an already-served read is
+            # still legible. `begin_round` also clears the guard's served-THIS-BATCH
+            # set; see its docstring for why that reset is load-bearing (a read
+            # dispatched moments ago cannot yet be in `readable_tool_call_ids`, and
+            # must not be mistaken for one the budget trimmed away).
+            read_guard.begin_round(request.readable_tool_call_ids)
             # Set by a SUCCESSFUL answerWithTable in this iteration's batch; drives
             # terminal exit #2 below. Reset per iteration — a designation only ends
             # the turn it was made in.
@@ -3141,15 +3006,6 @@ class AgentLoop:
             # same-response `[getBlueprint(x), runBlueprint(x)]` pair must NOT pass
             # the gate. Reset per iteration, beside `designated_answer_text`.
             expanded_this_round: set[str] = set()
-            # Read signatures SERVED EARLIER IN THIS RESPONSE. The trim-aware
-            # exemption must skip them: `readable_tool_call_ids` was computed from the
-            # window as it stood BEFORE this batch ran, so a read dispatched moments
-            # ago is necessarily absent from it — and treating that as "trimmed away"
-            # would re-dispatch the second of two identical calls in one batch, which
-            # is precisely the duplicate the guard exists to collapse. Nothing can
-            # have been trimmed between two calls of the same batch (no rebuild has
-            # happened), so "served this round" means "will be readable next round".
-            served_this_round: set[tuple[str, str]] = set()
             # The window's forced re-round is consumed PER ROUND-TRIP, not per
             # refused call (05 §C.2) — so a `[answerWithTable, answerWithTable]`
             # batch is refused twice and advances the persisted counter once. Reset
@@ -3441,8 +3297,9 @@ class AgentLoop:
                 #   - the live MCP server rejects an argument its own schema does
                 #     not declare, and `runBlueprint`'s executor validates its
                 #     arguments too — so an un-stripped tag breaks the real call;
-                #   - `idempotent_read_signature` is computed below, and two
-                #     identical `getTableSchema` fetches tagged for different
+                #   - the repeated-read guard computes the signature inside
+                #     `ReadGuard.classify` from the args handed to it below, and
+                #     two identical `getTableSchema` fetches tagged for different
                 #     intents must still dedup to one signature;
                 #   - `TrailEntry.args` is what replay re-renders, and the tag has
                 #     its own persisted field there.
@@ -3481,81 +3338,25 @@ class AgentLoop:
                 # (`guard.record_iteration` below), so the worst case remains
                 # windows × iterations. The real served read stays in history under
                 # its own tool_call_id.
-                is_idempotent_read = tool_call.name in IDEMPOTENT_READ_TOOLS
-                read_sig = (
-                    idempotent_read_signature(tool_call.name, call_args)
-                    if is_idempotent_read
-                    else None
-                )
-                guarded_repeat = is_idempotent_read and read_sig in seen_read_calls
-                # --- TRIM-AWARE RE-FETCH EXEMPTION -----------------------------
                 #
-                # ⚠ THE GUARD'S PREMISE HAS A HOLE. The premise is "the already-served
-                # result is in the history above" — true of the persisted TRAIL (which
-                # is what `seen_read_calls` is seeded from), but NOT of the RENDERED
-                # window: `context/budget.py::fit_request_to_budget` pins only the K
-                # most recent current-turn tool pairs and drops older ones under real
-                # budget pressure, and `context/assembly.py` replaces a D44-stranded
-                # entry with a data-free sentinel. Either way the model is told "you
-                # already have this" about something it demonstrably cannot read, and
-                # nothing it can do recovers the result — the exact shape of an
-                # unrecoverable turn.
+                # AFTER the tag split, never before: two identical `getTableSchema`
+                # fetches tagged for different intents must dedup to ONE signature,
+                # so the guard is handed `call_args` (tag-stripped), not
+                # `tool_call.arguments`.
                 #
-                # It also made the base prompt lie: its re-fetch escape ("if it is NO
-                # LONGER above … fetch it again") described a door the guard had
-                # welded shut. `prompts.py` now states the escape positively BECAUSE
-                # this exemption makes it true; the two are a pair and must move
-                # together.
-                #
-                # So: a repeat whose SERVING RESULT IS NO LONGER READABLE is exempted
-                # and re-dispatched for real. When the result IS readable the guard
-                # fires exactly as before — that is D94's protection against the
-                # observed dozens-of-re-fetches spin, and it is untouched.
-                #
-                # UNIFORM ACROSS `IDEMPOTENT_READ_TOOLS`, deliberately. The predicate
-                # is a property of the CONTEXT, not of any tool: whatever the read
-                # was, if its answer is gone the model needs it again. A per-tool
-                # carve-out would leave the prompt's escape silently working for some
-                # reads and not others, which is the class of contradiction this
-                # release has already paid for twice.
-                #
-                # BOUNDED, because "correct each time" and "wasteful in aggregate" are
-                # both true here: a read that is fetched, trimmed, re-fetched, trimmed
-                # is re-adding bulk the budget has already judged droppable, and past
-                # a point the cheap nudge is strictly better than paying an MCP
-                # round-trip to re-add it. `_MAX_TRIMMED_READ_REFETCHES` exemptions
-                # per signature per window, then the guard resumes.
-                if guarded_repeat and read_sig is not None and read_sig not in served_this_round:
-                    served_by = served_read_call_ids.get(read_sig)
-                    if served_by is None or served_by not in readable_tool_call_ids:
-                        granted = read_refetch_exemptions.get(read_sig, 0)
-                        event = (
-                            "loop_trimmed_read_refetch_allowed"
-                            if granted < _MAX_TRIMMED_READ_REFETCHES
-                            else "loop_trimmed_read_refetch_capped"
-                        )
-                        if granted < _MAX_TRIMMED_READ_REFETCHES:
-                            read_refetch_exemptions[read_sig] = granted + 1
-                            guarded_repeat = False
-                        self._observer(
-                            event,
-                            _trimmed_read_refetch_event(
-                                tool_call.name,
-                                call_args,
-                                granted=granted,
-                                reason=(
-                                    "result_not_readable_in_window"
-                                    if served_by is not None
-                                    else "no_readable_source"
-                                ),
-                            ),
-                        )
-                if guarded_repeat:
+                # `classify` also applies the TRIM-AWARE RE-FETCH EXEMPTION — a repeat
+                # whose serving result is no longer readable is re-dispatched for real,
+                # bounded per signature per window — and emits that decision's own
+                # events. See `ReadGuard.classify` for why the exemption exists and why
+                # it is bounded; `read_decision.declined` is the whole answer here.
+                read_decision = read_guard.classify(tool_call.name, call_args)
+                if read_decision.declined:
                     # A guarded `getBlueprint` STILL SATISFIES the blueprint-definition
                     # gate. Being deduped means the definition is already in the
-                    # model's context (the exemption above is what makes that true),
-                    # which is exactly what the gate asks. Without this a deadlock is
-                    # reachable: expand, run refused for an unrelated reason (a missing
+                    # model's context (the guard's trim-aware exemption is what makes
+                    # that true), which is exactly what the gate asks. Without this a
+                    # deadlock is reachable:
+                    # expand, run refused for an unrelated reason (a missing
                     # slot), re-expand defensively, get a data-free marker, and never
                     # satisfy the gate again.
                     #
@@ -3595,7 +3396,7 @@ class AgentLoop:
                     await self._session_store.append_trail_entry(session_id, guard_entry)
                     self._observer(
                         "loop_repeated_idempotent_read_guarded",
-                        _repeated_read_guard_event(
+                        repeated_read_guard_event(
                             tool_call.name, tool_call.id, call_args
                         ),
                     )
@@ -4079,14 +3880,10 @@ class AgentLoop:
                 # this turn is caught by the guard above. Only `ok` reads are
                 # "already served" — a denied/errored read is NOT recorded, so a
                 # legitimate retry after a transient failure is never suppressed.
-                if is_idempotent_read and tool_result.status == "ok" and read_sig is not None:
-                    seen_read_calls.add(read_sig)
-                    # THIS entry is now where the result lives — the pointer the
-                    # trim-aware exemption tests for readability next round-trip. It
-                    # is overwritten on a re-fetch, so the pointer always names the
-                    # freshest serving entry rather than a stale trimmed one.
-                    served_read_call_ids[read_sig] = tool_call.id
-                    served_this_round.add(read_sig)
+                # The DECISION is handed back rather than the arguments, so the
+                # signature recorded is provably the one that was tested.
+                if read_decision.is_idempotent_read and tool_result.status == "ok":
+                    read_guard.record_served(read_decision, tool_call.id)
 
                 # Record a SUCCESSFUL `getBlueprint` so the blueprint-definition gate
                 # lets that id run. Staged in the per-response set, not folded into

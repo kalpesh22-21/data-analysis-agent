@@ -37,10 +37,8 @@ from data_agent.runtime.context.assembly import (
     ContextAssembler,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
-from data_agent.runtime.loop.agent_loop import (
-    _MAX_TRIMMED_READ_REFETCHES,
-    AgentLoop,
-)
+from data_agent.runtime.loop.agent_loop import AgentLoop
+from data_agent.runtime.loop.read_guard import _MAX_TRIMMED_READ_REFETCHES
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
@@ -542,7 +540,7 @@ async def test_every_exemption_payload_key_survives_the_guardrail_allowlist() ->
     correctly-named span carrying nothing. The capped event is the one worth
     alerting on — a turn thrashing against the budget — and it is useless without
     `refetch_count`/`reason`."""
-    from data_agent.runtime.loop.agent_loop import _trimmed_read_refetch_event
+    from data_agent.runtime.loop.read_guard import _trimmed_read_refetch_event
     from data_agent.runtime.observability.tracing import _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST
 
     payload = _trimmed_read_refetch_event(

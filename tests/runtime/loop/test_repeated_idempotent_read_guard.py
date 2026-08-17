@@ -27,7 +27,8 @@ from data_agent.runtime.context.assembly import (
     ContextAssembler,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
-from data_agent.runtime.loop.agent_loop import AgentLoop, _repeated_read_guard_event
+from data_agent.runtime.loop.agent_loop import AgentLoop
+from data_agent.runtime.loop.read_guard import repeated_read_guard_event
 from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
@@ -738,7 +739,7 @@ def test_guard_event_never_places_free_form_args_like_sql_on_the_span() -> None:
     """`explainQuery`'s `sql` (which can carry PII literals) must NEVER reach the
     guard event — only catalog-safe identifiers do. The span still self-describes
     as a deduped explainQuery via the fixed note."""
-    payload = _repeated_read_guard_event(
+    payload = repeated_read_guard_event(
         "explainQuery", "eq_2", {"sql": "SELECT secret FROM employee WHERE name = 'PII_VALUE'"}
     )
     assert "sql" not in payload

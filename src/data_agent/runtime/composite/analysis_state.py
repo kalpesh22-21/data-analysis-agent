@@ -416,8 +416,9 @@ def _deduped_original_reason(entry: TrailEntry, trail: Sequence[TrailEntry]) -> 
     completion condition having fetched NOTHING, which is why condition 5 exists.
 
     Since this validator holds the WHOLE trail it can also locate the original
-    and name it. The loop cannot: its `seen_read_calls` is a set of signatures
-    with no ids attached.
+    and name it. The loop cannot: its `ReadGuard` holds signatures plus (only for
+    the readability test) a pointer to the FRESHEST serving entry — not the trail
+    history this walk searches.
     """
     original_id = _find_deduped_original_id(entry, trail)
     if original_id is not None:
