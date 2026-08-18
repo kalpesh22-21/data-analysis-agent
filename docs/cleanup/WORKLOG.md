@@ -413,3 +413,34 @@ T5.5 finish(). Eight ordering invariants documented in the builder brief.
 - Builder hit an API-error stall mid-build; resumed with mandatory
   containment re-verification (G1 protocol) — clean. Base trap caught by
   pinning again (worktree at 9558e9e → reset to 2a67102).
+
+## #12 — T5.5: single _finish() for the in-body exits (2026-08-17)
+
+- **T5.5** consolidated the epilogue of the FIVE in-body TurnOutcome exits
+  (done/no-tool-calls, askUser pause, done/answerWithTable, hard ceiling,
+  budget-cap pause) into one async `AgentLoop._finish` (checkpoint write →
+  conditional message append tagged with provenance → envelope → event
+  LAST → outcome). Per-exit variation stays at the sites: provenance-union
+  calls (done-only), checkpoint construction, force-blocks (E6
+  unconditional, E7 conditional). **Converts 5 of the plan's "7 sites"** —
+  the resume-stop exit (no accumulators exist there) and
+  _pause_from_runtime_tool (already a single-purpose finisher) are
+  deliberate exclusions, documented in the docstring.
+- **Pre-flight characterization tests** (9, all verified green on the
+  UNMODIFIED base — reviewer re-ran them on base independently):
+  resume-stop emits no loop_turn_done (+positive control), 3× pause/ceiling
+  provenance-is-None, M1 pause-envelope pin, blank-final-answer persists
+  nothing (written against a LIVE mutation of the `or None` guard — the
+  full 5800-test suite passed with the mutation until this test existed),
+  2× store-write-before-event order pins.
+- **ISSUES M1 fixed in this slice** (explicitly called out): the
+  per-tool-call envelope compute sunk into its only consumer (the pause
+  branch); purity of envelope()/answer_envelope verified by builder AND
+  reviewer.
+- Review: APPROVE, 0 blockers, 0 suggestions (1 no-action format nit).
+- V0 **5803 passed / 225 skipped / 1 xfailed**, ruff clean.
+  V1: **1 failed (L3 1/3, the accepted oscillating red — J7 cause) /
+  8 passed, 15:24**; all else 3/3, L7 2/3 above floor.
+  V2: L2 live → 2 blueprint-verified tables, answer_sql present, done exit
+  through _finish; traces in `data-agent-runtime` (02:21).
+- Base trap caught by pinning again (worktree at 9558e9e → reset 1d02276).

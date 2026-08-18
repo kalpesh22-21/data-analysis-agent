@@ -1540,6 +1540,132 @@ class AgentLoop:
             self._observer("loop_intent_force_blocked", force_blocked)
         return new_state
 
+    async def _finish(
+        self,
+        *,
+        session_id: str,
+        turn_index: int,
+        status: TurnStatus,
+        assistant_text: str | None,
+        tool_calls_made: int,
+        accum: TurnAccumulators,
+        checkpoint: PauseCheckpoint | None = None,
+        provenance: frozenset[tuple[str, str]] | None = None,
+        persist_text: str | None = None,
+        event: tuple[str, dict[str, Any]] | None = None,
+    ) -> TurnOutcome:
+        """THE ORDER every in-body `TurnOutcome` return performs its effects in, in
+        one place: checkpoint write, assistant-message append, envelope read,
+        observer event, return.
+
+        WHAT THIS REPLACES. Five returns inside `_run_loop_body` (the two `done`
+        exits, the `askUser` pause, the hard ceiling, the budget-cap pause), each
+        re-spelling a nine-field `TurnOutcome(...)` tail — `sql_executed`, the four
+        envelope projections, `assumptions`, `pending_question` — beside its own
+        copy of the same effect ORDER. The fields were the visible duplication; the
+        order was the dangerous one, because it is invisible at every site and only
+        one of the five reads correctly at a time. `_compute_turn_provenance_union`
+        must be read BEFORE the message it tags is appended; the envelope must be
+        read AFTER the round's folds; the observer must fire AFTER every store
+        write, so an observer that reads the session back never races the write it
+        is announcing. Five copies of that is five chances to reorder one.
+
+        THIS OWNS NO STATE, and is a method rather than an object for that reason.
+        The two things an object would bind — the accumulators and the checkpoint —
+        are mutable locals of a running loop body, so an object built at the top of
+        the window would either snapshot them too early or just hold a reference to
+        them, which is the parameter it takes anyway. What it DOES need is
+        `self._session_store` and `self._observer`, so a free function would take
+        both as parameters and be a method with extra steps.
+
+        NOTHING IS DERIVED, and the two parameters that look derivable are the
+        point:
+
+          - *event* is passed, never computed from *status*. The budget-cap
+            `"stop"` answer in `resume()` returns `status="done"` and emits NO
+            event (it is not a window finishing a turn — there is no window), so
+            "`done` means `loop_turn_done`" is FALSE and any code that assumes it
+            starts emitting a spurious finish. `tests/runtime/loop/
+            test_turn_exit_contract.py` pins both halves.
+          - *provenance* is passed, never computed from *status*. It is non-`None`
+            at the `done` exits ONLY, and computing it here would put a second
+            `_compute_turn_provenance_union` call in the codebase — the whole
+            discipline is that there is exactly ONE per done-exit, made at the
+            site, whose single value tags the persisted message AND rides the
+            outcome (`test_repeated_idempotent_read_guard.py::
+            test_turn_provenance_union_excludes_guard_entry` pins that they are the
+            same object). A pause carries `None` deliberately: it has no persisted
+            assistant message for a lineage tag to belong to.
+
+        *persist_text* is likewise a value, not a flag, and it carries the ONE
+        difference between the two `done` exits. The no-tool-calls exit appends
+        only `if result.assistant_text` — a model can finish with `None`/`""` and
+        must not leave an empty assistant message in history — so that site passes
+        `result.assistant_text or None`. The `answerWithTable` exit appends
+        UNCONDITIONALLY, and may: its text came through `clean_answer_text`, which
+        returns `None` for anything that strips to empty, so a non-`None`
+        `designated_answer_text` is a non-empty string by construction.
+
+        WHAT STAYED AT THE SITES, following `read_guard.py` / `blueprint_gate.py` /
+        `finalization.py`: everything whose POSITION relative to this call is the
+        behaviour. `_force_block_pending_intents` runs ABOVE the call at the two
+        terminal-escape exits (unconditionally at the hard ceiling, only for a
+        refused round at the budget cap) — pulling it in here would bury a
+        conditional store write inside a function whose contract is "no decisions".
+        The provenance union and the `PauseCheckpoint` construction stay at their
+        sites for the same reason.
+
+        TWO EXITS DO NOT ROUTE THROUGH THIS, deliberately:
+
+          - `resume()`'s budget-cap `"stop"` return. It happens before `_run_loop`
+            is ever entered, so there are no accumulators — routing it here would
+            mean constructing an empty `TurnAccumulators()` purely to have its
+            reads produce the `None`s that return site writes literally.
+          - `_pause_from_runtime_tool`. It is already a single-purpose finisher for
+            one exit, and it receives an `AnswerEnvelope` as a PARAMETER (its
+            callers, including `_resume_blueprint`, may not have a live window's
+            accumulators at all), so it has nothing to read an envelope from.
+        """
+        if checkpoint is not None:
+            await self._session_store.write_pause_checkpoint(session_id, checkpoint)
+        if persist_text is not None:
+            await self._session_store.append_message(
+                session_id,
+                TurnMessage(
+                    turn_index=turn_index,
+                    role="assistant",
+                    content=persist_text,
+                    ts=_now_iso(),
+                    provenance=provenance,
+                ),
+            )
+        # AFTER every fold and `commit_round` of the round — this is called at the
+        # exit, never hoisted, so the envelope describes the window as it ends.
+        envelope = accum.envelope()
+        if event is not None:
+            # LAST, after every store write above: an observer that reads the
+            # session back must never see it mid-update.
+            self._observer(*event)
+        return TurnOutcome(
+            status=status,
+            assistant_text=assistant_text,
+            # From the checkpoint OBJECT, not re-derived from the question text —
+            # the outcome and the persisted checkpoint hand the client the same dict.
+            pending_question=checkpoint.pending_question if checkpoint is not None else None,
+            tool_calls_made=tool_calls_made,
+            # `[]` (no successful query this turn) -> `None`, so the UI treats
+            # "no SQL panel" and "empty SQL" identically (§1 fork 1).
+            sql_executed=accum.sql_executed,
+            answer_sql=envelope.answer_sql,
+            blueprint_use=envelope.blueprint_use,
+            verification=envelope.verification,
+            answer_tables=envelope.answer_tables,
+            provenance=provenance,
+            # `[]` (no recordAssumptions this turn) -> `None`, same fork as
+            # `sql_executed`: the UI treats "no assumptions" and "empty" identically.
+            assumptions=accum.assumptions,
+        )
+
     async def _pause_from_runtime_tool(
         self,
         *,
@@ -2442,35 +2568,22 @@ class AgentLoop:
                 # Computed ONCE here (the single fail-closed source of truth; do
                 # not re-derive in-loop).
                 turn_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
-                if result.assistant_text:
-                    await self._session_store.append_message(
-                        session_id,
-                        TurnMessage(
-                            turn_index=turn_index,
-                            role="assistant",
-                            content=result.assistant_text,
-                            ts=_now_iso(),
-                            provenance=turn_provenance,
-                        ),
-                    )
-                envelope = accum.envelope()
-                self._observer("loop_turn_done", {"tool_calls_made": tool_calls_made})
-                return TurnOutcome(
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
                     status="done",
                     assistant_text=result.assistant_text,
-                    pending_question=None,
                     tool_calls_made=tool_calls_made,
-                    # `[]` (no successful query this turn) -> `None`, so the UI
-                    # treats "no SQL panel" and "empty SQL" identically (§1 fork 1).
-                    sql_executed=accum.sql_executed,
-                    answer_sql=envelope.answer_sql,
-                    blueprint_use=envelope.blueprint_use,
-                    verification=envelope.verification,
-                    answer_tables=envelope.answer_tables,
+                    accum=accum,
                     provenance=turn_provenance,
-                    # `[]` (no recordAssumptions this turn) -> `None`, same fork as
-                    # `sql`: the UI treats "no assumptions" and "empty" identically.
-                    assumptions=accum.assumptions,
+                    # `or None` IS THE APPEND GUARD (`if result.assistant_text:`),
+                    # carried as a value. A model may finish this exit with `None`
+                    # or `""`; either must leave NO assistant message in history,
+                    # while `assistant_text` above still reports it verbatim. The
+                    # `answerWithTable` exit below persists unconditionally — see
+                    # `_finish` for why the two differ and why both are correct.
+                    persist_text=result.assistant_text or None,
+                    event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
                 )
 
             # A REFUSED EXIT-#1 ROUND FALLS THROUGH FROM HERE — deliberately, and
@@ -2962,8 +3075,18 @@ class AgentLoop:
                 # trail entry or counting the call (a paused tool did not
                 # complete, mirroring `askUser`). A dispatched MCP tool never
                 # sets `.pause`, so this is inert on the normal path.
-                envelope = accum.envelope()
                 if tool_result.pause is not None:
+                    # Computed INSIDE the branch that consumes it. It used to be
+                    # read once per tool call and used on the ~0.1% of them that
+                    # pause; `TurnAccumulators.envelope` is pure (no store, no
+                    # observer — `turn_accumulators.answer_envelope` and
+                    # `rollup_verification`/`AnswerTable.to_doc` below it only build
+                    # values), so where it is called cannot be observed, only how
+                    # often. `tests/runtime/loop/test_turn_exit_contract.py::
+                    # test_an_in_loop_pause_carries_the_envelope_of_the_same_batch`
+                    # pins that it is still read LATE — after the folds of the
+                    # calls that drained before this one.
+                    envelope = accum.envelope()
                     return await self._pause_from_runtime_tool(
                         session_id=session_id,
                         pause=tool_result.pause,
@@ -3151,23 +3274,17 @@ class AgentLoop:
                     consumed=False,
                     budget_window_count=window_count,
                 )
-                await self._session_store.write_pause_checkpoint(session_id, checkpoint)
-                envelope = accum.envelope()
-                self._observer("loop_paused_ask_user", {"question": question})
-                return TurnOutcome(
+                # Best-effort partials (§1) ride along; `provenance` is left unset
+                # (the fail-closed union is reused only on the `done` returns).
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
                     status="paused_ask_user",
                     assistant_text=result.assistant_text,
-                    pending_question=checkpoint.pending_question,
                     tool_calls_made=tool_calls_made,
-                    # Best-effort partial (§1): whatever succeeded in an earlier
-                    # window of this turn; `provenance` stays `None` (the fail-closed
-                    # union is reused only on the `done` return).
-                    sql_executed=accum.sql_executed,
-                    answer_sql=envelope.answer_sql,
-                    blueprint_use=envelope.blueprint_use,
-                    verification=envelope.verification,
-                    answer_tables=envelope.answer_tables,
-                    assumptions=accum.assumptions,
+                    accum=accum,
+                    checkpoint=checkpoint,
+                    event=("loop_paused_ask_user", {"question": question}),
                 )
 
             # TERMINAL EXIT #2 (answerWithTable). The loop's other exit is a model
@@ -3186,30 +3303,20 @@ class AgentLoop:
                 turn_provenance = await self._compute_turn_provenance_union(
                     session_id, turn_index
                 )
-                await self._session_store.append_message(
-                    session_id,
-                    TurnMessage(
-                        turn_index=turn_index,
-                        role="assistant",
-                        content=designated_answer_text,
-                        ts=_now_iso(),
-                        provenance=turn_provenance,
-                    ),
-                )
-                envelope = accum.envelope()
-                self._observer("loop_turn_done", {"tool_calls_made": tool_calls_made})
-                return TurnOutcome(
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
                     status="done",
                     assistant_text=designated_answer_text,
-                    pending_question=None,
                     tool_calls_made=tool_calls_made,
-                    sql_executed=accum.sql_executed,
-                    answer_sql=envelope.answer_sql,
-                    blueprint_use=envelope.blueprint_use,
-                    verification=envelope.verification,
-                    answer_tables=envelope.answer_tables,
+                    accum=accum,
                     provenance=turn_provenance,
-                    assumptions=accum.assumptions,
+                    # UNCONDITIONAL, unlike the no-tool-calls exit's `or None`, and
+                    # allowed to be: `designated_answer_text` came through
+                    # `clean_answer_text`, which returns `None` for anything that
+                    # strips to empty — so reaching here means a non-empty string.
+                    persist_text=designated_answer_text,
+                    event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
                 )
 
             # SPEND, not occupancy: `total_tokens` is this round-trip's prompt +
@@ -3234,21 +3341,16 @@ class AgentLoop:
                         state=analysis_state,
                         reason_code="BUDGET_EXHAUSTED",
                     )
-                    envelope = accum.envelope()
-                    self._observer("loop_hard_ceiling_stop", {"window": window_count})
-                    return TurnOutcome(
+                    # Best-effort partials (§1): whatever succeeded before the hard
+                    # ceiling; `provenance` is left unset (done-only).
+                    return await self._finish(
+                        session_id=session_id,
+                        turn_index=turn_index,
                         status="stopped_hard_ceiling",
                         assistant_text=last_assistant_text,
-                        pending_question=None,
                         tool_calls_made=tool_calls_made,
-                        # Best-effort partial (§1): whatever succeeded before the
-                        # hard ceiling; `provenance` stays `None` (done-only).
-                        sql_executed=accum.sql_executed,
-                        answer_sql=envelope.answer_sql,
-                        blueprint_use=envelope.blueprint_use,
-                        verification=envelope.verification,
-                        answer_tables=envelope.answer_tables,
-                        assumptions=accum.assumptions,
+                        accum=accum,
+                        event=("loop_hard_ceiling_stop", {"window": window_count}),
                     )
                 # 05 §F, fourth forced path: the budget cap reached DURING A
                 # REFUSED ROUND. §C.3 created it — the forced re-round is charged,
@@ -3301,22 +3403,17 @@ class AgentLoop:
                     consumed=False,
                     budget_window_count=window_count,
                 )
-                await self._session_store.write_pause_checkpoint(session_id, checkpoint)
-                envelope = accum.envelope()
-                self._observer("loop_paused_budget_cap", {"window": window_count})
-                return TurnOutcome(
+                # Best-effort partials (§1): whatever succeeded before the cap;
+                # `provenance` is left unset (done-only).
+                return await self._finish(
+                    session_id=session_id,
+                    turn_index=turn_index,
                     status="paused_budget_cap",
                     assistant_text=last_assistant_text,
-                    pending_question=checkpoint.pending_question,
                     tool_calls_made=tool_calls_made,
-                    # Best-effort partial (§1): whatever succeeded before the cap;
-                    # `provenance` stays `None` (done-only).
-                    sql_executed=accum.sql_executed,
-                    answer_sql=envelope.answer_sql,
-                    blueprint_use=envelope.blueprint_use,
-                    verification=envelope.verification,
-                    answer_tables=envelope.answer_tables,
-                    assumptions=accum.assumptions,
+                    accum=accum,
+                    checkpoint=checkpoint,
+                    event=("loop_paused_budget_cap", {"window": window_count}),
                 )
             # Under budget — loop back to 3a within the same window.
 

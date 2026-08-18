@@ -160,7 +160,7 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 ## M. Tier-5 follow-ups (2026-08-17 — queued, not gating)
 
-**M1 — per-tool-call envelope rebuild feeds a branch that almost never fires.**
+**M1 — FIXED in T5.5 (WORKLOG #12): per-tool-call envelope rebuild feeds a branch that almost never fires.**
 `agent_loop._run_loop_body` computes the answer envelope (a
 `rollup_verification` + N `table.to_doc()` calls) unconditionally for EVERY
 tool call in a batch, solely to feed `_pause_from_runtime_tool` when
@@ -169,6 +169,15 @@ same shape is `accum.envelope()` at the same position). Moving the call
 inside the `if pause` branch is behaviour-neutral for outputs but was kept
 verbatim in T5.4 to stay strictly behaviour-identical. Fix in a follow-up
 slice: one-line move + a test that a pause still carries the envelope.
+
+**M2 — "stop" at the budget cap returns less than "continue" rebuilds.**
+`resume()`'s stop path returns `assumptions=None`/`answer_tables=None` with
+the rationale "the in-loop accumulators are gone with the prior window" —
+but the continue path, 20 lines below, reconstructs exactly those from the
+trail (`_compute_turn_assumptions` / `_compute_turn_answer_tables`). A user
+who answers "stop" loses the table/assumptions a user who answers
+"continue" keeps, even though the trail could serve both. Product decision
++ small fix; T5.5 deliberately reproduced the current behaviour.
 
 A reviewer document ("Planning and System-Prompt Review") landed the same session, proposing blueprint-first routing over the current SIMPLE/COMPLICATED planning policy. Its questions, the four decisions taken so far, and the follow-on questions those opened are tracked separately in **`docs/decisions/prompt-routing-review-qa.md`** (in-repo, for Lead sign-off) — not here. Issues **A4** (D22 deletes assistant text) and **B1/B3** above are now owned by that document's Decision 4 and Priority-1 workstream.
 
