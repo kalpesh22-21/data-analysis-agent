@@ -666,3 +666,64 @@ install to the MAIN checkout's src — every landed slice is unaffected
 (each was re-verified with full V0 in main after patch-apply), but
 builder/reviewer briefs now require verifying `data_agent.__file__`
 resolves inside the worktree before trusting a run.
+
+## #19 — C5 schema preview + I1 answer scrub, e2e-verified on the real database (2026-08-18)
+
+User decisions: C5 solve-the-truncation; I1 build the prose scrub (+ blueprint
+ids); I2 full transparency KEPT (structured payload untouched, recorded in
+ISSUES).
+
+- **C5** — `dispatch/schema_preview.py::fit_schema_under_cap` owns the policy:
+  lossless null-key compaction (–34% payload) → {name,type} skeleton for EVERY
+  column → base sections protected → relevance-ranked detail upgrades
+  (per-table IDF scorer; annual_salary first for the salary question;
+  plural stemming ies→y) → honest budgeted marker (no false re-fetch advice).
+  question threaded as an ordering-only hint (D25 leak test). Before: 35/130
+  employee columns visible, annual_salary ABSENT. After: 130/130 named,
+  detail follows the question. Prompt ceiling raised 17,000→17,400 (dated
+  tripwire rationale) for the two-tier teaching; byte-pinned draft doc moved
+  with it. Review: APPROVE; folds incl. the silent base-drop event gap.
+- **I1** — `runtime/answer_scrub.py`: one-pass alternation (corpus ids →
+  [saved analysis]; qualified ≥2-dotted incl. 3-part, underscored, quoted →
+  [schema detail withheld]); @-adjacent and data-file-extension carve-outs
+  (R0 consumes-but-preserves); KN-95/BP-1042 value protection; scrub at
+  _finish (one string → persist + outcome: live/history parity), pause path,
+  askUser question; count-only event. Review: APPROVE WITH FIXES, all folded
+  (3-part leak, carve-outs, letter-required prefix). The sentinel test
+  rename judged correct by review.
+- **Workflow fix that outlives the slice**: pytest `pythonpath=["src"]` — a
+  worktree suite could silently import MAIN's src (reviewer-proven);
+  now structurally impossible.
+- Verification (user directive: e2e on the real DB before committing):
+  V0 **5972**; V1 **9 passed** (L1/2/5/6 3/3, L3/L4/L7 2/3 ≥ floor);
+  C5 live: correct medians + "130 of 130 columns are listed" marker PROVEN in
+  the model's request payload (eval AND live service); I1 live: 3 adversarial
+  probes → 100% model compliance (it refused to name identifiers, on accuracy
+  grounds once), zero redaction events on a verified-working channel;
+  mechanism pinned at the seam by 33 tests. ISSUES: C5/I1 popped; M3 (C5b
+  user spec), M4 queued.
+
+## #20 — demo harness snake-case debt + learning loop verified live (2026-08-18)
+
+User directive: prove candidates are learnt properly. First flywheel run
+stopped honestly at PART A — root cause PRE-EXISTING harness staleness
+(scripts/_e2e_harness.py still minted a CamelCase column scope from before
+the warehouse snake-migration → MCP scope-filtered the schema to zero columns
+→ model hallucinated names → PARSE_FAILED_CLOSED, fail-closed guard correct).
+Fixed: SALARY_COL/DEPT_COL/CATALOG → real snake_case + types; scope widened
+to 5 columns (each proven load-bearing live — the model wrote the
+exclude-not-hired rule predicate the 2-column scope would have hidden);
+_ACCEPTED_SQL in the sibling demo (executed live) fixed; flywheel /turn
+result contract caught up (sql → sql_executed/answer_sql/answer_tables).
+
+**Learning loop VERIFIED with a novel candidate** (by-status average salary —
+no corpus coverage): live ask $700k → rectify $100k avg → sweep
+(scanned=1 claimed=1) → REAL gpt-5.5 extractor → blueprint candidate
+(confidence 0.95, snake_case citations, enum slot with real values) → S4
+template clean (static_validation ok) → review inbox → HUMAN APPROVE →
+VALIDATED LANDING in Neo4j (created_by=learning). Prior-art logic also
+demonstrated: the covered question produced a knowledge candidate instead of
+a duplicate blueprint. PART C non-autoplay root-caused to the DELIBERATE
+governed-corpus trust gate (recall serves source='mcp' only; the landed node
+ranks #1 in the raw index — will serve on promotion). ISSUES M4 queued for
+the stale demo narrative.

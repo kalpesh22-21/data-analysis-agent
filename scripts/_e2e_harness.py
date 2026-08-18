@@ -129,19 +129,51 @@ EMBEDDING_MODEL = "all-mpnet-base-v2"
 # Old enough that any sweep window considers a seeded session idle.
 OLD_TS = "2000-01-01T00:00:00+00:00"
 
+# The warehouse is snake_case (docker/clickhouse-init/hr-4tables-snake-migration.sql,
+# aligned column-for-column with the Semantic Catalog YAMLs). These names are
+# CASE-SENSITIVE all the way down: the MCP's `getTableSchema` overlay binds by exact
+# column name, and the JWT column scope is matched as an exact string. A stale
+# CamelCase name here does not error — it silently matches NOTHING, so the overlay
+# scope-filters the schema down to an empty column list and the model, shown a table
+# with no columns, invents them (-> PARSE_FAILED_CLOSED).
 TABLE = "dbpcm_warehouse.employee"
-SALARY_COL = f"{TABLE}.AnnualSalary"
-DEPT_COL = f"{TABLE}.Department"
+SALARY_COL = f"{TABLE}.annual_salary"
+# Departments are filtered by NAME in the demos ("the Sales department"); the catalog's
+# `department` ambiguity resolves to department_code/department_name, and the seeded
+# rows carry both (D02/'Sales').
+DEPT_COL = f"{TABLE}.department_name"
+DEPT_CODE_COL = f"{TABLE}.department_code"
+STATUS_COL = f"{TABLE}.employee_status"
+EMPLOYEE_COL = f"{TABLE}.employee_code"
 
-# The sqlglot schema the extractor's static validation reads.
+# The column scope the demos mint their JWTs with. Deliberately MINIMAL, but it must
+# cover every column the demo's expected SQL can legitimately touch, because the
+# overlay drops out-of-scope columns from `getTableSchema` AND drops any rule /
+# ambiguity whose predicate references one:
+#   * annual_salary   — the measure (sum/avg).
+#   * department_name — the filter the demos ask for ("Sales", "Engineering").
+#   * department_code — the OTHER half of the catalog's `department` ambiguity; in
+#     scope so the ambiguity entry survives the filter intact and a model that
+#     resolves "Sales" to D02 is not a scope violation.
+#   * employee_status — the `exclude_not_hired_default` rule predicates on it. Out of
+#     scope, that default rule is silently dropped from the schema the model sees.
+#   * employee_code   — the "AVERAGE annual salary PER EMPLOYEE" rectification invites
+#     sum(annual_salary) / count(DISTINCT employee_code) as readily as avg().
+DEMO_COLUMN_SCOPE = [SALARY_COL, DEPT_COL, DEPT_CODE_COL, STATUS_COL, EMPLOYEE_COL]
+
+# The sqlglot schema the extractor's static validation reads. A deliberate MINI
+# catalog — only the columns the demos touch — but the names and ClickHouse types are
+# the REAL ones (tests/fixtures/catalog_export.json / the snake migration), because
+# static validation resolves the model's proposed SQL against exactly this mapping.
 CATALOG = {
     TABLE: {
-        "ClientCode": "String",
-        "EmployeeCode": "String",
-        "Department": "String",
-        "EmployeeName": "String",
-        "EmployeeStatus": "String",
-        "AnnualSalary": "Decimal(18, 6)",
+        "client_code": "String",
+        "employee_code": "String",
+        "department_code": "Nullable(String)",
+        "department_name": "Nullable(String)",
+        "employee_name": "Nullable(String)",
+        "employee_status": "Nullable(String)",
+        "annual_salary": "Nullable(Decimal(18, 6))",
     }
 }
 
@@ -560,14 +592,18 @@ def span_attrs(node: Any) -> dict:
 
 __all__ = [
     "CATALOG",
+    "DEMO_COLUMN_SCOPE",
+    "DEPT_CODE_COL",
     "DEPT_COL",
     "EMBEDDING_MODEL",
+    "EMPLOYEE_COL",
     "MODEL_CANDIDATES",
     "OLD_TS",
     "PHOENIX_GRAPHQL",
     "PHOENIX_OTLP",
     "PHOENIX_UI",
     "SALARY_COL",
+    "STATUS_COL",
     "TABLE",
     "CapturingExtractor",
     "Infra",

@@ -185,7 +185,21 @@ async def test_undetermined_provenance_turns_assistant_message_always_dropped() 
     """A turn whose only tool call had undetermined provenance (here: an
     uncatalogued `sampleRows` table) makes that turn's assistant message
     undetermined too — dropped even under the widest possible (allow-all)
-    re-assembly scope (D44 fail-closed, read literally)."""
+    re-assembly scope (D44 fail-closed, read literally).
+
+    THE SENTINEL IS DELIBERATELY PROSE-SHAPED. It used to be
+    `UNDETERMINED_PROVENANCE_ANSWER`, and the answer-prose scrub (ISSUES I1)
+    correctly redacts that — a SCREAMING_SNAKE token is identifier-shaped, exactly
+    like the `EMPLOYEE_MASTER` this rule exists to withhold. Keeping it would NOT
+    have gone unnoticed: the turn-0 equality assertion below compares
+    `turn0.assistant_text` against the sentinel, and the loop scrubs that string
+    before returning it, so the test would have failed LOUDLY the day the scrub
+    landed. The real hazard is narrower and survives that fix: the FINAL
+    assertion — the one this test exists for — goes VACUOUS, because a string the
+    scrub deletes at the door can never appear in a re-assembled blob whether the
+    D44 drop works or not. A loud failure on the setup assertion is not a
+    substitute for a load-bearing one on the assertion under test. A sentinel only
+    needs to be UNIQUE, so it is now a unique sentence."""
     store = InMemorySessionStore()
     model = ScriptedModelClient(
         [
@@ -198,7 +212,7 @@ async def test_undetermined_provenance_turns_assistant_message_always_dropped() 
                     )
                 ]
             ),
-            ModelTurnResult(assistant_text="UNDETERMINED_PROVENANCE_ANSWER"),
+            ModelTurnResult(assistant_text="Sampled the upload — undetermined provenance sentinel answer."),
             ModelTurnResult(assistant_text="Something else."),
         ]
     )
@@ -215,7 +229,7 @@ async def test_undetermined_provenance_turns_assistant_message_always_dropped() 
         session_id=SESSION_ID, credentials=_credentials(frozenset()), user_message="Sample the upload."
     )
     assert turn0.status == "done"
-    assert turn0.assistant_text == "UNDETERMINED_PROVENANCE_ANSWER"
+    assert turn0.assistant_text == "Sampled the upload — undetermined provenance sentinel answer."
 
     # Re-assemble under the WIDEST possible scope (allow-all) — still dropped.
     turn1 = await loop.run(
@@ -224,4 +238,4 @@ async def test_undetermined_provenance_turns_assistant_message_always_dropped() 
     assert turn1.status == "done"
 
     last_call_blob = _messages_blob(model.calls[-1])
-    assert "UNDETERMINED_PROVENANCE_ANSWER" not in last_call_blob
+    assert "Sampled the upload — undetermined provenance sentinel answer." not in last_call_blob

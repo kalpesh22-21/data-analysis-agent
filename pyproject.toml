@@ -42,6 +42,8 @@ dev = [
 packages = ["src/data_agent"]
 
 [tool.pytest.ini_options]
+# A worktree's test run must import THAT worktree's src, not the main checkout's editable install.
+pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-v"
 asyncio_mode = "auto"

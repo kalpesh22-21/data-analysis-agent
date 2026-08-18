@@ -19,6 +19,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from data_agent.runtime.answer_scrub import ANSWER_PROSE_REDACTED_EVENT
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import (
     ANALYSIS_STATE_AUTO_BOUND_EVENT,
@@ -461,3 +462,58 @@ async def test_the_answer_shape_events_survive_the_real_guardrail_observer() -> 
     for finished_span in spans:
         for value in finished_span.attributes.values():
             assert "headcount by department" not in str(value)
+
+
+async def test_the_answer_prose_scrub_event_survives_the_observer_without_its_tokens() -> None:
+    """THE PREFIX IS THE TEST, third instance (ISSUES I1) — with a second edge the
+    other two do not have.
+
+    The scrub is the one guardrail whose telemetry could UNDO it. Its event fires
+    precisely when an identifier has been withheld from a user, so a payload
+    carrying that identifier would republish it through the tracing side door,
+    where it is far more durable than the answer was. `redaction_count` is
+    therefore the only thing added to `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST`, and
+    this drives the REAL observer to prove both halves at once: the span arrives
+    with its count, and NO span on the turn carries the redacted token.
+    """
+    tracer, exporter = _tracer_with_memory_exporter()
+    observer = tracing.guardrail_observer(tracer)
+
+    store = InMemorySessionStore()
+    loop = AgentLoop(
+        model_client=ScriptedModelClient(
+            [ModelTurnResult(assistant_text=f"Read from {_E}, joined employee_master.")]
+        ),
+        tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=observer, tracer=tracer),
+        context_assembler=ContextAssembler(store, tracer=tracer),
+        session_store=store,
+        tools_provider=_query_tools_provider,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        observer=combine_observers(observer),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="where from?"
+    )
+    assert outcome.assistant_text is not None
+    assert "employee_master" not in outcome.assistant_text
+
+    spans = exporter.get_finished_spans()
+    redacted = [s for s in spans if s.name == ANSWER_PROSE_REDACTED_EVENT]
+    assert len(redacted) == 1, (
+        "the answer-prose scrub event did not survive guardrail_observer — check "
+        f"the `loop_` prefix on {ANSWER_PROSE_REDACTED_EVENT!r}"
+    )
+    attributes = dict(redacted[0].attributes)
+    assert attributes["redaction_count"] == 2, (
+        "the span exported no `redaction_count` — the key is missing from "
+        "_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST, so the span carries nothing"
+    )
+    assert attributes["exit"] == "no_tool_calls"
+    # The point: what the answer withheld, the telemetry withholds too.
+    for finished_span in spans:
+        for value in finished_span.attributes.values():
+            assert "employee_master" not in str(value)
+            assert _E not in str(value)

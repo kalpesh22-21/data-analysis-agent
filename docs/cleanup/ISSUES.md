@@ -50,8 +50,6 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 **C4 — `schema_notes` is authored across the semantic catalog but has ZERO readers (2026-08-17, found during J1 placement analysis).** `build_table_schema_response` returns a fixed key set that omits it; it ships in `/catalog/export` verbatim but nothing renders it anywhere in either repo. Guidance authored there is invisible. Wire it into the schema response or mark the field inert in the authoring docs.
 
-**C5 — wide-table schema previews silently hide column guidance/ambiguities from the model (2026-08-17, found live during the J1 fix).** `_cap_nontabular_result` keeps only the HEAD of a wide table's column list under `max_result_tokens`; every column past the cut loses its description/notes entirely (`_truncated` marker only). The prompt instructs the model to "read each column's description" — structurally impossible for late columns on wide tables (employee's `annual_salary` guidance was proven absent from a 170KB request payload while the column name appeared elsewhere). Levers: prioritize question-relevant columns in the kept head; a column-filter arg on getTableSchema; or accept that authored guidance belongs in the knowledge corpus (the J1 resolution) and document the contract. Affects ambiguities/clarify_if too.
-
 **C2 — Full 14-tool schema list is re-sent every round-trip**, with no `tool_choice`, `temperature`, `parallel_tool_calls`, or reasoning params set on either the Responses or Chat path (`model/openai_client.py`).
 
 ---
@@ -102,9 +100,7 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 ## I. UI disclosure surface — remaining after the 2026-08-13 hardening slice (`1885a8f`)
 
-**I1 — Answer-text schema disclosure is prompt-only; no runtime scrub.** The `1885a8f` slice hardened the system prompt (business-terms answers, no table/column/DDL), the progress summarizer (default-deny arg allowlist + structural output filter), and gated internal dispatch progress (`emit_progress=False`: executor ×4, resolveValues, discovery emulation). But nothing inspects the model's final answer prose — a model ignoring the instruction is caught by nobody. Next layer if needed: scrub answer text against catalog identifiers seen in the turn's trail. Only a live sweep measures prompt compliance.
-
-**I2 — The `result` SSE frame still carries full SQL/structure by design (D56 transparency).** `sql_executed` (every query verbatim incl. blueprint node SQL), `answer_sql`/`answer_tables[].sql`, `provenance` (`db.table.column` chips), `blueprint_use` slots — straight projection in `app.py::_outcome_to_dict`, no redaction layer; `redaction.py` is telemetry-only by stated design. Also `POST /query/page` accepts SQL *from* the browser. Curbing these is a product decision (e.g. a config flag gating transparency payloads), deliberately not made in the hardening slice.
+**I2 — DECIDED 2026-08-18 (user): full transparency KEPT.** The `result` SSE frame continues to carry sql_executed/answer_sql/provenance chips/blueprint_use verbatim (D56 transparency is the product posture), and `POST /query/page` keeps accepting SQL from the browser. Revisit only before an external-facing deployment. Note the boundary with I1: transparency applies to the STRUCTURED payload; the model's PROSE is scrubbed (I1 slice).
 
 **I3 — Hermetic corpus fixture drifted from canon (committed in `e8cf36e`).** `tests/runtime/retrieval/test_corpus_loader_structural_key_qa.py` — 2 standing failures: canon's `bp-active-headcount-by-department.sql_template` gained `ORDER BY headcount`, hermetic fixture lacks it. Only failures in the runtime suite (3036 pass otherwise).
 

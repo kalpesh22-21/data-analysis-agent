@@ -47,10 +47,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _catalog import catalog_dict, catalog_handle  # noqa: E402
 from _e2e_harness import (  # noqa: E402
     CATALOG,
-    DEPT_COL,
+    DEMO_COLUMN_SCOPE,
     EMBEDDING_MODEL,
     OLD_TS,
-    SALARY_COL,
     CapturingExtractor,
     Infra,
     apply_live_env,
@@ -107,7 +106,7 @@ _PHOENIX_OTLP = os.environ.get("OTLP_ENDPOINT", "http://localhost:6006/v1/traces
 # PART A: ask, then rectify intent, in ONE session -> a real correction trail.
 _QUESTION_A = "what is the total annual salary for the Sales department?"
 # A schema-supported intent rectification that stays within the bound column scope
-# ([AnnualSalary, Department]): swap the metric total->average on the same column
+# (`DEMO_COLUMN_SCOPE`): swap the metric total->average on the same column
 # and filter the model already used, so turn 2 converges cleanly (no new schema,
 # no out-of-scope column) and the session stays learnable.
 _RECTIFY_A = "actually, I want the AVERAGE annual salary per employee in Sales, not the total."
@@ -232,29 +231,43 @@ def _print_runtime_result(label: str, result: dict | None) -> None:
     print(f"  status         : {result.get('status')}")
     print(f"  tool_calls_made: {result.get('tool_calls_made')}")
     print(f"  assistant_text : {result.get('assistant_text')!r}")
-    print(f"  sql            : {result.get('sql')}")
-    rt = result.get("result_table")
-    if isinstance(rt, dict):
+    # The `/turn` result contract (runtime/app.py): `sql` was split into
+    # `sql_executed` (EVERY query the turn ran — the audit list) and `answer_sql`
+    # (the ONE query the model designated via `presentTable`), and `result_table`
+    # — a runtime-chosen 20-row preview — was replaced by `answer_tables`.
+    executed = result.get("sql_executed") or []
+    print(f"  sql_executed   : {len(executed)} query(ies)")
+    for q in executed:
+        print(f"    - {q}")
+    print(f"  answer_sql     : {result.get('answer_sql')}")
+    for i, tbl in enumerate(result.get("answer_tables") or []):
         print(
-            f"  result_table   : row_count={rt.get('row_count')} "
-            f"columns={rt.get('columns')} preview_rows={rt.get('preview_rows')}"
+            f"  answer_tables[{i}]: sql={tbl.get('sql')!r} caption={tbl.get('caption')!r} "
+            f"verification={tbl.get('verification')}"
         )
+    assumptions = result.get("assumptions") or []
+    for a in assumptions:
+        print(f"  assumption     : {a}")
     bpu = result.get("blueprint_use")
     if bpu is not None:
         print(f"  blueprint_use  : {bpu}")
 
 
 def _looks_like_ran_query(result: dict | None) -> bool:
-    """A turn 'actually ran a query and returned a number' iff a runQuery/runBlueprint
-    SQL is present AND some numeric-looking result rows came back."""
+    """A turn 'actually ran a query and answered' iff it EXECUTED read-only SQL (or
+    played a blueprint) and came back with prose.
+
+    Reads `sql_executed`, not the retired `sql`/`result_table` pair. The check is
+    deliberately NOT `answer_sql`/`answer_tables`: those carry the model's
+    `presentTable` designation, which is advisory and is legitimately absent for a
+    SCALAR answer — and "the total annual salary for Sales" is exactly that. Gating
+    on the designation made a perfectly good turn (three tool calls, a real number
+    in the prose) read as "the model did not run a query".
+    """
     if result is None:
         return False
-    if not result.get("sql"):
-        return False
-    rt = result.get("result_table")
-    if not isinstance(rt, dict):
-        return False
-    return bool(rt.get("preview_rows")) or int(rt.get("row_count") or 0) > 0
+    ran = bool(result.get("sql_executed")) or bool(result.get("blueprint_use"))
+    return ran and bool(result.get("assistant_text"))
 
 
 # --------------------------------------------------------------------------- run
@@ -284,7 +297,7 @@ async def _run() -> int:
         print("# [PART A] a LIVE runtime turn: ask -> rectify intent -> verify")
         print("#" * 72)
 
-        jwt_a = await mint_bound_token([SALARY_COL, DEPT_COL], sid_a)
+        jwt_a = await mint_bound_token(DEMO_COLUMN_SCOPE, sid_a)
         infra.created_sessions.append(sid_a)
 
         print(f"\n[STAGE A1] POST /turn  session={sid_a!r}  q={_QUESTION_A!r}")
@@ -527,7 +540,7 @@ async def _run() -> int:
         print("# [PART C] a VARIANT question AUTOPLAYS the blueprint through the RUNTIME")
         print("#" * 72)
 
-        jwt_c = await mint_bound_token([SALARY_COL, DEPT_COL], sid_c)
+        jwt_c = await mint_bound_token(DEMO_COLUMN_SCOPE, sid_c)
         infra.created_sessions.append(sid_c)
 
         print(f"\n[STAGE C1] POST /turn  session={sid_c!r}  q={_QUESTION_C!r}")

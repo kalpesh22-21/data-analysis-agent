@@ -235,6 +235,8 @@ interface Verification {
 }
 ```
 
+**Prose is scrubbed; the payload beside it is not (ISSUES I1 + I2).** `assistant_text` and `pending_question.question` are model-authored prose shown to the user, and the runtime redacts identifier-shaped tokens from both before they leave: a qualified name, a `snake_case` token or a quoted identifier renders as **`[schema detail withheld]`**, a blueprint/knowledge id as **`[saved analysis]`**. The markers are literal text in the string — render them as-is; they are meant to be seen. The same string is what `GET /session/history` returns for that turn, so live and history never disagree. **Every structured field is deliberately untouched:** `sql_executed`, `answer_sql`, `answer_tables[].sql`, `answer_tables[].caption`, `blueprint_use.blueprint_id`, `verification` and `provenance` still name exactly what ran, so a UI can (and should) keep showing the SQL panel, the blueprint chip and the lineage next to an answer whose sentence withheld the same identifier. Do not "reconcile" the two — the divergence is the design.
+
 #### 4.2.1 `sql_executed` — null vs `[]`
 *(was `sql` before 2026-08 — renamed so it can never be read as "the answer".)*
 

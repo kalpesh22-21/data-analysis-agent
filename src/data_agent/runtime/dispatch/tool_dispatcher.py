@@ -54,6 +54,7 @@ from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 from data_agent.runtime.session.models import ResultPreview
 
 from .denial_mapping import DenialInfo, classify_denial
+from .schema_preview import _estimate_tokens, fit_schema_under_cap
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
@@ -177,21 +178,17 @@ class ToolResult:
 
 
 # Default per-result token cap for the stored preview (RuntimeSettings.
-# max_tool_result_tokens overrides it). The estimator below is intentionally a
-# byte-identical copy of context/budget.py::_estimate_tokens (chars/4) — the two
-# modules cannot share the import (dispatch/__init__ eagerly imports this module,
-# and budget.py transitively imports dispatch, so a direct import cycles). A
-# parity test (`tests/runtime/dispatch/test_tool_dispatcher.py`) pins the two
-# implementations together so a future tokenizer swap must update both.
+# max_tool_result_tokens overrides it). The estimator imported above
+# (`schema_preview._estimate_tokens`) is intentionally a byte-identical copy of
+# context/budget.py::_estimate_tokens (chars/4) — the two modules cannot share the
+# import (dispatch/__init__ eagerly imports this module, and budget.py transitively
+# imports dispatch, so a direct import cycles). A parity test
+# (`tests/runtime/dispatch/test_tool_dispatcher.py`) pins the two implementations
+# together so a future tokenizer swap must update both. It LIVES in schema_preview
+# (which imports nothing from this package) because the schema fitter has to measure
+# its own trial fits with exactly the estimator this cap is expressed in; re-defining
+# it here would have made a THIRD copy of the same four characters-per-token rule.
 _DEFAULT_MAX_TOOL_RESULT_TOKENS = 4_000
-
-
-def _estimate_tokens(text: str) -> int:
-    """chars/4 token estimate — a byte-identical copy of context/budget.py::
-    `_estimate_tokens` (see the module note above on why it cannot be imported), so
-    the per-result cap and the trail budget walk measure token cost identically. A
-    parity test locks the two together."""
-    return max(1, len(text) // 4)
 
 
 def _cap_list_under_key(
@@ -200,16 +197,23 @@ def _cap_list_under_key(
     """Keep the HEAD of `raw_result[key]` — as many leading items as fit under
     *max_result_tokens* — and return `(capped_dict, kept_count, total_count)`.
 
-    The head is kept because both callers hand in an ordered list whose leading
-    items are the most useful ones (a schema's leading columns; a search's
-    highest-scoring cards, already score-ordered by the pipeline). The other
-    top-level keys ride along untouched, so the result stays the SAME SHAPE the
-    model expects — a dict with a (shorter) list under *key*, never a string.
+    The head is kept because the caller hands in a RANKED list — the blueprint
+    cards, already score-ordered by the pipeline — so dropping the tail degrades
+    it the way a ranked list should degrade. The other top-level keys ride along
+    untouched, so the result stays the SAME SHAPE the model expects — a dict with
+    a (shorter) list under *key*, never a string.
+
+    NOT for column lists any more (ISSUES C5). A schema's columns are ordered but
+    NOT ranked: head-cutting them dropped the NAMES of everything past the cut,
+    which is how `employee.annual_salary` (index ~87 of 124) stopped existing as
+    far as the model could tell. That branch now delegates to
+    `schema_preview.fit_schema_under_cap`, which degrades per-column detail
+    instead. The cards branch is the only caller left.
 
     No minimum-one carve-out: if not even the first item fits, the list comes
     back empty. Forcing an over-cap item back in would reintroduce exactly the
     unbounded cell this cap exists to prevent, and the `_truncated` marker the
-    callers add names the drop either way.
+    caller adds names the drop either way.
     """
     items = raw_result[key]
     base = {k: v for k, v in raw_result.items() if k != key}
@@ -228,17 +232,19 @@ def _cap_nontabular_result(
     *,
     observer: ToolObserver = _default_observer,
     tool_name: str | None = None,
+    question: str | None = None,
 ) -> tuple[Any, bool]:
     """Bound a non-tabular tool result stored as ONE preview cell (esp. a wide
     `getTableSchema`) so it can never be a 30k-token blob that survives the
     row-count-only trail budget. Returns `(capped_value, truncated)`.
 
     Truncation keeps the output VALID + parseable (never a broken JSON blob):
-      * a `{... "columns": [...]}` dict (getTableSchema) keeps the HEAD of the
-        column list — as many leading columns as fit under the cap — and adds a
-        `"_truncated"` marker naming how many of how many columns were omitted, so
-        the model sees a still-valid schema and knows to re-fetch/narrow if it
-        needs a dropped column;
+      * a `{... "columns": [...]}` dict (getTableSchema) is fitted by
+        `schema_preview.fit_schema_under_cap`, which keeps EVERY column present
+        (name + type at worst) and degrades per-column DETAIL instead of dropping
+        columns wholesale — see that module for why the old head-cut was, in
+        effect, a silent truncation (ISSUES C5). *question*, when the caller has
+        one, only ORDERS which columns keep their detail (D25);
       * a `{... "blueprints": [...]}` dict (`searchBlueprints`) keeps the HEAD of
         the CARD list the same way — see below;
       * any other over-cap value is rendered to a string and truncated at the cap
@@ -263,15 +269,50 @@ def _cap_nontabular_result(
         return raw_result, False
 
     if isinstance(raw_result, dict) and isinstance(raw_result.get("columns"), list):
-        capped, kept_count, total_columns = _cap_list_under_key(
-            raw_result, "columns", max_result_tokens
+        fitted, report = fit_schema_under_cap(
+            raw_result, max_result_tokens, question=question
         )
-        omitted = total_columns - kept_count
-        capped["_truncated"] = (
-            f"…[truncated: {omitted} of {total_columns} columns omitted — "
-            f"re-fetch getTableSchema or narrow if you need an omitted column]"
-        )
-        return capped, True
+        # GATED ON `marker_added`, i.e. on "the fit was lossy AT ALL" — the same
+        # condition that puts the `_truncated` marker in front of the model. The
+        # earlier `reduced_count or omitted_columns` gate asked only about COLUMNS,
+        # so a schema that fit by dropping BASE SECTIONS instead (an enormous
+        # `rules`/`ambiguities` beside a handful of small documented columns, which
+        # is a real shape) told the model its table-level semantics were withheld
+        # and told the operator NOTHING — no event, no log line. `marker_added` is
+        # the report's own answer to "was anything withheld", so the two channels
+        # can no longer disagree.
+        if report.marker_added:
+            # Same degrade-not-fail posture as the card branch below: the model is
+            # told by the in-fit marker, the operator by this event + the log.
+            # COUNTS ONLY (D25) — no column name, no section name, no schema text,
+            # no question. Like every other `tool_dispatch_*` event this is NOT
+            # forwarded to Phoenix (see the standing note in the card branch below);
+            # it is consumed by the SSE progress observer, the log, and any
+            # `create_app(extra_observers=…)` sink.
+            observer(
+                "tool_dispatch_schema_detail_dropped",
+                {
+                    "tool_name": tool_name,
+                    "detailed_count": report.detailed_count,
+                    "total_count": report.total_columns,
+                    "base_dropped_count": report.base_dropped_count,
+                },
+            )
+            # Every count is emitted unconditionally, including the zeros: a
+            # base-only degrade reads "reduced 0 of 4 columns … 2 table-level
+            # sections dropped", which is the whole truth about that fit.
+            _logger.warning(
+                "Preview cap reduced %d of %d columns of %r to name+type (and omitted "
+                "%d entirely, %d table-level sections dropped; cap=%d tokens) — raise "
+                "RuntimeSettings.max_tool_result_tokens to show more",
+                report.reduced_count,
+                report.total_columns,
+                tool_name,
+                report.omitted_columns,
+                report.base_dropped_count,
+                max_result_tokens,
+            )
+        return fitted, True
 
     if isinstance(raw_result, dict) and isinstance(raw_result.get("blueprints"), list):
         capped, kept_count, total_cards = _cap_list_under_key(
@@ -355,6 +396,7 @@ def _build_preview(
     *,
     observer: ToolObserver = _default_observer,
     tool_name: str | None = None,
+    question: str | None = None,
 ) -> ResultPreview:
     """Build the `{columns, row_count, truncated, preview_rows}` preview object.
 
@@ -369,8 +411,11 @@ def _build_preview(
     row-count-only trail budget never trims) — see `_cap_nontabular_result`.
 
     *observer*/*tool_name* are used ONLY to report a size-cap degrade (the
-    blueprint-card drop) and default to the no-op observer, so every existing
-    call site is unchanged.
+    blueprint-card drop, the schema-detail drop) and default to the no-op
+    observer, so every existing call site is unchanged. *question* is the turn's
+    raw user text, supplied ONLY by the agent loop's dispatch site; it reaches
+    the schema fitter, where it orders which columns keep their documentation and
+    is never written into any output (D25).
     """
     if isinstance(raw_result, dict) and "rows" in raw_result and "columns" in raw_result:
         rows = raw_result["rows"]
@@ -392,7 +437,11 @@ def _build_preview(
         )
     # Small non-tabular dict (e.g. getTableSchema) — size-capped, not row-capped.
     capped, truncated = _cap_nontabular_result(
-        raw_result, max_result_tokens, observer=observer, tool_name=tool_name
+        raw_result,
+        max_result_tokens,
+        observer=observer,
+        tool_name=tool_name,
+        question=question,
     )
     return ResultPreview(columns=[], row_count=1, truncated=truncated, preview_rows=[[capped]])
 
@@ -509,6 +558,7 @@ class ToolDispatcher:
         credentials: RuntimeCredentials,
         *,
         emit_progress: bool = True,
+        question: str | None = None,
     ) -> ToolResult:
         """Dispatch one tool call. `emit_progress=False` silences the
         `tool_dispatch_start`/`ok`/`denied`/`error` OBSERVER events for THIS call
@@ -532,6 +582,14 @@ class ToolDispatcher:
             reached the UI to begin with.
           - control flow is UNAFFECTED: denials and errors return the same
             `ToolResult` and propagate exactly as with progress on.
+
+        `question` is the turn's raw user text, supplied ONLY by the agent loop's
+        own dispatch site (every other caller — the blueprint executor, resolve-
+        values, discovery emulation, the paging endpoint — leaves it None, and
+        none of them dispatches a `getTableSchema` anyway). Its ONE use is to
+        order which columns of an over-cap schema keep their documentation
+        (`schema_preview`); it is never persisted, never spanned, never echoed
+        into a result (D25).
         """
         # One local, resolved once: the four progress events below route through it,
         # so a future event added to this method cannot silently escape the gate by
@@ -628,6 +686,7 @@ class ToolDispatcher:
             self._max_tool_result_tokens,
             observer=self._observer,
             tool_name=tool_name,
+            question=question,
         )
 
         emit("tool_dispatch_ok", {"tool_name": tool_name})

@@ -42,13 +42,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _catalog import catalog_dict  # noqa: E402
 from _e2e_harness import (  # noqa: E402
     CATALOG,
-    DEPT_COL,
+    DEMO_COLUMN_SCOPE,
     EMBEDDING_MODEL,
     OLD_TS,
     PHOENIX_GRAPHQL,
     PHOENIX_OTLP,
     PHOENIX_UI,
-    SALARY_COL,
     TABLE,
     CapturingExtractor,
     apply_live_env,
@@ -106,7 +105,9 @@ from data_agent.runtime.session.models import SessionDoc, TrailEntry, TurnMessag
 # lives in `_e2e_harness`; what stays here is what THIS demo is about.
 
 _QUESTION = "what is the total annual salary for the Sales department?"
-_ACCEPTED_SQL = f"SELECT sum(AnnualSalary) AS total_salary FROM {TABLE} WHERE Department = 'Sales'"
+_ACCEPTED_SQL = (
+    f"SELECT sum(annual_salary) AS total_salary FROM {TABLE} WHERE department_name = 'Sales'"
+)
 _RELATED_QUESTION = "how much total salary does a department pay its employees"
 
 
@@ -245,7 +246,7 @@ async def _run() -> int:
     try:
         # ============================================================ STAGE 1
         probe_session = f"demo-probe-{tag}"
-        probe_jwt = await mint_bound_token([SALARY_COL, DEPT_COL], probe_session)
+        probe_jwt = await mint_bound_token(DEMO_COLUMN_SCOPE, probe_session)
         live_result = await infra.mcp_client.call_tool(
             "runQuery", {"sql": _ACCEPTED_SQL}, jwt=probe_jwt, session_id=probe_session
         )

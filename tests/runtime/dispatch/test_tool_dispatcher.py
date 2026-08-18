@@ -122,10 +122,18 @@ async def test_preview_truncates_to_preview_row_count() -> None:
 
 
 async def test_wide_get_table_schema_is_size_capped_with_a_marker() -> None:
-    """Part 2 fix: a wide getTableSchema (100+ columns) must NOT be stored as one
-    unbounded ~30k-token preview cell — it is size-capped to `max_tool_result_tokens`
-    with a clear marker, and the stored preview stays a VALID, parseable dict the
-    model can still read columns from."""
+    """A wide getTableSchema (100+ columns) must NOT be stored as one unbounded
+    ~30k-token preview cell — it is size-capped to `max_tool_result_tokens` and the
+    stored preview stays a VALID, parseable dict.
+
+    REWRITTEN for the two-tier fit (ISSUES C5). The cap used to keep the HEAD of
+    the column list and drop every other column INCLUDING ITS NAME, which is how
+    `employee.annual_salary` (index ~87 of 124) became invisible to the model. Now
+    EVERY column is present — at worst as `{name, type}` — and it is per-column
+    DETAIL that degrades. The policy itself is pinned in
+    `tests/runtime/dispatch/test_schema_preview.py`; this test pins the
+    DISPATCHER's end of it: the fitted dict is what lands in the preview cell, the
+    marker rides inside the fit, and `result_full` is untouched."""
     wide_schema = {
         "database": "dbpcm_warehouse",
         "table": "employee",
@@ -135,7 +143,10 @@ async def test_wide_get_table_schema_is_size_capped_with_a_marker() -> None:
         ],
     }
     mcp_client = FakeMCPClient(scripted={"getTableSchema": [wide_schema]})
-    dispatcher = ToolDispatcher(mcp_client, CATALOG, max_tool_result_tokens=500)
+    # 6,000 tokens holds all 400 NAMES (~4,000) with room for some detail; the
+    # 500-token cap this test used to run at cannot hold the names at all (that
+    # floor is covered in test_schema_preview.py).
+    dispatcher = ToolDispatcher(mcp_client, CATALOG, max_tool_result_tokens=6_000)
 
     result = await dispatcher.dispatch(
         "getTableSchema", {"database": "dbpcm_warehouse", "table": "employee"}, _credentials()
@@ -144,23 +155,168 @@ async def test_wide_get_table_schema_is_size_capped_with_a_marker() -> None:
     assert result.status == "ok"
     assert result.result_preview is not None
     assert result.result_preview.truncated is True
-    # The stored cell is the capped dict — still valid + parseable.
+    # The stored cell is the fitted dict — still valid + parseable.
     capped = result.result_preview.preview_rows[0][0]
     assert isinstance(capped, dict)
     assert capped["database"] == "dbpcm_warehouse"
     assert capped["table"] == "employee"
-    # Head preserved: leading columns kept, far fewer than the full 400.
-    assert 0 < len(capped["columns"]) < 400
-    assert capped["columns"][0]["name"] == "Column_0"
-    # Marker names how many of how many were omitted.
+    # EXISTENCE SURVIVES: all 400 columns are named, in order.
+    assert [c["name"] for c in capped["columns"]] == [f"Column_{i}" for i in range(400)]
+    # DETAIL DEGRADES: a head of them keeps the comment, the rest are name/type.
+    detailed = [c["name"] for c in capped["columns"] if set(c) - {"name", "type"}]
+    assert detailed
+    assert len(detailed) < 400
+    assert detailed[0] == "Column_0"
+    assert capped["columns"][-1] == {"name": "Column_399", "type": "String"}
+    # The marker says what was withheld and promises nothing unfollowable.
     assert "_truncated" in capped
-    assert "of 400 columns omitted" in capped["_truncated"]
-    # Actually bounded (JSON estimate under a small multiple of the cap).
-    assert len(json.dumps(capped)) // 4 <= 500 * 2
+    assert "400 of 400 columns are listed" in capped["_truncated"]
+    assert "name and type ONLY" in capped["_truncated"]
+    assert "re-fetch" not in capped["_truncated"]
+    # Actually bounded — and now MARKER-INCLUSIVE, so the TIGHT bound holds: the
+    # marker is part of every trial render, not appended after the fit was
+    # measured. (The old `<= 6_000 * 2` slack bound that sat here is subsumed by
+    # this one and asserted nothing a passing tight bound does not already.)
+    assert len(json.dumps(capped)) // 4 <= 6_000
 
     # The FULL, un-capped result is still returned on result_full for the caller
     # (the preview cap bounds only the model-facing stored preview).
     assert len(result.result_full["columns"]) == 400
+    assert result.result_full["columns"][399] == {
+        "name": "Column_399",
+        "type": "String",
+        "comment": "some descriptive comment",
+    }
+
+
+async def test_wide_schema_detail_drop_is_reported_to_the_operator() -> None:
+    """Degrade-not-fail, NEVER SILENTLY — the same posture as the card branch. The
+    model is told by the in-fit marker; the operator gets a counts-only observer
+    event (D25: no column name, no schema text, no question)."""
+    wide_schema = {
+        "database": "dbpcm_warehouse",
+        "table": "employee",
+        "columns": [
+            {"name": f"Column_{i}", "type": "String", "comment": "some descriptive comment"}
+            for i in range(400)
+        ],
+    }
+    events: list[tuple[str, dict]] = []
+    mcp_client = FakeMCPClient(scripted={"getTableSchema": [wide_schema]})
+    dispatcher = ToolDispatcher(
+        mcp_client,
+        CATALOG,
+        max_tool_result_tokens=6_000,
+        observer=lambda e, p: events.append((e, p)),
+    )
+
+    result = await dispatcher.dispatch(
+        "getTableSchema", {"database": "dbpcm_warehouse", "table": "employee"}, _credentials()
+    )
+
+    capped = result.result_preview.preview_rows[0][0]
+    detailed = [c["name"] for c in capped["columns"] if set(c) - {"name", "type"}]
+    assert ("tool_dispatch_schema_detail_dropped", {
+        "tool_name": "getTableSchema",
+        "detailed_count": len(detailed),
+        "total_count": 400,
+        # Nothing but `columns` in this schema, so nothing table-level to drop.
+        "base_dropped_count": 0,
+    }) in events
+
+
+async def test_a_base_only_schema_degrade_is_still_reported_to_the_operator() -> None:
+    """THE SILENT-DEGRADE REGRESSION. The event used to be gated on
+    `reduced_count or omitted_columns` — a COLUMN-shaped question. This schema is
+    over the cap because of ONE enormous `rules` section beside four small
+    documented columns: the fit drops `rules` (and whatever else it must), every
+    column keeps its full detail, and the old gate therefore fired NOTHING while
+    the model was handed a `_truncated` marker saying its table-level semantics
+    had been withheld. The operator now hears about it, with counts only (D25 —
+    no section name, no rule text)."""
+    schema = {
+        "database": "dbpcm_warehouse",
+        "table": "employee",
+        "grain": "one row per employee",
+        # ~9k tokens on its own: far over the 4,000-token cap, so the fit cannot
+        # keep it, and the four columns below all fit whole once it is gone.
+        "rules": [
+            f"Rule {i}: " + "consult the catalog before aggregating. " * 8
+            for i in range(100)
+        ],
+        "ambiguities": ["'headcount' may mean active or all employees."],
+        "columns": [
+            {"name": "employee_id", "type": "String", "description": "Employee key."},
+            {"name": "annual_salary", "type": "Decimal", "description": "Yearly pay, USD."},
+            {"name": "department_code", "type": "String", "description": "Department key."},
+            {"name": "employee_status", "type": "String", "description": "Active or not."},
+        ],
+    }
+    events: list[tuple[str, dict]] = []
+    mcp_client = FakeMCPClient(scripted={"getTableSchema": [dict(schema)]})
+    dispatcher = ToolDispatcher(
+        mcp_client,
+        CATALOG,
+        max_tool_result_tokens=4_000,
+        observer=lambda e, p: events.append((e, p)),
+    )
+
+    result = await dispatcher.dispatch(
+        "getTableSchema", {"database": "dbpcm_warehouse", "table": "employee"}, _credentials()
+    )
+
+    capped = result.result_preview.preview_rows[0][0]
+    # The precondition that makes this the base-only case: every column kept its
+    # documentation, so the OLD gate would have been False on both its terms.
+    assert all(set(c) - {"name", "type"} for c in capped["columns"])
+    assert len(capped["columns"]) == 4
+    # ...and the model WAS told something was withheld.
+    assert "_truncated" in capped
+    assert "Table-level sections omitted to fit" in capped["_truncated"]
+
+    drops = [payload for name, payload in events
+             if name == "tool_dispatch_schema_detail_dropped"]
+    assert len(drops) == 1
+    assert drops[0]["tool_name"] == "getTableSchema"
+    assert drops[0]["detailed_count"] == 4
+    assert drops[0]["total_count"] == 4
+    # THE point of the event: a degrade the column counts cannot describe.
+    assert drops[0]["base_dropped_count"] >= 1
+
+
+async def test_the_question_only_reorders_the_schema_fit() -> None:
+    """The loop hands `dispatch` the turn's raw user text. It may ONLY choose which
+    columns keep their documentation — D25 forbids it from reaching any stored,
+    streamed or spanned surface, so the whole ToolResult is scanned for it (the
+    same scan the credential invariant at the top of this module uses)."""
+    nonce = "zqx-nonce-42"
+    wide_schema = {
+        "database": "dbpcm_warehouse",
+        "table": "employee",
+        "columns": [
+            {"name": f"Column_{i}", "type": "String", "comment": "some descriptive comment"}
+            for i in range(400)
+        ]
+        + [{"name": "annual_salary", "type": "Decimal", "comment": "Yearly pay, in USD."}],
+    }
+    mcp_client = FakeMCPClient(scripted={"getTableSchema": [dict(wide_schema)]})
+    dispatcher = ToolDispatcher(mcp_client, CATALOG, max_tool_result_tokens=6_000)
+
+    result = await dispatcher.dispatch(
+        "getTableSchema",
+        {"database": "dbpcm_warehouse", "table": "employee"},
+        _credentials(),
+        question=f"what is the average annual salary, {nonce}?",
+    )
+
+    capped = result.result_preview.preview_rows[0][0]
+    detailed = {c["name"] for c in capped["columns"] if set(c) - {"name", "type"}}
+    # The LAST column of 401 — unreachable by any head-cut — keeps its detail.
+    assert "annual_salary" in detailed
+    # ...and the question text itself is nowhere in the result.
+    blob = _result_to_scannable_json(result)
+    assert nonce not in blob
+    assert "average annual salary" not in blob
 
 
 def test_dispatch_estimator_matches_budget_estimator() -> None:

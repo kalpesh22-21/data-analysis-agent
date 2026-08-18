@@ -572,8 +572,15 @@ def test_metadata_answers_are_business_language_never_physical_identifiers() -> 
     Metadata questions stay a legitimate deliverable and `listTables`/
     `getTableSchema` stay their grounding route — what changed is the ANSWER
     contract: those tools ground the MODEL, and the user-facing text describes the
-    data in business terms. The prompt is the only carrier of this rule (nothing in
-    the runtime inspects answer prose), so it is asserted rather than assumed.
+    data in business terms.
+
+    THE PROMPT IS NO LONGER THE ONLY CARRIER — and it is still the FIRST one, which
+    is why this stays asserted. Since ISSUES I1 the runtime scrubs answer prose of
+    identifier-shaped tokens on the way out (`runtime/answer_scrub.py`, applied at
+    every exit in `_finish`), so a model that names a table is redacted rather than
+    obeyed. That is a backstop, not a substitute: it can only replace an identifier
+    with a marker, while this bullet is what gets the model to write the business
+    sentence the user actually wanted in the first place.
     """
     routing = AGENT_SYSTEM_PROMPT[
         AGENT_SYSTEM_PROMPT.index("## Routing the request") : AGENT_SYSTEM_PROMPT.index(
@@ -831,10 +838,17 @@ def test_prompt_stays_within_its_token_budget() -> None:
     `getBlueprint` renders the blueprint's own `window_anchor` declaration, and a
     data-anchored run carries a note on its tool result. The prompt carries only the
     standing rule those two are instances of, which is the part no runtime check can
-    enforce. **71 chars spare** — thinner than the 125 already called thin above, so the
-    re-argue paragraph applies with full force to whatever comes next.
+    enforce.
+
+    CEILING RAISED 17,000 -> 17,400 (2026-08-18, C5 slice): the two-tier schema
+    teaching (+206 chars: a name/type-only column has unseen documentation — never
+    infer semantics from the name) crossed the old ceiling with no trimmable
+    neighbour. The ceiling is a growth TRIPWIRE, not a resource limit — the prompt
+    costs ~4.3k tokens of an 89.6k request budget — so it moved deliberately, once,
+    with this note. **265 chars spare** at the raise; the re-argue paragraph applies
+    with full force to whatever comes next.
     """
-    assert len(AGENT_SYSTEM_PROMPT) <= 17_000
+    assert len(AGENT_SYSTEM_PROMPT) <= 17_400
 
 
 def test_the_prompt_draft_doc_matches_the_shipped_constant_byte_for_byte() -> None:

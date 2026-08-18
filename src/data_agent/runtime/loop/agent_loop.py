@@ -91,6 +91,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from data_agent.runtime.answer_scrub import ANSWER_PROSE_REDACTED_EVENT, scrub_answer_prose
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import (
     MAX_STATE_CALLS,
@@ -255,6 +256,19 @@ _RUNTIME_TOOL_UNAVAILABLE_MESSAGE: dict[str, str] = {
 }
 
 TurnStatus = Literal["done", "paused_ask_user", "paused_budget_cap", "stopped_hard_ceiling"]
+
+# WHICH EXIT produced the prose the answer scrub inspected (ISSUES I1) — the
+# `exit` label on `loop_answer_prose_redacted`, and nothing else. It is a
+# PARAMETER of `_finish`, never derived from `status`, for the same reason
+# *event* and *provenance* are: `status="done"` is reached by TWO exits (the
+# no-tool-calls finish and the `answerWithTable` finish) whose disclosure
+# profiles are entirely different, and a derivation could not tell them apart.
+# `"pause"` covers every non-`done` finisher — the `askUser` pause, the budget
+# cap, the hard ceiling and `_pause_from_runtime_tool` — because all four carry
+# the same thing: best-effort partial prose from a turn that did not answer.
+# `"ask_user_question"` is the one label that is NOT about `assistant_text`: it
+# tags the `askUser` QUESTION, which is model prose shown to the user too.
+AnswerExitLabel = Literal["no_tool_calls", "answer_with_table", "pause", "ask_user_question"]
 
 _BUDGET_CAP_QUESTION = "This is taking a while — continue, refine, or stop?"
 _BUDGET_CAP_OPTIONS = ["continue", "refine", "stop"]
@@ -1581,6 +1595,7 @@ class AgentLoop:
         session_id: str,
         turn_index: int,
         status: TurnStatus,
+        exit_label: AnswerExitLabel,
         assistant_text: str | None,
         tool_calls_made: int,
         accum: TurnAccumulators,
@@ -1631,6 +1646,17 @@ class AgentLoop:
             test_turn_provenance_union_excludes_guard_entry` pins that they are the
             same object). A pause carries `None` deliberately: it has no persisted
             assistant message for a lineage tag to belong to.
+          - *exit_label* is passed for the same reason and is the third of these:
+            `status="done"` is reached by BOTH done exits, so no derivation can
+            tell a no-tool-calls finish from an `answerWithTable` one — which is
+            exactly the distinction the answer-scrub telemetry is read for. See
+            `AnswerExitLabel`.
+
+        THE ANSWER-PROSE SCRUB (ISSUES I1) RUNS HERE, at the top, and this is the
+        second thing (after the effect ORDER) that this function exists to make
+        unmissable: every exit that hands prose to a user goes through here, so
+        one call covers all five, and the SAME scrubbed string necessarily feeds
+        the outcome and the persisted message.
 
         *persist_text* is likewise a value, not a flag, and it carries the ONE
         difference between the two `done` exits. The no-tool-calls exit appends
@@ -1665,6 +1691,30 @@ class AgentLoop:
             callers, including `_resume_blueprint`, may not have a live window's
             accumulators at all), so it has nothing to read an envelope from.
         """
+        # THE ANSWER-PROSE SCRUB (ISSUES I1) — FIRST, above every effect, so there
+        # is exactly ONE scrubbed string and it is the one that reaches BOTH the
+        # user (`TurnOutcome.assistant_text`) and history (the persisted
+        # `TurnMessage`). Scrubbing at the two sites separately would be two
+        # chances to drift, and a live answer that disagrees with
+        # `/session/history` on exactly the redacted turns is the failure this
+        # position exists to prevent (`session_history` projects the persisted
+        # message, so the persisted string IS what the user re-reads tomorrow).
+        #
+        # THE STRUCTURED PAYLOAD BELOW IS UNTOUCHED, deliberately (the I2
+        # decision): `sql_executed`, `answer_sql`, `blueprint_use`, `verification`
+        # and `answer_tables` keep naming exactly what ran. Prose is the agent's
+        # voice; those fields are the audit surface.
+        assistant_text, redaction_count = scrub_answer_prose(
+            assistant_text, provenance=provenance
+        )
+        if persist_text is not None:
+            # THE SCRUBBED STRING, REUSED — never a second scrub. Both call sites
+            # that persist pass the same string they pass as *assistant_text* (the
+            # no-tool-calls exit's `or None` differs only when there is nothing to
+            # persist at all), so this assignment is an identity for them and
+            # fail-closed for anything else: an unscrubbed string can never be the
+            # thing that gets written.
+            persist_text = assistant_text
         if checkpoint is not None:
             await self._session_store.write_pause_checkpoint(session_id, checkpoint)
         if persist_text is not None:
@@ -1681,6 +1731,16 @@ class AgentLoop:
         # AFTER every fold and `commit_round` of the round — this is called at the
         # exit, never hoisted, so the envelope describes the window as it ends.
         envelope = accum.envelope()
+        if redaction_count:
+            # ONLY when something was redacted, so the event rate IS the disclosure
+            # rate. Below the store writes with the finish event, under the same
+            # rule. COUNT AND LABEL ONLY: a redacted token may be a column name,
+            # which is deliberately not on the D25 attribute allowlist, so neither
+            # the token nor the prose around it is ever placed on this payload.
+            self._observer(
+                ANSWER_PROSE_REDACTED_EVENT,
+                {"redaction_count": redaction_count, "exit": exit_label},
+            )
         if event is not None:
             # LAST, after every store write above: an observer that reads the
             # session back must never see it mid-update.
@@ -1745,6 +1805,23 @@ class AgentLoop:
             serves_intent=serves_intent,
         )
         await self._session_store.write_pause_checkpoint(session_id, checkpoint)
+        # ISSUES I1, the same scrub `_finish` applies — this exit does not route
+        # through it (see `_finish`'s "TWO EXITS DO NOT ROUTE THROUGH THIS"), and a
+        # pause is still model prose on a user's screen. `provenance=None`: a pause
+        # has no determined turn provenance (there is no persisted assistant
+        # message to tag), which costs only the quoted-value arm — the corpus-id,
+        # qualified and snake_case rules need no knowledge of the turn.
+        #
+        # The checkpoint's `pending_question` is NOT scrubbed here: it is authored
+        # by the pausing runtime tool (a blueprint slot prompt), not by the model,
+        # and it never reaches the observer payload's published attributes
+        # (`question` is not on the D25 allowlist).
+        assistant_text, redaction_count = scrub_answer_prose(assistant_text, provenance=None)
+        if redaction_count:
+            self._observer(
+                ANSWER_PROSE_REDACTED_EVENT,
+                {"redaction_count": redaction_count, "exit": "pause"},
+            )
         self._observer(
             "loop_paused_ask_user",
             {"question": pause.pending_question.get("question", "")},
@@ -2550,6 +2627,7 @@ class AgentLoop:
                         session_id=session_id,
                         turn_index=turn_index,
                         status="done",
+                        exit_label="no_tool_calls",
                         assistant_text=result.assistant_text,
                         tool_calls_made=tool_calls_made,
                         accum=accum,
@@ -2884,8 +2962,15 @@ class AgentLoop:
                             tool_call.name, _RUNTIME_TOOL_UNAVAILABLE_CODE[tool_call.name]
                         )
                     else:
+                        # `question` (this turn's raw user text) is handed over for
+                        # ONE purpose: an over-cap `getTableSchema` keeps every column
+                        # NAMED and spends its remaining detail budget on the columns
+                        # the question is about (`dispatch/schema_preview.py`). It
+                        # orders that fit and nothing else — it is never written into
+                        # the result, the trail, or a span (D25). This is the only
+                        # dispatch call site that supplies it.
                         tool_result = await self._tool_dispatcher.dispatch(
-                            tool_call.name, call_args, credentials
+                            tool_call.name, call_args, credentials, question=question
                         )
 
                     # REFRESH THE ENFORCEMENT LOCAL (05 §E). The state call just wrote
@@ -3243,7 +3328,30 @@ class AgentLoop:
                 # path, so every other call still waits for the resume exactly as it
                 # always did.
                 if ask_user_call is not None:
-                    question = str(ask_user_call.arguments.get("question", ""))
+                    # THE QUESTION IS MODEL PROSE SHOWN TO THE USER, so it is
+                    # scrubbed exactly like an answer (ISSUES I1) — "which
+                    # department_id did you mean?" discloses as much as an answer
+                    # would. Scrubbed HERE, at the single point the string is
+                    # extracted, so the persisted `PauseCheckpoint`, the
+                    # `TurnOutcome.pending_question` projected from it, and the
+                    # `loop_paused_ask_user` event below all carry the same text —
+                    # a resume replays the checkpoint, so a question scrubbed only
+                    # on the way out would come back unscrubbed. `provenance=None`:
+                    # this is a pause, and none is computed on this path.
+                    #
+                    # `options` are NOT scrubbed: they are the answer choices the
+                    # user clicks, and are values by construction.
+                    question, question_redactions = scrub_answer_prose(
+                        str(ask_user_call.arguments.get("question", "")), provenance=None
+                    )
+                    if question_redactions:
+                        self._observer(
+                            ANSWER_PROSE_REDACTED_EVENT,
+                            {
+                                "redaction_count": question_redactions,
+                                "exit": "ask_user_question",
+                            },
+                        )
                     options = ask_user_call.arguments.get("options")
                     checkpoint = PauseCheckpoint(
                         reason="askUser",
@@ -3258,6 +3366,7 @@ class AgentLoop:
                         session_id=session_id,
                         turn_index=turn_index,
                         status="paused_ask_user",
+                        exit_label="pause",
                         assistant_text=result.assistant_text,
                         tool_calls_made=tool_calls_made,
                         accum=accum,
@@ -3285,6 +3394,7 @@ class AgentLoop:
                         session_id=session_id,
                         turn_index=turn_index,
                         status="done",
+                        exit_label="answer_with_table",
                         assistant_text=designated_answer_text,
                         tool_calls_made=tool_calls_made,
                         accum=accum,
@@ -3325,6 +3435,7 @@ class AgentLoop:
                             session_id=session_id,
                             turn_index=turn_index,
                             status="stopped_hard_ceiling",
+                            exit_label="pause",
                             assistant_text=last_assistant_text,
                             tool_calls_made=tool_calls_made,
                             accum=accum,
@@ -3387,6 +3498,7 @@ class AgentLoop:
                         session_id=session_id,
                         turn_index=turn_index,
                         status="paused_budget_cap",
+                        exit_label="pause",
                         assistant_text=last_assistant_text,
                         tool_calls_made=tool_calls_made,
                         accum=accum,

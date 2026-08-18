@@ -194,7 +194,10 @@ AGENT_SYSTEM_PROMPT = (
     "turn, to save a round-trip each. Only batch reads you are sure you need; do "
     "not fetch schemas speculatively.\n"
     "- Read each column's description and the `ambiguities` / `clarify_if` "
-    "notes getTableSchema returns; they tell you which column to use. Once "
+    "notes getTableSchema returns; they tell you which column to use. On a "
+    "wide table the schema is two-tier: a column listed with only a name and "
+    "type HAS documentation you were not shown — never infer what it means, "
+    "contains or is denominated in from its name; ask instead. Once "
     'the catalog resolves a term ("annual salary" -> '
     "employee.AnnualSalary), commit to that table and column instead of "
     "re-checking others.\n"

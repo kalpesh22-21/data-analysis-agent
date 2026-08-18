@@ -701,6 +701,18 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     # that forgot a table and one that abandoned the format entirely.
     # (`loop_answer_shape_exhausted` carries no payload at all.)
     "multi_row_calls",
+    # --- the answer-prose scrub (ISSUES I1) ---
+    # `loop_answer_prose_redacted.redaction_count` — HOW MANY identifier-shaped
+    # tokens were replaced with a visible marker in the prose that reached the
+    # user. A count of the SCRUB'S OWN work, and the only number that makes the
+    # event actionable (one redaction is a slip; twelve is a model narrating the
+    # schema). The MATCHED TOKENS ARE NOT AND MUST NOT BE ADDED, in either
+    # direction: a match is by definition an identifier the runtime just decided
+    # the user may not see, and it may be a COLUMN NAME, which is deliberately
+    # absent from this list — putting it here would publish through telemetry
+    # exactly what was withheld from the answer. The `exit` that produced the
+    # prose is already allowlisted above.
+    "redaction_count",
 )
 
 
