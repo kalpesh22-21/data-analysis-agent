@@ -664,7 +664,7 @@ Plus named `..._is_a_known_limitation` tests asserting current behaviour:
 
 | Divergence | Exposure | Note |
 |---|---|---|
-| Rule predicates | 3/10 canon | `rewrite.py:142` drops `role=rule` predicates; canon inlines them *and* declares the rule. The two paths disagree about what the template *is*. |
+| Rule predicates | 3/10 canon | ~~`rewrite.py:142` drops `role=rule` predicates; canon inlines them *and* declares the rule. The two paths disagree about what the template *is*.~~ **SUPERSEDED 2026-08-18 (ISSUES H5/H6):** the rewrite no longer drops them — `role=rule` KEEPS the predicate and records the rule id, which is what canon always did, so the two paths converge and this divergence is closed. It was never a key gap: no normalization can invent a predicate one side deleted. Pinned by `test_a_rule_predicate_is_no_longer_dropped_so_the_tiers_converge`. |
 | Slot naming | 9/10 | `{department}` renders as `{department: }`; the name survives, so `{dept}` mints a different key. Positional renaming would fix it; declined as a debatable semantic change. |
 | Table aliases | 4/10 | `FROM ... AS e` normalizes differently from unaliased. |
 | Operand order | unbounded | sqlglot canonicalizes boolean *form*, not operand order. |

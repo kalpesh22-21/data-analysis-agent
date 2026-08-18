@@ -10,6 +10,7 @@ Pure and deterministic (NO LLM). Orchestrates: AST-rewrite (`rewrite`), transiti
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from ...sqlparse import ProvenanceExtractionError, extract_column_provenance
@@ -29,6 +30,8 @@ from .validate import (
     check_read_only_select,
     decide_outcome,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 def _result_grain(payload: dict[str, Any]) -> ResultGrainStamp:
@@ -168,6 +171,33 @@ def _plan_params_ok(raw_params: Any) -> bool:
     return True
 
 
+def _canonical_or_empty(
+    sql_template: str | None, node_templates: tuple[NodeTemplate, ...] = ()
+) -> str:
+    """The S6 hash input, or `""` when the template will not normalize.
+
+    `canonical_ast_norm` PARSES the template, and it is the last thing this module does
+    on a path that has already decided what it thinks of the candidate — so a template
+    the recipe chokes on used to raise `sqlglot.ParseError` out of a function contracted
+    never to raise, taking the whole S4 stage (and, on the consumer path, the session)
+    with it. The empty string is the documented S6 fail-soft: no hash input, no hard key,
+    the candidate is reviewed rather than deduplicated (`_fail_to_review` stamps the same
+    value deliberately, and `test_unrewritable` pins it).
+
+    This is also the one call that could kill a candidate ALREADY stamped
+    `fail_to_review` — with its own hash-input computation, after the verdict was made."""
+    try:
+        return canonical_ast_norm(sql_template, node_templates)
+    except Exception:
+        _logger.warning(
+            "S4 canonical_ast_norm failed for a %s template; hashing is skipped "
+            "(fail-soft) and the candidate is reviewed rather than deduplicated",
+            "composite" if sql_template is None else "single",
+            exc_info=True,
+        )
+        return ""
+
+
 def _fail_to_review(
     payload: dict[str, Any],
     parameterization: list[dict[str, Any]],
@@ -191,6 +221,19 @@ def _fail_to_review(
         ),
         canonical_ast_norm="",
     )
+
+
+def fail_to_review_generalization(
+    payload: dict[str, Any], reason: str = REASON_UNREWRITABLE
+) -> BlueprintGeneralization:
+    """The in-band `fail_to_review` generalization, for a caller OUTSIDE this module.
+
+    `GeneralizeStage` needs it for its defensive catch: the stage's contract is that S4
+    never raises, and the only way to keep that true for a fault this module did not
+    anticipate is to stamp the same verdict a fault it DID anticipate gets. Deliberately
+    takes no `parameterization` — an unanticipated fault is no reason to trust the plan
+    enough to derive `uses_rules` from it."""
+    return _fail_to_review(payload, [], reason)
 
 
 def _accepted_sql_for_single(
@@ -288,7 +331,7 @@ def _generalize_single(
             outcome=outcome,
             reason=reason,
         ),
-        canonical_ast_norm=canonical_ast_norm(sql_template),
+        canonical_ast_norm=_canonical_or_empty(sql_template),
     )
 
 
@@ -372,5 +415,5 @@ def _generalize_composite(
             outcome=outcome,
             reason=reason,
         ),
-        canonical_ast_norm=canonical_ast_norm(None, tuple(node_templates)),
+        canonical_ast_norm=_canonical_or_empty(None, tuple(node_templates)),
     )

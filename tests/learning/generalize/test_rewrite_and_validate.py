@@ -30,7 +30,16 @@ def test_slot_becomes_brace_placeholder_inline_literal_kept():
     assert "record_type = 'EARNING'" in template  # inline literal preserved
 
 
-def test_rule_role_drops_predicate_from_template():
+def test_rule_role_keeps_the_predicate_in_the_template():
+    """WAS `test_rule_role_drops_predicate_from_template`, asserting the opposite.
+
+    The drop rested on "the rule re-applies at runtime". It does not: a learned
+    `uses_rules` entry is a bare catalog id string, `parse_rule` classifies every one as
+    STATIC, and `executor._expand_rules` skips static rules — so the deleted filter was
+    re-applied by nothing. The predicate stays in the template and the rule id is
+    recorded beside it (`test_rule_id_lands_in_uses_rules`, unchanged below): kept AND
+    annotated, instead of removed and annotated. See
+    `test_rewrite_rule_role_keeps.py` for the full argument and the shape matrix."""
     params = [
         {"locator": {"table": "payroll.payroll_fact", "column": "department", "value": "0420"},
          "role": "slot", "slot": {"name": "department"}},
@@ -38,8 +47,8 @@ def test_rule_role_drops_predicate_from_template():
          "role": "rule", "rule_id": "rule.earning_record_type"},
     ]
     template = rewrite_sql_to_template(_SQL, params, strict=True)
-    assert "{department}" in template
-    assert "record_type" not in template  # the rule predicate is dropped from the template
+    assert "{department}" in template          # the slot still substitutes
+    assert "record_type = 'EARNING'" in template  # the rule predicate is KEPT verbatim
 
 
 def test_rule_id_lands_in_uses_rules():

@@ -10,6 +10,7 @@ from data_agent.learning.extractor.models import ExtractedCandidate
 from data_agent.learning.extractor.sql_predicates import literal_predicates
 from data_agent.learning.extractor.validation import to_candidate
 from data_agent.learning.generalize import GeneralizeStage
+from data_agent.learning.generalize.stage import _collapse_designations
 from data_agent.learning.generalize.validate import REASON_UNREWRITABLE
 from data_agent.learning.stage import StageContext
 
@@ -101,13 +102,19 @@ async def test_a_designation_the_chosen_sql_does_not_constrain_refuses_to_collap
     """THE REGRESSION (found in review, reproduced live). Two designations under one
     ref: the first filters on `country`, the last does not. A plan whose only entry
     for `country` is `role=inline` passes S3 totality — `_validate_totality` counts
-    ANY entry as coverage — while `rewrite_sql_to_template` SKIPS inline entries and
-    never looks for the literal. So the strict rewrite raises nothing, and before the
-    subset check S4 shipped `outcome: ok` with a template that has no country filter
-    and a plan that claims one: a silently dropped filter, the D56 class.
+    ANY entry as coverage — while the rewrite is handed the LAST designation alone. So
+    before the subset check S4 shipped `outcome: ok` with a template that has no country
+    filter and a plan that claims one: a silently dropped filter, the D56 class.
 
     Both halves are asserted here, because the bug lives in the DISAGREEMENT between
-    the two layers and either half alone reads as correct."""
+    the two layers and either half alone reads as correct.
+
+    WHICH LAYER REFUSES IS PART OF THE CLAIM. It is the COLLAPSE — asserted directly
+    below — and it runs first. Since the H3 fix the strict rewrite would also refuse
+    this plan (an inline literal absent from the SQL being rewritten now raises), so a
+    test that only checked the outcome would keep passing with this check deleted. The
+    collapse is still the layer that must hold it: it is the only one that can see the
+    DISCARDED designation at all."""
     country_sql = "SELECT count(*) FROM payroll.payroll_fact WHERE country = 'IE'"
     summary = make_summary(
         tool_calls=(make_tool_call(ref="tc1", sql=None, tool_name="answerWithTable"),),
@@ -121,6 +128,10 @@ async def test_a_designation_the_chosen_sql_does_not_constrain_refuses_to_collap
     # S3 says yes: every predicate of both designations has SOME entry.
     accepted = to_candidate(raw, summary, known_rules=frozenset())
     assert isinstance(accepted, ExtractedCandidate)
+
+    # The COLLAPSE is what refuses: it will not pick a query that drops `country`, so
+    # the builder is handed no accepted SQL and never reaches the rewrite.
+    assert _collapse_designations((country_sql, SINGLE_SQL)) is None
 
     # S4 refuses anyway — it will not rewrite from a query that drops `country`.
     result = await GeneralizeStage(catalog_schema=CATALOG).process(

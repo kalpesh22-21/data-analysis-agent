@@ -613,3 +613,56 @@ re-seeded); real questions asked through the BFF:
 **Easy×high triage quadrant complete** (H4+H7, E1/E2+M2, J3b+J1, H1+H2 —
 WORKLOG #14–#17). Remaining stack = discussion items: H3/H5/H6 rewrite
 family, J7 product call, Wave B, C5, I1/I2, D2/D3, plus hygiene batch.
+
+## #18 — the rewrite-fragility family (H3/H5/H6) + keep-and-annotate (2026-08-18)
+
+Landed in two acts. The deep-map found the family WIDER than filed: beyond
+H5 (all-rule WHERE → unparseable → ParseError escapes → SESSION-level
+poison: never-ACK → redelivery loop → dead_letter, and a permanent 500 on
+the reviewer completion path) and H6 (rule inside sumIf → one-arg sumIf +
+byte-identical metrics + silently narrowed `uses` scope), measurement
+showed 5 unparseable shapes, a raw KeyError escape (OR parent), and a
+SILENT CROSS JOIN (sole join-ON deletion). Also corrected the record:
+H6 was NOT "mitigated by approve-path static validation" — nothing
+recomputes S4 (the approve gate reads the stored ok stamp) and golden
+replay misattributes the real-warehouse failure as probe_unavailable.
+
+Act 1 built an allowlist around the deletion surgery; review REQUEST-
+CHANGES with two proven blockers (OR-arm/NOT context lost by immediate-
+parent checks; one-member locator deleting a whole multi-member IN).
+
+Act 2 — **USER DECISION (2026-08-18): `role: rule` keeps the filter.**
+The deletion design assumed platform re-application that exists only for
+RLS-backed tenancy, not catalog-default rules (executor contract: static
+rule = "authored SQL, no action"). The rewriter now keeps the predicate
+verbatim and annotates uses_rules — matching canon and the executor; the
+whole deletion path (and both blockers, and H5/H6 themselves) is deleted,
+not fixed. 15/15 shape matrix kept verbatim; the deductions-ratio
+candidate that crashed the pipeline now generalizes cleanly. Executor
+chain verified (reviewer, link-by-link): learned uses_rules are bare
+strings → parse_rule None → always static → dynamic-rule hazard
+unreachable. Cross-tier structural keys CONVERGE — the known-gap test is
+now a convergence pin DERIVED through the real rewrite (tautology caught
+by review; reworked; fails against the old deleting rewriter, stash-
+proven). G7's hint concern is RESOLVED by the semantics change (the hint's
+role:rule advice is now correct).
+
+Kept from act 1 (all still live): the output gate (render wrap + template
+re-parse via the SLOT_TOKEN colon-trick + function-arity census — belt),
+H3 strict-inline verification pre+post pass (locatability = _find_literal
+with comma-split IN ∪ the S3 literal_predicates enumerator, so
+BETWEEN/boolean inline entries don't false-fail), canonical_ast_norm
+fail-soft at both builder sites, the stage-level never-raise belt, and
+the completion path returning in-band declines instead of 500s.
+
+Reviews: act-1 REQUEST-CHANGES (both blockers proven end-to-end);
+act-2 APPROVE, 0 blockers (2 suggestions + 2 nits folded: the convergence
+pin rework, docstring/message prose, validation.py threat-model comment).
+36 new tests, base-first-proven. V0 **5905 passed / 225 skipped /
+1 xfailed**, ruff clean. Learning-plane slice; no live gate required.
+
+Process finding (reviewer): worktree venvs can resolve the editable
+install to the MAIN checkout's src — every landed slice is unaffected
+(each was re-verified with full V0 in main after patch-apply), but
+builder/reviewer briefs now require verifying `data_agent.__file__`
+resolves inside the worktree before trusting a run.

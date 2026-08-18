@@ -11,8 +11,12 @@ rather than from production. Each test is named `..._is_a_known_miss` and assert
 CURRENT divergent behavior, so tightening the normalizer makes the test FAIL loudly and
 forces a deliberate update rather than a silent semantic change.
 
-Gaps (a)-(d) were identified by the builder's own audit and REMAIN open; the
-grain-qualification one CONFIRMS the builder's claim and also remains open. QA
+Gap (a) is now CLOSED — see its test, which asserts agreement rather than divergence.
+It was never a normalizer gap: the learning rewrite DELETED `role=rule` predicates while
+canon inlined them, so the two tiers described the same query with different SQL. The
+rewrite keeps the predicate now (`learning/generalize/rewrite.py`), and the two templates
+converge on their own. Gaps (b)-(d) were identified by the builder's own audit and REMAIN
+open; the grain-qualification one CONFIRMS the builder's claim and also remains open. QA
 additionally found aggregate-function casing and SQL comments, which were NOT on the
 builder's list — both have since been FIXED in `structural_ast_norm_one`, and their tests
 now assert the agreement plus the boundary of the fix (camelCase names still preserved,
@@ -53,15 +57,28 @@ def _keys(sql_a: str, sql_b: str) -> tuple[str, str]:
 # --- (a) role=rule predicates -------------------------------------------------
 
 
-def test_a_rule_predicate_dropped_by_s4_is_a_known_miss() -> None:
-    """GAP (a). `learning/generalize/rewrite.py:142` DROPS `role=rule` predicates from
-    the generated `sql_template`, while a hand-authored canon blueprint INLINES the same
-    predicate (e.g. the `active_employee` rule as `employee_status = 'A'`).
+def test_a_rule_predicate_is_no_longer_dropped_so_the_tiers_converge() -> None:
+    """GAP (a), CLOSED — was `test_a_rule_predicate_dropped_by_s4_is_a_known_miss`.
 
-    So canon's template and the learning template for one query differ by a whole WHERE
-    conjunct and mint different keys. This is the highest-likelihood miss of the four:
-    `uses_rules` is exactly the concept the canon tier expresses inline, and 4 of the 10
-    canon blueprints carry an inlined rule predicate.
+    THE DIAGNOSIS WAS RIGHT AND THE LAYER WAS WRONG. The gap was real — canon INLINES a
+    rule predicate (`active_employee` as `employee_status = 'A'`) while the learning
+    rewrite DELETED it, so the two tiers described one query with SQL that differed by a
+    whole WHERE conjunct and minted different keys. It was recorded here as a
+    normalization residual to be folded away later. It was not: no fold can invent a
+    predicate one side deleted.
+
+    What closed it was fixing the rewrite. `role=rule` keeps the predicate now and
+    records the rule id beside it (ISSUES H5/H6 — the deletion also produced unparseable
+    SQL, one-argument `sumIf`s and silently widened filters), which is exactly what canon
+    has always done. The two authoring paths now emit the SAME template for the same
+    query, and the key agrees without being asked to.
+
+    This was the highest-likelihood miss of the four — 4 of the 10 canon blueprints carry
+    an inlined rule predicate — so it is also the one whose closure moves the measured
+    cross-tier rate.
+
+    Kept as a test rather than deleted: it is the pin that says the two tiers agree HERE,
+    and a rewrite that starts deleting again fails it immediately.
     """
     canon_inlines_the_rule = (
         "SELECT department_name AS department, COUNT(DISTINCT employee_code) AS headcount "
@@ -69,14 +86,45 @@ def test_a_rule_predicate_dropped_by_s4_is_a_known_miss() -> None:
         "WHERE employee_status = 'A' AND department_name = {department} "
         "GROUP BY department_name"
     )
-    learning_drops_the_rule = (
+    # The learned side is DERIVED THROUGH THE REAL REWRITE, not assumed: the accepted
+    # SQL carries the concrete department literal, the plan slots the department and
+    # marks the status conjunct role=rule. A rewrite that starts deleting rule
+    # predicates again makes the templates (and therefore the keys) diverge and fails
+    # this assertion — that is the pin. (`uses_rules` is deliberately not hashed by
+    # the structural key — that is the whole point of the looser key.)
+    from data_agent.learning.generalize.rewrite import rewrite_sql_to_template
+
+    accepted_sql = (
         "SELECT department_name AS department, COUNT(DISTINCT employee_code) AS headcount "
         "FROM dbpcm_warehouse.employee "
-        "WHERE department_name = {department} "
+        "WHERE employee_status = 'A' AND department_name = '0420' "
         "GROUP BY department_name"
     )
-    a, b = _keys(canon_inlines_the_rule, learning_drops_the_rule)
-    assert a != b
+    learning_keeps_the_rule = rewrite_sql_to_template(
+        accepted_sql,
+        [
+            {
+                "locator": {
+                    "table": "dbpcm_warehouse.employee",
+                    "column": "department_name",
+                    "value": "0420",
+                },
+                "role": "slot",
+                "slot": {"name": "department"},
+            },
+            {
+                "locator": {
+                    "table": "dbpcm_warehouse.employee",
+                    "column": "employee_status",
+                    "value": "A",
+                },
+                "role": "rule",
+                "rule_id": "active_employee",
+            },
+        ],
+    )
+    a, b = _keys(canon_inlines_the_rule, learning_keeps_the_rule)
+    assert a == b
 
 
 # --- (b) table aliases / column qualification ---------------------------------

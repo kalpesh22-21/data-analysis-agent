@@ -1335,11 +1335,13 @@ def _validate_totality(
                     continue
                 # COVERED IS NOT THE SAME AS CORRECTLY COVERED. This is the landing
                 # gate: an entry may claim a predicate with the WRONG catalog rule, and
-                # a rule id is not decoration — later runs execute the rule, so
-                # `gross_earnings` on a `register_type = 'DDUCT'` predicate ships a
-                # blueprint that computes deductions and calls them earnings, in every
-                # future run, with nothing downstream to catch it (S4 checks columns,
-                # not rule semantics). Checked HERE rather than in `_validate_roles`
+                # a rule id is not decoration — the kept predicate stays correct SQL
+                # (S4 keeps role=rule predicates verbatim since 2026-08-18), but a
+                # wrong citation ships a false ANNOTATION: `gross_earnings` declared
+                # on a `register_type = 'DDUCT'` predicate misleads every reviewer
+                # and keys the blueprint against the wrong governance concept, with
+                # nothing downstream to catch it (S4 checks columns, not rule
+                # semantics). Checked HERE rather than in `_validate_roles`
                 # because this is the only place the cited rule and the predicate it
                 # covers are both in hand.
                 #

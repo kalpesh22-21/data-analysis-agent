@@ -22,13 +22,16 @@ Wiring (NOT done here — a one-line registration at the composition root, D102 
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 
 from ..candidate.models import CandidateEnvelope
 from ..extractor.sql_predicates import literal_predicates
 from ..stage import StageContext, StageResult
 from ..summary.refs import sql_by_ref
-from .builder import generalize_blueprint
+from .builder import fail_to_review_generalization, generalize_blueprint
+
+_logger = logging.getLogger(__name__)
 
 
 def _collapse_designations(sqls: tuple[str, ...]) -> str | None:
@@ -45,13 +48,20 @@ def _collapse_designations(sqls: tuple[str, ...]) -> str | None:
 
     IT CANNOT BE LEFT TO THE STRICT REWRITE, which was the first cut of this and is
     wrong for one specific reason. `_validate_totality` counts ANY parameterization
-    entry as covering a predicate regardless of role, but `rewrite_sql_to_template`
-    SKIPS `role == "inline"` entries entirely (rewrite.py, `if role == "inline" …
-    continue`) — it never looks for their literals. So a plan whose only entry for
-    designation 1's `country = 'IE'` is inline passes totality, rewrites cleanly from
-    designation 2, and ships a template that has no country filter and a plan that
-    says it does. Every OTHER role does raise `RewriteError` when its literal is
-    absent, which is why the hole is invisible until an inline entry is involved.
+    entry as covering a predicate regardless of role, and the rewrite sees ONE
+    designation — the chosen one. So a plan whose only entry for designation 1's
+    `country = 'IE'` is inline passes totality, rewrites cleanly from designation 2, and
+    ships a template that has no country filter and a plan that says it does.
+
+    THE ARGUMENT NARROWED, AND STILL HOLDS (H3, 2026-08-17). The strict rewrite no
+    longer SKIPS inline entries: `_check_inline_literals` requires an inline literal to
+    be present in the SQL it is rewriting, so the single-designation half of that hole
+    is closed at the rewrite now, and the two layers agree on the `country` case rather
+    than disagreeing. What the rewrite still cannot see is the DISCARDED designations —
+    it is handed one query and has no way to know another one was dropped, whatever the
+    roles say — so this check remains the only layer that can compare them. A
+    multi-designation plan that loses a `role=slot` or `role=rule` constraint is caught
+    by both; one that loses an inline constraint is caught here.
 
     THE COMPARISON IS EXACT `LiteralPredicate` equality — same enumerator as the
     totality gate (`extractor/sql_predicates.py`), so the two layers see the same
@@ -104,7 +114,29 @@ class GeneralizeStage:
         resolved: dict[str, str | None] = {
             ref: _collapse_designations(sqls) for ref, sqls in sql_by_ref(ctx.summary).items()
         }
-        generalization = generalize_blueprint(env.payload, resolved, self.catalog_schema)
+
+        # THE CONTRACT ABOVE ("S4 never raises") IS ENFORCED HERE, not assumed. The
+        # builder makes every failure it anticipates in-band, and one it did not —
+        # a `role=rule` predicate whose deletion left un-normalizable SQL — escaped
+        # as a `sqlglot.ParseError` all the way out of this stage, where it stopped
+        # the pipeline for a candidate the design says gets REVIEWED. The blast
+        # radius is the reason for the belt: on the consumer path the message is
+        # never ACKed and the whole SESSION redelivers into the dead-letter queue,
+        # and on the reviewer completion path it is a permanent 500 on a form whose
+        # only fault is the shape of its SQL. Narrow on purpose — it wraps the one
+        # call, and it stamps the same in-band verdict the anticipated faults get.
+        try:
+            generalization = generalize_blueprint(
+                env.payload, resolved, self.catalog_schema
+            )
+        except Exception:
+            _logger.exception(
+                "S4 generalize raised for candidate %s — stamping fail_to_review "
+                "in-band; the candidate goes to review rather than stopping the "
+                "pipeline",
+                env.candidate_id,
+            )
+            generalization = fail_to_review_generalization(env.payload)
 
         new_payload = dict(env.payload)
         new_payload["generalization"] = generalization.to_doc()
