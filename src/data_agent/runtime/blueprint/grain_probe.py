@@ -1,23 +1,16 @@
 """blueprint/grain_probe.py — the SHARED D56 grain-probe builder (one oracle).
 
-The grain-integrity probe (`SELECT count(), count(DISTINCT <grain cols>)` over the
-final SQL, §4.2) is the fan-out canary the D56 gate relies on. It is built in TWO
-places that MUST stay byte-identical:
+The grain-integrity probe (`SELECT count(), count(DISTINCT <grain cols>)` over the final
+SQL) is the fan-out canary the D56 gate relies on, and it is needed in TWO places that MUST
+stay byte-identical: the live `runBlueprint` fast path (`executor._verify`) and the offline
+golden-replay probe (`learning/promotion/warehouse_probe.py`). Any drift — a different
+grain-column mapping, probe shape or unpack — would let an offline replay pass while the
+live run failed, silently breaking the golden replay's whole premise that offline green
+implies live green over the exact same enforced path. So the three pieces live here once
+and both callers import them: `map_grain_columns`, `build_grain_probe_sql` and
+`unpack_grain_probe`.
 
-  * the live `runBlueprint` fast path (`runtime/blueprint/executor.py::_verify`), and
-  * the S9 offline golden-replay probe (`learning/promotion/warehouse_probe.py`).
-
-If those two ever drifted — a different grain-column mapping, a different probe SQL
-shape, a different unpack — an offline replay could pass while the live run failed
-(or vice-versa), silently breaking the whole point of the golden replay ("offline
-green ⇒ live green over the exact same enforced path", S9-design §1.1/§1.2). So the
-three pieces live here, once, and both callers import them:
-
-  * `map_grain_columns`  — DECLARED grain column → OUTPUT column name (fail-closed).
-  * `build_grain_probe_sql` — the AST-built COUNT(*)/COUNT(DISTINCT) probe.
-  * `unpack_grain_probe`  — pull `(total, distinct)` from the single-row result.
-
-Pure + I/O-free (the caller does the dispatch); fail-closed on every ambiguity.
+Pure and I/O-free (the caller does the dispatch); fail-closed on every ambiguity.
 """
 
 from __future__ import annotations

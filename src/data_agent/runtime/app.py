@@ -1,28 +1,18 @@
-"""app.py — the composition root (design §1/§9, item 11 of the Pass-B brief).
+"""app.py — the composition root.
 
-Wires `RealMCPClient` + `CouchbaseSessionStore` + `OpenAIModelClient` +
-`ToolDispatcher` + `ContextAssembler` + `AgentLoop` + observability into one
-FastAPI app, per `RuntimeSettings`.
+Wires `RealMCPClient` + `CouchbaseSessionStore` + `OpenAIModelClient` + `ToolDispatcher` +
+`ContextAssembler` + `AgentLoop` + observability into one FastAPI app, per `RuntimeSettings`.
+`POST /turn` and `POST /turn/resume` read `Authorization: Bearer <jwt>` + `X-Session-Id`,
+build `RuntimeCredentials` via `auth/jwt_verify.py`, and stream progress plus the final
+result over SSE; `/turn/resume` CAS-consumes the pending checkpoint first.
 
-HTTP surface:
-    `POST /turn`         — reads `Authorization: Bearer <jwt>` + `X-Session-Id`,
-                            builds `RuntimeCredentials` via `auth/jwt_verify.py`,
-                            runs a fresh turn (`AgentLoop.run`), and streams
-                            progress + the final result over SSE (OQ-F).
-    `POST /turn/resume`  — same headers, CAS-consumes the pending checkpoint
-                            and continues (`AgentLoop.resume`), same SSE shape.
+D5 (load-bearing): `RuntimeCredentials` is built exactly once per request, here, from the
+inbound headers, and is threaded as an explicit argument into `AgentLoop.run`/`resume`. It is
+never placed into any JSON body, any `messages` payload, or any span or progress attribute.
 
-D5 model-invisibility (load-bearing): `RuntimeCredentials` is built exactly
-once per request, here, from the inbound headers, and is threaded as an
-explicit argument into `AgentLoop.run`/`resume` — it is never placed into any
-JSON body, any `messages` payload, or any span/progress attribute.
-
-Import-time safety (acceptance criterion): `create_app(...)` is a factory,
-not a module-level singleton — merely `import data_agent.runtime.app` never
-constructs a real MCP/Couchbase/OpenAI client or makes a network call.
-`create_app()` (no arguments) is the real-infra entrypoint for a deployment;
-tests call `create_app(session_store=..., mcp_client=..., model_client=...)`
-with Layer-1 fakes for a full no-infra smoke test of the HTTP wiring itself.
+Import-time safety: `create_app(...)` is a FACTORY, not a module-level singleton — merely
+importing this module never constructs a real MCP, Couchbase or OpenAI client, nor makes a
+network call. Tests call it with Layer-1 fakes for a full no-infra smoke test of the wiring.
 """
 
 from __future__ import annotations
@@ -289,17 +279,15 @@ def create_app(
     # or noisy recorder can never displace either.
     extra_observers: Sequence[ToolObserver] = (),
 ) -> FastAPI:
-    """Build the FastAPI app. All dependencies default to the real
-    implementations, sourced from *settings* — pass Layer-1 fakes for any of
-    them (e.g. in a smoke test) to avoid touching real infra entirely.
+    """Build the FastAPI app. All dependencies default to the real implementations, sourced
+        from *settings* — pass Layer-1 fakes for any of them to avoid touching real infra
+        entirely.
 
-    *retrieval* (design §12 / neo4j-corpus-design §2.4): the D7/D8 pipeline
-    pre-injected into `ContextAssembler`. When left `None` AND `neo4j_url` + an
-    embedder are configured, a `Neo4jVectorIndex`-backed pipeline is constructed
-    here (Slice 2) and its driver is closed on app shutdown; absent either the
-    store or the embedder it stays `None` (byte-identical Phase-0 parity, D86).
-    Tests inject a pipeline (real D71 clients + a seeded `FakeVectorIndex` or a
-    live `Neo4jVectorIndex`) to exercise the whole embed→rerank→inject path."""
+        *retrieval*: the D7/D8 pipeline pre-injected into `ContextAssembler`. When left `None`
+        AND `neo4j_url` plus an embedder are configured, a `Neo4jVectorIndex`-backed pipeline is
+        constructed here and its driver is closed on app shutdown; absent either the store or the
+        embedder it stays `None`, which is byte-identical Phase-0 parity (D86).
+    """
     settings = settings or get_runtime_settings()
     mcp_client = mcp_client or RealMCPClient(settings.mcp_url)
     # The scratch side-channel client is a singleton shared by every per-request
@@ -851,16 +839,16 @@ def create_app(
         authorization: str | None = Header(default=None),
         x_session_id: str | None = Header(default=None, alias="X-Session-Id"),
     ) -> JSONResponse:
-        """UI Slice 3 (docs/decisions/ui-slice3-history-lineage-contract.md): a
-        scope-filtered, read-only projection of the persisted `SessionDoc` into a
-        `turns[]` transcript. Same `_extract_credentials` auth (401/400) as
-        `/turn`; one store read; no CAS/loop/KV de-ref and no writes beyond the
-        store's doc auto-create for an unknown (authenticated) session. The
-        two D44 filters run over THIS request's `column_scope` inside
-        `project_history` before any serialization, so a past turn's answer /
-        tool-call is fail-closed dropped if it is no longer in scope — the read
-        sibling of the live replay gate. An unknown session yields an empty doc →
-        `turns: []` (never 404)."""
+        """A scope-filtered, read-only projection of the persisted `SessionDoc` into a `turns[]`
+                transcript. Same `_extract_credentials` auth as `/turn`; one store read, no CAS, no
+                loop, no KV de-reference, and no writes beyond the store's doc auto-create for an
+                unknown but authenticated session.
+
+                The two D44 filters run over THIS request's `column_scope` inside `project_history`
+                BEFORE any serialization, so a past turn's answer or tool call is fail-closed dropped
+                once it is no longer in scope — the read sibling of the live replay gate. An unknown
+                session yields an empty doc and `turns: []`, never a 404.
+        """
         credentials = _extract_credentials(
             authorization=authorization, session_id=x_session_id, settings=settings
         )
@@ -933,25 +921,20 @@ def create_app(
     ) -> JSONResponse:
         """Execute the model-designated `answer_sql` and return ONE page of rows.
 
-        This is what replaced the old `result_table` field: instead of the runtime
-        shipping a fixed ~20-row `ResultPreview` the user could not page past, the
-        model designates the answer query via `presentTable` and the UI pages
-        through it here.
+                This replaced the fixed ~20-row `ResultPreview` the user could not page past: the
+                model designates the answer query and the UI pages through it here.
 
-        It adds NO authority. The query runs through the SAME
-        `ToolDispatcher.dispatch("runQuery", ...)` the model uses, with THIS
-        caller's credentials — so column-scope (D57/D80), read-only enforcement,
-        row caps, denial mapping and provenance capture are the identical code
-        path. A designated query can never read a column the same caller could not
-        already reach by asking the agent. See `runtime/query_page.py`.
+                It adds NO authority. The query runs through the SAME
+                `ToolDispatcher.dispatch("runQuery", ...)` the model uses, with THIS caller's
+                credentials, so column scope (D57/D80), read-only enforcement, row caps, denial
+                mapping and provenance capture are the identical code path — a designated query can
+                never read a column the same caller could not already reach by asking the agent.
 
-        Paging is applied by WRAPPING the SQL via sqlglot
-        (`SELECT * FROM (<sql>) LIMIT n OFFSET m`), never by splicing a LIMIT onto
-        model text — which also rejects multi-statement and non-SELECT payloads
-        before dispatch. A rejection is a 400 with a STATIC message (never the
-        offending SQL, never a raw parser message). A denial from the MCP is
-        returned as the dispatcher's own canned `user_message`, exactly as the
-        model would have seen it.
+                Paging is applied by WRAPPING the SQL via sqlglot, never by splicing a LIMIT onto
+                model text, which also rejects multi-statement and non-SELECT payloads before
+                dispatch. A rejection is a 400 with a STATIC message — never the offending SQL, never
+                a raw parser message. A denial from the MCP is returned as the dispatcher's own
+                canned `user_message`, exactly as the model would have seen it.
         """
         credentials = _extract_credentials(
             authorization=authorization, session_id=x_session_id, settings=settings

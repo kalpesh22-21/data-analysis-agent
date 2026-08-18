@@ -1,11 +1,9 @@
 """EvidenceSnapshot — the entity-bearing audit record (D51/D95, §4.2).
 
-This is the ONE place entity-bearing quotes live: the dedicated `learning_audit`
-bucket, access-controlled, TTL-retained. The entity-FREE global candidate stores
-(neo4j / the vector index) carry ONLY the `evidence_ref` (the KV key), never the
-snapshot — so the global stores stay entity-free (D17) while audit stays durable
-(D51). S2 provisions the store + client but writes NO snapshot (the first write is
-S3's).
+This is the ONE place entity-bearing quotes live: the dedicated, access-controlled,
+TTL-retained `learning_audit` bucket. The entity-FREE global stores carry ONLY the
+`evidence_ref` (the KV key), never the snapshot, so they stay entity-free (D17) while audit
+stays durable (D51).
 """
 
 from __future__ import annotations

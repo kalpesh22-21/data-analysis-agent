@@ -1,9 +1,8 @@
 """UserKnowledgeRecord — the per-user committed knowledge row (S8, D17).
 
-The ONE learning target allowed to carry entities (05 §Write targets): a durable,
-per-user fact stored in the access-controlled per-user bucket and surfaced only in
-that user's context. Built from a `user_knowledge` `CandidateEnvelope`; keyed
-deterministically off the candidate id so a re-commit UPSERTs (idempotent, D17).
+The ONE learning target allowed to carry entities: a durable, per-user fact stored in the
+access-controlled per-user bucket and surfaced only in that user's context. Keyed
+deterministically off the candidate id, so a re-commit UPSERTs.
 """
 
 from __future__ import annotations
@@ -70,11 +69,11 @@ class UserKnowledgeRecord:
     def from_candidate(cls, env: Any, *, user_id: str) -> UserKnowledgeRecord:
         """Project a `user_knowledge` `CandidateEnvelope` into a committable record.
 
-        The record is scoped to *user_id* — the SESSION's AUTHENTICATED user
-        (`ctx.summary.user_id`), NEVER the LLM-supplied `payload["user_id"]` (R6/D17):
-        an extractor (or a poisoned session) that emits a foreign `user_id` in the
-        payload must not be able to write into another user's surface. A blank
-        authenticated user_id is refused (fail-loud — no un-scoped commit)."""
+        Scoped to *user_id* — the SESSION's AUTHENTICATED user, NEVER the LLM-supplied
+        `payload["user_id"]` (R6/D17): an extractor, or a poisoned session, that emits a foreign
+        `user_id` must not be able to write into another user's surface. A blank authenticated
+        user_id is refused, fail-loud — no un-scoped commit.
+        """
         if not user_id:
             raise ValueError(
                 "user_knowledge commit requires a non-empty authenticated user_id "

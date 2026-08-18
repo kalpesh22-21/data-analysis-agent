@@ -1,12 +1,9 @@
 """UserKnowledgeStore — the per-user knowledge port (S8, D17; mirrors D95/D101).
 
-A dedicated, access-controlled store — its OWN Couchbase bucket + an RBAC user
-scoped to THAT bucket only (the D95 `learning_audit` / D101 `learning_candidates`
-posture). Unlike the entity-free global stores, this one holds entity-BEARING
-per-user facts, so its RBAC boundary is load-bearing: the store may touch only its
-own bucket, and a read is always scoped to a single `user_id` (no cross-user
-surface). Protocol + in-memory fake (`memory_user_store`) + Couchbase impl
-(`couchbase_user_store`), same shape as the audit/candidate ports.
+A dedicated, access-controlled store with its OWN bucket and an RBAC user scoped to THAT
+bucket only. Unlike the entity-free global stores this one holds entity-BEARING per-user
+facts, so its RBAC boundary is load-bearing: the store may touch only its own bucket, and a
+read is always scoped to a single `user_id`.
 """
 
 from __future__ import annotations
@@ -17,10 +14,12 @@ from .models import UserKnowledgeRecord
 
 
 class UserKnowledgeAccessError(PermissionError):
-    """Raised when the store's RBAC role is asked to touch a bucket outside its
-    grant — the Layer-1 stand-in for the Couchbase RBAC boundary (D95). A real
-    cross-bucket access would fail at the cluster; the fake fails here so a wiring
-    test can assert the boundary without infra."""
+    """The store's RBAC role was asked to touch a bucket outside its grant.
+
+    The Layer-1 stand-in for the Couchbase RBAC boundary (D95): a real cross-bucket access would
+    fail at the cluster, and the fake fails here so a wiring test can assert the boundary without
+    infra.
+    """
 
 
 class UserKnowledgeStore(Protocol):

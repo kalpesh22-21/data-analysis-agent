@@ -1,22 +1,12 @@
 """WriterStage — the terminal write-router `CandidateStage` (Slice 7).
 
-Runs LAST (generalize → leakage → dedup → **writer**). It converts the upstream
-verdicts into the consumer-owned `status` transition (extracted → candidate |
-in_review) and the pipeline `control` the consumer honors:
-
-  * `continue`    — auto-land: the enriched envelope is persisted at
-                    `status=candidate` (a clean, unsampled blueprint).
-  * `route_inbox` — persist at `status=in_review`; the review inbox is the
-                    projection over these rows (Contract D §4).
-
-The blueprint inbox SAMPLE (D58b, `blueprint_inbox_sample_rate = 0.10` provisional)
-is an injected decider so tests are deterministic and no global RNG/settings is
-read here. Leakage near-misses are NEVER sampled out — `route_candidate` forces
-them to the inbox before the sample is consulted.
-
-This stage does NOT own `user_knowledge` (S8 auto-commits + drops it upstream) and
-never mutates another stage's verdict field — it only advances `status` (the D102
-additivity rule: `status` is a consumer-pipeline-owned field).
+Runs LAST, converting the upstream verdicts into the consumer-owned `status` transition and
+the pipeline `control`: `continue` auto-lands at `status=candidate` (a clean, unsampled
+blueprint), `route_inbox` persists at `status=in_review`. The blueprint inbox SAMPLE (D58b)
+is an injected decider, so tests are deterministic and no global RNG is read here; leakage
+near-misses are NEVER sampled out, because `route_candidate` forces them to the inbox before
+the sample is consulted. This stage does not own `user_knowledge` and never mutates another
+stage's verdict field — it only advances `status`.
 """
 
 from __future__ import annotations

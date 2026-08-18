@@ -1,40 +1,19 @@
-"""ToolDispatcher — the single choke point for every model-requested tool call (design §3.3).
+"""ToolDispatcher — the single choke point for every model-requested tool call.
 
-    1. Credential injection (jwt/session_id attached at the MCP-call boundary
-       only — `MCPClient.call_tool(..., jwt=..., session_id=...)`).
-    2. MCP call (`askUser` is intercepted upstream in Pass B's `AgentLoop`;
-       it never reaches this dispatcher).
-    3. Graceful-denial mapping on `MCPToolError` (`denial_mapping.py`).
-    4. Provenance capture for every tool (`provenance/capture.py`).
-    5. Result-preview construction (preview-only, D46 — the full result is
-       returned on `ToolResult.result_full` for the caller to persist via
-       `SessionStore.write_full_result`; the dispatcher itself does no
-       session I/O).
+Per call: credentials are attached at the MCP-call boundary only, the tool is invoked,
+an `MCPToolError` maps through `denial_mapping.py`, provenance is captured, and a
+PREVIEW-only result is built — the full result rides `ToolResult.result_full` for the
+caller to persist, and the dispatcher itself does no session I/O. `askUser` is
+intercepted upstream by `AgentLoop` and never reaches here.
 
-B4 (2026-07-01, HIGH fix): a RAW (non-`MCPToolError`) transport exception from
-`MCPClient.call_tool` — a connection refusal, timeout, or malformed response,
-none of which carry the `[{CODE}]` prefix `MCPToolError` expects — used to
-propagate straight out of `dispatch()` uncaught, crashing the whole turn and
-(via `app.py`'s last-resort SSE handler) leaking `str(exc)` verbatim to the
-client. `dispatch()` now wraps the `call_tool` invocation in a broad
-`except Exception` fallback (below the specific `MCPToolError` handler) that
-degrades to a clean `ToolResult(status="error", ...)` with a generic,
-PII-safe `user_message` — never the raw exception text — and logs the real
-exception server-side only (`logging`, never forwarded to the client/model).
-This is what makes `ToolResult.status == "error"` (declared but previously
-dead code) actually reachable.
+A RAW (non-`MCPToolError`) transport exception — a refusal, a timeout, a malformed
+response, none of which carry the `[{CODE}]` prefix — is caught by a broad
+`except Exception` and degraded to a clean `ToolResult(status="error", ...)` with a
+generic, PII-safe `user_message`. The real exception is logged server-side only and
+never reaches the client or the model.
 
-Pass-B observability seam: `observer` is an optional callback invoked at each
-stage boundary (`observer(event_name, payload)`), defaulting to a no-op.
-Pass B's `observability/tracing.py` + `observability/progress.py` wire a real
-observer in here without any change to this class's public interface — see
-`_default_observer` below.
-
-D5 model-invisibility (load-bearing): `ToolResult` NEVER carries the JWT or
-session_id in any field — `credentials` is consumed only to build the
-`call_tool(..., jwt=credentials.jwt, session_id=credentials.session_id)` call
-and is not otherwise referenced. `tests/runtime/dispatch/test_tool_dispatcher.py`
-scans every `ToolResult` field for the JWT/session_id substrings.
+D5 (load-bearing): `ToolResult` NEVER carries the JWT or session_id in any field —
+`credentials` is consumed only to build the `call_tool(...)` invocation.
 """
 
 from __future__ import annotations
@@ -74,14 +53,14 @@ CatalogProvider = Callable[[RuntimeCredentials], Awaitable["CatalogHandle"]]
 async def resolve_catalog(
     catalog: CatalogHandle | CatalogProvider, credentials: RuntimeCredentials
 ) -> CatalogHandle:
-    """Resolve THIS turn's `CatalogHandle` — a fixed handle passes through; a provider
-    is awaited with the turn's credentials (D75 Wave 1b).
+    """Resolve THIS turn's `CatalogHandle` — a fixed handle passes through; a provider is
+        awaited with the turn's credentials (D75).
 
-    Lives here, beside the `CatalogProvider` alias it destructures, because BOTH
-    holders of a `CatalogHandle | CatalogProvider` have to agree on what the union
-    means. `ToolDispatcher` and `ResolveValuesTool` each carried a verbatim copy; the
-    `isinstance` branch IS the contract of the union, so a third holder should call
-    this rather than re-derive which arm is which."""
+        Lives here, beside the `CatalogProvider` alias it destructures, because BOTH holders
+        of a `CatalogHandle | CatalogProvider` have to agree on what the union means: the
+        `isinstance` branch IS the contract, so a third holder should call this rather than
+        re-derive which arm is which.
+    """
     if isinstance(catalog, CatalogHandle):
         return catalog
     return await catalog(credentials)
@@ -107,13 +86,13 @@ def _default_observer(event: str, payload: dict[str, Any]) -> None:
 
 @dataclass(frozen=True)
 class ToolPause:
-    """A runtime tool's request to PAUSE the turn — the generalized `askUser`
-    terminal-pause seam (runblueprint-design §2.5). Carried on `ToolResult.pause`;
-    the agent loop honors it by writing a `PauseCheckpoint` and returning
-    `paused_ask_user`, exactly as for `askUser`. Only RUNTIME tools set it
-    (dispatched MCP tools never pause); the loop ignores it on any dispatched
-    result. Slice B uses it for a slot-resolution `askUser`; the `blueprint_*`
-    fields carry the D45 mid-DAG resume state Slice C populates for approvals."""
+    """A runtime tool's request to PAUSE the turn — the generalized `askUser` seam.
+
+        Carried on `ToolResult.pause`; the loop honors it by writing a `PauseCheckpoint` and
+        returning `paused_ask_user`, exactly as for `askUser`. Only RUNTIME tools set it —
+        dispatched MCP tools never pause, and the loop ignores it on a dispatched result.
+        The `blueprint_*` fields carry the D45 mid-DAG resume state.
+    """
 
     reason: str  # "blueprint_slot" (Slice C: "blueprint_approval" | "blueprint_when_ask")
     pending_question: dict[str, Any]
@@ -127,18 +106,15 @@ class ToolPause:
 class ToolResult:
     """The outcome of one dispatched tool call — never carries credentials.
 
-    `pause` (additive, runblueprint-design §2.5) is set ONLY by a runtime tool
-    that needs to pause the turn (`runBlueprint` on a slot-resolution `askUser`);
-    it is `None` for every dispatched MCP tool and every non-pausing runtime tool,
-    so the existing trail/budget path is unchanged.
+        `pause` is set ONLY by a runtime tool that needs to pause the turn, and is `None`
+        for every dispatched MCP tool and every non-pausing runtime tool.
 
-    `authoritative` (additive) is set True ONLY by `runBlueprint` on a SUCCESSFUL,
-    D56-VERIFIED result (status verified + grain/signature ok). It is False for a
-    `runQuery`, for any denied/errored/paused outcome, and for a blueprint whose
-    verify did not pass — so a `result_preview` shaped identically to a raw query
-    result still carries an unambiguous "this is the trusted answer, do not
-    re-derive" signal into the model's tool message (see
-    `loop/agent_loop.py::_tool_trail_entry_to_canonical`)."""
+        `authoritative` is set True ONLY by `runBlueprint` on a SUCCESSFUL, D56-VERIFIED
+        result. It is False for a `runQuery`, for any denied/errored/paused outcome, and for
+        a blueprint whose verify did not pass — so a `result_preview` shaped identically to
+        a raw query result still carries an unambiguous "this is the trusted answer, do not
+        re-derive" signal into the model's tool message.
+    """
 
     status: Literal["ok", "denied", "error"]
     tool_name: str
@@ -207,25 +183,20 @@ def _cap_list_under_key(
     raw_result: dict[str, Any], key: str, max_result_tokens: int
 ) -> tuple[dict[str, Any], int, int]:
     """Keep the HEAD of `raw_result[key]` — as many leading items as fit under
-    *max_result_tokens* — and return `(capped_dict, kept_count, total_count)`.
+        *max_result_tokens* — and return `(capped_dict, kept_count, total_count)`.
 
-    The head is kept because the caller hands in a RANKED list — the blueprint
-    cards, already score-ordered by the pipeline — so dropping the tail degrades
-    it the way a ranked list should degrade. The other top-level keys ride along
-    untouched, so the result stays the SAME SHAPE the model expects — a dict with
-    a (shorter) list under *key*, never a string.
+        The head is kept because the caller hands in a RANKED list (the score-ordered
+        blueprint cards), so dropping the tail degrades it the way a ranked list should. The
+        other top-level keys ride along untouched, so the result stays the SAME SHAPE the
+        model expects — a dict with a shorter list under *key*, never a string.
 
-    NOT for column lists any more (ISSUES C5). A schema's columns are ordered but
-    NOT ranked: head-cutting them dropped the NAMES of everything past the cut,
-    which is how `employee.annual_salary` (index ~87 of 124) stopped existing as
-    far as the model could tell. That branch now delegates to
-    `schema_preview.fit_schema_under_cap`, which degrades per-column detail
-    instead. The cards branch is the only caller left.
+        NOT for column lists: a schema's columns are ordered but NOT ranked, and head-cutting
+        them dropped the NAMES of everything past the cut. That branch delegates to
+        `schema_preview.fit_schema_under_cap`, which degrades per-column detail instead.
 
-    No minimum-one carve-out: if not even the first item fits, the list comes
-    back empty. Forcing an over-cap item back in would reintroduce exactly the
-    unbounded cell this cap exists to prevent, and the `_truncated` marker the
-    caller adds names the drop either way.
+        No minimum-one carve-out: if not even the first item fits, the list comes back empty.
+        Forcing an over-cap item back in would reintroduce exactly the unbounded cell this
+        cap exists to prevent, and the caller's `_truncated` marker names the drop either way.
     """
     items = raw_result[key]
     base = {k: v for k, v in raw_result.items() if k != key}
@@ -247,47 +218,34 @@ def _cap_nontabular_result(
     question: str | None = None,
     schema_columns_token_budget: int = _DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET,
 ) -> tuple[Any, bool]:
-    """Bound a non-tabular tool result stored as ONE preview cell (esp. a wide
-    `getTableSchema`) so it can never be a 30k-token blob that survives the
-    row-count-only trail budget. Returns `(capped_value, truncated)`.
+    """Bound a non-tabular tool result stored as ONE preview cell (especially a wide
+        `getTableSchema`) so it can never be an unbounded blob that the row-count-only trail
+        budget never trims. Returns `(capped_value, truncated)`, always valid and parseable:
 
-    Truncation keeps the output VALID + parseable (never a broken JSON blob):
-      * a `{... "columns": [...]}` dict (getTableSchema) ALWAYS goes through
-        `schema_preview.fit_schema_under_cap` — see the SCHEMA BRANCH note below;
-      * a `{... "blueprints": [...]}` dict (`searchBlueprints`) keeps the HEAD of
-        the CARD list — see below;
-      * any other over-cap value is rendered to a string and truncated at the cap
-        with a `…[truncated: N of M chars omitted]` marker (a valid string cell).
+          * a `{... "columns": [...]}` dict ALWAYS goes through
+            `schema_preview.fit_schema_under_cap`;
+          * a `{... "blueprints": [...]}` dict keeps the HEAD of the ranked card list;
+          * any other over-cap value is rendered to a string and truncated at the cap with a
+            `…[truncated: N of M chars omitted]` marker.
 
-    THE SCHEMA BRANCH RUNS FIRST AND UNCONDITIONALLY (ISSUES C5b). It is the only
-    branch that is not a size cap: it also strips the PRE-APPLIED TENANCY COLUMNS
-    (`client_code` / proc-center), which are not the model's to filter on at any
-    size, so a small schema must go through it too. It then fits the COLUMNS
-    SECTION ALONE under *schema_columns_token_budget* — the table-level sections
-    (rules, ambiguities, join_keys, …) ride complete and unbudgeted — and returns
-    `truncated=` whether anything was actually withheld. A schema whose columns fit
-    is returned COMPACTED-STABLE rather than byte-identical: the tenancy columns
-    and the information-free keys (`"unit": null`) come off on every path by the
-    user spec, and the keys that survive keep their order and values. *question*,
-    when the caller has one, only ORDERS the columns (D25).
+        THE SCHEMA BRANCH RUNS FIRST AND UNCONDITIONALLY: it is the one branch that is not a
+        size cap — it also strips the PRE-APPLIED TENANCY COLUMNS, which are not the model's
+        to filter on at any size, so a small schema must go through it too. It then fits the
+        COLUMNS SECTION ALONE under *schema_columns_token_budget*, with the table-level
+        sections riding complete and unbudgeted. A schema whose columns fit is returned
+        COMPACTED-STABLE rather than byte-identical. *question*, when the caller has one,
+        only ORDERS the columns (D25).
 
-    Only `getTableSchema` reaches that branch: `_build_preview` has already routed
-    every `{columns, rows}` tabular result and every bare list elsewhere, and no
-    other non-tabular tool result carries a top-level `columns` list (design §0).
+        Only `getTableSchema` reaches that branch: `_build_preview` has already routed every
+        tabular result and every bare list elsewhere, and no other non-tabular tool result
+        carries a top-level `columns` list.
 
-    The card branch exists because release-1 §02 ENRICHED the search card (slots,
-    pinned resolutions, result grain) and made per-deliverable `searchBlueprints`
-    the default route. Corpus-scale cards at `k=20` are ~10,200 chars and stay
-    under the cap, but maximally-slotted ones reach ~25,600 chars and first cross
-    it at `k=13` — and a `searchBlueprints` result carries no top-level `columns`
-    key, so without this branch it fell through to stringify-and-truncate and the
-    model received a MANGLED JSON STRING ending in a truncation marker instead of
-    a card list, on the release's primary route. Dropping whole low-scoring cards
-    from the tail degrades a ranked list the way a ranked list should degrade; the
-    marker and the observer event below make it visible rather than silent.
+        The card branch exists because a `searchBlueprints` result carries no top-level
+        `columns` key: without it, maximally-slotted cards crossing the cap fell through to
+        stringify-and-truncate and the model received a MANGLED JSON STRING ending in a
+        truncation marker instead of a card list, on the release's primary route.
 
-    Under the cap a non-schema value is returned unchanged (`truncated=False`) —
-    byte-identical to before this cap existed.
+        Under the cap a non-schema value is returned unchanged (`truncated=False`).
     """
     if isinstance(raw_result, dict) and isinstance(raw_result.get("columns"), list):
         fitted, report = fit_schema_under_cap(
@@ -447,25 +405,18 @@ def _build_preview(
 ) -> ResultPreview:
     """Build the `{columns, row_count, truncated, preview_rows}` preview object.
 
-    Handles the three MCP result shapes actually returned by the six tools
-    (design §0):
-      - `{columns, rows, row_count, truncated}` (runQuery/sampleRows/explainQuery)
-      - a bare list of dicts (listDatabases/listTables)
-      - a small non-tabular dict (getTableSchema: `{database, table, columns}`)
-    The row/list shapes enforce the N-row preview cap. The non-tabular dict is
-    additionally SIZE-capped to `max_result_tokens` (a large non-tabular result is
-    otherwise stored as one unbounded ~30k-token cell that the row-count-only
-    trail budget never trims) — except a getTableSchema, whose COLUMNS SECTION is
-    budgeted separately by `schema_columns_token_budget` while its table-level
-    sections ride complete, and which is reshaped on EVERY path so the pre-applied
-    tenancy columns never reach the model. See `_cap_nontabular_result`.
+        Handles the three MCP result shapes the tools return: `{columns, rows, row_count,
+        truncated}`, a bare list of dicts, and a small non-tabular dict. The first two
+        enforce the N-row preview cap. A non-tabular dict is additionally SIZE-capped to
+        `max_result_tokens` — except a `getTableSchema`, whose COLUMNS SECTION is budgeted
+        separately by `schema_columns_token_budget` while its table-level sections ride
+        complete, and which is reshaped on EVERY path so the pre-applied tenancy columns
+        never reach the model (see `_cap_nontabular_result`).
 
-    *observer*/*tool_name* are used ONLY to report a size-cap degrade (the
-    blueprint-card drop, the schema-detail drop) and default to the no-op
-    observer, so every existing call site is unchanged. *question* is the turn's
-    raw user text, supplied ONLY by the agent loop's dispatch site; it reaches
-    the schema fitter, where it orders which columns keep their documentation and
-    is never written into any output (D25).
+        *observer*/*tool_name* are used ONLY to report a size-cap degrade. *question* is the
+        turn's raw user text, supplied ONLY by the agent loop's dispatch site; it reaches the
+        schema fitter, where it orders which columns keep their documentation, and is never
+        written into any output (D25).
     """
     if isinstance(raw_result, dict) and "rows" in raw_result and "columns" in raw_result:
         rows = raw_result["rows"]
@@ -579,20 +530,18 @@ class ToolDispatcher:
     async def capture_sql_provenance(
         self, sql: str, credentials: RuntimeCredentials
     ) -> frozenset[tuple[str, str]] | None:
-        """The D44 USES set of a query that is NOT being dispatched (08 §D.2).
+        """The D44 USES set of a query that is NOT being dispatched.
 
-        `answerWithTable` may designate a query the agent never ran — that is the
-        documented contract, because the executed query usually carries a LIMIT the
-        agent chose for its own reading and paging needs the un-capped shape. Such
-        a query therefore appears in no trail entry's provenance, so the turn union
-        does not cover it and the read path cannot tell whether the table it is
-        offering is still in scope.
+                `answerWithTable` may designate a query the agent never ran — that is the
+                documented contract, because the executed query usually carries a LIMIT the agent
+                chose for its own reading and paging needs the un-capped shape. Such a query
+                appears in no trail entry's provenance, so the turn union does not cover it and
+                the read path cannot otherwise tell whether the table it offers is still in scope.
 
-        SAME extractor, SAME catalog, SAME `capture_provenance` entry point as a
-        real `runQuery` dispatch, so the two can never disagree about one query.
-        Reads NOTHING and dispatches NOTHING: it parses a string. Degrades to
-        `None` (undetermined) rather than raising — see
-        `answer_with_table.is_answer_table_in_scope` for what `None` then means.
+                SAME extractor, SAME catalog, SAME `capture_provenance` entry point as a real
+                `runQuery` dispatch, so the two can never disagree about one query. Reads NOTHING
+                and dispatches NOTHING: it parses a string. Degrades to `None` (undetermined)
+                rather than raising.
         """
         try:
             catalog = await self._resolve_catalog(credentials)
@@ -617,35 +566,25 @@ class ToolDispatcher:
         question: str | None = None,
     ) -> ToolResult:
         """Dispatch one tool call. `emit_progress=False` silences the
-        `tool_dispatch_start`/`ok`/`denied`/`error` OBSERVER events for THIS call
-        and nothing else.
+                `tool_dispatch_start`/`ok`/`denied`/`error` OBSERVER events for THIS call and
+                nothing else.
 
-        Why it exists: `blueprint/executor.py` runs every node of a composed
-        blueprint through this same choke point, and those events are UI progress
-        labels (`observability/progress.py::_STEP_LABELS`) — so a single
-        `runBlueprint` painted the user a "running runQuery…" line per internal
-        node, exposing that the answer is assembled from queries over internal
-        tables. The user asked for ONE analysis; the internal steps are not their
-        business. The OUTER `runBlueprint` dispatch from the agent loop still emits
-        normally, so the turn is never silent.
+                `blueprint/executor.py` runs every node of a composed blueprint through this same
+                choke point, and those events are UI progress labels — so a single `runBlueprint`
+                otherwise painted the user a "running runQuery…" line per internal node, exposing
+                that the answer is assembled from queries over internal tables. The OUTER
+                `runBlueprint` dispatch from the agent loop still emits normally, so the turn is
+                never silent.
 
-        SCOPE, deliberately narrow — this gates the OBSERVER channel only:
-          - `_emit_tool_span` (Phoenix/OTel, via `redaction.tool_span_args`) is
-            UNAFFECTED: every inner node still gets its own `tool.runQuery` span,
-            because an operator debugging a blueprint needs exactly that.
-          - `tool_dispatch_cards_dropped` (from `_build_preview`) is UNAFFECTED: it
-            is an operator degrade signal with no `_STEP_LABELS` entry, so it never
-            reached the UI to begin with.
-          - control flow is UNAFFECTED: denials and errors return the same
-            `ToolResult` and propagate exactly as with progress on.
+                SCOPE, deliberately narrow — this gates the OBSERVER channel only. The
+                Phoenix/OTel span is UNAFFECTED (an operator debugging a blueprint needs every
+                inner node's span), `tool_dispatch_cards_dropped` is UNAFFECTED (an operator
+                degrade signal that never reached the UI), and control flow is UNAFFECTED.
 
-        `question` is the turn's raw user text, supplied ONLY by the agent loop's
-        own dispatch site (every other caller — the blueprint executor, resolve-
-        values, discovery emulation, the paging endpoint — leaves it None, and
-        none of them dispatches a `getTableSchema` anyway). Its ONE use is to
-        order which columns of an over-cap schema keep their documentation
-        (`schema_preview`); it is never persisted, never spanned, never echoed
-        into a result (D25).
+                `question` is the turn's raw user text, supplied ONLY by the agent loop's own
+                dispatch site. Its ONE use is to order which columns of an over-cap schema keep
+                their documentation; it is never persisted, never spanned, never echoed into a
+                result (D25).
         """
         # One local, resolved once: the four progress events below route through it,
         # so a future event added to this method cannot silently escape the gate by

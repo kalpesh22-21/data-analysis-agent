@@ -1,83 +1,33 @@
-"""AgentLoop — the per-turn state machine (design §4.1), built on Pass-A's seams.
+"""AgentLoop — the per-turn state machine.
 
-Implements the design §4.1 turn state machine exactly:
+Per turn: assemble the canonical messages, then loop `send_turn` -> dispatch each
+requested tool -> budget check, until the model returns no tool calls (done), a tool
+pauses, or the budget window ends. `resume()` is the separate entry point that
+CAS-consumes the checkpoint (D45), threads the answer back in, and re-enters with a FRESH
+`BudgetGuard` window; only a `budget_cap` resume answered "continue"/"refine" counts a new
+window grant, and a "stop" ends the turn with the best partial result already in the trail.
 
-    1. (caller) builds `RuntimeCredentials` (app.py, from the inbound request).
-    2. `ContextAssembler.assemble(session_id, column_scope)` -> canonical messages.
-    3. loop:
-         a. `ModelClient.send_turn(messages, tools)` -> `ModelTurnResult`.
-         b. no tool_calls -> done. [TERMINATION: normal]
-         c. for each tool_call:
-              - `askUser` -> pause checkpoint, return control. [TERMINATION: pause]
-              - else -> `ToolDispatcher.dispatch(...)`, persist `TrailEntry`
-                (+full result via `SessionStore.write_full_result`) + a tool
-                message. Dispatched **sequentially**, not concurrently: the
-                design flags parallel tool-call dispatch as a possible
-                optimization "capped — see §11 tunables", but §11 leaves the
-                cap value an open question, and sequential dispatch keeps
-                `BudgetGuard` iteration accounting and trail ordering
-                trivially deterministic for Phase 0 — a pure performance
-                question deferred, like design §11 OQ-J's MCP connection
-                pooling.
-         d. `BudgetGuard` check -> continue, or budget-cap pause
-            (or the hard outer ceiling force-stop). [TERMINATION: budget /
-            hard ceiling]
-    4. `resume()` — a separate entry point — CAS-consumes the checkpoint
-       (`SessionStore.resume_checkpoint`, D45), threads the answer back in,
-       and re-enters the loop with a FRESH `BudgetGuard` window; a fresh
-       *window grant* (D55) is only counted for `reason="budget_cap"` +
-       "continue"/"refine" answers — a "stop" answer ends the turn with the
-       best partial result already in the trail; an `askUser`-reason resume
-       just continues the same window count (it was not a budget grant).
+Tool calls are dispatched SEQUENTIALLY, which keeps `BudgetGuard` iteration accounting and
+trail ordering trivially deterministic.
 
-Read-only, no D56 verify gate (Phase 1): the final assistant message is
-returned to the user as-is.
+`askUser` is intercepted here and ONLY here — it never reaches `ToolDispatcher.dispatch`.
+Runtime tools (`resolveValues` plus the three read tools) are intercepted here too, but
+each returns an INLINE `ToolResult`, so the trail/budget path treats them identically to a
+dispatched tool. An advertised-but-unwired runtime tool returns a clean local error, never
+an MCP unknown-tool denial.
 
-`askUser` is intercepted here and ONLY here — it is never handed to
-`ToolDispatcher.dispatch` (design §3.3 "askUser is intercepted upstream in
-the agent loop, never reaches this dispatcher").
+Statelessness across pauses (D45): both `run()` and `resume()` rebuild the canonical
+message list from the `SessionStore` on EVERY model round-trip, so any process can resume
+any paused session — no in-process state survives a pause.
 
-Runtime tools (`resolveValues` + the three read tools `searchBlueprints`/
-`getBlueprint`/`searchKnowledge`) are intercepted here via the `runtime_tools`
-registry (read-tools-design §2), handled symmetrically: each never reaches
-`ToolDispatcher.dispatch` under its own name (only any inner tool it issues
-does), but — unlike `askUser`, which pauses — each returns an INLINE `ToolResult`
-so the loop's existing TrailEntry + write_full_result + budget path handles it
-identically to a dispatched tool. Each therefore counts as exactly ONE
-`tool_calls_made` and respects `max_tool_calls_per_iteration` + wall-clock like
-any other tool call. An advertised-but-unwired runtime tool returns a clean
-local unavailable error, never an MCP unknown-tool denial (§6).
+D5 (load-bearing): `RuntimeCredentials` is threaded as an explicit argument to
+`ToolDispatcher.dispatch` and to `ContextAssembler.assemble` (scope only). It is NEVER
+placed into the canonical `messages` list handed to `ModelClient.send_turn`.
 
-Statelessness across pauses (D45): both `run()` and `resume()` rebuild the
-canonical message list from the `SessionStore` on every single model
-round-trip (`_build_canonical_messages`) rather than carrying an in-memory
-working-message list across the pause boundary — any process can resume any
-paused session because there is no in-process state that survives a pause.
-
-D5 model-invisibility (load-bearing): `RuntimeCredentials` (jwt, session_id,
-raw column_scope) is threaded as an explicit argument to
-`ToolDispatcher.dispatch` and to `ContextAssembler.assemble` (scope only) —
-it is NEVER placed into the canonical `messages` list handed to
-`ModelClient.send_turn`. `tests/runtime/loop/test_agent_loop.py` scans every
-message payload `ScriptedModelClient` records across a multi-tool-call turn
-for the JWT/session_id substrings to prove this end-to-end.
-
-Two DIFFERENT token ceilings live on this class and must not be confused
-(conflating them was a real defect, fixed 2026-08-12):
-`max_token_spend` is the per-window SPEND ceiling (Σ prompt+completion over the
-window's round-trips) handed to `BudgetGuard`; `request_token_budget` is the
-per-request OCCUPANCY ceiling handed to `fit_request_to_budget`, which trims a
-single request so it cannot overflow the model's context window. A sum answers
-the first question and never the second.
-
-Deviation from the design doc (noted for review): the design's §4.1
-"BudgetGuard.check(iterations, tokens, wall_clock)" is driven off
-`RuntimeSettings` values, but this class accepts the four budget scalars
-(`max_loop_iterations`, `max_wall_clock_seconds`, `max_budget_windows`,
-`max_token_spend`) directly as constructor arguments rather than a whole
-`RuntimeSettings` object — a narrower, more directly-testable dependency
-surface. `app.py` (the composition root) is the only caller expected to
-thread these through from `RuntimeSettings`.
+Two DIFFERENT token ceilings live on this class and must not be confused:
+`max_token_spend` is the per-window SPEND ceiling handed to `BudgetGuard`;
+`request_token_budget` is the per-request OCCUPANCY ceiling handed to
+`fit_request_to_budget`. A sum answers the first question and never the second.
 """
 
 from __future__ import annotations
@@ -189,42 +139,34 @@ _RUNTIME_TOOL_INTERNAL_ERROR_MESSAGE = "That tool hit an internal error. Please 
 
 @dataclass(frozen=True)
 class TurnContext:
-    """What a `RuntimeTool` may know about the turn it is running in (03 §C.1).
+    """What a `RuntimeTool` may know about the turn it is running in.
 
-    `turn_index` ONLY. It exists because `updateAnalysisState` must write
-    turn-scoped state, and the two alternatives are both wrong:
+        `turn_index` ONLY, and it must come from the loop's own computation. The two
+        alternatives are both wrong: `app.py` has only `turn_index_hint`, documented as
+        best-effort telemetry, so making it load-bearing introduces a TOCTOU gap; and
+        re-deriving it from the store means duplicating two DIFFERENT formulas (`/turn` uses
+        `messages[-1].turn_index + 1`, `/turn/resume` uses `messages[-1].turn_index`), which
+        guarantees eventual disagreement.
 
-      - Take it from `app.py`. `runtime_tools` is built in `_build_agent_loop`,
-        which has only `turn_index_hint` — documented at its own definition as
-        "best-effort … never load-bearing for correctness, purely a telemetry
-        label". Making it load-bearing introduces a TOCTOU gap against the loop's
-        own computation.
-      - Re-derive it from the store. `/turn` and `/turn/resume` use DIFFERENT
-        formulas (`messages[-1].turn_index + 1` vs `messages[-1].turn_index`), so
-        duplicating the derivation guarantees eventual disagreement.
-
-    IT MUST NOT CARRY THE TRAIL. `_run_loop_body`'s only trail load sits ABOVE
-    the round-trip loop and is immediately reduced to signatures inside the
-    `ReadGuard`; every entry is appended later. A snapshot taken there
-    contains NOTHING from the current window, so evidence written in round 1 and
-    cited in round 2 would fail as "unknown tool_call_id" — every completion and
-    block, on every turn, while looking correctly wired. A tool that needs the
-    trail loads it itself, filtered to `turn_index`.
+        IT MUST NOT CARRY THE TRAIL. `_run_loop_body`'s only trail load sits ABOVE the
+        round-trip loop, so a snapshot taken there contains NOTHING from the current window:
+        evidence written in round 1 and cited in round 2 would fail as "unknown tool_call_id"
+        on every turn, while looking correctly wired. A tool that needs the trail loads it
+        itself, filtered to `turn_index`.
     """
 
     turn_index: int
 
 
 class RuntimeTool(Protocol):
-    """A model-facing tool implemented in the RUNTIME (not the MCP), intercepted
-    in the loop and returning an inline `ToolResult` — the `resolveValues` shape
-    (read-tools-design §2). `askUser` is NOT a `RuntimeTool`: it is TERMINAL (it
-    pauses, it does not return a `ToolResult`), so it stays a hardcoded branch.
+    """A model-facing tool implemented in the RUNTIME (not the MCP), intercepted in the
+        loop and returning an inline `ToolResult`. `askUser` is NOT a `RuntimeTool`: it is
+        TERMINAL — it pauses rather than returning a `ToolResult` — so it stays a hardcoded
+        branch.
 
-    *turn* is passed by `_run_runtime_tool` on every dispatch. It is keyword-
-    optional so a tool that does not care about the turn simply ignores it; the
-    signature is EXPLICIT rather than a side channel because six implementers and
-    no production constraint made the honest version cheap."""
+        *turn* is passed by `_run_runtime_tool` on every dispatch, keyword-optional so a tool
+        that does not care about the turn simply ignores it.
+    """
 
     async def run(
         self,
@@ -307,9 +249,9 @@ def _first_user_question(messages: list[TurnMessage], turn_index: int) -> str | 
 
 
 def _runtime_tool_unavailable(tool_name: str, code: str) -> ToolResult:
-    """A clean local error for an advertised-but-unwired runtime tool (§6) —
-    never dispatched to the MCP under its own name. Shared by `resolveValues`
-    and the three read tools."""
+    """A clean local error for an advertised-but-unwired runtime tool — never dispatched to
+        the MCP under its own name. Shared by `resolveValues` and the three read tools.
+    """
     return ToolResult(
         status="error",
         tool_name=tool_name,
@@ -342,12 +284,12 @@ def _runtime_tool_internal_error(tool_name: str) -> ToolResult:
 def _sanitize_runtime_provenance(
     provenance: Any, tool_name: str
 ) -> frozenset[tuple[str, str]] | None:
-    """Validate a `RuntimeTool`'s returned `provenance` BEFORE it is persisted
-    (S2). It must be `None` or a `frozenset` of `(str, str)` tuples — the exact
-    shape `context/scope_filter.is_provenance_in_scope` unpacks. Anything else
-    (a contract violator) is coerced to `None` fail-closed (dropped from replay)
-    with a server-side warning, rather than crashing the NEXT round-trip inside
-    the D44 replay filter."""
+    """Validate a `RuntimeTool`'s returned `provenance` BEFORE it is persisted: it must be
+        `None` or a `frozenset` of `(str, str)` tuples — the exact shape
+        `context/scope_filter.is_provenance_in_scope` unpacks. Anything else is coerced to
+        `None` fail-closed (dropped from replay) with a server-side warning, rather than
+        crashing the NEXT round-trip inside the D44 replay filter.
+    """
     if provenance is None:
         return None
     if isinstance(provenance, frozenset) and all(
@@ -415,27 +357,18 @@ class TurnOutcome:
 
 @dataclass(frozen=True)
 class _CanonicalRequest:
-    """One round-trip's canonical message list, plus WHICH tool results the model
-    can actually READ in it.
+    """One round-trip's canonical message list, plus WHICH tool results the model can
+        actually READ in it.
 
-    The second field exists because "is this result still in context?" cannot be
-    answered from `messages` alone, and the repeated-idempotent-read guard now
-    depends on the answer (see `_run_loop_body`'s trim-aware re-fetch exemption).
-    Two different things can put a `tool` message with a given `tool_call_id` into
-    the list:
-
-      - a REAL rendered result (`context/budget.py::_render_entry` → a JSON payload
-        with `result_preview`), which the model can read; and
-      - a SENTINEL — D94's "result withheld: provenance could not be determined" or
-        the repeated-read "you already have this" nudge — which is data-free by
-        construction (`context/assembly.py::_build_withheld_sentinel_message`).
-
-    A membership test over `tool_call_id`s alone cannot tell them apart, and the
-    difference is the whole point: a stranded `getTableSchema` renders a sentinel
-    under its own id, so treating that id as "visible" would tell the guard the
-    schema is readable while the model is looking at *"result withheld … Do not
-    retry"* — and the schema could never be recovered. So sentinel ids are excluded
-    HERE, at the one place that still knows which render item was which.
+        The second field exists because "is this result still in context?" cannot be answered
+        from `messages` alone, and the repeated-read guard's trim-aware exemption depends on
+        the answer. Two different things put a `tool` message with a given `tool_call_id` into
+        the list: a REAL rendered result, and a data-free SENTINEL (D94's "result withheld",
+        or the repeated-read nudge). A membership test over ids alone cannot tell them apart,
+        and treating a sentinel id as "visible" would tell the guard a schema is readable
+        while the model is looking at "result withheld … Do not retry" — with no way to
+        recover it. Sentinel ids are excluded HERE, at the one place that still knows which
+        render item was which.
     """
 
     messages: list[dict[str, Any]]
@@ -448,27 +381,20 @@ ANSWER_TABLE_BLUEPRINT_NOT_RUN_CODE = "ANSWER_TABLE_BLUEPRINT_NOT_RUN"
 def _answer_table_blueprint_not_run(blueprint_id: str) -> ToolResult:
     """The nudge for `answerWithTable(blueprint_id=X)` where X never ran this turn.
 
-    Without it the call SUCCEEDS and — because it carries `answer` — TERMINATES the
-    turn, so the user gets prose with no table and the model never learns why. The
-    designation is advisory, but silently swallowing a designation the model
-    explicitly made is the wrong kind of advisory.
+        Without it the call SUCCEEDS and — because it carries `answer` — TERMINATES the turn,
+        so the user gets prose with no table and the model never learns why.
 
-    A non-`ok` status is what makes this work end-to-end: it stops the terminal exit
-    firing (so the turn continues and the model can fix it), and
-    `scope_filter.filter_trail`'s current-turn exemption is status-gated to
-    `status != "ok"`, so the entry reaches the model this same turn instead of being
-    dropped as undetermined-provenance history.
+        A non-`ok` status is what makes this work end-to-end: it stops the terminal exit
+        firing, and `scope_filter.filter_trail`'s current-turn exemption is status-gated to
+        `status != "ok"`, so the entry reaches the model this same turn instead of being
+        dropped as undetermined-provenance history.
 
-    The instructional text below is NOT what the model reads. `TrailEntry` has no
-    `user_message` field at all, and `context/budget.py::_render_entry` — the single
-    producer of every model-facing tool message — sets it from
-    `classify_denial(entry.error_code)` unconditionally. So the model sees the
-    DENIAL-TABLE text, on the first rebuild and every one after; the string here only
-    reaches non-model readers (logs, `/query/page`'s error body).
-    That is why `ANSWER_TABLE_BLUEPRINT_NOT_RUN` is registered in
-    `dispatch/denial_mapping.py`: without an entry there, `classify_denial` falls
-    back to "Something went wrong processing that request." and the model is told
-    nothing actionable. The two strings are kept in step deliberately.
+        The instructional text below is NOT what the model reads. `TrailEntry` has no
+        `user_message` field at all, and `context/budget.py::_render_entry` sets it from
+        `classify_denial(entry.error_code)` unconditionally — so the model sees the
+        DENIAL-TABLE text. That is why `ANSWER_TABLE_BLUEPRINT_NOT_RUN` is registered in
+        `dispatch/denial_mapping.py`, and why the two strings are kept in step; the string
+        here reaches only non-model readers (logs, `/query/page`'s error body).
     """
     return ToolResult(
         status="error",
@@ -543,19 +469,19 @@ _MAX_SURPLUS_STATE_REJECTIONS = 2
 
 
 class _NoLiveStateToForceError(Exception):
-    """Raised from inside the force-block merge when the live state vanished
-    between the loop's read and the store's write (a concurrent turn boundary is
-    the only way). Aborts the write with nothing persisted, rather than
-    resurrecting a state the model never saw."""
+    """Raised from inside the force-block merge when the live state vanished between the
+        loop's read and the store's write. Aborts the write with nothing persisted, rather
+        than resurrecting a state the model never saw.
+    """
 
 
 def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]]:
-    """One rendered tool-trail entry (context/budget.py `_render_entry` shape) ->
+    """One rendered tool-trail entry -> a synthetic `[assistant-with-tool_calls,
+        tool-result]` canonical pair.
 
-    a synthetic `[assistant-with-tool_calls, tool-result]` canonical pair —
-    required because D22 discards the model's original "thinking"/free text
-    around a tool call, so replay must synthesize a minimal, API-valid
-    assistant/tool exchange rather than replaying the original text verbatim.
+        Required because D22 discards the model's original free text around a tool call, so
+        replay must synthesize a minimal, API-valid exchange rather than replaying the
+        original verbatim.
     """
     tool_call_id = entry["tool_call_id"]
     assistant_message = {
@@ -650,24 +576,20 @@ def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]
 
 
 def _assembled_to_canonical(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """`AssembledContext.messages` (the interleaved render list, Phase 1)
-    -> the canonical `ModelClient.send_turn` message shape (design §1 `model/client.py`).
+    """`AssembledContext.messages` (the interleaved render list) -> the canonical
+        `ModelClient.send_turn` message shape.
 
-    The interleaved list carries four render shapes: the base `system` message; a
-    `user` message (a prior-turn question, the current question, an askUser answer,
-    or the retrieval cards block); an `assistant` TEXT message (a prior turn's
-    answer — new in the interleave, passed straight through); and a `tool` render
-    item (a trail entry / withheld sentinel) that expands to a synthetic
-    `assistant(tool_calls)` + `tool(result)` PAIR (D22 discards the model's original
-    free text around a tool call, so replay synthesizes a minimal API-valid pair).
+        Four render shapes: the base `system` message; a `user` message (a prior-turn
+        question, the current question, an askUser answer, or the retrieval block); an
+        `assistant` TEXT message passed straight through; and a `tool` render item that
+        expands to a synthetic `assistant(tool_calls)` + `tool(result)` PAIR.
 
-    §6.2 defensive dedup: the OpenAI API requires every `tool_call_id` in a turn to
-    be UNIQUE with exactly one matching `tool` response. A legacy/corrupt trail (or
-    a paused-and-resumed DAG that re-appended a colliding id) would otherwise emit
-    two `tool` messages with the same id → an API 400 that aborts the turn. So we
-    drop a duplicate `tool_call_id` here (keeping the FIRST) — fail-closed toward a
-    valid (if lossy) replay, never a turn-aborting one. This matters more for the
-    `runBlueprint` brick whose resume re-enters and appends new trail entries."""
+        Defensive dedup: the API requires every `tool_call_id` in a turn to be UNIQUE with
+        exactly one matching `tool` response, so a legacy or corrupt trail — or a
+        paused-and-resumed DAG that re-appended a colliding id — would emit two `tool`
+        messages with one id and abort the turn with a 400. A duplicate is dropped here,
+        keeping the FIRST: fail-closed toward a valid, if lossy, replay.
+    """
     canonical: list[dict[str, Any]] = []
     seen_tool_call_ids: set[str] = set()
     for message in messages:
@@ -979,75 +901,40 @@ class AgentLoop:
         discovery_canonical: list[dict[str, Any]] | None = None,
         finalization_nudge: str | None = None,
     ) -> _CanonicalRequest:
-        """*current_turn_index* (turn-scoped continuity, 2026-07-01): passed
-        through to `ContextAssembler.assemble` so the CURRENT in-progress
-        turn's own tool-trail entries — including denials/errors, whose
-        `provenance` is always `None` (`dispatch/tool_dispatcher.py`) — are
-        exempt from D44's strict replay drop and reach the model this same
-        turn (design §3.4 self-correction). Cross-turn D44 is unchanged: a
-        PRIOR turn's undetermined/denied entry is still always dropped. A
-        denied/errored entry never carries result rows regardless
-        (`result_preview` is `None`), so this exemption leaks nothing.
+        """Rebuild the canonical `send_turn` message list for ONE round-trip (D45: rebuilt
+                every round-trip, never carried across a pause).
 
-        *question*/*user_id*/*retrieval_memo* (Slice-1 retrieval, design §3.3):
-        threaded into `assemble` so the retrieval pipeline (when configured)
-        pre-injects thin cards + knowledge for this turn's question. The memo is
-        turn-window-local (created fresh in `_run_loop_body`) so retrieval embeds at
-        most ONCE per window despite the D45 per-round-trip rebuild. When no
-        retrieval pipeline is wired, these are inert (assemble short-circuits).
+                *current_turn_index* exempts the CURRENT turn's own denied/errored entries —
+                whose provenance is always `None` — from D44's strict replay drop, so the model
+                can self-correct. Cross-turn D44 is unchanged, and a denied entry carries no
+                result rows regardless.
 
-        *withheld_call_ids* (D94 Part 2): the same turn-window-local memo pattern
-        as *retrieval_memo* — a `set[str]` created fresh in `_run_loop_body` so the
-        `loop_result_withheld_provenance` diagnostic fires at most ONCE per
-        stranded `tool_call_id` despite the per-round-trip rebuild.
+                *question*/*user_id*/*retrieval_memo* thread retrieval through `assemble`. The
+                memo is turn-window-local, so retrieval embeds at most ONCE per window despite
+                the per-round-trip rebuild; *withheld_call_ids* is the same pattern for the D94
+                diagnostic. Both are inert when no retrieval pipeline is wired.
 
-        *discovery_canonical* (emulated-discovery injection): the per-window
-        synthetic `assistant(tool_calls=...)+tool(result)` pairs for
-        `listDatabases`+`listTables`, already run through
-        `_tool_trail_entry_to_canonical` (or `None`/empty). Computed ONCE in
-        `_run_loop_body` and threaded in (never recomputed per round-trip, D45).
+                *discovery_canonical* is the per-window emulated-discovery pair list, computed
+                ONCE in `_run_loop_body`. It is spliced immediately AFTER the CURRENT turn's
+                question (the LAST `user` message), so the turn reads sequentially — question,
+                then the discovery the model "already did" for it, then its own work — and so it
+                sits inside the range `fit_request_to_budget` pins as the current turn (droppable
+                only under real pressure). Splicing after the leading `system` run instead hoists
+                every pair ABOVE turn 0's question and exposes them to prior-turn trimming; that
+                position remains only as the fallback when there is no `user` message at all.
 
-        It is spliced in immediately AFTER the CURRENT turn's question (the LAST
-        `user` message), so the turn reads sequentially — question, then the
-        discovery the model "already did" for it, then the model's own work. This
-        is the whole point of emulating the CALLS rather than summarizing them: the
-        pairs must sit where the model's own calls would have, which is inside the
-        current turn.
+                *finalization_nudge* shares that splice site and never-persisted posture but NOT
+                its lifetime: it lives EXACTLY ONE ROUND-TRIP (the caller clears it immediately
+                after this call), because a once-per-window value would repeat the nudge forever,
+                including after the intents were closed, and — being anchored at the tail — would
+                migrate to be the newest message on every rebuild.
 
-        It used to splice after the leading `role=="system"` run instead, hoisting
-        every emulated pair ABOVE turn-0's question on the theory that they were
-        "the earliest session activity". That read as a block of tool calls before
-        the user had asked anything — the sweep is re-run per budget window against
-        the CURRENT turn, so it was never prior-session history in the first place,
-        and prepending it broke the sequential turn layout the interleave in
-        `context/assembly.py` otherwise maintains.
-
-        Splicing after the last `user` message keeps it inside the range
-        `context/budget.py::fit_request_to_budget` pins as the current turn, so the
-        pairs are treated as current-turn tool pairs (droppable only at tier 2,
-        under real budget pressure) rather than as prior-turn history that gets
-        trimmed first. When there is no `user` message at all (a Layer-1 assemble
-        with no dialogue) it falls back to the old position after the system head.
-        `None`/empty (feature off / degraded) leaves the message list byte-identical.
-
-        *finalization_nudge* (05 §B.2/§D): the ephemeral `user`-role message that
-        replaces exit #1's missing error channel. It shares `discovery_canonical`'s
-        splice site and never-persisted posture but NOT its lifetime — it lives
-        EXACTLY ONE ROUND-TRIP (the caller clears it immediately after this call),
-        because a once-per-window value would repeat the nudge forever, including
-        after the intents were closed, and — being ephemeral and anchored at the
-        tail — would migrate to be the newest message on every rebuild, appearing
-        after tool results it predates.
-
-        SPLICE ORDER (05 §D.1 — this loop owns it, being the later insertion):
-        `ContextAssembler` inserts the `analysisState` block at
-        `_last_user_index`, i.e. immediately BEFORE the current question. The nudge
-        is appended at the TAIL, AFTER that — appending it first would make it the
-        last `user` message and land 03's state block after the question instead of
-        before it. A trailing `user` message is safe there: `_current_turn_start`
-        anchors on the first `user` after the last plain-assistant answer, so it
-        does not move the current-turn pin, and `fit_request_to_budget` classifies
-        it as a current-turn non-tool-pair unit, which is pinned.
+                SPLICE ORDER, which this loop owns as the later insertion: `ContextAssembler`
+                inserts the `analysisState` block immediately BEFORE the current question, and the
+                nudge is appended at the TAIL, AFTER that — appending it first would make it the
+                last `user` message and land the state block after the question. A trailing `user`
+                message is safe there: `_current_turn_start` anchors on the first `user` after the
+                last plain-assistant answer, so the current-turn pin does not move.
         """
         assembled = await self._context_assembler.assemble(
             session_id,
@@ -1224,13 +1111,11 @@ class AgentLoop:
     async def _compute_turn_provenance_union(
         self, session_id: str, turn_index: int
     ) -> frozenset[tuple[str, str]] | None:
-        """Union of every `TrailEntry.provenance` produced at *turn_index*
-        (across every budget window of this external turn) — the tag applied
-        to that turn's final assistant `TurnMessage` (B1/D44). Fail-closed:
-        any undetermined (`None`) tool-result provenance makes the whole
-        turn's assistant message undetermined too. A turn with no tool calls
-        at all (a pure clarification/chat turn) is determined-empty
-        (`frozenset()`) — always kept on replay.
+        """Union of every `TrailEntry.provenance` produced at *turn_index*, across every budget
+                window of this external turn — the tag applied to that turn's final assistant
+                `TurnMessage` (D44). Fail-closed: any undetermined (`None`) tool-result provenance
+                makes the whole turn's assistant message undetermined too. A turn with no tool
+                calls at all is determined-empty (`frozenset()`), always kept on replay.
         """
         trail = await self._session_store.load_trail(session_id)
         turn_entries = [entry for entry in trail if entry.turn_index == turn_index]
@@ -1266,13 +1151,12 @@ class AgentLoop:
         return frozenset(union)
 
     async def _compute_turn_assumptions(self, session_id: str, turn_index: int) -> list[str]:
-        """Reconstruct the plain-English assumptions recorded at *turn_index* from
-        the persisted `recordAssumptions` trail entries (deduped, first-occurrence
-        order, via the SAME `fold_assumptions` the loop and `session_history`
-        use). Used to SEED a resumed window on BOTH resume paths — the plain
-        `resume()` (askUser / budget-continue) and the blueprint approval-resume —
-        so assumptions the model recorded in an earlier window are not dropped and
-        the resumed turn's live result matches what `project_history` reconstructs."""
+        """Reconstruct the plain-English assumptions recorded at *turn_index* from the
+                persisted `recordAssumptions` entries (deduped, first-occurrence order, via the
+                SAME `fold_assumptions` the loop and `session_history` use). Seeds a resumed
+                window on BOTH resume paths, so assumptions recorded in an earlier window are not
+                dropped and the live result matches what `project_history` reconstructs.
+        """
         trail = await self._session_store.load_trail(session_id)
         gathered: list[str] = []
         for entry in trail:
@@ -1287,42 +1171,29 @@ class AgentLoop:
     async def _compute_turn_answer_tables(
         self, session_id: str, turn_index: int
     ) -> tuple[list[AnswerTable], dict[str, BlueprintRun]]:
-        """Reconstruct the model-designated answer TABLES for *turn_index* from the
-        persisted `answerWithTable` trail entries — the `_compute_turn_assumptions`
-        sibling, used to SEED a resumed window on BOTH resume paths so a designation
-        the model made BEFORE an askUser / blueprint-approval pause survives it.
+        """Reconstruct the model-designated answer TABLES for *turn_index* from the persisted
+                `answerWithTable` entries — the `_compute_turn_assumptions` sibling, seeding a
+                resumed window on BOTH resume paths so a designation made BEFORE a pause survives
+                it.
 
-        THE WHOLE LIST, not the first element (08 §M): a three-part answer that
-        paused must come back with three tables, or the resume silently degrades
-        the exact turns multi-table exists for. The blueprint-run map is returned
-        alongside it because the resumed window needs it too — a blueprint that ran
-        BEFORE the pause must stay designatable after it.
+                THE WHOLE LIST, not the first element: a three-part answer that paused must come
+                back with three tables, or the resume silently degrades the exact turns
+                multi-table exists for. The blueprint-run map is returned alongside because a
+                blueprint that ran BEFORE the pause must stay designatable after it.
 
-        LAST successful designation wins, matching `TurnAccumulators.
-        note_answer_tables`'s in-window rule (a later call supersedes an earlier one — the model changed
-        its mind about which query is the answer). Without this, a turn
-        that designated its answer table and THEN paused comes back with
-        `answer_sql=None` and the UI silently loses the table.
+                LAST successful designation wins, matching the in-window rule. BOTH designation
+                forms are reconstructed: reading only `args["sql"]` silently drops every blueprint
+                designation, which is the form the live model actually emits (observed sending
+                `sql=""` alongside `blueprint_id`). AND BOTH ARGUMENT SHAPES — entries written
+                before the `tables` key carry `sql`/`blueprint_id` at the TOP LEVEL, and
+                `resolve_designations` folds that shape in, so this seed keeps working on any
+                session document ever written, with no migration.
 
-        BOTH designation forms are reconstructed. Reading only `args["sql"]` looked
-        sufficient but silently dropped every blueprint designation — and that is the
-        form the live model actually emits: observed in a real turn, it sent
-        `sql=""` alongside `blueprint_id`, which cleans to `None`. So a
-        blueprint-answered turn that paused lost its table on resume, in exactly the
-        case the blueprint path exists for.
-
-        AND BOTH ARGUMENT SHAPES, which is a second thing. Persisted entries written
-        before 08 §O carry `{"sql": …}` / `{"blueprint_id": …}` at the TOP LEVEL and
-        no `tables` key at all. `resolve_designations` folds that shape in, so this
-        seed keeps working on any session document ever written — there is no
-        migration, and a resume that could not read an old entry would silently drop
-        the user's own answer table rather than fail.
-
-        Resolving `blueprint_id` here needs the blueprint's `terminal_sql`, which
-        lives in `result_full` behind a D46 KV pointer (the in-window path reads it
-        straight off the dispatch result and never pays this cost). The
-        de-reference happens ONLY on the resume path, once per blueprint, and a
-        missing/expired ref simply leaves that id unresolved rather than raising."""
+                Resolving a `blueprint_id` here needs the blueprint's `terminal_sql`, which lives
+                behind a D46 KV pointer. That de-reference happens ONLY on the resume path, once
+                per blueprint, and a missing or expired ref leaves the id unresolved rather than
+                raising.
+        """
         trail = await self._session_store.load_trail(session_id)
         turn_entries = [
             e for e in trail if e.turn_index == turn_index and e.status == "ok"
@@ -1377,16 +1248,13 @@ class AgentLoop:
     def _maybe_start_summary(self, tool_name: str, arguments: dict[str, Any]) -> None:
         """Fire a FIRE-AND-FORGET progress-summary task for one tool CALL (opt-in).
 
-        Non-blocking is load-bearing: this schedules the LLM call CONCURRENTLY and
-        returns immediately — the caller dispatches the tool without ever awaiting
-        the summary, so the summarizer can never add latency to the tool nor delay
-        the turn result. The line arrives on the progress stream when ready
-        (additive to the instant `tool_dispatch_start` template label); if it never
-        arrives (slow / failed / cancelled at turn end), the template label stands.
-        A SHALLOW snapshot of `arguments` (`dict(...)`) is passed so a rebinding of
-        the top-level keys can't race the background read; nested mutable structures
-        are shared, which is fine because no in-loop mutation of the call arguments
-        exists today. No-op when the summarizer is not wired (feature off)."""
+                Non-blocking is load-bearing: the LLM call is scheduled CONCURRENTLY and the
+                caller never awaits it, so the summarizer can never add latency to the tool nor
+                delay the turn result. If the line never arrives, the instant template label
+                stands. A SHALLOW snapshot of `arguments` is passed so a rebinding of the
+                top-level keys cannot race the background read. No-op when the summarizer is not
+                wired.
+        """
         if self._progress_summarizer is None:
             return
         task: asyncio.Task[None] = asyncio.create_task(
@@ -1396,10 +1264,10 @@ class AgentLoop:
         task.add_done_callback(self._summary_tasks.discard)
 
     async def _summarize_and_emit(self, tool_name: str, arguments: dict[str, Any]) -> None:
-        """Await the summarizer and emit the value-rich progress line — fail-soft:
-        a summarizer error/timeout yields `None` (dropped), and even the observer
-        emit is guarded so a late arrival after the emitter is closed (or any other
-        observer error) can never raise into this fire-and-forget task."""
+        """Await the summarizer and emit the value-rich progress line — fail-soft: an error or
+                timeout yields `None` (dropped), and even the observer emit is guarded, so a late
+                arrival after the emitter is closed can never raise into this fire-and-forget task.
+        """
         try:
             summary = await self._progress_summarizer.summarize(tool_name, arguments)
         except asyncio.CancelledError:
@@ -1420,10 +1288,10 @@ class AgentLoop:
             _logger.debug("progress-summary emit failed for %s (ignored)", tool_name)
 
     def _cancel_pending_summaries(self) -> None:
-        """Best-effort cancel any still-pending summary tasks at turn end — the
-        turn result never blocks on them (design: the enriching line is optional).
-        `discard` in the done-callback keeps the set self-cleaning; clearing here is
-        belt-and-suspenders so a resumed window starts clean."""
+        """Best-effort cancel any still-pending summary tasks at turn end — the turn result
+                never blocks on them. Clearing here is belt-and-suspenders so a resumed window
+                starts clean.
+        """
         for task in list(self._summary_tasks):
             if not task.done():
                 task.cancel()
@@ -1437,15 +1305,13 @@ class AgentLoop:
         credentials: RuntimeCredentials,
         turn: TurnContext,
     ) -> ToolResult:
-        """Run one registry handler with a B4-style crash guard + a returned-
-        provenance-type validation (S2), so a misbehaving runtime tool cannot
-        abort the turn or persist a replay-poisoning provenance. The three read
-        tools + `resolveValues` already self-guard; this is defense in depth and
-        the containment seam the future `runBlueprint` brick relies on.
+        """Run one registry handler with a crash guard and a returned-provenance-type
+                validation, so a misbehaving runtime tool cannot abort the turn or persist a
+                replay-poisoning provenance.
 
-        *turn* is the loop's OWN `turn_index`, threaded explicitly (03 §C.1) —
-        the only correct source. Passed to every runtime tool, ignored by the
-        ones that do not need it."""
+                *turn* is the loop's OWN `turn_index`, threaded explicitly — the only correct
+                source. Passed to every runtime tool, ignored by the ones that do not need it.
+        """
         try:
             result = await handler.run(arguments, credentials, turn=turn)
         except Exception:
@@ -1469,53 +1335,40 @@ class AgentLoop:
         reason_code: str,
         budget_cap_reached: bool = False,
     ) -> AnalysisState | None:
-        """Mark every surviving `pending` intent `blocked` with a RUNTIME reason
-        code, immediately before a turn reaches a terminal outcome (05 §F).
+        """Mark every surviving `pending` intent `blocked` with a RUNTIME reason code,
+                immediately before a turn reaches a terminal outcome.
 
-        Four callers, three codes:
+                Four callers, three codes:
 
-          | hard ceiling                          | `BUDGET_EXHAUSTED`      |
-          | budget cap reached DURING a refused round | `ENFORCEMENT_EXHAUSTED` |
-          | block counter spent, intents pending  | `ENFORCEMENT_EXHAUSTED` |
-          | budget-cap resume answered "stop"     | `USER_STOPPED`          |
+                  | hard ceiling                              | `BUDGET_EXHAUSTED`      |
+                  | budget cap reached DURING a refused round | `ENFORCEMENT_EXHAUSTED` |
+                  | block counter spent, intents pending      | `ENFORCEMENT_EXHAUSTED` |
+                  | budget-cap resume answered "stop"         | `USER_STOPPED`          |
 
-        `ENFORCEMENT_EXHAUSTED` MEANS "ENFORCEMENT COULD NOT ESTABLISH A
-        DISPOSITION" — **not** that the system proved the intent impossible (Lead,
-        2026-08-11). Claiming proof would overstate what the runtime knows: zero
-        rows is often the correct answer, some denial probes cost one metadata
-        call, and a user who withdraws an ask mid-clarification lands here and does
-        so legitimately under that reading.
+                `ENFORCEMENT_EXHAUSTED` MEANS "ENFORCEMENT COULD NOT ESTABLISH A DISPOSITION" —
+                NOT that the system proved the intent impossible. Zero rows is often the correct
+                answer, some denial probes cost one metadata call, and a user who withdraws an ask
+                mid-clarification lands here legitimately under that reading.
 
-        `budget_cap_reached` is TELEMETRY ONLY and is set by the refused-round
-        caller alone. That path reaches the cap, so the capacity fact is real and an
-        operator watching budget pressure must still see it — but it is NOT the
-        cause of the disposition, so it does not go on the intent record. Live
-        evidence (session `s412e8424614e465bbd26d7a2a1400ebe`, trace
-        `647416592aff2225d1903ae7c82b8396`): the answer was computed at 25s and the
-        turn capped at 61.6s on the WALL CLOCK, with tokens moving +385 across the
-        final three rounds — 36 seconds spent on two rejected `updateAnalysisState`
-        calls and one refused `answerWithTable`. More budget would have changed
-        nothing, and `BUDGET_EXHAUSTED` sent whoever read 07 §E.2's buckets to raise
-        a ceiling that was not the problem. Emitted as a bare `True` on
-        `loop_intent_force_blocked` and OMITTED otherwise, so the other three
-        callers' event payloads are unchanged.
+                `budget_cap_reached` is TELEMETRY ONLY and is set by the refused-round caller
+                alone. That path really did reach the cap, so an operator watching budget pressure
+                must see it — but the cap is NOT the cause of the disposition, so it does not go on
+                the intent record. Emitted as a bare `True` on `loop_intent_force_blocked` and
+                OMITTED otherwise, so the other three callers' payloads are unchanged.
 
-        THIS PATH WRITES THE RUNTIME CODES DIRECTLY. It must NOT be routed through
-        `validate_block_evidence`, which allowlists `MODEL_REASON_CODES` — every
-        code above would be rejected by it, by design. There is no evidence to
-        cite: `evidence_tool_call_id` stays `None`, which is exactly what
-        distinguishes a runtime-forced block from a model-declared one in the
-        ledger.
+                THIS PATH WRITES THE RUNTIME CODES DIRECTLY. It must NOT be routed through
+                `validate_block_evidence`, which allowlists `MODEL_REASON_CODES` and would reject
+                every code above, by design. There is no evidence to cite: `evidence_tool_call_id`
+                stays `None`, which is exactly what distinguishes a runtime-forced block from a
+                model-declared one in the ledger.
 
-        The §A turn gate is already applied by the caller (the `state` handed in is
-        the LIVE one), and again by the store, whose merge callback receives
-        `live_analysis_state(...)`. No live state, or nothing pending, is a no-op
-        with no write at all.
+                The turn gate is already applied by the caller (the `state` handed in is the LIVE
+                one) and again by the store, whose merge callback receives `live_analysis_state`.
+                No live state, or nothing pending, is a no-op with no write at all.
 
-        DEGRADE-NEVER-FAIL: this runs on terminal paths that are already returning
-        a result to the user, so a store failure here is logged and swallowed —
-        losing the forced disposition is bad, aborting the user's answer to record
-        it is worse.
+                DEGRADE-NEVER-FAIL: this runs on terminal paths that are already returning a
+                result to the user, so a store failure is logged and swallowed — losing the forced
+                disposition is bad, aborting the user's answer to record it is worse.
         """
         pending = pending_intents(state)
         if not pending:
@@ -1604,92 +1457,53 @@ class AgentLoop:
         persist_text: str | None = None,
         event: tuple[str, dict[str, Any]] | None = None,
     ) -> TurnOutcome:
-        """THE ORDER every in-body `TurnOutcome` return performs its effects in, in
-        one place: checkpoint write, assistant-message append, envelope read,
-        observer event, return.
+        """THE ORDER every in-body `TurnOutcome` return performs its effects in, in one place:
+                checkpoint write, assistant-message append, envelope read, observer event, return.
 
-        WHAT THIS REPLACES. Five returns inside `_run_loop_body` (the two `done`
-        exits, the `askUser` pause, the hard ceiling, the budget-cap pause), each
-        re-spelling a nine-field `TurnOutcome(...)` tail — `sql_executed`, the four
-        envelope projections, `assumptions`, `pending_question` — beside its own
-        copy of the same effect ORDER. The fields were the visible duplication; the
-        order was the dangerous one, because it is invisible at every site and only
-        one of the five reads correctly at a time. `_compute_turn_provenance_union`
-        must be read BEFORE the message it tags is appended; the envelope must be
-        read AFTER the round's folds; the observer must fire AFTER every store
-        write, so an observer that reads the session back never races the write it
-        is announcing. Five copies of that is five chances to reorder one.
+                THE ORDER IS THE POINT, because it is invisible at every call site and only one
+                reading is correct: `_compute_turn_provenance_union` must be read BEFORE the
+                message it tags is appended; the envelope must be read AFTER the round's folds;
+                and the observer must fire AFTER every store write, so an observer that reads the
+                session back never races the write it is announcing.
 
-        THIS OWNS NO STATE, and is a method rather than an object for that reason.
-        The two things an object would bind — the accumulators and the checkpoint —
-        are mutable locals of a running loop body, so an object built at the top of
-        the window would either snapshot them too early or just hold a reference to
-        them, which is the parameter it takes anyway. What it DOES need is
-        `self._session_store` and `self._observer`, so a free function would take
-        both as parameters and be a method with extra steps.
+                THIS OWNS NO STATE, and is a method rather than an object for that reason — the
+                accumulators and the checkpoint are mutable locals of a running loop body.
 
-        NOTHING IS DERIVED, and the two parameters that look derivable are the
-        point:
+                NOTHING IS DERIVED, and the three parameters that look derivable are the point:
 
-          - *event* is passed, never computed from *status*. The budget-cap
-            `"stop"` answer in `resume()` returns `status="done"` and emits NO
-            event (it is not a window finishing a turn — there is no window), so
-            "`done` means `loop_turn_done`" is FALSE and any code that assumes it
-            starts emitting a spurious finish. `tests/runtime/loop/
-            test_turn_exit_contract.py` pins both halves.
-          - *provenance* is passed, never computed from *status*. It is non-`None`
-            at the `done` exits ONLY, and computing it here would put a second
-            `_compute_turn_provenance_union` call in the codebase — the whole
-            discipline is that there is exactly ONE per done-exit, made at the
-            site, whose single value tags the persisted message AND rides the
-            outcome (`test_repeated_idempotent_read_guard.py::
-            test_turn_provenance_union_excludes_guard_entry` pins that they are the
-            same object). A pause carries `None` deliberately: it has no persisted
-            assistant message for a lineage tag to belong to.
-          - *exit_label* is passed for the same reason and is the third of these:
-            `status="done"` is reached by BOTH done exits, so no derivation can
-            tell a no-tool-calls finish from an `answerWithTable` one — which is
-            exactly the distinction the answer-scrub telemetry is read for. See
-            `AnswerExitLabel`.
+                  - *event* is passed, never computed from *status*: the budget-cap "stop" answer
+                    returns `status="done"` and emits NO event, so "done means loop_turn_done" is
+                    FALSE and any code assuming it starts emitting a spurious finish.
+                  - *provenance* is passed, never computed: it is non-`None` at the `done` exits
+                    ONLY, and computing it here would put a SECOND
+                    `_compute_turn_provenance_union` call in the codebase. The discipline is
+                    exactly one per done-exit, made at the site, whose single value tags the
+                    persisted message AND rides the outcome. A pause carries `None` deliberately —
+                    it has no persisted assistant message for a lineage tag to belong to.
+                  - *exit_label* is passed because `status="done"` is reached by BOTH done exits,
+                    so no derivation can tell a no-tool-calls finish from an `answerWithTable`
+                    one — which is exactly the distinction the answer-scrub telemetry is read for.
 
-        THE ANSWER-PROSE SCRUB (ISSUES I1) RUNS HERE, at the top, and this is the
-        second thing (after the effect ORDER) that this function exists to make
-        unmissable: every exit that hands prose to a user goes through here, so
-        one call covers all five, and the SAME scrubbed string necessarily feeds
-        the outcome and the persisted message.
+                THE ANSWER-PROSE SCRUB RUNS HERE, at the top: every exit that hands prose to a user
+                goes through this function, so one call covers all five and the SAME scrubbed
+                string necessarily feeds both the outcome and the persisted message.
 
-        *persist_text* is likewise a value, not a flag, and it carries the ONE
-        difference between the two `done` exits. The no-tool-calls exit appends
-        only `if result.assistant_text` — a model can finish with `None`/`""` and
-        must not leave an empty assistant message in history — so that site passes
-        `result.assistant_text or None`. The `answerWithTable` exit appends
-        UNCONDITIONALLY, and may: its text came through `clean_answer_text`, which
-        returns `None` for anything that strips to empty, so a non-`None`
-        `designated_answer_text` is a non-empty string by construction.
+                *persist_text* is likewise a value, not a flag, and it carries the ONE difference
+                between the two `done` exits. The no-tool-calls exit appends only when there is
+                text — a model may finish with `None`/`""` and must not leave an empty assistant
+                message in history — while the `answerWithTable` exit appends UNCONDITIONALLY,
+                because its text came through `clean_answer_text` and is non-empty by construction.
 
-        WHAT STAYED AT THE SITES, following `read_guard.py` / `blueprint_gate.py` /
-        `finalization.py`: everything whose POSITION relative to this call is the
-        behaviour. `_force_block_pending_intents` runs ABOVE the call at the two
-        terminal-escape exits (unconditionally at the hard ceiling, only for a
-        refused round at the budget cap) — pulling it in here would bury a
-        conditional store write inside a function whose contract is "no decisions".
-        The provenance union and the `PauseCheckpoint` construction stay at their
-        sites for the same reason.
+                WHAT STAYED AT THE SITES: everything whose POSITION relative to this call is the
+                behaviour — `_force_block_pending_intents` (unconditional at the hard ceiling, only
+                for a refused round at the budget cap), the provenance union, and the
+                `PauseCheckpoint` construction.
 
-        TWO EXITS DO NOT ROUTE THROUGH THIS, deliberately:
-
-          - `resume()`'s budget-cap `"stop"` return. It happens before
-            `_run_loop_body` is ever entered, so there is no window to have
-            accumulated anything: since M2 it builds a `TurnAccumulators` of its
-            OWN, seeded purely from the trail rebuild, and reads the envelope +
-            assumptions off that. Everything else this function does is a no-op
-            there — no checkpoint, no persisted message, no event (see *event*
-            above) — so routing it here would add three `None` arguments and a
-            reader detour to reach one `TurnOutcome(...)` it already spells out.
-          - `_pause_from_runtime_tool`. It is already a single-purpose finisher for
-            one exit, and it receives an `AnswerEnvelope` as a PARAMETER (its
-            callers, including `_resume_blueprint`, may not have a live window's
-            accumulators at all), so it has nothing to read an envelope from.
+                TWO EXITS DO NOT ROUTE THROUGH THIS, deliberately: `resume()`'s budget-cap "stop"
+                return, which happens before `_run_loop_body` is entered and builds its own
+                accumulators from the trail rebuild, so everything here is a no-op for it; and
+                `_pause_from_runtime_tool`, which is already a single-purpose finisher and receives
+                its `AnswerEnvelope` as a parameter.
         """
         # THE ANSWER-PROSE SCRUB (ISSUES I1) — FIRST, above every effect, so there
         # is exactly ONE scrubbed string and it is the one that reaches BOTH the
@@ -1778,15 +1592,14 @@ class AgentLoop:
         assumptions: list[str] | None = None,
         serves_intent: str | None = None,
     ) -> TurnOutcome:
-        """Honor a runtime tool's `ToolPause` (§2.5) — write the checkpoint (with
-        the additive `blueprint_*` mid-DAG state) and return `paused_ask_user`,
-        the same terminal contract as `askUser`. The loop owns `budget_window_count`
-        (the tool cannot know it), exactly as for the `askUser` checkpoint above.
+        """Honor a runtime tool's `ToolPause` — write the checkpoint (with the additive
+                `blueprint_*` mid-DAG state) and return `paused_ask_user`, the same terminal
+                contract as `askUser`. The loop owns `budget_window_count`; the tool cannot know it.
 
-        UI Slice 1 Fix 2 (pause-path symmetry): the four enrichment accumulators are
-        threaded through best-effort so "runQuery succeeded, then runBlueprint paused
-        on a slot question" surfaces the partial SQL/table on THIS pause flavor too,
-        matching the direct `askUser` pause. Default `None` when no query succeeded."""
+                The four enrichment accumulators are threaded through best-effort, so a "runQuery
+                succeeded, then runBlueprint paused on a slot question" turn surfaces the partial
+                SQL and table on this pause flavor too, matching a direct `askUser` pause.
+        """
         checkpoint = PauseCheckpoint(
             reason=pause.reason,
             pending_question=pause.pending_question,
@@ -1849,20 +1662,17 @@ class AgentLoop:
         turn_index: int,
         window_count: int,
     ) -> TurnOutcome:
-        """Re-enter the paused blueprint at `awaiting_node` (D45, §2.5). The
-        executor is stateless — everything to continue is in the checkpoint, so a
-        FRESH process resumes identically (restart-durable). The outcome maps the
-        same way `runBlueprint`'s first call does:
+        """Re-enter the paused blueprint at `awaiting_node` (D45). The executor is stateless —
+                everything needed to continue is in the checkpoint, so a FRESH process resumes
+                identically. The outcome maps the same way `runBlueprint`'s first call does:
 
-          - `Paused` (another approval / degrade) → write a new checkpoint (with
-            the grown completed-nodes state) and return `paused_ask_user`;
-          - `Completed`/`Failed` → persist a `runBlueprint` trail entry (so replay
-            carries the result + provenance) and CONTINUE the model loop — the
-            model's next round-trip narrates / does the D56 LLM review (§4.4).
+                  - `Paused` (another approval or degrade) -> write a new checkpoint with the
+                    grown completed-nodes state and return `paused_ask_user`;
+                  - `Completed`/`Failed` -> persist a `runBlueprint` trail entry, so replay carries
+                    the result and provenance, and CONTINUE the model loop.
 
-        n2: the executor re-fires the (deterministic) slot/rule resolves on resume
-        for settled bindings — the design accepts this deterministic re-fill (the
-        probes are read-only + idempotent; §2.5 / Q8).
+                The executor re-fires the deterministic slot/rule resolves on resume for settled
+                bindings — accepted, since those probes are read-only and idempotent.
         """
         try:
             slot_bindings = json.loads(checkpoint.slot_bindings_json or "{}")
@@ -2013,12 +1823,11 @@ class AgentLoop:
         )
 
     def _blueprint_outcome_to_tool_result(self, outcome: Any) -> ToolResult:
-        """Map a `BlueprintExecutor` `ExecOutcome` to a `ToolResult` — the SAME
-        mapping `RunBlueprintTool._execute` uses (`blueprint_outcome_to_tool_result`),
-        reused here for the resume path so a mid-DAG resume produces byte-identical
-        results — INCLUDING the verified `authoritative` marker — to a first call.
-        Sharing the one mapper is what stops the resume path from silently losing
-        the marker (the exact drift this dedup fixes)."""
+        """Map a `BlueprintExecutor` `ExecOutcome` to a `ToolResult` — the SAME mapping
+                `RunBlueprintTool._execute` uses, reused here so a mid-DAG resume produces
+                byte-identical results, INCLUDING the verified `authoritative` marker. Sharing the
+                one mapper is what stops the resume path from silently losing it.
+        """
         from data_agent.runtime.blueprint.tool import blueprint_outcome_to_tool_result
 
         mapped = blueprint_outcome_to_tool_result(outcome)
@@ -2037,49 +1846,38 @@ class AgentLoop:
     ) -> tuple[list[AnswerTable], str | None, bool]:
         """Resolve ONE `answerWithTable` call into its designated answer tables.
 
-        Returns `(tables, unresolved_blueprint_id, carried_designation)`.
+                Returns `(tables, unresolved_blueprint_id, carried_designation)`.
 
-        THE THIRD VALUE IS NOT DERIVABLE FROM THE FIRST TWO, which is why it is
-        returned rather than inferred. An empty `tables` list has two completely
-        different causes and they need opposite handling: the model NAMED NOTHING
-        (`carried_designation=False` — a defect, and the caller nudges), or it named
-        something the runtime then dropped for a reason the model cannot act on — a
-        table proven out of the caller's column scope, a duplicate, an over-cap
-        entry. Nudging the second would tell the model to fix a payload that was
-        already correct.
+                THE THIRD VALUE IS NOT DERIVABLE FROM THE FIRST TWO, which is why it is returned
+                rather than inferred. An empty `tables` list has two completely different causes
+                needing opposite handling: the model NAMED NOTHING (`carried_designation=False` —
+                a defect, and the caller nudges), or it named something the runtime then dropped
+                for a reason the model cannot act on (out of the caller's column scope, a
+                duplicate, an over-cap entry). Nudging the second would tell the model to fix a
+                payload that was already correct.
 
-        `resolve_answer_tables` of 08 §B.4, in the place `_resolve_answer_sql` sat.
-        The order is fixed and each step is there for a measured reason:
+                The order is fixed and each step is there for a measured reason:
 
-          1. Choose the source list — `tables` when it carries a designation, else
-             the LEGACY top-level `sql`/`blueprint_id` pair folded in as one entry
-             (`resolve_designations`). Since 08 §O `tables` is the only shape the
-             schema declares, so step 1 normally has nothing to choose; the fold is
-             there for a model working from a stale context, and for the replay
-             paths that share this resolver and read pre-§O trail entries forever.
-          2. Resolve each item through the EXISTING `resolve_designation`. There is
-             no second resolution path: an element of `tables` is exactly the
-             mapping that function already reads, which is why multi-table costs no
-             new resolver and cannot drift from the single-table one.
-          3. An item naming a blueprint that did not run this turn REFUSES THE
-             WHOLE CALL (the caller turns the returned id into the existing
-             retryable `_answer_table_blueprint_not_run` nudge) — after the dormant
-             ON_ANSWER_TABLE_UNRESOLVED seam has had first refusal, exactly as at
-             N=1. Dropping it instead would silently lose a deliverable's table,
-             which is the failure this whole change exists to fix.
-          4. Dedupe on resolved SQL, then cap at `MAX_ANSWER_TABLES`
-             (`finalize_designations`).
-          5. Per-table provenance (08 §D.2) — an additive, positionally parallel
-             read-path check, NOT this entry's provenance.
+                  1. Choose the source list — `tables` when it carries a designation, else the
+                     LEGACY top-level `sql`/`blueprint_id` pair folded in as one entry. The fold
+                     is there for a model working from a stale context, and for the replay paths
+                     that share this resolver and read pre-`tables` trail entries forever.
+                  2. Resolve each item through the EXISTING `resolve_designation`. There is no
+                     second resolution path, which is why multi-table costs no new resolver and
+                     cannot drift from the single-table one.
+                  3. An item naming a blueprint that did not run this turn REFUSES THE WHOLE CALL
+                     (the caller turns the returned id into the retryable
+                     `_answer_table_blueprint_not_run` nudge), after the dormant
+                     ON_ANSWER_TABLE_UNRESOLVED seam has had first refusal. Dropping it instead
+                     would silently lose a deliverable's table.
+                  4. Dedupe on resolved SQL, then cap at `MAX_ANSWER_TABLES`.
+                  5. Per-table provenance — an additive, positionally parallel read-path check,
+                     NOT this entry's provenance.
 
-        THE HOOKS FIRE PER TABLE, NOT PER CALL. `AnswerTableEvent` already carries a
-        single `blueprint_id`/`sql` pair, so one event per designated table is the
-        natural reading and needs no field change. Both seams stay dormant.
-
-        A hook-substituted query LOSES ITS VERIFICATION AND ITS CHIP: the D56 gate
-        verified a query that is no longer the one being paged. Inert today (both
-        seams are empty), stated in code so a future hook cannot silently inherit a
-        badge.
+                THE HOOKS FIRE PER TABLE, NOT PER CALL. A hook-substituted query LOSES ITS
+                VERIFICATION AND ITS CHIP: the D56 gate verified a query that is no longer the one
+                being paged. Inert today (both seams are empty), stated in code so a future hook
+                cannot silently inherit a badge.
         """
         event_base = {
             # D5: hashed, never the raw session id — a hook is never given one.
@@ -2190,24 +1988,21 @@ class AgentLoop:
         tables: Sequence[AnswerTable],
         result_sql_by_call_id: Mapping[str, str],
     ) -> None:
-        """Emit `loop_answer_table_intent_uncovered` when a COMPLETED intent's
-        result is not among the designated tables (08 §B.1).
+        """Emit `loop_answer_table_intent_uncovered` when a COMPLETED intent's result is not
+                among the designated tables.
 
-        DERIVATION IS A CHECK HERE, NEVER A SOURCE, and that distinction is the
-        whole of §B.1. The tables are LISTED by the model because the evidence call
-        is the wrong query: a designated `sql` is deliberately not required to be
-        one the agent ran, *because the executed query usually carries a LIMIT the
-        agent chose for its own reading and paging needs the un-capped shape*.
-        Deriving the tables from the evidence would page that capped query and
-        silently truncate every grid — a new silent failure, introduced to avoid a
-        payload field. (`getTableSchema` evidence has no pageable SQL at all, and a
-        `blocked` intent's evidence is a denial; both would need hand-enumerated
-        exclusions, which is the defect class this release keeps finding.)
+                DERIVATION IS A CHECK HERE, NEVER A SOURCE. The tables are LISTED by the model
+                because the evidence call is the wrong query: a designated `sql` is deliberately
+                not required to be one the agent ran, because the executed query usually carries a
+                LIMIT the agent chose for its own reading and paging needs the un-capped shape.
+                Deriving the tables from the evidence would page that capped query and silently
+                truncate every grid. (`getTableSchema` evidence has no pageable SQL at all, and a
+                `blocked` intent's evidence is a denial.)
 
-        NOT A REFUSAL. A scalar part of a multi-part answer correctly belongs in the
-        prose, so this counts a signal, not an error. Best-effort by construction:
-        an intent whose evidence call ran in an EARLIER window contributes nothing,
-        because `result_sql_by_call_id` is window-local.
+                NOT A REFUSAL. A scalar part of a multi-part answer correctly belongs in the prose,
+                so this counts a signal, not an error. Best-effort by construction: an intent whose
+                evidence call ran in an EARLIER window contributes nothing, because
+                `result_sql_by_call_id` is window-local.
         """
         if state is None:
             return
@@ -2242,11 +2037,9 @@ class AgentLoop:
         # caller with nothing to carry) → a fresh, empty window.
         accumulators: TurnAccumulators | None = None,
     ) -> TurnOutcome:
-        """The turn-window driver. Its `try` opens as the FIRST statement (above the
-        tools/discovery preamble) because T5.6 inlined the `_run_loop` wrapper that
-        used to wrap the whole call: a `tools_provider` failure has always run the
-        straggler-summary cancel in the `finally` below, and must keep doing so.
-        The wrapper's mirror-hole story lives in `turn_accumulators.py` + WORKLOG.
+        """The turn-window driver. Its `try` opens as the FIRST statement, above the
+                tools/discovery preamble, so a `tools_provider` failure still runs the
+                straggler-summary cancel in the `finally` below.
         """
         try:
             # The live MCP authenticates every request, including tools/list, so

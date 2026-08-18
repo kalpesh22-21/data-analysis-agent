@@ -1,28 +1,13 @@
-"""Pure projection of a persisted `SessionDoc` into the `GET /session/history`
-transcript (UI Slice 3, docs/decisions/ui-slice3-history-lineage-contract.md).
+"""Pure projection of a persisted `SessionDoc` into the `GET /session/history` transcript.
 
-`project_history` is the pure, HTTP-free, I/O-free D44 *read-surface* target —
-the sibling of `filter_trail`/`filter_messages` (`context/scope_filter.py`) that
-the history endpoint composes with them. It:
-
-  1. Runs the two D44 filters over this request's `column_scope` BEFORE any
-     serialization (§2, load-bearing): `filter_messages` drops assistant answers
-     whose provenance ⊄ scope (or is `None`); `filter_trail` (with
-     `current_turn_index=None` — a read has no in-progress turn, every entry gets
-     the strict check) drops out-of-scope / undetermined tool calls. User
-     messages always survive (they carry no warehouse-derived data), so a turn is
-     never wholly dropped as long as it recorded a question (§2.1).
-  2. Joins the survivors INDEPENDENTLY by `turn_index` (§2.1, YELLOW-2): a turn's
-     answer can be withheld while one of its tool calls survives, or vice versa —
-     the two filters are never coupled.
-  3. Projects each turn/tool-call using EXACTLY the Slice-1 encodings — provenance
-     as `sorted("db.table.column")` (identical to `_outcome_to_dict`,
-     `runtime/app.py`) and result tables via `ResultPreview.to_doc()`.
-
-Inline-only (§0, YELLOW-1): a `runBlueprint` node's SQL lives behind a KV pointer
-(`TrailEntry.result_full_ref`), not inline, so its `sql` is projected as `null`
-here (its provenance + result table + `blueprint_id` in `args` still surface). No
-KV de-reference happens on the read path.
+Load-bearing order: the two D44 filters run over this request's `column_scope` BEFORE
+any serialization — `filter_messages` drops answers whose provenance is out of scope or
+undetermined, and `filter_trail` (with `current_turn_index=None`, so every entry gets the
+strict check) drops out-of-scope tool calls. Survivors are joined INDEPENDENTLY by
+`turn_index`: an answer may be withheld while one of its tool calls survives. User
+messages always survive, so a turn is never wholly dropped. Inline-only — a
+`runBlueprint` node's SQL lives behind a KV pointer, so its `sql` projects as `null` and
+no KV de-reference happens on the read path.
 """
 
 from __future__ import annotations
@@ -54,21 +39,20 @@ def _noop_observer(event: str, payload: dict[str, Any]) -> None:  # pragma: no c
 def _project_provenance(
     provenance: frozenset[tuple[str, str]] | None,
 ) -> list[str] | None:
-    """Project a `frozenset[(db.table, column)]` provenance set to a sorted list
-    of `"db.table.column"` strings — IDENTICAL to `_outcome_to_dict`
-    (`runtime/app.py`). `None` (undetermined) → `null`; `frozenset()`
-    (determined-empty) → `[]`."""
+    """Project a provenance set to a sorted list of `"db.table.column"` strings, identical
+        to `_outcome_to_dict` (`runtime/app.py`). `None` (undetermined) -> `null`;
+        `frozenset()` (determined-empty) -> `[]`.
+    """
     if provenance is None:
         return None
     return sorted(f"{db_table}.{column}" for db_table, column in provenance)
 
 
 def _project_tool_call(entry: TrailEntry) -> dict[str, Any]:
-    """Project one surviving `TrailEntry` to a `tool_calls[]` element (§1.1).
+    """Project one surviving `TrailEntry` to a `tool_calls[]` element.
 
-    `sql` is `args["sql"]` for `runQuery`; `null` for `runBlueprint` (§0
-    YELLOW-1 — its node SQL is behind a KV pointer, not inline) and for any tool
-    that carries no `sql` argument.
+        `sql` is `args["sql"]` for `runQuery`; `null` for `runBlueprint` (its node SQL is
+        behind a KV pointer, not inline) and for any tool that carries no `sql` argument.
     """
     sql = None if entry.tool_name == "runBlueprint" else entry.args.get("sql")
     return {
@@ -88,12 +72,12 @@ def project_history(
     blueprint_runs: Mapping[str, BlueprintRun] | None = None,
     observer: Callable[[str, dict[str, Any]], None] = _noop_observer,
 ) -> dict[str, Any]:
-    """Project the persisted `messages`/`tool_trail` into the §1.1 transcript
-    shape under *column_scope*, applying the two D44 filters first.
+    """Project the persisted `messages`/`tool_trail` into the transcript shape under
+        *column_scope*, applying the two D44 filters first.
 
-    Returns `{"turns": [...], "pending_question": ...}` (ordered by `turn_index`
-    ascending). The caller (`GET /session/history`) wraps this with `session_id`.
-    Pure: no I/O, no store read, no KV de-reference.
+        Returns `{"turns": [...], "pending_question": ...}` ordered by `turn_index`
+        ascending; the caller wraps it with `session_id`. Pure: no I/O, no store read, no
+        KV de-reference.
     """
     surviving_messages = filter_messages(messages, column_scope)
     # A read has NO in-progress turn — pass `current_turn_index=None` so every

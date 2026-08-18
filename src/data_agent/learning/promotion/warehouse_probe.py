@@ -1,25 +1,13 @@
 """promotion/warehouse_probe.py — the REAL S9 golden-replay probe (D98/D56/D57).
 
-Replaces the deferred stub: runs the golden-replay grain probe through the adopted
-MCP `runQuery` choke point, under a JWT minted PER BLUEPRINT and scoped to EXACTLY
-that blueprint's declared `uses` footprint (S9-design §1). Running through the MCP
-(not a direct ClickHouse connection) REUSES the D57 column-scope teeth verbatim and
-gives oracle parity: an offline replay that passes travels the identical
-`runQuery` → `COUNT(*),COUNT(DISTINCT)` path a live `runBlueprint` would (§1.1).
-
-Two load-bearing invariants:
-  * **Never returns a value (D98/D17).** The probe returns ONLY the D56 triple
-    `(row_count, distinct_grain_count, columns)` — counts + column NAMES. It reads the
-    replay's column header and DISCARDS every row; the grain probe returns aggregates.
-    No row value ever enters `ProbeResult` (the `S9-probe-never-returns-value` gate).
-  * **Fail-closed by RAISING (§1.4).** Any mint / MCP-denial / MCP-down / malformed
-    result RAISES — `golden_replay` already catches every `probe.run` exception →
-    `probe_unavailable` HOLD, so both the cron scan and the human approve path degrade
-    cleanly (never a value leak, never a crash into the cron `_guard`).
-
-The grain-probe SQL is built by the SHARED `runtime/blueprint/grain_probe.py` helper —
-the SAME builder the live executor uses — so this offline oracle can never drift from
-the live one (`S9-probe-oracle-parity`).
+Runs the grain probe through the adopted MCP `runQuery` choke point under a JWT scoped to
+EXACTLY the blueprint's declared `uses` footprint (§1), which REUSES the D57 column-scope
+teeth verbatim and gives oracle parity: an offline replay that passes travelled the
+identical path a live `runBlueprint` would. NEVER RETURNS A VALUE (D98/D17) — only the D56
+triple `(row_count, distinct_grain_count, columns)`; it reads the column header and DISCARDS
+every row. FAIL-CLOSED BY RAISING (§1.4): any mint, denial, outage or malformed result
+raises, and `golden_replay` catches it into a `probe_unavailable` HOLD. The probe SQL comes
+from the SHARED `grain_probe` builder the live executor uses, so the two cannot drift.
 """
 
 from __future__ import annotations
@@ -52,10 +40,12 @@ class WarehouseProbeError(Exception):
 
 
 class MCPWarehouseProbe:
-    """The real `WarehouseProbe` (S9-design §1). Every collaborator is injected —
-    an `MCPClient` (the runQuery transport), a `TokenMinter` (the offline scoped
-    JWT), and an optional synthetic-session-id factory — so Layer-1 fakes and the
-    live stack travel the identical path (no real network in Layer-1)."""
+    """The real `WarehouseProbe` (S9-design §1).
+
+    Every collaborator is injected — an `MCPClient` (the runQuery transport), a `TokenMinter`
+    (the offline scoped JWT), and an optional synthetic-session-id factory — so Layer-1 fakes
+    and the live stack travel the identical path.
+    """
 
     def __init__(
         self,
@@ -77,9 +67,10 @@ class MCPWarehouseProbe:
     ) -> ProbeResult:
         """Run one golden replay and return the D56 STRUCTURE triple (never a value).
 
-        `column_scope` is the blueprint's declared `uses` footprint — the token is
-        minted to EXACTLY that scope (§1.3), so the replay reads only within the
-        declared footprint and the MCP's D57 teeth reject anything outside it."""
+        `column_scope` is the blueprint's declared `uses` footprint: the token is minted to EXACTLY
+        that scope (§1.3), so the replay reads only within the declared footprint and the MCP's D57
+        teeth reject anything outside it.
+        """
         # Mint a JWT scoped to EXACTLY the blueprint's declared footprint (uses),
         # BOUND to a fresh synthetic session id the probe also presents as
         # X-Session-Id (the live MCP's require_sid_binding, §1.3 deviation). Any mint

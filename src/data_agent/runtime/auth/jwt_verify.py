@@ -1,24 +1,11 @@
-"""auth/jwt_verify.py — local JWKS verification (design §11 sub-decision B).
+"""Local JWKS verification — defense-in-depth only.
 
-Defense-in-depth only: this module's verification result never gates a live
-MCP tool call — `clickhouse-api`'s own `app/auth_jwt.py::validate_token`
-remains the sole *live* enforcement boundary (D57/D80). This module exists
-solely so the runtime's own `context/scope_filter.py` D44 replay-filter can
-trust the `column_scope` it uses to decide what history to re-show the
-*same* already-authenticated user; a forged/stale JWT here is low-severity
-(self-serves the same session, not cross-tenant) — see design §11 for the
-full rationale.
-
-Mirrors `clickhouse-api`'s own pattern (PyJWT + `PyJWKClient`, RS256, JWKS)
-so the two services can never disagree on *how* a JWT is validated — same
-library, same algorithm pinning, same issuer/audience/expiry checks. One
-deliberate divergence (LOCKED per the orchestrator brief):
-`clickhouse-api`'s live enforcement REJECTS a token with a missing/empty
-`column_scope` claim (fail-closed — it gates live query execution); this
-module treats a missing/empty/unparseable claim as `frozenset()`
-(allow-all), matching `scope_filter.py`'s own D80(b) semantics exactly —
-appropriate here because this only shapes replayed history for the same
-user, never a live query.
+This result NEVER gates a live MCP tool call; `clickhouse-api`'s own validation is the
+sole live enforcement boundary (D57/D80). It exists so `context/scope_filter.py`'s D44
+replay filter can trust the `column_scope` it uses to decide what history to re-show the
+same already-authenticated user. Deliberate divergence from the MCP: a missing, empty or
+unparseable `column_scope` claim is `frozenset()` (allow-all) here rather than a
+rejection, matching `scope_filter.py`'s own D80(b) semantics.
 """
 
 from __future__ import annotations
@@ -60,9 +47,8 @@ def _jwk_client(jwks_url: str) -> PyJWKClient:
 def _extract_column_scope(claims: dict[str, Any]) -> frozenset[str]:
     """Decode the `column_scope` claim -> `frozenset[str]`.
 
-    Missing / unparseable / wrong-shaped -> `frozenset()` (allow-all), per
-    the module docstring's LOCKED divergence from clickhouse-api's stricter
-    live-enforcement behavior.
+        Missing / unparseable / wrong-shaped -> `frozenset()` (allow-all), per the module
+        docstring's deliberate divergence from the MCP's stricter live enforcement.
     """
     raw_scope = claims.get("column_scope")
     if raw_scope is None:
@@ -100,13 +86,10 @@ def verify_jwt(
 ) -> frozenset[str]:
     """Verify *token* against *jwks_url*/*issuer*/*audience* and return its `column_scope`.
 
-    *signing_key_resolver*, if given, replaces the real `PyJWKClient` HTTP
-    fetch — the Layer-1 test seam (design §8: "test JWKS fixture, self-signed
-    test key pair"). `app.py` never passes it (real `PyJWKClient` path).
-
-    Raises:
-        JWTVerificationError: on an empty token, an unreachable/unmatched
-            JWKS key, or any signature/issuer/audience/expiry failure.
+        *signing_key_resolver*, if given, replaces the real `PyJWKClient` HTTP fetch (the
+        Layer-1 test seam; `app.py` never passes it). Raises `JWTVerificationError` on an
+        empty token, an unreachable or unmatched JWKS key, or any
+        signature/issuer/audience/expiry failure.
     """
     if not token or not token.strip():
         raise JWTVerificationError("Empty bearer token.", code="MISSING_AUTH")

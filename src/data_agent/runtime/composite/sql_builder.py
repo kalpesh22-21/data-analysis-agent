@@ -1,21 +1,17 @@
-"""sql_builder.py — validated target resolution + injection-safe SQL (design §2). Pure.
+"""sql_builder.py — validated target resolution + injection-safe SQL. Pure.
 
-`table`/`column`/`period.column` are model-supplied and are ALLOWLISTED against
-the runtime catalog `{database.table: {column: type}}` before any SQL is built
-(design §2.1) — an unknown/ambiguous target fails closed with
-`TargetValidationError` and NEVER reaches the MCP. `concept` is never a SQL
-input at all (D10) — it lives entirely in the ranking path.
+`table`/`column`/`period.column` are model-supplied and are ALLOWLISTED against the runtime
+catalog `{database.table: {column: type}}` before any SQL is built; an unknown or ambiguous
+target fails closed with `TargetValidationError` and NEVER reaches the MCP. `concept` is
+never a SQL input at all (D10).
 
-The SQL is assembled with **sqlglot AST nodes** (identifiers + literal nodes),
-never Python string concatenation of model input (design §2.2). Even though the
-identifiers are already catalog-allowlisted, this stacks a second independent
-guarantee, and `period` start/end become properly-escaped sqlglot string
-literals (design §2.4) rather than interpolated text.
+The SQL is assembled with sqlglot AST nodes, never Python string concatenation of model
+input — a second independent guarantee on top of the allowlist, and what makes `period`
+bounds properly-escaped string literals rather than interpolated text.
 
-Description-column discovery (design §2.3): the catalog-authored `description_col`
-linkage is tried first, then a convention-based candidate list, then a value-only
-fallback when no sibling description column exists (OQ-2). Every candidate is
-catalog-validated and scope-pre-checked before use.
+Description-column discovery: the catalog-authored `description_col` linkage first, then a
+convention-based candidate list, then a value-only fallback when no sibling description
+column exists. Every candidate is catalog-validated and scope-pre-checked before use.
 """
 
 from __future__ import annotations
@@ -45,9 +41,8 @@ _PASCAL_DESCRIPTION_SUFFIXES = ("Description", "Name")
 class TargetValidationError(Exception):
     """A model-supplied table/column/period target failed catalog validation.
 
-    `message` is model/user-facing and names ONLY the specific target the model
-    already supplied — never an enumeration of the catalog (no scope leak,
-    design §2.1).
+        `message` is model/user-facing and names ONLY the specific target the model already
+        supplied — never an enumeration of the catalog, which would leak scope.
     """
 
     def __init__(self, message: str) -> None:
@@ -57,12 +52,11 @@ class TargetValidationError(Exception):
 
 @dataclass(frozen=True)
 class Period:
-    """A concrete, structured period predicate (design §2.4).
+    """A concrete, structured period predicate.
 
-    `column` is validated against the catalog exactly like the code column;
-    `start`/`end` are optional inclusive bounds rendered as sqlglot string
-    literals. Deictic/relative period resolution ("latest", "Q2") is out of
-    scope (OQ-3) — this is an already-concrete window only.
+        `column` is validated against the catalog exactly like the code column; `start`/`end`
+        are optional inclusive bounds rendered as sqlglot string literals. Deictic or relative
+        period resolution ("latest", "Q2") is out of scope — this is an already-concrete window.
     """
 
     column: str
@@ -81,11 +75,10 @@ class ResolvedTarget:
 
 
 def _candidate_description_columns(column: str) -> list[str]:
-    """Convention-based sibling description/label column candidates (design §2.3).
+    """Convention-based sibling description/label column candidates.
 
-    Pure. Generates a snake_case family (production reality) followed by a
-    PascalCase family (kept for pre-existing catalogs/tests), de-duplicated
-    preserving first-seen order. A candidate can never equal *column* itself.
+        Pure. A snake_case family (production reality) followed by a PascalCase family,
+        de-duplicated preserving first-seen order. A candidate can never equal *column* itself.
     """
     candidates: list[str] = []
 
@@ -141,22 +134,19 @@ def resolve_target(
     period: Period | None,
     column_scope: frozenset[str] = frozenset(),
 ) -> ResolvedTarget:
-    """Validate + resolve the model's target against the catalog allowlist (design §2.1).
+    """Validate + resolve the model's target against the catalog allowlist.
 
-    *column_scope* is used ONLY as an availability pre-check for the discovered
-    description column (M1): if the sibling description column is out of the
-    caller's scope, it is skipped and the query falls back to value-only —
-    otherwise every call would draw a non-retryable `COLUMN_SCOPE_VIOLATION`
-    from the MCP and the tool would be permanently unusable for that column.
-    This is a pre-check, NOT enforcement — the MCP still enforces D57 on the
-    inner query. The value column and period column are deliberately NOT
-    scope-pre-checked: if they are out of scope the MCP denies (design §7),
-    which is the correct fail-closed behaviour for a directly-requested target.
-    Empty scope == allow-all (matches `context/scope_filter` D80b semantics).
+        *column_scope* is used ONLY as an availability pre-check for the discovered DESCRIPTION
+        column: if it is out of the caller's scope it is skipped and the query falls back to
+        value-only, because otherwise every call would draw a non-retryable
+        `COLUMN_SCOPE_VIOLATION` from the MCP and the tool would be permanently unusable for
+        that column. This is a pre-check, NOT enforcement — the MCP still enforces D57 on the
+        inner query. The value column and period column are deliberately NOT pre-checked: if
+        they are out of scope the MCP denies, which is the correct fail-closed behaviour for a
+        directly-requested target. Empty scope == allow-all.
 
-    Raises:
-        TargetValidationError: unknown/ambiguous table, unknown column, or an
-            unknown period column — all fail-closed, before any SQL is built.
+        Raises `TargetValidationError` on an unknown or ambiguous table, an unknown column, or
+        an unknown period column — all before any SQL is built.
     """
     db_table = _resolve_db_table(catalog, table)
     columns = catalog.schema[db_table]

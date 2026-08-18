@@ -1,23 +1,10 @@
-"""Model-visible tool schemas — 6 MCP tools (live-fetched) + `askUser` (design §3.2).
+"""Model-visible tool schemas — the MCP tools (live-fetched) + `askUser`.
 
-Rather than hand-author 6 JSON schemas that can drift from the MCP's own (a
-real risk — the MCP is adopted/external, D75), this module fetches
-`MCPClient.list_tools()` and translates each `MCPToolSpec.input_schema`
-(JSON Schema, produced by FastMCP) into an OpenAI `type: "function"` tool
-declaration, passed through **verbatim** — the MCP is the single source of
-truth for parameter shape.
-
-`askUser` is the one locally-authored tool (no MCP equivalent — a runtime
-control primitive, D6/D45). Neither schema declares `session_id`, `jwt`, or
-`scope` as a parameter (D5) — those never appear in any model-visible JSON;
-`test_no_credential_params_leak` in
-`tests/runtime/mcp/test_tool_schema.py` guards this for every schema this
-module can produce, including future MCP tool additions.
-
-Pass-B seam: this module has no dependency on `model/openai_client.py` — it
-only produces plain `dict`s in the OpenAI function-tool JSON shape. Pass B's
-`ModelClient` implementations consume the output of `ToolSchemaCache.get_schemas()`
-directly; no interface here needs to change when that lands.
+The MCP is the single source of truth for parameter shape: `list_tools()` is fetched
+and each `input_schema` translated VERBATIM into an OpenAI `type: "function"`
+declaration, rather than hand-authored copies that can drift from it (D75). `askUser`
+is the one locally-authored tool (D6/D45). No schema this module can produce may
+declare `session_id`, `jwt` or `scope` as a parameter (D5).
 """
 
 from __future__ import annotations
@@ -584,13 +571,12 @@ _LOCAL_TOOL_NAMES: frozenset[str] = frozenset(s["name"] for s in _LOCAL_TOOL_SCH
 
 
 class ToolNameCollisionError(RuntimeError):
-    """A locally-authored tool name collides with an MCP-advertised one (§6.1).
+    """A locally-authored tool name collides with an MCP-advertised one.
 
-    Raised at schema-fetch (startup), fail-closed and LOUD: were a collision
-    allowed, the model would see two schemas with the same name and the loop's
-    `runtime_tools` interception would silently SHADOW the MCP tool (or vice
-    versa) depending on dispatch order. A config/deploy error surfaced here,
-    never a silent runtime ambiguity."""
+        Raised at schema fetch (startup), fail-closed and LOUD: two schemas with the same
+        name would make the loop's `runtime_tools` interception silently SHADOW the MCP
+        tool, or vice versa, depending on dispatch order.
+    """
 
 
 def translate_tool_spec(tool: MCPToolSpec) -> dict[str, Any]:
@@ -606,17 +592,11 @@ def translate_tool_spec(tool: MCPToolSpec) -> dict[str, Any]:
 def augment_with_serves_intent(schema: dict[str, Any]) -> dict[str, Any]:
     """Add the optional `serves_intent` property to a TRANSLATED MCP schema.
 
-    A POST-TRANSLATION step, deliberately separate from `translate_tool_spec`: the
-    MCP stays the single source of truth for parameter SHAPE (this module's whole
-    premise), and this is the one runtime-owned addition on top of it — visible as
-    such rather than blended into the translation.
-
-    NON-MUTATING. `MCPToolSpec.input_schema` is the client's own object and the
-    translated schemas are cached by `ToolSchemaCache`, so this rebuilds
-    `parameters`/`properties` rather than writing into either. A schema whose
-    `parameters`/`properties` are not dicts (nothing the live MCP produces, but the
-    shape is not ours to assume) is returned UNCHANGED — the tag is an
-    optimisation for the model, never a precondition for calling the tool.
+        NON-MUTATING: `MCPToolSpec.input_schema` is the client's own object and the
+        translated schemas are cached by `ToolSchemaCache`, so this rebuilds
+        `parameters`/`properties` rather than writing into either. A schema whose
+        `parameters`/`properties` are not dicts is returned UNCHANGED — the tag is an
+        optimisation for the model, never a precondition for calling the tool.
     """
     if schema.get("name") not in _INTENT_TAGGABLE_MCP_TOOLS:
         return schema
@@ -640,13 +620,9 @@ async def fetch_function_schemas(
 ) -> list[dict[str, Any]]:
     """Fetch `list_tools()` from *mcp_client*, translate, and append `askUser`.
 
-    *jwt*/*session_id* are required because the live MCP authenticates every
-    request, including `tools/list` — but the tool catalogue itself is
-    scope-INDEPENDENT (D5-safe: no credential ever appears in the returned
-    schemas, only in the outbound transport headers `list_tools` attaches).
-
-    No caching here — see `ToolSchemaCache` for the cached variant used at
-    runtime.
+        *jwt*/*session_id* are required because the live MCP authenticates every request,
+        including `tools/list`; no credential appears in the returned schemas (D5). No
+        caching here — see `ToolSchemaCache` for the cached variant used at runtime.
     """
     tools = await mcp_client.list_tools(jwt=jwt, session_id=session_id)
     # §6.1 name-collision guard: the locally-authored tool names MUST be disjoint
@@ -677,22 +653,12 @@ async def fetch_function_schemas(
 class ToolSchemaCache:
     """Caches the translated tool-schema list, refreshed on explicit reload.
 
-    Startup dependency (design §11 sub-decision C): the first `get_schemas()`
-    call requires the MCP to be reachable. Pass B's composition root decides
-    the local-dev fallback behavior (e.g. cache-on-disk) — out of scope here.
-
-    Lazy-per-turn-with-cache (2026-07-01 fix): `get_schemas` takes the
-    CURRENT turn's `jwt`/`session_id` because the live MCP requires them on
-    every request, including `tools/list` — there is no anonymous/startup-time
-    introspection call available. But the tool catalogue itself never varies
-    by scope (every principal sees the same 6 tools; only per-call *results*
-    are scope-filtered by the MCP), so the cache is still keyed on nothing but
-    "has a fetch ever succeeded": the FIRST successful `get_schemas()` call —
-    made with whichever turn's credentials happens to trigger it — populates
-    `self._cache` for every subsequent call, turn, session, and column scope,
-    until an explicit `force_reload=True`. Credentials are used ONLY to
-    authenticate that one fetch; they are never retained or reflected in the
-    cached schemas (D5).
+        `get_schemas` takes the CURRENT turn's `jwt`/`session_id` because the live MCP
+        authenticates `tools/list` too, but the catalogue never varies by scope — so the
+        FIRST successful fetch populates the cache for every later call, turn, session and
+        column scope until `force_reload=True`. Those credentials authenticate that one
+        fetch and are never retained or reflected in the cached schemas (D5). The first
+        call requires the MCP to be reachable.
     """
 
     def __init__(self, mcp_client: MCPClient) -> None:

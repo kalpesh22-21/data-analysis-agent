@@ -1,38 +1,17 @@
-"""The corrective turn's prompt text — what the extractor says to a model whose
-candidate was well-analysed and badly packaged.
+"""The corrective turn's prompt text, for a candidate well-analysed and badly packaged.
 
-**Why this exists.** Across ten live analyst sessions the extractor mined zero
-candidates, and in every case the model's ANALYSIS was right while its PACKAGING was
-wrong: `gpt-4.1` flattened the envelope, `gpt-5.5` wrote `result_signature.grain` as
-prose where an object belongs. Both were terminal — a shape decline was returned to the
-consumer and the model was never told. This module writes the telling.
-
-**What it must not do.** It must not argue with the model's judgement. Every message
-below is scoped to a NAMED field of a NAMED candidate and to what that field must
-contain; the content is never disputed, and the closing line explicitly says to omit a
+It must NOT argue with the model's judgement: every message is scoped to a NAMED field of a
+NAMED candidate and to what that field must contain, and the closing line says to OMIT the
 candidate rather than bend the analysis to fit. A decline for a substantive reason never
-reaches here at all (`validation.py::_malformed`).
+reaches here.
 
-**Three families, and the header has to be true of all of them.** Most corrections are
-about SHAPE — a reader failed, the field is the wrong JSON type. Two are not, and both
-are candidates that were read perfectly well: a `rule`-role plan whose `rule_id` the
-catalog does not declare but can name a counterpart for (`validation.py::_rule_hint`),
-and a plan that left a literal predicate of the accepted SQL with no entry at all
-(`validation.py::_predicate_hint`). Telling either of those that it "could not be READ"
-would be false, and a model told the wrong thing about its own output is being invited to
-change something nobody asked about. The opening and closing lines are therefore chosen
-from what is actually in the batch, and the two invariants EVERY variant keeps are the
-ones that stop a correction becoming coercion: change ONLY what the lines name, and OMIT
-the candidate rather than invent something to satisfy the correction.
-
-**Entity-freedom.** Every sentence is assembled from `Decline.detail`, which for a
-shape decline is a `shape.py` message: a path, a required shape and the JSON type that
-arrived, never a value. The two hinting families quote more than that — an identifier
-the model itself authored a turn earlier, and a literal of the accepted SQL this same
-prompt already carries in full — and `validation.py::_correctable` states the rule they
-satisfy and where it stops. The candidate TYPE is echoed only when it is one of the four
-known ones, because a model that flattened the envelope can leave arbitrary session text
-in `type`.
+THREE FAMILIES, and the header has to be true of all of them: most corrections are about
+SHAPE, but the two hinting families (`validation.py::_rule_hint`, `_predicate_hint`) are
+candidates that were read perfectly well, so telling them they "could not be READ" would be
+false. ENTITY-FREEDOM: every sentence is assembled from `Decline.detail`, and
+`validation.py::_correctable` owns the rule the hinting families satisfy. The candidate TYPE
+is echoed only when it is one of the four known ones, because a model that flattened the
+envelope can leave arbitrary session text in `type`.
 """
 
 from __future__ import annotations
@@ -117,9 +96,9 @@ def build_correction_message(
 ) -> str:
     """The user-visible correction for one turn's correctable declines.
 
-    *declines* pairs each decline with the ZERO-BASED index of the candidate in the
-    `candidates` array the model just sent, so the model can find the one being talked
-    about without the extractor having to quote its content back at it.
+    *declines* pairs each decline with the ZERO-BASED index of the candidate in the `candidates`
+    array the model just sent, so the model can find the one being talked about without the
+    extractor quoting its content back at it.
     """
     families = {
         _FAMILIES.get(decline.reason, _SHAPE_FAMILY) for _index, decline in declines
@@ -158,9 +137,10 @@ def build_correction_message(
 def _type_phrase(decline: Decline) -> str:
     """` (type "blueprint")`, or nothing when the type is not one of the four.
 
-    Derived from the closed set rather than from truthiness: the decline whose type is
-    unusable is exactly the flattened-envelope one, where `type` is whatever the model
-    happened to leave at the top level."""
+    Derived from the closed set rather than from truthiness: the decline whose type is unusable
+    is exactly the flattened-envelope one, where `type` is whatever the model left at the top
+    level.
+    """
     if decline.type in CANDIDATE_TYPES:
         return f' (type "{decline.type}")'
     return ""

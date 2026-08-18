@@ -1,15 +1,11 @@
 """Correction / confirmation lexicons for `accepted_signal` inference (D99, §2.1).
 
-Matching is WORD-BOUNDARY (regex `\\b`), not bare substring (HIGH-2): "yesterday"
-must NOT hit "yes", and "I don't think that looks right" must NOT score
-`explicit_confirm`. Confirmations additionally pass a NEGATION guard — a
-confirmation phrase preceded by a negator within the same clause is not a
-confirmation.
-
-The lexicons encode the D99 §2.3 asymmetry: over-matching a CORRECTION is SAFE
-(costs one un-learned blueprint, recoverable via D48 recurrence), while
-over-matching a CONFIRMATION manufactures a candidate off a challenged answer. So
-`CORRECTION_PHRASES` is broad + aggressive (HIGH-3) and confirmations are guarded.
+Matching is WORD-BOUNDARY, not bare substring: "yesterday" must NOT hit "yes", and
+confirmations additionally pass a NEGATION guard, so a confirmation phrase preceded by a
+negator in the same clause is not a confirmation. The lexicons encode the D99 §2.3 asymmetry:
+over-matching a CORRECTION is SAFE (it costs one un-learned blueprint, recoverable via
+recurrence), while over-matching a CONFIRMATION manufactures a candidate off a challenged
+answer. So corrections are broad and aggressive, and confirmations are guarded.
 """
 
 from __future__ import annotations
@@ -116,9 +112,11 @@ def _phrase_pattern(phrase: str) -> re.Pattern[str]:
 
 
 def matches_any(text: str, phrases: frozenset[str]) -> bool:
-    """True iff the normalized *text* contains any phrase in *phrases* as a
-    WORD-BOUNDARY match. Used for CORRECTION matching (no negation guard — a
-    negated correction is still safely treated as a correction, D99 §2.3)."""
+    """True iff the normalized *text* contains any phrase as a WORD-BOUNDARY match.
+
+    Used for CORRECTION matching, with no negation guard: a negated correction is still safely
+    treated as a correction (§2.3).
+    """
     normalized = normalize(text)
     return any(_phrase_pattern(phrase).search(normalized) for phrase in phrases)
 
@@ -136,9 +134,11 @@ def _negated_before(normalized: str, index: int) -> bool:
 
 
 def matches_confirmation(text: str) -> bool:
-    """True iff *text* contains an un-negated confirmation phrase (word-boundary +
-    negation guard, HIGH-2). A confirmation preceded by a negator in the same
-    clause ("I don't think that looks right") does NOT count."""
+    """True iff *text* contains an UN-NEGATED confirmation phrase.
+
+    Word-boundary plus the negation guard, so a confirmation preceded by a negator in the same
+    clause does not count.
+    """
     normalized = normalize(text)
     for phrase in CONFIRMATION_PHRASES:
         for match in _phrase_pattern(phrase).finditer(normalized):

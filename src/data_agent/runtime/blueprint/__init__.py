@@ -1,27 +1,22 @@
-"""runtime/blueprint — the `runBlueprint` fast-path package (runblueprint-design).
+"""runtime/blueprint — the `runBlueprint` fast-path package.
 
-Slice A ships the STORAGE + PURE-FUNCTION foundations only — no execution engine,
-no loop changes beyond the §6 owed items:
-
-  - `models`   — the typed parse layer (`Blueprint`, `SlotSpec`, `Node`,
-                 `WhenClause`, `ResultGrain`) over the additive full-DAG JSON
-                 stored on the `:Blueprint` node (§1) / carried by `BlueprintDetail`.
-  - `template` — F1 sqlglot-AST typed-literal slot binding (D10-safe; the
-                 `resolveValues` `sql_builder` discipline, realized for authored
-                 `{slot}` templates).
-  - `slots`    — the D49 deterministic per-type slot resolvers (pure code, NO LLM;
-                 multi-match / no-match / fuzzy → an `AskUser` signal, never a guess).
-  - `when`     — the §2.6 declarative `when`-clause evaluator + the entity-agnostic
-                 (leakage) validator (D59) used at load time.
-  - `verify`   — the D56 deterministic grain-integrity + signature assertion as a
-                 pure function (the "no silent path" teeth).
-
-Slice B adds the execution engine + the tool:
-  - `executor` — `BlueprintExecutor`: the single-node DAG walk (fetch → resolve +
-                 bind slots → dispatch through the runQuery choke point → D56
-                 verify gate), returning a typed `ExecOutcome` union.
-  - `tool`     — `RunBlueprintTool`: the model-facing `RuntimeTool` wrapper
-                 (span + redaction + B4 guard + the §2.5 pausing-tool seam).
+  - `models`   — the typed parse layer (`Blueprint`, `SlotSpec`, `Node`, `WhenClause`,
+                 `ResultGrain`) over the additive full-DAG JSON stored on the `:Blueprint`
+                 node and carried by `BlueprintDetail`.
+  - `template` — sqlglot-AST typed-literal slot binding (D10-safe), the `resolveValues`
+                 `sql_builder` discipline realized for authored `{slot}` templates.
+  - `slots`    — the D49 deterministic per-type slot resolvers: pure code, NO LLM, where a
+                 multi-match, no-match or fuzzy result raises an `AskUser` signal rather than
+                 guessing.
+  - `when`     — the declarative `when`-clause evaluator plus the entity-agnostic leakage
+                 validator (D59) used at load time.
+  - `verify`   — the D56 deterministic grain-integrity + signature assertion, as a pure
+                 function.
+  - `executor` — `BlueprintExecutor`: the DAG walk (fetch, resolve + bind slots, dispatch
+                 through the runQuery choke point, D56 verify gate), returning a typed
+                 `ExecOutcome` union.
+  - `tool`     — `RunBlueprintTool`: the model-facing `RuntimeTool` wrapper (span, redaction,
+                 crash guard, and the pausing-tool seam).
 """
 
 from __future__ import annotations

@@ -1,30 +1,13 @@
-"""Shared rig for the standalone live demos under `scripts/`.
+"""Shared rig for the standalone live demos under `scripts/`: the live-env block, the
+five Couchbase stores, the Redis stream, the teardown, the token mint, the model
+preflight. It lives here so a fix cannot land in one demo's copy and silently leave the
+other running the old wiring; what stays in a demo is the story that demo is about.
 
-`demo_learning_e2e_openai.py` and `demo_flywheel_inbox_e2e.py` are executable
-documentation: each walks a real path through the REAL stack (live OpenAI, l2-mcp,
-Couchbase, Neo4j, Redis, ClickHouse) and narrates it. They are not tests, and their
-value is that a reader can follow the STORY. What they should not also carry is ~400
-identical lines of rig — the live-env block, the five Couchbase stores, the Redis
-stream, the teardown, the token mint, the model preflight — copied between them, where
-a fix to one copy silently leaves the other running the old wiring.
-
-So the RIG lives here and the demos keep their narrative. Everything in this module is
-infrastructure a reader can take on trust; everything left in a demo is the thing that
-demo is about.
-
-`demo_runtime_turn_traced.py` and `run_ui_runtime_real.py` share the smaller half:
-reading the OpenAI key out of `.env`, the model preflight, the Phoenix span-attribute
-helpers, the token mint.
-
-Import pattern (mirrors `scripts/_catalog.py` and `seed_neo4j_corpus.py`): this is a
-SIBLING module under `scripts/`, so an importing script puts its own directory on
-`sys.path` first —
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _e2e_harness import ...
-
-which resolves both when run as `python scripts/x.py` and when the file is loaded by
-path (importlib `spec_from_file_location`, e.g. from a test).
+Import pattern (mirrors `scripts/_catalog.py`): this is a SIBLING module under
+`scripts/`, so an importing script puts its own directory on `sys.path` first
+(`sys.path.insert(0, str(Path(__file__).resolve().parent))`), which resolves both when
+run as `python scripts/x.py` and when the file is loaded by path (importlib
+`spec_from_file_location`, e.g. from a test).
 
 NO IMPORT-TIME SIDE EFFECTS, deliberately: the demos set their env block BEFORE
 constructing any settings object, so nothing here may build a settings object, open a
@@ -88,9 +71,6 @@ def apply_live_env(**extra: str) -> None:
     """Set the live-stack env block (plus any demo-specific *extra*) in place.
 
     Call this at module level, before the demo constructs any settings object.
-    (The Phoenix project name is set IN CODE by `configure_learning_tracing` /
-    `configure_tracing(project_name=...)`; no OTEL_RESOURCE_ATTRIBUTES hack is
-    involved.)
     """
     os.environ.update(_LIVE_ENV)
     os.environ.update(extra)

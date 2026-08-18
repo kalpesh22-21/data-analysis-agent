@@ -1,10 +1,8 @@
 """promotion — the S9 cron-scanned promotion scheduler + golden replay (D29/§7.2).
 
-A STANDALONE background process (NOT a `CandidateStage`) that reads
-`learning_candidates` by `status`, runs golden replay (reusing the D56
-`verify_result` gate + the runtime template binder) + the D43 drift probes, and
-advances `status` + stamps `drift` (Contract E). See
-`docs/decisions/learning-loop-s9-promotion-design.md`.
+A STANDALONE background process, NOT a `CandidateStage`: it reads `learning_candidates` by
+`status`, runs golden replay (reusing the D56 `verify_result` gate and the runtime template
+binder) plus the D43 drift probes, and advances `status` + stamps `drift` (Contract E).
 """
 
 from .dependency_resolver import CandidateStoreDependencyResolver

@@ -1,71 +1,26 @@
 """Inbox ranking — `novelty × groundedness² × session-quality` (plan §4).
 
-The squared term is not a typo and not an implementation detail: the plan words the axes
-as "novelty × groundedness × session-quality", and implementing that literally is the one
-way to get this wrong. See "Groundedness enters TWICE" below.
+The squared term is not a typo. GROUNDEDNESS is the share of the `parameterization` resolving
+to a catalog rule or a known column, as against free-floating `inline` literals — all-hardcoded
+filters are a one-off transcription, slots and rules are a reusable template. SESSION-QUALITY
+is how the producing session went, from the stamped `SessionSignals`. NOVELTY is distance from
+the closest LANDED artifact, from the dedup stage's `NoveltyStamp`.
 
-**Why a ranking exists at all.** Until this slice the promotion gate required three
-sessions to converge on a byte-identical normalized AST, which has never happened, so
-nothing reached the inbox by the auto path. With that gate at 1 the queue becomes the
-place work accumulates, and the question changes from *"is this correct enough to
-trust?"* — which the human verify/promote step answers, and which every correctness
-guard still enforces — to *"is this worth thirty seconds of a human's time?"*
+GROUNDEDNESS ENTERS TWICE, and the asymmetry is the point: a plain product is symmetric in its
+first two terms, so a hardcoded one-off nothing resembles would rank identically to a
+well-parameterized template of a familiar question. Novelty is therefore GATED — scaled by
+groundedness before entering the product — which pushes the ungrounded outlier down an order
+of magnitude and leaves the grounded-but-familiar candidate where it was.
 
-The three axes, and what each is actually computed from:
+Everything degrades to a NUMBER, never an exception: this runs inside a list projection a
+human is waiting on, over rehydrated JSON. A missing stamp yields that axis's neutral, and
+`components` reports which axes were measured.
 
-  * **groundedness** — the share of the candidate's `parameterization` that resolves to
-    a catalog RULE or to a KNOWN COLUMN (a slot whose `binds_to` is inside the
-    blueprint's declared `uses` footprint), as against free-floating `inline` literals.
-    A blueprint whose filters are all hardcoded values is a one-off transcription; one
-    whose filters are all slots and rules is a reusable template. Computable today, from
-    fields S3 and S4 already write.
-  * **session-quality** — how the session that produced it went, from the
-    `SessionSignals` stamped at extraction: a clean single-shot acceptance versus a long
-    struggle, with a CORRECTED blueprint as an explicit negative.
-  * **novelty** — how far the intent sits from the closest LANDED artifact, from the
-    `NoveltyStamp` the dedup stage writes. Measured against landed artifacts only, never
-    against sibling candidates; see `candidate/signals.py::NoveltyStamp`.
-
-**Groundedness enters TWICE, and the asymmetry is the whole point.** A plain product
-`novelty × groundedness × quality` is symmetric in its first two terms, so a hardcoded
-one-off that nothing resembles (novelty 1.0, groundedness 0.1) would rank identically to
-a well-parameterized template of a familiar question (0.1, 1.0). The plan is explicit
-that the second is the better use of a reviewer's time and the first is usually just
-idiosyncratic. So novelty is GATED: it is scaled by groundedness before it enters the
-product, which makes the score `novelty × groundedness² × quality` and pushes the
-ungrounded outlier down by an order of magnitude while leaving the grounded-but-familiar
-candidate where it was.
-
-**Everything degrades to a NUMBER, never to an exception.** This runs inside a list
-projection a human is waiting on, over rehydrated JSON from a store other things write.
-A missing stamp yields the documented neutral for that axis, and `components` reports
-which axes were actually measured so an operator can tell a ranked queue from an
-arbitrary one.
-
-**THE SCORE IS AN ORDERING, NOT A PERCENTAGE — and it does not use the top of its range.**
-Measured against the live dev corpus (10 canon blueprints, `all-mpnet-base-v2`, via the
-real `Neo4jPriorArtIndex`):
-
-    query                                    best cosine   novelty
-    an exact re-derivation of a landed intent   0.9998       0.0002
-    a plausible NEW HR question                 0.7411       0.2589
-    a genuinely unrelated question              0.5869       0.4131
-    total nonsense                              0.5342       0.4658
-
-Sentence-embedding cosines over English prose have a high floor — two texts about nothing
-in common still score ~0.53 — so `novelty = 1 - cosine` occupies roughly `[0.0, 0.47]`,
-not `[0.0, 1.0]`. A perfectly grounded, cleanly accepted, genuinely novel candidate
-therefore scores about **0.26**, and the ceiling of the whole scale in practice is under
-0.5.
-
-Two consequences, both easy to get wrong:
-
-  * **`review_score_cutoff` must be set from measured data, never from intuition.** A
-    "half decent" cutoff of 0.5 would hide the ENTIRE queue — which is why the shipped
-    default is 0.0 and why the knob is applied to a listing rather than to routing, where
-    the same mistake would silently discard work.
-  * **Do not render the score to a reviewer as a confidence or a percentage.** It ranks;
-    it does not measure. The `*_measured` flags are what a UI should surface.
+THE SCORE IS AN ORDERING, NOT A PERCENTAGE, and does not use the top of its range: cosines
+over English prose have a ~0.53 floor, so `novelty = 1 - cosine` occupies roughly
+`[0.0, 0.47]` and a perfect candidate scores about 0.26. So `review_score_cutoff` must be set
+from MEASURED data — a "half decent" 0.5 would hide the ENTIRE queue, hence the 0.0 default —
+and the score must never be shown to a reviewer as a confidence.
 """
 
 from __future__ import annotations
@@ -133,9 +88,10 @@ _UNMEASURED = 1.0
 class RankedScore:
     """One candidate's review score plus every input that produced it.
 
-    The components travel to the review UI so a reviewer can see WHY a row is where it
-    is. A bare float would make the ordering unfalsifiable — the single most common way a
-    ranking quietly stops working is that nobody can tell it has."""
+    The components travel to the review UI so a reviewer can see WHY a row is where it is. A bare
+    float would make the ordering unfalsifiable — the single most common way a ranking quietly
+    stops working is that nobody can tell it has.
+    """
 
     score: float
     novelty: float
@@ -174,34 +130,20 @@ class RankedScore:
 
 
 def groundedness(env: CandidateEnvelope) -> tuple[float, bool]:
-    """The share of this candidate's parameterization that is GROUNDED, and whether it
-    could be computed at all.
+    """The share of this candidate's parameterization that is GROUNDED.
 
-    A parameterization entry is grounded when it resolves to something the catalog knows:
+    An entry is grounded when it resolves to something the catalog knows: `role == "rule"` with a
+    non-empty `rule_id`; `role == "slot"` whose `binds_to` is a member of the S4 `uses`
+    footprint; or `role == "slot"` with `binds_to is None`, a WINDOWED slot type that the
+    runtime's `SlotSpec.parse` REFUSES a `binds_to` for because it consumes no column domain. The
+    last predicate is `is None`, not falsiness — `""` is a value `SlotSpec.parse` refuses — since
+    mirroring the operator rather than the sentence is what keeps the two from drifting.
+    Everything else is ungrounded.
 
-      * `role == "rule"` with a non-empty `rule_id` — a catalog rule the blueprint
-        declares and the loader re-validates;
-      * `role == "slot"` whose `binds_to` is a member of the S4 `uses` footprint — a real
-        `database.table.column` the blueprint declares it reads;
-      * `role == "slot"` with `binds_to is None` — a WINDOWED slot type
-        (`relative_window`), which the runtime's `SlotSpec.parse` REFUSES a `binds_to`
-        for because it consumes no column domain. Absent is the CORRECT value there, so
-        treating it as ungrounded would penalise the one slot type that is right by
-        construction. Note the predicate is `is None`, not falsiness: `""` is a value
-        `SlotSpec.parse` refuses, so it is ungrounded, and mirroring the operator rather
-        than the sentence is what keeps the two from drifting.
-
-    Everything else is ungrounded: an `inline` literal (a value baked into the template),
-    a `rule` with no id, a slot pointing outside `uses`, or a malformed entry.
-
-    **An EMPTY parameterization is fully grounded (1.0), not undefined.** The measure is
-    "what share of this template's literals are still hardcoded"; a query with no literal
-    predicates at all (`SELECT count(*) FROM employees`) has none hardcoded. Returning a
-    low score there would push the most general blueprints to the bottom of the queue.
-
-    Returns `(share, measured)`. `measured` is False only when the candidate carries no
-    parameterization FIELD at all — a non-blueprint, or a payload shape this function has
-    no opinion about — which is different from an empty list.
+    An EMPTY parameterization is fully grounded (1.0), not undefined: the measure is what share
+    of this template's literals are still hardcoded, and a query with no literal predicates has
+    none. Returns `(share, measured)`, where `measured` is False only when the candidate carries
+    no parameterization FIELD at all — which is different from an empty list.
     """
     payload = env.payload
     if not isinstance(payload, Mapping):
@@ -247,11 +189,11 @@ def _entry_is_grounded(entry: Mapping[str, Any], uses: frozenset[str]) -> bool:
 def _uses_footprint(env: CandidateEnvelope) -> frozenset[str]:
     """The S4-declared `database.table.column` scope keys, as a membership set.
 
-    Read off `payload["generalization"]["uses"]` rather than reconstructed, because that
-    is the authored list the loader validates and the golden-replay token is minted from
-    — the same list the runtime treats as this blueprint's footprint. A missing or
-    malformed generalization yields an EMPTY set, which makes every slot ungrounded; that
-    is the fail-closed direction (an unrankable candidate sinks rather than floats)."""
+    Read off `payload["generalization"]["uses"]` rather than reconstructed, because that is the
+    authored list the loader validates and the golden-replay token is minted from. A missing or
+    malformed generalization yields an EMPTY set, which makes every slot ungrounded — the
+    fail-closed direction, where an unrankable candidate sinks rather than floats.
+    """
     gen = env.payload.get("generalization") if isinstance(env.payload, Mapping) else None
     if not isinstance(gen, Mapping):
         return frozenset()
@@ -264,20 +206,15 @@ def _uses_footprint(env: CandidateEnvelope) -> frozenset[str]:
 def session_quality(env: CandidateEnvelope) -> tuple[float, bool]:
     """How clean the session that produced this candidate was.
 
-    `acceptance × struggle × corrected`, all in `(0, 1]`:
-
-      * ACCEPTANCE — an explicit confirmation outranks the mere absence of a complaint,
-        which outranks no detected acceptance at all.
-      * STRUGGLE — one unit per failed-then-fixed query, per clarifying question, and per
-        turn beyond the first, discounted hyperbolically. A single-shot accepted session
-        scores exactly 1.0 here, which is the reference point the plan names.
-      * CORRECTED — halved when the session had to CORRECT an existing blueprint. The
-        plan calls this out as a negative specifically, and it is the only signal here
-        that is about the corpus rather than about the analyst.
-
-    Returns `(quality, measured)`. Unmeasured (neutral 1.0) for a candidate extracted
-    before `SessionSignals` existed — the summary it was derived from is long gone and
-    cannot be re-read."""
+    `acceptance × struggle × corrected`, all in `(0, 1]`. ACCEPTANCE ranks an explicit
+    confirmation above the mere absence of a complaint, which outranks no detected acceptance at
+    all. STRUGGLE charges one unit per failed-then-fixed query, per clarifying question and per
+    turn beyond the first, discounted hyperbolically, so a single-shot accepted session scores
+    exactly 1.0. CORRECTED halves the score when the session had to CORRECT an existing
+    blueprint — the only signal here about the corpus rather than the analyst. Unmeasured
+    (neutral 1.0) for a candidate extracted before `SessionSignals` existed, whose summary is long
+    gone and cannot be re-read.
+    """
     signals = env.session_signals
     if signals is None:
         return _UNMEASURED, False
@@ -295,13 +232,11 @@ def session_quality(env: CandidateEnvelope) -> tuple[float, bool]:
 def novelty(env: CandidateEnvelope) -> tuple[float, bool]:
     """Distance from the closest LANDED artifact, as stamped by S6 dedup.
 
-    Not recomputed here on purpose. Recomputing would mean an embed plus an ANN query per
-    row per page view, and — worse — it would answer a different question than the one
-    routing was decided on, because the graph moves. The stamp is the novelty AT THE
-    MOMENT we decided to ask a human, which is the honest thing to rank on.
-
-    Unmeasured (neutral 1.0) when no stamp exists: no prior-art index wired, the graph was
-    unreachable, or the candidate never reached the soft layer."""
+    Not recomputed here on purpose: recomputing would cost an embed plus an ANN query per row per
+    page view and — worse — would answer a different question than the one routing was decided
+    on, because the graph moves. The stamp is the novelty AT THE MOMENT we decided to ask a
+    human, which is the honest thing to rank on. Unmeasured (neutral 1.0) when no stamp exists.
+    """
     stamp = env.novelty
     if stamp is None or not stamp.measured:
         return _UNMEASURED, False
@@ -311,8 +246,9 @@ def novelty(env: CandidateEnvelope) -> tuple[float, bool]:
 def review_score(env: CandidateEnvelope) -> RankedScore:
     """The composite review score for one candidate — `[0.0, 1.0]`, higher first.
 
-    `gated_novelty × groundedness × quality`, where `gated_novelty = novelty ×
-    groundedness`. See the module docstring for why groundedness appears twice."""
+    `gated_novelty × groundedness × quality`, where `gated_novelty = novelty × groundedness`. See
+    the module docstring for why groundedness appears twice.
+    """
     nov, nov_measured = novelty(env)
     ground, ground_measured = groundedness(env)
     quality, quality_measured = session_quality(env)
@@ -329,35 +265,23 @@ def review_score(env: CandidateEnvelope) -> RankedScore:
 
 
 def rank_key(env: CandidateEnvelope) -> tuple[int, float, str]:
-    """Sort key for the review queue: MEASURED FIRST, then score descending, then
-    `created_at` ascending.
+    """Sort key for the review queue: MEASURED FIRST, then score descending, then `created_at`.
 
-    **The partition comes before the score, and it is the fix for an inversion a plain
-    score-sort has.** An unmeasured axis contributes the neutral 1.0, and novelty's
-    measured ceiling against a real corpus is ~0.47 — so a candidate nobody could measure
-    outranks every candidate we actually know something about, permanently. The realistic
-    population makes that the DEFAULT rather than an edge case: a writer-routed
-    `global_knowledge` item has no dedup verdict and no parameterization, so two of its
-    three axes are neutral by construction. Comparing the two groups on one number
-    compares a measurement against a placeholder; putting the placeholders in a second
-    block does not.
+    The partition comes BEFORE the score, and it fixes an inversion a plain score-sort has: an
+    unmeasured axis contributes the neutral 1.0 while novelty's measured ceiling is ~0.47, so a
+    candidate nobody could measure would outrank every candidate we actually know something
+    about, permanently. The realistic population makes that the DEFAULT rather than an edge case —
+    a writer-routed `global_knowledge` item has two of its three axes neutral by construction.
+    Unmeasured rows are ordered among THEMSELVES by the same score, which is meaningful within
+    the block and meaningless across it.
 
-    Unmeasured rows are ordered among THEMSELVES by the same score, which is meaningful
-    within the block (they share the same neutrals) and meaningless across it.
-
-    The final tiebreak is load-bearing and is NOT the candidate id. At the shipped weights
-    a great many candidates score identically, so without a meaningful tiebreak the
-    queue's order would be whatever the store happened to return — and a FIFO drain is
-    what the inbox promised before ranking existed. Falling back to arrival order
-    preserves that for every tie.
-
-    **`created_at` is coerced, and the reason is the operation, not the field.**
-    `CandidateEnvelope.from_doc` reads it with a bare `doc.get(...)` and no type check, so
-    a hand-edited or foreign-written document can put anything there. Inside `sorted` the
-    second element is compared ONLY when the first ties — so a non-str would be a
-    TIE-DEPENDENT `TypeError`, i.e. a crash that appears the day two candidates happen to
-    score the same and never before. That is the same latent load-dependent shape a
-    previous slice found in `_best_card`; a non-str sorts as `""` (first) instead."""
+    The final tiebreak is load-bearing and is NOT the candidate id: at the shipped weights many
+    candidates score identically, and arrival order preserves the FIFO drain the inbox promised
+    before ranking existed. `created_at` is COERCED because of the OPERATION, not the field —
+    `from_doc` reads it with a bare `doc.get`, and inside `sorted` it is compared ONLY when the
+    score ties, so a non-str would be a tie-dependent `TypeError` appearing the day two rows
+    happen to score the same and never before.
+    """
     created = env.created_at if isinstance(env.created_at, str) else ""
     scored = review_score(env)
     return (0 if scored.measured else 1, -scored.score, created)

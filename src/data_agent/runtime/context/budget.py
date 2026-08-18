@@ -1,30 +1,17 @@
 """D46/D50 — preview-only entry rendering + the total-request token budget.
 
-Ordering contract (D50, enforced by the caller `context/assembly.py`, not
-here): this module must only ever be handed an already scope-filtered trail
-(§5 "filter-strictly-before-compact") — it has no scope information of its
-own and performs no filtering.
+Ordering contract, enforced by the CALLER (`context/assembly.py`): this module must only
+ever be handed an already scope-filtered trail — it has no scope information of its own
+and performs no filtering.
 
-Two live surfaces:
+`_render_entry` is the SINGLE producer of every model-facing tool message;
+`fit_request_to_budget` is the final size bound on the FULL canonical request, applied
+right before `send_turn`. Trail compaction is bypassed entirely — every in-scope turn
+interleaves verbatim.
 
-  * `_render_entry` — the SINGLE producer of every model-facing tool message
-    (imported by `context/assembly.py` and `context/discovery_emulation.py`);
-  * `fit_request_to_budget` — the final size bound on the FULL canonical
-    request, applied by `loop/agent_loop.py` right before `send_turn`.
-
-Phase 1 bypasses trail compaction entirely: every in-scope turn interleaves
-verbatim and `fit_request_to_budget` is the sole size bound. The D46
-compaction machinery (newest-first split + injected `Summarizer` + summary
-cache) was removed once nothing invoked it; the summary MESSAGE prefix is
-retained (`_SUMMARY_CONTEXT_PREFIX`) because the fit step still classifies a
-summary block it may find in the message list.
-
-Preview object: NOT built here — `dispatch/tool_dispatcher.py` builds
-`TrailEntry.result_preview` once at write-time. This module only re-truncates
-defensively to the *current* `preview_row_count` setting when rendering (in
-case the setting changed since the entry was written), and never exposes
-anything beyond the stored preview (`TrailEntry` has no `result_full` field —
-only `result_full_ref` — so budget.py cannot leak full results even by bug).
+Previews are built once at write-time by `dispatch/tool_dispatcher.py`; this module only
+re-truncates defensively to the CURRENT `preview_row_count`, and can never expose more
+than the stored preview (`TrailEntry` holds no `result_full`, only a ref).
 """
 
 from __future__ import annotations
@@ -40,27 +27,22 @@ from data_agent.runtime.session.models import TrailEntry
 
 
 def _estimate_tokens(text: str) -> int:
-    """Crude token estimate (chars/4) — good enough for a budget heuristic; not
-    a tokenizer. Pass B may swap in a real tokenizer without changing callers."""
+    """Crude token estimate (chars/4) — a budget heuristic, not a tokenizer."""
     return max(1, len(text) // 4)
 
 
 def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
     """Render one verbatim `TrailEntry` into a plain, model-facing dict.
 
-    SQL (and every other model-supplied arg) is preserved verbatim — this
-    function never paraphrases. Only the already-persisted preview is
-    exposed; it is defensively re-truncated to *preview_row_count* rows in
-    case the setting shrank since write-time (never grown back — a smaller
-    stored preview stays smaller).
+        SQL and every other model-supplied arg is preserved verbatim — this function never
+        paraphrases. Only the already-persisted preview is exposed, defensively re-truncated
+        to *preview_row_count* rows in case the setting shrank since write-time (never grown
+        back).
 
-    `user_message` (S4): for a non-`"ok"` entry, re-derives the static,
-    PII-safe denial message from `entry.error_code` via
-    `dispatch/denial_mapping.py::classify_denial` (the same canned lookup
-    `ToolDispatcher` used at dispatch time — never the raw MCP error text,
-    never re-persisted on `TrailEntry` itself) so the model can see WHY a
-    retryable tool call failed and self-correct, instead of only a bare
-    `error_code`.
+        `user_message`: for a non-`"ok"` entry, re-derives the static, PII-safe denial
+        message from `entry.error_code` via `dispatch/denial_mapping.py::classify_denial` —
+        never the raw MCP error text, and never re-persisted on the `TrailEntry` itself — so
+        the model can see WHY a retryable call failed and self-correct.
     """
     preview: dict[str, Any] | None = None
     if entry.result_preview is not None:
@@ -147,9 +129,9 @@ _SUMMARY_CONTEXT_PREFIX = "[Earlier steps in this session were summarized to sav
 
 
 def estimate_message_tokens(message: Mapping[str, Any]) -> int:
-    """Token estimate for one canonical `send_turn` message — the chars/4
-    heuristic (`_estimate_tokens`), the single estimator to swap for a real
-    tokenizer later."""
+    """Token estimate for one canonical `send_turn` message — the chars/4 heuristic, and
+        the single estimator to swap for a real tokenizer later.
+    """
     return _estimate_tokens(json.dumps(message, default=str))
 
 
@@ -202,15 +184,13 @@ _DEFAULT_PINNED_RECENT_TOOL_PAIRS = 3
 def _fit_units(
     messages: list[dict[str, Any]], head_end: int, tail_start: int
 ) -> list[tuple[int, int]]:
-    """Group the droppable middle `messages[head_end:tail_start)` into
-    pairing-preserving UNITS (half-open `(start, end)` index ranges):
+    """Group the droppable middle `messages[head_end:tail_start)` into pairing-preserving
+        UNITS (half-open `(start, end)` index ranges).
 
-      * an assistant message carrying `tool_calls` + its immediately following
-        `tool` result message(s) form ONE atomic unit — dropped/kept together so a
-        `tool` message is never orphaned from its announcing assistant and vice
-        versa (invariant 4);
-      * every other message (a `user` retrieval/summary/conversation message, a
-        plain assistant answer) is its own single-message unit.
+        An assistant message carrying `tool_calls` plus its immediately following `tool`
+        result message(s) form ONE atomic unit, dropped or kept together so a `tool` message
+        is never orphaned from its announcing assistant (invariant 4). Every other message
+        is its own single-message unit.
     """
     units: list[tuple[int, int]] = []
     i = head_end
@@ -230,11 +210,10 @@ def _fit_units(
 def _unit_kind(messages: list[dict[str, Any]], start: int, end: int) -> str:
     """Classify a droppable unit for drop-priority + telemetry:
 
-      * `trail`        — an assistant `tool_calls` + `tool` result pair;
-      * `retrieval`    — the current question's retrieved-context `user` block
-                         (candidate blueprints/knowledge), detected by its prefix;
-      * `summary`      — the compaction summary `user` block (its prefix);
-      * `conversation` — anything else (a prior-turn user/assistant exchange).
+          * `trail`        — an assistant `tool_calls` + `tool` result pair;
+          * `retrieval`    — the current question's retrieved-context `user` block;
+          * `summary`      — the compaction summary `user` block (by its prefix);
+          * `conversation` — anything else (a prior-turn user/assistant exchange).
     """
     first = messages[start]
     if first.get("role") == "assistant" and first.get("tool_calls"):
@@ -250,27 +229,21 @@ def _unit_kind(messages: list[dict[str, Any]], start: int, end: int) -> str:
 
 
 def _current_turn_start(messages: list[dict[str, Any]], head_end: int, n: int) -> int:
-    """Index where the CURRENT (in-progress) turn's messages begin — the first
-    `user` message after the last COMPLETED prior turn.
+    """Index where the CURRENT (in-progress) turn's messages begin — the first `user`
+        message after the last COMPLETED prior turn.
 
-    A completed prior turn always ends in a plain `assistant` ANSWER (a persisted
-    `TurnMessage`, role `assistant` with NO `tool_calls`); the in-progress current
-    turn has none yet (its answer is not persisted until the turn ends, and its
-    synthetic `assistant` messages all carry `tool_calls`). So the current turn is
-    the run of messages after the LAST plain-assistant answer, starting at that
-    run's first `user` message (the originating question — even after an askUser
-    resume appended a later clarification-answer `user` message). This is the
-    boundary `fit_request_to_budget` pins from, so the ORIGINATING question is
-    never dropped and the current turn's tool pairs are identified positionally
-    (no `turn_index` threading needed).
+        A completed prior turn always ends in a plain `assistant` ANSWER (role `assistant`
+        with NO `tool_calls`); the in-progress turn has none yet, and its synthetic
+        assistant messages all carry `tool_calls`. So the current turn is the run after the
+        LAST plain-assistant answer, starting at that run's first `user` message — the
+        ORIGINATING question, even after an askUser resume appended a clarification answer.
+        Identifying it positionally is what removes any need to thread `turn_index`.
 
-    Returns `n` when there is no current-turn `user` message (e.g. a list ending in
-    a tool pair, public-API-only) → nothing is pinned as the current turn and every
-    unit after the head is droppable, which is what stops a lone trailing `tool`
-    from being pinned while its announcing assistant unit stays droppable (invariant
-    4). Edge: if EVERY prior turn's assistant answer was scope-dropped, the boundary
-    walks back to the first user message, harmlessly over-pinning some prior units —
-    never unsafe (base + question survive, pairing intact).
+        Returns `n` when there is no current-turn `user` message, so nothing is pinned as
+        the current turn — which is what stops a lone trailing `tool` from being pinned
+        while its announcing assistant unit stays droppable (invariant 4). If EVERY prior
+        turn's assistant answer was scope-dropped, the boundary walks back to the first user
+        message, harmlessly over-pinning.
     """
     last_answer = head_end - 1
     for i in range(n - 1, head_end - 1, -1):
@@ -291,47 +264,35 @@ def fit_request_to_budget(
     pinned_recent_tool_pairs: int = _DEFAULT_PINNED_RECENT_TOOL_PAIRS,
     pinned_tool_call_ids: frozenset[str] | None = None,
 ) -> RequestFitResult:
-    """Fit the FULL canonical request to `token_budget` while honoring the
-    send-seam invariants:
+    """Fit the FULL canonical request to `token_budget` while honoring the send-seam
+        invariants:
 
-      1. the base prompt (the leading run of `role:"system"` messages) is NEVER
-         dropped or truncated — it is pinned as the head;
-      2. the returned list never exceeds `token_budget` tokens WHEN that is
-         achievable without violating (1), (3) or (6) — only droppable units go;
-      3. the CURRENT turn's question is NEVER dropped. The current turn is pinned
-         from its FIRST `user` message (the originating question, `_current_turn_
-         start`) through the end, so its question, its retrieval-cards block, and an
-         askUser clarification-answer are all undroppable;
-      4. assistant `tool_calls` <-> `tool` result pairing is preserved (units are
-         dropped/kept atomically, see `_fit_units`);
-      5. under pressure droppable units go in DROP-PRIORITY tier order, not pure
-         position: PRIOR-turn CONVERSATION + PRIOR-turn TRAIL first (tier 0), then a
-         prior RETRIEVAL/SUMMARY block (tier 1), and ONLY as a last resort the
-         current turn's OLDER tool pairs (tier 2, `_TIER_CURRENT_OLDER_TRAIL`).
-         Within a tier the OLDEST unit (lowest position) goes first;
-      6. the current turn's most-recent `pinned_recent_tool_pairs` (K) tool pairs
-         are PINNED (never dropped) — K protects the D94 withheld/idempotent-read
-         self-correct loop and the immediate reasoning context; only the current
-         turn's tool pairs OLDER than those K are droppable (tier 2). This is what
-         keeps a single non-terminating turn (whose tool pairs would otherwise be an
-         un-trimmable pinned tail) bounded by the budget.
+          1. the base prompt (the leading run of `role:"system"` messages) is NEVER dropped
+             or truncated — it is pinned as the head;
+          2. the returned list never exceeds `token_budget` tokens WHEN that is achievable
+             without violating (1), (3) or (6);
+          3. the CURRENT turn is pinned from its FIRST `user` message through the end, so
+             its originating question, its retrieval-cards block and an askUser
+             clarification answer are all undroppable;
+          4. assistant `tool_calls` <-> `tool` result pairing is preserved — units are
+             dropped or kept atomically (see `_fit_units`);
+          5. under pressure droppable units go in DROP-PRIORITY tier order, not pure
+             position: prior-turn conversation and trail first (tier 0), then a prior
+             retrieval/summary block (tier 1), and only as a last resort the current turn's
+             OLDER tool pairs (tier 2). Within a tier the oldest goes first;
+          6. the current turn's most-recent `pinned_recent_tool_pairs` (K) tool pairs are
+             PINNED — K protects the D94 withheld/idempotent-read self-correct loop, and
+             making the pairs older than K droppable is what keeps a single non-terminating
+             turn bounded by the budget;
+          7. any unit whose `tool_call_id` is in *pinned_tool_call_ids* is PINNED regardless
+             of tier or age. This carries the emulated-discovery pairs, which are anchored
+             at the SESSION'S FIRST question and so classify as prior-turn trail, tier 0.
+             Dropping them is uniquely harmful: the loop seeds its repeated-idempotent-read
+             guard from the same sweep, so the model would be unable to see the tables AND
+             unable to re-fetch them. `None`/empty behaves as if the parameter did not exist.
 
-      7. any unit whose `tool_call_id` is in *pinned_tool_call_ids* is PINNED
-         regardless of tier or age. This carries the emulated-discovery pairs
-         (`context/discovery_emulation.py`), which are anchored at the SESSION'S
-         FIRST question and so classify as prior-turn trail — tier 0, the FIRST
-         thing dropped. Dropping them is uniquely harmful: the loop seeds its
-         repeated-idempotent-read guard from the SAME sweep, so a trimmed listing
-         leaves the model unable to see the tables AND unable to re-fetch them (the
-         guard answers "already served"). They are a handful of database/table
-         names, so pinning them costs almost nothing. `None`/empty is
-         byte-identical to before this parameter existed.
-
-    The head (base prompt), the current question, its retrieval block, the K
-    most-recent current-turn tool pairs, and any *pinned_tool_call_ids* unit are
-    never dropped, so in the pathological corner where those ALONE exceed
-    `token_budget` the result may still exceed it — invariants 1/3/6/7 take
-    precedence over 2. In practice base + question are tiny and K is small.
+        Invariants 1/3/6/7 take precedence over 2, so in the pathological corner where the
+        pinned material ALONE exceeds `token_budget` the result may still exceed it.
     """
     pinned_ids = pinned_tool_call_ids or frozenset()
     sizes = [estimate_message_tokens(m) for m in messages]

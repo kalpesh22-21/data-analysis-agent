@@ -1,83 +1,46 @@
 """answer_with_table.py — the `answerWithTable` runtime tool.
 
-The model calls `answerWithTable(answer=..., tables=[{sql | blueprint_id,
-caption}])` when its answer IS a table. The call is TERMINAL: it carries the final
-prose AND designates the queries whose rows the user should see, so the turn ends
-there.
+The model calls `answerWithTable(answer=..., tables=[{sql | blueprint_id, caption}])` when
+its answer IS a table. The call is TERMINAL: it carries the final prose AND designates the
+queries whose rows the user should see, so the turn ends there. A non-terminal designation
+tool cost a whole extra round-trip in which the model learned nothing — it already had the
+results in context. `answer` is REQUIRED, so a model calling this out of habit mid-turn
+cannot terminate the turn with an empty answer.
 
-Why terminal. The loop's other exit is a model turn with NO tool calls. A non-
-terminal designation tool therefore cost a whole extra round-trip: the model
-designated the table, got back a trivial confirmation, and then re-sent the ENTIRE
-conversation (4.7k-10.2k tokens on a measured turn) purely to emit one sentence it
-could already have written. It learned nothing in between — it had the query
-results in context at designation time. Folding the prose into the designation
-removes a round-trip that bought nothing.
+The safe default is unchanged: a SCALAR answer still ends the old way, a turn with no tool
+calls, so a model that never calls this tool cannot hang.
 
-Why `answer` is REQUIRED. If it were optional, a model calling this out of habit
-mid-turn would terminate the turn with an empty answer — a total, silent failure.
-Requiring it makes the call self-describing: "this is my final answer, and here is
-its table."
+TWO WAYS TO DESIGNATE INSIDE EACH ENTRY, one wire contract:
 
-The safe default is unchanged. A SCALAR answer still ends the old way — a turn with
-no tool calls — so a model that never calls this tool cannot hang; it falls through
-to prose with no table, exactly today's degradation.
+  * `sql=` — a raw read-only SELECT, NOT required to be one the agent already ran: the
+    executed query usually carries a LIMIT the agent chose for its own reading, and paging
+    needs the un-capped shape. Scope is still enforced where the query runs (the MCP, under
+    the caller's own JWT), so this can never widen access.
+  * `blueprint_id=` — resolved to that blueprint's `terminal_sql`, captured when it RAN
+    this turn. It MUST name a blueprint that ran successfully this turn: re-running it to
+    find out would decouple the paged table from the D56 verification that gated the answer
+    the user was given.
 
-ONE CARRIER, `tables`; TWO WAYS TO DESIGNATE INSIDE EACH ENTRY, one wire contract:
+`tables` IS THE ONLY CARRIER. It exists because a single designation could name only ONE of
+the several result sets a multi-intent turn produces, and the prompt-level merge rules
+written to close that gap were unsatisfiable rather than badly worded. It is the ONLY
+carrier because the live model cannot omit declared keys — a second carrier for the same
+fact is a second thing to fill in wrong. The top-level `sql`/`blueprint_id` pair survives
+only as a read-path fold (`resolve_designations`), for trail entries written before the
+change and for a model working from a stale context; that fold has no expiry, because old
+session documents are read forever.
 
-  * `sql=` — a raw read-only SELECT. NOT required to be one the agent already ran:
-    the executed query usually carries a LIMIT the agent chose for its own reading,
-    and paging needs the un-capped shape. Scope is still enforced where the query
-    runs (the MCP, under the caller's own JWT), so this can never widen access.
+An element of `tables` is EXACTLY the mapping `resolve_designation` already reads, so
+multi-table adds no second resolution path.
 
-  * `blueprint_id=` — the blueprint whose result IS the answer. The model should
-    not have to copy rendered SQL it may only partly see. The runtime resolves the
-    id to that blueprint's `terminal_sql` (`blueprint/executor.py`), captured when
-    the blueprint RAN this turn.
+The UI receives `answer_tables` (a list) plus `answer_sql` — a DERIVED projection of
+`answer_tables[0]`, kept so every existing single-table consumer works untouched — and
+pages EACH table through `POST /query/page`. The blueprint path is resolved server-side
+precisely so the UI never re-executes a DAG.
 
-    It must name a blueprint run SUCCESSFULLY THIS TURN. Unlike raw SQL there is
-    nothing to resolve otherwise, and re-running it to find out would decouple the
-    paged table from the D56 verification that gated the answer the user was given.
-    An unmatched id resolves to nothing and is logged.
-
-WHY `tables` EXISTS (08, `docs/decisions/release-1/08-multi-table-answer.md`).
-Measured across 17 live sessions, `answerWithTable` succeeded on 6/6
-single-deliverable turns and 1/9 multi-intent ones, because the payload could name
-only ONE of the three result sets a three-part turn produces and the model answered
-the rest in prose. Two prompt-level merge rules were written to close that gap; both
-were measured live and both were REVERTED (01a §§10-11), because the instruction set
-they created was unsatisfiable rather than badly worded: *one table per answer* +
-*never re-derive a blueprint result* + *two blueprints answer two same-grain parts*
-cannot all hold. `tables` deletes the first premise, so nothing has to be merged and
-nothing re-derived.
-
-An element of `tables` is EXACTLY the mapping `resolve_designation` already reads,
-so multi-table adds no second resolution path — the same function, in a loop
-(`resolve_designations` below).
-
-WHY IT IS NOW THE ONLY CARRIER (08 §O, 2026-08-13). `tables` shipped BESIDE a
-top-level `sql`/`blueprint_id` pair, kept because that pair was the shape measured
-6/6 and removing a working path for tidiness is not a trade. What retired it is not
-tidiness: 03 §C.3.1's measured failure is that the model CANNOT OMIT DECLARED KEYS,
-and R7 q1's live call was `{"answer": …, "sql": "", "blueprint_id": "bp-…",
-"tables": []}` — four declared properties carrying ONE field's worth of information,
-two placeholders and an empty array, because every declared key had to be filled with
-something. A second carrier for the same fact is a second thing to fill in wrong. The
-model-facing schema now declares `tables` alone and REQUIRES it; the top-level pair
-survives only as a read-path fold (`resolve_designations`) for trail entries written
-before the change and for a model working from a stale context. That fold has no
-expiry: old session documents are read forever.
-
-The UI receives `answer_tables` (a list) plus `answer_sql` — a DERIVED projection
-of `answer_tables[0]`, kept so every existing N<=1 consumer works untouched — and
-pages EACH table through `POST /query/page`, one request per table with its own
-offset. The blueprint path is resolved server-side precisely so the UI never
-re-executes a DAG: for a composed blueprint that would re-run every node and
-re-materialise scratch on every scroll.
-
-KNOWN LIMIT: a scratch-backed composed blueprint's terminal SQL references a
-session-scoped `scratch.*` table with a TTL. Paging works until that lapses, then
-returns an ordinary query error. Fixing it properly means materialising the answer
-separately, which is a larger change than this tool.
+KNOWN LIMIT: a scratch-backed composed blueprint's terminal SQL references a session-scoped
+`scratch.*` table with a TTL, so paging works until that lapses and then returns an ordinary
+query error.
 """
 
 from __future__ import annotations
@@ -118,10 +81,10 @@ _MAX_ANSWER_LEN = 20_000
 def clean_answer_sql(raw: Any) -> str | None:
     """Normalize a model-supplied `sql` value into a single SQL string or `None`.
 
-    Non-`str` → `None`; stripped; empty → `None`; truncated to `_MAX_SQL_LEN`.
-    Does NOT parse, validate, or rewrite the SQL — validation happens where the
-    query actually runs (`runtime/query_page.py` + the MCP), so this helper can
-    never be the thing that silently changes what the user sees.
+        Non-`str` -> `None`; stripped; empty -> `None`; truncated to `_MAX_SQL_LEN`. Does NOT
+        parse, validate or rewrite the SQL — validation happens where the query actually runs
+        (`runtime/query_page.py` + the MCP), so this helper can never be the thing that
+        silently changes what the user sees.
     """
     if not isinstance(raw, str):
         return None
@@ -152,20 +115,17 @@ def resolve_designation(
 ) -> str | None:
     """Resolve ONE designation mapping to a concrete query, or `None`.
 
-    The single expression of the two-forms rule, shared by every caller so they
-    cannot drift: one entry of `tables`, and — through `resolve_designations`'
-    legacy fold — a whole pre-08-§O call's arguments, which have the same shape.
-    `sql=` wins when both are given: it is the more specific instruction. Otherwise
-    `blueprint_id` is looked up in *terminal_by_id*, the `blueprint_id ->
-    terminal_sql` map of blueprints that ran successfully in that turn.
+        The single expression of the two-forms rule, shared by every caller so they cannot
+        drift. `sql=` wins when both are given: it is the more specific instruction. Otherwise
+        `blueprint_id` is looked up in *terminal_by_id*, the `blueprint_id -> terminal_sql` map
+        of blueprints that ran successfully in that turn.
 
-    Callers differ only in how they BUILD that map: in-window the loop reads
-    `terminal_sql` straight off the dispatch result, while the resume and history
-    paths de-reference each blueprint's `result_full` from the D46 KV store. The
-    resolution itself is identical, which is the point of this function — reading
-    only `args["sql"]` looked complete and silently dropped every blueprint
-    designation, the form the live model actually emits (`sql=""` beside
-    `blueprint_id`).
+        Callers differ only in how they BUILD that map — in-window the loop reads `terminal_sql`
+        straight off the dispatch result, while the resume and history paths de-reference each
+        blueprint's `result_full` from the D46 KV store. The resolution itself is identical,
+        which is the point: reading only `args["sql"]` looked complete and silently dropped
+        every blueprint designation, the form the live model actually emits (`sql=""` beside
+        `blueprint_id`).
     """
     if not isinstance(args, dict):
         return None
@@ -183,16 +143,14 @@ def resolve_designation(
 
 @dataclass(frozen=True)
 class BlueprintRun:
-    """What one SUCCESSFUL `runBlueprint` of this turn leaves behind for the
-    answer-table machinery: the query whose rows ARE its result, whether the D56
-    gate verified it, and the slots it was run with.
+    """What one SUCCESSFUL `runBlueprint` of this turn leaves behind for the answer-table
+        machinery: the query whose rows ARE its result, whether the D56 gate verified it, and
+        the slots it was run with.
 
-    ONE RECORD, CAPTURED AT ONE SITE (`loop/turn_accumulators.py::
-    capture_terminal_sql`), because
-    the alternative — a `blueprint_id -> terminal_sql` map beside a separate
-    `blueprint_id -> verification` map — allows a table's SQL and its badge to be
-    paired from DIFFERENT runs of the same blueprint later. Here they cannot be:
-    they are read out of one `result_full` at the moment it is in hand.
+        ONE RECORD, CAPTURED AT ONE SITE (`loop/turn_accumulators.py::capture_terminal_sql`),
+        because a `blueprint_id -> terminal_sql` map beside a separate `blueprint_id ->
+        verification` map allows a table's SQL and its badge to be paired from DIFFERENT runs of
+        the same blueprint later. Here they cannot be: both are read out of one `result_full`.
     """
 
     terminal_sql: str
@@ -213,28 +171,25 @@ VERIFICATION_EMPTY_STATUS = "empty — unverifiable"
 
 
 def is_zero_row_count(row_count: Any) -> bool:
-    """Is *row_count* a genuine integer zero? (J6)
+    """Is *row_count* a genuine integer zero?
 
-    THE ONE PLACE the bool exclusion is written. `isinstance(True, int)` is True in
-    Python, so a bare `row_count == 0` reads a poisoned/legacy `row_count: false`
-    as an empty result and retracts a verification claim over a value that says
-    nothing about the row count. Both J6 sites read a row count off an untrusted
-    JSON payload — the rehydrated `result_full` here, the rendered `result_preview`
-    in `loop/agent_loop.py::_tool_trail_entry_to_canonical` — so the rule lives in
-    one function rather than being spelled out twice and drifting once.
+        THE ONE PLACE the bool exclusion is written. `isinstance(True, int)` is True in Python,
+        so a bare `row_count == 0` reads a poisoned or legacy `row_count: false` as an empty
+        result and retracts a verification claim over a value that says nothing about the row
+        count. Both call sites read a row count off an untrusted JSON payload, so the rule lives
+        in one function rather than being spelled out twice and drifting once.
     """
     return isinstance(row_count, int) and not isinstance(row_count, bool) and row_count == 0
 
 
 def _is_empty_blueprint_result(result_full: Mapping[str, Any]) -> bool:
-    """Did this blueprint return ZERO rows? (J6)
+    """Did this blueprint return ZERO rows?
 
-    Read TWO ways on purpose. `verify.empty_result` is what the executor writes
-    today; `row_count == 0` is the underlying fact, and is what catches a
-    `result_full` PERSISTED BEFORE this change and rehydrated from the D46 KV on
-    `GET /session/history` — that record has no marker, and re-deriving from the
-    row count is the difference between a reloaded transcript telling the truth and
-    it reproducing the exact over-claim this fixes.
+        Read TWO ways on purpose: `verify.empty_result` is what the executor writes today, and
+        `row_count == 0` is the underlying fact — which is what catches a `result_full`
+        PERSISTED BEFORE that marker existed and rehydrated from the D46 KV on
+        `GET /session/history`, where re-deriving is the difference between a reloaded
+        transcript telling the truth and reproducing the exact over-claim this fixes.
     """
     if (result_full.get("verify") or {}).get("empty_result") is True:
         return True
@@ -244,23 +199,19 @@ def _is_empty_blueprint_result(result_full: Mapping[str, Any]) -> bool:
 def blueprint_verification(result_full: Any) -> dict[str, Any] | None:
     """The D56 verification block for one `runBlueprint` `result_full`, or `None`.
 
-    The SINGLE constructor of that dict — shared by the turn-level enrichment
-    accumulator and by per-table designation, so the two can never describe the
-    same run differently. `None` (not `{"passed": False}`) is the negative form for
-    a table NOTHING verified: absence reads as *no claim*, which is what an
-    unverified (raw-loop / hand-written) result is.
+        The SINGLE constructor of that dict — shared by the turn-level enrichment accumulator
+        and by per-table designation, so the two can never describe the same run differently.
+        `None` (not `{"passed": False}`) is the negative form for a table NOTHING verified:
+        absence reads as NO CLAIM, which is what an unverified result is.
 
-    J6 — THE ONE PLACE `passed: False` IS EMITTED: a blueprint whose result is
-    EMPTY. The grain teeth are `row_count == distinct_grain_count`, so at zero rows
-    they read `0 == 0` and pass for every blueprint alive; a structurally-empty
-    blueprint therefore shipped a 0-row grid wearing a full "verified ✓" badge.
-    That claim is withdrawn here and replaced with an EXPLICIT state
-    (`empty_result: True` + `status: "empty — unverifiable"`) rather than with
-    `None`, because `None` means "a hand-written query, no gate involved" — which
-    would lose the fact that a blueprint ran and came back with nothing. The rows
-    are still the authoritative answer for the intent (see
-    `tool._is_verified_blueprint_result`); it is the VERIFICATION claim, and only
-    that, which is retracted.
+        THE ONE PLACE `passed: False` IS EMITTED is a blueprint whose result is EMPTY. The grain
+        teeth are `row_count == distinct_grain_count`, so at zero rows they read `0 == 0` and
+        pass for every blueprint alive, and a structurally-empty blueprint shipped a 0-row grid
+        wearing a full verified badge. That claim is withdrawn and replaced with an EXPLICIT
+        state (`empty_result: True` + `status: "empty — unverifiable"`) rather than with `None`,
+        because `None` means "a hand-written query, no gate involved" and would lose the fact
+        that a blueprint ran and came back with nothing. Only the VERIFICATION claim is
+        retracted; the rows are still the authoritative answer for the intent.
     """
     if not isinstance(result_full, dict) or result_full.get("status") != "verified":
         return None
@@ -284,12 +235,12 @@ def blueprint_verification(result_full: Any) -> dict[str, Any] | None:
 def blueprint_run_from_result(
     result_full: Any, *, slots: Mapping[str, Any] | None = None
 ) -> tuple[str, BlueprintRun] | None:
-    """`(blueprint_id, BlueprintRun)` for a SUCCESSFUL blueprint `result_full`, or
-    `None` when the payload carries no usable terminal SQL.
+    """`(blueprint_id, BlueprintRun)` for a SUCCESSFUL blueprint `result_full`, or `None` when
+        the payload carries no usable terminal SQL.
 
-    The terminal SQL is exposed explicitly rather than inferred as "the last
-    element of `result_full["sql"]`": rehydrated nodes are appended to that list
-    FIRST on a D45 resume, so the positional assumption is not safe.
+        The terminal SQL is exposed explicitly rather than inferred as "the last element of the
+        result's sql list": rehydrated nodes are appended to that list FIRST on a D45 resume, so
+        the positional assumption is not safe.
     """
     if not isinstance(result_full, dict):
         return None
@@ -309,8 +260,8 @@ def blueprint_run_from_result(
 def terminal_sql_by_id(runs: Mapping[str, BlueprintRun]) -> dict[str, str]:
     """The `blueprint_id -> terminal_sql` projection `resolve_designation` takes.
 
-    A pure projection of the one captured map, NOT a second source — which is why
-    the pairing hazard `BlueprintRun` exists to close stays closed.
+        A pure projection of the one captured map, NOT a second source — which is what keeps the
+        pairing hazard `BlueprintRun` exists to close, closed.
     """
     return {blueprint_id: run.terminal_sql for blueprint_id, run in runs.items()}
 
@@ -319,11 +270,10 @@ def terminal_sql_by_id(runs: Mapping[str, BlueprintRun]) -> dict[str, str]:
 class DesignationItem:
     """One element of the model's designation, resolved as far as pure code can.
 
-    `sql is None` with `named_blueprint` set is the REFUSAL case: the model named a
-    blueprint that did not run successfully this turn, and there is nothing to
-    resolve it to. It is deliberately carried here rather than dropped, because
-    dropping it would silently lose a deliverable's table — the exact failure
-    multi-table exists to fix.
+        `sql is None` with `named_blueprint` set is the REFUSAL case: the model named a blueprint
+        that did not run successfully this turn, and there is nothing to resolve it to. It is
+        deliberately carried here rather than dropped, because dropping it would silently lose a
+        deliverable's table.
     """
 
     sql: str | None
@@ -363,13 +313,10 @@ class Designation:
 def _resolve_item(item: Any, terminal_by_id: Mapping[str, str]) -> DesignationItem:
     """Resolve ONE designation mapping through the EXISTING `resolve_designation`.
 
-    The flat-schema mis-fill (03 §C.3.1) is handled by construction: the live model
-    emits every declared property and fills the unused ones with placeholders, so
-    `{"sql": "", "blueprint_id": "bp-x", "caption": ""}` is the shape that actually
-    arrives. `clean_answer_sql`/`clean_blueprint_id` already map empty and
-    whitespace to `None`, and `resolve_designation`'s docstring records that this
-    exact serialisation is what the live model sends — the normalisers were written
-    against it and are already load-bearing on it.
+        The flat-schema mis-fill is handled by construction: the live model emits every declared
+        property and fills the unused ones with placeholders, so `{"sql": "", "blueprint_id":
+        "bp-x", "caption": ""}` is the shape that actually arrives, and
+        `clean_answer_sql`/`clean_blueprint_id` already map empty and whitespace to `None`.
     """
     raw_sql = clean_answer_sql(item.get("sql")) if isinstance(item, dict) else None
     named = clean_blueprint_id(item.get("blueprint_id")) if isinstance(item, dict) else None
@@ -393,61 +340,45 @@ def _resolve_item(item: Any, terminal_by_id: Mapping[str, str]) -> DesignationIt
 def resolve_designations(args: Any, terminal_by_id: Mapping[str, str]) -> Designation:
     """Read one `answerWithTable` call's arguments into an ORDERED item list.
 
-    `tables` IS THE SHAPE (08 §O). The model-facing schema declares exactly one
-    carrier and requires it, so every live call arrives as a list — a single-table
-    answer as a one-entry list. Everything below about the top-level
-    `sql`/`blueprint_id` pair is a READ-PATH FOLD for arguments that were not
-    written by today's schema.
+        `tables` IS THE SHAPE: the model-facing schema declares exactly one carrier and requires
+        it, so every live call arrives as a list — a single-table answer as a one-entry list.
+        Everything below about the top-level `sql`/`blueprint_id` pair is a READ-PATH FOLD for
+        arguments today's schema did not write.
 
-    THE PRECEDENCE (08 §B.3, kept verbatim because the fold has to behave the same
-    way the shorthand did), mirroring the rule already in `resolve_designation`
-    ("`sql=` wins when both are given: it is the more specific instruction"):
+        THE PRECEDENCE, mirroring the rule already in `resolve_designation`:
 
-        `tables` wins when at least one of its items CARRIES A DESIGNATION.
-        Otherwise the legacy top-level `sql`/`blueprint_id` pair is folded in as
-        ONE item.
+            `tables` wins when at least one of its items CARRIES A DESIGNATION. Otherwise the
+            legacy top-level `sql`/`blueprint_id` pair is folded in as ONE item.
 
-    "Carries a designation" — rather than "resolves" — is deliberate and is the one
-    place the doc's wording needed sharpening to stay self-consistent. `tables:
-    [{blueprint_id: X}]` where X never ran carries a designation that RESOLVES to
-    nothing; under a resolves-only test it would fall back to an empty top-level
-    pair and the model would silently lose its table, which is precisely what §B.4
-    step 3 forbids. Under this test it stays the source, the item survives as a
-    refusal, and the model gets the retryable nudge it can act on.
+        "Carries a designation" — rather than "resolves" — is deliberate: `tables:
+        [{blueprint_id: X}]` where X never ran carries a designation that RESOLVES to nothing,
+        and under a resolves-only test it would fall back to an empty top-level pair and the
+        model would silently lose its table. Under this test it stays the source, the item
+        survives as a refusal, and the model gets the retryable nudge it can act on.
 
-    WHAT THE FOLD IS FOR, now that nothing is supposed to send it. Two callers, and
-    neither is optional:
+        WHAT THE FOLD IS FOR, now that nothing is supposed to send it. Two callers, neither
+        optional:
 
-      1. **Replay.** Every `answerWithTable` trail entry persisted before 08 §O
-         carries `{"sql": …}` or `{"blueprint_id": …}` at the top level and no
-         `tables` at all. Those entries are SUCCESSFUL, and successful
-         `answerWithTable` entries replay cross-turn, seed a resumed window
-         (`_compute_turn_answer_tables`) and rebuild a reloaded transcript
-         (`session_history.project_history`). A read path that understood only the
-         new shape would silently drop every one of them: the table vanishes from
-         the transcript and from the resume, with nothing anywhere reporting it.
-         There is no migration and no expiry date on this — old documents are read
-         forever.
-      2. **A stale-context model.** The declared schema changes the moment the
-         process restarts, but a conversation already in flight, or a provider-side
-         cached tool list, can still produce the old serialisation. Refusing it
-         would cost the user a finished answer over a payload detail the runtime
-         can read perfectly well.
+          1. REPLAY. Every `answerWithTable` trail entry persisted before the schema change
+             carries the pair at the top level and no `tables` at all. Those entries are
+             SUCCESSFUL, so they replay cross-turn, seed a resumed window and rebuild a reloaded
+             transcript — a read path that understood only the new shape would silently drop
+             every one of them. There is no migration and no expiry date: old documents are read
+             forever.
+          2. A STALE-CONTEXT MODEL. A conversation already in flight, or a provider-side cached
+             tool list, can still produce the old serialisation, and refusing it would cost the
+             user a finished answer over a payload detail the runtime can read perfectly well.
 
-    A LEGACY KEY CARRYING NO INFORMATION IS ABSENT, not an error: `sql: ""` and
-    `blueprint_id: ""` clean to `None` in `clean_answer_sql`/`clean_blueprint_id`,
-    so R7 q1's `{"answer": …, "sql": "", "blueprint_id": "bp-…", "tables": []}`
-    resolves through the blueprint id and nothing is refused. The same rule is why
-    placeholder soup BESIDE a real array (`sql: ""`, `blueprint_id: ""`,
-    `tables: [{…}]`) is not a conflict at all — there is nothing there to conflict.
+        A LEGACY KEY CARRYING NO INFORMATION IS ABSENT, not an error: `sql: ""` and
+        `blueprint_id: ""` clean to `None`, so `{"answer": …, "sql": "", "blueprint_id": "bp-…",
+        "tables": []}` resolves through the blueprint id. The same rule is why placeholder soup
+        BESIDE a real array is not a conflict — there is nothing there to conflict.
 
-    NEVER A UNION. A model that fills `tables: [{blueprint_id: X}]` AND `sql: <X's
-    SQL>` gets ONE table, not two. Fallback rather than union is also what lets an
-    empty array (`tables: []`, the array analogue of `""` — and the exact thing a
-    model that cannot omit a required key emits when it has nothing to put there)
-    keep its legacy designation instead of silently losing it.
+        NEVER A UNION. A model that fills `tables: [{blueprint_id: X}]` AND `sql: <X's SQL>` gets
+        ONE table, not two. Fallback rather than union is also what lets an empty `tables: []`
+        keep its legacy designation instead of silently losing it.
 
-    Pure: no hooks, no store, no dedupe, no cap — see `finalize_designations`.
+        Pure: no hooks, no store, no dedupe, no cap — see `finalize_designations`.
     """
     if not isinstance(args, dict):
         return Designation(items=())
@@ -506,21 +437,18 @@ class FinalizedDesignation:
 
 
 def finalize_designations(items: Sequence[DesignationItem]) -> FinalizedDesignation:
-    """Dedupe on resolved SQL (first-occurrence order, the same discipline the
-    turn's SQL accumulator applies)
-    and cap at `MAX_ANSWER_TABLES`.
+    """Dedupe on resolved SQL (first-occurrence order, the discipline the turn's SQL
+        accumulator applies) and cap at `MAX_ANSWER_TABLES`.
 
-    OVERFLOW TRUNCATES, IT DOES NOT REFUSE — and this is the one place 03 §A.4's
-    "REJECT, never truncate" precedent deliberately does not transfer. There,
-    truncating rewrote a FROZEN `description` that enforcement depended on, so a
-    clipped value was a corrupted one. Here the cap equals `MAX_INTENTS`, so
-    exceeding it means the model designated more tables than it can possibly have
-    intents — duplication or nonsense, not a legitimate request being clipped. And
-    refusing would cost the user a finished answer over the model's own
-    bookkeeping.
+        OVERFLOW TRUNCATES, IT DOES NOT REFUSE — the one place the "REJECT, never truncate"
+        precedent deliberately does not transfer. There, truncating rewrote a FROZEN
+        `description` that enforcement depended on, so a clipped value was a corrupted one. Here
+        the cap equals `MAX_INTENTS`, so exceeding it means the model designated more tables than
+        it can possibly have intents, and refusing would cost the user a finished answer over the
+        model's own bookkeeping.
 
-    Items that resolved to nothing are skipped: the caller decides whether they are
-    a refusal (the loop, which can nudge) or simply absent (a replay, which cannot).
+        Items that resolved to nothing are skipped: the caller decides whether they are a refusal
+        (the loop, which can nudge) or simply absent (a replay, which cannot).
     """
     tables: list[DesignatedTable] = []
     seen: set[str] = set()
@@ -550,13 +478,12 @@ def finalize_designations(items: Sequence[DesignationItem]) -> FinalizedDesignat
 class AnswerTable:
     """One designated answer table, fully enriched — what the wire carries.
 
-    `provenance` is NOT on the wire and is NOT this entry's provenance: it is the
-    D44 USES set of the designated query, persisted separately on the
-    `answerWithTable` `TrailEntry` (`answer_table_provenance`) so a scope narrowing
-    can drop out-of-scope tables individually. It must NEVER enter
-    `_compute_turn_provenance_union`, which is fail-closed: one unparseable
-    designated query would collapse the whole turn's union to `None` and drop the
-    user's own answer from every later replay.
+        `provenance` is NOT on the wire and is NOT this entry's provenance: it is the D44 USES
+        set of the designated query, persisted separately on the `answerWithTable` `TrailEntry`
+        (`answer_table_provenance`) so a scope narrowing can drop out-of-scope tables
+        individually. It must NEVER enter `_compute_turn_provenance_union`, which is fail-closed
+        — one unparseable designated query would collapse the whole turn's union and drop the
+        user's own answer from every later replay.
     """
 
     sql: str
@@ -580,11 +507,9 @@ def enrich_table(
     *,
     provenance: frozenset[tuple[str, str]] | None = None,
 ) -> AnswerTable:
-    """Attach the per-table chip + badge, both read from the SAME `BlueprintRun`
-    that supplied the table's SQL.
-
-    A raw `sql=` table gets neither: there is nothing that verified it, and no
-    blueprint produced it.
+    """Attach the per-table chip + badge, both read from the SAME `BlueprintRun` that supplied
+        the table's SQL. A raw `sql=` table gets neither: nothing verified it, and no blueprint
+        produced it.
     """
     run = runs.get(table.blueprint_id) if table.blueprint_id is not None else None
     if run is None:
@@ -599,30 +524,24 @@ def enrich_table(
 
 
 def rollup_verification(tables: Sequence[AnswerTable]) -> dict[str, Any] | None:
-    """The envelope's `verification`: a CONSERVATIVE **AND** over the DESIGNATED
-    tables only (08 §C.3).
+    """The envelope's `verification`: a CONSERVATIVE AND over the DESIGNATED tables only.
 
-    Green only if EVERY designated table is verified and there is at least one.
-    An OR roll-up would be the over-claim restated; computing it over "any
-    blueprint that ran anywhere in the turn" — which is what the turn-level
-    accumulator does — is an over-claim of a second, older kind: a verified
-    blueprint for part 1 plus a hand-written query for part 2 badges an unverified
-    grid green, and has done since the field existed.
+        Green only if EVERY designated table is verified and there is at least one. An OR
+        roll-up would be the over-claim restated; computing it over "any blueprint that ran
+        anywhere in the turn" — what the turn-level accumulator does — badges an unverified grid
+        green whenever some other part of the turn used a verified blueprint.
 
-    ABSENCE, NOT `passed: False`, IS THE SIGNAL FOR "one of these is a hand-written
-    query" — that is not a failure at all and a `False` would be read as one.
+        ABSENCE, NOT `passed: False`, IS THE SIGNAL FOR "one of these is a hand-written query":
+        that is not a failure at all, and a `False` would be read as one.
 
-    J6 adds the one state that is neither: EVERY designated table backed by an
-    EMPTY blueprint result rolls up to the same explicit *empty — unverifiable*
-    block the per-table badge carries. It is propagated rather than flattened to
-    `None` because the UI renders the ENVELOPE's badge at N<=1 — and N=1 is exactly
-    the confirmed case (one designated table, zero rows). Flattening would make the
-    fix invisible in the situation it exists for.
+        EVERY designated table backed by an EMPTY blueprint result rolls up to the same explicit
+        *empty — unverifiable* block the per-table badge carries. It is propagated rather than
+        flattened to `None` because the UI renders the ENVELOPE's badge at N<=1, which is exactly
+        the confirmed case — flattening would make the fix invisible in the situation it exists
+        for.
 
-    A MIXED set (some verified, some empty) rolls up to `None`. "Empty" would
-    over-state it — part of the answer has rows — and "verified" would be the
-    original over-claim restated. No claim is the honest reading, and it is the
-    same answer this function already gives for any other mixture.
+        A MIXED set rolls up to `None`: "empty" would over-state it, since part of the answer has
+        rows, and "verified" would be the original over-claim restated.
     """
     if not tables:
         return None
@@ -651,24 +570,20 @@ def rollup_verification(tables: Sequence[AnswerTable]) -> dict[str, Any] | None:
 def is_answer_table_in_scope(
     provenance: frozenset[tuple[str, str]] | None, column_scope: frozenset[str]
 ) -> bool:
-    """Is this designated table still offerable under *column_scope*? (08 §D)
+    """Is this designated table still offerable under *column_scope*?
 
-    ONE predicate, read by the live path and by `session_history.project_history`,
-    for the reason `resolve_designation` itself exists: reading a designation one
-    way live and another way on reload silently dropped every blueprint
-    designation once, and *reload is the only place that regression shows*.
+        ONE predicate, read by the live path and by `session_history.project_history`, for the
+        reason `resolve_designation` itself exists: reading a designation one way live and
+        another way on reload silently dropped every blueprint designation once, and RELOAD is
+        the only place that regression shows.
 
-    UNDETERMINED PROVENANCE (`None`) IS KEPT, and that is a deliberate refinement of
-    08 §D.2's "`None` drops that table". §D.3 states the posture this sits in: the
-    gap being closed is a CONSISTENCY defect, not an entitlement hole, because
-    `POST /query/page` re-enforces column scope at execution under the caller's own
-    credentials — nothing out of scope was ever readable. Dropping on `None` would
-    therefore buy no access control while silently deleting every grid whose query
-    the runtime's own extractor cannot parse (an uncatalogued table is enough), for
-    queries `/query/page` executes perfectly well today. Fail-closed here would be
-    a new silent failure introduced to satisfy a posture, which is the defect class
-    this release has spent itself finding. A table PROVEN out of scope is still
-    dropped.
+        UNDETERMINED PROVENANCE (`None`) IS KEPT, deliberately. The gap being closed here is a
+        CONSISTENCY defect, not an entitlement hole: `POST /query/page` re-enforces column scope
+        at execution under the caller's own credentials, so nothing out of scope was ever
+        readable. Dropping on `None` would buy no access control while silently deleting every
+        grid whose query the runtime's own extractor cannot parse — an uncatalogued table is
+        enough — for queries `/query/page` executes perfectly well today. A table PROVEN out of
+        scope is still dropped.
     """
     if provenance is None:
         return True
@@ -678,11 +593,10 @@ def is_answer_table_in_scope(
 class AnswerWithTableTool:
     """The `answerWithTable(answer, tables=[{sql | blueprint_id, caption}])` tool.
 
-    Stateless: `run` never raises on malformed args (the loop's
-    `_run_runtime_tool` also guards, defense in depth) and holds nothing itself.
-    The loop reads the ARGUMENTS — the same discipline as `recordAssumptions` — to
-    build the turn's `answer_sql`/`assistant_text`, and treats a SUCCESSFUL call as
-    the turn's terminal event.
+        Stateless: `run` never raises on malformed args (the loop's `_run_runtime_tool` also
+        guards, defense in depth) and holds nothing itself. The loop reads the ARGUMENTS — the
+        same discipline as `recordAssumptions` — and treats a SUCCESSFUL call as the turn's
+        terminal event.
     """
 
     tool_name = TOOL_NAME

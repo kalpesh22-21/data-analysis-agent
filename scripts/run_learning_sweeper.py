@@ -1,15 +1,14 @@
 #!/usr/bin/env python
 """run_learning_sweeper — the learning-loop SWEEPER entrypoint (D96 §g).
 
-Composes a `LearningSweeper` from real infra (Couchbase session store + Redis
-Streams queue) and runs the periodic idle-detection loop. The D58c kill-switch is
-read FRESH at the top of every cycle inside `run_once` (via `learning_enabled()`),
-so flipping `LEARNING_ENABLED` halts enqueue without a restart.
+Composes a `LearningSweeper` from real infra (Couchbase session store + Redis Streams
+queue) and runs the periodic idle-detection loop. The D58c kill-switch is read FRESH at
+the top of every cycle, so flipping `LEARNING_ENABLED` halts enqueue without a restart.
 
 Environment: `RuntimeSettings` (Couchbase: COUCHBASE_*) + `LearningSettings`
 (LEARNING_*). Traced to the Phoenix `learning-loop` project — the startup log says
-whether tracing is actually ON (an empty `OTLP_ENDPOINT` yields a NO-OP provider
-and ZERO spans, which used to be silent).
+whether tracing is actually ON (an empty `OTLP_ENDPOINT` yields a NO-OP provider and
+ZERO spans).
 
 Usage:
     uv run python scripts/run_learning_sweeper.py            # loop forever

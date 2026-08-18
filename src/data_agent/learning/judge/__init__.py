@@ -1,13 +1,10 @@
 """judge — the coverage judge (plan §3b): "does the corpus already do this?".
 
-`judge.py` holds the two-stage judge itself, `schema.py` the forced tool + the guard on
-the untrusted response, `prompt.py` what each stage is shown.
-
-The verdict vocabulary and the durable record deliberately do NOT live here — they are
-`audit/judgement.py`, next to the doc shape that persists them. See that module's
-docstring: the verdict is a record first and a branch second, and the placement is also
-what keeps `candidate/models.py` (which stamps an assessment on the envelope) out of an
-import cycle with this package.
+`judge.py` holds the two-stage judge, `schema.py` the forced tool + the guard on the untrusted
+response, `prompt.py` what each stage is shown. The verdict vocabulary and the durable record
+deliberately live in `audit/judgement.py` instead, next to the doc shape that persists them —
+the verdict is a record first and a branch second, and that placement also keeps
+`candidate/models.py` out of an import cycle with this package.
 """
 
 from .judge import (

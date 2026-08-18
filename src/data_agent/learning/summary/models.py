@@ -1,15 +1,10 @@
-"""SessionSummary — the deterministic, normalized view the triage gate and the
-S3 extractor consume (learning-loop-slice2-design §1, D27).
+"""SessionSummary — the deterministic, normalized view triage and the extractor consume.
 
-Entity-bearing but strictly in-boundary: `user_nl`, `assistant_text`, and `args`
-(SQL literals) may carry PII. This is fine — the summary is produced INSIDE the
-learning process, pre-leakage-gate (S5), and NEVER leaves it except as (a) an
-access-controlled `learning_audit` snapshot (S3) or (b) an entity-FREE derivative
-after the S5 gate. S2 itself emits neither: it hands the in-memory summary to the
-stub extractor and drops it.
-
-`tool_call_ref` (= `TrailEntry.tool_call_id`) and `turn_index` are preserved so
-S3's `EvidenceRef{turn_ref, tool_call_ref}` resolves against the live session.
+Entity-bearing but strictly IN-BOUNDARY: `user_nl`, `assistant_text` and `args` may carry
+PII. That is fine, because the summary is produced INSIDE the learning process, pre-leakage
+gate, and never leaves it except as an access-controlled `learning_audit` snapshot or as an
+entity-FREE derivative after the S5 gate. `tool_call_ref` and `turn_index` are preserved so
+an `EvidenceRef` resolves against the live session.
 """
 
 from __future__ import annotations
@@ -97,10 +92,9 @@ class FailedFixedSql:
 class AnswerSql:
     """One query the FINAL answer stood on — an `answerWithTable` designation (§2.6).
 
-    NOT a `ToolCallSummary`: `answerWithTable` executes nothing, and the query it
-    designates need never have been dispatched as a `runQuery` at all, so this is
-    the only record of it. `tool_call_ref` is the `answerWithTable` call, which keeps
-    it resolvable as an S3 `EvidenceRef` like every other ref in this module.
+    NOT a `ToolCallSummary`: `answerWithTable` executes nothing, and the query it designates need
+    never have been dispatched as a `runQuery`, so this is the only record of it. `tool_call_ref`
+    is the `answerWithTable` call, which keeps it resolvable as an `EvidenceRef`.
     """
 
     tool_call_ref: str  # the answerWithTable call that designated this query

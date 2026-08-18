@@ -1,21 +1,15 @@
 """Offline catalog loading for the standalone `scripts/` (D75 Wave 1b).
 
-`databaseSchemaDocs/` has been deleted: the semantic catalog now comes from the
-MCP `GET /catalog/export` route, or from the committed frozen snapshot
-`tests/fixtures/catalog_export.json` (the SAME payload that route serves). The
-runtime and the test suite are already migrated; these helpers give the
-standalone scripts the same catalog WITHOUT importing anything under `tests/`.
+The semantic catalog comes from the MCP `GET /catalog/export` route, or from the
+committed frozen snapshot of that same payload. These scripts hold no per-request MCP
+JWT, so they read the FROZEN export resolved by `RuntimeSettings.catalog_fixture_file()`
+— the committed fixture by default, or whatever `CATALOG_FIXTURE_PATH` points at. To
+refresh against the LIVE catalog without a code change, dump the MCP's
+`GET /catalog/export` body to a file and set `CATALOG_FIXTURE_PATH` to it.
 
-The scripts here hold no per-request MCP JWT, so they read the FROZEN export
-snapshot resolved by `RuntimeSettings.catalog_fixture_file()` — the committed
-fixture by default, or whatever `CATALOG_FIXTURE_PATH` points at. To refresh
-against the LIVE catalog without a code change, an operator dumps the MCP's
-`GET /catalog/export` body to a file and sets `CATALOG_FIXTURE_PATH` to it.
-
-Two projections, mirroring `load_catalog_handles_from_export` / the from-catalog
-loaders the runtime uses:
-  * `catalog_dict()`   — the raw `{db.table: <entry>}` mapping (feeds both the
-    sqlglot schema and the `rules[*].id` grounding the extractor needs).
+Two projections, mirroring the from-catalog loaders the runtime uses:
+  * `catalog_dict()`   — the raw `{db.table: <entry>}` mapping (feeds both the sqlglot
+    schema and the `rules[*].id` grounding the extractor needs).
   * `catalog_handle()` — the immutable `CatalogHandle` (provenance/scope).
 """
 

@@ -1,21 +1,10 @@
-"""FakeMCPClient — scripted in-memory MCPClient double (Layer 1, design §8).
+"""FakeMCPClient — scripted in-memory `MCPClient` double (Layer 1).
 
-Scripted as `{tool_name: [responses...]}` where each response is either a
-plain dict/list (returned as-is) or an `Exception` instance (raised as-is —
-typically an `MCPToolError`). Responses are consumed in order per tool name;
-calling a tool more times than it has scripted responses raises
-`AssertionError` (a test-authoring bug, not a runtime condition).
-
-Every call is recorded in `self.calls` (tool_name, args, jwt, session_id) so
-tests can assert the credential-injection boundary (D5): the JWT/session_id
-DID reach this transport boundary, even though they never appear in any
-`ToolResult`/`TrailEntry`/model-facing structure produced downstream.
-
-`list_tools` also requires `jwt`/`session_id` keyword arguments (mirroring
-the real MCP, which authenticates every request including `tools/list`) —
-each call is recorded in `self.list_tools_calls`, but the returned tool
-catalogue itself never varies by credentials (it is scope-independent, like
-the real MCP's).
+Scripted as `{tool_name: [responses...]}`; a response that is an `Exception` instance
+is raised as-is, and consuming past the end raises `AssertionError` (a test-authoring
+bug, not a runtime condition). Every call is recorded in `self.calls` so tests can
+assert the D5 boundary: credentials DID reach the transport, and appear nowhere
+downstream. The catalogue `list_tools` returns never varies by credentials.
 """
 
 from __future__ import annotations

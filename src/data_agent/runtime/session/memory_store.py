@@ -1,15 +1,10 @@
 """InMemorySessionStore — the Layer-1 SessionStore fake (dict-backed, D45 CAS emulation).
 
-CAS emulation: an integer version counter per session_id, bumped on every
-mutating write. `get_session_with_cas` returns `(doc_copy, version)`;
-`resume_checkpoint` only commits if the version is still current at the time
-of the write — otherwise `CASMismatchError`. Because Python's asyncio is
-single-threaded/cooperative, two "concurrent" resumers in a test are simply
-two coroutines that both call `get_session_with_cas` (both observe the same
-version) before either calls `resume_checkpoint`; whichever call executes
-first wins and bumps the version, so the second deterministically loses —
-this faithfully simulates the real Couchbase CAS race without needing actual
-threads or a container.
+CAS emulation: an integer version counter per session_id, bumped on every mutating
+write. `get_session_with_cas` returns `(doc_copy, version)`; `resume_checkpoint` commits
+only if that version is still current, else `CASMismatchError`. Under cooperative
+asyncio two "concurrent" resumers both observe the same version and the second
+deterministically loses — the real Couchbase race, without threads or a container.
 """
 
 from __future__ import annotations
@@ -111,13 +106,13 @@ class InMemorySessionStore:
         turn_index: int,
         merge: Callable[[AnalysisState | None], AnalysisState],
     ) -> AnalysisState:
-        """In-memory counterpart of the merge-callback contract (03 §B.1).
+        """In-memory counterpart of the merge-callback contract.
 
-        There is no CAS retry to drive here (this fake is single-writer by
-        construction), but the ORDER matters and mirrors the real store: *merge*
-        runs FIRST against the live state and may raise, and only a merge that
-        returned normally mutates the doc — so a rejected state call leaves the
-        document byte-identical in both implementations.
+                There is no CAS retry to drive here (this fake is single-writer by
+                construction), but the ORDER matters and mirrors the real store: *merge* runs
+                FIRST against the live state and may raise, and only a merge that returned
+                normally mutates the doc — so a rejected call leaves the document
+                byte-identical in both implementations.
         """
         doc = await self.get_or_create_session(session_id)
         new_state = merge(live_analysis_state(doc, turn_index))
@@ -133,11 +128,10 @@ class InMemorySessionStore:
         window_count: int,
         kind: FinalizationBlockKind,
     ) -> bool:
-        """In-memory counterpart of the claim (05 §C.1, §J.3). Same shape as the
-        real store: the limit is checked and the counter incremented in ONE step, so
-        two claimants for the same (turn, window, kind) can never both succeed — and
-        two claimants for DIFFERENT kinds never contend at all, which is the point of
-        the kind being in the key."""
+        """In-memory counterpart of the claim. The limit is checked and the counter
+                incremented in ONE step, so two claimants for the same (turn, window, kind) can
+                never both succeed — and two claimants for DIFFERENT kinds never contend at all.
+        """
         doc = await self.get_or_create_session(session_id)
         blocks = dict(doc.finalization_blocks or {})
         key = finalization_block_key(turn_index, window_count, kind)

@@ -1,12 +1,10 @@
 """LearningSweeper — idle-detection + two-step claim + enqueue (D96 §6).
 
-Every cycle: read the kill-switch FRESH; if enabled, scan idle sessions and, for
-each, perform the two-step claim (`active → pending` CAS, then XADD, then
-`pending → queued` CAS recording `content_hash`). A CAS loss (peer sweeper won,
-or the session was resumed) is a skip, not a retry.
-
-Read-only w.r.t. request-path data (D72): the ONLY writes are the two lifecycle
-transitions and `learning_content_hash`.
+Every cycle reads the kill-switch FRESH, then for each idle session performs the two-step
+claim (`active → pending` CAS, XADD, `pending → queued` CAS recording `content_hash`). A
+CAS loss (a peer won, or the session resumed) is a SKIP, not a retry. Read-only w.r.t.
+request-path data (D72): the only writes are those two transitions and
+`learning_content_hash`.
 """
 
 from __future__ import annotations
@@ -131,11 +129,12 @@ class LearningSweeper:
         return SweepResult(scanned=scanned, claimed=claimed, enqueued=enqueued)
 
     async def _enqueue(self, doc, cas, content_hash: str) -> str:
-        """XADD the reference envelope, returning the message id. When a tracer is
-        wired the enqueue runs INSIDE the `learning.enqueue` span (the per-session
-        trace ROOT) and injects that span's `traceparent` onto the job so the
-        consumer/scheduler spans join the SAME Phoenix trace; otherwise a plain
-        XADD with no traceparent (no-op-tracer behavior preserved)."""
+        """XADD the reference envelope, returning the message id.
+
+        With a tracer wired the XADD runs INSIDE the `learning.enqueue` span (the per-session trace
+        ROOT) and injects that span's `traceparent` onto the job, so the consumer/scheduler spans
+        join the same trace; otherwise a plain XADD with no traceparent.
+        """
         if self._tracer is None:
             job = LearningJob.from_doc(doc, content_hash=content_hash, cas=cas)
             return await self._queue.enqueue(job)
@@ -153,13 +152,12 @@ class LearningSweeper:
             return message_id
 
     async def run_forever(self, *, sleep) -> None:
-        """Periodic loop (used by the entrypoint). *sleep* is injected
-        (`asyncio.sleep`) so it is unit-drivable. Ensures the consumer group
-        exists once, then sweeps every `learning_sweep_interval_seconds`.
+        """Periodic loop; *sleep* is injected (`asyncio.sleep`) so it is unit-drivable.
 
-        The kill-switch STATE CHANGE is logged — once per change, never per cycle (see
-        the same note on `LearningConsumer.run_forever`): a sweeper held off by
-        `LEARNING_ENABLED` enqueues nothing and, without this, says nothing about why."""
+        Ensures the consumer group exists once, then sweeps every
+        `learning_sweep_interval_seconds`. The kill-switch STATE CHANGE is logged once per change,
+        never per cycle — a sweeper held off by `LEARNING_ENABLED` otherwise says nothing at all.
+        """
         await self._queue.ensure_group()
         disabled_logged = False
         while True:

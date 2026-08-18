@@ -1,22 +1,11 @@
 """SchemaEditPRStage — the S8 schema-edit PR bot (`CandidateStage`, D53/D18).
 
-The highest-stakes target: a `schema_edit` grounds `getTableSchema` for ALL users,
-so it is NEVER auto-committed (D18). This stage, at the writer position of the
-pipeline (§7.1), turns a `schema_edit` candidate into a **branch + YAML-patch PR**
-via the injected git client, gated by the injected CI checks (schema lint +
-`explainQuery` dry-run). It then routes the candidate to the review inbox
-(`status=in_review`) — the human MERGE of the PR is the real gate (D53). It writes
-NOTHING to the catalog.
-
-  * CI passes -> open the PR (branch + patch) -> record the PR ref on the payload
-    -> `status=in_review`, `control="route_inbox"`.
-  * CI fails  -> do NOT open a PR (no red branch) -> record the failure reason ->
-    `status=in_review` with `reason="fail_to_review"`, `control="route_inbox"`.
-
-Either way: never a catalog write, never a real GitHub call in tests (the client
-is an injected scripted double; the real wiring is deferred).
-
-Every non-`schema_edit` candidate passes straight through (`control="continue"`).
+The highest-stakes target: a `schema_edit` grounds `getTableSchema` for ALL users, so it is
+NEVER auto-committed (D18). At the writer position this turns the candidate into a branch +
+YAML-patch PR via the injected git client, gated by the injected CI checks, and routes it to
+the review inbox — the human MERGE of the PR is the real gate (D53). CI passing opens the PR
+and records its ref; CI failing opens none and records the reason, routing `fail_to_review`.
+Either way: never a catalog write. Every non-`schema_edit` candidate passes straight through.
 """
 
 from __future__ import annotations
@@ -35,8 +24,10 @@ def _branch_name(env: CandidateEnvelope) -> str:
 
 
 def _catalog_path(patch: SchemaEditPatch) -> str:
-    """The catalog YAML file the patch merges into (placeholder mapping — the real
-    path resolver lands with the real git wiring)."""
+    """The catalog YAML file the patch merges into.
+
+    A placeholder mapping — the real path resolver lands with the real git wiring.
+    """
     catalog = patch.target_catalog or "catalog"
     return f"catalog/{catalog}/semantic.yaml"
 

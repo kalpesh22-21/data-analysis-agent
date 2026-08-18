@@ -1,38 +1,20 @@
 #!/usr/bin/env python
-"""demo_runtime_turn_traced — a REAL normal user interaction driven through the
-online agent runtime (`create_app`) and traced to Phoenix.
+"""demo_runtime_turn_traced — a REAL normal user interaction driven through the online
+agent runtime (`create_app`) and traced to Phoenix. NOT a pytest test: the real LLM is
+nondeterministic.
 
-This is NOT a pytest test (the real LLM is nondeterministic). It stands up the
-REAL runtime composition root with REAL dependencies:
+It stands up the REAL composition root with REAL dependencies: an OpenAI model client
+(key from `.env`), a `RealMCPClient` against the live l2-mcp running a REAL ClickHouse
+query on the seeded `dbpcm_warehouse.employee` table, the catalog rebuilt from the
+frozen catalog-export snapshot (D75 Wave 1b), an `InMemorySessionStore`, and a scoped
+JWT minted via the live l2-token IdP and bound to the session id.
 
-  1. a REAL OpenAI model client (`build_openai_model_client`, key from `.env`,
-     model `gpt-5.5` with a small preflight fallback like the learning demo),
-  2. a REAL `RealMCPClient` -> the live l2-mcp (streamable-HTTP), which runs a
-     REAL ClickHouse query against the seeded `dbpcm_warehouse.employee` table
-     the MCP live tests use,
-  3. the REAL catalog rebuilt from the frozen catalog-export snapshot (D75 Wave
-     1b — `databaseSchemaDocs/` is gone; `catalog_source="fixture"` reads the
-     committed export, provenance) + a real minimal in-memory session store
-     (`InMemorySessionStore` — the production store, not a fake),
-  4. a scoped JWT minted via the live l2-token IdP (bound to the session id,
-     like the MCP live tests / conftest).
+Tracing lands in the `data-agent-runtime` Phoenix project. A runtime TURN is already
+ONE connected trace — `agent.turn` wraps it and the TOOL/CHAIN/LLM spans nest under it
+via ambient context, so no cross-process propagation is needed.
 
-Tracing is exported to Phoenix (`OTLP_ENDPOINT=http://localhost:6006/v1/traces`)
-and lands in the `data-agent-runtime` project — the project name is now set IN
-CODE by `configure_tracing(project_name=...)` (no OTEL_RESOURCE_ATTRIBUTES hack).
-
-Unlike the learning loop, a runtime TURN is already ONE connected trace: the
-`agent.turn` AGENT span wraps the whole turn and the TOOL/CHAIN spans (plus the
-OpenInference OpenAI LLM span from `instrument_openai`) nest under it via the
-ambient context — so NO cross-process propagation is needed.
-
-D25: the MANUAL runtime spans (AGENT/TOOL/CHAIN/GUARDRAIL) are SHAPE-ONLY (no
-verbose flag; SQL literals + bound-slot values already redacted). The auto
-OpenAI LLM span's raw prompt/completion is hidden BY DEFAULT in the library
-(`RuntimeSettings.otlp_hide_llm_content=True`). This DIAGNOSTIC demo OPTS IN to
-revealing it (`otlp_hide_llm_content=False`) — like the learning-loop verbose
-gate — so the question/answer are visible in Phoenix. Set DEMO_HIDE_LLM_CONTENT=1
-to run the D25-safe DEFAULT posture (LLM span content-free) instead.
+D25: the manual runtime spans are SHAPE-ONLY, but this DIAGNOSTIC demo OPTS IN to
+revealing the auto OpenAI span's prompt/completion (`otlp_hide_llm_content=False`).
 
 Run (from the repo root, the l2 stack + Phoenix UP):
 

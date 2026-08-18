@@ -1,35 +1,23 @@
-"""corpus_loader — offline write path for the neo4j retrieval corpus (Slice 2).
+"""corpus_loader — offline write path for the neo4j retrieval corpus.
 
-`load_corpus(...)` is a reusable, idempotent bulk upsert of a small, curated,
-TRUSTED seed (neo4j-corpus-design §3): it embeds every blueprint `intent` and
-knowledge `text` through the REAL `HttpEmbeddingClient` (the same D71 endpoint
-the online path uses — parity by construction), MERGE-by-id upserts the nodes
-with the embedding + `embedding_model` stamp + the denormalized `uses` list
-property, and links each blueprint's `:USES` edges to the PRE-EXISTING catalog
-`:Column` nodes (MERGE→MATCH — the nodes are owned by `load_catalog_graph`, no
-longer minted here) in the SAME transaction (the D60 graph shape; unread at recall).
+`load_corpus(...)` is a reusable, idempotent bulk upsert of a small, curated, TRUSTED seed:
+it embeds every blueprint `intent` and knowledge `text` through the REAL embedding client
+(parity with the online path by construction), MERGE-by-id upserts the nodes with the
+embedding + `embedding_model` stamp + the denormalized `uses` property, and links each
+blueprint's `:USES` edges to the PRE-EXISTING catalog `:Column` nodes in the SAME
+transaction.
 
-`resolve_blueprint_references(...)` runs FIRST inside `load_corpus`'s pre-write pass
-(plan §2b): a `composes` node may name another blueprint by id instead of carrying
-its own SQL, and that reference is resolved and INLINED here, at load. The executor is
-untouched (it never resolves a reference), no reference id survives onto the node, and
-a composite must DECLARE the union of everything it inlines or the load fails closed —
-see the "Blueprint references" section for the rules and their rationale.
+`resolve_blueprint_references(...)` runs FIRST in that pre-write pass: a `composes` node may
+name another blueprint by id instead of carrying its own SQL, and that reference is resolved
+and INLINED at load, so no reference id survives onto a node and the executor never resolves
+one.
 
-`load_catalog_graph(...)` is the separate, catalog-OWNED hydration of the enriched,
-self-healing `:Table`/`:Column` graph from the MCP catalog EXPORT dict (no embeds,
-no model-parity): every node carries its catalog props + a `catalog_sha` stamp, and
-GC removes any node a newer catalog run no longer touches (§ catalog-graph).
+`load_catalog_graph(...)` is the separate, catalog-OWNED hydration of the `:Table`/`:Column`
+graph from the MCP catalog EXPORT dict (no embeds, no model parity).
 
-Parity is STRICT at write (§3.3): the loader refuses to write two different
-embedding-model ids into one index — a mixed index is silently broken, so
-write-time is the right place to fail loudly. Read-time parity is a DEGRADE
-(`Neo4jVectorIndex` filters by `expected_model` → `[]` on mismatch, D86).
-
-NOT Track B (§3.4): no `canonical_key`/dedup, no leakage gate, no promotion
-lifecycle — the reserved lifecycle/provenance properties are seeded trivially
-(`status=validated`, `created_by=seed`, `hit_count=0`) and simply not read by
-the recall path.
+Parity is STRICT at write: the loader refuses to write two different embedding-model ids
+into one index, because a mixed index is silently broken. Read-time parity is a DEGRADE
+instead (`Neo4jVectorIndex` filters by `expected_model`, D86).
 """
 
 from __future__ import annotations
@@ -92,11 +80,10 @@ _logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class BlueprintSeed:
-    """One hand-authored blueprint fixture (neo4j-corpus-design §3.2).
+    """One hand-authored blueprint fixture.
 
-    `uses` MUST be byte-exact `"database.table.column"` scope keys (the HR
-    warehouse the ClickHouse seed + Semantic Catalog describe) or the read-path
-    scope pre-filter silently drops the blueprint (§8 highest-risk contract).
+        `uses` MUST be byte-exact `"database.table.column"` scope keys, or the read-path scope
+        pre-filter silently drops the blueprint — the corpus's highest-risk contract.
     """
 
     id: str
@@ -184,14 +171,12 @@ class KnowledgeSeed:
 
 @dataclass(frozen=True)
 class LoadReport:
-    """Outcome of a `load_corpus` run — counts + the model the corpus was
-    stamped with (for a CLI/exit summary).
+    """Outcome of a `load_corpus` run — counts plus the model the corpus was stamped with.
 
-    `columns_referenced`/`tables_referenced` count the DISTINCT column/table keys
-    the seeded blueprints REFERENCE (their `uses` footprint) — NOT nodes this loader
-    writes. Since the MERGE→MATCH rewrite, `:Column`/`:Table` nodes are owned by
-    `load_catalog_graph`; `load_corpus` only links `:USES` to pre-existing catalog
-    nodes. These counts are a footprint summary for the CLI, nothing more."""
+        `columns_referenced`/`tables_referenced` count the DISTINCT keys the seeded blueprints
+        REFERENCE, not nodes this loader writes: `:Column`/`:Table` nodes are owned by
+        `load_catalog_graph`, and `load_corpus` only links `:USES` to pre-existing ones.
+    """
 
     model_id: str
     blueprints_written: int
@@ -207,13 +192,12 @@ class LoadReport:
 
 @dataclass(frozen=True)
 class CatalogGraphReport:
-    """Outcome of a `load_catalog_graph` run — the enriched `:Table`/`:Column`
-    hydration counts + the run's `catalog_sha`.
+    """Outcome of a `load_catalog_graph` run — the `:Table`/`:Column` hydration counts and the
+        run's `catalog_sha`.
 
-    `skipped=True` is the B1 no-op fast path (the graph already carries this
-    export's sha, so nothing was written). `drift_referenced_columns` lists any
-    `:Column` the GC removed that STILL had an inbound `:USES` — a blueprint
-    referencing a column the catalog just dropped (GC wins; the drift is logged).
+        `skipped=True` is the no-op fast path (the graph already carries this export's sha, so
+        nothing was written). `drift_referenced_columns` lists any `:Column` the GC removed that
+        STILL had an inbound `:USES` — GC wins, and the drift is logged.
     """
 
     catalog_sha: str
@@ -230,14 +214,14 @@ class CorpusLoadError(Exception):
 
 
 class DimensionMismatchError(CorpusLoadError):
-    """Raised when a pre-existing vector index carries a DIFFERENT embedding
-    dimension than the one this run wants to write (Part B dimension-parity).
+    """Raised when a pre-existing vector index carries a DIFFERENT embedding dimension than
+        the one this run wants to write.
 
-    A `CREATE VECTOR INDEX ... IF NOT EXISTS` silently KEEPS the old (wrong)
-    dimension, so the only way to detect a changed embedding model/dimension is to
-    introspect `SHOW VECTOR INDEXES` and raise LOUD — this error is the operator's
-    signal that the embedding model changed and the graph must be rebuilt — the
-    singleton hydrator daemon catches this and nukes + rebuilds at the new dimension."""
+        A `CREATE VECTOR INDEX ... IF NOT EXISTS` silently KEEPS the old (wrong) dimension, so
+        the only way to detect a changed embedding model is to introspect `SHOW VECTOR INDEXES`
+        and raise LOUD. The singleton hydrator catches this and nukes + rebuilds at the new
+        dimension.
+    """
 
 
 # The default embedding dimension (all-mpnet-base-v2 → 768). Used when a caller
@@ -269,9 +253,8 @@ def load_seed_fixtures(
 ) -> tuple[list[BlueprintSeed], list[KnowledgeSeed]]:
     """Read `blueprints.yaml` + `knowledge.yaml` under *corpus_dir* into seeds.
 
-    Raises `CorpusLoadError` on a duplicate id (within OR across the two files,
-    QA flag 6): MERGE-by-id would silently let a copy-pasted id overwrite in
-    place, masking an authoring mistake — fail loudly instead.
+        Raises `CorpusLoadError` on a duplicate id, within OR across the two files: MERGE-by-id
+        would otherwise let a copy-pasted id overwrite in place, masking an authoring mistake.
     """
     root = Path(corpus_dir)
     blueprints = [BlueprintSeed(**item) for item in _read_yaml_list(root / "blueprints.yaml")]
@@ -285,34 +268,25 @@ _KNOWLEDGE_SEED_FIELDS = frozenset(f.name for f in fields(KnowledgeSeed))
 
 
 def _seed_from_entry(entry_id: str, entry: dict[str, Any], *, kind: str) -> Any:
-    """Project one MCP-export entry (`{<field>: <value>}`) onto a `BlueprintSeed`/
-    `KnowledgeSeed`, WHITELISTING to the dataclass fields.
+    """Project one MCP-export entry onto a `BlueprintSeed`/`KnowledgeSeed`, WHITELISTING to
+        the dataclass fields.
 
-    The MCP export is a separate repo's canon, so unknown/extra keys are DROPPED
-    (never spread blindly into the dataclass constructor, which would `TypeError`) —
-    the same defensive whitelist the catalog-graph prop mappers use. The dict key is
-    the authoritative id (falls back to the entry's own `id` only if the key is
-    somehow absent). `source`/`verified` come through verbatim when the export carries
-    them AS THE RIGHT TYPE (the MCP injects `source="mcp"`, `verified=True`); when
-    absent OR malformed, the dataclass DEFAULTS (`mcp`/`True`) present the seed as
-    trusted canon.
+        The export is a separate repo's canon, so unknown or extra keys are DROPPED rather than
+        spread blindly into the constructor. The dict key is the authoritative id.
+        `source`/`verified` come through verbatim only when present AS THE RIGHT TYPE; absent OR
+        malformed falls back to the dataclass defaults (`mcp`/`True`).
 
-    **Why malformed falls back to the default rather than through to neo4j.** The upsert
-    writes `b.source = $source`, and neo4j REMOVES a property set to null — so an export
-    entry carrying an explicit `"source": null` produced a SOURCELESS node. That node is
-    invisible to recall (its trust gate is bare `= 'mcp'`, fail-closed) but perfectly
-    visible to the prior-art read, which deliberately drops that gate. Rather than teach
-    every reader to coalesce, the WRITER is made to always stamp: after this whitelist,
-    `source` is a non-empty `str` and `verified` is a `bool` on every seed this loader
-    builds, so a sourceless/unstamped node can only come from a hand edit or a foreign
-    writer — which is exactly what `priorart.models.TIER_UNSOURCED` is for.
+        The malformed fallback matters because the upsert writes `b.source = $source` and neo4j
+        REMOVES a property set to null — an explicit `"source": null` produced a SOURCELESS node,
+        invisible to recall's fail-closed trust gate but perfectly visible to the prior-art read,
+        which deliberately drops that gate. Rather than teach every reader to coalesce, the
+        WRITER always stamps: a sourceless node can then only come from a hand edit or a foreign
+        writer, which is what `priorart.models.TIER_UNSOURCED` is for.
 
-    This is NOT a trust escalation. Everything this function projects came from the MCP
-    canon export, fetched over the service-key-authenticated route; trust rests on the
-    TRANSPORT, and `source` is provenance metadata the export happens to echo back. The
-    dataclass already treats "absent" as canon for exactly that reason — this only
-    extends the same rule to "present but not a `str`/`bool`", which is otherwise a
-    silent property-deleting write."""
+        Not a trust escalation: everything here came from the canon export over the
+        service-key-authenticated route, so trust rests on the TRANSPORT and `source` is
+        provenance metadata the export echoes back.
+    """
     fields_ = _BLUEPRINT_SEED_FIELDS if kind == "blueprint" else _KNOWLEDGE_SEED_FIELDS
     data = {k: v for k, v in entry.items() if k in fields_}
     data["id"] = entry_id or data.get("id")
@@ -323,26 +297,20 @@ def _seed_from_entry(entry_id: str, entry: dict[str, Any], *, kind: str) -> Any:
 def _drop_malformed_trust_stamp(
     data: dict[str, Any], *, entry_id: Any, kind: str
 ) -> None:
-    """Coerce a malformed `source`/`verified` so the node write always gets a usable
-    value (see `_seed_from_entry`). Mutates *data*.
+    """Coerce a malformed `source`/`verified` so the node write always gets a usable value.
+        Mutates *data*.
 
-    **The two fields take DIFFERENT fallbacks, and the asymmetry is the point.**
+        THE TWO FIELDS TAKE DIFFERENT FALLBACKS, and the asymmetry is the point.
 
-    `source` must be a NON-EMPTY `str` (`""` would write an empty-string property that
-    matches neither trust partition — a third state nothing handles). A malformed one is
-    DROPPED so the dataclass default (`mcp`) applies. That is not a trust escalation:
-    an exporter emitting `"source": null` is indistinguishable in trust terms from one
-    omitting the key entirely — which already defaults to `mcp` — and anyone who controls
-    that value could simply have written `"mcp"`. Trust rests on the service-key
-    authenticated transport, not on a field in the payload.
+        `source` must be a NON-EMPTY `str` — `""` would write a property matching neither trust
+        partition, a third state nothing handles — so a malformed one is DROPPED and the
+        dataclass default (`mcp`) applies. An exporter emitting `"source": null` is
+        indistinguishable in trust terms from one omitting the key, which already defaults to
+        `mcp`; trust rests on the authenticated transport, not on a field in the payload.
 
-    `verified` must be a real `bool`, and a malformed one is set to **`False`**, NOT
-    dropped. The `source` argument does not transfer: a present `"verified": "false"`
-    plausibly MEANT false, and falling back to the dataclass default would silently
-    INVERT it to true. `False` is a legal, honest value — "landed but nobody has verified
-    it" — it costs nothing today (recall does not read `verified`), and it stays correct
-    when `recheck_verified_only` starts reading it. An ABSENT `verified` still defaults
-    to `True` via the dataclass; only a malformed one gets the untrusting value.
+        `verified` must be a real `bool`, and a malformed one is set to `False`, NOT dropped: a
+        present `"verified": "false"` plausibly MEANT false, and falling back to the dataclass
+        default would silently INVERT it. An ABSENT `verified` still defaults to `True`.
     """
     source = data.get("source")
     if "source" in data and not (isinstance(source, str) and source.strip()):
@@ -371,25 +339,17 @@ def _drop_malformed_trust_stamp(
 def _seeds_from_entries(raw: dict[str, Any], *, kind: str) -> list[Any]:
     """Build seeds from a `{<id>: <entry>}` map, DEGRADE-not-fail per entry.
 
-    A non-dict entry, a falsy id, or an entry the dataclass ctor rejects (a missing
-    required field → `TypeError`, an out-of-range value → `ValueError`) is SKIPPED with
-    a warning — never allowed to fail the whole seed. This is load-bearing: the cache
-    re-arms + retries the SAME export every turn on a raised seed, so one malformed
-    entry from the (separate-repo) MCP would otherwise brick the corpus indefinitely.
+        A non-dict entry, a falsy id, or one the dataclass constructor rejects is SKIPPED with a
+        warning. This is load-bearing: the cache re-arms and retries the SAME export every turn
+        on a raised seed, so one malformed entry from the separate MCP repo would otherwise brick
+        the corpus indefinitely.
 
-    **The scope of that promise is narrower than it reads, and always was.** It covers
-    the PROJECTION step only — turning an export entry into a `BlueprintSeed`. It does
-    NOT make the load as a whole tolerant: `load_corpus`'s pre-write pass runs
-    `_validate_blueprint_uses`, `resolve_blueprint_references` and
-    `_validate_blueprint_dag` over the surviving seeds and raises `CorpusLoadError` on
-    the first failure, aborting everything. A malformed scope key, an unparseable
-    template, a DAG cycle, and (since plan §2b) a dangling blueprint REFERENCE all brick
-    the corpus in exactly the way this function's skip exists to prevent. That is
-    deliberate — those are authoring errors that must not ship half-applied, and the
-    hydrator logs and retries rather than destructively rebuilding — but it means "never
-    fatal to the seed" is a claim about THIS function, not about the load. See
-    `_reference_graph` for the reference case, which is the one whose blast radius grew:
-    a widely-referenced blueprint is now a single point of failure for the whole load."""
+        THE SCOPE OF THAT PROMISE IS NARROWER THAN IT READS: it covers the PROJECTION step only.
+        `load_corpus`'s pre-write pass still raises `CorpusLoadError` on the first failure of
+        `_validate_blueprint_uses`, `resolve_blueprint_references` or `_validate_blueprint_dag`,
+        aborting everything — deliberately, since those are authoring errors that must not ship
+        half-applied. See `_reference_graph` for the case whose blast radius grew.
+    """
     seeds: list[Any] = []
     for entry_id, entry in raw.items():
         if not isinstance(entry, dict):
@@ -414,28 +374,26 @@ def _seeds_from_entries(raw: dict[str, Any], *, kind: str) -> list[Any]:
 def corpus_seeds_from_export(
     export: dict[str, Any],
 ) -> tuple[list[BlueprintSeed], list[KnowledgeSeed]]:
-    """Build the seed lists from a combined corpus export dict (governed-corpus
-    Phase 2): `{"blueprints": {<id>: <entry>}, "knowledge": {<id>: <entry>}, ...}`.
+    """Build the seed lists from a combined corpus export dict
+        (`{"blueprints": {<id>: <entry>}, "knowledge": {<id>: <entry>}, ...}`) — the online
+        analogue of `load_seed_fixtures`.
 
-    Each entry is the verbatim blueprint/knowledge fields the MCP `/blueprints/export`
-    + `/knowledge/export` routes serve (PLUS `source="mcp"`/`verified=True` injected at
-    export time). DEGRADE-not-fail per entry (`_seeds_from_entries`): a non-dict /
-    falsy-id / malformed entry is skipped with a warning so a single bad entry from the
-    separate MCP repo can never brick the whole corpus seed. This is the online/HTTP
-    analogue of `load_seed_fixtures`."""
+        Each entry is the verbatim fields the MCP export routes serve, plus the `source`/
+        `verified` stamp injected at export time. DEGRADE-not-fail per entry, so a single bad
+        entry from the separate MCP repo can never brick the whole corpus seed.
+    """
     blueprints = _seeds_from_entries(export.get("blueprints") or {}, kind="blueprint")
     knowledge = _seeds_from_entries(export.get("knowledge") or {}, kind="knowledge")
     return blueprints, knowledge
 
 
 def effective_corpus_sha(export: dict[str, Any]) -> str:
-    """The stamp/guard key for an online corpus hydration — a stable combination of
-    the export's `blueprints_sha` + `knowledge_sha`, or a deterministic content hash
-    FALLBACK when either is empty/missing (mirrors `_effective_catalog_sha`).
+    """The stamp/guard key for an online corpus hydration — the export's `blueprints_sha` +
+        `knowledge_sha` combined, or a deterministic content hash when either is missing.
 
-    A change to EITHER corpus flips the combined stamp, so the B1 skip-guard + GC
-    re-run. An empty combined stamp would silently break both guards, so a missing sha
-    derives a stable SHA-1 over the `{blueprints, knowledge}` content (sorted keys)."""
+        A change to EITHER corpus flips the combined stamp, so the skip-guard and the GC re-run.
+        An empty combined stamp would silently break both guards, hence the derived fallback.
+    """
     bp_sha = export.get("blueprints_sha")
     kn_sha = export.get("knowledge_sha")
     if isinstance(bp_sha, str) and bp_sha and isinstance(kn_sha, str) and kn_sha:
@@ -455,10 +413,10 @@ def effective_corpus_sha(export: dict[str, Any]) -> str:
 def corpus_content_sha(
     blueprints: list[BlueprintSeed], knowledge: list[KnowledgeSeed]
 ) -> str:
-    """A stable content-hash `corpus_sha` for a SEED-LIST reconcile (the seed script,
-    which loads fixtures directly rather than an export dict). Deterministic over the
-    seeds' full field content (sorted by id), so a re-seed of unchanged fixtures keeps
-    the same stamp (idempotent GC no-op) and any edit flips it (GC reaps stale nodes)."""
+    """A stable content-hash `corpus_sha` for a SEED-LIST reconcile. Deterministic over the
+        seeds' full field content, so a re-seed of unchanged fixtures keeps the same stamp (an
+        idempotent GC no-op) and any edit flips it.
+    """
     from dataclasses import asdict
 
     payload = {
@@ -528,17 +486,15 @@ _CORPUS_CONSTRAINTS: tuple[str, ...] = (
 
 
 def schema_statements(dimension: int) -> tuple[str, ...]:
-    """The full idempotent schema DDL (constraints + the two native vector indexes),
-    with the vector-index dimension parameterized (Part B).
+    """The full idempotent schema DDL (constraints + the two native vector indexes), with the
+        vector-index dimension parameterized.
 
-    The dimension is no longer hardcoded to 768: it is resolved from
-    `RuntimeSettings.embedding_dimension` (when set) or INFERRED from the live
-    embedder (`resolve_embedding_dimension`), so a different embedding model is
-    honored without a code edit. Constraints are unchanged. Every statement is
-    idempotent (`IF NOT EXISTS`) so the loader's whole write path is re-runnable —
-    BUT note a `CREATE VECTOR INDEX ... IF NOT EXISTS` silently keeps the OLD
-    dimension of a pre-existing index, which is why `apply_schema` introspects +
-    raises `DimensionMismatchError` BEFORE creating (see `check_dimension_parity`)."""
+        The dimension is resolved from settings or INFERRED from the live embedder, so a
+        different embedding model is honored without a code edit. Every statement is
+        `IF NOT EXISTS`, so the whole write path is re-runnable — BUT a
+        `CREATE VECTOR INDEX ... IF NOT EXISTS` silently keeps the OLD dimension of a
+        pre-existing index, which is why `apply_schema` introspects and raises before creating.
+    """
     return (
         *_CORPUS_CONSTRAINTS,
         # PriorArt Slice 2 — the LOOSE cross-tier key's lookup index. The learning
@@ -772,12 +728,12 @@ RETURN count(*) AS deleted
 
 
 def check_model_parity(existing_models: set[str], model_id: str) -> None:
-    """Refuse a write that would mix embedding models into one index (§3.3).
+    """Refuse a write that would mix embedding models into one index.
 
-    Pure function (the strict write-time guard, Layer-1-testable without infra):
-    any already-stored model id other than *model_id* → `CorpusLoadError`. An
-    empty-string stored stamp is treated as a CONFLICTING model, not a non-model
-    (N2): a node with no model stamp is a broken row, not a free pass.
+        Pure (the strict write-time guard, Layer-1-testable without infra): any already-stored
+        model id other than *model_id* raises `CorpusLoadError`. An empty-string stored stamp is
+        treated as a CONFLICTING model, not a non-model — a node with no model stamp is a broken
+        row, not a free pass.
     """
     conflicting = {m for m in existing_models if m != model_id}
     if conflicting:
@@ -789,17 +745,15 @@ def check_model_parity(existing_models: set[str], model_id: str) -> None:
 
 
 def check_dimension_parity(existing_dims: set[int], target_dim: int) -> None:
-    """Refuse to (re)deploy the schema when a pre-existing vector index carries a
-    DIFFERENT embedding dimension than *target_dim* (Part B, mirrors
-    `check_model_parity`).
+    """Refuse to (re)deploy the schema when a pre-existing vector index carries a DIFFERENT
+        embedding dimension than *target_dim*.
 
-    Pure function (Layer-1-testable without infra). *existing_dims* is the set of
-    `vector.dimensions` read from `SHOW VECTOR INDEXES` for the two corpus indexes;
-    an empty set (no index yet) passes trivially (the create runs at *target_dim*).
-    Any dimension other than *target_dim* → `DimensionMismatchError`, naming BOTH the
-    stored and target dims and instructing the operator to rebuild — because a
-    `CREATE ... IF NOT EXISTS` would silently keep the old (wrong) dimension, so an
-    embedding-model change is otherwise undetectable and recall would break."""
+        Pure. *existing_dims* is the set of `vector.dimensions` read from `SHOW VECTOR INDEXES`;
+        an empty set (no index yet) passes trivially and the create runs at *target_dim*. Any
+        other dimension raises `DimensionMismatchError` naming BOTH dims, because a
+        `CREATE ... IF NOT EXISTS` would silently keep the old one and recall would break
+        undetectably.
+    """
     conflicting = {d for d in existing_dims if d != target_dim}
     if conflicting:
         raise DimensionMismatchError(
@@ -815,10 +769,10 @@ def check_dimension_parity(existing_dims: set[int], target_dim: int) -> None:
 async def _fetch_existing_vector_dims(runner: Any) -> set[int]:
     """The set of `vector.dimensions` configured on the two corpus vector indexes.
 
-    *runner* is anything with `.run` (a live session OR a recording stub). Absent
-    indexes / a `SHOW VECTOR INDEXES` that yields nothing ⇒ an empty set (a fresh
-    graph — the create then runs at the target dim). A `None`/non-int dimension row is
-    skipped defensively."""
+        *runner* is anything with `.run` (a live session OR a recording stub). Absent indexes
+        yield an empty set — a fresh graph, so the create runs at the target dim. A `None` or
+        non-int dimension row is skipped defensively.
+    """
     result = await runner.run(_EXISTING_VECTOR_DIMS)
     rows = await result.data()
     dims: set[int] = set()
@@ -835,20 +789,17 @@ async def resolve_embedding_dimension(
     configured: int | None = None,
     sample_vectors: list[list[float]] | None = None,
 ) -> int:
-    """Resolve the vector-index dimension (Part B): the CONFIGURED value when set,
-    else INFERRED from an already-embedded *sample_vectors* (no extra network call),
-    else a one-shot PROBE embed of a fixed string (`len(vectors[0])`).
+    """Resolve the vector-index dimension: the CONFIGURED value when set, else INFERRED from
+        already-embedded *sample_vectors* (no extra network call), else a one-shot PROBE embed.
 
-    `HttpEmbeddingClient.embed` guarantees a non-empty finite-float vector, so
-    `len(vectors[0])` is the true model dimension. An empty/degenerate probe result
-    raises `CorpusLoadError` (the schema cannot be shaped without a dimension).
+        An empty or degenerate probe result raises `CorpusLoadError` — the schema cannot be
+        shaped without a dimension.
 
-    S1 cross-check: when BOTH a *configured* value AND a non-empty sample vector are
-    present, the sample's length MUST equal *configured* — otherwise the operator set
-    `EMBEDDING_DIMENSION` to a value the live model does NOT emit, which would build the
-    index at one dimension, write vectors of another, and silently EXCLUDE every row
-    from the index (cryptic-empty-recall, the exact class this feature exists to kill).
-    Raise `CorpusLoadError` naming both numbers rather than ship a broken index."""
+        When BOTH a configured value AND a non-empty sample vector are present, the sample's
+        length MUST equal the configured one: otherwise the operator set `EMBEDDING_DIMENSION` to
+        a value the live model does NOT emit, which would build the index at one dimension, write
+        vectors of another, and silently EXCLUDE every row from the index.
+    """
     first_sample = next((vec for vec in sample_vectors or [] if vec), None)
     if configured is not None:
         if first_sample is not None and len(first_sample) != configured:
@@ -873,8 +824,8 @@ async def resolve_embedding_dimension(
 def _use_edges(uses: list[str]) -> list[dict[str, str]]:
     """Derive `{column_key, table_key}` edge rows from `"db.table.column"` keys.
 
-    `table_key` is everything before the final dot (`"db.table"`), matching the
-    scope-key construction `f"{db_table}.{column}"` (context/scope_filter).
+        `table_key` is everything before the final dot, matching the scope-key construction
+        `f"{db_table}.{column}"`.
     """
     edges: list[dict[str, str]] = []
     for key in uses:
@@ -903,15 +854,13 @@ def _json_or_none(value: Any) -> str | None:
 
 def _str_list(value: Any) -> list[str]:
     """Coerce a value into a list of strings (dropping a non-list to `[]`), for the
-    array-of-primitive node props (`grain`, `synonyms`). Casing is preserved (D70).
+        array-of-primitive node props (`grain`, `synonyms`). Casing is preserved (D70).
 
-    TODO (cleanup wave B): replace with `data_agent.untrusted.as_str_list`. This is the
-    WEAK copy of that guard — `str(item)` writes the literal `"None"` onto a node for a
-    JSON null, and a member that is a dict lands as its repr, both of which then read as
-    real grain/synonym content. The shared coercer SKIPS non-`str` members instead. The
-    change is behavioural (a catalog export with a null in `grain` currently seeds
-    `"None"`), so it belongs in a slice that owns this file rather than in the dedup
-    pass that created `untrusted.py`.
+        TODO (cleanup wave B): replace with `data_agent.untrusted.as_str_list`. This is the WEAK
+        copy — `str(item)` writes the literal `"None"` for a JSON null and a dict member lands as
+        its repr, both of which then read as real grain/synonym content, whereas the shared
+        coercer SKIPS non-`str` members. The change is behavioural, so it belongs in a slice that
+        owns this file.
     """
     if not isinstance(value, list):
         return []
@@ -921,11 +870,11 @@ def _str_list(value: Any) -> list[str]:
 def _table_node_props(db_table: str, entry: dict[str, Any]) -> dict[str, Any]:
     """Project one catalog entry into the enriched `:Table` node props.
 
-    `key` is `db_table` (byte-identical to `_use_edges`' `table_key`). Scalars +
-    arrays are stored natively; `temporal`/`primary_key`/`join_keys`/`measures`
-    (nested) are JSON-encoded to `*_json`. `grain_verifiable` defaults True when
-    absent (parity with `SemanticCatalogHandle._table_grain`). `catalog_sha` is NOT
-    included here — the upsert Cypher stamps it via `$sha`."""
+        `key` is `db_table`, byte-identical to `_use_edges`' `table_key`. Scalars and arrays are
+        stored natively; the nested fields are JSON-encoded to `*_json`. `grain_verifiable`
+        defaults True when absent (parity with `SemanticCatalogHandle`). `catalog_sha` is NOT
+        included here — the upsert Cypher stamps it.
+    """
     default_db, _, default_table = db_table.partition(".")
     grain_verifiable = entry.get("grain_verifiable", True)
     if not isinstance(grain_verifiable, bool):
@@ -950,14 +899,11 @@ def _table_node_props(db_table: str, entry: dict[str, Any]) -> dict[str, Any]:
 def _column_node_props(db_table: str, name: str, col: dict[str, Any]) -> dict[str, Any]:
     """Project one catalog column into the enriched `:Column` node props.
 
-    `key` is `f"{db_table}.{name}"` — byte-identical to `_use_edges`' `column_key`
-    (asserted by a unit test). `name` mirrors the FULL `key` (the node identity) so
-    Neo4j Browser/Bloom caption the column by its `db.table.column` key — consistent
-    with :Blueprint/:KnowledgeChunk/:Table; the bare short name (casing preserved, D70)
-    is retained separately as `short_name`. `values` (a nested map) is JSON-encoded to
-    `values_json`; every other listed field is a native scalar/array. Unknown/adversarial
-    extra keys (e.g. `client_defined`, `observed_values`, or fixture-mangled keys) are
-    simply not read (whitelist)."""
+        `key` is `f"{db_table}.{name}"` — byte-identical to `_use_edges`' `column_key`, asserted
+        by a unit test. `name` mirrors the FULL key so graph browsers caption the column by it,
+        consistently with the other node types; the bare short name is retained as `short_name`.
+        Nested `values` is JSON-encoded; unknown or adversarial extra keys are simply not read.
+    """
     key = f"{db_table}.{name}"
     return {
         "key": key,
@@ -976,14 +922,13 @@ def _column_node_props(db_table: str, name: str, col: dict[str, Any]) -> dict[st
 def _catalog_graph_rows(
     catalog: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str], set[str]]:
-    """Build the batched UNWIND rows for the `:Table`/`:Column` upserts from a
-    parsed catalog dict (`{db.table: <entry>}`).
+    """Build the batched UNWIND rows for the `:Table`/`:Column` upserts from a parsed catalog
+        dict (`{db.table: <entry>}`).
 
-    Returns `(table_rows, column_rows, table_keys, column_keys)` where a
-    `table_row` is `{key, props}` and a `column_row` is `{key, table_key, props}`.
-    A non-dict entry (or a non-dict column def) is tolerated: the entry is skipped /
-    the column def falls back to `{}` (so a mangled fixture never crashes the build,
-    it just yields sparse props via the whitelist)."""
+        Returns `(table_rows, column_rows, table_keys, column_keys)`. A non-dict entry, or a
+        non-dict column def, is tolerated — skipped, or falling back to `{}` — so a mangled
+        fixture never crashes the build and just yields sparse props via the whitelist.
+    """
     table_rows: list[dict[str, Any]] = []
     column_rows: list[dict[str, Any]] = []
     table_keys: set[str] = set()
@@ -1026,23 +971,19 @@ def _format_edge_drift(missing_by_blueprint: dict[str, list[str]]) -> str:
 
 
 def _validate_blueprint_uses(bp: BlueprintSeed) -> None:
-    """Fail-closed with context on a malformed `uses` entry (S2 / §8).
+    """Fail-closed with context on a malformed `uses` entry.
 
-    The design's own "highest-risk contract": a `uses` key that is not a byte-
-    exact `"database.table.column"` scope key is silently dropped by the scope
-    pre-filter at recall. Guard it at WRITE — every entry must be a `str` with at
-    least 3 NON-EMPTY dot-separated parts, else raise with the offending key so
-    an authoring mistake fails loudly instead of retrieving nothing.
+        The design's own highest-risk contract: a `uses` key that is not a byte-exact
+        `"database.table.column"` scope key is silently dropped by the scope pre-filter at
+        recall. Guard it at WRITE — every entry must be a `str` with at least 3 NON-EMPTY
+        dot-separated parts, and the offending key is named.
 
-    The CONTAINER is type-checked before the loop, and that is not cosmetic. The
-    seed dataclass declares `uses: list[str]` but enforces nothing at runtime, and
-    the MCP export is a separate repo's JSON: `uses: 5` made this `for` raise a bare
-    `TypeError` — an un-wrapped third-party exception out of `load_corpus`, the class
-    the module docstring forbids because the hydration cache re-arms and retries the
-    same poisoned entry every turn. `uses: "db.t.c"` was worse than a crash: it
-    ITERATES CHARACTER-WISE, so every reader downstream (`_use_edges`, the union
-    rule, `columns`/`tables`) would see 8 one-character "scope keys". Both now fail
-    as one clean `CorpusLoadError`.
+        The CONTAINER is type-checked before the loop, and that is not cosmetic. The seed
+        dataclass enforces nothing at runtime and the MCP export is a separate repo's JSON:
+        `uses: 5` raised a bare `TypeError` out of `load_corpus` — the class the module docstring
+        forbids, since the hydration cache retries the same poisoned entry every turn — and
+        `uses: "db.t.c"` was worse than a crash: it ITERATES CHARACTER-WISE, so every downstream
+        reader would see one-character "scope keys".
     """
     if not isinstance(bp.uses, (list, tuple)):
         raise CorpusLoadError(
@@ -1126,13 +1067,11 @@ _SUSPECT_DRIFT = "suspect"
 class _NodeReference:
     """One validated `ref` on one `composes` node, in resolution-ready shape.
 
-    `slot_map` is `{<child slot name>: <parent slot name>}` — keyed by the CHILD
-    deliberately. The resolution OPERATION is "rewrite every bind token in the child's
-    SQL into the parent's vocabulary", which needs a total function from child token →
-    parent token; keying by the child makes that function single-valued by
-    construction (a dict cannot repeat a key), whereas keying by the parent would
-    admit `{a: dept, b: dept}` — two parents claiming one child slot, an ambiguity with
-    no correct resolution.
+        `slot_map` is `{<child slot name>: <parent slot name>}`, keyed by the CHILD deliberately:
+        the operation is "rewrite every bind token in the child's SQL into the parent's
+        vocabulary", which needs a total, single-valued function from child token to parent
+        token. Keying by the parent would admit `{a: dept, b: dept}` — two parents claiming one
+        child slot, an ambiguity with no correct resolution.
     """
 
     index: int  # position in the raw `composes` list (nodes may lack a usable `order`)
@@ -1144,29 +1083,28 @@ class _NodeReference:
 def _is_bind_token_name(name: Any) -> bool:
     """True iff `{name}` tokenizes to exactly the slot bind site *name*.
 
-    DERIVED, never mirrored: the candidate is round-tripped through the SAME
-    `referenced_slots` tokenizer the templates are read with, so this cannot drift
-    from `template.SLOT_TOKEN` the way a copied regex would (`_TABLE_CONSUME_REF`
-    existed in three hand-copied versions before that lesson was written down).
+        DERIVED, never mirrored: the candidate is round-tripped through the SAME
+        `referenced_slots` tokenizer the templates are read with, so this cannot drift from
+        `template.SLOT_TOKEN` the way a copied regex would.
 
-    Load-bearing for SAFETY, not tidiness. A slot-map VALUE is substituted into the
-    child's SQL as the literal text `{<value>}`. A value that is not exactly a bind
-    token — say `"x} OR 1=1 --"` — would emit `{x} OR 1=1 --}`, i.e. attacker-chosen
-    raw SQL spliced into a template that is then parsed and executed. This round-trip
-    is the boundary that keeps the substitution a RENAME instead of an injection."""
+        Load-bearing for SAFETY, not tidiness. A slot-map VALUE is substituted into the child's
+        SQL as the literal text `{<value>}`, so a value that is not exactly a bind token — say
+        `"x} OR 1=1 --"` — would splice attacker-chosen raw SQL into a template that is then
+        parsed and executed. This round-trip is the boundary that keeps the substitution a
+        RENAME instead of an injection.
+    """
     return isinstance(name, str) and referenced_slots("{" + name + "}") == {name}
 
 
 def _seed_compose_nodes(bp: BlueprintSeed) -> list[dict[str, Any]]:
     """*bp*'s raw `composes` entries, with the CONTAINER type-checked first.
 
-    `Blueprint.parse` rejects a non-list `composes` too — but that runs later
-    (`_validate_blueprint_dag`), and reference resolution has to walk the nodes
-    before then. A non-iterable (`composes: 5`) would raise a bare `TypeError` out of
-    `load_corpus`; a STRING would iterate CHARACTER-WISE and look like a perfectly
-    valid zero-reference DAG, which is the quieter and worse failure. A non-dict
-    ENTRY is passed through untouched — it carries no reference, and `Node.parse`
-    owns that error message."""
+        `Blueprint.parse` rejects a non-list too, but that runs later and reference resolution
+        has to walk the nodes before then. A non-iterable would raise a bare `TypeError` out of
+        `load_corpus`; a STRING would iterate CHARACTER-WISE and look like a perfectly valid
+        zero-reference DAG, which is the quieter and worse failure. A non-dict ENTRY is passed
+        through untouched — it carries no reference, and `Node.parse` owns that error message.
+    """
     if bp.composes is None:
         return []
     if not isinstance(bp.composes, (list, tuple)):
@@ -1177,15 +1115,14 @@ def _seed_compose_nodes(bp: BlueprintSeed) -> list[dict[str, Any]]:
 
 
 def _seed_slot_specs(bp: BlueprintSeed) -> dict[str, SlotSpec]:
-    """*bp*'s declared slots as `{name: SlotSpec}`, parsed EARLY (before
-    `_validate_blueprint_dag`) because reference resolution needs each slot's bind
-    TOKENS — a `period_range` occupies two (`{n}_start`/`{n}_end`), everything else one.
+    """*bp*'s declared slots as `{name: SlotSpec}`, parsed EARLY because reference resolution
+        needs each slot's bind TOKENS — a `period_range` occupies two, everything else one.
 
-    Wraps `BlueprintParseError` as `CorpusLoadError` and re-checks the container type
-    for the same reason as `_seed_compose_nodes`. Duplicate names are rejected here as
-    well as in `Blueprint.parse`: this function builds a dict, and a silent last-wins
-    overwrite would make the reference rename pick one of two colliding specs
-    arbitrarily."""
+        Wraps `BlueprintParseError` as `CorpusLoadError` and re-checks the container type for the
+        same reason as `_seed_compose_nodes`. Duplicate names are rejected here as well as in
+        `Blueprint.parse`: this builds a dict, and a silent last-wins overwrite would make the
+        reference rename pick one of two colliding specs arbitrarily.
+    """
     if bp.slots is None:
         return {}
     if not isinstance(bp.slots, (list, tuple)):
@@ -1205,14 +1142,13 @@ def _seed_slot_specs(bp: BlueprintSeed) -> dict[str, SlotSpec]:
 
 
 def _seed_rules_by_bind(bp: BlueprintSeed) -> dict[str, Any]:
-    """The `resolve_via` rules *bp* declares, keyed by the `{token}` each binds
-    (`earn_codes` → the parsed `ResolvedRule`).
+    """The `resolve_via` rules *bp* declares, keyed by the `{token}` each binds.
 
-    Keyed by BIND rather than by `id` because the bind name is what a template
-    references and therefore what a reference has to reconcile. The rule OBJECT is
-    kept, not just the name, so the caller can compare what two same-named rules
-    actually probe. `parse_rule` is total — a static/malformed entry yields `None` — so
-    the only guard needed is the container type."""
+        Keyed by BIND rather than by `id` because the bind name is what a template references and
+        therefore what a reference has to reconcile. The rule OBJECT is kept, not just the name,
+        so the caller can compare what two same-named rules actually probe. `parse_rule` is
+        total, so the only guard needed is the container type.
+    """
     if bp.uses_rules is None:
         return {}
     if not isinstance(bp.uses_rules, (list, tuple)):
@@ -1231,25 +1167,24 @@ def _seed_rules_by_bind(bp: BlueprintSeed) -> dict[str, Any]:
 def _node_reference(bp_id: str, index: int, node: Any) -> _NodeReference | None:
     """Validate and project one node's `ref`, or `None` when the node has none.
 
-    Every field is untrusted (a separate repo's YAML, or a hand edit) and every check
-    below is derived from what the value is LATER USED FOR, not from its name:
+        Every field is untrusted, and every check below is derived from what the value is LATER
+        USED FOR, not from its name:
 
-    | value                | downstream use                          | guard              |
-    |----------------------|-----------------------------------------|--------------------|
-    | `ref`                | `.get()` of two known keys              | must be a dict     |
-    | extra `ref` keys     | nothing — silently ignored              | whitelist, reject  |
-    | `ref.blueprint`      | key into the `{id: seed}` dict          | non-empty `str`    |
-    | `ref.slots`          | `.items()`, key lookups, set algebra    | must be a dict     |
-    | `ref.slots` keys     | matched against child slot NAMES        | bind-token shaped  |
-    | `ref.slots` values   | emitted into SQL as the text `{value}`  | bind-token shaped  |
+        | value                | downstream use                          | guard              |
+        |----------------------|-----------------------------------------|--------------------|
+        | `ref`                | `.get()` of two known keys              | must be a dict     |
+        | extra `ref` keys     | nothing — silently ignored              | whitelist, reject  |
+        | `ref.blueprint`      | key into the `{id: seed}` dict          | non-empty `str`    |
+        | `ref.slots`          | `.items()`, key lookups, set algebra    | must be a dict     |
+        | `ref.slots` keys     | matched against child slot NAMES        | bind-token shaped  |
+        | `ref.slots` values   | emitted into SQL as the text `{value}`  | bind-token shaped  |
 
-    The `ref.blueprint` guard is the unhashable-value case that has bitten this
-    codebase repeatedly: `blueprint: [a, b]` reaches `by_id[...]` and raises
-    `TypeError: unhashable type: 'list'` — un-wrapped, out of `load_corpus`. The
-    `ref.slots` VALUE guard is the injection boundary (see `_is_bind_token_name`).
-    Extra keys are rejected rather than ignored because the realistic authoring
-    mistake is `slot:` for `slots:`, which would otherwise resolve to "no mappings
-    declared" and produce a confusing downstream error about unmapped child slots."""
+        The `ref.blueprint` guard is the unhashable-value case: `blueprint: [a, b]` reaches
+        `by_id[...]` and raises an un-wrapped `TypeError` out of `load_corpus`. The `ref.slots`
+        VALUE guard is the injection boundary (see `_is_bind_token_name`). Extra keys are
+        rejected rather than ignored because the realistic authoring mistake is `slot:` for
+        `slots:`, which would otherwise resolve to "no mappings declared".
+    """
     if not isinstance(node, dict):
         return None  # `Node.parse` owns this error; it carries no reference
     # MEMBERSHIP, not value. `ref:` with the body deleted is a real and distinguishable
@@ -1347,31 +1282,23 @@ def _reference_graph(
 ) -> dict[str, list[_NodeReference]]:
     """`{blueprint id: [validated references]}` for every seed that has any.
 
-    A reference to an id absent from THIS load is fatal (requirement 5). "Absent"
-    covers deleted, renamed, never-authored, and — because the whole load is one
-    fail-closed unit — a child that is itself unloadable for any other reason: if the
-    child's own validation raises, no blueprint is written at all, so a composite can
-    never ship holding SQL from a blueprint that did not.
+        A reference to an id absent from THIS load is fatal. "Absent" covers deleted, renamed,
+        never-authored, and — because the whole load is one fail-closed unit — a child that is
+        itself unloadable for any other reason, so a composite can never ship holding SQL from a
+        blueprint that did not load.
 
-    **The availability trade, stated plainly.** `_seeds_from_entries` SKIPS a malformed
-    export entry precisely so one bad entry from the separate corpus repo cannot brick
-    the corpus; this function then fails the ENTIRE load when a reference points at an
-    id that entry would have supplied, and the hydrator deliberately does not catch it
-    (it logs and retries every poll rather than destructively rebuilding). So a skipped
-    child does, transitively, what the skip exists to prevent — and the canon conversion
-    that introduced the first real reference made the referenced blueprint the
-    highest-blast-radius entry in the export.
+        THE AVAILABILITY TRADE, stated plainly: `_seeds_from_entries` SKIPS a malformed export
+        entry precisely so one bad entry cannot brick the corpus, and this function then fails
+        the ENTIRE load when a reference points at an id that entry would have supplied — and
+        the hydrator deliberately does not catch it. So a skipped child transitively does what
+        the skip exists to prevent.
 
-    Considered and DECLINED for this slice: skipping the referencing parent too when its
-    target was present-but-skipped, reserving whole-load failure for a genuinely
-    never-authored id. It is a coherent asymmetry, but it would make the loader tolerant
-    of exactly ONE of the many ways a bad entry aborts the load — an unparseable
-    template, a bad scope key, a DAG cycle and a `uses` under-declaration all still abort
-    — so it buys a special case rather than a property. It also needs the set of skipped
-    ids threaded from `corpus_seeds_from_export` through `load_corpus` into this
-    resolver, which is real plumbing on the request path for a case that has never
-    occurred. If corpus availability is later made a first-class goal, do it uniformly
-    (a per-blueprint quarantine in `load_corpus`), not here."""
+        Considered and DECLINED: skipping the referencing parent too, reserving whole-load
+        failure for a genuinely never-authored id. It would make the loader tolerant of exactly
+        ONE of the many ways a bad entry aborts the load, so it buys a special case rather than a
+        property. If corpus availability becomes a first-class goal, do it uniformly with a
+        per-blueprint quarantine in `load_corpus`, not here.
+    """
     graph: dict[str, list[_NodeReference]] = {}
     for bp in by_id.values():
         refs = [
@@ -1395,15 +1322,14 @@ def _reference_graph(
 def _reference_resolution_order(graph: dict[str, list[_NodeReference]]) -> list[str]:
     """Blueprint ids in CHILD-BEFORE-PARENT order, raising on a cycle.
 
-    Iterative DFS colouring with an explicit stack — the same shape, and for the same
-    reason, as `_validate_dag_structure`'s intra-DAG check: a long reference chain must
-    fail as a clean `CorpusLoadError`, never as a `RecursionError` escaping
-    `load_corpus`. That existing check is scoped to ONE blueprint's `feeds_from` edges
-    and structurally cannot see A→B→A; this is its cross-blueprint sibling, and the two
-    are independent (a corpus can be free of intra-DAG cycles and still have a
-    reference cycle).
+        Iterative DFS colouring with an explicit stack — the same shape, and for the same reason,
+        as `_validate_dag_structure`'s intra-DAG check: a long reference chain must fail as a
+        clean `CorpusLoadError`, never as a `RecursionError` escaping `load_corpus`. That check
+        is scoped to ONE blueprint's `feeds_from` edges and structurally cannot see A->B->A; this
+        is its independent cross-blueprint sibling.
 
-    Iteration order follows the seed list, so the reported cycle is deterministic."""
+        Iteration order follows the seed list, so the reported cycle is deterministic.
+    """
     white, grey, black = 0, 1, 2
     color: dict[str, int] = {}
     order: list[str] = []
@@ -1455,28 +1381,23 @@ def _assert_reference_depth(
 
 
 def _assert_reference_target_loadable(parent: BlueprintSeed, child: BlueprintSeed, where: str) -> None:
-    """Refuse to inline from a child in a different trust partition, or from one recall
-    would refuse to serve (requirement 5, "retracted").
+    """Refuse to inline from a child in a different trust partition, or from one recall would
+        refuse to serve.
 
-    Both gates are DERIVED from `vector_index._BLUEPRINT_RECALL_QUERY`, which is the
-    only place the corpus defines "servable": `source = 'mcp'` (bare equality),
-    `coalesce(status,'validated') = 'validated'`, `coalesce(drift_status,'clean') <>
-    'suspect'`. Inlining copies the child's SQL into the parent, so a retracted or
-    learning-tier child would keep running under the parent's id — retraction that does
-    not retract, and a trust-partition crossing that no reader could see.
+        Both gates are DERIVED from `vector_index._BLUEPRINT_RECALL_QUERY`, the only place the
+        corpus defines "servable". Inlining copies the child's SQL into the parent, so a
+        retracted or learning-tier child would keep running under the parent's id — retraction
+        that does not retract, and a trust-partition crossing no reader could see.
 
-    The `coalesce` halves are mirrored EXACTLY, via the property write in between.
-    `_UPSERT_BLUEPRINT` does `SET b.status = $status`, and neo4j REMOVES a property set
-    to null — so a Python `None` becomes an ABSENT property, which recall coalesces to
-    `validated` and serves. The first cut read `None` as `""`, failed the equality, and
-    refused the load with a message claiming recall would not serve it; that was false,
-    and `status: null` is reachable from the export (`_seed_from_entry` sanitizes
-    `source`/`verified`, not `status`), so a servable child would have bricked the whole
-    corpus. `""` is a DIFFERENT case and stays refused: an empty string is written as a
-    real property, coalesce leaves it alone, and it matches neither partition. A
-    non-`str` `status` also stays refused — it is written as some non-string property and
-    fails recall's equality just the same. Drift needs no coalesce: the test is
-    `== 'suspect'`, which `None` and any non-string already fail."""
+        The `coalesce` halves are mirrored EXACTLY, because `_UPSERT_BLUEPRINT` does
+        `SET b.status = $status` and neo4j REMOVES a property set to null: a Python `None`
+        becomes an ABSENT property, which recall coalesces to `validated` and SERVES. Reading
+        `None` as `""` failed the equality and refused the load with a message claiming recall
+        would not serve it — false, and reachable from the export, so a servable child would have
+        bricked the whole corpus. `""` is a DIFFERENT case and stays refused: it is written as a
+        real property, coalesce leaves it alone, and it matches neither partition. Drift needs no
+        coalesce — the test is `== 'suspect'`, which `None` already fails.
+    """
     if child.source != parent.source:
         raise CorpusLoadError(
             f"blueprint {parent.id}: {where} references {child.id!r}, which is in the "
@@ -1495,33 +1416,24 @@ def _assert_reference_target_loadable(parent: BlueprintSeed, child: BlueprintSee
 def _referenced_sql_template(parent_id: str, where: str, child: BlueprintSeed) -> str:
     """The ONE SQL statement *child* contributes to a referencing node.
 
-    A leaf (`sql_template`, no `composes`) contributes it directly. A single-node
-    `composes` contributes its one node's template — that shape exists so a reference
-    CHAIN is possible at all (a leaf carries no nodes and therefore no `ref`), which is
-    what makes the depth cap and the cross-blueprint cycle check live rules rather than
-    dead code.
+        A leaf (`sql_template`, no `composes`) contributes it directly. A single-node `composes`
+        contributes its one node's template — that shape is what makes a reference CHAIN possible
+        at all, since a leaf carries no nodes and therefore no `ref`.
 
-    Everything the child's node declares BESIDES the SQL is refused rather than
-    dropped, because the referencing node keeps its own. The control-flow trio —
-    `node_kind`, `when`, `requires_approval` — are the ones that matter: silently
-    discarding a gate is how an approval pause disappears. `feeds_from`/`consumes`
-    cannot mean anything in a one-node DAG. `output` IS ignored, deliberately and
-    alone: it describes what a node hands to a DOWNSTREAM sibling, a one-node DAG has
-    none, and the referencing node declares its own.
+        Everything the child's node declares BESIDES the SQL is REFUSED rather than dropped,
+        because the referencing node keeps its own. The control-flow trio — `node_kind`, `when`,
+        `requires_approval` — is what matters: silently discarding a gate is how an approval
+        pause disappears. `node_kind` is a gate ON ITS OWN, not a modifier of `requires_approval`
+        (`executor._execute_dag` pauses on either), so anything PRESENT and not `"query"` is
+        refused; absent is fine. The check is `!= "query"` rather than `== "approval"` so a
+        future `NODE_KINDS` member is refused by default instead of waved through.
 
-    `node_kind` was MISSING from that list for a review cycle, and the docstring above
-    it asserted the list was complete — the confident-comment-contradicting-code shape
-    this codebase keeps paying for. It is a gate ON ITS OWN, not a modifier of
-    `requires_approval`: `executor._execute_dag` pauses on `node.node_kind ==
-    "approval" or node.requires_approval`, and the loader's own gate (i) accepts an
-    approval node that carries a `sql_template`, so `{order: 0, node_kind: "approval",
-    sql_template: ...}` was a legal, silently-de-gated reference target. Anything
-    PRESENT and not `"query"` is refused; absent is fine (`"query"` is the default and
-    what every canon node means). The check is `!= "query"` rather than `== "approval"`
-    so a future `NODE_KINDS` member is refused by default instead of waved through.
+        `output` IS ignored, deliberately and alone: it describes what a node hands to a
+        DOWNSTREAM sibling, a one-node DAG has none, and the referencing node declares its own.
 
-    Called only after the child has itself been resolved (child-first order), so its
-    node template is already inlined if it was a reference."""
+        Called only after the child has itself been resolved (child-first order), so its node
+        template is already inlined if it was a reference.
+    """
     composes = _seed_compose_nodes(child)
     if child.sql_template is not None and composes:
         raise CorpusLoadError(
@@ -1582,39 +1494,33 @@ def _reference_token_rename(
     ref: _NodeReference,
     template: str,
 ) -> dict[str, str]:
-    """The TOTAL `{child token}` → `{parent token}` map for one reference.
+    """The TOTAL `{child token}` -> `{parent token}` map for one reference.
 
-    Total is the whole point: every bind token the child's template references gets an
-    entry (identity for a rule bind), so the substitution below can never leave a token
-    behind for a later gate to trip over with a confusing message.
+        Total is the whole point: every bind token the child's template references gets an entry
+        (identity for a rule bind), so the substitution can never leave a token behind for a later
+        gate to trip over with a confusing message.
 
-    SLOT-COLLISION SEMANTICS, and why each is what it is:
+        SLOT-COLLISION SEMANTICS, and why each is what it is:
 
-    * **No implicit identity.** A child slot is bound ONLY through an explicit
-      `ref.slots` entry, even when the two names are identical. Slots are resolved ONCE
-      per blueprint before the DAG walk (`executor._resolve_all_slots`), so after
-      inlining the child's slot DECLARATIONS are gone — type, `binds_to`,
-      `enum_values`, `optional_pattern`, all of it — and the PARENT's same-named slot
-      governs. Letting that happen implicitly means renaming a parent slot silently
-      re-points a child's filter at a different domain. `employee: employee` reads as
-      redundant and is exactly the case worth writing down.
-    * **Child needs a slot the parent does not supply** → refuse, naming the slots. The
-      alternative is a `{token}` with nothing to bind it, i.e. a dropped filter (D56).
-    * **Parent maps a slot the child does not have, or does not USE** → refuse. A dead
-      mapping is an author believing a filter is applied when it is not — the same
-      wrong-answer class, arriving from the other direction.
-    * **Bind ARITY must match** → refuse on mismatch. A `period_range` occupies two
-      tokens and everything else one; mapping a range onto a scalar would emit
-      `{p_start}`/`{p_end}` against a parent slot that binds neither.
-    * **Bind TYPE and `binds_to` may differ** → WARN, do not refuse. The parent is the
-      authority on its own slots (the child's spec is discarded either way) and the
-      value still binds as a typed AST literal, so a divergence is a resolution-strictness
-      difference, not a safety one. It is worth a log line because the usual cause is a
-      copy-paste that will validate values against the wrong domain.
-    * **A `resolve_via` rule bind is NOT renamed**, and the parent must re-declare the
-      rule itself — see the residual-token branch at the bottom, which also warns when
-      the two same-named rules probe different things (the rule-side twin of the
-      `binds_to` divergence, and the more consequential one: a rule fires a probe).
+        * NO IMPLICIT IDENTITY. A child slot is bound ONLY through an explicit `ref.slots` entry,
+          even when the two names are identical. Slots are resolved ONCE per blueprint before the
+          DAG walk, so after inlining the child's slot DECLARATIONS are gone — type, `binds_to`,
+          `enum_values`, all of it — and the PARENT's same-named slot governs. Implicit binding
+          would let renaming a parent slot silently re-point a child's filter at a different
+          domain.
+        * CHILD NEEDS A SLOT THE PARENT DOES NOT SUPPLY -> refuse, naming the slots. The
+          alternative is a `{token}` with nothing to bind it, i.e. a dropped filter (D56).
+        * PARENT MAPS A SLOT THE CHILD DOES NOT HAVE, OR DOES NOT USE -> refuse. A dead mapping
+          is an author believing a filter is applied when it is not.
+        * BIND ARITY must match -> refuse on mismatch. A `period_range` occupies two tokens and
+          everything else one, so mapping a range onto a scalar emits tokens nothing binds.
+        * BIND TYPE and `binds_to` may differ -> WARN, do not refuse. The parent is the authority
+          on its own slots and the value still binds as a typed AST literal, so a divergence is a
+          resolution-strictness difference, not a safety one — but the usual cause is a
+          copy-paste that will validate values against the wrong domain.
+        * A `resolve_via` RULE BIND IS NOT RENAMED, and the parent must re-declare the rule
+          itself — see the residual-token branch, which also warns when two same-named rules
+          probe different things.
     """
     parent_slots = _seed_slot_specs(parent)
     child_slots = _seed_slot_specs(child)
@@ -1788,29 +1694,26 @@ def _assert_uses_union(
     refs: list[_NodeReference],
     footprint: dict[str, frozenset[str]],
 ) -> None:
-    """THE SECURITY GATE (requirement 4). A composite must DECLARE at least the union
-    of its referenced blueprints' footprints, or the load fails. Not a warning.
+    """THE SECURITY GATE. A composite must DECLARE at least the union of its referenced
+        blueprints' footprints, or the load fails. Not a warning.
 
-    `uses` is hand-AUTHORED, never derived from the SQL, and it is the corpus's only
-    machine-readable statement of what a blueprint reads. Three readers act on it:
-    the recall scope pre-filter drops a blueprint whose `uses` is not a subset of the
-    caller's `column_scope`; `promotion/token_minter.mint(column_scope=<uses>)` mints
-    the golden-replay JWT from it verbatim; and `_validate_blueprint_dag` gate (c)
-    checks every template against it. A composite that under-declares is offered to
-    users whose scope does not cover what it actually reads — the pre-filter's whole
-    job, silently defeated.
+        `uses` is hand-AUTHORED, never derived from the SQL, and it is the corpus's only
+        machine-readable statement of what a blueprint reads. Three readers act on it: the recall
+        scope pre-filter drops a blueprint whose `uses` is not a subset of the caller's
+        `column_scope`; `promotion/token_minter.mint(column_scope=<uses>)` mints the
+        golden-replay JWT from it verbatim; and DAG gate (c) checks every template against it. A
+        composite that under-declares is offered to users whose scope does not cover what it
+        actually reads — the pre-filter's whole job, silently defeated.
 
-    Gate (c) DOES independently re-check the inlined SQL against the parent's `uses`,
-    so this is not the only thing standing between a reference and a scope escape.
-    The union rule is stricter on purpose: it binds the parent to the child's DECLARED
-    footprint rather than to whatever columns the child's SQL happens to name today, so
-    a later widening of the child cannot quietly widen every composite that inlines it.
-    A child column added upstream fails the parent's load until a human re-declares it.
+        Gate (c) DOES independently re-check the inlined SQL against the parent's `uses`, so this
+        is not the only thing between a reference and a scope escape. The union rule is stricter
+        on purpose: it binds the parent to the child's DECLARED footprint rather than to whatever
+        columns the child's SQL happens to name today, so a later widening of the child cannot
+        quietly widen every composite that inlines it.
 
-    TRANSITIVITY. *footprint* accumulates `declared ∪ ⋃ children` in child-first order,
-    so a grandchild's columns reach the grandparent even though only direct children are
-    inspected. Once this check passes, `footprint[id] == set(declared)` — the union is
-    tracked separately anyway so transitivity does not rest on that induction holding.
+        TRANSITIVITY: *footprint* accumulates `declared ∪ ⋃ children` in child-first order, so a
+        grandchild's columns reach the grandparent even though only direct children are
+        inspected.
     """
     declared = _declared_uses(parent)
     required: frozenset[str] = frozenset()
@@ -1835,25 +1738,22 @@ def _assert_uses_union(
 def resolve_blueprint_references(blueprints: list[BlueprintSeed]) -> list[BlueprintSeed]:
     """Resolve every `composes` node `ref` by INLINING the referenced blueprint's SQL.
 
-    Pure and hermetic (no I/O, no driver, no embedder) — `load_corpus` calls it as the
-    first step of its pre-write pass, so every write path (fixture seed, MCP export
-    hydration, the learning landing writer) goes through exactly this. Input seeds are
-    never mutated; a blueprint with no references is returned as-is, by identity.
+        Pure and hermetic (no I/O, no driver, no embedder) — `load_corpus` calls it as the first
+        step of its pre-write pass, so every write path (fixture seed, MCP export hydration, the
+        learning landing writer) goes through exactly this. Input seeds are never mutated; a
+        blueprint with no references is returned as-is, by identity.
 
-    Order of operations, and why:
+        Order of operations: build and shape-validate the reference graph (a dangling target
+        fails here); order it CHILD-FIRST, failing on a cross-blueprint cycle; cap the chain
+        depth; then resolve in that order, so a child is already inlined when its parent reads
+        it, checking the `uses` union per parent against the accumulated footprint.
 
-      1. build + shape-validate the reference graph (a dangling target fails here);
-      2. topologically order it CHILD-FIRST, failing on a cross-blueprint cycle;
-      3. cap the chain depth;
-      4. resolve in that order, so a child is already inlined when its parent reads it,
-         and check the `uses` union per parent against the accumulated footprint.
+        Returns the seeds in the ORIGINAL input order — `load_corpus` zips the returned list
+        against its embedding vectors, and a reordered list would silently mis-pair them.
 
-    Returns the seeds in the ORIGINAL input order — `load_corpus` zips the returned list
-    against its embedding vectors, and a reordered list would silently mis-pair them.
-
-    Raises only `CorpusLoadError`. That is a hard requirement, not a style preference:
-    this runs inside `load_corpus`, which the hydrator's self-heal poll re-arms and
-    retries every turn, so an un-wrapped exception here bricks the corpus indefinitely.
+        Raises only `CorpusLoadError`. That is a hard requirement, not a style preference: this
+        runs inside `load_corpus`, which the hydrator's self-heal poll re-arms and retries every
+        turn, so an un-wrapped exception here bricks the corpus indefinitely.
     """
     by_id: dict[str, BlueprintSeed] = {}
     for bp in blueprints:
@@ -1915,25 +1815,23 @@ def resolve_blueprint_references(blueprints: list[BlueprintSeed]) -> list[Bluepr
 def _declared_uses(bp: BlueprintSeed) -> frozenset[str]:
     """*bp*'s declared scope keys as a set, grammar-checked first.
 
-    The check is not redundant with `load_corpus`'s pre-write pass: this is the set the
-    `uses` UNION rule compares, and building it from an unvalidated `uses` is how a
-    string silently becomes 8 one-character "scope keys" (see `_validate_blueprint_uses`)."""
+        Not redundant with `load_corpus`'s pre-write pass: this is the set the `uses` UNION rule
+        compares, and building it from an unvalidated `uses` is how a string silently becomes a
+        handful of one-character "scope keys".
+    """
     _validate_blueprint_uses(bp)
     return frozenset(bp.uses)
 
 
 def _warn_on_catalog_skew(blueprints: list[BlueprintSeed], catalog: CatalogHandle) -> None:
-    """D94 Part 3 — log a SOFT WARNING per blueprint whose `uses` references a
-    `db.table` absent from *catalog*. Never raises: a blueprint may legitimately
-    reference tables absent from a partial/dev catalog snapshot, so this is a
-    dev-time early warning for the catalog/extractor skew, not a load precondition.
-    `uses` keys are `database.table.column` scope keys (grammar enforced by
-    `_validate_blueprint_uses`: >=3 non-empty dot-separated parts). The `db.table`
-    grouping is derived as everything-before-the-final-dot — the SAME convention as
-    `_use_edges`' `table_key` (and the scope-key construction in
-    `context/scope_filter`) — so the two parsers agree even for keys with a dotted
-    table segment. `is_catalogued(database, table)` reconstructs `f"{database}.{table}"`,
-    so splitting that grouping on its FIRST dot round-trips to the same `db.table`.
+    """Log a SOFT WARNING per blueprint whose `uses` references a `db.table` absent from
+        *catalog*. Never raises: a blueprint may legitimately reference tables absent from a
+        partial or dev catalog snapshot, so this is a dev-time early warning for catalog and
+        extractor skew, not a load precondition.
+
+        The `db.table` grouping is everything-before-the-final-dot — the SAME convention as
+        `_use_edges`' `table_key` and the scope-key construction — so the two parsers agree even
+        for a key with a dotted table segment.
     """
     for bp in blueprints:
         missing: list[str] = []
@@ -1957,12 +1855,13 @@ def _warn_on_catalog_skew(blueprints: list[BlueprintSeed], catalog: CatalogHandl
 
 
 def _compose_node_templates(composes: list[dict[str, Any]]) -> list[tuple[int, str]]:
-    """The `(order, sql_template)` pairs of a composite seed's DAG nodes — the shape
-    the shared canonicalizer joins in ascending order (§11.2 composite rule).
+    """The `(order, sql_template)` pairs of a composite seed's DAG nodes — the shape the shared
+        canonicalizer joins in ascending order.
 
-    A node with no `sql_template` (canon authors output-only DAG nodes) or a non-integer
-    `order` is SKIPPED, mirroring the learning side where every `NodeTemplate` carries a
-    real template — so both paths join the same set of normalized strings."""
+        A node with no `sql_template` (canon authors output-only DAG nodes) or a non-integer
+        `order` is SKIPPED, mirroring the learning side where every `NodeTemplate` carries a real
+        template, so both paths join the same set of normalized strings.
+    """
     pairs: list[tuple[int, str]] = []
     for node in composes:
         if not isinstance(node, dict):
@@ -1980,21 +1879,17 @@ def _compose_node_templates(composes: list[dict[str, Any]]) -> list[tuple[int, s
 def _seed_structural_key(bp: BlueprintSeed) -> str:
     """The seed's LOOSE cross-tier `structural_key`, or `""` when one cannot be minted.
 
-    An EXPLICIT `bp.structural_key` wins; absent one, DERIVE it from the seed's own
-    `sql_template`/`composes` + `result_grain`. Both branches run the SAME
-    `structural_key_from_templates` helper, so they agree by construction — the learning
-    landing seed stamps its key up front only to save a second sqlglot parse, and the
-    MCP-canon tier (whose YAMLs carry no key) always takes the derive branch.
+        An EXPLICIT `bp.structural_key` wins; absent one it is DERIVED from the seed's own
+        templates + `result_grain`. Both branches run the SAME `structural_key_from_templates`
+        helper, so they agree by construction — the learning landing seed stamps its key up front
+        only to save a second sqlglot parse.
 
-    FAIL-SOFT (D52): an unparseable template yields `""` and a WARNING, never a raise —
-    but that branch is defensive DEPTH, not the active load-path behavior. `load_corpus`
-    never reaches it with a bad template: `_validate_blueprint_dag` runs unconditionally
-    in the earlier pre-write pass and raises `CorpusLoadError` for anything this recipe
-    would also reject, aborting the WHOLE load fail-CLOSED (pre-existing by design — an
-    authoring mistake must not ship). The guard here becomes live only if the key recipe
-    ever grows stricter than loader validation, which
-    `test_every_template_the_key_recipe_rejects_is_also_rejected_by_loader_validation`
-    watches for."""
+        FAIL-SOFT (D52): an unparseable template yields `""` and a WARNING, never a raise — but
+        that branch is defensive DEPTH, not active load-path behaviour: `_validate_blueprint_dag`
+        runs unconditionally in the earlier pre-write pass and aborts the whole load for anything
+        this recipe would also reject. The guard goes live only if the key recipe ever grows
+        stricter than loader validation, which a test watches for.
+    """
     if bp.structural_key:
         return bp.structural_key
     if not bp.sql_template and not bp.composes:
@@ -2022,19 +1917,18 @@ def _seed_structural_key(bp: BlueprintSeed) -> str:
 
 
 def _dag_properties(bp: BlueprintSeed) -> dict[str, Any]:
-    """Serialize the additive full-DAG fields into the neo4j string properties
-    (§1.1). Empty structures are stored as `null` so a DAG-less blueprint carries
-    no phantom `{}`/`[]` — additive and back-compatible with D87/D88 seeds.
+    """Serialize the additive full-DAG fields into the neo4j string properties. Empty
+        structures are stored as `null`, so a DAG-less blueprint carries no phantom `{}`/`[]`.
 
-    `structural_key` follows the same `null`-when-absent rule, and that is
-    SAFETY-RELEVANT rather than cosmetic: an empty-string key stored on every
-    unparseable blueprint would make a naive `MATCH (b {structural_key: $k})` lookup
-    match them ALL as false prior art. Absent means absent.
+        `structural_key` follows the same null-when-absent rule, and that is SAFETY-RELEVANT
+        rather than cosmetic: an empty-string key stored on every unparseable blueprint would make
+        a naive `MATCH (b {structural_key: $k})` lookup match them ALL as false prior art.
 
-    `structural_key_recipe` is written ONLY alongside a real key, under the same rule —
-    a recipe stamp on a keyless node describes nothing. Unread today; it exists so that a
-    sqlglot bump splitting the re-derived canon tier from the write-once learning tier is
-    DETECTABLE rather than silent (see `structural_key_recipe`)."""
+        `structural_key_recipe` is written ONLY alongside a real key, under the same rule — a
+        recipe stamp on a keyless node describes nothing. Unread today; it exists so a sqlglot
+        bump splitting the re-derived canon tier from the write-once learning tier is DETECTABLE
+        rather than silent.
+    """
     key = _seed_structural_key(bp) or None
     return {
         "resolves_json": json.dumps(bp.resolves) if bp.resolves else None,
@@ -2073,20 +1967,16 @@ def _uses_schema(uses: list[str]) -> dict[str, dict[str, dict[str, str]]]:
 
 
 def _scratch_placeholder_names(sql_template: str | None) -> set[str]:
-    """The set of `scratch.<placeholder>` table names a template references in a
-    FROM/JOIN position (the table-consume bind sites, §2.3). Parsed via
-    `parse_template` so a `{slot}` template parses too. A non-parsing template →
-    empty set (the other load checks surface the parse failure).
+    """The set of `scratch.<placeholder>` table names a template references in a FROM/JOIN
+        position. Parsed via `parse_template` so a `{slot}` template parses too; a non-parsing
+        template yields an empty set.
 
-    CASE-SENSITIVE, and that is the correct polarity HERE even though the sibling
-    recognizer below is not. This set answers "which placeholders will the executor
-    REWRITE", and `template._rewrite_scratch_tables` matches `db == 'scratch'`
-    exactly — so gate (h) ("a table-consume must appear as a `scratch.<ph>` source")
-    must use the same exact test or it would accept a spelling the executor cannot
-    rewrite. Case-folding here would LOOSEN gate (h) while tightening every other
-    caller: one function, two callers, opposite fail-closed directions. The two
-    questions are therefore split, and `_assert_canonical_scratch_spelling` keeps them
-    from ever disagreeing about a template that actually loads."""
+        CASE-SENSITIVE, and that is the correct polarity HERE even though the sibling recognizer
+        below is not. This answers "which placeholders will the executor REWRITE", and
+        `template._rewrite_scratch_tables` matches `db == 'scratch'` exactly — so gate (h) must
+        use the same exact test or it would accept a spelling the executor cannot rewrite.
+        Case-folding here would LOOSEN gate (h) while tightening every other caller.
+    """
     if not sql_template:
         return set()
     try:
@@ -2101,15 +1991,14 @@ def _scratch_placeholder_names(sql_template: str | None) -> set[str]:
 
 
 def _scratch_db_sources_in_tree(tree: exp.Expression) -> list[tuple[str, str]]:
-    """Every `(db_as_written, table)` source in a PARSED template whose database is the
-    scratch DB under a CASE-INSENSITIVE match.
+    """Every `(db_as_written, table)` source in a PARSED template whose database is the scratch
+        DB under a CASE-INSENSITIVE match.
 
-    The single tree-level definition of "this source is session scratch", shared by its
-    two callers so they cannot drift: `_scratch_db_sources` (which parses a template
-    string first) and `_assert_canonical_scratch_spelling` (which already holds the
-    tree). Their agreement IS the load-bearing property of the D3 scratch split — the
-    canonical-spelling gate is only sound if it recognizes exactly the sources the
-    reference gate does — so it gets one implementation, not two identical ones."""
+        The single tree-level definition of "this source is session scratch", shared by its two
+        callers so they cannot drift. Their agreement IS the load-bearing property of the scratch
+        split: the canonical-spelling gate is only sound if it recognizes exactly the sources the
+        reference gate does.
+    """
     return [
         (table.text("db"), table.name)
         for table in tree.find_all(exp.Table)
@@ -2119,16 +2008,16 @@ def _scratch_db_sources_in_tree(tree: exp.Expression) -> list[tuple[str, str]]:
 
 def _scratch_db_sources(sql_template: str | None) -> list[tuple[str, str]]:
     """Every `(db_as_written, table)` source whose database is the scratch DB under a
-    CASE-INSENSITIVE match — the "does this template touch session scratch at all?"
-    question, deliberately over-approximating.
+        CASE-INSENSITIVE match — the "does this template touch session scratch at all?" question,
+        deliberately over-approximating.
 
-    The authority for that question is the MCP's `service._references_scratch_db`,
-    which matches the scratch database name with `re.IGNORECASE` *specifically* so a
-    spelling cannot route a query around the session gate, and which documents itself as
-    a fail-closed over-approximation. This mirrors that polarity; the exact-match
-    sibling above answers a different question (see its docstring).
+        The authority for that question is the MCP's own `service._references_scratch_db`, which
+        matches with `re.IGNORECASE` specifically so a spelling cannot route a query around the
+        session gate. This mirrors that polarity; the exact-match sibling above answers a
+        different question.
 
-    Returns the db text AS WRITTEN so a caller can name the offending spelling."""
+        Returns the db text AS WRITTEN so a caller can name the offending spelling.
+    """
     if not sql_template:
         return []
     try:
@@ -2141,21 +2030,19 @@ def _scratch_db_sources(sql_template: str | None) -> list[tuple[str, str]]:
 def _assert_canonical_scratch_spelling(bp_id: str, where: str, tree: exp.Expression) -> None:
     """Reject a scratch-database source spelled anything other than `scratch`.
 
-    This is what keeps the two recognizers above from disagreeing on anything that
-    actually loads: after this gate, "recognized case-insensitively" and "recognized
-    exactly" describe the same set, so gate (h), the executor's rewrite and the
-    reference gate cannot diverge.
+        This is what keeps the two recognizers above from disagreeing on anything that actually
+        loads: after this gate, "recognized case-insensitively" and "recognized exactly" describe
+        the same set, so gate (h), the executor's rewrite and the reference gate cannot diverge.
 
-    Without it the escape is real and not merely cosmetic. sqlglot does NOT normalize
-    identifier case on this path (measured: `qualify_tables` and `qualify_columns` both
-    leave `SCRATCH` as written), so `FROM SCRATCH.borrowed` reads as an ordinary
-    warehouse source; declare `SCRATCH.borrowed.<col>` in `uses` — which passes the
-    `db.table.column` grammar unchanged — and `_assert_source_tables_in_uses` finds it
-    declared and the whole corpus loads. The result is a `validated` blueprint reading a
-    session-scoped table nothing can materialize for it, and an offline golden-replay
-    JWT minted from a `column_scope` containing a scratch key. The runtime still fails
-    closed (the MCP's own IGNORECASE gate catches it), so this is defence in depth —
-    but a blueprint that cannot run should not load."""
+        Without it the escape is real and not merely cosmetic. sqlglot does NOT normalize
+        identifier case on this path, so `FROM SCRATCH.borrowed` reads as an ordinary warehouse
+        source; declare `SCRATCH.borrowed.<col>` in `uses` — which passes the `db.table.column`
+        grammar unchanged — and the whole corpus loads, yielding a `validated` blueprint reading a
+        session-scoped table nothing can materialize for it, and an offline golden-replay JWT
+        minted from a scope containing a scratch key. The runtime still fails closed via the MCP's
+        own IGNORECASE gate, so this is defence in depth — but a blueprint that cannot run should
+        not load.
+    """
     for db, name in _scratch_db_sources_in_tree(tree):
         if db != _SCRATCH_DB:
             raise CorpusLoadError(
@@ -2203,16 +2090,16 @@ def _assert_source_tables_in_uses(
     qualified: exp.Expression,
     schema_dict: dict[str, dict[str, dict[str, str]]],
 ) -> None:
-    """Assert every SOURCE table (FROM/JOIN) resolves to a `(db, table)` present in
-    the uses-schema (review re-review BLOCKER — the qualified-column JOIN hole).
+    """Assert every SOURCE table (FROM/JOIN) resolves to a `(db, table)` present in the
+        uses-schema.
 
-    The column-level qualify only validates UNQUALIFIED columns against the schema —
-    a column already qualified to a source alias (`p.SSN`) is treated as resolved
-    and its SOURCE table is never checked. So a JOIN to a table absent from `uses`
-    reads arbitrary columns. This closes it at the TABLE level (qualified,
-    fully-qualified, and CROSS JOIN forms). A CTE name is the query's OWN derived
-    table (not a warehouse source) and is skipped; a table-function / db-less source
-    that is not a CTE and not in `uses` is rejected (fail-closed)."""
+        The column-level qualify only validates UNQUALIFIED columns: a column already qualified
+        to a source alias (`p.SSN`) is treated as resolved and its SOURCE table is never checked,
+        so a JOIN to a table absent from `uses` reads arbitrary columns. This closes it at the
+        TABLE level (qualified, fully-qualified and CROSS JOIN forms). A CTE name is the query's
+        OWN derived table and is skipped; a table-function or db-less source that is not a CTE is
+        rejected fail-closed.
+    """
     cte_names = {cte.alias for cte in qualified.find_all(exp.CTE) if cte.alias}
     for table in qualified.find_all(exp.Table):
         name = table.name
@@ -2239,20 +2126,19 @@ def _assert_template_reads_within_uses(
     uses: list[str],
     scratch_schema: dict[str, dict[str, str]] | None = None,
 ) -> None:
-    """§1.2(c), table-aware (review FIX 1): every table + column the template reads
-    must resolve to a `db.table.column` present in the declared `uses`.
+    """Every table + column the template reads must resolve to a `db.table.column` present in
+        the declared `uses`.
 
-    Two-level check: (1) every SOURCE table in FROM/JOIN resolves into the
-    uses-schema (`_assert_source_tables_in_uses` — closes the JOIN-to-an-unlisted-
-    table hole where an alias-qualified `p.SSN` reads an undeclared table); (2)
-    every column qualifies against a schema built ONLY from `uses`, with
-    `expand_alias_refs=False` so an output-alias name can never mask a real
-    same-named column read (the alias-mask evasion). Any column that cannot be
-    resolved — out of `uses`, wrong table, an alias-masked read — raises `sqlglot`'s
-    `OptimizeError`, surfaced as `CorpusLoadError`.
+        Two levels: (1) every SOURCE table in FROM/JOIN resolves into the uses-schema, closing
+        the JOIN-to-an-unlisted-table hole where an alias-qualified `p.SSN` reads an undeclared
+        table; (2) every column qualifies against a schema built ONLY from `uses`, with
+        `expand_alias_refs=False` so an output-alias name can never mask a real same-named column
+        read. Any column that cannot be resolved raises sqlglot's `OptimizeError`, surfaced as
+        `CorpusLoadError`.
 
-    `*` stars and dict-family functions are rejected by the caller BEFORE this runs
-    (they defeat any column-level analysis)."""
+        `*` stars and dict-family functions are rejected by the caller BEFORE this runs — they
+        defeat any column-level analysis.
+    """
     schema_dict = _uses_schema(uses)
     # Register the session-gated scratch placeholder tables (their producing node's
     # output columns) so qualify_columns resolves `scratch.<placeholder>` columns —
@@ -2285,9 +2171,9 @@ def _assert_template_reads_within_uses(
 
 
 def _assert_no_dict_functions(bp_id: str, where: str, tree: exp.Expression) -> None:
-    """Reject dictionary-family functions (`dictGet…`) that read a ClickHouse
-    dictionary source INVISIBLE to the column walk (review FIX 1 / reviewer dictGet
-    case) — a hidden read outside the declared `uses`."""
+    """Reject dictionary-family functions (`dictGet…`), which read a ClickHouse dictionary
+        source INVISIBLE to the column walk — a hidden read outside the declared `uses`.
+    """
     for node in tree.walk():
         if isinstance(node, exp.Anonymous):
             name = node.this or ""
@@ -2299,10 +2185,10 @@ def _assert_no_dict_functions(bp_id: str, where: str, tree: exp.Expression) -> N
 
 
 def _validate_dag_structure(bp_id: str, blueprint: Blueprint) -> None:
-    """§1.2(d): `composes` is a DAG — every `feeds_from` reference exists and there
-    are no cycles. Raises `CorpusLoadError` on a dangling ref, a cycle, or an
-    adversarially large DAG (FIX 3: a hard node-count cap so a huge/malicious
-    composes fails LOUD with a clean error, never a stack overflow)."""
+    """`composes` is a DAG: every `feeds_from` reference exists and there are no cycles. Raises
+        `CorpusLoadError` on a dangling ref, a cycle, or a DAG past the hard node-count cap, so a
+        huge or malicious `composes` fails LOUD rather than overflowing the stack.
+    """
     nodes = blueprint.composes
     if not nodes:
         return
@@ -2352,19 +2238,16 @@ def _validate_dag_structure(bp_id: str, blueprint: Blueprint) -> None:
 
 
 def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
-    """Write-time full-DAG validation (§1.2, fail-loud — mirrors
-    `_validate_blueprint_uses`). An authoring mistake FAILS the seed load rather
-    than shipping a silently-broken blueprint.
+    """Write-time full-DAG validation, fail-loud: an authoring mistake FAILS the seed load
+        rather than shipping a silently-broken blueprint.
 
-    Checks: (structural) the DAG parses into typed objects; (a) every `{slot}`
-    token in a sql_template has a matching `slots` entry; (b) each sql_template
-    parses under sqlglot ClickHouse AND is a single READ-ONLY SELECT (no DDL/DML,
-    no multi-statement block — FIX 2); (c) the template's footprint ⊆ the declared
-    `uses`, enforced TABLE-AWARELY (every source table AND every column resolves
-    into the uses-schema — FIX 1) after rejecting the analysis-defeating constructs
-    (`*` stars — FIX 1a; dict-family functions); (d) `composes` is a DAG (no cycles,
-    refs exist, ≤ the node cap — FIX 3); and every `when` clause is a valid,
-    entity-AGNOSTIC predicate (D59)."""
+        Checks: the DAG parses into typed objects; (a) every `{slot}` token in a `sql_template`
+        has a matching `slots` entry; (b) each template parses under sqlglot ClickHouse AND is a
+        single READ-ONLY SELECT; (c) the template's footprint is a subset of the declared `uses`,
+        enforced TABLE-AWARELY, after rejecting the analysis-defeating constructs (`*` stars,
+        dict-family functions); (d) `composes` is a DAG within the node cap; and every `when`
+        clause is a valid, entity-AGNOSTIC predicate (D59).
+    """
     try:
         blueprint = Blueprint.parse(
             id=bp.id,
@@ -2715,15 +2598,15 @@ def _validate_blueprint_dag(bp: BlueprintSeed) -> None:
 async def apply_schema(
     driver: AsyncDriver, *, dimension: int, database: str = "neo4j"
 ) -> None:
-    """Create the constraints + native vector indexes (idempotent, at *dimension*),
-    then wait for every index to come ONLINE so a subsequent recall sees them (§4.2).
+    """Create the constraints + native vector indexes (idempotent, at *dimension*), then wait
+        for every index to come ONLINE so a subsequent recall sees them.
 
-    Part B dimension-parity: BEFORE the `CREATE VECTOR INDEX ... IF NOT EXISTS` (which
-    silently keeps a pre-existing index's OLD dimension), introspect the existing
-    vector-index dimensions and `check_dimension_parity` — raising
-    `DimensionMismatchError` if an index already exists at a DIFFERENT dimension (the
-    signal that the embedding model changed and the graph must be rebuilt). A fresh
-    graph (no such index) passes and the indexes are created at *dimension*."""
+        BEFORE the `CREATE VECTOR INDEX ... IF NOT EXISTS` — which silently keeps a pre-existing
+        index's OLD dimension — the existing dimensions are introspected and checked, raising
+        `DimensionMismatchError` when one already exists at a DIFFERENT dimension (the signal
+        that the embedding model changed and the graph must be rebuilt). A fresh graph passes and
+        the indexes are created at *dimension*.
+    """
     async with driver.session(database=database) as session:
         existing_dims = await _fetch_existing_vector_dims(session)
         check_dimension_parity(existing_dims, dimension)
@@ -2812,15 +2695,14 @@ async def claim_rebuild_lock(
     stale_seconds: int = 300,
     database: str = "neo4j",
 ) -> bool:
-    """Best-effort single-flight claim on the `RebuildLock` singleton (Part C).
+    """Best-effort single-flight claim on the `RebuildLock` singleton.
 
-    Returns True iff THIS *holder* now owns the lock (it may nuke + rebuild); False
-    iff another live holder holds a fresh claim (skip). Best-effort: without a
-    uniqueness constraint a simultaneous MERGE could in theory double-create, and the
-    nuke SPARES the lock node, so the claim protects the FULL rebuild + the stale
-    window; a `rebuild_lock_id` uniqueness constraint (created here, before the MERGE)
-    closes the simultaneous double-MERGE. A stale claim (holder crashed) is reclaimed
-    after *stale_seconds*."""
+        Returns True iff THIS *holder* now owns the lock and may nuke + rebuild; False iff
+        another live holder holds a fresh claim. The claim protects the FULL rebuild plus the
+        stale window, and the `rebuild_lock_id` uniqueness constraint created here closes the
+        simultaneous double-MERGE. A stale claim (holder crashed) is reclaimed after
+        *stale_seconds*.
+    """
     async with driver.session(database=database) as session:
         await session.run(_REBUILD_LOCK_CONSTRAINT)  # type: ignore[arg-type]
         result = await session.run(
@@ -2831,18 +2713,19 @@ async def claim_rebuild_lock(
 
 
 async def nuke_graph(driver: AsyncDriver, *, database: str = "neo4j") -> None:
-    """DESTRUCTIVE (Part C): drop the corpus vector indexes + all schema constraints,
-    then `DETACH DELETE` every node — leaving a completely empty graph ready for a
-    fresh `apply_schema` + reseed at a (possibly new) embedding dimension.
+    """DESTRUCTIVE: drop the corpus vector indexes + all schema constraints, then
+        `DETACH DELETE` every node, leaving an empty graph ready for a fresh `apply_schema` and
+        reseed at a possibly new embedding dimension.
 
-    Dropping the vector indexes is REQUIRED (a `CREATE ... IF NOT EXISTS` keeps the
-    old dimension otherwise); deleting the nodes is REQUIRED so the B1 freshness
-    singletons (`:CatalogMeta`/`:CorpusMeta`) don't short-circuit the re-seed. The
-    `:RebuildLock` singleton is SPARED so the single-flight guard survives its own nuke
-    (see `_NUKE_DELETE_NODES`). Strictly for the seed-script maintenance op — the SINGLETON
-    hydrator does NOT call this (it would DESTROY the `source='learning'` staging tier, which
-    is not in the MCP export and would not be re-seeded); the hydrator uses the scoped
-    `rebuild_mcp_corpus_partition` instead."""
+        Dropping the vector indexes is REQUIRED (a `CREATE ... IF NOT EXISTS` keeps the old
+        dimension otherwise); deleting the nodes is REQUIRED so the freshness singletons do not
+        short-circuit the re-seed. The `:RebuildLock` singleton is SPARED so the single-flight
+        guard survives its own nuke.
+
+        Strictly the seed-script maintenance op. The SINGLETON hydrator does NOT call this — it
+        would DESTROY the `source='learning'` staging tier, which is not in the MCP export and
+        would not be re-seeded; the hydrator uses `rebuild_mcp_corpus_partition` instead.
+    """
     async with driver.session(database=database) as session:
         for statement in _NUKE_STATEMENTS:
             await session.run(statement)  # type: ignore[arg-type]
@@ -2878,36 +2761,32 @@ async def rebuild_mcp_corpus_partition(
 ) -> None:
     """Scoped destructive reseed-prep for the SINGLETON hydrator (data-loss-safe).
 
-    Clears ONLY the trusted `source='mcp'` `:Blueprint`/`:KnowledgeChunk` nodes + the
-    `:CorpusMeta`/`:CatalogMeta` freshness singletons, then leaves the caller to reseed.
-    PRESERVES the `source='learning'` staging tier (human-promoted content not in the MCP
-    export — a full `nuke_graph` would destroy it) AND the `:Table`/`:Column` catalog graph.
+        Clears ONLY the trusted `source='mcp'` nodes plus the `:CorpusMeta`/`:CatalogMeta`
+        freshness singletons, then leaves the caller to reseed. PRESERVES the `source='learning'`
+        staging tier (human-promoted content not in the MCP export, which a full `nuke_graph`
+        would destroy) AND the `:Table`/`:Column` catalog graph.
 
-    Two modes:
-      * *dimension* given (a DIMENSION change) — additionally DROP + recreate the two corpus
-        vector indexes at the new dimension (a `CREATE ... IF NOT EXISTS` silently keeps the
-        OLD dim, so the index must be dropped to reshape). The preserved learning-tier nodes
-        keep their old-dim embeddings; they are excluded from the new-dim index + the recall
-        source-gate, so no bad neighbours surface — they get a correct-dim embedding only
-        if/when promoted.
-      * *dimension* `None` (a same-dim MODEL swap) — leave the indexes; just clear the mcp
-        nodes so the reseed re-embeds every mcp node at the new model WITHOUT tripping the
-        (mcp-scoped) write-time model-parity guard, which reads the pre-write state.
+        Two modes:
+          * *dimension* given (a DIMENSION change) — additionally DROP and recreate the two
+            corpus vector indexes at the new dimension, since a `CREATE ... IF NOT EXISTS`
+            silently keeps the old one. The preserved learning-tier nodes keep their old-dim
+            embeddings and are excluded from both the new-dim index and the recall source gate,
+            so no bad neighbours surface.
+          * *dimension* `None` (a same-dim MODEL swap) — leave the indexes; just clear the mcp
+            nodes so the reseed re-embeds them at the new model without tripping the mcp-scoped
+            write-time model-parity guard, which reads the pre-write state.
 
-    Deleting the mcp nodes (not merely overwriting) is REQUIRED even for a same-dim model
-    swap: `load_corpus`'s parity check reads the existing mcp models as the FIRST statement
-    of its write txn, so a stale old-model node would raise `CorpusLoadError` before the
-    MERGE-by-id overwrite ran. Clearing first makes the reseed provably parity-clean.
+        Deleting the mcp nodes rather than overwriting them is REQUIRED even for a same-dim swap:
+        the parity check reads the existing mcp models as the FIRST statement of the write txn, so
+        a stale old-model node would raise `CorpusLoadError` before the MERGE-by-id overwrite ran.
 
-    ATOMICITY (crash-safety): the mcp-node delete AND the freshness-singleton delete run in
-    ONE `execute_write` transaction so they commit together. Were they two auto-commit
-    statements, a crash BETWEEN them (a transient neo4j/network blip `run_forever` swallows,
-    or a pod kill) could leave the mcp partition DELETED while `:CorpusMeta` SURVIVED at its
-    old sha — the next cycle would see no mcp model change, take the normal path, and
-    `load_corpus` would B1 sha-SKIP on the matching sha → recall permanently empty while
-    /ready still reads 200 (the silent-fleet-recall-loss class). Committing both deletes
-    atomically guarantees a crash leaves BOTH gone, forcing a converging reseed next cycle.
-    The vector-index DDL stays OUTSIDE the txn (neo4j forbids schema ops inside a data txn)."""
+        ATOMICITY: the mcp-node delete AND the freshness-singleton delete run in ONE
+        `execute_write` so they commit together. As two auto-commit statements, a crash between
+        them could leave the mcp partition DELETED while `:CorpusMeta` SURVIVED at its old sha —
+        the next cycle would see no model change, sha-SKIP, and recall would be permanently empty
+        while /ready still read 200. The vector-index DDL stays OUTSIDE the txn (neo4j forbids
+        schema ops inside a data txn).
+    """
     async with driver.session(database=database) as session:
         if dimension is not None:
             # Drop the vector indexes so they can be recreated at the new dimension.
@@ -2929,14 +2808,13 @@ async def rebuild_mcp_corpus_partition(
 
 
 async def apply_catalog_graph_schema(driver: AsyncDriver, *, database: str = "neo4j") -> None:
-    """Ensure ONLY the catalog-graph constraints (`Table.key`, `Column.key`,
-    `CatalogMeta.id`) — the lightweight schema-ensure `load_catalog_graph` uses.
+    """Ensure ONLY the catalog-graph constraints (`Table.key`, `Column.key`, `CatalogMeta.id`)
+        — the lightweight schema-ensure `load_catalog_graph` uses.
 
-    Deliberately does NOT create the vector indexes NOR call `db.awaitIndexes(300)`:
-    those are irrelevant to the `:Table`/`:Column` upsert and would add index-await
-    latency to the B1 cold-fetch turn. The full `apply_schema` (with vector indexes)
-    stays owned by `load_corpus`. Self-deploys the `:CatalogMeta` singleton
-    constraint the graph's sha-guard relies on. Idempotent (`IF NOT EXISTS`)."""
+        Deliberately does NOT create the vector indexes nor await indexes: both are irrelevant to
+        the `:Table`/`:Column` upsert and would add index-await latency to the cold-fetch turn.
+        The full `apply_schema` stays owned by `load_corpus`. Idempotent.
+    """
     async with driver.session(database=database) as session:
         for statement in _CATALOG_GRAPH_CONSTRAINTS:
             await session.run(statement)  # type: ignore[arg-type]
@@ -2965,15 +2843,14 @@ async def _read_corpus_meta(session: Any) -> str | None:
 
 
 def _effective_catalog_sha(catalog_export: dict[str, Any]) -> str:
-    """The stamp/guard key for a hydration run — the export's own `catalog_sha`,
-    or a deterministic content-hash FALLBACK when it is empty/missing (M1).
+    """The stamp/guard key for a hydration run — the export's own `catalog_sha`, or a
+        deterministic content-hash FALLBACK when it is empty or missing.
 
-    An empty sha would silently break BOTH the skip-guard (`current == ""` never
-    triggers a no-op) AND the GC predicate (`coalesce(sha,'') <> ''` matches every
-    node, incl. freshly-stamped ones), so we never propagate one: a missing sha
-    derives a stable SHA-1 over the `catalog` dict (sorted keys, `default=str` for
-    any non-JSON value) and logs a warning. The same content always yields the same
-    stamp, so the skip-guard + GC still function idempotently."""
+        An empty sha would silently break BOTH the skip-guard (`current == ""` never triggers a
+        no-op) AND the GC predicate (`coalesce(sha,'') <> ''` matches every node, including
+        freshly-stamped ones), so one is never propagated. The same content always yields the same
+        stamp, so both guards stay idempotent.
+    """
     sha = catalog_export.get("catalog_sha")
     if isinstance(sha, str) and sha:
         return sha
@@ -2997,31 +2874,26 @@ async def load_catalog_graph(
     ensure_schema: bool = True,
     gc: bool = True,
 ) -> CatalogGraphReport:
-    """Independent, enriched, self-healing hydration of the `:Table`/`:Column`
-    catalog graph from the MCP catalog EXPORT dict (`{"catalog_sha", "catalog"}`).
+    """Independent, enriched, self-healing hydration of the `:Table`/`:Column` catalog graph
+        from the MCP catalog EXPORT dict (`{"catalog_sha", "catalog"}`).
 
-    Catalog-OWNED (separate from `load_corpus`): no embeddings, no model-parity.
-    Every node upsert stamps the run's `catalog_sha` (or a derived content hash when
-    the export lacks one, `_effective_catalog_sha`).
+        Catalog-OWNED and separate from `load_corpus`: no embeddings, no model parity. Every node
+        upsert stamps the run's `catalog_sha`.
 
-    Two write modes (QA#1 — the different-sha mutual-GC race):
-      * `gc=True` (default, the EXPLICIT seed/reconcile path — `scripts/seed_neo4j_
-        corpus.py`): after upserting, GC deletes any `:Table`/`:Column` whose stamp
-        is stale (a dropped-column reconcile), logging any GC'd column that still had
-        an inbound `:USES` (a blueprint referencing a column the catalog just dropped
-        — GC wins). This is a full reconcile / maintenance op.
-      * `gc=False` (the ONLINE B1 self-heal wired in `app.py`): upsert + meta-stamp
-        ONLY, NEVER delete. Two replicas booting on DIFFERENT shas during a rolling
-        deploy then converge to a current-or-SUPERSET graph instead of GC-deleting
-        each other's freshly-stamped nodes. Dropped-column garbage collection is
-        deferred to the explicit seed-script maintenance op.
+        Two write modes:
+          * `gc=True` (the EXPLICIT seed/reconcile path) — after upserting, GC deletes any
+            `:Table`/`:Column` whose stamp is stale, logging any GC'd column that still had an
+            inbound `:USES`.
+          * `gc=False` (the ONLINE self-heal wired in `app.py`) — upsert + meta-stamp ONLY, NEVER
+            delete, so two replicas booting on DIFFERENT shas during a rolling deploy converge to
+            a current-or-SUPERSET graph instead of GC-deleting each other's freshly-stamped nodes.
+            Dropped-column GC is deferred to the explicit maintenance op.
 
-    B1 no-op fast path (BOTH modes): if the stored `:CatalogMeta.catalog_sha` already
-    EQUALS this run's sha, returns `skipped=True` WITHOUT writing (an empty/absent
-    meta ⇒ proceed). Cheap short-circuit so replicas racing on boot stay idempotent.
+        No-op fast path (BOTH modes): if the stored `:CatalogMeta.catalog_sha` already EQUALS this
+        run's sha, returns `skipped=True` without writing.
 
-    Atomicity: the upserts + (optional) GCs + the meta upsert run in ONE
-    `session.execute_write`, so no concurrent reader ever sees a torn graph.
+        Atomicity: the upserts, optional GCs and the meta upsert run in ONE `execute_write`, so no
+        concurrent reader ever sees a torn graph.
     """
     export_sha = _effective_catalog_sha(catalog_export)
     catalog = catalog_export["catalog"]
@@ -3108,46 +2980,28 @@ async def load_corpus(
 ) -> LoadReport:
     """Embed + upsert the seed corpus into neo4j (idempotent). See module docs.
 
-    *dimension* (Part B) is the vector-index embedding dimension. `None` (default)
-    INFERS it — from the just-embedded corpus vectors when present, else a one-shot
-    probe embed (`resolve_embedding_dimension`) — so the schema is shaped to the live
-    embedding model without a code edit; pass an explicit int to pin it (the app
-    startup-rebuild path resolves it once and threads it here).
+        *dimension* is the vector-index embedding dimension. `None` INFERS it — from the
+        just-embedded corpus vectors when present, else a one-shot probe — so the schema is shaped
+        to the live embedding model without a code edit; pass an int to pin it.
 
-    Raises `CorpusLoadError` on a malformed `uses` key (S2) or a write-time
-    model-parity violation (§3.3).
+        Raises `CorpusLoadError` on a malformed `uses` key or a write-time model-parity violation.
 
-    Governed corpus (Phase 2): each seed carries a `source`/`verified` trust stamp
-    (defaulting `mcp`/`True`, so the fixture path + existing callers write TRUSTED
-    canon; the learning landing writer overrides to `learning`/`False`). These flow
-    onto the node so recall's `source='mcp'` trust gate + the corpus GC can partition
-    the trusted canon from the learning staging tier.
+        Each seed carries a `source`/`verified` trust stamp (defaulting `mcp`/`True`, so the
+        fixture path writes TRUSTED canon; the learning landing writer overrides to
+        `learning`/`False`). These flow onto the node so recall's `source='mcp'` trust gate and
+        the corpus GC can partition the trusted canon from the learning staging tier.
 
-    *corpus_sha* + *gc* mirror `load_catalog_graph`'s self-healing reconcile, keyed on
-    `corpus_sha` and SCOPED to `source='mcp'`:
-      * every seeded node is stamped with *corpus_sha*;
-      * a truthy *corpus_sha* enables the B1 no-op fast path — if the `:CorpusMeta`
-        singleton already carries it, the load SKIPS (no re-embed, no write) and
-        returns `skipped=True`;
-      * `gc=True` (the EXPLICIT seed/reconcile op — `scripts/seed_neo4j_corpus.py`)
-        additionally DELETES any `source='mcp'` node whose stamp is stale (a dropped
-        blueprint/knowledge reconcile). The GC WHERE clause is `source='mcp'`-scoped,
-        so it can NEVER touch a `source='learning'` staging node. `gc=False` (default;
-        the ONLINE seed wired in `app.py`, and the landing writer) is additive-only.
-    An empty *corpus_sha* (the landing writer, Layer-1 tests) NEVER skips and NEVER
-    stamps the `:CorpusMeta` singleton — behavior is byte-identical to before Phase 2.
+        *corpus_sha* + *gc* mirror `load_catalog_graph`'s self-healing reconcile, SCOPED to
+        `source='mcp'`: every seeded node is stamped; a truthy sha enables the no-op fast path
+        (returning `skipped=True` without re-embedding); and `gc=True` (the explicit seed op)
+        additionally DELETES any `source='mcp'` node whose stamp is stale. The GC WHERE clause is
+        `source='mcp'`-scoped, so it can NEVER touch a learning node. An empty *corpus_sha* never
+        skips and never stamps the singleton.
 
-    *catalog* (D94 Part 3, optional dev-time aid): when a `CatalogHandle` is
-    supplied, every blueprint's `uses` tables are cross-checked against it and a
-    SOFT WARNING is logged per blueprint referencing an uncatalogued table (a
-    seed-time early warning for the catalog/extractor skew that otherwise strands
-    an `ok`+`None` result at runtime). Load ALWAYS proceeds — a blueprint may
-    legitimately reference tables absent from a partial/dev catalog snapshot, so
-    this never raises `CorpusLoadError` (that stays reserved for genuine
-    corpus-internal-consistency failures). Omit it (default `None`) to skip the
-    check silently — it is not a load precondition, and the real production safety
-    is MCP-fails-closed + both catalogs in agreement, not this check (D94 record
-    correction).
+        *catalog*, when supplied, cross-checks every blueprint's `uses` tables and logs a SOFT
+        WARNING per blueprint referencing an uncatalogued table. The load ALWAYS proceeds — this
+        is a dev-time early warning, never a `CorpusLoadError`, and the real production safety is
+        MCP-fails-closed plus both catalogs agreeing.
     """
     # Governed-corpus B1 no-op fast path (Phase 2): when a truthy corpus_sha is
     # supplied AND the `:CorpusMeta` singleton already carries it, the seeded canon is
@@ -3353,15 +3207,13 @@ async def load_corpus(
 
 
 async def _fetch_existing_models(runner: Any) -> set[str]:
-    """Distinct non-null `embedding_model` stamps on the TRUSTED `source='mcp'`
-    partition (the hydrator-redesign scope — learning-tier nodes are excluded; see
-    `_EXISTING_MODELS`). Powers BOTH load_corpus's write-txn parity check AND the
-    hydrator's model-change detection.
+    """Distinct non-null `embedding_model` stamps on the TRUSTED `source='mcp'` partition;
+        learning-tier nodes are excluded. Powers BOTH `load_corpus`'s write-txn parity check and
+        the hydrator's model-change detection.
 
-    *runner* is anything with `.run` — a session OR a managed transaction (S3
-    calls this inside the write txn). Empty-string stamps are RETAINED (not
-    filtered), so a broken/unstamped mcp row surfaces as a parity conflict (N2)
-    rather than a silent free pass; the Cypher already excludes true NULLs.
+        *runner* is anything with `.run` — a session OR a managed transaction. Empty-string stamps
+        are RETAINED, not filtered, so a broken or unstamped mcp row surfaces as a parity conflict
+        rather than a silent free pass; the Cypher already excludes true NULLs.
     """
     result = await runner.run(_EXISTING_MODELS)
     row = await result.single()

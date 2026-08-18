@@ -1,23 +1,11 @@
 """`GeneralizeStage` — the S4 `CandidateStage` (the write-router pipeline seam).
 
-First stage in the frozen order `generalize (S4) → leakage (S5) → dedup (S6) →
-writer (S7)` (`learning/stage.py`, D102 §7.1). It reads the freshly-extracted
-blueprint envelope + the session's tool trail (accepted SQL), computes the
-`BlueprintGeneralization`, and merges it under `payload["generalization"]` — an
-ADDITIVE payload key; it mutates no S3 field.
-
-`control` is always `continue`: a `fail_to_review` outcome is an IN-BAND value on
-the payload (`static_validation.outcome`) that the S7 writer routes on — S4 never
-drops it and never raises (D52/D97). Non-blueprint envelopes pass straight through.
-
-The one non-mechanical thing here is `_collapse_designations`: a cited ref can stand
-for SEVERAL queries (a multi-table `answerWithTable`) and the builder rewrites one.
-The collapse is subset-CHECKED, and refuses rather than picks when the queries it
-would discard constrain something the chosen one does not — see its docstring for
-why the strict rewrite cannot be relied on to catch that.
-
-Wiring (NOT done here — a one-line registration at the composition root, D102 §7.1):
-    stages=(GeneralizeStage(catalog_schema=build_sqlglot_schema_from_catalog(...)), ...)
+First stage in the frozen order (D102 §7.1). It reads the freshly-extracted blueprint
+envelope plus the session's accepted SQL and merges the `BlueprintGeneralization` under
+`payload["generalization"]` — an ADDITIVE key; it mutates no S3 field. `control` is always
+`continue`: a `fail_to_review` outcome is an IN-BAND value on the payload that the S7 writer
+routes on, and S4 never drops a candidate and never raises (D52/D97). Non-blueprint
+envelopes pass straight through.
 """
 
 from __future__ import annotations
@@ -35,42 +23,21 @@ _logger = logging.getLogger(__name__)
 
 
 def _collapse_designations(sqls: tuple[str, ...]) -> str | None:
-    """The ONE accepted SQL a ref resolves to for S4, or `None` when there is no safe
-    choice (→ the builder's existing `REASON_UNREWRITABLE` → `fail_to_review`).
+    """The ONE accepted SQL a ref resolves to for S4, or `None` when there is no safe choice.
 
-    One ref, several queries: a multi-table `answerWithTable` (08 §B.3). The last
-    designation wins — `builder._accepted_sql_for_single`'s "latest wins" rule,
-    extended from refs to designations — but ONLY when every earlier designation's
-    literal predicates also appear in it. Otherwise the earlier query constrains
-    something the chosen one does not, and rewriting from the chosen one alone would
-    emit a template that silently drops that constraint: the D56 wrong-answer class,
-    landed as `outcome: ok`.
+    One ref can stand for SEVERAL queries (a multi-table `answerWithTable`). The last
+    designation wins — the builder's "latest wins" rule extended from refs to designations — but
+    ONLY when every earlier designation's literal predicates also appear in it; otherwise the
+    earlier query constrains something the chosen one does not, and rewriting from the chosen
+    one alone emits a template that silently drops that constraint.
 
-    IT CANNOT BE LEFT TO THE STRICT REWRITE, which was the first cut of this and is
-    wrong for one specific reason. `_validate_totality` counts ANY parameterization
-    entry as covering a predicate regardless of role, and the rewrite sees ONE
-    designation — the chosen one. So a plan whose only entry for designation 1's
-    `country = 'IE'` is inline passes totality, rewrites cleanly from designation 2, and
-    ships a template that has no country filter and a plan that says it does.
-
-    THE ARGUMENT NARROWED, AND STILL HOLDS (H3, 2026-08-17). The strict rewrite no
-    longer SKIPS inline entries: `_check_inline_literals` requires an inline literal to
-    be present in the SQL it is rewriting, so the single-designation half of that hole
-    is closed at the rewrite now, and the two layers agree on the `country` case rather
-    than disagreeing. What the rewrite still cannot see is the DISCARDED designations —
-    it is handed one query and has no way to know another one was dropped, whatever the
-    roles say — so this check remains the only layer that can compare them. A
-    multi-designation plan that loses a `role=slot` or `role=rule` constraint is caught
-    by both; one that loses an inline constraint is caught here.
-
-    THE COMPARISON IS EXACT `LiteralPredicate` equality — same enumerator as the
-    totality gate (`extractor/sql_predicates.py`), so the two layers see the same
-    predicates — and deliberately NOT that gate's looser `_table_compatible` /
-    case-insensitive column matching. The two ask different questions: totality asks
-    whether a human-reviewable plan accounts for a predicate, where near-matching is
-    tolerable; this asks whether a constraint is literally present in the query we are
-    about to rewrite, where any doubt must refuse. An un-parseable designation refuses
-    for the same reason — an unknown predicate set is not a subset of anything.
+    IT CANNOT BE LEFT TO THE STRICT REWRITE, which is handed ONE query and has no way to know
+    another was discarded, whatever the roles say (see docs/cleanup/WORKLOG.md #18). The
+    comparison is EXACT `LiteralPredicate` equality — the same enumerator as the totality gate,
+    but deliberately not its looser table/case matching: totality asks whether a plan accounts
+    for a predicate, where near-matching is tolerable, while this asks whether a constraint is
+    literally present in the query about to be rewritten, where any doubt must refuse. An
+    un-parseable designation refuses for the same reason.
     """
     if len(sqls) == 1:
         return sqls[0]
@@ -90,8 +57,9 @@ def _collapse_designations(sqls: tuple[str, ...]) -> str | None:
 class GeneralizeStage:
     """Deterministic (NO LLM) generalize + AST-rewrite + static-validate stage.
 
-    `catalog_schema`: the D69 `database.table` → `{column: type}` catalog the
-    provenance extractor qualifies against (injected at the composition root)."""
+    `catalog_schema`: the D69 `database.table` → `{column: type}` catalog the provenance
+    extractor qualifies against (injected at the composition root).
+    """
 
     catalog_schema: dict[str, dict[str, str]]
     stage_id: str = "generalize"

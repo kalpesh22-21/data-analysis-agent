@@ -1,45 +1,20 @@
 """CouchbaseBlueprintCorpus — the DURABLE `BlueprintCorpus` (Wave 3b-(i), D48).
 
 Its OWN `Cluster`, authenticated as `learning_corpus_writer` against the dedicated
-`learning_corpus` bucket (`_default._default`) — a separate RBAC boundary from the
-session/audit/candidate stores (mirroring D95/D101). Holds the landed blueprint
-artifacts the S6 dedup hard key looks up, keyed by `canonical_key`; the S9 promotion
-scheduler reads the same artifacts' `hit_count` (this store also duck-types the
-`HitCountReader` port, §11).
+`learning_corpus` bucket — a separate RBAC boundary from the session/audit/candidate stores.
+It also duck-types the S9 `HitCountReader`/`RecurrenceCountReader` ports, so the scheduler
+and the dedup stage read one source of truth.
 
-**Correctness crux (D48 — the whole reason this store is durable, not in-memory):**
+CORRECTNESS CRUX (the whole reason this store is durable, not in-memory):
+`increment_hit_count` is ATOMIC SERVER-SIDE — a sub-document counter, NEVER a
+read-modify-write — so two concurrent sessions on the same hard key converge to +2 instead
+of racing and losing an update; and `seed_artifact` is INSERT-WINS idempotent, because an
+`upsert` would clobber an already-accrued `hit_count`. Both treat a vanished doc as a
+tolerated no-op (D52).
 
-  * `increment_hit_count` is ATOMIC SERVER-SIDE — a sub-document counter
-    (`mutate_in` + `SD.increment`), NEVER a read-modify-write. Two concurrent
-    sessions each hitting the same hard key both apply a server-side +1, so the
-    count converges to +2; a read-modify-write would race and lose an update,
-    breaking the D48 "one create + one increment" invariant that feeds the T=3
-    promotion threshold. A hit on a vanished doc (concurrent retire) is a tolerated
-    no-op (`DocumentNotFoundException` swallowed), never a crash (fail-soft, D52).
-
-  * `seed_artifact` is INSERT-WINS idempotent — `insert` + catch
-    `DocumentExistsException` → no-op. Two concurrent first-sightings of the same
-    key therefore produce EXACTLY one create; an `upsert` would clobber an
-    already-accrued `hit_count` (a later insert-attempt must NOT reset the count),
-    so `insert` is load-bearing, not a style choice.
-
-`get_by_canonical_key` is a KV get by doc id; `list_artifacts` is an N1QL scan
-(the soft layer embeds each artifact's `intent`).
-
-Import-guarded exactly like `couchbase_candidate_store` / `couchbase_audit_store`:
-the module imports with or without the `couchbase` SDK (so the unit suite stays
-green with zero infra); constructing the store without the SDK raises.
-
-CONNECT (2026-08-11): shares `CouchbaseConnectGate` with every other
-Couchbase-backed store — `acouchbase` refuses all ops until `on_connect()` has
-been awaited, which a sync `__init__` cannot do, so each public coroutine gates
-itself. The consumer, the promotion scheduler and the inbox service all build
-this store and none of them connected it. See `runtime/couchbase_connect.py`.
-
-CONSTRUCTION (2026-08-17): also shared, via `CouchbaseStoreBase` — the SDK guard,
-the `Cluster`/bucket/collection graph and the TTL are built there from this store's
-own settings, and (with no `cluster=` injected) not until the first
-`_ensure_connected()`. `__init__` does no I/O.
+Import-guarded (the module imports without the `couchbase` SDK; constructing the store
+raises), gated per public coroutine by `CouchbaseConnectGate`, and built through
+`CouchbaseStoreBase` so `__init__` does no I/O.
 """
 
 from __future__ import annotations
@@ -72,13 +47,12 @@ def _doc_id(canonical_key: str) -> str:
 
 
 def _to_doc(artifact: CorpusArtifact) -> dict[str, Any]:
-    """The persisted document for a landed artifact. `hit_count` is stored as a
-    plain integer so the sub-document counter can atomically increment it.
+    """The persisted document for a landed artifact.
 
-    `status`/`source` are written from this slice on (PriorArtIndex Slice 1). Docs
-    already in the bucket carry neither; `CorpusArtifact.from_doc` defaults them to the
-    values those docs have always implicitly had, so no migration is needed and none of
-    the sub-document mutations below are affected (they address `hit_count` only)."""
+    `hit_count` is stored as a plain integer so the sub-document counter can atomically
+    increment it. Docs written before `status`/`source` existed carry neither, and
+    `CorpusArtifact.from_doc` defaults them, so no migration is needed.
+    """
     return {
         "id": artifact.id,
         "canonical_key": artifact.canonical_key,
@@ -96,9 +70,9 @@ def _to_doc(artifact: CorpusArtifact) -> dict[str, Any]:
 class CouchbaseBlueprintCorpus(CouchbaseStoreBase):
     """Real `BlueprintCorpus` backed by the dedicated `learning_corpus` bucket.
 
-    Also duck-types the S9 `HitCountReader` port (`hit_count(canonical_key) -> int`)
-    so the promotion scheduler reads the SAME durable artifacts the S6 stage seeds
-    and increments — one source of truth for the cross-session count.
+    Also duck-types the S9 `HitCountReader` port, so the promotion scheduler reads the SAME
+    durable artifacts the S6 stage seeds and increments — one source of truth for the
+    cross-session count.
     """
 
     def __init__(self, settings: LearningSettings, cluster: Any = None) -> None:
@@ -208,19 +182,18 @@ class CouchbaseBlueprintCorpus(CouchbaseStoreBase):
         return out
 
     async def hit_count(self, canonical_key: str) -> int:
-        """The S9 `HitCountReader` port: the landed artifact's cross-session
-        `hit_count`, or 0 when no artifact is keyed here (nothing has accrued)."""
+        """The S9 `HitCountReader` port: the artifact's cross-session count, or 0 when unkeyed."""
         await self._ensure_connected()
         artifact = await self.get_by_canonical_key(canonical_key)
         return artifact.hit_count if artifact is not None else 0
 
     async def recurrence_count(self, canonical_key: str) -> int:
-        """The S9 `RecurrenceCountReader` port (plan §4): the artifact's SOFT paraphrase
-        count, or 0 when no artifact is keyed here.
+        """The S9 `RecurrenceCountReader` port (plan §4): the artifact's SOFT paraphrase count, or 0.
 
-        Duck-typed onto this store for the same reason `hit_count` is — the scheduler's
-        corroboration gate weighs both counts and they must come from the ONE set of
-        artifacts the dedup stage writes, not from two stores that could diverge."""
+        Duck-typed onto this store for the same reason `hit_count` is — the scheduler's corroboration
+        gate weighs both counts, and they must come from the ONE set of artifacts the dedup stage
+        writes rather than from two stores that could diverge.
+        """
         await self._ensure_connected()
         artifact = await self.get_by_canonical_key(canonical_key)
         return artifact.recurrence_count if artifact is not None else 0

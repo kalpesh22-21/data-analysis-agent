@@ -1,97 +1,10 @@
 """The process-lifecycle wrapper the uvicorn-serving entrypoints run under.
 
-`daemon.py::run_daemon` does this for the four non-HTTP workers. This is the same
-policy — **a rollout is a success, so a SIGTERM shutdown exits 0** — for the servers,
-where the mechanism is completely different because uvicorn already handles the signal
-and the fight is over what happens AFTER it.
-
-WHAT UVICORN ACTUALLY DOES (0.49, `uvicorn/server.py`)::
-
-    async def serve(self, sockets=None):
-        with self.capture_signals():
-            await self._serve(sockets)
-
-    async def _serve(self, sockets=None):
-        config = self.config
-        if not config.loaded:
-            config.load()          # <-- imports/calls the app
-        ...
-
-`capture_signals` installs `signal.signal(sig, self.handle_exit)` for SIGINT+SIGTERM,
-saving whatever was there before. `handle_exit` records the signal and sets
-`should_exit`, which the tick loop notices, so the graceful shutdown is uvicorn's and
-it is correct. Then, on the way OUT of the context manager — after the server has
-stopped cleanly — it restores the original handlers and does::
-
-    for captured_signal in reversed(self._captured_signals):
-        signal.raise_signal(captured_signal)
-
-The comment there says it is "trying to trigger the expected behaviour now", and it
-does exactly that. For SIGINT the restored handler is Python's `default_int_handler`,
-so the re-raise becomes a `KeyboardInterrupt` out of `serve()` — catchable, which is
-why every launcher already catches it. For SIGTERM the restored handler is `SIG_DFL`,
-and the default disposition of SIGTERM is *terminate the process*. So `raise_signal`
-does not return: the process dies right there, inside `capture_signals.__exit__`,
-with wait-status "killed by SIGTERM" = shell code 143.
-
-**Nothing after `await server.serve()` can run.** No `return 0`, no `sys.exit`, no
-`finally`, no `atexit`. An exit-code policy written in `main()` is unreachable code on
-this path, which is why the inbox/runtime/ui pods exited 143 through every rollout
-while the four workers exited 0 (ISSUES C3).
-
-THE FIX IS A CHAINED HANDLER, INSTALLED FIRST. We install our own SIGTERM handler
-BEFORE calling `serve()`. uvicorn then saves OURS as the "original", and the restore +
-re-raise at the end runs OURS instead of `SIG_DFL` — a Python-level handler, so the
-signal is delivered, nothing dies, `serve()` returns normally, and the caller's exit
-code is reached. uvicorn's own graceful shutdown is untouched: between `capture_signals`
-entry and exit, `handle_exit` is the installed handler and ours is not called at all.
-
-THE APP IS BUILT BY UVICORN, NOT BY US (`factory=True`). The `Config` is constructed
-out here — `Config.__init__` only validates arguments and configures logging, it never
-touches a loop — and it is handed the FACTORY rather than an app. uvicorn then calls it
-from `config.load()`, which runs inside `_serve`, which buys two properties at once:
-
-  * **in the loop.** `load()` is awaited from inside `asyncio_run`, which is what the
-    inbox service needs — its full write plane composes `acouchbase.Cluster`, and that
-    raises `RuntimeError: Event loop is not running` when constructed without one (H7).
-  * **inside `capture_signals`.** Composition is the SLOWEST boot phase (imports,
-    driver setup, warm-up) and it used to be the one phase running before any handler
-    of ours existed, i.e. at `SIG_DFL`: a SIGTERM arriving while a pod was still
-    building its app killed it by signal at 143, which is the exact bug this module
-    exists to close. Now that same signal is `handle_exit`, so uvicorn boots, notices
-    `should_exit`, and shuts down gracefully.
-
-The residual unprotected window is what is left in front of that: `Config`
-construction and the handful of statements between installing the handler and entering
-`serve()`. `Config.__init__` reads its arguments and calls `logging.config.dictConfig`;
-there is no I/O and nothing to block on, so what is left is bounded by argument
-validation and a `dictConfig` rather than by imports, drivers or the network.
-
-**The handler is not a no-op, and that is not incidental.** It sets
-`server.should_exit`, which makes it correct in the one window where it is the only
-handler installed: after we install it and before uvicorn captures. A no-op handler
-would SWALLOW a signal arriving there and leave a server that ignores its stop signal
-until the grace period runs out in SIGKILL — strictly worse than the bug being fixed.
-Setting `should_exit` means uvicorn boots and immediately stops, which is what was
-asked for.
-
-**Nothing is logged from inside the handler.** It runs re-entrantly at a bytecode
-boundary in the main thread (`signal.signal`, not `loop.add_signal_handler` — we have
-to match what uvicorn saves and restores), so it touches one attribute and returns; the
-operator-facing line is emitted after `serve()` returns, where it is a normal log call.
-
-**SIGINT stays the interactive path.** The `KeyboardInterrupt` uvicorn re-raises is
-caught here and mapped to 0 for exactly the reason `uvicorn.run()` swallows it: a dev's
-Ctrl-C should not print a traceback over a clean shutdown.
-
-NOT COVERED — the CLI-launched servers. `runtime`, `ui` and `inbox-ui` are deployed as
-`uvicorn <module>:<app>`, so uvicorn owns `main()` and there is no in-repo code around
-`serve()` to install a handler in. An import-time handler is NOT a substitute and must
-not be attempted: `capture_signals` is entered BEFORE `config.load()` imports the app,
-so a handler installed at import would land INSIDE the captured region — clobbering
-`handle_exit` and breaking the graceful shutdown itself. Those three keep exiting 143
-until their Deployment `command` moves to a `python scripts/...` launcher that can call
-this wrapper.
+Same policy as `daemon.py` (a clean SIGTERM shutdown exits 0), different mechanism: uvicorn's
+`capture_signals` restores the pre-existing SIGTERM handler and re-raises the signal, so at
+`SIG_DFL` the process dies inside `serve()` at 143 and nothing after it runs. Ours is chained
+in BEFORE `serve()`; installed at IMPORT time it would land inside the captured region and
+clobber uvicorn's own graceful shutdown (see docs/cleanup/WORKLOG.md #22).
 """
 
 from __future__ import annotations
@@ -195,31 +108,11 @@ def run_http_daemon(
 ) -> int:
     """`uvicorn.run(app_factory, factory=True, ...)`, but a SIGTERM shutdown exits 0.
 
-    *app_factory* is handed to uvicorn as a `factory=True` app, so it is called by
-    `config.load()` from inside `serve()`: in the running loop (load-bearing for the
-    inbox service, whose write plane composes `acouchbase.Cluster` — which raises
-    `RuntimeError: Event loop is not running` when constructed without one) and inside
-    uvicorn's captured-signal region (so a SIGTERM during composition becomes a
-    graceful shutdown instead of a 143). See the module docstring.
-
-    The loop is uvicorn's own choice — `Config.get_loop_factory()` fed to the same
-    `asyncio_run` `Server.run` uses — so a process started through here and the same
-    app started through `uvicorn ...` are on the same event loop implementation
-    (uvloop, wherever `uvicorn[standard]` is installed).
-
-    Returns 0 for a clean stop (SIGTERM or Ctrl-C), or `uvicorn.main.STARTUP_FAILURE`
-    when the lifespan `startup` hook failed. Every other exception propagates —
-    including anything *app_factory* raises, which uvicorn lets out of `serve()`
-    untouched (the one exception being a `TypeError`, which it reports as a bad factory
-    signature and turns into `SystemExit(1)`).
-
-    ONE KNOWN DIVERGENCE FROM `uvicorn.run`, interactive-only: a Ctrl-C during a boot
-    that then FAILS its startup hook exits 0 here, where `uvicorn.run` catches the
-    `KeyboardInterrupt` and still falls through to `sys.exit(STARTUP_FAILURE)`. The
-    `KeyboardInterrupt` short-circuits the `server.started` check below. It cannot
-    happen under a supervisor (nothing sends SIGINT to a pod), and "the operator
-    stopped it themselves" is arguably the more truthful of the two exit codes, so it
-    is documented rather than fixed.
+    *app_factory* is handed to uvicorn as a `factory=True` app, so `config.load()` calls it from
+    inside `serve()`: in the running loop (load-bearing for the inbox service, whose
+    `acouchbase.Cluster` needs one) and inside uvicorn's captured-signal region. Returns 0 for a
+    clean stop, or `uvicorn.main.STARTUP_FAILURE` when the lifespan `startup` hook failed; every
+    other exception — including anything *app_factory* raises — propagates.
     """
     config_kwargs: dict[str, Any] = {"host": host, "port": port}
     if log_level is not None:

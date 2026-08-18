@@ -1,35 +1,14 @@
-"""tracing.py — OTel/Phoenix setup + span helpers (D23/D24/D61, design §7).
+"""OTel/Phoenix setup + span helpers (D23/D24/D61).
 
-`configure_tracing(...)` builds an OTel `TracerProvider`. When
-`otlp_endpoint` is set it wires an OTLP-over-HTTP exporter (self-hosted
-Phoenix, D24); when unset (local dev / tests / no infra) **no span
-processor is attached at all** — spans are still created (so all the manual
-instrumentation call sites below work unconditionally) but are never
-exported anywhere, so importing/using this module never requires a
-reachable Phoenix collector or makes a network call (design §8: `uv run
-pytest` stays green with zero infrastructure).
+`configure_tracing` builds a `TracerProvider`; with no `otlp_endpoint` NO span processor
+is attached, so spans are still created but never exported and nothing here needs a
+reachable collector. Span kinds ride OpenInference's `openinference.span.kind`; `LLM`
+spans are NOT created here — the OpenAI SDK is auto-instrumented instead.
 
-Span kinds mirror design §7's Phase-0 subset (`AGENT`/`LLM`/`TOOL`/`CHAIN`/
-`GUARDRAIL`) via the OpenInference `openinference.span.kind` attribute
-(OpenInference semantic conventions, D23) on plain OTel spans. `LLM` spans
-are **not** manually created here — the OpenAI SDK is auto-instrumented via
-`openinference-instrumentation-openai` (D24), which emits its own `LLM`
-spans around every `responses.create`/`chat.completions.create` call.
-
-Every attribute passed through the `*_span` helpers below must already be
-redacted by the caller (`observability/redaction.py`) — this module does not
-re-redact; it only forwards `{key: value}` pairs onto the OTel span. Callers
-must never pass raw SQL/scope/JWT/result rows here IN THE DEFAULT POSTURE.
-
-The ONE exception is `RuntimeSettings.otlp_disable_redaction` (see `config.py`),
-and since 2026-08-10 it is the DEFAULT rather than an exception an operator opts
-into: the composition root passes the caller the REAL (un-redacted) tool args +
-the tool RESULT preview into `tool_span`, so Phoenix shows the real tool call —
-real SQL literals, real resolved values. That flip is TELEMETRY-ONLY (it never
-weakens actual scope/PII enforcement) but it DOES make the Phoenix project
-entity-bearing, so the collector must be access-controlled like the session
-store. "IN THE DEFAULT POSTURE" above therefore now describes the OPT-OUT
-(`OTLP_DISABLE_REDACTION=false`), not the shipped default.
+This module never re-redacts — it forwards whatever attributes the caller sets. Under
+`otlp_disable_redaction` (the shipped DEFAULT) the caller passes REAL args and result
+previews, which makes the Phoenix project entity-bearing and means it must be
+access-controlled like the session store.
 """
 
 from __future__ import annotations
@@ -91,19 +70,14 @@ DEFAULT_DROP_SPAN_NAMES: frozenset[str] = frozenset(
 
 
 class _NameFilteringSpanExporter(SpanExporter):
-    """A `SpanExporter` decorator that DROPS spans by NAME before forwarding to a
-    real exporter — the one central, name-based place trace noise is reduced
-    (design §7). Wraps whatever exporter `configure_tracing` would otherwise use
-    (the OTLP/Phoenix exporter AND any injected in-memory test exporter), so a
-    single denylist governs BOTH paths identically.
+    """A `SpanExporter` decorator that DROPS spans by NAME before forwarding.
 
-    Filtering here (at the exporter, downstream of the span processor) rather than
-    at each `span()` call site keeps the instrumentation call sites untouched and
-    makes the policy a single tunable set (`RuntimeSettings.otlp_drop_span_names`).
-    A dropped span's CHILDREN are still exported with their original
-    `parent_span_id`; a trace UI (Phoenix) renders such orphans under the trace
-    root, so dropping a mid-tree plumbing span flattens — never severs — the tree
-    (see `DEFAULT_DROP_SPAN_NAMES`' re-parenting note)."""
+        Wraps every real exporter (the OTLP one AND any injected test exporter), so a single
+        denylist (`RuntimeSettings.otlp_drop_span_names`) governs both paths and no
+        instrumentation call site changes. A dropped span's CHILDREN are still exported with
+        their original `parent_span_id`, which a trace UI renders under the trace root —
+        dropping a mid-tree span flattens the tree, never severs it.
+    """
 
     def __init__(self, inner: SpanExporter, drop_names: frozenset[str]) -> None:
         self._inner = inner
@@ -127,26 +101,14 @@ class _NameFilteringSpanExporter(SpanExporter):
 class LLMExceptionEventScrubber(SpanProcessor):
     """Strip content-bearing EVENTS off the auto-instrumented OpenAI `LLM` span (D25).
 
-    `TraceConfig`/`instrument_openai(hide_content=True)` masks span ATTRIBUTES, but
-    NOT span EVENTS — and the OpenAI instrumentor calls `record_exception(exc)` on a
-    failed request, so an `openai.APIStatusError` (whose message/stacktrace embeds
-    the response error BODY, potentially content-bearing) lands on the online LLM
-    span as `exception.message` / `exception.stacktrace`, bypassing `hide_content`.
-    The learning loop closes this same class by refusing `record_exception` on its
-    OWN spans; here the instrumentor (not our code) owns the span, so we scrub the
-    events post-hoc.
-
-    `on_end` receives the ONE `ReadableSpan` snapshot `Span.end()` builds and hands
-    to every processor in turn; rebinding its `_events` to an empty tuple drops the
-    events from what the exporter later reads WITHOUT mutating the live span or its
-    shape attributes. Wired FIRST (before any `SimpleSpanProcessor`, which exports
-    synchronously in `on_end`) so the scrub always precedes export; the Batch path
-    reads events lazily at export time, so ordering there is immaterial.
-
-    Only OpenInference `LLM`-kind spans are touched (they carry no shape-relevant
-    events — only the redacted content channels + a possible `exception`); the
-    manual AGENT/TOOL/CHAIN/GUARDRAIL spans are left byte-identical (they are already
-    literal-redacted and never carry content events)."""
+        `instrument_openai(hide_content=True)` masks span ATTRIBUTES but not span EVENTS,
+        and the instrumentor calls `record_exception`, so a response error body can land as
+        `exception.message`/`exception.stacktrace`. `on_end` rebinds the `ReadableSpan`'s
+        `_events` to an empty tuple, dropping them from what the exporter later reads without
+        mutating the live span. Must be wired FIRST, ahead of any `SimpleSpanProcessor`
+        (which exports synchronously in `on_end`). Only OpenInference `LLM`-kind spans are
+        touched; the manual AGENT/TOOL/CHAIN/GUARDRAIL spans stay byte-identical.
+    """
 
     def on_start(
         self, span: Span, parent_context: Context | None = None
@@ -180,60 +142,26 @@ def configure_tracing(
     drop_span_names: Collection[str] = (),
     id_generator: IdGenerator | None = None,
 ) -> TracerProvider:
-    """Build a `TracerProvider` exporting to *otlp_endpoint* (Phoenix), or a
-    no-op provider (no span processor) when *otlp_endpoint* is empty.
+    """Build a `TracerProvider` exporting to *otlp_endpoint* (Phoenix), or a no-op
+        provider (no span processor) when *otlp_endpoint* is empty.
 
-    Does NOT call `trace.set_tracer_provider(...)` — that is a one-time
-    process-global side effect the composition root (`app.py`) performs
-    exactly once; keeping it out of this function makes `configure_tracing`
-    safely callable multiple times in tests without triggering OTel's
-    "Overriding of current TracerProvider is not allowed" warning.
+        Does NOT call `trace.set_tracer_provider(...)`: that process-global side effect
+        belongs to the composition root, and keeping it out makes this function safely
+        callable many times in tests.
 
-    *project_name* is the Phoenix PROJECT the spans land in: Phoenix groups
-    traces by the `openinference.project.name` resource attribute, NOT by
-    `service.name`. Setting only `service.name` (as this function used to)
-    dumps everything into Phoenix's catch-all `default` project, invisible as
-    a named project in the UI. We set `openinference.project.name` here, IN
-    CODE, so a caller (`app.py`, `configure_learning_tracing`) picks a stable
-    named project without an `OTEL_RESOURCE_ATTRIBUTES` env hack. Defaults to
-    *service_name* when omitted, so the project name is never empty.
-
-    *hide_llm_content* (this PARAM): when True, install `LLMExceptionEventScrubber`
-    as the FIRST span processor so a recorded `exception` event (which the OpenAI
-    instrumentor embeds the response error body into) is stripped off the auto-
-    instrumented `LLM` span before export — closing the residual content channel
-    `TraceConfig` (attributes-only) leaves open. Pair with
-    `instrument_openai(hide_content=True)`; both are gated on the SAME
-    `otlp_hide_llm_content` setting by `app.py`. NOTE (D25 amended 2026-07-15): the
-    SYSTEM default is now REVEAL — `otlp_hide_llm_content` defaults False, so `app.py`
-    passes `hide_llm_content=False` by default and this scrubber is NOT installed by
-    default (a failed OpenAI call's error body can then land on the span — the
-    accepted consequence of the reveal posture). This param default stays False.
-
-    *span_exporter* (test-only seam, D-L3-5): when supplied, its spans are
-    attached via a `SimpleSpanProcessor` (synchronous flush — a batched
-    processor would leave spans un-exported when a test reads them right after
-    a turn). This is the injection point the Layer-3 demo launcher uses to
-    install an `InMemorySpanExporter` and assert the D25 PII invariant over the
-    real emitted spans, with NO Phoenix container. Production leaves it `None`,
-    so this branch is inert and the provider is byte-identical to before.
-
-    *drop_span_names* (design §7 noise reduction): span NAMES to DROP before
-    export, applied centrally by wrapping EVERY real exporter (the OTLP one AND an
-    injected *span_exporter*) in `_NameFilteringSpanExporter`. Empty (the default)
-    ⇒ NO wrapper is installed and the provider is byte-identical to before (so
-    every existing span-assertion test and any other consumer sees all spans);
-    `app.py` passes `RuntimeSettings.otlp_drop_span_names` (defaulting to
-    `DEFAULT_DROP_SPAN_NAMES`) so a normal deployment drops the plumbing spans.
-    Filtering is name-based and downstream of the span processor, so it never
-    touches an instrumentation call site and never orphans a kept child badly
-    (see `_NameFilteringSpanExporter` / `DEFAULT_DROP_SPAN_NAMES`).
-
-    *id_generator* (optional): a custom OTel `IdGenerator` for the provider — used
-    by the learning session-trace projection to mint DETERMINISTIC trace/span ids
-    (seeded by session id) so a re-export upserts the same Phoenix spans instead of
-    duplicating them. `None` (the default) leaves the provider byte-identical to
-    before (the SDK's random id generator).
+        Args:
+            project_name: the Phoenix PROJECT, set as `openinference.project.name` —
+                Phoenix groups traces by that resource attribute, NOT by `service.name`.
+                Defaults to *service_name*, so it is never empty.
+            hide_llm_content: install `LLMExceptionEventScrubber` as the FIRST span
+                processor. Pair with `instrument_openai(hide_content=True)`; both are gated
+                on `otlp_hide_llm_content`, whose system default is REVEAL.
+            span_exporter: test-only seam, attached via a `SimpleSpanProcessor` so spans
+                flush synchronously; `None` (production) installs no processor for it.
+            drop_span_names: names dropped by wrapping EVERY real exporter in
+                `_NameFilteringSpanExporter`. Empty ⇒ no wrapper is installed at all.
+            id_generator: a custom `IdGenerator`; the learning session-trace projection
+                passes a deterministic one so a re-export upserts rather than duplicates.
     """
     drop_names = frozenset(drop_span_names)
 
@@ -267,26 +195,16 @@ def configure_tracing(
 
 
 def llm_content_trace_config(hide_content: bool) -> TraceConfig | None:
-    """The OpenInference `TraceConfig` governing the auto-instrumented OpenAI
-    `LLM` span's CONTENT capture (D25).
+    """The OpenInference `TraceConfig` governing the auto-instrumented `LLM` span's
+        CONTENT capture (D25).
 
-    Returns `None` when *hide_content* is False — the library default, where the
-    `LLM` span carries the raw prompt + completion (`input.value`/`output.value`/
-    `llm.input_messages`/`llm.output_messages`). Otherwise returns a config that
-    SUPPRESSES every content channel (inputs, outputs, per-message content, and
-    prompts) while leaving the non-content shape/timing attributes intact
-    (`llm.model_name`, `llm.token_count.*`, `llm.provider`, span timing).
-
-    D25, amended 2026-07-15: unlike the manual AGENT/TOOL/CHAIN spans — which
-    already redact SQL literals / bound-slot values before setting an attribute —
-    the OpenAI auto-instrumentor (D24) captures the model's raw prompt AND
-    completion by DEFAULT, and the completion embeds cell values / the query-derived
-    answer. By deliberate operator choice the runtime now REVEALS LLM content BY
-    DEFAULT (`RuntimeSettings.otlp_hide_llm_content=False`), so the online Phoenix
-    project is ENTITY-BEARING BY DEFAULT and MUST be access-controlled like the
-    audit/session store — mirroring the learning loop's verbose gate. Hiding is the
-    explicit opt-OUT (`otlp_hide_llm_content=True`), which restores the D25 shape/
-    count/latency-only surface. This function's redaction MECHANISM is unchanged."""
+        `None` when *hide_content* is False — the library default, where the span carries
+        the raw prompt and completion. Otherwise every content channel is suppressed while
+        the shape/timing attributes (`llm.model_name`, `llm.token_count.*`, `llm.provider`)
+        stay intact. The SYSTEM default is REVEAL (`otlp_hide_llm_content=False`), so the
+        online Phoenix project is entity-bearing by default and must be access-controlled
+        like the audit/session store; hiding is the explicit opt-out.
+    """
     if not hide_content:
         return None
     return TraceConfig(
@@ -301,29 +219,15 @@ def llm_content_trace_config(hide_content: bool) -> TraceConfig | None:
 def instrument_openai(provider: TracerProvider, *, hide_content: bool = True) -> None:
     """Auto-instrument the OpenAI SDK (D24) — idempotent, best-effort.
 
-    Safe to call repeatedly (e.g. across test modules importing `app.py`
-    more than once): a second call is a no-op rather than raising.
+        FIRST-CALLER-WINS: `OpenAIInstrumentor` is a process-global singleton, so the first
+        call's *hide_content* config wins for the whole process and a later call with a
+        different value silently no-ops. The paired `LLMExceptionEventScrubber` is not
+        subject to this — each provider gets its own.
 
-    FIRST-CALLER-WINS: `OpenAIInstrumentor` is a process-global singleton behind
-    the idempotency guard below, so the FIRST call's *hide_content* config wins
-    for the whole process — a later call with a DIFFERENT *hide_content* value
-    silently no-ops (its config is ignored). Production's single `create_app` is
-    unaffected; this note guards against a future in-process surprise (e.g. two
-    `create_app`s with divergent settings, or a test that instruments before the
-    app). The paired `LLMExceptionEventScrubber` (an OWN span processor, not the
-    singleton) is NOT subject to this — each provider gets its own.
-
-    *hide_content* (this PARAM defaults True): when True the emitted `LLM` span
-    carries NO raw prompt/completion — only shape/timing/model-name/token-counts — so
-    the online per-turn Phoenix project stays content-free. NOTE (D25 amended
-    2026-07-15): the SYSTEM default is now REVEAL — `app.py` resolves
-    `otlp_hide_llm_content` (now defaulting False) via `effective_llm_hide` and passes
-    the result here, so by default `hide_content=False` and the runtime Phoenix
-    project is ENTITY-BEARING (the raw question AND the query-derived answer land on
-    the span), subject to the same in-boundary PII posture + access control as the
-    session/audit stores. Hiding is now the explicit opt-OUT (`otlp_hide_llm_content=
-    True`) restoring the shape-only D25 posture. Same trade-off as the learning-loop
-    `LEARNING_TRACE_VERBOSE` gate. This PARAM default stays True (call sites drive it).
+        *hide_content* True emits no raw prompt/completion, only shape/timing/model-name/
+        token-counts. The SYSTEM default is REVEAL: `app.py` resolves `otlp_hide_llm_content`
+        (defaulting False) and passes it here, making the runtime Phoenix project
+        entity-bearing. This PARAM's default stays True; call sites drive it.
     """
     instrumentor = OpenAIInstrumentor()
     if instrumentor.is_instrumented_by_opentelemetry:
@@ -347,25 +251,19 @@ def span(
     context: Context | None = None,
     record_exception: bool = True,
 ) -> Iterator[Span]:
-    """Generic span helper — sets the OpenInference span-kind attribute plus
-    whatever *attributes* the caller supplies (already redacted).
+    """Generic span helper — sets the OpenInference span-kind attribute plus whatever
+        *attributes* the caller supplies (already redacted).
 
-    *context* is the OTel parent `Context` to start the span under (default
-    `None` ⇒ the ambient current context, so spans auto-nest as before). Passing
-    an EXPLICIT context — e.g. one rehydrated from a W3C `traceparent` extracted
-    off a cross-process message (`context_from_traceparent`) — makes this span a
-    CHILD of that remote parent, so a session's spans join ONE trace across the
-    sweeper → consumer → scheduler process boundaries.
+        *context* is the OTel parent to start under (`None` ⇒ the ambient current context).
+        Passing one rehydrated from a W3C `traceparent` makes this span a CHILD of that
+        remote parent, so a session's spans join ONE trace across process boundaries.
 
-    *record_exception* forwards to `start_as_current_span`. It defaults to `True`
-    (the online-runtime behavior: a raised exception attaches an `exception` event —
-    `exception.message` + `exception.stacktrace` — to the span). Callers that WRAP
-    real work AND must stay content-free even on error (the learning-loop spans, D25)
-    MUST pass `record_exception=False`: an OpenAI SDK error embeds response bodies and
-    a landing error references the entity-bearing `forbidden_spans`, so recording it
-    would leak transcript/entity content onto the span EVEN WITH VERBOSE OFF. The span
-    status is still set on exception (`set_status_on_exception=True`), so the ERROR is
-    visible in traces — only the entity-bearing detail is withheld."""
+        *record_exception* defaults True. Callers that wrap real work AND must stay
+        content-free even on error MUST pass `record_exception=False`: an SDK error embeds
+        response bodies and a landing error references entity-bearing spans, so recording it
+        leaks content even with verbose off. The span STATUS is still set on exception, so
+        the error stays visible in traces — only the detail is withheld.
+    """
     with tracer.start_as_current_span(
         name,
         context=context,
@@ -390,31 +288,25 @@ _PROPAGATOR = TraceContextTextMapPropagator()
 
 
 def inject_current_traceparent() -> str | None:
-    """Serialize the CURRENT span's context to a W3C `traceparent` string (or
-    `None` when there is no recording span in context). Call it INSIDE the span
-    that should become the cross-process parent; the returned value rides on the
-    outgoing message/envelope and is rehydrated by `context_from_traceparent`."""
+    """Serialize the CURRENT span's context to a W3C `traceparent` string, or `None` when
+        no span is recording. Call it INSIDE the span that should become the cross-process
+        parent; the value rides the outgoing envelope for `context_from_traceparent`.
+    """
     carrier: dict[str, str] = {}
     inject(carrier)
     return carrier.get("traceparent")
 
 
 def context_from_traceparent(traceparent: str | None) -> Context | None:
-    """Rehydrate a parent `Context` from a `traceparent` carried on an incoming
-    message/envelope, for `span(..., context=...)`.
+    """Rehydrate a parent `Context` from a `traceparent` carried on an incoming envelope,
+        for `span(..., context=...)`.
 
-    FAIL-OPEN, by two DIFFERENT mechanisms — stated separately because the difference
-    is invisible at the call site and easy to assert wrongly:
-
-      * MISSING (`None` or `""`, e.g. a job enqueued with no tracer, or by hand) ⇒
-        `None`, and `span(..., context=None)` starts a normal ROOT span;
-      * MALFORMED (garbage, wrong version, bad field widths) ⇒ NOT `None`. The W3C
-        propagator does not raise on garbage; it extracts nothing and returns an EMPTY
-        `Context`, which carries no valid span context, so the span is ALSO a root.
-
-    The guarantee callers depend on is therefore "no VALID remote parent and never a
-    crash" — the cost of a bad value is the cross-process CHAINING, nothing else. The
-    `except` below is belt-and-braces for a propagator that ever changes its mind."""
+        FAIL-OPEN by two DIFFERENT mechanisms: MISSING (`None`/`""`) returns `None` and the
+        span starts as a normal ROOT; MALFORMED returns a non-`None` but EMPTY `Context`
+        (the W3C propagator does not raise on garbage), which is also a root. The guarantee
+        callers depend on is "no VALID remote parent, and never a crash" — a bad value costs
+        the cross-process chaining and nothing else.
+    """
     if not traceparent:
         return None
     try:
@@ -426,7 +318,7 @@ def context_from_traceparent(traceparent: str | None) -> Context | None:
 def agent_span(
     tracer: Tracer, *, scope_hash: str, turn_index: int
 ) -> Any:
-    """One turn (design §7 span map: `AGENT`, `session.id`/`scope_hash`/turn index)."""
+    """One turn (`AGENT`; `session.id` / `scope_hash` / turn index)."""
     return span(
         tracer,
         "agent.turn",
@@ -438,7 +330,7 @@ def agent_span(
 def chain_span(
     tracer: Tracer, name: str, *, attributes: dict[str, Any] | None = None
 ) -> Any:
-    """Context assembly / budget-guard-adjacent chain stages (design §7 `CHAIN`)."""
+    """Context assembly / budget-guard-adjacent chain stages (`CHAIN`)."""
     return span(tracer, name, OpenInferenceSpanKindValues.CHAIN, attributes)
 
 
@@ -452,34 +344,21 @@ def tool_span(
     result_preview: Any = None,
     reveal_complex_args: bool = False,
 ) -> Any:
-    """Each tool call (design §7 `TOOL`).
+    """Each tool call (`TOOL`).
 
-    DEFAULT (D25) posture: *args* must already be SQL-literal-masked by the caller
-    (`observability/redaction.py::redact_tool_args`), *result_preview* is `None`,
-    and *reveal_complex_args* is `False` — tool RESULTS never reach a span and only
-    SCALAR args are set (nested dict/list args like `period`/`slot_bindings` are
-    skipped entirely), so the online Phoenix project stays a shape/count/latency-
-    only surface.
+        DEFAULT (D25) posture: *args* are already SQL-literal-masked by the caller,
+        *result_preview* is `None`, and *reveal_complex_args* is False — tool RESULTS never
+        reach a span and nested dict/list args are skipped entirely.
 
-    DEBUG posture (`RuntimeSettings.otlp_disable_redaction=True`): the caller passes
-    the REAL (un-redacted) *args*, a *result_preview*, AND *reveal_complex_args=True*
-    so the WHOLE tool call — the real SQL/values, the nested dict/list args (real
-    `period` bounds, `slot_bindings` values), AND the columns + preview rows it
-    returned — is visible in Phoenix. This makes the project ENTITY-BEARING and MUST
-    be access-controlled like the audit store (see
-    `RuntimeSettings.otlp_disable_redaction`). This module does not itself redact; it
-    forwards whatever the caller supplies.
+        DEBUG posture (`RuntimeSettings.otlp_disable_redaction=True`): the caller passes the
+        REAL args, a *result_preview*, and `reveal_complex_args=True`, which makes the
+        project ENTITY-BEARING and requires it to be access-controlled like the audit store.
+        This module does not itself redact; it forwards whatever the caller supplies.
 
-    *result_preview* (when supplied — debug only) is a `ResultPreview`-shaped object
-    (`.columns`/`.row_count`/`.truncated`/`.preview_rows`); its columns/shape land as
-    scalar span attributes and the preview rows are JSON-serialized onto one
-    attribute (`tool.result.preview_rows`), since a span attribute cannot hold a
-    ragged list-of-lists.
-
-    *reveal_complex_args* (debug only) JSON-serializes each non-scalar arg value
-    (dict/list) onto `tool.args.{key}` — a span attribute cannot hold a nested dict,
-    so a scalar-only pass would drop `period`/`slot_bindings` even when the flag is
-    on. Default `False` keeps the default span byte-identical (those keys absent).
+        *result_preview* columns/shape land as scalar attributes and its rows are
+        JSON-serialized onto `tool.result.preview_rows`, because a span attribute cannot
+        hold a ragged list-of-lists — the same reason *reveal_complex_args* JSON-serializes
+        each non-scalar arg value onto `tool.args.{key}`.
     """
     attributes: dict[str, Any] = {"tool.name": tool_name, "tool.status": status}
     if error_code is not None:
@@ -509,16 +388,16 @@ def tool_span(
 def guardrail_span(
     tracer: Tracer, name: str, *, attributes: dict[str, Any] | None = None
 ) -> Any:
-    """Budget-cap checks / denial classification (design §7 `GUARDRAIL`)."""
+    """Budget-cap checks / denial classification (`GUARDRAIL`)."""
     return span(tracer, name, OpenInferenceSpanKindValues.GUARDRAIL, attributes)
 
 
 def embedding_span(tracer: Tracer, *, model: str, input_count: int) -> Any:
     """The custom embedding-API call (`resolveValues` ranking, D24/D71).
 
-    The auto-instrumentor covers only the agent LLM, not this custom endpoint,
-    so `HttpEmbeddingClient` wraps its POST here manually. Vector counts +
-    model id + latency only — the embedded TEXT is never logged (D25).
+        The auto-instrumentor covers only the agent LLM, not this custom endpoint, so
+        `HttpEmbeddingClient` wraps its POST here manually. Vector counts, model id and
+        latency only — the embedded TEXT is never logged (D25).
     """
     return span(
         tracer,
@@ -535,19 +414,13 @@ def rerank_span(
     document_count: int,
     reranked: bool | None = None,
 ) -> Any:
-    """The custom reranker-API call / the retrieval-pipeline rerank stage
-    (retrieval pipeline, D24/D71, design §3.5).
+    """The custom reranker-API call and the retrieval-pipeline rerank stage (D24/D71).
 
-    Mirrors `embedding_span`: the auto-instrumentor covers only the agent LLM,
-    not this custom endpoint. Two call sites share this helper:
-      - `HttpRerankerClient` wraps its POST here manually (transport level, no
-        `reranked` flag — it has no knowledge of pipeline-level degrade).
-      - `retrieval/pipeline.py` wraps the rerank STAGE here (design §3.5),
-        passing `reranked` — `False` on the degrade path (no reranker
-        configured / rerank error → recall order used), so the degrade is
-        visible in traces even when the reranker client was never called.
-    Document counts + model id + the `reranked` flag only — the reranker QUERY
-    and the DOCUMENT text are never logged (D25).
+        Two call sites share it: `HttpRerankerClient` wraps its POST (no `reranked` flag —
+        the transport knows nothing of pipeline-level degrade), and `retrieval/pipeline.py`
+        wraps the STAGE, passing `reranked=False` on the degrade path so a skipped rerank is
+        still visible in traces. Document counts, model id and the flag only — never the
+        reranker QUERY or the DOCUMENT text (D25).
     """
     return span(
         tracer,
@@ -569,14 +442,12 @@ def recall_span(
     candidate_count: int,
     dropped_by_scope_count: int,
 ) -> Any:
-    """The retrieval-pipeline vector-recall stage per corpus (design §3.5).
+    """The retrieval-pipeline vector-recall stage, per corpus (`CHAIN`).
 
-    `CHAIN` kind. Structural counters only — corpus name (`blueprint`/
-    `knowledge`, non-PII), the recall fan-out `k`, how many candidates the
-    index returned, and how many blueprint candidates the scope pre-filter
-    dropped (D60/D44 read-path analogue). The QUESTION TEXT is never an
-    attribute (D25), nor are candidate ids/intent/chunk text (design §3.5:
-    "no query text"; intent/chunk text is not worth the redaction surface).
+        Structural counters only: corpus name, the recall fan-out `k`, how many candidates
+        the index returned, and how many blueprint candidates the scope pre-filter dropped.
+        The QUESTION TEXT is never an attribute (D25), nor are candidate ids, intent, or
+        chunk text.
     """
     return span(
         tracer,
@@ -717,12 +588,11 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
 
 
 def guardrail_observer(tracer: Tracer) -> Callable[[str, dict[str, Any]], None]:
-    """Build a `(event, payload) -> None` observer emitting one GUARDRAIL span
-    per `loop_*` `AgentLoop` stage-boundary event (design §7). The single
-    call site `app.py`'s composition root uses — factored out here (rather
-    than defined inline in `app.py`) so this exact redaction-allowlist
-    behavior is directly unit-testable without spinning up the whole HTTP app
-    (see `tests/runtime/observability/test_tool_span_wiring_e2e.py`).
+    """Build a `(event, payload) -> None` observer emitting one GUARDRAIL span per `loop_*`
+        `AgentLoop` stage-boundary event.
+
+        Factored out of `app.py`'s composition root so this exact redaction-allowlist
+        behavior is unit-testable without spinning up the HTTP app.
     """
 
     def _observe(event: str, payload: dict[str, Any]) -> None:

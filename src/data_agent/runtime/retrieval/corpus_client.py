@@ -1,31 +1,21 @@
-"""CorpusClient — the transport for the MCP corpus exports (governed corpus, Phase 2).
+"""CorpusClient — the transport for the MCP corpus exports (governed corpus).
 
-The MCP is the single source of TRUSTED recall canon. Two auth-required routes serve
-the git-versioned corpus:
+The MCP is the single source of TRUSTED recall canon. Two auth-required routes serve the
+git-versioned corpus:
 
-  - `GET /blueprints/export` → `{"blueprints_sha": <sha>, "blueprints": {<id>: <entry>}}`
-  - `GET /knowledge/export`  → `{"knowledge_sha": <sha>, "knowledge": {<id>: <entry>}}`
+  - `GET /blueprints/export` -> `{"blueprints_sha": <sha>, "blueprints": {<id>: <entry>}}`
+  - `GET /knowledge/export`  -> `{"knowledge_sha": <sha>, "knowledge": {<id>: <entry>}}`
 
-Each entry is the verbatim blueprint/knowledge fields PLUS `source="mcp"` +
-`verified=True` injected at export time. The singleton hydrator daemon
-(`retrieval/hydrator.py`) projects these into the neo4j recall corpus as the
-`source="mcp"` partition — the ONLY partition the agent recall serves (the trust gate in
-`vector_index`). A separate learning-staging tier (`source="learning"`) recall ignores.
+Each entry is the verbatim blueprint/knowledge fields PLUS `source="mcp"` + `verified=True`
+injected at export time. The singleton hydrator daemon projects these into the neo4j
+`source="mcp"` partition — the ONLY partition agent recall serves. A separate
+`source="learning"` staging tier is ignored by recall.
 
-`CorpusClient` (Protocol) has two implementations:
-  * `HttpCorpusClient`    — `GET {root}/blueprints/export` + `GET {root}/knowledge/export`
-    on the MCP host. Auth is EITHER the static service key (`X-Service-Key`, the hydrator's
-    mode — no user JWT) OR the per-request `Authorization: Bearer <jwt>` + `X-Session-Id`
-    pair (fallback). The corpus is scope-INDEPENDENT; credentials authenticate the fetch
-    only, never entering a node or a message (D5). Returns a COMBINED export dict.
-  * `FixtureCorpusClient` — reads the frozen offline seed YAML
-    (`tests/fixtures/corpus/{blueprints,knowledge}.yaml`) instead of HTTP. Those fixtures
-    do NOT carry `source`/`verified`; the client presents them as canon and the loader/seed
-    DEFAULTS (`source="mcp"`, `verified=True`) do the rest.
-
-NOTE: the old per-turn `CorpusCache` one-shot seed trigger was REMOVED in the
-singleton-hydrator redesign — the runtime no longer seeds on the request path; the
-hydrator daemon owns the seed loop, building an `HttpCorpusClient` directly.
+`HttpCorpusClient` authenticates with EITHER the static service key (the hydrator's mode, no
+user JWT) OR the per-request Bearer/session pair. The corpus is scope-INDEPENDENT, so
+credentials authenticate the fetch only and never enter a node or a message (D5).
+`FixtureCorpusClient` reads the frozen offline seed YAML instead; those fixtures carry no
+`source`/`verified`, and the loader defaults present them as trusted canon.
 """
 
 from __future__ import annotations
@@ -51,13 +41,9 @@ _logger = logging.getLogger(__name__)
 class CorpusClientError(SideChannelError):
     """A corpus export fetch was rejected or returned an unusable body.
 
-    Carries the endpoint's stable *code* (when the JSON error body supplies one) so the
-    cache can log it; the cache degrades on ANY error, so this is never surfaced to the
-    model/client.
-
-    The `(code, message)` shape comes from `mcp/_transport.py::SideChannelError`. It
-    stays its OWN class because the consequence is specific: this one degrades the
-    hydrate, leaving the previously-seeded corpus partition in place.
+        Carries the endpoint's stable *code* when the JSON error body supplies one. It stays its
+        OWN class because the consequence is specific: this one degrades the hydrate, leaving the
+        previously-seeded corpus partition in place.
     """
 
 
@@ -88,14 +74,11 @@ def _combined_export(
 
 
 class HttpCorpusClient:
-    """Real `CorpusClient` over the live MCP corpus-export routes (Layer 2+).
+    """Real `CorpusClient` over the live MCP corpus-export routes.
 
-    Two auth modes (mirroring `HttpCatalogClient`):
-      * per-request JWT (default) — `Authorization: Bearer <jwt>` + `X-Session-Id`.
-      * static SERVICE KEY (`service_key=`) — `X-Service-Key: <key>` INSTEAD of the
-        Bearer/session pair, so the singleton hydrator daemon authenticates the corpus
-        exports with a static key and no user JWT. When set, the per-request
-        `jwt`/`session_id` args are IGNORED.
+        Two auth modes, mirroring `HttpCatalogClient`: the per-request Bearer JWT +
+        `X-Session-Id` pair (default), or a static `X-Service-Key` when `service_key=` is set —
+        in which case the per-request `jwt`/`session_id` args are IGNORED.
     """
 
     def __init__(
@@ -108,13 +91,9 @@ class HttpCorpusClient:
         self._service_key = service_key or None
 
     def _auth_headers(self, *, jwt: str, session_id: str) -> dict[str, str]:
-        """The auth headers for one fetch — the static service key when configured,
-        else the per-request Bearer/session pair.
-
-        The BRANCH lives in `mcp/_transport.py::auth_headers` (one implementation for
-        every side channel); this method stays as the per-client seam that binds it to
-        THIS client's normalized `_service_key`, which is what
-        `tests/runtime/test_service_key_clients.py` asserts against."""
+        """The auth headers for one fetch — the static service key when configured, else the
+                per-request Bearer/session pair.
+        """
         return auth_headers(service_key=self._service_key, jwt=jwt, session_id=session_id)
 
     async def _get(
@@ -155,10 +134,9 @@ class HttpCorpusClient:
 class FixtureCorpusClient:
     """Offline/test `CorpusClient` — reads the frozen seed YAML from disk.
 
-    Credentials are accepted (same interface) but IGNORED: the fixtures are not
-    scope-sensitive. The fixtures carry NO `source`/`verified` (and no per-corpus sha);
-    the loader/seed defaults present them as trusted canon. This is the client the suite
-    and fully-offline runs use.
+        Credentials are accepted for interface parity but IGNORED. The fixtures carry NO
+        `source`/`verified` and no per-corpus sha; the loader defaults present them as trusted
+        canon.
     """
 
     def __init__(self, blueprints_path: Path | str, knowledge_path: Path | str) -> None:

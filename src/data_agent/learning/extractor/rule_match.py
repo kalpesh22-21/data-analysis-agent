@@ -1,73 +1,12 @@
 """The deterministic catalog-rule matchers behind the two hinted declines.
 
-Two functions, two failures, one rule about what a hint may be:
-
-  * `nearest_known_rule` — the plan cited a rule id that does not exist. Matches on the
-    IDENTIFIER, and answers "which rule was this trying to name?"
-  * `rules_for_predicate` — a literal predicate of the accepted SQL has no
-    parameterization entry at all. Matches on the PREDICATE, and answers "does the
-    catalog already declare exactly this filter?"
-
-Neither is a similarity engine for the pipeline to form opinions with. Each exists so a
-decline that would otherwise say only "no" can say what the catalog calls the thing the
-candidate is talking about — and each refuses, everywhere it is not certain, because the
-cost of a refusal is a decline that a human reads and the cost of a wrong hint is a
-model talked into a candidate that silently means something else.
-
---------------------------------------------------------------------------------------
-`nearest_known_rule` — the ONE thing that can make a `missing_rule` decline correctable
-(`validation.py::_validate_roles`).
-
-**The case this exists for.** A live extraction cited the rule `earnings_only` on
-`dbpcm_warehouse.payroll`. No such rule exists; the catalog names that exact concept
-`gross_earnings` (`predicate: register_type = 'EARN'`). The id came from a PRIOR ART
-card — the blueprint corpus's `uses_rules` namespace had drifted from the catalog's —
-so the model was quoting something it had been SHOWN. The proposal was correct in every
-other respect and the decline threw it away, because a `missing_rule` decline is
-terminal: the whole point of that decline is to tell a HUMAN that a rule is missing, and
-re-asking a model to "cite an existing rule" is pressure to name any id that passes.
-
-**What changes, and what emphatically does not.** This module answers one question and
-answers it deterministically: *is there exactly one catalog rule the cited id can only
-have meant?* When there is, the decline becomes correctable and the re-ask CARRIES that
-id, so the model is never asked to go and choose one — the fix is handed to it and its
-only decision is whether the fix is true of its plan. When there is not — no candidate,
-a weak candidate, or two plausible ones — this returns `None` and the decline is
-terminal, byte-identical to the behaviour before this module existed. Every threshold
-below is set so that the ambiguous case falls on the terminal side.
-
-**Every signal is the candidate's own content plus the catalog.** Nothing here reads the
-model's prose, its rationale, or the conversation. The evidence is: the id the plan
-cited, the `locator` the plan cited it FOR, and what the catalog declares. That is what
-makes the hint a fix rather than a suggestion, and it is why a hint can be put in front
-of the model without the pipeline having formed an opinion of its own.
-
-**Why the score is over the ID and not over the rule's prose.** `applies_when` and
-`description` are English sentences about the subject matter; scoring them would find
-rules that are ABOUT the same area, and "about the same area" is a judgement — exactly
-the thing a correctable decline may not make. Scoring identifier tokens can only find
-rules the model was plausibly trying to NAME, which is a change of expression.
-
---------------------------------------------------------------------------------------
-`rules_for_predicate` — what a `totality_violation` decline can say about the predicate
-the plan left uncovered (`validation.py::_validate_totality`).
-
-**The case this exists for.** A live session asked for the highest ratio of deductions
-to earnings; the accepted SQL filtered `register_type IN ('DDUCT','EARN')`; the plan
-covered neither value, and the decline said so and stopped. The catalog declares both
-of them, as `employee_deductions` and `gross_earnings`. The model had two corrective
-turns left over from unrelated shape fixes and was never told the one thing that would
-have finished the candidate.
-
-**No threshold, and no similarity — EXACT structural equality only.** A rule is named
-for a predicate iff the rule's whole `predicate` fragment IS that comparison: same
-column, same literal, same operator, and nothing else in the fragment (see
-`sql_predicates.sole_literal_predicate`, which enforces the "nothing else" part at the
-parse root). There is no near-match tier here and there must not be one: naming a rule
-for a predicate is the pipeline telling a model what its query's filter MEANS, and the
-only version of that which is not a judgement is a literal identity. A predicate no rule
-matches is simply reported with no rule attached — which is the §7 signal that the
-catalog may be missing one, arriving with a worked example attached.
+`nearest_known_rule` matches on the IDENTIFIER — "which rule was this trying to name?" —
+for a plan that cited an id that does not exist. `rules_for_predicate` matches on the
+PREDICATE — "does the catalog already declare exactly this filter?" — for a literal
+predicate no `ParamPlan` covers, by EXACT structural equality only. Neither is a similarity
+engine: each refuses wherever it is not certain, because a refusal costs a decline a human
+reads while a wrong hint costs a model talked into a candidate that silently means
+something else.
 """
 
 from __future__ import annotations
@@ -132,28 +71,15 @@ def nearest_known_rule(
 ) -> str | None:
     """The single catalog rule *unknown_id* can only have meant, or `None`.
 
-    *known_rules* is authoritative for WHAT EXISTS: nothing outside it is ever returned,
-    so a `RuleIndex` built from a different catalog snapshot can narrow the search but
-    can never widen it. *rules* is optional — without it the table-scoped tier cannot
-    run and only the exact-normalisation and unscoped tiers apply, which is the correct
-    degrade for a deployment that grounds ids but not the index.
-
-    THREE TIERS, strongest first, and the first tier that has evidence DECIDES:
-
-      1. EXACT after normalisation — `Gross-Earnings`/`grossEarnings`/`gross_earnings`
-         are the same id written three ways. A change of spelling, nothing more.
-      2. TABLE-SCOPED — the plan's own locator names a table; the candidates are the
-         catalog rules declared on it, narrowed further to those whose predicate
-         mentions the plan's column when any do. Scored on shared identifier tokens.
-         If the table is known and no candidate wins, the answer is `None`: the plan's
-         binding evidence says the rule is on THIS table, so a better-scoring rule
-         somewhere else in the catalog is not a spelling fix, it is a different rule.
-      3. UNSCOPED — only when there is no usable table evidence at all. Same scoring
-         against every known id, at the higher threshold.
-
-    A tie is always `None`. Two plausible catalog counterparts mean the pipeline does
-    not know which one the plan implements, and guessing there is precisely the coercion
-    the terminal decline exists to prevent."""
+    *known_rules* is authoritative for WHAT EXISTS — nothing outside it is ever returned, so a
+    `RuleIndex` built from a different catalog snapshot can narrow the search but never widen
+    it. *rules* is optional; without it the table-scoped tier cannot run. THREE TIERS, strongest
+    first, and the first tier with evidence DECIDES: (1) EXACT after normalisation, a change of
+    spelling and nothing more; (2) TABLE-SCOPED on the plan's own locator, where no winner
+    means `None`, because a better-scoring rule elsewhere in the catalog is a different rule
+    rather than a spelling fix; (3) UNSCOPED at a higher threshold, only when there is no usable
+    table evidence at all. A tie is always `None`.
+    """
     unknown_id = unknown_id.strip()
     if not unknown_id or not known_rules or unknown_id in known_rules:
         return None
@@ -188,9 +114,10 @@ def nearest_known_rule(
 def _best_match(unknown_id: str, candidates: list[str], *, minimum: float) -> str | None:
     """The single highest-scoring candidate at or above *minimum*, or `None`.
 
-    `None` covers three different situations on purpose — nothing scored high enough,
-    two candidates tied at the top, or the winner shares only short fragments — because
-    the caller does the same thing with all three: decline terminally."""
+    `None` covers three situations on purpose — nothing scored high enough, two candidates tied
+    at the top, or the winner shares only short fragments — because the caller declines
+    terminally on all three.
+    """
     unknown_tokens = _concept_tokens(unknown_id)
     if not unknown_tokens:
         return None
@@ -214,9 +141,10 @@ def _unique(matches: list[str]) -> str | None:
 def _score(left: frozenset[str], right: frozenset[str]) -> float:
     """Jaccard over concept tokens: |shared| / |union|.
 
-    Jaccard rather than "how much of the unknown id is covered", because coverage is
-    asymmetric in the dangerous direction — a one-token id like `earnings` would score
-    1.0 against every rule containing that word, however much else those rules say."""
+    Jaccard rather than "how much of the unknown id is covered", because coverage is asymmetric
+    in the dangerous direction: a one-token id like `earnings` would score 1.0 against every
+    rule containing that word, however much else those rules say.
+    """
     if not left or not right:
         return 0.0
     return len(left & right) / len(left | right)
@@ -234,11 +162,11 @@ def _polarity_matches(left_id: str, right_id: str) -> bool:
 def _mentions_column(predicate: str, column: str) -> bool:
     """Does *predicate* name *column* as an identifier?
 
-    Word-bounded so `type_code` does not match `code`, and case-insensitive because
-    catalog predicates preserve authored casing (D70) while a model writes whatever it
-    read off the SQL. A few catalog `predicate`s are prose rather than SQL; those simply
-    never mention a column, which costs nothing — the narrowing is an optional
-    refinement of a candidate set that is already scoped to one table."""
+    Word-bounded so `type_code` does not match `code`, and case-insensitive because catalog
+    predicates preserve authored casing (D70) while a model writes whatever it read off the
+    SQL. A prose `predicate` simply never mentions a column, which costs nothing — the
+    narrowing is an optional refinement of a set already scoped to one table.
+    """
     column = column.strip()
     if not column or not predicate:
         return False
@@ -278,8 +206,9 @@ _MAX_RULES_PER_VALUE = 3
 @dataclass(frozen=True)
 class PredicateRuleMatch:
     """One catalog rule that declares exactly one literal of an uncovered predicate.
-    `value` is the literal it accounts for — an `IN` list has one match per member, and
-    the live case (`register_type IN ('DDUCT','EARN')`) has two."""
+
+    `value` is the literal it accounts for — an `IN` list has one match per member.
+    """
 
     value: str
     rule: CatalogRule
@@ -290,34 +219,15 @@ def rules_for_predicate(
 ) -> tuple[PredicateRuleMatch, ...]:
     """Every catalog rule whose predicate IS one of *predicate*'s literal comparisons.
 
-    Exact structural equality, in the strong sense — the rule's whole fragment parses to
-    the same (column, literal, operator) and to nothing else. `()` means the catalog
-    declares no rule for this filter, which is a legitimate and common answer: the
-    caller reports the predicate on its own and the plan covers it with a slot or an
-    inline classification instead.
-
-    TABLE SCOPING IS DECIDED BY WHETHER THE QUALIFIER RESOLVES, not by whether it
-    yields rules. `LiteralPredicate.table` is whatever qualified the column: a bare
-    table name (`payroll`) for an unaliased FROM, an ALIAS (`p`) for the aliased form
-    this module cannot resolve without a FROM clause, and "" for an unqualified column.
-    So:
-
-      * a qualifier the CATALOG KNOWS is authoritative, including when that table
-        declares NO rules — the answer is then "no rule for this predicate", not "look
-        somewhere else". This is the same posture `nearest_known_rule` takes, and the
-        reason it must be the same is that the two hints appear side by side in one
-        message: one of them ranging over the whole catalog while the other refuses to
-        leave the plan's table would be an inconsistency a reader has to relearn.
-      * a qualifier that resolves to nothing (an alias, or an empty one) is NO
-        EVIDENCE, and the search covers every table. That is what makes the live case
-        work at all (`FROM dbpcm_warehouse.payroll AS p` yields `p`), and it is honest
-        because the caller prints each rule's own table beside its id — the message
-        OFFERS named options and never asserts which one the plan means.
-
-    The cross-table risk that widening creates is closed downstream rather than by
-    guessing here: `rule_contradicts_predicate` re-checks whatever the model finally
-    cites against what the catalog declares, so a rule offered from the wrong table
-    still cannot land a candidate whose predicate it does not implement."""
+    Exact structural equality in the strong sense: the rule's whole fragment parses to the same
+    (column, literal, operator) and to nothing else. `()` — the catalog declares no rule for
+    this filter — is a legitimate and common answer. TABLE SCOPING IS DECIDED BY WHETHER THE
+    QUALIFIER RESOLVES, not by whether it yields rules: a qualifier the CATALOG KNOWS is
+    authoritative even when that table declares none, while one that resolves to nothing (an
+    alias, or an empty one) is NO EVIDENCE and the search covers every table. The cross-table
+    risk that widening creates is closed downstream by `rule_contradicts_predicate` rather than
+    by guessing here.
+    """
     if rules is None or predicate.operator not in _NAMEABLE_OPERATORS:
         return ()
     if predicate.table and rules.knows_table(predicate.table):
@@ -343,39 +253,18 @@ def rules_for_predicate(
 def rule_contradicts_predicate(
     rule_id: str, predicate: LiteralPredicate, rules: RuleIndex | None
 ) -> CatalogRule | None:
-    """The cited rule, IF the catalog proves it declares a different filter from
-    *predicate*. `None` in every other case — including every case of doubt.
+    """The cited rule, IF the catalog proves it declares a different filter from *predicate*.
 
-    THE SEAM THIS GUARDS. Everything else in this module is advisory: a hint is offered,
-    the model decides, and a wrong hint costs a wasted turn. This is the one check with
-    teeth, and it is what makes the advice safe to give. A `rule`-role entry that lands
-    puts a catalog rule's name on a blueprint's predicate FOREVER — later runs execute
-    the rule, not the literal the session used — so a plan that cites `gross_earnings`
-    for `register_type = 'DDUCT'` ships a blueprint that computes deductions and calls
-    them earnings, silently, in every future run. Nothing downstream re-derives that:
-    S4's `binds_to ⊆ uses` says nothing about rule semantics.
-
-    It closes three failure modes at once, which is why it is worth its weight:
-
-      * a hint that was WRONG. The matchers are deterministic but not omniscient, and a
-        cross-table offer from the widened search is exactly the case they cannot rule
-        out by themselves.
-      * a hint that was FORGED. A literal of the analyst's SQL cannot forge a hint line
-        any more (`validation._quoted`), but the model can also simply be wrong, or be
-        steered by any other text in a session it was told to read. The rendering rule
-        makes authorship visible; this makes the outcome checkable.
-      * a plan that was mistaken with no hint involved at all — the case that existed
-        before any of this and had no gate.
-
-    CAN'T-VERIFY IS NOT REJECT, and that is a deliberate asymmetry rather than a
-    limitation to fix later. Many catalog rules are not a single literal comparison
-    (`hours IS NOT NULL`, `employee_status != 'N' OR employee_status IS NULL`,
-    `field_id IN ({field_codes})`, a prose note) — `sole_literal_predicate` returns
-    `None` for all of them, and this returns `None` too, accepting the citation exactly
-    as the pipeline did before this check existed. Rejecting what it cannot parse would
-    turn every complex rule in the catalog into an un-citable one, which is a far larger
-    and more certain loss than the mis-citations it would catch. With no `RuleIndex`
-    wired the whole check is inert, for the same reason."""
+    `None` in every other case, including every case of doubt. THE SEAM WITH TEETH: everything
+    else in this module is advisory, but a landed `rule`-role entry puts a catalog rule's name
+    on a blueprint's predicate FOREVER — later runs execute the RULE, not the literal the
+    session used — so a plan citing `gross_earnings` for `register_type = 'DDUCT'` would ship a
+    blueprint that computes deductions and calls them earnings, silently, in every future run.
+    Nothing downstream re-derives that. CAN'T-VERIFY IS NOT REJECT, deliberately: many catalog
+    rules are not a single literal comparison, and rejecting what cannot be parsed would make
+    every complex rule un-citable — a far larger loss than the mis-citations it would catch.
+    With no `RuleIndex` wired the whole check is inert, for the same reason.
+    """
     if rules is None:
         return None
     declared_by = rules.by_id(rule_id)
@@ -395,19 +284,14 @@ def rule_contradicts_predicate(
 def _same_filter(declared: LiteralPredicate, predicate: LiteralPredicate) -> bool:
     """Do two literal predicates state the SAME filter?
 
-    Same column, and then the comparison itself. `=` and `IN` are compared as MEMBER
-    SETS rather than as text, which is the difference between a check and a nuisance:
-    `IN ('Rejected','Knocked Out')` and `IN ('Knocked Out','Rejected')` are one filter,
-    and so are `= 'EARN'` and `IN ('EARN')`. Anything else (`!=`, `>`, `LIKE`,
-    `BETWEEN`) must match operator and value exactly — those forms carry no membership
-    semantics to normalize, and loosening them is how an inverted filter would slip
-    through the one check that exists to stop it.
-
-    TABLE IS NOT COMPARED, deliberately. The rule's table is a `database.table` and the
-    predicate's is whatever qualified the column — usually an alias — so a table test
-    here would reject correct citations in aliased queries, which is most of them. The
-    column-plus-filter identity is the part that can be established from what is
-    actually in hand."""
+    Same column, then the comparison itself. `=` and `IN` are compared as MEMBER SETS rather
+    than as text, so `IN ('a','b')` and `IN ('b','a')` are one filter and so are `= 'x'` and
+    `IN ('x')`. Anything else (`!=`, `>`, `LIKE`, `BETWEEN`) must match operator and value
+    exactly — those forms carry no membership semantics to normalize, and loosening them is how
+    an inverted filter would slip through. TABLE IS NOT COMPARED: the rule's is a
+    `database.table` and the predicate's is usually an alias, so a table test would reject
+    correct citations in aliased queries.
+    """
     if declared.column.lower() != predicate.column.lower():
         return False
     if declared.operator in _NAMEABLE_OPERATORS and predicate.operator in _NAMEABLE_OPERATORS:
@@ -419,22 +303,23 @@ def _same_filter(declared: LiteralPredicate, predicate: LiteralPredicate) -> boo
 def _declared_predicate(fragment: str) -> LiteralPredicate | None:
     """`sole_literal_predicate`, memoised on the fragment text.
 
-    Every catalog rule is re-read for every uncovered predicate, so a declining
-    candidate would otherwise re-parse the whole catalog several times over. The cache
-    is keyed on the fragment and the function is pure, so the only thing it can go stale
-    against is a rule whose text changed under a running process — which would mean a
-    new catalog, which arrives as a new `RuleIndex` built at startup."""
+    Every catalog rule is re-read for every uncovered predicate, so a declining candidate would
+    otherwise re-parse the whole catalog several times over. The cache is keyed on the fragment
+    and the function is pure, so the only thing it can go stale against is a rule whose text
+    changed under a running process — which arrives as a new `RuleIndex` built at startup.
+    """
     return sole_literal_predicate(fragment)
 
 
 def _literal_values(predicate: LiteralPredicate) -> tuple[str, ...]:
     """The individual literals a predicate constrains its column to.
 
-    `LiteralPredicate.value` joins an `IN` list's members with "," (that is the
-    enumerator's shape, and the totality COVERAGE check compares the joined form, so it
-    is not changed here). Splitting it back is exact for every literal that does not
-    itself contain a comma; one that does yields fragments that match no rule, so the
-    predicate is reported with no rule attached — a missed hint, never a wrong one."""
+    `LiteralPredicate.value` joins an `IN` list's members with "," — the enumerator's shape,
+    which the totality COVERAGE check compares against, so it is not changed here. Splitting it
+    back is exact for every literal that does not itself contain a comma; one that does yields
+    fragments matching no rule, so the predicate is reported with no rule attached — a missed
+    hint, never a wrong one.
+    """
     if predicate.operator == "IN":
         return tuple(value for value in predicate.value.split(",") if value)
     return (predicate.value,)
@@ -443,12 +328,11 @@ def _literal_values(predicate: LiteralPredicate) -> tuple[str, ...]:
 def _singular(token: str) -> str:
     """A crude plural fold, applied to BOTH sides of every comparison.
 
-    `active_employees` and `active_employee` are the same rule written twice; without
-    this they score 1/3 and the correction never happens. Words ending in `ss`/`us`/`is`
-    are left alone (`gross`, `status`, `analysis`) — everything else is only ever
-    compared against another token that went through the same fold, so a token this
-    mangles (`taxes` → `taxe`) still matches its own kind and simply fails to match
-    `tax`, which is a missed hint (terminal, safe), never a wrong one."""
+    `active_employees` and `active_employee` are the same rule written twice; without this they
+    score 1/3 and the correction never happens. Words ending in `ss`/`us`/`is` are left alone,
+    and a token this mangles (`taxes` → `taxe`) still matches its own kind while simply failing
+    to match `tax` — a missed hint (terminal, safe), never a wrong one.
+    """
     if len(token) > 3 and token.endswith("s") and not token.endswith(("ss", "us", "is")):
         return token[:-1]
     return token

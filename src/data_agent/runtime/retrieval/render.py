@@ -1,37 +1,24 @@
-"""render.py — RetrievedContext → one model-facing user message (design §3.1).
+"""render.py — `RetrievedContext` -> one model-facing user message.
 
-Pure formatting: given the already-cut, already-ordered `RetrievedContext`,
-produce a single `{"role": "user", "content": ...}` message the assembler
-prepends before history. Deterministic (same block → same string), so a D45
-resume that re-derives the same block renders byte-identically (design §6).
+Pure formatting over an already-cut, already-ordered block, producing the single
+`{"role": "user", "content": ...}` message the assembler prepends before history.
+Deterministic (same block, same string), so a D45 resume renders byte-identically.
 
-Non-system role: the block is rendered under `role: "user"` (not `system`) so
-the base prompt (`context/assembly.py`) stays the SOLE `role: "system"` message.
-A second system message here would compete with the base instructions on the
-OpenAI-compatible endpoints that honor only the first-or-last system message —
-the same anti-pattern the compaction-summary demotion closed. A leading prefix
-marks the block as retrieved prior-context so the model never mistakes it for
-the current user question.
+`role: "user"`, not `system`, so the base prompt stays the SOLE `role: "system"` message: a
+second system message would compete with the base instructions on the OpenAI-compatible
+endpoints that honor only the first-or-last one. A leading prefix marks the block as
+retrieved prior-context so the model never mistakes it for the current question.
 
-Trust boundary (H2 — structural sanitisation, as-built): this block is
-interpolated into a model-facing message alongside the real conversation. Even
-though the corpus is written offline and passes the write-time leakage gate (so
-its CONTENT is trusted), the retrieved TEXT must not be able to forge the
-message's STRUCTURE — a newline in an intent/chunk/slot string could otherwise
-fabricate a new "## System" section or a fake instruction/bullet. So every
-interpolated text field is structurally sanitised before it is placed in the
-message: newlines/tabs and
-other C0/C1 control characters (incl. NUL) are collapsed to single spaces (or
-dropped), and each field is length-capped (`_MAX_FIELD_CHARS` for card fields,
-`_MAX_CHUNK_CHARS` for knowledge chunks) so one 100 KB card cannot dominate the
-prompt. Sanitisation is deterministic (resume still renders byte-identically).
-Content itself remains trusted per the leakage gate; when Track-B (less-trusted,
-learned) content lands in Slice 2 this trust posture must be reconfirmed. See
-the design doc's trust-boundary as-built note.
+Trust boundary (H2): even though the corpus is written offline and passes the write-time
+leakage gate — so its CONTENT is trusted — the retrieved TEXT must not be able to forge the
+message's STRUCTURE, since a newline in an intent, chunk or slot string could otherwise
+fabricate a section header or a fake instruction. Every interpolated field is therefore
+structurally sanitised (control characters collapsed or dropped) and length-capped, and the
+sanitisation is deterministic. When less-trusted learned content lands, this trust posture
+must be reconfirmed.
 
-Redaction is by construction: the input carries no question, no `column_scope`,
-and no JWT — only blueprint ids/intents/slot summaries, knowledge chunks, and
-user-memory items. The renderer emits exactly those (sanitised), nothing more.
+Redaction is by construction: the input carries no question, no `column_scope` and no JWT —
+only blueprint ids/intents/slot summaries, knowledge chunks and user-memory items.
 """
 
 from __future__ import annotations
@@ -71,16 +58,16 @@ _CARD_DETAIL_INDENT = "  "
 
 
 def _card_detail_lines(card: ThinCard) -> list[str]:
-    """Render one card's release-1 §02 enrichment fields as indented sub-lines.
+    """Render one card's enrichment fields as indented sub-lines.
 
-    Every interpolated piece goes through `_sanitize` (H2) for the same reason
-    the intent does: these strings come from the same corpus, so a newline in a
-    slot name, a resolved column or a grain entry could forge a bullet or a fake
-    "## System" section inside the pre-injected block.
+        Every interpolated piece goes through `_sanitize` (H2) for the same reason the intent
+        does: these strings come from the same corpus, so a newline in a slot name, a resolved
+        column or a grain entry could forge a bullet or a fake section header inside the
+        pre-injected block.
 
-    Per-field capping does not bound a CARD, so the slot COLLECTION is capped
-    upstream (`pipeline._MAX_CARD_SLOTS`) and the overflow is rendered here as
-    `(+K more)` — the model must never be told a 12-slot blueprint has 6.
+        Per-field capping does not bound a CARD, so the slot COLLECTION is capped upstream and
+        the overflow is rendered here as `(+K more)` — the model must never be told a 12-slot
+        blueprint has 6.
     """
     lines: list[str] = []
     if card.slots:
@@ -110,9 +97,8 @@ def _card_detail_lines(card: ThinCard) -> list[str]:
 def render_retrieved_context(context: RetrievedContext) -> dict[str, Any] | None:
     """Render *context* to one `user`-role message, or `None` when it is empty.
 
-    `None` means "prepend nothing" — the assembler then behaves exactly as if
-    retrieval had not run, keeping the empty-retrieval path byte-identical to
-    the unconfigured path.
+        `None` means "prepend nothing": the assembler then behaves exactly as if retrieval had
+        not run, keeping the empty-retrieval path byte-identical to the unconfigured path.
     """
     if context.is_empty():
         return None

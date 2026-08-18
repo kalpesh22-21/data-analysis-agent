@@ -1,26 +1,20 @@
-"""blueprint/tool.py — `RunBlueprintTool`, the model-facing runtime tool (§5, Slice B).
+"""blueprint/tool.py — `RunBlueprintTool`, the model-facing runtime tool.
 
-A `RuntimeTool` (the `resolveValues`/read-tool shape): intercepted in the agent
-loop, never dispatched to the MCP under its own name, counts as exactly ONE
-`tool_calls_made` (the DAG's inner runQuery probes are the tool's implementation,
-invisible to the loop's budget, §2.7). It is a THIN wrapper over
+A `RuntimeTool`: intercepted in the agent loop, never dispatched to the MCP under its own
+name, counting as exactly ONE `tool_calls_made` — the DAG's inner runQuery probes are the
+tool's implementation and are invisible to the loop's budget. It is a THIN wrapper over
 `BlueprintExecutor`:
 
-  - one `TOOL` span (`slot_bindings` values REDACTED, §5.5) + symmetric
-    start/ok/error progress;
-  - a B4-parity crash guard so a raising executor NEVER aborts the turn or leaks
-    `str(exc)` (§5.4 `RUN_BLUEPRINT_INTERNAL_ERROR`);
-  - maps the executor's `ExecOutcome`:
-      `Completed` → ok `ToolResult` (verified result + preview, union provenance);
-      `Paused`    → a `ToolResult` carrying a `ToolPause` (the §2.5 loop seam —
-                    a slot-resolution `askUser`);
-      `Failed`    → error `ToolResult` (runBlueprint-family code OR an inner
-                    denial passed through verbatim, §5.4) → the raw-loop fallback.
+  - one `TOOL` span (`slot_bindings` values REDACTED) plus symmetric start/ok/error progress;
+  - a crash guard, so a raising executor NEVER aborts the turn or leaks `str(exc)`;
+  - the `ExecOutcome` mapping: `Completed` to an ok `ToolResult` (verified result + preview,
+    union provenance), `Paused` to a `ToolResult` carrying a `ToolPause` (the loop's pause
+    seam), and `Failed` to an error `ToolResult` — a runBlueprint-family code, or an inner
+    denial passed through verbatim — which routes the model to the raw loop.
 
-D49 (absolute): NO LLM runs inside this tool — every resolver is pure code +
-scope-enforced probe queries. The D56 LLM *review* is the loop's NEXT ordinary
-round-trip (the tool returns the verified result + assertion outcomes), never a
-nested call.
+D49 (absolute): NO LLM runs inside this tool; every resolver is pure code plus
+scope-enforced probe queries. The D56 LLM review is the loop's NEXT ordinary round-trip,
+never a nested call.
 """
 
 from __future__ import annotations

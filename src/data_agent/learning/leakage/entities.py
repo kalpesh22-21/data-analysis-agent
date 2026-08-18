@@ -1,16 +1,10 @@
 """Deterministic regex / NER entity detectors for the S5 leakage gate (D58/D17).
 
-The first, cheap layer of the gate: a fixed battery of anchored regexes that flag
-the entity families a GLOBAL (entity-free) candidate must never carry — employee
-codes, department codes, person names, dates/years, and known region tokens. It
-is deliberately over-eager on the hard-entity families (a false positive routes to
-human review, which is safe) but never scans the entity-BEARING targets
-(`user_knowledge`); the gate decides applicability, not this module.
-
-No I/O, no model call — a pure `str -> tuple[EntityHit, ...]` function so the same
-detectors run identically in the consumer, in tests, and (later) in an offline
-audit sweep. The injected LLM semantic scan (see `scanner.py`) is the second layer
-that catches what these patterns cannot.
+The first, cheap layer of the gate: a fixed battery of anchored regexes flagging the entity
+families a GLOBAL candidate must never carry. Deliberately over-eager on the hard-entity
+families, because a false positive routes to human review, which is safe. No I/O and no model
+call — a pure `str -> tuple[EntityHit, ...]` so the same detectors run identically everywhere;
+the injected semantic scan is the second layer that catches what patterns cannot.
 """
 
 from __future__ import annotations
@@ -53,9 +47,10 @@ _DETECTORS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 def scan_text(field: str, text: str) -> tuple[EntityHit, ...]:
-    """Return every regex/NER entity hit in *text*, tagged with *field* (the
-    payload location it came from — audit trail). Deterministic order: detectors
-    in declaration order, then match position within each detector."""
+    """Every regex/NER entity hit in *text*, tagged with *field* (its payload location).
+
+    Deterministic order: detectors in declaration order, then match position within each.
+    """
     hits: list[EntityHit] = []
     for kind, pattern in _DETECTORS:
         for match in pattern.finditer(text):

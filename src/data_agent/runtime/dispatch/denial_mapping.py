@@ -1,17 +1,10 @@
-"""Graceful-denial mapping — ToolError code -> {retryable-by-model, user-facing-message} (design §3.4).
+"""Graceful-denial mapping — ToolError code -> {retryable-by-model, user-facing-message}.
 
-| Code | Model retry makes sense? | User-facing surfacing |
-|---|---|---|
-| `COLUMN_SCOPE_VIOLATION` | No | "This needs access to columns outside your current permissions." |
-| `SCRATCH_SESSION_VIOLATION` | No | "That data isn't available in this session." |
-| `PARSE_FAILED_CLOSED` | Sometimes (rephrase) | Nudges the model toward `explainQuery` first. |
-| `DATABASE_NOT_ALLOWED` | Yes | Fed back as a normal tool error; the model self-corrects. |
-| `TABLE_NOT_FOUND` | Yes | Fed back as a normal tool error; the model self-corrects. |
-| `CLICKHOUSE_QUERY_ERROR` | Yes | Fed back as a normal tool error; the model self-corrects. |
-| `CLICKHOUSE_UNAVAILABLE` | No (transient) | "The data warehouse is temporarily unavailable." |
-
-All seven code paths increment the loop's iteration/token counters (Pass B's
-`loop/budget_guard.py`) — a rejected call is not free.
+A retryable code (`TABLE_NOT_FOUND`, `CLICKHOUSE_QUERY_ERROR`, …) is fed back as an
+ordinary tool error so the model self-corrects; a non-retryable one (a scope violation,
+a transient warehouse outage) surfaces a static, PII-safe user message instead. Either
+way the call still increments the loop's iteration/token counters — a rejected call is
+not free.
 """
 
 from __future__ import annotations
@@ -387,11 +380,10 @@ ENFORCEMENT_DENIAL_CODES = frozenset(
 def classify_denial(code: str | None) -> DenialInfo:
     """Classify a `ToolError` code into `{retryable, user_message}`.
 
-    An unrecognized (or missing, `None`) code — e.g. an unexpected/internal
-    MCP error whose `[{CODE}]` prefix could not be parsed — is treated
-    conservatively: not retryable, and surfaced as a generic failure. This
-    never raises, so `dispatch/tool_dispatcher.py` can always classify
-    whatever `MCPToolError.code` it receives.
+        An unrecognized or missing (`None`) code — an unexpected/internal MCP error whose
+        `[{CODE}]` prefix could not be parsed — is treated conservatively: not retryable,
+        surfaced as a generic failure. This never raises, so the dispatcher can always
+        classify whatever `MCPToolError.code` it receives.
     """
     if code is not None and code in _DENIAL_TABLE:
         return _DENIAL_TABLE[code]

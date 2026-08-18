@@ -1,38 +1,16 @@
-"""query_page.py — paging for the model-designated answer table.
+"""Paging for the model-designated answer table.
 
-`POST /query/page` executes ONE read-only query with `LIMIT`/`OFFSET` and returns
-a page of rows. It exists so the UI can render the answer table itself, with real
-paging, instead of the model transcribing rows into its prose or the runtime
-shipping a fixed ~20-row `ResultPreview` the user could not page past (the
-`result_table` field this replaced).
+`POST /query/page` executes ONE read-only query with `LIMIT`/`OFFSET` so the UI can page
+the answer table itself. The SQL is whatever the model designated; it is NOT required to
+have been executed during the turn. It adds NO authority: it runs through the SAME
+`ToolDispatcher.dispatch("runQuery", ...)` with the CALLER's own credentials, so column
+scope (D57/D80), read-only enforcement, row caps, denial mapping and provenance capture
+are the identical code path — a designated query can never read a column the same caller
+could not read by asking the agent.
 
-The SQL is the `answer_sql` the model designated via `presentTable`. It is NOT
-required to have been executed during the turn (see `composite/present_table.py`
-for why: the agent's own query usually carries a `LIMIT` it picked for its own
-reading, and paging needs the un-capped shape).
-
-WHY THAT IS SAFE, precisely — this endpoint adds NO authority:
-
-  * It runs through the SAME `ToolDispatcher.dispatch("runQuery", ...)` the model
-    uses, with the CALLER'S OWN credentials taken from this request's headers.
-    Column-scope (D57/D80), read-only enforcement, row caps, denial mapping,
-    provenance capture and telemetry are therefore the identical code path — a
-    designated query can never read a column the same caller could not read by
-    asking the agent for it.
-  * It is not an eval hatch: anything the MCP rejects (write statement, out-of-
-    scope column, unparseable SQL) is rejected here in exactly the same way, and
-    surfaces as an ordinary denial rather than a runtime error.
-
-So the trust boundary is unchanged; this is a second doorway onto the same
-enforced path, not a bypass of it.
-
-PAGING is applied by WRAPPING, never by string-splicing a `LIMIT` onto model
-text: the SQL is parsed with sqlglot's ClickHouse dialect (the dialect
-`sqlparse/provenance.py` already standardizes on) and nested as
-`SELECT * FROM (<sql>) LIMIT n OFFSET m`. Wrapping is what makes the page bounds
-OURS rather than the model's — a `LIMIT` inside the designated query still
-applies to the inner result, but it can never let a page exceed `limit`, and a
-malformed or multi-statement payload fails at parse time, before dispatch.
+Paging is applied by WRAPPING (`SELECT * FROM (<sql>) LIMIT n OFFSET m`) through
+sqlglot, never by splicing a `LIMIT` onto model text: that makes the page bounds OURS,
+and a malformed or multi-statement payload fails at parse time, before dispatch.
 """
 
 from __future__ import annotations
@@ -64,20 +42,17 @@ MAX_PAGE_SIZE = _MAX_PAGE_SIZE
 class QueryPageError(ValueError):
     """The designated SQL could not be turned into a page query.
 
-    Carries a SHORT, static reason only. `str(exc)` reaches the client, so it must
-    never echo the offending SQL or a raw sqlglot message — a parse error can quote
-    a fragment of the statement back (the same reasoning as
-    `sqlparse/oracle.py`'s masking).
+        Carries a SHORT, static reason only: `str(exc)` reaches the client, so it must never
+        echo the offending SQL or a raw sqlglot message (which can quote a fragment back).
     """
 
 
 def clamp_page_params(limit: Any, offset: Any) -> tuple[int, int]:
     """Coerce and clamp caller-supplied paging params.
 
-    Total by design (never raises): a non-integer/negative/absent value falls back
-    to the default rather than 400-ing, because paging params are UI plumbing, not
-    a place to fail a user's scroll. `limit` is clamped to
-    `[1, _MAX_PAGE_SIZE]`, `offset` to `>= 0`.
+        Total by design (never raises): a non-integer, negative or absent value falls back
+        to the default rather than 400-ing. `limit` clamps to `[1, _MAX_PAGE_SIZE]`,
+        `offset` to `>= 0`.
     """
     try:
         page_limit = int(limit)
@@ -95,17 +70,11 @@ def clamp_page_params(limit: Any, offset: Any) -> tuple[int, int]:
 def build_page_sql(sql: str, *, limit: int, offset: int) -> str:
     """Wrap *sql* as `SELECT * FROM (<sql>) LIMIT limit OFFSET offset`.
 
-    Parsed and re-rendered through sqlglot (ClickHouse dialect) rather than string
-    concatenation, so:
-      * a multi-statement payload is rejected — `parse_one` raises on the trailing
-        statement, closing the `…; DROP …` shape at the door rather than relying on
-        the MCP's read-only mode as the only guard;
-      * a non-SELECT top level (INSERT/ALTER/CREATE) is rejected here explicitly,
-        before dispatch;
-      * the emitted page query is whatever sqlglot renders, so a payload crafted to
-        break out of a hand-built f-string has nothing to break out of.
-
-    Raises `QueryPageError` (static message) on anything it cannot safely wrap.
+        Parsed and re-rendered through sqlglot (ClickHouse dialect) rather than concatenated,
+        so a multi-statement payload and a non-SELECT top level are both rejected here,
+        before dispatch, and a payload crafted to break out of a hand-built f-string has
+        nothing to break out of. Raises `QueryPageError` (static message) on anything it
+        cannot safely wrap.
     """
     if not isinstance(sql, str) or not sql.strip():
         raise QueryPageError("No query was provided.")

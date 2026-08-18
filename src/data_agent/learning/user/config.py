@@ -1,11 +1,8 @@
 """UserKnowledgeStoreConfig — the per-user store's dedicated settings surface (S8).
 
-Kept in this module (not the shared `learning/config.py`) so this slice never
-co-edits a file another track touches. Mirrors the `learning_audit` /
-`learning_candidates` settings block (D95/D101): its OWN connection string,
-bucket, and an RBAC user scoped to THAT bucket only. Read by
-`CouchbaseUserKnowledgeStore` at construction; the entrypoint (composition root)
-builds it from env once the real store is wired.
+Mirrors the `learning_audit`/`learning_candidates` settings block (D95/D101): its OWN
+connection string, bucket, and an RBAC user scoped to THAT bucket only. Read by
+`CouchbaseUserKnowledgeStore` at construction; the composition root builds it from env.
 """
 
 from __future__ import annotations

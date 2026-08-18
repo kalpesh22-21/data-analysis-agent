@@ -1,93 +1,13 @@
 """promotion/scheduler.py — the S9 promotion scheduler (D29/D30, §7.2).
 
-A STANDALONE background process, NOT a `CandidateStage`. It is cron-scanned state
-(D29 "cron-scanned state, not queued"): each cycle it reads
-`learning_candidates.list_by_status(...)`, runs golden replay + the D43 drift
-probes, and advances `status` + stamps `drift` (Contract E). It shares the envelope
-contract with the write-router stages but NOT their pipeline seam (§7.2), so it
-parallelizes cleanly against the S4 fixture.
-
-Contract E state machine (the edges this scheduler owns):
-
-    candidate ─(static ok AND golden-replay pass AND deps resolved
-                AND corroboration ≥ T)──────────────────────────▶ in_review  (route)
-    candidate ─(any guard fails / dep unresolved / below T)─────▶ candidate  (hold)
-    in_review ─(human approve)──────────────────────────────────▶ validated
-    in_review ─(human reject)───────────────────────────────────▶ rejected
-    validated ─(drift probes clean)─────────────────────────────▶ validated  (drift=clean)
-    validated ─(drift suspect OR replay fails OR user correction)─▶ candidate  (demote + review flag)
-
-**THE SCHEDULER IS A ROUTER, NOT A PROMOTER (plan §4).** The auto path used to end at
-`validated`; it now ends at `in_review`, and `→ validated` happens ONLY through
-`apply_human_decision`. Three reasons, in descending order of how much they cost:
-
-  * `_recheck_validated` runs a golden replay — a JWT mint plus two live warehouse
-    queries — against every validated artifact, forever. Auto-landing at a threshold of 1
-    would put hundreds of never-recalled nodes into that loop within weeks.
-  * A landed learning-tier node is NOT recallable anyway (the recall trust gate serves
-    only `source='mcp'`), so auto-landing buys the agent nothing at all. What the
-    threshold rations is a human's attention, which is why lowering it is safe and why
-    the destination has to change at the same time.
-  * It is what makes a user correction stick. See `apply_user_correction`.
-
-Every correctness guard is unchanged and still runs on this edge: the leakage scan,
-static validation, `depends_on` resolution and the golden replay. Only the corroboration
-count and the destination changed.
-
-**But the guards that matter moved with the LANDING, not with this edge.** Narrowing
-landing to one path meant the approve edge's guard list became the only one enforcing
-anything about the corpus, and it was missing the leakage scan entirely — the auto edge's
-Guard 0 was the only reference to `_entity_scan_is_clean` in this module. QA caught it.
-`apply_human_decision` now carries `_entity_scan_is_actionable` as its own Guard 2; the
-two predicates differ deliberately (see that function). The general lesson, since it will
-recur: when a change narrows N paths to 1, the surviving path inherits the RESPONSIBILITY
-of the others but not their CODE.
-
-Load-bearing guards (D29/D98):
-  * **Replay alone NEVER promotes** (D98 layer iii). This is now enforced STRUCTURALLY
-    rather than by a threshold: the auto path cannot produce `validated` at all, whatever
-    the replay said. A green replay routes to a human; the human's approve re-runs the
-    replay before anything lands.
-  * **`depends_on` guard** (§11.6): a candidate whose `depends_on` references an
-    unresolved artifact stays `candidate` — never promotes until it resolves.
-  * **Human-gated targets** (`global_knowledge`/`schema_edit`, D58a/D18): T = ∞;
-    the auto path never promotes them (they land via the S7 inbox → human
-    approve). `user_knowledge` auto-commits in its OWN writer (S8), not here.
-
-Fail-closed throughout: one bad candidate must not abort the cycle (mirrors the
-sweeper's per-item guard); the kill-switch is read FRESH every cycle (D58c).
-
-**Cost + fairness (the two properties that make the cron survivable at scale).**
-This is a daemon, not a one-shot, so every per-candidate cost is multiplied by 288
-cycles a day, forever:
-
-  * **The golden replay is rate-limited, the cheap guards are not.** One replay costs
-    a JWT mint plus two live warehouse queries. Guards 0-2 (`entity_scan`, static
-    validation, `depends_on`) are pure field reads / one resolver call and keep running
-    on every examination, so a dependency that lands mid-day is still noticed the next
-    time the candidate comes up. Only Guard 3 consults
-    `PromotionPolicy.replay_recheck_interval_seconds`: inside that window the STORED
-    D43 verdict is reused (`reusable_replay_verdict`), outside it the probe runs for
-    real. Without this a candidate that can never clear Guard 4 was fully replayed
-    every 5 minutes forever — 576 warehouse queries a day, each one re-deriving a
-    verdict that had not changed.
-  * **The scan window ROTATES.** Both status reads are ordered by `last_scanned_at`
-    (never-scanned FIRST), and every examined candidate gets its cursor stamped. The
-    old `created_at ASC` read handed the bounded `scan_limit` window to the same oldest
-    rows forever, so once more than `scan_limit` candidates were parked in a hold, a
-    newly extracted candidate was NEVER examined — no error, no metric, the loop simply
-    stopped making progress on anything new.
-
-A consequence worth stating plainly, because several comments below used to say "every
-cycle": the corpus re-asserts and the cheap guards now run on every EXAMINATION, which
-is every cycle while the backlog fits in `scan_limit` and once per rotation period
-beyond that. That is strictly better than the previous behaviour (where the overflow was
-examined NEVER), but it is a rotation guarantee, not a per-cycle one.
-
-The cursor stamp makes a HOLD a write path, which it previously was not. It is a
-narrow sub-document write (`CandidateStore.touch_scanned`), issued AFTER the handler
-has finished, precisely so it cannot revert whatever that handler — or a concurrent
-S7 inbox transition — wrote to the envelope; see `run_once`.
+A STANDALONE cron-scanned process, NOT a `CandidateStage`: each cycle it lists candidates
+by status, runs golden replay + the D43 drift probes, and advances `status` + stamps `drift`
+(Contract E). THE SCHEDULER IS A ROUTER, NOT A PROMOTER — the auto path ends at `in_review`,
+and `→ validated` happens ONLY through `apply_human_decision`, which is therefore the only
+edge that writes content to the corpus. Fail-closed throughout: one bad candidate never
+aborts the cycle, and the kill-switch is read FRESH every cycle (D58c). The golden replay is
+rate-limited (the cheap guards are not), and the scan window ROTATES by `last_scanned_at`,
+so a bounded `scan_limit` cannot starve newly extracted candidates.
 """
 
 from __future__ import annotations
@@ -139,11 +59,10 @@ _LANDED_TYPES: frozenset[str] = frozenset({BLUEPRINT_TYPE, "global_knowledge"})
 def _parse_clock(now_iso: str) -> datetime | None:
     """The injected clock's string as a tz-AWARE datetime, or `None` if it is not one.
 
-    `clock` is a `Callable[[], str]` injected by the caller (tests pin it to a literal),
-    so its output is not a guaranteed ISO-8601 string; `datetime.fromisoformat` raises
-    ValueError on a malformed string and TypeError on a non-string. Both mean the same
-    thing to every caller here — "no usable now" — and every caller treats that as
-    "cannot judge freshness, run the real probe", i.e. the pre-rate-limit behaviour."""
+    `clock` is a `Callable[[], str]`, so its output is not a guaranteed ISO-8601 string; a
+    malformed string and a non-string both mean "no usable now", which every caller treats as
+    "cannot judge freshness, run the real probe" — the pre-rate-limit behaviour.
+    """
     if not isinstance(now_iso, str):
         return None
     try:
@@ -166,53 +85,28 @@ ROUTE_REASON_USER_CORRECTED = "user_corrected"
 def _is_user_correction_stamp(drift: DriftStamp) -> bool:
     """True iff this drift stamp is the one `user_correction_stamp` writes.
 
-    Identified STRUCTURALLY (`suspect` + no probes + no failed probe) rather than by a
-    marker field, because that is exactly what the stamp IS: a `suspect` verdict that
-    names no probe, because no probe fired — the cause was an out-of-band human
-    correction. `reusable_replay_verdict` already keys off the same absence (it refuses to
-    reuse a stamp that does not name `grain_integrity`), so the two agree about what a
-    correction stamp is without either importing a flag from the other.
-
-    It has to be read BEFORE Guard 3, which replays and overwrites `drift` with a `clean`
-    verdict — and a passing replay is the NORMAL outcome here, because a correction is
-    about a VALUE and the replay is structure-only by design (D98). After Guard 3 the
-    evidence is gone."""
+    Identified STRUCTURALLY (`suspect` + no probes + no failed probe) rather than by a marker
+    field, because that is exactly what the stamp IS. It has to be read BEFORE Guard 3, which
+    replays and overwrites `drift` with a `clean` verdict — and a passing replay is the NORMAL
+    outcome here, because a correction is about a VALUE while the replay is structure-only by
+    design (D98).
+    """
     return drift.status == "suspect" and not drift.probes and drift.failed_probe is None
 
 
 def _entity_scan_is_actionable(env: CandidateEnvelope) -> bool:
     """True iff this candidate's leakage verdict is one the D17 machinery can ACT on.
 
-    DERIVED FROM THE OPERATION, not from a field name. Both entity defenses on the approve
-    path consume exactly one thing — `entity_spans(env)` — and both perform the same
-    operation on it: `strip_entity_bearing` REMOVES those spans from the payload, and the
-    landing writer's last-gate tripwire RE-CHECKS that they are gone. So an EMPTY span set
-    disables both layers, and the only question that matters is whether the emptiness is
-    *explained*:
-
-        verdict shape                          entity_spans()   is the emptiness explained?
-        settled `pass`                         ()               YES — nothing was found
-        settled finding WITH hits              (spans…)         n/a — the defenses can act
-        settled finding with NO hits           ()               NO  — a leak nobody located
-        unsettled (`pending`)                  ()               NO  — nobody looked at all
-
-    Rows 3 and 4 are the same failure wearing different clothes: the verdict does not say
-    "there is nothing to remove", yet nothing is removed and nothing is checked. So the
-    rule is not "settled" and not "clean" — it is **either a clean pass, or a finding that
-    localizes itself**.
-
-    Row 3 is REACHABLE with the shipped scanner, not a hypothetical: `gate._decide`
-    returns `reroute` when the semantic classification is `user_fact` and `quarantine` as
-    its fallback, in both cases WITHOUT consulting whether `hits` is empty — so a semantic
-    scanner that judges text leaky without enumerating a span produces exactly this.
-
-    Deliberately a DIFFERENT predicate from `_entity_scan_is_clean`, which the AUTOMATIC
-    edge uses. That edge demands a clean `pass` because nobody is looking. This one admits
-    a finding, because D58b routes 100% of leakage near-misses to a human precisely so a
-    person can decide — and a LOCALIZED finding is the state in which the machinery works
-    and the reviewer is genuinely informed (`_leakage_view` shows them the result and each
-    hit's field and kind). What it refuses is approving on a span set that is empty for
-    any reason other than "there was nothing there"."""
+    DERIVED FROM THE OPERATION, not from a field name: both entity defenses on the approve path
+    consume `entity_spans(env)` — the strip REMOVES those spans, the landing writer's tripwire
+    RE-CHECKS they are gone — so an EMPTY span set disables both layers, and the only question
+    is whether the emptiness is EXPLAINED. The rule is therefore neither "settled" nor "clean"
+    but EITHER A CLEAN PASS, OR A FINDING THAT LOCALIZES ITSELF: a settled finding with no hits
+    and an unsettled `pending` scan are the same failure in different clothes. The first is
+    reachable with the shipped scanner — `gate._decide` returns `reroute`/`quarantine` without
+    consulting whether `hits` is empty. Deliberately a DIFFERENT predicate from
+    `_entity_scan_is_clean`, which the AUTOMATIC edge uses because nobody is looking there.
+    """
     scan = env.entity_scan
     if not LeakageVerdict.is_settled(scan):
         return False
@@ -288,18 +182,21 @@ class PromotionScheduler:
 
     @property
     def store(self) -> CandidateStore:
-        """The candidate store this scheduler reads + CAS-writes. Exposed read-only
-        so a composition root can pin the inbox to the SAME instance (a split-brain
-        store would let the inbox read one store while this scheduler writes another
-        — stale-envelope approve)."""
+        """The candidate store this scheduler reads + CAS-writes, exposed read-only.
+
+        So a composition root can pin the inbox to the SAME instance: a split-brain store would let
+        the inbox read one store while this scheduler writes another (stale-envelope approve).
+        """
         return self._store
 
     @property
     def policy(self) -> PromotionPolicy:
-        """The policy this scheduler routes on. Exposed read-only for the SAME reason
-        `store` is: `build_promotion_plane` pins the inbox to it, so the threshold that puts
-        work into the review queue and the cutoff that decides whether a human ever sees
-        that work can never end up configured independently."""
+        """The policy this scheduler routes on, exposed read-only for the same reason `store` is.
+
+        `build_promotion_plane` pins the inbox to it, so the threshold that puts work into the
+        review queue and the cutoff that decides whether a human ever sees that work can never end
+        up configured independently.
+        """
         return self._policy
 
     # -- the cron cycle -------------------------------------------------------
@@ -307,9 +204,9 @@ class PromotionScheduler:
     async def run_once(self) -> PromotionSweep:
         """One scan: advance eligible `candidate`s, re-check every `validated`.
 
-        Kill-switch FIRST (D58c): disabled ⇒ no scan, no transition. Read uncached,
-        per cycle. A per-candidate error is logged and skipped (the whole cycle
-        never aborts on one bad candidate — sweeper parity)."""
+        Kill-switch FIRST (D58c), read uncached per cycle: disabled ⇒ no scan, no transition. A
+        per-candidate error is logged and skipped, so the cycle never aborts on one bad candidate.
+        """
         if not learning_enabled():
             return PromotionSweep(disabled=True)
 
@@ -343,19 +240,13 @@ class PromotionScheduler:
     async def _guard(self, fn, env: CandidateEnvelope) -> CandidateDecision:
         """Run one per-candidate handler, then advance its scan cursor — ALWAYS.
 
-        The cursor write is in the `finally` for the same reason the whole handler is
-        wrapped: the cycle must keep its fairness property even for the candidate that
-        just blew up. If a candidate that raises kept its cursor, it would stay pinned
-        at the front of the rotation and re-raise on every cycle for ever, which is the
-        head-of-line starvation this ordering exists to remove — now caused by the one
-        row least likely to ever succeed.
-
-        Stamping AFTER the handler (not before, not as part of a re-put of `env`) is
-        what makes it clobber-free: `touch_scanned` writes the single cursor path on
-        whatever the CURRENT stored document is, so it cannot undo the handler's own
-        `put` and cannot revert a concurrent S7 inbox transition. It also cannot fail
-        the cycle — a cursor is bookkeeping, so a store hiccup here is logged and
-        swallowed rather than being allowed to mask the real decision."""
+        The cursor write is in the `finally` so a candidate that raises does not keep its cursor,
+        stay pinned at the front of the rotation, and re-raise every cycle forever. Stamping AFTER
+        the handler is what makes it clobber-free: `touch_scanned` writes the single cursor path on
+        whatever the CURRENT stored document is, so it cannot undo the handler's own `put` or revert
+        a concurrent S7 inbox transition. A store hiccup here is logged and swallowed — a cursor is
+        bookkeeping and must not mask the real decision.
+        """
         try:
             return await fn(env)
         except Exception:  # noqa: BLE001 - one bad candidate must not abort the cycle
@@ -640,47 +531,28 @@ class PromotionScheduler:
     async def apply_human_decision(
         self, env: CandidateEnvelope, decision: str
     ) -> CandidateDecision:
-        """Apply a human `in_review` decision (Contract D / Contract E): approve →
-        validated, reject → rejected. This is the ONE caller-driven promotion path
-        (not the cron scan) and the SINGLE implementation of the approve transition —
-        `ReviewInbox.approve` delegates here so EVERY approve enforces the identical
-        invariants (R4): the entity strip, the current-status guard, the `depends_on`
-        guard, and (for a replayable blueprint) the static + replay guards.
+        """Apply a human `in_review` decision: approve → validated, reject → rejected.
 
-        **SINCE PLAN §4 THIS IS THE ONLY EDGE THAT WRITES CONTENT TO THE CORPUS.** The
-        automatic edge routes to `in_review` and lands nothing, so every guard below is
-        now the sole enforcement of what it checks rather than a second opinion. The three
-        other human edges do not weaken that: `apply_retract`, `apply_verify` and
-        `apply_promote` all require `status == validated`, and approve is the only
-        transition that produces it — so they INHERIT this method's guarantees rather than
-        needing their own copies. That inheritance is asserted by
-        `test_nothing_auto_lands_qa.py`, because it stops holding the moment any other
-        edge learns to write `validated`.
+        THE ONE caller-driven promotion path and the SINGLE implementation of the approve
+        transition — `ReviewInbox.approve` delegates here so EVERY approve enforces the identical
+        invariants (R4). Since plan §4 it is also the ONLY edge that writes content to the corpus,
+        so every guard below is the sole enforcement of what it checks. `apply_retract`,
+        `apply_verify` and `apply_promote` all require `status == validated`, which only this
+        transition produces, so they INHERIT these guarantees rather than carrying copies.
 
         Approve invariants, in order:
           1. current status MUST be `in_review` (a mis-routed approve never mutates).
-          2. the leakage verdict must be ACTIONABLE — a clean `pass`, or a finding that
-             LOCALIZES itself. A human may approve over a located finding; nobody may
-             approve over a scan that never ran, nor over a scanner asserting a leak it
-             could not locate, because both leave the span set empty and thereby switch
-             off the strip AND the landing tripwire at once. See the guard for the
-             derivation and for why it is neither `settled` nor `clean`.
+          2. the leakage verdict must be ACTIONABLE — a clean `pass`, or a finding that LOCALIZES
+             itself; an empty span set switches off the strip AND the landing tripwire at once.
           3. strip entity-bearing payload + audit spans BEFORE `validated` (D17/Q3).
-          4. `depends_on` must be resolved (§11.6/Q2) — a human cannot promote a
-             blueprint whose required schema_edit has not landed.
-          5. a REPLAYABLE blueprint (has a generalization) STILL passes static +
-             golden replay (human approval substitutes for the hit-count threshold,
-             NOT for structural integrity — D98). A non-replayable target
-             (knowledge/schema, or a blueprint with no template) approves directly.
+          4. `depends_on` must be resolved (§11.6/Q2).
+          5. a REPLAYABLE blueprint STILL passes static + golden replay — human approval substitutes
+             for the corroboration threshold, NOT for structural integrity (D98).
 
-        Guards 1-4 are TYPE-AGNOSTIC and run before the blueprint/knowledge split, which
-        is what makes the leakage guard cover the `global_knowledge` landing too — that
-        branch reaches the same `_land_and_promote` with the same `forbidden_spans`.
-
-        REJECT is deliberately ungated by any of this: it writes no content (the corpus
-        write-backs on that path set a status string on an existing node), and it is the
-        ONLY action available for a candidate whose scan never settled. Gating it would
-        leave such a candidate with no terminal action at all.
+        Guards 1-4 are TYPE-AGNOSTIC and run before the blueprint/knowledge split, which is what
+        makes the leakage guard cover the `global_knowledge` landing too. REJECT is deliberately
+        ungated: it writes no content, and it is the ONLY action available for a candidate whose
+        scan never settled.
         """
         if decision == "reject":
             rejected = replace(env, status=CandidateStatus.REJECTED)
@@ -865,30 +737,15 @@ class PromotionScheduler:
     async def apply_user_correction(
         self, env: CandidateEnvelope
     ) -> CandidateDecision:
-        """A user correction is a NEGATIVE signal (D29/D43): demote a `validated`
-        artifact to `candidate` + review flag. Idempotent for a non-validated
-        candidate (a no-op hold).
+        """A user correction is a NEGATIVE signal (D29/D43): demote `validated` → `candidate`.
 
-        **The correction now STICKS, and it does so as a side effect of the routing
-        change (plan §4).** It previously survived about five minutes: the demote wrote
-        `candidate`, the next cron cycle re-ran the guards, and every one of them passed —
-        the entity scan was untouched, the golden replay PASSED (a correction is about a
-        VALUE and the replay is structure-only by design, D98), and `hit_count` was
-        unchanged because a correction does not decrement it — so the artifact was
-        re-promoted to `validated` and re-landed, silently erasing the human's signal.
-
-        None of those facts changed. What changed is the DESTINATION: the next cycle now
-        routes the demoted candidate to `in_review` instead of back to `validated`, so it
-        stops being a recallable artifact and starts being a question for a human, which
-        is what a correction should produce. The landed node is stamped non-recallable on
-        the demote edge below and re-stamped on the route edge, and only a human approve
-        can put it back.
-
-        What this does NOT do, and must not be read as doing: it does not make the
-        correction a durable property of the ARTIFACT. There is still no
-        `corrected_at`/`correction_count` field, so a candidate approved by a human after
-        a correction carries no memory of it, and a SECOND correction of the same
-        artifact repeats the identical cycle rather than escalating."""
+        Idempotent for a non-validated candidate (a no-op hold). The correction STICKS only because
+        the next cycle routes the demoted candidate to `in_review` instead of back to `validated` —
+        every guard still passes (a correction is about a VALUE and the replay is structure-only by
+        design, D98), so before the routing change it was silently re-promoted within minutes. It
+        does NOT make the correction a durable property of the ARTIFACT: there is no `corrected_at`,
+        so a second correction repeats the cycle rather than escalating.
+        """
         if env.status != CandidateStatus.VALIDATED:
             return self._hold(env, "not_validated")
         demoted = replace(
@@ -911,17 +768,14 @@ class PromotionScheduler:
         )
 
     async def apply_retract(self, env: CandidateEnvelope) -> CandidateDecision:
-        """Retract a promoted artifact `validated → retired` (the inbox leak/drift PULL,
-        §11.4) — the SINGLE implementation `ReviewInbox.retract` delegates to, so the
-        highest-stakes human edge (pulling a LEAKED blueprint from recall) enforces the
-        same corpus write-back as every other demote edge (review BLOCKER 2).
+        """Retract a promoted artifact `validated → retired` (the inbox leak/drift PULL, §11.4).
 
-        Stamps the landed node `retired` (fail-open, BEFORE the store retire so a crash
-        between leaves the node un-recallable — the safe direction), then writes
-        `retired` to the store. Idempotent for a non-validated env (a no-op hold — a
-        mis-routed retract never mutates). Physical index removal + the D25 exposure
-        trace remain S10; the STAMP here is what makes recall exclude the leaked node
-        NOW (the recall filter drops any non-`validated` status)."""
+        The SINGLE implementation `ReviewInbox.retract` delegates to. Stamps the landed node
+        `retired` (fail-open, BEFORE the store retire, so a crash between leaves the node
+        un-recallable — the safe direction), then writes `retired` to the store. Idempotent for a
+        non-validated env. Physical index removal remains S10; the STAMP is what makes recall
+        exclude the leaked node NOW.
+        """
         if env.status != CandidateStatus.VALIDATED:
             return self._hold(env, "not_validated")
         retired = replace(env, status=CandidateStatus.RETIRED)
@@ -940,25 +794,16 @@ class PromotionScheduler:
     async def apply_verify(
         self, env: CandidateEnvelope
     ) -> tuple[CandidateDecision, bool]:
-        """VERIFY a `validated` learning node (Phase-3 inbox VERIFY action) — the SINGLE
-        implementation `ReviewInbox.verify` delegates to. Flips `verified → true` on BOTH
-        the landed neo4j node AND the candidate-store envelope, and RETURNS whether the
-        node write actually landed (`node_stamped`) so the caller can surface a re-verify
-        prompt when it did not.
+        """VERIFY a `validated` learning node — the SINGLE implementation `ReviewInbox.verify` uses.
 
-        The node is stamped FIRST, then the authoritative envelope is written:
-          * a CRASH BETWEEN the two writes is the SAFE direction (node verified, envelope
-            not → the candidate still shows verifiable, a re-verify converges it);
-          * the node write FAILS OPEN (`_verify_corpus`) so a neo4j hiccup never BLOCKS
-            the verify — but that leaves the envelope `verified=true` over an unverified
-            node. That gap is NOT silent: it is REPORTED via `node_stamped=False`, and a
-            re-verify converges the two (the envelope write is idempotent and
-            `mark_verified` re-runs).
-
-        Status stays `validated` — verify is a flag flip, not a lifecycle transition, and
-        does NOT move the node into the trusted MCP recall partition (that is the promote
-        action's manual-PR reseed). Idempotent for a non-validated env (a no-op hold with
-        `node_stamped=False`; a mis-routed verify never mutates)."""
+        Flips `verified → true` on BOTH the landed neo4j node AND the candidate-store envelope, and
+        RETURNS whether the node write actually landed (`node_stamped`) so the caller can surface a
+        re-verify prompt. The node is stamped FIRST: a crash between the two writes is the SAFE
+        direction, and the node write FAILS OPEN so a neo4j hiccup never blocks the verify — the
+        resulting gap is REPORTED rather than silent, and a re-verify converges the two. Status
+        stays `validated`; verify is a flag flip, not a lifecycle transition, and does NOT move the
+        node into the trusted MCP recall partition.
+        """
         if env.status != CandidateStatus.VALIDATED:
             return self._hold(env, "not_validated"), False
         node_stamped = await self._verify_corpus(env)
@@ -972,16 +817,13 @@ class PromotionScheduler:
         )
 
     async def apply_promote(self, env: CandidateEnvelope) -> CandidateDecision:
-        """PROMOTE a verified learning node to the terminal `promoted` state (Phase-3
-        inbox PROMOTE action) — the store-side move `ReviewInbox.promote` delegates to
-        AFTER it has emitted the MCP-format YAML. Requires `validated` + `verified`
-        (fail-loud hold otherwise) and moves `validated → promoted` so the candidate
-        drops out of the inbox validated listing (optimistic — the actual `learning→mcp`
-        reseed happens when the human merges the emitted YAML PR; if they never do, the
-        node stays `source='learning'`/excluded and the candidate stays `promoted`).
+        """PROMOTE a verified learning node to the terminal `promoted` state (Phase-3).
 
-        Purely a candidate-store transition: it does NOT touch neo4j (the node stays
-        `source='learning'` until the manual PR reseeds it) and does NOT touch git."""
+        The store-side move `ReviewInbox.promote` delegates to AFTER it has emitted the MCP-format
+        YAML. Requires `validated` + `verified` (fail-loud hold otherwise). Purely a candidate-store
+        transition: it touches neither neo4j nor git, so the node stays `source='learning'` and
+        excluded until a human merges the emitted YAML PR.
+        """
         if env.status != CandidateStatus.VALIDATED:
             return self._hold(env, "not_validated")
         if not env.verified:
@@ -996,23 +838,15 @@ class PromotionScheduler:
     # -- helpers --------------------------------------------------------------
 
     def _reusable_drift(self, env: CandidateEnvelope) -> DriftStamp | None:
-        """`env.drift` when it is a golden-replay verdict still inside the re-check
-        window, else `None` meaning "pay for a real replay".
+        """`env.drift` when it is a golden-replay verdict still inside the re-check window.
 
-        Two things are load-bearing here, both of them fail-SAFE in the direction of
-        spending money rather than fabricating a verdict:
-
-          * The window is `min(replay_recheck_interval_seconds,
-            drift_freshness_seconds)`. The policy documents the invariant that the
-            re-check interval sits inside the trust window; this ENFORCES it at the
-            point of use, so a misconfiguration can only make the scheduler probe more
-            often — never make it reuse a verdict for longer than its own policy says
-            that verdict may be believed.
-          * `now` is parsed from the injected clock, and an unparseable/naive clock
-            yields `None` (`_is_fresh` requires both sides aware). That degrades to the
-            pre-rate-limit behaviour — always replay — which is correct but expensive,
-            rather than to "everything looks fresh", which would silently disable the
-            structural gate."""
+        Else `None`, meaning "pay for a real replay". Both details fail SAFE in the direction of
+        spending money rather than fabricating a verdict: the window is
+        `min(replay_recheck_interval_seconds, drift_freshness_seconds)`, enforced at the point of
+        use so a misconfiguration can only make the scheduler probe MORE often; and an unparseable
+        or naive clock yields `None`, degrading to always-replay rather than to "everything looks
+        fresh", which would silently disable the structural gate.
+        """
         now = _parse_clock(self._clock())
         if now is None:
             return None
@@ -1034,8 +868,10 @@ class PromotionScheduler:
             return None
 
     def _blueprint_intent(self, env: CandidateEnvelope) -> str | None:
-        """The learned blueprint intent for the verbose promote/land span (entity-
-        bearing, D25-gated). `None` for a non-blueprint / payload-less env."""
+        """The learned blueprint intent for the verbose promote/land span (entity-bearing, D25-gated).
+
+        `None` for a non-blueprint or payload-less env.
+        """
         payload = env.payload
         intent = payload.get("intent") if isinstance(payload, dict) else None
         return intent if isinstance(intent, str) and intent else None
@@ -1081,17 +917,14 @@ class PromotionScheduler:
         )
 
     def _landing_gate_blocks(self) -> bool:
-        """§4 dormant gate: `require_landing` is set but NO landing writer is wired. A
-        blueprint can PASS the replay gate but must not become `validated` when there is
-        nowhere to land it (it would be `validated` yet never recallable — the silent
-        gap). True ⇒ HOLD (`landing_unavailable`). With a real writer present this is
-        False, and `_land_and_promote` runs the land-then-status sequence instead.
+        """§4 dormant gate: `require_landing` is set but NO landing writer is wired.
 
-        Consulted ONLY on the human-approve edge since plan §4. The auto path routes to
-        `in_review`, which lands nothing, so gating it here would park candidates at
-        `candidate` with a reason about a landing nobody asked for. A deployment with no
-        writer therefore fills its inbox and refuses each approve honestly (503), which
-        is a visible degrade rather than a silent stall."""
+        A blueprint can PASS the replay gate but must not become `validated` when there is nowhere
+        to land it — it would be `validated` yet never recallable. True ⇒ HOLD
+        (`landing_unavailable`). Consulted ONLY on the human-approve edge: the auto path lands
+        nothing, so gating it there would park candidates with a reason about a landing nobody asked
+        for. A deployment with no writer fills its inbox and refuses each approve honestly (503).
+        """
         return self._require_landing and self._landing_writer is None
 
     async def _land_and_promote(
@@ -1105,38 +938,20 @@ class PromotionScheduler:
     ) -> CandidateDecision:
         """The SINGLE land-then-status sequence for the `→ validated` edge (§3.1).
 
-        Since plan §4 there is exactly ONE caller — `apply_human_decision`'s approve —
-        because the auto path stops at `in_review`. Every invariant below is unchanged and
-        is now enforced on the only edge that can produce a recallable artifact.
-
         Order is LOAD-BEARING: land into the neo4j retrieval corpus FIRST, then write
-        `status = validated` to the candidate store. Invariant "not landed ⇒ not
-        validated":
-          * a landing failure → HOLD `landing_failed`; the candidate is NOT written
-            `validated` (it stays `candidate`/`in_review`, never a half state), so the
-            next cycle retries;
-          * a crash BETWEEN land and the status write is safe — the next cycle
-            re-lands idempotently (MERGE by the deterministic id) then writes status.
+        `status = validated`. Invariant "not landed ⇒ not validated" — a landing failure HOLDs
+        `landing_failed` and never writes a half state, and a crash between the two is safe because
+        the next cycle re-lands idempotently (MERGE by the deterministic id) then writes status.
 
-        The status write is a plain store upsert, not a compare-and-set: S9 assumes a
-        SINGLE promotion writer (the cron scan and the human-approve path both serialize
-        through this scheduler over the shared store, §7.2), so no CAS is needed; a
-        second concurrent writer is out of scope (and would need one).
-
-        The fresh `drift` is stamped on the env BEFORE landing so the landed seed's
-        `drift_status`, the crash-retry re-land, and the status write all carry the SAME
-        fresh stamp (review S1 / §8.1) — never the stale pre-promotion `unchecked`/
-        `suspect` value.
-
-        The entity strip runs on THIS edge (D17, §3.3): the human path already stripped
-        (Guard 2), the auto path only CHECKED `entity_scan` was clean — so strip here
-        (idempotent) makes BOTH edges land an entity-free seed. *forbidden_spans* (the
-        spans S5 identified, captured by the caller BEFORE the strip) drive the writer's
-        last-gate defense, which RAISES if the strip regressed and let one through.
-
-        *verified* (Phase-3) is the human-approval flag stamped onto BOTH the landed
-        neo4j node AND the candidate-store envelope so the two never diverge: the
-        human-approve path passes `verified=True`, the auto path `verified=False`."""
+        The status write is a plain upsert, not a CAS: S9 assumes a SINGLE promotion writer, since
+        the cron scan and the human-approve path both serialize through this scheduler over the
+        shared store. The fresh `drift` is stamped BEFORE landing so the seed, the crash-retry
+        re-land and the status write all carry the SAME stamp. The entity strip runs on THIS edge
+        too (idempotent), and *forbidden_spans* — the spans S5 identified, captured by the caller
+        BEFORE the strip — drive the writer's last-gate defense, which RAISES if the strip
+        regressed. *verified* is stamped onto BOTH the node and the envelope so the two never
+        diverge.
+        """
         from_status = env.status
         # Stamp the fresh drift BEFORE landing so the landed seed carries it (§8.1);
         # strip is idempotent (the human path already stripped at Guard 2).
@@ -1178,35 +993,17 @@ class PromotionScheduler:
     async def _retract_corpus(
         self, env: CandidateEnvelope, *, status: str, drift_status: str
     ) -> None:
-        """FAIL-OPEN corpus write-back (S9-activation Slice 3, §8.6): stamp the landed
-        neo4j node's recall-eligibility (`status`/`drift_status`) via the landing
-        writer, keyed by the same deterministic landing id.
+        """FAIL-OPEN corpus write-back: stamp the landed node's recall-eligibility (§8.6).
 
-        The store transition is SOURCE-OF-TRUTH and must SUCCEED even if this write-back
-        fails, so EVERY exception is swallowed and logged LOUDLY (never re-raised) — a
-        demote/reject/correction is never blocked by a neo4j hiccup. The recall filter's
-        coalesce default is fail-OPEN for an UN-stamped node (a node that never got
-        stamped still reads `validated`/`clean` ⇒ recallable), so the filter alone is NOT
-        a backstop for a FAILED demote write-back. Convergence is provided by the
-        RE-ASSERTS instead, which fire on EVERY EXAMINATION of the artifact:
-          * a landed-type artifact in the `candidate` scan re-stamps its node with its
-            CURRENT status/drift every `_advance_candidate` pass (the demote direction);
-          * a still-validated blueprint's clean `_recheck_validated` re-stamps it
-            `validated`/`clean` (the self-heal direction).
-        Neither is keyed on the drift STAMP — a re-assert whose trigger a later write can
-        erase is not a convergence guarantee (see the comment in `_advance_candidate`).
-        Both are also outside the golden-replay rate limit: a re-assert is one idempotent
-        Cypher, and only the warehouse probe is expensive enough to ration.
-
-        "Every examination" is once per cycle while the backlog fits in `scan_limit`, and
-        once per rotation period beyond that (the scan is ordered by `last_scanned_at`, so
-        the window round-robins rather than pinning the oldest rows). So a transient
-        failure at demote is retried on each subsequent examination and converges the node
-        to non-recallable once neo4j recovers.
-
-        No writer wired (the dormant Slice-1 state, `landing_writer is None`) ⇒ nothing
-        ever landed ⇒ nothing to retract ⇒ a no-op. Idempotent for a never-landed /
-        already-retracted node (the writer's MATCH-by-id matches nothing)."""
+        The store transition is SOURCE-OF-TRUTH and must succeed even if this fails, so EVERY
+        exception is swallowed and logged LOUDLY. The recall filter's coalesce default is fail-OPEN
+        for an un-stamped node, so the filter is NOT a backstop for a FAILED demote write-back;
+        convergence comes from the RE-ASSERTS, which fire on every EXAMINATION of the artifact (the
+        demote direction from `_advance_candidate`, the self-heal direction from a clean
+        `_recheck_validated`) and are deliberately NOT keyed on the drift STAMP — a re-assert whose
+        trigger a later write can erase is not a convergence guarantee. Both sit outside the replay
+        rate limit: a re-assert is one idempotent Cypher. No writer wired ⇒ nothing landed ⇒ no-op.
+        """
         if self._landing_writer is None:
             return
         try:
@@ -1229,20 +1026,13 @@ class PromotionScheduler:
     async def _stamp_corpus_status(self, env: CandidateEnvelope, status: str) -> None:
         """FAIL-OPEN `learning_corpus` artifact status write-back (PriorArt Slice 2).
 
-        Called ONLY on the two terminal edges (reject, retract). Keyed by the S6
-        `canonical_key`, which is the artifact's identity — no dedup verdict means S6
-        never ran, so there is no artifact and nothing to stamp (a clean no-op, not an
-        error: a human-approved candidate that skipped S6 is a supported path, OQ-3).
-
-        Fail-open for the same reason `_retract_corpus` is: the candidate-store
-        transition is source of truth and a human's reject must never be blocked by a
-        Couchbase hiccup. The cost of a lost stamp is bounded and self-correcting in the
-        direction that matters — the artifact stays visible as prior art, so the worst
-        case is one extra candidate reaching a human, not a bad landing. Unlike the
-        neo4j write-back there is deliberately NO periodic re-assert: the terminal edges
-        are one-shot human actions with no recurring scan behind them, and inventing a
-        convergence loop for a review-noise-grade failure would be more machinery than
-        the risk justifies. The warning is the recovery path."""
+        Called ONLY on the two terminal edges (reject, retract), keyed by the S6 `canonical_key`:
+        no dedup verdict means S6 never ran, so there is no artifact and nothing to stamp — a clean
+        no-op, since a human-approved candidate that skipped S6 is a supported path. Fail-open
+        because the candidate-store transition is source of truth. Unlike the neo4j write-back there
+        is deliberately NO periodic re-assert: the terminal edges are one-shot human actions, and
+        the worst case of a lost stamp is one extra candidate reaching a human.
+        """
         if self._corpus_status is None:
             return
         key = self._canonical_key(env)
@@ -1263,15 +1053,13 @@ class PromotionScheduler:
             )
 
     async def _verify_corpus(self, env: CandidateEnvelope) -> bool:
-        """FAIL-OPEN corpus verify write-back (Phase-3): flip the landed node's
-        `verified` flag true via the landing writer, keyed by the deterministic landing
-        id. RETURNS whether a landed node was actually stamped — False when no writer is
-        wired, no node was landed, OR the write failed — so `apply_verify` can report a
-        re-verify prompt (`node_stamped`). The envelope write in `apply_verify` is
-        source-of-truth and must succeed even if this fails, so every exception is
-        swallowed + logged (never re-raised) — a neo4j hiccup never blocks a human verify.
-        No writer wired (dormant) ⇒ nothing landed ⇒ False. Idempotent for a never-landed
-        node (the MATCH-by-id misses → False)."""
+        """FAIL-OPEN corpus verify write-back (Phase-3): flip the landed node's `verified` flag.
+
+        RETURNS whether a landed node was actually stamped — False when no writer is wired, no node
+        was landed, OR the write failed — so `apply_verify` can report a re-verify prompt. The
+        envelope write is source-of-truth, so every exception is swallowed and logged: a neo4j
+        hiccup never blocks a human verify.
+        """
         if self._landing_writer is None:
             return False
         try:
@@ -1288,9 +1076,11 @@ class PromotionScheduler:
             return False
 
     async def _deps_resolved(self, env: CandidateEnvelope) -> bool:
-        """True iff every `depends_on` ref resolves (§11.6). No deps ⇒ trivially
-        resolved. Deps present but NO resolver injected ⇒ fail-closed (unresolved):
-        never promote a candidate whose dependencies cannot be verified."""
+        """True iff every `depends_on` ref resolves (§11.6). No deps ⇒ trivially resolved.
+
+        Deps present but NO resolver injected ⇒ fail-closed: never promote a candidate whose
+        dependencies cannot be verified.
+        """
         if not env.depends_on:
             return True
         if self._deps is None:
@@ -1303,34 +1093,16 @@ class PromotionScheduler:
     async def _corroboration(self, env: CandidateEnvelope) -> float:
         """How much evidence there is that this idea is worth a human's time (plan §4).
 
-        `max(hit_count, 1) + recurrence_weight * recurrence_count`.
-
-        **The floor of 1 is the fix for a hole the threshold change opens, not a
-        loosening.** `_read_hit_count` returns 0 when S6 could not mint a `canonical_key`
-        (no `canonical_ast_norm`, or malformed hard-key inputs), so an unkeyable candidate
-        reads 0 sightings. At the old T=3 that was indistinguishable from "not corroborated
-        yet" and the candidate held; at T=1 it would hold FOREVER — the one subclass of
-        candidate that could never reach a human, which is the exact bug this slice
-        exists to remove. The candidate in hand IS one sighting; a keyed first sighting
-        reads 1 only because `_seed_on_insert` wrote that 1 on its behalf. The floor makes
-        the two agree.
-
-        It changes no outcome at any threshold above 1, and the reason is one step deeper
-        than `max(0, 1) = 1 < 2`: the floor can only ever bind on a candidate with NO
-        `canonical_key`, because a keyed artifact is seeded at `hit_count = 1` and the
-        counter never decreases. And an unkeyable candidate reads zero on BOTH counters —
-        `_read_recurrence_count` keys off the same missing `canonical_key` — so the floor
-        cannot combine with a recurrence term to manufacture corroboration either. That
-        second half is unexercised today (the weight is 0.0) and is the half that will
-        matter on the day it is turned up.
-
-        **The recurrence term is DORMANT at the shipped weight of 0.0** and is read
-        anyway, so the read path is exercised from the first deploy rather than being
-        switched on cold years later. With no reader wired it contributes 0 regardless.
-
-        A `float`, not an `int`: `recurrence_weight` is fractional by design (a paraphrase
-        is weaker evidence than a byte-identical re-derivation), so an int return would
-        silently floor away exactly the tuning the weight exists to express."""
+        `max(hit_count, 1) + recurrence_weight * recurrence_count`. THE FLOOR OF 1 closes a hole the
+        threshold change opens rather than loosening anything: `_read_hit_count` returns 0 when S6
+        could not mint a `canonical_key`, and at T=1 such a candidate would hold FOREVER — the one
+        subclass that could never reach a human. It changes no outcome above 1, because a keyed
+        artifact is seeded at `hit_count = 1` and the counter never decreases, and an unkeyable
+        candidate reads zero on BOTH counters so the floor cannot combine with a recurrence term.
+        The recurrence term is DORMANT at the shipped weight of 0.0 and is read anyway, so the path
+        is exercised from the first deploy. A `float`, not an `int`: `recurrence_weight` is
+        fractional by design, and an int return would floor away the tuning it exists to express.
+        """
         hits = await self._read_hit_count(env)
         weight = self._policy.recurrence_weight
         if weight <= 0.0:
@@ -1338,9 +1110,10 @@ class PromotionScheduler:
         return max(hits, 1) + weight * await self._read_recurrence_count(env)
 
     async def _read_hit_count(self, env: CandidateEnvelope) -> int:
-        """Read `hit_count` from the LANDED corpus artifact via the injected
-        reader, keyed by the S6 `canonical_key`. No dedup verdict yet (S6 not run)
-        ⇒ no canonical_key ⇒ count 0 — see `_corroboration` for what that means now."""
+        """Read `hit_count` from the LANDED corpus artifact, keyed by the S6 `canonical_key`.
+
+        No dedup verdict yet (S6 not run) ⇒ no canonical_key ⇒ count 0 — see `_corroboration`.
+        """
         if env.dedup is None or not env.dedup.canonical_key:
             return 0
         return await self._hit_counts.hit_count(env.dedup.canonical_key)
@@ -1348,10 +1121,11 @@ class PromotionScheduler:
     async def _read_recurrence_count(self, env: CandidateEnvelope) -> int:
         """The SOFT paraphrase count for this candidate's artifact, or 0.
 
-        Fail-soft on ANY reader failure: this is a dormant secondary signal, and a corpus
-        hiccup must not be able to hold a candidate that its PRIMARY count already
-        corroborates. (The hard count is deliberately not treated this way — it can only
-        raise the sum, so swallowing its failure would be swallowing the gate.)"""
+        Fail-soft on ANY reader failure: this is a dormant secondary signal, and a corpus hiccup
+        must not hold a candidate its PRIMARY count already corroborates. The hard count is
+        deliberately not treated this way — it can only raise the sum, so swallowing its failure
+        would be swallowing the gate.
+        """
         if self._recurrence_counts is None:
             return 0
         if env.dedup is None or not env.dedup.canonical_key:
@@ -1382,9 +1156,10 @@ class PromotionScheduler:
     # -- the daemon loop ------------------------------------------------------
 
     async def run_forever(self, *, sleep) -> None:
-        """Periodic loop (the entrypoint). *sleep* is injected (`asyncio.sleep`) so
-        it is unit-drivable. A transient error must not kill the daemon — log +
-        retry next interval (sweeper parity)."""
+        """Periodic loop (the entrypoint); *sleep* is injected so it is unit-drivable.
+
+        A transient error must not kill the daemon — log and retry next interval.
+        """
         while True:
             try:
                 await self.run_once()

@@ -1,45 +1,14 @@
-"""answer_table.py — dormant hook seams for the two answer-table failure modes.
+"""Dormant hook seams for the two answer-table failure modes: a designated
+`blueprint_id` that resolved to no successful run this turn, and a resolved query
+reading the session-scoped `scratch` database that will stop working at its TTL.
 
-`answerWithTable` designates the query the UI pages as the answer
-(`composite/answer_with_table.py`). Two conditions were identified as real but
-deliberately left unhandled, because handling either properly is a larger piece of
-work than the tool itself. Rather than leave them as comments, each gets a named
-seam so the handling can be added later WITHOUT reopening the loop:
-
-  UNRESOLVED DESIGNATION
-      The model designated `blueprint_id=X`, but X names no blueprint that ran
-      successfully THIS turn. There is nothing to resolve to a pageable query, so
-      `answer_sql` stays null and the user gets prose with no table. A hook may
-      supply a replacement query (for example by looking X up in the corpus and
-      rendering it against the turn's slot bindings).
-
-  EPHEMERAL DESIGNATION
-      The resolved query references the session-scoped `scratch` database — the
-      D93 materialization area a composed blueprint writes into. It is real and
-      correct right now, and it STOPS WORKING when the scratch TTL lapses, at which
-      point paging returns an ordinary query error and the user's table disappears
-      mid-scroll. A hook may supply a durable replacement (for example by
-      re-materializing the answer somewhere with a longer life).
-
-CONTRACT (D72, docs/12-extensibility.md "What hooks may never do"):
-
-  * A hook NEVER receives the JWT, the raw scope token, or the raw session id. The
-    event carries a HASHED session id only, so a hook cannot key anything to a real
-    session identifier or forward one.
-  * A hook NEVER sees cell values — an event carries SQL and identifiers, never
-    result rows.
-  * A hook may only REPLACE the designated query string. It cannot bypass column
-    scope: whatever it returns is executed through the same scope-enforced
-    `POST /query/page` path under the caller's own credentials, so a hook cannot
-    widen access to a column the caller could not already read.
-
-DEGRADE-NOT-FAIL: a hook that raises is logged and skipped, and the runtime
-continues exactly as if it had returned `None`. An extension point must never be
-able to break a turn.
-
-DORMANT BY DEFAULT: `AnswerTableHooks()` starts empty and every `resolve_*` call
-returns `None` on an empty registry without touching anything. `app.py` does not
-wire a populated registry — activating a hook is a deliberate registration.
+CONTRACT (D72, docs/12-extensibility.md): a hook never receives the JWT, the raw scope
+token, or the raw session id (the event carries a HASHED id only), never sees cell
+values, and may only REPLACE the designated query string — the replacement executes
+through the same scope-enforced `POST /query/page` path under the caller's own
+credentials, so a hook cannot widen access to a column the caller could not read. A hook
+that raises is logged and skipped: an extension point must never break a turn. Dormant
+by default — an empty registry returns `None` from every `resolve_*` without doing work.
 """
 
 from __future__ import annotations
@@ -72,10 +41,8 @@ __all__ = [
 class AnswerTableEvent:
     """What a hook is told about one answer-table designation.
 
-    D5: `session_id_hash` is a HASH, never the raw session id, and there is no JWT
-    or scope token field at all — a hook cannot capture credentials it is never
-    given. `blueprint_id` and `sql` are model/runtime-authored identifiers and
-    query text; neither carries warehouse cell values.
+        D5: `session_id_hash` is a HASH, never the raw session id, and there is no JWT or
+        scope-token field at all. `blueprint_id` and `sql` carry no warehouse cell values.
     """
 
     session_id_hash: str
@@ -91,17 +58,17 @@ class AnswerTableEvent:
 class UnresolvedDesignationHook(Protocol):
     """Called when a `blueprint_id` designation resolved to nothing.
 
-    Return a replacement query to page, or `None` to leave the answer table absent.
+        Return a replacement query to page, or `None` to leave the answer table absent.
     """
 
     def __call__(self, event: AnswerTableEvent) -> str | None: ...
 
 
 class EphemeralDesignationHook(Protocol):
-    """Called when the resolved query references the session-scoped `scratch`
-    database and will therefore stop working at TTL.
+    """Called when the resolved query references the session-scoped `scratch` database
+        and will therefore stop working at TTL.
 
-    Return a durable replacement query, or `None` to accept the ephemeral one.
+        Return a durable replacement query, or `None` to accept the ephemeral one.
     """
 
     def __call__(self, event: AnswerTableEvent) -> str | None: ...
@@ -110,12 +77,9 @@ class EphemeralDesignationHook(Protocol):
 def references_scratch(sql: str | None) -> bool:
     """True iff *sql* appears to read from the scratch database.
 
-    Deliberately a cheap textual check on `scratch.` rather than a sqlglot parse:
-    this only decides whether to FIRE AN OBSERVATIONAL HOOK, never whether to run
-    or reject a query, so a false positive costs one no-op hook call and a false
-    negative costs nothing that was not already the status quo. Parsing here would
-    duplicate `query_page.build_page_sql`'s work on every designation to answer a
-    question with no safety weight.
+        A cheap textual check on `scratch.`, not a parse: it only decides whether to fire an
+        OBSERVATIONAL hook, never whether to run or reject a query, so a false positive
+        costs one no-op hook call and a false negative costs nothing.
     """
     return bool(sql) and f"{SCRATCH_DATABASE}." in sql.lower()
 
@@ -123,9 +87,8 @@ def references_scratch(sql: str | None) -> bool:
 class AnswerTableHooks:
     """Registry for the two answer-table hook points. Empty (dormant) by default.
 
-    Hooks run in registration order; the FIRST non-`None` return wins and the rest
-    are skipped — so an earlier, more specific handler takes precedence over a
-    later fallback, and registration order is the priority order.
+        Hooks run in registration order and the FIRST non-`None` return wins — registration
+        order IS the priority order.
     """
 
     def __init__(

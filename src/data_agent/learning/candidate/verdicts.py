@@ -1,22 +1,11 @@
-"""Envelope verdict sub-records — the frozen wire format the write-router stages
-stamp onto a `CandidateEnvelope` (Wave-0 contract freeze, D102).
+"""Envelope verdict sub-records — the frozen wire format the write-router stages stamp on.
 
-Each verdict is written by exactly ONE stage and read by others; no stage mutates
-another stage's field (the D102 additivity rule). The three verdicts here map to
-the three additive envelope fields:
-
-  * `LeakageVerdict`  → `envelope.entity_scan` — S5 leakage gate WRITES (Contract B).
-                        S3 seeds a preliminary `{result:"pending"}` self-check dict;
-                        S5 overwrites it with `LeakageVerdict(...).to_doc()`. The
-                        envelope field stays a plain dict so the S3 `pending` state
-                        (whose `result` is NOT a settled verdict) is representable —
-                        this dataclass freezes the SETTLED S5 shape S5 writes.
-  * `DedupVerdict`    → `envelope.dedup` — S6 dedup WRITES (Contract C).
-  * `DriftStamp`      → `envelope.drift` — S9 scheduler WRITES (Contract E).
-
-All are pure frozen value objects with `to_doc`/`from_doc` round-trip fidelity so a
-fixture (or a persisted candidate) survives a serialize → deserialize cycle
-unchanged. No stage logic lives here.
+Each verdict is written by exactly ONE stage and read by others; no stage mutates another
+stage's field (the D102 additivity rule). `LeakageVerdict` → `entity_scan` (S5 writes; S3
+seeds a `{result:"pending"}` self-check dict, which is why the envelope field stays a plain
+dict — this dataclass freezes only the SETTLED shape). `DedupVerdict` → `dedup` (S6).
+`DriftStamp` → `drift` (S9). All are pure frozen value objects with `to_doc`/`from_doc`
+round-trip fidelity; no stage logic lives here.
 """
 
 from __future__ import annotations
@@ -37,8 +26,11 @@ _SETTLED_RESULTS: frozenset[str] = frozenset({"pass", "reroute", "quarantine", "
 
 @dataclass(frozen=True)
 class EntityHit:
-    """One entity the leakage scan found in the payload. `span` is entity-bearing
-    (audit-store / reviewer context only — stripped before any promotion, D17)."""
+    """One entity the leakage scan found in the payload.
+
+    `span` is entity-bearing — audit-store and reviewer context only, stripped before any
+    promotion (D17).
+    """
 
     field: str  # where in the payload it was found
     kind: str  # employee_code | dept_code | person | date | region | ...
@@ -75,9 +67,10 @@ class LeakageVerdict:
 
     @classmethod
     def is_settled(cls, doc: dict[str, Any]) -> bool:
-        """True iff *doc* is a SETTLED S5 verdict (its `result` is one of the four
-        settled outcomes), False for the S3 `pending` self-check sentinel. S5/S7
-        call this BEFORE `from_doc` to distinguish the two `entity_scan` shapes."""
+        """True iff *doc* is a SETTLED S5 verdict, False for the S3 `pending` sentinel.
+
+        S5/S7 call this BEFORE `from_doc` to distinguish the two `entity_scan` shapes.
+        """
         return doc.get("result") in _SETTLED_RESULTS
 
     @classmethod
@@ -107,26 +100,17 @@ class LeakageVerdict:
 class DedupVerdict:
     """The D48 dedup verdict, serialized into `envelope.dedup`.
 
-    Three layers now produce one, and the `layer` tag says which — the actions are not
-    interchangeable across them:
+    Three layers produce one and the `layer` tag says which, because the actions are not
+    interchangeable across them: `hard` is the frozen canonical key over the corpus bucket,
+    race-safe by construction, and the ONLY layer that may emit `increment`; `structural` is the
+    loose cross-authoring-path key through the `PriorArtIndex`, deterministic but reaching
+    artifacts the loop does not own, emitting `redundant_with_canon` or `merge`; `soft` is
+    embedding near-miss adjudication — a hint, never a drop.
 
-      * `hard`       — the frozen SHA-256 canonical key over the `learning_corpus`
-                       bucket. Race-safe by construction (identical semantics ⇒
-                       identical key), which is what makes `increment` a sound
-                       cross-session counter. Only this layer emits `increment`.
-      * `structural` — the LOOSE cross-authoring-path key
-                       (`runtime/blueprint/structural_key.py`) looked up through the
-                       `PriorArtIndex`. Deterministic like the hard key, but it reaches
-                       artifacts the loop does NOT own — the MCP canon. Emits
-                       `redundant_with_canon` (canon) or `merge` (learning tier).
-      * `soft`       — embedding near-miss adjudication. A hint, never a drop.
-
-    `redundant_with_canon` exists because `increment` is WRONG against the canon: the
-    hit count lives on an artifact in the learning corpus bucket, and a git-versioned
-    MCP blueprint has no such artifact and no count the loop is entitled to bump. The
-    candidate is dropped instead, and the verdict is what makes the drop COUNTABLE — a
-    high rate of it is a RETRIEVAL defect surfacing here (the agent is failing to recall
-    a blueprint it already has), not a learning-loop success.
+    `redundant_with_canon` exists because `increment` is WRONG against the canon: the hit count
+    lives on a learning-corpus artifact, and a git-versioned MCP blueprint has none. The candidate
+    is dropped instead, and the verdict is what makes the drop COUNTABLE — a high rate is a
+    RETRIEVAL defect surfacing here, not a learning-loop success.
     """
 
     canonical_key: str  # sha256 over (resolves, uses_rules, result_grain, canonical_ast_norm)
@@ -162,8 +146,10 @@ DriftStatus = Literal["clean", "suspect", "stale", "unchecked"]
 
 @dataclass(frozen=True)
 class DriftStamp:
-    """The D43 drift stamp, serialized into `envelope.drift`. Defaults to
-    `unchecked` (a pre-S9 candidate is drift-unchecked, never silent-eligible)."""
+    """The D43 drift stamp, serialized into `envelope.drift`.
+
+    Defaults to `unchecked`: a pre-S9 candidate is drift-unchecked, never silent-eligible.
+    """
 
     status: DriftStatus = "unchecked"
     last_drift_check_at: str | None = None

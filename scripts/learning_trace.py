@@ -1,24 +1,18 @@
 #!/usr/bin/env python
 """Reconstruct one session's journey through the learning loop from durable stores.
 
-Reads ONLY the durable Couchbase stores (session / candidate / audit) — no Phoenix,
-no Redis, no network beyond those stores. Gives a human ONE view of one session's
-lifecycle instead of correlating three daemon terminals by three different keys.
+Reads ONLY the durable Couchbase stores (session / candidate / audit) — no Phoenix, no
+Redis, no network beyond those stores. READ-ONLY: never writes, never creates a session
+doc. A missing session, a session that never entered the learning loop, a missing audit
+store, or missing evidence refs are all reported gracefully (no traceback).
 
-READ-ONLY: never writes, never creates a session doc. A missing session, a session
-that never entered the learning loop, a missing audit store, or missing evidence
-refs are all reported gracefully (no traceback).
-
-Optionally (`--export-phoenix`) it ALSO projects the reconstructed lifecycle into
-Phoenix as one synthetic per-session trace (project `learning-sessions`). That is
-additive: the text/JSON report still prints to STDOUT unchanged; the export's status
-messaging goes to STDERR, and any export failure degrades to a warning (never blanks
-the report). Since the 2026-07-15 D25 amendment the export is VERBOSE (entity-bearing:
-intent/template/resolves/rationale/quote) BY DEFAULT, because
-`LearningSettings.learning_trace_verbose` now defaults True (the effective posture is
-`--verbose-trace or learning_trace_verbose`). The `learning-sessions` project is
-therefore entity-bearing and MUST be access-controlled like the audit/session store;
-set `LEARNING_TRACE_VERBOSE=false` to restore the shape-only telemetry posture.
+`--export-phoenix` additionally projects the reconstructed lifecycle into Phoenix as one
+synthetic per-session trace (project `learning-sessions`); the STDOUT report is
+unchanged, export status goes to STDERR, and an export failure degrades to a warning.
+That export is VERBOSE (entity-bearing: intent/template/resolves/rationale/quote) by
+default, since the effective posture is `--verbose-trace or learning_trace_verbose` and
+the latter defaults True — so the `learning-sessions` project MUST be access-controlled
+like the audit/session store. Set `LEARNING_TRACE_VERBOSE=false` for shape-only.
 
 Usage:
     uv run python scripts/learning_trace.py <session_id> \

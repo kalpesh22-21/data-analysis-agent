@@ -1,13 +1,10 @@
 """InMemoryAuditStore — the Layer-1 `AuditStore` fake (§4.2).
 
-Dict-backed, same KV semantics as `CouchbaseAuditStore` (mint / snapshot / read, plus
-the judge's record_judgement / read_judgement) for Layer-1 wiring tests — including the
-S2 invariant test that the consumer path performs ZERO `snapshot` calls (this fake
-counts them so QA can assert it).
-
-`fail_judgements` exists because the judge's write is the ONE audit write whose failure
-changes behaviour (a record that did not land must not be followed by a drop). A fake
-that can only succeed cannot exercise that branch, and that branch is the mitigation.
+Dict-backed, same KV semantics as `CouchbaseAuditStore`, and it COUNTS `snapshot` calls so QA
+can assert the S2 invariant that the consumer path performs zero of them. `fail_judgements`
+exists because the judge's write is the ONE audit write whose failure changes behaviour — a
+record that did not land must not be followed by a drop — and a fake that can only succeed
+cannot exercise the branch that IS the mitigation.
 """
 
 from __future__ import annotations

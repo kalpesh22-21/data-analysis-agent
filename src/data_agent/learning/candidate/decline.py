@@ -1,52 +1,25 @@
-"""The two stamps a FAIL-TO-REVIEW candidate carries (`docs/decisions/
-learning-declined-candidate-review.md`).
+"""The two stamps a FAIL-TO-REVIEW candidate carries.
 
-A candidate the judge ruled worth extracting (`proceeded`) and that then died on the
-parameterization form — `totality_violation` / `rule_predicate_mismatch`, after its
-corrective rounds — is persisted for a human to complete instead of being discarded.
-Two things have to travel with it, and they answer two different questions:
+A candidate the judge ruled worth extracting that then died on the parameterization form is
+persisted for a human to complete. `DeclineBlock` says WHY it stopped, in the words the model
+was shown — that text IS the form, naming the uncovered predicates and any catalog rule that
+is that filter. `ValidationSnapshot` says WHAT the form will be re-checked against: the
+re-validation reads a `SessionSummary`, an in-process value dropped when extraction ends, and
+depending on the live session instead would make a review item stop being completable when
+that session's TTL expires.
 
-  * `DeclineBlock` — WHY it stopped, in the words the model was shown. The reviewer's
-    task is "fill in the form", and the decline detail is the form: it names the
-    predicates with no entry and any catalog rule that IS that filter. Without it the
-    review item says only that something was missing.
-  * `ValidationSnapshot` — WHAT the form will be re-checked against. Re-validation is
-    the same `to_candidate` contract the corrective turn ran, and that contract reads
-    the `SessionSummary` — an in-process value dropped the moment extraction ends. The
-    session itself is not a substitute: it is request-path state under its own TTL and
-    its own access boundary, and making the review queue depend on it would mean a
-    review item silently stops being completable when the session expires.
+THE SNAPSHOT IS MINIMAL BY DERIVATION: exactly what the re-validation path reads
+(`accepted_signal`, `sql_by_ref`, `user_id`, and the session/trace/content ids) and nothing
+else. `sql_by_ref` is stored as its OWN result and replayed through `answer_sqls`, because it
+maps a ref to a TUPLE and dedupes within a ref — replaying the resolved map is what
+reproduces it exactly, where re-deriving the tool trail would invite drift.
 
-**The snapshot is MINIMAL BY DERIVATION, not by taste.** It carries exactly what the
-re-validation path reads and nothing else:
-
-    to_candidate            `summary.accepted_signal` (D34 acceptance), and
-                            `sql_by_ref(summary)` for the D97 totality walk
-    GeneralizeStage         `sql_by_ref(ctx.summary)`
-    LeakageGateStage        `ctx.summary.user_id` (reroute scoping)
-    DedupStage → judge      `session_id` / `trace_id` / `content_hash`
-
-`sql_by_ref` is stored as its OWN result rather than as the two projections it is
-computed from, and the reconstruction replays it through `answer_sqls`. That is not a
-shortcut: `sql_by_ref` maps a ref to a TUPLE (one `answerWithTable` can designate
-several queries) and dedupes exact repeats within a ref, so replaying the resolved map
-through the one field that carries a (ref, sql) pair reproduces the map exactly —
-which is the property `test_snapshot_parity` pins. Re-deriving the tool trail would
-reproduce a shape nobody reads and invite it to drift from what validation walks.
-
-**Evidence is POINTERS ONLY.** `EvidenceRef.quote` is entity-bearing and lives in
-`learning_audit`, never on a candidate (D51/D17) — that rule is older than this slice
-and this slice does not get an exemption. What the snapshot keeps is `(turn_ref,
-tool_call_ref)`, which is what makes the citation resolvable against the live session,
-and re-validation's evidence gate (D31: at least one citation) is satisfied by the
-pointers with an explicit marker where the quote was. The gate that mattered — did the
-MODEL cite anything — was already answered when the candidate was emitted; nothing on
-the completion path can invent a citation, because the reviewer never supplies one.
-
-Both stamps are entity-BEARING in the same way the payload already is (SQL literals,
-predicate values), which is why they live in the access-controlled `learning_candidates`
-store (D101) and why the wire projection withholds the detail unless the persisted
-leakage verdict is a pass (`inbox/models.py::InboxItem.decline_view`).
+EVIDENCE IS POINTERS ONLY: `EvidenceRef.quote` is entity-bearing and lives in
+`learning_audit`, never on a candidate (D51/D17). The pointers keep the citation resolvable
+and satisfy D31's gate with an explicit marker where the quote was; nothing on the completion
+path can invent a citation, because the reviewer never supplies one. Both stamps are
+entity-BEARING like the payload, which is why they live in the access-controlled store and
+why the wire projection withholds the detail unless the leakage verdict is a pass.
 """
 
 from __future__ import annotations
@@ -63,9 +36,11 @@ QUOTE_WITHHELD = "(quote withheld from the candidate store — see learning_audi
 
 
 def _text(value: Any, default: str = "") -> str:
-    """NORMALIZE, do not trust — every field below is rehydrated JSON from a store
-    humans can write through cbq. A non-string reads as absent rather than reaching a
-    reviewer's browser as a repr, mirroring `CandidateEnvelope.from_doc::route_reason`."""
+    """NORMALIZE, do not trust.
+
+    Every field below is rehydrated JSON from a store humans can write through cbq, so a
+    non-string reads as absent rather than reaching a reviewer's browser as a repr.
+    """
     return value if isinstance(value, str) else default
 
 
@@ -73,13 +48,11 @@ def _text(value: Any, default: str = "") -> str:
 class DeclineBlock:
     """The terminal decline of a merit-passed candidate, as the model saw it.
 
-    `detail` is the extractor's own hint text, ALREADY SANITIZED at its build site
-    (`extractor/validation.py::_quoted`/`_flattened`: single-line literals, bounded,
-    quotes doubled) — this class re-renders nothing and must not, because the value of
-    the text is that it is exactly what the model was told.
-
-    `correction_history` is the messages that were actually sent, so "the model could
-    not fill the form" stays distinguishable from "the model was never asked twice"."""
+    `detail` is the extractor's own hint text, ALREADY SANITIZED at its build site — this class
+    re-renders nothing and must not, because the value of the text is that it is exactly what the
+    model was told. `correction_history` is the messages actually sent, so "the model could not
+    fill the form" stays distinguishable from "the model was never asked twice".
+    """
 
     reason: str
     detail: str = ""
@@ -98,10 +71,10 @@ class DeclineBlock:
     def from_doc(cls, doc: Any) -> DeclineBlock | None:
         """Rehydrate, or `None` when the stored shape is not one of ours.
 
-        `None` rather than a coerced empty block, because absent and "present but
-        unreadable" must not collapse: the inbox keys the whole review-item rendering on
-        this field being present, and a block with no reason would put a row in front of
-        a reviewer with nothing to act on."""
+        `None` rather than a coerced empty block, because absent and "present but unreadable" must
+        not collapse: the inbox keys the whole review-item rendering on this field being present, and
+        a block with no reason would put a row in front of a reviewer with nothing to act on.
+        """
         if not isinstance(doc, dict):
             return None
         reason = _text(doc.get("reason"))
@@ -140,19 +113,16 @@ class EvidencePointer:
 class ValidationSnapshot:
     """Everything re-validation + the write-router stages read off the session.
 
-    INVARIANT, relied on by `from_doc`: a snapshot that was legitimately WRITTEN always
-    carries a non-empty `sql_by_ref` and at least one `evidence` pointer. Both follow
-    from the route's entry conditions — a session with no resolvable SQL declines
-    `unrewritable_sql`, and a candidate with no readable citation declines `no_evidence`,
-    and neither of those reasons routes to review. An empty one read back from the store
-    is therefore damage, not a legitimate shape, and is reported as missing.
+    INVARIANT relied on by `from_doc`: a legitimately WRITTEN snapshot always carries a non-empty
+    `sql_by_ref` and at least one `evidence` pointer, because a session with no resolvable SQL
+    declines `unrewritable_sql` and a candidate with no readable citation declines `no_evidence`,
+    and neither reason routes to review. An empty one read back is damage, not a legitimate
+    shape.
 
-    Reconstructed into a `SessionSummary` by `to_summary`; the fields nothing on that
-    path reads (`turns`, `blueprint_usages`, `askuser_exchanges`, `failed_fixed_sql`,
-    `scope_ref`) are left EMPTY rather than snapshotted. An empty transcript is the
-    honest shape for a value that was never stored, and a reconstruction that filled
-    them with plausible content would be the one thing worse: a summary that looks
-    complete and is not."""
+    Reconstructed by `to_summary`; the fields nothing on that path reads are left EMPTY rather
+    than snapshotted. An empty transcript is the honest shape for a value never stored, and
+    filling it with plausible content would be worse: a summary that looks complete and is not.
+    """
 
     session_id: str
     user_id: str
@@ -179,8 +149,10 @@ class ValidationSnapshot:
         )
 
     def to_summary(self) -> SessionSummary:
-        """Rebuild the summary the validation path walks (see the module doc for why
-        the SQL comes back through `answer_sqls`)."""
+        """Rebuild the summary the validation path walks.
+
+        See the module docstring for why the SQL comes back through `answer_sqls`.
+        """
         return SessionSummary(
             session_id=self.session_id,
             user_id=self.user_id,
@@ -215,32 +187,20 @@ class ValidationSnapshot:
     def from_doc(cls, doc: Any) -> ValidationSnapshot | None:
         """Rehydrate, or `None` when the stored shape cannot be re-validated against.
 
-        **THE GUARD IS DERIVED FROM THE READS, not from the key that names the record.**
-        An earlier cut checked only `session_id` — the field that IDENTIFIES a snapshot —
-        and so a document whose `sql_by_ref` came back junk rehydrated into a snapshot
-        with an EMPTY map, which is exactly the outcome this docstring claimed to prevent:
-        re-validation then walks no SQL, declines `unrewritable_sql`, and tells a reviewer
-        that the accepted query — a query that ran live and answered a user — could not be
-        rewritten. That is a misdiagnosis blaming the model for a storage fault, and it is
-        unactionable: nothing the reviewer can type fixes a map that is not there. The
-        same argument applies to the citations, whose loss produces `no_evidence` on a
-        form that carries no citations to supply.
+        THE GUARD IS DERIVED FROM THE READS, not from the key that names the record. Checking only
+        `session_id` let a document whose `sql_by_ref` came back junk rehydrate with an EMPTY map:
+        re-validation then walks no SQL, declines `unrewritable_sql`, and tells a reviewer that a
+        query which ran live could not be rewritten — a misdiagnosis blaming the model for a storage
+        fault, and unactionable, because nothing the reviewer types fixes a map that is not there.
+        The same argument applies to the citations, whose loss produces `no_evidence` on a form that
+        carries none to supply.
 
-        So the three things the completion path actually READS are the three things
-        checked: the identity, the SQL it walks, and at least one citation. Any of them
-        unusable ⇒ MISSING ⇒ `CompletionUnavailableError` → 503, "this cannot be
-        checked", which is honest and already wired.
-
-        EMPTY IS UNUSABLE, and it cannot be a legitimate stored value: a candidate whose
-        session resolved no SQL declines `unrewritable_sql` at extraction and never routes
-        to review at all, and one whose citations were unreadable declines `no_evidence`
-        before the totality walk is ever reached. Both checks run BEFORE the two reasons
-        that route here, so every legitimately-persisted snapshot has a non-empty map and
-        at least one pointer. An empty one is damage by construction.
-
-        The per-FIELD normalization inside is unchanged and still tolerant (one unreadable
-        ref does not cost the others); what changed is that the aggregate is judged after
-        it."""
+        So the three things the completion path READS are the three things checked: the identity, the
+        SQL it walks, and at least one citation. Any of them unusable ⇒ MISSING ⇒
+        `CompletionUnavailableError` → 503. EMPTY is unusable and cannot be a legitimate stored
+        value. The per-FIELD normalization inside stays tolerant (one unreadable ref does not cost
+        the others); what changed is that the aggregate is judged after it.
+        """
         if not isinstance(doc, dict):
             return None
         session_id = _text(doc.get("session_id"))

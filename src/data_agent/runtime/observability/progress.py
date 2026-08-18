@@ -1,19 +1,11 @@
-"""ProgressEmitter — UI-facing progress events (D61, design §7).
+"""ProgressEmitter — UI-facing progress events (D61).
 
-Same stage boundaries as `tracing.py`'s spans, but coarser and PII-safe by
-construction: every emitted `ProgressEvent` carries only a human-readable
-`step` label plus a `shape` dict drawn from an explicit allowlist of
-non-sensitive fields (tool name, error code, budget window number, tool-call
-count) — never SQL text, never row/cell values, never the JWT or raw scope
-(design §7: "progress events... carry step/shape, not values").
-
-`ProgressEmitter.observe` is directly wire-compatible with
-`dispatch.tool_dispatcher.ToolObserver` and the same-shaped callback
-`loop.agent_loop.AgentLoop`'s `observer` constructor argument expects, so one
-`ProgressEmitter` instance can be handed to both. `combine_observers` fans a
-single `(event, payload)` call out to multiple observers (e.g. this emitter
-*and* a tracing-span-emitting observer) — the "one instrumentation, two
-consumers" property (design §7).
+Same stage boundaries as `tracing.py`'s spans but coarser and PII-safe by construction:
+a `ProgressEvent` carries a human-readable `step` plus a `shape` dict drawn from an
+explicit allowlist (tool name, error code, budget window, tool-call count) — never SQL
+text, never row or cell values, never the JWT or raw scope. `observe` is wire-compatible
+with both `ToolDispatcher`'s and `AgentLoop`'s observer argument; `combine_observers`
+fans one call out to several observers.
 """
 
 from __future__ import annotations
@@ -100,8 +92,8 @@ _PROGRESS_SUMMARY_EVENT = "tool_progress_summary"
 def to_progress_event(event: str, payload: dict[str, Any]) -> ProgressEvent | None:
     """Translate one observer `(event, payload)` call into a `ProgressEvent`.
 
-    Returns `None` for observer events that have no user-facing progress
-    label (e.g. internal-only telemetry) — callers should simply drop those.
+        Returns `None` for observer events that have no user-facing progress label; callers
+        simply drop those.
     """
     if event == _PROGRESS_SUMMARY_EVENT:
         # Value-rich, LLM-authored line → straight into `step` (verbatim, never
@@ -141,7 +133,7 @@ class ProgressEmitter:
             self._queue.put_nowait(progress_event)
 
     def close(self) -> None:
-        """Signal end-of-stream — call once the turn completes (design §7)."""
+        """Signal end-of-stream — call once the turn completes."""
         if self._closed:
             return
         self._closed = True
@@ -161,9 +153,8 @@ def combine_observers(
 ) -> Callable[[str, dict[str, Any]], None]:
     """Fan one `(event, payload)` call out to multiple observers.
 
-    "One instrumentation, two consumers" (design §7): `app.py` wires this
-    around a tracing-span-emitting observer and a `ProgressEmitter.observe`
-    together into a single callback passed to `ToolDispatcher`/`AgentLoop`.
+        `app.py` wires a tracing-span observer and a `ProgressEmitter.observe` together into
+        the single callback `ToolDispatcher`/`AgentLoop` accept.
     """
 
     def _combined(event: str, payload: dict[str, Any]) -> None:

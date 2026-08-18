@@ -1,12 +1,10 @@
-"""CandidateEnvelope — the persisted candidate record (D101, 05 §Candidate envelope).
+"""CandidateEnvelope — the persisted candidate record (D101).
 
-Held in the dedicated, access-controlled `learning_candidates` Couchbase store
-(D101), NOT the entity-free neo4j / vector recall stores: a pre-leakage-gate
-candidate may still be entity-bearing (in its payload) and is less-trusted until
-validated, so it needs the audit-store access posture, not an entity-free store.
-The candidate carries only `evidence_refs` (KV keys into `learning_audit`) — never
-the entity-bearing evidence quotes (D51/D17). S3 persists at `status=extracted`;
-nothing promotes it (that is Slice 9).
+Held in the dedicated, access-controlled `learning_candidates` bucket, NOT the entity-free
+neo4j / vector stores: a pre-leakage-gate candidate may still be entity-bearing in its payload
+and is less-trusted until validated, so it needs the audit-store access posture. The candidate
+carries only `evidence_refs` (KV keys into `learning_audit`) — never the entity-bearing quotes
+(D51/D17).
 """
 
 from __future__ import annotations
@@ -51,24 +49,23 @@ class CandidateStatus:
 
 
 def mint_candidate_id(content_hash: str, ordinal: int) -> str:
-    """Deterministic candidate key derived from the session `content_hash` +
-    ordinal, so a re-processed session (crash/redelivery before `done`) UPSERTS
-    the same candidate docs rather than duplicating them — best-effort idempotency
-    until the D48 `canonical_key` dedup lands in Slice 6."""
+    """Deterministic candidate key from the session `content_hash` + ordinal.
+
+    A re-processed session (a crash or redelivery before `done`) therefore UPSERTS the same
+    candidate docs rather than duplicating them.
+    """
     return f"candidate::{content_hash}::{ordinal}"
 
 
 def mint_review_candidate_id(content_hash: str, ordinal: int) -> str:
     """The same deterministic key for a DECLINED candidate routed to review.
 
-    A SEPARATE ordinal namespace, and it is load-bearing rather than tidy. Kept
-    candidates are minted from `enumerate(result.candidates)` while a decline's natural
-    ordinal is its index in the RAW emitted array — two different counts over the same
-    batch, so `candidate::<hash>::1` could name a kept candidate and a declined one at
-    once and the later `put` would silently overwrite the earlier. The prefix makes that
-    collision unexpressible. Supersede is unaffected either way — both stores sweep on
-    the `content_hash` FIELD, not on the key — so a re-processed session still replaces
-    its stale review item."""
+    A SEPARATE ordinal namespace, and load-bearing rather than tidy: kept candidates are minted
+    from `enumerate(result.candidates)` while a decline's natural ordinal is its index in the RAW
+    emitted array, so without the prefix one key could name both and the later `put` would
+    silently overwrite the earlier. Supersede is unaffected — both sweep on the `content_hash`
+    FIELD, not the key.
+    """
     return f"candidate::{content_hash}::review-{ordinal}"
 
 
@@ -345,18 +342,18 @@ def build_envelope(
     evidence_refs: tuple[str, ...],
     traceparent: str | None = None,
 ) -> CandidateEnvelope:
-    """Assemble the persisted envelope from an `ExtractedCandidate` + the minted
-    `evidence_refs` (the quotes are already snapshotted to `learning_audit`).
-    `entity_scan.result` is `pending` — the Slice-5 leakage gate is authoritative
-    (D58); S3 only records the extractor's preliminary self-check. *traceparent* (the
-    extracting consume span's W3C context) is carried forward so the scheduler's
-    promote/land spans continue the SAME session trace.
+    """Assemble the persisted envelope from an `ExtractedCandidate` + the minted `evidence_refs`.
 
-    THIS is the only place `session_signals` can be stamped (plan §4): the summary is an
-    in-process value that is dropped as soon as the extraction finishes, so the
-    session-quality axis of the inbox ranking is derivable here and nowhere later. Only
-    counts, one bool and one enum member are read — the stamp is entity-free by
-    construction, which it must be, because it travels to the review UI."""
+    The quotes are already snapshotted to `learning_audit`. `entity_scan.result` is `pending` —
+    the S5 leakage gate is authoritative and this only records the extractor's self-check.
+    *traceparent* is carried forward so the scheduler's promote/land spans continue the same
+    session trace.
+
+    THIS is the only place `session_signals` can be stamped: the summary is an in-process value
+    dropped as soon as extraction finishes, so the session-quality ranking axis is derivable here
+    and nowhere later. Only counts, one bool and one enum member are read, so the stamp is
+    entity-free by construction — which it must be, because it travels to the review UI.
+    """
     header = candidate.header
     return CandidateEnvelope(
         candidate_id=candidate_id,
@@ -403,17 +400,13 @@ def _depends_on_of(raw: dict[str, Any]) -> tuple[str, ...]:
 def _evidence_pointers(raw: dict[str, Any]) -> tuple[EvidencePointer, ...]:
     """The citations, as (turn_ref, tool_call_ref) pairs — never the quotes (D51).
 
-    Reads the RAW array rather than a typed model because there is no typed model to
-    read: this candidate never became an `ExtractedCandidate`. An item this cannot read
-    is skipped, matching `validation.py::_evidence`'s partial tolerance — evidence is a
-    `>= 1` gate, and one malformed citation among three must not cost the review item.
-
-    THROUGH THE SAME READERS the validator uses, not through hand-written isinstance
-    checks, and that is a derived guard rather than a stylistic preference: `as_int`
-    accepts the `"0"` a real model emits, so a stricter reader here would drop citations
-    validation had already accepted — and the completion path would then re-validate a
-    candidate with fewer citations than the one that declined, failing D31's evidence
-    gate for a reason nobody could see."""
+    Reads the RAW array because there is no typed model to read: this candidate never became an
+    `ExtractedCandidate`. An unreadable item is skipped, matching `validation.py::_evidence`'s
+    partial tolerance. THROUGH THE SAME READERS the validator uses, not hand-written isinstance
+    checks: `as_int` accepts the `"0"` a real model emits, so a stricter reader here would drop
+    citations validation had already accepted, and the completion path would then fail D31's
+    evidence gate for a reason nobody could see.
+    """
     items = raw.get("evidence")
     if not isinstance(items, list):
         return ()
@@ -440,13 +433,11 @@ def _evidence_pointers(raw: dict[str, Any]) -> tuple[EvidencePointer, ...]:
 def _self_check(raw: dict[str, Any]) -> tuple[bool, list[str]]:
     """The model's OWN entity attestation, as it wrote it.
 
-    Read from the raw candidate rather than defaulted, because a hardcoded `False` is not
-    a neutral value here — it is an assertion, in the field a reviewer and the S5 gate
-    both read as "the extractor looked and found nothing". A model that said
-    `contains_entities: true` about a candidate it could not parameterize has told us
-    something, and erasing it makes the review row claim the opposite of what was
-    emitted. Preliminary either way: the S5 gate is authoritative and overwrites this
-    whole doc with its settled verdict (`consumer.py::_scan_declined`)."""
+    Read from the raw candidate rather than defaulted, because a hardcoded `False` is not neutral
+    here — it is an assertion, in the field a reviewer and the S5 gate both read as "the extractor
+    looked and found nothing". Preliminary either way: the S5 gate is authoritative and overwrites
+    this whole doc with its settled verdict.
+    """
     esc = raw.get("entity_self_check")
     if not isinstance(esc, dict):
         return False, []
@@ -466,31 +457,20 @@ def build_declined_envelope(
     judge: CoverageAssessment | None = None,
     traceparent: str | None = None,
 ) -> CandidateEnvelope:
-    """Assemble the FAIL-TO-REVIEW envelope for a merit-passed candidate that died on
-    the parameterization form (`docs/decisions/learning-declined-candidate-review.md`).
+    """Assemble the FAIL-TO-REVIEW envelope for a candidate that died on the parameterization form.
 
-    A SIBLING of `build_envelope`, deliberately not a mode of it. `build_envelope` takes
-    an `ExtractedCandidate` — a value that exists only because every validation passed —
-    and this one exists precisely because they did not, so its input is the raw JSON the
-    model emitted and every field is read defensively. Contorting one constructor to
-    serve both would put "was this validated?" behind a parameter, in the one place where
-    the answer decides what may be trusted.
+    A SIBLING of `build_envelope`, deliberately not a mode of it: that one takes an
+    `ExtractedCandidate`, a value that exists only because every validation passed, and this one
+    exists precisely because they did not, so its input is the raw model JSON and every field is
+    read defensively. Contorting one constructor to serve both would put "was this validated?"
+    behind a parameter.
 
-    `entity_scan` is left at the S3 `pending` self-check because THIS FUNCTION IS NOT THE
-    GATE: the caller runs the real leakage stage over the result and stamps the settled
-    verdict before persisting (`consumer.py::_persist_declined_for_review`). A decline
-    must not become a side door around the entity scan, and leaving the sentinel here
-    means a caller that forgets fails CLOSED — an unsettled scan withholds the decline
-    detail at the wire and blocks every approve path (`writer/routing.py`,
-    `promotion/scheduler.py::_entity_scan_is_actionable`).
-
-    `evidence_refs` are the MINTED audit keys, exactly as for a kept candidate: the caller
-    snapshots the entity-bearing quotes into `learning_audit` first
-    (`consumer.py::_snapshot_quotes`) and passes the refs here, so a review item's
-    citations are auditable and a candidate that lands through completion has a durable
-    evidence record. They default to `()` for the additive case — an envelope written
-    before that was wired, which the completion path still has to be able to re-validate
-    from its snapshot's pointers alone."""
+    `entity_scan` is left at the `pending` self-check because THIS FUNCTION IS NOT THE GATE — the
+    caller runs the real leakage stage and stamps the settled verdict before persisting — so a
+    caller that forgets fails CLOSED: an unsettled scan withholds the decline detail at the wire
+    and blocks every approve path. `evidence_refs` are the MINTED audit keys, exactly as for a
+    kept candidate, defaulting to `()` for envelopes written before that was wired.
+    """
     raw = decline.raw_payload or {}
     contains_entities, found = _self_check(raw)
     return CandidateEnvelope(

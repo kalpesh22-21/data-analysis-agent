@@ -1,15 +1,8 @@
-"""MCPClient Protocol — transport + schema bridging to the adopted MCP (D75, §3.1/§8).
+"""MCPClient Protocol — transport + schema bridging to the adopted MCP (D75).
 
-Two implementations:
-  - `fake_client.FakeMCPClient` (Layer 1, scripted responses).
-  - `real_client.RealMCPClient` (Layer 2/3, `mcp` SDK `streamablehttp_client`
-    + `ClientSession`, one session per dispatched call per design §3.1).
-
-`call_tool` takes `jwt`/`session_id` as explicit keyword-only arguments so the
-credential-injection boundary (D5) is visible at every call site: this is the
-*only* place in the runtime where the JWT and session_id are attached to an
-outbound request. `ToolDispatcher.dispatch` (dispatch/tool_dispatcher.py) is
-the sole caller in Pass A.
+`call_tool` takes `jwt`/`session_id` as explicit keyword-only arguments so the D5
+credential-injection boundary is visible at every call site: this is the ONLY place in
+the runtime where the JWT and session_id are attached to an outbound request.
 """
 
 from __future__ import annotations
@@ -20,7 +13,7 @@ from typing import Any, Protocol
 
 @dataclass(frozen=True)
 class MCPToolSpec:
-    """One MCP tool description, as returned by `list_tools()` (design §3.2)."""
+    """One MCP tool description, as returned by `list_tools()`."""
 
     name: str
     description: str
@@ -28,14 +21,11 @@ class MCPToolSpec:
 
 
 class MCPToolError(Exception):
-    """Raised on a tool-level denial/failure — mirrors the MCP's own
-    `ToolError("[{CODE}] message")` convention (design §3.4).
+    """Raised on a tool-level denial/failure — mirrors the MCP's `ToolError("[{CODE}] msg")`.
 
-    `code` is one of the ToolError codes classified by `dispatch/denial_mapping.py`
-    (the authoritative set is `denial_mapping.KNOWN_DENIAL_CODES`; e.g.
-    COLUMN_SCOPE_VIOLATION, TABLE_NOT_FOUND, CARTESIAN_JOIN_FORBIDDEN, …), or None
-    if the `[{CODE}]` prefix could not be parsed out of the raw tool-error text
-    (unexpected/internal MCP error).
+        `code` is one of `denial_mapping.KNOWN_DENIAL_CODES`, or None when the `[{CODE}]`
+        prefix could not be parsed out of the raw tool-error text (an unexpected or
+        internal MCP error).
     """
 
     def __init__(self, code: str | None, message: str) -> None:
@@ -57,23 +47,17 @@ class MCPClient(Protocol):
     ) -> dict[str, Any] | list[Any]:
         """Invoke *tool_name* with *args*, injecting credentials at the transport boundary.
 
-        Returns the tool's parsed JSON payload on success.
-
-        Raises:
-            MCPToolError: on any tool-level denial or execution failure.
+                Returns the tool's parsed JSON payload; raises `MCPToolError` on any tool-level
+                denial or execution failure.
         """
         ...
 
     async def list_tools(self, *, jwt: str, session_id: str) -> list[MCPToolSpec]:
         """Return the live MCP's tool catalogue (for `mcp/tool_schema.py` to translate).
 
-        The live MCP requires a valid Bearer JWT on EVERY request, including
-        `tools/list` (no anonymous introspection) — so *jwt*/*session_id* are
-        threaded through here exactly like `call_tool`, even though the
-        resulting tool catalogue itself is scope-INDEPENDENT (every caller
-        sees the same 6 tools regardless of column scope; only per-call
-        results are scope-filtered). Callers that want to avoid repeating
-        this fetch on every turn should cache the result — see
-        `mcp/tool_schema.py::ToolSchemaCache`.
+                The MCP requires a valid Bearer JWT on EVERY request, including `tools/list`,
+                so credentials are threaded through here exactly like `call_tool` — but the
+                catalogue itself is scope-INDEPENDENT, so callers should cache it rather than
+                re-fetch per turn (see `mcp/tool_schema.py::ToolSchemaCache`).
         """
         ...

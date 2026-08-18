@@ -1,9 +1,8 @@
-"""retrieval — the Phase-1 D7/D8 retrieval pipeline package (design brick).
+"""retrieval — the D7/D8 retrieval pipeline package.
 
-Slice 1 scope: the recall+rerank CORE over an in-memory `VectorIndex` fake,
-with the three degrade-not-fail paths and the `ContextAssembler` pre-injection
-integration. No neo4j, no model-facing search tools, no offline indexing job
-(those are Slice 2/3, design §4.3).
+The recall + rerank core over a `VectorIndex`, its three degrade-not-fail paths, the
+`ContextAssembler` pre-injection integration, the neo4j-backed index, and the three
+model-facing read tools.
 
 See `docs/decisions/retrieval-pipeline-design.md`.
 """

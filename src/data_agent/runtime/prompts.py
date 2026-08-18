@@ -1,81 +1,34 @@
 """Static, always-present base system prompt for the runtime agent.
 
-`AGENT_SYSTEM_PROMPT` is prepended as the FIRST `{"role": "system"}` message of
-every assembled model turn (before the retrieval-context block and history —
-see `context/assembly.py::ContextAssembler.assemble`). It gives the model its
-role and a decisive, do-not-over-explore operating procedure; without it the
-model has been observed re-fetching the same table schema dozens of times and
-never running a query.
+`AGENT_SYSTEM_PROMPT` is prepended as the FIRST `{"role": "system"}` message of every
+assembled model turn, before the retrieval block and history. It gives the model its role and
+a decisive, do-not-over-explore operating procedure; without it the model has been observed
+re-fetching the same table schema dozens of times and never running a query.
 
-It leads with BLUEPRINT-FIRST ROUTING (Release 1 §3): identify the distinct
-user-requested deliverables, check the pre-injected blueprint cards before any
-schema fetch, and search the corpus once PER DELIVERABLE rather than once for
-the whole question. The route is chosen by what covers the deliverable, never by
-how complex the sentence is — the old SIMPLE/COMPLICATED sizing block was
-removed for exactly that reason, and route classes stay in telemetry and
-evaluation, out of model-facing text.
+Determinism (D45): this is a module-level CONSTANT, so every per-round-trip rebuild and every
+resume re-derives byte-identical messages. `assemble` inserts it LAST, at index 0, and
+`budget.fit_request_to_budget` pins the leading `system` run as the undroppable head.
 
-It also carries the `analysisState` contract (Release 1 §5): a multi-deliverable
-request declares its intents BEFORE any runQuery/runBlueprint/sampleRows/
-resolveValues, because the runtime refuses a first declaration past that
-boundary and the turn then runs untracked. That contract is durable where the
-model's own notes are not: D22 discards the model's free text around a tool call
-(replay synthesizes `assistant(tool_calls=..., content=None)` — see
-`loop/agent_loop.py::_tool_trail_entry_to_canonical`), so a decomposition the
-model merely "remembers" does not survive the round.
+Two properties of the text are load-bearing elsewhere and must move with it:
 
-The tracking section teaches CALL-TIME TAGGING as the way an intent is closed:
-tag the runQuery/runBlueprint/getTableSchema with `serves_intent` when you make
-it, then close the intent with `{intent_id, status}` alone. The earlier "cite the
-tool_call_id" instruction is GONE (2026-08-12), along with the model-declared
-`reason_code`: citation was the primary path and failed 9 live attempts out of 9,
-because a model will not reliably copy a 24-character opaque id, and the one
-shape it was retained for — one call answering two deliverables — is now the
-runtime's auto-bind backstop, so the bullet says to mark the second one completed
-and stop there. The block reason is derived from the tagged call, which the
-validator already required it to prove.
+  * THE `analysisState` CONTRACT — a multi-deliverable request declares its intents BEFORE
+    any runQuery/runBlueprint/sampleRows/resolveValues, because the runtime refuses a first
+    declaration past that boundary and the turn then runs untracked. The prompt has to say so
+    because D22 discards the model's free text around a tool call, so a decomposition the
+    model merely "remembers" does not survive the round.
+  * THERE IS DELIBERATELY NO INSTRUCTION about merging several deliverables into one table.
+    Two versions of a same-grain merge rule were written and both were REVERTED after live
+    measurement: each pushed the model off blueprints and onto hand-written SQL, and the turn
+    then timed out with no answer at all. The cause is not wording — one table per answer,
+    plus "never re-derive a blueprint result", plus two blueprints answering two same-grain
+    parts, is an unsatisfiable instruction set. Do not re-add such a rule.
 
-That section CLOSES on the rule that closing the last intent is not the end of the
-turn (01a §13). Measured: three live runs of one three-intent question ended on
-`updateAnalysisState` and then wrote prose — `answer_tables: 0`, all intents
-`completed`, no `answerWithTable` call of ANY kind — while a single-deliverable
-control on the same build ended on `answerWithTable`. So the model is told to send
-both in one response, which 03 §E.2's partition makes safe (state calls dispatch
-first) and 05 §G already relied on. The multi-row rule is NOT restated there; the
-bullet points at `## Presenting a table`, which owns it, and that section carries
-the matching cross-reference.
+`## What runQuery accepts` leads with the positive route (listTables / getTableSchema)
+because the SQL metadata paths really are closed: `SHOW`/`DESCRIBE`/`EXPLAIN` pass the
+statement-prefix allowlist and are then rejected by provenance extraction, which admits only
+SELECT/WITH/UNION, and `system.*` is denied by keyword and excluded from the catalog.
 
-There is deliberately NO instruction here about merging several deliverables into
-one table. Two versions of a same-grain merge rule were written and both were
-REVERTED after live measurement: each one pushed the model off blueprints and
-onto hand-written SQL, and the turn then timed out with no answer at all. The
-cause is not wording — `answerWithTable` carries ONE query, one table per answer
-plus "never re-derive a blueprint result" plus two blueprints answering two
-same-grain parts is an unsatisfiable instruction set, and the model resolves it
-by dropping the blueprints. Do not re-add such a rule; the fix is a multi-table
-`answerWithTable`, scoped separately. Evidence and full reasoning:
-`docs/decisions/release-1/01a-prompt-draft.md` §§10-11 (both marked REVERTED).
-
-`## What runQuery accepts` states what the MCP's SQL guard actually admits, and
-exists because the model kept reaching for SQL metadata discovery that is closed:
-one live metadata question burned 3 of its 11 round-trips on `SHOW TABLES`, a
-`system.tables` SELECT and a hand-built literal table list, then hit the 60s wall
-clock with no answer. The tools were used too — the prompt was simply silent on
-the SQL path being shut. It leads with the positive route (listTables /
-getTableSchema) for that reason. The closed paths are real and verified in
-`clickhouse-api`: `SHOW`/`DESCRIBE`/`EXPLAIN` pass the statement-prefix allowlist
-(`app/security.py:123`) and are then rejected by provenance extraction, which
-admits only SELECT/WITH/UNION (`app/sqlparse/provenance.py:739-758`); `system.*`
-is denied by keyword (`app/security.py:170`) and is excluded from the catalog
-(`app/catalog.py:58`). No error code is named — those arrive via `denial_detail`.
-
-Determinism (D45): this is a module-level constant, so every per-round-trip
-rebuild and every resume re-derives byte-identical messages. `assemble` inserts
-it LAST, at index 0, and `budget.fit_request_to_budget` pins the leading
-`system` run as the undroppable head — so it always leads the message list and
-is never trimmed.
-
-Its rendered text and the rationale for each section are reviewed in
+The rendered text and the rationale for each section are reviewed in
 `docs/decisions/release-1/01a-prompt-draft.md`.
 """
 

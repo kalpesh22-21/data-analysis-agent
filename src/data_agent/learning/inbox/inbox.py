@@ -1,42 +1,20 @@
 """ReviewInbox — the `in_review` projection + the human transitions (§4).
 
-The inbox is a PROJECTION over `learning_candidates` (D101): `list()` reads the
-store by `status == "in_review"` and maps each envelope to an `InboxItem`. It adds
-NO second store; it only advances `status` on the human's action — the ONLY
-caller-driven transitions in the write router:
+A PROJECTION over `learning_candidates` (D101) adding NO second store: `list()` reads by
+status and maps each envelope to an `InboxItem`, and a human's action advances `status`.
 
-    approve  → in_review → validated   (knowledge becomes retrievable; blueprint
-                                         confirmed; schema_edit opens the D53 PR — the
-                                         human MERGE is the real gate, out of scope here)
-    reject   → in_review | needs_parameterization → rejected
-                                        (archived as a NEGATIVE training signal — D29;
-                                         NOT a delete: the row stays for the S9 learner)
+    approve  → in_review → validated
+    reject   → in_review | needs_parameterization → rejected   (archived as a NEGATIVE
+                                                                training signal, NOT a delete)
     complete → needs_parameterization → extracted → (the write router decides)
-                                        (fail-to-review: the human fills in the missing
-                                         parameterization entries and the candidate
-                                         RE-VALIDATES and re-runs the pipeline — no
-                                         bypass; see `completion.py`)
-    retract  → validated → retired      (a post-promotion pull-from-index; the physical
-                                         index removal + D25 exposure trace are S10, §11.4)
-    verify   → validated → validated    (Phase-3: flip `verified=true` on the landed node
-                                         + envelope so a human vouches for a learning node)
-    promote  → validated → promoted     (Phase-3: emit the MCP-format YAML for a MANUAL PR;
-                                         requires `verified`; terminal `promoted` state)
+    retract  → validated → retired          (a post-promotion pull-from-index)
+    verify   → validated → validated        (Phase-3: flip `verified` on node + envelope)
+    promote  → validated → promoted         (Phase-3: emit the MCP YAML for a MANUAL PR)
 
-**One approve implementation (R4).** `approve`/`reject` are the caller-driven
-promotion transitions. To guarantee EVERY approve enforces the same invariants (the
-D17 entity strip, the `depends_on` guard, and the static/replay guards for a
-replayable blueprint), the inbox does NOT re-implement them — it fetches + guards
-the current status (fail-loud) and DELEGATES the transition to the single
-`PromotionScheduler.apply_human_decision` implementation. A production inbox injects
-the wired scheduler; an unwired inbox builds a default one (its guards are guard
-functions of the envelope + injected collaborators, so an unwired approve of a
-non-replayable candidate still strips + validates).
-
-Transitions are guarded: `approve`/`reject` require the current status to be
-`in_review`; `retract` requires `validated`. An illegal transition raises
-`InboxTransitionError` (fail-loud — a mis-routed action never silently mutates a
-candidate).
+ONE APPROVE IMPLEMENTATION (R4): the inbox does NOT re-implement the invariants — the D17
+entity strip, the `depends_on` guard, the static/replay guards — it guards the current status
+fail-loud and DELEGATES to `PromotionScheduler.apply_human_decision`. An illegal transition
+raises `InboxTransitionError`, so a mis-routed action never silently mutates a candidate.
 """
 
 from __future__ import annotations
@@ -61,9 +39,11 @@ class InboxTransitionError(Exception):
 
 
 class _NoOpProbe:
-    """A no-op warehouse probe for an UNWIRED inbox (no scheduler injected). Only
-    reached if an approve replays a blueprint template; a production inbox injects
-    the real scheduler + probe."""
+    """A no-op warehouse probe for an UNWIRED inbox (no scheduler injected).
+
+    Only reached if an approve replays a blueprint template; a production inbox injects the real
+    scheduler and probe.
+    """
 
     async def run(
         self,
@@ -130,36 +110,22 @@ class ReviewInbox:
     ) -> list[InboxItem]:
         """The inbox projection for *status* (default `in_review`, the review queue).
 
-        The archive view passes `status=rejected` (durable rejected rows, D29) so the
-        SAME projection also serves the Archived tab (ui-inbox-type-archive contract).
-        The caller passes `order="desc"` for the archive so the LIMIT trims OLD history,
-        not present rejects — the ordering is chosen explicitly here, never inferred from
-        the status string inside the store.
+        The archive view passes `status=rejected` so the SAME projection serves the Archived tab,
+        with `order="desc"` chosen explicitly by the caller — never inferred from the status string
+        inside the store — so the LIMIT trims OLD history rather than present rejects.
 
-        **The REVIEW QUEUE — and only the review queue — is RANKED (plan §4)**, by
-        `novelty × groundedness² × session-quality` descending, MEASURED rows first,
-        arrival order breaking ties, and filtered by `review_score_cutoff`. The other two
-        listings are left exactly as they were on purpose:
+        ONLY the review queue is RANKED (plan §4), by `novelty × groundedness² × session-quality`
+        descending, MEASURED rows first, arrival order breaking ties, filtered by
+        `review_score_cutoff`. The other listings are left alone on purpose: `rejected` is an ARCHIVE
+        whose newest-first contract the LIMIT depends on; `validated` is the verify/promote worklist,
+        whose rows have already been through a human once; `needs_parameterization` is a WORK list
+        whose entry condition already answered "is this worth extracting".
 
-          * `rejected` is an ARCHIVE. Ranking history by how interesting it would have
-            been is meaningless, and reordering it would break the newest-first contract
-            the LIMIT depends on to trim old rows rather than present ones.
-          * `validated` is the Phase-3 verify/promote worklist. Its rows have already been
-            through a human once; "is this worth thirty seconds" is not the question being
-            asked of them.
-          * `needs_parameterization` is a WORK list, not a judgement queue. Every row on
-            it has already been ruled worth extracting (that is the entry condition), so
-            ranking them by how worth-reviewing they look would sort on a question that
-            was answered before they were written, and a cutoff would hide work a machine
-            already said should be done.
-
-        **The LIMIT is applied by the store, BEFORE the ranking**, and that is a real
-        limitation rather than an oversight: the ranking inputs live inside the candidate
-        document, so ranking the whole `in_review` population would mean fetching it all.
-        With `limit=100` and a queue smaller than that (every deployment today — the store
-        is empty) the two are identical. Past 100 in_review rows the caller ranks the
-        oldest 100, not the best 100. Fixing it properly means ranking server-side, which
-        needs the score materialized; it is not worth doing before there is a queue.
+        THE LIMIT IS APPLIED BY THE STORE, BEFORE THE RANKING — a real limitation rather than an
+        oversight: the ranking inputs live inside the candidate document, so ranking the whole
+        `in_review` population would mean fetching it all. Past 100 rows the caller ranks the oldest
+        100, not the best 100; fixing it properly means ranking server-side, which needs the score
+        materialized.
         """
         envelopes = await self._store.list_by_status(status, limit=limit, order=order)
         if status != CandidateStatus.IN_REVIEW:
@@ -177,22 +143,17 @@ class ReviewInbox:
     def _apply_cutoff(self, items: list[InboxItem]) -> list[InboxItem]:
         """Drop review-queue rows below `review_score_cutoff` — MEASURED rows only.
 
-        **The exemption is the second half of the unmeasured-neutral fix.** A row whose
-        novelty or groundedness could not be measured carries a NEUTRAL 1.0 on that axis,
-        and novelty's measured ceiling against a real corpus is ~0.47. Filtering both
-        groups on one number would therefore hide the candidates we know most about and
-        keep the ones we know nothing about — the knob doing the exact opposite of what
-        its name says. A cutoff is a judgement about a score; an unmeasured row has no
-        score to judge, so it is never hidden by one. It is also never in the way: the
-        sort has already put every unmeasured row below every measured one.
+        A row whose novelty or groundedness could not be measured carries a NEUTRAL 1.0 on that axis,
+        and novelty's measured ceiling against a real corpus is ~0.47 — so filtering both groups on
+        one number would hide the candidates we know most about and keep the ones we know nothing
+        about, the knob doing the exact opposite of what its name says. A cutoff is a judgement about
+        a score, and an unmeasured row has no score to judge; it is never in the way either, because
+        the sort has already put every unmeasured row below every measured one.
 
-        The consequence, stated rather than hidden: **a queue dominated by unmeasured rows
-        cannot be trimmed with this knob.** That is a signal, not a defect — the fix is to
-        wire the prior-art index (which is what makes novelty measurable at all), not to
-        hide the rows that prove it is dark.
-
-        An operator who empties their own inbox is TOLD. Silently returning zero rows to a
-        reviewer who set a knob they misjudged is how a queue stops being read."""
+        The consequence, stated rather than hidden: a queue dominated by unmeasured rows cannot be
+        trimmed with this knob. That is a signal, not a defect — the fix is to wire the prior-art
+        index. An operator who empties their own inbox is TOLD.
+        """
         cutoff = self._policy.review_score_cutoff
         if cutoff <= 0.0 or not items:
             return items
@@ -223,14 +184,12 @@ class ReviewInbox:
         return env
 
     async def approve(self, candidate_id: str) -> CandidateEnvelope:
-        """Human approve: `in_review → validated`. Delegates to the single
-        `apply_human_decision` path (strip + deps + static/replay guards; D17/R4).
+        """Human approve: `in_review → validated`, delegating to `apply_human_decision` (D17/R4).
 
-        A guard that HOLDS (e.g. an unresolved `depends_on`, a missing generalization,
-        a failed replay) leaves the candidate `in_review`. That is NOT a success — so
-        a held approve is surfaced as an `InboxTransitionError` carrying the hold
-        reason (nit: a held approve must be distinguishable from a validated one), not
-        silently returned as an unchanged envelope."""
+        A guard that HOLDS — an unresolved `depends_on`, a missing generalization, a failed replay —
+        leaves the candidate `in_review`. That is NOT a success, so a held approve surfaces as an
+        `InboxTransitionError` carrying the hold reason rather than as an unchanged envelope.
+        """
         await self._require(candidate_id, CandidateStatus.IN_REVIEW)
         env = await self._store.get(candidate_id)
         decision = await self._scheduler.apply_human_decision(env, "approve")
@@ -241,24 +200,19 @@ class ReviewInbox:
         return await self._store.get(candidate_id)
 
     async def reject(self, candidate_id: str) -> CandidateEnvelope:
-        """Human reject: `in_review | needs_parameterization → rejected`. A NEGATIVE
-        signal, NOT a delete — the row is retained for the S9 learner (D29). Delegates to
-        the single path.
+        """Human reject: `in_review | needs_parameterization → rejected`. A NEGATIVE signal, not a delete.
 
-        `needs_parameterization` is accepted for the reason the scheduler already states
-        about reject in general: it writes no content, so gating it would leave a row with
-        NO terminal action at all — completable only by a human who may have decided the
-        form has no honest answer, and otherwise clearable only by waiting out a 90-day
-        TTL. A queue whose rows cannot be cleared stops being read.
+        The row is retained for the S9 learner (D29). `needs_parameterization` is accepted because
+        reject writes no content, so gating it would leave a row with NO terminal action at all —
+        completable only by a human who may have decided the form has no honest answer, and otherwise
+        clearable only by waiting out a 90-day TTL.
 
-        RACE, stated because it is real and unclosed here: the guard reads the envelope
-        and `apply_human_decision` writes it back, so a completion that finishes in
-        between is overwritten by this reject. That direction is the SAFE one — the
-        human's "no" wins over a machine's re-validation, and nothing lands — where the
-        opposite direction (a completion resurrecting a rejected row) is refused by
-        `completion.py::_guarded_put`. Both windows only close properly with a CAS on the
-        candidate store, which the port does not have; that is a store change, not an
-        inbox one."""
+        RACE, stated because it is real and unclosed here: the guard reads the envelope and
+        `apply_human_decision` writes it back, so a completion finishing in between is overwritten by
+        this reject. That direction is the SAFE one — the human's "no" wins and nothing lands — where
+        the opposite is refused by `completion.py::_guarded_put`. Both windows close properly only
+        with a CAS on the candidate store.
+        """
         env = await self._require_one_of(
             candidate_id,
             (CandidateStatus.IN_REVIEW, CandidateStatus.NEEDS_PARAMETERIZATION),
@@ -286,18 +240,14 @@ class ReviewInbox:
         entries: list,
         replace_all: bool = False,
     ) -> CompletionResult:
-        """FILL IN the form of a `needs_parameterization` candidate and put it back
-        through the pipeline (`docs/decisions/learning-declined-candidate-review.md` §4).
+        """FILL IN the form of a `needs_parameterization` candidate and re-run the pipeline.
 
-        Guarded on `needs_parameterization` specifically — NOT on `in_review` — so this
-        can never be used as a second, unvalidated route into an ordinary review item's
-        payload. Approve is guarded the other way round (`in_review` only), so the two
-        surfaces cannot be crossed: nobody approves a form that has not been completed,
-        and nobody rewrites the payload of a candidate awaiting judgement.
-
-        Returns the `CompletionResult` rather than an envelope, because "the form is
-        still incomplete" is an outcome the caller must be able to SHOW, not an error to
-        map to a status code."""
+        Guarded on `needs_parameterization` specifically — NOT on `in_review` — so this can never be
+        used as a second, unvalidated route into an ordinary review item's payload; approve is
+        guarded the other way round, so the two surfaces cannot be crossed. Returns the
+        `CompletionResult` rather than an envelope, because "the form is still incomplete" is an
+        outcome the caller must be able to SHOW, not an error to map to a status code.
+        """
         env = await self._require(candidate_id, CandidateStatus.NEEDS_PARAMETERIZATION)
         if self._completer is None:
             raise InboxTransitionError(
@@ -312,28 +262,24 @@ class ReviewInbox:
     async def retract(self, candidate_id: str) -> CandidateEnvelope:
         """Retract a promoted artifact: `validated → retired` (a leak/drift pull).
 
-        DELEGATES to the single `apply_retract` path (like approve/reject) so the leak
-        PULL stamps the landed neo4j node `retired` (fail-open) BEFORE the store retire —
-        the recall filter then excludes it, so a leaked blueprint stops being recallable
-        immediately (S9-activation Slice 3, review BLOCKER 2). The physical index removal
-        + the D25 exposure trace remain S10 (§11.4); the STAMP is what closes the recall
-        exposure here and now."""
+        DELEGATES to the single `apply_retract` path, so the leak PULL stamps the landed neo4j node
+        `retired` (fail-open) BEFORE the store retire and the recall filter excludes it immediately.
+        The physical index removal and the D25 exposure trace remain S10; the STAMP is what closes
+        the recall exposure here and now.
+        """
         env = await self._require(candidate_id, CandidateStatus.VALIDATED)
         await self._scheduler.apply_retract(env)
         return await self._store.get(candidate_id)
 
     async def verify(self, candidate_id: str) -> tuple[CandidateEnvelope, bool]:
-        """VERIFY an auto-landed learning node (Phase-3): flip `verified → true` on both
-        the landed neo4j node and the candidate envelope. Requires the current status to
-        be `validated` (a validated learning node is the verifiable set — all validated
-        candidates in the store are `source='learning'` by construction). DELEGATES to
-        the single `PromotionScheduler.apply_verify` path (fail-open node write-back +
-        the authoritative envelope write).
+        """VERIFY an auto-landed learning node (Phase-3): flip `verified` on node AND envelope.
 
-        Returns `(env, node_stamped)`: `node_stamped` is False when the neo4j node write
-        did not land (no writer wired, node never landed, or a fail-open write error), so
-        the caller can prompt a re-verify — the envelope reads `verified=true` regardless
-        (source-of-truth for the inbox), a re-verify converges the node."""
+        Requires the current status to be `validated` — every validated candidate in the store is
+        `source='learning'` by construction. DELEGATES to `apply_verify`. Returns
+        `(env, node_stamped)`, where `node_stamped` is False when the neo4j write did not land (no
+        writer, never landed, or a fail-open error) so the caller can prompt a re-verify; the
+        envelope reads `verified=true` regardless, and a re-verify converges the node.
+        """
         env = await self._require(candidate_id, CandidateStatus.VALIDATED)
         _decision, node_stamped = await self._scheduler.apply_verify(env)
         return await self._store.get(candidate_id), node_stamped
@@ -345,25 +291,16 @@ class ReviewInbox:
         doc_id: str | None = None,
         title: str | None = None,
     ) -> PromotionEmit:
-        """PROMOTE a verified learning node (Phase-3): emit the MCP-format YAML for a
-        MANUAL PR into the MCP corpus repo. The FIRST promote (from `validated`) also
-        moves the candidate `validated → promoted`; a re-promote (from `promoted`)
-        RE-EMITS the same YAML with NO status move so an abandoned/revived/lost PR can
-        always regenerate it (`build_promotion_emit` is pure).
+        """PROMOTE a verified learning node (Phase-3): emit the MCP-format YAML for a MANUAL PR.
 
-        First promote requires `validated` AND `verified == True` — an unverified node is
-        refused with a clear transition error (a human must VERIFY before PROMOTE). A
-        `promoted` candidate was necessarily verified at its first promote (the only edge
-        into `promoted`), so the re-emit needs no re-check. Any other status is a fail-loud
-        transition error. The YAML `id` is the landing id VERBATIM so a later reseed flips
-        THAT SAME node `learning → mcp` instead of duplicating it. `doc_id`/`title` are
-        OPTIONAL human refinements for knowledge; `id` can NEVER be overridden.
-
-        The move is OPTIMISTIC (abandoned-PR caveat): the emit + status move happen here,
-        but the actual `learning → mcp` reseed only happens when the human MERGES the PR.
-        If they never do, the neo4j node stays `source='learning'` (excluded from recall)
-        and the candidate stays `promoted` — no recall exposure either way, and the
-        idempotent re-emit above lets the PR be regenerated."""
+        The FIRST promote (from `validated`, requiring `verified`) also moves the candidate to
+        `promoted`; a re-promote RE-EMITS the same YAML with NO status move, so an abandoned or lost
+        PR can always be regenerated. Any other status is a fail-loud transition error. The YAML `id`
+        is the landing id VERBATIM so a later reseed flips THAT SAME node instead of duplicating it;
+        `doc_id`/`title` are optional knowledge refinements and `id` can NEVER be overridden. The
+        move is OPTIMISTIC: the actual `learning → mcp` reseed happens only when the human MERGES,
+        and until then the node stays excluded from recall.
+        """
         env = await self._store.get(candidate_id)
         if env is None:
             raise InboxTransitionError(f"candidate {candidate_id!r} not found")

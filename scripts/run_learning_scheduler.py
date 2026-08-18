@@ -1,40 +1,31 @@
 #!/usr/bin/env python
 """run_learning_scheduler — the learning-loop PROMOTION SCHEDULER entrypoint (D29, §7.2).
 
-The S9 promotion scheduler is a SEPARATE cron-scanned process (D29 "cron-scanned
-state, not queued"), DISTINCT from the consumer daemon (D96 §g). Each cycle it reads
-`learning_candidates` by status, runs golden replay + the D43 drift probes, and
-advances `status` (Contract E). It is NOT a consumer stage — it parallelizes against
-the write-router — so it runs as its own process, launched here via
-`scheduler.run_forever(sleep=asyncio.sleep)` (or `run_once` from an external cron
-trigger).
+A SEPARATE cron-scanned process (D29 "cron-scanned state, not queued"), DISTINCT from
+the consumer daemon: each cycle it reads `learning_candidates` by status, runs golden
+replay + the D43 drift probes, and advances `status` (Contract E). It parallelizes
+against the write-router, so it runs as its own process — `run_forever` here, or
+`run_once` from an external cron trigger.
 
-Composed via the Wave-3 composition-root `build_promotion_plane`, which pins ONE
-shared candidate store across the scheduler and the review inbox (a split store would
-let the inbox read a stale envelope from one store while the scheduler CAS-writes
-another). The durable `CouchbaseBlueprintCorpus` doubles as the `HitCountReader` port
-(it is the one source of truth for the cross-session `hit_count` the promotion guard
-reads — the same artifacts S6 seeds + increments).
+Composed via `build_promotion_plane`, which pins ONE shared candidate store across the
+scheduler and the review inbox (a split store would let the inbox read a stale envelope
+from one store while the scheduler CAS-writes another). The durable
+`CouchbaseBlueprintCorpus` doubles as the `HitCountReader` port — one source of truth
+for the cross-session `hit_count` the promotion guard reads.
 
 DORMANT + fail-closed by default:
-  * The D58c kill-switch is read FRESH every cycle inside `run_once`; disabled ⇒ no
-    scan, no transition.
-  * S9-activation Slice 1 wires the REAL golden-replay probe + dependency resolver
-    when the write plane is configured (`MCP_URL` + `TOKEN_SERVICE_URL` +
-    `TOKEN_ISSUER_API_KEY`): the probe runs the D56 grain probe through the MCP
-    `runQuery` choke point under a per-blueprint JWT scoped to the blueprint's `uses`
-    (D57 reuse); the resolver reads the shared candidate store (`depends_on` resolved
-    ⟺ the sibling candidate is `validated`). When the write plane is NOT configured,
-    the entrypoint keeps the fail-closed DEFERRED stubs (probe raises → clean
-    `probe_unavailable` hold; resolver reports unresolved) so the scheduler runs safely
-    but auto-promotes nothing.
-  * Auto-promotion-INTO-RETRIEVAL stays GATED (Slice 1). There is no corpus-landing
-    writer yet (Slice 2), so `require_landing=True` with `landing_writer=None` makes a
-    blueprint that passes the (now real) replay gate HOLD `landing_unavailable` — a
-    real probe with no landing writer would validate a blueprint that never becomes
-    recallable (the silent gap). The human `approve` path for a BLUEPRINT holds the
-    same way; only the human-gated targets (global_knowledge/schema_edit) approve
-    without a replay and remain fully approvable via the S7 inbox.
+  * The D58c kill-switch is read FRESH every cycle; disabled ⇒ no scan, no transition.
+  * The REAL golden-replay probe + dependency resolver are wired only when the write
+    plane is configured (`MCP_URL` + `TOKEN_SERVICE_URL` + `TOKEN_ISSUER_API_KEY`); the
+    probe runs the D56 grain probe through the MCP `runQuery` choke point under a
+    per-blueprint JWT scoped to the blueprint's `uses` (D57 reuse). Otherwise the
+    fail-closed DEFERRED stubs stay (probe raises ⇒ clean `probe_unavailable` hold;
+    resolver reports unresolved), so the scheduler runs safely and promotes nothing.
+  * Auto-promotion INTO RETRIEVAL stays GATED: with no corpus-landing writer,
+    `require_landing=True` + `landing_writer=None` makes a blueprint that passes the
+    replay gate HOLD `landing_unavailable`, rather than validate one that never becomes
+    recallable. The human `approve` path for a BLUEPRINT holds the same way; only the
+    human-gated targets (global_knowledge/schema_edit) approve without a replay.
 
 Environment: `RuntimeSettings` (COUCHBASE_*, MCP_URL, TOKEN_SERVICE_URL,
 TOKEN_ISSUER_API_KEY) + `LearningSettings` (LEARNING_CANDIDATES_*, LEARNING_CORPUS_*).

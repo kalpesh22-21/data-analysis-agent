@@ -1,21 +1,12 @@
 """promotion/mcp_export.py — the Phase-3 PROMOTE emit (governed-corpus §Promote).
 
-The inbox PROMOTE action turns a VERIFIED learning node into the MCP-format YAML a
-human opens a MANUAL PR with into the MCP corpus repo (`clickhouse-api`,
-`app/corpus/data/{blueprints,knowledge}/`). This module is that serializer: it REUSES
-`blueprint_seed_from_candidate` / `knowledge_seed_from_candidate` to normalize the
-candidate (the SAME projection the landing writer uses, so the emitted YAML can never
-drift from what actually landed), then projects the seed onto the EXACT MCP field set,
-DROPPING the non-MCP provenance fields (`source`, `verified`, `created_by`,
-`source_candidate_id`, and knowledge `drift_status`).
-
-The emitted `id` is the LANDING id VERBATIM (`bp::<hash>` / `kn::<hash>`) so a later
-reseed of the merged YAML flips THAT SAME neo4j node `learning → mcp` in place instead
-of creating a duplicate (the load path MERGEs by `id`).
-
-This module NEVER touches git or the filesystem: it returns the YAML string plus the
-suggested PR metadata (filename / target path / branch / commit message) for the human
-to open the PR themselves.
+Serializes a VERIFIED learning node into the MCP-format YAML a human opens a MANUAL PR with.
+REUSES `blueprint_seed_from_candidate` / `knowledge_seed_from_candidate` to normalize — the
+SAME projection the landing writer uses, so the emitted YAML can never drift from what
+actually landed — then projects onto the EXACT MCP field set, DROPPING the non-MCP
+provenance fields. The emitted `id` is the LANDING id VERBATIM, so a reseed of the merged
+YAML flips THAT SAME neo4j node `learning → mcp` in place. NEVER touches git or the
+filesystem: it returns the YAML plus suggested PR metadata.
 """
 
 from __future__ import annotations
@@ -68,23 +59,19 @@ def _slug(text: str, *, fallback: str) -> str:
 
 
 def _compact_slots(slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop null-valued optional keys (`optional_pattern: null`, `enum_values: null`) so
-    the emitted slots match hand-authored MCP canon's compact `name/type/binds_to/
-    required` shape instead of carrying the generalizer's full nullable slot record."""
+    """Drop null-valued optional keys so the emitted slots match hand-authored MCP canon's
+    compact `name/type/binds_to/required` shape.
+    """
     return [{k: v for k, v in slot.items() if v is not None} for slot in slots]
 
 
 def _result_grain_field(result_grain: Any) -> Any | None:
-    """Normalize the generalizer's `{columns, verifiable}` result-grain to the canon
-    shape, returning None when the field should be OMITTED entirely:
+    """Normalize the generalizer's `{columns, verifiable}` result-grain to the canon shape.
 
-      * a VERIFIABLE grain with columns → the BARE column list (canon shape,
-        e.g. `[Department]`);
-      * a VERIFIABLE grain with NO columns → None (a semantically-absent grain is
-        omitted, never `{columns: [], verifiable: true}`);
-      * a NON-verifiable grain → the `{columns, verifiable}` dict verbatim (the grain
-        integrity probe is off, so the shape must be preserved for a later reseed);
-      * an already-bare list (or other truthy value) → itself; empty ⇒ None.
+    `None` means the field is OMITTED entirely: a VERIFIABLE grain with columns becomes the BARE
+    column list, a verifiable grain with none becomes `None` (a semantically-absent grain is
+    omitted, never `{columns: [], verifiable: true}`), a NON-verifiable grain keeps the dict
+    verbatim so a later reseed preserves the shape, and an already-bare truthy value is itself.
     """
     if isinstance(result_grain, dict):
         columns = list(result_grain.get("columns") or [])
@@ -97,9 +84,10 @@ def _result_grain_field(result_grain: Any) -> Any | None:
 
 @dataclass(frozen=True)
 class PromotionEmit:
-    """The PROMOTE action's structured result: the MCP-format YAML plus the suggested
-    (never-executed) PR metadata. The service does NOT touch git — the human opens the
-    PR with these."""
+    """The PROMOTE action's structured result: the MCP-format YAML plus suggested PR metadata.
+
+    The service does NOT touch git — the human opens the PR with these.
+    """
 
     yaml: str
     filename: str
@@ -125,15 +113,13 @@ _PARITY_NOTE = (
 
 
 def _blueprint_doc(env: CandidateEnvelope, node_id: str) -> dict[str, Any]:
-    """Project a blueprint candidate onto the EXACT MCP blueprint field set. Reuses
-    `blueprint_seed_from_candidate` to normalize, then keeps ONLY the MCP fields (drops
-    `source`/`verified`/`created_by`/`source_candidate_id`/`structural_key` — the last
-    is re-derived by the reseed from the templates), in the MCP field order.
+    """Project a blueprint candidate onto the EXACT MCP blueprint field set.
 
-    This whitelist is hand-written, which is precisely how J7's `window_anchor` was lost
-    twice (see `tests/eval/test_harness_field_drift.py`); the field-parity tripwire in
-    `test_mcp_export.py` now derives the required key set from `BlueprintSeed` so the
-    next field added to the seed cannot be dropped here in silence."""
+    Reuses `blueprint_seed_from_candidate` to normalize, then keeps ONLY the MCP fields in the
+    MCP field order. This whitelist is hand-written, which is precisely how `window_anchor` was
+    lost twice; the field-parity tripwire in `test_mcp_export.py` derives the required key set
+    from `BlueprintSeed`, so the next field added to the seed cannot be dropped here in silence.
+    """
     seed = blueprint_seed_from_candidate(env, id=node_id)
     doc: dict[str, Any] = {
         "id": seed.id,  # the landing id VERBATIM — a reseed MERGEs this same node
@@ -172,10 +158,11 @@ def _blueprint_doc(env: CandidateEnvelope, node_id: str) -> dict[str, Any]:
 def _knowledge_doc(
     env: CandidateEnvelope, node_id: str, *, doc_id: str | None, title: str | None
 ) -> dict[str, Any]:
-    """Project a knowledge candidate onto the EXACT MCP knowledge field set. Reuses
-    `knowledge_seed_from_candidate` to normalize, then keeps ONLY the MCP fields (drops
-    `source`/`verified`/`created_by`/`source_candidate_id`/`drift_status`). The human may
-    supply a semantic `doc_id` (the candidate's is non-semantic) and a refined `title`."""
+    """Project a knowledge candidate onto the EXACT MCP knowledge field set.
+
+    Reuses `knowledge_seed_from_candidate` to normalize, then keeps ONLY the MCP fields. The
+    human may supply a semantic `doc_id` (the candidate's is non-semantic) and a refined `title`.
+    """
     seed = knowledge_seed_from_candidate(env, id=node_id)
     return {
         "id": seed.id,  # the landing id VERBATIM — a reseed MERGEs this same node
@@ -191,11 +178,11 @@ def build_promotion_emit(
 ) -> PromotionEmit:
     """Build the MCP-format YAML + PR metadata for a verified learning candidate.
 
-    `id` in the YAML is the landing id VERBATIM so a reseed flips the SAME neo4j node
-    `learning → mcp`. `doc_id`/`title` are OPTIONAL human refinements for knowledge (the
-    caller must NOT allow overriding `id`). Raises `ValueError`/`BlueprintParseError`
-    (from the seed builders) for a malformed/non-landable candidate — never a silent
-    broken emit."""
+    `id` in the YAML is the landing id VERBATIM, so a reseed flips the SAME neo4j node
+    `learning → mcp`. `doc_id`/`title` are OPTIONAL human refinements for knowledge, and the
+    caller must NOT allow overriding `id`. Raises `ValueError`/`BlueprintParseError` for a
+    malformed or non-landable candidate — never a silent broken emit.
+    """
     node_id = landing_id(env)
     if env.type == "global_knowledge":
         doc = _knowledge_doc(env, node_id, doc_id=doc_id, title=title)

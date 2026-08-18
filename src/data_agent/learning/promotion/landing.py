@@ -1,43 +1,17 @@
 """promotion/landing.py — the S9 corpus-landing writer (S9-activation Slice 2, §3).
 
-The learning loop's write into the neo4j retrieval corpus. On `candidate → validated`,
-`CorpusLandingWriter.land` MERGE-upserts the validated blueprint via the reused
-`runtime/retrieval/corpus_loader.load_corpus`.
+On `candidate → validated`, `CorpusLandingWriter.land` MERGE-upserts the validated blueprint
+via the reused `runtime/retrieval/corpus_loader.load_corpus`. GOVERNED CORPUS (Phase 2): the
+node lands in the `source='learning'` STAGING tier, and agent recall serves ONLY
+`source='mcp'`, so a freshly-landed node is NEVER recallable end-to-end —
+`status`/`drift_status` govern recall eligibility only WITHIN the mcp partition.
 
-GOVERNED CORPUS (Phase 2): a landed node lands in the `source='learning'` STAGING tier
-(the mapping stamps `source="learning"`, `verified=False`), NOT the trusted MCP canon.
-The agent recall serves ONLY `source='mcp'` (the fail-closed trust gate in
-`runtime/retrieval/vector_index`), so a freshly-landed learning node is NEVER recallable
-end-to-end regardless of its status/drift_status — those two fields govern recall
-eligibility ONLY WITHIN the mcp partition. Promoting a vetted learning node into the
-recallable mcp canon is a Phase-3 future (human-approve → `verified=True` → re-source to
-mcp); until then landing is a stage-only write. The safety guards here are load-bearing:
-
-  * **Deterministic id (idempotent MERGE, §3.2).** The seed's neo4j `id` is derived
-    from the candidate's `canonical_key` (the S6 dedup identity), so a re-promotion of
-    the same canonical blueprint MERGEs the SAME node in place — never a duplicate.
-    A human-approved blueprint that never ran S6 (no canonical_key) falls back to a
-    stable `candidate_id`-derived id (OQ-3).
-
-  * **Entity-strip DEFENSE (D17, §3.3).** The candidate is already stripped at
-    validation, but the landing writer is the LAST gate before a GLOBAL, recallable
-    write. Before any embed/neo4j write, `land` asserts NO settled entity span leaked
-    into the generalized seed fields; if one is detected it RAISES (never lands).
-
-  * **Model-parity (§3.3).** `load_corpus` stamps `model_id` and refuses to mix
-    embedding models into one index (`check_model_parity`, the first statement of the
-    write txn) — a mismatch raises `CorpusLoadError`, which the scheduler catches and
-    HOLDS `landing_failed` (never a mixed-model index).
-
-  * **Fail-closed by RAISING.** Any failure — the entity defense, a malformed seed, a
-    parity violation, an embed error, or a neo4j write error — RAISES. The scheduler's
-    `_land_and_promote` catches it and HOLDS, leaving the candidate un-promoted for an
-    idempotent retry next cycle.
-
-The neo4j async driver + the real embedding client are INJECTED (the same D71 endpoint
-the online recall path embeds against — parity by construction), so Layer-1 tests drive
-the mapping + defense with a fake driver/embedder (no real network) and Layer-2 lands
-into real neo4j and recalls it back.
+Load-bearing guards: a DETERMINISTIC id derived from the S6 `canonical_key`, so a
+re-promotion MERGEs the SAME node; the ENTITY-STRIP defense, this being the LAST gate before
+a global recallable write; MODEL-PARITY, which refuses to mix embedding models into one
+index; and FAIL-CLOSED BY RAISING — every failure raises, so the scheduler HOLDS and retries
+idempotently next cycle. The neo4j driver and embedding client are INJECTED (the same D71
+endpoint the online recall path embeds against — parity by construction).
 """
 
 from __future__ import annotations
@@ -67,9 +41,11 @@ _logger = logging.getLogger(__name__)
 
 
 class LandingEntityError(Exception):
-    """A settled entity span leaked into the generalized landing seed — the last-gate
-    D17 defense (§3.3). RAISED so the writer NEVER lands an entity-bearing blueprint
-    into the global, recallable corpus; the scheduler then HOLDS `landing_failed`."""
+    """A settled entity span leaked into the generalized landing seed — the last-gate D17 defense.
+
+    RAISED so the writer NEVER lands an entity-bearing blueprint into the global, recallable
+    corpus; the scheduler then HOLDS `landing_failed`.
+    """
 
 
 # Per-type landing-id prefix (UI Slice 2 §1.1 row 4). A blueprint and a
@@ -85,17 +61,13 @@ _LANDING_PREFIX: dict[str, str] = {
 def landing_id(env: CandidateEnvelope) -> str:
     """The DETERMINISTIC neo4j node id for a landed artifact (§3.2).
 
-    Derived from the S6 `canonical_key` (the dedup identity) so a re-promotion of the
-    same canonical artifact MERGEs the SAME node — idempotent by construction
-    (`load_corpus` MERGEs by `id`). Falls back to the `candidate_id` when no
-    canonical_key exists (a human-approved artifact that never ran S6, OQ-3). The
-    prefix is TYPE-DRIVEN — `bp::` for a blueprint, `kn::` for global_knowledge — so a
-    blueprint and a knowledge node can NEVER collide on a shared canonical_key/
-    candidate_id suffix (they MERGE into disjoint id namespaces). Disjointness within a
-    type rests on the SHAPE of the suffix — a `sha256:`-shaped canonical key vs. a
-    `candidate::`-shaped candidate id. The fallback has a semantic-dupe window (two
-    candidates for the same canonical artifact that never ran S6 land as two nodes);
-    the writer WARNs on it. An unknown type defaults to `bp::` (baseline, unchanged)."""
+    Derived from the S6 `canonical_key` so a re-promotion of the same canonical artifact MERGEs
+    the SAME node, falling back to the `candidate_id` when there is no canonical_key (a
+    human-approved artifact that never ran S6, OQ-3). The prefix is TYPE-DRIVEN — `bp::` for a
+    blueprint, `kn::` for global_knowledge — so the two can NEVER collide on a shared suffix.
+    The fallback has a semantic-dupe window (two candidates for the same artifact that never ran
+    S6 land as two nodes); the writer WARNs on it.
+    """
     prefix = _LANDING_PREFIX.get(env.type, "bp::")
     key = env.dedup.canonical_key if env.dedup is not None else None
     if key:
@@ -149,10 +121,11 @@ _VERIFY_LABEL: dict[str, str] = {
 
 
 def _seed_haystack(seed: BlueprintSeed) -> str:
-    """Every text-bearing generalized field of the seed, concatenated for the entity
-    scan. Covers the natural-language `intent`, the SQL templates, the slot/resolve/
-    compose/grain structures, and the `uses`/`uses_rules` — the full surface a global
-    write would expose."""
+    """Every text-bearing generalized field of the seed, concatenated for the entity scan.
+
+    The natural-language `intent`, the SQL templates, the slot/resolve/compose/grain structures
+    and `uses`/`uses_rules` — the full surface a global write would expose.
+    """
     return "\n".join(
         [
             seed.intent,
@@ -169,10 +142,11 @@ def _seed_haystack(seed: BlueprintSeed) -> str:
 
 
 def _knowledge_haystack(seed: KnowledgeSeed) -> str:
-    """Every text-bearing field of a knowledge seed, concatenated for the entity scan
-    — the knowledge-side sibling of `_seed_haystack`. Covers the `text` (statement +
-    related terms + serialized `structured`) and the `title`, the full surface a global
-    knowledge write would expose."""
+    """Every text-bearing field of a knowledge seed, concatenated for the entity scan.
+
+    The knowledge-side sibling of `_seed_haystack`: the `text` (statement + related terms +
+    serialized `structured`) and the `title`.
+    """
     return "\n".join([seed.text, seed.title or ""])
 
 
@@ -181,14 +155,13 @@ def _assert_seed_entity_free(
     seed: BlueprintSeed | KnowledgeSeed,
     forbidden_spans: tuple[str, ...],
 ) -> None:
-    """Last-gate D17 defense (§3.3): RAISE if any *forbidden_spans* entry appears in
-    the landed seed. `forbidden_spans` are the entity spans S5 identified, captured
-    BEFORE `strip_entity_bearing` blanked them (`redaction.entity_spans` on the
-    PRE-strip envelope) — so this fires even though a validated candidate's own
-    `entity_scan` is blanked. On the normal path the strip already removed every span
-    from the payload (⇒ nothing leaks ⇒ no-op); this is the tripwire for a strip
-    regression, letting an entity into the global recallable corpus. The haystack is
-    routed by seed TYPE — the generalized blueprint fields or the knowledge text/title."""
+    """Last-gate D17 defense (§3.3): RAISE if any *forbidden_spans* entry appears in the seed.
+
+    `forbidden_spans` are the entity spans S5 identified, captured BEFORE `strip_entity_bearing`
+    blanked them, so this fires even though a validated candidate's own `entity_scan` is
+    blanked. On the normal path the strip already removed every span, so this is the tripwire
+    for a strip REGRESSION. The haystack is routed by seed TYPE.
+    """
     if not forbidden_spans:
         return
     haystack = (
@@ -206,12 +179,11 @@ def _assert_seed_entity_free(
 
 
 class CorpusLandingWriter:
-    """The real `LandingWriter` (S9 §3.4). Wraps `load_corpus` over an INJECTED neo4j
-    driver + embedding client, stamping `model_id` for read-path parity.
+    """The real `LandingWriter` (S9 §3.4), wrapping `load_corpus` over an INJECTED driver.
 
-    `ensure_schema=False`: the neo4j corpus schema (constraints + native vector
-    indexes) is provisioned by the seed load (`scripts/seed_neo4j_corpus.py`); the
-    scheduler is a WRITER, not a provisioner (§3.3)."""
+    Stamps `model_id` for read-path parity. `ensure_schema=False`: the neo4j corpus schema is
+    provisioned by the seed load, and the scheduler is a WRITER, not a provisioner.
+    """
 
     def __init__(
         self,
@@ -235,15 +207,12 @@ class CorpusLandingWriter:
     ) -> None:
         """Materialize *env* into the neo4j retrieval corpus (idempotent MERGE).
 
-        Order: map → entity-defense → embed + MERGE. *forbidden_spans* are the entity
-        spans S5 identified, captured by the caller BEFORE the strip (the scheduler
-        passes `redaction.entity_spans(pre_strip_env)`); the last-gate defense RAISES if
-        any survives into the seed. *verified* is the Phase-3 human-approval flag stamped
-        onto the seed (auto-land False, human-approve True) — `source` stays `"learning"`
-        either way; verification does NOT move the node into the trusted MCP partition.
-        Any failure RAISES (the entity defense, a malformed seed, a model-parity
-        violation, an embed/neo4j error) so the scheduler HOLDS `landing_failed` and
-        never writes `validated` (§3.1)."""
+        Order: map → entity-defense → embed + MERGE. *forbidden_spans* are the spans S5 identified,
+        captured by the caller BEFORE the strip; the last-gate defense RAISES if any survives into
+        the seed. *verified* is the Phase-3 approval flag stamped onto the seed — `source` stays
+        `"learning"` either way. Any failure RAISES, so the scheduler HOLDS `landing_failed` and
+        never writes `validated` (§3.1).
+        """
         seed_id = landing_id(env)
         if not (env.dedup is not None and env.dedup.canonical_key):
             # OQ-3 fallback: no canonical_key ⇒ a `candidate_id`-derived id. Two
@@ -289,27 +258,17 @@ class CorpusLandingWriter:
     async def update_status(
         self, env: CandidateEnvelope, *, status: str, drift_status: str
     ) -> bool:
-        """Stamp the landed node's recall-eligibility (`status` + `drift_status`),
-        keyed by the SAME deterministic `landing_id` (S9-activation Slice 3, §8.6).
+        """Stamp the landed node's recall-eligibility (`status` + `drift_status`) by `landing_id`.
 
-        This is the retraction write-back the learning loop's demote/reject/user-
-        correction/retract edges use to make a demoted/broken/leaked blueprint
-        un-recallable (the recall filter reads exactly these two properties), AND the
-        per-cycle RE-ASSERT that converges a transiently-failed write-back — a demoted
-        blueprint re-stamped ineligible in the candidate scan, a still-validated one
-        re-stamped `validated`/`clean` in the clean rescan.
-
-        IDEMPOTENT + safe no-op: MATCH-by-id, so a node that was never landed (or
-        already removed) matches nothing and NO write happens — retracting a
-        never-landed / already-retracted node is harmless. Returns True iff a node was
-        actually stamped (False = no landed node), for the caller's observability log.
-
-        NO embed, NO model-parity, NO entity defense: this only mutates two lifecycle
-        scalars on an EXISTING node — it never (re)writes the intent/embedding/seed
-        payload, so none of the landing write's global-exposure gates apply. RAISES on
-        a driver/query failure; the scheduler catches it and FAILS OPEN (the store
-        transition is source-of-truth and must never be blocked by a corpus-write
-        failure — the recall filter + the periodic re-assert are the backstops)."""
+        The retraction write-back the demote/reject/user-correction/retract edges use to make a
+        blueprint un-recallable (the recall filter reads exactly these two properties), AND the
+        per-cycle RE-ASSERT that converges a transiently-failed write-back. IDEMPOTENT MATCH-by-id,
+        so a node that was never landed matches nothing and NO write happens; returns True iff a
+        node was actually stamped. NO embed, model-parity or entity defense — it mutates two
+        lifecycle scalars on an EXISTING node and never rewrites the seed payload, so none of the
+        landing write's global-exposure gates apply. RAISES on a driver failure; the scheduler
+        catches it and FAILS OPEN.
+        """
         seed_id = landing_id(env)
         # Dispatch the retraction Cypher by artifact type (UI Slice 2 §1.1 row 4): a
         # knowledge chunk stamps `:KnowledgeChunk`, everything else `:Blueprint`.
@@ -344,18 +303,14 @@ class CorpusLandingWriter:
         return stamped
 
     async def mark_verified(self, env: CandidateEnvelope) -> bool:
-        """Flip the landed node's `verified` flag true (the Phase-3 inbox VERIFY
-        action), keyed by the SAME deterministic `landing_id`.
+        """Flip the landed node's `verified` flag true (the Phase-3 VERIFY action), by `landing_id`.
 
-        IDEMPOTENT + safe no-op: MATCH-by-id, so a node that was never landed matches
-        nothing and NO write happens. NO embed / model-parity / entity defense — it only
-        flips one lifecycle scalar on an EXISTING node, never (re)writing the seed
-        payload, so none of the landing write's global-exposure gates apply. `source`
-        stays `"learning"`: verify does NOT move the node into the trusted MCP recall
-        partition (that is the manual-PR reseed the promote action emits). RAISES on a
-        driver/query failure; the scheduler catches it and FAILS OPEN (the store
-        transition is source-of-truth and must never be blocked by a corpus-write
-        failure). Returns True iff a node was actually stamped."""
+        IDEMPOTENT MATCH-by-id, returning True iff a node was actually stamped. No embed,
+        model-parity or entity defense — one lifecycle scalar on an EXISTING node, never rewriting
+        the seed payload. `source` stays `"learning"`: verify does NOT move the node into the
+        trusted MCP recall partition (that is the manual-PR reseed the promote action emits). RAISES
+        on a driver failure; the scheduler catches it and FAILS OPEN.
+        """
         seed_id = landing_id(env)
         label = _VERIFY_LABEL.get(env.type, "Blueprint")
         query = _MARK_VERIFIED.format(label=label)

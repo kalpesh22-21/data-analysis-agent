@@ -1,13 +1,9 @@
-"""ScriptedModelClient — cassette-style `ModelClient` double (Layer 1, design §8).
+"""ScriptedModelClient — cassette-style `ModelClient` double (Layer 1).
 
-Scripted as a fixed, ordered sequence of `ModelTurnResult`s. Each `send_turn`
-call consumes the next scripted result; calling it more times than scripted
-raises `AssertionError` (a test-authoring bug, not a runtime condition — mirrors
-`FakeMCPClient`'s own convention).
-
-Every call is recorded (`self.calls`, a deep-ish copy of `(messages, tools)`)
-so loop tests can scan every message payload actually handed to the model for
-JWT/session_id leakage (D5) — see `tests/runtime/loop/test_agent_loop.py`.
+Consumes a fixed, ordered sequence of `ModelTurnResult`s; consuming past the end raises
+`AssertionError` (a test-authoring bug, not a runtime condition). Every call is recorded
+in `self.calls` so loop tests can scan the messages actually handed to the model for
+JWT/session_id leakage (D5).
 """
 
 from __future__ import annotations
@@ -47,10 +43,9 @@ class ScriptedModelClient:
         return result
 
     def begin_turn(self) -> ScriptedModelClient:
-        """No per-turn state to isolate (Layer-1 double, always single-
-        threaded/sequential per test) — returns `self` so `self.calls`/the
-        scripted cursor keep accumulating across a whole test's `run()`/
-        `resume()` sequence, per `model/client.py::begin_turn_client`."""
+        """Returns `self` — no per-turn state to isolate, so `self.calls` and the scripted
+                cursor keep accumulating across a whole test's run/resume sequence.
+        """
         return self
 
     @property

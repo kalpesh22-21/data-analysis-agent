@@ -1,27 +1,20 @@
-"""RetrievalPipeline — embed → recall → scope-filter → rerank → cut (design §2).
+"""RetrievalPipeline — embed -> recall -> scope-filter -> rerank -> cut.
 
-The one turn-time entry point: `retrieve(question, column_scope, user_id)` →
-`RetrievedContext`. It is a deterministic function of (question, scope, corpus
-snapshot) so a D45 resume re-derives the same block (design §6); the per-turn
-memo that prevents re-embedding on every round-trip lives on the CALLER
-(`ContextAssembler`/`AgentLoop`), not here — this object is a stateless,
-shareable singleton.
+The one turn-time entry point: `retrieve(question, column_scope, user_id)` ->
+`RetrievedContext`. Deterministic in (question, scope, corpus snapshot) so a D45 resume
+re-derives the same block; the per-turn memo that prevents re-embedding on every round-trip
+lives on the CALLER, so this object is a stateless, shareable singleton.
 
-Three independent degrade-not-fail paths (design §2, mirroring D85):
-  - no embedder configured / embed failure → empty `RetrievedContext`;
-  - no reranker configured / rerank failure → recall order + `reranked=False`;
-  - vector index unavailable/empty → empty per-corpus result (other corpora
-    unaffected).
-`retrieve` NEVER raises and NEVER lets a `str(exc)` reach anything model- or
-user-facing (the "never raises" invariant is enforced DEFENSIVELY here — a broad
-`except Exception` at every external-call stage, not merely by trusting the D71
-clients to wrap their own failures). A degrade is never silent: each empty-return
-emits a shape-only `retrieval.degraded` CHAIN span AND a `{"blueprints": 0,
-"knowledge": 0}` progress event (H1 — the D85 silent-degrade lesson).
+Three independent degrade-not-fail paths: no embedder or an embed failure yields an empty
+context; no reranker or a rerank failure yields recall order with `reranked=False`; an
+unavailable or empty index yields an empty result for THAT corpus only. `retrieve` NEVER
+raises and never lets a `str(exc)` reach anything model- or user-facing — enforced
+DEFENSIVELY with a broad `except Exception` at every external-call stage, not by trusting
+the clients to wrap their own failures. A degrade is never silent: each empty return emits a
+shape-only `retrieval.degraded` CHAIN span AND a zeroed progress event.
 
-Observability (design §3.5): one `recall_span` (CHAIN) per corpus WRAPPING the
-awaited recall (real stage latency), one `rerank_span` (RERANKER) per corpus
-WRAPPING the awaited rerank, plus one shape-only progress event. The QUESTION
+Observability: one `recall_span` per corpus WRAPPING the awaited recall, one `rerank_span`
+per corpus WRAPPING the awaited rerank, plus one shape-only progress event. The QUESTION
 TEXT is never a span attribute or a progress value (D25).
 """
 
@@ -71,11 +64,10 @@ _MAX_CARD_SLOTS = 6
 def _project_resolves(raw: Any) -> dict[str, str] | None:
     """Project a decoded `resolves` map onto the card: `{str: str}` entries only.
 
-    `resolves` pins an ambiguous term to a column NAME ("salary" →
-    "annual_salary"), which is the whole routing value — and the reason the
-    search entry's D44 provenance stops being safe-empty (see
-    `retrieval/tools.py::_cards_to_provenance`). Non-string keys/values are
-    dropped; an empty result degrades to `None` so the key is omitted entirely.
+        `resolves` pins an ambiguous term to a column NAME, which is the whole routing value —
+        and the reason the search entry's D44 provenance stops being safe-empty (see
+        `retrieval/tools.py::_cards_to_provenance`). Non-string keys or values are dropped; an
+        empty result degrades to `None` so the key is omitted entirely.
     """
     if not isinstance(raw, dict):
         return None
@@ -86,19 +78,18 @@ def _project_resolves(raw: Any) -> dict[str, str] | None:
 def _project_slots(raw: Any) -> tuple[tuple[SlotSummary, ...] | None, int]:
     """Project decoded, AUTHORED slots onto the card. Returns `(slots, omitted)`.
 
-    THE enforcement point for the card's slot shape (release-1 §02 change 3).
-    `slots_json` stores the authored `SlotSpec` dicts including `binds_to`
-    (a fully-qualified `database.table.column` path), `enum_values`,
-    `optional_pattern` and numeric bounds. NONE of those may reach a card: they
-    are execution detail `getBlueprint` exists to serve, they would inflate every
-    card in a list of `k`, and `binds_to` is a column identifier that makes the
-    provenance problem strictly worse. Building `SlotSummary` field-by-field —
-    rather than filtering keys out of the raw dict — means a NEW authored slot
-    field is excluded by default instead of leaking until someone notices.
+        THE enforcement point for the card's slot shape. `slots_json` stores the authored
+        `SlotSpec` dicts including `binds_to` (a fully-qualified `database.table.column` path),
+        `enum_values`, `optional_pattern` and numeric bounds. NONE of those may reach a card:
+        they are execution detail `getBlueprint` exists to serve, they would inflate every card
+        in a list of `k`, and `binds_to` is a column identifier that makes the provenance problem
+        strictly worse. Building `SlotSummary` field-by-field — rather than filtering keys out of
+        the raw dict — means a NEW authored slot field is excluded by default instead of leaking
+        until someone notices.
 
-    Fail-soft throughout: a non-list, a non-dict entry, or an entry with no usable
-    `name` is skipped rather than raised on; `required` defaults to True (the
-    `SlotSpec` default) so an unparseable flag never understates the contract.
+        Fail-soft throughout: a non-list, a non-dict entry, or an entry with no usable `name` is
+        skipped rather than raised on, and `required` defaults to True so an unparseable flag
+        never understates the contract.
     """
     if not isinstance(raw, list):
         return None, 0
@@ -171,10 +162,9 @@ class RetrievalPipeline:
     ) -> RetrievedContext:
         """Run the full pipeline for one turn. Never raises (degrade-not-fail).
 
-        *observer* (optional) overrides the constructor observer for this call —
-        the integration threads the PER-REQUEST observer here (the pipeline is a
-        shared singleton on `ContextAssembler`, so the request-scoped progress
-        emitter cannot be a constructor argument).
+                *observer* overrides the constructor observer for this call: the pipeline is a
+                shared singleton on `ContextAssembler`, so the request-scoped progress emitter
+                cannot be a constructor argument.
         """
         obs = observer if observer is not None else self._observer
 
@@ -234,10 +224,11 @@ class RetrievalPipeline:
         k: int,
         observer: Observer | None = None,  # noqa: ARG002 - reserved (progress owned by the tool)
     ) -> tuple[list[ThinCard], bool]:
-        """embed → recall(blueprint) → scope pre-filter → rerank → top-*k*
-        (read-tools §4). Returns `(cards, reranked)`; `reranked` is `False` on
-        any embedder/index degrade (empty) or the no-reranker path (recall
-        order). Never raises — the backing helpers all degrade-not-fail (D86)."""
+        """embed -> recall(blueprint) -> scope pre-filter -> rerank -> top-*k*.
+
+                Returns `(cards, reranked)`; `reranked` is `False` on any embedder or index degrade
+                and on the no-reranker path. Never raises — the backing helpers all degrade-not-fail.
+        """
         query_vector, _reason = await self._embed_query(question)
         if query_vector is None:
             return [], False
@@ -254,9 +245,9 @@ class RetrievalPipeline:
         k: int,
         observer: Observer | None = None,  # noqa: ARG002 - reserved (progress owned by the tool)
     ) -> tuple[list[KnowledgeHit], bool]:
-        """embed → recall(knowledge) → (NO scope filter) → rerank → floor →
-        top-*k* (read-tools §4). Knowledge is entity-agnostic (never scope
-        filtered). Returns `(hits, reranked)`; `reranked=False` on degrade."""
+        """embed -> recall(knowledge) -> rerank -> floor -> top-*k*. Knowledge is
+                entity-agnostic and never scope-filtered. Returns `(hits, reranked)`.
+        """
         query_vector, _reason = await self._embed_query(question)
         if query_vector is None:
             return [], False
@@ -269,10 +260,10 @@ class RetrievalPipeline:
     # --------------------------------------------------- shared single-corpus impl
 
     async def _embed_query(self, question: str) -> tuple[list[float] | None, str | None]:
-        """Embed *question* to one query vector, or `(None, reason)` on any
-        degrade (no embedder / embed failure / empty batch). Shared by
-        `retrieve` and the two public tool methods so the embed-degrade
-        discipline (D86) is authored once."""
+        """Embed *question* to one query vector, or `(None, reason)` on any degrade (no
+                embedder, an embed failure, an empty batch). Shared by `retrieve` and the two public
+                tool methods so the embed-degrade discipline is authored once.
+        """
         if self._embedding_client is None:
             return None, "embedding_unconfigured"
         try:
@@ -310,9 +301,10 @@ class RetrievalPipeline:
         k: int,
         recall_k: int,
     ) -> tuple[list[KnowledgeHit], bool | None]:
-        """recall(knowledge) → rerank → floor → top-*k* → knowledge hits.
-        No scope filter (entity-agnostic). Floor is applied BEFORE the cut,
-        exactly as pre-injection does."""
+        """recall(knowledge) -> rerank -> floor -> top-*k*. No scope filter
+                (entity-agnostic); the floor is applied BEFORE the cut, exactly as pre-injection
+                does.
+        """
         candidates = await self._recall_with_span(
             query_vector, "knowledge", column_scope=None, recall_k=recall_k
         )
@@ -333,13 +325,14 @@ class RetrievalPipeline:
         column_scope: frozenset[str] | None,
         recall_k: int | None = None,
     ) -> list[Candidate]:
-        """Recall one corpus inside a CHAIN span WRAPPING the awaited index call
-        (L2 — real stage latency). For blueprints (*column_scope* not None) the
-        USES ⊄ scope pre-filter runs inside the span so its dropped-count is
-        recorded. A per-corpus degrade returns `[]`, never raises.
+        """Recall one corpus inside a CHAIN span WRAPPING the awaited index call, so the span
+                carries real stage latency. For blueprints (*column_scope* not None) the
+                `uses ⊄ scope` pre-filter runs inside the span, so its dropped count is recorded. A
+                per-corpus degrade returns `[]`, never raises.
 
-        *recall_k* overrides the constructor `recall_k` for the recall fan-out
-        (the tools size a pool of `max(recall_k, k)`); `None` → the default."""
+                *recall_k* overrides the constructor value for the recall fan-out; `None` uses the
+                default.
+        """
         effective_recall_k = self._recall_k if recall_k is None else recall_k
         with self._recall_span(corpus, effective_recall_k) as span:
             raw = await self._recall(query_vector, corpus, effective_recall_k)
@@ -371,12 +364,12 @@ class RetrievalPipeline:
     ) -> tuple[list[Candidate], bool | None]:
         """Return (ordered candidates, reranked-flag).
 
-        Flag is `True` when the reranker re-sorted, `False` on the degrade path
-        (no reranker / any rerank failure / a score-count mismatch → recall order
-        preserved), and `None` when there was nothing to rerank (empty corpus —
-        not a degrade). Any exception (typed `RerankerError`, a `ValueError` from
-        the strict score-count zip, or a non-conforming client's arbitrary error)
-        degrades to recall order — no candidate is ever silently dropped (M1)."""
+                The flag is `True` when the reranker re-sorted, `False` on the degrade path (no
+                reranker, any rerank failure, a score-count mismatch — recall order preserved), and
+                `None` when there was nothing to rerank. Any exception, including a non-conforming
+                client's arbitrary error, degrades to recall order: no candidate is ever silently
+                dropped.
+        """
         if not candidates:
             return [], None
         if self._reranker is None:
@@ -393,9 +386,10 @@ class RetrievalPipeline:
     async def _rerank_with_span(
         self, question: str, candidates: Sequence[Candidate]
     ) -> list[Candidate]:
-        """Rerank inside a RERANKER span WRAPPING the awaited call (L2). Uses
-        `zip(..., strict=True)` so a score-count mismatch raises `ValueError`
-        (caught by the caller → degrade), never silently drops candidates (M1)."""
+        """Rerank inside a RERANKER span WRAPPING the awaited call. Uses
+                `zip(..., strict=True)` so a score-count mismatch raises `ValueError` (caught by the
+                caller, which degrades) rather than silently dropping candidates.
+        """
         docs = [c.text for c in candidates]
         with self._rerank_span(len(docs)) as span:
             try:
@@ -414,23 +408,23 @@ class RetrievalPipeline:
     # -------------------------------------------------------------------- cut
 
     def _apply_knowledge_floor(self, candidates: list[Candidate]) -> list[Candidate]:
-        """Drop knowledge candidates below the (optional) score floor (OQ-R2).
+        """Drop knowledge candidates below the optional score floor.
 
-        Off by default (`None`) — ms-marco logits are uncalibrated, so an
-        arbitrary floor is more likely to drop good hits than catch junk."""
+                Off by default: ms-marco logits are uncalibrated, so an arbitrary floor is more
+                likely to drop good hits than catch junk.
+        """
         if self._knowledge_min_score is None:
             return candidates
         floor = self._knowledge_min_score
         return [c for c in candidates if (c.score or 0.0) >= floor]
 
     def _to_thin_card(self, candidate: Candidate) -> ThinCard:
-        """`Candidate` → `ThinCard` — the ONE place a card is built.
+        """`Candidate` -> `ThinCard` — the ONE place a card is built.
 
-        Both the pre-injected block and the `searchBlueprints` tool result flow
-        through here, so an enrichment field that is not projected here is
-        silently dropped everywhere (no error, no test failure) — and a field
-        projected too widely leaks everywhere at once. `status` is deliberately
-        not carried; see the `ThinCard` docstring for why.
+                Both the pre-injected block and the `searchBlueprints` tool result flow through
+                here, so an enrichment field that is not projected here is silently dropped
+                everywhere, and one projected too widely leaks everywhere at once. `status` is
+                deliberately not carried.
         """
         payload = candidate.payload
         slots, slots_omitted = _project_slots(payload.get("slots"))
@@ -504,8 +498,9 @@ class RetrievalPipeline:
             pass
 
     def _degrade(self, reason: str, obs: Observer | None) -> RetrievedContext:
-        """A retrieval-wide degrade early-return: emit a shape-only degrade span
-        + a `{0, 0}` progress event (H1 — never a silent degrade), return empty."""
+        """A retrieval-wide degrade early-return: emit a shape-only degrade span and a zeroed
+                progress event — never a silent degrade — and return empty.
+        """
         if self._tracer is not None:
             from data_agent.runtime.observability import tracing
 
@@ -517,10 +512,10 @@ class RetrievalPipeline:
         return RetrievedContext.empty()
 
     def _emit_event(self, obs: Observer | None, event: str, payload: dict[str, Any]) -> None:
-        """Emit one shape-only retrieval progress event. Counts/labels only,
-        never the question (D25/D61). A misbehaving observer is swallowed +
-        logged server-side — a progress-emit failure must not crash the turn
-        (M2)."""
+        """Emit one shape-only retrieval progress event. Counts and labels only, never the
+                question (D25/D61). A misbehaving observer is swallowed and logged server-side — a
+                progress-emit failure must not crash the turn.
+        """
         if obs is None:
             return
         try:

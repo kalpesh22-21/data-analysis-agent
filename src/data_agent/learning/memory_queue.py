@@ -1,14 +1,9 @@
 """InMemoryLearningQueue — the Layer-1 `LearningQueue` fake (design §9).
 
 Dict-backed, no I/O, but with the SAME observable semantics as
-`RedisStreamsLearningQueue` so Layer-1 tests exercise the real state
-transitions: a pending-entries-list (PEL), per-message redelivery counting,
-content-hash enqueue idempotency, and dead-letter after N deliveries.
-
-Idle simulation for `reclaim_stale`: each PEL entry records the wall-time of its
-last delivery via an injectable `now_fn` (seconds). Tests drive staleness by
-advancing that clock (e.g. a mutable list/holder) rather than sleeping, mirroring
-Redis's `min-idle` without real time.
+`RedisStreamsLearningQueue`: a PEL, per-message redelivery counting, content-hash enqueue
+idempotency, dead-letter after N deliveries. `reclaim_stale` staleness is driven by an
+injectable `now_fn` (seconds), so tests advance a clock instead of sleeping.
 """
 
 from __future__ import annotations
@@ -69,10 +64,11 @@ class InMemoryLearningQueue:
         return message_id
 
     async def enqueue_without_dedup_mark(self, job: LearningJob) -> str:
-        """TEST SEAM: add WITHOUT recording the dedup mark — simulates a crash
-        that XADDed but died before the mark, so a subsequent `enqueue` of the
-        same hash produces a benign DUPLICATE (the consumer's idempotency absorbs
-        it). Proves no-strand at Layer 1. Never used in production."""
+        """TEST SEAM: add WITHOUT recording the dedup mark — a crash between the two.
+
+        A subsequent `enqueue` of the same hash then produces a benign DUPLICATE (the consumer's
+        idempotency absorbs it), proving no-strand. Never used in production.
+        """
         message_id = self._next_id()
         self._entries[message_id] = job
         self._new.append(message_id)

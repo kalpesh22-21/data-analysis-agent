@@ -1,37 +1,20 @@
 """learning/inbox/service.py — the review-inbox HTTP service (UI Slice 2, §2/§3).
 
-A SMALL, dedicated FastAPI process (Option A, contract §0) that mounts ONE
-`ReviewInbox` over the promotion write plane and exposes the four reviewer routes
-(`GET /inbox`, `POST /inbox/{id}/{approve|reject|retract}`, `GET /inbox/health`).
-The UI BFF (`ui/server.py`) serves the page and PROXIES `/api/inbox/*` here,
-attaching the shared reviewer token server-side — the browser never reaches this
-service directly and never sees the token.
+A SMALL, dedicated FastAPI process mounting ONE `ReviewInbox` over the promotion write plane
+and exposing the reviewer routes. The UI BFF serves the page and PROXIES `/api/inbox/*` here,
+attaching the shared reviewer token server-side, so the browser never reaches this service
+directly and never sees the token. It is a separate process because the BFF's charter is
+chat-session JWTs ONLY, while this service holds the neo4j + couchbase + MCP + embedding
+WRITE plane.
 
-Why a separate process (not folded into the BFF): the BFF's charter is chat-session
-JWTs ONLY (`ui/server.py:2-16`). This service holds the neo4j + couchbase + MCP +
-embedding WRITE plane; injecting that into the BFF would couple reviewer infra to the
-chat lifecycle. Keeping it structurally separate mirrors the existing runtime↔BFF
-split.
+AUTH (§3): an env FLAG (`REVIEW_INBOX_ENABLED`) plus a shared-secret `X-Reviewer-Token`
+compared CONSTANT-TIME to `REVIEWER_TOKEN`, both enforced BEFORE the inbox is touched. This
+is NOT a `column_scope` JWT and this service never mints a token.
 
-Auth (contract §3): a lightweight gate — an env FLAG (`REVIEW_INBOX_ENABLED`) plus a
-shared-secret `X-Reviewer-Token` header compared CONSTANT-TIME to `REVIEWER_TOKEN`.
-This is NOT a `column_scope` JWT (a reviewer has no warehouse scope) and this service
-never mints a token. Both are enforced BEFORE the inbox is touched.
+DEGRADE (§5/§6): in offline dev mode list/reject/retract still work honestly, but an approve
+that would need to LAND is refused with 503 — the service never fakes a `validated`.
 
-Degrade (contract §5/§6): with the full write plane wired, `approve` lands then
-validates a `global_knowledge`/`blueprint`. In offline dev mode (an
-`InMemoryCandidateStore` + the default unwired scheduler) list/reject/retract still
-work honestly, but an approve that would need to LAND is refused with `503` — the
-service never fakes a `validated`.
-
-Config (env vars, all optional):
-    REVIEW_INBOX_ENABLED   "1" to expose the routes; anything else ⇒ every route 404
-    REVIEWER_TOKEN         the shared secret the `X-Reviewer-Token` header must match
-    (full-plane infra vars, read only when building the default app: COUCHBASE_*,
-     MCP_URL, TOKEN_SERVICE_URL, TOKEN_ISSUER_API_KEY, NEO4J_*, EMBEDDING_API_URL)
-
-Run:
-    uv run python scripts/run_inbox_service.py
+Run: `uv run python scripts/run_inbox_service.py`
 """
 
 from __future__ import annotations
@@ -61,29 +44,27 @@ from .models import InboxItem
 
 
 class PromoteRequest(BaseModel):
-    """The optional PROMOTE request body (contract §Promote). The human may refine the
-    knowledge `doc_id` (the candidate's is non-semantic) and `title`; both are typed
-    `str | None` so FastAPI 422s a malformed value (e.g. a dict `doc_id`) before it can
-    reach the emitted YAML. `id` is NEVER accepted here — it must equal the landing node
-    id verbatim."""
+    """The optional PROMOTE request body (contract §Promote).
+
+    The human may refine the knowledge `doc_id` (the candidate's is non-semantic) and `title`;
+    both are typed `str | None` so FastAPI 422s a malformed value before it can reach the emitted
+    YAML. `id` is NEVER accepted here — it must equal the landing node id verbatim.
+    """
 
     doc_id: str | None = None
     title: str | None = None
 
 
 class CompleteParameterizationRequest(BaseModel):
-    """The fail-to-review COMPLETE body (`docs/decisions/
-    learning-declined-candidate-review.md` §4).
+    """The fail-to-review COMPLETE body.
 
-    `entries` is the parameterization the reviewer wrote: appended to what the model
-    already produced by default (the `totality_violation` case — entries are missing), or
-    REPLACING the whole array with `replace=true` (the `rule_predicate_mismatch` case — an
-    entry is wrong and no append can fix it).
-
-    Typed as loosely as the payload it becomes: every entry goes through the SAME readers
-    and the SAME D97 totality walk as model output, so validating its shape twice — once
-    in pydantic, once in `extractor/validation.py` — would give the reviewer two different
-    error vocabularies for one mistake, and only one of them names the fix."""
+    `entries` is the parameterization the reviewer wrote: APPENDED to what the model already
+    produced by default (the `totality_violation` case), or REPLACING the whole array with
+    `replace=true` (the `rule_predicate_mismatch` case, where an entry is wrong and no append can
+    fix it). Typed as loosely as the payload it becomes: every entry goes through the SAME
+    readers and the SAME D97 totality walk as model output, so validating its shape twice would
+    give the reviewer two error vocabularies for one mistake, only one of which names the fix.
+    """
 
     entries: list[dict[str, Any]] = []
     replace: bool = False
@@ -117,11 +98,12 @@ _LISTABLE_STATUSES = frozenset(
 
 
 def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
-    """Project an `InboxItem` to the EXACT wire shape. Carries the real fields plus the
-    envelope `status` (a plain string; `in_review` for the review queue, `rejected` for
-    the archive view — ui-inbox-type-archive contract §List API). No invented
-    `confidence`/`drift`. `payload_view` is the already-redacted dict (D17) rendered
-    verbatim — the raw entity values never cross this boundary."""
+    """Project an `InboxItem` to the EXACT wire shape.
+
+    The real fields plus the envelope `status`; no invented `confidence`/`drift`. `payload_view`
+    is the already-redacted dict (D17) rendered verbatim — the raw entity values never cross this
+    boundary.
+    """
     return {
         "candidate_id": item.candidate_id,
         "type": item.type,
@@ -161,9 +143,10 @@ def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
 
 
 def _action_result(env: Any) -> dict[str, Any]:
-    """The minimal `ActionResult` (§2a): the new store status after the transition,
-    `reason=null` on success. Deliberately NOT the full envelope — the UI just
-    refreshes the list."""
+    """The minimal `ActionResult` (§2a): the new store status, `reason=null` on success.
+
+    Deliberately NOT the full envelope — the UI just refreshes the list.
+    """
     return {
         "candidate_id": env.candidate_id,
         "type": env.type,
@@ -175,11 +158,12 @@ def _action_result(env: Any) -> dict[str, Any]:
 def _completion_result(result: CompletionResult) -> dict[str, Any]:
     """The fail-to-review COMPLETE response.
 
-    Carries the same four `ActionResult` fields every other action returns, plus the
-    `outcome` the caller branches on and — when the form is still incomplete — the fresh
-    decline. The decline is projected through the SAME `InboxItem` rule that governs the
-    list surface, so the withholding of an entity-bearing detail cannot differ between
-    the row a reviewer is reading and the response to the edit they just made."""
+    The same four `ActionResult` fields every other action returns, plus the `outcome` the caller
+    branches on and — when the form is still incomplete — the fresh decline. The decline is
+    projected through the SAME `InboxItem` rule that governs the list surface, so the withholding
+    of an entity-bearing detail cannot differ between the row a reviewer is reading and the
+    response to the edit they just made.
+    """
     item = InboxItem.from_envelope(result.envelope)
     return {
         "candidate_id": result.envelope.candidate_id,
@@ -231,23 +215,17 @@ def _build_completer(
     corpus: Any,
     embedding_client: Any,
 ) -> ParameterizationCompleter | None:
-    """Build the fail-to-review completion plane, or `None` when the catalog cannot be
-    read.
+    """Build the fail-to-review completion plane, or `None` when the catalog cannot be read.
 
-    THE CATALOG COMES FROM THE SAME PLACE THE CONSUMER'S DOES — the frozen
-    `GET /catalog/export` snapshot (`RuntimeSettings.catalog_fixture_file()`,
-    overridable with `CATALOG_FIXTURE_PATH`) — and that is the load-bearing detail. The
-    completer re-runs the extractor's own validation, so its `known_rules` / `rule_index`
-    must be the SAME grounding the extraction was judged against: a completer holding a
-    different catalog would accept rule ids the extractor could not, or decline ones it
-    would have taken, and the review queue and the loop would be arguing about which
-    rules the deployment has.
-
-    FAIL-OPEN on a missing/unreadable snapshot: no completer, and a completion attempt
-    answers 503 ("unavailable in this deployment") instead of re-validating against an
-    empty catalog — which would decline every rule-role entry a reviewer wrote and blame
-    them for it. Logged loudly, because a reviewer facing that 503 has no other way to
-    learn the cause."""
+    THE CATALOG COMES FROM THE SAME PLACE THE CONSUMER'S DOES — the frozen `GET /catalog/export`
+    snapshot — and that is the load-bearing detail: the completer re-runs the extractor's own
+    validation, so a different catalog would accept rule ids the extractor could not, or decline
+    ones it would have taken, and the review queue and the loop would be arguing about which
+    rules the deployment has. FAIL-OPEN on a missing or unreadable snapshot: no completer, and a
+    completion attempt answers 503 instead of re-validating against an empty catalog, which would
+    decline every rule-role entry a reviewer wrote and blame them for it. Logged loudly, because
+    a reviewer facing that 503 has no other way to learn the cause.
+    """
     import json
 
     from ..extractor.grounding import known_rule_ids_from_catalog, rule_index_from_catalog
@@ -291,13 +269,12 @@ def _build_completer(
 def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
     """Build the `ReviewInbox` for a standalone run. Returns `(inbox, mode, driver)`.
 
-    Mirrors `scripts/run_learning_scheduler.py:129-193` — which builds the write plane
-    and DISCARDS its inbox. Here we KEEP the inbox. When every full-plane port is
-    configured, wire the fully-activated write plane via `build_promotion_write_plane`
-    (couchbase store + MCP + token minter + neo4j + embedding). Otherwise fall back to
-    the OFFLINE dev mode: an `InMemoryCandidateStore` + the default unwired scheduler
-    (list/reject/retract work; a landing-approve honestly 503s, §5). The neo4j driver
-    is returned so the caller can close it on shutdown (None in offline mode)."""
+    When every full-plane port is configured, wires the fully-activated write plane via
+    `build_promotion_write_plane`; otherwise falls back to OFFLINE dev mode (an
+    `InMemoryCandidateStore` + the default unwired scheduler), where list/reject/retract work and
+    a landing-approve honestly 503s. The neo4j driver is returned so the caller can close it on
+    shutdown (None in offline mode).
+    """
     from ..config import LearningSettings
 
     learning_settings = LearningSettings()
@@ -444,9 +421,8 @@ def create_inbox_app(
 ) -> FastAPI:
     """Build the inbox FastAPI app mounting *inbox*.
 
-    When *inbox* is None, build it from env (`_build_inbox_from_env`): the full write
-    plane when configured, else the offline dev fallback. Tests inject their own
-    `ReviewInbox` (over an `InMemoryCandidateStore`) + an explicit *write_plane*.
+    When *inbox* is None, build it from env: the full write plane when configured, else the
+    offline dev fallback. Tests inject their own `ReviewInbox` plus an explicit *write_plane*.
     """
     driver: Any = None
     if inbox is None:
@@ -463,11 +439,11 @@ def create_inbox_app(
     ) -> None:
         """Enforce the flag + reviewer token BEFORE the inbox is touched (§3).
 
-        Flag off (`REVIEW_INBOX_ENABLED` != "1") ⇒ 404: the surface does not exist.
-        Token not configured ⇒ 503 (FAIL CLOSED): an unset `REVIEWER_TOKEN` must NOT
-        collapse to a passing `compare_digest("", "")` — that would admit an empty
-        `X-Reviewer-Token:` header and expose the whole write plane. Missing token ⇒
-        401; mismatch ⇒ 403 (constant-time compare, no length oracle)."""
+        Flag off ⇒ 404: the surface does not exist. Token not configured ⇒ 503, FAIL CLOSED — an
+        unset `REVIEWER_TOKEN` must NOT collapse to a passing `compare_digest("", "")`, which would
+        admit an empty `X-Reviewer-Token` header and expose the whole write plane. Missing token ⇒
+        401; mismatch ⇒ 403, constant-time compared with no length oracle.
+        """
         if os.environ.get("REVIEW_INBOX_ENABLED") != "1":
             raise HTTPException(status_code=404, detail="Not found.")
         expected = os.environ.get("REVIEWER_TOKEN", "")
@@ -484,10 +460,11 @@ def create_inbox_app(
 
     @app.get("/inbox", dependencies=guard)
     async def list_inbox(status: str | None = None) -> dict[str, Any]:
-        """List the review queue (default) or, with `?status=rejected`, the durable
-        archive (ui-inbox-type-archive contract §List API). The BFF already validates
-        `status`, but validate defensively here too — an out-of-set value is a 400, not a
-        pass-through to `list_by_status` (which would happily enumerate any status)."""
+        """List the review queue, or with `?status=rejected` the durable archive.
+
+        The BFF already validates `status`, but validate defensively here too — an out-of-set value
+        is a 400, not a pass-through to `list_by_status`, which would happily enumerate any status.
+        """
         selected = status if status is not None else CandidateStatus.IN_REVIEW
         if selected not in _LISTABLE_STATUSES:
             raise HTTPException(
@@ -535,18 +512,16 @@ def create_inbox_app(
     async def complete(
         candidate_id: str, body: CompleteParameterizationRequest | None = None
     ) -> dict[str, Any]:
-        """FAIL-TO-REVIEW COMPLETE: the reviewer supplies the missing parameterization
-        entries, the candidate RE-VALIDATES in full, and — if it passes — re-runs the
-        write-router pipeline. Requires `status=needs_parameterization`.
+        """FAIL-TO-REVIEW COMPLETE: the reviewer supplies the missing parameterization entries.
 
-        **A still-incomplete form answers 200, not 4xx**, with `outcome="declined"` and
-        the fresh decline. It is not a client error: the reviewer sent a well-formed
-        attempt, and the pipeline's answer ("these predicates are still uncovered") is the
-        RESULT they need to see in order to make the next one. Mapping it to a 409 would
-        put the one sentence that names the fix into an error banner and lose the
-        structure. The 4xx/5xx codes stay for what they mean elsewhere here: 404 unknown
-        id, 409 wrong status, 422 an `entries` value that is not a parameterization array
-        at all, 503 no validation plane in this deployment."""
+        The candidate RE-VALIDATES in full and, if it passes, re-runs the write-router pipeline.
+        Requires `status=needs_parameterization`. A STILL-INCOMPLETE FORM ANSWERS 200, not 4xx, with
+        `outcome="declined"` and the fresh decline: the reviewer sent a well-formed attempt, and the
+        pipeline's answer is the RESULT they need in order to make the next one — mapping it to a 409
+        would put the one sentence that names the fix into an error banner. The other codes keep
+        their usual meanings: 404 unknown id, 409 wrong status, 422 an `entries` value that is not a
+        parameterization array at all, 503 no validation plane in this deployment.
+        """
         req = body or CompleteParameterizationRequest()
         try:
             result = await inbox.complete_parameterization(
@@ -569,10 +544,12 @@ def create_inbox_app(
 
     @app.post("/inbox/{candidate_id}/verify", dependencies=guard)
     async def verify(candidate_id: str) -> dict[str, Any]:
-        """Phase-3 VERIFY: a human vouches for an auto-landed validated learning node —
-        flips `verified=true` on the landed node + envelope. Requires status=validated.
-        The response carries `node_stamped` — False when the neo4j node write did not
-        land (fail-open), so the UI can prompt a re-verify."""
+        """Phase-3 VERIFY: a human vouches for an auto-landed validated learning node.
+
+        Flips `verified=true` on the landed node + envelope; requires `status=validated`. The
+        response carries `node_stamped` — False when the neo4j write did not land (fail-open) — so
+        the UI can prompt a re-verify.
+        """
         try:
             env, node_stamped = await inbox.verify(candidate_id)
         except InboxTransitionError as exc:
@@ -585,11 +562,13 @@ def create_inbox_app(
     async def promote(
         candidate_id: str, body: PromoteRequest | None = None
     ) -> dict[str, Any]:
-        """Phase-3 PROMOTE: emit the MCP-format YAML for a MANUAL PR into the MCP corpus
-        repo. The first promote (from `validated`, requires `verified=true`) also moves
-        the candidate → `promoted`; a re-promote (from `promoted`) re-emits the same YAML
-        with no status move. Optional body: `doc_id`/`title` (knowledge refinements); `id`
-        can NEVER be overridden. Returns the YAML + suggested PR metadata (no git here)."""
+        """Phase-3 PROMOTE: emit the MCP-format YAML for a MANUAL PR into the MCP corpus repo.
+
+        The first promote (from `validated`, requiring `verified=true`) also moves the candidate to
+        `promoted`; a re-promote re-emits the same YAML with no status move. Optional body:
+        `doc_id`/`title` knowledge refinements — `id` can NEVER be overridden. Returns the YAML plus
+        suggested PR metadata; no git here.
+        """
         req = body or PromoteRequest()
         try:
             emit = await inbox.promote(

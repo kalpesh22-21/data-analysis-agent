@@ -1,31 +1,18 @@
-"""ParameterizationCompleter — the human half of fail-to-review
-(`docs/decisions/learning-declined-candidate-review.md` §4).
+"""ParameterizationCompleter — the human half of fail-to-review.
 
-A `needs_parameterization` candidate is a form with holes in it: the judge said the work
-was worth extracting, and the model could not classify every literal predicate of the
-accepted SQL. A reviewer supplies the missing entries and the candidate re-enters the
-pipeline it fell out of.
+A `needs_parameterization` candidate is a form with holes in it: the judge said the work was
+worth extracting, and the model could not classify every literal predicate of the accepted
+SQL. A reviewer supplies the missing entries and the candidate re-enters the pipeline it fell
+out of.
 
-**NO BYPASS, and that is the whole design.** The completed payload runs the SAME
-`to_candidate` validation the corrective turn ran — totality walk included — and then the
-SAME write-router stages (generalize → leakage → dedup → writer) any extracted candidate
-runs. A reviewer cannot hand-wave a predicate into coverage: if the entries do not
-account for the SQL, the re-validation declines exactly as the model's did and the row
-stays in the queue with the fresh reason on it. The one thing a human is trusted with
-here is CONTENT (which slot, which rule, which inline justification) — never the checks.
-
-**No session store, by construction.** Everything the re-validation reads was snapshotted
-onto the envelope at decline time (`candidate/decline.py::ValidationSnapshot`). A review
-item that depended on the live session would quietly stop being completable when that
-session's TTL expired — a second silent loss, at the end of the path built to close the
-first one.
-
-**Failure is a RESULT, not an exception.** A still-incomplete form is the expected
-outcome of this operation, not an error: the caller gets the fresh decline detail to show
-the reviewer, and the stored decline block is updated so the next reader sees the current
-state rather than the original one. Exceptions are reserved for the cases where the
-operation could not be attempted at all (no validation plane wired, no snapshot, a
-malformed request body).
+NO BYPASS, and that is the whole design: the completed payload runs the SAME `to_candidate`
+validation the corrective turn ran — totality walk included — and then the SAME write-router
+stages any extracted candidate runs. The one thing a human is trusted with is CONTENT, never
+the checks. NO SESSION STORE either: everything the re-validation reads was snapshotted onto
+the envelope at decline time, so a review item does not quietly stop being completable when
+the session's TTL expires. FAILURE IS A RESULT, not an exception — a still-incomplete form is
+the expected outcome, and exceptions are reserved for operations that could not be attempted
+at all.
 """
 
 from __future__ import annotations
@@ -70,25 +57,23 @@ class CompletionInputError(ValueError):
 
 
 class CompletionRaceError(RuntimeError):
-    """The candidate stopped being a form while this completion was running — another
-    reviewer rejected it, or a second completion of the same row won.
+    """The candidate stopped being a form while this completion was running.
 
-    Its own type because the CALLER must be able to tell it from a wrong-status request:
-    the request was legal when it arrived, and the honest answer is "somebody moved it",
-    not "you sent the wrong thing". Both map to 409; only this one means the reviewer
-    should re-read the row before deciding anything."""
+    Its own type because the CALLER must be able to tell it from a wrong-status request: the
+    request was legal when it arrived, so the honest answer is "somebody moved it". Both map to
+    409; only this one means the reviewer should re-read the row before deciding anything.
+    """
 
 
 @dataclass(frozen=True)
 class CompletionResult:
     """What one completion attempt did.
 
-    `outcome="declined"` carries the FRESH decline (the caller shows it to the reviewer;
-    the same withholding rule as the wire projection applies to the detail) and the
-    envelope is still `needs_parameterization`. `outcome="completed"` carries the
-    envelope as the pipeline left it — which may be `candidate` (auto-land) or
-    `in_review` (sampled, near-miss, dedup conflict); the completion path asserts nothing
-    about which, because that is the router's decision, not the reviewer's."""
+    `outcome="declined"` carries the FRESH decline — subject to the same withholding rule as the
+    wire projection — and the envelope is still `needs_parameterization`. `outcome="completed"`
+    carries the envelope as the pipeline left it, which may be `candidate` or `in_review`; this
+    path asserts nothing about which, because that is the router's decision.
+    """
 
     outcome: Literal["completed", "declined"]
     envelope: CandidateEnvelope
@@ -100,15 +85,12 @@ def _merged_parameterization(
 ) -> list[Any]:
     """The parameterization array the re-validation will walk.
 
-    APPEND by default, REPLACE on request, and the pair is the honest answer to two
-    different reviewer tasks. `totality_violation` — the case this slice was built for —
-    is "entries are MISSING", and appending leaves the model's already-valid
-    classifications untouched. `rule_predicate_mismatch` is "an entry is WRONG", which no
-    amount of appending fixes, so the reviewer must be able to send the whole array.
-
-    Neither mode is trusted: whatever comes out of here goes through the same readers and
-    the same D97 totality walk as model output, so a reviewer who deletes an entry they
-    should not have gets a decline, not a silently dropped filter."""
+    APPEND by default, REPLACE on request, because they answer two different reviewer tasks:
+    `totality_violation` means entries are MISSING, so appending leaves the model's already-valid
+    classifications untouched, while `rule_predicate_mismatch` means an entry is WRONG, which no
+    amount of appending fixes. Neither mode is trusted — whatever comes out goes through the same
+    readers and the same D97 totality walk as model output.
+    """
     if replace_all:
         return list(entries)
     existing = payload.get("parameterization")
@@ -118,11 +100,11 @@ def _merged_parameterization(
 def _raw_candidate(env: CandidateEnvelope, payload: dict[str, Any]) -> dict[str, Any]:
     """Rebuild the raw candidate envelope `to_candidate` reads.
 
-    The evidence QUOTES are not the candidate store's to hold (D51), so each citation is
-    rebuilt from its snapshotted pointer with an explicit marker in the quote's place.
-    That satisfies D31's structural gate honestly — the citations are the model's own,
-    unchanged, and the reviewer supplies none — while keeping the entity-bearing text
-    where it belongs. See `candidate/decline.py`."""
+    The evidence QUOTES are not the candidate store's to hold (D51), so each citation is rebuilt
+    from its snapshotted pointer with an explicit marker in the quote's place — satisfying D31's
+    structural gate honestly, since the citations are the model's own and the reviewer supplies
+    none, while keeping the entity-bearing text where it belongs.
+    """
     snapshot = env.revalidation
     assert snapshot is not None  # guarded by the caller
     return {
@@ -147,18 +129,13 @@ def _raw_candidate(env: CandidateEnvelope, payload: dict[str, Any]) -> dict[str,
 def _entity_self_check(env: CandidateEnvelope) -> dict[str, Any]:
     """Rebuild the candidate's entity attestation from wherever it now lives.
 
-    TWO SOURCES, because the field MOVES. `build_declined_envelope` seeds `entity_scan`
-    with the model's own `self_check_contains_entities`, and then the S5 gate overwrites
-    that whole doc with its settled `LeakageVerdict` — which has no such key. Reading only
-    the key therefore returned `False` for every scanned row, i.e. for every row in a
-    correctly-wired deployment: an attestation that was always negative and never
-    consulted anything.
-
-    So: the SETTLED verdict wins where it exists (a machine that looked beats a model that
-    said it looked), and the model's own self-check is the fallback for a row nobody
-    scanned. Advisory either way — `build_envelope`'s equivalent seeds a `pending`
-    sentinel that the gate re-settles moments later — but it must not ASSERT the opposite
-    of what is known."""
+    TWO SOURCES, because the field MOVES: `build_declined_envelope` seeds `entity_scan` with the
+    model's own self-check, and the S5 gate then overwrites that whole doc with its settled
+    `LeakageVerdict`, which has no such key — so reading only the key returned `False` for every
+    scanned row. The SETTLED verdict wins where it exists (a machine that looked beats a model
+    that said it looked), with the self-check as the fallback for a row nobody scanned. Advisory
+    either way, but it must not ASSERT the opposite of what is known.
+    """
     scan = env.entity_scan if isinstance(env.entity_scan, dict) else {}
     if LeakageVerdict.is_settled(scan):
         # `found` stays EMPTY on purpose: the verdict's hits carry the raw `span` — the
@@ -175,17 +152,14 @@ def _entity_self_check(env: CandidateEnvelope) -> dict[str, Any]:
 class ParameterizationCompleter:
     """Re-validate a human-completed form and put it back through the pipeline.
 
-    `known_rules` / `rule_index` MUST come from the same catalog the extractor was
-    grounded against (`factory.py::build_learning_consumer`). A completer holding a
-    different catalog would accept rule ids the extractor could not, or decline ones it
-    would have taken — the review queue and the loop disagreeing about what the
-    deployment's rules are.
-
-    `stages` is the write-router pipeline. EMPTY is a legal but degraded wiring: the
+    `known_rules`/`rule_index` MUST come from the same catalog the extractor was grounded
+    against: a completer holding a different one would accept rule ids the extractor could not,
+    or decline ones it would have taken. `stages` EMPTY is a legal but degraded wiring — the
     candidate re-validates and is persisted at `extracted` with no generalization and an
-    unsettled scan, which every downstream guard refuses. Legal because an offline dev
-    inbox has no write plane to run; degraded because such a candidate can never be
-    approved — and logged, because that is not obvious from the 200 the reviewer gets."""
+    unsettled scan, which every downstream guard refuses, so it can never be approved. Legal
+    because an offline dev inbox has no write plane; logged, because it is not obvious from the
+    200 the reviewer gets.
+    """
 
     store: CandidateStore
     known_rules: frozenset[str] = frozenset()
@@ -237,29 +211,18 @@ class ParameterizationCompleter:
     ) -> CompletionResult:
         """The form is still not complete: keep the row, keep the reviewer's work.
 
-        The MERGED payload is persisted even though it failed, so the next attempt starts
-        from what the reviewer already wrote rather than from the model's original — the
-        alternative makes every round of a two-round fix retype the first one. The
-        correction COUNT is preserved from the original block: it records what the MODEL
-        was asked, and a human's attempt is not a corrective turn.
+        The MERGED payload is persisted even though it failed, so the next attempt starts from what
+        the reviewer already wrote rather than from the model's original. The correction COUNT is
+        preserved from the original block: it records what the MODEL was asked, and a human's attempt
+        is not a corrective turn.
 
-        **THE SCAN IS RE-SETTLED, because the payload CHANGED.** The verdict on the row
-        was settled about the payload as it was; what is written back is a different
-        payload, and that verdict is not decorative — it is exactly what the wire
-        projection consults before showing the decline detail to a browser. A stamp
-        inherited from content that is no longer there is a claim nobody made.
-
-        BE PRECISE ABOUT THE MARGIN, because overstating it would be its own bug: what a
-        completion merges is `parameterization`, and the gate deliberately does NOT scan
-        that surface (it holds pre-generalization slot values by design —
-        `leakage/gate.py::_ENTITY_FREE_SURFACES`). So for today's shapes the re-scan
-        usually returns the same verdict. What changes is that it is MEASURED against what
-        is being stored rather than carried over: a stale verdict cannot outlive the text
-        it was about, and the day the scanned surfaces grow — or a reviewer's edit reaches
-        one — this path is already correct instead of newly wrong. It is the same rule the
-        success path obeys, applied to the path that runs far more often.
-
-        With no gate wired it goes back to `pending`, which fails closed everywhere."""
+        THE SCAN IS RE-SETTLED, because the payload CHANGED. The stored verdict was settled about
+        different content, and it is exactly what the wire projection consults before showing the
+        decline detail to a browser. For today's shapes the re-scan usually returns the same verdict
+        (a completion merges `parameterization`, which the gate deliberately does not scan); what
+        changes is that the verdict is MEASURED against what is being stored. With no gate wired it
+        goes back to `pending`, which fails closed everywhere.
+        """
         block = DeclineBlock(
             reason=decline.reason,
             detail=decline.detail,
@@ -293,26 +256,19 @@ class ParameterizationCompleter:
     ) -> CompletionResult:
         """Re-validation passed: rebuild an ORDINARY candidate and run the pipeline.
 
-        `replace` on the existing envelope rather than `build_envelope`, deliberately.
-        The identity and the history are the ones already in the store — same
-        `candidate_id` (so the review row transitions in place instead of forking),
-        same `content_hash`, same `created_at`, same `session_signals` (which
-        `build_envelope` would recompute from the RECONSTRUCTED summary, whose transcript
-        is empty by design — a ranking stamp derived from a deliberately partial value is
-        worse than the real one).
+        `replace` on the existing envelope rather than `build_envelope`, deliberately: the identity
+        and the history are the ones already in the store — same `candidate_id` (so the review row
+        transitions in place instead of forking), `content_hash`, `created_at` and `session_signals`,
+        which `build_envelope` would recompute from a RECONSTRUCTED summary whose transcript is empty
+        by design.
 
-        THREE FIELDS ARE DELIBERATELY CLEARED:
-          * `decline` — the form is filled in; a block left here would keep the inbox
-            rendering it as an outstanding task for ever (`derive_inbox_reason` keys on
-            exactly this field);
-          * `revalidation` — its only reader is this path, and a completed candidate has
-            no second completion to run;
-          * `entity_scan` — back to the S3 `pending` sentinel, because the PAYLOAD
-            CHANGED. Carrying the old verdict forward would let text nobody scanned ride
-            a `pass` that was settled about different content, and the whole slice is
-            written on the rule that a decline is not a side door around the gate.
-        The status returns to `extracted` for the same reason: it is what the pipeline
-        expects to be handed, and the router decides where it goes from there."""
+        THREE FIELDS ARE DELIBERATELY CLEARED: `decline`, because a block left here would keep the
+        inbox rendering an outstanding task for ever; `revalidation`, whose only reader is this path;
+        and `entity_scan`, back to the S3 `pending` sentinel because THE PAYLOAD CHANGED — carrying
+        the old verdict forward would let text nobody scanned ride a `pass` settled about different
+        content. The status returns to `extracted` for the same reason: it is what the pipeline
+        expects to be handed, and the router decides where it goes from there.
+        """
         rebuilt = replace(
             env,
             status=CandidateStatus.EXTRACTED,
@@ -359,30 +315,21 @@ class ParameterizationCompleter:
 
     @staticmethod
     def _settled(outcome) -> CandidateEnvelope:
-        """The envelope this completion leaves in the store — INCLUDING when the pipeline
-        said `drop`, which is the case that used to leave a zombie.
+        """The envelope this completion leaves in the store — INCLUDING when the pipeline said `drop`.
 
-        `drop` means a stage handled the candidate elsewhere: S6 dedup bumps the existing
-        artifact's count and drops the duplicate (`increment`), or drops it as redundant
-        with the canon. On the EXTRACTION path "do not persist" is harmless because the
-        consumer has already written the row at `extracted` before the stages ran, so a
-        dropped candidate simply stays there — invisible, TTL-bounded, terminal in
-        practice. On THIS path there is a row already, and it says
-        `needs_parameterization`: not persisting left it saying that FOR EVER while the
-        response said "completed". The row then relists, and every re-completion of it
-        bumps the same corpus counter again — a review queue that cannot be drained,
-        inflating a metric each time it is tried.
+        `drop` means a stage handled the candidate elsewhere: S6 bumps the existing artifact's count
+        and drops the duplicate, or drops it as redundant with the canon. On the EXTRACTION path "do
+        not persist" is harmless, because the consumer already wrote the row at `extracted` before
+        the stages ran. On THIS path there is a row already, and it says `needs_parameterization`:
+        not persisting left it saying that FOR EVER while the response said "completed", so the row
+        relisted and every re-completion bumped the same corpus counter again. Not a corner case
+        either — a re-processed session mints a fresh review item for a blueprint that may have
+        landed on the earlier run, and completing it is GUARANTEED to hit the hard key and drop.
 
-        And it is not a corner case. A re-processed session mints a fresh review item for
-        a blueprint that may have landed on the earlier run; completing that item is
-        GUARANTEED to hit the hard canonical-key layer and drop.
-
-        So the enriched envelope is persisted whatever the control said, at the status the
-        pipeline left it — which for a drop is `extracted`, exactly where the consumer's
-        dropped candidates sit, carrying the `dedup` verdict that explains why nothing
-        landed. The one thing forced is that it is NOT the review status: a completed form
-        must never be a form again, and a status that says otherwise is the disagreement
-        between store and response that this whole method exists to prevent."""
+        So the enriched envelope is persisted whatever the control said, at the status the pipeline
+        left it. The one thing forced is that it is NOT the review status: a completed form must
+        never be a form again.
+        """
         env = outcome.envelope
         if env.status == CandidateStatus.NEEDS_PARAMETERIZATION:
             return replace(env, status=CandidateStatus.EXTRACTED)
@@ -393,18 +340,14 @@ class ParameterizationCompleter:
     ) -> None:
         """Persist *updated*, unless the row stopped being a form while we were working.
 
-        BEST-EFFORT, and the honest name for it is a NARROWED window rather than a closed
-        one: `CandidateStore` has no compare-and-swap, so between this re-read and the
-        `put` a concurrent reject can still be overwritten. What it does close is the wide
-        window — the whole re-validation, which runs a SQL parse, a template rewrite, an
-        entity scan and possibly an embedding call, and is far and away the most likely
-        place for another reviewer's action to land.
-
-        The direction of the failure decides the posture: silently resurrecting a
-        REJECTED candidate re-enters work a human deliberately removed (D29), while
-        refusing a completion that raced costs one retry against a row the reviewer is
-        about to re-read anyway. A proper fix is a CAS on the candidate store, which is a
-        store-port change and out of this slice's scope."""
+        BEST-EFFORT, and the honest name for it is a NARROWED window rather than a closed one:
+        `CandidateStore` has no compare-and-swap, so between this re-read and the `put` a concurrent
+        reject can still be overwritten. What it closes is the WIDE window — the whole re-validation,
+        which parses SQL, rewrites a template, scans for entities and possibly embeds. The direction
+        of the failure decides the posture: silently resurrecting a REJECTED candidate re-enters work
+        a human deliberately removed (D29), while refusing a completion that raced costs one retry
+        against a row the reviewer is about to re-read anyway.
+        """
         current = await self.store.get(before.candidate_id)
         if current is None or current.status != before.status:
             raise CompletionRaceError(

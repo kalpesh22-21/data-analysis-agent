@@ -1,72 +1,51 @@
-"""answer_scrub.py — the last-mile scrub of USER-FACING ANSWER PROSE (ISSUES I1).
+"""answer_scrub.py — the last-mile scrub of USER-FACING ANSWER PROSE.
 
-The prompt already tells the model to answer metadata questions in business terms
-and never to name a database, a table, a column, or a saved analysis (1885a8f).
-A prompt is a request. This is the enforcement: whatever the model wrote, the
-prose that reaches the user carries no identifier-shaped token and no corpus id.
+The prompt already tells the model to answer metadata questions in business terms and never
+to name a database, a table, a column, or a saved analysis. A prompt is a request; this is
+the enforcement: whatever the model wrote, the prose that reaches the user carries no
+identifier-shaped token and no corpus id.
 
-WHAT IS *NOT* SCRUBBED, deliberately — the STRUCTURED payload. `sql_executed`,
-`answer_sql`, `answer_tables[].sql`, `blueprint_use`, `verification` and
-`provenance` stay FULLY transparent (the same-day I2 decision): those fields are
-the audit surface a reviewer needs to check the answer, they are rendered as
-labelled machine detail rather than as the agent's voice, and redacting them
-would destroy the D56 transparency contract. Only the PROSE — the sentences the
-agent speaks — is scrubbed. So an answer may say "[schema detail withheld]" while
-the SQL panel beside it shows the very identifier that was withheld, and that is
-the intended shape: the agent describes what it did in business terms, and the
-machinery it used is inspectable on demand rather than narrated.
+WHAT IS NOT SCRUBBED, deliberately — the STRUCTURED payload. `sql_executed`, `answer_sql`,
+`answer_tables[].sql`, `blueprint_use`, `verification` and `provenance` stay FULLY
+transparent: those fields are the audit surface a reviewer needs to check the answer, they
+are rendered as labelled machine detail rather than as the agent's voice, and redacting them
+would destroy the D56 transparency contract. So an answer may say "[schema detail withheld]"
+while the SQL panel beside it shows the very identifier that was withheld — the intended
+shape, not a defect.
 
-DETECTION IS BY IDENTIFIER *FORM*, NEVER BY WORD MEMBERSHIP. The obvious
-implementation — "redact any token that is a column name in this turn's
-provenance" — destroys the answers this rule exists to produce: the catalog
-carries bare-word columns (`department`, `amount`, `status`, `name`, ...), and a
-correct business answer MUST be able to say "department" in a sentence. So the
-rules below match SHAPES that ordinary English does not produce (a corpus id, a
-dotted qualification, a snake_case token, a quoted identifier) and never a word
-list.
+DETECTION IS BY IDENTIFIER FORM, NEVER BY WORD MEMBERSHIP. The obvious implementation —
+redact any token that is a column name in this turn's provenance — destroys the answers this
+rule exists to produce, because the catalog carries bare-word columns (`department`,
+`amount`, `status`, `name`) and a correct business answer MUST be able to say "department"
+in a sentence. So the rules match SHAPES ordinary English does not produce: a corpus id, a
+dotted qualification, a snake_case token, a quoted identifier.
 
-NEVER REFUSES, NEVER NUDGES, ALWAYS COMPLETES. Unlike the answer-shape gate (05
-§J) this does not hand the round back: it redacts in place and the turn finishes.
-A gate that can be exhausted has an honour-system hole at the end of its
-allowance; a scrub does not.
+NEVER REFUSES, NEVER NUDGES, ALWAYS COMPLETES. Unlike the answer-shape gate, this does not
+hand the round back — it redacts in place and the turn finishes, so there is no allowance to
+exhaust and no honour-system hole at the end of one.
 
-WHY IT LIVES AT THE RUNTIME ROOT, and why it imports nothing from `data_agent`:
-the same reason as `sanitize.py` and `loop/read_guard.py` — a leaf with no
-package imports can be depended on from anywhere (the loop today, a history
-projection or a transport tomorrow) without an import cycle, and can be unit
-tested without constructing a loop.
+It lives at the runtime root and imports nothing from `data_agent`, for the same reason as
+`sanitize.py` and `loop/read_guard.py`: a leaf with no package imports can be depended on
+from anywhere without an import cycle, and unit-tested without constructing a loop.
 
-DETERMINISM AND SAFETY. One left-to-right pass of one compiled alternation, so
-the same input always produces the same output (a D45 resume re-renders the same
-answer) and overlapping candidates cannot double-count: `warehouse.employee_id`
-is ONE redaction (the qualified arm wins at that position), not two, and so is
-the three-part `warehouse.employee_master.pay_check`. The replacement markers are
-themselves unmatchable by every rule — no dot, no underscore, no `bp-`/`kn-`
-prefix, no quotes — so a marker can never be scrubbed into another marker even if
-this function is applied twice. The scan is linear in the length of the text (no
-nested quantifiers, no backtracking blowup); no cap is imposed here because
-truncating a user's answer would be a worse failure than scanning it. For
-reference on the caps that DO apply upstream:
-`composite/answer_with_table.py::clean_answer_text` truncates the
-`answerWithTable` prose at 20_000 characters, while the no-tool-calls exit's
-`assistant_text` is uncapped and arrives as the model produced it.
+DETERMINISM AND SAFETY. One left-to-right pass of one compiled alternation, so the same input
+always produces the same output (a D45 resume re-renders the same answer) and overlapping
+candidates cannot double-count — `warehouse.employee_id` is ONE redaction, the qualified arm
+winning at that position. The replacement markers are themselves unmatchable by every rule —
+no dot, no underscore, no `bp-` prefix, no quotes — so a marker can never be scrubbed into
+another marker even if this runs twice. The scan is linear with no backtracking blowup, and
+no cap is imposed: truncating a user's answer would be a worse failure than scanning it.
 
-DOTTED *VALUES* ARE THE HARD CASE, and the carve-outs are deliberately NARROW.
-A dot between two identifier-shaped words is usually a schema qualification, but
-two kinds of ordinary CELL VALUE wear the same shape, and both are things an
-answer exists to deliver rather than things it must withhold:
+DOTTED VALUES ARE THE HARD CASE, and the carve-outs are deliberately NARROW. A dot between
+two identifier-shaped words is usually a schema qualification, but two kinds of ordinary CELL
+VALUE wear the same shape, and both are things an answer exists to deliver:
 
-  - an EMAIL ADDRESS (`jane.smith@acme.com`) — recognised by the adjacent `@`,
-    which is why R2 carries a lookbehind and a lookahead for it. Both halves are
-    spared: the local part is the match followed by `@`, the domain part the
-    match preceded by it.
-  - a DATA-FILE NAME (`sales_data.csv`, `report_2026.csv`) — recognised by a
-    final segment that is a common data-file extension. This is a whole ARM of
-    the alternation rather than a lookaround on R2, because the underscored rule
-    R3 would otherwise eat `sales_data` off the front of the filename one
-    character before R2 ever looked at the dot. The arm consumes the entire
-    filename and returns it verbatim, so it is the ONLY place the extension
-    carve-out has to be expressed.
+  - an EMAIL ADDRESS (`jane.smith@acme.com`), recognised by the adjacent `@` — which is why
+    R2 carries a lookbehind and a lookahead for it, sparing both halves.
+  - a DATA-FILE NAME (`sales_data.csv`), recognised by a final segment that is a common
+    data-file extension. This is a whole ARM of the alternation rather than a lookaround on
+    R2, because R3 would otherwise eat `sales_data` off the front one character before R2
+    ever looked at the dot. The arm consumes the entire filename and returns it verbatim.
 
 KNOWN EATEN — false positives accepted with open eyes, not oversights:
 
@@ -75,22 +54,16 @@ KNOWN EATEN — false positives accepted with open eyes, not oversights:
   | `intranet.company.com` | `[schema detail withheld]`    |
   | `bp-active_headcount`  | `bp-[schema detail withheld]` |
 
-A URL or hostname is a dotted identifier by SHAPE and neither carve-out reaches
-it — it has no `@` and `.com` is not a data-file extension. Accepted rather than
-carved out: URLs are rare in answer prose, and an internal hostname is closer to
-infrastructure detail than to the answer a user asked for, so losing it costs
-little.
+A URL or hostname is a dotted identifier by SHAPE and neither carve-out reaches it; accepted
+because URLs are rare in answer prose and an internal hostname is closer to infrastructure
+detail than to the answer a user asked for. The second is the BP-UNDERSCORE HYBRID: R1's
+trailing word boundary cannot sit in front of an underscore, so R1 declines the whole token,
+R3 takes the tail, and the result carries the SCHEMA marker plus a surviving `bp-` prefix.
+The id itself is still gone; only the marker's claim and the stub prefix are wrong.
 
-The second is the BP-UNDERSCORE HYBRID. R1's segments are alphanumeric and its
-trailing word boundary cannot sit in front of an underscore, so R1 declines the
-whole token, R3 takes the tail, and the result carries the SCHEMA marker plus a
-surviving `bp-` prefix instead of "[saved analysis]". The id itself is still
-gone; only the marker's claim and the stub prefix are wrong.
-
-OUT OF SCOPE — UNICODE LOOKALIKES. Every rule is ASCII, so a full-width `．` or a
-Cyrillic `а` inside an identifier passes straight through; the model is not the
-adversary here, the identifiers it is quoting are ASCII, and an evasion would
-have to be authored deliberately.
+OUT OF SCOPE — UNICODE LOOKALIKES. Every rule is ASCII, so a full-width `．` or a Cyrillic
+`а` inside an identifier passes straight through. The model is not the adversary here, the
+identifiers it quotes are ASCII, and an evasion would have to be authored deliberately.
 """
 
 from __future__ import annotations
@@ -228,20 +201,17 @@ def scrub_answer_prose(
 ) -> tuple[str | None, int]:
     """Redact identifier-shaped tokens from user-facing prose.
 
-    Returns `(scrubbed_text, redaction_count)`. `None` and `""` pass through
-    untouched with a count of 0 — an absent answer has nothing to disclose.
-    Deterministic, never raises, and never returns `None` for a non-`None` input
-    (every replacement is a non-empty marker, so a scrubbed answer is never
-    scrubbed into nothing).
+        Returns `(scrubbed_text, redaction_count)`. `None` and `""` pass through untouched with a
+        count of 0 — an absent answer has nothing to disclose. Deterministic, never raises, and
+        never returns `None` for a non-`None` input, since every replacement is a non-empty
+        marker.
 
-    *provenance* is this turn's `(database.table, column)` USES set — the same
-    frozenset that tags the persisted assistant message. It is CONSULTED BY ONE
-    ARM ONLY (R4's double-quoted half, so that `the "department" column` is
-    redacted while `the "Sales" department` is not) and is optional everywhere:
-    with `provenance=None` the double-quoted arm simply never fires and the other
-    three rules — which need no knowledge of the turn at all — do the work. The
-    pause exits pass `None` for exactly that reason: a pause has no determined
-    provenance to consult.
+        *provenance* is this turn's `(database.table, column)` USES set — the same frozenset that
+        tags the persisted assistant message. It is CONSULTED BY ONE ARM ONLY (R4's double-quoted
+        half, so that `the "department" column` is redacted while `the "Sales" department` is
+        not) and is optional everywhere: with `provenance=None` that arm never fires and the
+        other three rules, which need no knowledge of the turn, do the work. The pause exits pass
+        `None` for exactly that reason — a pause has no determined provenance to consult.
     """
     if not text:
         return text, 0

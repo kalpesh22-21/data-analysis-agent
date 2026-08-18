@@ -1,33 +1,20 @@
-"""blueprint/executor.py — the single-node `BlueprintExecutor` (runblueprint-design §2, Slice B).
+"""blueprint/executor.py — the `BlueprintExecutor` deterministic fast-path engine.
 
-The deterministic fast-path engine. Slice B executes a SINGLE-node (leaf)
-blueprint end-to-end:
+Per run: FETCH the stored DAG authoritatively by id through the `getBlueprint` store read,
+scope-checked identically to the model-facing tool (a miss and an out-of-scope blueprint are
+the SAME `NOT_FOUND` — the non-oracle, byte-identical); PARSE it into the typed `Blueprint`;
+RESOLVE + BIND each slot with the pure resolvers over a scope-enforced DISTINCT domain probe,
+binding typed sqlglot-AST literals (D10) and PAUSING before any node runs on an `AskUser`;
+DISPATCH the bound SQL through `ToolDispatcher.dispatch("runQuery", …)`, so D57 column scope,
+D64 scratch isolation, D5 credential injection and provenance capture all come free and an
+inner denial passes through verbatim; and VERIFY (D56) via a scope-enforced
+`COUNT(*), COUNT(DISTINCT <grain>)` probe. A verify FAIL — or a grain the probe cannot
+compute — NEVER returns the result: it is `Failed(VERIFY_FAILED)` and the model falls back to
+the raw loop ("no silent path").
 
-  1. **Fetch** the stored DAG authoritatively by id via the `getBlueprint` store
-     read, scope-checked identically to the model-facing tool (§2.2 step 1). A
-     miss OR an out-of-scope blueprint is the SAME `NOT_FOUND` (the D88(b)
-     non-oracle — no scope probe, byte-identical).
-  2. **Parse** the stored JSON into the typed `Blueprint` (Slice-A `models`).
-     A multi-node DAG (`composes`) or a table-passing blueprint is `UNSUPPORTED`
-     in Slice B (F2 — Slice C) → fall back to the raw loop.
-  3. **Resolve + bind** each slot: the Slice-A pure resolvers (`slots.resolve_slot`)
-     over a scope-enforced DISTINCT domain probe (when the slot declares
-     `binds_to`) → typed sqlglot-AST-literal binding into the template
-     (`template.bind_template`, F1/D10). A resolver `AskUser` → PAUSE (a
-     `Paused` outcome the loop honors, §2.5) BEFORE any node runs.
-  4. **Dispatch** the bound SQL through `ToolDispatcher.dispatch("runQuery", …)`
-     so D57 column-scope, D64 scratch-isolation, D5 credential injection, and
-     provenance capture come free and identically to `resolveValues` (§2.3).
-     An inner denial passes through verbatim (never bypassed).
-  5. **Verify** (D56, §4): a scope-enforced `COUNT(*), COUNT(DISTINCT <grain>)`
-     probe over the final SQL → the Slice-A `verify.verify_result` gate. A FAIL
-     (or a grain the probe cannot compute) NEVER returns the result — it is a
-     `Failed(VERIFY_FAILED)` → the raw loop (D56 "no silent path", §4.4).
-
-Fail-closed throughout (B4 discipline): a raising executor must not crash the
-turn — the tool's guard (`tool.py`) contains it. The executor itself returns a
-typed `ExecOutcome` union; it never raises for an expected denial/verify/parse
-failure, only for a genuine bug (which the tool's B4 guard catches).
+Fail-closed throughout: the executor returns a typed `ExecOutcome` union and never raises for
+an expected denial, verify failure or parse failure — only for a genuine bug, which the
+tool's crash guard contains.
 """
 
 from __future__ import annotations
@@ -143,19 +130,19 @@ class ExecCompleted:
 
 @dataclass(frozen=True)
 class ExecPaused:
-    """A pause the executor yields; the loop honors it (§2.5).
+    """A pause the executor yields; the loop honors it.
 
-    Slice B: a slot-resolution `askUser` (`reason="blueprint_slot"`,
-    `awaiting_node=None`) — the pause happens BEFORE any node runs, so there is no
-    mid-DAG state to rehydrate and resume re-runs via the model loop.
+        A slot-resolution `askUser` (`reason="blueprint_slot"`, `awaiting_node=None`) happens
+        BEFORE any node runs, so there is no mid-DAG state to rehydrate and the resume re-runs
+        via the model loop.
 
-    Slice C (D45 mid-DAG durability): an approval gate (`blueprint_approval`) or a
-    `when…on_violation:ask` (`blueprint_when_ask`). These carry
-    `completed_nodes_json` (SCALAR outputs + provenance + SQL of the nodes already
-    run, B2) + `awaiting_node` (the node order to resume AT) so `AgentLoop.resume`
-    re-enters `resume()` here with completed nodes rehydrated — completed nodes
-    never re-run (exactly-once, survives a process restart). A `resolve_via`
-    degrade does NOT pause (S2 honest-call) — it falls back to the raw loop."""
+        An approval gate (`blueprint_approval`) or a `when…on_violation:ask`
+        (`blueprint_when_ask`) carries `completed_nodes_json` — the SCALAR outputs, provenance
+        and SQL of the nodes already run — plus `awaiting_node`, so `AgentLoop.resume` re-enters
+        `resume()` with completed nodes rehydrated and never re-runs them (exactly-once,
+        surviving a process restart). A `resolve_via` degrade does NOT pause; it falls back to
+        the raw loop.
+    """
 
     reason: str  # "blueprint_slot" | "blueprint_approval" | "blueprint_when_ask"
     pending_question: dict[str, Any]
@@ -181,8 +168,9 @@ ExecOutcome = ExecCompleted | ExecPaused | ExecFailed
 
 
 class BlueprintExecutor:
-    """The single-node DAG walker (Slice B). Stateless per call; every dependency
-    is injected so Layer-1 fakes and the live stack use the identical path."""
+    """The DAG walker. Stateless per call; every dependency is injected so Layer-1 fakes and
+        the live stack use the identical path.
+    """
 
     def __init__(
         self,
@@ -471,14 +459,13 @@ class BlueprintExecutor:
         approval_answer: str,
         credentials: RuntimeCredentials,
     ) -> ExecOutcome:
-        """Re-enter a paused mid-DAG blueprint at *awaiting_node* (D45, §2.5).
+        """Re-enter a paused mid-DAG blueprint at *awaiting_node* (D45).
 
-        Stateless by construction — everything needed to continue lives in the
-        checkpoint the loop passes back (the raw `slot_bindings`, the completed
-        SCALAR outputs, the node to resume at). Nothing is held in memory across
-        the pause, so a FRESH process resumes identically (restart-durable). The
-        loop has already CAS-consumed the checkpoint (exactly-once); completed
-        nodes are rehydrated here and NEVER re-run."""
+                Stateless by construction: everything needed to continue lives in the checkpoint the
+                loop passes back (the raw `slot_bindings`, the completed SCALAR outputs, the node to
+                resume at), so a FRESH process resumes identically. The loop has already CAS-consumed
+                the checkpoint (exactly-once); completed nodes are rehydrated here and NEVER re-run.
+        """
         detail = await self._vector_index.get_blueprint(blueprint_id)
         if detail is None or not is_blueprint_in_scope(
             Candidate(id=detail.id, kind="blueprint", text=detail.intent, uses=detail.uses),
@@ -990,19 +977,19 @@ class BlueprintExecutor:
     async def _probe_domain(
         self, binds_to: str, credentials: RuntimeCredentials
     ) -> tuple[list[str] | None, list[frozenset[tuple[str, str]] | None]]:
-        """Return the scope-enforced DISTINCT domain of `binds_to`
-        ("database.table.column") and the provenance entries to fold into the
-        union (§5.3, B2):
-          - malformed `binds_to` / denied / errored probe → `(None, [])`: no
-            domain (the resolver binds directly; the NODE query's own D57
-            enforcement still gates it — never a fabricated match) and NOTHING is
-            added to the union (a denied probe read nothing).
-          - a SUCCESSFUL probe → `(values, [probe.provenance])`: the probe
-            provenance is appended UNCONDITIONALLY (even when `None`) so a
-            successful probe with undetermined provenance POISONS the union, the
-            same fail-closed rule as the node/grain queries.
-        An ordinary dispatched runQuery (scope-enforced); it does NOT count against
-        the model budget (§3.2)."""
+        """Return the scope-enforced DISTINCT domain of `binds_to` ("database.table.column") and
+                the provenance entries to fold into the union:
+
+                  - a malformed `binds_to`, or a denied or errored probe -> `(None, [])`: no domain
+                    (the resolver binds directly, and the NODE query's own D57 enforcement still
+                    gates it — never a fabricated match), and NOTHING is added to the union, since a
+                    denied probe read nothing.
+                  - a SUCCESSFUL probe -> `(values, [probe.provenance])`, appended UNCONDITIONALLY
+                    even when `None`, so a successful probe with undetermined provenance POISONS the
+                    union — the same fail-closed rule as the node and grain queries.
+
+                An ordinary dispatched runQuery; it does not count against the model budget.
+        """
         db_table, sep, column = binds_to.rpartition(".")
         if not sep or not db_table or not column:
             return None, []
@@ -1032,14 +1019,14 @@ class BlueprintExecutor:
         result_full: Any,
         credentials: RuntimeCredentials,
     ) -> tuple[str | None, ExecFailed | None]:
-        """Materialize a table-output node's result into a session-scoped scratch
-        table via the D93 side-channel (§2.2 steps 1-2).
+        """Materialize a table-output node's result into a session-scoped scratch table via the
+                D93 side-channel.
 
-        Returns `(full_scratch_table_name, None)` on success — the RETURNED
-        `scratch.s_<sid>_bp_<uuid>` name used VERBATIM (never reconstructed) — or
-        `(None, ExecFailed(UNSUPPORTED))` on a structural over-cap or a
-        rejected/failed materialize. Both fail closed to the raw loop: never a
-        runaway materialization, never a wrong answer.
+                Returns `(full_scratch_table_name, None)` on success — the RETURNED
+                `scratch.s_<sid>_bp_<uuid>` name, used VERBATIM and never reconstructed — or
+                `(None, ExecFailed(UNSUPPORTED))` on a structural over-cap or a rejected materialize.
+                Both fail closed to the raw loop: never a runaway materialization, never a wrong
+                answer.
         """
         columns, rows, _rc, truncated = _unpack_result(result_full)
         if not columns:
@@ -1181,16 +1168,15 @@ def _parse_detail(detail: BlueprintDetail) -> Blueprint:
 def _stamp_window_anchor(result_full: dict[str, Any], blueprint: Blueprint) -> None:
     """Record the EXECUTED blueprint's window-anchor declaration on the result (J7).
 
-    ONE writer for both finish paths (single-node and DAG `_finalize`) so the two cannot
-    describe the same blueprint's window differently — the same reason `_verify_block` is
-    a shared builder. The key is written only when the blueprint declares an anchor, so a
-    result for any of the other blueprints is byte-identical to before.
+        ONE writer for both finish paths (single-node and DAG `_finalize`) so the two cannot
+        describe the same blueprint's window differently. The key is written only when the
+        blueprint declares an anchor, so every other result is byte-identical to before.
 
-    This is the value the model-facing note is DERIVED from (`tool.window_note_for_result`)
-    rather than a second copy of the note: `result_full` is persisted behind a D46 KV
-    pointer and re-read on the D45 resume path, so storing the raw declaration lets a
-    resumed run re-derive the identical note instead of carrying prose through the
-    checkpoint."""
+        This is the value the model-facing note is DERIVED from (`tool.window_note_for_result`)
+        rather than a second copy of the note: `result_full` is persisted behind a D46 KV pointer
+        and re-read on the D45 resume path, so storing the raw declaration lets a resumed run
+        re-derive the identical note instead of carrying prose through the checkpoint.
+    """
     if blueprint.window_anchor is not None:
         result_full["window_anchor"] = blueprint.window_anchor
 
@@ -1218,25 +1204,23 @@ def _unpack_result(raw: Any) -> tuple[list[str], list[list[Any]], int, bool]:
 
 
 def _verify_block(verify_out: VerifyOutcome, row_count: int) -> dict[str, Any]:
-    """The `result_full["verify"]` block — ONE builder for BOTH the single-node and
-    the DAG finalize path, so the two can never describe the same gate differently.
+    """The `result_full["verify"]` block — ONE builder for BOTH the single-node and the DAG
+        finalize path, so the two can never describe the same gate differently.
 
-    J6 — AN EMPTY RESULT IS UNVERIFIABLE, NOT VERIFIED. The D56 grain teeth are
-    `row_count == distinct_grain_count`; at zero rows that is `0 == 0`, which passes
-    for every blueprint ever written, correct or not. The check did not catch
-    anything because there was nothing to catch — so it is reported as NOT having
-    run (`grain_checked: False`, the same honesty rule §4.2's skip already follows)
-    plus an explicit `empty_result: True` marker, which is what lets the badge say
-    *empty — unverifiable* instead of *verified ✓*.
+        AN EMPTY RESULT IS UNVERIFIABLE, NOT VERIFIED. The D56 grain teeth are
+        `row_count == distinct_grain_count`; at zero rows that reads `0 == 0`, which passes for
+        every blueprint ever written, correct or not. The check did not catch anything because
+        there was nothing to catch, so it is reported as NOT having run (`grain_checked: False`)
+        plus an explicit `empty_result: True` marker — which is what lets the badge say
+        *empty — unverifiable* instead of *verified*.
 
-    DELIBERATELY UNTOUCHED: `grain_ok` stays as the gate computed it (vacuously
-    True). It — with `signature_ok` — is what `tool._is_verified_blueprint_result`
-    reads to set the `authoritative` marker, and an empty blueprint result IS still
-    the authoritative answer for its intent ("there are none" is an answer). Only
-    the VERIFICATION CLAIM is withdrawn here, never the no-re-derivation rule.
+        DELIBERATELY UNTOUCHED: `grain_ok` stays as the gate computed it (vacuously True). It,
+        with `signature_ok`, is what `tool._is_verified_blueprint_result` reads to set the
+        `authoritative` marker, and an empty blueprint result IS still the authoritative answer
+        for its intent. Only the VERIFICATION CLAIM is withdrawn, never the no-re-derivation rule.
 
-    On a NON-empty result the returned dict is byte-identical to what it has always
-    been: `empty_result` is emitted only when it is true.
+        On a NON-empty result the returned dict is byte-identical to what it has always been:
+        `empty_result` is emitted only when it is true.
     """
     block: dict[str, Any] = {
         "grain_ok": verify_out.grain_ok,
@@ -1257,18 +1241,15 @@ def _verify_block(verify_out: VerifyOutcome, row_count: int) -> dict[str, Any]:
 def _union_provenance(
     provenances: list[frozenset[tuple[str, str]] | None],
 ) -> frozenset[tuple[str, str]] | None:
-    """Union every inner runQuery's captured provenance (§5.3). Fail-closed: if
-    ANY inner call had undetermined (`None`) provenance, the union is `None` (the
-    assistant message drops from D44 replay), matching
-    `_compute_turn_provenance_union`'s posture.
+    """Union every inner runQuery's captured provenance. Fail-closed: if ANY inner call had
+        undetermined (`None`) provenance the union is `None` — the assistant message then drops
+        from D44 replay, matching `_compute_turn_provenance_union`'s posture.
 
-    SCRATCH columns are EXCLUDED (D69/OQ-4, §2.2 step 4): a `scratch.*` pair is
-    session-gated, not scope-gated, and the materialized scratch table is an
-    ephemeral projection of already-scope-checked warehouse data. Dropping the
-    `scratch.` pairs here keeps the persisted footprint HONEST — exactly the real
-    warehouse columns the answer depends on (the same posture the read plane's
-    `is_provenance_in_scope` takes at check time). The `None`-poison rule is
-    unchanged: an undetermined inner call still drops the whole answer."""
+        SCRATCH columns are EXCLUDED (D69): a `scratch.*` pair is session-gated, not scope-gated,
+        and the materialized scratch table is an ephemeral projection of already-scope-checked
+        warehouse data. Dropping those pairs keeps the persisted footprint HONEST — exactly the
+        real warehouse columns the answer depends on. The `None`-poison rule is unchanged.
+    """
     acc: set[tuple[str, str]] = set()
     for prov in provenances:
         if prov is None:
@@ -1366,14 +1347,14 @@ def _node_table_bindings(
 
 
 def _infer_ch_type(values: list[Any]) -> str:
-    """Infer the non-Nullable ClickHouse type for a column's NON-NULL cells (OQ-A).
+    """Infer the non-Nullable ClickHouse type for a column's NON-NULL cells.
 
-    Maps NATIVE result types: Bool → Int64 → Float64 → String. A STRING cell maps
-    to `String` (never re-parsed as a number), so an explicit `toString(...)` CAST
-    on a join key is HONORED — the scratch column stays String and matches the
-    String warehouse key, sidestepping the all-numeric-string mistyping hazard. A
-    measure CAST to `toFloat64(...)` arrives as a native float → Float64. Any mixed
-    column falls back to `String` (fail-safe: the endpoint stores it as data)."""
+        Maps NATIVE result types: Bool -> Int64 -> Float64 -> String. A STRING cell maps to
+        `String` and is never re-parsed as a number, so an explicit `toString(...)` CAST on a
+        join key is HONORED — the scratch column stays String and matches the String warehouse
+        key, sidestepping the all-numeric-string mistyping hazard. Any mixed column falls back to
+        `String` (fail-safe: the endpoint stores it as data).
+    """
     if not values:
         return "String"  # all-NULL → the caller Nullable-wraps this
     if all(isinstance(v, bool) for v in values):
@@ -1405,12 +1386,12 @@ def _infer_scratch_columns(
 def _all_referenced_slots(blueprint: Blueprint) -> set[str]:
     """Every `{slot}` token referenced by the templates the DAG path ACTUALLY runs.
 
-    B4 (hybrid record): when `composes` is non-empty the DAG path runs — the
-    top-level `sql_template` is DEAD (never executed). Counting its `{slot}` tokens
-    here would let a required slot that lives ONLY in the dead template pass the B3
-    referenced-slot backstop while being silently dropped at execution → a
-    company-wide "verified" wrong answer. Only count node templates when composes
-    is present (the loader also rejects the both-present hybrid outright)."""
+        When `composes` is non-empty the DAG path runs and the top-level `sql_template` is DEAD.
+        Counting its `{slot}` tokens here would let a required slot that lives ONLY in the dead
+        template pass the referenced-slot backstop while being silently dropped at execution — a
+        company-wide "verified" wrong answer. So only node templates count when composes is
+        present; the loader also rejects the both-present hybrid outright.
+    """
     referenced: set[str] = set()
     if blueprint.composes:
         for node in blueprint.composes:
@@ -1422,17 +1403,16 @@ def _all_referenced_slots(blueprint: Blueprint) -> set[str]:
 
 
 def _extract_scalar_output(node: Node, result_full: Any) -> dict[str, Any] | None:
-    """Read a query node's SCALAR output(s) from its single-cell result (§2.4).
+    """Read a query node's SCALAR output(s) from its single-cell result.
 
-    A SCALAR intermediate is a single cell per declared scalar (D59a). B1 (fail-
-    closed): returns `None` — a hard contract violation the caller maps to
-    SLOT_INVALID — when the node does NOT return exactly one row, when the column
-    count does not equal the declared-scalar count, or when a mapped cell is NULL.
-    This closes the "silently take `rows[0][0]`" hazard: because the D56 grain gate
-    only guards the TERMINAL node, a fanned-out (>1 row) or wide (>1 column)
-    intermediate would otherwise bind an ARBITRARY cell downstream and still return
-    a "verified" answer. A node with NO declared scalar output yields `{}` (a
-    terminal/table result, not an intermediate — unconstrained here)."""
+        A scalar intermediate is a single cell per declared scalar. Fail-closed: returns `None` —
+        a hard contract violation the caller maps to SLOT_INVALID — when the node does NOT return
+        exactly one row, when the column count does not equal the declared-scalar count, or when
+        a mapped cell is NULL. This closes the "silently take `rows[0][0]`" hazard: the D56 grain
+        gate only guards the TERMINAL node, so a fanned-out or wide intermediate would otherwise
+        bind an ARBITRARY cell downstream and still return a "verified" answer. A node with NO
+        declared scalar output yields `{}`.
+    """
     scalars = [name for name, kind in node.output.items() if kind == "scalar"]
     if not scalars:
         return {}
@@ -1491,14 +1471,15 @@ def _node_bindings(
     node_outputs: dict[str, Any],
     omitted_patterns: dict[str, str],
 ) -> tuple[dict[str, Any], ExecFailed | None]:
-    """Assemble the exact `{placeholder: value}` set a node template needs from
-    (a) upstream scalar `consumes`, (b) resolved slots, (c) `resolve_via` rule
-    IN-lists. An unbound placeholder or an unresolvable consume is fail-closed to
-    SLOT_INVALID (never a half-bound query).
+    """Assemble the exact `{placeholder: value}` set a node template needs from (a) upstream
+        scalar `consumes`, (b) resolved slots, and (c) `resolve_via` rule IN-lists. An unbound
+        placeholder or an unresolvable consume is fail-closed to SLOT_INVALID (never a half-bound
+        query).
 
-    *omitted_patterns* (Slice C): tokens satisfied by an omitted optional slot's
-    `optional_pattern` — NOT value-bound here (the pattern replaces their predicate
-    in `bind_template`), so they are excluded from the unbound-token check."""
+        *omitted_patterns* carries tokens satisfied by an omitted optional slot's
+        `optional_pattern` — NOT value-bound here, since the pattern replaces their predicate in
+        `bind_template`, so they are excluded from the unbound-token check.
+    """
     refs = referenced_slots(node.sql_template or "")
     bindings: dict[str, Any] = {}
     # (a) consumes: {placeholder: "$N.name"} — the upstream SCALAR value.
@@ -1569,13 +1550,13 @@ _APPROVAL_AFFIRMATIVES: tuple[str, ...] = (
 
 
 def _approval_decision(answer: str | None) -> str:
-    """Classify a resume answer as `"approve"` | `"deny"` | `"repause"` (B3).
+    """Classify a resume answer as `"approve"` | `"deny"` | `"repause"`.
 
-    Consent is opt-IN: proceed ONLY on an explicit affirmative. An explicit
-    negation → deny (raw-loop fallback); anything unrecognized (garbage, silence)
-    → `"repause"` (re-ask the same gate — never proceed on ambiguity). Negations
-    are matched before affirmatives so "do not proceed" denies rather than the
-    embedded "proceed" approving."""
+        Consent is opt-IN: proceed ONLY on an explicit affirmative. An explicit negation denies
+        (raw-loop fallback); anything unrecognized — garbage, silence — re-asks the same gate,
+        never proceeding on ambiguity. Negations are matched before affirmatives, so "do not
+        proceed" denies rather than the embedded "proceed" approving.
+    """
     if answer is None:
         return "repause"
     normalized = answer.strip().casefold()

@@ -1,26 +1,13 @@
 """Literal-predicate enumeration for the D97 totality check.
 
-The extractor's `parameterization` must have EXACTLY ONE `ParamPlan` per literal
-predicate of the accepted SQL (D97 §4.1) — a predicate with no plan is a silently
-dropped filter (the D56 wrong-answer class). This module deterministically
-enumerates EVERY literal comparison predicate so the validator can assert
-coverage per-locator.
-
-Scope (reconciled §4.1 ↔ D97 "every literal predicate"): all literal COMPARISON
-predicates — `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `LIKE`/`ILIKE` —
-found ANYWHERE in the statement: WHERE, JOIN-`ON`, HAVING, and derived-table/CTE
-sub-WHEREs at every nesting level (the walk is over the whole AST, not a single
-WHERE subtree — the previous WHERE-only walk silently missed JOIN-`ON` literals
-and >1-WHERE queries). A predicate is "literal" iff ONE side resolves to a single
-column (seen through a function wrapper, e.g. `toYear(col)`) and the OTHER side is
-a constant — INCLUDING a function-wrapped literal (`toDate('2025-01-01')`) — on
-EITHER side.
-
-Over-enumeration is the SAFE direction (D97 §2.3): a predicate this module returns
-that the plan does not cover → a conservative decline (fail-to-review), never a
-silent drop. Subquery-internal predicates are therefore enumerated too — a known
-conservative-decline class, not special-cased away. Un-parseable SQL → `None`
-(the validator routes it to fail-to-review, D52).
+The extractor's `parameterization` must have EXACTLY ONE `ParamPlan` per literal predicate
+of the accepted SQL — a predicate with no plan is a silently dropped filter. This enumerates
+every literal COMPARISON predicate (`=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`,
+`LIKE`/`ILIKE`) ANYWHERE in the statement: WHERE, JOIN-`ON`, HAVING and sub-WHEREs at every
+nesting level, because the walk is over the whole AST. "Literal" means one side resolves to
+a single column (through function wrappers) and the other to a constant. OVER-enumeration is
+the SAFE direction (§2.3) — a conservative decline, never a silent drop. Un-parseable ⇒
+`None`.
 """
 
 from __future__ import annotations
@@ -150,8 +137,10 @@ def _predicate_of(node: exp.Expression) -> LiteralPredicate | None:
 
 
 def literal_predicates(sql: str) -> list[LiteralPredicate] | None:
-    """Enumerate every literal comparison predicate in *sql* (deterministic AST
-    walk order), or `None` if *sql* cannot be parsed (→ fail-to-review, D52)."""
+    """Enumerate every literal comparison predicate in *sql*, in deterministic AST walk order.
+
+    `None` if *sql* cannot be parsed (→ fail-to-review, D52).
+    """
     try:
         ast = sqlglot.parse_one(sql, dialect="clickhouse")
     except Exception:  # noqa: BLE001 - un-parseable SQL → caller fails to review
@@ -172,19 +161,13 @@ def literal_predicates(sql: str) -> list[LiteralPredicate] | None:
 def sole_literal_predicate(fragment: str) -> LiteralPredicate | None:
     """The one literal predicate *fragment* consists of ENTIRELY, or `None`.
 
-    Written for the catalog's `rules[*].predicate` (a boolean SQL fragment, not a
-    statement), so a rule can be compared against an uncovered predicate of the accepted
-    SQL — and deliberately the STRICTEST reading of "the rule is this predicate": the
-    parse ROOT must itself be the comparison. `literal_predicates` would answer for the
-    fragment too, but it walks, so it reports the `!=` inside
-    `employee_status != 'N' OR employee_status IS NULL` and the first half of
-    `a = '1' AND b = '2'` — each a rule that is NOT that predicate, only one that
-    contains it. Offering such a rule as "the catalog declares this predicate" would
-    hand a model a rule strictly different from the filter its query ran.
-
-    Prose (`Use department_name as the display label.`), a placeholder-bearing predicate
-    (`field_id IN ({field_codes})`) and a null-check (`hours IS NOT NULL`) all return
-    `None` — nothing to match, and nothing said about them."""
+    Written for the catalog's `rules[*].predicate` and deliberately the STRICTEST reading of
+    "the rule IS this predicate": the parse ROOT must itself be the comparison.
+    `literal_predicates` walks, so it would report the `!=` inside `a != 'N' OR a IS NULL` — a
+    rule that CONTAINS the predicate rather than one that IS it, and offering that would hand a
+    model a rule strictly different from the filter its query ran. Prose, a placeholder-bearing
+    predicate and a null-check all return `None`.
+    """
     try:
         root = sqlglot.parse_one(fragment, dialect="clickhouse")
     except Exception:  # noqa: BLE001 - prose or a placeholder: not a comparison

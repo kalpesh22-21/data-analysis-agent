@@ -1,28 +1,13 @@
 """promotion/replay.py — golden replay (D29/D36/D98), the STRUCTURE oracle.
 
-A candidate does not promote on replay alone (D98 layer iii), but replay is a hard
-GATE on the `candidate → validated` edge: it proves the frozen S4 template still
-executes and still produces a result whose STRUCTURE (grain-integrity teeth +
-result_signature column shape) is intact. It verifies **structure, not values**
-(D98) — there is NO value oracle here; adding one would breach D17 (the recorded
-scalar answer is entity-bearing and never stored).
-
-REUSE, not reimplement:
-  * the D56 `verify_result` gate (`runtime/blueprint/verify.py`) — the grain-teeth
-    (`row_count == COUNT(DISTINCT grain)`) + signature-shape check, verbatim.
-  * the runtime template binder (`runtime/blueprint/template.py::bind_template`) —
-    the same F1/D10 typed-literal binding the executor uses, so the replay SQL is
-    built exactly as a live `runBlueprint` would build it.
-
-Slot values are SAMPLED — synthetic tokens minted here, NEVER stored entity inputs
-(D17: no entity input is ever persisted, so replay cannot and must not reuse one).
-The synthetic sample proves the template BINDS and RUNS; the injected
-`WarehouseProbe` (fake in tests, no real ClickHouse) returns the `verify_result`
-triple. A single green replay is not a correctness proof.
-
-Contract note: the S4 `generalization.sql_template` is BRACE authoring form
-(`{department}`) — the SAME shape the runtime binder authors — so it feeds straight
-into `bind_template`/`referenced_slots` with zero placeholder translation.
+A candidate does not promote on replay alone (D98 layer iii), but replay is a hard GATE on
+the `candidate → validated` edge: it proves the frozen S4 template still executes and still
+produces a result whose STRUCTURE (grain-integrity teeth + result_signature column shape) is
+intact. Structure, NOT values — there is no value oracle here, and adding one would breach
+D17. REUSE, not reimplement: the D56 `verify_result` gate and the runtime template binder
+verbatim, so the replay SQL is built exactly as a live `runBlueprint` would build it. Slot
+values are SAMPLED synthetic tokens, never stored entity inputs. A single green replay is
+not a correctness proof.
 """
 
 from __future__ import annotations
@@ -46,9 +31,11 @@ from .models import WarehouseProbe
 
 @dataclass(frozen=True)
 class ReplayOutcome:
-    """The result of one golden replay. `passed` is the reused D56 gate verdict;
-    `verify` carries the per-check breakdown (grain teeth + signature shape).
-    Never carries a returned value/number (D98)."""
+    """The result of one golden replay.
+
+    `passed` is the reused D56 gate verdict and `verify` carries the per-check breakdown. Never
+    carries a returned value (D98).
+    """
 
     passed: bool
     verify: VerifyOutcome | None
@@ -58,10 +45,11 @@ class ReplayOutcome:
 
 
 def _pick_template(gen: BlueprintGeneralization) -> str | None:
-    """The template whose result STRUCTURE the D56 gate verifies: a single
-    blueprint's top-level template, or the TERMINAL node of a composite (highest
-    `order`) — the node that produces the final result the grain/signature
-    describes (the executor gates only the terminal, §2.4/D56)."""
+    """The template whose result STRUCTURE the D56 gate verifies.
+
+    A single blueprint's top-level template, or the TERMINAL node of a composite (highest
+    `order`) — the node that produces the final result the grain/signature describes.
+    """
     if gen.sql_template:
         return gen.sql_template
     if gen.node_templates:
@@ -83,34 +71,21 @@ _SAMPLE_RELATIVE_WINDOW = 1
 
 
 def _slot_types(payload: dict[str, Any]) -> dict[str, str]:
-    """Map each `{token}` a slot may bind → the slot's declared `type` from
-    `payload.parameterization` (role=="slot"). Used to sample a TYPE-CORRECT synthetic
-    value per bind site (R7) so a date/list/windowed slot does not type-error when the
-    replay hits a real warehouse.
+    """Map each `{token}` a slot may bind → the slot's declared `type` (role=="slot").
 
-    Keyed by TOKEN, not by slot name, and the difference is only visible for one type:
-    a `period_range` occupies TWO bind sites (`{name}_start`/`{name}_end`) and every
-    other type occupies one. `_sample_bindings` looks values up by what
-    `referenced_slots(template)` found in the SQL — i.e. by token — so a name-keyed map
-    silently missed both halves of a `period_range` and sampled them as untyped
-    strings, which a real warehouse rejects as a date comparison.
+    Keyed by TOKEN, not by slot name, and the difference is visible for exactly one type: a
+    `period_range` occupies TWO bind sites (`{name}_start`/`{name}_end`). `_sample_bindings`
+    looks values up by what `referenced_slots(template)` found in the SQL, so a name-keyed map
+    silently missed both halves and sampled them as untyped strings, which a real warehouse
+    rejects. The expansion calls the runtime's own `slot_token_names` rather than re-spelling
+    the grammar a fourth time, and a `SlotSpec` is constructed directly rather than parsed,
+    because the plan's slot dict is untrusted and a full parse would raise on the fail-closed
+    promotion path.
 
-    The expansion calls `slot_token_names`, the runtime's own anti-drift helper, rather
-    than re-spelling the `_start`/`_end` grammar: that grammar already exists in the
-    executor, the corpus loader and the binder, and a fourth hand-written copy is the
-    mirror-drift failure this codebase keeps paying for. A `SlotSpec` is constructed
-    directly (not via `parse`) because only `name`/`type` matter to the helper and the
-    plan's slot dict is untrusted — running the full parse here would turn a malformed
-    plan into a raise on the fail-closed promotion path.
-
-    NOTE: the `period_range` half is currently AHEAD of the pipeline. S4's
-    `rewrite_sql_to_template` emits one token per predicate, so the loop cannot yet
-    produce a range slot at all and the extractor declines the type
-    (`extractor/models.py::UNSUPPORTED_SLOT_TYPES`). It is kept, and kept correct,
-    because removing it would re-arm exactly the trap that motivated it: the fake probe
-    never executes the SQL, so a name-keyed map made golden replay report `passed=True`
-    on SQL ClickHouse rejects. When the rewriter learns the grammar, this must not be a
-    second thing to remember."""
+    NOTE: the `period_range` half is AHEAD of the pipeline — S4 cannot yet emit a range slot —
+    and is kept correct because the fake probe never executes the SQL, so the bug it prevents
+    reports `passed=True` on SQL ClickHouse rejects.
+    """
     types: dict[str, str] = {}
     params = payload.get("parameterization")
     if not isinstance(params, list):
@@ -146,16 +121,20 @@ def _sample_value(name: str, slot_type: str) -> Any:
 
 
 def _sample_bindings(slot_names: set[str], slot_types: dict[str, str]) -> dict[str, Any]:
-    """Mint a type-correct SYNTHETIC value per referenced slot — never a stored
-    entity input (D17). The value proves the template binds + runs; the probe is a
-    structure oracle, so only the TYPE (not the value) matters (D98/R7)."""
+    """Mint a type-correct SYNTHETIC value per referenced slot — never a stored entity input (D17).
+
+    The value proves the template binds and runs; the probe is a structure oracle, so only the
+    TYPE matters (D98/R7).
+    """
     return {name: _sample_value(name, slot_types.get(name, "")) for name in slot_names}
 
 
 def _expected_columns(payload: dict[str, Any]) -> tuple[str, ...] | None:
     """The declared result-signature column SHAPE (D98 — the entity-free golden).
-    `None` (no declared signature) makes the reused `verify_result` skip the shape
-    check (a no-op), never a false pass."""
+
+    `None` (no declared signature) makes the reused `verify_result` skip the shape check, never
+    a false pass.
+    """
     sig = payload.get("result_signature") or {}
     shape = sig.get("shape") or []
     cols = tuple(
@@ -171,14 +150,11 @@ async def golden_replay(
 ) -> ReplayOutcome:
     """Replay `env`'s frozen S4 template through the reused binder + D56 gate.
 
-    Returns a `ReplayOutcome`; `passed=False` (with a machine `reason`) on a
-    missing generalization/template, a bind failure, a failed D56 gate, OR a probe
-    failure (`reason="probe_unavailable"` — the warehouse/query service is down or,
-    today, the deferred stub probe is wired). NEVER raises: an unavailable probe is a
-    fail-closed NON-promotion, not an exception that escapes into the cron `_guard`
-    (needless traceback spam) or, worse, uncaught out of the human `approve` path.
-    The scheduler treats any non-passing replay as "do not promote" / "demote", the
-    D98 fail-closed posture."""
+    `passed=False` with a machine `reason` on a missing generalization or template, a bind
+    failure, a failed D56 gate, or a probe failure (`probe_unavailable`). NEVER raises: an
+    unavailable probe is a fail-closed NON-promotion, not an exception escaping into the cron
+    `_guard` or, worse, out of the human approve path.
+    """
     gen_doc = env.payload.get("generalization")
     if not isinstance(gen_doc, dict):
         return ReplayOutcome(False, None, None, (), reason="no_generalization")

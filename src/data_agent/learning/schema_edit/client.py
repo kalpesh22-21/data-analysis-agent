@@ -1,17 +1,10 @@
 """Injected seams for the schema-edit PR bot (S8, D53/D18).
 
-Two injected collaborators, both scripted in tests (NO real GitHub, NO real
-network, NO catalog write):
-
-  * `GitPullRequestClient` — authors a branch + YAML-patch PR. The real
-    GitHub/git wiring is DELIBERATELY DEFERRED; this slice builds only the seam.
-  * `SchemaEditChecks` — runs the CI gate (schema lint + `explainQuery` dry-run)
-    that CI would run on the PR. Injected so a test drives a deterministic
-    pass/fail without a schema engine.
-
-The default `SchemaEditChecks` (`AllPassChecks`) passes; there is NO default git
-client (a missing client is a wiring error the stage surfaces loudly, never a
-silent no-op that could look like an auto-commit).
+Two injected collaborators, both scripted in tests (no real GitHub, no network, no catalog
+write): `GitPullRequestClient` authors a branch + YAML-patch PR, with the real git wiring
+deliberately deferred, and `SchemaEditChecks` runs the CI gate. The default checks pass, but
+there is NO default git client — a missing client is a wiring error the stage surfaces
+loudly, never a silent no-op that could look like an auto-commit.
 """
 
 from __future__ import annotations

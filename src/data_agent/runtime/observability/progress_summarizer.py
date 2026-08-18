@@ -1,44 +1,16 @@
-"""ProgressSummarizer — a small/cheap side LLM that turns one tool CALL (name +
-args, NOT results) into a natural-language, present-tense UI progress line
-(design §7 / docs/08-ui.md; opt-in behind `progress_summary_enabled`).
+"""ProgressSummarizer — a cheap side LLM that turns one tool CALL (name + args, never
+results) into a natural-language UI progress line. Opt-in behind
+`progress_summary_enabled`, fired CONCURRENTLY with dispatch and never awaited before it.
 
-Today the progress stream shows raw tool-name templates ("running runQuery…").
-When enabled, the agent loop fires this summarizer CONCURRENTLY with each tool
-dispatch (never awaited before dispatch — it must not add latency to the tool)
-to mint a richer line ("Querying overtime pay by department for January") that
-is streamed to the UI as it arrives, additive to the instant template label.
+D25 relaxation for this channel only: the line MAY carry BUSINESS values (a period, a
+department) but never internal database structure. It reaches the UI VERBATIM as the
+progress event's `step`, bypassing the `shape` allowlist, so the guard is at the INPUT
+and is default-deny — `_project_args` passes only per-tool allowlisted arguments, and
+nothing at all for an unlisted tool. Two deterministic checks then drop a line back to
+the tool's static phrasing: `_looks_structural` and `_leaks_identifiers`.
 
-D25 relaxation (this channel ONLY, gated): the produced line is deliberately
-VALUE-RICH — it MAY include concrete parameters drawn from the tool arguments
-(e.g. a period, a department). This relaxes the D25 "no cell/slot values in
-progress" rule for the progress-summary channel and is why the feature is
-opt-in. The machine-readable tool name stays in the progress event's `shape`.
-
-WHAT THE RELAXATION IS *NOT*: it admits BUSINESS values, never internal database
-structure. This line goes into the progress event's `step` VERBATIM
-(`progress.py`'s `_PROGRESS_SUMMARY_EVENT` branch bypasses the `shape`
-allowlist by design), so anything the small model is shown can reach the UI. The
-guard is therefore at the INPUT, and it is default-deny: `_project_args` passes
-only the arguments explicitly allowlisted per tool (`_ARG_ALLOWLIST`) and NOTHING
-at all for an unlisted tool — `runQuery`'s `sql`, `listTables`'s `database`,
-`getTableSchema`'s `table` and every other physical identifier never reach the
-prompt, so the model cannot narrate one. The produced line then faces two
-deterministic checks, either of which drops it in favour of the tool's static
-`_STATIC_LINES` phrasing: `_looks_structural` (the line is SHAPED like database
-structure — a qualified or quoted identifier, or SQL — whatever its provenance,
-which is what covers the allowlisted FREE-TEXT arguments the schema-aware main
-model authored) and `_leaks_identifiers` (the line repeats an identifier-looking
-token drawn from the WITHHELD raw arguments).
-
-Fail-soft everywhere (load-bearing): `summarize` returns `None` on ANY error,
-timeout, or empty output — a flaky/slow summarizer must never break a turn nor
-delay a tool. Token cost is bounded: each argument value is truncated before it
-is serialized into the prompt, and the whole call is wrapped in a timeout.
-
-Reuses the per-call-scoped model handle pattern (`begin_turn_client`, B3): this
-call may run concurrently with an in-flight `/turn` also using a shared
-`OpenAIModelClient`, so it never touches the shared instance's fallback
-stickiness directly. The auto-instrumented OpenAI span covers this extra call.
+Fail-soft (load-bearing): `summarize` returns `None` on any error, timeout or empty
+output — a flaky summarizer must never break a turn nor delay a tool.
 """
 
 from __future__ import annotations
@@ -165,9 +137,10 @@ _MAX_ARGS_BLOB_CHARS = 1200
 
 
 def _truncate(value: Any) -> Any:
-    """Bound one argument value's serialized size. Strings are cut to
-    `_MAX_ARG_VALUE_CHARS`; lists/tuples are element-truncated then capped;
-    dicts are recursively value-truncated; scalars pass through unchanged."""
+    """Bound one argument value's serialized size: strings are cut, lists/tuples are
+        element-truncated then capped, dicts are recursively value-truncated, scalars pass
+        through unchanged.
+    """
     if isinstance(value, str):
         return value if len(value) <= _MAX_ARG_VALUE_CHARS else value[:_MAX_ARG_VALUE_CHARS] + "…"
     if isinstance(value, (list, tuple)):
@@ -190,8 +163,9 @@ def _compact_args(arguments: dict[str, Any]) -> str:
 
 
 def _project_args(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """The arguments the summarizer prompt may see — allowlisted per tool,
-    EMPTY for any tool not in `_ARG_ALLOWLIST` (default-deny)."""
+    """The arguments the summarizer prompt may see — allowlisted per tool, EMPTY for any
+        tool not in `_ARG_ALLOWLIST` (default-deny).
+    """
     allowed = _ARG_ALLOWLIST.get(tool_name)
     if not allowed:
         return {}
@@ -199,8 +173,9 @@ def _project_args(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def _collect_strings(value: Any, out: list[str]) -> None:
-    """Flatten every string reachable in *value* into *out* (keys included — a
-    dict KEY can itself be a column name, e.g. a `slot_bindings` entry)."""
+    """Flatten every string reachable in *value* into *out*, keys included — a dict KEY
+        can itself be a column name (e.g. a `slot_bindings` entry).
+    """
     if isinstance(value, str):
         out.append(value)
     elif isinstance(value, dict):
@@ -216,9 +191,8 @@ def _collect_strings(value: Any, out: list[str]) -> None:
 def _forbidden_tokens(tool_name: str, arguments: dict[str, Any]) -> set[str]:
     """Identifier-looking tokens drawn from the arguments this tool WITHHELD.
 
-    Only the withheld ones: an allowlisted value (a department, a search phrase)
-    is exactly what the line is allowed to repeat, so scanning for it would
-    reject every good line for `runBlueprint`.
+        Withheld ones only: an allowlisted value (a department, a search phrase) is exactly
+        what the line is allowed to repeat, so scanning for it would reject every good line.
     """
     allowed = _ARG_ALLOWLIST.get(tool_name, frozenset())
     withheld = [value for key, value in arguments.items() if key not in allowed]
@@ -250,18 +224,11 @@ def _leaks_identifiers(line: str, forbidden: set[str]) -> bool:
 def _is_identifier_shaped(token: str) -> bool:
     """True when *token* looks like a physical identifier rather than a word.
 
-    `employee_master`, `dbpcm_warehouse.employee`, `EmployeeMaster`, `AnnualSalary`
-    — an underscore, a dot, or camel/Pascal casing (BOTH cases present, so an
-    ordinary capitalised word "January" and an acronym "OPEX" are not matched). A
-    plain word ("payroll", "department", "from") is NOT identifier-shaped:
-    flagging those would downgrade every good line the channel exists to produce.
-
-    KNOWN, ACCEPTED FALSE POSITIVE: a business value that is genuinely
-    inner-capitalised ("McKinsey", "DeVries") reads as identifier-shaped and costs
-    that line its static fallback. The trade is deliberate — this rule is what
-    catches the warehouse's PascalCase column names (`AnnualSalary`,
-    `EmployeeCode`), and a downgraded line is a far cheaper failure than a leaked
-    column name.
+        An underscore, a dot, or mixed camel/Pascal casing — BOTH cases must be present, so
+        a capitalised word ("January") and an acronym ("OPEX") are not matched, and a plain
+        word is never identifier-shaped. Accepted false positive: a genuinely
+        inner-capitalised business value ("McKinsey") costs that line its static fallback,
+        which is the cheap side of catching PascalCase column names.
     """
     token = token.strip('`"')
     if len(token) < _MIN_TOKEN_CHARS:
@@ -274,13 +241,12 @@ def _is_identifier_shaped(token: str) -> bool:
 
 
 def _looks_structural(line: str) -> bool:
-    """True when *line* itself is shaped like database structure — UNCONDITIONAL,
-    independent of where the material came from.
+    """True when *line* is itself shaped like database structure — UNCONDITIONAL,
+        independent of where the material came from.
 
-    This is the layer that covers the allowlisted free-text arguments (a
-    `concept`, a search `query`, a slot value, a recorded assumption): those are
-    written by the schema-aware main model, reach the summarizer legitimately, and
-    are invisible to the withheld-token scan.
+        This is the layer covering the allowlisted FREE-TEXT arguments (a `concept`, a
+        search `query`, a slot value): written by the schema-aware main model, they reach
+        the summarizer legitimately and are invisible to the withheld-token scan.
     """
     if _QUOTED_IDENTIFIER.search(line):
         return True
@@ -294,9 +260,9 @@ def _looks_structural(line: str) -> bool:
 
 
 def _static_line(tool_name: str) -> str:
-    """The safe, deterministic line for *tool_name* — used when the model's line
-    is rejected. Never contains the tool name (`progress.py`'s instant template
-    label already carries that)."""
+    """The safe, deterministic line for *tool_name*, used when the model's line is
+        rejected. Never contains the tool name — the instant template label already does.
+    """
     return _STATIC_LINES.get(tool_name, _GENERIC_STATIC_LINE)
 
 

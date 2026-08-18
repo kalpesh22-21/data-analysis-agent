@@ -1,24 +1,13 @@
 """CouchbaseUserKnowledgeStore — the real per-user store (S8, D17; mirrors D95).
 
 Its OWN `Cluster`, authenticated as `user_knowledge_writer` against the dedicated
-`user_knowledge` bucket — a separate RBAC boundary from the session / audit /
-candidate stores. This is the ONE store that holds entity-bearing facts, so the
-scoped role is load-bearing: `open_bucket` refuses any bucket but its grant, and
-`list_for_user` is a `user_id`-parameterized N1QL query (no cross-user surface).
+`user_knowledge` bucket — a separate RBAC boundary from the session, audit and candidate
+stores. This is the ONE store that holds entity-bearing facts, so the scoped role is
+load-bearing: `open_bucket` refuses any bucket but its grant, and `list_for_user` is a
+`user_id`-parameterized N1QL query with no cross-user surface.
 
-Import-guarded exactly like `couchbase_audit_store` / `couchbase_candidate_store`:
-imports with or without the SDK; constructing without it raises.
-
-CONNECT (2026-08-11): shares `CouchbaseConnectGate` with every other
-Couchbase-backed store — `acouchbase` refuses all ops until `on_connect()` has
-been awaited, which a sync `__init__` cannot do, so each public coroutine gates
-itself. The consumer builds this store and never connected it. See
-`runtime/couchbase_connect.py`.
-
-CONSTRUCTION (2026-08-17): also shared, via `CouchbaseStoreBase` — the SDK guard,
-the `Cluster`/bucket/collection graph and the TTL are built there from this store's
-own config, and (with no `cluster=` injected) not until the first
-`_ensure_connected()`. `__init__` does no I/O.
+Import-guarded (imports without the SDK; constructing raises), gated per public coroutine by
+`CouchbaseConnectGate`, and built through `CouchbaseStoreBase` so `__init__` does no I/O.
 """
 
 from __future__ import annotations

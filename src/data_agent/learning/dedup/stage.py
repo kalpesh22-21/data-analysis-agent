@@ -1,106 +1,27 @@
 """DedupStage — the blueprint dedup `CandidateStage` (D48 Slice 6, + PriorArt Slice 2).
 
-Runs third in the write-router pipeline (generalize → leakage → **dedup** → writer)
-and writes `envelope.dedup` (Contract C, `DedupVerdict`).
+Runs third in the frozen pipeline and writes `envelope.dedup` (Contract C). THREE LAYERS in
+strictly decreasing certainty, and only the two DETERMINISTIC ones may discard a candidate:
 
-**Three layers now, in strictly decreasing certainty.** The order is the design: a
-deterministic answer is always preferred to a probabilistic one, and only the two
-deterministic layers are allowed to discard a candidate.
+  1. HARD KEY (`canonical_key`) against the `learning_corpus` bucket — race-safe by
+     construction, which is what makes the cross-session hit count sound. A hit ⇒ `increment`
+     the EXISTING artifact and DROP the duplicate.
+  2. STRUCTURAL KEY against the `PriorArtIndex`, hashing only what BOTH authoring paths have,
+     because two of the hard key's four inputs are effectively learning-only. Against the MCP
+     canon ⇒ `redundant_with_canon`, DROP (a git-versioned blueprint has no corpus artifact
+     and no count the loop owns); against the learning tier or an unsourced node ⇒ `merge`.
+  3. SOFT LAYER — embedding similarity on `intent` over the UNION of the graph AND the bucket,
+     the latter being the only place an IN-FLIGHT sibling is visible. Never drops:
+     `merge`/`conflict` route to the inbox, below the band is `insert`.
 
-  1. **Hard key** (`canonical_key`, D48 §3) against the `learning_corpus` bucket. The
-     SHA-256 over `(resolves, uses_rules, result_grain, canonical_ast_norm)`. Race-safe
-     by construction — two workers hashing the same candidate always agree — and that
-     property is load-bearing for the cross-session hit count, which is why this stays
-     the first layer and stays unchanged. A HIT ⇒ `action="increment"`: bump the
-     EXISTING artifact's `hit_count` and DROP the duplicate (the count lives on the
-     artifact, not the envelope, §11.1).
-
-  2. **Structural key** (`runtime/blueprint/structural_key.py`) against the
-     `PriorArtIndex`. THE NEW LAYER, and the reason this slice exists. The hard key
-     cannot match across authoring paths — two of its four inputs (`resolves`,
-     `uses_rules`) are effectively learning-only, absent from 9-of-10 and 7-of-10 of
-     the MCP-canon YAMLs respectively — so a hand-authored canon blueprint and a
-     learning candidate describing the SAME query hash to different canonical keys. The
-     structural key hashes only what both paths genuinely have. A hit is an identity
-     claim, not a similarity guess, so it is allowed to be terminal:
-       * against the **MCP canon** ⇒ `redundant_with_canon`, DROP. `increment` would be
-         wrong here: there is no corpus artifact behind a git-versioned blueprint and no
-         count the loop owns. See below for why this is counted, not just logged.
-       * against the **learning tier** (or an unsourced node) ⇒ `merge`, routed to a
-         human. We may well already own it, but we cannot bump a count we cannot key,
-         and an unsourced node is not evidence of canon.
-
-  3. **Soft layer** — embedding similarity on `intent`, over the UNION of BOTH stores:
-     the `PriorArtIndex` (the graph — canon + landed learning tier) AND the
-     `learning_corpus` bucket (candidates that have NOT landed yet, which the graph
-     cannot see at all). A near-match with a DIFFERENT key is NEVER auto-appended and
-     never dropped (§3): `merge` (a mergeable variant) or `conflict` (partial overlap),
-     both routed to the inbox by the writer. Below the band ⇒ `insert`.
-
-     The union is a REGRESSION FIX, not an optimization — see `_soft_layer`. Treating
-     the bucket as a mere fallback silently removed the only check that caught two
-     concurrent sessions proposing the same blueprint.
-
-**Why `redundant_with_canon` is COUNTED.** A high rate of it is not the loop working
-well — it is a RETRIEVAL defect surfacing in the learning loop. The agent had a
-blueprint for this question, failed to recall it, the analyst wrote the SQL by hand, and
-the loop then re-derived what we already own. That signal is only visible here, so the
-verdict is emitted on a `learning.dedup` span (shape-only attributes) as well as logged,
-making the rate queryable rather than anecdotal.
-
-**Fail-soft (D52), extended.**
-  * No `canonical_ast_norm` (S4 could not produce one) ⇒ the hard key is SKIPPED; a
-    missing template never mints a spurious key.
-  * No structural key (the templates do not normalize) ⇒ layer 2 is skipped.
-  * **The prior-art index is FAIL-OPEN.** An unreachable/unconfigured graph raises
-    `PriorArtUnavailableError`, and that half of the soft union simply contributes
-    nothing, with a LOUD log; the bucket half still runs. Never stop learning because a
-    graph read failed. The residual exposure is stated plainly: while the index is down
-    the loop cannot see the canon or the landed tier, so it will mint duplicates it would
-    otherwise have dropped. That is strictly better than dropping the session, and the
-    log is what makes the window visible. Layer 2 (the canon-redundancy drop) simply does
-    not fire during that window.
-  * A degraded/failing embedder, or a failed corpus scan, contributes an empty bucket
-    half — never a wrong `merge`.
-
-**A FOURTH, optional adjudicator sits behind the soft layer (plan §3b).** When a
-`CoverageJudge` is wired, a soft-layer best score inside the ambiguous band
-(~0.70-0.97) is put to a model: "does this artifact already do what the candidate
-does?" Outside the band nothing is asked, because outside it the answer is obvious and
-free — below, nothing is close; above, the deterministic layers and the merge routing
-already have an opinion.
-
-It runs HERE rather than as a new pipeline stage for two reasons. The stage order is
-frozen (D102 §7.1), and this is not a new decision so much as a better-informed version
-of the one the soft layer is already making — it needs exactly the cards the soft layer
-just retrieved, and a separate stage would either re-embed and re-search (paying the
-soft layer's cost twice) or adjudicate a set the routing never saw.
-
-The judge may only ever DROP. It never softens a verdict, never turns a `merge` into an
-`insert`, and never advances a candidate past a gate — so the worst a mis-tuned judge
-can do is discard work, which is why it drops only on positive evidence and writes a
-durable `learning_audit` record before it does. Note that a `learning.dedup` span is
-emitted for a judge-dropped candidate exactly as it would be otherwise: it faithfully
-reports what DEDUP decided, and the drop is reported on the `learning.judge` span. So a
-dedup span is not a claim that the candidate survived the pipeline.
-
-**Two plan-§4 side outputs ride along, because this is the only stage that has already
-paid for the embed and the graph query.**
-
-  * `envelope.novelty` — the inbox-ranking novelty axis, computed from the GRAPH cards
-    ALONE (never the bucket half). See `_soft_layer` and `_novelty_from`.
-  * `CorpusArtifact.recurrence_count` — a DORMANT (weight 0.0) counter of paraphrase
-    sightings, bumped for each `learning_corpus` artifact inside the recurrence band.
-    See `_bump_recurrence`.
-
-Neither can change a dedup verdict, and both fail soft.
-
-The stage only adjudicates BLUEPRINTS (both keys are AST-derived). Non-blueprint targets
-pass through untouched (`dedup` stays `None`); the writer stage routes them.
-
-Thresholds, the corpus, the embedder and the prior-art index are all injected
-(composition-root config knobs), so nothing here reads global settings and tests stay
-hermetic.
+`redundant_with_canon` is COUNTED because a high rate is a RETRIEVAL defect surfacing here —
+the agent owned a blueprint, failed to recall it, and the loop re-derived it. FAIL-SOFT (D52):
+a missing key skips its own layer, and an unreachable prior-art index contributes nothing to
+the union with a LOUD log, so the loop mints duplicates it would have dropped rather than
+dropping the session. An optional COVERAGE JUDGE adjudicates the ambiguous band and may only
+ever DROP. Two plan-§4 side outputs ride along because this stage has already paid for the
+embed: `envelope.novelty` (from the GRAPH cards ALONE) and the dormant `recurrence_count`;
+neither can change a verdict. Only BLUEPRINTS are adjudicated.
 """
 
 from __future__ import annotations
@@ -171,47 +92,28 @@ def _cosine(a: list[float], b: list[float]) -> float:
 def _text(raw: object) -> str:
     """A rehydrated JSON value as a stripped `str`, or `""`.
 
-    NOT `(raw or "").strip()`, which is what this replaced: that raises AttributeError on
-    a non-string truthy value (`5`, `["SELECT 1"]`) — and both `canonical_ast_norm` and
-    `intent` come straight out of a model-authored, store-rehydrated payload."""
+    NOT `(raw or "").strip()`, which raises AttributeError on a non-string truthy value — and
+    both `canonical_ast_norm` and `intent` come out of a model-authored, rehydrated payload.
+    """
     return raw.strip() if isinstance(raw, str) else ""
 
 
 def _hard_key_inputs_ok(resolves: object, uses_rules: object, result_grain: object) -> bool:
     """Are the FROZEN hard key's three structured inputs shaped the way it needs?
 
-    DERIVED FROM `compute_canonical_key`, not from a remembered field list. Its inputs
-    are rehydrated JSON from `learning_candidates`, and the key function is FROZEN
-    (Contract C §3 — its digests are persisted), so it cannot be made defensive itself.
-    The operation each input is subjected to is what forces the requirement:
+    DERIVED FROM `compute_canonical_key`, not from a remembered field list: its inputs are
+    rehydrated JSON and the key function is FROZEN (its digests are persisted), so it cannot be
+    made defensive itself. `resolves` and `result_grain` are `dict(...)`-ed ⇒ Mapping;
+    `uses_rules` is `set(...)`-then-`sorted(...)` ⇒ list/tuple of str, because a BARE STRING
+    iterates char-wise into fictitious rule ids with no crash and a silently wrong key; a
+    list/tuple `columns` must hold str members, since `sorted` raises across mixed types.
 
-      input           operation in compute_canonical_key       ⇒ requirement
-      resolves        `dict(resolves)` — ValueError on a str
-                      or a list of scalars, TypeError on an int ⇒ Mapping
-      uses_rules      `set(uses_rules)` — TypeError on an
-                      unhashable member (list/dict) and on a
-                      non-iterable; a BARE STRING iterates
-                      char-wise into fictitious rule ids (no
-                      crash, a silently wrong key).
-                      Then `sorted(...)` — TypeError comparing
-                      mixed types                              ⇒ list/tuple of str
-      result_grain    `dict(result_grain)` — as resolves.
-                      Then `sorted(grain["columns"])` when it
-                      is a list/tuple — TypeError on mixed
-                      types                                    ⇒ Mapping, str columns
-
-    A failure SKIPS the hard key, which is the SAME fail-soft path an absent
-    `canonical_ast_norm` already takes (D52): a malformed input never mints a spurious
-    key, and the candidate falls through to the structural and soft layers rather than
-    dead-lettering the session. Before this guard a bare-string `result_grain` raised
-    ValueError out of `process` and killed the whole extraction.
-
-    Note the deliberate asymmetry with `_normalized_grain`: it tolerates a `columns` that
-    is not a list at all (it simply does not sort it), so this guard only constrains the
-    MEMBERS of a list/tuple `columns` — matching what the function actually does rather
-    than what its type hints suggest.
-
-    A NEW input to the frozen key belongs in this table before it belongs in the code."""
+    A failure SKIPS the hard key — the same fail-soft path an absent `canonical_ast_norm` takes
+    (D52) — so a malformed input never mints a spurious key and never dead-letters the session.
+    Note the deliberate asymmetry with `_normalized_grain`, which tolerates a `columns` that is
+    not a list at all. A NEW input to the frozen key belongs in this docstring before it belongs
+    in the code.
+    """
     if not isinstance(resolves, Mapping):
         return False
     if not isinstance(uses_rules, (list, tuple)):
@@ -237,29 +139,23 @@ _BLUEPRINT_LANDING_PREFIX = "bp::"
 
 
 def _bucket_landing_id(canonical_key: str) -> str:
-    """The neo4j node id a `learning_corpus` artifact WILL have (or already has) once it
-    lands. The join key between the two soft sources — see `DedupStage._corpus_cards`."""
+    """The neo4j node id a `learning_corpus` artifact will have once it lands.
+
+    The join key between the two soft sources — see `DedupStage._corpus_cards`.
+    """
     return f"{_BLUEPRINT_LANDING_PREFIX}{canonical_key}"
 
 
 def _card_from_artifact(artifact: CorpusArtifact, *, similarity: float) -> PriorArtCard:
-    """Project a `learning_corpus` artifact onto a `PriorArtCard` so both soft sources
-    adjudicate through ONE code path.
+    """Project a `learning_corpus` artifact onto a `PriorArtCard`.
 
-    `id` stays the artifact's own id (the originating candidate id), NOT the derived
-    landing id: it is what the verdict's `matched_id` has always carried for a bucket
-    match, and it is the id a human chasing the duplicate can actually look up.
-
-    `model_matched=True` is a statement of fact here, not an assumption: the query
-    vector and this artifact's vector were produced by the SAME `embed` call on the SAME
-    client moments ago, so they are in the same space by construction. There is no
-    stored `embedding_model` to compare — and inventing a mismatch would apply the
-    cross-space discount to a comparison that has no cross-space risk.
-
-    Fields the bucket genuinely does not have are EMPTY rather than guessed:
-    `structural_key` (never stamped on an artifact), `drift_status`, `result_grain`, and
-    `verified` (`None` — "the artifact does not say", the same tri-state a node without
-    the property gets)."""
+    So both soft sources adjudicate through ONE code path. `id` stays the artifact's own id (the
+    originating candidate id), NOT the derived landing id: it is what `matched_id` has always
+    carried for a bucket match, and what a human chasing the duplicate can look up.
+    `model_matched=True` is a statement of fact, not an assumption — the query vector and this
+    artifact's were produced by the SAME `embed` call moments ago. Fields the bucket genuinely
+    does not have are EMPTY rather than guessed.
+    """
     return PriorArtCard(
         id=artifact.id,
         kind="blueprint",
@@ -282,15 +178,13 @@ def _card_from_artifact(artifact: CorpusArtifact, *, similarity: float) -> Prior
 def _novelty_from(graph_cards: list[PriorArtCard], *, measured: bool) -> NoveltyStamp:
     """The plan-§4 novelty stamp from the LANDED (graph) prior-art cards.
 
-    Scored on `confidence`, not raw `similarity`, for exactly the reason
-    `_adjudicate_cards` is: a cosine taken across two embedding spaces carries no
-    information, and letting a meaningless 0.97 declare a genuinely-new blueprint
-    unoriginal would push the most valuable candidate to the bottom of the review queue.
-
-    *measured* is threaded through from whether the index was actually CONSULTED, not
-    inferred from the card list being empty. `[]` from a healthy index is the strongest
-    possible novelty claim ("nothing like this has landed"); `[]` from an index that
-    raised is no claim at all, and the two must never render as the same number."""
+    Scored on `confidence`, not raw `similarity`, for the same reason `_adjudicate_cards` is: a
+    cosine taken across two embedding spaces carries no information, and letting a meaningless
+    0.97 declare a genuinely-new blueprint unoriginal would push the most valuable candidate to
+    the bottom of the review queue. *measured* is threaded from whether the index was actually
+    CONSULTED, not inferred from an empty card list — `[]` from a healthy index is the strongest
+    possible novelty claim, `[]` from an index that raised is no claim at all.
+    """
     if not measured:
         return NoveltyStamp()
     best = max((card.confidence for card in graph_cards), default=0.0)
@@ -460,18 +354,14 @@ class DedupStage:
     async def _adjudicate(
         self, env: CandidateEnvelope, ctx: StageContext, cards: list[PriorArtCard]
     ) -> tuple[CandidateEnvelope, bool]:
-        """Put a band-straddling near-match to the coverage judge. Returns the (possibly
-        verdict-stamped) envelope and whether the candidate was DROPPED.
+        """Put a band-straddling near-match to the coverage judge.
 
-        The band test itself lives in the judge, not here: it is the judge's own knob and
-        both of its stages consult it, so duplicating the comparison would be a second
-        place for the band to drift. This method's job is to decide whether the judge is
-        ASKED at all (blueprint, judge wired) and to carry the result back onto the
-        envelope.
-
-        Never raises. The judge is fail-open internally, but a Protocol violation by an
-        injected collaborator must not escape into `_run_stages` and abort the whole
-        extraction — the same posture every other read in this stage takes (D52)."""
+        Returns the (possibly verdict-stamped) envelope and whether the candidate was DROPPED. The
+        band test itself lives in the judge — it is the judge's own knob and both of its stages
+        consult it — so this method only decides whether the judge is ASKED at all. Never raises: a
+        Protocol violation by an injected collaborator must not escape into `_run_stages` and abort
+        the whole extraction (D52).
+        """
         if self._judge is None:
             return env, False
         try:
@@ -500,18 +390,13 @@ class DedupStage:
     ) -> tuple[DedupVerdict, PriorArtCard] | None:
         """Look this candidate's LOOSE structural key up across every corpus tier.
 
-        Returns `None` — meaning "fall through to the soft layer" — for every
-        non-answer: no index wired, no derivable key, a genuine miss, or an index that
-        could not be consulted. Only a real hit produces a verdict, so this layer can
-        never invent one out of a degraded read.
-
-        The candidate's key is derived here rather than read off the envelope because
-        nothing stamps it on a candidate: `generalize/mapping.py` mints it at LANDING
-        time for the seed. Deriving it costs one sqlglot render of a template S4 has
-        already parsed, and — critically — it goes through
-        `structural_key_from_templates`, the SAME entry point the canon seeder and the
-        landing writer use. Calling the raw `structural_key` with `canonical_ast_norm`
-        in hand would mint a digest that matches nothing, silently."""
+        Returns `None` — "fall through to the soft layer" — for every non-answer: no index wired, no
+        derivable key, a genuine miss, or an index that could not be consulted, so this layer can
+        never invent a verdict out of a degraded read. The key is derived here because nothing
+        stamps it on a candidate, and it goes through `structural_key_from_templates`, the SAME
+        entry point the canon seeder and the landing writer use — calling the raw `structural_key`
+        with `canonical_ast_norm` in hand would mint a digest that matches nothing, silently.
+        """
         if self._prior_art is None:
             return None
         key = self._candidate_structural_key(env)
@@ -573,10 +458,10 @@ class DedupStage:
     def _candidate_structural_key(self, env: CandidateEnvelope) -> str:
         """This candidate's loose structural key, or `""` when one cannot be minted.
 
-        Imported lazily: `runtime.blueprint.structural_key` pulls in sqlglot's optimizer
-        passes, and the stage must stay cheap to import for a consumer that never wires
-        a prior-art index. Never raises — a malformed generalization is a `""` key
-        (fall through to the soft layer), never a dead-lettered session."""
+        Imported lazily: `runtime.blueprint.structural_key` pulls in sqlglot's optimizer passes, and
+        the stage must stay cheap to import for a consumer that never wires a prior-art index. Never
+        raises — a malformed generalization is a `""` key, never a dead-lettered session.
+        """
         from ...runtime.blueprint.structural_key import structural_key_from_templates
 
         gen = env.payload.get("generalization")
@@ -618,51 +503,28 @@ class DedupStage:
     async def _soft_layer(
         self, env: CandidateEnvelope, *, hard_key: str
     ) -> tuple[DedupVerdict, PriorArtCard | None, list[PriorArtCard], NoveltyStamp]:
-        """Embedding near-miss adjudication on `intent` over the UNION of both soft
-        sources — the neo4j prior-art index AND the `learning_corpus` bucket.
+        """Embedding near-miss adjudication on `intent` over the UNION of both soft sources.
 
-        **The bucket is a SECOND SOURCE, not a fallback, and that distinction is a
-        regression fix.** The first cut of this slice returned the index's answer and
-        reached the bucket only when the index RAISED. That silently removed working
-        behaviour: `_seed_on_insert` registers a candidate's artifact in the bucket the
-        moment it is adjudicated `insert`, months before it LANDS in the graph, so the
-        bucket is the only place an IN-FLIGHT sibling candidate is visible. With the
-        index wired, the graph answered `[]` honestly (it holds no unlanded candidate)
-        and two analysts asking the same question five minutes apart both got `insert` —
-        a pair QA measured at a live 0.9645 cosine, i.e. above the merge threshold, which
-        the PRE-slice loop routed to a human.
+        The bucket is a SECOND SOURCE, not a fallback: `_seed_on_insert` registers a candidate's
+        artifact the moment it is adjudicated `insert`, months before it LANDS in the graph, so the
+        bucket is the only place an IN-FLIGHT sibling is visible. Treating it as a fallback silently
+        removed the check that catches two analysts asking the same question minutes apart. The two
+        are complementary: the INDEX sees the MCP canon and the landed tier cheaply (one ANN), the
+        BUCKET sees unlanded candidates expensively (N+1 embeddings, see `_corpus_cards`).
 
-        The two sources are complementary, not redundant:
-          * the INDEX sees the MCP canon and the landed learning tier, cheaply (one ANN);
-          * the BUCKET sees candidates that have not landed yet, expensively (N+1
-            embeddings — see `_corpus_cards`).
+        Returns the verdict; the matched CARD (or `None` on an `insert`) so the caller can record
+        its tier, status and origin — a merge against the canon, against a landed node, and against
+        an unlanded sibling are three very different facts; the WHOLE union, because an `insert`
+        returns no matched card yet a 0.75 near-match is exactly the ambiguous case the coverage
+        judge is for; and the novelty stamp, computed from the GRAPH half ALONE — measuring novelty
+        against sibling candidates would score the first sighting of an idea as novel and each of
+        its corroborations as redundant, getting the sign of the evidence backwards.
 
-        Returns the verdict, the matched CARD (or `None` on an `insert`) so the caller
-        can record its tier, status and origin — a `merge` against the canon, a `merge`
-        against a landed node, and a `merge` against an unlanded sibling are the same
-        verdict but three very different facts — and the WHOLE union.
-
-        The third element exists for the coverage judge (plan §3b) and is deliberately
-        NOT the matched card: an `insert` returns no matched card by design (nothing was
-        near enough to route on), but a 0.75 near-match is exactly the ambiguous case
-        the judge is for, so the judge must see the candidates the banding rejected.
-        Handing over the assembled list rather than a search handle is what keeps the
-        judge adjudicating EXACTLY what dedup banded, and pays the embed once.
-
-        The FOURTH element is the inbox-ranking novelty stamp (plan §4), and it is
-        computed from the GRAPH half ALONE — never from the union. That asymmetry is the
-        point: novelty must be measured against what has LANDED, because measuring it
-        against sibling candidates would score the first sighting of an idea as novel and
-        each of its corroborations as redundant, an ordering-dependent answer that gets
-        the sign of the evidence backwards. It is computed here because this is the one
-        place in the pipeline that has already paid for the embed and the ANN query.
-
-        Degrades to `insert` on an empty intent, both sources empty, or ANY failure —
-        never a wrong merge. An index that RAISES is logged loudly and simply contributes
-        nothing to the union; the bucket half still runs, which is why the fail-open path
-        is now strictly a subset of the healthy path rather than a different one. In that
-        window the novelty stamp reports `measured=False` rather than "maximally novel":
-        a candidate we could not compare must not be ranked as a discovery."""
+        Degrades to `insert` on an empty intent, both sources empty, or ANY failure — never a wrong
+        merge. An index that raises contributes nothing and the bucket half still runs, so the
+        fail-open path is a subset of the healthy one; in that window the novelty stamp reports
+        `measured=False` rather than "maximally novel".
+        """
         intent = _text(env.payload.get("intent"))
         if not intent:
             # Nothing to embed, so nothing to be novel WITH RESPECT TO — an unmeasured
@@ -708,23 +570,16 @@ class DedupStage:
     def _adjudicate_cards(
         self, cards: list[PriorArtCard], *, hard_key: str
     ) -> tuple[DedupVerdict, PriorArtCard | None]:
-        """Band the best card of the UNION. Scored on `confidence`, NOT on the raw
-        cosine: a card whose stored `embedding_model` differs from the query's was
-        compared across two vector spaces, and its cosine carries no information — the
-        discount is what keeps it out of the merge/conflict bands instead of letting a
-        meaningless 0.97 route a genuinely-new blueprint into the inbox as a duplicate.
+        """Band the best card of the UNION, scored on `confidence` and NOT on the raw cosine.
 
-        **Sorts here rather than trusting the port's ordering contract.** `search` does
-        promise best-first, but this list is now a UNION of two independently-ordered
-        sources, so "the port is ordered" cannot make the merged list ordered. Sorting at
-        the point of use also removes a silent coupling: an implementation that returned
-        an unsorted list would previously have mis-banded with no test able to see it.
-        The `id` tiebreak keeps the choice deterministic across equal confidences.
-
-        Never emits `redundant_with_canon`, even for a canon card at 0.99. A cosine over
-        intent PROSE is not an identity claim, and dropping a candidate on one would make
-        the loop's most consequential decision on its weakest evidence. Layer 2 is where
-        canon redundancy is settled; a canon card here is a `merge` a human reads."""
+        A card whose stored `embedding_model` differs from the query's was compared across two
+        vector spaces and its cosine carries no information; the discount is what keeps it out of
+        the merge/conflict bands. SORTS here rather than trusting the port's ordering contract,
+        because a UNION of two independently-ordered sources cannot inherit either one's order; the
+        `id` tiebreak keeps the choice deterministic. NEVER emits `redundant_with_canon`, even for a
+        canon card at 0.99 — a cosine over intent PROSE is not an identity claim, and layer 2 is
+        where canon redundancy is settled.
+        """
         if not cards:
             return DedupVerdict(hard_key, None, 0.0, "insert", "soft"), None
         best = min(cards, key=lambda c: (-c.confidence, c.id))
@@ -740,43 +595,20 @@ class DedupStage:
     ) -> list[PriorArtCard]:
         """The `learning_corpus` half of the soft union, projected onto `PriorArtCard`.
 
-        **Cost, stated plainly.** `list_artifacts()` is `SELECT c.*` with no WHERE and no
-        LIMIT, and this embeds EVERY surviving artifact's intent for EVERY candidate —
-        N+1 embeddings per candidate. The original slice removed this path for exactly
-        that reason and thereby dropped the in-flight duplicate check with it; the cost
-        is being paid back deliberately, because a correct answer that is expensive beats
-        a cheap answer that is wrong. The bound is `len(learning_corpus)`, which is the
-        set of artifacts the loop itself has minted.
+        COST, stated plainly: `list_artifacts()` is a scan with no WHERE and no LIMIT, and this
+        embeds EVERY surviving artifact's intent for EVERY candidate — N+1 embeddings, bounded by
+        the artifacts the loop itself has minted. It is paid deliberately, because removing it
+        dropped the in-flight duplicate check with it. The principled way to shrink it is to scan
+        only the NOT-YET-LANDED subset, and nothing distinguishes those today.
 
-        The principled way to shrink it is to scan only the NOT-YET-LANDED subset — the
-        graph covers everything else — but nothing distinguishes those today: `status`
-        is written only by the terminal transitions, so every live artifact reads
-        `extracted` whether or not it has landed. Recording a landed stamp is the
-        follow-up; it is not guesswork this function should be doing.
-
-        Two exclusions, each for a different reason:
-          * `canonical_key == hard_key` — this candidate's OWN artifact from an earlier
-            processing attempt of the same session. Comparing it to itself would band a
-            perfect 1.0 and route every redelivery to a human.
-          * `is_terminal` — a human declined it; a NEAR-match to a rejected idea is not
-            the same idea, and resurfacing it would turn a settled decision into
-            recurring review noise. (The HARD layer deliberately does not skip terminal
-            artifacts — see `CorpusArtifact.is_terminal`.)
-
-        **The join with the graph half.** Once an artifact LANDS, the same blueprint
-        exists in both sources under different ids: the bucket keys it by
-        `canonical_key`, and the landed node's id is the deterministic landing id
-        `bp::<canonical_key>` (`promotion/landing.py::landing_id`). Deriving that id here
-        is what lets *already_seen* drop the duplicate, and the graph copy is the one
-        kept — it is the richer projection (a real tier, status, `verified`, structural
-        key) where the bucket card has only a name and a cosine.
-
-        **It has ONE side effect**, and it is here rather than in the caller because this
-        is where the (artifact, cosine) pairs exist: each near-matched artifact gets its
-        dormant soft recurrence counter bumped (`_bump_recurrence`, plan §4).
-
-        Never raises: a corpus-scan or embedder failure contributes `[]` (D52), so the
-        graph half of the union still adjudicates."""
+        Two exclusions: this candidate's OWN artifact from an earlier processing attempt (comparing
+        it to itself would band a perfect 1.0 and route every redelivery to a human), and
+        `is_terminal` artifacts (a near-match to a rejected idea is not the same idea; the HARD
+        layer deliberately does NOT skip them). The join with the graph half derives the landed id
+        `bp::<canonical_key>` so *already_seen* drops the duplicate, keeping the graph copy — the
+        richer projection. ONE side effect: each near-matched artifact gets its dormant recurrence
+        counter bumped. Never raises — a scan or embedder failure contributes `[]` (D52).
+        """
         try:
             all_artifacts = await self._corpus.list_artifacts()
         except Exception:  # noqa: BLE001 — a corpus-listing failure contributes nothing (D52)
@@ -823,37 +655,22 @@ class DedupStage:
     async def _bump_recurrence(self, artifacts: list[CorpusArtifact]) -> None:
         """Record a SOFT recurrence sighting against each near-matched artifact (plan §4).
 
-        **Why here.** This is the only loop in the system that already knows a candidate's
-        intent cosine against a KEYED artifact. The graph half of the union cannot be
-        counted — a `PriorArtCard` from neo4j carries no `canonical_key`, and "we cannot
-        bump a count we cannot key" is the same constraint that makes layer 2's
-        learning-tier hit a `merge` rather than an `increment`.
+        Here because this is the only loop that already knows a candidate's intent cosine against a
+        KEYED artifact: a graph card carries no `canonical_key`, and "we cannot bump a count we
+        cannot key" is the same constraint that makes layer 2's learning-tier hit a `merge`. The
+        caller has already stripped this candidate's own key and every terminal artifact, which is
+        exactly right — a paraphrase of a declined idea must not accrue evidence for re-proposing
+        it. A judge-dropped candidate STILL counts, since the drop happens after this and "somebody
+        asked this again" is true either way; contrast `_seed_on_insert`, deliberately skipped for a
+        drop because it would create a NEW artifact for work nobody kept.
 
-        **What is deliberately NOT filtered.** The artifacts reaching here have already
-        been stripped of this candidate's own key and of terminal (rejected/retired)
-        artifacts by the caller, which is exactly right: a paraphrase of a declined idea
-        must not accrue evidence for re-proposing it.
-
-        **A judge-dropped candidate still counts.** The drop happens after this, and that
-        ordering is intentional — the judge drops a candidate because an artifact already
-        COVERS it, and "somebody asked this again" is true whether or not we kept the
-        candidate. Contrast `_seed_on_insert`, which is deliberately skipped for a
-        dropped candidate: that would create a NEW artifact for work nobody kept, which
-        is a different thing entirely.
-
-        **NO PER-SIGHTING IDEMPOTENCY, and this is the thing to know before the weight is
-        raised.** `increment_hit_count` fires once per hard-key hit and the candidate is
-        then DROPPED, so a redelivery collapses to one increment. Nothing here does that:
-        a candidate that survives dedup can be re-processed (a queue redelivery, a
-        re-enqueue, a peer race, a pipeline re-run) and will re-bump every near artifact
-        again. The stored count is therefore "sightings PLUS redelivery noise", biased
-        upward and not bounded by the number of distinct sessions. Harmless while the
-        weight is 0.0; at a non-zero weight a flapping session can corroborate itself.
-        Closing it needs a per-(artifact, content_hash) marker in the corpus — a store
-        change, not a knob change.
-
-        Fail-soft per artifact and in aggregate (D52): this counter is weighted 0.0
-        today, so it must never be the reason a candidate fails to be adjudicated."""
+        NO PER-SIGHTING IDEMPOTENCY, and this is the thing to know before the weight is raised: a
+        candidate that survives dedup can be re-processed (a redelivery, a peer race, a pipeline
+        re-run) and will re-bump every near artifact, so the stored count is "sightings PLUS
+        redelivery noise". Harmless at the shipped weight of 0.0; at a non-zero weight a flapping
+        session can corroborate itself. Closing it needs a per-(artifact, content_hash) marker in
+        the corpus — a store change, not a knob change. Fail-soft per artifact and in aggregate.
+        """
         if not artifacts:
             return
         for art in artifacts:
@@ -871,10 +688,11 @@ class DedupStage:
     # -- bookkeeping -----------------------------------------------------------
 
     async def _seed_on_insert(self, env: CandidateEnvelope, verdict: DedupVerdict) -> None:
-        """On a genuinely-new `insert` with a real hard key, register the corpus
-        artifact at `hit_count=1` from THIS first candidate (D48 §11.1) so the
-        count-based promotion threshold can accrue before the artifact lands. A
-        fail-soft insert (no hard key) has nothing to key on — skip it."""
+        """On a genuinely-new `insert` with a real hard key, register the artifact at `hit_count=1`.
+
+        From THIS first candidate (D48 §11.1), so the count-based promotion threshold can accrue
+        before the artifact lands. A fail-soft insert (no hard key) has nothing to key on — skip.
+        """
         if verdict.action != "insert" or not verdict.canonical_key:
             return
         gen = env.payload.get("generalization") or {}
@@ -899,21 +717,14 @@ class DedupStage:
     ) -> None:
         """Emit the shape-only `learning.dedup` span for this verdict.
 
-        Three separate rates come out of the same span, which is why the two dimensions
-        are carried on EVERY verdict rather than only on the one that motivated them:
-
-          * `action=redundant_with_canon` — a deterministic canon rediscovery;
-          * `action=merge AND prior_art_tier=mcp` — a probable one, on softer evidence;
-          * `action=increment AND matched_status IN (rejected, retired)` — somebody
-            re-derived, byte for byte, an idea a human already DECLINED. Without
-            `matched_status` that is indistinguishable from an ordinary hit-count bump
-            against a live artifact, and the two say opposite things about the loop.
-          * `matched_origin=corpus` — the soft match came from an IN-FLIGHT sibling in
-            the `learning_corpus` bucket rather than from anything landed. That is the
-            concurrency signal, and it is the only way to see how often the bucket half
-            of the union is the one doing the work.
-
-        No tracer wired ⇒ nothing emitted."""
+        Both extra dimensions are carried on EVERY verdict, not only the one that motivated them, so
+        several rates come out of one span: `redundant_with_canon` (a deterministic canon
+        rediscovery), `merge AND prior_art_tier=mcp` (a probable one on softer evidence), `increment
+        AND matched_status IN (rejected, retired)` (a byte-identical re-derivation of an idea a human
+        already DECLINED, otherwise indistinguishable from an ordinary bump), and
+        `matched_origin=corpus` (the concurrency signal — how often the bucket half is doing the
+        work). No tracer wired ⇒ nothing emitted.
+        """
         if self._tracer is None:
             return
         with dedup_span(

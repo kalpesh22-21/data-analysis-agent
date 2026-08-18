@@ -1,46 +1,12 @@
 """factory — the learning-loop COMPOSITION ROOT (Wave 3a, D102 §7.1).
 
-The ONE place the six write-router stages (S4–S8) are assembled, in the FROZEN
-order (D102 §7.1 / `stage.py`), and injected into the consumer's frozen `stages`
-seam alongside the S3 extractor + the shared candidate/audit stores. Every
-collaborator is passed IN (dependency injection) so Layer-1 fakes and the live
-Couchbase/Redis stack travel the identical path — this module constructs NO infra
-clients itself (that stays in the process entrypoint).
-
-Frozen stage order (honored exactly, D-frozen 2026-07-03):
-    generalize (S4) → leakage (S5) → dedup (S6) → schema_edit_pr (S8)
-    → user_commit (S8) → writer (S7)
-
-Three load-bearing invariants this root enforces:
-
-  1. **Shared singletons.** The candidate store handed to the leakage gate and the
-     consumer's `candidates` are the SAME instance (a split-brain store would strand
-     candidates); the user-knowledge store shared by the leakage gate's reroute path
-     and the S8 auto-commit stage is likewise one instance. (The terminal `WriterStage`
-     takes NO candidate store — the consumer's `_run_stages` owns the persist, so the
-     writer's "store" is the consumer's `candidates` by construction.)
-
-  2. **All-or-nothing gating (critical, S3 precedent).** Extraction is a UNIT: the
-     model client + a durable audit store + a durable candidate store. When it is not
-     configured (no model client), the consumer falls back to the S2 `would_extract`
-     stub with an EMPTY pipeline — never a half-wired plane. When it IS configured,
-     EVERY collaborator the full pipeline needs must be present, else we FAIL FAST
-     (`LearningWiringError`) — never a PARTIAL pipeline that strands candidates
-     mid-flow (the exact class of bug S3's config gating fixed). A stage's own fake
-     collaborator (null semantic scanner, insert-only embedder, null git client) is a
-     fine DELIBERATE default — but the stage itself is always present or none are.
-
-  3. **Dormant by default.** This root only BUILDS the wiring; nothing runs until an
-     entrypoint calls `run_forever` AND the D58c kill-switch (`LEARNING_ENABLED`, read
-     FRESH per cycle inside `run_once`) permits it. There is no request-path import of
-     the learning plane (the D58c no-import invariant); this module lives entirely
-     under `learning/`.
-
-The S9 promotion scheduler is NOT a consumer stage (§7.2): it is a separate
-cron-scanned process. `build_promotion_plane` assembles it TOGETHER with the review
-inbox from one candidate store — that pairing is the writer↔inbox↔scheduler linkage,
-so a human approve runs the ONE guarded `apply_human_decision` path (R4) over the
-same store the inbox read.
+The ONE place the six write-router stages are assembled, in the FROZEN order
+(`generalize → leakage → dedup → schema_edit_pr → user_commit → writer`), and injected
+into the consumer; every collaborator is passed IN and no infra client is constructed here.
+Three invariants: SHARED SINGLETONS (one candidate store, one user store across stages);
+ALL-OR-NOTHING (extraction is a unit — configured-but-incomplete raises
+`LearningWiringError` rather than stranding candidates in a partial pipeline); DORMANT
+(nothing runs until an entrypoint calls `run_forever` and `LEARNING_ENABLED` permits it).
 """
 
 from __future__ import annotations
@@ -101,8 +67,10 @@ _logger = logging.getLogger(__name__)
 
 class Embedder(Protocol):
     """The dedup soft-layer embedding seam (mirrors `dedup/stage.py::_EmbeddingClient`).
-    Typed here so a miswired embedder fails static checks rather than silently
-    degrading the soft layer to insert-forever."""
+
+    Typed here so a miswired embedder fails static checks rather than silently degrading the
+    soft layer to insert-forever.
+    """
 
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
 
@@ -112,21 +80,20 @@ Sampler = Callable[[CandidateEnvelope], bool]
 
 
 class LearningWiringError(RuntimeError):
-    """Raised when extraction is configured but a full-pipeline collaborator is
-    absent. Fails FAST at composition so a half-wired plane never runs and strands
-    candidates mid-flow (the all-or-nothing invariant, §2)."""
+    """Extraction is configured but a full-pipeline collaborator is absent.
+
+    Fails FAST at composition, so a half-wired plane never runs and strands candidates mid-flow.
+    """
 
 
 class _InsertOnlyEmbedder:
-    """The DEFAULT dedup embedder when none is injected: its `embed` raises, so the
-    S6 soft layer degrades to `insert` (D48/D52 fail-soft) — the race-safe hard
-    canonical key still dedups exact duplicates; only the soft near-miss
-    adjudication is disabled. Inject a real embedder to enable it.
+    """The DEFAULT dedup embedder when none is injected: its `embed` raises.
 
-    A deployment with no embedding endpoint configured is a SUPPORTED posture, not a
-    misconfiguration: it must keep running on hard-key-only dedup rather than crash. It
-    is, however, an INVISIBLE degrade (every candidate looks like a clean `insert`), so
-    the factory logs the fallback loudly at startup — see `build_learning_consumer`."""
+    The S6 soft layer then degrades to `insert` (D48/D52 fail-soft) — the race-safe hard
+    canonical key still dedups exact duplicates, only the near-miss adjudication is off. A
+    SUPPORTED posture, but an INVISIBLE degrade (every candidate looks like a clean `insert`),
+    so `build_learning_consumer` logs the fallback loudly at startup.
+    """
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         raise RuntimeError(
@@ -136,10 +103,11 @@ class _InsertOnlyEmbedder:
 
 
 class _NullGitPullRequestClient:
-    """The DEFAULT schema-edit git client when none is injected: opens NO real PR
-    and returns a marker result, so the S8 PR stage still stamps its
-    `schema_edit_review` marker and routes the candidate to human review (never an
-    auto-commit — D18). Inject a real client to author actual PRs (deferred, D53)."""
+    """The DEFAULT schema-edit git client: opens NO real PR, returns a marker result.
+
+    The S8 PR stage still stamps its `schema_edit_review` marker and routes the candidate to
+    human review — never an auto-commit (D18). Inject a real client to author actual PRs.
+    """
 
     async def open_pull_request(self, spec: PullRequestSpec) -> PullRequestResult:
         return PullRequestResult(url="", number=0, branch=spec.branch)
@@ -171,40 +139,19 @@ def build_learning_consumer(
 ) -> LearningConsumer:
     """Assemble a fully-wired (or a deliberately stub) `LearningConsumer`.
 
-    Extraction is a UNIT (`model_client` + durable `audit_store` + durable
-    `candidate_store`, §2). When `model_client is None` the consumer runs the S2
-    `would_extract` stub with an EMPTY pipeline (the safe fallback). When it is
-    present, ALL of `audit_store`, `candidate_store`, `blueprint_corpus`,
-    `user_store`, and `catalog_schema` MUST be provided (a `{}` catalog is a
-    permitted, degraded-but-safe choice — every blueprint then fails static
-    validation and routes to review, never auto-lands); a missing one raises
-    `LearningWiringError` rather than building a partial pipeline.
+    Extraction is a UNIT: with `model_client is None` the consumer runs the S2 `would_extract`
+    stub with an EMPTY pipeline; with it present, ALL of `audit_store`, `candidate_store`,
+    `blueprint_corpus`, `user_store` and `catalog_schema` must be provided or this raises
+    `LearningWiringError`. A `{}` catalog is permitted and degraded-safe (every blueprint then
+    fails static validation and routes to review). Stage-level fakes default in place, so the
+    six stages are always all present or all absent.
 
-    Stage-level fakes default in place (null semantic scanner → regex-only gate,
-    insert-only embedder → hard-key-only dedup, null git client → PR-marker-only
-    schema-edit) so the SIX stages are always all present or all absent.
-
-    `prior_art` is deliberately NOT part of the all-or-nothing unit (PriorArt Slice 2),
-    and it is threaded to TWO collaborators: the S6 dedup stage and — since plan §3a —
-    the S3 extractor, which pre-fetches a PRIOR ART block and gains a `searchCorpus`
-    tool. Absent, BOTH behave exactly as they did before their respective slices: dedup
-    on hard key plus a brute-force corpus-bucket scan, and the extractor on a single
-    forced `emit_candidates` call with no block and no search tool. Making it required
-    would mean a neo4j outage stops learning, and the whole point of the fail-open
-    posture is that it must not. It is logged loudly instead, because the symptom of
-    running without it (duplicate candidates for blueprints the canon already carries)
-    points nowhere near the cause.
-
-    **The coverage judge (plan §3b) is built here, and it can DISCARD work.** It is
-    wired only when all three of its preconditions hold — the kill-switch
-    (`LEARNING_JUDGE_ENABLED`) is on, a prior-art index is present, and a durable audit
-    store is present — and it is handed THE SAME audit store instance the consumer
-    snapshots evidence into. That sharing is not incidental: every drop's durable record
-    goes to that store, and a split would put the records somewhere nobody queries,
-    leaving the mitigation present in code and absent in practice. Absent any
-    precondition, no judge is built and the loop behaves exactly as it did before the
-    slice. `judge_model_client` overrides which model answers (the economics favour a
-    smaller one); omitted, the extractor's client is reused.
+    `prior_art` is deliberately NOT part of that unit and is threaded to BOTH the S6 dedup stage
+    and the S3 extractor; absent, each behaves exactly as it did pre-slice, because requiring it
+    would let a neo4j outage stop learning. It is logged loudly instead. The coverage judge,
+    which can DISCARD work, is wired only when its kill-switch, a prior-art index and a durable
+    audit store are all present — and is handed THE SAME audit store the consumer snapshots
+    evidence into, so every drop's record lands where someone queries it.
     """
     # Only override the consumer's OWN defaults when a loader/triage is supplied
     # (tests inject a scripted loader; production uses the consumer's defaults).
@@ -406,20 +353,12 @@ def build_write_router_stages(
 ) -> tuple[CandidateStage, ...]:
     """The FROZEN write-router order (D102 §7.1), assembled in ONE place.
 
-    Two callers assemble this pipeline now — `build_learning_consumer` for freshly
-    extracted candidates, and the inbox service for a candidate a human finished filling
-    in (`inbox/completion.py`) — and the ORDER is the thing that must not fork. A second
-    hand-written tuple somewhere else is how `leakage` ends up after `dedup` in one
-    process and before it in another, with nothing failing until a leak lands.
-
-    `include_target_specific=False` omits `schema_edit_pr` and `user_commit`. That is a
-    STATEMENT ABOUT THE CANDIDATE, not a convenience: both stages handle-then-stop their
-    own target type, and the completion path only ever re-runs a `blueprint` (a
-    `needs_parameterization` candidate is one by construction — its decline reasons are
-    blueprint-only checks), so neither stage would do anything except require a git
-    client and a per-user store the completion plane has no reason to hold. The four that
-    remain — generalize → leakage → dedup → writer — are exactly the ones the decision
-    doc requires a completed candidate to pass, in the same relative order."""
+    Two callers assemble this pipeline — `build_learning_consumer`, and the inbox service for a
+    candidate a human finished filling in (`inbox/completion.py`) — and the ORDER is the thing
+    that must not fork. `include_target_specific=False` omits `schema_edit_pr` and
+    `user_commit`: the completion path only ever re-runs a `blueprint`, so neither would do
+    anything except require a git client and a per-user store that plane has no reason to hold.
+    """
     stages: list[CandidateStage] = [
         GeneralizeStage(catalog_schema=catalog_schema),
         LeakageGateStage(
@@ -477,25 +416,12 @@ def _build_judge(
 ) -> CoverageJudge | None:
     """Build the coverage judge, or `None` when any precondition is missing.
 
-    THREE preconditions, and each absence is a different fact so each gets its own log
-    line — a single "judge not wired" message would leave an operator guessing which of
-    three things to fix:
-
-      * the kill-switch is off — a deliberate operator choice, logged at INFO;
-      * no prior-art index — there is nothing to be covered BY, so a judge could only
-        ever answer `new` at the price of a model call. Already warned about loudly by
-        the caller (the same absence disables two other surfaces), so this one is INFO
-        too;
-      * no audit store — the DISQUALIFYING one, and it is a WARNING. Without a durable
-        record a drop is invisible, and an invisible drop is precisely the risk the
-        record was agreed as the mitigation for. Building a judge that cannot write is
-        not a degraded judge, it is the failure mode; so we build none.
-
-    Note the third check is redundant TODAY — `_require_full_pipeline` has already
-    refused a missing audit store by the time this runs — and it stays because the
-    guarantee it encodes ("no record store, no judge") must not depend on another
-    function's ordering. That coupling is the shape this codebase keeps getting bitten
-    by (see `writer/routing.py::_AUTO_LAND_DEDUP_ACTIONS`).
+    THREE preconditions, each absence logged separately so an operator knows which of three
+    things to fix: the kill-switch is off (INFO), there is no prior-art index (INFO — nothing
+    to be covered BY), or there is no audit store (WARNING, and DISQUALIFYING: without a
+    durable record a drop is invisible, which is exactly the risk the record mitigates). The
+    third check is redundant today — `_require_full_pipeline` already refused — and stays so
+    the guarantee does not depend on another function's ordering.
     """
     if not settings.learning_judge_enabled:
         _logger.info(
@@ -567,26 +493,14 @@ def _build_judge(
 
 
 def _judge_model_id(settings: LearningSettings, *, injected: bool) -> str:
-    """The model id STAMPED ON EVERY VERDICT — which must describe the client that will
-    actually answer, not the one an operator configured.
+    """The model id STAMPED ON EVERY VERDICT — it must name the client that will actually ANSWER.
 
-    `JudgeRecord.model` exists for exactly one purpose: verdicts are compared across
-    months, the model changes underneath them, and without this field the dataset
-    silently pools two judges. Reading it off `LEARNING_JUDGE_MODEL` unconditionally
-    would defeat that at the first opportunity — the shipped entrypoint only builds a
-    separate client when that setting names a DIFFERENT model, but `build_learning_
-    consumer` is called from other places (both demo scripts) that pass one model client
-    and never look at the setting. Those runs would have recorded the configured id
-    while the extractor's model answered: the exact mislabel the field exists to
-    prevent, asserted with a straight face.
-
-    So the id follows the CLIENT:
-      * a judge-specific client was injected ⇒ the configured judge model (or an
-        explicit `unknown-injected-judge-client` when the caller injected a client and
-        configured no id — honest rather than plausible);
-      * no separate client ⇒ the extractor's model, because that is what will answer,
-        and a configured-but-unused `LEARNING_JUDGE_MODEL` is warned about loudly rather
-        than believed.
+    `JudgeRecord.model` exists so verdicts compared across months are not silently pooled when
+    the model changes underneath them. Reading `LEARNING_JUDGE_MODEL` unconditionally would
+    mislabel the callers that pass one model client and never consult the setting. So the id
+    follows the CLIENT: an injected judge client ⇒ the configured judge model (or an explicit
+    `unknown-injected-judge-client` when none is configured — honest rather than plausible); no
+    separate client ⇒ the extractor's model, with a configured-but-unused setting warned about.
     """
     if injected:
         return settings.learning_judge_model or "unknown-injected-judge-client"
@@ -623,41 +537,21 @@ def build_promotion_plane(
     tracer: object | None = None,
     completer: ParameterizationCompleter | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
-    """Assemble the S9 promotion plane — the scheduler + the review inbox — from ONE
-    `candidate_store` instance. The inbox's `approve` reads that store and DELEGATES
-    to the scheduler's single guarded `apply_human_decision` CAS-write over the SAME
-    store, so taking the store once here is what pins the shared singleton: a split
-    (inbox on one store, scheduler on another) would read a stale envelope and
-    CAS-write the wrong one. Prefer this over the two thin builders below when wiring
-    both — it is the ONLY builder for either half, so the split cannot be expressed.
+    """Assemble the S9 promotion plane (scheduler + review inbox) over ONE `candidate_store`.
 
-    *corpus_status* (PriorArt Slice 2) is the `learning_corpus` write-side port the
-    TERMINAL transitions stamp so a rejected/retired artifact stops surfacing as live
-    prior art. Pass the SAME object as `hit_counts` — `CouchbaseBlueprintCorpus`
-    duck-types both ports, and a split would let a reject stamp one store while the
-    promotion guard reads the count from another. Omitted ⇒ no stamping (the exact
-    pre-slice behaviour), which is why every existing caller is unaffected.
+    The inbox's `approve` reads that store and DELEGATES to the scheduler's single guarded
+    `apply_human_decision` CAS-write over the same one, so a split would read a stale envelope
+    and CAS-write the wrong one. Prefer this over the two thin builders below — it is the only
+    builder for either half, so the split cannot be expressed. *corpus_status* must be the SAME
+    object as *hit_counts* for that reason; omitted ⇒ no terminal stamping (pre-slice
+    behaviour). *completer* takes the same store too (an inbox without one refuses 503).
 
-    *tracer* (optional) wires the scheduler's promote/land span seam; `trace_verbose`
-    is read off `settings.learning_trace_verbose` (D25 gate).
-
-    **The POLICY is built from *settings* when the caller omits it (plan §4).** Before
-    this slice `policy=None` fell through to `PromotionScheduler`'s own
-    `PromotionPolicy()` default, and since no entrypoint ever passed one, every knob on
-    that class was a hardcoded constant wearing a config's clothes. Defaulting HERE — at
-    the composition root, which is the only place that legitimately reads settings —
-    means an operator's `LEARNING_PROMOTION_*` vars take effect without any entrypoint
-    change, while an explicit `policy=` (tests, demos) still wins. The SAME policy object
-    is handed to the inbox, because `review_score_cutoff` and the routing threshold are
-    two ends of one decision about how much a reviewer is asked to look at, and reading
-    them from two objects would let a deployment route work into a queue its own cutoff
-    then hides.
-
-    *completer* is the fail-to-review completion plane (optional, default absent — an
-    inbox without one refuses a completion 503 rather than pretending). It takes the SAME
-    `candidate_store` for the same reason the scheduler does: it re-validates the envelope
-    the inbox read and writes the result back, and a split would put the completed
-    candidate in a store nobody lists."""
+    The POLICY is built from *settings* when the caller omits it, so `LEARNING_PROMOTION_*`
+    vars take effect without an entrypoint change while an explicit `policy=` still wins. The
+    SAME policy object is handed to the inbox: `review_score_cutoff` and the routing threshold
+    are two ends of one decision, and reading them from two objects would let a deployment
+    route work into a queue its own cutoff then hides.
+    """
     extra = {} if clock is None else {"clock": clock}
     scheduler = PromotionScheduler(
         candidate_store,
@@ -705,18 +599,15 @@ def build_promotion_write_plane(
     tracer: object | None = None,
     completer: ParameterizationCompleter | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
-    """Assemble the FULLY-ACTIVATED S9 promotion WRITE plane (S9-activation Slice 2,
-    §4) — the scheduler + inbox with the REAL warehouse probe, dependency resolver,
-    AND corpus-landing writer, `require_landing` flipped ON.
+    """Assemble the FULLY-ACTIVATED S9 promotion WRITE plane (S9-activation Slice 2, §4).
 
-    The write plane is a UNIT (§4, mirroring the consumer factory's all-or-nothing
-    rule): the caller passes EVERY injected infra client — the MCP `runQuery`
-    transport, the offline token minter, the neo4j async driver, and the embedding
-    client — and this root wraps them into the three ports (probe / resolver / landing
-    writer). With a real writer present, `require_landing=True` no longer HOLDS
-    `landing_unavailable`; the scheduler LANDS a validated blueprint into neo4j FIRST,
-    then CAS-writes `validated` (`_land_and_promote`, §3.1). This module constructs NO
-    infra clients itself (that stays in the process entrypoint) — it only wires ports."""
+    The scheduler + inbox with the REAL warehouse probe, dependency resolver AND corpus-landing
+    writer, `require_landing` flipped ON. The write plane is a UNIT: the caller passes EVERY
+    injected infra client (the MCP `runQuery` transport, the offline token minter, the neo4j
+    async driver, the embedding client) and this root wraps them into ports, constructing no
+    infra itself. With a real writer present, `require_landing=True` no longer holds
+    `landing_unavailable` — the scheduler LANDS into neo4j FIRST, then CAS-writes `validated`.
+    """
     probe = MCPWarehouseProbe(mcp_client=mcp_client, token_minter=token_minter)
     resolver = CandidateStoreDependencyResolver(candidate_store)
     landing_writer = CorpusLandingWriter(
@@ -754,9 +645,10 @@ def _require_full_pipeline(
     user_store: UserKnowledgeStore | None,
     catalog_schema: dict[str, dict[str, str]] | None,
 ) -> None:
-    """Fail FAST if extraction is configured but a full-pipeline collaborator is
-    absent (§2). A `{}` catalog is intentionally ALLOWED (degraded-safe); only
-    `None` is missing."""
+    """Fail FAST if extraction is configured but a full-pipeline collaborator is absent (§2).
+
+    A `{}` catalog is intentionally ALLOWED (degraded-safe); only `None` counts as missing.
+    """
     required = {
         "audit_store": audit_store,
         "candidate_store": candidate_store,

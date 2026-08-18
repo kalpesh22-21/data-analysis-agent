@@ -1,60 +1,24 @@
 """Persistent REAL agent-runtime server for the Phase-0 UI (`ui/`).
 
-This is the production-shaped sibling of `scripts/run_ui_runtime.py`. That
-launcher wires Layer-1 FAKES (a content-routed `DemoModelClient` + a scripted
-`DemoMCPClient`) so the UI can be driven OFFLINE with no OpenAI key and no live
-warehouse — every answer it returns is canned. THIS launcher keeps the SAME
-`create_app`-based structure, the SAME host/port (:8000), and the SAME real
-JWT-vs-l2-token verification posture, but injects the REAL components proven to
-compose in `scripts/demo_runtime_turn_traced.py`, so the UI answers REAL
-questions against real ClickHouse:
+The production-shaped sibling of `scripts/run_ui_runtime.py` (which wires Layer-1
+fakes): SAME `create_app` structure, SAME port (:8000), SAME real JWT-vs-l2-token
+verification, but with the REAL components — an OpenAI model client (key from `.env`,
+model from `DEMO_MODEL` or a startup preflight), a `RealMCPClient` against the live
+l2-mcp, the real `CouchbaseSessionStore` (`REAL_SESSION_STORE=memory` falls back to the
+in-memory store), and the real `CatalogHandle` rebuilt from the frozen catalog-export
+snapshot (`CATALOG_FIXTURE_PATH` points at a live `/catalog/export` dump to refresh).
+Loop tunables are the PRODUCTION defaults, not the scripted demo's low caps.
 
-    - `model_client`  -> a REAL `build_openai_model_client` (key read/stripped
-      from `.env`, model from `DEMO_MODEL` or a preflight-selected default). The
-      model is picked once at startup by a synchronous OpenAI Responses preflight
-      (like `demo_runtime_turn_traced.py`) so an account that lacks `gpt-5.5`
-      transparently falls back to the first candidate it can actually call.
-    - `mcp_client`    -> a REAL `RealMCPClient` -> the live l2-mcp
-      (`http://localhost:18090/mcp`), so getTableSchema/runQuery hit real
-      ClickHouse under the caller's JWT scope (D57/D80 enforced by the MCP).
-    - `session_store` -> the REAL `CouchbaseSessionStore` (live l2-cb bucket
-      `agent_sessions`), so sessions PERSIST across restarts and feed the
-      learning loop. Built directly here at module import: the store's `__init__`
-      does no I/O and needs no event loop (the `acouchbase` cluster is constructed
-      by its first `_ensure_connected()`), so uvicorn's loop being absent at
-      `app = build_real_app()` time is not a problem.
-      Set `REAL_SESSION_STORE=memory` (or if the `couchbase` SDK is unimportable)
-      to fall back to the in-memory store instead.
-    - `catalog`       -> the REAL `CatalogHandle` rebuilt from the frozen
-      catalog-export snapshot (D75 Wave 1b — `databaseSchemaDocs/` is gone; the
-      snapshot is the SAME payload the MCP `GET /catalog/export` serves), so
-      provenance for real warehouse tables is DETERMINED (a result with
-      undetermined provenance is dropped by the D44 replay/scope filter). Set
-      `CATALOG_FIXTURE_PATH` to a live `/catalog/export` dump to refresh.
-    - JWT             -> REAL verification against the l2-token JWKS (NOT
-      bypassed), exactly like `run_ui_runtime.py`. The BFF (`ui/server.py`) mints
-      per-user-entitlement JWTs bound to the session id.
-    - OTLP -> Phoenix : `otlp_endpoint=http://localhost:6006/v1/traces`, project
-      `data-agent-runtime`. `otlp_hide_llm_content=True` is kept (the D25
-      DEFAULT) — this is a real server, NOT the diagnostic demo, so the LLM
-      span's raw prompt/completion is NOT revealed. Set `OTLP_DISABLE_REDACTION=1`
-      to flip the master telemetry debug switch: Phoenix then shows the REAL tool
-      calls (actual SQL WITH literals + the result preview) AND the LLM Q/A, for a
-      debugging operator ONLY. It makes the Phoenix project entity-bearing, so
-      access-control this server exactly like the audit store when the flag is on.
-      Default OFF (D25 shape-only preserved). TELEMETRY-ONLY: it never weakens the
-      MCP-enforced scope/PII posture (D5/D57) — only what Phoenix records.
+Retrieval (neo4j blueprint recall) is OFF by default: it needs the corpus seeded with an
+`embedding_model` matching `RuntimeSettings`, or recall parity-filters to an empty
+corpus. Set `REAL_RETRIEVAL=1` to opt in (points at l2-neo4j + l2-embedding).
 
-Loop tunables are the PRODUCTION defaults (`max_loop_iterations=15`,
-`max_wall_clock_seconds=60`, `max_budget_windows=3`) — NOT the scripted demo's
-low `max_loop_iterations=3` — so a real multi-step question completes.
-
-Retrieval (neo4j blueprint recall) is OFF by default: wiring it needs the neo4j
-corpus seeded with an `embedding_model` that matches `RuntimeSettings`
-(otherwise recall parity-filters to an empty corpus, see app.py's B2 warning),
-which is a separate step. Set `REAL_RETRIEVAL=1` to opt in (points at l2-neo4j +
-l2-embedding); leave it off for a plain real-turn server. This is a documented
-follow-on, not a blocker for the core real turn.
+Traced to Phoenix, project `data-agent-runtime`, in the D25 default posture
+(`otlp_hide_llm_content=True`). `OTLP_DISABLE_REDACTION=1` flips the master telemetry
+debug switch: Phoenix then records the real tool calls (SQL WITH literals + result
+preview) AND the LLM Q/A, which makes that project entity-bearing — access-control it
+like the audit store when the flag is on. TELEMETRY-ONLY: it never weakens the
+MCP-enforced scope/PII posture (D5/D57).
 
 Prerequisites (this launcher does NOT start/stop any container):
     - `.env` with `OPENAI_API_KEY=...` at the repo root.
@@ -123,14 +87,12 @@ _PREFLIGHT_LABEL = "[run_ui_runtime_real]"
 
 
 def _build_session_store(settings: RuntimeSettings) -> tuple[Any, str]:
-    """Prefer the real Couchbase store; fall back to in-memory on request or if
-    the SDK is unavailable. Returns (store, human-readable choice).
+    """Prefer the real Couchbase store; fall back to in-memory on request or if the SDK
+    is unavailable. Returns (store, human-readable choice).
 
-    Constructed DIRECTLY: `CouchbaseSessionStore.__init__` does no I/O and touches
-    no event loop, so building it here — at module import, before uvicorn's loop —
-    is safe; the cluster is built by the store's first `_ensure_connected()`. This
-    used to need a hand-written lazy proxy that re-declared every `SessionStore`
-    method and drifted from the Protocol twice."""
+    Safe to construct directly here, at module import and before uvicorn's event loop:
+    `CouchbaseSessionStore.__init__` does no I/O and touches no loop — the cluster is
+    built by the store's first `_ensure_connected()`."""
     if os.environ.get("REAL_SESSION_STORE") == "memory":
         return InMemorySessionStore(), "InMemorySessionStore (REAL_SESSION_STORE=memory)"
     try:

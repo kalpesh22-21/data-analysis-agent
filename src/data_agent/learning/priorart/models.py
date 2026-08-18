@@ -1,36 +1,20 @@
 """PriorArtCard — the entity-free projection the prior-art search returns.
 
-**Cards only, never payloads.** This is the whole safety story of the port, and it is
-not a style preference — two live facts force it:
+CARDS ONLY, NEVER PAYLOADS, and two live facts force it: a candidate at `status="extracted"`
+has NOT passed the leakage gate (S5 runs after generalize), and `extractor_rationale` is never
+touched by `strip_entity_bearing`, which only redacts payload string leaves and blanks scan
+spans. So a card carries only surfaces that are entity-free BY CONSTRUCTION or that the gate
+explicitly scans, plus derived structure and lifecycle flags — no SQL, no evidence, no
+rationale, no payload leaves.
 
-  1. A candidate at `status="extracted"` has NOT passed the leakage gate. S5 is stage 2
-     of the write-router (`generalize → leakage → dedup → …`), so anything read back
-     out of the learning tier may still carry entity-bearing text.
-  2. `extractor_rationale` is never touched by `candidate/redaction.py::
-     strip_entity_bearing`, which only redacts `payload` string leaves and blanks
-     `entity_scan.hits[].span`. Free-text model prose is therefore NEVER safe to hand a
-     prompt on the strength of the strip alone.
+It carries `result_grain`, not the plan's `result_signature`: there is no such property on a
+node, and naming the card field after the RAW extractor field — the one the gate scans
+precisely because it can carry entities — would invite someone to populate it from that one.
 
-So a card carries only surfaces that are entity-free BY CONSTRUCTION or that the
-leakage gate explicitly scans (`intent`), plus derived structure (grain columns, rule
-ids, the structural key) and lifecycle/provenance flags. It carries no SQL, no
-evidence, no rationale, and no payload leaves. A consumer that needs more must go and
-fetch it through a path that re-runs the gate.
-
-**Why `result_grain` and not the plan's `result_signature`.** The plan sketched the
-card with a `result_signature` field. There is no such property on a neo4j node: the
-canon seeder and the learning landing writer both persist `result_grain_json` (the D56
-grain), and `result_signature` is the RAW extractor field the leakage gate scans
-precisely because it can carry entities. Naming the card field after the raw one would
-invite someone to populate it from the raw one. The grain columns are the entity-free
-projection that genuinely exists on both tiers, so that is what the card carries.
-
-**The trust tier is a first-class field, not an afterthought.** A prior-art search
-deliberately drops recall's `source='mcp'` gate (that is the point of it), so a card
-can describe an artifact from any of three partitions, and consumers make materially
-different decisions per partition — only a `mcp` match is "the canon already has this".
-`tier` is therefore always populated, and a node with no usable `source` maps to the
-explicit `unsourced` tier rather than defaulting into either real one.
+The trust TIER is a first-class field, because the search deliberately drops recall's
+`source='mcp'` gate and consumers decide differently per partition — only an `mcp` match means
+"the canon already has this". A node with no usable `source` maps to the explicit `unsourced`
+tier rather than defaulting into either real one.
 """
 
 from __future__ import annotations
@@ -91,11 +75,9 @@ MODEL_MISMATCH_PENALTY = 0.5
 class PriorArtCard:
     """One prior-art hit: what exists, which tier it lives in, and how sure we are.
 
-    Every field is either entity-free by construction or a leakage-gate-scanned surface
-    (see the module docstring). Frozen + hashable-free-of-surprises: all members are
-    scalars or tuples of `str`, which is what lets a consumer `sorted()`, set-difference
-    or join them without a type check at every call site — the mapper is what guarantees
-    it (`neo4j_index._card_from_record`), not the caller.
+    Every field is either entity-free by construction or a leakage-gate-scanned surface. All
+    members are scalars or tuples of `str`, which is what lets a consumer sort, set-difference or
+    join them without a type check at every call site — the mapper guarantees it, not the caller.
     """
 
     id: str
@@ -140,28 +122,32 @@ class PriorArtCard:
 
     @property
     def confidence(self) -> float:
-        """The score a consumer should threshold on — `similarity`, discounted when it
-        is a cosine across two different embedding spaces.
+        """The score a consumer should threshold on — `similarity`, discounted across embedding spaces.
 
-        Computed rather than stored so it can never drift from `model_matched`: there is
-        exactly one place the discount is applied, and no way to construct a card whose
-        stored confidence disagrees with its stored model flag."""
+        Computed rather than stored so it can never drift from `model_matched`: there is exactly one
+        place the discount is applied, and no way to construct a card whose stored confidence
+        disagrees with its stored model flag.
+        """
         if self.score_basis != "vector" or self.model_matched:
             return self.similarity
         return self.similarity * MODEL_MISMATCH_PENALTY
 
     @property
     def is_canon(self) -> bool:
-        """True iff this artifact lives in the trusted, git-versioned MCP canon — the
-        tier the agent ALREADY recalls, and the only tier for which "we have re-derived
-        something we own" is a statement about RETRIEVAL rather than about the loop."""
+        """True iff this artifact lives in the trusted, git-versioned MCP canon.
+
+        The tier the agent ALREADY recalls, and the only one for which "we re-derived something we
+        own" is a statement about RETRIEVAL rather than about the loop.
+        """
         return self.tier == TIER_MCP
 
     @property
     def is_terminal(self) -> bool:
-        """True iff a human killed this artifact (rejected/retired). Readers filter
-        these out; kept as a property so a card that somehow arrives from an unfiltered
-        path is still self-describing."""
+        """True iff a human killed this artifact (rejected/retired).
+
+        Readers filter these out; kept as a property so a card arriving from an unfiltered path is
+        still self-describing.
+        """
         return self.status in TERMINAL_STATUSES
 
 

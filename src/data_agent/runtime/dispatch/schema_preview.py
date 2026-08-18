@@ -1,103 +1,46 @@
-"""schema_preview — shape a `getTableSchema` result for the model: hide the
-tenancy columns the platform pre-applies, keep every table-level section whole,
-and fit only the COLUMNS section under its own token budget (ISSUES C5 / C5b).
+"""schema_preview — shape a `getTableSchema` result for the model: hide the tenancy
+columns the platform pre-applies, keep every table-level section whole, and fit only
+the COLUMNS section under its own token budget.
 
-WHAT WAS WRONG (C5). `_cap_nontabular_result`'s columns branch kept the HEAD of
-the column list: on `dbpcm_warehouse.employee` (130 emitted columns, ~12k
-estimated tokens) a 4,000-token cap kept the first ~35 columns WHOLE and dropped
-the other ~95 ENTIRELY — names included. `annual_salary` sits at index ~93, so
-the model was never told the column exists. C5 replaced that with a two-tier fit.
-
-WHAT C5b CHANGES (user spec, 2026-08-18), in the order the pipeline applies it:
-
-  0. TENANCY COLUMNS ARE NOT MODEL-FACING AT ALL. `client_code` and the
-     proc-center family are removed from `columns` on EVERY path — over budget
-     and under it. They are pre-applied by the platform (the ClickHouse row
-     policy binds them to the caller's token claims: see the canon's
-     `docs/row-policy.md` and `mcp_projection.hidden_columns`), so the model
-     never writes a predicate on them; showing them can only invite one. The MCP
-     already hides them for the four tables that declare `hidden_columns`
-     (employee, payroll, department, labor_allocation) — this strip is what makes
-     the other seven catalogued tables, which expose `client_code` as an ordinary
-     column, behave the same. The strip is SILENT by design (no marker clause):
-     naming a column the model must not use re-introduces exactly the thing the
-     removal exists to prevent. The operator hears the count via the fit report.
-
-     BASE SECTIONS ARE NOT SCRUBBED. A `rule` or `join_keys` entry that mentions
-     a tenancy column describes filtering the PLATFORM applies, and section
-     completeness (below) outranks name-hiding; a sweep of the catalog found no
-     rule whose PREDICATE names one (see the C5b report).
-
-  1. TABLE-LEVEL SECTIONS RIDE COMPLETE, ALWAYS. `description, grain, temporal,
-     primary_key, join_keys, measures, rules, ambiguities` are exempt from the
-     budget — the C5 largest-first base-degradation ladder is DELETED. Those
-     sections are the semantics the system prompt tells the model to read; a
-     budget that can silently delete `rules` buys column detail with correctness.
-
-  2. THE BUDGET APPLIES TO THE COLUMNS SECTION ONLY (`schema_columns_token_budget`,
-     6,000 by default — NOT the generic `max_tool_result_tokens`, which still
-     bounds every other tool result). Total preview = full base + ≤ budget of
-     columns + the marker.
-
+  0. TENANCY COLUMNS ARE NOT MODEL-FACING AT ALL. `client_code` and the proc-center
+     family are removed from `columns` on EVERY path, over budget and under it: the
+     row policy binds them to the caller's token claims, so the model never writes a
+     predicate on them and showing them can only invite one. The strip is SILENT by
+     design — naming a column the model must not use re-introduces the very thing the
+     removal prevents; the operator hears the count via the fit report. Base sections
+     are NOT scrubbed: a `rule` that mentions a tenancy column describes filtering the
+     PLATFORM applies, and section completeness outranks name-hiding.
+  1. TABLE-LEVEL SECTIONS RIDE COMPLETE, ALWAYS (`description, grain, temporal,
+     primary_key, join_keys, measures, rules, ambiguities`). They are the semantics the
+     system prompt tells the model to read; a budget that can silently delete `rules`
+     buys column detail with correctness.
+  2. THE BUDGET APPLIES TO THE COLUMNS SECTION ONLY (`schema_columns_token_budget`, not
+     the generic `max_tool_result_tokens`, which still bounds every other tool result).
   3. THE COLUMNS SECTION IS FITTED IN A FIXED LADDER:
-     a. COMPACT (LOSSLESS), ALWAYS — UNDER BUDGET TOO. The MCP emits a fixed
-        10-key entry per column
-        (`clickhouse-api semantic_catalog/overlay.py::_merge_columns`) and
-        defaults the overlay half to `None`/`False` for any column the catalog
-        does not document; on employee ~38% of the column payload is that
-        boilerplate. A key is dropped ONLY when its value is null/False/""/[]/{}
-        — a truthy field is never lost and a numeric `0` is NOT empty
-        (`_is_empty`). Lossless, so no marker.
+     a. COMPACT (LOSSLESS), ALWAYS — under budget too. A key is dropped ONLY when its
+        value is null/False/""/[]/{}; a numeric `0` is NOT empty. So an under-budget
+        schema is COMPACTED-STABLE rather than byte-identical — surviving keys keep
+        their order and values — and carries NO marker. Everything below this rung is
+        over-budget-only.
+     b. SKELETON-FOR-ALL (`{name, type}`), then entries upgrade back to their full
+        compacted form while the fit holds: STRUCTURAL columns first (read from the
+        schema's own `primary_key`/`join_keys` — the model cannot join or de-duplicate
+        without them, whatever the question was), then the rest in question-relevance
+        order.
+     c. Only if not even the skeletons fit does the tail of the emission order come
+        off, and the marker then says plainly that the column list is incomplete.
+  4. THE EMITTED ORDER IS GROUPED, NOT PHYSICAL: the detailed group in relevance order,
+     then the remaining skeletons in the table's original order. The marker states this
+     in the form that is TRUE OF THIS PAYLOAD — only a turn whose question actually
+     ranked the columns is told the order is relevance order.
+  5. THE MARKER IS INSIDE THE FIT, part of every trial render, so what is measured is
+     what is returned. It points at `getTableSchema`'s optional `columns: [...]`
+     argument; the repeated-read guard keys on canonicalized ARGUMENTS, so that second
+     call is a different signature from the bare fetch and is dispatched, not declined.
 
-        USER SPEC 2026-08-18 point 5 — UNCONDITIONAL; overrides the earlier
-        byte-identity deviation. The first C5b draft made this a BUDGET device:
-        a schema whose raw entries already fit was returned byte-identical, null
-        keys and all, and only an over-budget one was compacted. The user's spec
-        is explicit that null keys are stripped from the response ALWAYS, to save
-        tokens — `"unit": null` teaches the model nothing at any size, and the
-        request budget is shared with every other tool result in the turn. So the
-        under-budget contract is now COMPACTED-STABLE, not byte-identical: the
-        keys that survive keep their original order and their values verbatim,
-        `columns` keeps its position among the table-level sections, and a
-        compacted under-budget schema carries NO marker (nothing the model needed
-        was withheld). Everything BELOW this rung — skeletons, grouping,
-        reordering, the marker — remains over-budget-only.
-     b. SKELETON-FOR-ALL, THEN GROUPED DETAIL UPGRADES. Every column is present
-        as `{name, type}` (~2.0k tokens for all of employee's), then entries are
-        upgraded back to their full compacted form while the fit holds:
-        STRUCTURAL columns first (primary-key + join-key columns, read from the
-        schema's own `primary_key`/`join_keys` — the model cannot join or
-        de-duplicate without them, whatever the question was), then the rest in
-        question-relevance order (`_rank_columns`).
-     c. Only if not even the skeletons fit does the tail of the emission order
-        come off — and the marker then says plainly that this is not the full
-        column list.
-
-  4. THE EMITTED ORDER IS GROUPED, NOT PHYSICAL: [detailed group first, in
-     relevance order] + [the remaining skeletons in the table's ORIGINAL order].
-     The marker states this, so the model never reads the list as physical
-     column order (it has no other way to find out) — and it states it in the
-     form that is TRUE OF THIS PAYLOAD: only a turn whose question actually
-     ranked the columns is told the order is relevance order; with no usable
-     question the ranking IS list order, so the marker claims only that the key
-     and leading columns come first.
-
-  5. THE MARKER IS INSIDE THE FIT — part of every trial render, so what is
-     measured is what is returned. Its text makes no promise the runtime cannot
-     keep. It used to end at "ask the user rather than assuming", because
-     `getTableSchema` had no narrowing argument; the MCP now takes an optional
-     `columns: ["<name>", …]` argument, so the marker carries the ACTIONABLE
-     contract instead — a name/type-only column's documentation can be fetched by
-     calling `getTableSchema` again for the same table with `columns` naming just
-     the ones needed. That second call is NOT declined by the repeated-read guard:
-     `loop/read_guard.py::idempotent_read_signature` keys on the tool name plus
-     the canonicalized ARGUMENTS, so a call carrying `columns` is a different
-     signature from the bare fetch that produced this payload.
-
-D25 (load-bearing): *question* is RAW USER TEXT. It may ONLY influence the ORDER
-in which columns are upgraded and emitted. It is never written into the returned
-schema, the marker, the report, or anything derived from them — a test scans the
-whole output for it.
+D25 (load-bearing): *question* is RAW USER TEXT. It may ONLY influence the ORDER in
+which columns are upgraded and emitted. It is never written into the returned schema,
+the marker, the report, or anything derived from them.
 """
 
 from __future__ import annotations
@@ -136,19 +79,19 @@ _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _estimate_tokens(text: str) -> int:
-    """chars/4 token estimate — THE single home for the dispatch-side estimator
-    (`tool_dispatcher.py` imports this name; `context/budget.py::_estimate_tokens`
-    is the deliberate copy that cannot be imported without an import cycle, and a
-    parity test in `tests/runtime/dispatch/test_tool_dispatcher.py` pins the two
-    together so a tokenizer swap must update both)."""
+    """chars/4 token estimate — THE single home for the dispatch-side estimator.
+        `context/budget.py::_estimate_tokens` is the deliberate copy that cannot be imported
+        without an import cycle; a parity test pins the two together, so a tokenizer swap
+        must update both.
+    """
     return max(1, len(text) // 4)
 
 
 @dataclass(frozen=True)
 class SchemaFitReport:
-    """What the fit did — COUNTS AND BOOLEANS ONLY (D25). No column names, no
-    question text, no schema content: this is safe to log, to put on an observer
-    event, and to assert on."""
+    """What the fit did — COUNTS AND BOOLEANS ONLY (D25). No column names, no question
+        text, no schema content: safe to log, to put on an observer event, and to assert on.
+    """
 
     # Columns the MODEL could be shown, i.e. after the tenancy strip. The hidden
     # ones are counted separately below and are not part of any other count here.
@@ -189,13 +132,12 @@ def _normalized(name: Any) -> str:
 
 
 def _is_tenancy_column(column: Any) -> bool:
-    """FAIL CLOSED on the entry shape. A column entry is normally the MCP's dict,
-    but this module never assumes that (`_compact_column`/`_skeleton_of` pass any
-    other shape through), so a BARE STRING entry — `"client_code"` — has to be
-    recognized as the same column the dict form would be. No `_merge_columns` path
-    emits one today; the point is that the shape check must not be what decides a
-    tenancy column reaches the model. Anything that is neither a string nor a dict
-    has no name to match and is kept."""
+    """FAIL CLOSED on the entry shape: a BARE STRING entry — `"client_code"` — has to be
+        recognized as the same column the dict form would be. No MCP path emits one today;
+        the point is that the shape check must not be what decides a tenancy column reaches
+        the model. Anything that is neither a string nor a dict has no name to match and is
+        kept.
+    """
     if isinstance(column, str):
         name: Any = column
     elif isinstance(column, dict):
@@ -249,15 +191,13 @@ def _skeleton_of(column: Any) -> Any:
 def _structural_names(schema: dict[str, Any]) -> set[str]:
     """Column names the schema's OWN `primary_key` / `join_keys` sections name.
 
-    These are pinned into the detailed group whatever the question is: a model
-    that cannot see a key column's documentation cannot join, de-duplicate or
-    check grain, and no question phrasing makes that less true.
+        Pinned into the detailed group whatever the question is: a model that cannot see a
+        key column's documentation cannot join, de-duplicate or check grain.
 
-    Over-collection is harmless — the result is intersected with the table's real
-    column names by the caller — so `join_on` clause fragments are mined for bare
-    identifiers ("primary_supervisor_ee_code = employee_code" pins both sides of a
-    self-join) rather than parsed. Reading the RESPONSE's own sections (not a
-    catalog lookup) keeps this module a pure function of its input.
+        Over-collection is harmless — the caller intersects the result with the table's real
+        column names — so `join_on` clause fragments are mined for bare identifiers rather
+        than parsed. Reading the RESPONSE's own sections, not a catalog lookup, keeps this
+        module a pure function of its input.
     """
     names: set[str] = set()
 
@@ -313,17 +253,15 @@ _PROSE_WEIGHT = 0.6
 
 
 def _stem(word: str) -> str:
-    """Crude plural fold. `ies -> y` is checked BEFORE the trailing-`s` strip
-    because the strip alone turns "salaries" into "salarie", which matches
-    NOTHING — not `annual_salary`, not the word "salary" in any column's prose —
-    so the single most common phrasing of the question this ranker exists for
-    ("what are the average salaries by department") scored every column zero and
-    fell back to list order. Same for "ambiguities"/"cities"/"policies".
+    """Crude plural fold. `ies -> y` is checked BEFORE the trailing-`s` strip, because the
+        strip alone turns "salaries" into "salarie", which matches NOTHING — and that is the
+        single most common phrasing of the questions this ranker exists for.
 
-    The length guards keep short words whose `s`/`ies` is not a plural intact
-    ("lies" -> "lie", not "ly"; "gas" stays "gas"). This is not a real stemmer and
-    does not need to be: it is applied IDENTICALLY to the question and to the
-    columns, so the only thing that matters is that the two sides agree."""
+        The length guards keep short words whose `s`/`ies` is not a plural intact ("lies" ->
+        "lie", "gas" stays "gas"). This is not a real stemmer and does not need to be: it is
+        applied IDENTICALLY to the question and to the columns, so the only thing that
+        matters is that the two sides agree.
+    """
     if len(word) > 4 and word.endswith("ies"):
         return word[:-3] + "y"
     if len(word) > 3 and word.endswith("s"):
@@ -332,10 +270,10 @@ def _stem(word: str) -> str:
 
 
 def _tokens(text: Any) -> set[str]:
-    """Fold `AnnualSalary` / `annual_salary` / "annual salary" to the same tokens,
-    drop stopwords, and stem a plural (`_stem`) so "employees" matches "employee"
-    and "salaries" matches "salary". Applied identically to the question and to
-    the columns, so the crude stemming cannot make the two sides disagree."""
+    """Fold `AnnualSalary` / `annual_salary` / "annual salary" to the same tokens, drop
+        stopwords, and stem a plural. Applied identically to the question and to the
+        columns, so the crude stemming cannot make the two sides disagree.
+    """
     if not isinstance(text, str):
         return set()
     words = _TOKEN_RE.findall(_CAMEL_BOUNDARY_RE.sub(" ", text).lower())
@@ -366,12 +304,11 @@ def _column_fields(column: Any) -> tuple[set[str], set[str], set[str]]:
 def _rank_columns(columns: list[Any], question: str | None) -> list[int]:
     """Column INDICES in the order detail should be restored to them.
 
-    No question (or no usable token in it) -> list order, unchanged. Otherwise
-    columns are scored by the question's tokens, weighted by field and by
-    INVERSE DOCUMENT FREQUENCY over this table's own columns: a token that
-    occurs in most of the table's columns ("employee", "date", "code") carries
-    almost no signal, while a rare one ("salary") carries most of it. Ties fall
-    back to list order, so the ranking is total and deterministic.
+        No question, or no usable token in it, leaves list order unchanged. Otherwise
+        columns are scored by the question's tokens, weighted by field and by INVERSE
+        DOCUMENT FREQUENCY over this table's own columns, so a token occurring in most
+        columns carries almost no signal. Ties fall back to list order, so the ranking is
+        total and deterministic.
     """
     query = _tokens(question) if question else set()
     if not query:
@@ -413,29 +350,22 @@ def _rank_columns(columns: list[Any], question: str | None) -> list[int]:
 
 
 def _marker_text(report: SchemaFitReport, *, ranked: bool) -> str:
-    """The model-facing note. Every clause is a fact about THIS payload; there is
-    no instruction the runtime cannot honour.
+    """The model-facing note. Every clause is a fact about THIS payload; there is no
+        instruction the runtime cannot honour.
 
-    TWO ORDERING VARIANTS, because there are two orderings. *ranked* is True only
-    when the turn's question produced usable tokens and therefore actually ranked
-    the columns (`_rank_columns`'s own gate). Without one the emission order is the
-    structural pins plus the head of the table's own list — a real and useful
-    ordering, but NOT a relevance ordering, and a marker that called it one would
-    be telling the model the leading columns were chosen for its request when
-    nothing about the request was consulted. The unranked variant claims only what
-    is true: the key and leading columns come first.
+        TWO ORDERING VARIANTS, because there are two orderings. *ranked* is True only when
+        the turn's question produced usable tokens and therefore actually ranked the
+        columns. Without one the emission order is the structural pins plus the head of the
+        table's own list — real and useful, but NOT a relevance ordering — so the unranked
+        variant claims only that the key and leading columns come first.
 
-    THE NARROWING CLAUSE IS AN INSTRUCTION THE RUNTIME CAN HONOUR (2026-08-18). It
-    names the MCP's optional `columns` argument to `getTableSchema`, which returns
-    the full documentation for just the named columns; the repeated-read guard
-    keys on the canonicalized arguments, so that call is a different signature from
-    the bare fetch and is dispatched, not declined. It replaces the old "ask the
-    user rather than assuming" dead end, which made a recoverable gap look like a
-    conversation the model had to interrupt.
+        The narrowing clause names the MCP's optional `columns` argument to
+        `getTableSchema`; the repeated-read guard keys on canonicalized arguments, so that
+        call is a different signature from the bare fetch and is dispatched, not declined.
 
-    It says nothing about the tenancy columns removed upstream of the fit: those
-    are pre-applied by the platform and are not the model's to reason about, and
-    naming them would invite exactly the predicate their removal prevents (§0)."""
+        It says nothing about the tenancy columns removed upstream of the fit: naming them
+        would invite exactly the predicate their removal prevents.
+    """
     parts = [
         f"…[the COLUMN LIST of this schema was reduced to fit its token budget "
         f"(every other section — description, grain, temporal, primary_key, "
@@ -488,13 +418,12 @@ def _assemble(
     ranked: bool,
     columns_budget: int,
 ) -> tuple[dict[str, Any], SchemaFitReport]:
-    """Build one candidate payload AND its report, marker included, so every
-    trial measures exactly what would be returned.
+    """Build one candidate payload AND its report, marker included, so every trial
+        measures exactly what would be returned.
 
-    ONLY the columns section and the marker are measured against
-    *columns_budget*: the base sections ride complete by contract (§1) and are
-    not the fit's to trade away, so counting them would let a big `rules` buy
-    itself column detail it must not be able to buy.
+        ONLY the columns section and the marker are measured against *columns_budget*: the
+        base sections ride complete by contract, so counting them would let a big `rules`
+        section buy itself column detail it must not be able to buy.
     """
     listed = len(entries)
     detailed = sum(detail_flags)
@@ -536,18 +465,17 @@ def _assemble(
 def fit_schema_under_cap(
     schema: dict[str, Any], columns_token_budget: int, *, question: str | None = None
 ) -> tuple[dict[str, Any], SchemaFitReport]:
-    """Shape *schema* (a `getTableSchema` result) for the model: strip the tenancy
-    columns and the information-free keys unconditionally, keep every table-level
-    section complete, and fit the COLUMNS SECTION under *columns_token_budget* by
-    the ladder documented at the top of this module. Returns the payload the model
-    should see and a counts-only report.
+    """Shape *schema* (a `getTableSchema` result) for the model: strip the tenancy columns
+        and the information-free keys unconditionally, keep every table-level section
+        complete, and fit the COLUMNS SECTION under *columns_token_budget* by the ladder
+        documented at the top of this module. Returns the payload the model should see and a
+        counts-only report.
 
-    A schema that fits comes back COMPACTED-STABLE, not byte-identical (§3a, user
-    spec 2026-08-18): tenancy columns and null/False/empty keys are gone on every
-    path, the surviving keys keep their order and values, and no marker is added.
+        A schema that fits comes back COMPACTED-STABLE, not byte-identical: the surviving
+        keys keep their order and their values verbatim, and no marker is added.
 
-    *question* is the user's raw turn text. It is used ONLY to order the detail
-    upgrades and the emitted list, and never appears in either return value (D25).
+        *question* is the user's raw turn text. It orders the detail upgrades and the emitted
+        list, and never appears in either return value (D25).
     """
     # `schema["columns"]` is a list by the caller's own branch condition
     # (`_cap_nontabular_result` dispatches here on `isinstance(..., list)`), so a

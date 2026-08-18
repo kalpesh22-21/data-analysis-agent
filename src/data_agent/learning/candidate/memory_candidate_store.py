@@ -1,18 +1,11 @@
 """InMemoryCandidateStore — the Layer-1 `CandidateStore` fake (D101).
 
-Dict-backed, same semantics as `CouchbaseCandidateStore` (put / get /
-list_by_status / touch_scanned / stamp_drift) for Layer-1 wiring tests, including
-the S3 consumer-integration test that asserts a KEEP session persists candidates at
-`status=extracted`.
-
-PARITY IS THE POINT: the whole unit suite drives the scheduler through THIS class,
-so any place it diverges from the Couchbase impl is a place the tests prove
-nothing. The behaviours that must match exactly are (a) `list_by_status` ordering,
-including where a MISSING/None sort key lands, (b) the S9 bookkeeping stamps being
-single-field writes against the CURRENTLY-STORED envelope rather than whole-envelope
-puts of a possibly-stale copy, and (c) those stamps being NO-OPS on a missing id —
-the real `mutate_in` replaces, it does not upsert, so a superseded candidate must not
-be resurrected by a stamp.
+PARITY IS THE POINT: the whole unit suite drives the scheduler through THIS class, so
+anywhere it diverges from the Couchbase impl is a place the tests prove nothing. What must
+match exactly is (a) `list_by_status` ordering, including where a MISSING/None sort key
+lands, (b) the S9 bookkeeping stamps being single-field writes against the CURRENTLY-STORED
+envelope rather than whole-envelope puts of a possibly-stale copy, and (c) those stamps being
+NO-OPS on a missing id — the real `mutate_in` replaces, it does not upsert.
 """
 
 from __future__ import annotations
@@ -25,39 +18,22 @@ from .verdicts import DriftStamp
 
 
 def _sort_key(env: CandidateEnvelope, order_by: str) -> tuple:
-    """The ASC sort key, shaped to reproduce the ordering the Couchbase impl gets from
-    the N1QL collation + `idx_candidates_scan_rotation`.
+    """The ASC sort key, shaped to reproduce the ordering the Couchbase impl gets from N1QL.
 
-    The primary component is a `(rank, value)` TUPLE rather than the bare field:
+    The primary component is a `(rank, value)` TUPLE rather than the bare field, for two reasons:
+    `last_scanned_at` is `None` on every never-scanned candidate and a bare `sorted()` over a mix
+    of `None` and `str` RAISES — a crash in the cron's first read, not a mis-order — and N1QL
+    sorts MISSING/NULL BEFORE every string, which is also what the rotation depends on, so
+    brand-new work jumps ahead. The ROTATION key then appends `candidate_id`, matching the
+    Couchbase `ORDER BY`; without it the two stores broke ties differently and "which rows the
+    window contains" was impl-defined.
 
-      * `last_scanned_at` is `None` on every never-scanned candidate, and a bare
-        `sorted()` over a mix of `None` and `str` raises `TypeError: '<' not
-        supported between instances of 'str' and 'NoneType'` — a crash in the cron's
-        very first read, not a mis-order. The rank makes the comparison total.
-      * N1QL sorts MISSING/NULL BEFORE every string, so a never-scanned candidate must
-        sort FIRST here too (rank 0). That is also the behaviour the rotation depends
-        on: brand-new work jumps ahead of everything already examined.
-
-    The ROTATION key then appends `candidate_id`, matching the Couchbase `ORDER BY
-    last_scanned_at, candidate_id`. Without it the two stores broke ties differently —
-    this fake by dict insertion order, the GSI by its implicit trailing doc key — so
-    "which rows the window contains" was impl-defined and untestable. `created_at`
-    keeps its single key: its statement is byte-identical to the pre-rotation one and
-    its tie order is documented as impl-defined.
-
-    CAVEAT, so this is not read as more than it is: the tiebreak makes the order TOTAL,
-    it does not make it FAIR. Fairness comes from the cursor advancing, which confines
-    ties to rows stamped within one clock tick. A clock frozen across cycles (a test
-    double, never `_now_iso`) leaves every row tied forever and the same prefix is
-    returned every time — by construction, not for want of a tiebreak.
-
-    A non-`str` cursor is treated as absent (rank 0) — see `CandidateEnvelope`, which
-    documents why that DIVERGES from the server for array/object values.
-
-    The tuple is FLAT — `(rank, value[, candidate_id])` — so element 0 is always the
-    integer collation rank. The parity suite compares that rank directly against the
-    measured N1QL one, and burying it inside a nested tuple would break that comparison
-    without breaking any ordering, which is the worst way for it to go wrong."""
+    CAVEAT: the tiebreak makes the order TOTAL, not FAIR. Fairness comes from the cursor
+    advancing, which confines ties to rows stamped within one clock tick; a clock frozen across
+    cycles (only ever a test double) leaves every row tied forever. The tuple is FLAT so element
+    0 is always the collation rank, which the parity suite compares directly against the measured
+    N1QL one.
+    """
     if order_by == "created_at":
         raw = env.created_at
         return (1, raw) if isinstance(raw, str) else (0, "")
@@ -104,12 +80,13 @@ class InMemoryCandidateStore:
         return matches[:limit]
 
     async def touch_scanned(self, candidate_id: str, at: str) -> None:
-        """Single-field write of the S9 scan cursor, mirroring the Couchbase
-        sub-document `mutate_in`: it re-reads the CURRENTLY-STORED envelope and
-        changes only `last_scanned_at`. Writing the caller's (scanned, possibly
-        stale) copy back instead would let the cron silently revert a concurrent
-        inbox transition — the divergence would be invisible in the fake and fatal
-        in production. An unknown id is a no-op (the doc expired / was superseded)."""
+        """Single-field write of the S9 scan cursor, mirroring the Couchbase sub-document `mutate_in`.
+
+        It re-reads the CURRENTLY-STORED envelope and changes only `last_scanned_at`. Writing the
+        caller's (scanned, possibly stale) copy back instead would let the cron silently revert a
+        concurrent inbox transition — invisible in the fake and fatal in production. An unknown id is
+        a no-op.
+        """
         current = self._by_id.get(candidate_id)
         if current is None:
             return
@@ -117,14 +94,13 @@ class InMemoryCandidateStore:
         self._by_id[candidate_id] = replace(current, last_scanned_at=at)
 
     async def stamp_drift(self, candidate_id: str, drift: DriftStamp) -> None:
-        """Single-field write of the S9 drift verdict, mirroring the Couchbase
-        sub-document `mutate_in` exactly as `touch_scanned` does.
+        """Single-field write of the S9 drift verdict, mirroring `mutate_in` as `touch_scanned` does.
 
-        The missing-id NO-OP is the behaviour that matters most to reproduce: the real
-        `mutate_in` uses REPLACE semantics, so a candidate `supersede` deleted between
-        the cron's scan read and this write stays deleted. A fake that fell back to
-        `put` would RESURRECT it, and the divergence would only ever show up in
-        production."""
+        The missing-id NO-OP is what matters most to reproduce: the real `mutate_in` uses REPLACE
+        semantics, so a candidate `supersede` deleted between the scan read and this write stays
+        deleted. A fake falling back to `put` would RESURRECT it, and the divergence would only ever
+        show up in production.
+        """
         current = self._by_id.get(candidate_id)
         if current is None:
             return

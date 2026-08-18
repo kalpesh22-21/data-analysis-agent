@@ -1,33 +1,10 @@
-"""LearningConsumer — the no-op Slice-1 consumer (D96 §5/§7, design §2).
+"""LearningConsumer — the learning-loop worker (D96 §5/§7, design §2).
 
-Every cycle: read the kill-switch FRESH; if enabled, first reclaim stale PEL
-entries (dead-lettering any past N deliveries), then XREADGROUP new work. For
-each delivered job:
-
-  idempotency check (already-`done` + same `content_hash` → ACK + skip)
-    → CLAIM decision (`_claim_decision`: the delivered session's CURRENT status ×
-      the delivery path → forward / recover / refuse / terminal)
-    → CAS `queued → processing`   (or a `processing`/`done` recovery re-entry)
-    → **no-op work + trace event**   ← Slice 2 replaces this middle with the
-                                        loader + triage + extractor
-    → CAS `processing → done`  (records a FRESHLY computed content_hash)
-    → XACK
-
-Every non-`done` outcome LOGS what it saw and emits a `learning.consume` span
-carrying the state it refused from (`learning.session_status`) and a reason code
-(`learning.skip_reason`). This is not decoration: the claim used to be a bare
-`queued → processing` CAS whose failure returned `"skip"` with no ack, no log, no
-span and no metric, so a session in any other state produced a message that was
-reclaimed and re-refused until it dead-lettered by attrition — invisibly. See
-`_claim_decision` for the table and for which states are recoverable.
-
-Ordering invariant (MEDIUM-3): NO irreversible XACK (or dead-letter move) happens
-before the session-state CAS the message represents. A CAS loss / crash at either
-transition is a skip WITHOUT ack (the message stays in the PEL and is reclaimed
-later), so no work is silently dropped and a crash mid-transition is
-reclaim-recoverable via the `done`+same-hash dedup. The consumer is read-only
-w.r.t. request-path data (D72): the only writes are the two lifecycle
-transitions (+ `learning_content_hash` recorded on `done`).
+Per job: dedup check → `_claim_decision` → CAS `queued → processing` → work → CAS
+`processing → done` (recording a FRESHLY computed hash) → XACK; the kill-switch is read
+fresh each cycle and stale PEL entries are reclaimed first. ORDERING INVARIANT: no
+irreversible XACK or dead-letter move before the state CAS it represents, so a CAS loss or
+a crash is a skip WITHOUT ack. Read-only w.r.t. request-path data (D72).
 """
 
 from __future__ import annotations
@@ -157,8 +134,7 @@ REVIEW_ROUTED_DECLINE_REASONS: frozenset[str] = frozenset(
 
 
 def _session_question(summary: SessionSummary) -> str | None:
-    """The user's originating question (the first turn's NL). Entity-bearing —
-    only ever surfaced on a span behind the verbose gate."""
+    """The user's originating question (the first turn's NL) — entity-bearing, verbose-gated."""
     for turn in summary.turns:
         if turn.user_nl:
             return turn.user_nl
@@ -166,8 +142,7 @@ def _session_question(summary: SessionSummary) -> str | None:
 
 
 def _transcript_preview(summary: SessionSummary) -> str | None:
-    """A short human-readable preview of what the chat was about (user/assistant
-    lines, truncated). Entity-bearing — verbose-gated."""
+    """A truncated preview of the chat (user/assistant lines) — entity-bearing, verbose-gated."""
     parts: list[str] = []
     for turn in summary.turns:
         if turn.user_nl:
@@ -180,13 +155,12 @@ def _transcript_preview(summary: SessionSummary) -> str | None:
 
 
 def _accepted_sql(summary: SessionSummary) -> str | None:
-    """The accepted SQL: the LAST query the answer designated (`answerWithTable`),
-    else the last successful runQuery. Entity-bearing — verbose-gated.
+    """The accepted SQL — entity-bearing, verbose-gated.
 
-    The designation wins because the span answers "what did this session accept?" and
-    that is what the user was shown — which since Release 1 need never have been
-    dispatched as a runQuery at all, so reading only ok calls left the one query that
-    mattered out of the trace and put an intermediate probe in its place."""
+    The LAST query the answer DESIGNATED (`answerWithTable`), else the last successful
+    runQuery; since Release 1 a designated query need never have been dispatched at all, so
+    reading only ok calls left the one query that mattered out of the trace.
+    """
     if summary.answer_sqls:
         return summary.answer_sqls[-1].sql
     sql: str | None = None
@@ -197,20 +171,13 @@ def _accepted_sql(summary: SessionSummary) -> str | None:
 
 
 def _blueprint_verbose(payload: BlueprintPayload) -> tuple[str | None, str | None]:
-    """The learned (intent, slot-plan) of a BLUEPRINT payload for the verbose extract
-    span. `slots` renders as `name→binds_to; ...` — with the slot TYPE in place of
-    `binds_to` for a windowed slot, which legitimately declares none (it consumes no
-    column domain; see `extractor/models.py::WINDOWED_SLOT_TYPES`). An f-string would
-    have rendered the literal `None` there. Entity-bearing — verbose-gated.
+    """The learned (intent, slot-plan) of a BLUEPRINT payload — entity-bearing, verbose-gated.
 
-    Takes the PAYLOAD, not the candidate, and no longer returns the rationale. It used to
-    take a candidate of any type and return `(None, None, rationale)` for the three
-    non-blueprint targets — which meant the caller's `isinstance(payload,
-    BlueprintPayload)` guard skipped it entirely for a knowledge candidate and the
-    rationale went with it. A session that extracted only knowledge therefore emitted a
-    verbose extract span with NO human-readable attribute at all. The rationale lives on
-    `CandidateHeader` for EVERY target, so the caller reads it there and this function
-    answers only the question its name asks."""
+    `slots` renders as `name→binds_to; ...`, substituting the slot TYPE for a windowed slot,
+    which legitimately declares no `binds_to` (`extractor/models.py::WINDOWED_SLOT_TYPES`).
+    Takes the PAYLOAD and does NOT return the rationale: that lives on `CandidateHeader` for
+    every target, so the caller reads it there and a knowledge-only session still gets one.
+    """
     slots = (
         "; ".join(
             f"{p.slot.name}→{p.slot.binds_to or f'<{p.slot.type}>'}"
@@ -223,53 +190,13 @@ def _blueprint_verbose(payload: BlueprintPayload) -> tuple[str | None, str | Non
 
 
 def _decline_details(declines: tuple[Decline, ...]) -> str | None:
-    """The verbose extract span's `decline_details` — one `reason: detail` line per
-    decline, or `None` when nothing was declined or no decline carried a detail.
+    """The verbose extract span's `decline_details` — one `reason: detail` line per decline.
 
-    THE POINT: `decline_reasons` (shape-only) says `bad_role`; this says "slot pay_period
-    has no binds_to (only a ['as_of_quarter', 'period'] slot may omit it)". A session that
-    produced nothing and offered no readable why is the hole this closes, and a reason
-    code alone does not close it — the code names a class, the detail names the fix.
-
-    BOUNDED and FLATTENED, and not as a formality. `Decline.detail` interpolates
-    MODEL-authored strings (`f"unknown role {p.role!r}"`, a slot name, a candidate type),
-    which are neither a closed vocabulary nor a leakage-scanned surface: a newline in one
-    would smear the attribute across the Phoenix UI and an unbounded one would put an
-    arbitrary generation on a span. Same posture, and the same reason, as
-    `judge/schema.py::_clean` on the judge's `reason`.
-
-    **ENTITY-BEARING, and one detail is measurably so.** Most messages are derived from
-    `(path, requirement, arrived_json_type)` and name no value. `totality_violation` is
-    the exception: it interpolates `pred.value` — a literal lifted from a real analyst's
-    accepted SQL (`validation.py::_validate_totality`). That is a deliberate accepted
-    consequence of the D25 gate, not an oversight, and it is recorded here so the next
-    reader does not have to rediscover it:
-
-      * it changes no CLASS of content. This same span already carries
-        `learning.accepted_sql` — the whole accepted query WITH its literals — under the
-        SAME gate, and `pred.value` is by construction a literal out of a cited source
-        query. The span was entity-bearing before this attribute existed;
-      * it is therefore governed by the posture already stated on
-        `observability.py::judge_span` and the module docstring: with verbose ON the
-        `learning-loop` Phoenix project holds session content and MUST be
-        access-controlled like `learning_audit` and the session store (D51);
-      * this note used to say the RIGHT fix was at the producer — drop the value and
-        name the path like the message's neighbours. That is no longer the plan, and the
-        reversal is deliberate: `totality_violation` is now a CORRECTABLE decline whose
-        message is fed back to the model, and the predicate it names (column, operator,
-        literal) is the entire content of the fix. Dropping the value would make the
-        message unusable for the thing it now exists to do, and it would buy nothing —
-        the literal comes from the accepted SQL, which the extractor's own prompt
-        carries in full and which this same span carries in `learning.accepted_sql`.
-        `validation.py::_correctable` states the rule the message obeys instead.
-
-    **Not filtered by reason code here, deliberately.** Excluding `totality_violation`
-    from this attribute would be a guard keyed on a NAME — precisely the shape that has
-    already missed this class of bug repeatedly in this package, because the next
-    entity-bearing message added upstream inherits the exemption silently. It would also
-    fail closed on the one thing this attribute exists for: a decline that shows no
-    reason. `ENTITY_BEARING_DECLINE_REASONS` above records what is known, so a reader can
-    audit it; it is documentation, not a filter.
+    `decline_reasons` names a CLASS; the detail names the fix. BOUNDED and FLATTENED because
+    `Decline.detail` interpolates MODEL-authored strings (same posture as
+    `judge/schema.py::_clean`). ENTITY-BEARING: `totality_violation` deliberately carries a
+    literal out of the accepted SQL, because that predicate IS the correction fed back to the
+    model. `ENTITY_BEARING_DECLINE_REASONS` above documents the set; it is NOT a filter.
     """
     lines = [
         f"{d.reason}: {' '.join(d.detail.split())[:_DECLINE_DETAIL_LIMIT]}"
@@ -291,69 +218,25 @@ ClaimKind = Literal["forward", "recover", "refuse", "terminal"]
 def _claim_decision(status: str, *, reclaimed: bool) -> tuple[ClaimKind, str]:
     """THE skip-path table: `(learning_status, delivery path) → (claim, reason)`.
 
-    Pure and module-level so it can be read and tested as a table rather than inferred
-    from control flow. `done` + the SAME `content_hash` never reaches here — `_process`
-    ACKs that as `dedup_skip` before asking.
+      status          fresh delivery                    reclaimed delivery
+      --------------- --------------------------------- --------------------------------
+      queued          forward   (queued)                 forward   (queued)
+      processing      refuse    (owner_may_be_live)      recover   (reclaimed_processing)
+      done (≠hash)    recover   (content_changed)        recover   (content_changed)
+      active          refuse    (not_yet_claimable)      refuse    (not_yet_claimable)
+      pending         refuse    (not_yet_claimable)      refuse    (not_yet_claimable)
+      dead_letter     terminal  (dead_letter)            terminal  (dead_letter)
+      <anything else> terminal  (unknown_status)         terminal  (unknown_status)
 
-      status         fresh delivery                    reclaimed delivery
-      -------------- --------------------------------- --------------------------------
-      queued         forward   (queued)                 forward   (queued)
-      processing     refuse    (owner_may_be_live)      recover   (reclaimed_processing)
-      done (≠hash)   recover   (content_changed)        recover   (content_changed)
-      active         refuse    (not_yet_claimable)      refuse    (not_yet_claimable)
-      pending        refuse    (not_yet_claimable)      refuse    (not_yet_claimable)
-      dead_letter    terminal  (dead_letter)            terminal  (dead_letter)
-      <anything else> terminal (unknown_status)         terminal  (unknown_status)
-
-    WHY each row:
-
-    `processing` — a session left `processing` by an owner that crashed mid-run can be
-    finished by nobody unless a later delivery is allowed to re-enter it, and XAUTOCLAIM
-    re-assigning the message IS the transport saying "this is now yours". On a FRESH
-    delivery the same state means something else entirely: a peer picked the message up
-    seconds ago and is working. Hence the delivery path, not the state, decides.
-
-    THE DISCRIMINATOR, and why it is the delivery path and not `delivery_count > 1`:
-    the two are equivalent under both shipped queues (XREADGROUP `>` only yields
-    never-before-delivered entries, so a fresh delivery is always `delivery_count == 1`),
-    but the equivalence is a property of Redis Streams, not of the `LearningQueue` port
-    — a queue that redelivered by any other route would silently flip the meaning of the
-    derived form. `DeliveredJob.reclaimed` states the fact directly.
-
-    AND WHY NEITHER IS A STALENESS PROOF: min-idle (`LEARNING_RECLAIM_MIN_IDLE_SECONDS`,
-    300s) does NOT guarantee the previous owner is dead — Redis resets a PEL entry's
-    idle clock on DELIVERY, not on the owner's progress, so a consumer legitimately
-    grinding through a long extraction has its own message reclaimed out from under it.
-    What makes the re-entry safe is the CAS: the token comes from a fresh read taken
-    microseconds earlier, so if the live owner writes (its `processing → done`) either
-    it or this re-entry loses, and the loser takes the ordinary `CASMismatchError` skip.
-    The cost of the rare double-run is one duplicated extraction, absorbed by
-    `CandidateStore.supersede(content_hash)`; the cost of NOT re-entering is a session
-    that no delivery can ever finish.
-
-    `done` with a DIFFERENT hash — the session was processed and then gained turns, so
-    what was recorded at `done` no longer describes the transcript. This is the LIVE
-    signature behind the silent stall: the consumer records a FRESHLY computed hash at
-    `done` (MEDIUM-3), so a session that changed between enqueue and consume ends up
-    `done` with a hash the in-flight message never carried; a redelivery of that message
-    then matched neither the dedup check nor the `queued` gate and skipped forever.
-
-    `active`/`pending` — REFUSE, and deliberately WITHOUT an ack. Both are states the
-    sweeper still owns (`SWEEPABLE_STATUSES`): a `pending` session is re-detected and
-    driven to `queued` on a later sweep, at which point a reclaim of this very message
-    processes it. Acking here would drop work the sweeper is about to make claimable.
-
-    `dead_letter` and any UNRECOGNIZED status — TERMINAL, ack. Neither can become
-    `queued` again: `dead_letter` is terminal by design, and an unknown status string is
-    outside the state machine entirely (nothing in this package writes one — it means a
-    hand-edited doc or a schema skew) so no sweeper will ever pick it up. Leaving the
-    message in the PEL just re-runs this decision every reclaim until the delivery count
-    exhausts and it dead-letters by attrition — which is the CURRENT behaviour and the
-    least informative possible outcome. The ack is paired with a WARNING log and an
-    `ack_terminal` span so the discard is loud and countable rather than a slow silent
-    burn. (The alternative — CAS the session to `dead_letter` and XADD the message to
-    the dead stream — was rejected for the unknown-status case: it would overwrite the
-    very evidence an operator needs, and for `dead_letter` the session is already there.)
+    Pure and module-level so it reads as a table; `done` + the SAME hash never reaches here
+    (`_process` ACKs that as `dedup_skip` first). The DELIVERY PATH is the discriminator, not
+    `delivery_count > 1`: the two are equivalent only as a property of Redis Streams, not of
+    the `LearningQueue` port. A reclaim does NOT prove the previous owner is dead — Redis
+    resets the idle clock on DELIVERY, not on progress — so what makes re-entry safe is the
+    CAS, and the loser takes the ordinary skip. `active`/`pending` refuse WITHOUT an ack (the
+    sweeper still owns them, and acking would drop work it is about to make claimable);
+    `dead_letter` and any unknown status ack TERMINALLY, since neither can become `queued`
+    again and leaving the message in the PEL only dead-letters it by attrition.
     """
     if status == LearningStatus.QUEUED:
         return "forward", "queued"
@@ -462,9 +345,7 @@ class LearningConsumer:
         )
 
     async def _dispatch(self, delivered: DeliveredJob, tally: _Tally) -> None:
-        """Route one delivery, isolating transient failures (MEDIUM-1): a bad
-        message logs and is left in the PEL for a later reclaim rather than
-        killing the batch/daemon."""
+        """Route one delivery; a transient failure logs and stays in the PEL, sparing the batch."""
         try:
             if delivered.dead_lettered:
                 outcome = await self._handle_dead_letter(delivered)
@@ -493,8 +374,7 @@ class LearningConsumer:
         tally.record(outcome)
 
     async def _process(self, delivered: DeliveredJob) -> str:
-        """Idempotent process of one delivery. Returns the outcome label
-        (`done` | `dedup_skip` | `skip` | `ack_terminal`)."""
+        """Idempotent process of one delivery: `done` | `dedup_skip` | `skip` | `ack_terminal`."""
         job = delivered.job
         # Rehydrate the enqueue-propagated trace context so this consume (and the
         # triage/extract spans nested under it) join the session's ONE trace. A
@@ -628,12 +508,10 @@ class LearningConsumer:
     ) -> None:
         """EVERY non-processing outcome says what it saw, at INFO.
 
-        A skip is an ordinary, expected event under concurrency, so it is not a
-        warning — but it was previously not ANYTHING: no log, no span, no metric, while
-        the message sat in the PEL being reclaimed toward a dead letter. The three facts
-        here are the ones that were being discarded: the session, the state the claim
-        was refused FROM, and how many deliveries it has burned (the distance to
-        `LEARNING_MAX_DELIVERIES`, i.e. how close this is to dead-lettering)."""
+        A skip is ordinary and expected under concurrency, so it is not a warning. The three facts
+        here are the ones that were being discarded: the session, the state the claim was refused
+        FROM, and how many deliveries it has burned (the distance to `LEARNING_MAX_DELIVERIES`).
+        """
         _logger.info(
             "learning consume SKIPPED session %s: message %s (delivery %d, "
             "reclaimed=%s) found learning_status=%r, reason=%s — not ACKed, left in "
@@ -651,13 +529,12 @@ class LearningConsumer:
         session_status: str,
         reclaimed: bool,
     ):
-        """The consume span (default `outcome=done`, overridden to `skip` on the rare
-        DONE-CAS race) OR a `nullcontext(None)` when no tracer is wired, so the
-        no-op-tracer behavior is byte-identical.
+        """The consume span, or `nullcontext(None)` when no tracer is wired.
 
-        `session_status` is the state the claim was made FROM — `queued` on the ordinary
-        path, `processing`/`done` on a recovery re-entry — so a Phoenix filter can tell
-        the two apart without reading logs."""
+        Defaults `outcome=done`, overridden to `skip` on the rare DONE-CAS race. `session_status`
+        is the state the claim was made FROM — `queued` on the ordinary path, `processing`/`done`
+        on a recovery re-entry — so a Phoenix filter can tell the two apart without reading logs.
+        """
         if self._tracer is None:
             return nullcontext(None)
         return consume_span(
@@ -671,8 +548,10 @@ class LearningConsumer:
         )
 
     def _set_verbose_consume(self, consume, summary: SessionSummary) -> None:
-        """D25-gated: attach the user question + a transcript preview to the consume
-        span ONLY when verbose is on (entity-bearing — see observability docstring)."""
+        """D25-gated: attach the user question + a transcript preview to the consume span.
+
+        Only when verbose is on — entity-bearing (see the `observability` module docstring).
+        """
         if consume is None or not self._settings.learning_trace_verbose:
             return
         question = _session_question(summary)
@@ -683,9 +562,11 @@ class LearningConsumer:
             consume.set_attribute("learning.transcript_preview", preview)
 
     async def _handle_dead_letter(self, delivered: DeliveredJob) -> str:
-        """A message past N deliveries. Ordering (MEDIUM-3/4): CAS the session to
-        `dead_letter` FIRST, then `finalize_dead_letter` (XADD-dead + XACK).
-        Returns `dead_letter` | `ack_terminal` | `skip`."""
+        """A message past N deliveries. Returns `dead_letter` | `ack_terminal` | `skip`.
+
+        Ordering: CAS the session to `dead_letter` FIRST, then `finalize_dead_letter` (XADD-dead
+        + XACK).
+        """
         job = delivered.job
         parent_ctx = context_from_traceparent(job.traceparent)
         doc, cas = await self._store.get_session_with_cas(job.session_id)
@@ -741,13 +622,12 @@ class LearningConsumer:
         return "dead_letter"
 
     async def _do_work(self, doc: SessionDoc, delivered: DeliveredJob) -> SessionSummary:
-        """Slice-2/3 seam (§5.1): load the `SessionSummary` (READ-ONLY, D72), run
-        the deterministic triage gate, and on KEEP run the grounded extractor
-        (S3). Either way the outer `_process` CAS-marks the session `done` —
-        "processed" == "triaged". This method NEVER mutates the request-path
-        session (D72); the only writes are to the LEARNING plane (audit +
-        candidate stores). Returns the loaded summary so `_process` can attach the
-        verbose consume attrs."""
+        """Load the `SessionSummary` (READ-ONLY, D72), run triage, and on KEEP run the extractor.
+
+        Either way the outer `_process` CAS-marks the session `done` — "processed" == "triaged".
+        NEVER mutates the request-path session; the only writes are to the LEARNING plane (audit +
+        candidate stores). Returns the summary so `_process` can attach the verbose consume attrs.
+        """
         summary = await self._summary_loader(doc, self._store, job=delivered.job)
         verdict = self._triage(summary)
         self._emit_triage(summary, verdict)
@@ -775,28 +655,14 @@ class LearningConsumer:
         return summary
 
     async def _judge_session(self, summary: SessionSummary) -> JudgeOutcomeResult:
-        """Ask the coverage judge whether this session's work already exists (plan
-        §3b). `drop=True` ⇒ the caller must SKIP extraction entirely.
+        """Ask the coverage judge whether this session's work already exists; `drop=True` ⇒ skip S3.
 
-        **Returns the whole result, not a bool, and the difference is a slice.** The
-        `outcome` label is the only record of WHY a judgement did not drop — it proceeded
-        on merit, or it never ran (no cards, below the floor, unavailable, failed) — and
-        the fail-to-review route is allowed for exactly one of those values
-        (`proceeded`). Collapsing them to `drop=False` at this boundary, which is what
-        this method used to do, would leave the extractor's declines with no way to tell
-        "a model said this work is genuinely new" from "nobody was asked", and a review
-        queue that cannot tell them apart is a queue of unscreened declines.
-
-        Placed after the extractor-present check on purpose: with no extractor there is
-        no call to cancel, so paying a judge to cancel nothing would be pure cost — and
-        would drop a session on the ONE path that never spends money anyway.
-
-        NEVER raises. The judge is documented fail-open at every internal boundary, but
-        this call site is what makes that a guarantee rather than an intention: an
-        unforeseen escape (a Protocol violation by an injected audit store, a bug in the
-        judge itself) must degrade to "extract as usual", not dead-letter the session
-        through the consumer's blanket handler. The direction matters — a wrong keep
-        costs one extraction and lands in a review queue; a wrong drop is invisible.
+        Returns the WHOLE result, not a bool: the `outcome` label is the only record of WHY a
+        judgement did not drop, and the fail-to-review route is allowed for exactly one value
+        (`proceeded`). NEVER raises — an unforeseen escape must degrade to "extract as usual"
+        rather than dead-letter the session, because a wrong keep costs one extraction that lands
+        in a review queue while a wrong drop is invisible. Placed after the extractor-present
+        check: with no extractor there is no call to cancel.
         """
         # `not_judged` — the default — is the honest label for BOTH no-judge postures
         # (none wired, or one that raised): nobody screened this session, which is
@@ -821,16 +687,13 @@ class LearningConsumer:
         verdict: TriageVerdict,
         judged: JudgeOutcomeResult | None = None,
     ) -> None:
-        """S3: extract candidates → snapshot each candidate's evidence into
-        `learning_audit` (the FIRST real evidence writes) → persist the candidate
-        envelope (carrying only `evidence_ref`s) at `status=extracted`. A candidate
-        with no evidence never reaches here (rejected at emit, D31).
+        """S3: extract candidates, snapshot their evidence, persist each envelope at `extracted`.
 
-        *judged* is the PRE-extraction judgement (`_judge_session`), carried in because it
-        is the only thing that can say a decline belongs in front of a human rather than
-        in the bin — see `_persist_declined_for_review`. Defaulted `None` so the S3-era
-        callers (and every test that drives this method directly) keep the pre-slice
-        behaviour: no judgement, no review route."""
+        A candidate with no evidence never reaches here (rejected at emit, D31). *judged* is the
+        PRE-extraction judgement and is the only thing that can put a decline in front of a human
+        (see `_persist_declined_for_review`); defaulted `None` so the S3-era callers keep the
+        pre-slice behaviour of no review route.
+        """
         result = await self._extractor.extract(summary, verdict)
         # MEDIUM-3: drop any candidates a PRIOR attempt (redelivery before `done`)
         # wrote for this session, so the store never holds a mixed set from two
@@ -885,46 +748,17 @@ class LearningConsumer:
         judged: JudgeOutcomeResult | None,
         traceparent: str | None,
     ) -> int:
-        """Persist a MERIT-PASSED, form-failed decline for a human to complete. Returns
-        how many were written (0 or 1).
+        """Persist a MERIT-PASSED, form-failed decline for a human to complete; returns 0 or 1.
 
-        THE BUG THIS CLOSES is silent loss, and it is worth stating precisely because the
-        code reads like an addition rather than a fix. `validation.py`'s stated doctrine
-        is that a decline "routes to review, never a bad landing" — but a terminal decline
-        after corrections wrote NOTHING durable: no candidate, no inbox row, no audit
-        record beyond a span. One traced session proved a blueprint the corpus wanted
-        evaporating three times over two days
-        (`docs/decisions/learning-declined-candidate-review.md`). Precision was never the
-        problem; recall was being eaten by a form that sometimes has no fillable answer.
-
-        TWO CONDITIONS, and both are necessary:
-
-          * the pre-extraction judge said `proceeded` — a POSITIVE statement that a model
-            looked at the corpus and found this work new. Every other outcome, including
-            the `skipped_*` ones, means nobody screened it, and a review queue filled with
-            unscreened declines is a queue that stops being read. `judged is None` (the S3
-            callers, the tests that drive `_run_extractor` directly) is the same answer.
-          * the reason is one a human can act on (`REVIEW_ROUTED_DECLINE_REASONS`).
-
-        ONE PERSIST PER EXTRACTION, taking the LAST qualifying decline. The bound is the
-        decision doc's (§6) and it is about the queue, not about storage: a session that
-        produces several unfillable forms is a prompt problem, and putting each of them in
-        front of a person is how the surface earns its own neglect. The count is on the
-        span either way, and the LAST one is the model's final word.
-
-        THE LEAKAGE SCAN RUNS FIRST, over the built envelope, using the SAME wired stage
-        instance the extraction pipeline uses — never a private scanner, so the gate a
-        declined candidate passes can never drift from the one a kept candidate passes.
-        With no stage wired the envelope keeps its `pending` sentinel and every downstream
-        surface fails closed on it (the wire withholds the detail, the approve guards
-        refuse); that is a degraded review item, not a leak.
-
-        THE EVIDENCE IS SNAPSHOTTED, exactly as it is for a kept candidate. This row is a
-        durable candidate now, and a candidate whose citations resolve to nothing is one
-        no reviewer can audit and no landing can be traced back — the D31 evidence
-        contract does not become optional because the form was incomplete. The quotes go
-        to `learning_audit` and only the minted refs travel on the envelope (D51/D17),
-        which is the same split every other candidate obeys."""
+        TWO necessary conditions: the pre-extraction judge said `proceeded` (a POSITIVE statement
+        that a model looked at the corpus and found this work new — every other outcome, and
+        `judged is None`, means nobody screened it), and the reason is in
+        `REVIEW_ROUTED_DECLINE_REASONS`. ONE persist per extraction, taking the LAST qualifying
+        decline. The leakage scan runs FIRST over the built envelope using the SAME wired stage
+        instance the pipeline uses, so the two gates cannot drift; with no stage wired the
+        `pending` sentinel survives and every downstream surface fails closed on it. Evidence is
+        snapshotted exactly as for a kept candidate (D31/D51/D17).
+        """
         if judged is None or judged.outcome != OUTCOME_PROCEEDED:
             return 0
         eligible = [
@@ -973,23 +807,13 @@ class LearningConsumer:
     ) -> CandidateEnvelope:
         """Stamp the settled leakage verdict onto a fail-to-review envelope.
 
-        Runs the WIRED gate's SCAN — `leakage.settle_entity_scan`, which calls
-        `LeakageGateStage.scan` rather than `process`, so what comes back is a verdict and
-        nothing else. Two consequences are deliberately not taken:
-
-          * the stage's ROUTING (a `reject` sets `status=rejected`) — written for a
-            candidate flowing toward a landing, where this one is flowing toward a form.
-            A quarantine must leave the row exactly where a reviewer will find it;
-          * the stage's WRITES. `_apply` commits a per-user knowledge record on a
-            `reroute`, and doing that here would take an entity out of a candidate that
-            FAILED validation, may never be completed, and may be rejected outright, and
-            commit it to a user's durable store with nothing to retract it. On the
-            validated path that commit is the gate doing its job; here it would be the
-            gate doing a job nobody asked for.
-
-        No leakage stage wired ⇒ the `pending` sentinel survives and is persisted as-is.
-        Logged at WARNING because it is invisible otherwise and it degrades a real
-        reviewer surface: every consumer of an unsettled scan fails closed."""
+        Runs the WIRED gate's `scan`, not `process`, so what comes back is a verdict and nothing
+        else. The stage's ROUTING is deliberately not taken (a quarantine must leave the row where
+        a reviewer will find it) and neither are its WRITES (`_apply` would commit a per-user
+        knowledge record out of a candidate that FAILED validation and may never be completed).
+        No stage wired ⇒ the `pending` sentinel is persisted as-is, logged at WARNING because
+        every consumer of an unsettled scan fails closed.
+        """
         if not any(getattr(s, "stage_id", "") == "leakage" for s in self._stages):
             _logger.warning(
                 "learning: no leakage stage wired — the fail-to-review candidate for "
@@ -1009,23 +833,15 @@ class LearningConsumer:
         summary: SessionSummary,
         verdict: TriageVerdict,
     ) -> Literal["continue", "halt"]:
-        """Run the injected write-router pipeline over one freshly-`extracted`
-        envelope (D102 §7.1). Returns `"halt"` if a stage asked to stop the whole
-        extraction pipeline, else `"continue"`.
+        """Run the injected write-router pipeline over one freshly-`extracted` envelope (D102 §7.1).
 
-        EMPTY tuple ⇒ behaviorally identical S3 behavior (no extra `put`; the
-        candidate was already persisted at `extracted`): the loop never runs. Only
-        a WIRED stage triggers the final persist of its enriched envelope. Control
-        semantics (see `stage.StageControl`): `continue` → next stage; `route_inbox`
-        → stop + persist; `drop` → stop, do NOT persist; `halt` → stop + persist,
-        then skip the remaining candidates. An UNKNOWN control string is a
-        programming error and raises (never a silent route_inbox).
-
-        The loop itself lives in `stage.run_pipeline`, shared with the inbox's
-        parameterization-completion path — which re-runs the SAME pipeline over a
-        candidate a human finished filling in, and must not be able to disagree with this
-        one about what a control means. What stays here is the consumer's own half: the
-        store to persist into, and the halt that skips the remaining candidates."""
+        Returns `"halt"` if a stage asked to stop the whole extraction pipeline, else
+        `"continue"`. An EMPTY tuple never runs the loop (the candidate is already persisted at
+        `extracted`); only a WIRED stage triggers the final persist of its enriched envelope. The
+        loop itself lives in `stage.run_pipeline`, shared with the inbox's completion path so the
+        two cannot disagree about what a control means; what stays here is the consumer's own
+        half — the store to persist into, and the halt that skips the remaining candidates.
+        """
         if not self._stages:
             return "continue"
         outcome = await run_pipeline(
@@ -1044,15 +860,13 @@ class LearningConsumer:
     async def _snapshot_quotes(
         self, evidence: tuple[EvidenceRef, ...], summary: SessionSummary
     ) -> tuple[str, ...]:
-        """Snapshot each cited evidence quote into `learning_audit` (D51/D95) and
-        return the minted `evidence_ref`s. The entity-bearing quote lives ONLY in
-        the audit store; the candidate carries only the refs (D17).
+        """Snapshot each cited quote into `learning_audit` (D51/D95) and return the minted refs.
 
-        Takes the CITATIONS rather than the candidate, because a fail-to-review row has
-        no `ExtractedCandidate` to take them off — it exists precisely because validation
-        did not produce one — and its citations still have to be auditable. One
-        implementation for both, so the audit record of a review item is the same record
-        a kept candidate gets, minted the same way, keyed the same way."""
+        The entity-bearing quote lives ONLY in the audit store; the candidate carries only the refs
+        (D17). Takes the CITATIONS rather than the candidate, because a fail-to-review row has no
+        `ExtractedCandidate` to take them off and its citations still have to be auditable — one
+        implementation for both, minted and keyed the same way.
+        """
         refs: list[str] = []
         for ev in evidence:
             ref = self._audit.mint_evidence_ref(summary.session_id)
@@ -1154,17 +968,14 @@ class LearningConsumer:
                 pass
 
     async def run_forever(self, *, sleep) -> None:
-        """Blocking loop (used by the entrypoint). Ensures the group exists, then
-        consumes batches forever. A transient error logs + continues (MEDIUM-1);
-        when disabled, `run_once` returns immediately (no blocking XREADGROUP), so
-        *sleep* paces the re-check on the consumer's OWN idle interval.
+        """Blocking loop: ensure the group exists, then consume batches forever.
 
-        The kill-switch STATE CHANGE is logged — once per change, never per cycle. A
-        consumer held off by `LEARNING_ENABLED` otherwise looks exactly like a healthy
-        idle one (it emits a `learning.disabled` span, which is invisible unless OTLP
-        is configured, and nothing else), so "the loop is running and doing nothing" had
-        no readable cause. Per-cycle logging is refused: at the 5s idle interval it
-        would be 17k lines a day."""
+        A transient error logs and continues; when disabled, `run_once` returns immediately (no
+        blocking XREADGROUP), so *sleep* paces the re-check on the consumer's OWN idle interval.
+        The kill-switch STATE CHANGE is logged once per change, never per cycle — a consumer held
+        off by `LEARNING_ENABLED` otherwise looks exactly like a healthy idle one, and per-cycle
+        logging at the 5s idle interval would be 17k lines a day.
+        """
         await self._queue.ensure_group()
         disabled_logged = False
         while True:

@@ -1,27 +1,13 @@
 """CouchbaseCandidateStore — the real `CandidateStore` (D101).
 
-Its OWN `Cluster`, authenticated as `learning_candidates_writer` against the
-dedicated `learning_candidates` bucket (`_default._default`) — a separate RBAC
-boundary from the session/audit stores (D101, mirroring D95). `put` is a KV
-upsert with the candidate TTL; `list_by_status` is a parameterized N1QL query
-(needs the primary index provisioned by `scripts/learning-candidates-init.sh`);
-`touch_scanned` / `stamp_drift` are TTL-preserving sub-document writes of the two
-S9-owned bookkeeping fields.
+Its OWN `Cluster`, authenticated as `learning_candidates_writer` against the dedicated
+`learning_candidates` bucket — a separate RBAC boundary from the session/audit stores. `put`
+is a KV upsert with the candidate TTL; `list_by_status` is a parameterized N1QL query needing
+the provisioned primary index; `touch_scanned`/`stamp_drift` are TTL-preserving sub-document
+writes of the two S9-owned bookkeeping fields.
 
-Import-guarded exactly like `couchbase_store` / `couchbase_audit_store`: imports
-with or without the SDK; constructing without it raises.
-
-CONNECT (2026-08-11): shares `CouchbaseConnectGate` with every other
-Couchbase-backed store — `acouchbase` refuses all ops (KV *and* N1QL) until
-`on_connect()` has been awaited, which a sync `__init__` cannot do, so each
-public coroutine gates itself. The consumer, the promotion scheduler and the
-inbox service all build this store and none of them connected it. See
-`runtime/couchbase_connect.py`.
-
-CONSTRUCTION (2026-08-17): also shared, via `CouchbaseStoreBase` — the SDK guard,
-the `Cluster`/bucket/collection graph and the TTL are built there from this store's
-own settings, and (with no `cluster=` injected) not until the first
-`_ensure_connected()`. `__init__` does no I/O.
+Import-guarded (imports without the SDK; constructing raises), gated per public coroutine by
+`CouchbaseConnectGate`, and built through `CouchbaseStoreBase` so `__init__` does no I/O.
 """
 
 from __future__ import annotations
@@ -187,41 +173,34 @@ class CouchbaseCandidateStore(CouchbaseStoreBase):
     async def touch_scanned(self, candidate_id: str, at: str) -> None:
         """Sub-document write of the S9 scan cursor — see `CandidateStore.touch_scanned`.
 
-        `mutate_in` (not `upsert`) is what makes the two guarantees real: it writes the
-        ONE `last_scanned_at` path server-side, so it can never revert a concurrent
-        inbox transition the way re-putting a stale scanned envelope would, and
-        `preserve_expiry=True` keeps the document's existing TTL, so stamping a
-        permanently-held candidate every cycle does not renew its 90-day retention
-        clock into immortality (`put` deliberately sets the TTL fresh per write; this
-        write is bookkeeping, not a lifecycle event, and must not restart that clock).
-
-        A document that expired or was superseded between the scan read and this write
-        is a tolerated no-op — there is nothing left to rotate."""
+        `mutate_in` rather than `upsert` is what makes the two guarantees real: it writes the ONE
+        `last_scanned_at` path server-side, so it cannot revert a concurrent inbox transition the way
+        re-putting a stale envelope would, and `preserve_expiry=True` keeps the existing TTL, so
+        stamping a permanently-held candidate every cycle does not renew its retention clock into
+        immortality. A document that expired or was superseded in between is a tolerated no-op.
+        """
         await self._ensure_connected()
         await self._stamp_path(candidate_id, "last_scanned_at", at)
 
     async def stamp_drift(self, candidate_id: str, drift: DriftStamp) -> None:
         """Sub-document write of the S9 drift verdict — see `CandidateStore.stamp_drift`.
 
-        Same mechanism as `touch_scanned`, for the same reasons plus one specific to this
-        field: a full-envelope `put` of a cycle-start snapshot would RESURRECT a document
-        that `supersede` deleted in between (a redelivered session re-extracting), because
-        `put` is an upsert. `mutate_in` defaults to REPLACE semantics, so a missing
-        document raises `DocumentNotFoundException` and is swallowed as a no-op — the
-        deleted candidate stays deleted."""
+        Same mechanism as `touch_scanned`, plus one reason specific to this field: a full-envelope
+        `put` of a cycle-start snapshot would RESURRECT a document `supersede` deleted in between,
+        because `put` is an upsert. `mutate_in` defaults to REPLACE semantics, so a missing document
+        raises and is swallowed as a no-op — the deleted candidate stays deleted.
+        """
         await self._ensure_connected()
         await self._stamp_path(candidate_id, "drift", drift.to_doc())
 
     async def _stamp_path(self, candidate_id: str, path: str, value: Any) -> None:
         """One TTL-preserving sub-document upsert of a single S9-owned path.
 
-        `preserve_expiry=True` is load-bearing, not a nicety: `put` deliberately sets the
-        candidate TTL fresh on every write, so bookkeeping stamps issued on a schedule
-        would renew a parked candidate's 90-day retention clock indefinitely and make it
-        immortal. Bookkeeping must not restart the retention clock.
-
-        A document that expired, or that `supersede` removed between the scan read and
-        this write, is a tolerated no-op — never a resurrection, never an error."""
+        `preserve_expiry=True` is load-bearing: `put` deliberately sets the candidate TTL fresh on
+        every write, so scheduled bookkeeping stamps would renew a parked candidate's retention clock
+        indefinitely and make it immortal. A document that expired, or that `supersede` removed
+        between the scan read and this write, is a tolerated no-op — never a resurrection.
+        """
         try:
             await self._collection.mutate_in(
                 candidate_id,

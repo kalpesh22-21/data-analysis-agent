@@ -3,12 +3,10 @@
 
 Composes a `Hydrator` from real infra (an async neo4j driver + the D71 embedding client
 + the two service-key MCP export clients) and runs the periodic re-seed loop. The
-`HYDRATOR_ENABLED` kill-switch is read FRESH at the top of every cycle (inside
-`run_once`), so flipping it halts seeding without a restart.
-
-This is a true `replicas:1` singleton (owns the destructive nuke/rebuild), so there is
-no distributed lock. When neo4j OR the embedding API is unconfigured, `build_hydrator`
-returns `None` and this process IDLES (never crash-loops) — Phase-0 parity.
+`HYDRATOR_ENABLED` kill-switch is read FRESH at the top of every cycle, so flipping it
+halts seeding without a restart. A true `replicas:1` singleton (it owns the destructive
+nuke/rebuild), so there is no distributed lock. When neo4j OR the embedding API is
+unconfigured, `build_hydrator` returns `None` and this process IDLES, never crash-loops.
 
 Environment: `RuntimeSettings` (NEO4J_*, EMBEDDING_*, MCP_URL/MCP_SERVICE_KEY,
 HYDRATOR_POLL_INTERVAL_SECONDS, HYDRATOR_ENABLED).

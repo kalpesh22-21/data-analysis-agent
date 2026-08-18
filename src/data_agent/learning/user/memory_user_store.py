@@ -1,9 +1,8 @@
 """InMemoryUserKnowledgeStore — the Layer-1 `UserKnowledgeStore` fake (S8).
 
-Dict-backed, same semantics as `CouchbaseUserKnowledgeStore` (commit / get /
-list_for_user) for Layer-1 wiring tests. Two invariants it lets QA assert without
-infra: (1) the RBAC boundary — `open_bucket` raises for any bucket but the granted
-one; (2) per-user scoping — `list_for_user` returns only that user's rows.
+Dict-backed, same semantics as the Couchbase impl. Two invariants it lets QA assert without
+infra: the RBAC boundary (`open_bucket` raises for any bucket but the granted one) and
+per-user scoping (`list_for_user` returns only that user's rows).
 """
 
 from __future__ import annotations

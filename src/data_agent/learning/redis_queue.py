@@ -1,26 +1,10 @@
 """RedisStreamsLearningQueue — the real `LearningQueue` (D30, design §4/§9).
 
-Backed by `redis.asyncio`. Topology:
-  - work stream        `learning:jobs`       (XADD / XREADGROUP `>` / XACK)
-  - consumer group     `learning-workers`    (idempotent XGROUP CREATE MKSTREAM)
-  - dead-letter stream `learning:jobs:dead`  (terminal parking for poison jobs)
-
-Two idempotency mechanisms cooperate (D30/D96 §5):
-  1. Enqueue is idempotent by `content_hash` via a Redis `SET NX` dedup key, so a
-     sweeper that crashed AFTER XADD but BEFORE the `pending → queued` CAS does
-     not double-enqueue when the still-`pending` session is re-detected next
-     cycle.
-  2. Delivery is at-least-once; the CONSUMER makes it effectively exactly-once at
-     the processing boundary (already-`done` + same hash → ACK + skip).
-
-Dead-letter: `reclaim_stale` reclaims PEL entries idle past `min_idle_ms`
-(XAUTOCLAIM) and, for any whose delivery count (XPENDING) exceeds
-`max_deliveries`, XADDs them to the dead stream + XACKs them off the work stream,
-reporting them so the consumer can CAS the session to `dead_letter`.
-
-Import-guarded like `couchbase_store`: if `redis` is not installed the module
-still imports (so the unit suite stays green with zero infra); constructing the
-queue without the package raises.
+Topology: work stream `learning:jobs`, consumer group `learning-workers`, dead-letter
+stream `learning:jobs:dead`. Enqueue is idempotent by `content_hash` via a `SET NX` key (a
+duplicate-VOLUME reducer only); delivery is at-least-once and the CONSUMER makes it
+effectively exactly-once. Import-guarded: the module imports without `redis` installed,
+but constructing the queue then raises.
 """
 
 from __future__ import annotations
@@ -55,32 +39,11 @@ _SOCKET_TIMEOUT_MARGIN_SECONDS = 5.0
 def _socket_timeout_seconds(block_ms: int) -> float | None:
     """The client-wide socket read timeout that lets a blocking read finish FIRST.
 
-    WHY. A blocking `XREADGROUP ... BLOCK n` puts TWO deadlines on the SAME read:
-    the server's (return an empty reply after n ms) and the client's socket read
-    timeout. redis-py 8 defaults `socket_timeout` to 5s
-    (`connection.DEFAULT_SOCKET_TIMEOUT`) and `LEARNING_BLOCK_MS` defaults to 5000,
-    so at the SHIPPED configuration the two fire together and the socket usually
-    wins — measured against live Redis: 5 of 5 idle cycles raised
-    `redis.exceptions.TimeoutError`. The consumer's `run_forever` catches and
-    retries, so the loop "works" while logging a full traceback every idle cycle
-    for a cycle in which nothing was wrong. Noise that looks like a defect trains
-    an operator to ignore the one time it is one.
-
-    `BLOCK 0` means BLOCK FOREVER to Redis, so ANY finite socket timeout is
-    guaranteed to fire there. That configuration must therefore have no read
-    deadline at all → `None`. (`learning_block_ms` is `ge=0`, so 0 is the only
-    value that reaches this branch.)
-
-    STATED TRADE-OFF, not a side effect: `socket_timeout` is CLIENT-WIDE, so this
-    value is also the read ceiling for every NON-blocking call this queue makes
-    (XADD/XACK/XAUTOCLAIM/XPENDING/GET/SET). Accepted: those are sub-millisecond
-    ops, and a deadline of `block_ms + 5s` still catches a genuinely wedged
-    connection — it is the blocking read, not the fast ops, that sets the floor on
-    how tight the timeout may be, and one client cannot serve two floors. With
-    `block_ms=0` the fast ops get NO read deadline, which is the honest cost of
-    asking for an infinite block on the same client. `socket_connect_timeout` is a
-    SEPARATE knob and keeps its 5s default either way, so an unreachable host still
-    fails fast rather than hanging the daemon at startup.
+    redis-py's 5s `socket_timeout` default collides with the shipped `LEARNING_BLOCK_MS=5000`,
+    so the socket usually wins and every idle consume cycle raises `TimeoutError`. `BLOCK 0`
+    means block FOREVER, so that configuration gets no read deadline at all (`None`). Accepted
+    cost: `socket_timeout` is CLIENT-WIDE, so this also caps the fast ops;
+    `socket_connect_timeout` is a separate knob and keeps its 5s default.
     """
     if block_ms == 0:
         return None
@@ -118,18 +81,10 @@ class RedisStreamsLearningQueue:
     def from_settings(cls, settings: LearningSettings) -> RedisStreamsLearningQueue:
         """Build the queue + its Redis client from `LearningSettings`.
 
-        `decode_responses=True` so stream fields/ids come back as `str` (the
-        `LearningJob` (de)serialization assumes text, not bytes).
-
-        `socket_timeout` is DERIVED from `learning_block_ms` rather than left at
-        redis-py's default, because the default collides with the shipped block
-        duration and makes every idle consume cycle raise — see
-        `_socket_timeout_seconds`. This is the only place both facts are in scope,
-        which is why the derivation lives here and not at the call site.
-
-        INVARIANT this establishes for callers: `consume(block_ms=…)` must not be
-        passed a LARGER block than the one this client was built from, or the race
-        is back. Every production caller passes `settings.learning_block_ms`.
+        `decode_responses=True` because the `LearningJob` (de)serialization assumes text, not bytes.
+        `socket_timeout` is DERIVED from `learning_block_ms` (see `_socket_timeout_seconds`), which
+        imposes a caller invariant: `consume(block_ms=…)` must never be passed a LARGER block than
+        the one this client was built from.
         """
         if not REDIS_AVAILABLE:
             raise RuntimeError("The 'redis' package is not installed.")
@@ -157,16 +112,12 @@ class RedisStreamsLearningQueue:
                 raise
 
     async def enqueue(self, job: LearningJob) -> str:
-        """XADD-first, mark-dedup-second (BLOCKER fix). The dedup key is a
-        duplicate-VOLUME reducer, NEVER a correctness gate — correctness is the
-        consumer's `done`+same-hash idempotency.
+        """XADD first, mark the dedup key second.
 
-        Invariant: a SET dedup key ⟹ XADD definitely happened (it holds the real
-        message id); an ABSENT key ⟹ safe to (re-)XADD. So a crash AFTER XADD but
-        BEFORE the mark degrades to a benign DUPLICATE on the next re-sweep (the
-        consumer absorbs it), never a strand — whereas the old mark-first order
-        could strand a `pending`→`queued` session with zero messages on the
-        stream.
+        The dedup key is a duplicate-VOLUME reducer, NEVER a correctness gate — correctness is the
+        consumer's `done`+same-hash idempotency. A set key ⟹ the XADD happened; an absent key ⟹
+        safe to re-XADD. Mark-first could strand a `pending`→`queued` session with no message on
+        the stream.
         """
         key = self._dedup_key(job.content_hash)
         existing = await self._redis.get(key)
@@ -180,10 +131,11 @@ class RedisStreamsLearningQueue:
         return message_id
 
     async def enqueue_without_dedup_mark(self, job: LearningJob) -> str:
-        """TEST SEAM (Layer 1/2): XADD WITHOUT recording the dedup key —
-        simulating a crash that XADDed but died before the mark. Lets QA prove
-        the re-sweep produces a benign DUPLICATE (absorbed by consumer
-        idempotency), never a strand. Never called in production."""
+        """TEST SEAM (Layer 1/2): XADD WITHOUT the dedup key — a crash between the two.
+
+        Lets QA prove the re-sweep produces a benign DUPLICATE, never a strand. Never called in
+        production.
+        """
         return await self._redis.xadd(
             self._stream, job.to_fields(), maxlen=self._maxlen, approximate=True
         )

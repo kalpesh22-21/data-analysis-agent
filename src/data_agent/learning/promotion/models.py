@@ -1,23 +1,10 @@
 """promotion/models.py — the S9 scheduler's typed value objects + injected ports.
 
-S9 (the separate cron-scanned promotion scheduler, D29/§7.2) is NOT a
-`CandidateStage`; it reads `learning_candidates` by `status`, runs golden replay +
-the D43 drift probes, and advances `status` + stamps `drift` (Contract E). This
-module freezes the scheduler's own data contracts:
-
-  * `PromotionPolicy`  — the tunable promotion knobs (hit-count threshold T,
-    drift freshness window). Provisional defaults per the D-OQ1 resolution
-    (`blueprint_promotion_hit_threshold = 3`); wired as config, not constants.
-  * `ProbeResult`      — what an injected warehouse probe returns for a golden
-    replay: `(row_count, distinct_grain_count, columns)` — the exact input the
-    reused D56 `verify_result` gate consumes. NEVER the returned value/number
-    (D98 — replay verifies STRUCTURE, not values; no value oracle, D17).
-  * `CandidateDecision`/`PromotionSweep` — the per-candidate outcome + the
-    per-cycle report (observability + Layer-1 assertions).
-
-The three injected PORTS (`WarehouseProbe`, `HitCountReader`, `DependencyResolver`)
-are Protocols so Layer-1 fakes and the live stack use the identical path — no real
-ClickHouse, no real corpus store in tests.
+`PromotionPolicy` holds the tunable knobs (config, not constants). `ProbeResult` is what an
+injected warehouse probe returns for a golden replay — `(row_count, distinct_grain_count,
+columns)`, the exact D56 `verify_result` input, NEVER the returned value (D98/D17).
+`CandidateDecision`/`PromotionSweep` are the per-candidate and per-cycle outcomes. The
+injected PORTS are Protocols, so Layer-1 fakes and the live stack use the identical path.
 """
 
 from __future__ import annotations
@@ -62,11 +49,9 @@ DecisionAction = Literal[
 class PromotionPolicy:
     """Tunable promotion knobs (config, not constants — D-OQ1 posture).
 
-    **Built from `LearningSettings` by `policy_from_settings`, which the three promotion
-    factories now call by default.** Until plan §4 every factory accepted a `policy=` and
-    no entrypoint passed one, so production ran on the dataclass defaults and every knob
-    here was decorative. Anything added to this class must be reachable from an env var,
-    or it is not a knob.
+    Built from `LearningSettings` by `policy_from_settings`, which the three promotion factories
+    call by default. Anything added to this class must be reachable from an env var, or it is
+    not a knob.
     """
 
     # The CORROBORATION threshold. Named `blueprint_hit_threshold` for its origin (D-OQ1's
@@ -151,10 +136,11 @@ class PromotionPolicy:
 
 @dataclass(frozen=True)
 class ProbeResult:
-    """What an injected `WarehouseProbe` returns for one golden replay — the exact
-    `verify_result` (D56) input triple. `distinct_grain_count` is `None` when the
-    grain check is skipped (empty/unverifiable grain). NEVER carries the result
-    VALUE/number (D98/D17 — no value oracle)."""
+    """What an injected `WarehouseProbe` returns for one golden replay — the D56 input triple.
+
+    `distinct_grain_count` is `None` when the grain check is skipped (an empty or unverifiable
+    grain). NEVER carries the result VALUE (D98/D17 — no value oracle).
+    """
 
     row_count: int
     distinct_grain_count: int | None
@@ -186,9 +172,11 @@ class PromotionSweep:
 
     @property
     def promoted(self) -> int:
-        """Count of the retired `candidate → validated` auto edge — permanently 0 since
-        plan §4. Kept so an existing reader gets a truthful zero rather than an
-        AttributeError; `routed` is the counter that moved."""
+        """Count of the retired `candidate → validated` auto edge — permanently 0 since plan §4.
+
+        Kept so an existing reader gets a truthful zero rather than an AttributeError; `routed` is
+        the counter that moved.
+        """
         return self._count("promote")
 
     @property
@@ -207,10 +195,9 @@ class PromotionSweep:
     def routed(self) -> int:
         """How many candidates this cycle were routed to the human review queue.
 
-        Its OWN counter rather than a rename of `promoted`: after plan §4 the auto path
-        ends at `in_review`, and a dashboard that kept reading `promoted` would report
-        zero forever while the loop worked perfectly. `promoted` still counts the
-        `→ validated` edge, which now happens only on a human approve."""
+        Its OWN counter rather than a rename of `promoted`: a dashboard that kept reading `promoted`
+        would report zero forever while the loop worked perfectly.
+        """
         return self._count("route")
 
 
@@ -218,13 +205,12 @@ class PromotionSweep:
 
 
 class WarehouseProbe(Protocol):
-    """Runs a golden-replay SQL against the warehouse and returns the D56 probe
-    triple. Injected/fake in tests — NO real ClickHouse. The probe is a STRUCTURE
-    oracle only (row/distinct/columns); it never returns the result value (D98).
+    """Runs a golden-replay SQL and returns the D56 probe triple. A STRUCTURE oracle only.
 
-    `column_scope` is the blueprint's declared `uses` footprint (D87) — the real
-    probe mints a JWT scoped to EXACTLY it (S9-design §1.3) so the replay reads only
-    within the declared footprint and the MCP's D57 teeth reject anything outside it.
+    Injected/fake in tests — no real ClickHouse — and it never returns the result value (D98).
+    `column_scope` is the blueprint's declared `uses` footprint (D87): the real probe mints a
+    JWT scoped to EXACTLY it, so the replay reads only within the declared footprint and the
+    MCP's D57 teeth reject anything outside it.
     """
 
     async def run(
@@ -237,27 +223,25 @@ class WarehouseProbe(Protocol):
 
 
 class HitCountReader(Protocol):
-    """Reads the cross-session `hit_count` from the LANDED corpus artifact (the
-    neo4j blueprint node keyed by `canonical_key`, D-OQ1) — NOT the envelope. S6
-    seeds it at 1 on insert and increments on a hard-key hit; S9 reads it for the
-    promotion guard."""
+    """Reads the cross-session `hit_count` from the LANDED corpus artifact, not the envelope.
+
+    The neo4j blueprint node keyed by `canonical_key` (D-OQ1). S6 seeds it at 1 on insert and
+    increments on a hard-key hit; S9 reads it for the promotion guard.
+    """
 
     async def hit_count(self, canonical_key: str) -> int: ...
 
 
 class RecurrenceCountReader(Protocol):
-    """Reads the SOFT (intent-similarity) recurrence count from the corpus artifact
-    (plan §4) — the paraphrase sibling of `HitCountReader`.
+    """The SOFT (intent-similarity) recurrence count — the paraphrase sibling of `HitCountReader`.
 
-    Its OWN port rather than a second method on `HitCountReader`, because every existing
-    fake and production double implements that Protocol structurally: widening it would
-    turn a Protocol change into a runtime `AttributeError` at the one call site that
-    matters, in a cron nobody watches. `CouchbaseBlueprintCorpus` duck-types BOTH, and
-    the composition roots pass the SAME object as both — the two counts must address the
-    same set of artifacts or the corroboration sum is nonsense.
-
-    OPTIONAL on the scheduler. Absent ⇒ the recurrence term reads 0, which at the shipped
-    `recurrence_weight = 0.0` is arithmetically identical to having one."""
+    Its OWN port rather than a second method on that one, because every existing fake and
+    production double implements it structurally: widening it would turn a Protocol change into
+    a runtime `AttributeError` at the one call site that matters, in a cron nobody watches.
+    `CouchbaseBlueprintCorpus` duck-types BOTH and the composition roots pass the SAME object as
+    both — the two counts must address the same artifacts or the corroboration sum is nonsense.
+    OPTIONAL: absent ⇒ the term reads 0, arithmetically identical at the shipped weight of 0.0.
+    """
 
     async def recurrence_count(self, canonical_key: str) -> int: ...
 
@@ -265,24 +249,13 @@ class RecurrenceCountReader(Protocol):
 class CorpusStatusWriter(Protocol):
     """Stamps a corpus artifact's lifecycle `status` (PriorArtIndex Slice 2).
 
-    The write-side sibling of `HitCountReader` over the SAME `learning_corpus`
-    artifacts, kept as its own narrow port because the two have opposite risk profiles:
-    a stale read costs a delayed promotion, a bad write corrupts the cross-session
-    counter the promotion guard depends on.
-
-    Only the scheduler's TERMINAL transitions call it (reject → `rejected`, retract →
-    `retired`). Nothing else should: an intermediate state (`candidate`, `in_review`,
-    `validated`) lives on the ENVELOPE, and mirroring it onto the artifact would create
-    a second, divergent lifecycle for the same thing. What the artifact needs to know is
-    only whether it is DEAD.
-
-    Why it exists at all: `BlueprintCorpus` is get/seed/increment/list — no delete and
-    (until now) no status write — so a rejected candidate's artifact survived, kept
-    accruing hits, and kept surfacing as live prior art. `CouchbaseBlueprintCorpus`
-    duck-types this port, the same way it already duck-types `HitCountReader`.
-
-    Fail-open at the call site: the store transition is source of truth, so a corpus
-    write failure is logged, never allowed to block a human's reject.
+    The write-side sibling of `HitCountReader` over the SAME `learning_corpus` artifacts, kept
+    as its own narrow port because the two have opposite risk profiles: a stale read costs a
+    delayed promotion, a bad write corrupts the cross-session counter the promotion guard
+    depends on. ONLY the scheduler's TERMINAL transitions call it (reject, retract) — an
+    intermediate state lives on the ENVELOPE, and mirroring it onto the artifact would create a
+    second, divergent lifecycle for the same thing. Fail-open at the call site: the store
+    transition is source of truth, so a corpus write failure never blocks a human's reject.
     """
 
     async def set_status(self, canonical_key: str, status: str) -> None: ...
@@ -297,25 +270,19 @@ class DependencyResolver(Protocol):
 
 
 class LandingWriter(Protocol):
-    """Materializes a validated candidate into the neo4j retrieval corpus so it
-    becomes RECALLABLE (S9-activation Slice 2, §3). Injected/fake in Layer-1 (no real
-    neo4j). `land` MERGE-upserts the blueprint by a deterministic id (idempotent
-    re-land) and RAISES on any failure — a model-parity violation, an entity leaking
-    into the seed (the last-gate D17 defense), or a neo4j write error — so the
-    scheduler HOLDS `landing_failed` and NEVER writes `validated` (not landed ⇒ not
-    validated, §3.1). The concrete impl is `promotion/landing.py::CorpusLandingWriter`.
+    """Materializes a validated candidate into the neo4j retrieval corpus (S9 §3).
 
-    `forbidden_spans` are the entity spans S5 identified, captured by the scheduler
-    BEFORE `strip_entity_bearing` blanks them, so the last-gate defense can fire even
-    though a validated candidate's own `entity_scan` is blanked (§3.3).
+    `land` MERGE-upserts by a deterministic id (idempotent re-land) and RAISES on any failure —
+    a model-parity violation, an entity leaking into the seed, or a neo4j write error — so the
+    scheduler HOLDS `landing_failed` and NEVER writes `validated`. `forbidden_spans` are the
+    entity spans S5 identified, captured BEFORE `strip_entity_bearing` blanks them, so the
+    last-gate defense can fire even though a validated candidate's own `entity_scan` is blanked.
 
-    `update_status` is the RETRACTION write-back (S9-activation Slice 3, §8.6): a
-    demote / reject / user-correction stamps the landed node's `status`/`drift_status`
-    (keyed by the SAME deterministic landing id) so the recall filter excludes it, and
-    the clean validated-rescan re-asserts `validated`/`clean` (the self-heal). It is an
-    idempotent no-op when the node was never landed. It RAISES on a driver failure — the
-    scheduler catches it and FAILS OPEN (a corpus-write failure must never block the
-    store transition; the recall filter + the periodic re-assert are the backstops)."""
+    `update_status` is the RETRACTION write-back (§8.6): it stamps the landed node's
+    `status`/`drift_status` by the same deterministic id, is an idempotent no-op when the node
+    was never landed, and RAISES on a driver failure — the scheduler catches that and FAILS
+    OPEN, with the recall filter and the periodic re-assert as backstops.
+    """
 
     async def land(
         self,
@@ -335,17 +302,11 @@ class LandingWriter(Protocol):
 def policy_from_settings(settings: LearningSettings) -> PromotionPolicy:
     """Build the promotion policy from env-var configuration (plan §4).
 
-    THE point of this function: before it existed, `PromotionPolicy` was accepted by all
-    three promotion factories and passed by no entrypoint, so every knob on it was
-    hardcoded in a dataclass default and no operator could reach any of them. A knob that
-    cannot be turned is documentation, not configuration.
-
-    Deliberately NOT here: the coverage-judge thresholds (`LEARNING_JUDGE_*`). The plan
-    listed `prior_art_skip_threshold` among this class's knobs, but §3b put the judge's
-    settings on `LearningSettings` precisely because a knob that can silently cancel an
-    extraction had to be live from its first deploy and this class was not. They stay
-    there. Two homes for one threshold is strictly worse than one awkward home — a reader
-    who finds the wrong copy tunes a value nothing reads.
+    Before this existed, `PromotionPolicy` was accepted by all three promotion factories and
+    passed by no entrypoint, so every knob was hardcoded in a dataclass default — documentation,
+    not configuration. Deliberately NOT here: the coverage-judge thresholds, which live on
+    `LearningSettings` because a knob that can silently cancel an extraction had to be live from
+    its first deploy. Two homes for one threshold is strictly worse than one awkward home.
     """
     return PromotionPolicy(
         blueprint_hit_threshold=settings.learning_promotion_routing_threshold,

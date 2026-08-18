@@ -1,10 +1,8 @@
 """The S5 leakage-gate GUARDRAIL span (D58/D25, design §10).
 
-A GUARDRAIL-kind span emitted once per scanned candidate. Kept in the leakage
-module (not the shared `observability.py`) so this slice never co-edits a file
-another track touches. D25-safe by construction: the ONLY attributes set are the
-verdict label + non-PII COUNTS + the scanned-field labels + the scanner
-provenance string — NEVER an entity span, quote, or payload text.
+Emitted once per scanned candidate. D25-safe by construction: the ONLY attributes set are the
+verdict label, non-PII counts, the scanned-field labels and the scanner provenance string —
+never an entity span, quote or payload text.
 """
 
 from __future__ import annotations
@@ -26,9 +24,11 @@ def leakage_span(
     scanned_fields: tuple[str, ...],
     scanner: str,
 ) -> Any:
-    """One leakage-gate decision (`learning.leakage`, GUARDRAIL). SHAPE-only
-    (D25): the verdict label, the hit COUNT, the scanned-field labels, and the
-    scanner provenance — never an entity span or payload text."""
+    """One leakage-gate decision (`learning.leakage`, GUARDRAIL).
+
+    SHAPE-only (D25): the verdict label, the hit COUNT, the scanned-field labels and the scanner
+    provenance — never an entity span or payload text.
+    """
     return span(
         tracer,
         "learning.leakage",

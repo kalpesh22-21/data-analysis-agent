@@ -1,18 +1,11 @@
 """S3 PLAN + S4 `BlueprintGeneralization` → runtime `Blueprint` / `BlueprintSeed`.
 
-The whole point of Contract A: a validated candidate promotes (Slice 9) 1:1 onto
-`runtime/blueprint/models.py::Blueprint` with ZERO field invention. This module is
-that mapping — proving the round-trip in tests and reused by S9 at promotion:
-
-  id ← minted (caller) · intent/resolves/slots ← S3 PLAN ·
-  uses_rules/sql_template/result_grain ← S4 generalization ·
-  composes ← S3 `ComposeNodePlan` ⨝ S4 `NodeTemplate.sql_template` (by `order`).
-
-`blueprint_from_generalization` builds the runtime `Blueprint` (executed live).
-`blueprint_seed_from_candidate` builds the parallel `BlueprintSeed` the S9 landing
-writer MERGE-upserts into the neo4j retrieval corpus so a validated blueprint becomes
-RECALLABLE (S9-activation Slice 2, §3.2). Both share the SAME slot + composes
-projection helpers so the landed seed and the executable blueprint can never drift.
+Contract A: a validated candidate promotes 1:1 onto `runtime/blueprint/models.py::Blueprint`
+with ZERO field invention. `blueprint_from_generalization` builds the runtime `Blueprint`
+that is executed live; `blueprint_seed_from_candidate` builds the parallel `BlueprintSeed`
+the S9 landing writer MERGE-upserts into the neo4j retrieval corpus. Both share the SAME
+slot + composes projection helpers, so the landed seed and the executable blueprint can
+never drift.
 """
 
 from __future__ import annotations
@@ -28,17 +21,15 @@ from ..leakage.gate import _collect_text
 
 
 def _slot_docs(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Project the S3 `parameterization` entries onto the `slots_json` shape — every
-    `role=slot` param's `slot` dict (name/type/binds_to/required/…). The SINGLE slot
-    projection reused by both the runtime `Blueprint` and the landed `BlueprintSeed`.
+    """Project the S3 `parameterization` entries onto the `slots_json` shape.
 
-    Reads the raw plan defensively, in the same shape as `promotion/replay.py::
-    _slot_types`: a non-list `parameterization` is not iterable and a non-dict entry
-    has no `.get`, and this module's documented failure mode is `BlueprintParseError`
-    (fail-closed landing), never a `TypeError`/`AttributeError`. A skipped malformed
-    entry cannot smuggle anything through: the slot it would have declared is then
-    missing, so its `{token}` is an undeclared placeholder that the corpus loader
-    refuses at the landing write."""
+    Every `role=slot` param's `slot` dict — the SINGLE slot projection reused by both the
+    runtime `Blueprint` and the landed `BlueprintSeed`. Reads the raw plan defensively, because
+    this module's documented failure mode is `BlueprintParseError` (fail-closed landing), never
+    a `TypeError`. A skipped malformed entry cannot smuggle anything through: the slot it would
+    have declared is then missing, so its `{token}` is an undeclared placeholder the corpus
+    loader refuses at the landing write.
+    """
     params = payload.get("parameterization")
     if not isinstance(params, list):
         return []
@@ -68,22 +59,14 @@ _NODE_DOC_FIELDS: tuple[str, ...] = (
 def _compose_docs(
     payload: dict[str, Any], generalization: BlueprintGeneralization
 ) -> list[dict[str, Any]]:
-    """Project the S3 `composes` DAG ⨝ the S4 per-node `sql_template` (by `order`)
-    onto the `composes_json` shape. The SINGLE composes projection reused by both the
-    runtime `Blueprint` and the landed `BlueprintSeed`.
+    """Project the S3 `composes` DAG ⨝ the S4 per-node `sql_template` (by `order`).
 
-    Only `_NODE_DOC_FIELDS` are carried. Two PLAN fields are deliberately dropped:
-
-      * `source_tool_call_ref` — a SESSION-scoped identifier (D17). The corpus holds
-        entity-free, session-independent artifacts; session linkage belongs in the
-        `evidence_ref`s in the access-controlled `learning_audit` store, not in a
-        globally-recallable `:Blueprint` property.
-      * `step_intent` — free NL, and (unlike `intent`/`notes`) NOT one of the S5
-        `_ENTITY_FREE_SURFACES` the leakage gate scans. Landing it would put
-        UNSCANNED model prose into the global corpus, and because the last-gate
-        `_assert_seed_entity_free` can only match spans S5 already identified, the
-        tripwire could not catch it either. Dropped until it is either scanned or
-        proven unnecessary — the runtime never reads it, so nothing regresses.
+    The SINGLE composes projection reused by both the runtime `Blueprint` and the landed seed.
+    Only `_NODE_DOC_FIELDS` are carried, and two PLAN fields are deliberately dropped:
+    `source_tool_call_ref`, a SESSION-scoped identifier that has no place on a globally
+    recallable node (D17), and `step_intent`, free NL that is NOT one of the S5
+    `_ENTITY_FREE_SURFACES` the leakage gate scans — landing it would put UNSCANNED model prose
+    into the global corpus, and the last-gate tripwire can only match spans S5 already found.
     """
     template_by_order = {n.order: n.sql_template for n in generalization.node_templates}
     composes: list[dict[str, Any]] = []
@@ -102,19 +85,10 @@ def blueprint_from_generalization(
 ) -> Blueprint:
     """Assemble the runtime `Blueprint` from the S3 payload + the S4 generalization.
 
-    Raises `BlueprintParseError` (from `Blueprint.parse`) if any mapped field is
-    malformed — the round-trip contract (`S4-payload-maps-to-runtime-blueprint`)
-    asserts this succeeds with no missing field for a valid candidate.
-
-    `window_anchor` (J7/J7c) is read from the S3 PLAN like `intent`/`resolves`, and is
-    INERT until the extractor learns to declare it: today no candidate carries the key,
-    so `payload.get` yields `None` = "no claim" and every landing is byte-identical to
-    before. It is threaded anyway because the alternative failure is silent — the first
-    learned WINDOWED blueprint would otherwise promote to canon anchor-less, and J7 (the
-    model re-deriving a data-anchored window with its own calendar SQL) would return for
-    the learned corpus with nothing failing anywhere. Validation is `Blueprint.parse`'s
-    closed-set check, so a malformed declaration is a fail-closed `BlueprintParseError`
-    at landing, never a dropped field.
+    Raises `BlueprintParseError` if any mapped field is malformed. `window_anchor` (J7/J7c) is
+    read from the S3 PLAN and is INERT until the extractor learns to declare it; it is threaded
+    anyway because the alternative failure is silent — the first learned WINDOWED blueprint
+    would otherwise promote anchor-less, with nothing failing anywhere.
     """
     slots = _slot_docs(payload)
     composes = _compose_docs(payload, generalization)
@@ -137,25 +111,14 @@ def blueprint_seed_from_candidate(
 ) -> BlueprintSeed:
     """Project a validated candidate onto the neo4j-corpus `BlueprintSeed` (S9 §3.2).
 
-    Reuses `blueprint_from_generalization` to VALIDATE + normalize the structure (the
-    same parse the executable blueprint takes), then projects the generalized,
-    entity-free fields onto the seed the landing writer MERGE-upserts. Reads ONLY
-    generalized fields (template / resolves / slots / result_grain / intent / uses) —
-    never `evidence`, audit spans, or any entity-bearing payload (D17); the writer
-    additionally asserts the seed is entity-free before any neo4j write.
-
-    `id` is the deterministic landing id (derived from the canonical_key by the
-    caller, `promotion/landing.py::landing_id`) so a re-promotion MERGEs in place.
-
-    `verified` is the Phase-3 human-approval flag threaded onto the seed: an auto-landed
-    node is `verified=False` (the safe default), a human-approved landing is
-    `verified=True` (the `apply_human_decision` approve path passes it through). `source`
-    stays `"learning"` regardless — verification does not move the node into the trusted
-    MCP canon partition (that is the Phase-3 promote → manual-PR reseed).
-
-    Raises `ValueError` when the candidate carries no `generalization` (a non-blueprint
-    or malformed candidate can never land), and `BlueprintParseError` when the
-    generalized structure is malformed (fail-closed — never a silent broken landing).
+    Reuses `blueprint_from_generalization` to VALIDATE + normalize the structure, then projects
+    only generalized, entity-free fields — never `evidence`, audit spans, or any entity-bearing
+    payload (D17); the writer additionally asserts the seed is entity-free before any neo4j
+    write. `id` is the deterministic landing id, so a re-promotion MERGEs in place. `verified`
+    is the Phase-3 human-approval flag (auto-landed False, human-approved True) while `source`
+    stays `"learning"` either way. Raises `ValueError` when the candidate carries no
+    `generalization`, and `BlueprintParseError` when the structure is malformed — fail-closed,
+    never a silent broken landing.
     """
     gen_doc = env.payload.get("generalization")
     if not isinstance(gen_doc, dict):
@@ -223,26 +186,15 @@ def blueprint_seed_from_candidate(
 def knowledge_seed_from_candidate(
     env: CandidateEnvelope, *, id: str, verified: bool = False
 ) -> KnowledgeSeed:
-    """Project an approved global-knowledge candidate onto the neo4j-corpus
-    `KnowledgeSeed` (UI Slice 2 §1.1) — the knowledge-side mirror of
-    `blueprint_seed_from_candidate`. Pure function.
+    """Project an approved global-knowledge candidate onto the neo4j-corpus `KnowledgeSeed`.
 
-    Reads ONLY the entity-free knowledge surfaces the leakage gate scans
-    (`leakage/gate.py::_ENTITY_FREE_SURFACES` — `statement`, `structured`,
-    `related_terms`, `scope`): `text` ← `statement` (concatenated with
-    `related_terms` + a serialized `structured` for richer recall), `title` ←
-    `scope`, `doc_id` ← `env.candidate_id`, `id` ← the deterministic landing id,
-    plus the provenance/drift fields. NEVER reads `evidence`, audit spans, or any
-    entity-bearing payload (D17); the landing writer additionally asserts the seed is
-    entity-free before any neo4j write.
-
-    `id` is the deterministic landing id (`promotion/landing.py::landing_id`, the
-    `kn::`-prefixed form) so a re-promotion MERGEs the same node in place. `verified`
-    threads the Phase-3 human-approval flag (auto-land False, human-approve True);
-    `source` stays `"learning"` either way.
-
-    Raises `ValueError` when `statement` is empty — an empty knowledge chunk is never
-    landed (it would recall nothing meaningful and only pollute the index).
+    The knowledge-side mirror of `blueprint_seed_from_candidate`, and a pure function. Reads
+    ONLY the entity-free surfaces the leakage gate scans (`statement`, `structured`,
+    `related_terms`, `scope`) — never `evidence`, audit spans, or any entity-bearing payload
+    (D17). `id` is the deterministic landing id so a re-promotion MERGEs the same node in place;
+    `verified` threads the human-approval flag and `source` stays `"learning"`. Raises
+    `ValueError` when `statement` is empty: an empty chunk recalls nothing and only pollutes the
+    index.
     """
     payload = env.payload
     statement = payload.get("statement")

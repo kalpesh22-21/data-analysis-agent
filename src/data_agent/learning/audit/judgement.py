@@ -1,55 +1,23 @@
-"""The coverage judge's DURABLE contract — the verdict vocabulary + the audit record
-(plan §3b).
+"""The coverage judge's DURABLE contract — the verdict vocabulary + the audit record.
 
-This module lives under `audit/` rather than under `judge/` on purpose, and the
-placement is the design statement: **the verdict is a record first and a branch
-second.** Its primary consumer is not the `if` that cancels an extraction — it is the
-query, months from now, that answers "do the loop's re-derivations skew to
-`existing-plus-delta`?", which is the documented trigger for building atomic
-composable blueprints at all (plan §Decisions). A field shaped only to drive a branch
-would have been a `bool`.
+This module lives under `audit/` rather than `judge/` on purpose, and the placement is the
+design statement: THE VERDICT IS A RECORD FIRST AND A BRANCH SECOND. Its primary consumer is
+the query, months from now, that answers whether the loop's re-derivations skew to
+`existing-plus-delta`; a field shaped only to drive a branch would have been a `bool`. It is
+also what makes the drop AUDITABLE — a wrong DROP is invisible in a way a wrong KEEP is not,
+and the agreed mitigation is that every drop leaves a durable, queryable row.
 
-It is also what makes the drop AUDITABLE. The user's decision to let the judge drop
-candidates outright was taken with the risk stated out loud: a wrong DROP is invisible
-in a way a wrong KEEP is not — nothing downstream ever sees the thing that did not
-happen. The agreed mitigation is that every drop leaves a durable, queryable row
-carrying the session, the verdict, the reason, the artifact it was deemed covered by,
-and the confidence, so "we dropped four thousand candidates last quarter" is a query
-rather than a guess.
+Three placement consequences, each deliberate: (1) `learning_audit`, not the candidate store,
+because a dropped candidate has NO envelope and because `reason` is free model prose about a
+real session; (2) no import cycle — nothing here imports anything from the learning package,
+so `candidate/models.py` and `judge/judge.py` can both use it; (3) the verdict vocabulary is
+defined ONCE, next to the doc shape that persists it, and the prompt's enum is derived from
+it, so the model can never be offered a value the store has no meaning for.
 
-**Three placement consequences, each deliberate:**
-
-  1. `learning_audit`, not the candidate store. A dropped candidate has NO envelope —
-     that is the entire point of dropping before extraction — so the candidate store
-     has nowhere to put it. `learning_audit` is also the bucket already provisioned for
-     entity-bearing content, which `reason` is: it is free model prose about a real
-     session and may name a department or a person. The same reason evidence quotes
-     live here and not on a span.
-  2. No import cycle. `candidate/models.py` stamps a `CoverageAssessment` on the
-     envelope and `judge/judge.py` writes a `JudgeRecord`; if both types lived under
-     `judge/`, importing `judge` from `candidate` would close a loop through
-     `judge → audit → …`. Nothing in this module imports anything from the learning
-     package, so it can be imported from anywhere in it.
-  3. The verdict vocabulary is defined ONCE, here, next to the doc shape that
-     persists it. The prompt's enum is derived from it (`judge/schema.py`), so the
-     model can never be offered a value the store has no meaning for.
-
-**The KV key is DETERMINISTIC, and that is the idempotency mechanism.** An LLM call is
-not idempotent, so a judgement is keyed on the CONTENT it was rendered about
-(`judgement_fingerprint`) and read back before the model is asked. The hash-based dedup
-key in `DedupStage` is untouched and remains the race-safe first layer; this is a cache
-in front of a model call, not a dedup key.
-
-**Which re-runs it actually catches — corrected, because an earlier draft named the
-wrong one.** That draft said "a crash between `processing` and `done` puts the message
-back in the PEL", implying the reclaim path re-judges. QA traced it and it does not:
-there is no `processing → processing` edge in the state machine, so the reclaimed
-delivery CAS-mismatches in `_process` and returns `skip` without ever reaching
-`_do_work`. The key earns its keep on the paths that DO re-run a judgement — a session
-re-enqueued after a sweep, a peer racing the same work, a pipeline re-run over an
-existing envelope, and (post-extraction) a re-extraction that mints fresh envelopes for
-the same content. Worth stating precisely: "we tested the scenario in the comment" is a
-false reassurance when the comment names a scenario that cannot happen.
+THE KV KEY IS DETERMINISTIC, and that is the idempotency mechanism: an LLM call is not
+idempotent, so a judgement is keyed on the CONTENT it was rendered about
+(`judgement_fingerprint`) and read back before the model is asked. This is a cache in front of
+a model call, not a dedup key — `DedupStage`'s hash key remains the race-safe first layer.
 """
 
 from __future__ import annotations
@@ -118,28 +86,19 @@ _POST_PREFIX = "judgement::post::"
 def judgement_fingerprint(*parts: str) -> str:
     """A content fingerprint over everything the judge was SHOWN.
 
-    **The key must bind CONTENT, not position, and an earlier cut of this module got
-    that wrong on the post-extraction side.** It keyed on `candidate_id`, which is
-    `candidate::<content_hash>::<ordinal>` — and `consumer.py::_run_extractor` says in
-    its own comment that a re-extraction can emit "a different count/order". So:
-    delivery 1 extracts ordinal-0 = candidate B, judged `duplicate`, dropped; ordinal-1
-    = candidate A, novel. Crash before `done`. The redelivery re-extracts and now
-    ordinal-0 is A — which would read B's stored verdict under B's old key. The gate is
-    re-applied, so A only drops if A's own card union happens to contain the artifact
-    that covered B at an in-band score; but when it does, A is discarded on a verdict
-    rendered about different content and the audit `reason` describes B. That is
-    precisely the unauditable drop `judge.py::_resolve_covered_by` refuses to allow,
-    arriving through the cache instead of through the model.
+    THE KEY MUST BIND CONTENT, NOT POSITION. Keying on `candidate_id` —
+    `candidate::<content_hash>::<ordinal>` — was wrong, because a re-extraction can emit a
+    different count and order: ordinal-0 on the redelivery may be a different candidate, which
+    would then read the first one's stored verdict. The gate is re-applied, so it only drops when
+    the new candidate's own card union happens to contain the covering artifact at an in-band
+    score — but when it does, a candidate is discarded on a verdict rendered about different
+    content and the audit `reason` describes the wrong one.
 
-    The equivalence class that makes reusing a model's answer legitimate is therefore
-    "the judge would be shown exactly this again" — the rendered brief, plus the session
-    content hash, plus the stage. Hashing the brief rather than picking out fields also
-    means a change to `prompt.py`'s rendering invalidates every cached verdict, which is
-    correct: a verdict about a differently-shaped question is not this question's
-    verdict.
-
-    A content-keyed MISS costs one small judge call. A position-keyed false HIT costs a
-    session. Only one of those directions is acceptable here.
+    The equivalence class that makes reusing a model's answer legitimate is "the judge would be
+    shown exactly this again": the rendered brief, the session content hash, and the stage.
+    Hashing the brief also means a change to `prompt.py`'s rendering invalidates every cached
+    verdict, which is correct. A content-keyed MISS costs one small judge call; a position-keyed
+    false HIT costs a session.
     """
     digest = hashlib.sha256()
     for part in parts:
@@ -154,18 +113,19 @@ def judgement_fingerprint(*parts: str) -> str:
 def pre_extraction_ref(fingerprint: str) -> str:
     """The KV key for one session's PRE-extraction judgement.
 
-    *fingerprint* comes from `judgement_fingerprint` — see there for why this is content
-    and not position. The pre-extraction side was never exposed to the ordinal bug (the
-    session `content_hash` is content-derived and is the loop's own idempotency key),
-    but it is keyed the same way so there is ONE rule rather than two, and so a change to
-    the pre-extraction brief invalidates its cache too."""
+    *fingerprint* comes from `judgement_fingerprint`. The pre-extraction side was never exposed
+    to the ordinal bug, but it is keyed the same way so there is ONE rule rather than two, and so
+    a change to the pre-extraction brief invalidates its cache too.
+    """
     return f"{_PRE_PREFIX}{fingerprint}"
 
 
 def post_extraction_ref(fingerprint: str) -> str:
-    """The KV key for one candidate's POST-extraction judgement. See
-    `judgement_fingerprint` — this key binds the candidate's CONTENT, deliberately not
-    its `candidate_id`."""
+    """The KV key for one candidate's POST-extraction judgement.
+
+    This key binds the candidate's CONTENT, deliberately not its `candidate_id` — see
+    `judgement_fingerprint`.
+    """
     return f"{_POST_PREFIX}{fingerprint}"
 
 
@@ -173,21 +133,13 @@ def post_extraction_ref(fingerprint: str) -> str:
 class CoverageAssessment:
     """One judgement, as the model gave it — the parsed, guarded model output.
 
-    Separate from `JudgeRecord` because this is only the four fields the MODEL is
-    responsible for. Everything else on the record (which threshold was in force, what
-    we did about it, which artifacts were shown) is the CALLER's knowledge, and mixing
-    the two would make it impossible to tell later whether a field was asserted by a
-    language model or computed by the loop.
-
-    Every field here has already passed `judge/schema.py::parse_assessment`, whose
-    guards are derived from the operations performed below and downstream — see that
-    function's table. In particular `confidence` is guaranteed a real float in
-    `[0.0, 1.0]` (never a bool, never NaN, never an int too large to convert), because
-    the only thing anyone ever does with it is compare it to a configured bar.
-
-    It is stamped on `CandidateEnvelope.judge` as well as written to the audit store, so
-    a human reading a candidate in the review inbox can see the machine already had an
-    opinion about whether it was novel.
+    Separate from `JudgeRecord` because this is only the four fields the MODEL is responsible
+    for; everything else on the record is the CALLER's knowledge, and mixing the two would make it
+    impossible to tell later whether a field was asserted by a language model or computed by the
+    loop. Every field here has already passed `judge/schema.py::parse_assessment`, so
+    `confidence` is guaranteed a real float in `[0.0, 1.0]`. It is stamped on
+    `CandidateEnvelope.judge` as well as written to the audit store, so a human reading the inbox
+    can see the machine already had an opinion.
     """
 
     verdict: CoverageVerdict
@@ -214,26 +166,17 @@ class CoverageAssessment:
 
     @classmethod
     def from_doc(cls, doc: dict[str, Any]) -> CoverageAssessment | None:
-        """Rehydrate from a stored doc, or `None` when the stored verdict is not one of
-        ours.
+        """Rehydrate from a stored doc, or `None` when the stored verdict is not one of ours.
 
-        **`None`, not a coerced `new`, and an earlier cut of this method had it wrong.**
-        Coercing landed the value INSIDE the vocabulary, which the drop gate would then
-        refuse only by accident (it tests equality against `duplicate`, not membership)
-        — and, far worse, `judge.py::_judge` re-persists a reused assessment, so a
-        corrupted stored verdict would be rewritten as a `new` no model ever gave,
-        permanently replacing the original under the same key. That breaks this
-        module's own never-fabricate rule at the one place it matters most. A
-        rehydration failure is "no record on file", the caller re-judges, and one small
-        model call is the entire cost.
+        `None`, NOT a coerced `new`: coercing would land the value INSIDE the vocabulary, which the
+        drop gate refuses only by accident (it tests equality against `duplicate`, not membership) —
+        and `judge.py::_judge` re-persists a reused assessment, so a corrupted stored verdict would be
+        rewritten as a `new` no model ever gave, permanently replacing the original under the same
+        key. A rehydration failure is "no record on file" and costs one small model call.
 
-        The OTHER fields stay NORMALIZING, and the asymmetry is deliberate: `verdict` is
-        the field the record exists to carry and there is no safe default for it, while
-        `reason`/`covered_by` are only ever read and a junk value there must not throw
-        away a usable verdict. Every consumer treats `confidence` as a float (`>=`
-        against a bar) and the text fields as strings (formatted into logs and docs), so
-        a non-conforming stored value is coerced rather than raising inside a queue
-        worker.
+        The OTHER fields stay NORMALIZING, deliberately: `verdict` is the field the record exists to
+        carry and has no safe default, while `reason`/`covered_by` are only ever read and a junk value
+        there must not throw away a usable verdict.
         """
         raw_verdict = doc.get("verdict")
         if raw_verdict not in COVERAGE_VERDICTS:
@@ -260,22 +203,12 @@ class CoverageAssessment:
 class JudgeRecord:
     """One judgement as it lands in `learning_audit` — the durable, queryable row.
 
-    Flat scalars only, deliberately. The queries this exists to serve are counts and
-    distributions (`GROUP BY verdict`, `WHERE dropped = true AND judged_at >= …`), and
-    a nested shape would make every one of them a nested-path expression against a
-    bucket with one GSI.
-
-    **`threshold` and `best_similarity` are on the row for a reason.** Both bars are
-    operator-tunable, so a stored verdict with no record of the bar it was compared
-    against cannot be re-interpreted after a retune — "how many of last quarter's drops
-    would still drop at 0.95?" is answerable only if the row says what 0.90 meant at the
-    time. `best_similarity` is the retrieval score that decided the judge was worth
-    calling, which is what makes the band itself tunable from evidence.
-
-    ENTITY-BEARING via `reason` (free model prose about a real session), which is
-    exactly why this record lives in `learning_audit` and never on a span. The
-    `learning.judge` span carries the shape — verdict, confidence, tier, dropped — and
-    no prose.
+    Flat scalars only, because the queries this exists to serve are counts and distributions, and
+    a nested shape would make every one of them a nested-path expression against a bucket with one
+    GSI. `threshold` and `best_similarity` are on the row because both bars are operator-tunable:
+    a stored verdict with no record of the bar it was compared against cannot be re-interpreted
+    after a retune. ENTITY-BEARING via `reason`, which is exactly why this record lives in
+    `learning_audit` and never on a span — the span carries the shape and no prose.
     """
 
     judgement_ref: str
@@ -371,15 +304,14 @@ class JudgeRecord:
 
     @classmethod
     def from_doc(cls, doc: dict[str, Any]) -> JudgeRecord | None:
-        """Rehydrate a stored judgement, or `None` when the stored VERDICT is not one of
-        ours.
+        """Rehydrate a stored judgement, or `None` when the stored VERDICT is not one of ours.
 
-        `None` propagates `CoverageAssessment.from_doc`'s refusal all the way to
-        `AuditStore.read_judgement`, where the caller reads it as "no record on file"
-        and re-judges. Every other field is normalizing — the read-through idempotency
-        path feeds this straight into a drop decision, so a hand-edited doc must degrade
-        rather than raise inside a queue worker — but the verdict has no safe default and
-        inventing one would put a value in the dataset that no model ever gave."""
+        `None` propagates the refusal to `AuditStore.read_judgement`, where the caller reads it as "no
+        record on file" and re-judges. Every other field is normalizing — the read-through idempotency
+        path feeds this straight into a drop decision, so a hand-edited doc must degrade rather than
+        raise inside a queue worker — but the verdict has no safe default, and inventing one would put
+        a value in the dataset that no model ever gave.
+        """
         assessment = CoverageAssessment.from_doc(doc)
         if assessment is None:
             return None
@@ -420,16 +352,12 @@ class JudgeRecord:
 
 
 def _float(raw: Any) -> float:
-    """A stored numeric as a float, or 0.0. `bool` is excluded because it is an `int`
-    subclass and a stored `true` would read as a threshold of 1.0.
+    """A stored numeric as a float, or 0.0; `bool` is excluded (a stored `true` would read as 1.0).
 
-    DELIBERATELY UNBOUNDED, unlike `priorart/neo4j_index.py::_float`'s `[0, 1]`. The
-    three fields this reads (`threshold`, `best_similarity`, `authorizing_similarity`)
-    are the FORENSIC record of a judgement that already happened — nothing re-ranks or
-    re-thresholds on them; they are read back for audit, telemetry and QA. Replacing a
-    stored out-of-range number with a plausible in-range 0.0 would make the audit row
-    say something that never happened, which is the opposite of what an audit row is
-    for. The ranking path, where a broken score DOES change an outcome, passes bounds.
+    DELIBERATELY UNBOUNDED, unlike the ranking path's `[0, 1]`. The three fields this reads are
+    the FORENSIC record of a judgement that already happened — nothing re-ranks on them — so
+    replacing a stored out-of-range number with a plausible 0.0 would make the audit row say
+    something that never happened.
     """
     return as_float(raw)
 

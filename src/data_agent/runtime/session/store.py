@@ -1,21 +1,14 @@
-"""SessionStore Protocol — the Couchbase persistence + DI seam (D22/D44/D45, §8).
+"""SessionStore Protocol — the Couchbase persistence + DI seam (D22/D44/D45).
 
-Two implementations exist:
-  - `memory_store.InMemorySessionStore` (Layer 1, dict-backed, emulates CAS
-    with an in-memory version counter).
-  - `couchbase_store.CouchbaseSessionStore` (Layer 2/3, real Couchbase SDK).
+Two implementations: `memory_store.InMemorySessionStore` (Layer 1, CAS emulated with a
+version counter) and `couchbase_store.CouchbaseSessionStore` (Layer 2/3). Both apply a
+single `SESSION_TTL` to the session doc and to the `session_results` side collection it
+references.
 
-Both apply a single `SESSION_TTL` to the session doc and to the
-`session_results` side collection it references (design §6 "Retention").
-
-CAS / exactly-once resume (D45):
-    `get_session_with_cas` returns the doc alongside an opaque CAS token.
-    `resume_checkpoint` re-reads under the hood and only commits if the CAS
-    token still matches the currently-stored version — mirroring the
-    `bucket.replace(session_id, doc, cas=doc_cas)` snippet in design §6.
-    Concurrent resumers race: exactly one wins (`CASMismatchError` for the
-    loser); a checkpoint that is already `consumed` (or absent) raises
-    `AlreadyConsumedError` regardless of CAS.
+CAS / exactly-once resume (D45): `get_session_with_cas` returns the doc alongside an
+opaque CAS token, and `resume_checkpoint` commits only if that token still matches.
+Concurrent resumers race — exactly one wins, the loser gets `CASMismatchError`; an
+absent or already-consumed checkpoint raises `AlreadyConsumedError` regardless of CAS.
 """
 
 from __future__ import annotations
@@ -44,7 +37,7 @@ class CASMismatchError(Exception):
 
 
 class SessionStore(Protocol):
-    """The persistence seam `context/assembly.py` and Pass B's `AgentLoop` depend on."""
+    """The persistence seam `context/assembly.py` and `AgentLoop` depend on."""
 
     async def get_or_create_session(self, session_id: str) -> SessionDoc:
         """Load *session_id*, creating a fresh document if none exists yet."""
@@ -71,21 +64,19 @@ class SessionStore(Protocol):
     ) -> str:
         """Persist a full (non-preview) tool result to the results side-collection.
 
-        Returns the `result_full_ref` string to store on the owning `TrailEntry`.
-        Applies the same `SESSION_TTL` as the parent session doc (design §6).
+                Returns the `result_full_ref` string to store on the owning `TrailEntry`, and
+                applies the same `SESSION_TTL` as the parent session doc.
         """
         ...
 
     async def read_full_result(
         self, session_id: str, result_full_ref: str
     ) -> dict[str, Any] | None:
-        """Return the full (non-preview) tool result at *result_full_ref* (a
-        `result::<uuid>` key), or `None` if absent/expired.
+        """Return the full (non-preview) tool result at *result_full_ref*, or `None` if
+                absent or expired.
 
-        The read-back counterpart of `write_full_result`, added for the D46 full
-        tool I/O trail (the Slice-2 learning loader needs the full result for
-        shape/inspection). READ-ONLY (D72): never mutates the session or the
-        result doc. A TTL-expired result is a tolerated `None`, not an error.
+                READ-ONLY (D72): never mutates the session or the result doc. A TTL-expired
+                result is a tolerated `None`, not an error.
         """
         ...
 
@@ -101,23 +92,16 @@ class SessionStore(Protocol):
     ) -> AnalysisState:
         """Read-modify-write the turn's `analysis_state`, returning the new value.
 
-        Takes the MERGE, not the result (03 §B.1). `_mutate_with_cas_retry`
-        documents its precondition plainly: the callback "may be called more than
-        once (once per retry) against a freshly re-read document, so it must not
-        carry any state of its own across calls". A caller that loads the state,
-        computes a merged `AnalysisState`, and hands that OBJECT to a `setattr`
-        callback breaks exactly that: on a CAS conflict the callback re-runs
-        against a fresh doc but writes a value derived from the STALE read,
-        clobbering the winner — the lost-update class the helper exists to
-        prevent. Passing the merge instead means the recomputation happens
-        against whatever the retry actually read.
+                Takes the MERGE, not the result: the CAS retry re-runs the callback against a
+                freshly re-read document, so a caller that computed a merged object outside and
+                handed it in would, on a conflict, clobber the winner with a value derived from
+                the stale read.
 
-        *merge* receives the LIVE state (`live_analysis_state`, so `None` when
-        absent OR from another turn) and returns the state to persist. It runs
-        INSIDE the retry, so it is the right place for validation that depends on
-        the current state (mode, known ids, block-evidence distinctness): raising
-        from it aborts the write with nothing persisted. Validation that depends
-        only on the payload or on the trail belongs OUTSIDE, before the call.
+                *merge* receives the LIVE state (`live_analysis_state`, so `None` when absent OR
+                from another turn) and returns the state to persist. It runs INSIDE the retry, so
+                it is the right place for validation that depends on the current state — raising
+                from it aborts the write with nothing persisted. Validation that depends only on
+                the payload or the trail belongs outside, before the call.
         """
         ...
 
@@ -128,39 +112,26 @@ class SessionStore(Protocol):
         window_count: int,
         kind: FinalizationBlockKind,
     ) -> bool:
-        """Claim THE forced finalization re-round of *kind* for (*turn_index*,
-        *window_count*) (05 §C.1, §J.3).
+        """Claim THE forced finalization re-round of *kind* for (*turn_index*, *window_count*).
 
-        Returns `True` when this caller got it, `False` when that turn-and-window's
-        allowance for that KIND (`MAX_FINALIZATION_BLOCKS_PER_WINDOW`) is spent.
+                Returns `True` when this caller got it, `False` when that turn-and-window's
+                allowance for that KIND (`MAX_FINALIZATION_BLOCKS_PER_WINDOW`) is spent.
 
-        *kind* IS PART OF THE KEY, NOT A LABEL. `intents` and `answer_shape` hold
-        INDEPENDENT per-window allowances, so a turn refused for pending intents can
-        still be refused once for answer shape in the same window. They shared one
-        allowance until 2026-08-12; live measurement showed the intents nudge
-        consuming it first in 2 of 4 three-part runs and starving the shape gate
-        (05 §J.3). It is REQUIRED, with no default: this Protocol has four
-        implementations, two of them hand-written proxies in `scripts/`, and a
-        defaulted parameter is exactly what a proxy forwards silently and wrongly.
+                *kind* IS PART OF THE KEY, NOT A LABEL: `intents` and `answer_shape` hold
+                INDEPENDENT per-window allowances, so a turn refused for pending intents can
+                still be refused once for answer shape in the same window. It is REQUIRED with no
+                default — a defaulted parameter is exactly what a hand-written proxy forwards
+                silently and wrongly.
 
-        IT MUST BE PERSISTED, and that is the whole reason this method exists. A
-        counter local to `_run_loop_body` does NOT give "per window": that
-        function is re-entered once per `run()` AND once per resume of any kind —
-        an `askUser` resume and a `_resume_blueprint` both keep `window_count`
-        unchanged — so a local counter resets on every resume while the window
-        number stands still, and forced re-rounds become unbounded (user-paced,
-        but unbounded). An exit-#1 refusal leaves NO persisted artifact by design
-        (05 §B.2), so it cannot be reconstructed from the trail either.
+                IT MUST BE PERSISTED, and that is why this method exists. `_run_loop_body` is
+                re-entered once per `run()` AND once per resume of any kind, with `window_count`
+                unchanged, so a local counter resets on every resume while the window number
+                stands still and forced re-rounds become unbounded. An exit-#1 refusal leaves no
+                persisted artifact by design, so it cannot be reconstructed from the trail either.
 
-        Keyed by (TURN, WINDOW, KIND) on `SessionDoc.finalization_blocks`
-        (`{"0:2:intents": 1}`, via `models.finalization_block_key`) so "one per
-        budget window" is literal WITHIN a turn AND within a kind, and NOT on
-        `AnalysisState`, which is model-writable and unknown-key-rejecting.
-
-        THE TURN INDEX IS NOT DECORATION. `window_count` restarts at 1 for every
-        external turn while this map persists on the document and is never cleared,
-        so a window-only key silently killed the whole mechanism from a session's
-        second block-spending turn onward — see `finalization_block_key`.
+                Keyed by (TURN, WINDOW, KIND) on `SessionDoc.finalization_blocks` via
+                `models.finalization_block_key`, NOT on `AnalysisState`, which is model-writable
+                and unknown-key-rejecting.
         """
         ...
 
@@ -187,14 +158,13 @@ class SessionStore(Protocol):
         last_activity_before: str,
         limit: int,
     ) -> list[tuple[SessionDoc, Any]]:
-        """Return `(doc, cas)` for sessions whose `learning_status` is in
-        *statuses* and whose `last_activity` is strictly older than
-        *last_activity_before* (an ISO-8601 cutoff), capped at *limit*.
+        """Return `(doc, cas)` for sessions whose `learning_status` is in *statuses* and whose
+                `last_activity` is strictly older than *last_activity_before* (an ISO-8601
+                cutoff), capped at *limit*.
 
-        The sweeper (D96 §6) uses this to detect idle sessions to claim. Each
-        returned CAS is a best-effort snapshot for the sweeper's subsequent
-        CAS-guarded `transition_learning_status`; a doc that changes between the
-        scan and the transition simply mismatches and is skipped.
+                Each returned CAS is a best-effort snapshot for the caller's subsequent
+                CAS-guarded `transition_learning_status`; a doc that changes between the scan and
+                the transition simply mismatches and is skipped.
         """
         ...
 
@@ -210,17 +180,13 @@ class SessionStore(Protocol):
     ) -> Any:
         """CAS-guarded `learning_status` transition (D96 single-writer-per-session).
 
-        Reads the doc under *cas*, asserts `learning_status == expected_from`
-        (unless *assert_from* is False — the `* → dead_letter` transition #5 has
-        no `from` assertion), sets `learning_status = to`, optionally records
-        *content_hash* on `learning_content_hash`, and writes back CAS-guarded.
+                Reads the doc under *cas*, asserts `learning_status == expected_from` (unless
+                *assert_from* is False — the `* -> dead_letter` transition has no `from`
+                assertion), sets `learning_status = to`, optionally records *content_hash*, and
+                writes back CAS-guarded. Returns the new CAS token on success.
 
-        Returns the new CAS token on success.
-
-        Raises:
-            CASMismatchError: the CAS no longer matches (a peer won the race) OR
-                *assert_from* is set and the current status is not *expected_from*
-                (the session was resumed / already advanced) — both are "skip
-                this session", so the sweeper/consumer treats them identically.
+                Raises `CASMismatchError` both when the CAS no longer matches and when
+                *assert_from* is set and the current status is not *expected_from* — both mean
+                "skip this session", so callers treat them identically.
         """
         ...

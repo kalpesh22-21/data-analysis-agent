@@ -1,44 +1,23 @@
 """Project one reconstructed session lifecycle into Phoenix as ONE synthetic trace.
 
-The live learning loop scatters a session's spans across three decoupled processes
-(sweeper → consumer → scheduler). This module instead takes the already-reconstructed
-`SessionTrace` (from `reconstruct.py`, read straight out of the durable Couchbase
-stores) and emits it as a SINGLE, clean per-session tree into a dedicated Phoenix
-project `learning-sessions`:
+The live loop scatters a session's spans across three decoupled processes. This takes the
+already-reconstructed `SessionTrace` and emits a SINGLE per-session tree into the dedicated
+`learning-sessions` project: `learning.session` [AGENT] → `learning.candidate` [CHAIN] →
+`learning.evidence` [RETRIEVER].
 
-    learning.session            [AGENT]      (the session)
-      └─ learning.candidate     [CHAIN]      (one per extracted candidate)
-           └─ learning.evidence [RETRIEVER]  (one per evidence snapshot)
+Trace and span ids are DETERMINISTIC and CONTENT-KEYED (the trace id from `session_id`, each
+span id from a stable key), so re-exporting the same session UPSERTS the same spans instead of
+duplicating them — and a span's id stays invariant as the session EVOLVES, so a re-export
+refreshes each span in place rather than leaving stale positional duplicates.
 
-Trace/span ids are DETERMINISTIC and CONTENT-KEYED (the trace id from `session_id`;
-each span id from a stable key — `"root"`, `candidate:<id>`, `evidence:<ref>`), so
-re-exporting the same session UPSERTS the same spans in Phoenix instead of
-duplicating them — and a span's id stays invariant as the session EVOLVES (a new
-evidence snapshot, a landed drift stamp, a status transition), so re-export refreshes
-each span in place rather than leaving stale positional duplicates.
+PII posture: this honors the SAME verbose gate as the rest of the loop (`_verbose_attrs`,
+imported, never reinvented), and the setting defaults VERBOSE — so this project is
+ENTITY-BEARING BY DEFAULT and MUST be access-controlled like the `learning_audit`/session
+stores (D51). With `verbose=False` the ONLY attributes emitted are non-PII shape, labels,
+counts and statuses: no quote, intent, template, resolves or rationale reaches a span.
 
-PII posture (D25, amended 2026-07-15 — read `learning/observability.py`'s module
-docstring; this mirrors it EXACTLY). The projection honors the SAME verbose gate the
-rest of the learning loop uses (`_verbose_attrs`, imported — never reinvented). The
-SETTING (`LearningSettings.learning_trace_verbose`) now defaults VERBOSE by deliberate
-operator choice, so this project is ENTITY-BEARING BY DEFAULT and MUST be
-access-controlled like the `learning_audit`/session stores (D51):
-
-  * VERBOSE (`verbose=True`, the amended DEFAULT): the candidate/evidence spans carry
-    the entity-bearing content — the learned blueprint `intent`, the generalized
-    `template`, the `resolves` map, the extractor `rationale`, and the evidence
-    `quote` — in ADDITION to the shape attributes below.
-  * SHAPE-ONLY (`verbose=False`, now the opt-OUT): the ONLY attributes emitted are
-    non-PII shape/labels/counts/statuses — session id, learning/candidate statuses,
-    content hash, candidate/evidence counts, confidence, the leakage RESULT label, the
-    dedup/drift verdict labels, the evidence ref/turn/tool-call/origin-trace ids. NO
-    quote, NO intent, NO template, NO resolves, NO rationale reaches a span. Set
-    `learning_trace_verbose=false` to restore this D25 telemetry posture.
-
-`export_session_trace` is PURE emission: it takes a `tracer` and emits spans; it
-builds no providers and reads no settings (that is `build_session_export_provider` +
-the script). This keeps it unit-testable against an `InMemorySpanExporter` injected
-via `configure_tracing(span_exporter=...)`.
+`export_session_trace` is PURE emission — it takes a tracer, builds no providers and reads no
+settings — which is what keeps it unit-testable against an in-memory exporter.
 """
 
 from __future__ import annotations
@@ -65,20 +44,15 @@ _SEED_PREFIX = b"learning-session:"
 
 
 class _DeterministicIdGenerator(IdGenerator):
-    """OTel `IdGenerator` that mints STABLE, CONTENT-KEYED ids from a `session_id`.
+    """OTel `IdGenerator` minting STABLE, CONTENT-KEYED ids from a `session_id`.
 
-    The trace id is a pure function of the session id. Each span id is a pure
-    function of the seed + a STABLE content key (`"root"`, `f"candidate:{id}"`,
-    `f"evidence:{ref}"`) that `_start` sets on `next_key` immediately before
-    `start_span`. Keying on stable content — NOT a positional counter — makes a
-    span's id INVARIANT under tree growth: if a candidate later gains an evidence
-    snapshot, or a drift stamp lands, or a status advances, every OTHER span keeps
-    its id, so a re-export UPSERTS each session/candidate/evidence span IN PLACE
-    (refreshing its attributes) instead of leaving the first export's spans behind
-    as stale duplicates. OTel rejects all-zero ids, so a zero digest is forced to 1.
-
-    `next_key` unset (should never happen — `_start` is the single choke point that
-    sets it) falls back to a monotonic counter so id minting can never crash.
+    The trace id is a pure function of the session id, and each span id a pure function of the
+    seed plus a STABLE content key that `_start` sets immediately before `start_span`. Keying on
+    content rather than a positional counter makes a span's id INVARIANT under tree growth: if a
+    candidate later gains an evidence snapshot or a status advances, every OTHER span keeps its
+    id, so a re-export upserts each span IN PLACE. OTel rejects all-zero ids, so a zero digest is
+    forced to 1; an unset `next_key` falls back to a monotonic counter, so id minting can never
+    crash.
     """
 
     def __init__(self, session_id: str) -> None:
@@ -106,9 +80,8 @@ class _DeterministicIdGenerator(IdGenerator):
 def build_session_export_provider(*, otlp_endpoint: str, session_id: str) -> TracerProvider:
     """Build the `learning-sessions` Phoenix `TracerProvider` for *session_id*.
 
-    Wires the deterministic id generator so re-exports are idempotent. An empty
-    *otlp_endpoint* yields a no-op provider (no exporter) exactly as
-    `configure_tracing` does everywhere else.
+    Wires the deterministic id generator so re-exports are idempotent. An empty *otlp_endpoint*
+    yields a no-op provider, exactly as `configure_tracing` does everywhere else.
     """
     return configure_tracing(
         otlp_endpoint=otlp_endpoint,
@@ -142,15 +115,12 @@ def _start(
 ) -> Span:
     """Start (do NOT end) a span with the OpenInference kind + non-None *attrs*.
 
-    THE single choke point that pairs a span with its content key: it sets
-    *id_generator*`.next_key = span_key` immediately before `start_span`, so the
-    span id the SDK mints (via `generate_span_id`) is content-keyed, not positional.
-    Keeping this pairing in one place makes it impossible for key and span to drift.
-    A `None` generator (a non-SDK / non-deterministic tracer) is tolerated — the
-    span still emits, just with the tracer's own (random) id.
-
-    `record_exception=False` (D25): this projection never wraps work that could
-    raise, but the flag guarantees no exception detail could ever attach a span."""
+    THE single choke point pairing a span with its content key: it sets `next_key` immediately
+    before `start_span`, so the id the SDK mints is content-keyed rather than positional, and
+    keeping that pairing in one place makes it impossible for key and span to drift. A `None`
+    generator is tolerated — the span still emits with the tracer's own random id.
+    `record_exception=False` (D25) guarantees no exception detail could ever attach to a span.
+    """
     if id_generator is not None:
         id_generator.next_key = span_key
     span_obj = tracer.start_span(
@@ -164,9 +134,11 @@ def _start(
 
 
 def _leakage_result(entity_scan: dict[str, Any]) -> str:
-    """The leakage RESULT label: `pending` for the S3 self-check sentinel, the
-    settled S5 verdict result otherwise, `malformed` if a settled-looking doc fails
-    to parse (bare-string hits, etc.). Shape-only — no entity spans."""
+    """The leakage RESULT label — shape-only, never an entity span.
+
+    `pending` for the S3 self-check sentinel, the settled S5 verdict result otherwise, and
+    `malformed` when a settled-looking doc fails to parse.
+    """
     scan = entity_scan or {}
     if not LeakageVerdict.is_settled(scan):
         return "pending"
@@ -179,11 +151,11 @@ def _leakage_result(entity_scan: dict[str, Any]) -> str:
 def export_session_trace(
     trace_data: SessionTrace, tracer: Tracer, *, verbose: bool = False
 ) -> str | None:
-    """Emit *trace_data* as one synthetic Phoenix trace; return the trace id (32-hex)
-    or `None` when there is no session to project.
+    """Emit *trace_data* as one synthetic Phoenix trace; return the trace id, or `None`.
 
     PURE emission: no provider construction, no settings reads. Shape-only by default;
-    entity-bearing content only under *verbose* (see the module docstring)."""
+    entity-bearing content only under *verbose* (see the module docstring).
+    """
     session = trace_data.session
     if session is None:
         return None

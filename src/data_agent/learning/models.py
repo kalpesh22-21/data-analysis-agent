@@ -1,10 +1,7 @@
-"""Learning-loop models — the D30 reference envelope, the D96 state machine,
-and the D96 `content_hash` idempotency key.
+"""Learning-loop models: the D30 reference envelope, the D96 state machine, `content_hash`.
 
-Nothing here touches request-path data beyond READING a `SessionDoc`: the
-envelope is a *reference* (D30 — session id + hashes, never the transcript), and
-`compute_content_hash` is a pure function of the transcript-identifying subset of
-the doc (§5), used to make enqueue and consume idempotent.
+Nothing here touches request-path data beyond READING a `SessionDoc` — the envelope is a
+REFERENCE (session id + hashes), never the transcript.
 """
 
 from __future__ import annotations
@@ -18,8 +15,10 @@ from data_agent.runtime.session.models import SessionDoc
 
 
 class LearningStatus:
-    """The six `learning_status` states (D96 §3). `active` is the default already
-    carried by `SessionDoc`; `done`/`dead_letter` are terminal."""
+    """The six `learning_status` states (D96 §3).
+
+    `active` is the default already carried by `SessionDoc`; `done`/`dead_letter` are terminal.
+    """
 
     ACTIVE = "active"
     PENDING = "pending"
@@ -83,25 +82,13 @@ SWEEPABLE_STATUSES: list[str] = [LearningStatus.ACTIVE, LearningStatus.PENDING]
 
 
 def compute_content_hash(doc: SessionDoc) -> str:
-    """The D96 idempotency key: `sha256_hex(canonical_json({...}))` over EXACTLY
-    the transcript-identifying subset of the session doc (design §5).
+    """The D96 idempotency key over the transcript-identifying subset of the session doc (§5).
 
-    Included: `session_id`, the ordered `(turn_index, role, content)` of every
-    message, and the ordered `(turn_index, tool_call_id, tool_name,
-    canonical_json(args), status, error_code)` of every tool-trail entry.
-
-    Deliberately EXCLUDED (so the hash is stable across the lifecycle
-    transitions themselves and independent of storage/timestamp noise):
-    `learning_status` (circular — it changes as the machine advances),
-    every timestamp (`created_at`/`last_activity`/per-entry `ts`),
-    `result_full_ref` (a storage pointer), `result_preview` (a derived view),
-    `pause_checkpoint`, and all `provenance` sets (a re-parse artifact). What
-    remains is the transcript the Slice-2 extractor mines (D46's full tool I/O
-    trail).
-
-    Exclusion is by ALLOWLIST, not by subtraction: the payload below is built from
-    the three fields that identify a transcript, so a field added to (or deleted
-    from) `SessionDoc` cannot move the hash without an edit here.
+    Included: `session_id`, the ordered `(turn_index, role, content)` of every message and the
+    ordered `(turn_index, tool_call_id, tool_name, canonical_json(args), status, error_code)` of
+    every tool-trail entry. Timestamps, `learning_status`, storage pointers and derived views
+    are EXCLUDED so the hash is stable across the transitions themselves — and the payload is an
+    ALLOWLIST, so a field added to `SessionDoc` cannot move the hash without an edit here.
     """
     payload = {
         "session_id": doc.session_id,
@@ -124,14 +111,11 @@ def compute_content_hash(doc: SessionDoc) -> str:
 
 @dataclass(frozen=True)
 class LearningJob:
-    """The D30 reference envelope carried on the stream — session id + hashes +
-    a best-effort CAS snapshot, NEVER the transcript and NEVER the raw JWT or
-    `column_scope` (only a `scope_ref` id/hash travels — D25/D30).
+    """The D30 reference envelope carried on the stream: session id + hashes + a CAS snapshot.
 
-    `cas` is advisory (design §3): it is a snapshot for the Slice-2 loader's
-    optimistic read and is stale the instant transition #2 bumps the doc; the
-    authoritative single-writer mechanism is the consumer's own fresh CAS at
-    transition #3.
+    NEVER the transcript, and never the raw JWT or `column_scope` — only a `scope_ref` id/hash
+    travels (D25/D30). `cas` is ADVISORY: it is stale the instant transition #2 bumps the doc,
+    and the authoritative single-writer guard is the consumer's fresh CAS at transition #3.
     """
 
     session_id: str
@@ -163,10 +147,7 @@ class LearningJob:
         trace_id: str | None = None,
         traceparent: str | None = None,
     ) -> LearningJob:
-        """Build the reference envelope from a `SessionDoc`. Slice 1's session
-        doc carries no user/scope/trace identity, so those default to `None`;
-        they are threaded through by later slices without changing the transport.
-        """
+        """Build the reference envelope from a `SessionDoc`; absent identity fields are `None`."""
         return cls(
             session_id=doc.session_id,
             couchbase_doc_id=f"session::{doc.session_id}",

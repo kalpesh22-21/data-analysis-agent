@@ -1,36 +1,31 @@
 """retrieval/tools.py — the three model-facing knowledge-plane read tools (D8/D77).
 
-`searchBlueprints`, `getBlueprint`, `searchKnowledge` — runtime-implemented tools
-(read-tools-design), intercepted in the agent loop through the `RuntimeTool`
-registry exactly like `resolveValues`: each returns an inline `ToolResult`, counts
-as exactly one `tool_calls_made`, and never reaches `ToolDispatcher.dispatch`
-under its own name. They are the read-path siblings of the data-less tools
-(`listDatabases`/`listTables`/`explainQuery`): every result is corpus METADATA
-(blueprint intents, a blueprint's `uses` column IDENTIFIERS, knowledge prose),
-never out-of-scope warehouse row data. `ToolResult.provenance` is the safe-empty
-`frozenset()` (determined, zero warehouse columns → always kept in D44 replay)
-for `searchKnowledge` and the `getBlueprint` not-found path, and a real column
-footprint for the two results that NAME columns: `getBlueprint`'s FOUND path
-(its scoped `uses`) and — since card enrichment, release-1 §02 —
-`searchBlueprints` (the UNION of the returned cards' `uses`). Both drop from
-replay under a later scope narrowing. It is `None` (undetermined → dropped
-fail-closed, always) only where the footprint cannot be established: a malformed
-stored `uses` key, or a card printing a column identifier the union does not
-cover — see `_cards_to_provenance` and the printed-column guard above it.
+`searchBlueprints`, `getBlueprint` and `searchKnowledge` are runtime-implemented tools,
+intercepted in the agent loop through the `RuntimeTool` registry exactly like
+`resolveValues`: each returns an inline `ToolResult`, counts as one `tool_calls_made`, and
+never reaches `ToolDispatcher.dispatch` under its own name. Every result is corpus
+METADATA — blueprint intents, `uses` column IDENTIFIERS, knowledge prose — never
+out-of-scope warehouse row data.
 
-Shape/behaviour (read-tools §1/§3/§6):
-  - `searchBlueprints(query, k)` → reranked ThinCards, scope PRE-FILTERED (a card
-    the user cannot run is never returned); `degraded=true` on the recall-order
-    degrade so the model knows ranking is weaker.
-  - `getBlueprint(id)` → the stored D87 projection; out-of-scope AND absent both
-    return the identical `{found: false}` (the §3 non-oracle — no scope-probing).
-  - `searchKnowledge(query)` → reranked chunks; BYPASSES scope (entity-agnostic,
-    leakage-gated at write, D58(a)).
+PROVENANCE. The safe-empty `frozenset()` (determined, zero warehouse columns, always kept
+in D44 replay) for `searchKnowledge` and the `getBlueprint` not-found path. A real column
+footprint for the two results that NAME columns: `getBlueprint`'s FOUND path (its scoped
+`uses`) and `searchBlueprints` (the UNION of the returned cards' `uses`), so both drop from
+replay under a later scope narrowing. `None` (undetermined, dropped fail-closed always)
+only where the footprint cannot be established — a malformed stored `uses` key, or a card
+printing a column identifier the union does not cover.
+
+Shapes: `searchBlueprints(query, k)` returns reranked ThinCards, scope PRE-FILTERED so a
+card the user cannot run is never returned, with `degraded=true` on the recall-order
+degrade; `getBlueprint(id)` returns the stored projection, and out-of-scope AND absent both
+return the identical `{found: false}` (the non-oracle — no scope probing);
+`searchKnowledge(query)` returns reranked chunks and BYPASSES scope (entity-agnostic,
+leakage-gated at write, D58(a)).
+
 All degrade-not-fail: a wired-but-degraded stack returns `status="ok"` + empty +
-`degraded=true`; malformed args fail-closed to `RETRIEVAL_TOOL_INVALID_ARGS`
-before any work (`k` is clamped to `[1, max_k]`, never rejected for over-ask).
-The unwired case (no pipeline/store) is handled one level up in the loop registry
-(`RETRIEVAL_TOOL_UNAVAILABLE`), so these tools always hold live dependencies.
+`degraded=true`, and malformed args fail closed to `RETRIEVAL_TOOL_INVALID_ARGS` before any
+work (`k` is clamped, never rejected for over-ask). The unwired case is handled one level up
+in the loop registry, so these tools always hold live dependencies.
 """
 
 from __future__ import annotations
@@ -172,14 +167,13 @@ class _ReadTool:
         provenance: frozenset[tuple[str, str]] | None = frozenset(),
         preview_row_count: int = 20,
     ) -> ToolResult:
-        """*provenance* defaults to the safe-empty `frozenset()` (determined,
-        zero warehouse columns → always kept in D44 replay) — correct for
-        `searchKnowledge` and the `getBlueprint` not-found path, both of which
-        name no column. The two results that DO name columns override it so the
-        entry drops under a later scope narrowing (§3): `getBlueprint`'s FOUND
-        path with the blueprint's scoped `uses`, and `searchBlueprints` with the
-        union of its enriched cards' `uses` (release-1 §02) — or `None` when that
-        union does not cover what the cards print (`_cards_to_provenance`)."""
+        """*provenance* defaults to the safe-empty `frozenset()` — correct for `searchKnowledge`
+                and the `getBlueprint` not-found path, both of which name no column. The two results
+                that DO name columns override it so the entry drops under a later scope narrowing:
+                `getBlueprint`'s FOUND path with the blueprint's scoped `uses`, and
+                `searchBlueprints` with the union of its enriched cards' `uses` — or `None` when
+                that union does not cover what the cards print.
+        """
         return ToolResult(
             status="ok",
             tool_name=self.tool_name,
@@ -230,15 +224,14 @@ def _clamp_k(
 
 def _uses_to_provenance(uses: frozenset[str]) -> frozenset[tuple[str, str]] | None:
     """Split a blueprint's scoped `uses` ("database.table.column" keys) into the
-    `(db_table, column)` provenance tuples the D44 replay filter consumes — it
-    rebuilds each key as `f"{db_table}.{column}"` and checks scope membership
-    (`context/scope_filter.is_provenance_in_scope`). This is what makes a
-    getBlueprint trail entry DROP under a later scope narrowing (S1/§3): its
-    footprint is no longer a subset of the narrowed scope.
+        `(db_table, column)` provenance tuples the D44 replay filter consumes. This is what
+        makes a `getBlueprint` trail entry DROP under a later scope narrowing: its footprint is
+        no longer a subset of the narrowed scope.
 
-    Fail-closed: any malformed key (no dot, empty part) → `None` for the WHOLE
-    set (undetermined → dropped from replay), never a partial set that could
-    fail-open. An empty `uses` → `frozenset()` (determined, zero columns → kept)."""
+        Fail-closed: any malformed key (no dot, empty part) yields `None` for the WHOLE set
+        (undetermined, dropped from replay), never a partial set that could fail open. An empty
+        `uses` yields `frozenset()`.
+    """
     tuples: set[tuple[str, str]] = set()
     for use in uses:
         db_table, sep, column = use.rpartition(".")
@@ -263,17 +256,17 @@ _OPTIONAL_PLAIN_NOTE = "May be omitted."
 
 
 def _enrich_slot(raw: Any) -> dict[str, Any]:
-    """Shape one raw slot dict (name/type/required/binds_to/...) into the ENRICHED
-    model-facing view: keep name/type, ADD a plain-English `type_meaning` gloss, a
-    `requirement` ("required"/"optional"), and a `note` explaining the contract.
-    Preserves `binds_to`/`enum_values`/`min_value`/`max_value` when present (useful,
-    harmless). A raw slot missing `type` → generic gloss; missing/invalid `required`
-    → defaults to required=True (the SlotSpec default) — the slot is never dropped.
+    """Shape one raw slot dict into the ENRICHED model-facing view: keep name/type, ADD a
+        plain-English `type_meaning` gloss, a `requirement`, and a `note` explaining the
+        contract. `binds_to`/`enum_values`/bounds are preserved when present. A raw slot missing
+        `type` gets the generic gloss and a missing or invalid `required` defaults to True — the
+        slot is never dropped.
 
-    The optional note only promises "no filter (all values)" when the slot carries
-    an `optional_pattern` (round-tripped via slots_json) — the executor substitutes
-    that pattern on omission. Without one, omission fails closed to the raw loop, so
-    the note softens to a neutral "May be omitted." rather than overclaim."""
+        The optional note only promises "no filter (all values)" when the slot carries an
+        `optional_pattern`, which the executor substitutes on omission. Without one, omission
+        fails closed to the raw loop, so the note softens to a neutral "May be omitted." rather
+        than overclaim.
+    """
     slot = raw if isinstance(raw, dict) else {}
     type_ = slot.get("type")
     required = slot.get("required", True)
@@ -299,11 +292,12 @@ def _enrich_slot(raw: Any) -> dict[str, Any]:
 
 
 def _composition_annotation(composes: list[Any]) -> dict[str, Any]:
-    """Compact, model-facing stand-in for a composed blueprint's raw `composes`
-    DAG. The raw DAG (per-node `sql_template`/`feeds_from`/`consumes`/`$0.x` refs)
-    is the confusion vector — it invites the model to hand-run steps or reason
-    about their order. Replace it with a step count + a "one atomic call" note;
-    the runtime executes the DAG from the store, never from this serialization."""
+    """Compact, model-facing stand-in for a composed blueprint's raw `composes` DAG.
+
+        The raw DAG is the confusion vector — it invites the model to hand-run steps or reason
+        about their order — so it is replaced with a step count and a "one atomic call" note.
+        The runtime executes the DAG from the store, never from this serialization.
+    """
     steps = len(composes)
     return {
         "steps": steps,
@@ -334,28 +328,25 @@ def _require_text(raw: Any, name: str) -> tuple[str | None, str | None]:
 def _search_card(card: ThinCard) -> dict[str, Any]:
     """Serialize one `ThinCard` into a `searchBlueprints` result entry.
 
-    ENRICHED (release-1 §02) so the model can pick between candidates without a
-    `getBlueprint` round-trip each. The enrichment keys are OMITTED when the
-    blueprint stored no DAG (`None`), so a DAG-less blueprint serialises
-    byte-identically to before this change.
+        ENRICHED so the model can pick between candidates without a `getBlueprint` round-trip
+        each. The enrichment keys are OMITTED when the blueprint stored no DAG, so a DAG-less
+        blueprint serialises byte-identically to before.
 
-    `status` is DELIBERATELY absent. Recall filters
-    `coalesce(node.status,'validated') = 'validated'`
-    (`vector_index._BLUEPRINT_RECALL_QUERY`), so every card here is validated by
-    construction — the field would be a constant carrying no information, and
-    printing it would imply a distinction that cannot occur in a search result.
-    It stays on `getBlueprint`, where a keyed fetch by id genuinely can return a
-    non-validated blueprint.
+        `status` is DELIBERATELY absent. Recall filters
+        `coalesce(node.status,'validated') = 'validated'`, so every card here is validated by
+        construction — the field would be a constant carrying no information, and printing it
+        would imply a distinction that cannot occur in a search result. It stays on
+        `getBlueprint`, where a keyed fetch by id genuinely can return a non-validated blueprint.
 
-    `slots` are the `{name, type, required}` SUMMARY only (the projection is
-    enforced upstream in `pipeline._project_slots`); `binds_to`, `enum_values`,
-    `optional_pattern` and the numeric bounds are `getBlueprint`'s job.
+        `slots` are the `{name, type, required}` SUMMARY only (the projection is enforced
+        upstream); `binds_to`, `enum_values`, `optional_pattern` and the numeric bounds are
+        `getBlueprint`'s job.
 
-    ⚠ Every key emitted here is read back by the printed-column guard below
-    (`_card_printed_columns`), which decides whether the trail entry's D44
-    provenance can be claimed as determined. A NEW key is guarded by default —
-    its strings must be covered by the cards' `uses` union or the whole entry
-    fails closed out of replay — so classify it there when you add it.
+        ⚠ Every key emitted here is read back by the printed-column guard
+        (`_card_printed_columns`), which decides whether the trail entry's D44 provenance can be
+        claimed as determined. A NEW key is guarded by default — its strings must be covered by
+        the cards' `uses` union or the whole entry fails closed out of replay — so classify it
+        there when you add one.
     """
     entry: dict[str, Any] = {
         "id": card.id,
@@ -456,29 +447,22 @@ def _slot_printed_columns(value: Any) -> set[str]:
 def _grain_printed_columns(value: Any) -> set[str]:
     """Column identifiers printed by a card's `result_grain`.
 
-    A grain entry is an OUTPUT-COLUMN DISPLAY LABEL for a `SELECT … AS x`, not a
-    warehouse column identifier. That is this repo's own recorded reading —
-    `blueprint/structural_key.py::normalize_structural_grain` says so and pins a
-    case fold on the strength of it — and the seed corpus bears it out: 6 of the
-    11 seeds declare `result_grain: [Department]` over a footprint whose column
-    is `employee.department_name`, and the two hires blueprints declare `[month]`
-    for `toStartOfMonth(hire_date)`.
+        A grain entry is an OUTPUT-COLUMN DISPLAY LABEL for a `SELECT … AS x`, not a warehouse
+        column identifier. That is this repo's own recorded reading —
+        `blueprint/structural_key.py::normalize_structural_grain` says so and pins a case fold
+        on the strength of it — and the seed corpus bears it out.
 
-    So requiring a BARE grain entry to be covered would make 8 of the 11 real
-    blueprints undetermined — and undetermined is dropped from replay ALWAYS
-    (`context/scope_filter`: `None` is dropped even under allow-all, and even
-    inside its own turn once the entry is `ok`), i.e. the model would stop seeing
-    its own search results one round-trip after asking for them. That is a
-    strictly worse outcome than the label it would be withholding, which the
-    card's `intent`/`slots_summary` prose names in any case.
+        So requiring a BARE grain entry to be covered would make most real blueprints
+        undetermined, and undetermined is dropped from replay ALWAYS — even under allow-all, and
+        even inside its own turn once the entry is `ok`. The model would stop seeing its own
+        search results one round-trip after asking for them, which is strictly worse than the
+        label it would be withholding, and the card's prose names it anyway.
 
-    A bare entry is therefore read as the display label it is. A QUALIFIED entry
-    ("db.table.column") is no display label under any reading — it is a column
-    identifier and must be covered. (Residual, recorded deliberately: a bare
-    grain entry that IS a real column name of some other table cannot be told
-    apart from a label at this layer — retrieval holds no catalog — so it is not
-    caught here. A `resolves` value naming that column IS caught, and the corpus
-    test pins the seeds.)
+        A bare entry is therefore read as the display label it is. A QUALIFIED entry
+        ("db.table.column") is no display label under any reading and must be covered. Residual,
+        recorded deliberately: a bare grain entry that IS a real column name of some other table
+        cannot be told apart from a label at this layer, since retrieval holds no catalog. A
+        `resolves` value naming that column IS caught.
     """
     return {entry for entry in _printed_strings(value) if "." in entry}
 
@@ -507,26 +491,22 @@ def _card_printed_columns(entry: Mapping[str, Any]) -> set[str]:
 def _is_covered(printed: str, *, qualified: set[str], bare: set[str]) -> bool:
     """Is one printed identifier covered by the footprint being claimed?
 
-    THE qualification mismatch: `uses` keys are fully qualified
-    ("dbpcm_warehouse.employee.annual_salary") while a card prints BARE column
-    names ("annual_salary") — a card never prints a qualification, which is
-    exactly why `binds_to` is kept off it. Comparing the two as whole strings
-    would match nothing and make EVERY enriched card undetermined, silently
-    disabling replay for the entire release (see `_grain_printed_columns` for
-    what an undetermined entry costs). So:
+        THE qualification mismatch: `uses` keys are fully qualified while a card prints BARE
+        column names — a card never prints a qualification, which is exactly why `binds_to` is
+        kept off it. Comparing the two as whole strings would match nothing and make EVERY
+        enriched card undetermined, silently disabling replay for the entire release. So:
 
-      - a BARE printed name is compared against the LAST SEGMENT of each `uses`
-        key — the only comparison that can succeed at all;
-      - a DOTTED printed name is compared against the whole key, suffix-matched
-        on a dot boundary so a `table.column` spelling still matches its
-        `db.table.column` key.
+          - a BARE printed name is compared against the LAST SEGMENT of each `uses` key — the
+            only comparison that can succeed at all;
+          - a DOTTED printed name is compared against the whole key, suffix-matched on a dot
+            boundary so a `table.column` spelling still matches its `db.table.column` key.
 
-    Both sides are case-folded, matching `normalize_structural_grain`'s pinned
-    `str.lower()`. The real corpus hazard is authoring case skew (`Amount` vs
-    `amount`), not two columns of one table differing only by case.
+        Both sides are case-folded, matching `normalize_structural_grain`'s pinned `str.lower()`:
+        the real corpus hazard is authoring case skew, not two columns of one table differing
+        only by case.
 
-    A bare name matching no footprint column cannot be resolved to a qualified
-    column; that is itself undetermined, and the caller fails closed on it.
+        A bare name matching no footprint column cannot be resolved to a qualified column; that
+        is itself undetermined, and the caller fails closed on it.
     """
     token = printed.strip().lower()
     if "." not in token:
@@ -537,40 +517,32 @@ def _is_covered(printed: str, *, qualified: set[str], bare: set[str]) -> bool:
 def _cards_to_provenance(
     cards: Sequence[ThinCard], serialised: Sequence[Mapping[str, Any]]
 ) -> frozenset[tuple[str, str]] | None:
-    """The `searchBlueprints` entry's D44 provenance: the UNION of the returned
-    cards' `uses` footprints (release-1 §02 ⚠Provenance) — but only when that
-    union covers every column identifier the cards actually PRINT.
+    """The `searchBlueprints` entry's D44 provenance: the UNION of the returned cards' `uses`
+        footprints — but only when that union covers every column identifier the cards PRINT.
 
-    `_ok` defaults to the safe-empty `frozenset()`, and that WAS correct here for
-    a precise reason: a thin card carried no column identifier, so there was
-    nothing a later scope narrowing could forbid. Enrichment breaks that premise
-    — `resolves` maps a term to a COLUMN NAME and `result_grain` is a
-    column/alias list — so a `frozenset()` entry would be kept in replay FOREVER,
-    including after the caller's scope narrows past the columns it names. That is
-    exactly the leak `getBlueprint`'s FOUND-path override closes, reintroduced on
-    the tool that returns `k` cards at once.
+        `_ok` defaults to the safe-empty `frozenset()`, and that WAS correct here for a precise
+        reason: a thin card carried no column identifier, so there was nothing a later scope
+        narrowing could forbid. Enrichment breaks that premise — `resolves` maps a term to a
+        COLUMN NAME and `result_grain` is a column/alias list — so a `frozenset()` entry would
+        be kept in replay FOREVER, including after the caller's scope narrows past the columns
+        it names.
 
-    Every returned card is already in scope (recall pre-filters `uses ⊆ scope`),
-    so the union is in scope at write time; when scope later narrows past ANY of
-    it, the WHOLE entry drops. Whole-entry granularity is coarse but fail-closed,
-    and it is the granularity every other multi-column entry already has.
+        Every returned card is already in scope (recall pre-filters `uses ⊆ scope`), so the union
+        is in scope at write time; when scope later narrows past ANY of it, the WHOLE entry
+        drops. Whole-entry granularity is coarse but fail-closed, and it is what every other
+        multi-column entry already has.
 
-    Fail-closed three times over — an UNDETERMINED card footprint (`uses is
-    None`; it should never reach here, the scope pre-filter drops those), a
-    malformed `uses` key (via `_uses_to_provenance`), and a PRINTED COLUMN the
-    union does not cover — each yields `None` for the whole set (undetermined →
-    dropped from replay), never a partial or empty set that would fail open. NO
-    cards → `frozenset()` (determined, zero columns → kept), which keeps the
-    empty result byte-identical to its pre-enrichment behaviour.
+        Fail-closed three times over — an UNDETERMINED card footprint, a malformed `uses` key,
+        and a PRINTED COLUMN the union does not cover — each yielding `None` for the whole set,
+        never a partial or empty set that would fail open. NO cards yields `frozenset()`.
 
-    The coverage check runs against the UNION, not per card, because the entry's
-    provenance IS the union: a column card A prints that lives in card B's `uses`
-    is still in the claimed footprint, so the entry drops the moment that column
-    leaves scope. Per-card checking would fail closed on that case for no gain.
+        The coverage check runs against the UNION, not per card, because the entry's provenance
+        IS the union: a column card A prints that lives in card B's `uses` is still in the
+        claimed footprint, so the entry drops the moment that column leaves scope. Per-card
+        checking would fail closed on that case for no gain.
 
-    *serialised* must be the very dicts placed in `result_full` — the guard is
-    derived from what is printed, so handing it anything else (a re-render, a
-    subset) would measure the wrong thing.
+        *serialised* must be the very dicts placed in `result_full` — the guard is derived from
+        what is printed, so handing it anything else would measure the wrong thing.
     """
     union: set[str] = set()
     for card in cards:

@@ -1,62 +1,31 @@
-"""Emulated discovery — replay `listDatabases`+`listTables` as if the agent had
-already called them (design §4.1 optimization).
+"""Emulated discovery — replay `listDatabases`+`listTables` as if the agent had already
+called them, so no turn burns completion round-trips on pure discovery.
 
-Motivation: on every turn the model was prompted to call the two discovery tools
-`listDatabases` + `listTables` before it could do real work, burning a couple of
-completion round-trips on pure discovery. Since that catalog is scope-independent
-warehouse metadata (never row/cell data), the runtime can fetch it up front — ONCE
-PER SESSION (memoized by `EmulatedDiscoveryCache` below) — through the SAME
-`ToolDispatcher` the model would have used
-(so credentials/scope/denial-mapping/telemetry all stay consistent, D5/D57) and
-inject it into the model's message list as if the model had ALREADY made those
-calls: synthetic `assistant(tool_calls=...) + tool(result)` pairs, one per call.
+That catalogue is scope-independent metadata, so the runtime sweeps it ONCE PER SESSION
+through the SAME `ToolDispatcher` the model would have used (credentials, scope, denial
+mapping and telemetry all stay consistent, D5/D57) and injects synthetic
+`assistant(tool_calls=...) + tool(result)` pairs. Emulating the CALLS rather than
+summarizing them matters: both tools have determined-EMPTY provenance so their pairs
+replay cleanly, and both are `IDEMPOTENT_READ_TOOLS`, so a model re-call is served
+locally from the seeded read guard instead of re-dispatched.
 
-Why emulate the calls instead of a system-message summary: `listDatabases`/
-`listTables` have determined-EMPTY provenance (`frozenset()`, see
-`provenance/capture.py`), so their tool-result shape replays cleanly, and both
-names already live in `loop/read_guard.py::IDEMPOTENT_READ_TOOLS` — so a model
-RE-call of either is caught by the loop's repeated-idempotent-read guard (seeded
-from `read_signatures` below) and served locally, never re-dispatched to the MCP.
+Depth and breadth are deliberately narrow: `listDatabases` in full, `listTables` for the
+ONE `base_database` only. `getTableSchema` stays model-driven (scope-sensitive and
+per-table), and a `listTables` on a non-base database is a real dispatch — correct,
+since nothing was injected for it to be served from.
 
-Depth is deliberately shallow: `listDatabases` + `listTables` ONLY. `getTableSchema`
-stays model-driven (it is scope-sensitive and per-table — pre-fetching every table's
-schema would be large and mostly wasted).
+Shape fidelity (load-bearing): each synthetic entry goes through the SAME
+`context/budget.py::_render_entry` a real replayed read uses, so the model sees an
+identical shape by construction.
 
-BREADTH is deliberately narrow too: `listTables` is emulated for the ONE
-`base_database` (`settings.base_database`, default `dbpcm_warehouse`) — NOT for every
-database `listDatabases` returns. The other databases on a live warehouse are not
-analysis surface (`dbpcm_warehouse_security` is the access-control side, `scratch` is
-the D93 per-session materialization area), so sweeping them cost an MCP round-trip
-each per turn to inject listings the model should never query from. `listDatabases`
-is still emulated in full, so the model still sees that the others EXIST and can list
-them itself if it ever genuinely needs to — that path is simply no longer pre-paid.
+Degrade-not-fail: any failure returns an EMPTY `EmulatedDiscovery` and the turn proceeds
+exactly as before; this never raises out, and nothing is persisted to the trail. The
+injected pairs are PINNED by `fit_request_to_budget` rather than budgeted — as
+prior-turn units they would be the first thing dropped, stranding the model with a guard
+that answers "already served" for a listing no longer in its context.
 
-Note the guard interaction of that choice: only the emulated `listTables(base)` call
-seeds the read guard, so a model `listTables` on a NON-base database is a real
-dispatch (correct — nothing was injected for it to be served from).
-
-Shape fidelity (load-bearing): the injected `tool` message must render through the
-SAME path a real replayed read uses so the model sees an identical shape
-(status/error_code/user_message/result_preview). We therefore build each synthetic
-`entry` by feeding a `TrailEntry` through `context/budget.py::_render_entry` — the
-exact function `context/assembly.py` uses for a real trail entry — then let the loop
-run each through `loop/agent_loop.py::_tool_trail_entry_to_canonical` (the same
-assistant/tool synthesis a real replay uses). The shape is identical by construction.
-
-Degrade-not-fail (design §2): this is pure injected context. If the MCP is
-unreachable, denies discovery, or returns an unexpected shape,
-`build_emulated_discovery` returns an EMPTY `EmulatedDiscovery` and the turn proceeds
-exactly as before — the model simply falls back to calling the two tools itself. It
-never raises out. It is never persisted to the trail, and the injected pairs are
-PINNED by `context/budget.py::fit_request_to_budget` rather than budgeted: anchored
-at the session's first question they are otherwise a prior-turn unit, the first thing
-dropped under pressure — which would strand the model with a guard that says
-"already served" for a listing no longer in its context.
-
-D5: the JWT/session_id never enter this module's output. Credentials are consumed
-only by `ToolDispatcher.dispatch`, which attaches them at the MCP transport boundary;
-the returned `ToolResult` carries no credentials and the rendered entries are
-warehouse metadata (database + table names) only.
+D5: no credential enters this module's output — the JWT is consumed only by
+`ToolDispatcher.dispatch`, at the MCP transport boundary.
 """
 
 from __future__ import annotations
@@ -100,25 +69,18 @@ __all__ = ["EmulatedDiscovery", "EmulatedDiscoveryCache", "build_emulated_discov
 class EmulatedDiscoveryCache:
     """Process-wide, session-keyed, bounded cache of the ONCE-PER-SESSION sweep.
 
-    `_run_loop_body` is re-entered by `run()`, `resume()` AND the blueprint
-    approval-resume, so an uncached sweep re-dispatched `listDatabases` +
-    `listTables` to the MCP on every budget window — and, because the pairs are
-    ephemeral and re-spliced per rebuild, the model watched a fresh block of
-    discovery calls appear mid-session AFTER it had already read schemas. The
-    warehouse catalogue is scope-independent metadata that does not change within a
-    session, so it is swept once and served from here for every later window.
+        `_run_loop_body` is re-entered by `run()`, `resume()` AND the blueprint
+        approval-resume, so an uncached sweep re-dispatches both tools on every budget
+        window — and, because the pairs are re-spliced per rebuild, the model watches a
+        fresh block of discovery calls appear mid-session.
 
-    Only a NON-EMPTY sweep is cached. A degraded one (MCP blip, denial, base
-    database absent) is deliberately NOT memoized — caching it would disable
-    discovery for the whole remaining session on one transient failure, so the next
-    window retries. This preserves the module's degrade-not-fail posture.
+        Only a NON-EMPTY sweep is cached: memoizing a degraded one (MCP blip, denial, base
+        database absent) would disable discovery for the whole remaining session on one
+        transient failure, so the next window retries instead.
 
-    Bounded by `max_size` with FIFO eviction: an evicted session simply re-sweeps
-    once. The lock makes concurrent windows of the SAME session issue at most one
-    in-flight sweep (double-checked, mirroring `catalog/export_client.py::
-    CatalogCache`); the first result wins.
-
-    D5: only `session_id` is used as the key — no JWT/credential material is stored.
+        Bounded by `max_size` with FIFO eviction — an evicted session simply re-sweeps once.
+        The lock is double-checked, so concurrent windows of the SAME session issue at most
+        one in-flight sweep and the first result wins. D5: only `session_id` is a key.
     """
 
     def __init__(self, max_size: int = 512) -> None:
@@ -154,16 +116,12 @@ class EmulatedDiscoveryCache:
 class EmulatedDiscovery:
     """The output of one `build_emulated_discovery` sweep.
 
-    `entries`: synthetic rendered-entry dicts in the exact shape
-    `loop/agent_loop.py::_tool_trail_entry_to_canonical` consumes (the
-    `context/budget.py::_render_entry` shape) — `listDatabases` first, then a single
-    `listTables` for the base database. An empty list means nothing to inject.
-
-    `read_signatures`: the `idempotent_read_signature(tool_name, args)` of each
-    emulated call, used by the loop to SEED its repeated-idempotent-read guard so a
-    model re-call of `listDatabases`/`listTables` is served locally, never
-    re-dispatched to the MCP. Kept 1:1 with `entries` (a skipped/failed db
-    contributes neither an entry nor a signature).
+        `entries` are synthetic rendered-entry dicts in the exact `_render_entry` shape
+        `loop/agent_loop.py::_tool_trail_entry_to_canonical` consumes — `listDatabases`
+        first, then a single `listTables` for the base database; empty means nothing to
+        inject. `read_signatures` are the matching `idempotent_read_signature(tool_name,
+        args)` values, used to SEED the loop's repeated-idempotent-read guard, and are kept
+        1:1 with `entries` (a skipped or failed call contributes neither).
     """
 
     entries: list[dict[str, Any]] = field(default_factory=list)
@@ -197,11 +155,11 @@ def _rendered_entry(
     result: ToolResult,
     preview_row_count: int,
 ) -> dict[str, Any]:
-    """Render one dispatched `ok` discovery result into the SAME model-facing dict a
-    real replayed read produces — by feeding a `TrailEntry` through the exact
-    `context/budget.py::_render_entry` the assembler uses (no duplicated JSON logic).
-    *preview_row_count* is threaded from `settings.preview_row_count` so the emulated
-    entry re-truncates to the SAME row count a real replayed read would."""
+    """Render one dispatched `ok` discovery result into the SAME model-facing dict a real
+        replayed read produces, by feeding a `TrailEntry` through `_render_entry` rather
+        than duplicating its JSON logic. *preview_row_count* is threaded from settings so
+        the emulated entry re-truncates to the SAME row count a real replayed read would.
+    """
     entry = TrailEntry(
         turn_index=0,
         tool_call_id=tool_call_id,
@@ -218,10 +176,11 @@ def _rendered_entry(
 
 
 def _emit_degraded(observer: Observer | None) -> EmulatedDiscovery:
-    """Emit the shape-only `discovery_emulated` event on a degrade path (zero
-    counts + `degraded: true`) and return the EMPTY result. The event fires on
-    BOTH success and degrade so a silent MCP blip is observable in a trace, at the
-    SAME shape-only D25/D61 posture (no SQL/PII — only integer counts + the flag)."""
+    """Emit the shape-only `discovery_emulated` event on a degrade path (zero counts +
+        `degraded: true`) and return the EMPTY result. The event fires on BOTH success and
+        degrade, so a silent MCP blip is observable in a trace at the same shape-only
+        posture (integer counts + the flag, no SQL or PII).
+    """
     if observer is not None:
         observer(
             "discovery_emulated",
@@ -238,29 +197,22 @@ async def build_emulated_discovery(
     preview_row_count: int = _DEFAULT_PREVIEW_ROW_COUNT,
     observer: Observer | None = None,
 ) -> EmulatedDiscovery:
-    """Sweep `listDatabases` + `listTables(base_database)` through *dispatcher* and
-    build the synthetic rendered entries + guard signatures, or an EMPTY result to
-    degrade.
+    """Sweep `listDatabases` + `listTables(base_database)` through *dispatcher* and build
+        the synthetic rendered entries + guard signatures, or an EMPTY result to degrade.
 
-    *base_database* (threaded from `settings.base_database`): the ONE database whose
-    tables are emulated. `listDatabases` is still emulated in full — only the
-    `listTables` fan-out is narrowed, from one call per returned database to exactly
-    one. See the module docstring for why the other databases are not analysis
-    surface.
+        *base_database* is the ONE database whose tables are emulated; only the `listTables`
+        fan-out is narrowed, `listDatabases` is still emulated in full.
 
-    *preview_row_count* (threaded from `settings.preview_row_count`): the row-count
-    each emulated entry re-truncates to, so it matches a real replayed read under a
-    non-default setting (otherwise a table listing longer than 20 would be capped
-    while the guard seed blocked the model's same-args re-call — the tail becomes
-    undiscoverable for the turn).
+        *preview_row_count* is the row count each emulated entry re-truncates to, so it
+        matches a real replayed read under a non-default setting — otherwise a listing
+        longer than the preview would be capped while the guard seed blocked the model's
+        same-args re-call, making the tail undiscoverable for the turn.
 
-    Returns an empty `EmulatedDiscovery` (never raises) when: `listDatabases` is not
-    `ok` / empty / not a list; or any unexpected exception occurred. When
-    *base_database* is absent from the `listDatabases` result, or its `listTables`
-    call is not `ok`, the `listDatabases` pair is STILL injected on its own (the
-    model keeps the discovery it did get, and falls back to calling `listTables`
-    itself). Every degrade path emits the shape-only `discovery_emulated` observer
-    event with `degraded: true` so a silent MCP blip is observable.
+        Never raises. Returns an empty result when `listDatabases` is not `ok`, empty, or
+        not a list, and on any unexpected exception. When *base_database* is absent from the
+        result, or its `listTables` call is not `ok`, the `listDatabases` pair is STILL
+        injected on its own. Every degrade path emits `discovery_emulated` with
+        `degraded: true`.
     """
     try:
         # `emit_progress=False` on BOTH sweep dispatches (ratified): this is

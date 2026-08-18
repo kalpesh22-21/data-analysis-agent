@@ -1,14 +1,9 @@
 """Pure formatting of a `SessionTrace` — NO I/O, NO store access.
 
-Two renderers:
-  * `render_session_trace`      — a human-readable, sectioned, chronological report
-    (the whole point: ONE view of one session's journey). ANSI color is applied
-    only when *use_color* is set (the caller gates on `stdout.isatty()`); a plain
-    fallback is always available.
-  * `render_session_trace_json` — a stable dict → `json.dumps(indent=2)` for `--json`
-    piping, serialized through the models' own `to_doc()`.
-
-Long strings (SQL, quotes, rationale) are truncated to ~120 chars with an ellipsis.
+`render_session_trace` is the human-readable, sectioned, chronological report (ANSI color only
+when *use_color* is set — the caller gates on `isatty()`); `render_session_trace_json` is a
+stable dict for `--json` piping, serialized through the models' own `to_doc()`. Long strings
+are truncated with an ellipsis.
 """
 
 from __future__ import annotations

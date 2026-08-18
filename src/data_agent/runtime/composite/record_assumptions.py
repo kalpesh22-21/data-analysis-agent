@@ -1,27 +1,18 @@
 """record_assumptions.py — the `recordAssumptions` runtime tool.
 
-The model calls `recordAssumptions(assumptions=[...])` ONCE, just before its
-final answer, to surface the plain-English assumptions behind that answer as a
-first-class field on the turn result (alongside `sql`/`result_table` — the UI
-Slice 1 pattern). It is a RUNTIME tool (the `resolveValues`/`runBlueprint`
-shape): intercepted in the agent loop, never dispatched to the MCP under its own
-name, counting as exactly one `tool_calls_made`.
+The model calls `recordAssumptions(assumptions=[...])` ONCE, just before its final answer,
+to surface the plain-English assumptions behind that answer as a first-class field on the
+turn result. A RUNTIME tool: intercepted in the agent loop, never dispatched to the MCP
+under its own name, counting as exactly one `tool_calls_made`.
 
-The tool itself is stateless and near-trivial — it does NOT hold the turn's
-assumptions. It only returns a small confirmation `ToolResult`. The agent loop
-folds `clean_assumptions(arguments["assumptions"])` into the window's
-`TurnAccumulators` on a SUCCESSFUL call (`note_assumptions`, mirroring how the
-same object accumulates the turn's SQL), and
-`session_history.project_history` reconstructs the same set from the trail using
-the SAME `clean_assumptions` helper.
+The tool itself is stateless and does NOT hold the turn's assumptions — it only returns a
+small confirmation. The loop folds `clean_assumptions(arguments["assumptions"])` into the
+window's `TurnAccumulators` on a SUCCESSFUL call, and `session_history.project_history`
+reconstructs the same set from the trail using the SAME helper.
 
-Contract (MODEL-DECLARED, PLAIN ENGLISH): the model is instructed by the tool
-schema + system prompt to pass short plain-English sentences in the user's own
-terms — never SQL, codes, or column names. That contract is enforced by the
-PROMPT/SCHEMA, not the runtime: `clean_assumptions` deliberately does NOT try to
-detect or strip SQL (D5-style: the runtime does not second-guess model text
-here). It only drops blanks/non-strings, dedupes, and applies lenient safety
-caps.
+The plain-English contract (short sentences in the user's own terms, never SQL, codes or
+column names) is enforced by the SCHEMA and the PROMPT, not the runtime: `clean_assumptions`
+deliberately does not try to detect or strip SQL.
 """
 
 from __future__ import annotations
@@ -46,21 +37,17 @@ _MAX_ASSUMPTION_LEN = 2000
 
 
 def clean_assumptions(raw: Any) -> list[str]:
-    """Normalize a model-supplied `assumptions` value into a clean list of
-    plain-English strings — the SINGLE cleaning used by BOTH the agent loop
-    (accumulation) and `session_history` (history reconstruction), so both agree.
+    """Normalize a model-supplied `assumptions` value into a clean list of plain-English
+        strings — the SINGLE cleaning used by BOTH the agent loop and `session_history`, so the
+        two agree.
 
-    Rules (lenient by design):
-      - `raw` must be a list/tuple; anything else → `[]`.
-      - keep only `str` items that are non-empty after `.strip()` (stripped form
-        is stored); drop non-strings and blanks.
-      - dedupe, preserving FIRST-occurrence order (the same discipline the
-        window applies to the turn's SQL).
-      - safety caps: ignore items beyond `_MAX_ASSUMPTIONS`; truncate any single
-        item longer than `_MAX_ASSUMPTION_LEN`.
+        Lenient by design: a non-list is `[]`; only non-blank `str` items survive (stored in
+        stripped form); duplicates drop preserving FIRST-occurrence order; items past
+        `_MAX_ASSUMPTIONS` are ignored and any single item longer than `_MAX_ASSUMPTION_LEN` is
+        truncated.
 
-    Does NOT attempt to detect/strip SQL or codes — that plain-English contract
-    is enforced by the tool description + system prompt, never here.
+        Does NOT attempt to detect or strip SQL or codes — that contract is enforced by the tool
+        description and system prompt, never here.
     """
     if not isinstance(raw, list | tuple):
         return []
@@ -84,10 +71,11 @@ def clean_assumptions(raw: Any) -> list[str]:
 
 
 def fold_assumptions(target: list[str], raw: Any) -> None:
-    """Clean *raw* and append each assumption to *target* IN PLACE, skipping any
-    already present (dedupe, first-occurrence order). The SINGLE fold used by the
-    agent loop's accumulation, the loop's blueprint-resume trail reconstruction,
-    and `session_history`'s history gather — so all three stay in lockstep."""
+    """Clean *raw* and append each assumption to *target* IN PLACE, skipping any already
+        present (dedupe, first-occurrence order). The SINGLE fold used by the loop's
+        accumulation, the loop's blueprint-resume trail reconstruction and `session_history`, so
+        all three stay in lockstep.
+    """
     for assumption in clean_assumptions(raw):
         if assumption not in target:
             target.append(assumption)
@@ -96,11 +84,10 @@ def fold_assumptions(target: list[str], raw: Any) -> None:
 class RecordAssumptionsTool:
     """The `recordAssumptions(assumptions)` runtime tool.
 
-    Stateless: `run` never raises on malformed args (the loop's
-    `_run_runtime_tool` also guards, defense in depth) and never holds the
-    accumulated assumptions itself — it just returns a small confirmation. The
-    loop reads `arguments["assumptions"]` directly (via `clean_assumptions`) to
-    fold into the window's `TurnAccumulators`.
+        Stateless: `run` never raises on malformed args (the loop's `_run_runtime_tool` also
+        guards, defense in depth) and never holds the accumulated assumptions itself — it just
+        returns a small confirmation. The loop reads `arguments["assumptions"]` via
+        `clean_assumptions`.
     """
 
     tool_name = TOOL_NAME

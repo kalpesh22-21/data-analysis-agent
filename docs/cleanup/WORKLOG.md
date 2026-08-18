@@ -829,3 +829,24 @@ clean. Net: two genuine deletions (L1, L2), one new lifecycle module,
 
 NEXT (user 2026-08-18): docstring trim wave (src/ only; contracts kept,
 narratives move to WORKLOG/git), then Tier 4 Wave B.
+
+## #23 — docstring trim wave (2026-08-18)
+
+User decision: minimal docstrings across the code. Three parallel slices
+(runtime/ · learning/+top-level · scripts/+ui/), one shared contract: one
+summary line + contract essentials (invariants, caller constraints,
+security notes); narratives, incident history and design argument deleted
+— they live in this WORKLOG and git history. Booby-trapped invariants kept
+as one terse line (+ a bare WORKLOG pointer only where an entry actually
+describes them). Comments (#) deliberately out of scope.
+
+Numbers: **−6,670 lines** total (runtime −2,704, docstring mass −29.6%;
+learning+top −3,551, −43%; scripts/ui −415, −37%). ~1,150 docstrings
+rewritten, none deleted (AST position pins). Every slice PROVED
+docstring-only: AST-with-docstrings-blanked and comment-token comparisons
+against base — zero code/comment differences; byte-pinned constants
+(AGENT_SYSTEM_PROMPT, tool-schema descriptions) untouched. Suite exactly
+baseline (6019/225/1) in all three worktrees and after the merge; ruff
+clean. Incidental accuracy fixes: two stale scope claims deleted
+(retrieval/__init__, reranker "NOT WIRED YET"), one dead file pointer
+dropped, the generalize package's pre-keep-and-annotate claim corrected.

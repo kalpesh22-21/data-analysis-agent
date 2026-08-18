@@ -1,21 +1,11 @@
 """Contract A — the S4-enriched blueprint payload (Wave-0 contract freeze, D102).
 
-S4 (the deterministic generalize + AST-rewrite + static-validate stage) computes a
-`BlueprintGeneralization` and merges it under `payload["generalization"]` on a
-blueprint candidate. S6 hashes it (`canonical_ast_norm` + `uses_rules`) and S9
-replays it (`sql_template` + `result_grain`). It maps 1:1 onto
-`runtime/blueprint/models.py::Blueprint` so a promoted candidate is executable with
-zero translation (§1 mapping table).
-
-**S4 is not built yet.** This module freezes the target SHAPE so S6/S9 can build
-against a fixture (`tests/fixtures/learning/s4_enriched_blueprint.json`) before S4
-is wired. The real compute (parse → generalize → rewrite → static-validate) lands
-with S4 in its own module; nothing here does stage logic — these are pure frozen
-value objects with `to_doc`/`from_doc` round-trip fidelity.
-
-The doc these dataclasses (de)serialize is exactly what lives at
-`envelope.payload["generalization"]`. It is entity-free by construction (derived
-only from the templated SQL, never the values).
+S4 computes a `BlueprintGeneralization` and merges it under `payload["generalization"]` on a
+blueprint candidate; S6 hashes it and S9 replays it. It maps 1:1 onto
+`runtime/blueprint/models.py::Blueprint`, so a promoted candidate is executable with zero
+translation. These are pure frozen value objects with `to_doc`/`from_doc` round-trip
+fidelity — no stage logic — and the doc they serialize is entity-free by construction,
+derived only from the templated SQL and never from the values.
 """
 
 from __future__ import annotations
@@ -59,8 +49,11 @@ class ResultGrainStamp:
 
 @dataclass(frozen=True)
 class StaticValidation:
-    """The S4 dry-run stamp. `outcome=="fail_to_review"` is an in-band value S7
-    routes on (a un-rewritable candidate is reviewed, never dropped — D52/D97)."""
+    """The S4 dry-run stamp.
+
+    `outcome=="fail_to_review"` is an in-band value S7 routes on — an un-rewritable candidate is
+    reviewed, never dropped (D52/D97).
+    """
 
     explain_ok: bool  # explainQuery dry-run parsed vs. current schema
     binds_to_subset_uses: bool  # every slot.binds_to ∈ uses (corpus_loader assertion)
@@ -93,8 +86,10 @@ class StaticValidation:
 
 @dataclass(frozen=True)
 class BlueprintGeneralization:
-    """What S4 computes and merges under `payload["generalization"]`. Entity-free
-    by construction (derived only from the templated SQL, never the values)."""
+    """What S4 computes and merges under `payload["generalization"]`.
+
+    Entity-free by construction: derived only from the templated SQL, never the values.
+    """
 
     sql_template: str | None  # single: top-level template. composite: None (per-node below)
     uses: tuple[str, ...]  # BYTE-EXACT "database.table.column" scope keys (D87)

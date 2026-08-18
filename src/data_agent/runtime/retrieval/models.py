@@ -1,15 +1,12 @@
 """Retrieval data model — the frozen dataclasses the pipeline produces (D7/D8).
 
-Per `docs/decisions/retrieval-pipeline-design.md` §3.2. Every type here is an
-immutable value object: recall produces `Candidate`s; the pipeline cuts them to
-`ThinCard`/`KnowledgeHit`; `RetrievedContext` is the single per-turn block the
-renderer turns into one model-facing system message.
+Every type here is an immutable value object: recall produces `Candidate`s; the pipeline
+cuts them to `ThinCard`/`KnowledgeHit`; `RetrievedContext` is the single per-turn block the
+renderer turns into one model-facing message.
 
-`Candidate.score` is filled AFTER construction (by rerank, or by recall
-similarity on the degrade path) via `dataclasses.replace` — the dataclass is
-frozen, so scoring is functional (a new value), never a mutation. `payload`
-being a `dict` does not make `Candidate` unhashable-in-practice-a-problem: no
-code ever hashes a `Candidate`.
+`Candidate.score` is filled AFTER construction — by rerank, or by recall similarity on the
+degrade path — via `dataclasses.replace`: the dataclass is frozen, so scoring is functional,
+never a mutation.
 """
 
 from __future__ import annotations
@@ -34,20 +31,18 @@ class Candidate:
 
 @dataclass(frozen=True)
 class SlotSummary:
-    """One slot as it appears on a blueprint SEARCH card (release-1 §02).
+    """One slot as it appears on a blueprint SEARCH card.
 
-    DELIBERATELY `{name, type, required}` and nothing else — enough to judge
-    applicability and to fill `runBlueprint`. The AUTHORED slot (`slots_json`,
-    `blueprint.models.SlotSpec`) additionally carries `binds_to`
-    ("database.table.column"), `enum_values`, `optional_pattern` and numeric
-    bounds. Those are execution detail — what `getBlueprint` exists to serve —
-    and `binds_to` in particular is a fully-qualified COLUMN IDENTIFIER that
-    would otherwise ship on every one of `k` cards.
+        DELIBERATELY `{name, type, required}` and nothing else — enough to judge applicability
+        and to fill `runBlueprint`. The AUTHORED slot (`slots_json`, `blueprint.models.SlotSpec`)
+        additionally carries `binds_to` ("database.table.column"), `enum_values`,
+        `optional_pattern` and numeric bounds: those are execution detail `getBlueprint` exists
+        to serve, and `binds_to` in particular is a fully-qualified COLUMN IDENTIFIER that would
+        otherwise ship on every one of `k` cards.
 
-    The projection is enforced in exactly ONE place, `RetrievalPipeline.
-    _to_thin_card`; `Candidate.payload` may carry the raw decoded slots, the card
-    may not. Keep it that way — widening this type widens both the pre-injected
-    block and the tool result at once.
+        The projection is enforced in exactly ONE place, `RetrievalPipeline._to_thin_card`;
+        `Candidate.payload` may carry the raw decoded slots, the card may not. Widening this type
+        widens both the pre-injected block and the tool result at once.
     """
 
     name: str
@@ -58,13 +53,11 @@ class SlotSummary:
 def coerce_result_grain(raw: Any) -> tuple[str, ...] | None:
     """Coerce a stored `result_grain` into the card's column tuple, else `None`.
 
-    A grain is legal in two shapes (`blueprint/models.py`): a bare list of
-    column/alias names, or `{"columns": [...], "verifiable": bool}`. The card
-    carries the COLUMN TUPLE only — `verifiable` is a D56 statement about the
-    runtime's own post-run checking, not something the model routes on, so it is
-    dropped rather than invite reasoning about it. Anything else — a non-list, a
-    dict with no usable `columns`, a list with no strings — degrades to `None`
-    and the key is simply omitted (fail-soft, never raises).
+        A grain is legal in two shapes: a bare list of column/alias names, or
+        `{"columns": [...], "verifiable": bool}`. The card carries the COLUMN TUPLE only —
+        `verifiable` is a D56 statement about the runtime's own post-run checking, not something
+        the model routes on. Anything else — a non-list, a dict with no usable `columns`, a list
+        with no strings — degrades to `None` and the key is omitted (fail-soft, never raises).
     """
     columns: Any = raw.get("columns") if isinstance(raw, dict) else raw
     if not isinstance(columns, list):
@@ -75,21 +68,18 @@ def coerce_result_grain(raw: Any) -> tuple[str, ...] | None:
 
 @dataclass(frozen=True)
 class ThinCard:
-    """A top-N blueprint thin card (03 §Thin cards) — id + intent + slots summary,
-    ENRICHED (release-1 §02) so the model can choose between candidates without
-    spending a `getBlueprint` round-trip per candidate.
+    """A top-N blueprint thin card — id + intent + slots summary, ENRICHED so the model can
+        choose between candidates without spending a `getBlueprint` round-trip per candidate.
 
-    The additive fields default to `None`/`0` so every existing construction site
-    stays valid AND a blueprint with no stored DAG produces a card that renders
-    and serialises byte-identically to before.
+        The additive fields default to `None`/`0`, so every existing construction site stays
+        valid AND a blueprint with no stored DAG produces a card that renders and serialises
+        byte-identically to before.
 
-    `status` is DELIBERATELY ABSENT. Recall filters
-    `coalesce(node.status,'validated') = 'validated'`
-    (`vector_index._BLUEPRINT_RECALL_QUERY`), so every card is validated BY
-    CONSTRUCTION — the field would be a constant carrying no information, and
-    surfacing it would imply a distinction that cannot occur in a search result.
-    It stays on `getBlueprint`, where a KEYED fetch by id genuinely can return a
-    non-validated blueprint.
+        `status` is DELIBERATELY ABSENT. Recall filters
+        `coalesce(node.status,'validated') = 'validated'`, so every card is validated BY
+        CONSTRUCTION — the field would be a constant carrying no information, and surfacing it
+        would imply a distinction that cannot occur in a search result. It stays on
+        `getBlueprint`, where a KEYED fetch by id genuinely can return a non-validated blueprint.
     """
 
     id: str
@@ -126,21 +116,17 @@ class KnowledgeHit:
 
 @dataclass(frozen=True)
 class BlueprintDetail:
-    """The stored D87 retrieval projection of one blueprint — what `getBlueprint`
-    returns (read-tools-design §1.2), GROWN ADDITIVELY with the full DAG
-    (`sql_template`, typed `slots`, `resolves`, `uses_rules`, `composes`,
-    `result_grain`) now that the `runBlueprint` brick lands (runblueprint-design
-    §1 / OQ-T1). The additive fields default to `None`/`empty` so every existing
-    D87/D88 construction still holds — the recall projection is unchanged.
+    """The stored retrieval projection of one blueprint — what `getBlueprint` returns, GROWN
+        ADDITIVELY with the full DAG (`sql_template`, typed `slots`, `resolves`, `uses_rules`,
+        `composes`, `result_grain`). The additive fields default to `None`/empty, so the recall
+        projection is unchanged.
 
-    `uses` is a `frozenset[str] | None` (NOT the rendered list): `None` is the
-    fail-closed undetermined marker (a corrupt/absent stored `uses`), so a
-    scope check via `scope_filter.is_blueprint_in_scope` DROPS it rather than
-    fail-open — mirroring `Candidate.uses`. The tool renders it as a sorted list.
+        `uses` is a `frozenset[str] | None`, NOT the rendered list: `None` is the fail-closed
+        undetermined marker (a corrupt or absent stored `uses`), so a scope check DROPS it rather
+        than fail open, mirroring `Candidate.uses`. The tool renders it as a sorted list.
 
-    The full-DAG fields are carried JSON-DECODED (dicts/lists/str/None), NOT the
-    typed `runtime.blueprint` objects — retrieval stays free of blueprint typing;
-    `runtime.blueprint.models.Blueprint.parse(...)` turns them into typed objects.
+        The full-DAG fields are carried JSON-DECODED, not as typed `runtime.blueprint` objects —
+        retrieval stays free of blueprint typing; `Blueprint.parse` does that conversion.
     """
 
     id: str

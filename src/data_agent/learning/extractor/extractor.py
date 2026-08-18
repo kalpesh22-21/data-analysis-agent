@@ -1,73 +1,20 @@
 """LearningExtractor — the RAG-grounded, structured-output extractor (S3, D31).
 
-Turns one KEEP-triaged `SessionSummary` into zero-or-more typed candidate
-envelopes via a FORCED tool call (no free text, D31), retrying on a malformed
-response. The model client is INJECTED (the runtime `ModelClient` seam) so
-Layer-1 tests drive a deterministic `ScriptedModelClient` — no real LLM in unit
-tests. The extractor emits a PLAN only (never SQL, D35); the AST rewrite is S4.
+One KEEP-triaged `SessionSummary` → zero or more typed candidate envelopes via a FORCED
+tool call (no free text). The model client is INJECTED, so Layer-1 tests drive a scripted
+double; the extractor emits a PLAN only, never SQL (D35). Prior art comes from a MANDATORY
+pre-fetch block plus an OPTIONAL, per-call-capped `searchCorpus` tool.
 
-**Prior-art grounding (plan §3a).** The extractor used to be shown the session and
-nothing else, so it re-proposed artifacts the corpus already carries — a defect dedup
-catches one whole LLM call too late, and only for blueprints. Two reads now sit in
-front of the emit, and they are deliberately different in kind:
+`_drive_turns` runs THREE INDEPENDENT BUDGETS — `max_search_calls`, `max_retries` (a
+malformed response; exhausting it RAISES, which dead-letters the session) and
+`max_shape_corrections` (shared across every correctable family; exhausting it DECLINES).
+Pooling any two would couple unrelated failures: a shape decline that ate the retry budget
+would turn a later genuinely-malformed response into a dead-lettered session.
 
-  * A MANDATORY pre-fetch keyed on the session's question + accepted SQL, injected as
-    a `PRIOR ART` block. Mandatory rather than offered, because the value is in the
-    case where the model would NOT have thought to look — an optional lookup is
-    consulted exactly when it is least needed.
-  * An OPTIONAL `searchCorpus` tool, capped per extraction. One session can yield
-    several candidates of different types (a blueprint plus a knowledge note on an
-    unrelated topic), and a single pre-fetch keyed on the session intent cannot cover
-    the second one. The tool is what makes the second candidate checkable.
-
-**Three loop-ish behaviours, three independent budgets.** `_drive_turns` is one `while`
-with three ways to go round again, and they are deliberately not pooled:
-
-  * a SEARCH turn (`max_search_calls`, per CALL) — the model asked the corpus a
-    question instead of answering; it is served and re-asked.
-  * a MALFORMED-response retry (`max_retries`) — the response was not a valid
-    `emit_candidates` call at all, so nothing could be read from it. Exhausting this
-    one RAISES, which is what routes the session to dead-letter.
-  * a SHAPE CORRECTION (`max_shape_corrections`) — the call parsed, but a candidate
-    inside it declined for something the extractor can state as a named, one-field fix:
-    a field that could not be read into the typed model, or (since the rule-hint family)
-    a `rule_id` the catalog can name the counterpart of. The model is told which field
-    and what it must contain, and re-emits. Exhausting this one DECLINES, with the
-    attempt recorded on the decline. The budget is SHARED across those families on
-    purpose: it bounds how many extra prompts one session may cost, and that bound must
-    not grow every time a new correctable family is added.
-
-Pooling any two would couple failures with unrelated causes: a model that cannot call
-the tool would eat the budget meant for a model that called it with a mis-shaped
-argument, and vice versa — and the second direction is worse, because a shape decline
-that consumed the retry budget would turn a later genuinely-malformed response into a
-raise, i.e. a dead-lettered session caused by an unrelated formatting slip.
-
-**Termination.** Every iteration ends in exactly one of four ways, three of which
-strictly decrease a distinct non-negative counter that also guards the branch:
-`searches_left` (search turn, guarded `> 0`, decreases by the number served, which is
-`>= 1` whenever the branch is taken), `attempts_left` (malformed retry, guarded by the
-`while`, decreases by 1, raises at 0), `corrections_left` (correction, guarded `> 0`,
-decreases by 1). The fourth returns. So the loop makes at most
-`max_search_calls + (max_retries + 1) + max_shape_corrections` provider round-trips —
-6 + 2 = 8 at the shipped defaults. `test_search_loop_termination_qa.py` and
-`test_correction_loop_qa.py` assert that bound empirically against hostile scripts,
-because a three-counter argument spread over four functions is not something to trust
-on inspection alone.
-
-**The no-index path keeps its shape.** With no `PriorArtIndex` wired this class makes
-one forced tool call with `emit_candidates` as the only tool offered and
-retry-on-malformed, exactly as before plan §3a — no PRIOR ART block, no `searchCorpus`
-tool, no prior-art rules in the system prompt. (The system prompt is NOT byte-identical
-for such a deployment: rule 5 gained the windowed slot-type instructions, which every
-deployment needs — see `SLOT_TYPES`. What is unchanged is the tool list, the turn
-count, and the absence of every prior-art surface.) The correction budget is orthogonal
-to the index: it costs nothing until a candidate declines on shape.
-
-**Fail-open, everywhere.** An unreachable index degrades the prompt, never the run —
-see `prior_art.py::lookup_prior_art`. The distinction between "we looked and found
-nothing" and "we could not look" is carried into the prompt text rather than collapsed,
-because collapsing it is how a graph outage becomes a confident novelty claim.
+With no `PriorArtIndex` wired the tool list, the turn count and the absence of every
+prior-art surface are exactly what they were pre-§3a. Fail-open throughout: an unreachable
+index degrades the prompt, never the run, and "we could not look" is never collapsed into
+"we looked and found nothing".
 """
 
 from __future__ import annotations
@@ -250,8 +197,7 @@ class LearningExtractor:
     async def extract(
         self, summary: SessionSummary, verdict: TriageVerdict
     ) -> ExtractionResult:
-        """Run the forced-structured-output call + validation. Returns the
-        structurally-valid candidates + the declines (each with a reason code)."""
+        """Run the forced-structured-output call + validation → the candidates and the declines."""
         prior_art = await self._prefetch_prior_art(summary)
         return await self._drive_turns(summary, verdict, prior_art)
 
@@ -260,15 +206,12 @@ class LearningExtractor:
     async def _prefetch_prior_art(self, summary: SessionSummary) -> PriorArtLookup | None:
         """The MANDATORY pre-fetch, or `None` when no index is wired.
 
-        `None` (unwired) and `PriorArtLookup(available=False)` (wired but unreachable)
-        are kept apart all the way here: unwired means the prompt carries NO block at
-        all, which is the pre-slice prompt; unreachable means the block is present and
-        says so, so the model can discount its own novelty judgement.
-
-        The unwired case logs at DEBUG, not WARNING: it is a static deployment fact the
-        composition root already shouts about once at startup, and repeating it per
-        session would be pure noise at the 7000/day volume this loop is sized for. An
-        UNREACHABLE index is the loud one — that is an outage, and it is transient."""
+        `None` (unwired) and `PriorArtLookup(available=False)` (wired but unreachable) are kept
+        apart all the way here: unwired means the prompt carries NO block at all, unreachable means
+        the block is present and says so. Unwired logs at DEBUG — a static deployment fact the
+        composition root already shouts once at startup — while an UNREACHABLE index is the loud
+        one, because it is an outage and it is transient.
+        """
         if self._prior_art is None:
             _logger.debug(
                 "extractor: no prior-art index wired for session %s — extracting with "
@@ -295,17 +238,12 @@ class LearningExtractor:
     ) -> tuple[list[dict], int]:
         """Answer one turn's tool calls, returning `(messages_to_append, calls_served)`.
 
-        EVERY tool call in the turn gets a reply, not just the searches. A provider
-        rejects a follow-up whose history leaves a tool call unanswered, so a model that
-        emits `searchCorpus` alongside a hallucinated tool would otherwise wedge the
-        conversation on the next turn — an infrastructure error dressed up as a model
-        error. An unrecognized name gets an explicit "no such tool" instead.
-
-        The budget is spent PER CALL. A model can request several searches in one turn,
-        and each one costs an embed plus an ANN query per corpus, so counting turns
-        would let a single turn multiply the cost arbitrarily. Calls past the budget are
-        answered with a refusal rather than silently dropped — a silently dropped call
-        reads to the model as an empty corpus.
+        EVERY tool call in the turn gets a reply, not just the searches: a provider rejects a
+        follow-up whose history leaves a tool call unanswered, so an unrecognized name gets an
+        explicit "no such tool" rather than wedging the conversation. The budget is spent PER CALL
+        — each search costs an embed plus an ANN query per corpus — and calls past it are answered
+        with a refusal rather than silently dropped, which would read to the model as an empty
+        corpus.
         """
         messages: list[dict] = [_assistant_tool_calls(result)]
         served = 0
@@ -331,10 +269,10 @@ class LearningExtractor:
     async def _run_search(self, arguments: object) -> str:
         """One `searchCorpus` call → rendered cards. Never raises.
 
-        A rejected argument shape is reported to the MODEL (it can retry with a better
-        query) rather than logged and turned into an empty result, because an empty
-        result is indistinguishable from "nothing exists" — the same conflation the
-        whole slice is about."""
+        A rejected argument shape is reported to the MODEL, which can retry with a better query,
+        rather than logged and turned into an empty result — an empty result is indistinguishable
+        from "nothing exists".
+        """
         parsed = parse_search_corpus_args(arguments)
         if parsed is None:
             return (
@@ -366,30 +304,23 @@ class LearningExtractor:
     ) -> ExtractionResult:
         """Drive the turn(s) to a validated `ExtractionResult`, or raise.
 
-        TERMINATION (the reason this is a `while` and not a `for`): every iteration ends
-        in exactly one of four ways, and three of them strictly decrease a distinct
-        non-negative counter that also guards the branch —
+        TERMINATION (the reason this is a `while` and not a `for`): every iteration ends in exactly
+        one of four ways, and three of them strictly decrease a distinct non-negative counter that
+        also guards the branch —
 
-            searches_left     search turn      guarded `> 0`; -= served, and
-                                               `served >= 1` whenever the branch runs
+            searches_left     search turn      guarded `> 0`; -= served, and `served >= 1`
             attempts_left     malformed retry  guarded by the `while`; -= 1; raises at 0
             corrections_left  shape correction guarded `> 0`; -= 1
             (return)          a validated result
 
-        so the loop runs at most `max_search_calls + (max_retries + 1) +
-        max_shape_corrections` times. A search turn and a correction turn deliberately
-        do NOT consume a parse attempt: the retry budget is for MALFORMED output, and
-        spending it on a tool call the extractor itself offered — or on a candidate that
-        parsed perfectly well and merely had a field of the wrong type — would make the
-        retry contract depend on how chatty or how sloppy the model is.
+        so the loop runs at most `max_search_calls + (max_retries + 1) + max_shape_corrections`
+        times. A search or correction turn deliberately does NOT consume a parse attempt: the retry
+        budget is for MALFORMED output, and spending it on a tool call the extractor itself offered
+        would make the retry contract depend on how chatty the model is.
 
-        ONE ASYMMETRY WORTH STATING. Exhausting `attempts_left` raises, EXCEPT once a
-        correction has been issued, where it returns what has already been validated.
-        Before this slice a parsed turn returned immediately, so an unparseable response
-        after a good one was impossible; now it is reachable, and raising there would
-        dead-letter a session whose candidates we already hold. A correction is an
-        optional extra ask, and an optional extra ask must never be able to cost more
-        than it was asked for.
+        ONE ASYMMETRY: exhausting `attempts_left` raises, EXCEPT once a correction has been issued,
+        where it returns what has already been validated. An optional extra ask must never be able
+        to cost more than it was asked for.
         """
         client = begin_turn_client(self._model_client)
         messages = self._build_messages(summary, verdict, prior_art)
@@ -499,16 +430,13 @@ class LearningExtractor:
     ) -> tuple[list[ExtractedCandidate], list[Decline], list[tuple[int, Decline]]]:
         """Validate one emitted array → `(kept, settled, correctable)`.
 
-        The three-way split IS the correction policy: `settled` holds the declines that
-        judged the candidate's CONTENT (no evidence, an un-covered predicate, an unknown
-        rule id the catalog cannot name a counterpart for) and must never be re-asked,
-        because re-asking those is talking a model out of a refusal it was right to make.
-        The correctable ones keep their position in the emitted array so the correction
-        can name which candidate it means without quoting the candidate back.
-
-        The split is read off `Decline.correctable`, not off a list of reason codes, so a
-        new correctable family (`validation.py::_rule_hint` is the third) routes here the
-        day it is added rather than the day someone remembers to extend a set."""
+        The three-way split IS the correction policy: `settled` holds the declines that judged the
+        candidate's CONTENT and must never be re-asked, because re-asking those is talking a model
+        out of a refusal it was right to make. The correctable ones keep their POSITION in the
+        emitted array, so the correction can name which candidate it means without quoting the
+        candidate back. The split is read off `Decline.correctable`, not off a list of reason codes,
+        so a new correctable family routes here the day it is added.
+        """
         kept: list[ExtractedCandidate] = []
         settled: list[Decline] = []
         shape: list[tuple[int, Decline]] = []
@@ -601,28 +529,16 @@ def _finish(
     summary: SessionSummary,
     raw_candidates: list[dict],
 ) -> ExtractionResult:
-    """Assemble the result, stamping the correction record — and the payload it was
-    judged on — onto the declines that SURVIVED correction.
+    """Assemble the result, stamping the correction record onto the declines that SURVIVED it.
 
-    Only *pending* is stamped. A substantive decline was never re-asked and must not
-    look as though it was; a correctable decline that outlived the budget must carry the
-    count and the messages, so a human reading the inbox can tell "the model could not
-    produce a valid candidate" from "the model was never asked twice" — and so the
-    second reading is impossible to reach by accident, since a zero on a correctable
-    decline now means the budget was disabled or already spent elsewhere.
-
-    THE PAYLOAD IS STAMPED HERE, at the one place that holds both halves. `pending`
-    carries each decline's index into the array the model LAST emitted, and that pairing
-    exists nowhere else — `ExtractionResult` has never carried the raw output, and by the
-    time the consumer sees a decline the batch is gone. Stamping it in `_finish` also
-    covers both exits from the turn loop, including the one where the model stopped
-    returning parseable calls after a correction (the asymmetry documented in
-    `_drive_turns`), which is exactly the run whose last attempt is most worth keeping.
-
-    Index-bounded rather than assumed: `pending` and *raw_candidates* come from the same
-    batch by construction, but an out-of-range index would be a crash in a queue worker,
-    and the honest degrade (a decline with no payload — the pre-slice shape) costs a
-    review item, not a session."""
+    Only *pending* is stamped: a substantive decline was never re-asked and must not look as
+    though it was, while a correctable one that outlived the budget must carry the count and the
+    messages, so a reader can tell "could not produce a valid candidate" from "was never asked
+    twice". THE PAYLOAD IS STAMPED HERE, at the one place holding both halves — `pending` carries
+    each decline's index into the array the model LAST emitted, and that pairing exists nowhere
+    else. Index-bounded rather than assumed: an out-of-range index would be a crash in a queue
+    worker, and the honest degrade (a decline with no payload) costs a review item, not a session.
+    """
     corrected = [
         replace(
             decline,
@@ -657,15 +573,13 @@ def _finish(
 
 
 def _correction_messages(result: ModelTurnResult, correction: str) -> list[dict]:
-    """Echo the emitting turn and answer EVERY tool call in it, the correction riding
-    on the reply to `emit_candidates`.
+    """Echo the emitting turn and answer EVERY tool call in it.
 
-    A tool RESULT rather than a fresh user message, because that is where a model looks
-    for the outcome of a call it just made — and because leaving the call unanswered is
-    not an option: a provider rejects a follow-up whose history has a dangling tool
-    call, which is the same rule `_serve_search_calls` follows and for the same reason.
-    A `searchCorpus` call that arrived alongside the emit is answered too (it was not
-    served — the emit wins, see `_is_search_only`) so nothing dangles."""
+    The correction rides on the reply to `emit_candidates` — a tool RESULT rather than a fresh
+    user message, because that is where a model looks for the outcome of a call it just made,
+    and because a provider rejects a follow-up whose history has a dangling tool call. A
+    `searchCorpus` call that arrived alongside the emit is answered too, so nothing dangles.
+    """
     messages: list[dict] = [_assistant_tool_calls(result)]
     for call in result.tool_calls:
         content = (
@@ -683,9 +597,9 @@ def _correction_messages(result: ModelTurnResult, correction: str) -> list[dict]
 def _is_search_only(result: ModelTurnResult) -> bool:
     """Did this turn ask for a search and NOT emit?
 
-    An `emit_candidates` call WINS over a concurrent `searchCorpus` one: the model has
-    answered, and serving the search would discard that answer to ask a question it has
-    already stopped needing."""
+    An `emit_candidates` call WINS over a concurrent `searchCorpus` one: the model has answered,
+    and serving the search would discard that answer to ask a question it has stopped needing.
+    """
     if any(call.name == EXTRACTOR_TOOL_NAME for call in result.tool_calls):
         return False
     return any(call.name == SEARCH_CORPUS_TOOL_NAME for call in result.tool_calls)
@@ -694,9 +608,9 @@ def _is_search_only(result: ModelTurnResult) -> bool:
 def _assistant_tool_calls(result: ModelTurnResult) -> dict:
     """The canonical assistant message echoing a turn's tool calls (`model/client.py`).
 
-    `arguments` is re-serialized to a JSON string because that is the canonical wire
-    shape; `default=str` covers a scripted double handing us a value that never came
-    from JSON, so a test fixture can never make this the crash site."""
+    `arguments` is re-serialized to a JSON string because that is the canonical wire shape;
+    `default=str` covers a scripted double handing us a value that never came from JSON.
+    """
     return {
         "role": "assistant",
         "content": result.assistant_text,

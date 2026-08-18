@@ -1,13 +1,10 @@
 """Deterministic triage gate (D100, §3) — keep/skip, no LLM.
 
-A pure function of the `SessionSummary`: KEEP on any positive signal (K1–K4),
-else SKIP with a reason code. Runs BEFORE any extractor cost, so the ~majority of
-sessions that teach nothing are dropped for zero tokens. Every decision is a pure
-function of the summary → Layer-1 unit-testable with exact fixtures.
-
-Bias is PERMISSIVE (keep on any signal): the cost of heuristics is recall risk,
-mitigated by the observable skip-reason telemetry (§3.4) — an LLM refinement can
-later trim false-keeps over the KEEP set without touching this contract.
+A pure function of the `SessionSummary`: KEEP on any positive signal (K1–K4), else SKIP with a
+reason code. Runs BEFORE any extractor cost, so the majority of sessions that teach nothing
+are dropped for zero tokens. Bias is PERMISSIVE — the cost of heuristics is recall risk,
+mitigated by the observable skip-reason telemetry, and an LLM refinement can later trim
+false-keeps over the KEEP set without touching this contract.
 """
 
 from __future__ import annotations

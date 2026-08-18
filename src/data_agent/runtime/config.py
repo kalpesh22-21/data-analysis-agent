@@ -1,32 +1,14 @@
-"""RuntimeSettings — env-var configuration surface for the Phase-0 agent runtime.
+"""RuntimeSettings — env-var configuration surface for the agent runtime.
 
-Mirrors `clickhouse-api`'s `app/config.py` Settings pattern (pydantic-settings,
-uppercased env vars, `.env` file support, `extra="ignore"`). Every field maps
-1-to-1 to an environment variable of the same name.
+Mirrors `clickhouse-api`'s `app/config.py` Settings pattern (pydantic-settings, uppercased
+env vars, `.env` file support, `extra="ignore"`). Every field maps 1-to-1 to an environment
+variable of the same name, and each field's own comment records how its default was derived.
 
-Tunable defaults below were LOCKED per the orchestrator's Pass-A brief (not
-independently re-derived): session_ttl_seconds=604800 (7 days),
-preview_row_count=20, max_loop_iterations=15, max_wall_clock_seconds=60,
-max_budget_windows=3. See docs/decisions/
-phase0-runtime-design.md §11 (OQ-D/G/H/I) for the provenance of these numbers
-— they were explicitly provisional pending real Phase-0 traffic.
-
-**The loop budget has since been raised on that traffic** (Release 1, 2026-08-12):
-`max_wall_clock_seconds` 60 -> 180 and `max_loop_iterations` 15 -> 25. Live turns
-were capping on the WALL CLOCK at ~61-73s with iterations sitting at ~8 of 15 — the
-blueprint-definition gate added a round-trip per blueprint, and a multi-intent turn
-now legitimately needs 8+ rounds. `max_tool_calls_per_iteration` (8) and
-`max_budget_windows` (3) are unchanged; see their own field comments for why.
-
-`max_window_token_spend=1_000_000` was ADDED in the same pass (2026-08-12) and is
-what makes 25 a reachable round count. `BudgetGuard`'s token ceiling had no field
-of its own and borrowed `model_context_window` (128k), so a per-window SUM of
-whole replayed requests was compared against a single-request OCCUPANCY limit —
-quadratic in round count, ending windows at 6-14 rounds with the real context at
-12-31% of the window. Occupancy is not that counter's concern (a single request is
-bounded by `request_token_budget()` at the send seam); SPEND is, and spend now has
-its own explicit ceiling, derived from measured full-window spend in the field's
-own comment. See docs/decisions/release-1/README.md finding 30.
+`max_window_token_spend` exists because `BudgetGuard`'s token ceiling has to be a SPEND
+limit, not an occupancy one: borrowing `model_context_window` compared a per-window SUM of
+whole replayed requests against a single-request OCCUPANCY limit — quadratic in round count,
+ending windows at a fraction of real occupancy. A single request is bounded separately by
+`request_token_budget()` at the send seam.
 """
 
 from __future__ import annotations
@@ -819,20 +801,20 @@ class RuntimeSettings(BaseSettings):
         return self.agent_system_prompt if self.agent_system_prompt_enabled else None
 
     def request_token_budget(self) -> int:
-        """Absolute cap on the FULL assembled request (all messages) handed to
-        `send_turn`: the model context window minus the reserve held back for the
-        model's own output, times a 0.8 headroom factor.
+        """Absolute cap on the FULL assembled request (all messages) handed to `send_turn`: the
+                model context window minus the reserve held back for the model's own output, times a
+                0.8 headroom factor.
 
-        The 0.8 is headroom because the chars/4 estimator under-counts JSON/SQL-
-        dense content (~3 chars/token in practice): a list "fitted" to the raw
-        window could still be ~20-30% over the REAL window and let the endpoint
-        front-truncate the leading base prompt (the exact bug this fixes). The
-        margin is applied ONLY at this request-fit seam, not to the shared
-        estimator, so trail-compaction token math is untouched.
+                The 0.8 is headroom because the chars/4 estimator under-counts JSON- and SQL-dense
+                content (~3 chars/token in practice): a list "fitted" to the raw window could still
+                be 20-30% over the REAL window and let the endpoint front-truncate the leading base
+                prompt. The margin is applied ONLY at this request-fit seam, so the shared estimator
+                and the trail token math are untouched.
 
-        Clamped to at least 1 so a (mis)configuration where the reserve meets or
-        exceeds the window can never yield a non-positive budget the fit walk
-        would treat as "drop everything"."""
+                Clamped to at least 1, so a configuration where the reserve meets or exceeds the
+                window can never yield a non-positive budget the fit walk would treat as "drop
+                everything".
+        """
         headroom = (
             self.model_context_window - self.response_token_reserve
         ) * _REQUEST_BUDGET_HEADROOM
@@ -856,17 +838,14 @@ class RuntimeSettings(BaseSettings):
     def catalog_api_base(self) -> str:
         """Resolve the MCP catalog-export base URL (…/catalog), no trailing slash.
 
-        Uses `catalog_api_url` when set; otherwise derives it from `mcp_url` by
-        replacing the MCP mount path with `/catalog` (the route lives on the same MCP
-        host, Wave 1a). E.g. `http://host:18090/mcp` → `http://host:18090/catalog`.
-        `HttpCatalogClient` appends `/export`.
+                Uses `catalog_api_url` when set; otherwise derives it from `mcp_url` by replacing the
+                MCP mount path with `/catalog` (the route lives on the same MCP host).
+                `HttpCatalogClient` appends `/export`.
 
-        WARNING: the derivation keeps ONLY `mcp_url`'s scheme + netloc and
-        DISCARDS any path prefix. A path-routed ingress like
-        `https://host/prefix/mcp` therefore yields `https://host/catalog`
-        (NOT `https://host/prefix/catalog`), which may point at the wrong host
-        or 404. Set `catalog_api_url` to the explicit `…/catalog` base to
-        override the derivation in that case.
+                WARNING: the derivation keeps ONLY `mcp_url`'s scheme and netloc and DISCARDS any
+                path prefix, so a path-routed ingress like `https://host/prefix/mcp` yields
+                `https://host/catalog` — which may point at the wrong host or 404. Set
+                `catalog_api_url` to the explicit base to override the derivation in that case.
         """
         if self.catalog_api_url:
             return self.catalog_api_url.rstrip("/")
@@ -927,26 +906,22 @@ class RuntimeSettings(BaseSettings):
 def effective_llm_hide(settings: RuntimeSettings) -> bool:
     """The EFFECTIVE OpenAI-LLM-content hide, resolving the two observability flags.
 
-    Content is hidden ONLY when `otlp_hide_llm_content` is True AND the master
-    telemetry debug switch `otlp_disable_redaction` is False. Disabling redaction
-    forces the reveal (so a debugging operator sees the LLM Q/A + exception events
-    alongside the real tool calls) regardless of `otlp_hide_llm_content`. Truth
-    table (both flags now default toward REVEAL — see their field descriptions):
+        Content is hidden ONLY when `otlp_hide_llm_content` is True AND the master telemetry
+        debug switch `otlp_disable_redaction` is False. Disabling redaction forces the reveal, so
+        a debugging operator sees the LLM Q/A and exception events alongside the real tool calls:
 
-        hide_llm_content  disable_redaction  -> hidden?
-        True              False              -> True   (the ONLY hiding combination)
-        True              True               -> False  (revealed; disable wins)
-        False             False              -> False
-        False             True               -> False  (2026-08-10 SHIPPED DEFAULT)
+            hide_llm_content  disable_redaction  -> hidden?
+            True              False              -> True   (the ONLY hiding combination)
+            True              True               -> False  (revealed; disable wins)
+            False             False              -> False
+            False             True               -> False  (the shipped default)
 
-    Note what the flip cost: hiding the LLM content now takes TWO settings, not one.
-    `OTLP_HIDE_LLM_CONTENT=true` alone no longer hides anything, because
-    `otlp_disable_redaction` defaults True and overrides it. An operator who wants the
-    shape-only posture must set BOTH.
+        Note what that costs: hiding the LLM content takes TWO settings, not one.
+        `OTLP_HIDE_LLM_CONTENT=true` alone no longer hides anything, because
+        `otlp_disable_redaction` defaults True and overrides it.
 
-    `app.py` passes this single value to BOTH `configure_tracing(hide_llm_content=)`
-    (the LLMExceptionEventScrubber) and `instrument_openai(hide_content=)` (the
-    TraceConfig) so the two content channels can never disagree.
+        `app.py` passes this single value to BOTH `configure_tracing(hide_llm_content=)` and
+        `instrument_openai(hide_content=)`, so the two content channels can never disagree.
     """
     return settings.otlp_hide_llm_content and not settings.otlp_disable_redaction
 

@@ -1,25 +1,14 @@
 """Pure, injectable reconstruction of one session's learning-loop journey.
 
-Joins the THREE durable stores a human would otherwise have to correlate by hand
-across three daemon terminals:
+Joins the THREE durable stores a human would otherwise correlate by hand across three daemon
+terminals: the SESSION store (what the session was, its `learning_status`, the trail it was
+learned from), the CANDIDATE store (every candidate for that `content_hash`), and the AUDIT
+store (the quotes each candidate's `evidence_refs` point at). The walk is ORDINAL rather than
+query-based, so it needs no new store methods.
 
-  * the SESSION store (`session::<id>`)      — what the session was + its
-    `learning_status` + the `tool_trail` it was learned FROM;
-  * the CANDIDATE store (`candidate::<hash>::<n>`) — every candidate the extractor
-    emitted for that session's `content_hash`;
-  * the AUDIT store (`evidence::<id>::<uuid>`) — the entity-bearing quotes each
-    candidate's `evidence_refs` point at.
-
-The walk is ORDINAL, not query-based, so it needs NO new store methods (it matches
-`demo_learning_e2e_openai.py`): candidate ids are `mint_candidate_id(content_hash,
-ordinal)` for `ordinal = 0, 1, 2, …` until the first missing id.
-
-READ-ONLY by construction (D72): this module never writes and never creates a
-session doc. The real `CouchbaseSessionStore.get_session_with_cas` CREATES the doc
-on miss (a write) — so `_read_session` prefers the store's read-only `_get_doc`
-accessor when present and only falls back to `get_session_with_cas` for injected
-fakes that expose no read-only accessor. Every failure is collected into
-`SessionTrace.errors` rather than raised, so the CLI is robust to partial data.
+READ-ONLY by construction (D72): the real `get_session_with_cas` CREATES the doc on miss,
+which is a write, so `_read_session` prefers the store's read-only accessor. Every failure is
+collected into `SessionTrace.errors` rather than raised, so the CLI is robust to partial data.
 """
 
 from __future__ import annotations
@@ -56,12 +45,9 @@ class SessionTrace:
 async def _read_session(session_store, session_id: str) -> tuple[SessionDoc | None, object]:
     """Read the session doc READ-ONLY, returning `(doc | None, cas)`.
 
-    Prefers the store's private `_get_doc` (truly read-only: `(None, None)` on
-    miss) because the public `get_session_with_cas` CREATES the doc on miss on the
-    real Couchbase store — which would be a write AND would masquerade a missing
-    session as an empty one. Injected fakes without `_get_doc` fall back to the
-    public method (their `get_session_with_cas` is expected to be read-only / raise
-    / return None on miss, all of which the caller handles).
+    Prefers the store's private `_get_doc`, because the public `get_session_with_cas` CREATES the
+    doc on miss on the real store — which would be a write AND would masquerade a missing session
+    as an empty one. Injected fakes without `_get_doc` fall back to the public method.
     """
     read_only = getattr(session_store, "_get_doc", None)
     if callable(read_only):
@@ -80,9 +66,9 @@ async def reconstruct_session_trace(
 ) -> SessionTrace:
     """Reconstruct the `SessionTrace` for *session_id* from the durable stores.
 
-    Never raises for expected partial-data conditions (missing session, no
-    `content_hash`, missing/absent audit store, missing evidence refs): each is
-    recorded in `SessionTrace.errors` and a best-effort trace is still returned.
+    Never raises for expected partial-data conditions (a missing session, no `content_hash`, an
+    absent audit store, missing evidence refs): each is recorded in `SessionTrace.errors` and a
+    best-effort trace is still returned.
     """
     trace = SessionTrace(session_id=session_id)
 
@@ -145,8 +131,10 @@ async def reconstruct_session_trace(
 
 
 async def _resolve_evidence(candidate: CandidateTrace, audit_store, trace: SessionTrace) -> None:
-    """Resolve a candidate's `evidence_refs` against the audit store (if present),
-    recording a note for each missing/absent ref rather than raising."""
+    """Resolve a candidate's `evidence_refs` against the audit store, if one is present.
+
+    Records a note for each missing or absent ref rather than raising.
+    """
     if audit_store is None:
         return
     cid = candidate.envelope.candidate_id

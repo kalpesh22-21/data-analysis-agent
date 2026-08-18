@@ -1,90 +1,18 @@
-"""Dev launcher: the Phase-0 agent runtime (`create_app`), wired to Layer-1
-fakes only, so the minimal UI (`ui/`) can be exercised end-to-end WITHOUT an
-OpenAI API key, Couchbase, or the real ClickHouse MCP.
+"""Dev launcher: the Phase-0 agent runtime wired to Layer-1 fakes only (content-routed
+model + MCP doubles, in-memory session store, hermetic retrieval pipeline), so the
+minimal UI can be driven end-to-end with no OpenAI key, Couchbase or live ClickHouse MCP.
 
-Wiring (mirrors `tests/runtime/test_app.py::_build_client`, but as a live
-uvicorn process rather than a `TestClient`):
+JWT verification is NOT bypassed: settings point at the real `l2-token` JWKS from
+`docker-compose.integration.yml`, so that container must already be running.
+`max_loop_iterations` is deliberately LOW (3) to keep the budget-cap scenario reachable.
 
-    - `model_client`  -> `DemoModelClient` (below) — a small, content-routed
-      `ModelClient` double. NOT `ScriptedModelClient` verbatim: that class is
-      a single-use, strictly-ordered cassette (`AssertionError` once its
-      script is exhausted) — perfect for one pytest assertion, but this
-      launcher needs to serve an UNBOUNDED number of demo turns, from any
-      number of browser sessions, in either order. `DemoModelClient`
-      reproduces the same `ModelClient` Protocol (`send_turn`/`begin_turn`)
-      and the same `ModelTurnResult`/`ToolCallRequest` DTOs, but decides its
-      canned response by inspecting the canonical message shape the loop
-      hands it (see its docstring) instead of popping a fixed queue — so it
-      can be replayed indefinitely.
-    - `mcp_client`    -> `DemoMCPClient` (below), a thin subclass of
-      `data_agent.runtime.mcp.fake_client.FakeMCPClient`, scripted with a
-      repeated `getTableSchema` response (also for the same "must survive
-      many demo turns" reason — a `FakeMCPClient` scripted with exactly one
-      response would raise `AssertionError` on the second call). `runQuery`
-      is NOT scripted through the normal FIFO queue: `FakeMCPClient` forks
-      purely on tool name + call order, never on `args`, so it cannot itself
-      express "the SAME tool, called with different SQL, denied for
-      different reasons" — which the scope-denial (D57) and
-      parser-fail-closed (D63) conformance scenarios both need from the one
-      `runQuery` tool. `DemoMCPClient` overrides `call_tool` to content-route
-      `runQuery` off the submitted `query` string instead (see its
-      docstring); every other tool falls through to the base class unchanged.
-    - `session_store` -> `data_agent.runtime.session.memory_store.InMemorySessionStore`.
-    - `catalog`       -> a small hand-built `CatalogHandle` with one table
-      (`analytics.employees`) so `getTableSchema`'s provenance capture has
-      something real to resolve.
+Trigger phrases (matched case-insensitively on the FIRST user message; what each one
+does lives in `DemoModelClient.send_turn` / `DemoMCPClient.call_tool`):
+    ask | keep going | forever | salaries | raw sql | headcount by department |
+    bad headcount | average tenure | approve headcount | recall payroll | payroll
 
-JWT verification is NOT bypassed/monkeypatched: `RuntimeSettings.jwks_url` /
-`jwt_issuer` / `jwt_audience` are pointed at the already-running `l2-token`
-container's real JWKS endpoint (`docker-compose.integration.yml`, unmodified,
-untouched) — so a JWT minted by `ui/server.py` via the real token service is
-ALSO really verified here, exactly like production. Only the model provider
-and the ClickHouse MCP are faked (no OpenAI key, no live ClickHouse needed).
-
-Trigger phrases (content-routed on the FIRST user message of the turn,
-case-insensitive substring match — see `DemoModelClient.send_turn`):
-
-    | Phrase contains...        | Scenario                                    |
-    |----------------------------|---------------------------------------------|
-    | "ask"                      | clarify: askUser -> chip options -> resume   |
-    | "keep going" / "forever"   | budget-cap: never finishes -> paused_budget_cap |
-    | "salaries" / "salary"      | scope-denial (D57): COLUMN_SCOPE_VIOLATION   |
-    | "raw sql"                  | parser-fail-closed (D63): PARSE_FAILED_CLOSED |
-    | "headcount by department"  | runBlueprint fast path (D89): verified answer |
-    | "bad headcount"            | runBlueprint no-silent-verify (D56): VERIFY_FAILED -> raw loop |
-    | "average tenure"           | runBlueprint slot ask->clarify->resume (D49) |
-    | "approve headcount"        | runBlueprint approval pause/resume (D45/D59b) |
-    | "recall payroll"           | scope-narrowing turn 2 (D44): echo iff in scope |
-    | "payroll"                  | scope-narrowing turn 1 (D44): runQuery(sql=payroll) |
-    | (anything else)            | normal: getTableSchema -> final answer       |
-
-Slice-2 env toggles (all OFF by default → byte-identical to Slice 1):
-
-    | Env var                    | Effect                                        |
-    |----------------------------|-----------------------------------------------|
-    | DEMO_SESSION_STORE=couchbase | CouchbaseSessionStore (live l2-cb) for D45   |
-    | DEMO_TEST_SPANS=1          | in-memory span exporter + GET /_test/spans (D25) |
-
-(The D44 scope-narrowing BFF endpoint `POST /api/session/scope` is gated
-separately by `UI_TEST_AFFORDANCES=1` in ui/server.py — the runtime never
-sees that flag.)
-
-The four runBlueprint scenarios (D89) require the demo runtime to advertise a
-blueprint fast path, which `create_app` wires ONLY when a `RetrievalPipeline`
-is injected (`active_retrieval` non-None registers the read tools + runBlueprint
-+ the BlueprintExecutor). This launcher injects a HERMETIC pipeline built from a
-seeded `FakeVectorIndex` (keyed `get_blueprint` corpus — recall `entries` are
-left EMPTY, so recall returns 0 cards for EVERY question and the pre-injection
-step is inert for the 5 pre-existing scenarios) + a `FakeEmbeddingClient` (no
-neo4j, no embedder network). The blueprint executor's per-node `runQuery`/domain/
-grain probes are content-routed by `DemoMCPClient` off the SQL text (both the
-`sql` and `query` arg keys), statelessly — see its docstring.
-
-`RuntimeSettings.max_loop_iterations` is deliberately set LOW (3) below so
-the budget-cap scenario is reachable in a handful of demo turns without a
-real wall-clock wait; the normal/clarify/denial/parse-fail scenarios each
-only ever consume a single loop iteration, so they complete well under that
-cap regardless.
+Env toggles, both OFF by default: DEMO_SESSION_STORE=couchbase (D45 restart
+durability), DEMO_TEST_SPANS=1 (in-memory spans + GET /_test/spans).
 
 Run:
     uv run python scripts/run_ui_runtime.py
@@ -237,14 +165,12 @@ def _grain_probe_result(total: int, distinct: int) -> dict[str, Any]:
 def _blueprint_run_query(sql: str) -> dict[str, Any] | None:
     """Content-route one blueprint inner `runQuery` off its SQL text (D-L3-2).
 
-    Returns a canned `{columns, rows, row_count, truncated}` result, or `None`
-    when the SQL is not a blueprint query (so the caller falls through to the
-    base FakeMCPClient). Pure function of the SQL string — no per-call state.
-
-    Ordering matters: the D56 grain probe wraps the node SQL in a subquery aliased
-    with `__bp_*`, so it contains BOTH the `__bp_` marker AND the node's table
-    name — check the grain marker FIRST. And `demo.headcount_by_dept_bad` is a
-    superstring of `demo.headcount_by_dept`, so match the `_bad` table first.
+    Returns a canned `{columns, rows, row_count, truncated}` result, or `None` when the
+    SQL is not a blueprint query (the caller then falls through to the base
+    FakeMCPClient). Pure function of the SQL string. Match ORDER is load-bearing: the
+    D56 grain probe wraps node SQL, so it carries BOTH the `__bp_` marker and the
+    table name — check `__bp_` first; and `demo.headcount_by_dept_bad` is a superstring
+    of `demo.headcount_by_dept`, so match the `_bad` table first.
     """
     # 1. D56 grain-integrity probe (COUNT(*), COUNT(DISTINCT <grain>)).
     if "__bp_" in sql:
@@ -283,12 +209,8 @@ def _blueprint_run_query(sql: str) -> dict[str, Any] | None:
 def build_blueprint_details() -> dict[str, BlueprintDetail]:
     """The seeded `getBlueprint`-keyed corpus for the four runBlueprint scenarios.
 
-    `uses` is a NON-None frozenset (a `None` uses fails the scope pre-filter
-    closed even under an allow-all scope); the BFF mints an allow-all
-    (`column_scope=[]`) JWT, so every blueprint is in scope. The additive DAG
-    fields (`slots`/`sql_template`/`composes`/`result_grain`) are the JSON-decoded
-    shapes `BlueprintDetail` carries — `Blueprint.parse` turns them into the typed
-    executor objects.
+    `uses` must be a NON-None frozenset: a `None` uses fails the scope pre-filter closed
+    even under the allow-all (`column_scope=[]`) JWT the BFF mints.
     """
     return {
         # 1. Fast-path: a clean single-node blueprint. Bound department → node query
@@ -421,44 +343,11 @@ def build_blueprint_details() -> dict[str, BlueprintDetail]:
 class DemoModelClient:
     """A repeatable, content-routed `ModelClient` double for interactive demos.
 
-    Reads the ALREADY-BUILT canonical message list the loop hands it (same
-    shape `ScriptedModelClient` receives — see `model/client.py`) and decides
-    its canned response purely from that shape, so it needs no external
-    per-session state and never runs out of "script". Routed off the
-    ORIGINAL (first) user message of the turn (case-insensitive substring
-    match — see the module docstring's trigger-phrase table):
-
-      - "ask" -> demo the askUser/chip flow.
-          * 1st call this turn (only one user message seen so far) -> emit an
-            `askUser` tool call with a couple of chip `options`.
-          * 2nd call (a resume already appended the user's answer -> two user
-            messages now) -> final answer that echoes the chosen option.
-      - "keep going" / "forever" -> demo the budget-cap pause (D47).
-          * Every call THIS window (still only one user message seen) -> emit
-            another `getTableSchema` tool call, never a final answer, so the
-            loop's `BudgetGuard` is the only thing that can end the window.
-          * Once resumed with "continue"/"refine" (a second user message is
-            now present, appended by `AgentLoop.resume`/D55's fresh window) ->
-            a final answer immediately, so the turn ends cleanly on the very
-            first call of the new window.
-      - "salaries" / "salary" -> demo a column-scope denial (D57).
-          * 1st call (no `tool` messages yet) -> emit a `runQuery` tool call
-            whose SQL is `_SCOPE_DENIAL_QUERY` (matched by `DemoMCPClient`).
-          * 2nd call (the denied tool result was replayed back) -> a graceful
-            final answer that surfaces the denial in plain language — never
-            raw data (there is none: the MCP denied the call before any rows
-            existed).
-      - "raw sql" -> demo a fail-closed parser rejection (D63).
-          * 1st call (no `tool` messages yet) -> emit a `runQuery` tool call
-            whose SQL is `_PARSE_FAIL_QUERY` (matched by `DemoMCPClient`).
-          * 2nd call (the denied tool result was replayed back) -> a graceful
-            "couldn't validate that query" final answer — rejected, not
-            crashed.
-      - Otherwise -> demo an ordinary tool-call turn.
-          * 1st call (no `tool` messages yet) -> emit a `getTableSchema`
-            tool call.
-          * 2nd call (a `tool` role message is now present, i.e. the
-            dispatched result was replayed back) -> final free-text answer.
+    Decides its canned response purely from the canonical message list the loop hands
+    it — the ORIGINAL (first) user message selects the scenario, and what the loop has
+    already appended selects the step within it (a second user message = resumed; a
+    `tool` message = a dispatched result came back). Stateless, so it never runs out of
+    script and any number of sessions/turns replay identically.
     """
 
     async def send_turn(
@@ -767,35 +656,15 @@ class DemoModelClient:
 
 
 class DemoMCPClient(FakeMCPClient):
-    """`FakeMCPClient`, extended so `runQuery` denials are content-routed off
-    the submitted SQL string rather than a fixed FIFO queue.
+    """`FakeMCPClient`, extended so `runQuery` is content-routed off the submitted SQL
+    (whichever of the `sql`/`query` arg keys is present) instead of a fixed FIFO queue:
+    the two sentinel denials (`_SCOPE_DENIAL_QUERY`/`_PARSE_FAIL_QUERY`) plus the
+    blueprint executor's node/domain/grain probes. Routing is stateless, so the
+    long-lived server cannot drift. Every other tool call falls through to the base
+    class unchanged.
 
-    `FakeMCPClient.call_tool` forks purely on `(tool_name, call order)` — it
-    has no visibility into `args` at all — so it cannot express "the SAME
-    tool, called with different SQL, must be denied for two different
-    reasons depending on what the SQL says", which the scope-denial (D57)
-    and parser-fail-closed (D63) conformance scenarios both need from one
-    `runQuery` tool. This override intercepts `runQuery` specifically and
-    matches its `query` argument against the two sentinel strings
-    `DemoModelClient` emits (`_SCOPE_DENIAL_QUERY`/`_PARSE_FAIL_QUERY`);
-    every other tool call (including any `runQuery` call that matches
-    neither sentinel) falls straight through to the base class's normal
-    scripted-queue behavior unchanged.
-
-    This is demo-launcher plumbing ONLY — the real MCP derives these same
-    denial codes from its actual scope-check/parser, never from string
-    matching; nothing here is a substitute for `dispatch/denial_mapping.py`
-    or the adopted MCP's own enforcement.
-
-    The `runBlueprint` scenarios (D89) add a SECOND, purely-additive content
-    route: the `BlueprintExecutor`'s inner per-node `runQuery`s, its DISTINCT-
-    domain slot probes, and its D56 grain probes are all matched off the SQL
-    text and answered with canned results (`_blueprint_run_query` below). Because
-    routing is a pure function of the SQL string — matched off WHICHEVER of the
-    `sql`/`query` arg keys is present (the executor dispatches with `sql`; the
-    model-emitted `runQuery` uses `query`) — any number of sessions/turns replay
-    identically, with NO per-instance FIFO to drift across the long-lived server.
-    The two sentinel denials + the `getTableSchema` queue fall through untouched.
+    Demo-launcher plumbing ONLY — the real MCP derives these denial codes from its own
+    scope check and parser, never from string matching.
     """
 
     async def call_tool(
@@ -870,19 +739,9 @@ _COUCHBASE_PASSWORD = "password"
 def _build_session_store(settings: RuntimeSettings) -> Any:
     """In-memory by default; the REAL Couchbase store under DEMO_SESSION_STORE=couchbase.
 
-    Restart durability (D45, Slice 2) is the ONLY scenario that needs a real,
-    out-of-process store — an InMemorySessionStore loses a paused checkpoint on process
-    restart by design, so it cannot demonstrate durability. Every other scenario keeps
-    the in-memory store.
-
-    The real store is constructed DIRECTLY even though this runs BEFORE uvicorn's event
-    loop exists (`app = build_demo_app()` at module import): `CouchbaseSessionStore
-    .__init__` does no I/O and touches no loop — its `acouchbase` cluster is built by
-    the first `_ensure_connected()`, inside a request. That is what retired the
-    hand-written lazy `SessionStore` proxy this launcher used to carry.
-
-    Extracted (mirrors `run_ui_runtime_real.py`'s namesake) so the choice is testable
-    without building the whole app — see `tests/runtime/test_launcher_session_store.py`.
+    Only D45 restart durability needs an out-of-process store. The real store is safe to
+    construct here, before uvicorn's event loop exists: `CouchbaseSessionStore.__init__`
+    does no I/O and touches no loop — its cluster is built on first use, inside a request.
     """
     if os.environ.get("DEMO_SESSION_STORE") != "couchbase":
         return InMemorySessionStore()
@@ -996,13 +855,10 @@ def build_demo_app():
 
 
 def build_retrieval_pipeline(settings: RuntimeSettings) -> RetrievalPipeline:
-    """Build the hermetic Slice-1 retrieval pipeline: a `FakeVectorIndex` seeded
-    with the four blueprint fixtures (keyed `get_blueprint` fetch; NO recall
-    entries) + a `FakeEmbeddingClient`. Deterministic, no neo4j, no embedder.
-
-    Exposed (not inlined) so a non-e2e test can drive the exact seeded
-    executor path this launcher wires — proving runBlueprint end-to-end without
-    a browser or a live JWKS."""
+    """Build the hermetic Slice-1 retrieval pipeline: a `FakeVectorIndex` seeded with the
+    four blueprint fixtures (keyed `get_blueprint` fetch; NO recall entries) + a
+    `FakeEmbeddingClient`. Deterministic, no neo4j, no embedder. Exposed rather than
+    inlined so a non-e2e test can drive the same seeded executor path."""
     vector_index = FakeVectorIndex(entries=[], details=build_blueprint_details())
     return RetrievalPipeline(
         embedding_client=FakeEmbeddingClient(),

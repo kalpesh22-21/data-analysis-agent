@@ -1,15 +1,11 @@
-"""Entity redaction on the promotion boundary (D17) — the SINGLE strip used by both
-the human-approve path (`promotion.scheduler`) and the reviewer projection
-(`inbox.models`), so the "no entity crosses into a global store" invariant is
-enforced identically wherever a candidate is promoted or surfaced.
+"""Entity redaction on the promotion boundary (D17).
 
-Two complementary strips, both keyed off the settled `LeakageVerdict.hits`:
-
-  * `blank_scan_spans` — blank the audit `entity_scan` hit `span`s (keep field/kind
-    for the audit trail) so the verdict record stops carrying the raw value.
-  * `redact_payload` — remove the entity substrings from EVERY text leaf of the
-    payload, so the promotable payload a physical promoter reads (and the reviewer
-    view) is entity-free — not just the audit spans (the earlier gap, QA-Q3/Q7).
+The SINGLE strip used by both the human-approve path and the reviewer projection, so "no
+entity crosses into a global store" is enforced identically wherever a candidate is promoted
+or surfaced. Two complementary strips, both keyed off the settled `LeakageVerdict.hits`:
+`blank_scan_spans` blanks the audit hit `span`s (keeping field/kind for the trail), and
+`redact_payload` removes the entity substrings from EVERY text leaf of the payload — not just
+the audit spans, which was the earlier gap.
 """
 
 from __future__ import annotations
@@ -28,10 +24,10 @@ _REDACTED = "[redacted]"
 def entity_spans(env: CandidateEnvelope) -> tuple[str, ...]:
     """The distinct, non-empty entity `span`s the settled S5 verdict found.
 
-    Public because the S9 landing writer's last-gate D17 defense must capture these
-    BEFORE `strip_entity_bearing` blanks them (a stripped env's spans are `""` → the
-    tripwire would be a no-op). Returns `()` for an unsettled scan or a scan with no
-    entity-bearing hits."""
+    Public because the S9 landing writer's last-gate D17 defense must capture these BEFORE
+    `strip_entity_bearing` blanks them — a stripped env's spans are `""`, so the tripwire would
+    be a no-op. Returns `()` for an unsettled scan or one with no entity-bearing hits.
+    """
     scan = env.entity_scan
     if not LeakageVerdict.is_settled(scan):
         return ()
@@ -79,10 +75,11 @@ def blank_scan_spans(env: CandidateEnvelope) -> CandidateEnvelope:
 
 
 def strip_entity_bearing(env: CandidateEnvelope) -> CandidateEnvelope:
-    """Strip entity-bearing data from BOTH the payload AND the audit `entity_scan`
-    spans (D17) — the full strip applied before a candidate is stamped `validated`.
-    The payload strip closes the gap where blanking only the audit spans left the
-    raw entity in `payload.intent` for a physical promoter to read (QA-Q3)."""
+    """Strip entity-bearing data from BOTH the payload AND the audit `entity_scan` spans (D17).
+
+    The full strip applied before a candidate is stamped `validated`. The payload half closes the
+    gap where blanking only the audit spans left the raw entity in `payload.intent`.
+    """
     spans = entity_spans(env)
     stripped = replace(env, payload=redact_payload(env.payload, spans))
     return blank_scan_spans(stripped)

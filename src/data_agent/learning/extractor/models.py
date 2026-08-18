@@ -1,15 +1,10 @@
-"""Extractor output models — the shared candidate header + the `blueprint`
-payload (learning-loop-extractor-design §2/§3, D31/D34/D97).
+"""Extractor output models — the shared candidate header + the `blueprint` payload.
 
-The extractor emits a PLAN, never SQL (D35): `parameterization` classifies each
-literal predicate of the ACCEPTED SQL as `slot | rule | inline` (totality, no
-drop — D97); the deterministic AST rewrite → `sql_template` is Slice 4. Evidence
-is MANDATORY (D31): a zero-evidence candidate is rejected at emit, before it ever
-reaches the audit snapshot.
-
-`EvidenceRef.quote` is entity-bearing and is snapshotted to `learning_audit`
-(D51/D95); the persisted candidate carries only the minted `evidence_ref`, never
-the quote (see `audit`/`candidate` stores).
+The extractor emits a PLAN, never SQL (D35): `parameterization` classifies each literal
+predicate of the ACCEPTED SQL as `slot | rule | inline` (totality, no drop — D97), and the
+deterministic AST rewrite is S4. Evidence is MANDATORY (D31) — a zero-evidence candidate is
+rejected at emit. `EvidenceRef.quote` is entity-bearing and is snapshotted to
+`learning_audit` (D51/D95); the persisted candidate carries only the minted `evidence_ref`.
 """
 
 from __future__ import annotations
@@ -273,8 +268,10 @@ class BlueprintPayload:
 @dataclass(frozen=True)
 class ExtractedCandidate:
     """One structurally-valid candidate the extractor emitted (evidence present).
-    `payload` is a `BlueprintPayload` for `type=="blueprint"`, else a validated
-    dict (the other three targets are minimally modelled in S3 — §3.3)."""
+
+    `payload` is a `BlueprintPayload` for `type=="blueprint"`, else a validated dict (the other
+    three targets are minimally modelled in S3).
+    """
 
     header: CandidateHeader
     payload: BlueprintPayload | dict[str, Any]
@@ -287,36 +284,21 @@ class ExtractedCandidate:
 
 @dataclass(frozen=True)
 class Decline:
-    """A candidate the extractor rejected before emit, with the reason code the
-    consumer traces (fail-to-review / no-evidence / totality / …).
+    """A candidate the extractor rejected before emit, with the reason code the consumer traces.
 
-    MOSTLY not persisted — and the exception is the whole point of the one field that
-    carries content. A decline whose reason says the candidate was WRONG (no evidence,
-    no acceptance, un-parseable SQL) is supposed to die here: it names no artifact worth
-    keeping. A decline that says the FORM COULD NOT BE FILLED IN is different in kind,
-    because the artifact behind it may be one the corpus demonstrably wants — and the
-    live case that forced this said so three times over, then evaporated three times
-    (`docs/decisions/learning-declined-candidate-review.md`). `consumer.py` routes that
-    narrow class to the candidate store for a human to complete; every other reason keeps
-    the old behaviour exactly.
+    MOSTLY not persisted: a decline whose reason says the candidate was WRONG (no evidence, no
+    acceptance, un-parseable SQL) dies here. The one exception is the narrow class saying the
+    FORM COULD NOT BE FILLED IN, which `consumer.py` routes to the candidate store for a human
+    to complete.
 
-    `correctable` splits the two kinds apart. A CORRECTABLE decline is one whose fix the
-    extractor can NAME: a reader failed and `detail` says which field and what shape, or
-    a catalog check failed and `detail` says which id or which predicate. The extractor
-    may put that sentence in front of the model and let it re-emit. Everything else is a
-    rule about CONTENT judging a candidate it read successfully with no fix to hand, and
-    re-asking is talking a model into a candidate it was right to decline. Only
-    `validation.py::_correctable` sets the flag; see it for where the line sits and why.
-
-    `corrections_attempted` / `correction_history` are the record of what was actually
-    tried, and they exist so "the model could not produce a valid candidate" is
-    distinguishable from "the model was never asked twice" — a zero here on a
-    correctable decline means the budget was spent or disabled, not that the model
-    refused. `correction_history` carries whatever the DETAIL of those declines carried:
-    entity-free for the shape family, and for the two hinting families a model-authored
-    identifier or a literal of the accepted SQL (see `validation.py::_correctable`,
-    which owns that rule, and `consumer.py::ENTITY_BEARING_DECLINE_REASONS`, which
-    records which reason codes are affected)."""
+    `correctable` splits the two: a CORRECTABLE decline is one whose fix the extractor can NAME,
+    so the sentence may be put in front of the model; everything else judges CONTENT with no fix
+    to hand. Only `validation.py::_correctable` sets the flag.
+    `corrections_attempted`/`correction_history` record what was actually tried, so "the model
+    could not produce a valid candidate" stays distinguishable from "the model was never asked
+    twice"; the history carries whatever those declines' details carried (see
+    `consumer.py::ENTITY_BEARING_DECLINE_REASONS`).
+    """
 
     type: str
     reason: str

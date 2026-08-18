@@ -1,41 +1,15 @@
-"""Shape readers for untrusted structured-output fields — checks that carry their
-own decline message.
+"""Shape readers for untrusted structured-output fields: checks that carry their own message.
 
-**The failure this replaces.** `validation.py` used to wrap the whole payload build in
-`except (KeyError, TypeError, AttributeError) as exc` and hand the interpreter's own
-message to whoever read the decline. A live `gpt-5.5` extraction declined with
+A reader per OPERATION rather than a message per FIELD — the message is a BY-PRODUCT of the
+check (every reader takes `requirement` as a mandatory keyword), so there is no registry to
+forget to update and no silent fallback to an interpreter message that names no field.
+Readers are named for what happens downstream: `as_object` is "we are about to `.get()`
+this", `as_array` is "we are about to iterate this and the element type matters".
 
-    bad blueprint payload: 'str' object has no attribute 'get'
-
-which names neither the field (`candidate.payload.result_signature.grain`) nor the
-shape required (an object with a `columns` array), and which nothing downstream can
-act on. It is now also the wrong KIND of message to produce, because the extractor
-feeds a shape decline back to the model and asks it to re-emit: a message that names
-no field asks the model to guess.
-
-**Why a reader per OPERATION rather than a message per FIELD.** A table of strings
-keyed by field name is a second thing to maintain and the one that rots — a newly-read
-field ships with no entry and silently falls back to the interpreter message, which is
-exactly how the repo arrived here. Here the message is a BY-PRODUCT of the check:
-every reader below takes `requirement` as a mandatory keyword, so a check that rejects
-without saying what it required does not run. There is no registry to forget to update.
-
-Readers are named for the OPERATION downstream, not for the field: `as_object` is "we
-are about to `.get()` this", `as_array` is "we are about to iterate this and the
-element type matters" (iterating a `str` yields characters — a SILENT misread, which is
-worse than a raise), `as_flag` is "this decides a branch and `bool("false")` is True".
-A field whose only downstream use is `str(...)` gets no reader, because `str` is total
-and a coercion that cannot fail needs no guard.
-
-**Two invariants, both load-bearing.** A `ShapeError` message becomes prompt text on
-the corrective turn and is recorded on the final `Decline`:
-
-  * ENTITY-FREE. It names the path, the required shape and the JSON TYPE that arrived
-    — NEVER the value. The rejected content is model-authored from an entity-bearing
-    session and routinely carries warehouse literals (a department name, an employee
-    id), and a decline is not inside the D51 audit boundary that quotes live in.
-  * SELF-CONTAINED. It must be actionable to a reader who cannot see this file: full
-    dotted path from the candidate root, and the required shape spelled out.
+A `ShapeError` message becomes prompt text on the corrective turn and is recorded on the
+final `Decline`, so it must be ENTITY-FREE (the path, the required shape and the JSON TYPE
+that arrived — never the value) and SELF-CONTAINED (a full dotted path from the candidate
+root, actionable to a reader who cannot see this file).
 """
 
 from __future__ import annotations
@@ -62,8 +36,9 @@ __all__ = [
 def json_type(value: Any) -> str:
     """The JSON type of *value* as a noun phrase, for a message. NEVER the value.
 
-    `bool` is checked before `int` because it IS one in Python, and "a boolean arrived
-    where a number was required" is the more useful sentence of the two."""
+    `bool` is checked before `int` because it IS one in Python, and "a boolean arrived where a
+    number was required" is the more useful sentence of the two.
+    """
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -84,10 +59,9 @@ def json_type(value: Any) -> str:
 class ShapeError(Exception):
     """One untrusted field whose shape the read beneath it cannot use.
 
-    The message is assembled HERE, from the arguments of the check that raised, which
-    is what makes "every rejection explains itself" a property of the type rather than
-    a convention. `absent` and "wrong type" are different sentences on purpose: "you
-    did not send it" and "you sent the wrong kind of thing" call for different fixes.
+    The message is assembled HERE, from the arguments of the check that raised, which makes
+    "every rejection explains itself" a property of the type rather than a convention. `absent`
+    and "wrong type" are different sentences on purpose.
     """
 
     def __init__(
@@ -109,8 +83,7 @@ Reader = Callable[..., Any]
 
 
 def as_object(value: Any, *, at: str, requirement: str) -> dict[str, Any]:
-    """We are about to read KEYS off this. The live `gpt-5.5` decline was a `.get()`
-    on a string that the model had written as prose."""
+    """We are about to read KEYS off this."""
     if not isinstance(value, dict):
         raise ShapeError(at, requirement, value)
     return value
@@ -119,11 +92,11 @@ def as_object(value: Any, *, at: str, requirement: str) -> dict[str, Any]:
 def as_array(value: Any, *, at: str, requirement: str) -> list[Any]:
     """We are about to ITERATE this and the element type matters.
 
-    A `str` is the reason this cannot be a duck-typed `isinstance(value, Iterable)`
-    check: iterating one yields characters, so `enum_values: "NA,EU"` would become
-    seven single-character values with no error anywhere — a silent misread that
-    reaches the corpus. A tuple cannot arrive from JSON, and accepting one would let a
-    hand-fed payload take a path model output never can."""
+    A `str` is the reason this cannot be a duck-typed `Iterable` check: iterating one yields
+    characters, so `enum_values: "NA,EU"` would become seven single-character values with no
+    error anywhere. A tuple cannot arrive from JSON, and accepting one would let a hand-fed
+    payload take a path model output never can.
+    """
     if not isinstance(value, list):
         raise ShapeError(at, requirement, value)
     return value
@@ -132,11 +105,11 @@ def as_array(value: Any, *, at: str, requirement: str) -> list[Any]:
 def as_text(value: Any, *, at: str, requirement: str) -> str:
     """We are about to store this as a string.
 
-    A NUMBER is coerced, because `str(2025)` is exactly as usable as `"2025"` and a
-    model emitting an unquoted literal value is ordinary output, not an error. A
-    CONTAINER is not: `str({...})` yields a Python repr, which is not a rejection but a
-    corruption — it lands in the corpus as an intent or a `binds_to` nobody can parse.
-    A BOOL is not either: `str(True)` is "True", never a value a column carries."""
+    A NUMBER is coerced, because `str(2025)` is exactly as usable as `"2025"`. A CONTAINER is
+    not: its `str()` is a Python repr, which is not a rejection but a corruption — it lands in
+    the corpus as an intent or a `binds_to` nobody can parse. Nor is a BOOL: `str(True)` is
+    never a value a column carries.
+    """
     if isinstance(value, str):
         return value
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -147,10 +120,10 @@ def as_text(value: Any, *, at: str, requirement: str) -> str:
 def as_flag(value: Any, *, at: str, requirement: str) -> bool:
     """This decides a branch, so only a real boolean will do.
 
-    `bool(...)` would accept the string `"false"` and read it as TRUE — and the fields
-    that go through here (`required`, `verifiable`, `contains_entities`) are exactly
-    the ones where inverting the answer is silent. JSON has real booleans and the tool
-    schema declares them, so a string here is a model mistake worth naming."""
+    `bool(...)` would accept the string `"false"` and read it as TRUE — and the fields that go
+    through here (`required`, `verifiable`, `contains_entities`) are exactly the ones where
+    inverting the answer is silent.
+    """
     if not isinstance(value, bool):
         raise ShapeError(at, requirement, value)
     return value
@@ -159,9 +132,9 @@ def as_flag(value: Any, *, at: str, requirement: str) -> bool:
 def as_number(value: Any, *, at: str, requirement: str) -> float:
     """We are about to compare/rank on this as a float (`CandidateHeader.confidence`).
 
-    A numeric STRING is accepted — `float("0.9")` is the same number — but a bool is
-    not: `float(True)` is 1.0, a maximum-confidence claim conjured out of a type
-    confusion."""
+    A numeric STRING is accepted — `float("0.9")` is the same number — but a bool is not:
+    `float(True)` is 1.0, a maximum-confidence claim conjured out of a type confusion.
+    """
     if isinstance(value, bool):
         raise ShapeError(at, requirement, value)
     if isinstance(value, int | float):
@@ -177,9 +150,10 @@ def as_number(value: Any, *, at: str, requirement: str) -> float:
 def as_int(value: Any, *, at: str, requirement: str) -> int:
     """We are about to use this as an index into the session (`evidence.turn_ref`).
 
-    Mirrors `validation.py::_node_index` deliberately — a numeric string is accepted
-    (real models emit `"0"`), a bool is not (`True` would silently become turn 1) and a
-    fractional float is a typo, not something to truncate."""
+    Mirrors `validation.py::_node_index`: a numeric string is accepted (real models emit `"0"`),
+    a bool is not (`True` would silently become turn 1), and a fractional float is a typo rather
+    than something to truncate.
+    """
     if isinstance(value, bool):
         raise ShapeError(at, requirement, value)
     if isinstance(value, int):
@@ -197,14 +171,12 @@ def as_int(value: Any, *, at: str, requirement: str) -> int:
 
 
 def one_of(allowed: tuple[str, ...]) -> Reader:
-    """A reader for a CLOSED set. Returns a reader so it composes with
-    `require`/`optional` like every other one.
+    """A reader for a CLOSED set; returns a reader so it composes with `require`/`optional`.
 
-    The allowed values are appended to the message by the caller's `requirement`
-    rather than injected here: a bare list of tokens is rarely the whole story (the
-    candidate-type enum also has to say that the type-specific fields belong inside
-    `payload`), and a message assembled from two halves in two places is the kind
-    nobody rereads."""
+    The allowed values are appended by the caller's `requirement` rather than injected here: a
+    bare list of tokens is rarely the whole story, and a message assembled from two halves in
+    two places is the kind nobody rereads.
+    """
 
     def _read(value: Any, *, at: str, requirement: str) -> str:
         if not isinstance(value, str) or value not in allowed:
@@ -219,9 +191,9 @@ def require(
 ) -> Any:
     """Read a MANDATORY key through *reader*. Absent or null ⇒ `ShapeError`.
 
-    Null is treated as absent because every mandatory field here is one the caller
-    goes on to USE, and `None` is not usable for any of them — collapsing the two
-    keeps the model from having to learn a distinction that changes nothing."""
+    Null is treated as absent because every mandatory field here is one the caller goes on to
+    USE, and `None` is not usable for any of them.
+    """
     value = container.get(key)
     if value is None:
         raise ShapeError(f"{at}.{key}", requirement, None, absent=True)
@@ -239,12 +211,11 @@ def optional(
 ) -> Any:
     """Read an OPTIONAL key through *reader*, or return *default* when it is absent.
 
-    ABSENT and NULL mean "not stated" and take the default; every other wrong type
-    declines. That asymmetry is the one `validation.py::_validate_compose_nodes`
-    already settled for the `composes` DAG and it is repeated here for the same
-    reason: `container.get(key) or default` normalizes `0`, `""` and `{}` into
-    "not stated", which throws away the single most useful fact in a decline message —
-    that the model sent a string where a list belongs."""
+    ABSENT and NULL mean "not stated" and take the default; every other wrong type declines.
+    `container.get(key) or default` would normalize `0`, `""` and `{}` into "not stated",
+    throwing away the single most useful fact in a decline message — that the model sent a
+    string where a list belongs.
+    """
     value = container.get(key)
     if value is None:
         return default

@@ -1,59 +1,22 @@
 """The coverage judge's forced-tool schema and the guard on what comes back (plan §3b).
 
-One tool, one call, no retries. The judge exists to CANCEL a much larger extractor
-call, so every turn it spends eats the saving it was built to produce; a malformed
-response therefore fails OPEN (extraction proceeds exactly as it does today) rather
-than being re-asked. The extractor's three-attempt retry budget is the right posture
-for a call whose output is the product — it is the wrong posture for a call whose
-output is an optimization.
+One tool, one call, NO retries. The judge exists to CANCEL a much larger call, so every turn it
+spends eats the saving it was built to produce and a malformed response fails OPEN rather than
+being re-asked — the extractor's retry budget is right for a call whose output is the product
+and wrong for one whose output is an optimization.
 
-**The response is new untrusted model output**, and the guards below are derived from
-what downstream code READS and the OPERATION it performs on it — not from the field
-names, and not from the English sentence in the prompt. That distinction has cost this
-repo seven rounds on the same class; the most recent (plan §Method notes) was a guard
-written as `if binds_to:` to mirror an intent sentence while the downstream read was
-`is not None`, which agreed on every input except `""`. So:
+The response is untrusted model output, and every guard is DERIVED FROM WHAT DOWNSTREAM READS
+AND THE OPERATION IT PERFORMS, not from the field names: `verdict` is equality-compared against
+a closed set and is the dataset's `GROUP BY` key ⇒ a MEMBER of `COVERAGE_VERDICTS`, since
+anything else would silently become its own bucket in every distribution query; `covered_by` is
+set-membership-tested and interpolated into a log line ⇒ str, with that test handling `""`, an
+unknown id and a hallucinated id identically; `reason` is a JSON leaf and a log interpolation ⇒
+str, flattened to one line and capped; `confidence` is float-compared and serialized ⇒ a real
+number in `[0.0, 1.0]`, never a `bool` (an `int` subclass, so `True >= 0.9`) and never NaN,
+which serializes to invalid JSON and fails every comparison, reading as a silent "never drop".
 
-  field       every downstream read, and its OPERATION            ⇒ requirement
-  ---------   -------------------------------------------------   -----------------
-  verdict     `assessment.verdict == DROPPABLE_VERDICT`
-              (equality against a closed set);
-              `doc["verdict"]` → N1QL `GROUP BY verdict`
-              (the dataset's grouping key)                         ⇒ str, and a MEMBER
-              A value outside the set would silently become its       of COVERAGE_
-              own bucket in every distribution query ever run.       VERDICTS
-  covered_by  `covered_by in shown_ids` (set membership, in the
-              drop gate); `f"…{covered_by}…"` into a log line;
-              stored for a human to look the artifact up           ⇒ str
-              The membership test is what handles `""`, an
-              unknown id and a hallucinated id IDENTICALLY —
-              there is no separate emptiness check, because the
-              operation the value is subjected to already
-              distinguishes usable from unusable.
-  reason      `doc["reason"]` (a JSON leaf in a KV doc);
-              `_logger.info("… %s", reason)` (one log line)        ⇒ str, flattened to
-              A newline forges a log record; an unbounded value       one line, capped
-              is an unbounded doc.
-  confidence  `confidence >= threshold` (float comparison);
-              `f"{confidence:.2f}"`; `json`-serialized into a doc  ⇒ real number in
-              `bool` is an `int` subclass, so `True >= 0.9` is        [0.0, 1.0]; NOT a
-              True and a perfect false positive. `float(10**400)`     bool; not NaN;
-              raises OverflowError. `float("nan")` serializes to      not ±inf
-              invalid JSON and fails EVERY comparison, so it
-              would read as a silent "never drop" while
-              poisoning the stored dataset.
-
-`covered_by` is REQUIRED in the schema rather than nullable, with `""` as the "none"
-value. A nullable field gives a model two ways to say the same thing and gives this
-module two shapes to guard; the empty string is already handled by the membership test
-that the value's real consumer performs.
-
-**Out-of-range is a REJECTION, not a clamp.** A confidence of `5.0` or `-1.0` is not a
-strong or weak signal, it is a broken response — and clamping `5.0` to `1.0` would turn
-a malfunction into the most confident drop the system can express. The whole assessment
-is discarded and extraction proceeds. Same posture as
-`extractor/prior_art.py::_score`, for the same reason, on a value with far more
-authority.
+OUT-OF-RANGE IS A REJECTION, NOT A CLAMP: `5.0` is a broken response, and clamping it to `1.0`
+would turn a malfunction into the most confident drop the system can express.
 """
 
 from __future__ import annotations
@@ -146,27 +109,13 @@ def build_judge_tool() -> dict[str, Any]:
 def parse_assessment(result: ModelTurnResult) -> CoverageAssessment | None:
     """One judge turn → a guarded `CoverageAssessment`, or `None` when unusable.
 
-    `None` is the FAIL-OPEN signal and it covers every failure shape: no tool call, the
-    wrong tool, non-dict arguments, an unrecognized verdict, an unusable confidence. The
-    caller's contract on `None` is "behave exactly as if no judge were wired", so there
-    is no need for the caller to distinguish the shapes — but each one is logged
-    distinctly, because they mean different things to whoever tunes the prompt.
-
-    Returns a partial-but-valid assessment where a field can degrade safely
-    (`covered_by`/`reason`) and `None` where it cannot (`verdict`/`confidence`). The
-    split is not stylistic: the two fields that can degrade are only ever READ, while
-    the two that cannot are the two the drop DECISION is computed from.
-
-    **`tool_calls` is checked as a CONTAINER and as MEMBERS, and QA had to point that
-    out — the eighth sighting of this class in this repo.** `ModelTurnResult` is typed,
-    but `ModelClient` is a Protocol and this function is fed whatever an implementation
-    returns. `next(c for c in tool_calls if c.name == ...)` char-explodes a bare string
-    into `AttributeError: 'str' object has no attribute 'name'` and raises `TypeError`
-    on `None`. The correct version was already in the same package —
-    `prior_art.py::lookup_prior_art` performs exactly this container-AND-members check
-    on its own untrusted sequence — and the guard here is derived the same way, from
-    the two operations performed below (`for … in`, then `.name` per member) rather
-    than from the type annotation.
+    `None` is the FAIL-OPEN signal and covers every failure shape; the caller's contract on it is
+    "behave exactly as if no judge were wired", but each shape is logged distinctly because they
+    mean different things to whoever tunes the prompt. Returns a partial-but-valid assessment
+    where a field can degrade safely (`covered_by`/`reason`, which are only ever READ) and `None`
+    where it cannot (`verdict`/`confidence`, from which the drop DECISION is computed).
+    `tool_calls` is checked as a CONTAINER and as MEMBERS: `ModelClient` is a Protocol, and a
+    bare string char-explodes into an `AttributeError` on `.name`.
     """
     calls = result.tool_calls
     if not isinstance(calls, (list, tuple)):
@@ -231,16 +180,12 @@ def parse_assessment(result: ModelTurnResult) -> CoverageAssessment | None:
 
 
 def _confidence(raw: Any) -> float | None:
-    """A usable drop-gate confidence, or `None`. See the module table.
+    """A usable drop-gate confidence, or `None`. See the module docstring.
 
-    Three guards in order, and each one catches something the previous does not:
-      1. TYPE — `bool` first, because it passes `isinstance(x, int)` and `True >= 0.90`
-         is a perfect false positive that reads as maximal confidence.
-      2. CONVERSION — an `int` too large to be a float raises `OverflowError` from
-         `float()`, which would escape into a queue worker.
-      3. RANGE — `not (0.0 <= v <= 1.0)` rejects NaN without a separate `isnan` test
-         (NaN fails both comparisons) and rejects ±inf, which compares greater than
-         every bar there is.
+    Three guards in order, each catching what the previous does not: TYPE (`bool` first, since it
+    passes `isinstance(x, int)` and `True >= 0.90` reads as maximal confidence), CONVERSION (an
+    `int` too large to be a float raises `OverflowError` into a queue worker), and RANGE, which
+    rejects NaN without a separate `isnan` test and rejects ±inf.
     """
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
@@ -256,23 +201,17 @@ def _confidence(raw: Any) -> float | None:
 def _clean(raw: Any, *, limit: int) -> str:
     """Untrusted model text as one capped, single-line string; `""` for a non-str.
 
-    Derived from the two things done with these fields and NOTHING else: they are
-    written as JSON leaves into a KV document, and they are interpolated into log
-    records. So the guards are (a) flatten every Unicode control/format/separator to a
-    space, because a newline in a log record forges a second record and a line separator
-    survives a naive `"\\n" not in text` check, and (b) cap the length, because the
-    document has a TTL but no size limit of its own.
+    Derived from the two things done with these fields and NOTHING else: they are written as JSON
+    leaves into a KV document, and they are interpolated into log records. So every Unicode
+    control/format/separator is flattened to a space — a newline in a log record forges a second
+    record, and a line separator survives a naive newline check — and the length is capped,
+    because the document has a TTL but no size limit of its own.
 
-    Deliberately NOT `extractor/prior_art.py::_sanitize`, which is the right function
-    for a different job: that one additionally collapses runs of `=` so untrusted text
-    cannot spell the PRIOR ART block's fence. There is no fence here — nothing on this
-    path is composed back into a prompt — and importing a prompt guard into a storage
-    guard would tie the two together such that relaxing the prompt's fence rule silently
-    changes what is stored. Same class of transformation, different derivation, so they
-    are pinned apart by their own tests rather than merged into a shared helper.
-
-    NOT `str(raw)`: coercion turns `None` into the literal `"None"`, which then reads
-    as real content to whoever queries the bucket.
+    Deliberately NOT `extractor/prior_art.py::_sanitize`, which additionally collapses runs of
+    `=` so untrusted text cannot spell the PRIOR ART block's fence. There is no fence here —
+    nothing on this path is composed back into a prompt — and importing a prompt guard into a
+    storage guard would tie the two together such that relaxing the fence rule silently changes
+    what is stored. NOT `str(raw)`: coercion turns `None` into the literal "None".
     """
     if not isinstance(raw, str):
         return ""

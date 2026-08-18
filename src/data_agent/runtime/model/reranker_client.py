@@ -1,34 +1,11 @@
-"""RerankerClient — the D71 reranker seam (retrieval pipeline building block).
+"""RerankerClient — the D71 reranker seam for the retrieval pipeline.
 
-Mirrors `model/embedding_client.py` exactly (same structure + hardening), for
-the custom cross-encoder reranker API (D71 — NOT the OpenAI SDK). Three pieces:
-  - `RerankerClient` Protocol: `rerank(query, documents) -> scores`, one score
-    per document, SAME order as the input (higher = more relevant; the caller
-    re-sorts). Raises `RerankerError` on any transport/serialization failure.
-  - `FakeRerankerClient` (Layer 1): scripted `{document: score}` scores (with a
-    deterministic seeded-hash fallback for unscripted documents), OR a
-    `fail=True` flag that makes `rerank` raise — for exercising a caller's
-    degrade path. No network.
-  - `HttpRerankerClient` (Layer 2/3, real): a plain `httpx.AsyncClient` POST,
-    settings-driven URL/key, wrapped in a manual `RERANKER` span (D24). Raises
-    `RerankerError` on non-2xx / timeout / malformed body.
-
-Wire contract (resolved against the SQL-repo mocks at ~/Development/SQL/mocks):
+Wire contract of the custom cross-encoder endpoint (NOT the OpenAI SDK):
     request  : POST <url>  {"query": <str>, "documents": [<str>, ...]}
     response : {"scores": [<float>, ...]}   (one score per document, same order)
-The mock needs no auth; `api_key` is kept as an optional bearer header for the
-eventual production endpoint. An empty `documents` list returns `[]` WITHOUT a
-network call (matching the mock, which returns `{"scores": []}` for empty input).
-
-NOT WIRED YET: this is a standalone building block for the upcoming retrieval-
-pipeline brick (D71/§3 retrieval). It is intentionally NOT constructed in
-`app.py` or dispatched in the agent loop — a later brick composes it into the
-blueprint/knowledge retrieval path.
-
-D5/D25 (load-bearing): the reranker client never sees `RuntimeCredentials`; the
-reranker API key is its OWN secret (from `RuntimeSettings`, `.env`-backed). The
-`RERANKER` span logs document counts + model id + latency only — never the
-query or the document text.
+An empty `documents` list returns `[]` without a network call. D5/D25: the client never
+sees `RuntimeCredentials`, and the `RERANKER` span logs counts, model id and latency
+only — never the query or the document text.
 """
 
 from __future__ import annotations
@@ -49,8 +26,7 @@ if TYPE_CHECKING:
 class RerankerError(Exception):
     """Raised on any reranker transport/serialization failure.
 
-    The retrieval caller catches this and degrades (e.g. falls back to the
-    pre-rerank recall order) — it never propagates out as a hard failure.
+        The retrieval caller catches this and degrades to the pre-rerank recall order.
     """
 
 
@@ -60,8 +36,8 @@ class RerankerClient(Protocol):
     async def rerank(self, query: str, documents: list[str]) -> list[float]:
         """Return one relevance score per document, order-preserving.
 
-        Higher score = more relevant; the caller re-sorts. Raises:
-            RerankerError: on any transport/serialization failure.
+                Higher = more relevant; the caller re-sorts. Raises `RerankerError` on any
+                transport/serialization failure.
         """
         ...
 
@@ -100,21 +76,10 @@ class FakeRerankerClient:
 class HttpRerankerClient(JsonPostClient):
     """Real `RerankerClient` — POSTs to the custom reranker API (D71).
 
-    Wire contract (resolved against the SQL-repo mocks):
-        Request body:  `{"query": <str>, "documents": [<str>, ...]}`
-        Response body: `{"scores": [<float>, ...]}` — one score per document,
-                       order-preserving. Anything else (a non-dict body, a
-                       missing/non-list `scores`) is malformed -> `RerankerError`.
-
-    `model` is not a request parameter (the endpoint serves a single fixed
-    cross-encoder) — it is retained solely as the RERANKER span's
-    `reranker.model` attribute so traces stay coherent (D24).
-
-    The constructor, the bearer header, the traced POST and the fail-closed error
-    ladder come from `JsonPostClient`; only the payload, the `{"scores": [...]}`
-    parse and the span differ from the embedding client. `__init__` is restated
-    solely to keep `model` OPTIONAL here (the reranker span tolerates an unnamed
-    model; the embedding client requires one).
+        The response must be `{"scores": [<float>, ...]}`, one score per document,
+        order-preserving; anything else is malformed -> `RerankerError`. `model` is not a
+        request parameter — it is retained only as the RERANKER span's `reranker.model`
+        attribute, and stays OPTIONAL here (the embedding client requires one).
     """
 
     _error_class: ClassVar[type[Exception]] = RerankerError
@@ -154,8 +119,8 @@ class HttpRerankerClient(JsonPostClient):
     def _parse_scores(body: Any) -> list[Any]:
         """Return the raw `scores` list from a `{"scores": [...]}` response body.
 
-        Raises `RerankerError` on a structurally-malformed body — the element
-        CONTENTS are validated separately by `_validate_scores`.
+                Raises `RerankerError` on a structurally-malformed body; element CONTENTS are
+                validated separately by `_validate_scores`.
         """
         if isinstance(body, dict) and isinstance(body.get("scores"), list):
             return list(body["scores"])
@@ -165,9 +130,8 @@ class HttpRerankerClient(JsonPostClient):
     def _validate_scores(scores: list[Any]) -> list[float]:
         """Validate every score is a finite real number (no bool).
 
-        Guards the caller's re-sort from `TypeError`s (string scores) and from
-        NaN/inf scores (which `json.loads` happily parses) corrupting the sort.
-        Raises `RerankerError` on any violation.
+                NaN/inf parse cleanly through `json.loads` but corrupt the caller's re-sort,
+                so they are rejected here as `RerankerError`.
         """
         normalized: list[float] = []
         for element in scores:

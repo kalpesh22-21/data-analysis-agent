@@ -1,28 +1,19 @@
 #!/usr/bin/env python
 """run_learning_consumer — the learning-loop CONSUMER entrypoint (D96 §g).
 
-Composes a `LearningConsumer` from real infra (Couchbase session/audit/candidate/
-corpus/user stores + Redis Streams queue) via the Wave-3 composition-root factory
-(`build_learning_consumer`) and runs the blocking consume loop. The write-router
-pipeline (S4 generalize → S5 leakage → S6 dedup → S8 schema-edit/user-commit →
-S7 writer) is assembled by the factory; this entrypoint only constructs the infra
-clients and hands them in.
+Composes a `LearningConsumer` from real infra (Couchbase session/audit/candidate/corpus/
+user stores + Redis Streams queue) via `build_learning_consumer` and runs the blocking
+consume loop; the factory assembles the write-router pipeline, this entrypoint only
+constructs the infra clients. The D58c kill-switch is read FRESH each cycle, so flipping
+`LEARNING_ENABLED` stops processing without a restart (in-flight work simply waits in
+the stream — no loss). The plane stays DORMANT until an operator runs this process AND
+the kill-switch permits it; there is no request-path import of the learning plane.
 
-The D58c kill-switch is read FRESH each cycle inside `run_once`, so flipping
-`LEARNING_ENABLED` stops processing without a restart (in-flight work simply waits
-in the stream — no loss). The plane stays DORMANT until an operator runs this
-process AND the kill-switch permits it; there is no request-path import of the
-learning plane.
-
-**All-or-nothing gating (S3 precedent, extended).** Real extraction is a UNIT: the
-extractor model client + durable audit store + durable candidate store + durable
-blueprint corpus + durable per-user store + the catalog. When the extractor model
-is unconfigured, the consumer falls back to the S2 `would_extract` stub with an
-EMPTY pipeline (the safe partially-provisioned posture). When the extractor model
-IS configured, EVERY durable collaborator MUST be provisioned (its RBAC creds
-present) — a missing one raises `LearningWiringError` at composition (the factory
-enforces this) rather than running a PARTIAL pipeline that would strand candidates
-mid-flow. Never a third, partial branch.
+ALL-OR-NOTHING GATING (S3 precedent). Real extraction is a UNIT: extractor model
+unconfigured ⇒ the S2 `would_extract` stub with an EMPTY pipeline; extractor model
+configured ⇒ EVERY durable collaborator must be provisioned or the factory raises
+`LearningWiringError` at composition. Never a third, partial branch — that would strand
+candidates mid-flow.
 
 Environment: `RuntimeSettings` (COUCHBASE_*, EMBEDDING_*) + `LearningSettings`
 (LEARNING_*) + `UserKnowledgeStoreConfig` (USER_KNOWLEDGE_*). Traced to the Phoenix

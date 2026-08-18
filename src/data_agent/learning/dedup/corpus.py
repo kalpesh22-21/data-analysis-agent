@@ -1,28 +1,11 @@
 """BlueprintCorpus — the landed-artifact port the S6 hard key looks up (D48).
 
-The corpus is the set of already-LANDED blueprint artifacts (the neo4j blueprint
-nodes in Layer 2/3), keyed by `canonical_key`. S6 asks it two things:
-
-  * `get_by_canonical_key` — does an artifact with this exact hard key exist? A hit
-    means this candidate is a semantic duplicate. Deliberately NOT status-filtered —
-    see `CorpusArtifact.is_terminal` for why the hard and soft layers differ here.
-  * `increment_hit_count` — on a hard-key hit, bump the EXISTING artifact's
-    `hit_count` (it lives on the artifact, a cross-session aggregate — NOT on the
-    envelope, §11.1). The duplicate candidate is then dropped.
-  * `increment_recurrence_count` — on a SOFT (intent-similarity) sighting, bump the
-    dormant paraphrase counter (plan §4). Same store, different event; see
-    `CorpusArtifact.recurrence_count`.
-  * `set_status` — the S9 TERMINAL transitions (reject/retire) stamp the artifact dead
-    so it stops surfacing as live prior art (PriorArt Slice 2).
-
-The soft layer additionally reads `list_artifacts()` to embed each artifact's `intent`
-for the near-miss comparison, SKIPPING terminal artifacts. That path is now only the
-fail-open fallback: with a `PriorArtIndex` wired, the soft layer gets the same answer
-from one approximate-nearest-neighbour call against the neo4j vector index.
-
-`InMemoryBlueprintCorpus` is the Layer-1 fake, seedable from
-`existing_corpus_keys.json`. It records `increment_hit_count` calls so a test can
-assert "one create + one bump" without a warehouse.
+Artifacts are keyed by `canonical_key`. `get_by_canonical_key` answers the hard-key duplicate
+question and is deliberately NOT status-filtered (see `CorpusArtifact.is_terminal` for why
+the hard and soft layers differ); `increment_hit_count` bumps the cross-session count on the
+ARTIFACT, not the envelope (§11.1); `increment_recurrence_count` bumps the dormant paraphrase
+counter; `set_status` lets the S9 TERMINAL transitions stamp an artifact dead so it stops
+surfacing as live prior art. `InMemoryBlueprintCorpus` is the Layer-1 fake.
 """
 
 from __future__ import annotations
@@ -75,28 +58,26 @@ class CorpusArtifact:
 
     @property
     def is_terminal(self) -> bool:
-        """True iff a human killed this artifact (rejected/retired). Mirrors
-        `priorart.models.TERMINAL_STATUSES` — the corpus bucket and the graph must agree
-        about what "dead prior art" means, or the same candidate is dead in one reader
-        and alive in the other. A parity test pins the two lists together.
+        """True iff a human killed this artifact (rejected/retired).
 
-        **The two dedup layers treat this DIFFERENTLY, on purpose — do not "fix" the
-        asymmetry.** The SOFT layer SKIPS a terminal artifact: a near-match to a rejected
-        idea is not the same idea, and letting a dead artifact route live candidates to
-        review would resurrect a settled decision as recurring noise. The HARD layer does
-        NOT skip it: a byte-identical canonical key IS the same idea, the human said no to
-        exactly this thing, and it must still be dropped. See `DedupStage.process`, which
-        tags that increment with `matched_status` so the two increments are separable in
-        telemetry rather than silently conflated."""
+        Mirrors `priorart.models.TERMINAL_STATUSES` — the corpus bucket and the graph must agree
+        about what "dead prior art" means, and a parity test pins the two lists together. THE TWO
+        DEDUP LAYERS TREAT THIS DIFFERENTLY ON PURPOSE: the SOFT layer SKIPS a terminal artifact,
+        because a near-match to a rejected idea is not the same idea and resurfacing it would turn a
+        settled decision into recurring noise; the HARD layer does NOT, because a byte-identical
+        canonical key IS the same idea the human said no to. `DedupStage.process` tags that
+        increment with `matched_status` so the two stay separable in telemetry.
+        """
         return self.status in TERMINAL_ARTIFACT_STATUSES
 
     @classmethod
     def from_doc(cls, doc: dict[str, Any]) -> CorpusArtifact:
-        """Rehydrate a persisted doc. `status`/`source` are read with the SAME defaults
-        as the dataclass so a doc written BEFORE this slice (which carries neither key)
-        loads as the live-learning artifact it has always been — the corpus bucket is
-        durable and is never migrated, so tolerating the older shape is required, not
-        merely polite."""
+        """Rehydrate a persisted doc.
+
+        `status`/`source` are read with the SAME defaults as the dataclass, so a doc written before
+        those keys existed loads as the live-learning artifact it has always been. The corpus bucket
+        is durable and is never migrated, so tolerating the older shape is required, not polite.
+        """
         return cls(
             id=doc["id"],
             canonical_key=doc["canonical_key"],
@@ -119,11 +100,12 @@ class BlueprintCorpus(Protocol):
         ...
 
     async def seed_artifact(self, artifact: CorpusArtifact) -> None:
-        """Register a NEW artifact at `hit_count=1` on its FIRST sighting (D48 §11.1),
-        keyed by `canonical_key`. Called on `action="insert"` so the count-based
-        promotion threshold (T=3) can accrue from the candidate stage — the artifact
-        must exist BEFORE it lands, else the count could never converge. Idempotent:
-        a no-op if an artifact already exists at the key."""
+        """Register a NEW artifact at `hit_count=1` on its FIRST sighting (D48 §11.1).
+
+        Called on `action="insert"` so the count-based promotion threshold can accrue from the
+        candidate stage — the artifact must exist BEFORE it lands, or the count could never
+        converge. Idempotent: a no-op if an artifact already exists at the key.
+        """
         ...
 
     async def increment_hit_count(self, canonical_key: str) -> None:
@@ -133,29 +115,22 @@ class BlueprintCorpus(Protocol):
     async def increment_recurrence_count(self, canonical_key: str) -> None:
         """Bump the SOFT recurrence counter of the artifact at `canonical_key` (plan §4).
 
-        Called by the S6 soft layer for each surviving artifact whose intent came within
-        the recurrence band of the candidate being adjudicated — a paraphrase sighting,
-        as opposed to `increment_hit_count`'s byte-identical one. Same tolerated-no-op
-        contract as `increment_hit_count`: a vanished artifact is not an error.
-
-        Deliberately its OWN method rather than a flag on `increment_hit_count`: the two
-        counts feed the SAME gate at different weights, and one call site that could
-        write either would be one place to conflate them.
+        A paraphrase sighting, as opposed to `increment_hit_count`'s byte-identical one; a vanished
+        artifact is a tolerated no-op either way. Deliberately its OWN method rather than a flag:
+        the two counts feed the SAME gate at different weights, and one call site that could write
+        either would be one place to conflate them.
         """
         ...
 
     async def set_status(self, canonical_key: str, status: str) -> None:
         """Stamp the artifact's lifecycle `status` (PriorArtIndex Slice 2).
 
-        Written by the S9 scheduler's TERMINAL transitions only (reject → `rejected`,
-        retract → `retired`). A NARROW write on that one field — it must not disturb
-        `hit_count` (a full upsert would reset an accrued counter) and must not
-        RESURRECT an artifact that no longer exists, so a missing key is a tolerated
-        no-op, exactly like `increment_hit_count`'s.
-
-        Without this the corpus has no concept of a dead artifact: `BlueprintCorpus` is
-        get/seed/increment/list with no delete and no status write, so a rejected
-        candidate's artifact survived and kept surfacing as live prior art forever."""
+        Written by the S9 scheduler's TERMINAL transitions only (reject, retract). A NARROW write on
+        that one field: it must not disturb `hit_count` (a full upsert would reset an accrued
+        counter) and must not RESURRECT a vanished artifact, so a missing key is a tolerated no-op.
+        Without it the corpus has no concept of a dead artifact, and a rejected candidate's kept
+        surfacing as live prior art forever.
+        """
         ...
 
     async def list_artifacts(self) -> list[CorpusArtifact]:

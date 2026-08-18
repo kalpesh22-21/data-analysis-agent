@@ -1,22 +1,11 @@
-"""ScratchClient — the runtime side of the D93 scratch-write side-channel (Slice 2).
+"""ScratchClient — the runtime side of the D93 scratch-write side-channel.
 
 The executor materializes an already-scope-checked table-output node result into a
-session-partitioned scratch table (``scratch.s_<sid>_bp_<uuid>``) so a downstream
-node can ``JOIN`` it. This client is the transport for that one privileged call.
-
-It is NOT an MCP tool (D19): the materialize/drop routes are plain HTTP custom
-routes on the same MCP host (``POST {base}/scratch/v1/materialize``), behind the
-same ``JWTAuthMiddleware``. So the client rides the SAME credential binding the
-read plane uses — ``Authorization: Bearer <jwt>`` + ``X-Session-Id: <session_id>``
-(the D92-bound sid that NAMES the table) — and holds NO ClickHouse write
-credential of its own (invariant #8): the privilege is the MCP's server-side
-scratch-only grant.
-
-Two implementations, one interface (the ``FakeMCPClient`` pattern, §2.1):
-  - ``ScratchClient``     — real ``httpx`` POST to the live endpoint (Layer 2+).
-  - ``FakeScratchClient`` — records calls and hands back a deterministic
-    ``scratch.s_<sid>_bp_<n>`` name, so the executor path is fully testable with
-    zero infrastructure (Layer 1).
+session-partitioned scratch table (``scratch.s_<sid>_bp_<uuid>``) so a downstream node
+can ``JOIN`` it. Not an MCP tool (D19): plain HTTP routes on the MCP host behind the
+same ``JWTAuthMiddleware``, riding the same credential binding. The client holds NO
+ClickHouse write credential of its own (invariant #8) — the privilege is the MCP's
+server-side scratch-only grant.
 """
 
 from __future__ import annotations
@@ -33,13 +22,9 @@ from ._transport import side_channel_headers as _headers
 class ScratchClientError(SideChannelError):
     """A scratch materialize/drop call was rejected or failed.
 
-    Carries the endpoint's stable *code* (e.g. ``SCRATCH_TOO_LARGE``,
-    ``SCRATCH_SESSION_MISSING``) when available, so the executor can fail-closed
-    to the raw loop without leaking internals.
-
-    The ``(code, message)`` shape comes from ``_transport.SideChannelError``. It stays
-    its OWN class because the consequence is specific: this one fails the composite
-    node back to the raw loop rather than degrading a cached artifact.
+        Carries the endpoint's stable *code* (e.g. ``SCRATCH_TOO_LARGE``) when available.
+        Its OWN class because the consequence is specific: this one fails the composite
+        node back to the raw loop rather than degrading a cached artifact.
     """
 
 
@@ -76,10 +61,10 @@ class ScratchClient:
     ) -> str:
         """POST the columns+rows, return the RETURNED ``scratch.s_<sid>_bp_<uuid>``.
 
-        The rows go over the wire as native JSON DATA — the endpoint bulk-inserts
-        them via the driver, never string-interpolated into SQL (invariant #4).
-        The returned table name is used VERBATIM (the runtime never reconstructs
-        it): its ``s_<sid>_`` prefix is derived server-side from X-Session-Id.
+                The rows go over the wire as native JSON DATA — the endpoint bulk-inserts them
+                via the driver, never string-interpolated into SQL (invariant #4). The returned
+                table name is used VERBATIM (the runtime never reconstructs it): its
+                ``s_<sid>_`` prefix is derived server-side from X-Session-Id.
         """
         payload = {"columns": columns, "rows": rows}
         async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -97,8 +82,9 @@ class ScratchClient:
         return table
 
     async def drop(self, table: str, *, jwt: str, session_id: str) -> None:
-        """Best-effort drop (TTL is the real cleanup). Errors are non-fatal to the
-        caller — the caller may swallow them (courtesy GC on clean completion)."""
+        """Best-effort drop (TTL is the real cleanup); errors are non-fatal and the caller
+                may swallow them.
+        """
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(
                 f"{self._base_url}/drop",
@@ -126,11 +112,9 @@ class RecordedScratchCall:
 class FakeScratchClient:
     """Layer-1 ``ScratchClient`` double — records calls, returns deterministic names.
 
-    Mirrors ``FakeMCPClient``: every call is recorded (so tests can assert the
-    credential-injection boundary — the JWT + session_id DID reach the transport,
-    and NO ClickHouse credential is present) and ``materialize`` hands back a
-    ``scratch.s_<session_id>_bp_<n>`` name matching the endpoint's naming contract,
-    so the D64 read gate accepts the rewritten JOIN for this session.
+        ``materialize`` hands back a ``scratch.s_<session_id>_bp_<n>`` name matching the
+        endpoint's naming contract, so the D64 read gate accepts the rewritten JOIN for
+        this session. Every call is recorded so tests can assert the credential boundary.
     """
 
     def __init__(self, *, fail: Exception | None = None) -> None:

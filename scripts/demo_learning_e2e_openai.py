@@ -1,21 +1,15 @@
 #!/usr/bin/env python
 """demo_learning_e2e_openai — a REAL-OpenAI + Phoenix-traced end-to-end run of the
-Track-B learning loop.
+Track-B learning loop. NOT a pytest test: the real LLM is nondeterministic.
 
-This is NOT a pytest test (the real LLM is nondeterministic). It reuses the STAGE
-seeding/sweep/consume/promote/land/recall pattern of
-`tests/integration/test_learning_end_to_end_live.py` but swaps in:
-
-  1. a REAL OpenAI extractor (`build_openai_model_client` wrapped by the real
-     `LearningExtractor` the factory builds) making the learning decision, and
-  2. Phoenix OTel tracing CHAINED into ONE trace per session — the sweeper's
-     `learning.enqueue` is the per-session ROOT; its W3C `traceparent` rides on the
-     job so `learning.consume`/`triage`/`extract` nest under it, and the same
-     traceparent carried on the candidate makes the scheduler's own `promote`/`land`
-     spans (its REAL tracer seam, not manual wrappers) continue the SAME trace.
-     Exported to the `learning-loop` Phoenix project. `LEARNING_TRACE_VERBOSE=1` is
-     set here so the spans additionally carry human-readable content (question /
-     accepted SQL / learned intent) — the entity-bearing diagnostic posture.
+It walks the same seed/sweep/consume/promote/land/recall stages as
+`tests/integration/test_learning_end_to_end_live.py`, but with a REAL OpenAI extractor
+making the learning decision and Phoenix OTel tracing CHAINED into ONE trace per
+session (the sweeper's `learning.enqueue` is the root; its W3C `traceparent` rides on
+the job and then on the candidate, so consume/triage/extract and the scheduler's
+promote/land spans all continue it). Exported to the `learning-loop` Phoenix project.
+`LEARNING_TRACE_VERBOSE=1` is set here, so spans additionally carry human-readable
+content — the entity-bearing diagnostic posture.
 
 Run (from the repo root, the l2 stack + Phoenix UP):
 

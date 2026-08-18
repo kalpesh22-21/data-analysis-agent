@@ -1,11 +1,9 @@
 """LearningSettings — env-var config for the offline learning loop (D96 §11).
 
-Mirrors `runtime/config.py`'s `RuntimeSettings` pattern (pydantic-settings,
-uppercased env vars, `.env`, `extra="ignore"`), but is a SEPARATE settings
-surface: the two learning processes (sweeper, consumer) are distinct entrypoints
-(D96 §g) with their own configuration, and — critically — the D58c kill-switch
-must NOT be frozen behind an `@lru_cache`d settings singleton (see
-`learning_enabled()` below).
+Mirrors `runtime/config.py`'s pattern (pydantic-settings, uppercased env vars, `.env`,
+`extra="ignore"`) but is a SEPARATE settings surface. The D58c kill-switch is deliberately
+NOT a field here: it must not be frozen behind a cached settings singleton (see
+`learning_enabled`).
 """
 
 from __future__ import annotations
@@ -33,12 +31,11 @@ _TRUTHY = TRUTHY_ENV_VALUES
 
 
 class _KillSwitchSettings(BaseSettings):
-    """A one-field settings surface for `LEARNING_ENABLED` ONLY, constructed
-    FRESH on every `learning_enabled()` call (never cached). Reads BOTH `.env`
-    and the process environment — with the process env taking precedence
-    (pydantic-settings source order) — so an operator flipping the switch in
-    EITHER place is honored (MEDIUM-2: reading only `os.environ` silently
-    ignored a `.env` override, which fails DANGEROUS)."""
+    """A one-field settings surface for `LEARNING_ENABLED`, constructed FRESH on every call.
+
+    Reads BOTH `.env` and the process environment, process env taking precedence, so an
+    operator flipping the switch in either place is honored.
+    """
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -51,13 +48,10 @@ class _KillSwitchSettings(BaseSettings):
 
 
 def learning_enabled() -> bool:
-    """Read the D58c master kill-switch `LEARNING_ENABLED` FRESH, EVERY call —
-    deliberately bypassing the `@lru_cache`d `RuntimeSettings` so a flip (of the
-    env var OR `.env`) takes effect on the next cycle with NO restart/deploy
-    (D96 §e / design §7).
+    """Read the D58c master kill-switch FRESH, EVERY call, so a flip needs no restart/deploy.
 
-    Default (unset/blank) is enabled. Unrecognized values are treated as
-    disabled (fail-safe: a typo'd override halts, it does not silently run).
+    Default (unset or blank) is enabled. An unrecognized value is treated as DISABLED —
+    fail-safe: a typo'd override halts the loop rather than silently running it.
     """
     raw = _KillSwitchSettings().learning_enabled
     if raw is None or str(raw).strip() == "":
@@ -72,9 +66,8 @@ def _default_consumer_name() -> str:
 class LearningSettings(BaseSettings):
     """All learning-loop configuration, read from environment variables (or `.env`).
 
-    `LEARNING_ENABLED` is deliberately ABSENT from this model: it is read
-    uncached, per cycle, via the module-level `learning_enabled()` accessor so
-    the toggle is never frozen by the settings cache.
+    `LEARNING_ENABLED` is deliberately ABSENT: it is read uncached, per cycle, via
+    `learning_enabled()` so the toggle is never frozen by the settings cache.
     """
 
     model_config = SettingsConfigDict(
@@ -506,27 +499,21 @@ class LearningSettings(BaseSettings):
 
 
 def get_learning_settings() -> LearningSettings:
-    """Return a fresh `LearningSettings`. Deliberately NOT `@lru_cache`d at the
-    kill-switch's expense — but the process-static fields (Redis URL, stream
-    names, thresholds) are read once at process start by the entrypoints, so a
-    plain constructor is sufficient; the ONLY runtime-toggled value is
-    `LEARNING_ENABLED`, served fresh by `learning_enabled()`."""
+    """A fresh `LearningSettings` — deliberately not `@lru_cache`d.
+
+    The process-static fields are read once at process start by the entrypoints; the only
+    runtime-toggled value is `LEARNING_ENABLED`, served fresh by `learning_enabled()`.
+    """
     return LearningSettings()
 
 
 def unrecognized_learning_env_vars(environ: dict[str, str] | None = None) -> tuple[str, ...]:
     """Every `LEARNING_*` variable in *environ* that is NOT a settings field.
 
-    `model_config` sets `extra="ignore"` — required (the process env is full of
-    unrelated variables) and quietly dangerous: a typo'd `LEARNING_MAX_DELIVERES` is
-    accepted, dropped, and the shipped default silently applies. Nothing anywhere
-    reports it, so a knob an operator believes they turned is a knob that does not
-    exist, and the symptom shows up as behaviour nobody can explain.
-
-    Deliberately name-based and prefix-scoped: it can only ever flag a variable that
-    LOOKS like it was meant for this settings surface, so it cannot produce noise about
-    someone else's environment. `LEARNING_ENABLED` is known-good — it is the kill-switch,
-    read by `learning_enabled()` and deliberately absent from the model.
+    `extra="ignore"` is required (the process env is full of unrelated variables) and quietly
+    dangerous: a typo'd `LEARNING_MAX_DELIVERES` is accepted, dropped, and the shipped default
+    silently applies. Prefix-scoped, so it can only flag a variable that looks meant for this
+    surface; `LEARNING_ENABLED` is known-good (the kill-switch, deliberately absent).
     """
     known = {name.upper() for name in LearningSettings.model_fields}
     known.add("LEARNING_ENABLED")
@@ -541,9 +528,11 @@ def unrecognized_learning_env_vars(environ: dict[str, str] | None = None) -> tup
 
 
 def warn_unrecognized_learning_env_vars(logger: logging.Logger) -> tuple[str, ...]:
-    """Log (WARNING) any `LEARNING_*` variable that this settings surface will ignore,
-    and return them. Called once at entrypoint startup — the only moment at which the
-    difference between "configured" and "believed to be configured" is still cheap."""
+    """Log (WARNING) any `LEARNING_*` variable this settings surface will ignore; return them.
+
+    Called once at entrypoint startup — the only moment at which the difference between
+    "configured" and "believed to be configured" is still cheap.
+    """
     unknown = unrecognized_learning_env_vars()
     if unknown:
         logger.warning(

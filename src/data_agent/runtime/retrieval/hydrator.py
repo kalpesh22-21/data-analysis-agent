@@ -1,40 +1,27 @@
-"""Hydrator — the singleton neo4j seeder daemon (replaces the runtime's lazy per-turn
-graph seed).
+"""Hydrator — the singleton neo4j seeder daemon.
 
-The runtime pods are pure READERS of the neo4j retrieval graph. This INDEPENDENT
-`replicas:1` daemon (scripts/run_hydrator.py) owns the write path:
+Runtime pods are pure READERS of the retrieval graph; this independent `replicas:1` daemon
+owns the write path. It authenticates to the MCP export routes with a STATIC service key
+(no user JWT — the old per-turn seed borrowed the first turn's JWT and made every pod sync),
+seeds on boot, re-seeds on every poll cycle, and owns the DESTRUCTIVE rebuild on a dimension
+change so a runtime pod never has to.
 
-  * it authenticates to the MCP export routes with a STATIC service key (no user JWT —
-    the old per-turn seed borrowed the FIRST turn's JWT, and made every pod sync);
-  * it seeds neo4j on boot and re-seeds live on every poll cycle (default 60s);
-  * it owns the DESTRUCTIVE nuke + rebuild on a dimension change (a changed embedding
-    model), so a runtime pod never has to.
+`run_once` is idempotent and cheap on an unchanged poll: the loaders' sha-no-op fast paths
+short-circuit BEFORE any embed or write. BUT the sha does NOT compare the embedding MODEL or
+DIMENSION, so the hydrator probes both every cycle and routes a change — a dimension change
+goes through `rebuild_mcp_corpus_partition(dimension=new)` then reseed; a same-dim model swap
+clears the mcp corpus (so the mcp-scoped write-time parity guard cannot trip) then reseeds;
+otherwise the sha-gated no-op path.
 
-`run_once` is idempotent + cheap on an unchanged poll: the loaders' B1 sha-no-op fast
-paths (`:CatalogMeta`/`:CorpusMeta` singletons) short-circuit BEFORE any embed/write, so
-a steady-state poll is a couple of cheap reads. BUT the sha alone does NOT compare the
-embedding MODEL/DIMENSION, so the hydrator explicitly probes the `source='mcp'` model +
-the live vector-index dimension every cycle and routes a change correctly:
+CRUCIAL data-safety: the hydrator uses the SCOPED `rebuild_mcp_corpus_partition`, NEVER
+`nuke_graph` — the scoped rebuild preserves the `source='learning'` staging tier (human
+promoted, absent from the MCP export and never re-seeded) and the `:Table`/`:Column` graph.
 
-  * dimension change → `rebuild_mcp_corpus_partition(dimension=new)` (drop+recreate the
-    vector indexes at the new dim, clear the mcp corpus + freshness singletons) then reseed;
-  * same-dim model swap → clear the mcp corpus (so the mcp-scoped write-time parity guard
-    can't trip) then reseed — re-embedding every mcp node at the new model;
-  * otherwise → the normal sha-gated no-op path.
+As a true `replicas:1` singleton it needs no distributed `claim_rebuild_lock`.
 
-CRUCIAL data-safety: the hydrator uses the SCOPED `rebuild_mcp_corpus_partition`, NOT
-`nuke_graph` — the scoped rebuild deletes ONLY the trusted `source='mcp'` corpus + the
-freshness singletons and PRESERVES the `source='learning'` staging tier (human-promoted
-content that is NOT in the MCP export and would never be re-seeded) and the `:Table`/
-`:Column` catalog graph.
-
-Single-runner: because this is a true `replicas:1` singleton, there is NO distributed
-`claim_rebuild_lock` — a single writer needs no single-flight guard.
-
-Degrade-not-fail: `run_forever` swallows any per-cycle exception (logs, retries next
-interval), exactly like `learning/sweeper.py`. Neo4j-absent / embedding-absent — OR an
-empty `MCP_SERVICE_KEY` (which would 401 every poll) — ⇒ `build_hydrator` returns `None`
-and the entrypoint idles without crashing.
+Degrade-not-fail: `run_forever` swallows any per-cycle exception and retries next interval.
+An absent neo4j or embedding API — or an empty `MCP_SERVICE_KEY`, which would 401 every poll
+— makes `build_hydrator` return `None` so the entrypoint idles without crashing.
 """
 
 from __future__ import annotations
@@ -74,11 +61,11 @@ _logger = logging.getLogger(__name__)
 class Hydrator:
     """Seed the neo4j retrieval graph from the MCP exports, idempotently, on a poll loop.
 
-    Holds the write-side infra: an async neo4j driver, an embedding client, and the two
-    service-key export clients. `run_once` fetches the catalog + corpus exports, resolves
-    the embedding dimension, and seeds via `load_catalog_graph`/`load_corpus` (gc=True —
-    the hydrator is the single authoritative reconciler). A `DimensionMismatchError`
-    triggers a nuke + full re-seed at the new dimension.
+        Holds the write-side infra: an async neo4j driver, an embedding client and the two
+        service-key export clients. `run_once` fetches the catalog + corpus exports, resolves the
+        embedding dimension, and seeds via `load_catalog_graph`/`load_corpus` with `gc=True` —
+        the hydrator is the single authoritative reconciler. A `DimensionMismatchError` triggers
+        a rebuild at the new dimension.
     """
 
     def __init__(
@@ -105,9 +92,10 @@ class Hydrator:
     async def run_once(self) -> bool:
         """One poll cycle: fetch the exports and seed neo4j idempotently.
 
-        Returns True iff a seed pass ran (or was a B1 no-op), False iff the kill-switch
-        disabled the hydrator this cycle. Reads the kill-switch FRESH (uncached) FIRST —
-        a disabled hydrator does no fetch, no embed, no write."""
+                Returns True iff a seed pass ran (or was a no-op), False iff the kill-switch disabled
+                the hydrator this cycle. The kill-switch is read FRESH and FIRST — a disabled
+                hydrator does no fetch, no embed, no write.
+        """
         if not hydrator_enabled():
             _logger.info("hydrator disabled (HYDRATOR_ENABLED) — skipping this cycle")
             return False
@@ -181,10 +169,10 @@ class Hydrator:
         return True
 
     async def _read_mcp_state(self) -> tuple[set[str], set[int]]:
-        """The current `source='mcp'` embedding model(s) + the live vector-index
-        dimension(s) — the inputs to the model/dimension-change detection. Both reads are
-        scoped/introspective (no writes). An empty graph yields two empty sets (→ the
-        normal seed path, which creates the index at the target dimension)."""
+        """The current `source='mcp'` embedding model(s) and the live vector-index dimension(s) —
+                the inputs to model/dimension-change detection. Both reads are introspective, never
+                writes. An empty graph yields two empty sets, i.e. the normal seed path.
+        """
         async with self._driver.session(database=self._database) as session:
             models = await _fetch_existing_models(session)
             dims = await _fetch_existing_vector_dims(session)
@@ -193,12 +181,12 @@ class Hydrator:
     async def _seed(
         self, catalog_export: dict[str, Any], corpus_export: dict[str, Any], dimension: int
     ) -> None:
-        """Idempotent seed: schema → catalog graph → corpus, all at *dimension*, gc=True.
+        """Idempotent seed: schema -> catalog graph -> corpus, all at *dimension*, `gc=True`.
 
-        The loaders' B1 sha-no-op fast paths make an unchanged poll a cheap no-op (they
-        short-circuit BEFORE embedding/writing). `apply_schema` raises
-        `DimensionMismatchError` on a stale-dimension index; `load_corpus` can too —
-        both propagate to `run_once`'s nuke + rebuild handler."""
+                The loaders' sha-no-op fast paths make an unchanged poll a cheap no-op. Both
+                `apply_schema` and `load_corpus` can raise `DimensionMismatchError` on a
+                stale-dimension index; both propagate to `run_once`'s rebuild handler.
+        """
         await apply_schema(self._driver, dimension=dimension, database=self._database)
         await load_catalog_graph(
             self._driver, catalog_export, database=self._database, gc=True
@@ -226,9 +214,10 @@ class Hydrator:
             )
 
     async def run_forever(self, *, sleep: Callable[[float], Awaitable[None]]) -> None:
-        """Periodic poll loop (the entrypoint). *sleep* is injected (`asyncio.sleep`) so
-        it is unit-drivable. Mirrors `learning/sweeper.py::run_forever`: a transient
-        fetch/seed error must not kill the daemon — log it and retry next interval."""
+        """Periodic poll loop (the entrypoint). *sleep* is injected so it is unit-drivable. A
+                transient fetch or seed error must not kill the daemon — it is logged and retried
+                next interval.
+        """
         while True:
             try:
                 await self.run_once()
@@ -247,19 +236,19 @@ def build_hydrator(
 ) -> Hydrator | None:
     """Build a `Hydrator` from settings — or `None` when the prerequisites are absent.
 
-    Requires BOTH a neo4j URL AND a configured embedding API (the seeder must embed the
-    corpus and write to a graph). Absent either, returns `None` so the entrypoint idles
-    without crashing — the same Phase-0-parity gate `app.py` applies to the vector index.
+        Requires BOTH a neo4j URL AND a configured embedding API, since the seeder must embed the
+        corpus and write to a graph. Absent either, returns `None` so the entrypoint idles
+        without crashing.
 
-    Reuses `Neo4jVectorIndex` to obtain a driver bound to the SAME default database
-    (`"neo4j"`) the runtime reads from, so the hydrator seeds exactly what recall serves.
-    The two export clients are built with `service_key=settings.mcp_service_key` so the
-    daemon authenticates the MCP exports with the static key, never a user JWT.
+        Reuses `Neo4jVectorIndex` to obtain a driver bound to the SAME database the runtime reads
+        from, so the hydrator seeds exactly what recall serves. Both export clients are built
+        with the static `mcp_service_key`, so the daemon never needs a user JWT.
 
-    An EMPTY `mcp_service_key` also returns `None`: without it the export clients fall back
-    to per-request-JWT mode and the daemon (which has no user JWT) would send BLANK Bearer
-    creds → 401 every poll → neo4j never seeds → every runtime pod fails its /ready gate
-    FOREVER. Refuse to poll with garbage creds; log an unmistakable error and idle."""
+        An EMPTY `mcp_service_key` also returns `None`: without it the export clients fall back
+        to per-request-JWT mode, and the daemon has no JWT — every poll would 401, neo4j would
+        never seed, and every runtime pod would fail its /ready gate FOREVER. Refuse to poll with
+        garbage creds; log loudly and idle.
+    """
     if not settings.neo4j_url or not settings.embedding_api_url:
         return None
     if not settings.mcp_service_key:

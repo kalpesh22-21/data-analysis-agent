@@ -1,21 +1,19 @@
-"""blueprint/when.py — the §2.6 declarative `when`-clause evaluator + validator.
+"""blueprint/when.py — the declarative `when`-clause evaluator + validator.
 
-A `when.expr` is a SMALL declarative predicate over typed node outputs
-(04-blueprints §Control-flow): `count()`, `empty()`, scalar comparisons,
-`and`/`or`/`not`, set membership. **No raw SQL, no `eval()`** — the expression is
-parsed with Python's `ast` (in `mode="eval"`, which NEVER executes) into a tree we
-walk against an explicit whitelist; anything outside the grammar raises
+A `when.expr` is a SMALL declarative predicate over typed node outputs: `count()`,
+`empty()`, scalar comparisons, `and`/`or`/`not`, set membership. NO raw SQL and NO `eval()`
+— the expression is parsed with Python's `ast` in `mode="eval"` (which NEVER executes) into
+a tree walked against an explicit whitelist, and anything outside the grammar raises
 `WhenClauseError`.
 
-Node-output references use the `$N` / `$N.field` syntax (`$1.dept_actuals`,
-`$3.company_avg`). Since `$` is not a valid Python identifier char, each reference
-is rewritten to a sentinel identifier BEFORE `ast.parse`; the same rewrite is
-applied to the `outputs` keys so lookups line up.
+Node-output references use the `$N` / `$N.field` syntax. Since `$` is not a valid Python
+identifier character, each reference is rewritten to a sentinel identifier BEFORE
+`ast.parse`, and the same rewrite is applied to the `outputs` keys so lookups line up.
 
-Entity-agnostic gate (D59 / leakage, §2.6): a comparison against a STRING literal
-(`department = 'Warehouse'`) is a slot/filter, not a predicate — `validate_when`
-REJECTS it. Only thresholds/shape (`count > 50`, `company_avg > 0`, `empty($1)`)
-are allowed. Used at LOAD time so an entity-valued `when` never ships.
+Entity-agnostic gate (D59): a comparison against a STRING literal
+(`department = 'Warehouse'`) is a slot or filter, not a predicate, and `validate_when`
+REJECTS it. Only thresholds and shape (`count > 50`, `empty($1)`) are allowed. Applied at
+LOAD time, so an entity-valued `when` never ships.
 """
 
 from __future__ import annotations

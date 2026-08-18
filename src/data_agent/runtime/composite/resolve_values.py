@@ -1,32 +1,28 @@
-"""resolve_values.py — the `resolveValues` runtime composite tool (D77, design §1).
+"""resolve_values.py — the `resolveValues` runtime composite tool (D77).
 
 Model interface (fixed contract):
     resolveValues(table, column, concept, period?) -> [{value, description, score, freq}]
 
-Under the hood the runtime issues **one ordinary `runQuery`**
-(`SELECT <column>, <descCol>, count() AS freq FROM <table> [WHERE <period>]
-GROUP BY … ORDER BY freq DESC LIMIT N`) through the existing
-`ToolDispatcher.dispatch("runQuery", …)` — so D5 credential injection, D57/D5
-column-scope enforcement, provenance capture, denial mapping, preview building,
-and the inner TOOL span all come for FREE and unchanged — then ranks the rows
-by semantic similarity of `concept` (embedding client, D71) blended with `freq`.
+Under the hood it issues ONE ordinary `runQuery` through the existing
+`ToolDispatcher.dispatch`, so D5 credential injection, D57 column-scope enforcement,
+provenance capture, denial mapping, preview building and the inner TOOL span all come for
+free and unchanged; the rows are then ranked by semantic similarity of `concept` (embedding
+client, D71) blended with `freq`.
 
-Key invariants (design §§1-8):
-  - `concept` NEVER touches SQL (D10) — it is only ever embedded + compared.
-  - `table`/`column`/`period.column` are catalog-allowlisted before any SQL is
-    built (`sql_builder.resolve_target`); unknown/ambiguous -> fail-closed
-    `RESOLVE_VALUES_UNKNOWN_TARGET` (retryable), never reaching the MCP.
-  - Enforcement is the inner `runQuery`'s (D57/D5) — every returned value is
-    provably in-scope regardless of ranking.
-  - Embedding failure -> degrade to frequency-only ranking, `degraded=True`
-    (design §3.2) — it is NOT a tool-call failure.
-  - Inner denials/errors pass through `classify_denial` verbatim with
-    `tool_name="resolveValues"` (design §7); empty result -> ok + empty list.
-  - The returned `ToolResult` carries the INNER runQuery's provenance (design §8).
+Key invariants:
+  - `concept` NEVER touches SQL (D10) — it is only ever embedded and compared.
+  - `table`/`column`/`period.column` are catalog-allowlisted before any SQL is built;
+    unknown or ambiguous fails closed with `RESOLVE_VALUES_UNKNOWN_TARGET` (retryable) and
+    never reaches the MCP.
+  - Enforcement is the inner `runQuery`'s, so every returned value is provably in-scope
+    regardless of ranking.
+  - Embedding failure degrades to frequency-only ranking with `degraded=True`; it is NOT a
+    tool-call failure.
+  - The returned `ToolResult` carries the INNER runQuery's provenance.
 
-Two entry points (design §1.4): `run()` (model tool-call path -> `ToolResult`)
-is a thin adapter over `resolve()` (typed in, typed out -> `ResolveOutcome`),
-which D67's rule expander can call directly later without a model round-trip.
+Two entry points: `run()` (model tool-call path -> `ToolResult`) is a thin adapter over
+`resolve()` (typed in, typed out -> `ResolveOutcome`), which D67's rule expander can call
+directly without a model round-trip.
 """
 
 from __future__ import annotations
@@ -76,7 +72,7 @@ _logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ResolveOutcome:
-    """Typed result of a `resolve()` call — the D67 programmatic surface (design §1.4)."""
+    """Typed result of a `resolve()` call — the D67 programmatic surface."""
 
     status: Literal["ok", "denied", "error"]
     values: list[ResolvedValue] = field(default_factory=list)
@@ -92,9 +88,9 @@ class ResolveOutcome:
 def parse_period(raw: Any) -> Period | None:
     """Parse the model's optional structured `period` arg into a `Period`.
 
-    Fail-closed (design §2.4): a present-but-malformed `period` (not an object,
-    or missing/blank `column`, or non-string `start`/`end`) raises
-    `TargetValidationError` rather than being silently dropped.
+        Fail-closed: a present-but-malformed `period` (not an object, missing or blank `column`,
+        non-string `start`/`end`) raises `TargetValidationError` rather than being silently
+        dropped.
     """
     if raw is None:
         return None
@@ -162,14 +158,12 @@ class ResolveValuesComposite:
     ) -> ToolResult:
         """Model tool-call path: validate args, resolve, wrap as a `ToolResult`.
 
-        Emits one `TOOL` span for `resolveValues` (with `concept` redacted and
-        `period` literals masked, design §6.1 — UNLESS the access-controlled
-        `otlp_disable_redaction` debug switch is on, which reveals the real
-        concept/period values on the span, telemetry-only); the inner `runQuery` TOOL span
-        nests inside it via the ambient OTel context. The whole pipeline is
-        wrapped in a B4-parity guard (`_safe_run_inner`): an UNEXPECTED crash
-        never propagates out to abort the turn or leak `str(exc)` — it degrades
-        to a clean `status="error"` `ToolResult`, logged server-side only.
+                Emits one `TOOL` span with `concept` redacted and `period` literals masked — unless
+                the access-controlled `otlp_disable_redaction` switch reveals the real values,
+                telemetry-only — and the inner `runQuery` span nests inside it via the ambient OTel
+                context. The whole pipeline is wrapped in a crash guard: an UNEXPECTED exception
+                never propagates out to abort the turn or leak `str(exc)`, degrading instead to a
+                clean `status="error"` result, logged server-side only.
         """
         if self._tracer is None:
             outcome = await self._safe_run_inner(model_args, credentials)
@@ -273,11 +267,10 @@ class ResolveValuesComposite:
         period: Period | None,
         credentials: RuntimeCredentials,
     ) -> ResolveOutcome:
-        """Typed in, typed out — no `ToolResult` wrapping (design §1.4).
+        """Typed in, typed out — no `ToolResult` wrapping.
 
-        L3: emits `tool_dispatch_start` at the top so every terminal event
-        (ok/denied/error) has a matching start, on BOTH the model tool-call
-        path and the D67 programmatic path.
+                Emits `tool_dispatch_start` at the top so every terminal event (ok/denied/error) has
+                a matching start, on BOTH the model tool-call path and the programmatic path.
         """
         self._observer("tool_dispatch_start", {"tool_name": TOOL_NAME})
         catalog = await self._resolve_catalog(credentials)
@@ -425,13 +418,12 @@ class ResolveValuesComposite:
 
 
 def _validate_embed_shape(vectors: Any, *, expected: int) -> list[list[float]] | None:
-    """Return *vectors* iff it is a well-shaped batch of `expected` equal-length
-    numeric vectors; else `None` (a signal to degrade — M2 / H1).
+    """Return *vectors* iff it is a well-shaped batch of *expected* equal-length numeric
+        vectors; else `None`, a signal to degrade.
 
-    Guards against a protocol-violating embedding client (wrong count, ragged
-    or non-list vectors, non-numeric elements) crashing `ranking.cosine`
-    (`strict=True`) or `vectors[0]`. Ranking quality degradation is always safe
-    — enforcement already happened on the inner query.
+        Guards against a protocol-violating embedding client (wrong count, ragged or non-list
+        vectors, non-numeric elements) crashing `ranking.cosine` or `vectors[0]`. Ranking
+        degradation is always safe — enforcement already happened on the inner query.
     """
     if not isinstance(vectors, list) or len(vectors) != expected:
         return None
@@ -453,12 +445,10 @@ def _validate_embed_shape(vectors: Any, *, expected: int) -> list[list[float]] |
 def _extract_rows(raw_result: Any, target: sql_builder.ResolvedTarget) -> list[RowValue]:
     """Map the backing `runQuery` `{columns, rows, ...}` result into `RowValue`s.
 
-    B4-parity hardening (H1): a MALFORMED backing result never crashes the turn
-    — every structural surprise (missing keys, wrong types, short rows, dict
-    rows, non-numeric freq) is skipped/defaulted so the call degrades to a
-    valid (possibly empty) result rather than raising. The composite issues the
-    inner SQL itself, so a well-formed MCP response is expected; this is purely
-    defense-in-depth against a protocol-violating/faulty backend.
+        A MALFORMED backing result never crashes the turn: every structural surprise (missing
+        keys, wrong types, short rows, dict rows, non-numeric freq) is skipped or defaulted, so
+        the call degrades to a valid — possibly empty — result rather than raising. Pure
+        defense-in-depth against a faulty backend; the composite issues the inner SQL itself.
     """
     if not isinstance(raw_result, dict):
         return []

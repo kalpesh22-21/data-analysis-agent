@@ -1,18 +1,14 @@
-"""blueprint/slots.py — the D49 deterministic per-type slot resolvers (§3.2).
+"""blueprint/slots.py — the D49 deterministic per-type slot resolvers.
 
-The hand-off is fixed (04-blueprints §Slot filling): the MODEL proposes raw
-values; the RUNTIME validates, normalizes, and binds them. These resolvers are
-**pure code — NO LLM runs inside `runBlueprint`** (D49, the hard invariant). A
-genuinely ambiguous / multi-match / no-match / fuzzy value is NEVER guessed — it
-returns an `AskUser` signal the executor turns into a pause.
+The hand-off is fixed: the MODEL proposes raw values; the RUNTIME validates, normalizes and
+binds them. These resolvers are PURE CODE — no LLM runs inside `runBlueprint` (D49, the hard
+invariant) — and a genuinely ambiguous, multi-match, no-match or fuzzy value is NEVER guessed:
+it returns an `AskUser` signal the executor turns into a pause.
 
-Slice-A posture (§Q7): resolvers are pure and Layer-1-exhaustive. Where a resolver
-needs the warehouse domain (an entity-existence check, the valid period-key set),
-the domain is PASSED IN (`domain=`) — Slice B supplies it from a scope-enforced
-`runQuery` probe. `domain=None` means "no domain available" → the resolver binds
-the normalized value without an existence check (the probe is the executor's job),
-never fabricating a match. This keeps the resolvers pure + deterministic here and
-lets the executor wire the real probe later without changing this contract.
+Where a resolver needs the warehouse domain (an entity-existence check, the valid period-key
+set), that domain is PASSED IN (`domain=`) from a scope-enforced probe the executor runs.
+`domain=None` means "no domain available", so the resolver binds the normalized value without
+an existence check — never fabricating a match.
 """
 
 from __future__ import annotations
@@ -71,11 +67,11 @@ class SlotBinding:
 
 @dataclass(frozen=True)
 class OmitSlot:
-    """An absent OPTIONAL slot — no binding; the slot's `optional_pattern` (carried
-    here) REPLACES the predicate containing its `{token}` at template-bind time
-    (Slice C, presence rule 1, 04-blueprints). `optional_pattern is None` means no
-    pattern was authored → the `{token}` stays unbound → the bind fails closed to
-    the raw loop (the safe default)."""
+    """An absent OPTIONAL slot — no binding; the slot's `optional_pattern` (carried here)
+        REPLACES the predicate containing its `{token}` at template-bind time.
+        `optional_pattern is None` means no pattern was authored, so the `{token}` stays unbound
+        and the bind fails closed to the raw loop (the safe default).
+    """
 
     name: str
     optional_pattern: str | None = None
@@ -235,14 +231,13 @@ def _resolve_enum(raw: Any, spec: SlotSpec) -> SlotResolution:
 
 
 def _resolve_period(raw: Any, spec: SlotSpec, domain: Iterable[str] | None) -> SlotResolution:
-    """Phase-1 temporal resolution (§3.2): explicit-named + `askUser` on fuzzy.
+    """Phase-1 temporal resolution: explicit-named, `askUser` on fuzzy.
 
-    A period value is a WAREHOUSE DOMAIN ENTITY, not a calendar date (04-blueprints
-    §Temporal). Explicit-named maps NL → a valid period key in *domain*; a
-    deictic/relative token ("latest"/"last period") is NEVER guessed here — it
-    routes to `AskUser` (Slice B resolves latest-settled via a probe). Multi-match
-    (e.g. bi-weekly "May") and no-match both → `AskUser` (a single `period` slot
-    pins one period). Period-range/period-dimension resolution is a carried OQ.
+        A period value is a WAREHOUSE DOMAIN ENTITY, not a calendar date. Explicit-named maps
+        natural language onto a valid period key in *domain*; a deictic or relative token
+        ("latest", "last period") is NEVER guessed here and routes to `AskUser`. Multi-match (a
+        bi-weekly "May") and no-match both go to `AskUser`, since a single `period` slot pins one
+        period.
     """
     value = _normalize(raw)
     if isinstance(value, str) and value.casefold() in _DEICTIC_PERIOD_TOKENS:
@@ -302,18 +297,16 @@ def _resolve_list(raw: Any, spec: SlotSpec, domain: Iterable[str] | None) -> Slo
 
 
 def _resolve_relative_window(raw: Any, spec: SlotSpec) -> SlotResolution:
-    """A trailing "last N <unit>" window (§3.2, the windowed-period gap): resolve
-    the raw value to a BOUNDED integer `n`, bound as an `INTERVAL {n} <unit>` number
-    literal (F1/D10 — never interpolated). Pure code, no LLM (D49).
+    """A trailing "last N <unit>" window: resolve the raw value to a BOUNDED integer `n`, bound
+        as an `INTERVAL {n} <unit>` number literal (D10 — never interpolated). Pure code, no LLM.
 
-    Accepts ONLY an `int` or a PURE-DIGIT string (whole string is digits after a
-    strip). ANY trailing non-digit text — "6 months", "6 weeks", "6; DROP" — is
-    REJECTED (H2): the unit lives in the TEMPLATE (`INTERVAL {n} MONTH`), so taking
-    a leading integer and dropping the trailing "weeks" would silently bind a WEEK
-    count as MONTHS (a wrong-answer unit mismatch). A float, non-numeric, or any
-    trailing text → `AskUser`. `n` must fall in `[lo, hi]` where `lo = spec.min_value
-    or 1`, `hi = min(spec.max_value or 120, 120)` — the ceiling is a HARD cap the
-    resolver clamps to even if a spec declares more (H1a); `n >= 1` always."""
+        Accepts ONLY an `int` or a PURE-DIGIT string. ANY trailing non-digit text — "6 months",
+        "6 weeks", "6; DROP" — is REJECTED: the unit lives in the TEMPLATE (`INTERVAL {n} MONTH`),
+        so taking a leading integer and dropping the trailing "weeks" would silently bind a WEEK
+        count as MONTHS. A float, a non-numeric, or any trailing text goes to `AskUser`. `n` must
+        fall in `[lo, hi]`, where the ceiling is a HARD cap the resolver clamps to even if a spec
+        declares more, and `n >= 1` always.
+    """
     value = _normalize(raw)
     if isinstance(value, bool):
         # A bool is an int subclass — never a window count. Ask rather than bind 1/0.
@@ -352,15 +345,15 @@ def _resolve_relative_window(raw: Any, spec: SlotSpec) -> SlotResolution:
 
 
 def _resolve_period_range(raw: Any, spec: SlotSpec) -> SlotResolution:
-    """An explicit `{start, end}` window (§3.2, the windowed-period gap). Resolves
-    to a `PeriodRange`; the executor expands it to `{name}_start`/`{name}_end` TYPED
-    string literals (F1/D10). Pure — NO relative→concrete date arithmetic (a deictic
-    word asks, consistent with `_resolve_period`).
+    """An explicit `{start, end}` window, resolved to a `PeriodRange`; the executor expands it to
+        `{name}_start`/`{name}_end` TYPED string literals (D10). Pure — NO relative-to-concrete
+        date arithmetic, since a deictic word asks, consistently with `_resolve_period`.
 
-    Accepts a dict with string `start`/`end` keys, or a 2-element `[start, end]`
-    list/tuple. Both bounds must match a strict ISO date/datetime shape and
-    `start < end` (a same-shape ISO string compare is valid). A non-dict/list, a
-    missing key, a malformed/deictic bound, or mismatched shapes → `AskUser`."""
+        Accepts a dict with string `start`/`end` keys, or a 2-element `[start, end]` list/tuple.
+        Both bounds must match a strict ISO date/datetime shape and `start < end` (a same-shape
+        ISO string compare is valid). A non-dict/list, a missing key, a malformed or deictic
+        bound, or mismatched shapes all go to `AskUser`.
+    """
     if isinstance(raw, dict):
         start = raw.get("start")
         end = raw.get("end")

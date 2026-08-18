@@ -105,10 +105,10 @@ class _FullResultReader(Protocol):
 def _is_enforcement_denial(tc: ToolCallSummary) -> bool:
     """Was this call stopped by runtime mechanics rather than by the data?
 
-    `error_code` is `None` on every pre-Release-1 trail entry, and on any MCP error
-    whose `[{CODE}]` prefix could not be parsed. `None` is not in the set, so it
-    reads as "not enforcement" and keeps the pre-existing behaviour — which is the
-    conservative direction: an unclassifiable failure stays a failure."""
+    `error_code` is `None` on every pre-Release-1 trail entry and on any MCP error whose prefix
+    could not be parsed. `None` is not in the set, so it reads as "not enforcement" — the
+    conservative direction, where an unclassifiable failure stays a failure.
+    """
     return tc.error_code in ENFORCEMENT_ERROR_CODES
 
 
@@ -154,10 +154,12 @@ async def _read_full_result_with_retry(
     backoff: float,
     sleep: Callable[[float], Awaitable[None]],
 ) -> dict[str, Any] | None:
-    """`store.read_full_result` with a bounded transient-error retry (MEDIUM-1).
-    A not-found result already returns `None` inside the store (no raise), so a
-    raised exception is retried; a persistent failure re-raises after *retries*
-    attempts so the message is (correctly) not-acked → reclaimed → dead-lettered."""
+    """`store.read_full_result` with a bounded transient-error retry.
+
+    A not-found result already returns `None` inside the store, so a RAISED exception is what gets
+    retried; a persistent failure re-raises after *retries* attempts, so the message is correctly
+    not-acked → reclaimed → dead-lettered.
+    """
     attempt = 0
     while True:
         try:
@@ -275,31 +277,22 @@ def _failed_fixed_pairs(tool_calls: tuple[ToolCallSummary, ...]) -> tuple[Failed
 
 
 def _designations(args: dict[str, Any]) -> Iterator[tuple[str, str | None]]:
-    """`(sql, blueprint_id)` for every designation in ONE `answerWithTable`'s args:
-    each `tables[i]` (Release 1's multi-table answer, 08 §B.3) and then the top-level
-    `sql`/`blueprint_id` pair — the runtime's own read order, `tables` FIRST.
+    """`(sql, blueprint_id)` for every designation in ONE `answerWithTable`'s args.
 
-    That order is what makes the caller's dedupe keep the right entry. The live
-    placeholder shape is `{sql: X, blueprint_id: "", tables: [{sql: X, blueprint_id:
-    "bp-a"}]}` — the model fills BOTH the array and the flat pair with the same query
-    — and the two entries differ only in that the array one carries the attribution.
-    Yielding the flat pair first would keep the blueprint-less copy and drop the
-    `bp-a` hint, which is the only thing either entry adds over the other.
+    Each `tables[i]` first, then the top-level `sql`/`blueprint_id` pair — the runtime's own read
+    order, and what makes the caller's dedupe keep the right entry: the live shape fills both the
+    array and the flat pair with the same query, and only the array one carries the attribution.
 
-    A UNION, where the runtime's `resolve_designations` applies precedence (`tables`
-    wins OUTRIGHT when any item designates). The divergence is deliberate and is
-    forced by what this loader cannot do: the runtime resolves `blueprint_id` →
-    SQL through the turn's executed queries, and we hold no such map. So
-    `tables: [{blueprint_id: X}]` alongside a top-level `sql` — a real live shape —
-    yields NOTHING under precedence and the right string under union. Over-inclusion
-    costs a duplicate evidence line; precedence-without-the-map costs the only SQL
-    the session has.
+    A UNION, where the runtime's `resolve_designations` applies precedence. The divergence is
+    forced by what this loader cannot do: the runtime resolves `blueprint_id` → SQL through the
+    turn's executed queries and we hold no such map, so a real live shape yields NOTHING under
+    precedence and the right string under union. Over-inclusion costs a duplicate evidence line;
+    precedence-without-the-map costs the only SQL the session has.
 
-    `args` is a `dict` by construction (`_build_tool_call` copies it with `dict()`),
-    but everything INSIDE it is model-authored JSON and nothing there is trusted:
-    `tables` may not be a list, an item may not be a mapping, and the live model
-    fills unused properties with `""` placeholders rather than omitting them (03
-    §C.3.1). Non-`str` and blank values are skipped."""
+    Everything inside `args` is model-authored JSON and nothing there is trusted: `tables` may not
+    be a list, an item may not be a mapping, and the live model fills unused properties with
+    placeholders rather than omitting them. Non-`str` and blank values are skipped.
+    """
     raw_tables = args.get("tables")
     tables = raw_tables if isinstance(raw_tables, list) else []
     for item in (*tables, args):
@@ -318,25 +311,19 @@ def _designations(args: dict[str, Any]) -> Iterator[tuple[str, str | None]]:
 
 
 def _answer_sqls(tool_calls: tuple[ToolCallSummary, ...]) -> tuple[AnswerSql, ...]:
-    """§2.6: the SQL behind every SUCCESSFUL `answerWithTable`, in trail order,
-    deduped on the SQL text (first occurrence keeps its `tool_call_ref`).
+    """§2.6: the SQL behind every SUCCESSFUL `answerWithTable`, deduped on the SQL text.
 
-    This is the ONLY route by which the final, human-facing answer's SQL reaches the
-    summary. `answerWithTable` is in neither `_SQL_TOOLS` nor `_DATA_TOOLS` — it
-    executes nothing — and a designated query need never have been dispatched as a
-    `runQuery`, so it is not recoverable from any other trail entry.
+    In trail order, first occurrence keeping its `tool_call_ref`. This is the ONLY route by which
+    the final, human-facing answer's SQL reaches the summary: `answerWithTable` executes nothing
+    and a designated query need never have been dispatched as a `runQuery`, so it is not
+    recoverable from any other trail entry. Only `status == "ok"` contributes — a refused
+    `answerWithTable` showed the user no table, and the retry that succeeded is a separate entry.
 
-    Only `status == "ok"` contributes. A refused `answerWithTable`
-    (`ANSWER_TABLE_BLUEPRINT_NOT_RUN`, `FINALIZATION_BLOCKED_PENDING_INTENTS`)
-    showed the user no table at all, and the retry that succeeded is a separate
-    entry that this pass picks up on its own.
-
-    The strictness of `_designations` is derived from the readers: the extractor
-    serializes these strings into a prompt payload and `prior_art_query_text` joins
-    them into the text it embeds. Both want a `str` and neither can do anything with
-    any other type, so a malformed item is skipped SILENTLY — this is an offline,
-    best-effort projection, and one placeholder-filled table entry must not cost the
-    session its whole summary."""
+    The strictness of `_designations` is derived from the readers: the extractor serializes these
+    strings into a prompt payload and `prior_art_query_text` embeds them, and both want a `str`.
+    So a malformed item is skipped SILENTLY — this is an offline, best-effort projection, and one
+    placeholder-filled table entry must not cost the session its whole summary.
+    """
     answers: list[AnswerSql] = []
     seen: set[str] = set()
     for tc in tool_calls:
@@ -480,11 +467,12 @@ async def load_session_summary(
     read_backoff_seconds: float = _DEFAULT_READ_BACKOFF_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> SessionSummary:
-    """Normalize *doc* (+ its D46 full results, via `store.read_full_result`) into
-    a `SessionSummary`. Pure + read-only (D72): reads only; the caller's
-    lifecycle CAS is the sole write. The D46 full-result reads retry transient
-    store errors (MEDIUM-1) before propagating; *sleep* is injectable so Layer-1
-    tests exercise the retry without real delay."""
+    """Normalize *doc* and its D46 full results into a `SessionSummary`.
+
+    Pure and read-only (D72): the caller's lifecycle CAS is the sole write. The full-result reads
+    retry transient store errors before propagating, and *sleep* is injectable so Layer-1 tests
+    exercise the retry without real delay.
+    """
     tool_calls = tuple(
         [
             await _build_tool_call(

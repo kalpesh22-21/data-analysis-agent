@@ -1,14 +1,13 @@
-"""blueprint/rules.py — D67 `resolve_via` rule expansion (runblueprint-design §3.4).
+"""blueprint/rules.py — D67 `resolve_via` rule expansion.
 
-A `uses_rules` entry is either **static** (a fixed SQL boolean authored directly
-into the template — the executor takes NO runtime action; it is just SQL) or
-**resolved/dynamic** (`resolve_via: "resolveValues(FieldId, 'employee status')"`).
-This module wires the dynamic case: it parses `resolve_via` into `(column,
-concept)`, calls the typed `ResolveValuesComposite.resolve()` hook (the D67
-programmatic entry point — NO model round-trip, D77 built it for exactly this),
-and turns the returned client-scoped code set into a typed AST `IN`-list binding
-that `template.bind_template` folds into the node SQL (never string-interpolated,
-D10 — the same F1 boundary as slots).
+A `uses_rules` entry is either STATIC (a fixed SQL boolean authored directly into the
+template — the executor takes NO runtime action; it is just SQL) or DYNAMIC
+(`resolve_via: "resolveValues(FieldId, 'employee status')"`). This module wires the dynamic
+case: it parses `resolve_via` into `(column, concept)`, calls the typed
+`ResolveValuesComposite.resolve()` hook (the D67 programmatic entry point — NO model
+round-trip), and turns the returned client-scoped code set into a typed AST `IN`-list
+binding that `template.bind_template` folds into the node SQL, never string-interpolated
+(D10 — the same boundary as slots).
 
 Rule shape the executor accepts (a `uses_rules` list entry):
 
@@ -17,14 +16,13 @@ Rule shape the executor accepts (a `uses_rules` list entry):
      "table": "dbpcm_warehouse.paf",         # the table resolveValues probes
      "binds": "field_codes"}                  # the {field_codes} template placeholder
 
-`binds` names the `{placeholder}` token the resolved IN-list fills; when absent it
-is derived from a `predicate` field's single `{token}` (the `04-blueprints.md`
-`predicate: "FieldId IN ({field_codes})"` shape). A malformed/static rule yields
-`None` from `parse_rule` (the executor treats it as inert — no runtime expansion).
+`binds` names the `{placeholder}` token the resolved IN-list fills; when absent it is
+derived from a `predicate` field's single `{token}`. A malformed or static rule yields
+`None` from `parse_rule`, and the executor treats it as inert.
 
-Pure parsing here; the async `expand_rules` does the `resolve()` calls + the
-degrade/empty policy (§3.4 steps 3-4). Kept out of `executor.py` so the DAG walk
-stays readable and this policy is unit-testable in isolation.
+Parsing here is pure; the async `expand_rules` does the `resolve()` calls plus the
+degrade/empty policy, kept out of `executor.py` so the DAG walk stays readable and the
+policy is unit-testable in isolation.
 """
 
 from __future__ import annotations
@@ -123,17 +121,16 @@ class RuleBinding:
 
 @dataclass(frozen=True)
 class RuleFallback:
-    """A degrade/low-margin, empty resolve, or an inner denial → fall back to the
-    raw loop (§3.4: an empty resolved-rule set is NEVER a silently-dropped filter;
-    a degraded resolve is NEVER silently filtered on a guessed code set).
+    """A degrade, a low margin, an empty resolve, or an inner denial -> fall back to the raw
+        loop: an empty resolved-rule set is NEVER a silently-dropped filter, and a degraded
+        resolve is NEVER silently filtered on a guessed code set.
 
-    Honest-call (reviewer S2): a degraded/low-margin resolve DOWNGRADES to a
-    raw-loop fallback rather than pausing to "confirm the code set" — there is no
-    channel for the model to feed a confirmed set back into a re-invocation (it
-    would just re-resolve → re-degrade → re-pause the same question, an
-    unfulfillable UX). The raw loop is strictly better and honest until a real
-    confirm channel exists. `error_code`/`user_message`/`retryable` carry an inner
-    DENIAL through verbatim (§5.4); a degrade/empty carries `provenance` only."""
+        A degraded or low-margin resolve DOWNGRADES to the raw loop rather than pausing to
+        "confirm the code set": there is no channel for the model to feed a confirmed set back
+        into a re-invocation, so a pause would just re-resolve, re-degrade and re-ask the same
+        unanswerable question. `error_code`/`user_message`/`retryable` carry an inner DENIAL
+        through verbatim; a degrade or empty carries `provenance` only.
+    """
 
     rule_id: str
     reason: str  # "degraded" | "empty" | "denied" | "low_confidence"

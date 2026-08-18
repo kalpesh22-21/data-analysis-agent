@@ -1,35 +1,17 @@
 """Durable, entity-free ranking inputs stamped onto a `CandidateEnvelope`.
 
-Both of these exist for ONE reason: the inbox ranking (plan §4) needs facts that are
-only knowable at a moment the inbox no longer has access to, and that no later reader
-can reconstruct.
+Both exist because the inbox ranking needs facts knowable only at a moment the inbox no
+longer has access to. `SessionSignals` is derived from the `SessionSummary`, which lives in
+memory for one extraction and is then dropped, so a struggle signal not stamped here does not
+exist. `NoveltyStamp` is measured at S6 dedup time, the one place that has already paid for
+an embed and an ANN query.
 
-  * `SessionSignals` — how the session that produced this candidate WENT. It is derived
-    from the `SessionSummary`, which lives in memory inside the learning consumer for
-    the duration of one extraction and is then dropped (the entity-bearing original is
-    never persisted outside the access-controlled `learning_audit` evidence snapshot,
-    D51/D17). By the time a human opens the inbox the summary is gone, so a struggle
-    signal that is not stamped here is a struggle signal that does not exist.
-  * `NoveltyStamp` — how far this candidate is from what has ALREADY LANDED. Measured at
-    S6 dedup time, because that is the one place in the pipeline that has already paid
-    for an embed of the candidate's intent and an ANN query against the graph. Computing
-    it again in the inbox would be a second embed per item per page view, against a
-    corpus that has moved on.
-
-**Both are scalars only, and that is a hard constraint, not a convenience.** These
-fields travel to the review UI through `InboxItem`, which is the surface the D17 entity
-redaction protects. A count, a bool, an enum member and a float carry no entity; a quoted
-question or a fragment of SQL would, and neither of these types has a field one could be
-put in.
-
-**Both are OPTIONAL on the envelope and every reader must tolerate their absence.**
-`learning_candidates` is durable and is never migrated, so a candidate extracted before
-this slice carries neither — and, more importantly, `None` and a zero-valued stamp are
-DIFFERENT claims. `SessionSignals(turn_count=0, ...)` says "the loader saw a session with
-no turns"; `None` says "nobody looked". `NoveltyStamp(novelty=0.0, measured=False)` says
-"we could not look"; `novelty=0.0, measured=True` says "an identical artifact is already
-landed". Collapsing either pair would let a degraded read masquerade as a measurement,
-which is the failure mode `PriorArtUnavailableError` exists to prevent one layer down.
+BOTH ARE SCALARS ONLY — a hard constraint: these travel to the review UI through `InboxItem`,
+the surface the D17 redaction protects, and a count, a bool, an enum member and a float carry
+no entity. BOTH ARE OPTIONAL and every reader must tolerate absence, because `None` and a
+zero-valued stamp are DIFFERENT claims: `turn_count=0` says the loader saw a session with no
+turns, `None` says nobody looked; `novelty=0.0, measured=False` says we could not look,
+`measured=True` says an identical artifact is already landed.
 """
 
 from __future__ import annotations
@@ -44,10 +26,9 @@ if TYPE_CHECKING:  # pragma: no cover - import-cycle avoidance only
 def _count(raw: Any) -> int:
     """A rehydrated count as a non-negative `int`, or 0.
 
-    NOT `int(raw)`: this doc comes back out of Couchbase, where a hand edit or a foreign
-    writer can put anything in it, and `int("12")`/`int(1.9)` would silently invent a
-    value while `int({})` raises inside a queue worker. `bool` is excluded explicitly
-    because it is an `int` subclass and `True` is not a count.
+    NOT `int(raw)`: this doc comes back out of Couchbase, where a hand edit can put anything in
+    it, and `int("12")`/`int(1.9)` would silently invent a value while `int({})` raises inside a
+    queue worker. `bool` is excluded because it is an `int` subclass and `True` is not a count.
     """
     if isinstance(raw, bool) or not isinstance(raw, int):
         return 0
@@ -57,12 +38,10 @@ def _count(raw: Any) -> int:
 def _unit(raw: Any) -> float:
     """A rehydrated score clamped into `[0.0, 1.0]`, or 0.0 for anything unusable.
 
-    Derived from what the reader DOES with it: `ranking.review_score` multiplies these
-    together and the product is compared against `review_score_cutoff` and used as a sort
-    key. A `nan` would make the sort order depend on the comparison direction (every
-    comparison with `nan` is False), and an out-of-range value would let one candidate
-    dominate the whole queue — so both are clamped rather than trusted. `bool` is
-    excluded for the same reason as in `_count`.
+    Derived from what the reader DOES with it: `ranking.review_score` multiplies these together
+    and the product is a sort key compared against a cutoff. A `nan` would make the sort order
+    depend on the comparison direction, and an out-of-range value would let one candidate
+    dominate the queue.
     """
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return 0.0
@@ -102,9 +81,10 @@ class SessionSignals:
     def from_summary(cls, summary: SessionSummary) -> SessionSignals:
         """Derive the stamp from the in-memory summary (the only place it exists).
 
-        Reads only lengths, a bool and one enum member — no `user_nl`, no
-        `assistant_text`, no `args`, no SQL. That is what makes the result safe to put on
-        an envelope the review UI renders."""
+        Reads only lengths, a bool and one enum member — no `user_nl`, no `assistant_text`, no
+        `args`, no SQL. That is what makes the result safe to put on an envelope the review UI
+        renders.
+        """
         return cls(
             accepted_signal=summary.accepted_signal,
             turn_count=len(summary.turns),
@@ -140,17 +120,12 @@ class SessionSignals:
 class NoveltyStamp:
     """How far this candidate's intent sits from the closest LANDED artifact.
 
-    **Landed, not sibling.** `novelty` is derived exclusively from the GRAPH half of the
-    S6 soft union (`PriorArtCard.origin == "graph"`) — the MCP canon plus the landed
-    learning tier. The `learning_corpus` half is deliberately excluded even though the
-    dedup stage has it in hand, because a sibling candidate from a concurrent session is
-    not something we own yet: including it would score the FIRST sighting of an idea as
-    novel and each of its corroborations as redundant, which is both order-dependent and
-    backwards — corroboration is evidence FOR an idea, not against it.
-
-    `measured=False` means the question was not answered (no index wired, the graph was
-    unreachable, no intent to embed, or the candidate never reached the soft layer). It is
-    NOT "nothing was found"; see the module docstring.
+    LANDED, not sibling: `novelty` comes exclusively from the GRAPH half of the S6 soft union.
+    The `learning_corpus` half is deliberately excluded even though dedup has it in hand, because
+    including it would score the FIRST sighting of an idea as novel and each of its
+    corroborations as redundant — order-dependent and backwards, since corroboration is evidence
+    FOR an idea. `measured=False` means the question was not answered, NOT that nothing was
+    found.
     """
 
     novelty: float = 0.0

@@ -1,16 +1,10 @@
 """InboxItem — the reviewer-facing projection of an `in_review` candidate (§4).
 
-`InboxItem` is DERIVED from a `CandidateEnvelope` + its `status`; it is not stored.
-It carries an entity-free-where-required view so a human can adjudicate without the
-review UI ever touching a global store. The `reason` is re-derived from the same
-routing rules the writer used (`writer.routing.derive_inbox_reason`) so the label
-can never drift from the decision that produced it.
-
-`payload_view` is the candidate payload with entity-bearing leakage spans REDACTED
-(the entity value replaced), so a reviewer sees WHAT leaked (field + kind, via
-`entity_scan`) without the raw value being re-exposed through the inbox surface
-(D17/QA-Q7). `entity_scan` is the settled S5 `LeakageVerdict`; `dedup` is the S6
-verdict (what it collided with, if anything).
+DERIVED from a `CandidateEnvelope` plus its `status`; never stored. The `reason` is
+re-derived from the same routing rules the writer used, so the label can never drift from the
+decision that produced it. `payload_view` is the candidate payload with entity-bearing
+leakage spans REDACTED, so a reviewer sees WHAT leaked (field + kind, via `entity_scan`)
+without the raw value being re-exposed through the inbox surface (D17/QA-Q7).
 """
 
 from __future__ import annotations
@@ -53,34 +47,26 @@ UNSCANNED_NOTICE = (
 def _withheld_for_unsettled_scan(env: CandidateEnvelope) -> bool:
     """Must this row's CONTENT be withheld from the wire entirely?
 
-    Only for a FAIL-TO-REVIEW row whose scan never settled, and both halves matter:
-
-      * the redaction machinery is keyed off SETTLED spans (`entity_spans`), so on an
-        unsettled row it removes nothing — `payload_view` and `summary` ship the raw
-        payload verbatim. For every other listable status that combination cannot arise:
-        a candidate reaches `in_review`/`rejected`/`validated` through the write router,
-        which routes an unsettled scan to review precisely because it is unsettled, and
-        the gate settled a verdict on the way there.
-      * a decline-bearing row CAN arrive here unscanned by design — the consumer persists
-        it with the `pending` sentinel when no leakage stage is wired, loudly, rather than
-        fabricating a pass. That degrade must not be a hole: withholding the decline
-        detail while shipping the same session's literals inside `payload_view` would be
-        an elaborate way of leaking exactly what the other rule protects.
-
-    The row itself still lists — a reviewer needs to know the work exists — with its
-    shape, its decline reason and its counts. Only the unscanned CONTENT is held back."""
+    Only for a FAIL-TO-REVIEW row whose scan never settled, and both halves matter. The redaction
+    machinery is keyed off SETTLED spans, so on an unsettled row it removes nothing and
+    `payload_view` would ship the raw payload verbatim — a combination no other listable status
+    can reach, because the write router settles a verdict on the way. And a decline-bearing row
+    CAN arrive here unscanned by design, since the consumer persists it with the `pending`
+    sentinel when no leakage stage is wired; withholding the decline detail while shipping the
+    same session's literals inside `payload_view` would be an elaborate way of leaking exactly
+    what the other rule protects. The row itself still LISTS, with its shape, decline reason and
+    counts — only the unscanned CONTENT is held back.
+    """
     return env.decline is not None and not LeakageVerdict.is_settled(env.entity_scan)
 
 
 def _summary_of(env: CandidateEnvelope) -> str:
-    """An entity-free one-liner: the blueprint `intent` or the knowledge `statement`,
-    with any settled entity spans REDACTED.
+    """An entity-free one-liner: the blueprint `intent` or the knowledge `statement`, redacted.
 
-    A near-miss candidate can carry the entity IN its `intent` (the very value
-    `payload_view` redacts) — surfacing the RAW intent here would bypass that redaction
-    and re-leak it through the summary. So the one-liner runs through the SAME
-    `redact_payload` strip (keyed off the settled S5 spans) the payload view uses, so a
-    reviewer sees `[redacted]` wherever a value was, never the raw span (D17/QA-Q7)."""
+    A near-miss candidate can carry the entity IN its `intent` — the very value `payload_view`
+    redacts — so surfacing the raw intent would bypass that redaction. The one-liner runs through
+    the SAME `redact_payload` strip, keyed off the settled S5 spans (D17/QA-Q7).
+    """
     if _withheld_for_unsettled_scan(env):
         return UNSCANNED_NOTICE
     payload = env.payload
@@ -92,28 +78,25 @@ def _summary_of(env: CandidateEnvelope) -> str:
 
 def _entity_free_payload_view(env: CandidateEnvelope) -> dict[str, Any]:
     """The payload for review with the settled leakage spans REDACTED (D17/QA-Q7).
-    Delegates to the shared redaction so the reviewer surface can never re-expose a
-    raw entity value the S5 verdict flagged. The source envelope is never mutated.
 
-    An UNSCANNED fail-to-review row ships the notice instead of the payload: the
-    redaction has nothing to key off, so "redacted" would mean "unmodified" — see
-    `_withheld_for_unsettled_scan`."""
+    Delegates to the shared redaction so the reviewer surface can never re-expose a raw entity
+    value the S5 verdict flagged; the source envelope is never mutated. An UNSCANNED
+    fail-to-review row ships the notice instead of the payload — the redaction has nothing to key
+    off, so "redacted" would mean "unmodified".
+    """
     if _withheld_for_unsettled_scan(env):
         return {"withheld": UNSCANNED_NOTICE}
     return entity_free_payload_view(env)
 
 
 def _leakage_view(env: CandidateEnvelope) -> LeakageVerdict:
-    """The settled S5 verdict with hit `span`s BLANKED (field/kind kept) — the
-    reviewer sees WHAT leaked and WHERE, never the raw value.
+    """The settled S5 verdict with hit `span`s BLANKED — field and kind kept, never the raw value.
 
-    An `in_review` envelope still stores the raw spans (they are only blanked at the
-    promotion boundary by `blank_scan_spans`), so projecting the verdict verbatim would
-    ship the exact entity value the payload redaction withholds (contract §2a requires
-    `span == ""`). Mirror `redaction.blank_scan_spans` here so the inbox surface is
-    span-free regardless of status. A pre-S5 (`pending`) self-check is not a settled
-    verdict → an empty `pass` view (the inbox never asserts a finding S5 did not
-    settle)."""
+    An `in_review` envelope still stores the raw spans (they are only blanked at the promotion
+    boundary), so projecting the verdict verbatim would ship the exact entity value the payload
+    redaction withholds. A pre-S5 (`pending`) self-check is not a settled verdict and renders as
+    an empty `pass`: the inbox never asserts a finding S5 did not settle.
+    """
     scan = env.entity_scan
     if LeakageVerdict.is_settled(scan):
         verdict = LeakageVerdict.from_doc(scan)
@@ -124,11 +107,11 @@ def _leakage_view(env: CandidateEnvelope) -> LeakageVerdict:
 def _leakage_cleared(env: CandidateEnvelope) -> bool:
     """Did the S5 gate SETTLE a clean `pass` on this envelope?
 
-    Reads the stored `entity_scan`, deliberately NOT `_leakage_view` above, which renders
-    an UNSETTLED scan as `result="pass"` so the reviewer sees no phantom finding. That
-    rendering is right for its own purpose and catastrophic for this one: "nobody
-    scanned" would read as "cleared", and the one surface that must fail closed would
-    open on the exact case where nothing is known."""
+    Reads the stored `entity_scan`, deliberately NOT `_leakage_view`, which renders an UNSETTLED
+    scan as `pass` so the reviewer sees no phantom finding. That rendering is right for its own
+    purpose and catastrophic for this one: "nobody scanned" would read as "cleared", and the one
+    surface that must fail closed would open on the exact case where nothing is known.
+    """
     scan = env.entity_scan
     return LeakageVerdict.is_settled(scan) and scan.get("result") == "pass"
 
@@ -201,26 +184,18 @@ class InboxItem:
     decline_detail_cleared: bool = False
 
     def decline_view(self) -> dict[str, Any] | None:
-        """The fail-to-review block AS IT MAY CROSS TO A BROWSER, or `None` when this is
-        not a fail-to-review row.
+        """The fail-to-review block AS IT MAY CROSS TO A BROWSER, or `None` for a non-decline row.
 
-        **The detail is withheld unless the leakage scan settled a clean `pass`.** The
-        text names predicates and their literal values — lifted from the analyst's
-        accepted SQL — which is why it lives in the access-controlled candidate store
-        (D101) and why this projection is narrower than that store. A `quarantine` or
-        `reroute` verdict means the scanners found something they could not clear, and
-        shipping a sentence full of the same session's literals to a browser at that
-        moment would route around the one gate that noticed. An UNSETTLED scan withholds
-        for the stronger reason: nobody looked.
-
-        `correction_history` is withheld by the same rule and for the same reason — it is
-        the hint text, repeated, one round earlier.
-
-        What survives withholding is the SHAPE: the reason code, whether the model was
-        re-asked, and the flag saying a detail exists and is being held back. A reviewer
-        who sees `detail_withheld` knows to go and look in the store rather than
-        concluding the row has nothing to say — which is the failure this whole slice is
-        about, one layer up."""
+        THE DETAIL IS WITHHELD unless the leakage scan settled a clean `pass`. The text names
+        predicates and their literal values, lifted from the analyst's accepted SQL, which is why it
+        lives in the access-controlled candidate store (D101) and why this projection is narrower. A
+        `quarantine` or `reroute` verdict means the scanners found something they could not clear; an
+        UNSETTLED scan withholds for the stronger reason that nobody looked. `correction_history` is
+        withheld by the same rule — it is the hint text, one round earlier. What survives is the
+        SHAPE: the reason code, whether the model was re-asked, and the flag saying a detail exists
+        and is being held back, so a reviewer knows to go look in the store rather than concluding
+        the row has nothing to say.
+        """
         if self.decline is None:
             return None
         cleared = self.decline_detail_cleared

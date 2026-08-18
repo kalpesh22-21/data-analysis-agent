@@ -1,11 +1,10 @@
 """Builder — the S3 blueprint PLAN + accepted SQL → `BlueprintGeneralization`.
 
-Pure and deterministic (NO LLM). Orchestrates: AST-rewrite (`rewrite`), transitive
-`uses` (the reused D69/D87 provenance extractor), `result_grain` (from the plan's
-`result_signature.grain`), static validation (`validate`), and the pinned
-`canonical_ast_norm` (`canonical`). Every failure path is IN-BAND: it produces a
-`BlueprintGeneralization` whose `static_validation.outcome == "fail_to_review"`
-(D52/D97) — this function never raises for a bad candidate and never auto-promotes.
+Pure and deterministic (NO LLM). Orchestrates the AST rewrite, the transitive `uses` from
+the D69/D87 provenance extractor, `result_grain`, static validation and the pinned
+`canonical_ast_norm`. Every failure path is IN-BAND: it produces a `BlueprintGeneralization`
+whose `static_validation.outcome == "fail_to_review"` (D52/D97). This module never raises
+for a bad candidate and never auto-promotes.
 """
 
 from __future__ import annotations
@@ -35,11 +34,13 @@ _logger = logging.getLogger(__name__)
 
 
 def _result_grain(payload: dict[str, Any]) -> ResultGrainStamp:
-    """The declared grain, read defensively: `result_signature`/`grain`/`columns` are
-    model-authored and rehydrated from the candidate store, so a wrong JSON type on any
-    of the three (a LIST where an object belongs) must degrade to the empty grain, not
-    `AttributeError` out of a module contracted never to raise. Runs on EVERY path,
-    including `_fail_to_review` — the error path must not have its own error path."""
+    """The declared grain, read defensively.
+
+    `result_signature`/`grain`/`columns` are model-authored and rehydrated from the candidate
+    store, so a wrong JSON type on any of the three must degrade to the empty grain rather than
+    `AttributeError` out of a module contracted never to raise. Runs on EVERY path, including
+    `_fail_to_review` — the error path must not have its own error path.
+    """
     signature = payload.get("result_signature")
     grain = signature.get("grain") if isinstance(signature, dict) else None
     if not isinstance(grain, dict):
@@ -60,8 +61,10 @@ def _result_grain(payload: dict[str, Any]) -> ResultGrainStamp:
 
 
 def _uses_rules(parameterization: list[dict[str, Any]]) -> tuple[str, ...]:
-    """The resolved catalog rule ids for role=rule locators (D48 input), sorted +
-    de-duplicated. A plan-level fact (independent of any single node)."""
+    """The resolved catalog rule ids for role=rule locators (D48 input), sorted + de-duplicated.
+
+    A plan-level fact, independent of any single node.
+    """
     rules = {
         p["rule_id"]
         for p in parameterization
@@ -83,8 +86,10 @@ def _slot_binds_to(parameterization: list[dict[str, Any]]) -> tuple[str, ...]:
 def _provenance_uses(
     templates: list[str], catalog_schema: dict[str, dict[str, str]]
 ) -> tuple[bool, tuple[str, ...]]:
-    """Transitive `uses` across the template(s) via the D69/D87 extractor. Returns
-    `(ok, uses)`; `ok=False` (a provenance failure) drives `explain_ok=False`."""
+    """Transitive `uses` across the template(s) via the D69/D87 extractor.
+
+    Returns `(ok, uses)`; `ok=False` (a provenance failure) drives `explain_ok=False`.
+    """
     uses: set[str] = set()
     for template in templates:
         try:
@@ -97,58 +102,31 @@ def _provenance_uses(
 
 
 def _absent_or_str(value: Any) -> bool:
-    """Absent (or explicitly null) means "not declared"; anything present must be a
-    string. Same rule the S3 gate applies to its collections — a wrong JSON type is
-    evidence about the prompt and should show up in a verdict, not be normalized away."""
+    """Absent (or explicitly null) means "not declared"; anything present must be a string.
+
+    A wrong JSON type is evidence about the prompt and should show up in a verdict, not be
+    normalized away.
+    """
     return value is None or isinstance(value, str)
 
 
 def _plan_params_ok(raw_params: Any) -> bool:
     """Is `parameterization` shaped the way its readers assume?
 
-    DERIVED FROM THE READERS, not from a remembered field list. Every consumer of
-    `parameterization` reachable from `generalize_blueprint` (success path AND
-    `_fail_to_review` path), every field it reads, and the OPERATION that forces the
-    requirement — Python is happy to iterate a string, hash-fail a list and
-    concatenate its way into a crash, so the operation is what matters, not the name:
+    DERIVED FROM THE READERS, not from a remembered field list: for every consumer reachable
+    from `generalize_blueprint` (success path AND `_fail_to_review` path), the OPERATION forces
+    the requirement — `.get()` ⇒ dict (`entry`, `locator`, `slot`); membership or `sorted()` ⇒
+    str (`locator.column`, `slot.binds_to`, `rule_id`); string concatenation ⇒ str
+    (`slot.name`). `role` and `locator.value` are deliberately unconstrained, because no reader
+    does anything partial with them: the first is only ever `==`-compared and the second is
+    `str()`-ed, both total on every type.
 
-      entry        rewrite / _uses_rules / _slot_binds_to
-                     `param.get(...)`               → AttributeError  ⇒ must be a dict
-      locator      rewrite
-                     `locator.get("column")`        → AttributeError  ⇒ dict (if present)
-      locator.column
-                   rewrite._find_literal
-                     `column not in {col.name …}`   → unhashable      ⇒ str (if present)
-      slot         rewrite / _slot_binds_to
-                     `slot.get("name")`             → AttributeError  ⇒ dict (if present)
-      slot.name    rewrite
-                     `"{" + name + ": }"`           → TypeError       ⇒ str (if present)
-      slot.binds_to
-                   _slot_binds_to → `all(b in uses_set …)`
-                                                    → unhashable      ⇒ str (if present)
-      rule_id      _uses_rules
-                     `{p["rule_id"] …}` then `sorted(rules)`
-                                                    → unhashable, and
-                                                      `<` across mixed types
-                                                                      ⇒ str (if present)
-
-    Two fields are deliberately NOT constrained, because no reader does anything
-    partial on them: `role` is only ever `==`-compared (total on every type — an
-    unrecognized role simply matches no branch) and `locator.value` is `str()`-ed
-    before use (total as well).
-
-    Where the driving operation is "must be hashable", the gate requires `str`: it is
-    the domain type, it is checkable, and it is outcome-equivalent — a hashable
-    non-string (say `column: 5`) matches no column and no `uses` entry, so it already
-    ended in `fail_to_review`; it just gets there by verdict now instead of by
-    coincidence. The one visible change is the REASON tag: a non-string `binds_to`
-    used to stamp `binds_to_not_subset`, and now stamps `unrewritable` with the rest
-    of the malformed-plan family.
-
-    Checked ONCE, here, so `rewrite`, `_uses_rules` and `_slot_binds_to` can each read
-    the plan directly — the gate is what makes this module's "never raises for a bad
-    candidate" contract true, so a NEW read added to any of them belongs in the table
-    above before it belongs in the code."""
+    Where the driving operation is "must be hashable", the gate requires `str`: it is the domain
+    type and it is outcome-equivalent — a hashable non-string matched nothing and already ended
+    in `fail_to_review`, it just gets there by verdict now. Checked ONCE, here, which is what
+    makes this module's "never raises for a bad candidate" contract true, so a NEW read added to
+    any reader belongs in this docstring before it belongs in the code.
+    """
     if not isinstance(raw_params, list):
         return False
     for param in raw_params:
@@ -176,16 +154,13 @@ def _canonical_or_empty(
 ) -> str:
     """The S6 hash input, or `""` when the template will not normalize.
 
-    `canonical_ast_norm` PARSES the template, and it is the last thing this module does
-    on a path that has already decided what it thinks of the candidate — so a template
-    the recipe chokes on used to raise `sqlglot.ParseError` out of a function contracted
-    never to raise, taking the whole S4 stage (and, on the consumer path, the session)
-    with it. The empty string is the documented S6 fail-soft: no hash input, no hard key,
-    the candidate is reviewed rather than deduplicated (`_fail_to_review` stamps the same
-    value deliberately, and `test_unrewritable` pins it).
-
-    This is also the one call that could kill a candidate ALREADY stamped
-    `fail_to_review` — with its own hash-input computation, after the verdict was made."""
+    `canonical_ast_norm` PARSES the template, and it is the last thing this module does on a
+    path that has already decided what it thinks of the candidate — so a template the recipe
+    chokes on used to raise `sqlglot.ParseError` out of a function contracted never to raise,
+    taking the whole stage (and, on the consumer path, the session) with it. The empty string is
+    the documented S6 fail-soft: no hash input, no hard key, the candidate is reviewed rather
+    than deduplicated.
+    """
     try:
         return canonical_ast_norm(sql_template, node_templates)
     except Exception:
@@ -203,8 +178,11 @@ def _fail_to_review(
     parameterization: list[dict[str, Any]],
     reason: str,
 ) -> BlueprintGeneralization:
-    """An in-band fail-to-review generalization — no guessed template, no canonical
-    hash input (S6 fail-soft: an empty `canonical_ast_norm` skips the hard key)."""
+    """An in-band fail-to-review generalization.
+
+    No guessed template, and no canonical hash input (S6 fail-soft: an empty
+    `canonical_ast_norm` skips the hard key).
+    """
     return BlueprintGeneralization(
         sql_template=None,
         uses=(),
@@ -228,24 +206,23 @@ def fail_to_review_generalization(
 ) -> BlueprintGeneralization:
     """The in-band `fail_to_review` generalization, for a caller OUTSIDE this module.
 
-    `GeneralizeStage` needs it for its defensive catch: the stage's contract is that S4
-    never raises, and the only way to keep that true for a fault this module did not
-    anticipate is to stamp the same verdict a fault it DID anticipate gets. Deliberately
-    takes no `parameterization` — an unanticipated fault is no reason to trust the plan
-    enough to derive `uses_rules` from it."""
+    `GeneralizeStage` needs it for its defensive catch: the stage's contract is that S4 never
+    raises, and the only way to keep that true for an unanticipated fault is to stamp the same
+    verdict an anticipated one gets. Deliberately takes no `parameterization` — an unanticipated
+    fault is no reason to trust the plan enough to derive `uses_rules` from it.
+    """
     return _fail_to_review(payload, [], reason)
 
 
 def _accepted_sql_for_single(
     payload: dict[str, Any], sql_by_ref: dict[str, str | None]
 ) -> str | None:
-    """The accepted single-blueprint SQL: the last `source_tool_call_ref` that
-    resolves to a non-empty SQL (the final accepted runQuery of the turn).
+    """The accepted SQL: the last `source_tool_call_ref` that resolves to a non-empty query.
 
     Refs are model-authored: a non-list `source_tool_call_refs` is not iterable and
-    `dict.get(<unhashable>)` raises TypeError, so both are read as "no accepted SQL"
-    (⇒ `unrewritable`, the same in-band verdict a dangling ref already gets) rather
-    than as an exception. The composite path guards the same field per node."""
+    `dict.get(<unhashable>)` raises `TypeError`, so both are read as "no accepted SQL" (⇒
+    `unrewritable`, the same in-band verdict a dangling ref gets) rather than as an exception.
+    """
     refs = payload.get("source_tool_call_refs") or []
     if not isinstance(refs, list):
         return None
@@ -262,17 +239,14 @@ def generalize_blueprint(
 ) -> BlueprintGeneralization:
     """Deterministically enrich a blueprint PLAN into a `BlueprintGeneralization`.
 
-    `sql_by_ref` maps a `tool_call_ref` → its accepted SQL (from the session trail,
-    `SessionSummary.tool_calls[*].sql`). `catalog_schema` is the D69 `database.table`
-    → `{column: type}` catalog the provenance extractor qualifies against.
+    `sql_by_ref` maps a `tool_call_ref` → its accepted SQL; `catalog_schema` is the D69
+    `database.table` → `{column: type}` catalog the provenance extractor qualifies against.
 
-    The two PLAN collections are shape-gated here, once, so nothing downstream has to
-    re-check: `parameterization` per `_plan_params_ok`, and `composes` as a list
-    (`_generalize_composite` then applies `check_dag`, the deeper structural gate).
-    `payload` itself is a `CandidateEnvelope.payload` — a dict by
-    construction — but everything INSIDE it is model-authored and rehydrated from the
-    store, so a wrong JSON type anywhere in it must be an in-band `fail_to_review`,
-    never an exception (this function's stated contract).
+    The two PLAN collections are shape-gated here, once, so nothing downstream re-checks:
+    `parameterization` per `_plan_params_ok`, and `composes` as a list (`check_dag` is the
+    deeper structural gate). Everything INSIDE `payload` is model-authored and rehydrated from
+    the store, so a wrong JSON type anywhere in it must be an in-band `fail_to_review`, never an
+    exception.
     """
     raw_params = payload.get("parameterization") or []
     raw_composes = payload.get("composes") or []

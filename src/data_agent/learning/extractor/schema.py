@@ -1,23 +1,12 @@
 """Forced structured-output schemas for the extractor (D31, + plan §3a).
 
-The extractor's TERMINAL tool is `emit_candidates`, and the turn must end in a call
-to it — no free text (D31). `parse_candidates` pulls the `candidates` array out of
-the model's tool call and raises `SchemaMismatchError` when the response is not a
-well-formed call to that tool, which the extractor retries (retry-on-mismatch, D31).
-Field-level SEMANTIC validation (evidence mandatory, D97 totality/roles) lives in
-`validation.py`; this module only enforces the transport shape.
-
-One OPTIONAL tool now sits alongside it: `searchCorpus` (plan §3a), a read-only
-prior-art lookup the model may call a bounded number of times BEFORE emitting. It is
-offered only when a `PriorArtIndex` is wired, so an extractor with no index sees the
-exact single-forced-tool shape it always did. Its untrusted arguments are validated
-in `prior_art.py`, next to the port whose operations force the requirements — this
-module owns the schema the model is shown, not the guard on what comes back.
-
-The tool dict uses the runtime's canonical FLAT function shape
-(`{"type":"function","name",...,"parameters"}` — `OpenAIModelClient` translates
-it to the Chat Completions nested form), so the same schema drives the real model
-and the Layer-1 `ScriptedModelClient` double.
+The TERMINAL tool is `emit_candidates` and the turn must end in a call to it — no free text.
+`parse_candidates` raises `SchemaMismatchError` when the response is not a well-formed call,
+which the extractor retries; field-level SEMANTIC validation lives in `validation.py`, and
+this module only enforces the transport shape. The optional `searchCorpus` tool is offered
+only when a `PriorArtIndex` is wired, and its untrusted arguments are validated in
+`prior_art.py`. Tool dicts use the runtime's canonical FLAT function shape, so the same
+schema drives the real model and the Layer-1 double.
 """
 
 from __future__ import annotations
@@ -295,17 +284,13 @@ _SEARCH_CORPUS_PARAMETERS = {
 
 
 def build_search_corpus_tool() -> dict[str, Any]:
-    """The OPTIONAL prior-art lookup tool, offered alongside `emit_candidates` only
-    when a `PriorArtIndex` is wired AND the per-extraction call budget is unspent.
+    """The OPTIONAL prior-art lookup tool, offered only with an index wired and budget unspent.
 
-    Deliberately NOT offered when no index is wired: a tool the process cannot service
-    is a trap — the model spends a turn on it, gets an apology, and the turn budget
-    that should have produced candidates is gone. With no index the extractor's tool
-    list is byte-identical to what it was before this slice.
-
-    Returns CARDS ONLY (see `priorart/models.py`), which is why the description says
-    so out loud: a model told it can "search the corpus" will otherwise ask for SQL,
-    and the whole safety story of the port is that payloads never come back."""
+    Deliberately NOT offered when no index is wired: a tool the process cannot service is a trap
+    — the model spends a turn on it, gets an apology, and the turn budget that should have
+    produced candidates is gone. Returns CARDS ONLY, which the description says out loud,
+    because a model told it can "search the corpus" will otherwise ask for SQL.
+    """
     return {
         "type": "function",
         "name": SEARCH_CORPUS_TOOL_NAME,
@@ -331,9 +316,11 @@ SEARCH_KIND_ENUM = _SEARCH_KIND_ENUM
 
 
 def parse_candidates(result: ModelTurnResult) -> list[dict[str, Any]]:
-    """Extract the raw `candidates` list from a well-formed `emit_candidates`
-    call. Raises `SchemaMismatchError` on any transport-shape violation (no tool call,
-    wrong name, missing/!list `candidates`) so the extractor can retry."""
+    """Extract the raw `candidates` list from a well-formed `emit_candidates` call.
+
+    Raises `SchemaMismatchError` on any transport-shape violation (no tool call, wrong name,
+    missing or non-list `candidates`) so the extractor can retry.
+    """
     call = next((c for c in result.tool_calls if c.name == EXTRACTOR_TOOL_NAME), None)
     if call is None:
         raise SchemaMismatchError(

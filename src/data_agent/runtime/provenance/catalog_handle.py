@@ -1,18 +1,9 @@
-"""CatalogHandle — a read-only, shared, immutable handle around the Semantic Catalog schema.
+"""Immutable, read-only handles over the Semantic Catalog, built once per catalog load.
 
-`catalog/loader.py`'s projections are pure/deploy-coupled (D53) and are applied
-**once** per catalog load (`load_catalog_handles_from_export`, from the MCP
-`/catalog/export` payload); the resulting dict is handed to
-`ContextAssembler`/`ToolDispatcher` as a read-only handle — never a mutable
-global. The same handle is reused for every session and request (design §2).
-
-`SemanticCatalogHandle` (runblueprint-design F3/§4.2) is its grain/measures/temporal
-sibling: the runtime `CatalogHandle` carries only `{column: type}`, but the D56
-verify gate needs GRAIN and the D65 temporal gate needs TEMPORAL DIMENSIONS — both
-live only in the FULL catalog overlay (`load_semantic_catalog_from_catalog`). This
-handle surfaces per-table `grain`, `grain_verifiable`, `temporal`, and per-measure
-`{column, agg, defined_over}` to the runtime as a read-only, deploy-coupled,
-immutable view built once per load — mirroring `CatalogHandle`.
+`CatalogHandle` carries `{column: type}` for provenance extraction;
+`SemanticCatalogHandle` carries the grain/temporal/measures view the D56 verify gate
+and the D65 temporal gate read. Both are shared across every session and request —
+never mutated, never a mutable global.
 """
 
 from __future__ import annotations
@@ -58,13 +49,11 @@ class CatalogHandle:
         return self._schema
 
     def description_col_for(self, db_table: str, column: str) -> str | None:
-        """Return *column*'s declared sibling description column on the qualified
-        `db_table` (e.g. `"dbpcm_warehouse.payroll"`), or None if none is declared.
+        """Return *column*'s declared sibling description column on `db_table`, or None.
 
-        This is the AUTHORED linkage only — it is NOT validated against the schema
-        or the caller's scope here (resolve_target still checks existence + scope
-        before using it, so an author typo or out-of-scope target falls back to the
-        naming convention rather than crashing)."""
+                AUTHORED linkage only — not validated against the schema or the caller's scope
+                here; `resolve_target` re-checks existence and scope before using it.
+        """
         table_links = self._description_cols.get(db_table)
         if table_links is None:
             return None
@@ -82,9 +71,7 @@ class CatalogHandle:
 
 
 def load_catalog_handle_from_catalog(catalog: dict[str, Any]) -> CatalogHandle:
-    """Build a `CatalogHandle` from a parsed catalog dict (the MCP `/catalog/export`
-    `catalog` value, or any `{db.table: <entry>}` mapping): the schema `{col: type}`
-    plus the authored description-col linkage."""
+    """Build a `CatalogHandle` from a parsed catalog dict (the export's `catalog` value)."""
     return CatalogHandle(
         build_sqlglot_schema_from_catalog(catalog),
         load_description_cols_from_catalog(catalog),
@@ -93,11 +80,9 @@ def load_catalog_handle_from_catalog(catalog: dict[str, Any]) -> CatalogHandle:
 
 @dataclass(frozen=True)
 class Measure:
-    """One catalog measure (`{column, agg, defined_over}`, F3/§4.2).
+    """One catalog measure (`{column, agg, defined_over}`).
 
-    `defined_over` is BEST-EFFORT PROSE (OPEN-QUESTIONS §measures) — so the
-    structural measure-agg check is deferred to the Phase-2 authoring gate (D37b,
-    §4.3); Phase-1 surfaces it for observability/completeness only.
+        `defined_over` is best-effort prose, not a structural contract.
     """
 
     column: str | None
@@ -116,12 +101,8 @@ class TableGrain:
 
 
 class SemanticCatalogHandle:
-    """Immutable, read-only per-table `grain`/`grain_verifiable`/`temporal`/`measures`
-    view over the full Semantic Catalog overlay (F3/§4.2).
-
-    Built ONCE per catalog load from the full overlay; deploy-coupled + immutable,
-    exactly like `CatalogHandle`. Read-only: it is consumed by the D56 verify
-    assertion (the result-grain probe) and the D65 temporal gate — never mutated.
+    """Immutable per-table `grain`/`grain_verifiable`/`temporal`/`measures` view over the
+        full catalog overlay. Built once per load; read-only.
     """
 
     def __init__(self, semantic_catalog: Mapping[str, Mapping[str, Any]]) -> None:
@@ -135,8 +116,9 @@ class SemanticCatalogHandle:
         return self._tables.get(db_table)
 
     def is_grain_verifiable(self, db_table: str) -> bool:
-        """True iff the table declares a verifiable grain (a COUNT(*)==COUNT(DISTINCT)
-        conformance probe applies). `payroll` declares `grain_verifiable: false`."""
+        """True iff the table declares a verifiable grain (a COUNT(*) == COUNT(DISTINCT)
+                conformance probe applies).
+        """
         grain = self._tables.get(db_table)
         return bool(grain and grain.grain_verifiable)
 
@@ -178,22 +160,16 @@ def _table_grain(entry: Mapping[str, Any]) -> TableGrain:
 
 
 def load_semantic_catalog_handle_from_catalog(catalog: dict[str, Any]) -> SemanticCatalogHandle:
-    """Build a `SemanticCatalogHandle` from a parsed catalog dict (the MCP export's
-    `catalog` value). The export IS the full overlay, so this is the identity view
-    the grain/temporal/measures projection reads from."""
+    """Build a `SemanticCatalogHandle` from a parsed catalog dict (the export's `catalog`
+        value, which is itself the full overlay).
+    """
     return SemanticCatalogHandle(load_semantic_catalog_from_catalog(catalog))
 
 
 def load_catalog_handles_from_export(
     export: dict[str, Any],
 ) -> tuple[CatalogHandle, SemanticCatalogHandle]:
-    """Build BOTH the `CatalogHandle` and `SemanticCatalogHandle` from one parsed
-    `/catalog/export` payload (`{"catalog_sha": ..., "catalog": {...}}`).
-
-    This is the single entry point the runtime `CatalogCache` (and the shared test
-    fixture) use to build the two immutable handles from the MCP export. The export's
-    `catalog` value carries the verbatim per-table entries, so the description-col
-    linkage the `CatalogHandle` exposes is derived from the SAME entries."""
+    """Build both catalog handles from one parsed `/catalog/export` payload."""
     catalog = export["catalog"]
     return (
         load_catalog_handle_from_catalog(catalog),

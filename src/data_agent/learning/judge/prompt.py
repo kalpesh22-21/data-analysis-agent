@@ -1,43 +1,24 @@
 """What the coverage judge is shown (plan §3b) — the two briefs and the system prompt.
 
-Two callers, two briefs, and the difference between them is the whole reason the two
-stages carry different confidence bars:
+`session_brief` (PRE-extraction) carries the question, the raw SQL WITH its literals, and the
+tool trail: everything the loop knows before it has paid for an extraction, with no
+generalization, parameterization or declared result grain. That is a genuinely harder
+comparison against a corpus of entity-free intents, and it is the cheapest place to drop, so
+its bar is higher. `candidate_brief` (POST-extraction) carries the extracted intent, the
+parameterized template, the grain and the rule ids, so a lower bar buys the same safety.
 
-  * `session_brief` (PRE-extraction) — the question, the raw SQL WITH its literals, and
-    the tool trail. That is everything the loop knows before it has paid for an
-    extraction. There is no generalization, no parameterization, no declared result
-    grain: the judge is comparing a concrete query against a corpus of entity-free
-    intents, which is a genuinely harder comparison than the post-extraction one. It is
-    the cheapest place to drop and the least-informed one, so its bar is higher.
-  * `candidate_brief` (POST-extraction) — the extracted intent, the parameterized
-    template, the grain and the rule ids. The same question asked with the evidence the
-    extraction produced, so a lower bar buys the same safety.
+BOTH BRIEFS ARE BOUNDED — turn count, SQL length and text lengths are all capped, because a
+brief that grew with the session would erode the saving exactly on the long, expensive
+sessions where it matters most. A truncated brief STATES that it is truncated: a judge that
+cannot see the whole session must not be encouraged to assert novelty about the part it did
+not see.
 
-**Both briefs are BOUNDED.** The point of the judge is that it costs less than the call
-it cancels, and the extractor's call carries the whole session verbatim. A brief that
-grew with the session would erode the saving exactly on the long, expensive sessions
-where the saving matters most, so the turn count, the SQL length and the text lengths
-are all capped. A truncated brief is stated as truncated rather than silently trimmed —
-a judge that cannot see the whole session must not be encouraged to assert novelty
-about the part it did not see, and the prompt says so.
-
-**The tool-call cap is spent on SUBSTANTIVE calls.** `summary/models.py::
-BOOKKEEPING_TOOLS` entries are removed BEFORE the cap, not after, so a Release-1
-session's intent-ledger churn cannot push the queries the judge is actually comparing
-out of the brief — or, worse, flip `truncated` and make the judge discount a verdict it
-had all the evidence for. They are removed rather than capped-around because the judge
-is asked exactly one question ("does the corpus already cover this work?") and a ledger
-update is not work the corpus could cover. Their COUNT is still stated
-(`bookkeeping_calls_omitted`), because "stated, not silently trimmed" is the rule this
-module already lives by and a session with thirty of them is a different session from
-one with none.
-
-**The PRIOR ART block is rendered by 3a's renderer, not re-implemented here.**
-`extractor/prior_art.py::render_prior_art_block` is where the flatten-and-cap guard on
-untrusted corpus text lives, and where the three distinct facts (found nothing / could
-not look / did not search) are kept apart. A second "simpler" formatter for the judge
-would be a guard covering only the path nobody attacks, and a place for the
-available/unavailable conflation to be reintroduced.
+The tool-call cap is spent on SUBSTANTIVE calls — `BOOKKEEPING_TOOLS` entries are removed
+BEFORE the cap, so ledger churn cannot push out the queries the judge is comparing or flip
+`truncated`; their COUNT is still stated. The PRIOR ART block is rendered by 3a's
+`render_prior_art_block`, not re-implemented here: that is where the flatten-and-cap guard on
+untrusted corpus text lives, and where found-nothing / could-not-look / did-not-search are
+kept apart.
 """
 
 from __future__ import annotations
@@ -83,13 +64,12 @@ SYSTEM_PROMPT = (
 
 
 def _text(raw: Any, limit: int) -> str | None:
-    """A summary/payload string field, capped; `None` for anything that is not a
-    non-blank string.
+    """A summary/payload string field, capped; `None` for anything not a non-blank string.
 
-    Total over any type on purpose. `CandidateEnvelope.payload` is rehydrated JSON from
-    a store, and `SessionSummary` fields are typed but reach here through a loader that
-    tolerates partial sessions — so a caller must never be able to make `json.dumps`
-    the crash site of a call that is only supposed to save money."""
+    Total over any type on purpose: `CandidateEnvelope.payload` is rehydrated JSON and
+    `SessionSummary` reaches here through a loader that tolerates partial sessions, so a caller
+    must never be able to make `json.dumps` the crash site of a call that only saves money.
+    """
     if not isinstance(raw, str) or not raw.strip():
         return None
     text = raw.strip()
@@ -97,30 +77,23 @@ def _text(raw: Any, limit: int) -> str | None:
 
 
 def _str_list(raw: Any) -> list[str]:
-    """A rehydrated JSON list-of-str as a bounded list. A bare `str` is REJECTED rather
-    than iterated — `list("abc")` fabricates three entries and raises nothing, the same
-    char-explosion class `untrusted.as_str_list` guards at every other untrusted-JSON
-    boundary in this loop."""
+    """A rehydrated JSON list-of-str as a bounded list.
+
+    A bare `str` is REJECTED rather than iterated — `list("abc")` fabricates three entries and
+    raises nothing, the same char-explosion class `untrusted.as_str_list` guards everywhere else.
+    """
     return as_str_list(raw, max_items=_MAX_LIST_ITEMS)
 
 
 def session_brief(summary: SessionSummary) -> str:
-    """The PRE-extraction brief: the question, the accepted SQL (both what ran and
-    what the answer designated), the tool trail.
+    """The PRE-extraction brief: the question, the accepted SQL, the tool trail.
 
-    ENTITY-BEARING and knowingly so — this is the session verbatim, minus its bulk, and
-    it goes to the same class of endpoint the extractor's own call already goes to. It
-    is strictly SMALLER than what extraction would have sent, which is the economic
-    premise of the whole stage.
-
-    `truncated` is stated explicitly rather than implied by the cap. A judge shown 12 of
-    40 tool calls that then asserts "nothing here matches the corpus" is asserting
-    something about the 28 it never saw, and the system prompt instructs it to discount
-    accordingly — which only works if the brief admits it.
-
-    Bookkeeping calls (`BOOKKEEPING_TOOLS`) are dropped before the cap and counted in
-    `bookkeeping_calls_omitted`; see the module docstring for why that is not the same
-    kind of omission as truncation.
+    ENTITY-BEARING and knowingly so — this is the session verbatim minus its bulk, going to the
+    same class of endpoint the extractor's own call already goes to, and strictly SMALLER than
+    what extraction would have sent, which is the economic premise of the whole stage.
+    `truncated` is STATED rather than implied by the cap: a judge shown 12 of 40 tool calls that
+    then asserts nothing matches the corpus is asserting something about the 28 it never saw.
+    Bookkeeping calls are dropped before the cap and counted separately.
     """
     turns = [
         {
@@ -190,17 +163,14 @@ def session_brief(summary: SessionSummary) -> str:
 def candidate_brief(env: CandidateEnvelope) -> str:
     """The POST-extraction brief: what the extractor actually produced.
 
-    Reads only entity-free-by-construction or leakage-gate-scanned surfaces — intent,
-    the parameterized template, the grain, the rule ids, the slot names. It deliberately
-    does NOT carry `extractor_rationale` (free model prose the redaction pass never
-    touches) or the evidence quotes (`learning_audit`-only, D51). That is not a leakage
-    control for the model call — the pre-extraction stage already ships the raw session
-    to the same provider — it is a discipline about which surfaces this pipeline treats
-    as re-emittable, and quietly widening it here is how the next thing gets widened.
-
-    Everything is pulled with `.get` and type-checked: `payload` is rehydrated JSON, and
-    a candidate that reached the dedup stage without a generalization is a normal,
-    supported state (S4 fail-soft), not an error.
+    Reads only entity-free-by-construction or leakage-gate-scanned surfaces — intent, the
+    parameterized template, the grain, the rule ids, the slot names. It deliberately does NOT
+    carry `extractor_rationale` (free model prose the redaction pass never touches) or the
+    evidence quotes (`learning_audit`-only, D51). That is not a leakage control for this model
+    call — the pre-extraction stage already ships the raw session to the same provider — but a
+    discipline about which surfaces this pipeline treats as re-emittable. Everything is pulled
+    with `.get` and type-checked: a candidate that reached dedup without a generalization is a
+    normal, supported state (S4 fail-soft), not an error.
     """
     payload = env.payload if isinstance(env.payload, dict) else {}
     gen = payload.get("generalization")

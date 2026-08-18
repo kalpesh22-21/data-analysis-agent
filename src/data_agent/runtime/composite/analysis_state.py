@@ -1,99 +1,46 @@
 """analysis_state.py — the `updateAnalysisState` runtime tool + the evidence validators.
 
-Release 1, docs/decisions/release-1/03-analysis-state.md and
-04-evidence-validators.md. The tool and the validators share this module
-deliberately: the validators are PURE functions over a trail, so they unit-test
-without a store, and the tool is the only caller that needs them.
+They share this module deliberately: the validators are PURE functions over a trail, so
+they unit-test without a store, and the tool is their only caller.
 
-WHAT IT GUARANTEES, stated precisely (04 §B.5, the Lead-approved contract):
+WHAT IT GUARANTEES: for every intent the model chooses to track, a recorded, falsifiable
+terminal disposition. NOT that every user intent was detected, and NOT that a
+model-declared disposition is semantically true. Tracking is OPT-IN — no live state means
+no enforcement, and a rejected late init leaves the turn running UNPROTECTED by design —
+and `completed` means "the model bound a qualifying `ok` call of the right kind to this
+deliverable", not "answered correctly".
 
-  > For every intent the model chooses to track, Release 1 guarantees a
-  > recorded, falsifiable terminal disposition. It does not guarantee that every
-  > user intent was detected, nor that a model-declared disposition is
-  > semantically true.
+HOW AN INTENT IS CLOSED: the model tags the work as it dispatches it
+(`runBlueprint(id=…, serves_intent="i2")`) and closes the intent with `{intent_id,
+status}` and NOTHING ELSE. The runtime resolves the `tool_call_id` from the tagged trail
+entry and runs it through the same validators (see `resolve_evidence`).
 
-Both clauses are load-bearing. Tracking is OPT-IN — no live state means no
-enforcement, and a rejected late init leaves the turn running UNPROTECTED by
-design. And `completed` means "the model bound a qualifying `ok` call of the right
-kind to this deliverable", not "answered correctly": the binding is now
-model-DECLARED at call time rather than cited after the fact, which makes it
-reachable — it does not make it true.
+TWO FIELDS ARE DERIVED, NOT MODEL-SUPPLIED. `evidence_tool_call_id` was hallucinated in
+every live citation attempt, and `reason_code` was only ever a second copy of a fact the
+trail already carried — `classify_block_evidence` INVERTS the validator, so there is no
+second implementation of the block rules to drift. Both are still PERSISTED (05's
+force-block paths and the rendered state block read `reason_code`); only the model stopped
+supplying them, and a stale replayed value arriving under either name is DROPPED SILENTLY
+rather than rejected as an unknown key.
 
-HOW AN INTENT IS CLOSED (call-time tagging, the amendment this module now
-implements). The model tags the work as it dispatches it —
-`runBlueprint(id=…, serves_intent="i2")` — and closes the intent with
-`{intent_id, status}` and NOTHING ELSE; the runtime resolves the `tool_call_id`
-from the tagged trail entry and runs it through the same 04 validators. See
-`resolve_evidence`.
+THE AUTO-BIND BACKSTOP (`resolve_evidence`): when an intent is closed and NO call carries
+its tag, the runtime binds the evidence itself, because a call that already ran cannot be
+retro-tagged. Every auto-bind emits `loop_analysis_state_auto_bound`, so the backstop is
+measured rather than assumed.
 
-WHAT THE MODEL NO LONGER SENDS (2026-08-12). The item schema is now exactly
-`{description}` on the first call and `{intent_id, status}` on every later one.
-Two fields were REMOVED from the model-facing schema and are now derived:
+WHAT IMMUTABILITY DOES AND DOES NOT CLOSE: runtime-assigned ids, frozen descriptions and
+merge-by-id make it structurally impossible to SILENTLY DROP an ask. They do NOT close
+manufactured evidence — a scratch-database metadata probe buys a valid `NO_ACCESS` block,
+and `SELECT ... WHERE 1=0` a valid `REQUIRED_DATA_UNAVAILABLE` one, neither needing
+warehouse access. Zero rows is also the shape of an honest empty answer, so the block
+predicate fires on correct work too. Both are recorded as KNOWN-OPEN and measured
+(`loop_zero_row_block` vs `loop_zero_row_completion`), not implied to be closed.
 
-  - `evidence_tool_call_id` — 9 live citation attempts, 9 hallucinated ids, 0
-    successes ever. The tag is the working path, and the one thing citation was
-    kept for (ONE call closing TWO intents, which 04 §A permits) is covered by
-    the AUTO-BIND BACKSTOP below.
-  - `reason_code` — the runtime CLASSIFIES the evidence instead of asking the
-    model to label it. 04 §B already refused a block unless the cited call PROVED
-    the code, so the model's value was never information: it was a second copy of
-    a fact the trail already carried, and the only thing it could add was a
-    mismatch. `classify_block_evidence` inverts the validator — the derived code
-    is the one whose validator ACCEPTS the call — so there is no second
-    implementation of 04 §B to drift.
-
-The PERSISTED document keeps both fields: `TrackedIntent.reason_code` is read by
-05's force-block paths (`ENFORCEMENT_EXHAUSTED` / `BUDGET_EXHAUSTED` /
-`USER_STOPPED`, written runtime-side and unchanged) and by the rendered state
-block. Only the MODEL stopped supplying them.
-
-TOLERANT READING OF THE REMOVED FIELDS. A model reading stale context — its own
-earlier calls are replayed to it verbatim — will send `evidence_tool_call_id` or
-`reason_code` again. Both are DROPPED SILENTLY on arrival, empty or not, and are
-never read: the runtime derives both, so a supplied value can only disagree.
-They are NOT rejected as unknown keys (that would fail a call whose intent was
-correct); see `_LEGACY_ITEM_KEYS`.
-
-THE AUTO-BIND BACKSTOP (`resolve_evidence`). When an intent is closed and NO call
-this turn carries its tag, the runtime binds the evidence itself rather than
-refusing bookkeeping the model cannot redo — a call that already ran cannot be
-retro-tagged. Rules, in order, over the calls that would VALIDATE as evidence for
-the requested status: exactly one UNTAGGED candidate wins; otherwise exactly one
-candidate of any tag wins (this is the "one call answered both deliverables"
-case); otherwise the update is refused with the fix named. Every auto-bind emits
-`loop_analysis_state_auto_bound` so the backstop's usage is measured, not assumed.
-
-WHAT IMMUTABILITY DOES AND DOES NOT CLOSE (03 §C.4). Runtime-assigned ids plus
-frozen descriptions plus merge-by-id close the cheap evasion: the model cannot
-SILENTLY DROP an ask by shortening the array. They do NOT close manufactured
-evidence — three known-permitted routes, verified, none needing warehouse access
-or any knowledge of the user's scope:
-
-  - `getTableSchema(<scratch_db>, <anything>)` fails closed with
-    `SCRATCH_SESSION_VIOLATION` -> a valid `NO_ACCESS` block, for one METADATA
-    call that does not even lock the late-init boundary;
-  - any table outside the database allowlist -> `DATABASE_NOT_ALLOWED` (not a
-    declarable code, but it shows how cheap a denial is to produce);
-  - `SELECT ... WHERE 1=0` -> `row_count == 0` -> a valid
-    `REQUIRED_DATA_UNAVAILABLE` block.
-
-WHAT THE MODEL CAN ACTUALLY SEND (found live, gpt-5.5). It cannot omit keys: it
-emits every property the flat item schema declares and fills the unused ones with
-placeholders — `""` for a string, the FIRST ENUM MEMBER for an enum. Six
-consecutive calls were rejected over an `intent_id` of `""` and the feature was
-inert for the whole turn, silently. The payload is therefore NORMALISED before
-mode inference and validation — "a key carrying no information is absent", by a
-general rule derived from what downstream reads require, not by spot-patching the
-field that happened to fail. See the block above `_carries_no_information`.
-Shrinking the schema to three properties reduces how much of that placeholder
-serialisation exists at all; it does not remove the rule, because `description`
-still has to be empty on an update and `intent_id` empty on a declaration.
-
-Zero rows is the same shape as an honest empty answer, so the block predicate
-fires on correct work too. Both are recorded here as KNOWN-OPEN and measured
-(`loop_zero_row_block` vs `loop_zero_row_completion`), not silently implied to be
-closed. The adversarial suite asserts them as permitted rather than pretending
-otherwise.
+LIVE MODELS CANNOT OMIT KEYS: they emit every property the item schema declares and fill
+the unused ones with placeholders (`""` for a string, the FIRST ENUM MEMBER for an enum).
+The payload is therefore NORMALISED before mode inference and validation — "a key carrying
+no information is absent" — by a general rule derived from what downstream reads require,
+not by spot-patching whichever field last failed. See `_carries_no_information`.
 """
 
 from __future__ import annotations
@@ -352,11 +299,10 @@ def _find_entry(
 ) -> TrailEntry | None:
     """The cited entry, IF it belongs to *turn_index*.
 
-    The `entry.turn_index == turn_index` conjunct is written explicitly into both
-    predicates rather than assumed: it is the same rule as `live_analysis_state`
-    — never accept evidence from a turn other than the one being enforced.
-    `turn_index` (not the budget window) is the right unit, so evidence survives
-    a pause and a budget-window resume within the same external turn.
+        The `entry.turn_index == turn_index` conjunct is written explicitly into both
+        predicates rather than assumed: it is the same rule as `live_analysis_state` — never
+        accept evidence from a turn other than the one being enforced. `turn_index`, not the
+        budget window, so evidence survives a pause and a resume within the same external turn.
     """
     for entry in trail:
         if entry.tool_call_id == tool_call_id and entry.turn_index == turn_index:
@@ -369,29 +315,18 @@ def _missing_entry_reason(
 ) -> str:
     """The reason for an id that resolves to no current-turn entry.
 
-    NO LONGER REACHABLE THROUGH THE TOOL, and kept anyway. Every id these
-    validators now see comes from a trail entry the runtime just selected, so it is
-    on this turn by construction. It stays because the validators are PURE and are
-    the written form of 04 §A/§B — a validator that silently assumed its caller had
-    already done the lookup would be a validator that stops being reusable, and
-    this branch is what makes "evidence must come from the turn being enforced"
-    true on the function's own terms.
+        NO LONGER REACHABLE THROUGH THE TOOL, and kept anyway: every id these validators now
+        see comes from a trail entry the runtime just selected. It stays because the validators
+        are PURE and are the written form of the evidence rules — one that silently assumed its
+        caller had already done the lookup would stop being reusable.
 
-    An id that exists at ANOTHER `turn_index` is precisely diagnosable. An id
-    that exists NOWHERE is genuinely ambiguous to the runtime, and the message
-    says so in both halves, because the correct model behaviour differs:
-
-      - "not dispatched yet" — 03 §E.2 dispatches `updateAnalysisState` FIRST in
-        every batch, so `[runQuery, updateAnalysisState(evidence=<that call>)]`
-        (the natural shape) can NEVER validate: the evidence entry does not exist
-        when the state call runs. The fix is to cite it next round.
-      - "unknown id" — the id was invented. The fix is to stop citing it.
-
-    LIMIT, stated rather than hidden: the runtime cannot mechanically tell these
-    two apart. Distinguishing them needs the ids of the OTHER calls in the same
-    model response, and `TurnContext` deliberately carries `turn_index` only (03
-    §C.1) — a side channel carrying the batch would be exactly the coupling that
-    decision refused. So the two cases share one message that names both.
+        An id that exists at ANOTHER `turn_index` is precisely diagnosable. An id that exists
+        NOWHERE is genuinely ambiguous, and the message names both halves because the correct
+        model behaviour differs: "not dispatched yet" (state calls are dispatched FIRST in
+        every batch, so citing a call from the same response can never validate — cite it next
+        round) versus "unknown id" (stop citing it). The runtime cannot mechanically tell them
+        apart without the ids of the OTHER calls in the batch, and `TurnContext` deliberately
+        carries `turn_index` only.
     """
     if any(entry.tool_call_id == tool_call_id for entry in trail):
         return (
@@ -410,15 +345,13 @@ def _missing_entry_reason(
 def _deduped_original_reason(entry: TrailEntry, trail: Sequence[TrailEntry]) -> str:
     """The reason for citing an idempotent-read GUARD marker, made actionable.
 
-    `getTableSchema` is in `IDEMPOTENT_READ_TOOLS`, so an identical repeat is not
-    re-dispatched — it is persisted as a data-free entry with `status="ok"` and
-    the `IDEMPOTENT_READ_ALREADY_SERVED` marker. That entry passes every other
-    completion condition having fetched NOTHING, which is why condition 5 exists.
+        A deduped `getTableSchema` is persisted as a data-free entry with `status="ok"` and the
+        `IDEMPOTENT_READ_ALREADY_SERVED` marker, and that entry passes every other completion
+        condition having fetched NOTHING — which is why condition 5 exists.
 
-    Since this validator holds the WHOLE trail it can also locate the original
-    and name it. The loop cannot: its `ReadGuard` holds signatures plus (only for
-    the readability test) a pointer to the FRESHEST serving entry — not the trail
-    history this walk searches.
+        Since this validator holds the WHOLE trail it can also locate the original and name it.
+        The loop cannot: its `ReadGuard` holds signatures plus a pointer to the freshest
+        serving entry, not the trail history this walk searches.
     """
     original_id = _find_deduped_original_id(entry, trail)
     if original_id is not None:
@@ -437,13 +370,11 @@ def _deduped_original_reason(entry: TrailEntry, trail: Sequence[TrailEntry]) -> 
 def _find_deduped_original_id(entry: TrailEntry, trail: Sequence[TrailEntry]) -> str | None:
     """The `tool_call_id` of the call that actually served *entry*'s result.
 
-    Deferred import (this is the only site): `loop/read_guard.py` is the canonical
-    signature helper, but importing anything from `data_agent.runtime.loop` at
-    module scope would run `loop/__init__.py` -> `agent_loop` -> back into this
-    module while it is still half-initialised, whenever this module is the FIRST
-    one imported (which every unit test of the validators does). Re-implementing
-    the signature here instead would silently diverge from the guard's own
-    canonicalisation the day either changes.
+        Deferred import (this is the only site): importing anything from
+        `data_agent.runtime.loop` at module scope would run `loop/__init__.py` -> `agent_loop`
+        -> back into this module while it is still half-initialised, whenever this module is
+        imported first — which every unit test of the validators does. Re-implementing the
+        signature here would silently diverge from the guard's own canonicalisation.
     """
     from data_agent.runtime.loop.read_guard import idempotent_read_signature
 
@@ -463,18 +394,17 @@ def _find_deduped_original_id(entry: TrailEntry, trail: Sequence[TrailEntry]) ->
 def validate_completion_evidence(
     tool_call_id: str, trail: Sequence[TrailEntry], turn_index: int
 ) -> str | None:
-    """`None` when *tool_call_id* is acceptable evidence that an intent was
-    ANSWERED; otherwise a model-facing reason string (04 §A).
+    """`None` when *tool_call_id* is acceptable evidence that an intent was ANSWERED;
+        otherwise a model-facing reason string.
 
-    All of: (1) the entry is from THIS turn, (2) `status == "ok"`, (3) the tool is
-    one of `runQuery`/`runBlueprint`/`getTableSchema`, (4) a `runBlueprint` is
-    additionally `authoritative` — a blueprint can return `ok` with an unclean
-    verify block, so this catches what (2) does not — and (5) it is not the
-    idempotent-read guard marker.
+        All of: (1) the entry is from THIS turn, (2) `status == "ok"`, (3) the tool is one of
+        `runQuery`/`runBlueprint`/`getTableSchema`, (4) a `runBlueprint` is additionally
+        `authoritative` — a blueprint can return `ok` with an unclean verify block, so this
+        catches what (2) does not — and (5) it is not the idempotent-read guard marker.
 
-    EVIDENCE REUSE ACROSS INTENTS IS ALLOWED here (telemetry-flagged only): one
-    query genuinely answers "headcount and average salary by department". Blocking
-    is deliberately asymmetric — see `validate_block_evidence`.
+        EVIDENCE REUSE ACROSS INTENTS IS ALLOWED here (telemetry-flagged only): one query
+        genuinely answers "headcount and average salary by department". Blocking is
+        deliberately asymmetric — see `validate_block_evidence`.
     """
     if not isinstance(tool_call_id, str) or not tool_call_id.strip():
         return "a tool call id is required to complete an intent."
@@ -505,18 +435,16 @@ def validate_completion_evidence(
 def validate_block_evidence(
     tool_call_id: str, reason_code: str, trail: Sequence[TrailEntry], turn_index: int
 ) -> str | None:
-    """`None` when *tool_call_id* supports blocking an intent for *reason_code*;
-    otherwise a model-facing reason string (04 §B).
+    """`None` when *tool_call_id* supports blocking an intent for *reason_code*; otherwise a
+        model-facing reason string.
 
-    `reason_code` is an ALLOWLIST (`MODEL_REASON_CODES`), never a blocklist of the
-    runtime-forced codes. Blocklisting would make any FUTURE runtime code
-    model-declarable the day it lands — and the allowlist rejects `None`, `""` and
-    unknown strings for free. Nothing is queued to be added, which is precisely
-    when a blocklist looks safe and quietly stops being so.
+        `reason_code` is an ALLOWLIST (`MODEL_REASON_CODES`), never a blocklist of the
+        runtime-forced codes: a blocklist would make any FUTURE runtime code model-declarable
+        the day it lands, and the allowlist rejects `None`, `""` and unknown strings for free.
 
-    05's runtime force-block path (`BUDGET_EXHAUSTED` / `USER_STOPPED` /
-    `ENFORCEMENT_EXHAUSTED`) BYPASSES this validator entirely and writes those
-    codes directly. Routing them through here gets them rejected by the allowlist.
+        05's runtime force-block path (`BUDGET_EXHAUSTED` / `USER_STOPPED` /
+        `ENFORCEMENT_EXHAUSTED`) BYPASSES this validator entirely and writes those codes
+        directly — routing them through here gets them rejected by the allowlist.
     """
     if not isinstance(reason_code, str) or reason_code not in MODEL_REASON_CODES:
         return (
@@ -580,20 +508,14 @@ def classify_block_evidence(
 ) -> str | None:
     """The reason code *tool_call_id* PROVES, or `None` if it proves neither.
 
-    THE INVERSION OF `validate_block_evidence`, AND DELIBERATELY NOT A SECOND
-    IMPLEMENTATION OF IT. 04 §B already refused a block unless the evidence
-    established the declared code; asking which code it establishes is the same
-    question read backwards, so this asks the validator itself rather than
-    re-deriving "refused with an access code" and "successful with zero rows" from
-    the entry. The two cannot drift, because there is only one of them.
+        THE INVERSION OF `validate_block_evidence`, AND DELIBERATELY NOT A SECOND
+        IMPLEMENTATION OF IT: the block rules already refuse a block unless the evidence
+        establishes the declared code, so asking which code it establishes is the same question
+        read backwards. This asks the validator itself rather than re-deriving the conditions,
+        so the two cannot drift.
 
-    This is what replaced the model-supplied `reason_code`. The model's value was
-    never information — the validator recomputed the same fact from the trail and
-    refused any disagreement — so removing it removes a field that could only ever
-    be wrong, not a judgement the runtime lacked.
-
-    `DERIVABLE_REASON_CODES` is mutually exclusive, so at most one code can match
-    and the first hit is the answer, not a preference.
+        `DERIVABLE_REASON_CODES` is mutually exclusive, so at most one code can match and the
+        first hit is the answer, not a preference.
     """
     for code in DERIVABLE_REASON_CODES:
         if validate_block_evidence(tool_call_id, code, trail, turn_index) is None:
@@ -611,30 +533,23 @@ def split_serves_intent(
 ) -> tuple[Any, str | None, str | None]:
     """Split `serves_intent` out of a model tool call's *arguments*.
 
-    Returns `(arguments_without_the_tag, tag_or_None, drop_reason_or_None)`.
+        Returns `(arguments_without_the_tag, tag_or_None, drop_reason_or_None)`.
 
-    ⚠ THE STRIP IS THE LOAD-BEARING HALF. `serves_intent` is a RUNTIME concept:
-    `runQuery` and `getTableSchema` are dispatched to the live MCP server, which
-    rejects an argument its own schema does not declare, and `runBlueprint`'s
-    executor validates its arguments too. So the tag must come off BEFORE either
-    sees it — which is why this returns the cleaned arguments rather than merely
-    reading the tag. It happens ONCE, at the top of the loop's dispatch body, so
-    the cleaned dict is also what the read-dedup signature is computed over (two
-    identical schema fetches tagged for different intents must still dedup) and
-    what lands in `TrailEntry.args`.
-    Doc 07's harness already stripped the fixture-level tag before dispatch; this
-    is the same move, now for a real field.
+        ⚠ THE STRIP IS THE LOAD-BEARING HALF. `serves_intent` is a RUNTIME concept, and the
+        live MCP rejects an argument its own schema does not declare, as does `runBlueprint`'s
+        executor — so the tag must come off BEFORE either sees it, which is why this returns
+        the cleaned arguments rather than merely reading the tag. It happens ONCE, at the top
+        of the loop's dispatch body, so the cleaned dict is also what the read-dedup signature
+        is computed over (two identical schema fetches tagged for different intents must still
+        dedup) and what lands in `TrailEntry.args`.
 
-    THE TAG IS VALIDATED LENIENTLY AND NEVER FAILS THE WORK (03's degrade-not-fail
-    convention). An unknown or stale id yields `(clean_args, None, reason)`: the
-    call still dispatches, the entry is recorded UNTAGGED, and the caller emits
-    `loop_intent_tag_dropped`. Refusing a real query over a bookkeeping typo would
-    be strictly worse than an untagged entry — the whole point of this release is
-    that a rejected bookkeeping call costs the user an answer.
+        THE TAG IS VALIDATED LENIENTLY AND NEVER FAILS THE WORK. An unknown or stale id yields
+        `(clean_args, None, reason)`: the call still dispatches, the entry is recorded
+        UNTAGGED, and the caller emits `loop_intent_tag_dropped`. Refusing a real query over a
+        bookkeeping typo is strictly worse than an untagged entry.
 
-    Only the three `INTENT_TAGGABLE_TOOLS` are touched. On any other tool the
-    arguments are returned untouched, so a stray `serves_intent` there fails
-    exactly as it does today rather than being silently accepted.
+        Only the three `INTENT_TAGGABLE_TOOLS` are touched; on any other tool the arguments are
+        returned untouched, so a stray `serves_intent` there fails exactly as it does today.
     """
     if tool_name not in INTENT_TAGGABLE_TOOLS or not isinstance(arguments, dict):
         return arguments, None, None
@@ -661,10 +576,10 @@ def split_serves_intent(
 def _tagged_entries(
     intent_id: str, trail: Sequence[TrailEntry], turn_index: int
 ) -> list[TrailEntry]:
-    """Every entry on *turn_index* the model tagged for *intent_id*, in trail
-    order. Append order, not `ts`: `_now_iso()` is not guaranteed monotonic within
-    a turn, so two calls in one batch can share a stamp (the same reason 07's
-    re-derivation predicate orders by trail position)."""
+    """Every entry on *turn_index* the model tagged for *intent_id*, in TRAIL order — not
+        `ts` order: `_now_iso()` is not guaranteed monotonic within a turn, so two calls in one
+        batch can share a stamp.
+    """
     return [
         entry
         for entry in trail
@@ -675,17 +590,14 @@ def _tagged_entries(
 def _tagged_failure_reason(
     entry: TrailEntry, status: str, trail: Sequence[TrailEntry], turn_index: int
 ) -> str:
-    """04's OWN reason why the most recent tagged call does not support *status*.
+    """The evidence rules' OWN reason why the most recent tagged call does not support
+        *status* — far more actionable than "no tagged work": it names the verification
+        failure, the deduped original, or the wrong-direction status.
 
-    Far more actionable than "no tagged work": it names the verification failure,
-    the deduped original, or the wrong-direction status.
-
-    For a block there is no declared code to validate against any more, so the
-    probe code is chosen by which direction the entry points — a call that FAILED
-    is asked about `NO_ACCESS` (its message names the error code that is not an
-    access denial), a call that SUCCEEDED about `REQUIRED_DATA_UNAVAILABLE` (its
-    message names the row count, the guard marker, or the missing result). Still
-    04's text, still one implementation.
+        For a block there is no declared code to validate against any more, so the probe code
+        is chosen by which direction the entry points: a call that FAILED is asked about
+        `NO_ACCESS`, a call that SUCCEEDED about `REQUIRED_DATA_UNAVAILABLE`. Still one
+        implementation.
     """
     if status == "completed":
         return validate_completion_evidence(entry.tool_call_id, trail, turn_index) or ""
@@ -698,43 +610,31 @@ def auto_bind_candidates(
 ) -> list[TrailEntry]:
     """Every call on *turn_index* that would VALIDATE as evidence for *status*.
 
-    THE POOL IS DEFINED BY THE VALIDATORS, NOT BY A HAND-WRITTEN LIST. Binding a
-    call the validators would refuse is the one thing the backstop must never do:
-    it would persist evidence that fails 04's own conditions, which is precisely
-    the guarantee this release exists to keep.
+        THE POOL IS DEFINED BY THE VALIDATORS, NOT BY A HAND-WRITTEN LIST. Binding a call the
+        validators would refuse is the one thing the backstop must never do — it would persist
+        evidence that fails the conditions this release exists to keep.
 
-    For COMPLETION the pool is additionally narrowed to `SUBSTANTIVE_TOOLS` — real
-    work, not a look-around. The intersection with `COMPLETION_EVIDENCE_TOOLS` is
-    `runQuery` + `runBlueprint`, so `getTableSchema` is deliberately OUT: it is
-    admitted as completion evidence only as an accepted trade (see
-    `COMPLETION_EVIDENCE_TOOLS`), and auto-binding a schema fetch to an analytical
-    intent would spend that trade without the model ever having claimed it. A
-    metadata intent closed on a schema fetch still works — it just has to be
-    TAGGED, which is the primary path anyway.
+        For COMPLETION the pool is additionally narrowed to `SUBSTANTIVE_TOOLS`, so
+        `getTableSchema` is deliberately OUT: it is admitted as completion evidence only as an
+        accepted trade, and auto-binding a schema fetch to an analytical intent would spend
+        that trade without the model ever having claimed it. A metadata intent closed on a
+        schema fetch still works — it just has to be TAGGED.
 
-    For BLOCKING the restriction is PER DERIVED CODE, which is the asymmetry 04 §B
-    already draws between the two:
+        For BLOCKING the restriction is PER DERIVED CODE:
 
-      - `NO_ACCESS` — UNRESTRICTED, exactly as `validate_block_evidence` is. A
-        denial is a denial whichever tool hit it, and 04 §B.4 already records that
-        the cheapest route is a `getTableSchema` metadata probe; excluding metadata
-        tools here would not close that (the probe is one call either way) and
-        would break the legitimate case where a schema fetch is genuinely the call
-        that was refused.
-      - `REQUIRED_DATA_UNAVAILABLE` — SUBSTANTIVE TOOLS ONLY. "The data is not
-        there" is a claim about a QUERY, and `_build_preview`'s bare-list branch
-        (`tool_dispatcher.py`) gives an empty `listDatabases`/`listTables` a
-        `row_count` of 0 — so without this clause an empty table listing is a
-        free, fully-"evidenced" block, bound by the backstop with no model claim
-        at all. That is not the 04 §B.4 hole being re-priced; it is a NEW one this
-        release would have opened, since citing that id was the only previous route
-        and it was the route that never worked. A listing is discovery, not
-        evidence of absence.
+          - `NO_ACCESS` — UNRESTRICTED, exactly as `validate_block_evidence` is. A denial is a
+            denial whichever tool hit it, and excluding metadata tools would not close the
+            cheap-probe route while it would break the legitimate case where a schema fetch is
+            genuinely the call that was refused.
+          - `REQUIRED_DATA_UNAVAILABLE` — SUBSTANTIVE TOOLS ONLY. "The data is not there" is a
+            claim about a QUERY, and an empty `listDatabases`/`listTables` also carries
+            `row_count == 0` — so without this clause an empty listing is a free, fully
+            "evidenced" block, bound by the backstop with no model claim at all. A listing is
+            discovery, not evidence of absence.
 
-    THE TAGGED PATH IS DELIBERATELY NOT NARROWED. There the model has explicitly
-    claimed the call for the intent, which is the same reasoning that lets a TAGGED
-    `getTableSchema` complete an intent while an auto-bound one cannot: the trade is
-    the model's to claim, not the runtime's to make on its behalf.
+        THE TAGGED PATH IS DELIBERATELY NOT NARROWED: there the model has explicitly claimed
+        the call for the intent, and the trade is the model's to claim, not the runtime's to
+        make on its behalf.
     """
     if status == "completed":
         return [
@@ -762,42 +662,35 @@ def resolve_evidence(
 ) -> tuple[str, str | None, str]:
     """The evidence backing *intent_id*: `(tool_call_id, reason_code, binding)`.
 
-    `reason_code` is the DERIVED one for a block and `None` for a completion;
-    `binding` is one of `EVIDENCE_BINDINGS`. Raises `AnalysisStateRejectedError`
-    when nothing can be bound — the update is refused, nothing is persisted, and
-    the detail names the fix.
+        `reason_code` is the DERIVED one for a block and `None` for a completion; `binding` is
+        one of `EVIDENCE_BINDINGS`. Raises `AnalysisStateRejectedError` when nothing can be
+        bound — the update is refused, nothing is persisted, and the detail names the fix.
 
-    TWO PATHS, IN ORDER.
+        TWO PATHS, IN ORDER.
 
-    1. THE TAG (primary). Candidates are the calls the model tagged
-       `serves_intent=<intent_id>` this turn, walked NEWEST FIRST so a retry
-       supersedes the attempt before it — but "most recent" means most recent
-       QUALIFYING call, so a later failed attempt does not strand an intent whose
-       earlier work succeeded. Each is run through 04's own validators, so a
-       `runBlueprint` that failed verification, an idempotent-read guard marker, a
-       failed call tagged for a completion and a successful one tagged for a block
-       are all still refused. If the model tagged work and NONE of it supports the
-       disposition, that is a claim about specific calls and it is refused with
-       04's reason for the most recent one — the backstop does not rescue it,
-       because binding some OTHER call would answer a question the model did not
-       ask.
+        1. THE TAG (primary). The calls the model tagged `serves_intent=<intent_id>` this turn,
+           walked NEWEST FIRST so a retry supersedes the attempt before it — but "most recent"
+           means most recent QUALIFYING call, so a later failed attempt does not strand an
+           intent whose earlier work succeeded. Each is run through the validators, so a
+           `runBlueprint` that failed verification, a guard marker, a failed call tagged for a
+           completion and a successful one tagged for a block are all refused. If the model
+           tagged work and NONE of it supports the disposition, that is a claim about specific
+           calls and it is refused with the reason for the most recent one — the backstop does
+           not rescue it, because binding some OTHER call would answer a question the model did
+           not ask.
 
-    2. THE AUTO-BIND BACKSTOP, only when NOTHING is tagged for the intent. Its
-       whole justification is that a call which already ran cannot be retro-tagged:
-       without it, an untagged-but-correct turn is refused bookkeeping it has no
-       way to satisfy, and the release's own measurement is that a rejected
-       bookkeeping call costs the user an answer.
+        2. THE AUTO-BIND BACKSTOP, only when NOTHING is tagged for the intent. Its whole
+           justification is that a call which already ran cannot be retro-tagged:
 
-         rule 1 — exactly ONE candidate is untagged      -> bind it
-         rule 2 — exactly ONE candidate exists at all     -> bind it
-         rule 3 — otherwise                               -> refuse
+             rule 1 — exactly ONE candidate is untagged   -> bind it
+             rule 2 — exactly ONE candidate exists at all -> bind it
+             rule 3 — otherwise                           -> refuse
 
-       Rule 2 is what makes ONE CALL ANSWERING TWO DELIVERABLES work now that
-       citation is gone: the single call is tagged for the first intent, so it has
-       no untagged candidate for the second, and rule 2 binds the same id to both.
-       04 §A permits exactly that reuse for completion (flagged by
-       `loop_evidence_reused`, never refused); 04 §B.3 still refuses it for
-       BLOCKING, over the merged state, whichever path established the binding.
+           Rule 2 is what makes ONE CALL ANSWERING TWO DELIVERABLES work now that citation is
+           gone: the call is tagged for the first intent, so the second has no untagged
+           candidate, and rule 2 binds the same id to both. That reuse is permitted for
+           completion (flagged by `loop_evidence_reused`, never refused) and still refused for
+           BLOCKING, over the merged state, whichever path established the binding.
     """
     tagged = _tagged_entries(intent_id, trail, turn_index)
     if tagged:
@@ -836,11 +729,10 @@ def _unbindable(
 ) -> tuple[str, str]:
     """`(reason, detail)` for an intent nothing can be bound to.
 
-    NOTHING vs TOO MANY are different failures with different fixes, so they get
-    different reasons and different text. Both messages name the tag, because
-    tagging is the only action that resolves either — and both say NEXT MESSAGE,
-    because 03 §E.2 dispatches state calls before everything else in the batch, so
-    a call made in this same response has not run yet.
+        NOTHING vs TOO MANY are different failures with different fixes, so they get different
+        reasons and different text. Both messages name the tag, because tagging is the only
+        action that resolves either, and both say NEXT MESSAGE, because state calls are
+        dispatched before everything else in the batch.
     """
     if candidates:
         return (
@@ -868,10 +760,10 @@ def _unbindable(
 
 
 def find_locking_tool(trail: Sequence[TrailEntry], turn_index: int) -> str | None:
-    """The first SUBSTANTIVE tool already run on *turn_index*, or `None` (03 §E).
+    """The first SUBSTANTIVE tool already run on *turn_index*, or `None`.
 
-    Emulated discovery is safe by construction: those entries are ephemeral and
-    never persisted, so they cannot reach the trail this reads.
+        Emulated discovery is safe by construction: those entries are ephemeral and never
+        persisted, so they cannot reach the trail this reads.
     """
     for entry in trail:
         if entry.turn_index == turn_index and entry.tool_name in SUBSTANTIVE_TOOLS:
@@ -941,19 +833,18 @@ def _carries_no_information(value: Any) -> bool:
 
 
 def _drop_legacy_fields(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The TOLERANT-READING clause: `evidence_tool_call_id` and `reason_code` are
-    dropped on arrival, whatever they hold, in BOTH modes.
+    """The TOLERANT-READING clause: `evidence_tool_call_id` and `reason_code` are dropped on
+        arrival, whatever they hold, in BOTH modes.
 
-    Not an elision of placeholders — an elision of the whole field. Neither is in
-    the model-facing schema any more, so anything arriving under those names is
-    stale replay of the model's own earlier calls, and the runtime derives both
-    facts from the trail. Silently dropping is the only behaviour that cannot cost
-    an answer: rejecting would fail a correct update over a field the model was
-    shown by its own history, and READING one would let a mismatch (a `NO_ACCESS`
-    label on a zero-row call) reach the ledger the validators exist to keep honest.
+        An elision of the whole FIELD, not of a placeholder. Neither is in the model-facing
+        schema any more, so anything arriving under those names is stale replay of the model's
+        own earlier calls, and the runtime derives both facts from the trail. Dropping silently
+        is the only behaviour that cannot cost an answer: rejecting would fail a correct update
+        over a field the model was shown by its own history, and READING one would let a
+        mismatch reach the ledger the validators exist to keep honest.
 
-    Runs BEFORE `_elide_empty_fields`, so those two names never reach the
-    unknown-key checks in either mode.
+        Runs BEFORE `_elide_empty_fields`, so those two names never reach the unknown-key
+        checks in either mode.
     """
     return [
         {key: value for key, value in item.items() if key not in _LEGACY_ITEM_KEYS}
@@ -962,10 +853,9 @@ def _drop_legacy_fields(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _elide_empty_fields(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Clause 1, applied to BOTH modes before the mode is even inferred.
-
-    So an update carrying `{"intent_id": "i2", "status": "completed",
-    "description": ""}` is not rejected for a `description` it did not really send.
+    """Clause 1, applied to BOTH modes before the mode is even inferred — so an update
+        carrying `{"intent_id": "i2", "status": "completed", "description": ""}` is not
+        rejected for a `description` it did not really send.
     """
     return [
         {
@@ -978,13 +868,13 @@ def _elide_empty_fields(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _declaration_fields(item: dict[str, Any]) -> dict[str, Any]:
-    """Clause 2 on an INITIALIZE, where the one enum cannot be read: every declared
-    intent starts `pending`.
+    """Clause 2 on an INITIALIZE, where the one enum cannot be read: every declared intent
+        starts `pending`.
 
-    `status == "pending"` is accepted and ignored — it is the first enum member,
-    i.e. the model's filler, and it agrees with what the runtime writes anyway.
-    Any OTHER status is a real contradiction (nothing can be completed or blocked
-    at the moment it is declared) and is REJECTED, not normalised away.
+        `status == "pending"` is accepted and ignored — it is the first enum member, i.e. the
+        model's filler, and it agrees with what the runtime writes anyway. Any OTHER status is
+        a real contradiction (nothing can be completed or blocked at the moment it is declared)
+        and is REJECTED, not normalised away.
     """
     status = item.get("status")
     if status is not None and status != "pending":
@@ -1033,15 +923,15 @@ def _require_intent_items(model_args: Any) -> list[dict[str, Any]]:
 
 
 def _validate_initialize_items(items: list[dict[str, Any]]) -> list[str]:
-    """Initialize accepts ONE key per item: `description`. Ids do not exist yet
-    (they are assigned below), and evidence cannot: 03 §E.2 dispatches state calls
-    first, so no call cited here could have run. Every intent therefore starts
-    `pending`, and the non-overlapping shapes make a mis-inferred mode visible
-    rather than silent.
+    """Initialize accepts ONE key per item: `description`. Ids do not exist yet, and
+        evidence cannot: state calls are dispatched first, so no call cited here could have
+        run. Every intent therefore starts `pending`, and the non-overlapping shapes make a
+        mis-inferred mode visible rather than silent.
 
-    `_declaration_fields` runs first on each item: `status` is elided as a
-    placeholder (a non-`pending` one raises there), so what reaches the key check
-    below is what the model actually MEANT to send."""
+        `_declaration_fields` runs first on each item — `status` is elided as a placeholder, a
+        non-`pending` one raises there — so what reaches the key check below is what the model
+        actually MEANT to send.
+    """
     descriptions: list[str] = []
     for raw_item in items:
         item = _declaration_fields(raw_item)
@@ -1082,16 +972,15 @@ def _validate_initialize_items(items: list[dict[str, Any]]) -> list[str]:
 
 
 def _validate_update_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Update accepts EXACTLY `intent_id` + `status`. It may NOT carry a
-    `description`: rewriting one is how the model would launder a hard ask into an
-    easy one, and adding/deleting is closed structurally by merge-by-id.
+    """Update accepts EXACTLY `intent_id` + `status`. It may NOT carry a `description`:
+        rewriting one is how the model would launder a hard ask into an easy one, and
+        adding or deleting is closed structurally by merge-by-id.
 
-    THERE IS NO EVIDENCE FIELD LEFT TO SHAPE-CHECK. Both retired fields were
-    dropped in `_drop_legacy_fields` before this ran, and the whole evidence
-    obligation now lives against the TRAIL in `_bind_evidence_against_trail` —
-    which is strictly stronger than the payload rule it replaced: that one could
-    only check that a non-empty string was present, this one has to find a call
-    that validates."""
+        THERE IS NO EVIDENCE FIELD LEFT TO SHAPE-CHECK. Both retired fields were dropped in
+        `_drop_legacy_fields`, and the evidence obligation now lives against the TRAIL in
+        `_bind_evidence_against_trail` — strictly stronger than the payload rule it replaced,
+        which could only check that a non-empty string was present.
+    """
     # A payload shaped ENTIRELY like an initialize (descriptions, no ids) sent
     # while a live state exists is a RE-DECLARATION attempt, not a botched update.
     # Both are rejected either way, but "you already declared these, update them by
@@ -1164,41 +1053,33 @@ def _bind_evidence_against_trail(
     turn_index: int,
     live: AnalysisState,
 ) -> dict[str, str]:
-    """Fill in `evidence_tool_call_id` and `reason_code` for every terminal update,
-    and refuse the ones nothing can be bound to. Returns
-    `{intent_id: EVIDENCE_BINDING_*}` for the ones this call actually resolved.
+    """Fill in `evidence_tool_call_id` and `reason_code` for every terminal update, and
+        refuse the ones nothing can be bound to. Returns `{intent_id: EVIDENCE_BINDING_*}` for
+        the ones this call actually resolved.
 
-    THE MODEL SUPPLIES NEITHER FIELD ANY MORE, so this is the ONLY place either is
-    established for a model-declared disposition. `resolve_evidence` does the work
-    (tag first, auto-bind backstop second) and raises when it cannot; the reason
-    code for a block is DERIVED from the bound call rather than declared, so it
-    cannot disagree with the evidence it sits next to.
+        THE MODEL SUPPLIES NEITHER FIELD ANY MORE, so this is the ONLY place either is
+        established for a model-declared disposition. `resolve_evidence` does the work (tag
+        first, auto-bind backstop second) and raises when it cannot; a block's reason code is
+        DERIVED from the bound call, so it cannot disagree with the evidence it sits next to.
 
-    RE-AFFIRMING A DISPOSITION IS A NO-OP. An intent already in the requested
-    terminal status, already carrying evidence, keeps that evidence and is not
-    re-resolved. Live models re-send the whole intent list every round, and without
-    this an already-closed intent could be refused later in the turn — the trail
-    grows, so a bind that was unambiguous in round 2 can be ambiguous in round 4,
-    and that refusal would take the OTHER intents in the same batch down with it.
-    It launders nothing: a status CHANGE (including completed -> blocked) misses
-    this branch and is resolved in full.
+        RE-AFFIRMING A DISPOSITION IS A NO-OP. An intent already in the requested terminal
+        status, already carrying evidence, keeps that evidence and is not re-resolved. Live
+        models re-send the whole intent list every round and the trail grows, so a bind that
+        was unambiguous in round 2 can be ambiguous in round 4 — and that refusal would take
+        the OTHER intents in the same batch down with it. It launders nothing: a status CHANGE
+        (including completed -> blocked) misses this branch and is resolved in full.
 
-    ⚠ THE NO-OP REQUIRES EVIDENCE TO BE PRESENT, WHICH EXCLUDES A FORCE-BLOCKED
-    INTENT. 05's runtime force-block paths write `reason_code` with
-    `evidence_tool_call_id` left `None`, so re-sending `{intent_id, status:
-    "blocked"}` for one of those falls through to a FULL re-resolution and is very
-    likely refused. That is unreachable today — all three force paths
-    (`BUDGET_EXHAUSTED`, `USER_STOPPED`, `ENFORCEMENT_EXHAUSTED`) are terminal, so
-    no further model turn follows them — and the condition is written as
-    "evidence present" deliberately rather than "same status", because a no-op on
-    a disposition with NO binding would be the one shape that lets a terminal
-    status stand with nothing behind it. If a resumable force path is ever added,
-    this is the branch to revisit: the fix is to treat a runtime-written
-    disposition as immutable here, not to relax the evidence test.
+        ⚠ THE NO-OP REQUIRES EVIDENCE TO BE PRESENT, WHICH EXCLUDES A FORCE-BLOCKED INTENT.
+        05's force-block paths write `reason_code` with `evidence_tool_call_id` left `None`, so
+        re-sending one falls through to a FULL re-resolution and is very likely refused. That
+        is unreachable today (all three force paths are terminal), and the condition is written
+        as "evidence present" deliberately rather than "same status", because a no-op on a
+        disposition with NO binding would be the one shape that lets a terminal status stand
+        with nothing behind it. If a resumable force path is ever added, the fix is to treat a
+        runtime-written disposition as immutable here, not to relax the evidence test.
 
-    Depends only on the payload, the trail and the state read, so it runs OUTSIDE
-    the merge callback — once, not once per CAS retry. The merge re-checks the ids
-    it needs against what is actually stored.
+        Depends only on the payload, the trail and the state read, so it runs OUTSIDE the merge
+        callback — once, not once per CAS retry.
     """
     by_id = {intent.intent_id: intent for intent in live.intents}
     bindings: dict[str, str] = {}
@@ -1230,10 +1111,9 @@ def _merged_intents(
 ) -> tuple[TrackedIntent, ...]:
     """Apply *updates* to *live* by id.
 
-    Merge-by-id is what makes the drop evasion structurally impossible: an intent
-    the model simply stops mentioning keeps its previous disposition, and an
-    unknown id is rejected rather than added. There is no "full replace" shape to
-    shorten.
+        Merge-by-id is what makes the drop evasion structurally impossible: an intent the model
+        simply stops mentioning keeps its previous disposition, and an unknown id is rejected
+        rather than added. There is no "full replace" shape to shorten.
     """
     by_id = {intent.intent_id: intent for intent in live.intents}
     for update in updates:
@@ -1259,23 +1139,20 @@ def _merged_intents(
 
 
 def _check_block_evidence_distinct(intents: tuple[TrackedIntent, ...]) -> None:
-    """BLOCK EVIDENCE MUST BE DISTINCT PER INTENT (04 §B.3, Lead-approved).
+    """BLOCK EVIDENCE MUST BE DISTINCT PER INTENT.
 
-    Reuse is right for completion and wrong for blocking: a denial arises from one
-    specific SQL and column set and asserts nothing about a DIFFERENT deliverable.
-    Without this rule the cost of bulk-blocking is O(1) — one
-    `getTableSchema(<scratch_db>, "x")` yields `SCRATCH_SESSION_VIOLATION`, and
-    eight `{intent_id, status: "blocked"}` items all bind to it (the auto-bind
-    backstop's rule 1 would hand every one of them that single untagged denial),
-    so finalization proceeds on a fully "evidenced" record. This is exactly why
-    the rule is checked over the MERGED state rather than at bind time: the
-    backstop cannot see the other intents in the batch, and does not need to.
+        Reuse is right for completion and wrong for blocking: a denial arises from one specific
+        SQL and column set and asserts nothing about a DIFFERENT deliverable. Without this rule
+        the cost of bulk-blocking is O(1) — one scratch-database metadata probe yields a
+        denial, and the backstop's rule 1 would hand every `{intent_id, status: "blocked"}`
+        item that single untagged id, so finalization proceeds on a fully "evidenced" record.
+        Which is exactly why the rule is checked over the MERGED state rather than at bind
+        time: the backstop cannot see the other intents in the batch, and does not need to.
 
-    Purely mechanical, no semantics. It does not stop manufacture; it raises the
-    price from O(1) to O(n) calls and makes bulk-blocking visible instead of
-    hiding it behind a shared id. Checked over the MERGED state, so a second call
-    cannot reuse an id an earlier call already spent. The asymmetry with
-    completion is deliberate.
+        Purely mechanical, no semantics. It does not stop manufacture; it raises the price from
+        O(1) to O(n) calls and makes bulk-blocking visible instead of hiding it behind a shared
+        id. Checked over the merged state, so a second call cannot reuse an id an earlier call
+        already spent.
     """
     seen: dict[str, str] = {}
     for intent in intents:
@@ -1298,9 +1175,10 @@ def _check_block_evidence_distinct(intents: tuple[TrackedIntent, ...]) -> None:
 
 
 def surplus_state_call_rejected() -> ToolResult:
-    """The result the LOOP returns for a state call beyond `MAX_STATE_CALLS` in
-    one model response (03 §E.2). Built here so the code, the retryability and
-    the model-facing text stay with every other rejection in this module."""
+    """The result the LOOP returns for a state call beyond `MAX_STATE_CALLS` in one model
+        response. Built here so the code, the retryability and the model-facing text stay with
+        every other rejection in this module.
+    """
     return _error_result(
         ANALYSIS_STATE_INVALID_CODE,
         (
@@ -1335,9 +1213,9 @@ def _error_result(code: str, detail: str, *, retryable: bool) -> ToolResult:
 def _state_result(state: AnalysisState) -> ToolResult:
     """The success result — the FULL state including the assigned ids.
 
-    A bare confirmation is not enough: this result is the only way the model
-    learns the ids it must use to update anything, and the rendered context block
-    (03 §D) repeats them every round so they survive a rebuild.
+        A bare confirmation is not enough: this result is the only way the model learns the ids
+        it must use to update anything, and the rendered context block repeats them every round
+        so they survive a rebuild.
     """
     result_full: dict[str, Any] = {
         "turn_index": state.turn_index,
@@ -1374,21 +1252,17 @@ def _state_result(state: AnalysisState) -> ToolResult:
 class UpdateAnalysisStateTool:
     """The `updateAnalysisState(intents)` runtime tool.
 
-    It takes `observer` AND `tracer` and SELF-EMITS `tool_dispatch_start`/`ok`/
-    `error`, like the three retrieval read tools — NOT like the two composite
-    runtime tools it otherwise resembles. `RecordAssumptionsTool()` and
-    `AnswerWithTableTool()` take neither, and `_run_runtime_tool` emits no
-    dispatch events on their behalf, so mirroring that precedent literally would
-    ship a silently-mute tool for the one feature whose telemetry is the whole
-    point of measuring it.
+        It takes `observer` AND `tracer` and SELF-EMITS `tool_dispatch_start`/`ok`/`error`,
+        like the three retrieval read tools: `_run_runtime_tool` emits no dispatch events on a
+        runtime tool's behalf, so following the other composite tools' precedent would ship a
+        silently-mute tool for the one feature whose telemetry is the point of measuring it.
 
-    It reads the TRAIL ITSELF at execution (`session_store.load_trail`), filtered
-    to `turn_index`. The trail the loop already holds is unusable: its only load
-    sits ABOVE the round-trip loop and is immediately reduced to signatures, so a
-    snapshot from there contains nothing from the current window — evidence
-    written in round 1 and cited in round 2 would fail as "unknown id", on every
-    turn, while looking correctly wired. `MAX_STATE_CALLS` bounds this at two
-    reads per round-trip, and none at all on turns without a state call.
+        It reads the TRAIL ITSELF at execution (`session_store.load_trail`), filtered to
+        `turn_index`. The trail the loop already holds is unusable: its only load sits ABOVE
+        the round-trip loop and is immediately reduced to signatures, so a snapshot from there
+        contains nothing from the current window — evidence written in round 1 and cited in
+        round 2 would fail as "unknown id" on every turn, while looking correctly wired.
+        `MAX_STATE_CALLS` bounds this at two reads per round-trip.
     """
 
     tool_name = TOOL_NAME
@@ -1586,9 +1460,9 @@ class UpdateAnalysisStateTool:
         trail: Sequence[TrailEntry],
         live: AnalysisState,
     ) -> ToolResult:
-        """UPDATE — batched by design: several intents per call. Load-bearing.
-        With automatic blueprint-flipping cut, one call per intent would
-        reintroduce exactly the bookkeeping overhead that trim exists to remove."""
+        """UPDATE — batched by design: several intents per call. Load-bearing, since one call
+                per intent would reintroduce exactly the bookkeeping overhead this trim removes.
+        """
         updates = _validate_update_items(items)
         # Resolves the evidence INTO `updates` (and refuses what cannot be bound),
         # so everything downstream — the merge, 04 §B.3's distinctness check, the
@@ -1640,11 +1514,11 @@ class UpdateAnalysisStateTool:
         turn_index: int,
         bindings: dict[str, str],
     ) -> None:
-        """Shape-only telemetry for what this call actually changed (06).
+        """Shape-only telemetry for what this call actually changed.
 
-        D25: `intent_id` is runtime-assigned and carries no user content, so it is
-        safe. `description` is model-authored from the user's question and is
-        NEVER emitted — not on any event, in any payload.
+                D25: `intent_id` is runtime-assigned and carries no user content, so it is safe.
+                `description` is model-authored from the user's question and is NEVER emitted —
+                not on any event, in any payload.
         """
         evidence_owners: dict[str, list[str]] = {}
         for intent in state.intents:

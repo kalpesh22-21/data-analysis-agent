@@ -1,47 +1,9 @@
-"""Per-tool-result provenance capture (design §3.3 table).
+"""Per-tool-result provenance capture: the USES set attached to each successful call.
 
-| Tool | Provenance source |
-|---|---|
-| `runQuery` | `extract_column_provenance(sql, catalog_schema, session_id=...)`, run via `asyncio.to_thread` |
-| `sampleRows` | Declarative: all columns of the referenced table (`SELECT *` semantics) |
-| `listDatabases`, `listTables`, `explainQuery`, `getTableSchema` | No provenance — always `frozenset()` |
-
-`getTableSchema` vs `sampleRows` (the distinction that keeps a fetched schema
-replayable, 2026-07-09):
-    - `sampleRows` is `SELECT * LIMIT n` — it returns real CELL VALUES from
-      EVERY column of the table, so its provenance is genuinely "all columns"
-      and a narrow `column_scope` correctly drops it from replay.
-    - `getTableSchema` returns column METADATA ONLY (names/types/descriptions,
-      NO cell values), and the MCP itself scope-filters that metadata to the
-      in-scope columns before returning it (verified in
-      `clickhouse-api/app/service.py::get_table_schema` ->
-      `app/semantic_catalog/overlay.py::build_table_schema_response`: when
-      `column_scope` is non-empty the merged `columns`, plus grain/primary_key/
-      join_keys/measures/rules/ambiguities/temporal, are all filtered to the
-      in-scope set). A getTableSchema RESULT therefore can never carry
-      out-of-scope column info, so it must NOT carry `SELECT *`/all-columns
-      provenance. It is a `_NO_PROVENANCE_TOOLS` member: safe-empty
-      (`frozenset()`) provenance, ALWAYS replayable (empty set ⊆ any scope),
-      D57-clean. Previously it lived in `_DECLARATIVE_ALL_COLUMNS_TOOLS`, which
-      made a successfully-fetched schema fail the D44 subset check under a
-      restricted scope and vanish from context (the model then saw the
-      repeated-read guard's "you already have this" nudge with no schema
-      anywhere — the bug this fixes).
-
-Return-value contract (D44 fail-closed — see `session/models.py` module
-docstring for the full rationale):
-    - `None` == undetermined (parse failure, or an uncatalogued table for
-      `sampleRows`) — ALWAYS dropped from replay by
-      `context/scope_filter.py`, regardless of scope.
-    - `frozenset()` (empty, non-None) == determined, zero columns referenced —
-      trivially in-scope, always kept.
-    - A non-empty `frozenset[tuple[str, str]]` == the determined USES set.
-
-Async/sync boundary (design §3.3, explicit callout): `extract_column_provenance`
-is pure CPU-bound (a sqlglot parse + optimizer pass), not I/O, but runs inside
-an event loop also juggling concurrent MCP calls. `asyncio.to_thread` avoids
-one large/pathological query blocking the loop; correctness (fail-closed on
-parse failure) is identical whether run inline or in a thread.
+`runQuery` derives columns from its SQL; `sampleRows` is all columns of its table;
+every other read tool has none — `getTableSchema` included, and it must stay that way
+or a fetched schema fails the D44 subset check under a narrow scope and vanishes.
+D44 contract: `None` == undetermined, dropped from replay; `frozenset()` == kept.
 """
 
 from __future__ import annotations
@@ -94,11 +56,7 @@ async def capture_provenance(
     *,
     session_id: str | None,
 ) -> frozenset[tuple[str, str]] | None:
-    """Compute the USES-set provenance for one successful tool call.
-
-    Called only on the MCP-success path (a denied/errored call never reaches
-    here — `dispatch/tool_dispatcher.py` short-circuits on `MCPToolError`).
-    """
+    """Compute the USES-set provenance for one successful tool call."""
     if tool_name == "runQuery":
         sql = args.get("sql", "")
         try:

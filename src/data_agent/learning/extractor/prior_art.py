@@ -1,51 +1,12 @@
 """Prior-art grounding for the extractor (plan §3a) — the query, the lookup, the block.
 
-The extractor was never shown what the corpus already contains, so it re-proposed
-blueprints we already own; slice 2 built the cross-tier `PriorArtIndex` and wired it
-into DEDUP, which catches the duplicate one whole LLM call too late. This module is
-the read on the OTHER side of that call.
-
-Three things live here, and they are together because they share one property: every
-value they touch is untrusted.
-
-  1. `prior_art_query_text` — what to search for. The session's questions plus its
-     ACCEPTED SQL, which is the closest thing we have to "what this session was
-     about" before the model has told us.
-  2. `lookup_prior_art` — the FAIL-OPEN call. Never raises; an index that cannot be
-     consulted degrades the extractor to exactly its pre-slice behaviour.
-  3. `render_prior_art_block` / `parse_search_corpus_args` — the two boundaries where
-     untrusted data enters the prompt and untrusted arguments leave it.
-
-**Searched-and-found-nothing, could-not-look, and never-searched are THREE different
-facts, and the block says which.** `PriorArtIndex` raises `PriorArtUnavailableError`
-rather than returning `[]` precisely because `[]` is a CLAIM ("nothing like this
-exists") that a caller acts on. Collapsing them here would re-introduce the bug the
-port was shaped to prevent, one layer up: the model would read "no prior art" off a
-graph outage and confidently mint a duplicate. So `PriorArtLookup.available` is carried
-all the way into the prompt text, and each state gets its own body sentence.
-
-**Cards only, never payloads — and the card projection is not widened here.** A
-candidate at status `extracted` has not passed the S5 leakage gate (it runs as stage 2
-of the write-router, AFTER extraction), and `extractor_rationale` is free-text model
-prose that `strip_entity_bearing` never touches. The card carries only surfaces that
-are entity-free by construction or that the gate explicitly scans. This module renders
-the card it is given and adds nothing to it.
-
-**A card is untrusted input to a PROMPT, which is a threat the port did not have.**
-`Neo4jPriorArtIndex._card_from_record` already coerces every field to the type its
-downstream reader needs — but its readers were logs, comparisons and a verdict field.
-A prompt is different in two ways, and `_card_line` is derived from both:
-
-  * The operation is "compose into a line-oriented text block", so a NEWLINE in an
-    `intent` can forge a block boundary or a fresh instruction line. Every rendered
-    field is therefore flattened to a single line and length-capped, and the block is
-    labelled as data. The corpus is not user-writable, but the `unsourced` tier exists
-    precisely to say "a hand edit or a foreign writer touched this node", so treating
-    node text as inert would be assuming exactly what that tier denies.
-  * The port is a PROTOCOL. `_card_from_record` guarantees nothing about a card from
-    another implementation, and the unit suite's own fake accepts whatever a test
-    seeds. So the renderer is total over any field type rather than trusting one
-    implementation's mapper.
+Every value these three touch is untrusted. SEARCHED-AND-FOUND-NOTHING, COULD-NOT-LOOK and
+NEVER-SEARCHED are three different facts and the block says which: `PriorArtIndex` raises
+rather than returning `[]` because `[]` is a CLAIM a caller acts on, so
+`PriorArtLookup.available` is carried all the way into the prompt text. CARDS ONLY, never
+payloads — a candidate at `extracted` has not passed the S5 leakage gate. And a card is
+untrusted input to a PROMPT: every rendered field is flattened to one line and capped, and
+the renderer is total over any field type because the port is a Protocol.
 """
 
 from __future__ import annotations
@@ -111,12 +72,10 @@ _FENCE_RUN = re.compile(r"={2,}")
 
 @dataclass(frozen=True)
 class PriorArtLookup:
-    """One prior-art consultation: what we asked, what came back, and whether we were
-    able to ask at all.
+    """One prior-art consultation: what we asked, what came back, and whether we could ask.
 
-    `available=False` is NOT `cards=()`. See the module docstring — the whole reason
-    the port raises instead of returning `[]` is that these two must stay
-    distinguishable, and this is the type that carries the distinction to the prompt.
+    `available=False` is NOT `cards=()` — this is the type that carries that distinction to
+    the prompt.
     """
 
     query: str
@@ -133,39 +92,20 @@ async def lookup_prior_art(
 ) -> PriorArtLookup:
     """Search *index*, FAIL-OPEN. Never raises.
 
-    An unreachable graph, a dead embedding endpoint, or an implementation that breaks
-    the port's contract all produce `available=False` and a loud log — never an
-    exception. That posture is not politeness: an uncaught raise here escapes
-    `LearningExtractor.extract`, which the consumer does not guard, so the message goes
-    un-acked → reclaim → dead-letter and the WHOLE session's learning is lost because a
-    read that only ever improves the prompt failed. Extraction without prior art is the
-    pre-slice behaviour and it is fine; extraction not happening is not.
+    An unreachable graph, a dead embedding endpoint, or an implementation that breaks the port's
+    contract all produce `available=False` and a loud log. An uncaught raise here escapes
+    `LearningExtractor.extract`, which the consumer does not guard, so the message goes un-acked
+    → reclaim → dead-letter and the WHOLE session's learning is lost to a read that only ever
+    improves the prompt.
 
-    THIS is the one place the available/unavailable decision is made, and every
-    malformed-return shape must be decided here rather than downstream — because every
-    downstream layer can only DROP what it does not understand, and a drop is
-    indistinguishable from "nothing exists". Three failure shapes, deliberately
-    distinguished in the log because they mean different things to whoever reads it:
-
-      * `PriorArtUnavailableError` — the CONTRACTED failure. Infrastructure is down.
-      * any other exception — the port was violated. Caught so a broken implementation
-        cannot cost the session.
-      * a return that is not a SEQUENCE OF CARDS. Derived from what the caller does
-        with it (`tuple(...)`, then `_card_line` per member), so BOTH the container and
-        the members are checked:
-          - a bare `str` is iterable, so `tuple(...)` char-explodes it into non-cards;
-          - `[{"id": ..., "intent": ...}]` — raw records instead of mapped cards, the
-            most likely protocol violation of the three — passes any container check
-            and is then skipped member-by-member by the renderer's isinstance gate.
-        Both would have rendered the EMPTY body: "the corpus was searched successfully
-        and nothing close was found", asserted on the strength of a type error. That is
-        the outage-becomes-a-novelty-claim conflation the whole port exists to prevent,
-        so both map to UNAVAILABLE.
-
-    A non-card member fails the WHOLE result, not just itself. A partially-mapped list
-    is not a trustworthy claim either: we cannot know whether the members we dropped
-    were the closest matches, so "here is what I could parse" would still understate
-    what exists.
+    THIS is the one place the available/unavailable decision is made, because every downstream
+    layer can only DROP what it does not understand and a drop is indistinguishable from
+    "nothing exists". A return that is not a SEQUENCE OF CARDS therefore maps to UNAVAILABLE: a
+    bare `str` char-explodes through `tuple(...)`, and raw records instead of mapped cards pass
+    any container check and are then skipped member-by-member by the renderer — both would
+    otherwise render the EMPTY body on the strength of a type error. A non-card member fails
+    the WHOLE result: a partially-mapped list cannot say whether the dropped members were the
+    closest matches.
     """
     query = _sanitize(text, limit=_MAX_QUERY_CHARS)
     if not query:
@@ -215,31 +155,15 @@ async def lookup_prior_art(
 def prior_art_query_text(summary: SessionSummary) -> str:
     """The pre-fetch search text: the session's QUESTIONS plus its ACCEPTED SQL.
 
-    Both halves earn their place. The natural-language turns are what the corpus
-    `intent` vectors were built from, so they are what the cosine is actually good at
-    matching. The SQL is what disambiguates two questions that read alike and compute
-    differently — and, unlike the turns, it is present in every session the loop cares
-    about (a KEEP-triaged session always has an accepted query; `turns` can legitimately
-    be empty).
-
-    Only `status == "ok"` calls contribute. A failed query is a shape the session
-    ABANDONED; searching for it would rank the corpus against the wrong question.
-
-    ORDER IS THE POINT, because the join is TRUNCATED at `_MAX_QUERY_CHARS`: questions,
-    then the ANSWER's SQL (`summary.answer_sqls` — what `answerWithTable` designated),
-    then the remaining ok calls. The answer's query is the best disambiguator the
-    session has — it is what the user was actually shown, and since Release 1 it need
-    never have been dispatched as a `runQuery`, so it can be absent from `tool_calls`
-    altogether. Appended LAST it was exactly what fell off a busy multi-intent
-    session, leaving the corpus ranked against that session's intermediate probes.
-    For the same reason the dedupe runs in this direction: an ok call whose SQL the
-    answer already designated is dropped, never the other way round, so the surviving
-    copy is the one that is definitely in the text.
-
-    ENTITY-BEARING, and knowingly so. This text is handed to the embedding endpoint —
-    a strictly smaller egress than the extractor's own model call, which already ships
-    the entire session, but a different endpoint. Nothing derived from it is persisted:
-    the vector is used for one ANN query and discarded.
+    The natural-language turns are what the corpus `intent` vectors were built from; the SQL
+    disambiguates two questions that read alike and compute differently, and is present in
+    every session the loop cares about. Only `status == "ok"` calls contribute — a failed query
+    is a shape the session ABANDONED. ORDER IS THE POINT, because the join is TRUNCATED at
+    `_MAX_QUERY_CHARS`: questions, then the ANSWER's SQL (`summary.answer_sqls`), then the
+    remaining ok calls. Since Release 1 the answer's query need never have been dispatched as a
+    `runQuery` at all, and appended LAST it was exactly what fell off a busy multi-intent
+    session. ENTITY-BEARING, knowingly: it goes to the embedding endpoint, and nothing derived
+    from it is persisted.
     """
     parts: list[str] = []
     for turn in summary.turns:
@@ -259,32 +183,16 @@ def prior_art_query_text(summary: SessionSummary) -> str:
 
 
 def parse_search_corpus_args(arguments: Any) -> tuple[str, tuple[PriorArtKind, ...]] | None:
-    """Validate one `searchCorpus` tool call's arguments → `(query, kinds)`, or `None`
-    when they are unusable.
+    """Validate one `searchCorpus` tool call's arguments → `(query, kinds)`, or `None`.
 
-    DERIVED FROM `PriorArtIndex.search`, not from the field names. These are raw model
-    output; the operations the port performs on them are what force the requirements:
-
-      arg     operation in an implementation of `search`        ⇒ requirement
-      query   `text.strip()` (Neo4jPriorArtIndex) and
-              `unicodedata.normalize("NFC", text)` (the fake)
-              → AttributeError / TypeError on a non-str          ⇒ str, non-blank
-      kinds   `tuple(k for k in kinds if k in _SEARCH_QUERY)`
-              → a bare STR iterates CHAR-WISE, matches nothing,
-                and returns `[]` — a false "nothing exists" with
-                no error at all; a non-iterable raises TypeError;
-                an unhashable member (a list) raises TypeError
-                out of the `in` test                             ⇒ list/tuple of str
-
-    `limit` is deliberately NOT a parameter the model can set. It is the one argument
-    with no upside — the caller knows how many cards fit in the prompt and the model
-    does not — and every untrusted number is another `max()`/slice to get right.
-
-    An UNKNOWN kind is dropped rather than rejected (the enum is advisory to a model
-    that may ignore it); if nothing recognizable survives we fall back to searching
-    everything, because "search fewer corpora than asked" is a silent wrong answer and
-    "search all of them" is only a cost. A missing/blank `query` returns `None` — there
-    is no safe default for what to look for.
+    DERIVED FROM `PriorArtIndex.search`, not from the field names. `query` must be a non-blank
+    `str` (implementations call `.strip()` and `normalize` on it); `kinds` must be a list or
+    tuple of `str`, because a bare `str` iterates CHAR-WISE, matches nothing and returns a false
+    "nothing exists" with no error at all. `limit` is deliberately NOT model-settable — the
+    caller knows how many cards fit in the prompt and the model does not. An UNKNOWN kind is
+    dropped rather than rejected, and an empty survivor set falls back to searching everything,
+    because "search fewer corpora than asked" is a silent wrong answer while "search all of
+    them" is only a cost. A missing or blank `query` returns `None`.
     """
     if not isinstance(arguments, dict):
         return None
@@ -330,19 +238,12 @@ _NOT_SEARCHED_BODY = (
 def render_prior_art_block(lookup: PriorArtLookup) -> str:
     """The `PRIOR ART` prompt block for one lookup.
 
-    Always rendered when an index is wired — including the empty and the unavailable
-    cases. A block that appears only on a hit would teach the model that its absence
-    means "no index", which is the same conflation `PriorArtLookup.available` exists to
-    prevent; and stating "we could not look" out loud is the only way the model can
-    weigh its own confidence honestly.
-
-    Delimited and labelled as DATA because everything inside it is untrusted node text
-    (see the module docstring). The delimiters are not a security boundary on their own
-    — `_card_line` flattening every field to one line is what makes them hold.
-
-    ALSO the `searchCorpus` tool-result body, deliberately: ONE renderer means one
-    place the flatten-and-cap guard lives. A second "simpler" formatter for tool
-    results is how a guard ends up covering only the path nobody attacks.
+    Always rendered when an index is wired, including the empty and unavailable cases: a block
+    that appeared only on a hit would teach the model that its absence means "no index", which
+    is the conflation `PriorArtLookup.available` exists to prevent. Delimited and labelled as
+    DATA, but the delimiters are not a security boundary on their own — `_card_line` flattening
+    every field to one line is what makes them hold. ALSO the `searchCorpus` tool-result body,
+    deliberately: one renderer means one place the flatten-and-cap guard lives.
     """
     lines = [_BLOCK_HEADER]
     # Re-sanitized rather than trusted. `lookup_prior_art` already flattened it, but
@@ -374,20 +275,11 @@ def render_prior_art_block(lookup: PriorArtLookup) -> str:
 def _card_line(card: Any) -> str:
     """One card as a single sanitized line, or `""` for anything unrenderable.
 
-    Total over any field type. The table is the operation, not the field name:
-
-      field           rendering operation                  ⇒ handled by
-      id/intent/
-      status/tier/
-      drift_status    f-string into a line                 ⇒ `_sanitize` (non-str → "")
-      uses_rules/
-      result_grain    `", ".join(...)` — TypeError on a
-                      non-str member, and a bare STR joins
-                      CHAR-WISE into fabricated entries    ⇒ `_str_list`
-      verified        tri-state label                      ⇒ `is True` / `is False`
-      confidence      `f"{x:.2f}"`, and it is a PROPERTY
-                      computing `similarity * penalty` —
-                      TypeError when `similarity` is a str ⇒ `_score`
+    Total over any field type, and the guard per field follows the OPERATION rather than the
+    name: f-string fields go through `_sanitize` (non-str → ""), joined fields through
+    `_str_list` (a bare `str` joins CHAR-WISE into fabricated entries), `verified` is tri-state
+    via `is True`/`is False`, and `confidence` through `_score` because it is a PROPERTY that
+    computes `similarity * penalty`.
     """
     if not isinstance(card, PriorArtCard):
         return ""
@@ -416,37 +308,18 @@ def _card_line(card: Any) -> str:
 
 
 def _score(card: PriorArtCard) -> float:
-    """A card's `confidence` as a renderable float in `[0.0, 1.0]`, or 0.0.
+    """A card's `confidence` as a renderable float in `[0.0, 1.0]`, else 0.0.
 
-    THREE guards, and the first version of this had only the first two — which is one
-    layer too shallow, because it protected the ATTRIBUTE ACCESS and the TYPE but not
-    the CONVERSION:
-
-      1. Access. `confidence` is a computed property (`similarity *
-         MODEL_MISMATCH_PENALTY` on a cross-embedding-space hit), so a card whose
-         `similarity` is a `str` raises from the access, not from the format.
-      2. Type. `bool` is an `int` subclass and a `True` scoring 1.00 is a perfect
-         false positive.
-      3. VALUE. `float(10**400)` raises `OverflowError` — which passes the isinstance
-         gate, escapes `_card_line`, escapes `render_prior_art_block`, and escapes
-         `extract()` on the MANDATORY pre-fetch, before the model is ever called. That
-         is precisely the outcome `lookup_prior_art`'s blanket handler is documented to
-         prevent, and it slipped because that handler guards the CALL to the port and
-         nothing guarded the RENDER of what came back.
-
-    The range clamp is part of guard 3, not decoration. `similarity` is a cosine, so
-    anything outside `[0, 1]` is not a weak signal — it is a broken one, and
-    `float('inf')` renders as `match=inf`, which sorts and READS as better than every
-    genuine hit. An `unsourced` node (the tier that exists to say a foreign writer
-    touched it) topping the block on a value the corpus cannot legitimately hold is the
-    same false positive `bool` was rejected for, without a ceiling. `1e308` also pastes
-    312 characters of digits into a token-budgeted prompt. Out of range ⇒ 0.0, the
-    bottom, matching `neo4j_index._float`'s "unusable for ranking" posture.
-
-    Guards 2 and 3 ARE `untrusted.as_float(lo=0.0, hi=1.0)` — the same call
-    `neo4j_index._float` makes, so the two ends of this pipe cannot drift on what counts
-    as a usable score. Guard 1 stays here: it is specific to `PriorArtCard.confidence`
-    being COMPUTED rather than stored, so the failure is in the access, not the value.
+    THREE guards, because two is one layer too shallow — they protect the ATTRIBUTE ACCESS and
+    the TYPE but not the CONVERSION. (1) Access: `confidence` is computed (`similarity *
+    MODEL_MISMATCH_PENALTY`), so a card whose `similarity` is a `str` raises from the access.
+    (2) Type: `bool` is an `int` subclass, and a `True` scoring 1.00 is a perfect false
+    positive. (3) Value: `float(10**400)` raises `OverflowError`, which passes the isinstance
+    gate and escapes all the way out of `extract()` on the MANDATORY pre-fetch. The range clamp
+    is part of guard 3 — `similarity` is a cosine, so `inf` is not a weak signal but a broken
+    one that sorts and READS above every genuine hit. Guards 2 and 3 ARE
+    `untrusted.as_float(lo=0.0, hi=1.0)`, the same call `neo4j_index._float` makes, so the two
+    ends of the pipe cannot drift on what counts as a usable score.
     """
     try:
         value = card.confidence
@@ -459,14 +332,10 @@ def _str_list(raw: Any) -> list[str]:
     """A card's tuple-of-str field as a bounded list of sanitized strings.
 
     The CONTAINER gate is `untrusted.as_str_list`: a bare `str` is REJECTED rather than
-    iterated, because `", ".join("abc")` is `"a, b, c"`, which manufactures three rule
-    ids that no registry has heard of and does it without raising. Same char-explosion
-    class `neo4j_index._rule_ids` guards, at the other end of the pipe.
-
-    The per-item cap is `_sanitize`, NOT the shared coercer's `max_chars`: these items
-    are rendered into the fenced prior-art block, so they need this module's flattening
-    and de-fencing, which belong to the block's delimiter rather than to the value.
-    Sanitizing to `""` drops the item — a member that renders as nothing is not a name.
+    iterated, because `", ".join("abc")` manufactures three rule ids no registry has heard of
+    and does it without raising. The per-item cap is `_sanitize`, NOT the shared coercer's
+    `max_chars`: these items are rendered into the fenced prior-art block and need this module's
+    flattening and de-fencing. Sanitizing to `""` drops the item.
     """
     out: list[str] = []
     for item in as_str_list(raw, max_items=_MAX_LIST_ITEMS):
@@ -477,29 +346,16 @@ def _str_list(raw: Any) -> list[str]:
 
 
 def _sanitize(raw: Any, *, limit: int) -> str:
-    """Untrusted text as ONE capped, single-line, fence-free string; `""` for anything
-    not a str.
+    """Untrusted text as ONE capped, single-line, fence-free string; `""` for anything not a str.
 
-    Two guards, both derived from how the output is consumed rather than from what the
-    field is called:
-
-      * FLATTEN. The block is line-oriented, so a newline — or a line separator, a
-        paragraph separator, or a bidi override, all of which survive a naive
-        `"\\n" not in text` check — is what would let corpus content start a fresh
-        instruction line. Every Unicode control/format/line/paragraph separator becomes
-        a space and runs of whitespace fold to one. `Cs` (lone surrogates) is in the
-        set too: it is the one category outside the other four that is not real text,
-        and while JSON encoding happens to escape it today, "the serializer saves us"
-        is not a property this function should depend on.
-      * DE-FENCE. The block is delimited by runs of `=`, and a delimiter a card can
-        REPRODUCE is not a delimiter. Runs of `=` collapse to one, so no card text can
-        spell `=== END PRIOR ART ===`. (The alternative, a random per-block nonce, is
-        the stronger technique and is deliberately not used: it makes the prompt
-        non-deterministic, which costs provider-side caching and makes the block
-        untestable by equality.)
-
-    NOT `str(raw)`: coercing turns `None` into the literal `"None"` and a list into its
-    repr, both of which then read as real content in a prompt.
+    Two guards, both derived from how the output is consumed. FLATTEN: the block is
+    line-oriented, so every Unicode control/format/line/paragraph separator becomes a space and
+    whitespace runs fold to one — including `Cs` lone surrogates, which JSON encoding happens
+    to escape today, but "the serializer saves us" is not a property to depend on. DE-FENCE:
+    the block is delimited by runs of `=`, and a delimiter a card can REPRODUCE is not a
+    delimiter, so those runs collapse to one. (A per-block nonce is stronger and deliberately
+    unused: it makes the prompt non-deterministic, costing provider-side caching and equality
+    testing.) NOT `str(raw)` — coercing turns `None` into the literal "None".
     """
     if not isinstance(raw, str):
         return ""

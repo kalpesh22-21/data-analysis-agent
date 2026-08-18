@@ -1,60 +1,24 @@
-"""CouchbaseSessionStore — the real `SessionStore` (Layer 2/3, design §6).
+"""CouchbaseSessionStore — the real `SessionStore` (Layer 2/3), on `acouchbase`.
 
-Uses the official async Couchbase Python SDK (`acouchbase`). Session documents
-live at key `session::<session_id>` in `couchbase_sessions_collection`; full
-tool results live at key `result::<uuid>` in `couchbase_results_collection`.
-Both collections share the single `SESSION_TTL` (`RuntimeSettings.
-session_ttl_seconds`) applied via `expiry=` on every write that creates or
-refreshes a document — matching design §6's "single TTL, no partial purge".
+Session documents live at `session::<session_id>`, full tool results at `result::<uuid>`
+in a second collection; both share the single `SESSION_TTL`, applied via `expiry=` on
+every write that creates or refreshes a document.
 
-CAS (D45): `get_session_with_cas` reads via `collection.get()` (the SDK's
-`Result.cas` property); `resume_checkpoint` writes with
-`collection.replace(key, doc, ReplaceOptions(cas=cas, ...))`, which raises
-`couchbase.exceptions.CasMismatchException` on a losing race — translated
-here to this package's `CASMismatchError` so callers never need to import the
-Couchbase SDK's exception types directly.
+CAS (D45): `get_session_with_cas` reads the SDK's `Result.cas`, and `resume_checkpoint`
+replaces under it, translating `CasMismatchException` into this package's
+`CASMismatchError` so callers never import SDK exception types. EVERY mutating write
+goes through `_mutate_with_cas_retry` — a bare read/mutate/upsert silently loses a
+concurrent write to the same session. After exhausting retries it raises rather than
+dropping the write, so a persistently-contended session fails loudly.
 
-B2 (2026-07-01, CRITICAL fix): EVERY mutating write (`append_message`,
-`append_trail_entry`, `bump_last_activity`, `write_pause_checkpoint`) used to
-do a bare read -> mutate -> `upsert()` with no CAS guard at all, so two
-concurrent writes to the SAME session (e.g. two tool calls dispatched close
-together, or a resume racing a still-finishing prior write) could silently
-lose one of them — the second `upsert()` simply clobbers whatever the first
-wrote, with no error, no retry, no signal. `_mutate_with_cas_retry` below
-fixes this: every one of those four methods now reads-with-CAS, applies its
-mutation, and writes via `collection.replace(key, doc, ReplaceOptions(cas=...))`
-— on a losing race (`CasMismatchException`) it re-reads the LATEST doc and
-retries the mutation from scratch, up to `_MAX_CAS_RETRIES` times (small
-fixed backoff), mirroring the CAS pattern `resume_checkpoint` already used
-correctly. After exhausting retries it raises `CASMismatchError` rather than
-silently dropping the write — a persistently-contended session fails loudly
-instead of losing data.
+CONNECT: every public coroutine opens with `await self._ensure_connected()` — see
+`runtime/couchbase_connect.py` for the invariant and the introspection test that keeps a
+newly-added method honest. `__init__` performs NO I/O and touches NO event loop, so this
+store can be constructed at module import.
 
-CONNECT (2026-08-11): this store waits for its OWN connection. `acouchbase`
-starts the bootstrap in `Cluster.__init__` and refuses every op — KV and N1QL
-alike — until `on_connect()` has been awaited, which a sync `__init__` cannot
-do; that wait used to be an invisible caller obligation, honoured by three
-interactive scripts (via the private `store._cluster`) and by NEITHER daemon
-entrypoint, so `run_learning_sweeper` failed every cycle and the learning loop
-had never once run from its own entrypoint. Every public coroutine below now
-opens with `await self._ensure_connected()` (`CouchbaseConnectGate`, idempotent);
-`connect()`/`close()` are the public lifecycle for callers that want eager
-failure or explicit teardown. See `runtime/couchbase_connect.py` for the
-invariant and the introspection test that keeps method #14 honest.
-
-CONSTRUCTION (2026-08-17): `__init__` performs NO I/O and touches NO event loop.
-Given a `cluster=` (the unit suites' fake handle graph) it derives its collections
-immediately as before; otherwise the `Cluster` itself is built by the first
-`_ensure_connected()`. That is what lets a launcher build this store at module
-import, and it is why the two hand-written lazy proxies in `scripts/` are gone.
-
-This module is exercised at Layer 2 only (a running Couchbase cluster is
-required); its own tests (`tests/runtime/session/test_couchbase_store.py`)
-are skipped automatically when `couchbase` is not importable or
-`RUN_COUCHBASE_TESTS` is unset, so `uv run pytest` stays green with zero
-infrastructure (design §8). `_mutate_with_cas_retry`'s retry LOOP itself is
-unit-testable at Layer 1 with a mocked Couchbase collection (no real cluster
-needed) — see `tests/runtime/session/test_couchbase_store_cas_retry.py`.
+Layer-2 only: its tests skip unless `couchbase` is importable and `RUN_COUCHBASE_TESTS`
+is set. The `_mutate_with_cas_retry` loop itself is unit-testable with a mocked
+collection.
 """
 
 from __future__ import annotations
@@ -150,13 +114,12 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
     async def _mutate_with_cas_retry(
         self, session_id: str, mutate: Callable[[SessionDoc], None]
     ) -> SessionDoc:
-        """Read-with-CAS -> apply *mutate* in place -> CAS'd `replace`, with a
-        bounded retry-on-`CasMismatchException` loop (B2).
+        """Read-with-CAS -> apply *mutate* in place -> CAS'd `replace`, with a bounded
+                retry-on-`CasMismatchException` loop.
 
-        *mutate* must be a pure in-place mutation of the freshly-read `doc`
-        (e.g. `doc.messages.append(...)`) — it may be called more than once
-        (once per retry) against a freshly re-read document, so it must not
-        carry any state of its own across calls.
+                *mutate* must be a pure in-place mutation of the freshly-read `doc`. It may be
+                called more than once — once per retry, against a freshly re-read document — so
+                it must not carry any state of its own across calls.
         """
         last_exc: CasMismatchException | None = None
         for attempt in range(_MAX_CAS_RETRIES):
@@ -196,9 +159,9 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         ) from last_exc
 
     async def _create_session(self, session_id: str) -> SessionDoc:
-        """Create (or return the already-present) session document. Internal: the
-        SessionStore seam exposes only `get_or_create_session` — this is the shared
-        create-on-miss body the paths below reuse once their own `_get_doc` missed."""
+        """Create (or return the already-present) session document — the shared
+                create-on-miss body the public paths reuse once their own `_get_doc` missed.
+        """
         await self._ensure_connected()
         doc, _ = await self._get_doc(session_id)
         if doc is not None:
@@ -265,13 +228,12 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         turn_index: int,
         merge: Callable[[AnalysisState | None], AnalysisState],
     ) -> AnalysisState:
-        """Merge-callback read-modify-write of `analysis_state` (03 §B.1).
+        """Merge-callback read-modify-write of `analysis_state`.
 
-        *merge* is re-invoked on every CAS retry against the FRESHLY re-read doc,
-        so a concurrent state write cannot be clobbered by a value derived from a
-        stale read. `applied` is reset at the top of each invocation rather than
-        appended across them, so the returned state is always the one that was
-        actually written by the winning attempt.
+                *merge* is re-invoked on every CAS retry against the FRESHLY re-read doc, so a
+                concurrent state write cannot be clobbered by a value derived from a stale read.
+                `applied` is reset at the top of each invocation rather than appended across
+                them, so the returned state is the one the winning attempt actually wrote.
         """
         await self._ensure_connected()
         applied: list[AnalysisState] = []
@@ -292,25 +254,20 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         window_count: int,
         kind: FinalizationBlockKind,
     ) -> bool:
-        """CAS-guarded claim of the (turn, window, kind)'s ONE forced re-round
-        (05 §C.1, §J.3).
+        """CAS-guarded claim of the (turn, window, kind)'s ONE forced re-round.
 
-        *kind* discriminates INDEPENDENT allowances (`intents` / `answer_shape`) on
-        the one map, so two different gates refusing in the same window contend for
-        nothing — the CAS retry below only ever serialises claimants of the SAME
-        key.
+                *kind* discriminates INDEPENDENT allowances on the one map, so two different
+                gates refusing in the same window contend for nothing.
 
-        The check and the increment happen inside the SAME `_mutate_with_cas_retry`
-        callback, so a concurrent claimant cannot also see "unspent": whichever
-        write lands first bumps the count, and the loser's callback re-runs against
-        the freshly re-read doc and returns `False`. `claimed` is reset at the top
-        of each invocation, never appended across retries — the same rule
-        `apply_analysis_state` follows.
+                The check and the increment happen inside the SAME `_mutate_with_cas_retry`
+                callback, so a concurrent claimant cannot also see "unspent": whichever write
+                lands first bumps the count, and the loser's callback re-runs against the fresh
+                doc and returns `False`. `claimed` is reset at the top of each invocation, never
+                appended across retries.
 
-        A refused claim still writes (the callback is a no-op but the helper always
-        replaces the doc, bumping `last_activity`). That is a deliberate
-        simplification: one benign write on the exhausted path buys a single
-        atomic code path, and the exhausted path ends the turn anyway.
+                A refused claim still writes (the helper always replaces the doc, bumping
+                `last_activity`) — one benign write on the exhausted path buys a single atomic
+                code path, and that path ends the turn anyway.
         """
         await self._ensure_connected()
         claimed: list[bool] = []
@@ -370,13 +327,11 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
         last_activity_before: str,
         limit: int,
     ) -> list[tuple[SessionDoc, Any]]:
-        """N1QL scan for idle sessions (design §6). `META().cas` is selected so
-        each returned CAS is usable directly by `transition_learning_status`'s
-        CAS-guarded `replace` — the sweeper claims exactly-once off that snapshot.
+        """N1QL scan for idle sessions. `META().cas` is selected so each returned CAS is
+                usable directly by `transition_learning_status`'s CAS-guarded `replace`.
 
-        N1QL is NOT exempt from the connect gate: `AsyncClusterImpl.query` calls the
-        SDK's `_ensure_connected()` exactly like a KV op does, which is why the
-        sweeper's very first read raised rather than merely returning no rows.
+                N1QL is NOT exempt from the connect gate: `AsyncClusterImpl.query` calls the
+                SDK's own `_ensure_connected()` exactly like a KV op does.
         """
         await self._ensure_connected()
         keyspace = (
@@ -421,14 +376,11 @@ class CouchbaseSessionStore(CouchbaseStoreBase):
     ) -> Any:
         """Single-shot CAS transition (D96 single-writer-per-session).
 
-        Mirrors `resume_checkpoint`'s CAS discipline — read fresh, assert the
-        `from` state, then `replace` under the CALLER's *cas* (the scan/read
-        snapshot). A loser (peer sweeper/consumer or a request-path write since
-        the scan) fails the `replace` with `CasMismatchException` → skip. This is
-        deliberately NOT the retrying `_mutate_with_cas_retry` path: a lost
-        transition race must be a skip, not a retry that would force the write.
-        The lifecycle flag is the ONLY field written — `last_activity` is left
-        untouched (D72 read-only: bumping it would resurrect the idle session).
+                Reads fresh, asserts the `from` state, then `replace`s under the CALLER's *cas*
+                (the scan snapshot). Deliberately NOT the retrying `_mutate_with_cas_retry`
+                path: a lost transition race must be a SKIP, not a retry that would force the
+                write. The lifecycle flag is the ONLY field written — bumping `last_activity`
+                would resurrect the idle session (D72 read-only).
         """
         await self._ensure_connected()
         doc, _ = await self._get_doc(session_id)

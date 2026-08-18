@@ -1,65 +1,17 @@
 """AST rewrite: accepted SQL + S3 role classification → a `{slot}` `sql_template`.
 
-Deterministic, sqlglot-only (D35 — never re-emit SQL from an LLM). For each S3
-`parameterization` entry we locate the literal predicate in the parsed AST and:
+Deterministic, sqlglot-only (D35 — never re-emit SQL from an LLM). role=slot replaces the
+literal with a `{slot}` placeholder; role=inline and role=rule both KEEP the literal in
+place. **role=rule keeps the predicate verbatim and only records the rule id — the runtime
+never re-applies a deleted predicate** (see docs/cleanup/WORKLOG.md #18).
 
-  * role=slot  → replace the literal with a `{slot}` placeholder;
-  * role=inline→ leave the literal in place (structural / metric-defining);
-  * role=rule  → ALSO leave the literal in place, and record the rule id in
-                 `uses_rules` — the predicate is KEPT and ANNOTATED, not deleted.
+The guards check the OUTPUT rather than a list of shapes somebody has to keep complete:
+`_check_inline_literals` before any mutation, `_recheck_inline_literals` after it, and
+`_check_rewritten` (the template re-parses, and no function call lost an argument).
 
-**WHY role=rule KEEPS THE PREDICATE.** It used to delete it, on the reading that the
-runtime would re-apply the rule. It does not: a learned `uses_rules` entry is a bare
-catalog id string, `runtime/blueprint/rules.py::parse_rule` classifies every one of them
-as STATIC ("authored SQL, no action"), and `executor._expand_rules` skips static rules
-entirely. So the deletion removed a filter that nothing put back — the D56 silently-
-wrong-answer class, shipped as `outcome: ok`.
-
-Deleting was also unsound at the SQL level in a way no allowlist fixes cheaply: the same
-edit is safe, meaningless or catastrophic depending on where the predicate sits (measured
-on the live corpus — `WHERE  GROUP BY`, a one-argument `sumIf`, a silent CROSS JOIN, a
-raw `KeyError`, a widened `OR` arm, a half-deleted `IN` list). Keeping is total: it needs
-no shape analysis, it cannot widen a result, and the template a reviewer approves is the
-SQL the analyst accepted. The rule id survives as PROVENANCE — it is what a reviewer
-reads, what D48 keys on, and what a future runtime could act on — and the annotation now
-agrees with the template instead of contradicting it. It also converges with the canon
-tier, which has always inlined rule predicates and named the rule alongside.
-
-The literal is rendered with the ClickHouse dialect (preserving `sum`/`toYear`
-casing) which emits a placeholder as the canonical token `{slot: }`; we then map
-`{slot: }` → `{slot}` so the runtime-executable template carries the BRACE authoring
-form `runtime/blueprint/template.py` expects (a promoted blueprint is runtime-
-executable with zero placeholder translation). This two-step keeps identifier casing
-exact while producing the `{slot}` surface the fixtures pin.
-
-Un-rewritable / unparseable SQL raises `RewriteError` — the caller maps it to
-`fail_to_review` (D52/D97), never a guessed template.
-
-**THE ONE REMAINING EDIT IS SLOT SUBSTITUTION, AND IT IS STILL GUARDED** (ISSUES
-H3/H5/H6). With the deletion gone the rewrite replaces literals and nothing else, which
-is the safest edit it can make — but the guards stay, because they check the OUTPUT
-rather than a list of shapes somebody has to keep complete, and that is what caught the
-deletion's failures in the first place:
-
-  1. `_check_inline_literals` — under `strict`, an `inline` entry's literal must
-     actually be in the accepted SQL, or the plan claims a filter the template does not
-     carry (H3). Runs BEFORE any mutation, so it reads the SQL as accepted, and returns
-     the entries `_recheck_inline_literals` verifies again on the way out.
-  2. `_recheck_inline_literals` — the same literals are STILL THERE afterwards. Cheap,
-     and it is the standing invariant that would have caught the deletion bugs on their
-     own terms: a rule entry that removed a literal another entry promised to keep.
-  3. `_check_rewritten` — the rendered template RE-PARSES, and no function call lost an
-     argument. Both halves earned their place against the deleting rewrite (H5's
-     unparseable `WHERE  GROUP BY` escaped as a `sqlglot.ParseError` two frames later;
-     H6's one-argument `sumIf` escaped as nothing at all) and both are kept, because
-     they make "this module produces a faithful, runnable template or raises
-     `RewriteError`" a property rather than a hope about its inputs.
-
-`RewriteError` is the ONLY exception this module raises for a bad plan or an awkward
-SQL shape — both call sites (`builder._generalize_single` / `_generalize_composite`)
-catch exactly that and stamp `fail_to_review/unrewritable_sql`. The reason tags are
-frozen (`validate.py`), so WHY a rewrite refused belongs in the exception MESSAGE,
-which is what the reviewer reads.
+`RewriteError` is the ONLY exception this module raises for a bad plan or an awkward SQL
+shape; both call sites catch exactly that and stamp `fail_to_review/unrewritable_sql`. The
+reason tags are frozen, so WHY a rewrite refused belongs in the exception MESSAGE.
 """
 
 from __future__ import annotations
@@ -95,8 +47,10 @@ _OPERATOR_NODES: tuple[type[exp.Expression], ...] = (exp.Binary, exp.Unary, exp.
 
 
 class RewriteError(Exception):
-    """The accepted SQL could not be parsed or a declared slot/rule literal could
-    not be located — the caller routes to `fail_to_review` (D52/D97)."""
+    """The accepted SQL could not be parsed, or a declared slot/rule literal could not be located.
+
+    The caller routes to `fail_to_review` (D52/D97).
+    """
 
 
 def parse_accepted_sql(accepted_sql: str) -> exp.Expression:
@@ -121,10 +75,9 @@ def _find_literal(
 ) -> exp.Literal | None:
     """Find the (currently in-tree) literal for `column <op> value`.
 
-    A comparison qualifies when it references `column` (directly or wrapped in a
-    function such as `toYear(pay_period)`) and carries a literal whose text equals
-    `value`. Replaced/dropped nodes leave the tree, so a repeat scan naturally
-    advances to the next occurrence — no external cursor needed.
+    A comparison qualifies when it references `column` — directly or wrapped in a function such
+    as `toYear(pay_period)` — and carries a literal whose text equals `value`. Replaced or
+    dropped nodes leave the tree, so a repeat scan naturally advances to the next occurrence.
     """
     for cmp in ast.find_all(*_COMPARISONS):
         if column not in {col.name for col in cmp.find_all(exp.Column)}:
@@ -138,10 +91,9 @@ def _find_literal(
 def _func_name(node: exp.Expression) -> str:
     """The function's name as authored (`sumIf`, `toYear`) or its SQL name (`SUM`).
 
-    Unrecognized functions carry their spelling as a STRING in `this` (the
-    `Anonymous`/`AnonymousAggFunc` family, `structural_key.py`); recognized ones answer
-    `sql_name()`. Both are stable across the rewrite, which is what the arity census and
-    the refusal message need."""
+    Unrecognized functions carry their spelling as a STRING in `this` (the `Anonymous` family);
+    recognized ones answer `sql_name()`. Both are stable across the rewrite.
+    """
     this = node.args.get("this")
     if isinstance(this, str) and this:
         return this
@@ -157,10 +109,10 @@ def _func_name(node: exp.Expression) -> str:
 def _function_shapes(ast: exp.Expression) -> Counter[tuple[str, int]]:
     """`(function name, argument count)` → occurrences, over the whole tree.
 
-    The ARGUMENT COUNT is the point. `sumIf(amount, register_type = 'EARN')` with its
-    condition deleted is `sumIf(amount)` — still parses, still runs on some engines, and
-    computes a DIFFERENT number under the same alias. Nothing downstream of S4 looks at
-    arity, so this is the only place that mutation is visible."""
+    The ARGUMENT COUNT is the point: `sumIf(amount, register_type = 'EARN')` with its condition
+    deleted is `sumIf(amount)` — still parses, still runs on some engines, and computes a
+    DIFFERENT number under the same alias. Nothing downstream of S4 looks at arity.
+    """
     shapes: Counter[tuple[str, int]] = Counter()
     for func in ast.find_all(exp.Func):
         if isinstance(func, _OPERATOR_NODES):
@@ -180,20 +132,12 @@ def _check_rewritten(
 ) -> None:
     """The output post-condition: the template PARSES, and no call lost an argument.
 
-    Both halves exist because the failure they catch is invisible at the call site. An
-    unparseable template (`WHERE  GROUP BY`) escaped as a `sqlglot.ParseError` from
-    `canonical_ast_norm` two frames later — which dead-lettered the whole session on the
-    consumer path and 500ed the reviewer completion path. A *parseable* one that lost a
-    function argument escaped as nothing at all: it landed, stamped `ok`.
-
-    The re-parse rewrites `{slot}` → `:slot` first, exactly as `structural_key` and the
-    runtime binder do, because a brace placeholder is not SQL and would fail the parse it
-    is supposed to prove.
-
-    The arity check flags a shape the input did not have (that many times), not a shape
-    the output no longer has: dropping a whole `WHERE toYear(pay_period) = 2025` legally
-    removes a `toYear` call, while `sumIf/2 → sumIf/1` legally removes nothing and is the
-    bug."""
+    The re-parse rewrites `{slot}` → `:slot` first, exactly as `structural_key` and the runtime
+    binder do, because a brace placeholder is not SQL and would fail the parse it is supposed to
+    prove. The arity check flags a shape the INPUT did not have that many times, not one the
+    output no longer has: dropping a whole predicate legally removes a `toYear` call, while
+    `sumIf/2 → sumIf/1` legally removes nothing and is the bug.
+    """
     colon_form = SLOT_TOKEN.sub(lambda m: f":{m.group(1)}", rendered)
     try:
         reparsed = sqlglot.parse_one(
@@ -223,19 +167,13 @@ def _inline_literal_present(
 ) -> bool:
     """Is an `inline` entry's literal actually in the accepted SQL?
 
-    Present under EITHER authority, because the two enumerate the same predicates with
-    different granularity and an inline entry may legitimately be written against either:
-
-      * this module's `_find_literal`, which sees INDIVIDUAL literals (each member of an
-        `IN` list separately) — so a plan entry naming one member is present;
-      * the S3 totality enumerator (`extractor/sql_predicates`), which is what DECIDED
-        this entry covers a predicate and which joins list/range members with commas
-        (`IN ('DDUCT','EARN')` → `"DDUCT,EARN"`; `BETWEEN a AND b` → `"a,b"`), and which
-        also reads shapes `_find_literal` cannot (`BETWEEN`, boolean constants).
-
-    Being present in one is enough. The hole this closes (H3) is a HALLUCINATED literal —
-    one that appears in neither — and the cost of a stricter test is a false
-    `fail_to_review` on a legitimate candidate, which is the direction that loses work."""
+    Present under EITHER authority, because the two enumerate the same predicates at different
+    granularity and an inline entry may legitimately be written against either: this module's
+    `_find_literal` sees INDIVIDUAL literals (each `IN` member separately), while the S3
+    totality enumerator joins list/range members with commas and reads shapes `_find_literal`
+    cannot (`BETWEEN`, boolean constants). Being present in one is enough — the hole this closes
+    is a HALLUCINATED literal, one that appears in neither.
+    """
     if _located_inline_literal(ast, column, value):
         return True
     predicates = literal_predicates(accepted_sql) or ()
@@ -246,11 +184,12 @@ def _inline_literal_present(
 
 
 def _located_inline_literal(ast: exp.Expression, column: str, value: str) -> bool:
-    """Is the inline literal findable IN THE TREE — the whole value, or every comma-
-    separated member of it (an `IN` list's members arrive joined)?
+    """Is the inline literal findable IN THE TREE?
 
-    The tree-only half of `_inline_literal_present`, split out because it is the half
-    that can be re-asked AFTER the rewrite."""
+    The whole value, or every comma-separated member of it (an `IN` list's members arrive
+    joined). The tree-only half of `_inline_literal_present`, split out because it is the half
+    that can be re-asked AFTER the rewrite.
+    """
     if _find_literal(ast, column, value) is not None:
         return True
     members = [member for member in value.split(",") if member]
@@ -264,25 +203,14 @@ def _recheck_inline_literals(
 ) -> None:
     """POST-CONDITION: every inline literal that was in the tree is STILL in the tree.
 
-    The pre-pass proves the plan is honest about the accepted SQL. This proves the
-    REWRITE was honest about the plan — two different claims, and only the second one
-    can catch an edit that removed more than its own predicate.
-
-    IT PASSES TRIVIALLY TODAY, and it is kept deliberately. When `role=rule` deleted
-    predicates this fired on a real shape: a rule locator naming ONE member of an `IN`
-    list resolved to the whole list, and the inline entry covering that list was deleted
-    with it — silently, stamped `ok`. That deletion is gone, so the only edit left is
-    slot substitution, and the invariant it now states is "no edit here removes a literal
-    another entry vouched for". It is cheap (a tree scan over a handful of entries), and
-    it is what a future edit — a new role, an optimizer pass, a re-introduced drop — has
-    to get past. A guard that only exists while its bug does is a guard that is missing
-    when the bug comes back.
-
-    Tree granularity only (no S3-enumerator fallback): the question is whether the
-    literal SURVIVED, and an entry whose presence rested on the enumerator was never
-    visible to `_find_literal` in the first place, so re-asking it would fail every
-    `BETWEEN`/boolean inline entry. Only entries the pre-pass located in the tree are
-    re-checked. The rewrite introduces no literals, so a pass here is genuine."""
+    The pre-pass proves the plan is honest about the accepted SQL; this proves the REWRITE was
+    honest about the plan. It passes trivially today and is KEPT deliberately, because the
+    invariant it states — no edit here removes a literal another entry vouched for — is what a
+    future role, optimizer pass or re-introduced drop has to get past (see
+    docs/cleanup/WORKLOG.md #18). Tree granularity only: an entry whose presence rested on the
+    S3 enumerator was never visible to `_find_literal`, so only entries the pre-pass located in
+    the tree are re-checked.
+    """
     for column, value in entries:
         if not _located_inline_literal(ast, column, value):
             raise RewriteError(
@@ -297,16 +225,12 @@ def _check_inline_literals(
 ) -> list[tuple[str, str]]:
     """Strict-mode only: every `role=inline` locator must name a literal of THIS SQL.
 
-    S3's totality gate counts ANY entry as covering a predicate, and the rewrite leaves
-    inline literals alone — so before this check an inline entry for a predicate the SQL
-    does not contain sailed through as `outcome: ok`, shipping a plan that claims a
-    filter the template has not got (H3). Every other role already raised when its
-    literal was missing; inline was the hole, and it is the role a model reaches for when
-    it is unsure.
-
-    Runs BEFORE the rewrite loop touches the tree, so an earlier entry's edit cannot
-    make a later inline entry look absent — and RETURNS the entries it found in the
-    tree, which `_recheck_inline_literals` re-asks once the rewrite is done."""
+    S3's totality gate counts ANY entry as covering a predicate, and the rewrite leaves inline
+    literals alone — so an inline entry for a predicate the SQL does not contain used to sail
+    through as `outcome: ok`, shipping a plan that claims a filter the template has not got.
+    Runs BEFORE the rewrite loop touches the tree, so an earlier entry's edit cannot make a
+    later one look absent, and RETURNS the entries it found there for the recheck.
+    """
     recheck: list[tuple[str, str]] = []
     for param in parameterization:
         if param.get("role") != "inline":
@@ -337,19 +261,13 @@ def rewrite_sql_to_template(
 ) -> str:
     """Rewrite `accepted_sql` into a `{slot}` template per the S3 role plan.
 
-    `strict=True` (single blueprint): every role=slot/role=rule literal MUST be
-    found — a miss raises `RewriteError`, for rule as much as for slot: the plan is a
-    claim about THIS SQL, and an entry naming a predicate that is not in it is wrong
-    whether or not the rewrite would have edited it — and every role=inline literal must
-    be PRESENT before the rewrite and STILL present after it (`_check_inline_literals`,
-    `_recheck_inline_literals`). `strict=False` (a composite node whose SQL
-    references only a subset of the top-level params): a param whose literal is
-    absent from THIS node's SQL is simply skipped, inline entries included — a node
-    that does not mention a shared param is the normal case there, not a fault.
-
-    `uses_rules` is NOT derived here (it is a plan-level fact aggregated once by the
-    builder); this function neither edits nor derives anything for role=rule —
-    the predicate stays in the template verbatim.
+    `strict=True` (single blueprint): every role=slot/role=rule literal MUST be found — the plan
+    is a claim about THIS SQL, and an entry naming a predicate not in it is wrong whether or not
+    the rewrite would have edited it — and every role=inline literal must be present before the
+    rewrite and STILL present after. `strict=False` (a composite node whose SQL references only
+    a subset of the top-level params): a param whose literal is absent from THIS node's SQL is
+    skipped, inline entries included. `uses_rules` is NOT derived here (a plan-level fact the
+    builder aggregates); role=rule leaves the predicate in the template verbatim.
     """
     ast = parse_accepted_sql(accepted_sql)
     before = _function_shapes(ast)

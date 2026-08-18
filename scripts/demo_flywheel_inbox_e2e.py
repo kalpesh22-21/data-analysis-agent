@@ -1,34 +1,19 @@
 #!/usr/bin/env python
-"""demo_flywheel_inbox_e2e — a REAL, human-in-the-loop end-to-end walk of the
-Track-B learning FLYWHEEL against the LIVE stack (real OpenAI + l2-mcp +
-Couchbase + Neo4j + ClickHouse, all already UP).
-
-This is NOT a pytest test (the real LLM is nondeterministic) — it is a DEMO
-driver, a sibling of `scripts/demo_learning_e2e_openai.py` (with which it shares
-its whole live rig — the env block, `build_infra`, `teardown`, the catalog, the
-mint, the sweep helper, the model preflight, the emission printer — through
-`scripts/_e2e_harness.py`) and of `scripts/run_ui_runtime_real.py` (whose
-`create_app` runtime wiring it drives in-process). It walks THREE parts, each
-failing HONESTLY (print + return) if the real model does not cooperate — a valid
-real-LLM outcome, not a hard error:
+"""demo_flywheel_inbox_e2e — a REAL, human-in-the-loop end-to-end walk of the Track-B
+learning FLYWHEEL against the LIVE stack (real OpenAI + l2-mcp + Couchbase + Neo4j +
+ClickHouse, all already UP). NOT a pytest test: the real LLM is nondeterministic, so
+each part fails HONESTLY (print + return) rather than raising.
 
   PART A — a LIVE runtime turn: ask -> rectify intent -> a real session trail.
-  PART B — learn from that live session, then HUMAN-ACCEPT via the review inbox
-           (the `sampler=True` coin routes the blueprint to `in_review`, so a
-           human `inbox.approve(...)` — not an auto-promotion — lands it).
-  PART C — a VARIANT question (a DIFFERENT filter) through the SAME in-process
-           runtime, and the GOVERNED-CORPUS TRUST GATE holding.
-
-           An inbox-approved blueprint lands in the `source='learning'` STAGING
-           tier (`learning/promotion/landing.py`), NOT the trusted MCP canon,
-           and agent recall serves `source='mcp'` ONLY — the fail-closed gate in
-           `runtime/retrieval/vector_index.py`. So the learned blueprint is
-           deliberately NOT recallable end-to-end yet, whatever its
-           status/drift_status: it must first be PROMOTED to canon (a human
-           verify -> re-source to mcp; the governed-corpus Phase-3 hop, not
-           built). PART C therefore shows the RAW-path answer plus the gate
-           doing its job — not an autoplay. If the fast path DOES fire, it fired
-           off the pre-existing MCP-canon corpus, not off what PART B landed.
+  PART B — learn from that live session, then HUMAN-ACCEPT via the review inbox (the
+           `sampler=True` coin routes the blueprint to `in_review`, so a human
+           `inbox.approve(...)` — not an auto-promotion — lands it).
+  PART C — a VARIANT question through the SAME in-process runtime, showing the
+           GOVERNED-CORPUS TRUST GATE hold: an inbox-approved blueprint lands in the
+           `source='learning'` STAGING tier while agent recall serves `source='mcp'`
+           ONLY, so it is deliberately NOT recallable until a human promotes it to
+           canon. If the fast path fires, it fired off pre-existing MCP canon, not off
+           what PART B landed.
 
 Run (from the repo root, the l2 stack UP):
 
@@ -134,13 +119,10 @@ _QUESTION_C = "what is the average annual salary per employee in the Engineering
 
 
 def _build_runtime_app(infra: Infra, model: str):
-    """Build the REAL in-process runtime `AgentLoop` (via `create_app`) EXACTLY as
-    `run_ui_runtime_real.py` wires it, with retrieval turned ON so a landed
-    blueprint is recallable. The SAME live Couchbase session store + RealMCPClient
-    that `build_infra` opened are reused (one event loop, one bucket) so the
-    session a runtime turn writes is the SAME doc the learning sweeper later reads.
-    `create_app` builds the Neo4jVectorIndex + RetrievalPipeline + runBlueprint
-    executor itself from these settings (retrieval_enabled + neo4j_url + embedder)."""
+    """Build the REAL in-process runtime `AgentLoop` (via `create_app`) exactly as
+    `run_ui_runtime_real.py` wires it, retrieval ON. Reuses the SAME live Couchbase
+    session store + RealMCPClient `build_infra` opened (one event loop, one bucket), so
+    the session a runtime turn writes is the SAME doc the learning sweeper later reads."""
     settings = RuntimeSettings(
         _env_file=None,
         mcp_url=mcp_url(),
@@ -274,12 +256,9 @@ def _looks_like_ran_query(result: dict | None) -> bool:
     """A turn 'actually ran a query and answered' iff it EXECUTED read-only SQL (or
     played a blueprint) and came back with prose.
 
-    Reads `sql_executed`, not the retired `sql`/`result_table` pair. The check is
-    deliberately NOT `answer_sql`/`answer_tables`: those carry the model's
-    `presentTable` designation, which is advisory and is legitimately absent for a
-    SCALAR answer — and "the total annual salary for Sales" is exactly that. Gating
-    on the designation made a perfectly good turn (three tool calls, a real number
-    in the prose) read as "the model did not run a query".
+    Reads `sql_executed`, deliberately NOT `answer_sql`/`answer_tables`: those carry the
+    model's `presentTable` designation, which is advisory and legitimately absent for a
+    SCALAR answer, so gating on it reads a perfectly good turn as a failure.
     """
     if result is None:
         return False

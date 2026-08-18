@@ -1,24 +1,18 @@
-"""blueprint/verify.py — the D56 deterministic verify assertion (§4, pure).
+"""blueprint/verify.py — the D56 deterministic verify assertion (pure).
 
-D56: every `runBlueprint` result passes a mandatory gate before the user sees it;
-the deterministic half is the TEETH — a wrong-grain number is shape-correct, so
-only a code-computed check catches the fan-out double-count. This module is that
-code-computed check, as a PURE function (no I/O): the executor (Slice B) runs the
-scope-enforced `SELECT count(), count(DISTINCT <grain cols>)` probe and hands the
-two numbers here.
+Every `runBlueprint` result passes a mandatory gate before the user sees it, and the
+deterministic half is the TEETH: a wrong-grain number is shape-correct, so only a
+code-computed check catches the fan-out double-count. The executor runs the scope-enforced
+`SELECT count(), count(DISTINCT <grain cols>)` probe and hands the two numbers here.
 
-Two parts (§4.2/§4.3), both Phase-1-computable:
-  1. **Grain-integrity** — `row_count == distinct_grain_count` against the
-     blueprint's DECLARED result grain (`ResultGrain`, §1.1). Skipped (vacuously
-     ok) when the grain is empty OR declared unverifiable (`grain_verifiable:false`
-     skip rule, §4.2) — there is nothing to check against.
-  2. **Result signature** — column-shape match (the Phase-1 interim invariant set,
-     §4.3: column-shape + declared-grain row-count; type/positivity invariants are
-     a carried OQ).
+Two parts, both computable today:
+  1. GRAIN-INTEGRITY — `row_count == distinct_grain_count` against the DECLARED result
+     grain. Skipped (vacuously ok) when the grain is empty OR declared unverifiable, since
+     there is nothing to check against.
+  2. RESULT SIGNATURE — column-shape match against the declared signature.
 
-A FAILED deterministic assertion is the executor's signal to fall back to the raw
-loop (`RUN_BLUEPRINT_VERIFY_FAILED`, §4.4) — this module only COMPUTES pass/fail,
-it never returns a suspect answer itself.
+A FAILED assertion is the executor's signal to fall back to the raw loop; this module only
+COMPUTES pass/fail and never returns a suspect answer itself.
 """
 
 from __future__ import annotations

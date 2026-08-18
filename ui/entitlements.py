@@ -1,32 +1,20 @@
-"""ui/entitlements.py — per-user `column_scope` entitlement resolution (readiness).
+"""ui/entitlements.py — per-user `column_scope` entitlement resolution.
 
-This module is the **Microsoft Entra swap seam** for auth-hardening Slice 2
-(Item 9; refines D82's interim all-access default). Today it is a STUB: a
-configurable default identity plus a small in-code entitlement map. When Entra
-OIDC lands, the two public functions below become **one-line source swaps** —
-nothing else in the BFF changes, because `ui/server.py::create_session` already
-resolves scope exclusively through these two seams:
+The **Microsoft Entra swap seam** (auth-hardening Slice 2, Item 9). Today it is a STUB:
+a configurable default identity plus a small in-code entitlement map. The two public
+functions are the ONLY places `ui/server.py::create_session` resolves scope, so an Entra
+swap is a one-line body change in each:
 
-  * `resolve_caller_identity(request) -> str`
-      today:    a configured default (`UI_DEFAULT_USER`), or an optional dev
-                header override behind `UI_TEST_AFFORDANCES`.
-      # ENTRA SEAM: replace the body with a read of the validated OIDC `sub`
-      # claim off the request/session — delete the default + dev-header path.
+  * `resolve_caller_identity(request) -> str` — today `UI_DEFAULT_USER`, or a dev header
+    override behind `UI_TEST_AFFORDANCES`. ENTRA SEAM: read the validated OIDC `sub`.
+  * `resolve_column_scope(identity) -> list[str]` — today a stub map + a configured
+    default. ENTRA SEAM: read the Entra entitlement claim/service.
 
-  * `resolve_column_scope(identity) -> list[str]`
-      today:    a stub `dict[str, list[str]]` map + a configured default scope.
-      # ENTRA SEAM: replace the body with a read of the Entra entitlement claim
-      # (or a call to the entitlement service) for `identity` — delete the map.
-
-Scope semantics (D80(b)): an empty `column_scope` (`[]`) means **ALLOW-ALL** (no
-column restriction); a non-empty list is an allowlist of fully-qualified
-`database.table.column` strings. The MCP is the live enforcement boundary
-(D57/D80); this module only *supplies* the scope the BFF mints into the token.
-
-Readiness posture: the demo/UI identity (`ui-user`) keeps its allow-all default so
-the Layer-3 conformance scenarios (which narrow FROM allow-all) stay green. A
-RESTRICTED per-user scope is an ADDED capability, not a changed default. See
-docs/decisions/auth-hardening-design.md §4.2 / §7 and DECISIONS.md D82.
+Scope semantics (D80(b)): an empty `column_scope` (`[]`) means **ALLOW-ALL**; a non-empty
+list is an allowlist of fully-qualified `database.table.column` strings. The MCP is the
+live enforcement boundary (D57/D80) — this module only *supplies* the scope the BFF mints
+into the token. The demo identity (`ui-user`) keeps its allow-all default; a RESTRICTED
+per-user scope is an ADDED capability, not a changed default.
 """
 
 from __future__ import annotations
@@ -84,10 +72,9 @@ _DEFAULT_SCOPE: list[str] = []
 def resolve_caller_identity(request: Request) -> str:
     """Resolve the caller's identity string for the current request.
 
-    Today: the configured default identity (`UI_DEFAULT_USER`, default
-    ``"ui-user"``), unless the dev-only `X-Debug-User` header is present AND
-    `UI_TEST_AFFORDANCES=1`, in which case that header wins (so a test/harness can
-    drive a restricted identity without a real login).
+    Today: the configured default identity (`UI_DEFAULT_USER`, default ``"ui-user"``),
+    unless the dev-only `X-Debug-User` header is present AND `UI_TEST_AFFORDANCES=1`, in
+    which case that header wins.
 
     ENTRA SEAM: replace this body with a read of the validated OIDC `sub` claim.
     """
@@ -101,13 +88,11 @@ def resolve_caller_identity(request: Request) -> str:
 def resolve_column_scope(identity: str) -> list[str]:
     """Resolve the `column_scope` entitled to *identity*.
 
-    Today: a lookup in the stub `_ENTITLEMENTS` map, falling back to
-    `_DEFAULT_SCOPE` for an unknown identity. Returns a fresh list (never the
-    stored object) so callers cannot mutate the entitlement table. `[]` ==
-    allow-all (D80b).
+    Today: a lookup in the stub `_ENTITLEMENTS` map, falling back to `_DEFAULT_SCOPE`
+    for an unknown identity. Returns a fresh list (never the stored object) so callers
+    cannot mutate the entitlement table. `[]` == allow-all (D80b).
 
-    ENTRA SEAM: replace this body with a read of the Entra entitlement
-    claim/service for *identity*.
+    ENTRA SEAM: replace this body with a read of the Entra entitlement claim/service.
     """
     if identity not in _ENTITLEMENTS:
         # An unmapped identity silently gets `_DEFAULT_SCOPE` (allow-all today) —

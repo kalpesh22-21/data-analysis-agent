@@ -1,29 +1,10 @@
-"""EmbeddingClient — the D71 embedding seam for `resolveValues` ranking (design §3).
+"""EmbeddingClient — the D71 embedding seam for `resolveValues` ranking.
 
-Three pieces:
-  - `EmbeddingClient` Protocol: `embed(texts) -> vectors`, order-preserving,
-    raising `EmbeddingError` on any transport/serialization failure.
-  - `FakeEmbeddingClient` (Layer 1): deterministic vectors from a seeded hash
-    of each text, OR an explicit scripted `{text: vector}` map for hand-crafted
-    ranking assertions. No network. A `fail=True` flag makes `embed` raise, to
-    exercise the composite's degrade-to-freq-only path (design §3.2).
-  - `HttpEmbeddingClient` (Layer 2/3, real): a plain `httpx.AsyncClient` POST to
-    the custom embedding API (D71 — NOT the OpenAI SDK), settings-driven
-    URL/key, wrapped in a manual `EMBEDDING` span (D24). Raises `EmbeddingError`
-    on non-2xx / timeout / malformed body. The wire contract (OQ-1, now RESOLVED
-    against the user-provided mocks at ~/Development/SQL/mocks) is:
-        request  : POST <url>  {"input_text": [<text>, ...]}
-        response : a BARE JSON array `[[float, ...], ...]` (one vector per input,
-                   768-dim all-mpnet-base-v2) — NOT an OpenAI-shaped envelope.
-    The mock needs no auth; `api_key` is kept as an optional bearer header for
-    the eventual production endpoint. The request/response mapping is unit-tested
-    against a mocked transport; a live Layer-2 test runs when EMBEDDING_TEST_URL
-    is set (`tests/integration/test_embedding_api.py`).
-
-D5/D25 (load-bearing): no embedding client ever sees `RuntimeCredentials`; the
-embedding API key is its OWN secret (from `RuntimeSettings`, `.env`-backed),
-distinct from the warehouse JWT. The `EMBEDDING` span logs vector counts and
-latency only — never the embedded text.
+Wire contract of the custom endpoint (NOT the OpenAI SDK):
+    request  : POST <url>  {"input_text": [<text>, ...]}
+    response : a BARE JSON array `[[float, ...], ...]`, one vector per input
+D5/D25: no embedding client ever sees `RuntimeCredentials` — the embedding API key is
+its own secret, and the `EMBEDDING` span logs counts and latency, never the text.
 """
 
 from __future__ import annotations
@@ -41,8 +22,8 @@ if TYPE_CHECKING:
 class EmbeddingError(Exception):
     """Raised on any embedding transport/serialization failure.
 
-    The `resolveValues` composite catches this and degrades to frequency-only
-    ranking (design §3.2) — it never propagates out as a tool-call failure.
+        `resolveValues` catches this and degrades to frequency-only ranking; it never
+        propagates out as a tool-call failure.
     """
 
 
@@ -52,8 +33,7 @@ class EmbeddingClient(Protocol):
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Return one dense vector per input text, order-preserving.
 
-        Raises:
-            EmbeddingError: on any transport/serialization failure.
+                Raises `EmbeddingError` on any transport/serialization failure.
         """
         ...
 
@@ -89,22 +69,12 @@ class FakeEmbeddingClient:
 
 
 class HttpEmbeddingClient(JsonPostClient):
-    """Real `EmbeddingClient` — POSTs to the custom embedding API (D71, design §3.1).
+    """Real `EmbeddingClient` — POSTs to the custom embedding API (D71).
 
-    Wire contract (OQ-1, resolved against the SQL-repo mocks):
-        Request body:  `{"input_text": [<text>, ...]}`
-        Response body: a BARE JSON array `[[float, ...], ...]` — one vector per
-                       input, order-preserving. Anything else (a dict, a bare
-                       scalar list, a non-list body) is a malformed body ->
-                       `EmbeddingError`.
-
-    `model` is not a request parameter (the endpoint serves a single fixed model)
-    — it is retained solely as the EMBEDDING span's `embedding.model` attribute so
-    traces stay coherent about which embedder produced the vectors (D24).
-
-    The constructor, the bearer header, the traced POST and the fail-closed error
-    ladder come from `JsonPostClient`; only the payload, the bare-array parse and
-    the span differ from the reranker client.
+        The response must be a BARE JSON array `[[float, ...], ...]`, one vector per input,
+        order-preserving; anything else is malformed -> `EmbeddingError`. `model` is not a
+        request parameter (the endpoint serves one fixed model) — it is retained only as
+        the EMBEDDING span's `embedding.model` attribute.
     """
 
     _error_class: ClassVar[type[Exception]] = EmbeddingError
@@ -125,8 +95,8 @@ class HttpEmbeddingClient(JsonPostClient):
     def _parse_vectors(body: Any) -> list[Any]:
         """Return the raw per-input vector list from a bare-array response body.
 
-        Raises `EmbeddingError` on a structurally-malformed body (not a list) —
-        the element CONTENTS are validated separately by `_validate_vectors`.
+                Raises `EmbeddingError` on a structurally-malformed body; element CONTENTS are
+                validated separately by `_validate_vectors`.
         """
         if not isinstance(body, list):
             raise EmbeddingError("Malformed embedding API response body (expected a JSON array).")
@@ -136,10 +106,8 @@ class HttpEmbeddingClient(JsonPostClient):
     def _validate_vectors(vectors: list[Any]) -> list[list[float]]:
         """Validate every vector is a non-empty list of finite real numbers.
 
-        Guards the composite's ranking path from later `TypeError`s (string
-        elements) and from NaN/inf `score`s (which `json.loads` happily parses)
-        being persisted to `result_full` / shown to the model. Raises
-        `EmbeddingError` on any violation so the composite degrades cleanly.
+                NaN/inf parse cleanly through `json.loads` but corrupt ranking and would be
+                persisted to `result_full`, so they are rejected here as `EmbeddingError`.
         """
         normalized: list[list[float]] = []
         for vec in vectors:

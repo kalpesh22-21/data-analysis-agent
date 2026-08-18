@@ -2,12 +2,11 @@
 """seed_neo4j_corpus — CLI wrapper that seeds the neo4j retrieval corpus.
 
 Reads the hand-authored fixtures under `tests/fixtures/corpus/`, builds a real
-`HttpEmbeddingClient` + an async neo4j driver from environment variables, and
-runs `corpus_loader.load_corpus` (schema DDL + embed + idempotent MERGE upsert +
-`:Column`/`:Table` edges + write-time model parity). Keeping the write logic in
-`corpus_loader` (not a raw Cypher dump) means the seed's node shape cannot drift
-from what `Neo4jVectorIndex` reads back — the same code writes what tests read
-(neo4j-corpus-design §3.1).
+`HttpEmbeddingClient` + an async neo4j driver from environment variables, and runs
+`corpus_loader.load_corpus` (schema DDL + embed + idempotent MERGE upsert +
+`:Column`/`:Table` edges + write-time model parity). The write logic stays in
+`corpus_loader` rather than a raw Cypher dump so the seed's node shape cannot drift
+from what `Neo4jVectorIndex` reads back.
 
 Environment:
     NEO4J_URI            bolt URL (default bolt://localhost:7687)
@@ -21,13 +20,12 @@ Environment:
 Usage:
     EMBEDDING_URL=http://localhost:18003/embed uv run python scripts/seed_neo4j_corpus.py
 
-Governed-corpus GC (Phase 2) — SAFETY: by DEFAULT this script does an ADDITIVE corpus
-upsert (`gc=False`). Pass `--reconcile` (alias `--gc`) to enable the DESTRUCTIVE
-fixture-based corpus reconcile, which DELETES every `source='mcp'` node ABSENT from
-these fixtures. Do NOT `--reconcile` against a DB seeded from the LIVE MCP export — the
-fixtures are a small dev subset, so the sweep would wipe the real canon. Use
-`--reconcile` only when these fixtures ARE the intended full corpus. The reconcile is
-`source='mcp'`-scoped and can never touch a `source='learning'` staging node either way.
+SAFETY — by DEFAULT this does an ADDITIVE corpus upsert (`gc=False`). `--reconcile`
+(alias `--gc`) enables the DESTRUCTIVE fixture-based reconcile, which DELETES every
+`source='mcp'` node ABSENT from these fixtures. Do NOT `--reconcile` against a DB seeded
+from the LIVE MCP export — the fixtures are a small dev subset, so the sweep would wipe
+the real canon. The reconcile is `source='mcp'`-scoped and can never touch a
+`source='learning'` staging node either way.
 """
 
 from __future__ import annotations
@@ -63,10 +61,9 @@ _logger = logging.getLogger(__name__)
 def _try_load_catalog() -> CatalogHandle | None:
     """Build the CatalogHandle for the D94 Part-3 seed-time skew warning, softly.
 
-    The check is a dev-time early warning, never a seed precondition: if the frozen
-    catalog-export snapshot is absent or unreadable (D75 Wave 1b — the catalog now
-    comes from the export, not `databaseSchemaDocs/`), log a note and return `None`
-    so `load_corpus` still proceeds (with the skew check skipped)."""
+    A dev-time early warning, never a seed precondition: if the frozen catalog-export
+    snapshot is absent or unreadable, log a note and return `None` so `load_corpus`
+    still proceeds with the skew check skipped."""
     try:
         return catalog_handle()
     except Exception as exc:  # noqa: BLE001 - soft dev-time aid, never blocks the seed

@@ -1,17 +1,9 @@
-"""ModelClient Protocol + DTOs — the model-provider abstraction seam (design §1/§4).
+"""ModelClient Protocol + DTOs — the model-provider abstraction seam.
 
-`send_turn` is deliberately the *only* method on the seam: one model round-trip,
-given the loop's current canonical message history and the tool schema list,
-returns either free-text (turn complete) or a batch of tool calls for the
-`AgentLoop` to dispatch. Two implementations exist:
-
-  - `scripted_client.ScriptedModelClient` (Layer 1, cassette-style double).
-  - `openai_client.OpenAIModelClient` (Layer 2/3, Responses-primary /
-    Chat-fallback per D71).
-
-Canonical message shape (this runtime's own convention, not necessarily any
-one provider's wire format — `OpenAIModelClient` translates it to/from the
-Responses API `input` items and the Chat Completions API `messages`):
+`send_turn` is the only method on the seam: one round-trip over the loop's canonical
+message history plus the tool schemas, returning free text (turn complete) or tool
+calls. The canonical shape is this runtime's own convention, Chat-Completions-flavored;
+`OpenAIModelClient` translates it to/from the Responses API:
 
     {"role": "system" | "user", "content": str}
     {"role": "assistant", "content": str | None,
@@ -19,12 +11,8 @@ Responses API `input` items and the Chat Completions API `messages`):
                       "function": {"name": str, "arguments": str}}] | None}
     {"role": "tool", "tool_call_id": str, "content": str}
 
-D5 (load-bearing): this canonical message list, and the `tools` schema list,
-are the *only* things `send_turn` ever sees — `RuntimeCredentials` (jwt,
-session_id, raw column_scope) must never be serialized into either. Every
-`ModelClient` implementation (real or fake) must honor this; Pass B's loop
-tests scan every message dict handed to `ScriptedModelClient.send_turn` for
-the JWT/session_id substrings to enforce it end-to-end.
+D5: that message list and the tool schemas are the ONLY things `send_turn` ever sees —
+`RuntimeCredentials` must never be serialized into either.
 """
 
 from __future__ import annotations
@@ -35,7 +23,7 @@ from typing import Any, Protocol
 
 @dataclass(frozen=True)
 class ToolCallRequest:
-    """One model-requested tool call (design §4.1 step 3c)."""
+    """One model-requested tool call."""
 
     id: str
     name: str
@@ -46,11 +34,9 @@ class ToolCallRequest:
 class ModelTurnResult:
     """The outcome of one `ModelClient.send_turn` round-trip.
 
-    `tool_calls` empty means the turn is complete (design §4.1 termination
-    condition #1) — `assistant_text` is then the final answer to persist and
-    stream to the user. `usage` carries whatever token/latency counters the
-    provider reports (`prompt_tokens`/`completion_tokens`/`total_tokens` at a
-    minimum); `loop/budget_guard.py` reads `total_tokens` if present.
+        Empty `tool_calls` means the turn is complete and `assistant_text` is the final
+        answer. `usage` carries whatever token counters the provider reports;
+        `loop/budget_guard.py` reads `total_tokens` if present.
     """
 
     assistant_text: str | None = None
@@ -66,47 +52,28 @@ class ModelClient(Protocol):
     ) -> ModelTurnResult:
         """One model round-trip: canonical *messages* + *tools* -> `ModelTurnResult`.
 
-        Must never mutate *messages* or *tools* in place, and must never
-        transmit anything beyond what those two arguments already contain
-        (D5 — credentials are never passed to this method by any caller).
+                Must not mutate *messages* or *tools* in place, and must never transmit
+                anything beyond what those two arguments already contain (D5).
         """
         ...
 
     def begin_turn(self) -> ModelClient:
-        """Optional: return a per-turn-scoped `ModelClient` handle (B3 fix,
-        2026-07-01).
+        """Optional: return a per-turn-scoped `ModelClient` handle.
 
-        `OpenAIModelClient` tracks Responses/Chat fallback stickiness (D71
-        §4.2); when ONE `ModelClient` instance is shared across concurrent
-        `/turn` requests (as `app.py`'s composition root does), mutating
-        that stickiness as *shared instance state* lets one turn's
-        fallback stomp another's. `begin_turn()` must therefore return a
-        FRESH, independent handle whenever the implementation carries any
-        such per-turn state (`OpenAIModelClient.begin_turn()` returns a new
-        lightweight `OpenAIModelClient` wrapping the same underlying
-        transport client); every `send_turn` call for the rest of that
-        external turn must go through the returned handle, never the
-        original shared instance.
-
-        Implementations with no per-turn state (e.g. `ScriptedModelClient`,
-        which is itself Layer-1-only and always single-threaded/sequential
-        per test) may simply `return self`. This method is genuinely
-        optional on the Protocol — callers must go through
-        `begin_turn_client()` below, which degrades gracefully for any
-        `ModelClient` double that omits it entirely.
+                One `ModelClient` instance is shared across concurrent `/turn` requests, so any
+                implementation carrying per-turn state MUST return a fresh, independent handle
+                here, and every `send_turn` in that turn must go through it. Stateless
+                implementations may `return self`; callers go through `begin_turn_client()`,
+                which degrades for doubles that omit this method entirely.
         """
         ...
 
 
 def begin_turn_client(model_client: ModelClient) -> ModelClient:
-    """Return a per-turn-scoped handle for *model_client* (B3).
+    """Return a per-turn-scoped handle for *model_client*.
 
-    Calls `model_client.begin_turn()` if the client implements it (duck-typed
-    — not every `ModelClient` double needs to; a minimal test stub with only
-    `send_turn` is a valid degenerate case), else returns *model_client*
-    unchanged. The single place `loop/agent_loop.py` obtains a turn handle, so
-    the "never share per-turn state" contract is enforced identically
-    everywhere a `ModelClient` is invoked.
+        Calls `begin_turn()` if the client implements it (duck-typed), else returns
+        *model_client* unchanged. The single place the loop obtains a turn handle.
     """
     begin_turn = getattr(model_client, "begin_turn", None)
     if callable(begin_turn):

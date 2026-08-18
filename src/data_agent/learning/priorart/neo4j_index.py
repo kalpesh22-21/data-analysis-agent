@@ -1,52 +1,25 @@
 """Neo4jPriorArtIndex — the cross-tier prior-art reader over the neo4j corpora.
 
-# READ THIS BEFORE TOUCHING THE CYPHER BELOW
+THE QUERIES BELOW DELIBERATELY DO NOT FILTER ON `source`. Every other neo4j read in this
+codebase does, so an unfiltered read looks exactly like a forgotten gate. It is not: recall
+asks "may the AGENT be shown this?", where anything outside the trusted canon must fail
+closed, while prior art asks "does this ALREADY EXIST anywhere?", and a `source='learning'`
+node the loop landed last week is the single most likely thing a new candidate duplicates.
+Nothing read here reaches a prompt as an artifact — it is projected onto `PriorArtCard` and
+used only to adjudicate novelty. IF A CARD EVER FEEDS THE AGENT'S REQUEST PATH, THIS REASONING
+NO LONGER HOLDS AND THE GATE MUST COME BACK.
 
-**The queries in this module deliberately DO NOT filter on `source`.** Every other
-neo4j read in this codebase does — `vector_index._BLUEPRINT_RECALL_QUERY`,
-`_KNOWLEDGE_RECALL_QUERY` and `_GET_BLUEPRINT_QUERY` all carry a BARE
-`source = 'mcp'` equality that fails closed, and `corpus_loader`'s GC and parity
-probes are scoped the same way. An unfiltered read looks exactly like someone forgot
-the gate. It is not forgotten. It is the point of this module:
+Two further deliberate inversions, for the same "different question" reason. NO
+`embedding_model` FILTER: the hydrator preserves learning-tier nodes across a model change
+without re-embedding them, and a cross-tier search that filtered would silently drop the whole
+tier after a model swap — so every card reports its stored model and a `model_matched` flag,
+and `confidence` discounts a mismatch. And `NOT status IN $terminal` rather than
+`status = 'validated'`: recall asks "is this positively eligible?", prior art asks "was this
+positively KILLED?", so an un-stamped node still counts.
 
-  * Recall asks "may the AGENT be shown this?" — and the answer must be no for
-    anything outside the trusted, human-reviewed MCP canon. Fail closed.
-  * Prior art asks "does this ALREADY EXIST anywhere?" — and a `source='learning'`
-    node that the loop landed last week is the single most likely thing a new
-    candidate duplicates. Filtering it out would reintroduce the exact blindness this
-    port exists to remove.
-
-Nothing read here reaches a prompt or an answer as an artifact: it is projected onto
-`PriorArtCard` (cards only, never payloads — see `models.py`) and used to adjudicate
-whether a candidate is new. **If you ever make a card feed the agent's request path,
-this reasoning no longer holds and the gate has to come back.**
-
-Two other deliberate inversions of recall's behaviour, for the same "different
-question" reason:
-
-  * **No `embedding_model = $expected_model` filter.** This is not an oversight either;
-    it is a correctness hole being made VISIBLE. The hydrator preserves
-    `source='learning'` nodes across an embedding-model change WITHOUT re-embedding
-    them — its parity accounting (`corpus_loader._EXISTING_MODELS`) is scoped to
-    `source='mcp'`. Recall never notices because it filters on the model. A cross-tier
-    search cannot filter (it would silently drop the whole learning tier after a model
-    swap), so instead every card reports its stored `embedding_model` and a
-    `model_matched` flag, and `PriorArtCard.confidence` discounts a mismatch rather
-    than trusting a cosine computed between two different vector spaces.
-
-  * **`NOT coalesce(status,'') IN $terminal`, not `coalesce(status,'validated') =
-    'validated'`.** Recall asks "is this positively eligible?"; prior art asks "was
-    this positively KILLED?". So only an EXPLICIT `rejected`/`retired` is excluded, and
-    a `candidate`/`in_review`/un-stamped node still counts as prior art. Over-including
-    here costs a human a glance; under-including re-proposes work we already have an
-    opinion about.
-
-**`db.index.vector.queryNodes` applies `$k` INSIDE the index, before the `WHERE`
-runs.** The terminal-status clause is therefore a post-filter that can eat results, so
-the reader over-fetches (`_OVERFETCH`) and truncates after mapping.
-
-Import-safe without the neo4j SDK: the driver is injected, and the only neo4j import is
-under `TYPE_CHECKING`.
+`db.index.vector.queryNodes` applies `$k` INSIDE the index, before the `WHERE`, so the
+terminal-status clause is a post-filter that can eat results — hence the over-fetch. Import-safe
+without the neo4j SDK: the driver is injected.
 """
 
 from __future__ import annotations
@@ -166,16 +139,12 @@ LIMIT 1
 def _tier(raw: Any) -> str:
     """Map a stored `source` property onto a card tier.
 
-    BARE equality on `'mcp'`, exactly like recall's trust gate — a node must SAY it is
-    canon to be treated as canon. Everything else that is a non-empty string is the
-    learning staging tier; anything absent, blank, or not a string at all is the
-    explicit `unsourced` tier.
-
-    Both writers we control always stamp a non-null `source` (`corpus_loader` from
-    `BlueprintSeed.source`, which now refuses to be overridden by a null export value;
-    the learning landing writer hardcodes `"learning"`). So an `unsourced` card means a
-    hand edit or a foreign writer touched the graph, which is worth SEEING rather than
-    silently absorbing into one of the real tiers."""
+    BARE equality on `'mcp'`, exactly like recall's trust gate — a node must SAY it is canon to be
+    treated as canon. Any other non-empty string is the learning staging tier; anything absent,
+    blank or not a string is the explicit `unsourced` tier. Both writers we control always stamp a
+    non-null `source`, so an `unsourced` card means a hand edit or a foreign writer touched the
+    graph, which is worth SEEING rather than absorbing into a real tier.
+    """
     if raw == TIER_MCP:
         return TIER_MCP
     if isinstance(raw, str) and raw.strip():
@@ -184,38 +153,29 @@ def _tier(raw: Any) -> str:
 
 
 def _str(raw: Any) -> str:
-    """A stored property as a `str`, or `""` when it is anything else
-    (`untrusted.as_str` — never `str(raw)`, which would turn a null into `"None"`)."""
+    """A stored property as a `str`, or `""` — never `str(raw)`, which turns a null into "None"."""
     return as_str(raw)
 
 
 def _bool_or_none(raw: Any) -> bool | None:
-    """A stored `verified` flag as a tri-state. Only a real bool is a verdict; anything
-    else — including a string `"true"` from a foreign writer — is "the node does not
-    say" (see `PriorArtCard.verified`)."""
+    """A stored `verified` flag as a tri-state.
+
+    Only a real bool is a verdict; anything else, including a string `"true"` from a foreign
+    writer, means "the node does not say".
+    """
     return as_bool_or_none(raw)
 
 
 def _float(raw: Any) -> float:
     """The index score as a renderable float in `[0.0, 1.0]`.
 
-    A score that is unusable for RANKING degrades to 0.0 — the bottom of the list —
-    rather than crashing the whole search. Three ways to be unusable, and the third was
-    missing until a prompt started rendering these:
-
-      * non-numeric — every consumer `>=`-compares it against a threshold, which raises
-        on a `str`/`None`;
-      * `bool` — an `int` subclass, and a `True` silently ranking as 1.0 is a perfect
-        false positive;
-      * OUT OF RANGE or unconvertible. The score is a cosine, so anything outside
-        `[0, 1]` is a broken signal rather than a weak one. `float(10**400)` raises
-        `OverflowError`; `inf` outranks every genuine hit and would let a hand-edited
-        node top the list; `nan` fails both comparisons and is rejected by the same
-        test. Only a hand edit or a foreign writer can put such a value on a node,
-        which is exactly the population the `unsourced` tier exists to flag.
-
-    All three are `untrusted.as_float`; the `[0, 1]` bounds are what makes them a
-    RANKING guard rather than a type check.
+    A score unusable for RANKING degrades to 0.0 — the bottom of the list — rather than crashing
+    the whole search. Three ways to be unusable: non-numeric (every consumer `>=`-compares it),
+    `bool` (an `int` subclass, and a `True` ranking as 1.0 is a perfect false positive), and OUT
+    OF RANGE or unconvertible — the score is a cosine, so anything outside `[0, 1]` is broken
+    rather than weak, `inf` would outrank every genuine hit and `float(10**400)` raises. All three
+    are `untrusted.as_float`; the bounds are what make it a RANKING guard rather than a type
+    check.
     """
     return as_float(raw, lo=0.0, hi=1.0)
 
@@ -223,35 +183,18 @@ def _float(raw: Any) -> float:
 def _rule_ids(raw: Any) -> tuple[str, ...]:
     """A JSON-decoded `uses_rules` list as a `tuple[str, ...]` of rule ids, or `()`.
 
-    **A `uses_rules` entry is legitimately EITHER shape**, and the canon authors both:
-    a bare string (a static rule the SQL already inlines) or an OBJECT carrying
-    `id`/`resolve_via`/`table`/`binds` (`runtime/blueprint/rules.py::parse_rule`).
-    2 of the 10 canon blueprints use strings; `bp-total-earnings-by-department` stores
-    `[{"id": "earnings_only", "binds": "earn_codes"}]`. An earlier cut of this mapper
-    accepted only the string form, so that blueprint's card claimed it used NO rules —
-    silent, and exactly wrong for a reader comparing a candidate's rules against a canon
-    card's.
+    A `uses_rules` entry is legitimately EITHER shape and the canon authors both: a bare string,
+    or an OBJECT carrying `id`/`binds`. Accepting only the string form made a canon blueprint's
+    card claim it used NO rules — silent, and exactly wrong for a reader comparing rule sets. The
+    id derivation MIRRORS `parse_rule` (`id` when a non-empty str, else `binds`) and deliberately
+    does not re-implement the rest of it: the card needs a NAME, not an executable rule.
 
-    The id derivation MIRRORS `parse_rule`: `id` when it is a non-empty `str`, else
-    `binds`. It deliberately does NOT re-implement the rest of `parse_rule` (the
-    `resolve_via` regex, the `predicate` single-token fallback) — the card needs a NAME
-    for display and comparison, not an executable rule, and duplicating that parser here
-    is the mirror-drift failure this codebase keeps hitting.
-
-    **Container vs. member, treated differently on purpose.** A non-list container is
-    `()`: a bare string in particular must never be ITERATED, because `tuple("abc")` is
-    `('a','b','c')` — the char-explosion class, which manufactures plausible-looking rule
-    ids that no registry has heard of, without raising.
-
-    A member that names NOTHING (a nested list, a null, a number, an object with no
-    usable `id`/`binds`) is SKIPPED, not fatal. That reverses the earlier all-or-nothing
-    rule, deliberately: with two legal member shapes, one authoring typo would otherwise
-    hide every real rule on the node, and — unlike the char-explosion case — skipping an
-    unnameable member cannot FABRICATE an id. The invariant that matters is "never
-    invent", not "all or nothing".
-
-    Order is preserved and duplicates are collapsed, so the result is join-able,
-    sort-able and set-comparable by every downstream reader (see `_card_from_record`).
+    CONTAINER vs MEMBER, treated differently on purpose. A non-list container is `()`: a bare
+    string must never be ITERATED, because `tuple("abc")` manufactures plausible rule ids no
+    registry has heard of, without raising. A member that names NOTHING is SKIPPED rather than
+    fatal — with two legal member shapes, one authoring typo would otherwise hide every real rule,
+    and skipping an unnameable member cannot FABRICATE an id. The invariant is "never invent", not
+    "all or nothing". Order is preserved and duplicates collapse.
     """
     if not isinstance(raw, list):
         return ()
@@ -277,9 +220,10 @@ def _rule_id(item: Any) -> str:
 
 
 def _decode_json(raw: Any) -> Any:
-    """Decode a stored `*_json` string property, tolerating null/malformed (→ `None`).
-    Mirrors `vector_index._decode_json`: a corrupt property degrades that ONE field to
-    absent, never the row."""
+    """Decode a stored `*_json` string property, tolerating null or malformed input (→ `None`).
+
+    A corrupt property degrades that ONE field to absent, never the row.
+    """
     if not isinstance(raw, str) or not raw:
         return None
     try:
@@ -296,41 +240,20 @@ def _card_from_record(
     expected_model: str,
     score_basis: str = "vector",
 ) -> PriorArtCard:
-    """Map one prior-art row → `PriorArtCard`, coercing every field to the type its
-    DOWNSTREAM READER needs.
+    """Map one prior-art row → `PriorArtCard`, coercing every field to what its READER needs.
 
-    DERIVED FROM THE READERS, not from a remembered field list. Graph properties are
-    untrusted input in exactly the way rehydrated JSON is — neo4j will store whatever a
-    hand edit or a foreign writer puts there, and Python is happy to iterate a string,
-    hash-fail a list, and `sorted()` its way into a TypeError. So the table below is the
-    operation each field is subjected to, which is what forces the requirement; the
-    field NAME forces nothing:
+    DERIVED FROM THE READERS, not from a remembered field list. Graph properties are untrusted in
+    exactly the way rehydrated JSON is — neo4j stores whatever a hand edit or a foreign writer
+    puts there, and Python is happy to iterate a string, hash-fail a list and `sorted()` its way
+    into a TypeError. So the OPERATION forces the requirement and the field name forces nothing:
+    rendering and `==` ⇒ `str`; frozenset membership (`status`) ⇒ a hashable `str`; `is True`
+    (`verified`) ⇒ `bool | None`; sorts, set ops and joins (`uses_rules`, `result_grain`) ⇒
+    `tuple[str, ...]`; a dict key (`structural_key`) ⇒ `str`; a float comparison (`score`) ⇒
+    `float`.
 
-      field            reader / operation                              ⇒ requirement
-      id               `DedupVerdict.matched_id` → `to_doc()` → JSON,
-                       and `f"...{card.id}"` in logs                   ⇒ str
-      intent           prompt/log rendering, `intent[:120]` slicing    ⇒ str
-      source           `_tier` → `== 'mcp'` (total on any type, but a
-                       non-str must not be read as a tier name)        ⇒ str, else unsourced
-      status           `status in TERMINAL_STATUSES` — frozenset
-                       membership, TypeError on an unhashable list     ⇒ str
-      verified         rendered / `is True` — never arithmetic         ⇒ bool | None
-      drift_status     `==` and rendering                              ⇒ str
-      uses_rules       `sorted(...)`, set ops, `", ".join(...)` —
-                       mixed types break `<`, non-str breaks join      ⇒ tuple[str, ...]
-                       (BOTH authored shapes projected to an id —
-                        see `_rule_ids`)
-      result_grain     same joins/sorts as uses_rules                  ⇒ tuple[str, ...]
-      structural_key   dict key + `==` — must be hashable              ⇒ str
-      embedding_model  `== expected_model`                             ⇒ str
-      score            `>= merge_threshold` float comparison —
-                       TypeError against a str/None                    ⇒ float
-
-    `result_grain` goes through `normalize_structural_grain`, the SAME normalizer the
-    structural key hashes, so a card's grain and its key can never disagree about what
-    the grain is; a grain that normalizer calls unusable (`None`) becomes `()`.
-
-    A NEW field on the card belongs in this table before it belongs in the code.
+    `result_grain` goes through `normalize_structural_grain`, the SAME normalizer the structural
+    key hashes, so a card's grain and its key can never disagree. A NEW field on the card belongs
+    in this docstring before it belongs in the code.
     """
     embedding_model = _str(record.get("embedding_model"))
     grain = normalize_structural_grain(_decode_json(record.get("result_grain_json")))
@@ -358,20 +281,12 @@ def _card_from_record(
 class Neo4jPriorArtIndex:
     """Real `PriorArtIndex` — one ANN call per corpus over the neo4j vector indexes.
 
-    Holds NO driver of its own: the driver is injected so the process opens exactly one
-    pool (the consumer entrypoint creates and closes it), mirroring how
-    `build_promotion_write_plane` takes a driver rather than a URL.
-
-    `expected_model` is the model the QUERY text is embedded with, and it must be the
-    same value the corpus was built with. There is one source of truth for that —
-    `RuntimeSettings.embedding_model`, which is what `build_hydrator` passes as both
-    the embedding client's `model` and the vector index's `expected_model` — and the
-    entrypoint threads the same value here. Configuring a second one would produce a
-    100% `model_matched=False` rate that looks exactly like a real corpus skew.
-
-    Unlike `Neo4jVectorIndex`, this class RAISES `PriorArtUnavailableError` on infra failure
-    instead of degrading to `[]`. See `index.py`'s module docstring: here an empty list
-    is a factual claim ("nothing like this exists") that the caller acts on.
+    Holds NO driver of its own: the driver is injected so the process opens exactly one pool.
+    `expected_model` is the model the QUERY text is embedded with and MUST equal the value the
+    corpus was built with — there is one source of truth for that, and configuring a second would
+    produce a 100% `model_matched=False` rate that looks exactly like a real corpus skew. Unlike
+    `Neo4jVectorIndex`, this RAISES `PriorArtUnavailableError` on infra failure instead of
+    degrading to `[]`, because here an empty list is a factual claim the caller acts on.
     """
 
     def __init__(
@@ -470,10 +385,11 @@ class Neo4jPriorArtIndex:
     ) -> list[PriorArtCard]:
         """Map rows → cards, skipping (never raising on) a single malformed row.
 
-        Same posture as `Neo4jVectorIndex.recall`: a QUERY-level failure is the caller's
-        problem, but one corrupt record must not discard the good neighbours next to it.
-        `_card_from_record` is total over every JSON type by construction, so reaching
-        this `except` means something genuinely unexpected — worth a stack trace."""
+        Same posture as `Neo4jVectorIndex.recall`: a QUERY-level failure is the caller's problem, but
+        one corrupt record must not discard the good neighbours next to it. `_card_from_record` is
+        total over every JSON type by construction, so reaching this `except` means something
+        genuinely unexpected — worth a stack trace.
+        """
         cards: list[PriorArtCard] = []
         for record in records:
             try:
@@ -492,8 +408,7 @@ class Neo4jPriorArtIndex:
         return cards
 
     async def _run(self, query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
-        """The single driver-touching seam (mirrors `Neo4jVectorIndex._run`), so a
-        Layer-1 test can drive mapping/ranking/degrade with no live neo4j."""
+        """The single driver-touching seam, so a Layer-1 test can drive mapping with no neo4j."""
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, parameters)  # type: ignore[arg-type]
             return await result.data()

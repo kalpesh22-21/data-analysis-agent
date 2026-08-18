@@ -1,23 +1,10 @@
-"""Redaction — PII/secret redaction for telemetry (D25, design §7).
+"""Redaction — PII/secret redaction for telemetry (D25).
 
-Module-level functions, no object: `observability/tracing.py` and
-`observability/progress.py` call `hash_scope` / `mask_sql` /
-`redact_tool_args` / `tool_span_args` directly.
-
-Non-negotiable redaction rules (D25 / docs/10-observability.md):
-  - Never log the JWT or the raw `column_scope` list — only a stable hash
-    (`hash_scope`, delegating to `context/scope_filter.py`'s own
-    `compute_scope_hash` so telemetry and the D44 replay-filter can never
-    disagree on what a given scope hashes to).
-  - Mask string/numeric SQL literals in the *telemetry copy* of any SQL
-    (`mask_sql`, mirroring `clickhouse-api`'s own `_mask_string_literals`
-    convention in `app/security.py`) — the dispatched/UI copy of the SQL is
-    untouched (08-ui.md's transparency principle: users see their own SQL
-    verbatim; only the trace copy is masked).
-  - Never emit result rows/cell values, anywhere. `redact_tool_args` only
-    ever touches recognized SQL-bearing argument keys; it never sees
-    `ToolResult.result_full`/`.result_preview` — callers must not pass those
-    to this module at all (spans/progress carry shape, not values).
+Non-negotiable rules: never log the JWT or the raw `column_scope`, only a stable hash
+(`hash_scope` delegates to `context/scope_filter.py`, so telemetry and the D44 replay
+filter can never disagree); mask SQL literals in the TELEMETRY COPY only, leaving the
+dispatched and UI-visible SQL verbatim; and never emit result rows or cell values
+anywhere — `redact_tool_args` must never be handed a `ToolResult`, only call arguments.
 """
 
 from __future__ import annotations
@@ -51,14 +38,10 @@ _REDACTED_PLACEHOLDER = "<redacted>"
 def hash_scope(column_scope: frozenset[str]) -> str:
     """Stable hash of *column_scope* — never log the raw scope (D25).
 
-    `compute_scope_hash` is imported lazily (inside the function) rather than at
-    module top: the eager import created an import CYCLE
-    (`redaction → context → dispatch → redaction`) that made
-    `runtime.observability.tracing` un-importable as an entry point. Deferring it
-    to call time — telemetry is emitted only at runtime, well after the module
-    graph is built — breaks the cycle while returning byte-identical hashes, so
-    the `learning` package (and any future consumer) can reuse `tracing` without
-    depending on a fragile import order."""
+        `compute_scope_hash` is imported INSIDE the function on purpose: an eager import
+        creates the cycle `redaction -> context -> dispatch -> redaction`, which makes
+        `runtime.observability.tracing` un-importable as an entry point.
+    """
     from data_agent.runtime.context.scope_filter import compute_scope_hash
 
     return compute_scope_hash(column_scope)
@@ -67,11 +50,9 @@ def hash_scope(column_scope: frozenset[str]) -> str:
 def mask_sql(sql: str) -> str:
     """Mask string and numeric literals in *sql* for the telemetry copy only.
 
-    Structurally equivalent output (keywords/identifiers/punctuation kept);
-    string literal *contents* become `''`/`\"\"`, numeric literals become `0`.
-    The un-redacted SQL is still what is dispatched to the MCP and shown in
-    the UI — only this masked copy may be written into a span/progress
-    attribute.
+        Structurally equivalent output: string literal contents become `''`/`""`, numeric
+        literals become `0`. The un-redacted SQL is still what is dispatched to the MCP and
+        shown in the UI — only this masked copy may enter a span or progress attribute.
     """
     masked = _SINGLE_QUOTED_STRING.sub("''", sql)
     masked = _DOUBLE_QUOTED_STRING.sub('""', masked)
@@ -80,12 +61,10 @@ def mask_sql(sql: str) -> str:
 
 
 def redact_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Return a telemetry-safe copy of *args* — SQL literals masked, everything else passed through.
+    """Return a telemetry-safe copy of *args* — SQL literals masked, the rest passed through.
 
-    Non-SQL arguments (`database`, `table`, `limit`, ...) are structural, not
-    PII, and are kept as-is for debuggability; only recognized SQL-bearing
-    keys are masked. Callers must never pass tool *results* to this function
-    — only the model-supplied call arguments.
+        Non-SQL arguments (`database`, `table`, `limit`, ...) are structural, not PII, and
+        are kept as-is for debuggability. Callers must never pass tool RESULTS here.
     """
     redacted: dict[str, Any] = dict(args)
     for key in _SQL_ARG_KEYS:
@@ -121,20 +100,13 @@ def tool_span_args(
     tool_name: str, args: dict[str, Any], *, disable_redaction: bool
 ) -> dict[str, Any]:
     """The args a TOOL span should carry — the single seam for the access-controlled
-    `RuntimeSettings.otlp_disable_redaction` master telemetry debug switch.
+        `RuntimeSettings.otlp_disable_redaction` telemetry debug switch.
 
-    DEFAULT (`disable_redaction=False`, the D25 posture): the redacted,
-    telemetry-safe copy (`redact_tool_args` — SQL literals masked, `concept`/
-    `query` fully redacted, `period`/`slot_bindings` values masked).
-    DEBUG (`disable_redaction=True`): the REAL args, so a debugging operator sees
-    the actual SQL/concept/query/slot/period values on the span in Phoenix.
-
-    TELEMETRY-ONLY: this governs ONLY what a span records. Every caller passes the
-    RAW `args` to the actual tool work regardless of this flag, so flipping it
-    never changes what the tool executes or what scope the MCP enforces — it only
-    changes what Phoenix sees (which becomes entity-bearing when on, hence the
-    access-control requirement). Returns a shallow copy so the span code can never
-    mutate the caller's live args dict.
+        Default is the D25 posture (the redacted copy); `disable_redaction=True` records the
+        REAL args so a debugging operator sees them in Phoenix. TELEMETRY-ONLY: every caller
+        passes the RAW args to the actual tool work regardless, so flipping the flag never
+        changes what executes or what scope the MCP enforces. Returns a shallow copy, so
+        span code can never mutate the caller's live args dict.
     """
     return dict(args) if disable_redaction else redact_tool_args(tool_name, args)
 

@@ -1,31 +1,15 @@
-"""Session document dataclasses — the Couchbase doc shape (design §6).
+"""Session document dataclasses — the Couchbase doc shape.
 
-These dataclasses are the in-process representation of the session document;
-`to_doc()`/`from_doc()` (de)serialize to the plain-dict shape that is actually
-written to/read from Couchbase (or the in-memory fake store). Keeping the
-dataclass and the wire-shape separate lets the rest of the runtime work with
-typed objects (e.g. `entry.provenance` is a real `frozenset[tuple[str, str]]`,
-not a list-of-lists) while the store implementations only ever persist plain
-JSON-compatible dicts.
+`to_doc()`/`from_doc()` (de)serialize to the plain-dict shape actually written to the
+store, so the rest of the runtime works with typed objects while the stores only ever
+persist JSON-compatible dicts.
 
-Provenance representation (load-bearing, D44/D63):
-    `TrailEntry.provenance` is `frozenset[tuple[str, str]] | None`.
-      - `None`  == "undetermined" (provenance could not be computed — e.g. the
-        runtime's own independent re-parse of a `runQuery` SQL string failed,
-        or a `sampleRows` table was uncatalogued). Per D44
-        fail-closed, an undetermined entry is ALWAYS dropped from replay by
-        `context/scope_filter.py`, regardless of how open `column_scope` is —
-        "never assume in-scope" is read literally here.
-      - `frozenset()` (empty, non-None) == "no columns referenced" — the
-        tool genuinely exposes no column-level data (`listDatabases`,
-        `listTables`, `explainQuery`, or `getTableSchema` — the last returns
-        MCP-scope-filtered column METADATA, no cell values, so a fetched schema
-        is always replayable) or the SQL genuinely referenced zero catalog
-        columns (e.g. `SELECT 1`). An empty-but-determined provenance set is
-        trivially a subset of any scope and is always kept.
-    On the wire (`to_doc`/`from_doc`), `None` round-trips as JSON `null`;
-    `frozenset()` round-trips as `[]`; a non-empty set round-trips as the
-    `[["db.table", "column"], ...]` pair-list shown in design §6.
+Provenance (load-bearing, D44/D63): `TrailEntry.provenance` is
+`frozenset[tuple[str, str]] | None`. `None` == UNDETERMINED and is ALWAYS dropped from
+replay, regardless of how open `column_scope` is; `frozenset()` == determined-empty (the
+tool exposes no column-level data, or the SQL referenced no catalog column) and is
+trivially a subset of any scope, so it is always kept. On the wire `None` -> `null`,
+`frozenset()` -> `[]`, otherwise `[["db.table", "column"], ...]`.
 """
 
 from __future__ import annotations
@@ -65,26 +49,14 @@ class ResultPreview:
 class TurnMessage:
     """A persisted user/assistant message (D22 — thinking is discarded).
 
-    `provenance` (2026-07-01 D44 clarification, load-bearing): the SAME
-    replay scope-filter that gates `TrailEntry` also gates conversational
-    ASSISTANT messages, so a prior turn's free-text answer ("Jane Doe's
-    salary is $85,000...") is never replayed once the user's `column_scope`
-    narrows past what that answer was derived from.
-      - `role == "user"` messages carry the user's own input, never
-        warehouse-derived data — always `frozenset()` (determined-empty,
-        i.e. "no restriction"), never `None`, and never dropped by the
-        replay filter (`context/scope_filter.py::is_message_in_scope`).
-      - `role == "assistant"` messages are tagged, at write time
-        (`loop/agent_loop.py`), with the UNION of the column-provenance of
-        every `TrailEntry` produced in that message's `turn_index`. If ANY
-        of those tool results had undetermined provenance (`None`), the
-        assistant message's provenance is `None` too (fail-closed — matches
-        `TrailEntry`'s own "never assume in-scope" rule). A turn with no
-        tool calls at all (a pure clarification/chat turn) yields
-        `frozenset()` (determined-empty) — always kept.
-    Wire encoding is identical to `TrailEntry.provenance` (`_provenance_to_doc`/
-    `_provenance_from_doc` below): `None` -> JSON `null`, `frozenset()` -> `[]`,
-    a non-empty set -> `[["db.table", "column"], ...]`.
+        `provenance` (load-bearing): the D44 replay filter gates assistant messages too, so
+        a prior turn's free-text answer is never replayed once the user's `column_scope`
+        narrows past what that answer was derived from. `user` messages carry no
+        warehouse-derived data — always `frozenset()`, never `None`, never dropped.
+        `assistant` messages are tagged at write time with the UNION of every `TrailEntry`
+        provenance in that `turn_index`, or `None` if ANY of them was `None` (fail-closed);
+        a turn with no tool calls yields `frozenset()`. Wire encoding is identical to
+        `TrailEntry.provenance`.
     """
 
     turn_index: int
@@ -126,23 +98,14 @@ def _provenance_from_doc(doc: list[list[str]] | None) -> frozenset[tuple[str, st
 
 
 def _answer_table_provenance_item(item: Any) -> frozenset[tuple[str, str]] | None:
-    """One table position's USES set, or `None` when this position's payload is not
-    a well-formed list of `[db_table, column]` pairs.
+    """One table position's USES set, or `None` when this position's payload is not a
+        well-formed list of `[db_table, column]` pairs.
 
-    THE TOTALITY HAS TO REACH THE PAIRS, not just the outer list. The outer
-    `isinstance` check below was already there and reads as if it covers the field,
-    but the conversion it guarded indexed `pair[0]`/`pair[1]` blind: a document
-    holding `[[["a"]]]` — one table, one pair, one element — raised `IndexError`
-    out of `TrailEntry.from_doc`, out of `SessionDoc.from_doc`, and out of EVERY
-    subsequent read of that session. One malformed inner pair bricked the whole
-    conversation, which is precisely the outcome the docstring promised could not
-    happen.
-
-    `None` for the position is the right degrade, and it is not a loophole: this
-    field is an additive optimisation that lets a scope narrowing on reload drop
-    the out-of-scope tables individually instead of all of them, and `None` means
-    "no per-table lineage here", which the reader already handles as the legacy
-    case. The cost of a malformed entry stays inside its own table position.
+        The totality has to reach the PAIRS, not just the outer list: a malformed inner pair
+        raised `IndexError` out of `from_doc` and so out of EVERY subsequent read of that
+        session. `None` is the right degrade — this field is an additive optimisation that
+        lets a narrowed scope drop out-of-scope tables individually, and `None` means "no
+        per-table lineage here", which the reader already handles as the legacy case.
     """
     if not isinstance(item, list):
         return None
@@ -154,20 +117,17 @@ def _answer_table_provenance_item(item: Any) -> frozenset[tuple[str, str]] | Non
 def _answer_table_provenance_from_doc(
     doc: Any,
 ) -> tuple[frozenset[tuple[str, str]] | None, ...] | None:
-    """Load `TrailEntry.answer_table_provenance` (08 §D.2).
+    """Load `TrailEntry.answer_table_provenance`.
 
-    Total on any shape: a legacy document has no such key (`None`), anything that is
-    not a list is treated the same way, and a malformed table POSITION degrades to
-    `None` on its own (`_answer_table_provenance_item`) rather than raising into a
-    store read — the field is an additive optimisation of the read path, so a
-    malformed one must cost the per-table filter, never the session.
+        Total on any shape: a legacy document has no such key, anything that is not a list
+        is treated the same way, and a malformed table POSITION degrades to `None` on its
+        own rather than raising into a store read — the field is an additive optimisation,
+        so a malformed one must cost the per-table filter, never the session.
 
-    Its sibling `_provenance_from_doc` is deliberately left strict. `TrailEntry.
-    provenance` is not an optimisation: it is what `scope_filter` reads to decide
-    whether an entry may be shown at all, `None` there means UNDETERMINED and is
-    treated fail-closed, and silently manufacturing that value from a malformed
-    payload would turn a corrupt document into a quiet scope decision. Loud is
-    correct there; total is correct here.
+        Its sibling `_provenance_from_doc` is deliberately STRICT: that field is what
+        `scope_filter` reads to decide whether an entry may be shown at all, `None` there
+        means UNDETERMINED and is treated fail-closed, and manufacturing it from a malformed
+        payload would turn a corrupt document into a quiet scope decision.
     """
     if not isinstance(doc, list):
         return None
@@ -359,37 +319,23 @@ FINALIZATION_BLOCK_KINDS: tuple[FinalizationBlockKind, ...] = ("intents", "answe
 def finalization_block_key(
     turn_index: int, window_count: int, kind: FinalizationBlockKind
 ) -> str:
-    """The `SessionDoc.finalization_blocks` key — `"0:1:intents"` for turn 0,
-    window 1, the pending-intents allowance.
+    """The `SessionDoc.finalization_blocks` key — `"0:1:intents"` for turn 0, window 1,
+        the pending-intents allowance.
 
-    THE TURN INDEX IS LOAD-BEARING, and 05 §C.1's original "keyed by window"
-    was a defect. `finalization_blocks` is persisted on the session document and
-    never cleared at a turn boundary, but `AgentLoop.run` starts EVERY external
-    turn at `window_count=1` — so a window-only key collides across turns, and from
-    a session's SECOND block-spending turn onward the first finalization attempt of
-    every turn is refused a re-round it never had. No `loop_finalization_refused`,
-    no nudge, and `ENFORCEMENT_EXHAUSTED` written for an intent the model was never
-    asked twice about (which also silently inflates 07's headline metric).
+        THE TURN INDEX IS LOAD-BEARING: `finalization_blocks` persists on the session
+        document and is never cleared at a turn boundary, but every external turn restarts
+        at `window_count=1`, so a window-only key collides across turns and refuses each
+        later turn a re-round it never had — silently, with `ENFORCEMENT_EXHAUSTED` written
+        for an intent the model was never asked twice about.
 
-    Same class as the bug `live_analysis_state` exists to prevent: a PER-TURN value
-    persisted on the session doc with no turn gate. Keying beats clearing — a clear
-    needs a turn-boundary hook that does not exist and would have to fire on every
-    resume path without resetting the counter mid-turn.
+        THE KIND IS THE SAME ARGUMENT ONE LEVEL DOWN: two gates that share a key share an
+        allowance, and the intents nudge spends it first, starving the shape gate.
 
-    THE KIND IS THE SAME ARGUMENT ONE LEVEL DOWN (05 §J.3). Two gates that share a
-    key share an allowance, and sharing measured badly — so the kind joins the key
-    rather than the gates queueing for one counter. Every kind is spelled into the
-    key, including `intents`: an unsuffixed key would read as "some allowance" in a
-    map that now holds several, and the migration cost is zero because nothing is in
-    production.
-
-    `kind` is VALIDATED here rather than trusted. This is the single point where a
-    persisted allowance key is minted, so an unrecognised kind — a typo at a call
-    site, a stale caller after a rename — must not quietly create an eighth
-    unbounded budget. Raising is safe for the runtime: `_grant_forced_reround`
-    treats any exception from the claim as "no re-round available" and finalizes.
-
-    Defined here so both store implementations and every test format it one way.
+        `kind` is VALIDATED here rather than trusted. This is the single point where a
+        persisted allowance key is minted, so an unrecognised kind — a typo, a stale caller
+        after a rename — must not quietly create an eighth unbounded budget. Raising is safe:
+        `_grant_forced_reround` treats any exception from the claim as "no re-round" and
+        finalizes.
     """
     if kind not in FINALIZATION_BLOCK_KINDS:
         raise ValueError(
@@ -401,13 +347,13 @@ def finalization_block_key(
 
 @dataclass(frozen=True)
 class TrackedIntent:
-    """One tracked deliverable of a multi-intent question (03 §A).
+    """One tracked deliverable of a multi-intent question.
 
-    `intent_id` is RUNTIME-assigned (`i1`, `i2`, … in proposal order) and never
-    model-supplied; `description` is FROZEN after initialization — an update may
-    only move `status`/`evidence_tool_call_id`/`reason_code`. Both rules exist so
-    the model cannot silently DROP an ask it decided not to answer (03 §C.4);
-    neither closes manufactured evidence, which is a known-open hole.
+        `intent_id` is RUNTIME-assigned (`i1`, `i2`, … in proposal order) and never
+        model-supplied; `description` is FROZEN after initialization, so an update may only
+        move `status`/`evidence_tool_call_id`/`reason_code`. Both rules exist so the model
+        cannot silently DROP an ask it decided not to answer; neither closes manufactured
+        evidence, which is a known-open hole.
     """
 
     intent_id: str
@@ -438,13 +384,13 @@ class TrackedIntent:
 
 @dataclass(frozen=True)
 class AnalysisState:
-    """The intent ledger for ONE turn — latest-wins on a single `SessionDoc`
-    field (03 §B.2), never an append-only stream of trail entries (N rounds
-    would put N copies inside `fit_request_to_budget`'s pinned region).
+    """The intent ledger for ONE turn — latest-wins on a single `SessionDoc` field, never
+        an append-only stream of trail entries (N rounds would put N copies inside
+        `fit_request_to_budget`'s pinned region).
 
-    It carries its own `turn_index` because the field is NOT cleared at the turn
-    boundary: everything that reads it goes through `live_analysis_state` below,
-    which makes a state from any other turn inert.
+        It carries its own `turn_index` because the field is NOT cleared at the turn
+        boundary: every reader goes through `live_analysis_state` below, which makes a state
+        from any other turn inert.
     """
 
     turn_index: int
@@ -468,12 +414,10 @@ class AnalysisState:
 class PauseCheckpoint:
     """`pause_checkpoint` — the D45 exactly-once resume checkpoint.
 
-    The four `blueprint_*` fields are ADDITIVE (runblueprint-design §2.5, D45
-    mid-DAG durability): they default to `None` so an `askUser`/`budget_cap`
-    checkpoint is byte-identical to before. Slice B writes `blueprint_id` +
-    `slot_bindings_json` on a slot-resolution `askUser` pause (`reason=
-    "blueprint_slot"`); `completed_nodes_json`/`awaiting_node` carry the mid-DAG
-    resume state that Slice C's multi-node/approval pauses populate.
+        The four `blueprint_*` fields are ADDITIVE and default to `None`, so an
+        `askUser`/`budget_cap` checkpoint is byte-identical without them. They carry the
+        blueprint id + slot bindings of a slot-resolution pause and the mid-DAG resume state
+        (`completed_nodes_json`/`awaiting_node`) of a multi-node or approval pause.
     """
 
     reason: str  # "askUser" | "budget_cap" | "blueprint_slot" (Slice C: approval/when_ask)
@@ -614,28 +558,17 @@ class SessionDoc:
 
 
 def live_analysis_state(doc: SessionDoc, turn_index: int) -> AnalysisState | None:
-    """The `AnalysisState` that GOVERNS *turn_index*, or `None` (03 §A.1).
+    """The `AnalysisState` that GOVERNS *turn_index*, or `None`.
 
-    **The single most important rule in the feature.** A state persists on the
-    session doc after its turn ends, so it is HISTORY for every later turn and
-    must be invisible to anything that initializes, validates or enforces. Every
-    read in 03 (the tool + the rendered context block), 04 (the evidence
-    validators) and 05 (finalization enforcement) goes through this predicate.
+        A state persists on the session doc after its turn ends, so it is HISTORY for every
+        later turn and must be invisible to anything that initializes, validates or
+        enforces. EVERY read of `analysis_state` goes through this predicate.
 
-    Without the `state.turn_index != turn_index` gate two failures are reachable,
-    and the second is the bad one:
-
-      - **Init dies after first use.** If "a state exists" means
-        `doc.analysis_state is not None`, then from the session's second turn
-        onward every multi-intent turn is refused initialization and the feature
-        silently stops working.
-      - **A stale state blocks an unrelated turn.** Turn N is multi-intent, the
-        model calls `askUser`, the user abandons it and asks something new.
-        `AgentLoop.run` does not check for an unconsumed checkpoint, so turn N+1
-        begins with turn N's `pending` intents on the doc: enforcement refuses
-        turn N+1's finalization, burns its nudge, and writes
-        `ENFORCEMENT_EXHAUSTED` onto **turn N's** intents — corrupting the
-        abandoned turn's record and emitting bogus telemetry for the live one.
+        Without the `state.turn_index != turn_index` gate two failures are reachable:
+        initialization is refused from the session's second multi-intent turn onward (the
+        feature silently stops working), and an abandoned turn's `pending` intents block the
+        NEXT turn's finalization — burning its nudge and writing `ENFORCEMENT_EXHAUSTED`
+        onto the abandoned turn's intents.
     """
     state = doc.analysis_state
     if state is None or state.turn_index != turn_index:

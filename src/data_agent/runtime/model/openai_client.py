@@ -1,42 +1,11 @@
-"""OpenAIModelClient — Responses-primary / Chat-fallback `ModelClient` (D71, design §4.2).
+"""OpenAIModelClient — Responses-primary / Chat-fallback `ModelClient` (D71).
 
-Fallback taxonomy (OQ-C, LOCKED by the orchestrator brief): OpenAI 5xx,
-`APIConnectionError`, `APITimeoutError`, or an explicit "feature unsupported"
-4xx trigger an immediate fallback from `client.responses.create(...)` to
-`client.chat.completions.create(...)` for the *same* logical turn. Once a turn
-has fallen back, every subsequent `send_turn` call within that turn stays on
-Chat Completions.
-
-Per-turn stickiness, not per-instance (B3 fix, 2026-07-01): `begin_turn()` —
-called once per external turn by `loop/agent_loop.py` (via
-`model/client.py::begin_turn_client`) — returns a FRESH `OpenAIModelClient`
-handle with its own independent `_fell_back_this_turn` flag, rather than
-mutating `self`. This matters because `app.py`'s composition root constructs
-exactly ONE `OpenAIModelClient` and shares it across every concurrent `/turn`
-request; if `begin_turn()` mutated shared instance state, two interleaved turns
-could stomp each other's Responses-vs-Chat stickiness mid-turn. Every caller MUST use the
-handle `begin_turn()` returns for the rest of that turn's `send_turn` calls —
-`model/client.py::begin_turn_client()` is the single shared call site that
-enforces this.
-
-Retry/backoff is hand-rolled (no `tenacity`, per design §9): a qualifying
-transient error on the Chat Completions fallback itself is retried up to
-`max_retries` times with exponential backoff (`sleep` is injectable so tests
-never actually sleep). The Responses attempt itself is not internally
-retried — a qualifying error there *is* the trigger to fall back, not to
-retry the same endpoint.
-
-Translation (design §4.2 "translating tool-call/tool-result shapes between the
-two APIs' formats"): `model/client.py`'s canonical message shape is
-Chat-Completions-flavored (assistant `tool_calls` nested under
-`{"function": {"name", "arguments"}}`, tool results as `{"role": "tool",
-"tool_call_id", "content"}`). `tool_schema.py` emits tool declarations in the
-Responses API's flat shape (`{"type": "function", "name", ...}` — no nested
-`"function"` key), so translation is needed in the *other* direction for the
-Chat Completions fallback (nest under `"function"`), and messages need
-translating *into* Responses `input` items (flat `function_call` /
-`function_call_output` items rather than nested `tool_calls`) for the primary
-path.
+Fallback triggers (OQ-C): 5xx, `APIConnectionError`, `APITimeoutError`, or an explicit
+"feature unsupported" 4xx; once a turn falls back it stays on Chat Completions for the
+rest of that turn. That stickiness is PER-TURN, held on the handle `begin_turn()`
+returns — `app.py` shares one instance across concurrent turns, so mutating `self`
+would let one turn stomp another's. The hand-rolled retry/backoff applies to the Chat
+fallback only: a qualifying error on the Responses attempt IS the trigger to fall back.
 """
 
 from __future__ import annotations
@@ -254,18 +223,11 @@ class OpenAIModelClient:
         self._fell_back_this_turn = False
 
     def begin_turn(self) -> OpenAIModelClient:
-        """Return a FRESH `OpenAIModelClient` handle with reset Responses/Chat
-        fallback stickiness (design §4.2; B3 fix, 2026-07-01).
+        """Return a FRESH handle with reset Responses/Chat fallback stickiness.
 
-        Deliberately does NOT mutate `self._fell_back_this_turn` — `self` may
-        be a single process-wide singleton shared across many concurrent
-        `/turn` requests (`app.py`'s composition root); mutating shared
-        instance state here would let one turn's fallback stomp another's
-        mid-turn. The returned object is a cheap wrapper reusing the SAME
-        underlying `AsyncOpenAI` transport client/model/retry config — only the
-        turn-local `_fell_back_this_turn` flag is fresh. Callers (the loop, via
-        `model/client.py::begin_turn_client`) must use the RETURNED handle for
-        every `send_turn` call within that turn, not `self` directly.
+                Deliberately does NOT mutate `self`, which may be a process-wide singleton
+                shared across concurrent `/turn` requests. The returned wrapper reuses the same
+                `AsyncOpenAI` transport; callers must use it for every `send_turn` in the turn.
         """
         return OpenAIModelClient(
             self._client,
@@ -321,9 +283,8 @@ def build_openai_model_client(
 ) -> OpenAIModelClient:
     """Construct an `OpenAIModelClient` wired to a real `AsyncOpenAI` client.
 
-    Kept separate from `__init__` so tests can inject a mock `client` directly
-    without constructing a real `AsyncOpenAI` (which validates `api_key` at
-    construction time). `app.py` (the composition root) is the only caller.
+        Kept separate from `__init__` so tests can inject a mock `client` without
+        constructing a real `AsyncOpenAI` (which validates `api_key` eagerly).
     """
     client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url or None)
     return OpenAIModelClient(client, model=model)

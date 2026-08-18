@@ -1,52 +1,28 @@
 """Write-router routing rules (Slice 7, Contract D §4 / D58a/b/D18/D52).
 
-ONE source of truth for two questions, so the writer's decision and the inbox's
-label can never disagree:
+ONE source of truth for two questions, so the writer's decision and the inbox's label can
+never disagree: `route_candidate` returns the terminal `status` + pipeline `control` +
+inbox `reason`, and `derive_inbox_reason` returns the reason for an already-`in_review`
+envelope.
 
-  * `route_candidate(env, sampled_for_inbox)` — the terminal `status` + pipeline
-    `control` + (if inbox-bound) the `InboxItem.reason`.
-  * `derive_inbox_reason(env)` — the `InboxItem.reason` for an already-`in_review`
-    envelope (the inbox projection calls this; it needs no sampling flag because a
-    clean blueprint only reaches `in_review` via the sampled path).
+Routing precedence, top wins:
 
-**Frozen stage order (D-frozen §7.1).** The target-specific writer stages run BEFORE
-this terminal writer and stop (persist/drop) their own type:
-`generalize → leakage → dedup → schema_edit_pr → user_commit → writer`. The
-`schema_edit_pr` stage handles every `schema_edit`, stamps a `schema_edit_review`
-marker on the payload, and returns `route_inbox` (stopping the pipeline before the
-writer). So in the correct wiring the writer NEVER sees a `schema_edit`; its
-`schema_edit` branch is a fail-closed DEFENSE-IN-DEPTH fallback (R8): a `schema_edit`
-that reaches the writer WITHOUT the PR-stage marker means the PR bot was bypassed
-(stage-order violation) — it is routed to review flagged `fail_to_review`, NEVER
-auto-landed.
-
-Routing (precedence, top wins):
-
-  1a. `global_knowledge`  → ALWAYS `in_review` (human pre-gate; never auto-retrievable
-      — D58a). Reason `knowledge_pre_gate`.
-  1b. `schema_edit`       → ALWAYS `in_review` (human pre-gate; D18). Reason
-      `schema_edit` when the PR bot ran (`schema_edit_review` marker present),
-      else `fail_to_review` (R8 — the PR stage was bypassed). Never auto-landed.
-  2. blueprint, `static_validation.outcome == "fail_to_review"` → `in_review`,
-     reason `fail_to_review` (un-rewritable, reviewed not dropped — D52/D97).
-  3. blueprint, `dedup.action` is anything other than `insert` → `in_review`, reason
-     `dedup_conflict` ("conflict/variant" — never auto-append, §3). An ALLOWLIST, not a
-     denylist (see `_AUTO_LAND_DEDUP_ACTIONS`): only `insert` auto-lands, so an
-     unrecognized or rehydrated-from-elsewhere action becomes review noise rather than a
-     silent auto-land. Two layers produce a `merge`: a soft-layer cosine near-miss, and
-     (PriorArt Slice 2) a DETERMINISTIC cross-tier structural-key hit against the
-     LEARNING tier, where we can see we probably already own it but cannot bump a count
-     we cannot key. Both want the same thing — a human's glance.
-     The two DROP verdicts (`increment`, `redundant_with_canon`) should never reach the
-     writer at all — S6 stops the pipeline on both — but if one does, the allowlist
-     routes it to a human instead of trusting that guarantee.
-  4. blueprint, settled `entity_scan.result != "pass"` (a leakage near-miss) →
-     ALWAYS `in_review`, reason `leakage_near_miss` (100% of near-misses, D58b).
-  5. clean blueprint, sampled (`blueprint_inbox_sample_rate`) → `in_review`, reason
-     `blueprint_sampled` (D58b audit sample).
-  6. clean blueprint, not sampled → `candidate` (auto-land, retrievable after S9).
-  7. anything else (`user_knowledge`, unknown) → pass through unchanged — S8's
-     auto-commit stage handles `user_knowledge` and drops it before the writer.
+  1a. `global_knowledge` → ALWAYS `in_review` (human pre-gate, D58a).
+  1b. `schema_edit`      → ALWAYS `in_review` (D18): reason `schema_edit` when the PR stage
+      ran, else `fail_to_review`. In the correct wiring the writer never sees one at all, so
+      this branch is a fail-closed DEFENSE-IN-DEPTH fallback against a stage-order violation
+      (R8) — never an auto-land.
+  2.  blueprint with `static_validation.outcome == "fail_to_review"` → `in_review`
+      (un-rewritable is reviewed, never dropped — D52/D97).
+  3.  blueprint whose `dedup.action` is anything but `insert` → `in_review`. An ALLOWLIST,
+      not a denylist, so an unrecognized action becomes review noise rather than a silent
+      auto-land; the two DROP verdicts should never reach the writer, and if one does a human
+      sees it instead of the guarantee being trusted.
+  4.  blueprint with a settled `entity_scan.result != "pass"` → ALWAYS `in_review` (100% of
+      leakage near-misses, D58b).
+  5.  clean blueprint, sampled → `in_review` (the D58b audit sample).
+  6.  clean blueprint, not sampled → `candidate` (auto-land, retrievable after S9).
+  7.  anything else → pass through unchanged.
 """
 
 from __future__ import annotations
@@ -79,9 +55,9 @@ _AUTO_LAND_DEDUP_ACTIONS = frozenset({"insert"})
 def _dedup_forces_review(env: CandidateEnvelope) -> bool:
     """True iff this candidate's dedup verdict must NOT auto-land (see the allowlist).
 
-    `dedup is None` is clean by construction — a non-blueprint, or a blueprint that
-    reached the writer without S6 having adjudicated it, both of which the other
-    routing rules already cover."""
+    `dedup is None` is clean by construction — a non-blueprint, or a blueprint that reached the
+    writer without S6 adjudicating it, both of which the other routing rules already cover.
+    """
     return env.dedup is not None and env.dedup.action not in _AUTO_LAND_DEDUP_ACTIONS
 
 
@@ -110,16 +86,20 @@ def _is_leakage_near_miss(env: CandidateEnvelope) -> bool:
 
 
 def _entity_scan_unsettled(env: CandidateEnvelope) -> bool:
-    """True iff the S5 leakage gate has NOT settled a verdict (still S3's `pending`
-    self-check). A blueprint that skipped the gate must NEVER auto-land (S4 fail-open
-    fix / §5 doc amendment) — route it to human review, fail-closed."""
+    """True iff the S5 leakage gate has NOT settled a verdict (still S3's `pending` self-check).
+
+    A blueprint that skipped the gate must NEVER auto-land — route it to human review,
+    fail-closed.
+    """
     return not LeakageVerdict.is_settled(env.entity_scan)
 
 
 def _schema_edit_pr_ran(env: CandidateEnvelope) -> bool:
-    """True iff the S8 `schema_edit_pr` stage processed this candidate (it stamps a
-    `schema_edit_review` marker on the payload; R8). A `schema_edit` reaching the
-    writer WITHOUT it is a stage-order violation → fail-closed to `fail_to_review`."""
+    """True iff the S8 `schema_edit_pr` stage processed this candidate (it stamps a marker).
+
+    A `schema_edit` reaching the writer WITHOUT it is a stage-order violation ⇒ fail-closed to
+    `fail_to_review` (R8).
+    """
     return isinstance(env.payload.get("schema_edit_review"), dict)
 
 
@@ -128,8 +108,11 @@ def _schema_edit_reason(env: CandidateEnvelope) -> str:
 
 
 def derive_inbox_reason(env: CandidateEnvelope) -> str:
-    """The `InboxItem.reason` for an inbox-listable envelope. Precedence matches
-    `route_candidate`; a clean blueprint in `in_review` is `blueprint_sampled`."""
+    """The `InboxItem.reason` for an inbox-listable envelope.
+
+    Precedence matches `route_candidate`; a clean blueprint in `in_review` is
+    `blueprint_sampled`.
+    """
     # FAIL-TO-REVIEW first, ahead of the type split, because it is the only reason here
     # that describes HOW the row got into the queue rather than what kind of thing it is:
     # the consumer persists it directly (`_persist_declined_for_review`), so it never
@@ -156,17 +139,13 @@ def derive_inbox_reason(env: CandidateEnvelope) -> str:
 
 
 def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> RoutingDecision:
-    """Decide the terminal status + control + inbox reason for one enriched
-    candidate. Pure: reads only the envelope + the sampling coin flip.
+    """Decide the terminal status + control + inbox reason for one enriched candidate.
 
-    A FAIL-TO-REVIEW envelope (`decline` set, `status=needs_parameterization`) never
-    reaches here and cannot be mislabelled by it: the consumer persists it directly
-    without running the pipeline, and the completion path rebuilds a CLEAN envelope —
-    decline block cleared, entity scan reset — before re-running the stages, precisely so
-    the candidate that reaches this function is an ordinary one. The `global_knowledge` /
-    `schema_edit` branch below delegates to `derive_inbox_reason`, which would return
-    `needs_parameterization` for a decline-bearing envelope; that is the correct answer if
-    one ever arrives, not a mislabel."""
+    Pure: reads only the envelope and the sampling coin flip. A FAIL-TO-REVIEW envelope never
+    reaches here — the consumer persists it directly without running the pipeline, and the
+    completion path rebuilds a CLEAN envelope before re-running the stages — so the candidate
+    that arrives is an ordinary one.
+    """
     if env.type in ("global_knowledge", "schema_edit"):
         # Both are human pre-gated → ALWAYS in_review, NEVER auto-landed. A
         # `schema_edit` without the PR-stage marker (R8) still fail-closes to review

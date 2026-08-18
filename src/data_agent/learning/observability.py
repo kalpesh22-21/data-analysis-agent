@@ -1,41 +1,10 @@
 """Learning-loop tracing (D23/D24/D25, design §10).
 
-Both processes trace to the Phoenix `learning-loop` project via their own
-`TracerProvider` (`service.name = "learning-loop"`). Reuses
-`runtime/observability/tracing.py`'s `configure_tracing` (same no-op-provider
-behavior when no OTLP endpoint is set — zero infra required to run) and its
-`span` primitive, adding the learning-specific span helpers.
-
-TWO cross-cutting concerns live in this module:
-
-1. **Span chaining (ONE trace per session).** A session's learning journey spans
-   three decoupled hops (sweeper → Redis → consumer → candidate store → cron
-   scheduler). The sweeper's `learning.enqueue` span is the per-session trace
-   ROOT; it injects its W3C `traceparent` onto the `LearningJob`, the consumer
-   extracts it to nest `learning.consume`/`triage`/`extract` under it, and the
-   extractor stamps the same `traceparent` onto each `CandidateEnvelope` so the
-   scheduler's `promote`/`land` spans continue the SAME trace. Every helper that
-   can be a cross-process child accepts a `context=` parent (rehydrated via
-   `context_from_traceparent`); a missing/malformed value ⇒ a normal root span
-   (fail-open).
-
-2. **The D25 verbose GATE (`verbose=`) — amended 2026-07-15, extended 2026-08-10.** By
-   deliberate operator choice the SETTING defaults VERBOSE (`LEARNING_TRACE_VERBOSE=true`):
-   the triage/consume/extract/judge/promote/land helpers set human-readable attributes
-   (the user question, a transcript preview, the accepted SQL, the learned
-   intent/slots/rationale, the extractor's decline detail, the judge's reason and the
-   prior-art block it was shown, the blueprint id/intent/canonical_key) BY DEFAULT, so the
-   `learning-loop` (and `learning-sessions`) Phoenix project is ENTITY-BEARING BY
-   DEFAULT and therefore subject to the SAME in-boundary PII posture + access control
-   as the `learning_audit` and session stores (D51). Set `LEARNING_TRACE_VERBOSE=false`
-   to restore the D25 shape-only telemetry posture, where the ONLY attributes set are
-   non-PII counters/labels + `session.id` (the trace-grouping key) + `content_hash`/
-   `message_id` (non-PII audit keys) and no transcript/SQL/question/intent content is
-   emitted. The gate MECHANISM (the `verbose` param + `_verbose_attrs`) is unchanged;
-   only the default posture flipped. NOTE: the per-helper docstrings below still say
-   "SHAPE-only by default" — that describes the `verbose=False` PARAM default (still
-   accurate); the composition root now passes `verbose=True` by default via the
-   flipped setting.
+ONE TRACE PER SESSION: the sweeper's `learning.enqueue` span is the root and injects its
+`traceparent` onto the job and thence onto each `CandidateEnvelope`; every helper takes a
+`context=` parent (missing/malformed ⇒ a plain root span, fail-open). D25 VERBOSE GATE:
+`LEARNING_TRACE_VERBOSE` defaults TRUE, so this Phoenix project is ENTITY-BEARING and MUST
+be access-controlled like `learning_audit` and the session store (D51); `false` = shape-only.
 """
 
 from __future__ import annotations
@@ -60,9 +29,11 @@ _TRACER_NAME = "learning-loop"
 
 
 def _verbose_attrs(verbose: bool, mapping: dict[str, Any]) -> dict[str, Any]:
-    """The D25 verbose gate: return the human-readable attrs ONLY when *verbose* is
-    True (dropping any `None` values), else an EMPTY dict — so with verbose OFF the
-    key is never even present on the span (not merely None-valued)."""
+    """The D25 verbose gate: the human-readable attrs only when *verbose*, else an EMPTY dict.
+
+    `None` values are dropped, and with verbose off the key is never present on the span at
+    all — not merely None-valued.
+    """
     if not verbose:
         return {}
     return {key: value for key, value in mapping.items() if value is not None}
@@ -77,16 +48,13 @@ def _learning_span(
     context: Context | None = None,
 ) -> Any:
     """The learning-loop's `span()` wrapper — ALWAYS `record_exception=False` (D25).
-    Unlike the online-runtime spans (which are `with span(...): pass` — no body, so
-    nothing can raise inside), several learning spans now WRAP real work
-    (`learning.consume` → the summary loader + LLM extractor; `learning.land` → the
-    landing writer). `start_as_current_span`'s default `record_exception=True` would
-    attach `exception.message`/`exception.stacktrace` to the exported span on ANY
-    raise — and an OpenAI SDK error embeds response bodies (prompt/session content)
-    while a landing error references the entity-bearing `forbidden_spans` — leaking
-    content EVEN WITH VERBOSE OFF. Recording exception detail is therefore refused for
-    EVERY learning span; the span STATUS is still set on error, so failures stay
-    visible in traces, only the entity-bearing detail is withheld."""
+
+    Several learning spans WRAP real work, and `record_exception=True` would attach
+    `exception.message`/`exception.stacktrace` on ANY raise: an OpenAI SDK error embeds
+    response bodies and a landing error references the entity-bearing `forbidden_spans`,
+    leaking content EVEN WITH VERBOSE OFF. The span STATUS is still set, so failures stay
+    visible in traces; only the entity-bearing detail is withheld.
+    """
     return span(
         tracer, name, kind, attributes, context=context, record_exception=False
     )
@@ -95,16 +63,13 @@ def _learning_span(
 def configure_learning_tracing(
     *, otlp_endpoint: str, service_name: str = "learning-loop"
 ) -> TracerProvider:
-    """Build the learning processes' `TracerProvider` (Phoenix `learning-loop`
-    project). Delegates to the runtime `configure_tracing` so the exporter /
-    no-op-provider behavior is identical; does NOT install the provider globally
-    (the entrypoint does that once).
+    """Build the learning processes' `TracerProvider` (Phoenix `learning-loop` project).
 
-    Passes `project_name="learning-loop"` so the spans land in the named
-    `learning-loop` Phoenix project directly from CODE — Phoenix groups by the
-    `openinference.project.name` resource attribute, so this replaces the old
-    `OTEL_RESOURCE_ATTRIBUTES=openinference.project.name=learning-loop` env hack
-    the demo launcher used to rely on."""
+    Delegates to the runtime `configure_tracing`, so exporter / no-op-provider behaviour is
+    identical, and does NOT install the provider globally (the entrypoint does that once).
+    `project_name` lands the spans in the named Phoenix project from CODE rather than via an
+    `OTEL_RESOURCE_ATTRIBUTES` env hack.
+    """
     return configure_tracing(
         otlp_endpoint=otlp_endpoint,
         service_name=service_name,
@@ -121,17 +86,10 @@ def log_tracing_status(
 ) -> None:
     """Say AT STARTUP whether spans will actually leave this process.
 
-    `LearningSettings.otlp_endpoint` defaults to `""` and `configure_tracing` answers an
-    empty endpoint with a NO-OP provider — deliberately (zero infra required to run the
-    loop), but SILENTLY. The observed cost of the silence: a full day of live runs that
-    produced ZERO Phoenix spans, with the cause only discoverable by reading source for
-    the name of the environment variable. Every learning entrypoint calls this
-    immediately after `configure_learning_tracing` so the answer is the first thing in
-    the log, mirroring how `scripts/run_ui_runtime_real.py` prints its OTLP posture.
-
-    OFF is a WARNING, not an INFO: it is a supported configuration, but it is also the
-    configuration in which every diagnostic this package emits to a span is discarded,
-    and that must not be something an operator infers from an absence."""
+    An empty `otlp_endpoint` gets a NO-OP provider — deliberate (zero infra required to run
+    the loop) but SILENT. OFF is a WARNING, not an INFO: it is a supported configuration, but
+    it is also the one in which every diagnostic this package emits to a span is discarded.
+    """
     if otlp_endpoint:
         logger.info(
             "learning %s tracing ON -> OTLP %s (service.name=%s, Phoenix project=%s)",
@@ -173,11 +131,12 @@ def sweep_span(
 def enqueue_span(
     tracer: Tracer, *, session_id: str, content_hash: str, message_id: str | None = None
 ) -> Any:
-    """One enqueue (design §10 `learning.enqueue`, CHAIN) — the per-session trace
-    ROOT (its `traceparent` is injected onto the job so the consumer/scheduler spans
-    chain under it). `session.id` is the D25 trace-grouping key; `content_hash`/
-    `message_id` are non-PII (`message_id` may be set on the yielded span AFTER the
-    XADD returns it). SHAPE-only: enqueue never carries transcript content."""
+    """One enqueue (design §10 `learning.enqueue`, CHAIN) — the per-session trace ROOT.
+
+    Its `traceparent` is injected onto the job so the consumer/scheduler spans chain under it.
+    SHAPE-only: `session.id` (the D25 trace-grouping key) plus the non-PII
+    `content_hash`/`message_id`, the latter settable on the yielded span after the XADD.
+    """
     return _learning_span(
         tracer,
         "learning.enqueue",
@@ -204,25 +163,15 @@ def consume_span(
     question: str | None = None,
     transcript_preview: str | None = None,
 ) -> Any:
-    """One consume (design §10 `learning.consume`, CHAIN) — the parent of the
-    triage/extract spans, started under the enqueue-propagated *context* so it joins
-    the session's trace. *outcome* ∈ {`done`, `dedup_skip`, `dead_letter`, `skip`,
-    `ack_terminal`}.
+    """One consume (design §10 `learning.consume`, CHAIN) — parent of the triage/extract spans.
 
-    SHAPE-only by default. With *verbose*, ALSO carries the user `question` + a short
-    `transcript_preview` of what the chat was about (D25 entity-bearing — see module
-    docstring).
-
-    `session_status` / `skip_reason` / `reclaimed` are the SKIP-PATH attributes and they
-    are the reason a skip is now visible at all. A delivery whose session is not
-    claimable used to return silently: no span, no log, no counter, while the message
-    stayed in the PEL and was reclaimed until it dead-lettered — every step invisible.
-    The ONE fact a debugger needs is the state the claim was refused FROM
-    (`session_status`), so it is an attribute and not a message; `skip_reason` is the
-    closed-vocabulary label that makes the classes countable
-    (`consumer.py::_claim_decision` owns both vocabularies), and `reclaimed` says which
-    delivery path produced the outcome. All three are SHAPE-only: a lifecycle label, a
-    reason code, a bool — no transcript, no content, nothing to gate."""
+    Started under the enqueue-propagated *context*. *outcome* ∈ {`done`, `dedup_skip`,
+    `dead_letter`, `skip`, `ack_terminal`}. SHAPE-only by default; with *verbose*, ALSO the
+    user `question` + a short `transcript_preview` (entity-bearing). `session_status` /
+    `skip_reason` / `reclaimed` are the SKIP-PATH attributes — the state the claim was refused
+    FROM, a closed-vocabulary reason code, and which delivery path produced the outcome
+    (`consumer.py::_claim_decision` owns both vocabularies).
+    """
     attrs: dict[str, Any] = {
         "session.id": session_id,
         "learning.outcome": outcome,
@@ -270,10 +219,12 @@ def triage_span(
     question: str | None = None,
     transcript_preview: str | None = None,
 ) -> Any:
-    """Triage verdict (Slice-2 §3.4 `learning.triage`, CHAIN). SHAPE-only by default
-    (D25): the decision label, the K#/skip_* reason code, and the target-hint labels.
-    With *verbose*, ALSO carries the user `question` + a short `transcript_preview`
-    (D25 entity-bearing — see module docstring)."""
+    """Triage verdict (Slice-2 §3.4 `learning.triage`, CHAIN).
+
+    SHAPE-only by default (D25): the decision label, the K#/skip_* reason code, the target-hint
+    labels. With *verbose*, ALSO the user `question` + a short `transcript_preview`
+    (entity-bearing — see the module docstring).
+    """
     attrs: dict[str, Any] = {
         "session.id": session_id,
         "learning.triage.decision": decision,
@@ -295,10 +246,11 @@ def triage_span(
 def extract_stub_span(
     tracer: Tracer, *, session_id: str, target_hints: tuple[str, ...] = ()
 ) -> Any:
-    """The S2 stub extractor seam (§5.2 `learning.extract`, CHAIN). Emits
-    `outcome=would_extract` + hint labels only — writes nothing. Retained for the
-    consumer's back-compat path when no extractor is injected; S3 uses
-    `extract_span` below when the real extractor runs."""
+    """The S2 stub extractor seam (§5.2 `learning.extract`, CHAIN): `outcome=would_extract`.
+
+    Hint labels only — writes nothing. Retained for the consumer's back-compat path when no
+    extractor is injected; S3 uses `extract_span`.
+    """
     return _learning_span(
         tracer,
         "learning.extract",
@@ -314,10 +266,10 @@ def extract_stub_span(
 def _extract_outcome(candidate_count: int, review_count: int) -> str:
     """The extract span's three-way outcome.
 
-    ORDER MATTERS: a session that both extracted a candidate and parked a declined
-    sibling for review reads as `extracted`, because the question this label answers is
-    "did the loop produce anything?" and the answer is yes. `review_count` is on the same
-    span for the sessions where it did not."""
+    ORDER MATTERS: a session that both extracted a candidate and parked a declined sibling for
+    review reads as `extracted`, because the question this label answers is "did the loop
+    produce anything?". `review_count` is on the same span for the sessions where it did not.
+    """
     if candidate_count:
         return "extracted"
     if review_count:
@@ -342,43 +294,19 @@ def extract_span(
     rationale: str | None = None,
     decline_details: str | None = None,
 ) -> Any:
-    """The S3 grounded-extractor outcome (`learning.extract`, CHAIN). SHAPE-only by
-    default (D25): candidate/decline COUNTS + decline reason codes + hint labels.
-    `outcome=extracted` when any candidate was produced, else `declined`.
+    """The S3 grounded-extractor outcome (`learning.extract`, CHAIN).
 
-    `correction_count` is the corrective turns the extractor spent telling the model
-    that a candidate could not be READ (`extractor.py`). It sits in the SHAPE-only set
-    because it is a plain integer, and it is here rather than in a log line because it
-    is the loop's prompt-quality signal: 0 on nearly every session is the healthy
-    reading, and a rate that climbs means the tool schema and the system prompt are
-    asking for something models keep mis-packaging. Correlate it with
-    `learning.extract.outcome` — corrections that end in `extracted` are the loop
-    healing, corrections that end in `declined` are a prompt to go fix.
+    SHAPE-only by default (D25): candidate/decline COUNTS, decline reason codes, hint labels,
+    and `correction_count` — the corrective turns spent telling the model a candidate could not
+    be READ, which is the loop's prompt-quality signal (corrections ending in `extracted` are
+    the loop healing; ending in `declined` they are a prompt to go fix). `review_count` is the
+    fail-to-review candidates PERSISTED for a human, kept as its own number so `candidate_count`
+    stays 0 on those sessions and the two kinds of "declined" remain separable in a group-by.
 
-    With *verbose*, ALSO carries the accepted SQL, the learned blueprint `intent`, the
-    `slots` plan (e.g. `department→dbpcm_warehouse.employee.Department`), the extractor
-    `rationale`, and `decline_details` (D25 entity-bearing — see module docstring).
-
-    `decline_details` is the SENTENCE behind each `decline_reasons` code, and it is the
-    half of a decline that an operator actually needs. `bad_role` names a class of
-    failure; "slot pay_period has no binds_to" names the thing to go fix. The codes stay
-    SHAPE-only (they are a closed vocabulary and the rates are read off them), while the
-    detail is gated because it interpolates MODEL-authored strings — a slot name, a role,
-    a type the model invented — and, in the `totality_violation` case, a SQL literal out
-    of the analyst's own query. It is gated with `accepted_sql`, alongside which it adds
-    no new class of content; `consumer.py::_decline_details` owns that argument and the
-    bounding. A session that produced nothing and says nothing about why is the exact
-    hole this attribute closes.
-
-    `review_count` is the fail-to-review candidates this extraction PERSISTED for a
-    human to complete (`docs/decisions/learning-declined-candidate-review.md`), and it is
-    its own number for the reason the decision doc gives: it measures how often the
-    parameterization form turns out to be unfillable, which is exactly the quantity that
-    disappears if it is folded into `candidate_count`. So `candidate_count` stays 0 on
-    these sessions — nothing was extracted — and the third `outcome` value is what makes
-    the two kinds of "declined" separable in a group-by. The reason codes are UNCHANGED
-    and still appear in `decline_reasons`, so every existing Phoenix query keeps working
-    and simply gains a way to split the outcome it was already counting."""
+    With *verbose*, ALSO the accepted SQL, the learned blueprint `intent`, the `slots` plan, the
+    `rationale` and `decline_details` — the last interpolating model-authored strings and, for
+    `totality_violation`, a SQL literal (`consumer.py::_decline_details` owns the bounding).
+    """
     attrs: dict[str, Any] = {
         "session.id": session_id,
         "learning.extract.outcome": _extract_outcome(candidate_count, review_count),
@@ -418,29 +346,13 @@ def dedup_span(
 ) -> Any:
     """The S6 dedup verdict (`learning.dedup`, CHAIN).
 
-    ALWAYS SHAPE-ONLY — no `verbose` parameter, unlike its neighbours. Every attribute
-    here is a machine tag, a float, a tier label or a lifecycle status; there is no
-    entity-bearing content to gate, and adding a verbose branch would only create a place
-    for someone to put the candidate's intent later.
-
-    Exists so the loop's DROP decisions are COUNTS and not just log lines. Three rates
-    the plan asks for come out of these attributes:
-
-      * `action=redundant_with_canon` — a DETERMINISTIC structural-key identity with the
-        MCP canon. The agent owns this blueprint and failed to recall it.
-      * `action=merge AND prior_art_tier=mcp` — the same story on softer (cosine)
-        evidence, routed to a human instead of dropped.
-        A rising rate of either means RETRIEVAL is missing artifacts it already holds;
-        the fix is in the recall path, not in the learning loop.
-      * `action=increment AND matched_status IN (rejected, retired)` — a byte-identical
-        re-derivation of an idea a human already DECLINED. A different question ("how
-        good are our rejections / are analysts repeatedly reaching for something we said
-        no to?"), and without the status tag it is indistinguishable from an ordinary
-        hit-count bump against a live artifact.
-      * `matched_origin=corpus` — the soft match came from the `learning_corpus` bucket,
-        i.e. from an IN-FLIGHT sibling candidate no graph read can see. A rising rate is
-        concurrency: analysts converging on the same question inside one landing cycle.
-        `matched_origin=graph` is a match against something already landed.
+    ALWAYS SHAPE-ONLY — no `verbose` parameter, unlike its neighbours: every attribute is a
+    machine tag, a float, a tier label or a lifecycle status, and a verbose branch would only
+    be somewhere to put the candidate's intent later. Exists so the loop's DROP decisions are
+    COUNTS: `action=redundant_with_canon`, and `action=merge AND prior_art_tier=mcp`, mean
+    RETRIEVAL is missing artifacts it already holds; `action=increment AND matched_status IN
+    (rejected, retired)` is re-derivation of something a human already declined;
+    `matched_origin=corpus` is an in-flight sibling no graph read can see.
     """
     return _learning_span(
         tracer,
@@ -486,61 +398,18 @@ def judge_span(
 ) -> Any:
     """The coverage judge's verdict (plan §3b, `learning.judge`, CHAIN).
 
-    SHAPE-only by default; GATED-VERBOSE since 2026-08-10, and this span used to refuse
-    a `verbose` parameter on principle. The refusal is reversed by deliberate operator
-    choice, and the reasoning that replaces it is worth stating because the old reasoning
-    is still in the git history: a judge that CANCELS work while the only readable
-    account of why lives in an audit bucket behind separate credentials is a judge nobody
-    tunes. `outcome=dropped` with a tier and a float answers "how often"; it does not
-    answer "was that drop right", and the drop gate is the one thing in this loop that
-    destroys work irrecoverably. So under *verbose* the span carries the whole basis of
-    the decision — what the model was SHOWN (`prior_art`, the rendered block verbatim),
-    what it NAMED (`covered_by`), and what it SAID (`reason`).
+    SHAPE-only by default, GATED-VERBOSE by deliberate operator choice: under *verbose* the span
+    carries the whole basis of the decision — what the model was SHOWN (`prior_art`, the
+    rendered block verbatim, from the SAME renderer that fed the prompt), what it NAMED
+    (`covered_by`), and what it SAID (`reason`). Both are ENTITY-BEARING and neither is
+    leakage-scanned, so with verbose on this Phoenix project holds the same class of content as
+    `learning_audit` and MUST be access-controlled to the same standard (D51).
 
-    It is GATED and not hardcoded, deliberately: the reverse of an absolute must not be
-    another absolute. `LEARNING_TRACE_VERBOSE=false` restores the previous shape-only
-    behaviour of this span exactly, and that switch is what makes the operator's choice
-    reversible without a code change.
-
-    **`reason` is ENTITY-BEARING and is the reason this gate exists.** It is free model
-    prose about a REAL analyst session — capped and single-lined by
-    `judge/schema.py::parse_assessment`, but not scanned by any leakage gate — and it can
-    name a department, a cost centre or a person. `prior_art` is corpus text
-    (`extractor/prior_art.py::render_prior_art_block`, the SAME renderer the model was
-    fed, so the span cannot drift from the prompt) and is bounded but likewise not a
-    reviewed surface. With verbose ON — the default — the `learning-loop` Phoenix project
-    therefore holds the same class of content as the `learning_audit` bucket and MUST be
-    access-controlled to the same standard (D51). That is the price of the reveal, and it
-    is the one thing an operator must decide BEFORE turning it on rather than after.
-
-    `threshold` is SHAPE-only (a configured float, no content) and always present. It is
-    here because `confidence` alone is unreadable: the two bars differ per stage and are
-    retunable, so "0.82" means nothing without the number it was compared against, and
-    joining a span against a config file is not a thing anyone does at 2am.
-
-    The span is the DENOMINATOR; the audit record is the numerator. Deliberately: the
-    store holds only verdicts a judge actually gave (fabricating one would poison the
-    dataset that decides whether composable blueprints are worth building), so the
-    several reasons a session was NOT judged exist only here. Rates that come out of it:
-
-      * `outcome=dropped` — work cancelled. Cross-check against
-        `SELECT count(*) FROM learning_audit WHERE record_type='judge_verdict' AND
-        dropped=true`; a divergence means drops are happening without records, which is
-        the one failure this design refuses.
-      * `outcome=skipped_unavailable` — the graph or the embedder was down. NOT a
-        corpus that holds nothing, and never a drop.
-      * `outcome=skipped_below_floor` vs `skipped_above_band` — the band is mistuned in
-        one direction or the other. Together with `best_similarity` this is what makes
-        the band tunable from evidence rather than from taste.
-      * `outcome=failed` — the model errored, timed out, or emitted something
-        unparseable. Every one of them proceeded to extraction; a rising rate is a
-        broken judge quietly costing what it was built to save.
-      * `would_drop=true AND shadow=true` — SHADOW MODE. The judge is running for real
-        and discarding nothing; this is the rollout dashboard ("what would we have
-        thrown away last week?"), readable here as well as in the audit bucket. Outside
-        shadow mode `would_drop` and `dropped` are always equal.
-      * `reused=true` — a redelivery served from the content-keyed audit record instead
-        of a second, non-idempotent model call.
+    `threshold` is SHAPE-only and always present, because `confidence` alone is unreadable —
+    the bars differ per stage and are retunable. The span is the DENOMINATOR and the audit
+    record the numerator: the store holds only verdicts a judge actually gave, so the several
+    reasons a session was NOT judged (`skipped_unavailable`, `skipped_below_floor`,
+    `skipped_above_band`, `failed`) exist only here.
     """
     attrs: dict[str, Any] = {
         "session.id": session_id,
@@ -586,11 +455,12 @@ def promote_span(
     blueprint_intent: str | None = None,
     canonical_key: str | None = None,
 ) -> Any:
-    """The scheduler's promote edge (`learning.promote`, CHAIN), started under the
-    candidate-propagated *context* so it continues the session's trace. SHAPE-only by
-    default: `session.id`, the candidate id, and the promotion *action*. With
-    *verbose*, ALSO the `blueprint_id`, the learned `blueprint_intent`, and the S6
-    `canonical_key` (D25 entity-bearing — see module docstring)."""
+    """The scheduler's promote edge (`learning.promote`, CHAIN), under the candidate's *context*.
+
+    SHAPE-only by default: `session.id`, the candidate id, and the promotion *action*. With
+    *verbose*, ALSO the `blueprint_id`, the learned `blueprint_intent` and the S6
+    `canonical_key` (entity-bearing — see the module docstring).
+    """
     attrs: dict[str, Any] = {
         "session.id": session_id,
         "learning.candidate_id": candidate_id,
@@ -622,8 +492,10 @@ def land_span(
     blueprint_intent: str | None = None,
     canonical_key: str | None = None,
 ) -> Any:
-    """The scheduler's land-into-corpus step (`learning.land`, CHAIN), nested under
-    the promote span. Same SHAPE-only/verbose contract as `promote_span`."""
+    """The scheduler's land-into-corpus step (`learning.land`, CHAIN), nested under promote.
+
+    Same SHAPE-only/verbose contract as `promote_span`.
+    """
     attrs: dict[str, Any] = {
         "session.id": session_id,
         "learning.candidate_id": candidate_id,
@@ -649,10 +521,11 @@ def learning_recall_span(
     session_id: str,
     context: Context | None = None,
 ) -> Any:
-    """The demo's recall probe (`learning.recall`, RETRIEVER), wrapped under the
-    session's *context* so the forget/recall demonstration reads in the same trace.
-    SHAPE-only: no query text (design §3.5). Named distinctly from the runtime
-    retrieval `tracing.recall_span` (different signature) to avoid shadowing."""
+    """The demo's recall probe (`learning.recall`, RETRIEVER), under the session's *context*.
+
+    SHAPE-only: no query text (design §3.5). Named distinctly from the runtime retrieval
+    `tracing.recall_span` (different signature) to avoid shadowing.
+    """
     return _learning_span(
         tracer,
         "learning.recall",

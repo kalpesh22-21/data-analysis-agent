@@ -1,73 +1,10 @@
 """The process-lifecycle wrapper every long-running worker entrypoint runs under.
 
-`run_daemon` is `asyncio.run` plus the ONE thing `asyncio.run` does not do: answer
-SIGTERM.
-
-Why that matters is entirely about PID 1. The Helm chart launches each worker as
-`command: [python, scripts/run_X.py]`, so Python IS the container's PID 1 — and PID 1
-is special: the kernel delivers a signal to it ONLY if it has installed a handler.
-An unhandled SIGTERM against any other process terminates it; against PID 1 it is
-silently DROPPED. `asyncio.run` installs a SIGINT handler (3.11+ `asyncio.Runner`) and
-NO SIGTERM handler, so every one of these workers ignored the signal Kubernetes uses
-to stop things. The consequence was not a slow shutdown, it was a WRONG one: the
-kubelet sends SIGTERM, the pod sits out the full `terminationGracePeriodSeconds`
-doing more work, and is then SIGKILLed mid-extraction / mid-stream-drain — which skips
-every `finally` in the entrypoint (the neo4j driver close in `run_learning_consumer`,
-the hydrator's `close()`). Those `finally` blocks were already written and correct;
-nothing ever ran them.
-
-So the fix is not new cleanup code, it is DELIVERING THE CANCEL that makes the
-existing cleanup run:
-
-    SIGTERM -> handler -> main_task.cancel() -> CancelledError raised at the current
-    await -> the entrypoint's `finally` blocks run -> shutdown
-
-`loop.add_signal_handler` (not `signal.signal`) is what makes this safe: the callback
-runs on the event loop rather than re-entrantly on whatever bytecode was executing,
-so `task.cancel()` is called from a context where cancellation means what it says.
-
-**A SIGTERM THAT ARRIVES WHILE A CANCELLATION IS ALREADY IN FLIGHT IS LOGGED AND
-IGNORED.** It does not re-cancel and does not escalate. Re-cancelling a task that is
-already inside its `finally` would raise CancelledError out of
-`await neo4j_driver.close()` — i.e. it would abort exactly the cleanup this module
-exists to guarantee, turning an impatient operator's second Ctrl-C-equivalent into the
-very failure mode the first signal fixed. Forcing the issue is SIGKILL's job, and
-Kubernetes already sends it at the end of the grace period. The ignored signal is
-logged at WARNING so an operator watching the logs learns that the shutdown is in
-progress rather than wondering whether the signal landed.
-
-"Already in flight" is TWO conditions, not one. The obvious one is a second SIGTERM
-(`terminating` is set). The other is the INTERLEAVE: Ctrl-C first, SIGTERM second —
-common when a dev impatiently follows a Ctrl-C with a `kill`, and reachable in a pod
-whenever anything signals the container before the kubelet does. A SIGINT-initiated
-cancel is not ours and leaves `terminating` False, so the flag alone would let the
-SIGTERM handler fire a SECOND cancel into a task mid-cleanup — the exact abort the
-second-SIGTERM rule prevents. `main_task.cancelling() > 0` is the direct question
-("has anyone already requested a cancel of this task?") and answers both cases. On
-that path `terminating` is deliberately LEFT UNSET, because the CancelledError branch
-below reads it to decide between "we asked for this, exit 0" and "someone else
-cancelled us, re-raise": setting it would convert the interactive operator's
-KeyboardInterrupt into a silent exit 0.
-
-**SIGINT is deliberately untouched.** `asyncio.Runner` already cancels the main task
-on Ctrl-C and re-raises KeyboardInterrupt; adding a handler here would change an
-interactive behaviour that was never broken. Note that a SIGINT cancels the task
-running `_supervise`, whose `_fut_waiter` IS the main task — so the cancel propagates
-inward, the entrypoint's `finally` blocks still run, and the KeyboardInterrupt still
-surfaces. That path is asserted in the tests.
-
-**Exit code 0 on a SIGTERM shutdown.** A worker that received the stop signal, cancelled
-cleanly and ran its cleanup has SUCCEEDED at stopping; 143 (128+SIGTERM) would paint
-every ordinary rollout as a container error in `kubectl get pod` last-state and in any
-alerting built on it. Entrypoints keep their own non-zero codes for real misprovision
-(the scheduler returns 1 when its buckets are absent), so a bad deploy is still
-distinguishable from a normal stop.
-
-Deliberately NOT in here: anything the entrypoints differ on. No settings, no logging
-setup (that is `learning/entrypoint.configure_daemon_process` for the learning daemons,
-and the hydrator's own `basicConfig`), no shutdown timeout. A cleanup that hangs is a
-bug in the cleanup, and capping it here would hide it behind a wrapper timeout while
-still losing the work.
+`run_daemon` is `asyncio.run` plus SIGTERM: as PID 1 the kernel drops an unhandled one, so
+the entrypoints' `finally` cleanup never ran. The handler cancels the main task; a SIGTERM
+arriving while a cancel is already in flight is logged and IGNORED, because re-cancelling
+aborts that cleanup. SIGINT is untouched, and a clean SIGTERM shutdown exits 0
+(see docs/cleanup/WORKLOG.md #14).
 """
 
 from __future__ import annotations
@@ -169,13 +106,8 @@ def run_daemon(
 ) -> int:
     """`asyncio.run(main())`, but SIGTERM cancels *main* instead of being dropped.
 
-    *main* is the entrypoint's zero-argument async `_main` (called here, not awaited by
-    the caller, so the task is created INSIDE the loop that will run it). *logger* is
-    the calling entrypoint's module logger, so the shutdown lines are attributed to the
-    script an operator is reading; *process* names the worker in those lines.
-
-    Returns *main*'s exit code, or 0 when a SIGTERM shutdown completed. Every exception
-    other than the cancellation we caused — including the KeyboardInterrupt that follows
-    a SIGINT — propagates unchanged.
+    *main* is called here rather than awaited by the caller, so the task is created INSIDE the
+    loop that will run it. Returns *main*'s exit code, or 0 when a SIGTERM shutdown completed;
+    every other exception — including the KeyboardInterrupt following a SIGINT — propagates.
     """
     return asyncio.run(_supervise(main, logger, process))

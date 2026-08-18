@@ -1,18 +1,12 @@
 #!/usr/bin/env python
 """Regenerate the frozen catalog-export fixture from the MCP's YAML source.
 
-Wave 0 of "MCP as the single source of truth for the semantic catalog": this
-DEV-ONLY tool imports the shared serializer from the sibling ``clickhouse-api``
-(MCP) repo and writes its output to ``tests/fixtures/catalog_export.json``. That
-fixture is the frozen export CONTRACT that later waves build to (the HTTP
-``/catalog/export`` endpoint on the MCP side, and the agent-side runtime loaders
-that will rebuild ``CatalogHandle`` / ``SemanticCatalogHandle`` / description-col
-linkage from the export instead of re-parsing ``databaseSchemaDocs/``).
-
-This script is NOT run in CI and is NOT imported by the agent at runtime. It
-depends on a local clone of the MCP repo being present as a sibling directory
-(or pointed at explicitly). If that repo is absent it fails loudly rather than
-silently producing a stale or partial fixture.
+A DEV-ONLY tool: it imports the shared serializer from the sibling ``clickhouse-api``
+(MCP) repo and writes its output to ``tests/fixtures/catalog_export.json``, the frozen
+export CONTRACT the runtime loaders and the MCP's ``/catalog/export`` endpoint both
+build to. NOT run in CI and NOT imported by the agent at runtime. It needs a local
+clone of the MCP repo; if that is absent it fails loudly rather than silently producing
+a stale or partial fixture.
 
 Usage
 -----
@@ -22,8 +16,8 @@ Locating the MCP repo (first match wins):
     1. ``$CLICKHOUSE_API_REPO`` env var (absolute path to the clickhouse-api repo)
     2. sibling of this agent repo: ``../clickhouse-api``
 
-Then the generated JSON is written to ``tests/fixtures/catalog_export.json``
-(override with ``$CATALOG_FIXTURE_OUT``). Commit the result.
+The generated JSON is written to ``tests/fixtures/catalog_export.json`` (override with
+``$CATALOG_FIXTURE_OUT``). Commit the result.
 """
 
 from __future__ import annotations

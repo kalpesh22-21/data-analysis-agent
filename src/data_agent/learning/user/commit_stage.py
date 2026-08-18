@@ -1,15 +1,11 @@
 """UserKnowledgeCommitStage — the S8 auto-commit writer stage (`CandidateStage`, D17).
 
-`user_knowledge` is the one target that auto-commits (05 §Write targets): it is
-scoped to a single user and surfaced only in that user's context, so it never
-needs the human pre-gate the global targets do. This stage runs at the writer
-position of the pipeline (§7.1): for a `user_knowledge` candidate it commits the
-projected record into the per-user store (scoped to `user_id`) and emits
-`control="drop"` so the enriched envelope NEVER reaches the review inbox — the
-candidate holding store is not its home; the per-user store is.
-
-Every other candidate type passes straight through (`control="continue"`) — the
-stage is a no-op for anything but `user_knowledge`.
+`user_knowledge` is the one target that auto-commits: it is scoped to a single user and
+surfaced only in that user's context, so it never needs the human pre-gate the global targets
+do. At the writer position of the pipeline this commits the projected record into the per-user
+store (scoped to `user_id`) and emits `control="drop"`, so the enriched envelope NEVER reaches
+the review inbox — the candidate holding store is not its home. Every other candidate type
+passes straight through.
 """
 
 from __future__ import annotations

@@ -1,37 +1,22 @@
 #!/usr/bin/env python
 """run_inbox_service — the review-inbox HTTP service entrypoint (UI Slice 2, §3).
 
-A SMALL, dedicated FastAPI process (Option A) that mounts ONE `ReviewInbox` over the
-promotion write plane and exposes the reviewer routes. The UI BFF (`ui/server.py`)
-proxies `/api/inbox/*` here, attaching the shared `X-Reviewer-Token` server-side.
+A SMALL, dedicated FastAPI process that mounts ONE `ReviewInbox` over the promotion
+write plane and exposes the reviewer routes. The UI BFF (`ui/server.py`) proxies
+`/api/inbox/*` here, attaching the shared `X-Reviewer-Token` server-side.
 
-DORMANT by default: every route 404s unless `REVIEW_INBOX_ENABLED=1`, and each
-mutating call requires the `X-Reviewer-Token` header to match `REVIEWER_TOKEN`. When
-the full write plane (couchbase + MCP + token + neo4j + embedding) is NOT configured,
-the service runs in OFFLINE dev mode (list/reject/retract work; a landing-approve
-honestly 503s).
+DORMANT by default: every route 404s unless `REVIEW_INBOX_ENABLED=1`, and each mutating
+call requires the `X-Reviewer-Token` header to match `REVIEWER_TOKEN`. When the full
+write plane (couchbase + MCP + token + neo4j + embedding) is NOT configured, the service
+runs in OFFLINE dev mode (list/reject/retract work; a landing-approve honestly 503s).
 
-**Importing this module builds NOTHING.** `create_inbox_app` is handed to
-`http_daemon.run_http_daemon` as a FACTORY and called inside the running event loop.
-
-The reason is that `create_inbox_app`'s full-plane branch composes durable infra, and
-`acouchbase.Cluster(...)` REFUSES to be constructed without a running loop — it raises
-`RuntimeError: Event loop is not running` (SDK 4.6.2), which import-time construction
-turned into "the full write plane cannot start at all, on every deploy that provisions
-it correctly" (ISSUES.md H7). The `Cluster` is no longer built in
-`CouchbaseCandidateStore.__init__` — the Tier-3 lazy Couchbase seam (`b7b21c1`) moved
-it behind the first `_ensure_connected()` — so the crash is not reachable from here
-today. It is one refactor away from returning: a store that reverts to connecting
-eagerly, or any new full-plane collaborator that builds a cluster/driver in `__init__`,
-resurrects it verbatim and only in the configuration that matters. Building the app at
-module scope (which is what "so `uvicorn scripts.run_inbox_service:app` also works"
-bought) is the property that made a lazily-fixed constructor the only thing standing
-between a deploy and a crash, so that second way in is gone.
-
-Anything that wants an ASGI factory should point at the real one, which has always been
-importable and is now the ONLY entry: `uvicorn data_agent.learning.inbox.service:create_inbox_app
---factory` (uvicorn calls a `--factory` app inside its own running loop, so acouchbase is
-happy). Note that path skips `configure_daemon_process` — prefer the script.
+**Importing this module builds NOTHING.** `create_inbox_app` is handed to the shared
+HTTP daemon wrapper as a FACTORY and called inside the running event loop — never at
+module scope, where a full-plane collaborator that connects in `__init__` becomes a
+crash on exactly the deploys that provision it correctly (see docs/cleanup/WORKLOG.md
+#14). Anything that wants an ASGI factory should point at the real one:
+`uvicorn data_agent.learning.inbox.service:create_inbox_app --factory` — note that path
+skips `configure_daemon_process`, so prefer the script.
 
 Usage:
     REVIEW_INBOX_ENABLED=1 REVIEWER_TOKEN=... uv run python scripts/run_inbox_service.py

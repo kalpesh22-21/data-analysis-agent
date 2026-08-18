@@ -1,14 +1,13 @@
-"""blueprint/models.py — the typed parse layer over the full-DAG JSON (§2.1).
+"""blueprint/models.py — the typed parse layer over the full-DAG JSON.
 
-The corpus stores the DAG as additive JSON-string properties on the `:Blueprint`
-node (§1.1); `getBlueprint`/`BlueprintDetail` carry them back JSON-decoded. This
-module parses those decoded structures into the frozen typed value objects the
-executor (Slice B) and the pure functions (`slots`/`when`/`verify`) consume.
+The corpus stores the DAG as additive JSON-string properties on the `:Blueprint` node, and
+`getBlueprint`/`BlueprintDetail` carry them back JSON-decoded. This module parses those
+decoded structures into the frozen typed value objects the executor and the pure functions
+(`slots`/`when`/`verify`) consume.
 
-Parsing is STRUCTURAL and fail-loud: a malformed shape raises `BlueprintParseError`
-(the same posture the corpus loader takes at WRITE, §1.2 — but this is the READ
-side, defense-in-depth against a corrupt/legacy stored value). Everything here is
-pure: no I/O, no LLM, no SQL execution.
+Parsing is STRUCTURAL and fail-loud: a malformed shape raises `BlueprintParseError` — the
+READ-side counterpart of the loader's write-time validation, defense-in-depth against a
+corrupt or legacy stored value. Everything here is pure: no I/O, no LLM, no SQL execution.
 """
 
 from __future__ import annotations
@@ -314,15 +313,14 @@ class WhenClause:
 
 @dataclass(frozen=True)
 class Node:
-    """One `composes` DAG node (§1.1). `output` maps each name → a `NODE_OUTPUT_KINDS`
-    value ('scalar' | 'table').
+    """One `composes` DAG node. `output` maps each name to a `NODE_OUTPUT_KINDS` value
+        ('scalar' | 'table').
 
-    Both kinds now execute: scalar-converging DAGs bind literals, and a `table`
-    intermediate consumed as `{ph: "$N"}` is materialized to session scratch (§2.3)
-    when a `scratch_client` is wired (the original F2 scalar-only boundary was lifted
-    there; without a scratch client the executor still degrades to UNSUPPORTED). This
-    parse layer records the shape faithfully; the loader (§1.2) enforces the DAG
-    invariants (including the table-consume ⇄ table-output pairing).
+        Both kinds execute: scalar-converging DAGs bind literals, and a `table` intermediate
+        consumed as `{ph: "$N"}` is materialized to session scratch when a `scratch_client` is
+        wired (without one the executor degrades to UNSUPPORTED). This parse layer records the
+        shape faithfully; the loader enforces the DAG invariants, including the
+        table-consume/table-output pairing.
     """
 
     order: int
@@ -407,12 +405,11 @@ class Node:
 
 @dataclass(frozen=True)
 class ResultGrain:
-    """The blueprint's DECLARED result grain (`result_grain_json`, §1.1 / §4.3).
+    """The blueprint's DECLARED result grain.
 
-    D56 checks the result's row-count against `COUNT(DISTINCT columns)`; a
-    blueprint that declares its own grain UNVERIFIABLE (`verifiable=False`) skips
-    the row-count teeth (the `grain_verifiable:false` skip rule, §4.2) but still
-    passes the signature check.
+        D56 checks the result's row count against `COUNT(DISTINCT columns)`; a blueprint that
+        declares its own grain UNVERIFIABLE (`verifiable=False`) skips the row-count teeth but
+        still passes the signature check.
     """
 
     columns: tuple[str, ...] = ()
@@ -441,9 +438,9 @@ class ResultGrain:
 
 @dataclass(frozen=True)
 class Blueprint:
-    """The parsed, executable-shape blueprint DAG (§2.1). Slice A produces it;
-    the Slice-B executor walks it. Single-node blueprints carry a top-level
-    `sql_template` and an empty `composes`."""
+    """The parsed, executable-shape blueprint DAG. Single-node blueprints carry a top-level
+        `sql_template` and an empty `composes`.
+    """
 
     id: str
     intent: str

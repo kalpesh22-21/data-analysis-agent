@@ -1,27 +1,17 @@
 """ui/server.py — thin FastAPI backend-for-frontend (BFF) for the minimal Phase-0 UI.
 
-Responsibilities (and ONLY these — see docs/08-ui.md / D82):
-    1. Serve the static page (`ui/static/index.html`) at `GET /`.
-    2. `POST /api/session` — mint a fresh `session_id` (uuid4) and a JWT for it
-       by calling the token service's guarded `POST /token` server-side, then
-       hold the JWT in an in-memory dict keyed by `session_id`. The browser
-       gets back ONLY `{"session_id": ...}` — it never sees the JWT (D82/D5:
-       credentials are model-invisible AND browser-invisible in this design;
-       the BFF is the only thing that ever holds the token).
-    3. `POST /api/turn` / `POST /api/turn/resume` — look the JWT up by the
-       `session_id` the browser sends, call the runtime's `/turn` /
-       `/turn/resume` with `Authorization: Bearer <jwt>` + `X-Session-Id`, and
-       stream the SSE response straight back to the browser byte-for-byte
-       (no re-parsing/re-framing here — the browser's own SSE parser in
-       `index.html` does that).
+Serves the static page, mints a `session_id` + a JWT for it by calling the token
+service server-side, and proxies turns / history / inbox / uploads to the runtime. The
+browser gets back ONLY `{"session_id": ...}` — it never sees the JWT (D82/D5: the BFF
+is the sole holder of the token). SSE bodies are forwarded byte-for-byte, never
+re-parsed or re-framed here.
 
 Config (env vars, all optional):
     RUNTIME_URL                   default http://localhost:8000
     TOKEN_SERVICE_URL             default http://localhost:19000/token
     TOKEN_ISSUER_API_KEY          default issuer-key-abc123
     TOKEN_TTL_SECONDS             default 3600 — MUST match the token service's own
-                                  `token_ttl_seconds` (`clickhouse-api/app/
-                                  token_service.py`). See `_TOKEN_TTL_SECONDS`.
+                                  `token_ttl_seconds`. See `_TOKEN_TTL_SECONDS`.
     TOKEN_REFRESH_AFTER_SECONDS   default TTL-300 — token age at which the next
                                   proxied call lazily re-mints. See `_jwt_for_session`.
 
@@ -207,12 +197,11 @@ class ResumeBody(BaseModel):
 class QueryPageBody(BaseModel):
     """`POST /api/query/page` — one page of a turn's designated answer table.
 
-    `sql` is the `answer_sql` the runtime returned on that turn's `result` event,
-    echoed back by the browser. It is NOT trusted on the strength of that echo: the
-    runtime re-parses it and runs it through the SAME scope-enforced dispatch path
-    the agent uses, under the JWT this BFF attaches server-side. A browser that
-    tampers with it can therefore only ask for something the same session's own
-    scope already permits.
+    `sql` is the `answer_sql` the runtime returned on that turn's `result` event, echoed
+    back by the browser. It is NOT trusted on the strength of that echo: the runtime
+    re-parses it and runs it through the SAME scope-enforced dispatch path the agent
+    uses, under the JWT this BFF attaches server-side — so a tampered `sql` can only
+    reach what the same session's own scope already permits.
     """
 
     session_id: str
@@ -227,38 +216,28 @@ class ScopeBody(BaseModel):
 
 
 async def _mint_jwt(user_name: str, column_scope: list[str], session_id: str) -> str:
-    """Call the token service server-side to mint a JWT carrying *column_scope*
-    and bound to *session_id* (D82/D5: the BFF is the ONLY holder of the token;
-    the browser never sees it). `column_scope=[]` == allow-all, matching the
-    runtime's D80(b)/D44 scope semantics.
+    """Call the token service server-side to mint a JWT carrying *column_scope* and
+    bound to *session_id* (D82/D5: the BFF is the ONLY holder of the token; the browser
+    never sees it). `column_scope=[]` == allow-all, matching the runtime's D80(b)/D44
+    scope semantics.
 
-    *user_name* is the resolved caller identity (auth-hardening Slice 2): it is
-    stamped into the token so the warehouse's row-level tenant isolation
-    (`SQL_tenant`/`user_name`, D82) attributes the session to the right user, and
-    it is the identity whose per-user `column_scope` entitlement produced
-    *column_scope* (see `ui/entitlements.py`).
+    *user_name* is the resolved caller identity (`ui/entitlements.py`), stamped into the
+    token so the warehouse's row-level tenant isolation (`SQL_tenant`/`user_name`, D82)
+    attributes the session to the right user.
 
-    THE THREE CALLERS ALL PASS A **CACHED** SCOPE, and only `create_session`
-    resolves one. `set_session_scope` passes the narrowed scope it validated, and
-    `_refresh_session_token` (E1) passes `_SESSION_SCOPES[session_id]` verbatim —
-    see the comment there for WHY re-resolving on refresh would be a defect rather
-    than a freshening (Decision 7 / Q22, docs/decisions/prompt-routing-review-qa.md).
+    ALL THREE CALLERS PASS A CACHED SCOPE, and only `create_session` resolves one;
+    re-resolving on refresh would be a defect, not a freshening — see
+    `_refresh_session_token`.
 
-    *session_id* is threaded into the mint request so the token carries a
-    `sid_hash` claim (auth-hardening Slice 1): the MCP then rejects any request
-    whose `X-Session-Id` header does not hash to that claim, closing the
-    session-hijack gap. Every JWT this BFF mints is for exactly one `session_id`
-    and is sent with the matching `X-Session-Id` header, so the binding always
-    holds for BFF-minted traffic.
+    *session_id* is threaded into the mint so the token carries a `sid_hash` claim: the
+    MCP rejects any request whose `X-Session-Id` header does not hash to that claim,
+    closing the session-hijack gap.
 
-    The transport is `HttpTokenMinter` — the SAME mint client the offline promotion
-    plane uses — so the `POST /token` body (tenant claims, scope, sid binding) has
-    ONE implementation rather than a request-path copy that drifts from it. Two of
-    its knobs are set for THIS plane: `ttl_seconds=None` (the IdP's own configured
-    lifetime governs a UI session, not the probe's deliberately short 300s) and
-    `allow_unscoped=True` (an entitlement of `[]` is a RESOLVED D80b allow-all here,
-    not the absent scope the offline backstop refuses). The minter is built per call
-    because `user_name` is the per-request caller identity; it does no I/O to build."""
+    The transport is `HttpTokenMinter`, shared with the offline promotion plane, with two
+    knobs set for THIS plane: `ttl_seconds=None` (the IdP's own configured lifetime
+    governs a UI session) and `allow_unscoped=True` (an entitlement of `[]` is a RESOLVED
+    D80b allow-all here, not the absent scope the offline backstop refuses). Built per
+    call because `user_name` is per-request; it does no I/O to build."""
     # Required by the MCP — see TENANT_* above. Omitting them is a 403
     # MISSING_TENANT_CLAIM on every tool call. `TenantClaims` refuses a blank or
     # control-character value HERE rather than letting it reach the wire, where its
@@ -300,25 +279,16 @@ async def index() -> FileResponse:
 
 @app.post("/api/session")
 async def create_session(request: Request) -> dict[str, str]:
-    """Mint a fresh `session_id` and a JWT scoped to the CALLER'S per-user
-    entitlement (auth-hardening Slice 2). The identity and its `column_scope` are
-    resolved exclusively through the `ui/entitlements.py` seams — the demo
-    `ui-user` resolves to allow-all (`[]`, D80b), a restricted user to their
-    entitled allowlist. This replaces D82's hardcoded all-access mint: allow-all
-    is now the *default entitlement*, not a blanket, so a real per-user scope is
-    honored end-to-end (the MCP enforces it, D57/D80). The token is still bound to
-    `session_id` (Slice 1 sid_hash) and never leaves the BFF (D82/D5).
+    """Mint a fresh `session_id` and a JWT scoped to the CALLER'S per-user entitlement.
+    The identity and its `column_scope` are resolved exclusively through the
+    `ui/entitlements.py` seams (the demo `ui-user` resolves to allow-all `[]`, D80b).
+    The token is bound to `session_id` (sid_hash) and never leaves the BFF (D82/D5).
 
-    SID FORMAT (table-intermediate Slice 2): the session_id is minted
-    UNDERSCORE-FREE and identifier-safe — ``s`` + a hyphen-stripped uuid4 hex
-    (``s<32hex>``, matching ``^[A-Za-z_][A-Za-z0-9_]*$`` with NO ``_``). This is
-    load-bearing for the D93 scratch namespace: scratch tables are named
-    ``s_<session_id>_bp_<hex>`` and the D64 read gate extracts the owning session
-    as the run after ``s_`` up to the next ``_``. A raw uuid4 (hyphens) is not a
-    safe SQL identifier and would be rejected at materialize; an underscore in the
-    sid would reintroduce the ``_``-boundary ambiguity the read gate now forbids.
-    Stripping the hyphens to hex (NOT converting them to ``_``) keeps the sid
-    underscore-free."""
+    SID FORMAT is load-bearing: ``s`` + a hyphen-stripped uuid4 hex, so the sid is
+    identifier-safe and contains NO underscore. D93 scratch tables are named
+    ``s_<session_id>_bp_<hex>`` and the D64 read gate extracts the owning session as the
+    run after ``s_`` up to the next ``_`` — a raw uuid4 is not a safe SQL identifier, and
+    an underscore in the sid would reintroduce the boundary ambiguity the gate forbids."""
     session_id = "s" + uuid.uuid4().hex
     identity = resolve_caller_identity(request)
     # THE ONLY `resolve_column_scope` CALL ON THE REQUEST PATH, and it must stay
@@ -335,22 +305,14 @@ async def create_session(request: Request) -> dict[str, str]:
 async def set_session_scope(body: ScopeBody) -> dict[str, bool]:
     """Test-only (D-L3-4): re-mint the session's JWT server-side with a NARROWER
     `column_scope`, replacing the one held for `session_id`. Active ONLY when
-    `UI_TEST_AFFORDANCES=1` — otherwise 404, so the production BFF never exposes
-    it. D82/D5 stay intact: the BFF is still the sole JWT holder and the browser
-    still never receives the token; this endpoint only lets the Layer-3 harness
-    drive a mid-session scope change (D44) that a real product would drive from
-    its identity provider. The scope-narrowing itself is enforced server-side by
-    the runtime's `ContextAssembler`/`scope_filter` fail-closed replay — this
-    just supplies the narrower token.
+    `UI_TEST_AFFORDANCES=1` — otherwise 404, so the production BFF never exposes it.
+    D82/D5 stay intact: the browser still never receives the token. The narrowing itself
+    is enforced by the runtime's fail-closed replay; this only supplies the token.
 
-    MONOTONIC-NARROWING (S1, security): the affordance may only NARROW scope,
-    never widen it — otherwise a caller could POST `[]` (== allow-all, D80b) to
-    re-widen a narrowed session, turning this into an escalation surface. With
-    Item-9 per-user scoped tokens (Slice 2), the session's base is the caller's
-    ENTITLED scope (which may already be a non-allow-all allowlist), so narrowing
-    happens WITHIN that base: `[]` is refused outright, and the new scope must be a
-    subset of the current scope (transitively a subset of the entitled base) —
-    widening beyond the entitled base is therefore rejected."""
+    MONOTONIC NARROWING (S1, security): this may only NARROW, never widen. `[]` (==
+    allow-all, D80b) is refused outright and the new scope must be a subset of the
+    current one — transitively a subset of the caller's entitled base — so the affordance
+    cannot become an escalation surface."""
     if os.environ.get("UI_TEST_AFFORDANCES") != "1":
         raise HTTPException(status_code=404, detail="Not found.")
     if body.session_id not in _SESSIONS:
@@ -389,12 +351,9 @@ async def set_session_scope(body: ScopeBody) -> dict[str, bool]:
 def _store_token(session_id: str, jwt: str) -> None:
     """THE ONLY writer of `_SESSIONS`, so a stored token always has a known age.
 
-    Every mint site goes through here (session create, the test-only scope narrow,
-    and the E1 refresh). Writing `_SESSIONS[sid]` directly would leave
+    Every mint site goes through here. Writing `_SESSIONS[sid]` directly leaves
     `_SESSION_TOKEN_MINTED_AT` stale, and a stale mint time is the one failure this
-    whole mechanism cannot detect: the token would look older than it is (harmless —
-    an extra re-mint) or, after a re-mint that forgot to stamp, permanently older
-    than the refresh threshold, re-minting on EVERY request forever.
+    mechanism cannot detect — at worst re-minting on EVERY request forever.
     """
     _SESSIONS[session_id] = jwt
     _SESSION_TOKEN_MINTED_AT[session_id] = time.time()
@@ -403,47 +362,21 @@ def _store_token(session_id: str, jwt: str) -> None:
 async def _refresh_session_token(session_id: str, age: float) -> str:
     """Re-mint the session's JWT from its CACHED claims and return the new token.
 
-    ────────────────────────────────────────────────────────────────────────────
     THIS FUNCTION MUST NEVER CALL `resolve_column_scope` (E2 — Decision 7 / Q22,
-    docs/decisions/prompt-routing-review-qa.md §Q15, §Q22, §D-7).
-    ────────────────────────────────────────────────────────────────────────────
-    It replays `_SESSION_SCOPES[session_id]` and `_SESSION_USERS[session_id]` — the
-    values resolved ONCE at `create_session` — and re-resolving either here would be
-    a defect, not a freshening. The reason is invisible from inside auth code, so it
-    is written out:
+    docs/decisions/prompt-routing-review-qa.md). It replays `_SESSION_SCOPES[session_id]`
+    and `_SESSION_USERS[session_id]`, resolved ONCE at `create_session`, because "a
+    session has ONE `column_scope` for its whole lifetime" is a product guarantee THIS
+    component supplies. Q15(b) was retired on the strength of it: scratch tables are not
+    stamped with the scope they were materialized under, so a scope change landing
+    mid-session would leave wide-scope rows readable under a narrower one — and the
+    defect would surface three components away. Any change that reintroduces a second
+    resolution owes a fail-closed comparison AND a revisit of Q15(b). Accepted cost,
+    recorded upstream: a revocation only takes effect at the user's next session.
 
-      * Decision 7 is a PRODUCT GUARANTEE that a session has ONE `column_scope` for
-        its whole lifetime. It is supplied by this component; the runtime does not
-        assume it (scope is rebuilt per request, and D44(C) exists precisely for
-        mid-session change).
-      * That guarantee is what retired Q15 option (b): materialized scratch tables
-        are NOT stamped with the scope hash they were created under, and reads are
-        NOT re-checked against it, because under Decision 7 the narrow-then-read
-        threat is unreachable. Decision 6 kept only the lineage-recording half.
-      * So a refresh that re-resolved entitlements would let a scope CHANGE land
-        mid-session — and the rows of a scratch table materialized under the old,
-        wider scope stay readable under the new, narrower one. The defect would
-        surface three components away, in a scratch table, with nothing pointing
-        back here.
-
-    Decision 7 held until now only because the BFF minted once and no re-mint path
-    existed (Q22 said so in as many words). This IS that path; it is written to
-    preserve the invariant BY CONSTRUCTION. Q22's option (b) — "a refresh that
-    produces a different scope than the cached one fails closed" — has nothing to
-    compare here, which is the stronger outcome: there is no second resolution to
-    disagree with the first. Any future change that reintroduces one owes a
-    fail-closed comparison AND a revisit of Q15(b).
-
-    The accepted cost is recorded upstream: an entitlement revocation does not take
-    effect until the user's next session (up to 8 hours). That is Decision 7's
-    stated accepted risk, not a gap this function should try to close on its own.
-
-    CONCURRENCY: two in-flight requests can both observe a stale token and both
-    re-mint. That is accepted rather than locked out. Both mints carry identical
-    claims and identical `sid_hash` binding, so both tokens are valid and equivalent;
-    last write wins and the loser's token simply goes unused after the requests that
-    hold it finish. The cost is one redundant mint at most once per refresh window,
-    against an `asyncio.Lock` per session on the hot path of every proxied call.
+    CONCURRENCY: two in-flight requests can both re-mint. Accepted rather than locked
+    out — both mints carry identical claims and `sid_hash`, so both tokens are valid and
+    the loser's simply goes unused; the alternative is a per-session `asyncio.Lock` on
+    the hot path of every proxied call.
     """
     jwt = await _mint_jwt(
         _SESSION_USERS[session_id], _SESSION_SCOPES[session_id], session_id
@@ -456,28 +389,22 @@ async def _refresh_session_token(session_id: str, age: float) -> str:
 
 
 async def _jwt_for_session(session_id: str) -> str:
-    """The session's CURRENT JWT, lazily re-minted when the held one is getting old
-    (E1). Every proxy hop attaches the token through here, so the refresh needs no
-    background task, no scheduler and no per-session timer — the next request the
-    user makes is what renews the session, and a session nobody uses simply expires.
+    """The session's CURRENT JWT, lazily re-minted when the held one is getting old (E1).
+    Every proxy hop attaches the token through here, so the next request the user makes
+    is what renews the session — no background task, scheduler or per-session timer.
 
-    THREE AGE BANDS, and the difference between the last two is the whole design:
+    THREE AGE BANDS:
+      age <= REFRESH_AFTER        serve the held token; no mint.
+      REFRESH_AFTER < age <= TTL  try to re-mint; on failure serve the HELD token and
+                                  warn — it is valid for another `TTL - REFRESH_AFTER`
+                                  seconds, so a token-service blip must not break a
+                                  working session. This band is the shock absorber.
+      age > TTL                   the held token is DEAD; on mint failure fail the
+                                  request LOUDLY (502) rather than proxy a known-expired
+                                  token, which would surface as a bare 401 pointing at
+                                  the wrong component.
 
-      age <= REFRESH_AFTER      serve the held token; no mint.
-      REFRESH_AFTER < age <= TTL  try to re-mint. On failure, serve the HELD token
-                                  and warn — it is still valid for up to
-                                  `TTL - REFRESH_AFTER` seconds, so a token service
-                                  blip must not break a working session. This band
-                                  exists to be the shock absorber.
-      age > TTL                 the held token is DEAD. Try to re-mint; on failure
-                                  fail the request LOUDLY (502). Proxying a known-
-                                  expired token would surface as a bare `401` from
-                                  the runtime, which the browser renders as an auth
-                                  error and which points at the wrong component
-                                  entirely.
-
-    A session with no token at all is still a 404, unchanged: `_SESSIONS` is the
-    membership test for "this session exists".
+    A session with no token at all is still a 404: `_SESSIONS` is the membership test.
     """
     jwt = _SESSIONS.get(session_id)
     if jwt is None:
@@ -537,19 +464,14 @@ async def _jwt_for_session(session_id: str) -> str:
 
 
 async def _proxy_stream(path: str, session_id: str, json_body: dict[str, str]) -> StreamingResponse:
-    """POST *json_body* to the runtime's *path* and forward the response —
-    status code, content-type, and body bytes — straight back to the browser
-    as it arrives.
+    """POST *json_body* to the runtime's *path* and forward the response — status code,
+    content-type and body bytes — straight back to the browser as it arrives.
 
-    The runtime's happy path is always `text/event-stream` (`event: progress`
-    / `event: result` / `event: error` frames, forwarded byte-for-byte, no
-    re-parsing here); but a request the runtime rejects BEFORE ever opening
-    the stream (e.g. `409` "no pending checkpoint" from a stale/duplicate
-    `/turn/resume`, or a `401`/`400` from the auth/header checks) comes back
-    as a plain JSON error body with a non-2xx status — that status and
-    content-type are propagated as-is (not silently coerced to a `200`
-    `text/event-stream`) so the browser's `!response.ok` branch renders it in
-    the error banner instead of trying to SSE-parse it.
+    The happy path is `text/event-stream`, forwarded byte-for-byte with no re-parsing.
+    A request the runtime rejects BEFORE opening the stream (409 stale resume, 401/400)
+    comes back as JSON with a non-2xx status, and that status + content-type propagate
+    as-is rather than being coerced into a 200 `text/event-stream` — so the browser's
+    `!response.ok` branch renders it instead of trying to SSE-parse it.
     """
     jwt = await _jwt_for_session(session_id)
     headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id}
@@ -587,11 +509,9 @@ async def turn_resume(body: ResumeBody) -> StreamingResponse:
 @app.get("/api/history")
 async def history(session_id: str) -> JSONResponse:
     """UI Slice 3 (§4): JSON (non-streaming) proxy for the runtime's
-    `GET /session/history`. Mirrors `_proxy_inbox`'s server-side-token attach —
-    the browser sends only `session_id` (a query param), the JWT is looked up and
-    attached server-side (D82/D5: the browser never sees the token). The runtime's
-    status + JSON body propagate as-is so a non-2xx (401/400) reaches the browser's
-    error branch unchanged."""
+    `GET /session/history`. The browser sends only `session_id`; the JWT is looked up and
+    attached server-side (D82/D5). The runtime's status + JSON body propagate as-is so a
+    non-2xx reaches the browser's error branch unchanged."""
     jwt = await _jwt_for_session(session_id)
     headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id}
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -608,14 +528,10 @@ async def history(session_id: str) -> JSONResponse:
 
 @app.post("/api/query/page")
 async def query_page(body: QueryPageBody) -> JSONResponse:
-    """JSON proxy for the runtime's `POST /query/page` — the paging behind the
-    answer table that replaced the old `result_table` preview.
-
-    Same server-side-token attach as `/api/history` (D82/D5: the browser never
-    sees the JWT, it sends only `session_id`). The runtime's status + JSON body
-    propagate as-is, so a 400 (unparseable/non-SELECT SQL) or 403 (column-scope
-    denial) reaches the browser's error branch unchanged rather than being
-    flattened into a generic failure."""
+    """JSON proxy for the runtime's `POST /query/page` — the paging behind the answer
+    table. Same server-side token attach as `/api/history` (D82/D5). The runtime's status
+    + JSON body propagate as-is, so a 400 (unparseable/non-SELECT SQL) or 403 (column-
+    scope denial) reaches the browser's error branch unflattened."""
     jwt = await _jwt_for_session(body.session_id)
     headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": body.session_id}
     payload = {"sql": body.sql, "limit": body.limit, "offset": body.offset}
@@ -646,10 +562,9 @@ def _require_inbox_enabled() -> None:
 async def _read_bounded_body(request: Request, cap: int) -> bytes | None:
     """The request body, or `None` when it exceeds *cap*.
 
-    Streamed rather than `await request.body()`, for the reason the upload route already
-    documents: `body()` buffers an unbounded amount for a chunked (no-`Content-Length`)
-    request, so the cap has to be enforced WHILE reading, not after. The header check
-    first is only a cheap early exit for the honest client."""
+    Streamed rather than `await request.body()`, which buffers an unbounded amount for a
+    chunked (no-`Content-Length`) request — the cap must be enforced WHILE reading, not
+    after. The header check first is only a cheap early exit for the honest client."""
     declared = request.headers.get("content-length")
     if declared is not None and declared.isdigit() and int(declared) > cap:
         return None
@@ -667,17 +582,13 @@ async def _proxy_inbox(
     method: str, path: str, json_body: Any | None = None
 ) -> JSONResponse:
     """Proxy a JSON (non-streaming) inbox request to the inbox service, attaching the
-    server-held `X-Reviewer-Token` on the hop (the browser never sees it — same
-    pattern as the TOKEN_ISSUER_API_KEY the mint uses). The service's status code +
-    JSON body are propagated as-is so a `4xx`/`5xx` (unknown id, illegal transition,
-    landing-plane `503`) reaches the browser's error branch unchanged. A JSON,
-    non-streaming sibling of `_proxy_stream`.
+    server-held `X-Reviewer-Token` on the hop (the browser never sees it). The service's
+    status code + JSON body are propagated as-is so a 4xx/5xx (unknown id, illegal
+    transition, landing-plane 503) reaches the browser's error branch unchanged.
 
-    *json_body* is forwarded VERBATIM when present (the fail-to-review `complete`
-    action's parameterization entries). The BFF does not inspect or reshape it: the
-    inbox service validates it, and behind it the extractor's own readers do — a second
-    schema here would be a second vocabulary for the same mistake, and the one that
-    names the fix is the one furthest down."""
+    *json_body* is forwarded VERBATIM when present. The BFF does not inspect or reshape
+    it: the inbox service validates it, and the extractor's own readers do behind that —
+    a second schema here would just be a second vocabulary for the same mistake."""
     headers = {"X-Reviewer-Token": REVIEWER_TOKEN}
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -770,11 +681,10 @@ async def inbox_action(
 
 
 def _scratch_base() -> str:
-    """Derive the `/scratch/v1` base URL from `MCP_URL` by keeping its scheme +
-    netloc and swapping the path — the identical derivation the runtime does at
-    runtime/config.py:362-374. The scratch upload routes are custom HTTP routes on
-    the MCP host (`clickhouse-api`), NOT on `RUNTIME_URL`, so this is where the
-    upload proxy hops to. E.g. `http://localhost:18090/mcp` -> `http://localhost:18090/scratch/v1`."""
+    """Derive the `/scratch/v1` base URL from `MCP_URL` by keeping its scheme + netloc
+    and swapping the path — the identical derivation `runtime/config.py` does. The
+    scratch upload routes are custom HTTP routes on the MCP host (`clickhouse-api`), NOT
+    on `RUNTIME_URL`. E.g. `http://localhost:18090/mcp` -> `http://localhost:18090/scratch/v1`."""
     parts = urllib.parse.urlsplit(MCP_URL)
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, "/scratch/v1", "", ""))
 
@@ -782,19 +692,13 @@ def _scratch_base() -> str:
 async def _proxy_upload(path: str, session_id: str, request: Request) -> JSONResponse:
     """RAW-BODY multipart passthrough to a clickhouse-api scratch route (§4).
 
-    Unlike `_proxy_stream` (JSON in / SSE out) and `_proxy_inbox` (JSON in / JSON
-    out), this proxies a `multipart/form-data` upload — but WITHOUT parsing it. The
-    BFF must not parse the form (that would pull `python-multipart` into this
-    package's deps, which the contract forbids), so it reads the raw body bytes and
-    forwards them verbatim with the browser's ORIGINAL `Content-Type` header (which
-    carries the multipart boundary the downstream parser needs). The `session_id`
-    arrives as a query param, so the BFF needs zero form parsing to know it.
-
-    The session's JWT + `X-Session-Id` are looked up and attached server-side — the
-    SAME credential pair `_proxy_stream` attaches (D82/D5: the browser holds neither
-    the token nor the session binding, only the opaque `session_id`). The upstream
-    status + JSON body propagate as-is (non-JSON -> `{"detail": text}`), so a
-    413/400/401 reaches the browser's error branch unchanged.
+    The BFF must NOT parse the form — that would pull `python-multipart` into this
+    package's deps, which the contract forbids — so it reads the raw body bytes and
+    forwards them verbatim with the browser's ORIGINAL `Content-Type` header, which
+    carries the multipart boundary the downstream parser needs. `session_id` arrives as a
+    query param, so no form parsing is needed to know it. The session's JWT +
+    `X-Session-Id` are attached server-side (D82/D5). Upstream status + JSON body
+    propagate as-is (non-JSON -> `{"detail": text}`).
     """
     jwt = await _jwt_for_session(session_id)
     # The BFF caps the WHOLE multipart body, but the downstream cap (UPLOAD_MAX_BYTES)
