@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from sqlglot import exp
@@ -118,10 +118,17 @@ _ABORTED_MESSAGE = (
 # first N distincts resolves as no_match → askUser (never a silent guess).
 _DOMAIN_PROBE_LIMIT = 500
 
+# `emit_progress=False` on EVERY inner dispatch below (node query, domain probe,
+# grain probe): a blueprint is ONE call from the user's side, so its internal
+# runQuery must not paint a "running runQuery…" line on the UI progress stream
+# (that stream is what the user reads; the internal step structure — and the fact
+# that it is SQL over internal tables — is not theirs to see). Spans, scope
+# enforcement and control flow are unchanged.
+
 
 @dataclass(frozen=True)
 class ExecCompleted:
-    """A verified single-node result, ready for the model + persistence (§5.2)."""
+    """A verified blueprint result, ready for the model + persistence (§5.2)."""
 
     result_full: dict[str, Any]
     preview: ResultPreview
@@ -225,7 +232,8 @@ class BlueprintExecutor:
         slot_bindings: dict[str, Any],
         credentials: RuntimeCredentials,
     ) -> ExecOutcome:
-        """Execute one single-node blueprint end-to-end → a typed `ExecOutcome`."""
+        """Execute one blueprint end-to-end → a typed `ExecOutcome`. A leaf
+        blueprint is synthesized into a one-node DAG and walked identically."""
         # 1. Fetch + scope-check (non-oracle: absent == out-of-scope == NOT_FOUND).
         detail = await self._vector_index.get_blueprint(blueprint_id)
         if detail is None or not is_blueprint_in_scope(
@@ -242,209 +250,33 @@ class BlueprintExecutor:
             _logger.warning("blueprint %s failed to parse; UNSUPPORTED", blueprint_id)
             return ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
 
-        # A multi-node DAG runs through the Slice-C scalar-passing walk; a
-        # single-node blueprint keeps the Slice-B leaf path below (unchanged).
-        if not blueprint.is_single_node:
-            return await self._execute_dag(
-                blueprint=blueprint,
-                slot_bindings=slot_bindings,
-                credentials=credentials,
-                completed={},
-                awaiting_node=None,
-                approval_answer=None,
+        # A LEAF BLUEPRINT *IS* A ONE-NODE DAG. There is exactly one walker: the
+        # top-level `sql_template` is synthesized into a single `composes` node
+        # HERE and the run continues down `_execute_dag`, so the slot loop, the
+        # read-only gate, the bind, the dispatch, the D56 verify and the
+        # `result_full` builder exist ONCE (they were hand-copied before, and the
+        # copies drifted).
+        #
+        # Synthesized HERE, never in `Blueprint.parse`: `is_single_node` is read by
+        # `resume()`'s corrupt-checkpoint guard, by `_all_referenced_slots`'
+        # dead-top-level-template rule and by the learning plane, so the STORED
+        # shape must stay honest — only this execution's local copy is rewritten.
+        # The node is pause-INCAPABLE by construction: `node_kind` defaults to
+        # `query`, `when=None`, `requires_approval=None`, `consumes/output` empty,
+        # so no `when` gate, approval gate or scalar-output check can fire on it.
+        if blueprint.is_single_node:
+            blueprint = replace(
+                blueprint,
+                sql_template=None,
+                composes=(Node(order=0, sql_template=blueprint.sql_template),),
             )
-        template_sql = blueprint.sql_template
-        assert template_sql is not None  # is_single_node guarantees it
-
-        # S-read-only (defense-in-depth): the loader validated the template is a
-        # single read-only SELECT at WRITE, but a POISONED/legacy READ record was
-        # not — re-assert on the PRE-BIND template before we resolve, probe, or
-        # dispatch anything (matches the grain-probe path). A non-parsing template
-        # falls through to the bind step (→ SLOT_INVALID); a template that PARSES
-        # but is a DDL/DML/multi-statement construct fails soft to the raw loop
-        # (UNSUPPORTED), never dispatched.
-        try:
-            pre_bind_tree = parse_template(template_sql)
-        except TemplateBindError:
-            pre_bind_tree = None  # non-parsing → bind_template fail-closes to SLOT_INVALID
-        if pre_bind_tree is not None:
-            try:
-                assert_read_only_select(pre_bind_tree)
-            except TemplateBindError:
-                _logger.warning(
-                    "blueprint %s template is not a read-only SELECT; UNSUPPORTED", blueprint_id
-                )
-                return ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
-
-        self._observer("blueprint_step", {"blueprint_id": blueprint_id, "step": "resolving_slots"})
-
-        # 3. Resolve + bind slots. Provenance accumulates across EVERY inner
-        # dispatched runQuery (domain probes + node query + grain probe), §5.3.
-        referenced = referenced_slots(template_sql)
-        provenances: list[frozenset[tuple[str, str]] | None] = []
-        bound: dict[str, Any] = {}
-        # Slice C: an omitted optional slot's `optional_pattern` REPLACES the
-        # predicate carrying its `{token}` (never a value substitution). Collected
-        # here, applied in `bind_template` below.
-        optional_patterns: dict[str, str] = {}
-        for spec in blueprint.slots:
-            raw = slot_bindings.get(spec.name)
-            # n3: fire the DISTINCT domain probe only when the value is PRESENT — a
-            # missing required slot pauses on presence alone and must not waste a
-            # warehouse query. §5.3 (B2 fix): when a probe DID run, its provenance
-            # is appended UNCONDITIONALLY (even `None`) so a successful probe with
-            # undetermined provenance POISONS the union — the same fail-closed rule
-            # as the node/grain queries. A skipped/denied probe read nothing → adds
-            # nothing.
-            if _is_present(raw) and spec.binds_to:
-                domain, probe_entries = await self._probe_domain(spec.binds_to, credentials)
-                provenances.extend(probe_entries)
-            else:
-                domain = None
-            outcome = resolve_slot(raw, spec, domain=domain)
-            if isinstance(outcome, AskUser):
-                # A required slot missing / ambiguous value → PAUSE, before any
-                # node runs (§2.2 step 2 / §2.5). Raw slot_bindings persist for a
-                # deterministic re-fill on resume (server-side only, not telemetry).
-                return ExecPaused(
-                    reason="blueprint_slot",
-                    pending_question={"question": outcome.question, "options": outcome.options},
-                    blueprint_id=blueprint_id,
-                    slot_bindings_json=_dumps(slot_bindings),
-                )
-            if isinstance(outcome, OmitSlot):
-                # Slice C: an absent optional slot with an `optional_pattern` → apply
-                # it to EVERY referenced `{token}` of the slot (a `period_range`
-                # occupies `{name}_start`/`{name}_end`, so key by `slot_token_names`,
-                # not the bare name — a `date >= {w_start} AND date < {w_end}` range
-                # omitted becomes `TRUE AND TRUE`). With NO pattern (or an
-                # unreferenced token) the `{token}` stays unbound → `bind_template`
-                # fails closed to SLOT_INVALID → raw loop (the correct safe default).
-                if outcome.optional_pattern is not None:
-                    for token in slot_token_names(spec):
-                        if token in referenced:
-                            optional_patterns[token] = outcome.optional_pattern
-                continue
-            if isinstance(outcome, SlotBinding):
-                # B3: a resolved value whose `{slot}` token(s) the template does not
-                # reference must NEVER be silently dropped — dropping it would run
-                # the query WITHOUT the user's intended filter and return
-                # company-wide numbers that still pass the grain gate (the exact
-                # wrong-answer class D56 exists to block). Fail-closed to
-                # SLOT_INVALID → raw loop. (The loader also rejects this at write;
-                # this is the READ-side backstop for a poisoned/legacy record.)
-                # `slot_token_names` centralizes the rule: for a scalar slot
-                # `tokens={name}` (identical to the old `name not in referenced`);
-                # for a `period_range` BOTH `{name}_start` AND `{name}_end` must be
-                # referenced or a dropped bound = a dropped filter (D56 class).
-                tokens = slot_token_names(spec)
-                if tokens - referenced:
-                    _logger.warning(
-                        "blueprint %s: resolved slot %r token(s) %s not referenced by the "
-                        "template; SLOT_INVALID (never a silent filter drop)",
-                        blueprint_id,
-                        spec.name,
-                        sorted(tokens - referenced),
-                    )
-                    return ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
-                bound.update(expand_binding(spec, outcome.value))
-
-        # S1: the single-node path is the CANONICAL D67 case (a PAF `*_change_fields`
-        # rule filtering one query) — expand any `resolve_via` rule through the same
-        # typed `resolve()` hook and merge its IN-list binding, so a loader-valid
-        # single-node rule blueprint runs instead of dying SLOT_INVALID on the
-        # unbound `{codes}` placeholder. Degrade/empty/denied → raw loop (§3.4).
-        rule_bindings, rule_outcome = await self._expand_rules(
-            blueprint, slot_bindings, credentials, provenances
-        )
-        if rule_outcome is not None:
-            return rule_outcome
-        for binds_name, codes in rule_bindings.items():
-            if binds_name in referenced:
-                bound[binds_name] = codes
-
-        # 4. Bind the typed AST literals into the template (F1/D10). A bind
-        # failure (unbound {slot}, extra binding, unbindable value) is fail-closed.
-        try:
-            node_sql = bind_template(
-                template_sql, bound, optional_patterns=optional_patterns
-            )
-        except TemplateBindError:
-            _logger.warning("blueprint %s template bind failed", blueprint_id)
-            return ExecFailed(SLOT_INVALID_CODE, _SLOT_INVALID_MESSAGE, retryable=True)
-
-        self._observer("blueprint_step", {"blueprint_id": blueprint_id, "step": "executing"})
-
-        # 5. Dispatch the node query through the runQuery choke point (D57/D64/D5).
-        # `emit_progress=False`: a blueprint is ONE call from the user's side, so its
-        # internal runQuery must not paint a "running runQuery…" line on the UI
-        # progress stream (that stream is what the user reads; the internal step
-        # structure — and the fact that it is SQL over internal tables — is not
-        # theirs to see). Spans, scope enforcement and control flow are unchanged.
-        node = await self._tool_dispatcher.dispatch(
-            "runQuery",
-            {"sql": node_sql, "limit": self._query_limit},
-            credentials,
-            emit_progress=False,
-        )
-        if node.status != "ok":
-            # Inner denial/error passes through verbatim (§5.4) — the tool relabels
-            # tool_name="runBlueprint"; never bypassed.
-            return ExecFailed(
-                error_code=node.error_code or UNSUPPORTED_CODE,
-                user_message=node.user_message or _UNSUPPORTED_MESSAGE,
-                retryable=bool(node.retryable),
-                provenance=node.provenance,
-            )
-        provenances.append(node.provenance)
-
-        # 6. D56 verify gate — the grain-integrity probe (§4.2) + signature check.
-        self._observer("blueprint_step", {"blueprint_id": blueprint_id, "step": "verifying"})
-        verify_out = await self._verify(
+        return await self._execute_dag(
             blueprint=blueprint,
-            template_sql=template_sql,
-            node_sql=node_sql,
-            node_result=node.result_full,
+            slot_bindings=slot_bindings,
             credentials=credentials,
-            provenances=provenances,
-        )
-        if verify_out is None:
-            # A grain probe was DENIED/errored — fail-closed, do not return.
-            return ExecFailed(VERIFY_FAILED_CODE, _VERIFY_FAILED_MESSAGE, retryable=True)
-        if not verify_out.passed:
-            # D56 "no unverified return": block + route to the raw loop (§4.4).
-            _logger.info(
-                "blueprint %s verify FAILED (%s); falling back to raw loop",
-                blueprint_id,
-                verify_out.reason,
-            )
-            return ExecFailed(VERIFY_FAILED_CODE, _VERIFY_FAILED_MESSAGE, retryable=True)
-
-        # 7. Build the verified result (§5.2) + the union provenance (fail-closed).
-        columns, rows, row_count, truncated = _unpack_result(node.result_full)
-        result_full: dict[str, Any] = {
-            "blueprint_id": blueprint_id,
-            "status": "verified",
-            "columns": columns,
-            "row_count": row_count,
-            "truncated": truncated,
-            "preview_rows": rows[: self._preview_row_count],
-            "sql": [node_sql],  # per-node SQL for transparency (D56 "SQL stays visible")
-            # The ONE query whose rows ARE this blueprint's answer. For a
-            # single-node blueprint that is trivially the node's SQL; the key exists
-            # so `answerWithTable(blueprint_id=…)` can resolve a designation to a
-            # concrete pageable query WITHOUT re-running the blueprint (see
-            # `composite/answer_with_table.py`). Kept separate from `sql` above,
-            # which is the full transparency list and is NOT ordered by terminality.
-            "terminal_sql": node_sql,
-            "verify": _verify_block(verify_out, row_count),
-        }
-        _stamp_window_anchor(result_full, blueprint)
-        preview = _build_preview(node.result_full, self._preview_row_count)
-        return ExecCompleted(
-            result_full=result_full,
-            preview=preview,
-            provenance=_union_provenance(provenances),
+            completed={},
+            awaiting_node=None,
+            approval_answer=None,
         )
 
     # -- Slice C: multi-node DAG + approval pause/resume + D67 -----------------
@@ -513,6 +345,37 @@ class BlueprintExecutor:
         topo = _topo_order(blueprint.composes)
         if topo is None:
             return ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+
+        # S-read-only (defense-in-depth): the loader validated every template is a
+        # single read-only SELECT at WRITE, but a POISONED/legacy READ record was
+        # not — re-assert on the PRE-BIND templates of EVERY node before anything
+        # resolves, probes, materializes or dispatches. A non-parsing template is
+        # NOT rejected here: it falls through to `bind_template`, which fail-closes
+        # to SLOT_INVALID (the pinned posture). A template that PARSES but is a
+        # DDL/DML/multi-statement construct fails soft to the raw loop
+        # (UNSUPPORTED), never dispatched.
+        #
+        # ORDER MATTERS: after `_topo_order` (a cyclic/dangling DAG is UNSUPPORTED
+        # on its shape first) and strictly BEFORE `_resolve_all_slots` — a poisoned
+        # template carrying a `binds_to` slot must never fire a DISTINCT domain
+        # probe against the warehouse on its way to being rejected.
+        for node in topo:
+            if not node.sql_template:
+                continue
+            try:
+                pre_bind_tree = parse_template(node.sql_template)
+            except TemplateBindError:
+                continue  # non-parsing → bind_template fail-closes to SLOT_INVALID
+            try:
+                assert_read_only_select(pre_bind_tree)
+            except TemplateBindError:
+                _logger.warning(
+                    "blueprint %s node %s template is not a read-only SELECT; UNSUPPORTED",
+                    bid,
+                    node.order,
+                )
+                return ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+
         table_consumed_orders = _table_consumed_orders(blueprint.composes)
         if table_consumed_orders and self._scratch_client is None:
             _logger.info(
@@ -680,6 +543,12 @@ class BlueprintExecutor:
                 node, bound_slots, rule_bindings, node_outputs, omitted_patterns
             )
             if bind_fail is not None:
+                _logger.warning(
+                    "blueprint %s node %s has referenced token(s) with no binding; "
+                    "SLOT_INVALID",
+                    bid,
+                    node.order,
+                )
                 return bind_fail
             # Table consumes: rewrite each `scratch.<placeholder>` FROM/JOIN token to
             # the runtime-controlled materialized scratch table (§2.2 step 3). An
@@ -706,7 +575,7 @@ class BlueprintExecutor:
                 "runQuery",
                 {"sql": node_sql, "limit": self._query_limit},
                 credentials,
-                emit_progress=False,  # internal DAG node — see `_execute_single`
+                emit_progress=False,  # internal blueprint query — see the emit_progress note at the top of this module
             )
             if result.status != "ok":
                 return ExecFailed(
@@ -934,7 +803,10 @@ class BlueprintExecutor:
             # The TERMINAL node's SQL — the one whose rows are the blueprint's
             # answer. Exposed explicitly rather than left as "the last element of
             # `sql`": rehydrated nodes (D45 exactly-once resume) are appended to
-            # `node_sqls` FIRST, so that positional assumption is not safe.
+            # `node_sqls` FIRST, so that positional assumption is not safe. It is
+            # what lets `answerWithTable(blueprint_id=…)` resolve a designation to
+            # a concrete pageable query WITHOUT re-running the blueprint (see
+            # `composite/answer_with_table.py`).
             "terminal_sql": terminal_sql,
             "verify": _verify_block(verify_out, row_count),
         }
@@ -1004,7 +876,7 @@ class BlueprintExecutor:
             "runQuery",
             {"sql": probe_sql, "limit": None},
             credentials,
-            emit_progress=False,  # internal domain probe — see `_execute_single`
+            emit_progress=False,  # internal blueprint query — see the emit_progress note at the top of this module
         )
         if probe.status != "ok":
             return None, []  # a denied/errored probe read nothing → contributes nothing
@@ -1129,7 +1001,7 @@ class BlueprintExecutor:
             "runQuery",
             {"sql": probe_sql, "limit": None},
             credentials,
-            emit_progress=False,  # internal grain probe — see `_execute_single`
+            emit_progress=False,  # internal blueprint query — see the emit_progress note at the top of this module
         )
         if probe.status != "ok":
             return None  # a denied/errored grain probe → fail-closed at the caller

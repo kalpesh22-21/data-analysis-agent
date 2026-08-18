@@ -166,3 +166,8 @@ helpers) → **T5.5 single `finish()`** (7 `TurnOutcome` sites) →
 | C5 two-tier schema previews + I1 answer scrub (+I2 decided: transparency kept) | done, live-verified incl. Phoenix payload proofs | #19 |
 | Demo harness snake-case + learning loop live-proven | done; flywheel PART C trust-gated by design (M4) | #20 |
 | C5b five-point spec + getTableSchema columns: argument | done, full-loop verified (agent + learning) | #21 |
+| Hygiene wave (J7c/L1/L2/B5/A2/C3 + docs alignment) | done, two commits, reviewed | #22 |
+| Docstring trim (−6,670 lines, contracts kept) | done, AST-proven docstring-only | #23 |
+| **Wave B: T4.2 executor collapse** | done — equivalence-audited, cross-binary resume proven | #24 |
+| Wave B: T4.4 span envelope | next | — |
+| Wave B: T4.1 compiler extraction | queued | — |

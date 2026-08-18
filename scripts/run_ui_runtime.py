@@ -359,6 +359,21 @@ class DemoModelClient:
         if not user_messages:
             return ModelTurnResult(assistant_text="I didn't receive a message to respond to.")
 
+        # The live assembly splices anchor/retrieval/state blocks as user-role
+        # messages BEFORE the question, so "the first user message" is no longer
+        # the question. Route on the first user message that is not one of those
+        # runtime-authored inserts (they all start with a recognizable prefix);
+        # fall back to the last user message (the question is the tail pin).
+        _runtime_inserts = ("today's date is", "[retrieved context", "[analysis state")
+        _question_messages = [
+            m for m in user_messages
+            if not str(m.get("content") or "").lower().startswith(_runtime_inserts)
+        ]
+        # The QUESTION list is what every branch below means by "user messages":
+        # turn-count heuristics (len==1 vs >=2) and last-message reads must not
+        # count the runtime-authored inserts.
+        if _question_messages:
+            user_messages = _question_messages
         first_user_text = str(user_messages[0].get("content") or "")
         first_lower = first_user_text.lower()
 

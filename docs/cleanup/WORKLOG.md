@@ -850,3 +850,39 @@ baseline (6019/225/1) in all three worktrees and after the merge; ruff
 clean. Incidental accuracy fixes: two stale scope claims deleted
 (retrieval/__init__, reranker "NOT WIRED YET"), one dead file pointer
 dropped, the generalize package's pre-keep-and-annotate claim corrected.
+
+## #24 — T4.2: executor leaf path collapsed into the DAG path (2026-08-18)
+
+- 193-line leaf body deleted; single-node blueprints synthesize a 1-node
+  DAG at execute-time (never in Blueprint.parse — the stored shape stays
+  honest for resume()'s guard, _all_referenced_slots and the learning
+  plane) and delegate to _execute_dag. executor.py −134 net. The ~90
+  existing single-path tests passed UNCHANGED — the equivalence proof —
+  plus 2 new (the gate-ordering trap with a binds_to slot; sql ==
+  [terminal_sql]). Review: APPROVE after an adversarial arm-by-arm
+  equivalence audit; fold: the silenced SLOT_INVALID warning restored.
+- Declared behaviour deltas (all approved-by-record): (1) single-node step
+  event `executing` → `executing_node`/0 — UI- and span-invisible;
+  (2) **the pre-bind read-only gate now covers DAG node templates** —
+  strictly safer; closes the hole where a poisoned DDL node reached
+  dispatch and died as RUN_BLUEPRINT_INTERNAL_ERROR via an uncaught
+  TemplateBindError from the grain-probe assert (reviewer independently
+  confirmed the unguarded raise path); (3) verify-fail log variant.
+  Precedence note (review nit): the rule/slot name-collision flip is
+  write-time-guarded (corpus_loader rejects the shape), reachable only for
+  poisoned records, and fail-safe in both orders.
+- **Cross-binary persistence probe PASSED** (the risk V0/V1 cannot touch):
+  a mid-DAG approval checkpoint produced by the PRE-collapse binary
+  (upstream node run, awaiting_node=1, completed_nodes_json persisted)
+  resumed on the COLLAPSED binary — verified result, sql len 2, upstream
+  NOT re-run, grain pass, provenance determined.
+- **Incidental find + fix: the fake-launcher trigger routing has been dead
+  since the 08-13 date-anchor injection** — assembly splices anchor/
+  retrieval/state as user-role messages before the question, so
+  DemoModelClient's first-user-message matching hit the anchor and every
+  turn fell through to the fallback (live-proven: bare "ask" fell
+  through). Fixed by filtering the runtime-authored inserts before
+  routing and turn-count heuristics; 56 demo-suite tests green (they
+  drive the loop pre-assembly, which is why CI never saw it).
+- V0 **6021 passed / 225 skipped / 1 xfailed**; V1 8 cases at/above
+  baseline (L3 its accepted 1/3); ruff clean.
