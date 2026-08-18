@@ -161,3 +161,8 @@ helpers) → **T5.5 single `finish()`** (7 `TurnOutcome` sites) →
 | Tier 5 loop decomposition | **COMPLETE** — T5.1–T5.6 all reviewed, V0+V1+V2 green | #8–#13 |
 | G1/G2 L5 robustness slice | built+contained in worktree, unlanded; optional post-5.5 | — |
 | Issues stack | committed to docs/cleanup/ISSUES.md (source of truth going forward) | — |
+| Issue-triage wave 1 (H4+H7, E1/E2+M2, J3b+J1, H1+H2) | done — all reviewed, e2e-verified on the real DB | #14–#17 |
+| Rewrite-fragility family (H3/H5/H6) → role:rule keep-and-annotate | done (user decision 2026-08-18); cross-tier keys converge | #18 |
+| C5 two-tier schema previews + I1 answer scrub (+I2 decided: transparency kept) | done, live-verified incl. Phoenix payload proofs | #19 |
+| Demo harness snake-case + learning loop live-proven | done; flywheel PART C trust-gated by design (M4) | #20 |
+| C5b five-point spec + getTableSchema columns: argument | done, full-loop verified (agent + learning) | #21 |

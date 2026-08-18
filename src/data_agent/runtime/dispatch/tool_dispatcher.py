@@ -190,6 +190,18 @@ class ToolResult:
 # it here would have made a THIRD copy of the same four characters-per-token rule.
 _DEFAULT_MAX_TOOL_RESULT_TOKENS = 4_000
 
+# Default budget for a getTableSchema result's COLUMNS SECTION ALONE
+# (RuntimeSettings.schema_columns_token_budget overrides it). Deliberately NOT the
+# generic cap above (ISSUES C5b): a schema's table-level sections — rules,
+# ambiguities, join_keys, grain — ride COMPLETE and unbudgeted, because they are
+# the semantics the prompt tells the model to read, and the column list gets its
+# own, larger allowance. At 6,000 the real `dbpcm_warehouse.employee` schema (130
+# columns) shows ~90% of its columns with full documentation instead of the ~28%
+# a shared 4,000-token cap left room for. Every OTHER tool result — the blueprint
+# cards, the generic stringify branch — is still bounded by
+# `max_tool_result_tokens`.
+_DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET = 6_000
+
 
 def _cap_list_under_key(
     raw_result: dict[str, Any], key: str, max_result_tokens: int
@@ -233,22 +245,35 @@ def _cap_nontabular_result(
     observer: ToolObserver = _default_observer,
     tool_name: str | None = None,
     question: str | None = None,
+    schema_columns_token_budget: int = _DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET,
 ) -> tuple[Any, bool]:
     """Bound a non-tabular tool result stored as ONE preview cell (esp. a wide
     `getTableSchema`) so it can never be a 30k-token blob that survives the
     row-count-only trail budget. Returns `(capped_value, truncated)`.
 
     Truncation keeps the output VALID + parseable (never a broken JSON blob):
-      * a `{... "columns": [...]}` dict (getTableSchema) is fitted by
-        `schema_preview.fit_schema_under_cap`, which keeps EVERY column present
-        (name + type at worst) and degrades per-column DETAIL instead of dropping
-        columns wholesale — see that module for why the old head-cut was, in
-        effect, a silent truncation (ISSUES C5). *question*, when the caller has
-        one, only ORDERS which columns keep their detail (D25);
+      * a `{... "columns": [...]}` dict (getTableSchema) ALWAYS goes through
+        `schema_preview.fit_schema_under_cap` — see the SCHEMA BRANCH note below;
       * a `{... "blueprints": [...]}` dict (`searchBlueprints`) keeps the HEAD of
-        the CARD list the same way — see below;
+        the CARD list — see below;
       * any other over-cap value is rendered to a string and truncated at the cap
         with a `…[truncated: N of M chars omitted]` marker (a valid string cell).
+
+    THE SCHEMA BRANCH RUNS FIRST AND UNCONDITIONALLY (ISSUES C5b). It is the only
+    branch that is not a size cap: it also strips the PRE-APPLIED TENANCY COLUMNS
+    (`client_code` / proc-center), which are not the model's to filter on at any
+    size, so a small schema must go through it too. It then fits the COLUMNS
+    SECTION ALONE under *schema_columns_token_budget* — the table-level sections
+    (rules, ambiguities, join_keys, …) ride complete and unbudgeted — and returns
+    `truncated=` whether anything was actually withheld. A schema whose columns fit
+    is returned COMPACTED-STABLE rather than byte-identical: the tenancy columns
+    and the information-free keys (`"unit": null`) come off on every path by the
+    user spec, and the keys that survive keep their order and values. *question*,
+    when the caller has one, only ORDERS the columns (D25).
+
+    Only `getTableSchema` reaches that branch: `_build_preview` has already routed
+    every `{columns, rows}` tabular result and every bare list elsewhere, and no
+    other non-tabular tool result carries a top-level `columns` list (design §0).
 
     The card branch exists because release-1 §02 ENRICHED the search card (slots,
     pinned resolutions, result grain) and made per-deliverable `searchBlueprints`
@@ -261,26 +286,40 @@ def _cap_nontabular_result(
     from the tail degrades a ranked list the way a ranked list should degrade; the
     marker and the observer event below make it visible rather than silent.
 
-    Under the cap the value is returned unchanged (`truncated=False`) — byte-
-    identical to before this cap existed for every normal-sized schema/result.
+    Under the cap a non-schema value is returned unchanged (`truncated=False`) —
+    byte-identical to before this cap existed.
     """
-    rendered = json.dumps(raw_result, default=str)
-    if _estimate_tokens(rendered) <= max_result_tokens:
-        return raw_result, False
-
     if isinstance(raw_result, dict) and isinstance(raw_result.get("columns"), list):
         fitted, report = fit_schema_under_cap(
-            raw_result, max_result_tokens, question=question
+            raw_result, schema_columns_token_budget, question=question
         )
-        # GATED ON `marker_added`, i.e. on "the fit was lossy AT ALL" — the same
-        # condition that puts the `_truncated` marker in front of the model. The
-        # earlier `reduced_count or omitted_columns` gate asked only about COLUMNS,
-        # so a schema that fit by dropping BASE SECTIONS instead (an enormous
-        # `rules`/`ambiguities` beside a handful of small documented columns, which
-        # is a real shape) told the model its table-level semantics were withheld
-        # and told the operator NOTHING — no event, no log line. `marker_added` is
-        # the report's own answer to "was anything withheld", so the two channels
-        # can no longer disagree.
+        # THE TENANCY STRIP HAS ITS OWN CHANNEL, ungated by the budget. It is not a
+        # degrade — those columns are pre-applied by the platform and are absent
+        # from every schema the four RLS tables already emit — so the model is told
+        # nothing (§0) and this is INFO, not a warning. But it happens on every
+        # path, including the under-budget one, and until this event existed the
+        # count only ever reached an operator when the SAME result also blew its
+        # columns budget: a small schema could have `client_code` silently removed
+        # with no record anywhere. The count is the whole payload (D25) — no column
+        # name, no schema text, no question.
+        if report.tenancy_hidden_count:
+            observer(
+                "tool_dispatch_tenancy_columns_hidden",
+                {
+                    "tool_name": tool_name,
+                    "tenancy_hidden_count": report.tenancy_hidden_count,
+                },
+            )
+            _logger.info(
+                "Hid %d pre-applied tenancy column(s) from the %r result shown to "
+                "the model — they are bound by the row policy, not by the model",
+                report.tenancy_hidden_count,
+                tool_name,
+            )
+        # GATED ON `marker_added`, i.e. on "the model was told something was
+        # withheld" — a COLUMN-BUDGET degrade and nothing else. The tenancy count
+        # rides along on this payload as context for the degrade; the event above
+        # is what reports the strip itself.
         if report.marker_added:
             # Same degrade-not-fail posture as the card branch below: the model is
             # told by the in-fit marker, the operator by this event + the log.
@@ -289,30 +328,37 @@ def _cap_nontabular_result(
             # forwarded to Phoenix (see the standing note in the card branch below);
             # it is consumed by the SSE progress observer, the log, and any
             # `create_app(extra_observers=…)` sink.
+            #
+            # `base_dropped_count` WAS here and is GONE (C5b): base sections can no
+            # longer be dropped at all, so the field could only ever report 0. It
+            # was never in `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST` (this event family
+            # does not reach Phoenix), so nothing outside this call site changes.
             observer(
                 "tool_dispatch_schema_detail_dropped",
                 {
                     "tool_name": tool_name,
                     "detailed_count": report.detailed_count,
                     "total_count": report.total_columns,
-                    "base_dropped_count": report.base_dropped_count,
+                    "tenancy_hidden_count": report.tenancy_hidden_count,
                 },
             )
-            # Every count is emitted unconditionally, including the zeros: a
-            # base-only degrade reads "reduced 0 of 4 columns … 2 table-level
-            # sections dropped", which is the whole truth about that fit.
+            # Every count is emitted unconditionally, including the zeros.
             _logger.warning(
-                "Preview cap reduced %d of %d columns of %r to name+type (and omitted "
-                "%d entirely, %d table-level sections dropped; cap=%d tokens) — raise "
-                "RuntimeSettings.max_tool_result_tokens to show more",
+                "Columns budget reduced %d of %d columns of %r to name+type (and "
+                "omitted %d entirely, %d tenancy columns hidden; budget=%d tokens) — "
+                "raise RuntimeSettings.schema_columns_token_budget to show more",
                 report.reduced_count,
                 report.total_columns,
                 tool_name,
                 report.omitted_columns,
-                report.base_dropped_count,
-                max_result_tokens,
+                report.tenancy_hidden_count,
+                schema_columns_token_budget,
             )
-        return fitted, True
+        return fitted, report.marker_added
+
+    rendered = json.dumps(raw_result, default=str)
+    if _estimate_tokens(rendered) <= max_result_tokens:
+        return raw_result, False
 
     if isinstance(raw_result, dict) and isinstance(raw_result.get("blueprints"), list):
         capped, kept_count, total_cards = _cap_list_under_key(
@@ -397,6 +443,7 @@ def _build_preview(
     observer: ToolObserver = _default_observer,
     tool_name: str | None = None,
     question: str | None = None,
+    schema_columns_token_budget: int = _DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET,
 ) -> ResultPreview:
     """Build the `{columns, row_count, truncated, preview_rows}` preview object.
 
@@ -406,9 +453,12 @@ def _build_preview(
       - a bare list of dicts (listDatabases/listTables)
       - a small non-tabular dict (getTableSchema: `{database, table, columns}`)
     The row/list shapes enforce the N-row preview cap. The non-tabular dict is
-    additionally SIZE-capped to `max_result_tokens` (a wide getTableSchema with
-    100+ columns is otherwise stored as one unbounded ~30k-token cell that the
-    row-count-only trail budget never trims) — see `_cap_nontabular_result`.
+    additionally SIZE-capped to `max_result_tokens` (a large non-tabular result is
+    otherwise stored as one unbounded ~30k-token cell that the row-count-only
+    trail budget never trims) — except a getTableSchema, whose COLUMNS SECTION is
+    budgeted separately by `schema_columns_token_budget` while its table-level
+    sections ride complete, and which is reshaped on EVERY path so the pre-applied
+    tenancy columns never reach the model. See `_cap_nontabular_result`.
 
     *observer*/*tool_name* are used ONLY to report a size-cap degrade (the
     blueprint-card drop, the schema-detail drop) and default to the no-op
@@ -442,6 +492,7 @@ def _build_preview(
         observer=observer,
         tool_name=tool_name,
         question=question,
+        schema_columns_token_budget=schema_columns_token_budget,
     )
     return ResultPreview(columns=[], row_count=1, truncated=truncated, preview_rows=[[capped]])
 
@@ -456,6 +507,7 @@ class ToolDispatcher:
         *,
         preview_row_count: int = 20,
         max_tool_result_tokens: int = _DEFAULT_MAX_TOOL_RESULT_TOKENS,
+        schema_columns_token_budget: int = _DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET,
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
         disable_redaction: bool = False,
@@ -472,6 +524,10 @@ class ToolDispatcher:
         # (esp. a wide getTableSchema) so it cannot balloon the trail. See
         # `_cap_nontabular_result`.
         self._max_tool_result_tokens = max_tool_result_tokens
+        # Budget (tokens) for a getTableSchema result's COLUMNS SECTION alone
+        # (C5b). Separate from the cap above because a schema's table-level
+        # sections ride complete: see `_DEFAULT_SCHEMA_COLUMNS_TOKEN_BUDGET`.
+        self._schema_columns_token_budget = schema_columns_token_budget
         self._observer = observer
         # B5: optional — when a real tracer is wired (app.py's composition
         # root), dispatch() emits one TOOL span per call, SQL-literal-masked
@@ -687,6 +743,7 @@ class ToolDispatcher:
             observer=self._observer,
             tool_name=tool_name,
             question=question,
+            schema_columns_token_budget=self._schema_columns_token_budget,
         )
 
         emit("tool_dispatch_ok", {"tool_name": tool_name})

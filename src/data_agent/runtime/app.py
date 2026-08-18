@@ -534,6 +534,10 @@ def create_app(
             # Per-result preview size cap (2026-08 fix): bounds a single stored tool
             # result (esp. a wide getTableSchema) so the trail cannot balloon.
             max_tool_result_tokens=settings.max_tool_result_tokens,
+            # Columns-only budget for a getTableSchema preview (C5b). Separate from
+            # the cap above: a schema's table-level sections ride complete, and its
+            # column list gets a larger allowance than a generic tool result.
+            schema_columns_token_budget=settings.schema_columns_token_budget,
             observer=observer,
             tracer=tracer,
             # Access-controlled TELEMETRY DEBUG switch: when set, the TOOL span

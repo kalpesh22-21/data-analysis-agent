@@ -240,7 +240,25 @@ class RuntimeSettings(BaseSettings):
             "call. A large non-tabular result (notably a wide getTableSchema with 100+ "
             "columns) is truncated to this cap with a clear marker rather than stored as "
             "one unbounded ~30k-token blob that survives the row-count-only trail budget. "
-            "See dispatch/tool_dispatcher.py::_build_preview."
+            "Applies to every tool result EXCEPT a getTableSchema's column list, which "
+            "has its own budget below. See dispatch/tool_dispatcher.py::_build_preview."
+        ),
+    )
+    schema_columns_token_budget: int = Field(
+        6_000,
+        gt=0,
+        description=(
+            "SCHEMA_COLUMNS_TOKEN_BUDGET — budget (approx tokens) for the COLUMNS SECTION "
+            "of a getTableSchema preview, and for that alone. A schema's table-level "
+            "sections (description, grain, temporal, primary_key, join_keys, measures, "
+            "rules, ambiguities) ride COMPLETE and are never budgeted: they are the "
+            "semantics the system prompt tells the model to read, so trading them away "
+            "for column detail buys width with correctness. Deliberately larger than "
+            "`max_tool_result_tokens` — at 6,000 the real 130-column "
+            "dbpcm_warehouse.employee schema shows ~90% of its columns with their full "
+            "documentation; column NAMES are never dropped above ~2,000. Raise it to "
+            "show more detail, at ~1 token per 4 characters of the model's request "
+            "budget per schema in the trail. See dispatch/schema_preview.py."
         ),
     )
 

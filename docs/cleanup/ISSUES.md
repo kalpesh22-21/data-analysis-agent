@@ -142,6 +142,15 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 ## M. Tier-5 follow-ups (2026-08-17 — queued, not gating)
 
+**M4 — flywheel demo PART C predates the governed-corpus trust gate (2026-08-18).**
+`demo_flywheel_inbox_e2e.py` PART C claims a just-landed learning blueprint
+autoplays; recall serves `source='mcp'` ONLY (vector_index.py trust gate,
+governed-corpus Phase 2), so an inbox-approved blueprint sits in Neo4j
+staging until PROMOTED to canon. Verified live 2026-08-18: the landed
+candidate ranks #1 in the raw vector index for the variant question and is
+correctly filtered by the trust gate. Update the demo to narrate the
+promotion hop or state the staging boundary honestly.
+
 **M1 — FIXED in T5.5 (WORKLOG #12): per-tool-call envelope rebuild feeds a branch that almost never fires.**
 `agent_loop._run_loop_body` computes the answer envelope (a
 `rollup_verification` + N `table.to_doc()` calls) unconditionally for EVERY

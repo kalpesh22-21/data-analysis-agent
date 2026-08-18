@@ -197,7 +197,9 @@ AGENT_SYSTEM_PROMPT = (
     "notes getTableSchema returns; they tell you which column to use. On a "
     "wide table the schema is two-tier: a column listed with only a name and "
     "type HAS documentation you were not shown — never infer what it means, "
-    "contains or is denominated in from its name; ask instead. Once "
+    "contains or is denominated in from its name: call getTableSchema again for "
+    "that table with `columns` set to the names you need, and it returns their "
+    "full documentation. Once "
     'the catalog resolves a term ("annual salary" -> '
     "employee.AnnualSalary), commit to that table and column instead of "
     "re-checking others.\n"

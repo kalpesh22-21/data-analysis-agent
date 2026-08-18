@@ -123,14 +123,15 @@ async def test_preview_truncates_to_preview_row_count() -> None:
 
 async def test_wide_get_table_schema_is_size_capped_with_a_marker() -> None:
     """A wide getTableSchema (100+ columns) must NOT be stored as one unbounded
-    ~30k-token preview cell — it is size-capped to `max_tool_result_tokens` and the
-    stored preview stays a VALID, parseable dict.
+    ~30k-token preview cell — its COLUMN LIST is fitted under
+    `schema_columns_token_budget` and the stored preview stays a VALID, parseable
+    dict.
 
-    REWRITTEN for the two-tier fit (ISSUES C5). The cap used to keep the HEAD of
-    the column list and drop every other column INCLUDING ITS NAME, which is how
-    `employee.annual_salary` (index ~87 of 124) became invisible to the model. Now
-    EVERY column is present — at worst as `{name, type}` — and it is per-column
-    DETAIL that degrades. The policy itself is pinned in
+    REWRITTEN TWICE. C5 replaced the head-cut that dropped every column past the
+    cut INCLUDING ITS NAME (how `employee.annual_salary` became invisible). C5b
+    moved the budget onto the COLUMNS SECTION ALONE, made the emitted order
+    GROUPED (detailed group first, skeleton remainder in original order) and made
+    the tenancy strip unconditional. The policy itself is pinned in
     `tests/runtime/dispatch/test_schema_preview.py`; this test pins the
     DISPATCHER's end of it: the fitted dict is what lands in the preview cell, the
     marker rides inside the fit, and `result_full` is untouched."""
@@ -143,10 +144,11 @@ async def test_wide_get_table_schema_is_size_capped_with_a_marker() -> None:
         ],
     }
     mcp_client = FakeMCPClient(scripted={"getTableSchema": [wide_schema]})
-    # 6,000 tokens holds all 400 NAMES (~4,000) with room for some detail; the
-    # 500-token cap this test used to run at cannot hold the names at all (that
-    # floor is covered in test_schema_preview.py).
-    dispatcher = ToolDispatcher(mcp_client, CATALOG, max_tool_result_tokens=6_000)
+    # 6,000 tokens holds all 400 NAMES (~4,000) with room for some detail. The
+    # generic `max_tool_result_tokens` is deliberately LEFT AT ITS DEFAULT here:
+    # it no longer governs this branch at all, and the assertions below would fail
+    # if it did.
+    dispatcher = ToolDispatcher(mcp_client, CATALOG, schema_columns_token_budget=6_000)
 
     result = await dispatcher.dispatch(
         "getTableSchema", {"database": "dbpcm_warehouse", "table": "employee"}, _credentials()
@@ -160,27 +162,37 @@ async def test_wide_get_table_schema_is_size_capped_with_a_marker() -> None:
     assert isinstance(capped, dict)
     assert capped["database"] == "dbpcm_warehouse"
     assert capped["table"] == "employee"
-    # EXISTENCE SURVIVES: all 400 columns are named, in order.
-    assert [c["name"] for c in capped["columns"]] == [f"Column_{i}" for i in range(400)]
-    # DETAIL DEGRADES: a head of them keeps the comment, the rest are name/type.
+    # EXISTENCE SURVIVES: all 400 columns are present.
+    names = [c["name"] for c in capped["columns"]]
+    assert sorted(names) == sorted(f"Column_{i}" for i in range(400))
+    # DETAIL DEGRADES, AND THE DETAILED ONES LEAD: with no question the ranking is
+    # list order, so the detailed group is the head of the list and the skeleton
+    # remainder follows in the table's own order.
     detailed = [c["name"] for c in capped["columns"] if set(c) - {"name", "type"}]
     assert detailed
     assert len(detailed) < 400
+    assert names[: len(detailed)] == detailed
     assert detailed[0] == "Column_0"
     assert capped["columns"][-1] == {"name": "Column_399", "type": "String"}
     # The marker says what was withheld and promises nothing unfollowable.
     assert "_truncated" in capped
     assert "400 of 400 columns are listed" in capped["_truncated"]
     assert "name and type ONLY" in capped["_truncated"]
+    # NO question was passed, so the marker must not claim relevance ordering —
+    # the leading columns here are the table's own, not the request's.
+    assert "relevance" not in capped["_truncated"].lower()
+    assert "NOT listed in the table's physical column order" in capped["_truncated"]
     assert "re-fetch" not in capped["_truncated"]
-    # Actually bounded — and now MARKER-INCLUSIVE, so the TIGHT bound holds: the
-    # marker is part of every trial render, not appended after the fit was
-    # measured. (The old `<= 6_000 * 2` slack bound that sat here is subsumed by
-    # this one and asserted nothing a passing tight bound does not already.)
-    assert len(json.dumps(capped)) // 4 <= 6_000
+    # The withheld documentation has a RECOVERY, not a dead end (2026-08-18).
+    assert 'columns: ["<name>", ...]' in capped["_truncated"]
+    # Actually bounded — the COLUMNS SECTION plus the marker, which is what the
+    # budget governs, and marker-INCLUSIVE (the marker is part of every trial
+    # render, not appended after the fit was measured).
+    budgeted = json.dumps(capped["columns"]) + capped["_truncated"]
+    assert len(budgeted) // 4 <= 6_000
 
     # The FULL, un-capped result is still returned on result_full for the caller
-    # (the preview cap bounds only the model-facing stored preview).
+    # (the preview budget bounds only the model-facing stored preview).
     assert len(result.result_full["columns"]) == 400
     assert result.result_full["columns"][399] == {
         "name": "Column_399",
@@ -189,16 +201,131 @@ async def test_wide_get_table_schema_is_size_capped_with_a_marker() -> None:
     }
 
 
+async def test_the_tenancy_columns_never_reach_the_stored_preview() -> None:
+    """C5b: `client_code` / `proc_center` are PRE-APPLIED by the platform (the row
+    policy binds them to the caller's token claims), so the model never filters on
+    them and must never be shown them. This schema is far UNDER any budget — the
+    path that used to return the raw result byte-identically — and they are still
+    gone, along with `hours`'s null `description` (user spec 2026-08-18 point 5:
+    the null-key strip is unconditional too). No marker either way: neither strip
+    withheld anything the model needed. `result_full` still carries the tenancy
+    columns for the runtime's own use.
+
+    The operator's channel for the strip is asserted in
+    `test_the_tenancy_strip_is_reported_even_when_nothing_was_truncated` below."""
+    schema = {
+        "database": "dbpcm_warehouse",
+        "table": "accrual_events",
+        "rules": ["client_code is applied server-side by the row policy."],
+        "columns": [
+            {"name": "client_code", "type": "String", "description": "Tenant key."},
+            {"name": "proc_center", "type": "String", "description": "Processing centre."},
+            {"name": "employee_code", "type": "String", "description": "Employee key."},
+            {"name": "hours", "type": "Float64", "description": None},
+        ],
+    }
+    mcp_client = FakeMCPClient(scripted={"getTableSchema": [json.loads(json.dumps(schema))]})
+    dispatcher = ToolDispatcher(mcp_client, CATALOG)
+
+    result = await dispatcher.dispatch(
+        "getTableSchema",
+        {"database": "dbpcm_warehouse", "table": "accrual_events"},
+        _credentials(),
+    )
+
+    stored = result.result_preview.preview_rows[0][0]
+    assert [c["name"] for c in stored["columns"]] == ["employee_code", "hours"]
+    # COMPACTED-STABLE: the documented column is verbatim, the null key is gone,
+    # no reordering, no marker, and `truncated` stays False.
+    assert stored["columns"] == [
+        {"name": "employee_code", "type": "String", "description": "Employee key."},
+        {"name": "hours", "type": "Float64"},
+    ]
+    assert "_truncated" not in stored
+    assert result.result_preview.truncated is False
+    # The base section that MENTIONS the tenant column rides complete: it explains
+    # why the model does not write that predicate.
+    assert stored["rules"] == schema["rules"]
+    # The un-capped result is untouched for the runtime's own consumers.
+    assert result.result_full["columns"] == schema["columns"]
+
+
+async def test_the_tenancy_strip_is_reported_even_when_nothing_was_truncated() -> None:
+    """SHOULD-FIX (2026-08-18): the tenancy count had ONE channel to the operator —
+    the `tool_dispatch_schema_detail_dropped` payload — and that event fires only
+    when the SAME result also blew its columns budget. So on a small schema, which
+    is every one of the seven catalogued tables that expose `client_code` as an
+    ordinary column, a column was removed from the model's view and nothing was
+    recorded anywhere. The strip now has its own ungated event.
+
+    Deliberately NOT a degrade signal: no marker is added, `truncated` stays False,
+    and the log line is INFO — the columns are pre-applied by the platform, so
+    removing them withholds nothing. It is an operator FACT, not a warning."""
+    schema = {
+        "database": "dbpcm_warehouse",
+        "table": "accrual_events",
+        "columns": [
+            {"name": "client_code", "type": "String", "description": "Tenant key."},
+            {"name": "employee_code", "type": "String", "description": "Employee key."},
+        ],
+    }
+    events: list[tuple[str, dict]] = []
+    mcp_client = FakeMCPClient(scripted={"getTableSchema": [json.loads(json.dumps(schema))]})
+    dispatcher = ToolDispatcher(mcp_client, CATALOG, observer=lambda e, p: events.append((e, p)))
+
+    result = await dispatcher.dispatch(
+        "getTableSchema",
+        {"database": "dbpcm_warehouse", "table": "accrual_events"},
+        _credentials(),
+    )
+
+    assert ("tool_dispatch_tenancy_columns_hidden", {
+        "tool_name": "getTableSchema",
+        "tenancy_hidden_count": 1,
+    }) in events
+    # EXACTLY this event — the budget never bound, so no degrade was reported.
+    assert [name for name, _ in events if name == "tool_dispatch_schema_detail_dropped"] == []
+    stored = result.result_preview.preview_rows[0][0]
+    assert "_truncated" not in stored
+    assert result.result_preview.truncated is False
+    assert [c["name"] for c in stored["columns"]] == ["employee_code"]
+
+
+async def test_no_tenancy_event_when_there_was_nothing_to_hide() -> None:
+    """The event is gated on `tenancy_hidden_count > 0` — a schema with no tenancy
+    column must not emit a zero-count event on every schema fetch."""
+    schema = {
+        "database": "dbpcm_warehouse",
+        "table": "employee",
+        "columns": [{"name": "employee_code", "type": "String", "description": "Key."}],
+    }
+    events: list[tuple[str, dict]] = []
+    mcp_client = FakeMCPClient(scripted={"getTableSchema": [json.loads(json.dumps(schema))]})
+    dispatcher = ToolDispatcher(mcp_client, CATALOG, observer=lambda e, p: events.append((e, p)))
+
+    await dispatcher.dispatch(
+        "getTableSchema", {"database": "dbpcm_warehouse", "table": "employee"}, _credentials()
+    )
+
+    assert [name for name, _ in events if name == "tool_dispatch_tenancy_columns_hidden"] == []
+
+
 async def test_wide_schema_detail_drop_is_reported_to_the_operator() -> None:
     """Degrade-not-fail, NEVER SILENTLY — the same posture as the card branch. The
     model is told by the in-fit marker; the operator gets a counts-only observer
-    event (D25: no column name, no schema text, no question)."""
+    event (D25: no column name, no schema text, no question). `base_dropped_count`
+    is GONE from the payload (C5b): base sections can no longer be dropped, so it
+    could only ever have reported 0; `tenancy_hidden_count` takes its place, which
+    is the one withholding the marker deliberately does not mention."""
     wide_schema = {
         "database": "dbpcm_warehouse",
         "table": "employee",
         "columns": [
-            {"name": f"Column_{i}", "type": "String", "comment": "some descriptive comment"}
-            for i in range(400)
+            {"name": "client_code", "type": "String", "comment": "Tenant key."},
+            *(
+                {"name": f"Column_{i}", "type": "String", "comment": "some descriptive comment"}
+                for i in range(400)
+            ),
         ],
     }
     events: list[tuple[str, dict]] = []
@@ -206,7 +333,7 @@ async def test_wide_schema_detail_drop_is_reported_to_the_operator() -> None:
     dispatcher = ToolDispatcher(
         mcp_client,
         CATALOG,
-        max_tool_result_tokens=6_000,
+        schema_columns_token_budget=6_000,
         observer=lambda e, p: events.append((e, p)),
     )
 
@@ -219,27 +346,27 @@ async def test_wide_schema_detail_drop_is_reported_to_the_operator() -> None:
     assert ("tool_dispatch_schema_detail_dropped", {
         "tool_name": "getTableSchema",
         "detailed_count": len(detailed),
+        # The tenancy column is NOT part of the model's column universe.
         "total_count": 400,
-        # Nothing but `columns` in this schema, so nothing table-level to drop.
-        "base_dropped_count": 0,
+        "tenancy_hidden_count": 1,
     }) in events
 
 
-async def test_a_base_only_schema_degrade_is_still_reported_to_the_operator() -> None:
-    """THE SILENT-DEGRADE REGRESSION. The event used to be gated on
-    `reduced_count or omitted_columns` — a COLUMN-shaped question. This schema is
-    over the cap because of ONE enormous `rules` section beside four small
-    documented columns: the fit drops `rules` (and whatever else it must), every
-    column keeps its full detail, and the old gate therefore fired NOTHING while
-    the model was handed a `_truncated` marker saying its table-level semantics
-    had been withheld. The operator now hears about it, with counts only (D25 —
-    no section name, no rule text)."""
+async def test_a_big_base_is_no_longer_a_degrade_at_all() -> None:
+    """THE C5b INVERSION of the old base-degradation test. This schema is far over
+    the generic `max_tool_result_tokens` because of ONE enormous `rules` section
+    beside four small documented columns. C5 dropped `rules` to fit and reported a
+    `base_dropped_count`; the user decision is that table-level sections are NEVER
+    truncated — so `rules` rides complete, every column keeps its detail, NOTHING
+    was withheld, and therefore there is no marker, no `truncated` flag and no
+    operator event. (The silent-degrade regression that test guarded against is
+    now impossible by construction: the only degrade left is a column degrade, and
+    the event is gated on the same `marker_added` the model sees.)"""
     schema = {
         "database": "dbpcm_warehouse",
         "table": "employee",
         "grain": "one row per employee",
-        # ~9k tokens on its own: far over the 4,000-token cap, so the fit cannot
-        # keep it, and the four columns below all fit whole once it is gone.
+        # ~9k tokens on its own — far over the 4,000-token generic cap.
         "rules": [
             f"Rule {i}: " + "consult the catalog before aggregating. " * 8
             for i in range(100)
@@ -253,7 +380,7 @@ async def test_a_base_only_schema_degrade_is_still_reported_to_the_operator() ->
         ],
     }
     events: list[tuple[str, dict]] = []
-    mcp_client = FakeMCPClient(scripted={"getTableSchema": [dict(schema)]})
+    mcp_client = FakeMCPClient(scripted={"getTableSchema": [json.loads(json.dumps(schema))]})
     dispatcher = ToolDispatcher(
         mcp_client,
         CATALOG,
@@ -265,23 +392,13 @@ async def test_a_base_only_schema_degrade_is_still_reported_to_the_operator() ->
         "getTableSchema", {"database": "dbpcm_warehouse", "table": "employee"}, _credentials()
     )
 
-    capped = result.result_preview.preview_rows[0][0]
-    # The precondition that makes this the base-only case: every column kept its
-    # documentation, so the OLD gate would have been False on both its terms.
-    assert all(set(c) - {"name", "type"} for c in capped["columns"])
-    assert len(capped["columns"]) == 4
-    # ...and the model WAS told something was withheld.
-    assert "_truncated" in capped
-    assert "Table-level sections omitted to fit" in capped["_truncated"]
-
-    drops = [payload for name, payload in events
-             if name == "tool_dispatch_schema_detail_dropped"]
-    assert len(drops) == 1
-    assert drops[0]["tool_name"] == "getTableSchema"
-    assert drops[0]["detailed_count"] == 4
-    assert drops[0]["total_count"] == 4
-    # THE point of the event: a degrade the column counts cannot describe.
-    assert drops[0]["base_dropped_count"] >= 1
+    stored = result.result_preview.preview_rows[0][0]
+    assert stored["rules"] == schema["rules"]
+    assert stored["ambiguities"] == schema["ambiguities"]
+    assert stored["columns"] == schema["columns"]
+    assert "_truncated" not in stored
+    assert result.result_preview.truncated is False
+    assert [name for name, _ in events if name == "tool_dispatch_schema_detail_dropped"] == []
 
 
 async def test_the_question_only_reorders_the_schema_fit() -> None:
@@ -300,7 +417,7 @@ async def test_the_question_only_reorders_the_schema_fit() -> None:
         + [{"name": "annual_salary", "type": "Decimal", "comment": "Yearly pay, in USD."}],
     }
     mcp_client = FakeMCPClient(scripted={"getTableSchema": [dict(wide_schema)]})
-    dispatcher = ToolDispatcher(mcp_client, CATALOG, max_tool_result_tokens=6_000)
+    dispatcher = ToolDispatcher(mcp_client, CATALOG, schema_columns_token_budget=6_000)
 
     result = await dispatcher.dispatch(
         "getTableSchema",
@@ -332,23 +449,41 @@ def test_dispatch_estimator_matches_budget_estimator() -> None:
         assert dispatch_estimate(text) == budget_estimate(text)
 
 
-async def test_small_get_table_schema_is_unchanged_no_marker() -> None:
-    """A normal-sized getTableSchema is byte-identical to before the cap existed:
-    stored whole, truncated=False, no marker."""
+async def test_small_get_table_schema_is_compacted_stable_no_marker() -> None:
+    """A normal-sized getTableSchema is stored whole with `truncated=False` and no
+    marker — the C5 contract — and, since the user spec of 2026-08-18 made the
+    null/empty-key strip unconditional, with its information-free keys removed:
+    `"comment": ""` costs the request budget and teaches the model nothing.
+    Everything else is verbatim, key order included."""
     schema = {
         "database": "dbpcm_warehouse",
         "table": "employee",
-        "columns": [{"name": "EmployeeCode", "type": "String", "comment": ""}],
+        "columns": [
+            {"name": "EmployeeCode", "type": "String", "comment": ""},
+            {"name": "AnnualSalary", "type": "Decimal", "comment": "Yearly pay, USD."},
+        ],
     }
-    mcp_client = FakeMCPClient(scripted={"getTableSchema": [schema]})
+    mcp_client = FakeMCPClient(scripted={"getTableSchema": [json.loads(json.dumps(schema))]})
     dispatcher = ToolDispatcher(mcp_client, CATALOG)
     result = await dispatcher.dispatch(
         "getTableSchema", {"database": "dbpcm_warehouse", "table": "employee"}, _credentials()
     )
     assert result.result_preview.truncated is False
     stored = result.result_preview.preview_rows[0][0]
-    assert stored == schema
+    assert json.dumps(stored) == json.dumps(
+        {
+            "database": "dbpcm_warehouse",
+            "table": "employee",
+            "columns": [
+                {"name": "EmployeeCode", "type": "String"},
+                {"name": "AnnualSalary", "type": "Decimal", "comment": "Yearly pay, USD."},
+            ],
+        }
+    )
     assert "_truncated" not in stored
+    # `result_full` is never reshaped — the runtime's own consumers see the MCP's
+    # response exactly as it arrived.
+    assert result.result_full == schema
 
 
 def test_over_cap_card_list_drops_whole_tail_cards_not_the_shape() -> None:

@@ -727,3 +727,47 @@ a duplicate blueprint. PART C non-autoplay root-caused to the DELIBERATE
 governed-corpus trust gate (recall serves source='mcp' only; the landed node
 ranks #1 in the raw index — will serve on promotion). ISSUES M4 queued for
 the stale demo narrative.
+
+## #21 — C5b + getTableSchema columns argument, full-loop verified live (2026-08-18)
+
+- **C5b (user five-point spec)**: grouped presentation (relevance-ordered
+  detailed prefix, primary/join-key columns pinned, skeleton tail in
+  original order, marker states which variant); tenancy strip ALWAYS
+  (client_code + proc_center; the 4 RLS tables were already MCP-hidden —
+  the strip is load-bearing for the 7 OTHER tables that exposed
+  client_code; no rule/ambiguity references them; result_full untouched);
+  base sections NEVER truncated (degradation ladder deleted); columns-only
+  budget `schema_columns_token_budget=6000` (generic 4k untouched);
+  null-strip UNCONDITIONAL (user point 5 overrode the reviewer-endorsed
+  byte-identity deviation). Employee: 17→114 of 130 detailed; preview
+  7,197 tok; 3 employee-sized schemas ≈24% of request budget (accepted).
+  Review: APPROVE; folds incl. the ungated tenancy operator event,
+  fail-closed bare-string strip, both marker variants.
+- **columns: narrowing argument** (clickhouse-api 26d2644): overlay-layer
+  filter after both authorization gates; hidden ≡ nonexistent in the echo;
+  base always complete; runtime pass-through verified (no arg filtering;
+  narrowed call = new read-guard signature by construction); marker +
+  prompt (17,246/17,400) now teach the actionable contract. Also fixed the
+  red test f838a7f landed (closed _KNOWLEDGE_IDS pin never learned
+  kn-clickhouse-median — my process gap: the knowledge entry was added
+  after that slice's suite run and the suite was not re-run).
+- **Live verification (user directive — full end-to-end incl. learning):**
+  V0 5987; V1 8 passed + L3 0/3 low-tail → isolated rerun 1/3 = exactly
+  its accepted baseline (oscillation, not regression). Probes: accrual
+  events schema clean of client_code in the model payload (after unmasking
+  a STALE-PROCESS false alarm — the serving runtime predated the code;
+  lesson recorded: verify process start time vs code under test); grouped
+  RELEVANCE marker live in payload with pinned employee_code leading;
+  median exact; narrowed fetch live (full docs for named columns;
+  client_code/no_such_column adversarial → identical fail-closed echo).
+- **Learning loop verified on this tree** (learning plane byte-identical
+  since d4fd911): one novel candidate landed CLEAN end-to-end this morning
+  (avg-by-status: extract → S4 ok → inbox → human approve → validated
+  Neo4j landing, ranks #1 in the raw index; recall correctly trust-gated
+  pending canon promotion, M4). Three further novel candidates today each
+  stopped by a DIFFERENT legitimate gate: H3 strict-inline (IS NOT NULL
+  planned as inline value 'NULL'), golden-replay grain-probe (slot-less
+  group-by candidate — pre-existing edge, worth an ISSUES entry if it
+  recurs), strict slot-miss (plan over-covered a literal absent from the
+  accepted SQL). All routed to review; zero garbage landed; zero crashes —
+  the exact shapes that session-poisoned a week ago now decline in-band.

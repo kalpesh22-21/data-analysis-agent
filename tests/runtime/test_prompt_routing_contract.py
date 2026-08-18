@@ -847,6 +847,18 @@ def test_prompt_stays_within_its_token_budget() -> None:
     costs ~4.3k tokens of an 89.6k request budget — so it moved deliberately, once,
     with this note. **265 chars spare** at the raise; the re-argue paragraph applies
     with full force to whatever comes next.
+
+    **2026-08-18, ceiling UNCHANGED at 17,400.** 17,135 -> **17,246** (+111, C5b):
+    the two-tier sentence ended at "ask instead", which was the truth only while
+    `getTableSchema` had no narrowing argument. The MCP now takes an optional
+    `columns` list, so the clause was rewritten from a dead end into the recovery —
+    fetch that table again naming just the columns you need. PAID FOR OUT OF THE
+    EXISTING HEADROOM, not with a raise: it edits a sentence the prompt already
+    carries, and turning "interrupt the user" into "make one cheap call" is the
+    single highest-value change available in that sentence. **154 chars spare.**
+    The same clause rides the schema payload's own `_truncated` marker
+    (`dispatch/schema_preview.py::_marker_text`), which is unbudgeted here and
+    carries the detail; the prompt states only the standing rule.
     """
     assert len(AGENT_SYSTEM_PROMPT) <= 17_400
 

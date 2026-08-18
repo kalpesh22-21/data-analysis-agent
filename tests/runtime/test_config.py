@@ -83,6 +83,11 @@ def test_request_token_budget_reserve_and_headroom() -> None:
     # Defaults are the same values.
     assert settings.response_token_reserve == 16_000
     assert settings.max_tool_result_tokens == 4_000
+    # C5b: the COLUMNS SECTION of a getTableSchema has its own, larger budget —
+    # the generic per-result cap above governs every OTHER tool result. Pinned
+    # here because the two are easy to confuse and a merge that collapsed them
+    # would silently re-truncate `rules`/`ambiguities`.
+    assert settings.schema_columns_token_budget == 6_000
 
 
 def test_request_token_budget_clamped_to_at_least_one() -> None:

@@ -11,11 +11,19 @@ receives on the following round-trip:
 
   * every column is NAMED, including the salary column at the very end of the
     list, which the old head-cut dropped outright;
-  * the salary column's DOCUMENTATION survived, because the question named it;
+  * the salary column's DOCUMENTATION survived, because the question named it,
+    and it is emitted in the DETAILED GROUP AT THE FRONT of the list (C5b);
   * a filler column the question says nothing about did NOT keep its
-    documentation at the same cap — i.e. the ordering is what made the
+    documentation at the same budget — i.e. the ordering is what made the
     difference, not a bigger budget;
+  * the table-level sections ride complete beside it (C5b: they are outside the
+    columns budget entirely);
   * the raw question text is nowhere in the message (D25).
+
+C5b: the budget this exercises is `schema_columns_token_budget` (the COLUMNS
+SECTION alone), not the generic `max_tool_result_tokens`. It is set explicitly
+below so the contrast between the two runs is a property of the ORDERING and not
+of whichever default happens to ship.
 """
 
 from __future__ import annotations
@@ -51,6 +59,10 @@ WIDE_SCHEMA: dict[str, Any] = {
     "database": "dbpcm_warehouse",
     "table": "employee",
     "catalogued": True,
+    # Table-level sections: never budgeted, so they must arrive whole (C5b).
+    "primary_key": ["employee_code"],
+    "rules": ["Exclude employees who never started: hire_date IS NOT NULL."],
+    "ambiguities": ["'headcount' may mean active or all employees."],
     "columns": [
         {
             "name": f"filler_{i}",
@@ -159,7 +171,9 @@ async def _run(question: str | None) -> str:
     store = InMemorySessionStore()
     loop = AgentLoop(
         model_client=model,
-        tool_dispatcher=ToolDispatcher(mcp, CATALOG, max_tool_result_tokens=4_000),
+        tool_dispatcher=ToolDispatcher(
+            mcp, CATALOG, schema_columns_token_budget=4_000
+        ),
         context_assembler=ContextAssembler(store),
         session_store=store,
         tools_provider=_tools_provider,
@@ -177,6 +191,16 @@ async def _run(question: str | None) -> str:
     return _schema_tool_message(model.calls[1]["messages"])
 
 
+def _emitted_columns(content: str) -> list[dict[str, Any]]:
+    """The fitted schema out of the rendered tool message. `content` is the
+    canonical trail rendering (`context/budget.py::_render_entry`), whose
+    `result_preview.preview_rows[0][0]` cell IS the schema dict the fitter
+    returned — the one surface the model actually reads."""
+    rendered = json.loads(content)
+    schema = rendered["result_preview"]["preview_rows"][0][0]
+    return schema["columns"]
+
+
 async def test_the_question_steers_which_columns_keep_their_documentation() -> None:
     content = await _run(QUESTION)
 
@@ -191,9 +215,21 @@ async def test_the_question_steers_which_columns_keep_their_documentation() -> N
     assert '"USD"' in content
     assert "The name of the department the employee is assigned to." in content
 
+    # The question's columns are in the DETAILED GROUP AT THE FRONT of the list —
+    # ahead of the 300 filler columns they physically sit behind.
+    columns = _emitted_columns(content)
+    detailed = [c["name"] for c in columns if set(c) - {"name", "type"}]
+    assert [c["name"] for c in columns][: len(detailed)] == detailed
+    assert detailed[0] == "annual_salary"
+
+    # The table-level sections were never in the budget and arrive whole.
+    assert "Exclude employees who never started" in content
+    assert "'headcount' may mean active or all employees." in content
+
     # The marker is present and honest.
     assert "302 of 302 columns are listed" in content
     assert "name and type ONLY" in content
+    assert "RELEVANCE order" in content
     assert "re-fetch" not in content
 
     # D25: the raw user text never reaches the model-facing tool result.
