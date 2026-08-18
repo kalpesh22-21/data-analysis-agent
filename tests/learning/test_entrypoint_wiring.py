@@ -375,12 +375,35 @@ def test_no_call_at_module_scope_in_the_inbox_entrypoint():
 def _stub_uvicorn(monkeypatch, recorded: dict, *, started: bool):
     """Stub `uvicorn.Config`/`Server` INSIDE `http_daemon` — the module that now builds
     them (C3 moved the serve call out of this script and into the shared wrapper, so
-    the seam these tests poke moved with it; the CONTRACTS they pin did not)."""
+    the seam these tests poke moved with it; the CONTRACTS they pin did not).
+
+    The stubs reproduce the ONE piece of uvicorn sequencing these tests stand on: with
+    `factory=True` the app factory is called by `Config.load()`, and `load()` is called
+    from inside `Server.serve()` — i.e. inside the running loop. That is not stub
+    convenience, it is verbatim `uvicorn/server.py::_serve` (`if not config.loaded:
+    config.load()`, under `capture_signals`), which is what makes the in-loop assertion
+    below a claim about production rather than about the fake.
+    """
 
     class _StubConfig:
-        def __init__(self, app, **kwargs):
-            recorded["app"] = app
+        def __init__(self, app, *, factory=False, **kwargs):
+            # `app` is the FACTORY now, not an app: the wrapper hands uvicorn the
+            # callable and lets `load()` call it. Recorded under its own key so the
+            # test can pin both halves — what was handed over, and what came back.
+            recorded["factory_arg"] = app
+            recorded["factory"] = factory
             recorded.update(kwargs)
+            self._app = app
+            self._factory = factory
+
+        def get_loop_factory(self):
+            # None = "the loop `asyncio.run` would have built anyway". The real Config
+            # answers uvloop here when it is installed; which implementation gets picked
+            # is `test_http_daemon.py`'s business, not this file's.
+            return None
+
+        def load(self):
+            recorded["app"] = self._app() if self._factory else self._app
 
     class _StubServer:
         # uvicorn's own post-boot flag, which the wrapper reads to reproduce
@@ -388,10 +411,12 @@ def _stub_uvicorn(monkeypatch, recorded: dict, *, started: bool):
         # True is the state after any successful boot.
         def __init__(self, config):
             recorded["config"] = config
+            self.config = config
             self.started = started
             self.should_exit = False
 
         async def serve(self):
+            self.config.load()
             recorded["served"] = True
 
     monkeypatch.setattr(http_daemon.uvicorn, "Config", _StubConfig)
@@ -410,6 +435,13 @@ def test_the_inbox_app_is_built_inside_the_running_loop(monkeypatch):
     `create_inbox_app` to `run_http_daemon` AS A FACTORY (not to call it and pass an
     app), and that is precisely the property under test. SYNC now, because
     `run_http_daemon` owns `asyncio.run` and cannot be re-entered from a running loop.
+
+    The factory now travels all the way into uvicorn (`Config(..., factory=True)`)
+    instead of being called by the wrapper, so "in the loop" is uvicorn's `load()`
+    doing it. Both halves are pinned below, because passing a factory to a Config that
+    does NOT have `factory=True` still "works" — uvicorn calls it anyway and merely
+    logs a warning — and that near-miss would take the app composition back out of the
+    captured-signal region without failing anything.
     """
     from data_agent.learning.inbox import service
 
@@ -433,8 +465,11 @@ def test_the_inbox_app_is_built_inside_the_running_loop(monkeypatch):
     assert module.main() == 0
 
     assert built == [app_sentinel]
-    # The app uvicorn serves is the one the factory just built — not a stale import-time
-    # object, which is what the old module-level `app` would have handed over.
+    # Handed over as a callable, declared as one, and only THEN called: the app uvicorn
+    # serves is the one `load()` just built, not a stale import-time object (which is
+    # what the old module-level `app` would have supplied).
+    assert recorded["factory_arg"] is _factory
+    assert recorded["factory"] is True
     assert recorded["app"] is app_sentinel
     assert (recorded["host"], recorded["port"]) == ("0.0.0.0", 8100)
     assert recorded["served"] is True
