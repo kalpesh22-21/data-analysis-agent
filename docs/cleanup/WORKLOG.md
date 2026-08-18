@@ -771,3 +771,18 @@ the stale demo narrative.
   recurs), strict slot-miss (plan over-covered a literal absent from the
   accepted SQL). All routed to review; zero garbage landed; zero crashes —
   the exact shapes that session-poisoned a week ago now decline in-band.
+
+## #21b — flywheel demo learning-plane tracing (2026-08-18)
+
+User observation: no learning spans in Phoenix. Root cause: the flywheel
+demo never installed the learning tracer — the learning collaborators take
+`tracer=` as an explicit seam (sweeper/consumer/write-plane all accept it;
+the sibling demo_learning_e2e_openai wires it at :238) and run NO-OP
+without it, so every flywheel run today traced its runtime turns
+(`data-agent-runtime`) while the learning stages ran dark. Fixed:
+configure_learning_tracing + get_learning_tracer at run start, tracer
+threaded into LearningSweeper / build_learning_consumer /
+build_promotion_write_plane, provider.force_flush() in the finally (both
+KEEP paths). Verified live: `learning-loop` project received the full
+chain — learning.sweep → enqueue → consume → triage → leakage → dedup →
+extract (+ judge Response spans) at 20:10-20:11.

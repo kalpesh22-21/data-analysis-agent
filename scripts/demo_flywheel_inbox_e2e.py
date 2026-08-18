@@ -85,6 +85,10 @@ from data_agent.learning.factory import (  # noqa: E402
 )
 from data_agent.learning.inbox.inbox import InboxTransitionError  # noqa: E402
 from data_agent.learning.models import LearningStatus, compute_content_hash  # noqa: E402
+from data_agent.learning.observability import (  # noqa: E402
+    configure_learning_tracing,
+    get_learning_tracer,
+)
 from data_agent.learning.promotion.landing import landing_id  # noqa: E402
 from data_agent.learning.sweeper import LearningSweeper  # noqa: E402
 from data_agent.runtime.app import create_app  # noqa: E402
@@ -278,6 +282,15 @@ async def _run() -> int:
         raise SystemExit("LEARNING_ENABLED must be truthy")
 
     model = await pick_openai_model_async(_OPENAI_KEY)
+
+    # Learning-plane tracing (Phoenix project `learning-loop`). The runtime app
+    # below wires its OWN provider (`data-agent-runtime`); the learning stages
+    # take the tracer as an explicit seam and run NO-OP without it — which is
+    # exactly what this demo silently did until 2026-08-18.
+    provider = configure_learning_tracing(otlp_endpoint=_PHOENIX_OTLP)
+    tracer = get_learning_tracer(provider)
+    print(f"[TRACE] Phoenix OTLP exporter -> {_PHOENIX_OTLP} (service.name=learning-loop)")
+
     infra = await build_infra(stream_prefix="demo:flywheel")
 
     tag = uuid.uuid4().hex[:10]
@@ -358,7 +371,7 @@ async def _run() -> int:
         parked = await park_foreign_idle_sessions(infra, sid_a)
         print(f"[STAGE B1] idled session for sweep; parked {parked} foreign idle session(s)")
 
-        sweeper = LearningSweeper(infra.session_store, infra.queue, infra.settings)
+        sweeper = LearningSweeper(infra.session_store, infra.queue, infra.settings, tracer=tracer)
         swept_doc = None
         last_sweep = None
         for _ in range(30):
@@ -387,6 +400,7 @@ async def _run() -> int:
         demo_catalog = catalog_dict()
         consumer = build_learning_consumer(
             infra.settings,
+            tracer=tracer,
             session_store=infra.session_store,
             queue=infra.queue,
             model_client=build_openai_model_client(api_key=_OPENAI_KEY, model=model, base_url=""),
@@ -423,6 +437,7 @@ async def _run() -> int:
         # Build the inbox + FULLY-ACTIVATED write plane (probe/resolver/landing).
         scheduler, inbox = build_promotion_write_plane(
             infra.settings,
+            tracer=tracer,
             candidate_store=infra.candidate_store,
             hit_counts=infra.corpus_store,
             mcp_client=infra.mcp_client,
@@ -614,6 +629,7 @@ async def _run() -> int:
         else:
             await teardown(infra)
             print("\n[TEARDOWN] cleaned created session/candidate/corpus/neo4j artifacts.")
+        provider.force_flush()
 
 
 async def _finish(infra, keys, part_a, part_b, part_c) -> None:  # noqa: ANN001
