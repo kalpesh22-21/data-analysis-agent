@@ -14,6 +14,8 @@ rationale for each section.
 
 from __future__ import annotations
 
+import re
+
 from data_agent.runtime.blueprint.models import SLOT_TYPE_GLOSS, SLOT_TYPES
 from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
@@ -518,6 +520,72 @@ def test_slot_type_gloss_parity_with_the_prompt() -> None:
     )
     for slot_type in SLOT_TYPES:
         assert f"`{slot_type}`" in gloss_line, f"slot type {slot_type!r} missing from the prompt"
+
+
+def _gloss_line() -> str:
+    """The prompt's one-line slot-type vocabulary (inside "Understanding blueprints")."""
+    return next(
+        line for line in AGENT_SYSTEM_PROMPT.splitlines() if line.startswith("Slot types:")
+    )
+
+
+def test_the_prompt_names_no_slot_type_the_runtime_does_not_have() -> None:
+    """B5, the other direction. The test above proves every real slot type is NAMED in
+    the prompt; nothing proved the reverse, so a type RENAMED or DELETED in
+    `SLOT_TYPES` left its old name in the prompt — the model would keep being taught a
+    vocabulary word `SlotSpec.parse` now rejects, and the addition half of the pin
+    would stay green throughout.
+
+    Derived by scanning the line for backticked tokens rather than by listing them, so
+    this keeps working across renames.
+    """
+    named = set(re.findall(r"`([a-z_]+)`", _gloss_line()))
+    assert named == set(SLOT_TYPES), (
+        f"the prompt's slot-type line and SLOT_TYPES disagree: "
+        f"prompt-only={sorted(named - set(SLOT_TYPES))}, "
+        f"runtime-only={sorted(set(SLOT_TYPES) - named)}"
+    )
+
+
+# The slot types whose `SLOT_TYPE_GLOSS` text the prompt reproduces VERBATIM (modulo
+# the terminal `.` vs `;` the list format needs). Pinned as a PREMISE, in the style of
+# `tests/eval/test_harness_field_drift.py::test_shared_field_set_is_non_trivial`: it is
+# not the enumeration under test (the test computes that), it is the claim that the
+# comparison below still has something to compare. These three are the corrections the
+# gloss exists to make — pass the bare integer, not "6 months"; a period is a warehouse
+# key, not a calendar date; a range is `{start, end}` — and they are the ones a model
+# gets wrong when the two copies disagree.
+_VERBATIM_IN_PROMPT = frozenset({"period", "period_range", "relative_window"})
+
+
+def test_shared_slot_type_glosses_are_still_shared() -> None:
+    """B5 — the CONTENT half of the prompt/`SLOT_TYPE_GLOSS` duplication.
+
+    HONEST LIMITATION, stated because it bounds what this pin can promise: the prompt
+    does NOT render the glosses mechanically. Five of the eight are deliberately
+    reworded for the prompt's list format (`string`/`entity`/`enum`/`list` are
+    shortened; `as_of_date` is folded into `period`'s clause), and for those only the
+    NAME is pinned — by the two tests above. There is no test that can tell a
+    legitimate rewording from a contradiction, and pretending otherwise with a
+    keyword-overlap heuristic would produce a pin that fails on prose edits and passes
+    on semantic ones.
+
+    What IS mechanically checkable is the three glosses the prompt copies verbatim.
+    That set is COMPUTED here and compared against the pinned premise, so the test
+    fails in either direction: reword the gloss in `blueprint/models.py` (or its copy
+    in `prompts.py`) and the set shrinks; make a fourth one verbatim and it grows —
+    either way somebody has to look at both files, which is the entire point.
+    """
+    line = _gloss_line()
+    shared = {t for t, gloss in SLOT_TYPE_GLOSS.items() if gloss.rstrip(".") in line}
+    assert shared == set(_VERBATIM_IN_PROMPT), (
+        "the prompt's slot-type glosses and blueprint/models.py::SLOT_TYPE_GLOSS have "
+        f"drifted: no longer verbatim={sorted(_VERBATIM_IN_PROMPT - shared)}, "
+        f"newly verbatim={sorted(shared - _VERBATIM_IN_PROMPT)}. `getBlueprint` serves "
+        "the models.py gloss and the prompt teaches its own copy, so a divergence "
+        "teaches the model two different slot vocabularies. Re-align the copies, or "
+        "update _VERBATIM_IN_PROMPT if the rewording is deliberate."
+    )
 
 
 def test_metadata_questions_are_routed_to_the_tools_not_to_sql() -> None:

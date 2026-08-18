@@ -6,7 +6,7 @@ this file. Convention: append new findings to the relevant section with a
 date; when one is fixed, delete the entry and note the fix in WORKLOG.md.
 
 
-A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-11 (Session 25) during a read-only analysis pass over the agent loop, tool surface, catalog schema, and blueprint execution. Nothing here is fixed yet — this is the queue.
+A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-11 (Session 25) during a read-only analysis pass over the agent loop, tool surface, catalog schema, and blueprint execution. Fixed entries are deleted (with a WORKLOG pointer) or annotated; the rest is the queue.
 
 **Why:** these were found by reading code against docs, not by a failing test, so none of them is recorded anywhere else. Several are silent-behavior issues (no error, no test failure) that would be re-discovered from scratch next session.
 
@@ -17,8 +17,6 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 ## A. Agent loop (`runtime/loop/agent_loop.py`)
 
 **A1 — FIXED 2026-08-12.** Quadratic budget accounting → `max_window_token_spend=1_000_000` (`BudgetGuard.max_token_spend`), derived as 25 rounds × 40k mean request; occupancy was never at risk (fit_request_to_budget held). Cached reads counted at full weight deliberately.
-
-**A2 — Mid-batch budget break can only fire on wall-clock.** The `if guard.exceeded: break` inside the per-tool-call loop runs *before* this round's `record_iteration`, so iterations/tokens for the current round are not yet recorded. Only the wall-clock arm can trip mid-batch. Probably fine, but it is not what the S3 comment claims.
 
 **A3 — `load_trail` is re-read 3+ times per window.** Guard seeding, `ContextAssembler.assemble`, and `_compute_turn_provenance_union` each load the full trail, plus `_compute_turn_assumptions` / `_compute_turn_answer_sql` on resume paths. Against Couchbase this is repeated I/O per round-trip.
 
@@ -32,23 +30,21 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 **B1 — Planning section is written against a memory the loop deletes.** It instructs a full decomposition before the first tool call, then admits the plan cannot be re-read (A4). The model is asked to produce a plan it structurally cannot retain, on every complicated request.
 
-**B2 — No date anchor anywhere.** Neither the prompt nor `context/assembly.py` injects "today". Deictic period resolution is deferred and `period` slots resolve against the warehouse domain — yet the Answering section asks for trailing-window projections and forward figures. The model has no grounded "now".
+**B2 — Date anchor is UTC, so it reads a day ahead of a local evening (residual; the core was FIXED 2026-08-13, see §G).** `context/assembly.py` now injects `Today's date is YYYY-MM-DD.` as one `user`-role message per turn, taken from the turn's own first `user` message `ts` (D45-stable across rebuilds, validated-not-trusted, absent rather than wrong). That `ts` is `datetime.now(UTC)`, so for a user west of UTC the anchor rolls over during their evening and the model is told it is already tomorrow — it will resolve "yesterday"/"this month" off a date the user does not recognise. **Open choice, not a defect to patch blindly:** the fix is a tenant/user timezone (none is carried today), and switching to server-local would just relocate the skew. Decide whether the anchor is UTC-by-contract (and say so in the anchor text) or timezone-aware.
 
 **B3 — Instruction/mechanism mismatches.** Prompt says "issue those tool calls together in one turn" without naming the cap (`max_tool_calls_per_iteration=8`, silently truncated). Says call `recordAssumptions` "exactly ONCE" while `_accumulate_assumptions` is built to fold repeated calls. `answerWithTable` terminality is stated three times (prompt Presenting-a-table, prompt Answering, tool description).
 
 **B4 — Answering section reads as a patch from one incident.** The forecast/projection policy is markedly more specific than its neighbours and duplicates guidance already in the tool descriptions.
 
-**B5 — Slot-type glosses duplicated with no parity test.** The slot-type list in `prompts.py` ("Understanding blueprints") duplicates `SLOT_TYPE_GLOSS` in `runtime/blueprint/models.py`. The existing parity test only pins `SLOT_TYPES` ↔ `SLOT_TYPE_GLOSS`, so the prompt copy can silently drift.
-
 ---
 
 ## C. Tool surface
 
-**C1 — Tool count doc drift.** `docs/02-tools-and-api.md` says 12; code advertises **14** (6 MCP + 8 in `_LOCAL_TOOL_SCHEMAS`), and the agreed `updateAnalysisState` takes it to **15**. The comment in `mcp/tool_schema.py` says "count 6 → 13". `recordAssumptions` and `answerWithTable` are undocumented there — and `answerWithTable` being a **second terminal exit** of the loop is architecturally significant enough to belong in that doc. Scheduled as step 1 of the implementation sequence in the Q&A doc.
+*(C1 — tool-count doc drift — ALREADY CLOSED, verified 2026-08-18. The fix landed with the Release-1 work (`37344be`/`e8cf36e`), ahead of this queue: `docs/02-tools-and-api.md` now says **15** throughout (header, per-group tables, count summary), `recordAssumptions`/`answerWithTable`/`updateAnalysisState` are all documented, and `answerWithTable`'s second-terminal-exit role has its own section. The `mcp/tool_schema.py` comment reads "count 6 → 15". **Re-counted from code:** 6 MCP (`listDatabases`, `listTables`, `getTableSchema`, `sampleRows`, `runQuery`, `explainQuery` — the 6 `@mcp.tool`s in `clickhouse-api/app/mcp_server.py`) + 9 in `_LOCAL_TOOL_SCHEMAS` (`askUser`, `resolveValues`, `searchBlueprints`, `getBlueprint`, `searchKnowledge`, `runBlueprint`, `recordAssumptions`, `answerWithTable`, `updateAnalysisState`) = **15**, appended unconditionally by `fetch_function_schemas` with no downstream filtering, and pinned by three `len(schemas) == 15` assertions in `tests/runtime/mcp/test_tool_schema.py`. Entry deleted.)*
 
-**C3 — uvicorn workloads exit 143 on SIGTERM (2026-08-17, found during H4).** uvicorn's `capture_signals` re-raises SIGTERM with default disposition, so runtime/ui/inbox pods die by signal (143) before any exit-code policy applies — exact `uvicorn.run()` parity, but it contradicts the exit-0-on-rollout rationale `daemon.py` establishes for the four PID-1 workers. Decide whether the k8s-facing policy should extend to the uvicorn three (catch the re-raised SIGTERM like dev Ctrl-C is caught).
+**C3 — uvicorn workloads exit 143 on SIGTERM. PARTIALLY FIXED (hygiene wave 2026-08-18).** `capture_signals` re-raises the captured SIGTERM onto the restored `SIG_DFL` after `serve()` returns, killing the process where no code can see it (verified: returncode=-15). `data_agent/http_daemon.py::run_http_daemon` chains that re-raise onto a handler installed first, builds the app via `Config(factory=True)` so composition happens INSIDE the captured region (mid-composition SIGTERM smoked graceful), and preserves uvloop via uvicorn's own runner. Adopted by the three in-repo launchers, all smoked at exit 0. **Still open:** `runtime`/`ui`/`inbox-ui` deploy as `uvicorn <module>:<app>` where no repo code brackets `serve()` and an import-time handler would land inside the captured region and break graceful shutdown — closing them means moving the Deployment command to a `python scripts/...` launcher (chart + Dockerfile change).
 
-**C4 — `schema_notes` is authored across the semantic catalog but has ZERO readers (2026-08-17, found during J1 placement analysis).** `build_table_schema_response` returns a fixed key set that omits it; it ships in `/catalog/export` verbatim but nothing renders it anywhere in either repo. Guidance authored there is invisible. Wire it into the schema response or mark the field inert in the authoring docs.
+**C4 — `schema_notes` is authored across the semantic catalog but has ZERO readers (2026-08-17, found during J1 placement analysis).** `build_table_schema_response` returns a fixed key set that omits it; it ships in `/catalog/export` verbatim but nothing renders it anywhere in either repo. Guidance authored there is invisible. Wire it into the schema response or mark the field inert in the authoring docs. **DOCUMENTED AS INERT 2026-08-18** (this repo can only document — the field and its only would-be reader live in `clickhouse-api`): a ⚠️ bullet in `09-infrastructure.md` §Semantic Catalog tells authors it never reaches the model and to use `columns[].description`/`rules`/`ambiguities` instead, and the `getTableSchema` row in `02-tools-and-api.md` notes the response key set excludes it. Re-verified: zero hits for `schema_notes` in this repo's `src/`+`tests/`, and `overlay.py::build_table_schema_response` builds from an explicit `entry.get(...)` list that omits it. **The wire-or-remove decision is still OPEN** and is a `clickhouse-api` change.
 
 **C2 — Full 14-tool schema list is re-sent every round-trip**, with no `tool_choice`, `temperature`, `parallel_tool_calls`, or reasoning params set on either the Responses or Chat path (`model/openai_client.py`).
 
@@ -56,7 +52,7 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 ## D. Blueprints (`runtime/blueprint/`)
 
-**D1 — `04-blueprints.md` stale on F2.** It states table-intermediate DAGs are "rejected pre-dispatch"; the executor now materializes them to session scratch via the D93 side-channel when `scratch_client` is wired, and the fixture corpus has two blueprints exercising it. Rejection is now *conditional* on scratch being unwired.
+*(D1 — F2 doc drift — CLOSED 2026-08-18. `04-blueprints.md` was already corrected ahead of this queue (release-1 checklist) and re-verified line-by-line against `blueprint/executor.py`: the `scratch_client is None` pre-dispatch check, `_materialize_node`'s truncation/no-column/over-cap fail-closed arms, and the un-materialized-on-resume `SLOT_INVALID` all match the prose. **The same stale claim survived in four other docs and was fixed in this batch:** `11-testing.md` (both the Layer-1 and Layer-2 rows), `decisions/DECISIONS.md` (D89 preamble + D89(d), dated SUPERSEDED-by-D93 markers), `decisions/TRACEABILITY.md` (the D59 and D89/F2 rows), `decisions/OPEN-QUESTIONS.md` (execution-semantics bullet). Entry deleted.)*
 
 **D2 — `semantic_catalog` is accepted-but-unread in `BlueprintExecutor`.** The D56 gate verifies only against the blueprint's **own declared** `result_grain`, never against the catalog's table grain/measures — so a blueprint declaring a wrong-but-self-consistent grain passes verification. This is the D37 authoring-gate gap, still open.
 
@@ -102,7 +98,7 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 **I2 — DECIDED 2026-08-18 (user): full transparency KEPT.** The `result` SSE frame continues to carry sql_executed/answer_sql/provenance chips/blueprint_use verbatim (D56 transparency is the product posture), and `POST /query/page` keeps accepting SQL from the browser. Revisit only before an external-facing deployment. Note the boundary with I1: transparency applies to the STRUCTURED payload; the model's PROSE is scrubbed (I1 slice).
 
-**I3 — Hermetic corpus fixture drifted from canon (committed in `e8cf36e`).** `tests/runtime/retrieval/test_corpus_loader_structural_key_qa.py` — 2 standing failures: canon's `bp-active-headcount-by-department.sql_template` gained `ORDER BY headcount`, hermetic fixture lacks it. Only failures in the runtime suite (3036 pass otherwise).
+*(I3 — hermetic corpus fixture drift — RESOLVED en route by the J3/J7 canon+mirror work and deleted 2026-08-18. `tests/runtime/retrieval/test_corpus_loader_structural_key_qa.py` verified green at `f9845f5`: 14 passed, 0 failed.)*
 
 ---
 
@@ -114,8 +110,6 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 **J6 — D56 verification is vacuous at 0 rows; empty-but-verified ships to the user (design decision needed, added 2026-08-17).** The grain check passes trivially on an empty result, so a structurally-empty blueprint (J3) presents a verified badge on a 0-row table, and the no-re-derivation rule (correct per L6) then forbids the model from sanity-checking with fresh SQL. **DECIDED 2026-08-17 (user): option (a)** — badge reports `row_count=0` as "empty — unverifiable" instead of verified; **BUILT, reviewed (APPROVE), live-verified, committed 3df9e76 same day.** Options (b) re-derivation-lock release and (c) prompt nudge deliberately NOT taken. Sibling of D2/D3 (verification weaker than it reads).
 
-**J7c — learned windowed blueprints will silently lose `window_anchor` at promotion (2026-08-17, J7b review nit; inert today).** Neither `learning/generalize/mapping.py::blueprint_seed_from_candidate` (~:124) nor `learning/promotion/mcp_export.py::_blueprint_doc` (~:127 whitelist) carries `window_anchor` — verified inert (candidates cannot produce the field yet), but the first learning-extracted windowed blueprint will promote to canon anchor-less and reintroduce the J7 failure for learned corpus. When the extractor grows window awareness, thread the field through both projections. Derive-the-guard class.
-
 **J7 — blueprint period semantics: data-relative windows collide with calendar-relative questions (2026-08-17, from the L3 trace read).** `bp-hires-per-month` counts "last N months" back from `max(hire_date)` (data-relative by design → answers about 2021 on this warehouse); the user's "last six months" means calendar months, and since the date-anchor injection (08-13) the model HAS a grounded today — so in 2 of 3 L3 re-baseline runs it ran the blueprint, judged the 2021-window result unresponsive, re-derived with `toDate(today)`-anchored SQL, and completed the intent with its OWN query as evidence. The re-derivation metric (newly judgeable under gpt-5.5 intent tracking) correctly flags it. Every component is defensible; the collision is corpus design. **Option (b) BUILT + landed 2026-08-17 (25429a8 + clickhouse-api 11258a9): PARTIAL EFFECT.** Delivery proven (note in model payloads, all 3 conclusive runs, after fixing the eval conftest field-drop 6b30465); behaviour moved 1-of-3 only — two runs re-derived DESPITE reading the static note. Next levers (queued, on hold): surface the CONCRETE anchor date ("window ends 2021-03-01") on the result so the model can present the discrepancy instead of resolving it with SQL; and/or decide the product question — an answer giving BOTH windows ("calendar: 0; as of latest data: 3 in Mar-2021") may be the ideal, but the no-re-derivation contract forbids the query that produces it. L3 stands red (1/3) with this understood cause. Also re-confirmed in the same traces: raw-SQL table designation whenever ad-hoc SQL is in the turn (0 blueprint-backed/verified — the badge-loss pattern from the harness re-baseline), and one run exhausted the answer-shape gate.
 
 **J4 — accrual→employee join under-keyed.** Ad-hoc PTO SQL joins `accrual_events` to `employee` on `employee_code` alone (no `client_code`) and groups by `employee_name`, which duplicates across codes (EMP001/EMP006 both "Anderson, Alice A"). Harmless on current data; conflates people on wider data.
@@ -126,19 +120,15 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 ## K. A2 live-eval baseline (2026-08-16, cleanup branch baseline run) — DIAGNOSED same day
 
-**K1 — L3 red 0/3, root cause = HARNESS INFIDELITY (never passed, not a regression).** `LiveEvalMCPClient.list_tools` (test_routing_live.py:106-119) advertises all 6 MCP tools with `description=""` and EMPTY `input_schema` — the model is told `runQuery()` takes no `sql` and `getTableSchema()` takes no table, so A2 is a blueprint-only arena; only the 2 cases needing a non-blueprint route (L3, L5) are red. Counterfactual proven live: patching faithful schemas (from clickhouse-api/app/mcp_server.py:205-330) → L3 passes. Fixes: F1 commit a `tools/list` export fixture (like `fixture_catalog`); F2 re-word L3's residual (bp-active-headcount already covers it → will flap post-fix); F3 `metrics.re_derivation` returns False vacuously when the turn is untracked. **F1 changes every A2 case's behaviour → re-baseline all 7 in the same slice.** Also seen: with real schemas the model designated raw-`sql` answer tables (0 verified) instead of `blueprint_id` — L7 can't catch verified-rate drops.
+*(K1 — harness infidelity, empty MCP tool schemas in the A2 live gate — FIXED by the harness-fidelity slice (`3d6d6d1`, WORKLOG #5): byte-exact `tools/list` fixture committed and reviewer-verified against the regen recipe, real `getTableSchema`/`sampleRows` shapes, L3 residual re-worded, three-valued `re_derivation`, `MIN_PASS_RATE` default corrected; all 7 A2 cases re-baselined on gpt-5.5 in the same slice. Entry deleted 2026-08-18.)*
 
-**K2 — L5 red 0/3, root cause = MODEL NEVER DECLARES INTENTS + silent tag drop (never passed).** `analysisState` is None in every run — predicate detail "not every intent reached terminal disposition" is a misreport (predicate conflates state-None with pending). The model DID tag `serves_intent` on calls, but `strip_serves_intent` drops tags silently (`no_live_state`, degrade-not-fail by design) and nothing tells the model → it never calls `updateAnalysisState`; when it tries later it hits `ANALYSIS_STATE_LATE_INIT` (natural order search→run→bookkeep vs SUBSTANTIVE_TOOLS lock). 0 of 4 diagnostic runs ever tracked. Fixes: G1 (cheapest/highest-value, RUNTIME change) at the `loop_intent_tag_dropped{no_live_state}` seam (agent_loop.py:~3429) append a corrective note to the tool result — "tags dropped; declare intents before next substantive call"; G2 prompt: decomposition trigger under-fires on non-enumerated conjunctive questions ("X and Y" vs "I need three things:"); G3 predicate: report state-None distinctly. Do NOT relax late-init. L5 needs BOTH the K1 schema fix and the declaration fix.
+**K2 — residual only: the `no_live_state` tag-drop is still silent (RESOLVED IN PRACTICE, not by construction).** The original entry was "L5 red 0/3, model never declares intents". That is closed by the model, not by the code: under gpt-5.5 the model declares intents unprompted and L5 re-baselined **3/3** (WORKLOG #5). What remains: when the model tags `serves_intent` before any state is live, `strip_serves_intent` still drops the tag **silently** (`loop_intent_tag_dropped{no_live_state}`, degrade-not-fail) and nothing tells the model — so the failure mode is latent behind a model behaviour that could regress with any model change. The **G1 corrective-note slice** (append "tags dropped; declare intents before your next substantive call" at the drop seam) is **BUILT and reviewed but UNLANDED**, contained in its own worktree — optional robustness, land it if a model change re-opens L5. G2 (decomposition trigger under-fires on non-enumerated conjunctive questions, "X and Y" vs "I need three things:") stays open as a prompt nit. G3 (report state-None distinctly) landed with WORKLOG #5. **Do NOT relax late-init.**
 
 ---
 
 ## L. Cleanup follow-ups (Tier-2 review, 2026-08-16 — queued, not gating)
 
-**L1 — `RuntimeSettings.history_token_budget` + `history_token_budget_ratio` are dead config.** After Tier 2 removed `ContextAssembler(history_token_budget=...)` (its only reader), the property (`runtime/config.py:449`) and field (`:798`) have zero readers; the comment at ~:458 describes deleted machinery. `HISTORY_TOKEN_BUDGET_RATIO` set in env is silently ignored. Deleting is a config-surface change → own slice: delete property+field+stale comment, or annotate INERT. `tests/runtime/test_config.py` still pins them.
-
-**L2 — `SessionDoc.context_summary_cache` is a permanently-None persisted field.** `runtime/session/models.py:523,555,578` — nothing can populate it post-Tier-2; round-trips None forever; old Couchbase docs may carry the key, so removal is a persisted-schema change (needs tolerant reader or migration note). `tests/learning/test_content_hash.py:142` still exercises its exclusion.
-
-**L3 — decision docs describe deleted APIs.** `docs/decisions/phase0-runtime-design.md:362-374` presents the compaction seam (budget.compact/render_messages/Redactor) as live architecture; `learning-loop-wave3-wiring-design.md` §25/26 documents `build_promotion_scheduler`/`build_review_inbox`; `OPEN-QUESTIONS.md` and `release-1/03-analysis-state.md` also name deleted APIs. Docs-only commit; decision docs are partly historical — mark superseded sections rather than rewrite history.
+*(L3 — decision docs describe deleted APIs — DONE 2026-08-18, by annotation (history preserved, nothing rewritten). Dated SUPERSEDED markers added at all four sites: `phase0-runtime-design.md` §5 (the compaction seam — `budget.compact`/`render_messages`/`CompactionResult`/`SummaryCache`/`llm_summarizer.py`/`Redactor` are gone; `fit_request_to_budget` is what ships, and the `assemble` signature shown is stale — Tier 2, WORKLOG #3); `learning-loop-wave3-wiring-design.md` §1 factory table + the §6 prose (`build_promotion_scheduler`/`build_review_inbox` folded into `build_promotion_plane` — Tier 2, WORKLOG #3); `OPEN-QUESTIONS.md` (the D46 compaction-trigger bullet, now also pointing at the dead `history_token_budget` config in L1; and the Observability "Redactor implementation" bullet); `release-1/03-analysis-state.md` (the two `scripts/` `_LazyCouchbaseSessionStore` proxy rows + `test_launcher_session_store_proxies.py` — deleted in **Tier 3**, WORKLOG #4, successor `test_launcher_session_store.py`; the incident note beneath them kept deliberately, since it is why the seam was fixed). Also corrected there: the proposed `runtime/context/sanitize.py` shipped as `runtime/sanitize.py::sanitize_text`. Entry deleted.)*
 
 ## M. Tier-5 follow-ups (2026-08-17 — queued, not gating)
 
@@ -148,8 +138,19 @@ autoplays; recall serves `source='mcp'` ONLY (vector_index.py trust gate,
 governed-corpus Phase 2), so an inbox-approved blueprint sits in Neo4j
 staging until PROMOTED to canon. Verified live 2026-08-18: the landed
 candidate ranks #1 in the raw vector index for the variant question and is
-correctly filtered by the trust gate. Update the demo to narrate the
-promotion hop or state the staging boundary honestly.
+correctly filtered by the trust gate. **NARRATIVE FIXED 2026-08-18** (prints +
+docstring only, zero logic): PART C now presents the RAW-path answer plus the
+trust gate holding — module docstring rewritten, PART C banner states the
+staging boundary, STAGE C2's three branches re-worded (a fast path that DOES
+fire is attributed to the MCP-canon corpus, not to what PART B landed, with the
+id to compare), and STAGE C3's backstop no longer blames "semantic distance":
+it names `AND node.source = 'mcp'` in the recall Cypher as the reason, reports
+the miss as CORRECTLY WITHHELD / "THE GATE HELD", and flags the found-branch as
+what a trust-gate failure would look like. The SUMMARY line no longer calls the
+expected raw path "not reached". **Still open, unchanged:** the promotion hop
+(staging → canon: human verify → `verified=True` → re-source to mcp) does not
+exist, so there is no autoplay to demo. Build that and PART C can show the real
+payoff.
 
 **M1 — FIXED in T5.5 (WORKLOG #12): per-tool-call envelope rebuild feeds a branch that almost never fires.**
 `agent_loop._run_loop_body` computes the answer envelope (a

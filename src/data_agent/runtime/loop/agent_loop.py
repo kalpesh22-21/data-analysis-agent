@@ -3307,10 +3307,26 @@ class AgentLoop:
                     ):
                         blueprint_gate.note_definition_in_context(call_args.get("id"))
 
-                    # S3: also check the budget INSIDE the per-tool-call loop (not
-                    # only once per outer iteration) so a slow batch of capped
-                    # calls that blows the wall-clock window mid-dispatch stops
-                    # cleanly instead of finishing the whole batch regardless.
+                    # S3: also check the budget INSIDE the per-tool-call loop (not only
+                    # once per outer iteration) so a slow batch of capped calls that
+                    # blows the wall-clock window mid-dispatch stops cleanly instead of
+                    # finishing the whole batch regardless.
+                    #
+                    # WHAT THIS CAN ACTUALLY TRIP ON: the WALL CLOCK, and only it (A2).
+                    # `guard.exceeded` reads three counters, but the other two cannot
+                    # change here — this round's `record_iteration` runs AFTER the batch
+                    # drains (below, once the round-trip's `total_tokens` is known), and
+                    # if the iteration or token-spend arm had already been over its cap
+                    # on a PREVIOUS round the loop would have ended that round instead of
+                    # dispatching this batch. Elapsed time is the one input that advances
+                    # while tools run, so it is the one arm that can newly trip mid-batch.
+                    #
+                    # That is the intended behaviour, not a gap to close: iterations and
+                    # spend are charged per ROUND-TRIP, so charging them mid-batch would
+                    # mean charging a round the model has not been billed for yet.
+                    # Documented because the plain reading of "check the budget" promises
+                    # all three, and a future reader debugging a batch that ran past an
+                    # iteration cap should not have to re-derive this from the ordering.
                     if guard.exceeded:
                         break
 

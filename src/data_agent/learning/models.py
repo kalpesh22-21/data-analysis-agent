@@ -95,9 +95,13 @@ def compute_content_hash(doc: SessionDoc) -> str:
     `learning_status` (circular — it changes as the machine advances),
     every timestamp (`created_at`/`last_activity`/per-entry `ts`),
     `result_full_ref` (a storage pointer), `result_preview` (a derived view),
-    `pause_checkpoint`, `context_summary_cache`, and all `provenance` sets (a
-    re-parse artifact). What remains is the transcript the Slice-2 extractor
-    mines (D46's full tool I/O trail).
+    `pause_checkpoint`, and all `provenance` sets (a re-parse artifact). What
+    remains is the transcript the Slice-2 extractor mines (D46's full tool I/O
+    trail).
+
+    Exclusion is by ALLOWLIST, not by subtraction: the payload below is built from
+    the three fields that identify a transcript, so a field added to (or deleted
+    from) `SessionDoc` cannot move the hash without an edit here.
     """
     payload = {
         "session_id": doc.session_id,

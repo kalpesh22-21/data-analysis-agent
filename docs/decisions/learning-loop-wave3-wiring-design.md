@@ -22,10 +22,11 @@ invariant).
 |---|---|---|
 | `build_learning_consumer(settings, *, session_store, queue, model_client, audit_store, candidate_store, blueprint_corpus, user_store, catalog_schema, embedder, git_client, semantic_scanner, checks, sampler, known_rules, tracer, summary_loader, triage)` | `LearningConsumer` | Assembles the S3 extractor + the SIX stages (frozen order) onto the consumer's `stages` seam. |
 | `build_promotion_plane(settings, *, candidate_store, probe, hit_counts, dependency_resolver, policy, clock)` | `tuple[PromotionScheduler, ReviewInbox]` | The S9 plane from ONE store (the preferred wiring — pins the shared singleton). |
-| `build_promotion_scheduler(settings, *, candidate_store, probe, hit_counts, dependency_resolver, policy, clock)` | `PromotionScheduler` | The SEPARATE S9 cron process alone (not a stage, §7.2). |
-| `build_review_inbox(candidate_store, *, scheduler)` | `ReviewInbox` | The inbox alone; asserts `candidate_store is scheduler.store` (fail-fast on a split store). |
+| ~~`build_promotion_scheduler(settings, *, candidate_store, probe, hit_counts, dependency_resolver, policy, clock)`~~ | ~~`PromotionScheduler`~~ | **SUPERSEDED (2026-08: deleted in cleanup Tier 2 — see docs/cleanup/WORKLOG.md #3; ISSUES L3).** Folded into `build_promotion_plane`. |
+| ~~`build_review_inbox(candidate_store, *, scheduler)`~~ | ~~`ReviewInbox`~~ | **SUPERSEDED (2026-08: deleted in cleanup Tier 2 — see docs/cleanup/WORKLOG.md #3; ISSUES L3).** Folded into `build_promotion_plane`; the split-store guard was preserved verbatim there. |
 
-Plus `LearningWiringError` (fail-fast on a partial pipeline). All four are re-exported from
+Plus `LearningWiringError` (fail-fast on a partial pipeline). ~~All four~~ **The two surviving
+builders** (`build_learning_consumer`, `build_promotion_plane`) are re-exported from
 `data_agent.learning`.
 
 Every collaborator is passed IN (dependency injection); the factory constructs **no** infra
@@ -113,10 +114,13 @@ distinct process from the consumer daemon (D96 §g). Its warehouse probe, hit-co
 CAS-WRITES that store — so the inbox and scheduler MUST share one instance, else the approve reads a
 stale envelope from one store and validates it in another (the same split-brain class the consumer
 factory prevents). `build_promotion_plane(settings, *, candidate_store, ...)` takes the store ONCE
-and returns `(scheduler, inbox)` wired from it, making the split impossible to express. The thin
+and returns `(scheduler, inbox)` wired from it, making the split impossible to express. ~~The thin
 `build_promotion_scheduler` / `build_review_inbox` remain for callers that need one alone;
 `build_review_inbox` FAILS FAST (`LearningWiringError`) when `candidate_store is not scheduler.store`
-(the scheduler exposes a read-only `store` property). The writer routes near-misses / human-gated
+(the scheduler exposes a read-only `store` property).~~ **SUPERSEDED (2026-08: both thin builders
+deleted in cleanup Tier 2 — see docs/cleanup/WORKLOG.md #3; ISSUES L3.)** No caller wanted one
+alone, so `build_promotion_plane` is now the ONLY wiring and the split-store shape is not merely
+guarded but unexpressible; the policy default and the split-store guard were folded in verbatim. The writer routes near-misses / human-gated
 targets to `in_review`; the test drives a `global_knowledge` to `in_review`, then approves it through
 the plane-wired inbox → `validated`, and pins the shared-store identity + the split-store refusal.
 

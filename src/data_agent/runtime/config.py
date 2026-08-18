@@ -6,8 +6,8 @@ uppercased env vars, `.env` file support, `extra="ignore"`). Every field maps
 
 Tunable defaults below were LOCKED per the orchestrator's Pass-A brief (not
 independently re-derived): session_ttl_seconds=604800 (7 days),
-preview_row_count=20, history_token_budget_ratio=0.20, max_loop_iterations=15,
-max_wall_clock_seconds=60, max_budget_windows=3. See docs/decisions/
+preview_row_count=20, max_loop_iterations=15, max_wall_clock_seconds=60,
+max_budget_windows=3. See docs/decisions/
 phase0-runtime-design.md §11 (OQ-D/G/H/I) for the provenance of these numbers
 — they were explicitly provisional pending real Phase-0 traffic.
 
@@ -215,8 +215,7 @@ class RuntimeSettings(BaseSettings):
         128_000,
         description=(
             "Token budget of the configured model's context window. Used to derive the "
-            "absolute history token budget (history_token_budget_ratio * this value) AND "
-            "the total-request fit budget (model_context_window - response_token_reserve)."
+            "total-request fit budget (model_context_window - response_token_reserve)."
         ),
     )
     response_token_reserve: int = Field(
@@ -461,14 +460,20 @@ class RuntimeSettings(BaseSettings):
     )
 
     # --- Context assembly (D46/D50) ---
+    # `history_token_budget_ratio` (0.20) + the `history_token_budget()` derivation it
+    # fed were DELETED here (L1, cleanup 2026-08): Tier 2 removed `ContextAssembler(
+    # history_token_budget=...)`, their only reader, leaving a knob that read like a
+    # live tuning lever and changed nothing. Replayed history is now bounded by
+    # `request_token_budget()` at the send seam (`context/budget.py::
+    # fit_request_to_budget`), not by a fraction reserved up front.
+    #
+    # MIGRATION POSTURE: `RuntimeSettings` is `extra="ignore"`, so a deployment still
+    # exporting `HISTORY_TOKEN_BUDGET_RATIO` keeps booting — the var is now INERT BY
+    # ABSENCE (silently dropped, no validation error), exactly as it was already inert
+    # by having no reader. Nothing to un-set before rollout; strip it from env files at
+    # leisure.
     preview_row_count: int = Field(
         20, ge=1, description="Max preview rows (N) rendered into model-visible context (OQ-G)."
-    )
-    history_token_budget_ratio: float = Field(
-        0.20,
-        gt=0,
-        le=1,
-        description="Fraction of model_context_window reserved for replayed history (OQ-G).",
     )
 
     # --- Base agent system prompt (always-present leading instruction) ---
@@ -812,10 +817,6 @@ class RuntimeSettings(BaseSettings):
         system message from this feature).
         """
         return self.agent_system_prompt if self.agent_system_prompt_enabled else None
-
-    def history_token_budget(self) -> int:
-        """Absolute history token budget derived from the model's context window (OQ-G)."""
-        return int(self.model_context_window * self.history_token_budget_ratio)
 
     def request_token_budget(self) -> int:
         """Absolute cap on the FULL assembled request (all messages) handed to

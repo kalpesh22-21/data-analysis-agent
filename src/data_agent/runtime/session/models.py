@@ -539,7 +539,17 @@ class SessionDoc:
     messages: list[TurnMessage] = field(default_factory=list)
     tool_trail: list[TrailEntry] = field(default_factory=list)
     pause_checkpoint: PauseCheckpoint | None = None
-    context_summary_cache: dict[str, Any] | None = None
+    # `context_summary_cache` was DELETED here (L2, cleanup 2026-08). Tier 2 removed the
+    # compaction seam that wrote it; nothing could populate it afterwards, so it
+    # round-tripped `None` forever while reading like live per-session state.
+    #
+    # MIGRATION POSTURE — no migration, and none needed. `from_doc` below names every
+    # key it reads (`doc["x"]` / `doc.get("x")`) and never spreads the document into the
+    # constructor, so an OLD Couchbase doc still carrying `context_summary_cache` (or
+    # any other key this class has never heard of) loads fine and the stray value is
+    # IGNORED. Writes are whole-document (`couchbase_store._upsert_doc`/`replace` both
+    # dump `to_doc()`), so the key is DROPPED the first time that session is written.
+    # Old docs therefore converge on their own; nothing has to sweep them.
     # Additive (Track-B Slice 1, D96): the idempotency key the learning sweeper
     # records at the `pending → queued` transition and the consumer compares on
     # re-delivery. `None` for every session that predates the learning loop and
@@ -571,7 +581,6 @@ class SessionDoc:
             "pause_checkpoint": (
                 self.pause_checkpoint.to_doc() if self.pause_checkpoint else None
             ),
-            "context_summary_cache": self.context_summary_cache,
             "learning_content_hash": self.learning_content_hash,
             "analysis_state": (
                 self.analysis_state.to_doc() if self.analysis_state else None
@@ -594,7 +603,6 @@ class SessionDoc:
             messages=[TurnMessage.from_doc(m) for m in doc.get("messages", [])],
             tool_trail=[TrailEntry.from_doc(e) for e in doc.get("tool_trail", [])],
             pause_checkpoint=PauseCheckpoint.from_doc(pc_doc) if pc_doc else None,
-            context_summary_cache=doc.get("context_summary_cache"),
             learning_content_hash=doc.get("learning_content_hash"),
             # `.get` (not `[...]`): a document written before these fields existed
             # loads with `None` and behaves exactly as it always did.

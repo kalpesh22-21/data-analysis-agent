@@ -30,6 +30,17 @@ catalog/
 - **Deploy-coupled load (D53; clarified by D78, D78 reversed and superseded by D84).** The catalog is now **baked into both the runtime and the MCP deploy artifacts** (D84 amends D53's original single-artifact framing, and D78's brief "runtime-only, not the MCP service" clarification no longer holds); a merged PR goes live on each service's next deploy/restart. Because there are now two deploy artifacts, `catalog_sha` is redefined (D84) as the **catalog subtree's own git SHA**, not either service's deploy SHA — this is what makes cross-service version-skew observable, rather than assuming the two always deploy in lockstep. "The catalog version a blueprint validated against" is that catalog SHA. The **MCP** reads the catalog and performs the overlay + scope-filter join before serving schema to the model (D83); the runtime's own copy remains available for the query-provenance/D62 uses `build_sqlglot_schema()` already had, and continues to be exposed as `catalog_sha` from its own git log. The warehouse is curated and rarely mutates, so gating catalog edits on deploy cadence is acceptable (edits are human-reviewed and batched with releases anyway). The learning loop / drift jobs read the catalog at the currently-deployed SHA.
 - **Version = git commit SHA (= deploy SHA).** Stamped into blueprint `USES`-edge validation and
   golden replays, so a blueprint always validates against a known catalog version.
+- **⚠️ `schema_notes:` is INERT — authored, never read (2026-08, ISSUES C4).** The table-level
+  `schema_notes` list (free-text notes on nullability, sentinel dates, multi-key join shapes…) is
+  authored across the catalog YAML but has **zero readers in either repo**: the MCP's
+  `build_table_schema_response` builds its response from an explicit field list
+  (`description`/`grain`/`primary_key`/`temporal`/`join_keys`/`measures`/`rules`/`ambiguities` +
+  columns) that **omits** it, so it never reaches `getTableSchema` and the model never sees it;
+  nothing in the runtime reads it either. It ships verbatim only inside the whole-YAML
+  `/catalog/export`. **Guidance written there is invisible to the agent** — put anything the model
+  must act on in a `columns[].description`, a `rules` entry, or an `ambiguities` entry instead. The
+  wire-it-or-remove-it decision is pending (ISSUES C4); until it is taken, treat `schema_notes` as
+  a human-readable comment block.
 - **Write path = the schema-edit review inbox, via a bot-authored PR (D53).** Learning-loop
   `schema_edit` candidates ([05-memory-and-learning.md](05-memory-and-learning.md)) are opened by a
   **bot identity** as a branch + YAML patch + PR, with **CI** (schema lint + `explainQuery` dry-run

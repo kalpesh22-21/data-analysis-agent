@@ -786,3 +786,46 @@ build_promotion_write_plane, provider.force_flush() in the finally (both
 KEEP paths). Verified live: `learning-loop` project received the full
 chain — learning.sweep → enqueue → consume → triage → leakage → dedup →
 extract (+ judge Response spans) at 20:10-20:11.
+
+## #22 — hygiene wave (2026-08-18)
+
+Two parallel batches, both reviewed (code: APPROVE + factory=True fold;
+docs: verified baseline-exact).
+
+**Code batch:** J7c — window_anchor threaded through both promotion
+projections via Blueprint.parse (single fail-closed gate) + a DERIVED
+seed-field-parity tripwire, mutation-verified. L1 — dead config deleted
+(history_token_budget method + ratio field; env var proven inert via
+extra="ignore"; counter-pin added). L2 — context_summary_cache deleted
+(reader tolerance proven empirically; content hash measured identical —
+allowlist-built; migration = stray key ignored on read, dropped on next
+write). B5 — two derived prompt-gloss parity tests (bidirectional token-set
+equality; verbatim-shared set pinned both ways with the rewording-vs-
+contradiction limitation stated). A2 — the S3 comment now states the
+wall-clock-only mid-batch truth with its derivation. C3 —
+`http_daemon.run_http_daemon`: root cause = uvicorn re-raises captured
+SIGTERM onto SIG_DFL post-shutdown; fix = chained handler + Config(
+factory=True) so app composition sits inside the captured region +
+uvicorn's own runner (uvloop restored — the first draft had silently
+downgraded the UI launchers to stdlib asyncio). All three launchers +
+mid-composition smoked at exit 0; counterfactual -15 recorded. Residual:
+the uvicorn-CLI deployments need a chart change (C3 entry updated).
+
+**Docs batch:** C1 verified ALREADY closed (real count 15, pinned ×3) —
+tombstoned. D1's stale claim lived in FOUR other docs (11-testing,
+DECISIONS D89, TRACEABILITY, OPEN-QUESTIONS) — fixed/marked, 04-blueprints
+itself was correct. L3 — dated SUPERSEDED markers (history preserved);
+corrected the entry's own error (the deleted proxies were Tier 3/#4, not
+Tier 2). C4 — schema_notes documented inert at the authoring surfaces.
+M4 — flywheel PART C narrative now states the staging/trust-gate truth
+(the "semantic distance" misattribution fixed); a near-miss SUMMARY-line
+change was caught and reverted by the builder itself. ISSUES housekeeping:
+I3 verified green and tombstoned (its "2 failures" were 4 env-induced
+ones), K1 tombstoned, B2/K2 reduced to their true residuals.
+
+Suite after the wave: **6019 passed / 225 skipped / 1 xfailed**; ruff
+clean. Net: two genuine deletions (L1, L2), one new lifecycle module,
++32 tests, and the doc surface re-aligned with reality.
+
+NEXT (user 2026-08-18): docstring trim wave (src/ only; contracts kept,
+narratives move to WORKLOG/git), then Tier 4 Wave B.

@@ -27,9 +27,12 @@ _DROPPED = {"source", "verified", "created_by", "source_candidate_id"}
 # The EXACT MCP-allowed field sets (the in-repo stand-in for the cross-repo round-trip):
 # a stray emit field fails CI here. Blueprint `drift_status` is allowed; knowledge is a
 # closed five-field set (its `drift_status` is NON-MCP and dropped).
+# `window_anchor` is MCP-canon (J7; hand-authored in clickhouse-api) and emitted only
+# when the candidate declares one — see test_window_anchor_j7c.py for its pins.
 _BLUEPRINT_ALLOWED = {
     "id", "intent", "slots_summary", "status", "drift_status", "catalog_sha",
-    "uses", "slots", "uses_rules", "result_grain", "sql_template", "composes", "resolves",
+    "uses", "slots", "uses_rules", "result_grain", "window_anchor", "sql_template",
+    "composes", "resolves",
 }
 _KNOWLEDGE_ALLOWED = {"id", "title", "doc_id", "status", "text"}
 

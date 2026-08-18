@@ -98,6 +98,14 @@ The split must be structural, not a comment, or the validator will drift toward 
 
 `SessionStore` is a `Protocol` with **four** implementations — two in `src/`, two hand-written proxies in `scripts/`. Eight places:
 
+> **SUPERSEDED (2026-08: the two `scripts/` proxies were deleted in cleanup Tier 3 — see
+> docs/cleanup/WORKLOG.md #4; ISSUES L3).** `SessionStore` now has **two** implementations, both in
+> `src/`; the launchers construct the real Couchbase store directly (`CouchbaseStoreBase` defers the
+> `Cluster(...)` build into `_ensure_connected()`, so construction needs no event loop). The two
+> proxy rows below are dead as instructions — a new Protocol method needs no `scripts/` edit. The
+> rows and the incident note beneath them are retained because the failure they record is why the
+> seam was fixed.
+
 | File | Change |
 |---|---|
 | `session/models.py` | `SessionDoc.analysis_state: AnalysisState \| None = None` and `SessionDoc.finalization_blocks: dict[str, int] \| None = None` (05 §cap); round-trip both in `to_doc`/`from_doc`, mirroring `pause_checkpoint` at models.py:299 |
@@ -107,7 +115,7 @@ The split must be structural, not a comment, or the validator will drift toward 
 | **`scripts/run_ui_runtime_real.py`** (`_LazyCouchbaseSessionStore`) | **The store the REAL server runs on.** Add the delegating method |
 | **`scripts/run_ui_runtime.py`** (`_LazyCouchbaseSessionStore`) | Same proxy, scripted launcher. Add the delegating method |
 | `tests/runtime/test_couchbase_connect_gate.py` | Auto-parametrises over every public coroutine — the new methods need `await self._ensure_connected()` first, exactly like `append_trail_entry`, or that test fails |
-| `tests/runtime/test_launcher_session_store_proxies.py` | Derives the required surface from the Protocol and fails when either `scripts/` proxy is missing a method. No edit needed — it covers a new Protocol method automatically. Do not weaken it |
+| ~~`tests/runtime/test_launcher_session_store_proxies.py`~~ | ~~Derives the required surface from the Protocol and fails when either `scripts/` proxy is missing a method. No edit needed — it covers a new Protocol method automatically. Do not weaken it~~ **SUPERSEDED (2026-08: the hand-written proxies were deleted in cleanup Tier 3 — see docs/cleanup/WORKLOG.md #4; ISSUES L3).** The seam that forced them is fixed (`CouchbaseStoreBase` defers connection into `_ensure_connected`), so the launchers construct the real store directly and there is no proxy surface to drift. The successor test is `tests/runtime/test_launcher_session_store.py` — still Protocol-derived, still do not weaken it |
 
 > **The two `scripts/` proxies are invisible to the suite.** They exist because `acouchbase` connects eagerly at construction and needs a running event loop, while each launcher builds its app at module import; each one therefore re-declares **every** `SessionStore` method by hand and forwards it. Nothing in `tests/` imports `run_ui_runtime_real.py` and nothing can (importing it reads `.env` and preflights OpenAI), so a method added to the Protocol and forgotten there passes CI and fails **only against the live server**.
 >
@@ -292,7 +300,7 @@ The model must read the state — and its ids — every round.
 
 **Placement:** immediately before the current question, adjacent to the retrieval block. **05 owns the final splice ordering** when a finalization nudge is also present — see 05 §splice-order.
 
-**Sanitisation:** `description` is model-authored text re-entering model context. `retrieval/render.py::_sanitize` is private and takes a required `max_chars`; promote it to a shared helper (`runtime/context/sanitize.py`) so there is one implementation, and reuse the `_MAX_FIELD_CHARS = 500` cap.
+**Sanitisation:** `description` is model-authored text re-entering model context. `retrieval/render.py::_sanitize` is private and takes a required `max_chars`; promote it to a shared helper (~~`runtime/context/sanitize.py`~~ — **built as `runtime/sanitize.py::sanitize_text`**, which is what `composite/analysis_state.py` imports) so there is one implementation, and reuse the `_MAX_FIELD_CHARS = 500` cap.
 
 ### D.1 Cross-turn suppression — two mechanisms, both required
 

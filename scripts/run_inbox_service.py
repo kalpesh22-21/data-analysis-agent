@@ -11,8 +11,8 @@ the full write plane (couchbase + MCP + token + neo4j + embedding) is NOT config
 the service runs in OFFLINE dev mode (list/reject/retract work; a landing-approve
 honestly 503s).
 
-**Importing this module builds NOTHING.** The app is constructed inside the running
-event loop (`_serve`).
+**Importing this module builds NOTHING.** `create_inbox_app` is handed to
+`http_daemon.run_http_daemon` as a FACTORY and called inside the running event loop.
 
 The reason is that `create_inbox_app`'s full-plane branch composes durable infra, and
 `acouchbase.Cluster(...)` REFUSES to be constructed without a running loop — it raises
@@ -39,12 +39,10 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 
-import uvicorn
-
+from data_agent.http_daemon import run_http_daemon
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.entrypoint import configure_daemon_process
 from data_agent.learning.inbox.service import create_inbox_app
@@ -52,38 +50,7 @@ from data_agent.learning.inbox.service import create_inbox_app
 _logger = logging.getLogger(__name__)
 
 
-async def _serve(host: str, port: int) -> None:
-    """Build the app IN the loop, then serve it.
-
-    `uvicorn.run(app, ...)` would be equivalent for the app object, but it takes an app
-    that already exists — and there is nowhere outside a running loop to build this one.
-    Driving `uvicorn.Server` directly is the smallest shape that puts `create_inbox_app`
-    on the right side of `asyncio.run`, and it keeps everything about the served app
-    identical: uvicorn still runs the app's lifespan (the `shutdown` hook that closes the
-    neo4j driver) and still installs its own SIGTERM/SIGINT handlers, so this process
-    needs none of `data_agent.daemon` — unlike the four non-HTTP workers.
-    """
-    app = create_inbox_app()
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port))
-    await server.serve()
-    # Parity with `uvicorn.run()`, which ends in exactly this check: driving `Server`
-    # by hand is otherwise identical, but it drops the one thing `run()` does AFTER
-    # serving. A failed lifespan `startup` hook does not raise out of `serve()` — uvicorn
-    # logs "Application startup failed. Exiting." and RETURNS NORMALLY — so without this
-    # a process that never served a request would exit 0, and Kubernetes would mark the
-    # pod Completed instead of restarting it. `started` stays True once the boot
-    # succeeded (shutdown never clears it), so an ordinary SIGTERM/SIGINT still falls
-    # through here.
-    #
-    # Unreachable today: this app registers only a `shutdown` hook, so startup cannot
-    # fail. It is the guard for the first `startup` hook anyone adds — a warm-up that
-    # pings couchbase, say, which is the shape of the H7 failure. Note a bind clash is
-    # NOT this path: `Config.bind_socket` calls `sys.exit(1)` itself, under `run()` too.
-    if not server.started:
-        raise SystemExit(3)  # uvicorn.main.STARTUP_FAILURE — parity with uvicorn.run()
-
-
-def main() -> None:
+def main() -> int:
     # The SAME startup preamble the sweeper/consumer/scheduler run. This process is a
     # learning-plane daemon like the others and had NEITHER half of it: no tracing
     # posture line and no LEARNING_* typo warning, so a mistyped variable here applied
@@ -98,15 +65,15 @@ def main() -> None:
     # caller is the co-located BFF proxy — bind wider (0.0.0.0) only deliberately.
     host = os.environ.get("INBOX_SERVICE_HOST", "127.0.0.1")
     port = int(os.environ.get("INBOX_SERVICE_PORT", "8100"))
-    try:
-        asyncio.run(_serve(host, port))
-    except KeyboardInterrupt:
-        # uvicorn (0.49) captures SIGINT itself, shuts down, and then RE-RAISES it out
-        # of `serve()` (`Server.capture_signals` calls `signal.raise_signal` on the way
-        # out). `uvicorn.run()` swallows that KeyboardInterrupt; so must we, or a dev's
-        # Ctrl-C prints a traceback over an otherwise clean shutdown.
-        pass
+    # `run_http_daemon`, not `uvicorn.run`/a bare `Server.serve()`: it builds the app IN
+    # the loop (the reason this script exists — `acouchbase.Cluster` refuses to be
+    # constructed without one) AND it chains uvicorn's SIGTERM re-raise so a rollout
+    # exits 0 instead of dying by signal at 143 (C3). See `data_agent/http_daemon.py`;
+    # the startup-failure code and the swallowed Ctrl-C moved there verbatim.
+    return run_http_daemon(
+        create_inbox_app, host=host, port=port, logger=_logger, process="inbox"
+    )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -105,6 +105,16 @@ def blueprint_from_generalization(
     Raises `BlueprintParseError` (from `Blueprint.parse`) if any mapped field is
     malformed — the round-trip contract (`S4-payload-maps-to-runtime-blueprint`)
     asserts this succeeds with no missing field for a valid candidate.
+
+    `window_anchor` (J7/J7c) is read from the S3 PLAN like `intent`/`resolves`, and is
+    INERT until the extractor learns to declare it: today no candidate carries the key,
+    so `payload.get` yields `None` = "no claim" and every landing is byte-identical to
+    before. It is threaded anyway because the alternative failure is silent — the first
+    learned WINDOWED blueprint would otherwise promote to canon anchor-less, and J7 (the
+    model re-deriving a data-anchored window with its own calendar SQL) would return for
+    the learned corpus with nothing failing anywhere. Validation is `Blueprint.parse`'s
+    closed-set check, so a malformed declaration is a fail-closed `BlueprintParseError`
+    at landing, never a dropped field.
     """
     slots = _slot_docs(payload)
     composes = _compose_docs(payload, generalization)
@@ -118,6 +128,7 @@ def blueprint_from_generalization(
         sql_template=generalization.sql_template,
         composes=composes or None,
         result_grain=generalization.result_grain.to_doc(),
+        window_anchor=payload.get("window_anchor"),
     )
 
 
@@ -200,6 +211,12 @@ def blueprint_seed_from_candidate(
         sql_template=gen.sql_template,
         composes=_compose_docs(env.payload, gen),
         result_grain=gen.result_grain.to_doc(),
+        # J7c — taken from the PARSED blueprint, not re-read from the payload, so the
+        # landed seed can only ever carry a value `Blueprint.parse` already accepted
+        # against the closed `WINDOW_ANCHORS` set (the corpus loader's write-time
+        # `_validate_blueprint_dag` rejects anything else anyway; agreeing here means
+        # a malformed anchor fails at build, not at the neo4j write).
+        window_anchor=blueprint.window_anchor,
     )
 
 

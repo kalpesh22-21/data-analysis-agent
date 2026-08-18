@@ -274,8 +274,12 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
 - **D89 (locked, 2026-07-02, Session 13 — the runBlueprint brick, Slices A/B/C).**
   **`runBlueprint(id, slot_bindings)` ships as a `RuntimeTool` that executes stored full-DAG
   blueprints fail-closed: scope-honest at load, D56-verified on return, injection-safe at every
-  bind, and durable across a mid-DAG approval pause.** The honest boundary is **scalar-converging
-  DAGs** — table-passing intermediates are rejected pre-dispatch (F2). Specifics:
+  bind, and durable across a mid-DAG approval pause.** ~~The honest boundary is **scalar-converging
+  DAGs** — table-passing intermediates are rejected pre-dispatch (F2).~~ **SUPERSEDED 2026-08-18 by
+  D93 (below), ISSUES D1:** table intermediates now execute, materialized to session scratch and
+  JOIN-rewritten, **when a `scratch_client` is wired**; pre-dispatch rejection is what happens only
+  when it is not. The scalar-converging boundary below is the Session-13 record, retained as such.
+  Specifics:
   **(a) The scope-honesty gate (the load-bearing check, Slice A).** A blueprint's `sql_template` can
   only read **within its declared `uses`** — enforced **table-aware** at load via `qualify_columns`
   against a `uses`-derived schema PLUS `_assert_source_tables_in_uses` (any JOINed / subquery /
@@ -297,8 +301,10 @@ Locked decisions from the design discussion. Newest at the bottom of each sectio
   node's single-cell scalar output feeds a downstream node's slot; a scalar-consumed node returning
   `!=1` row / wrong column count / NULL fails closed (`SLOT_INVALID`) **before** the consumer runs
   (D56 only verifies the terminal, so a fanned-out intermediate must fail closed on its own).
-  **Table intermediates are rejected pre-dispatch** — no scratch-write surface exists yet (F2,
-  gated on `clickhouse-api` Track A). **(e) D45 mid-DAG approval pause/resume (Slice C).** An
+  ~~**Table intermediates are rejected pre-dispatch** — no scratch-write surface exists yet (F2,
+  gated on `clickhouse-api` Track A).~~ **SUPERSEDED 2026-08-18 by D93 (ISSUES D1):** the Track-A
+  scratch-write surface shipped; a table intermediate is materialized and JOIN-rewritten when a
+  `scratch_client` is wired, and rejected pre-dispatch → raw loop only when it is not. **(e) D45 mid-DAG approval pause/resume (Slice C).** An
   approval node (D59b) checkpoints completed nodes' scalar outputs + per-node provenance + SQL;
   resume re-enters at `awaiting_node`, **CAS-consumes exactly-once** (double-resume rejected),
   survives a runtime restart (state only from the checkpoint), and the **resumed provenance union +

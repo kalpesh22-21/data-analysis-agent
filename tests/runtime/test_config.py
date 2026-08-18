@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from data_agent.runtime.config import RuntimeSettings, effective_llm_hide
 from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 
@@ -25,7 +27,6 @@ def test_locked_defaults() -> None:
     settings = RuntimeSettings(_env_file=None)
     assert settings.session_ttl_seconds == 604_800
     assert settings.preview_row_count == 20
-    assert settings.history_token_budget_ratio == 0.20
     assert settings.max_loop_iterations == 25
     assert settings.max_wall_clock_seconds == 180
     assert settings.max_budget_windows == 3
@@ -67,9 +68,28 @@ def test_base_agent_prompt_is_wired_as_the_default() -> None:
     assert AGENT_SYSTEM_PROMPT.strip() != ""
 
 
-def test_history_token_budget_derivation() -> None:
-    settings = RuntimeSettings(_env_file=None, model_context_window=100_000)
-    assert settings.history_token_budget() == 20_000
+def test_history_token_budget_knob_is_gone_and_its_env_var_is_inert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L1 — `history_token_budget_ratio` + `history_token_budget()` were DELETED.
+
+    Their only reader (`ContextAssembler(history_token_budget=...)`) went in Tier 2;
+    replayed history is bounded at the send seam by `request_token_budget()` now. The
+    pins for both were removed with them — this is the counter-pin, so a re-added knob
+    has to justify itself against a real reader.
+
+    The env var half is the MIGRATION posture, executable: `RuntimeSettings` is
+    `extra="ignore"`, so a deployment still exporting `HISTORY_TOKEN_BUDGET_RATIO`
+    boots unchanged and the value is silently dropped (inert by absence). Worth pinning
+    because the same `extra="ignore"` is what makes a MISSPELLED knob silently inert
+    too — here that behaviour is the feature, and nobody should discover it by finding
+    a stale env var still "set" in a running pod.
+    """
+    monkeypatch.setenv("HISTORY_TOKEN_BUDGET_RATIO", "0.9")
+    settings = RuntimeSettings(_env_file=None)
+    assert not hasattr(settings, "history_token_budget_ratio")
+    assert not hasattr(settings, "history_token_budget")
+    assert "history_token_budget_ratio" not in settings.model_dump()
 
 
 def test_request_token_budget_reserve_and_headroom() -> None:

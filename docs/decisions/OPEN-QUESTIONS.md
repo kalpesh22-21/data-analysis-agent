@@ -60,10 +60,13 @@ sub-detail: the SQL-AST canonicalization rules (alias/ordering normalization dep
 ### Execution semantics (track separately — not grain)
 - ~~Intermediate inlining vs. the injection boundary~~ — **RESOLVED by D59a; BUILT D89 for scalars:**
   scalars → **typed sqlglot-AST literals** (reframed from "server-side params" at build — no `runQuery`
-  param surface; the D10-safe path); tables (small or large) → session scratch + `JOIN` is **DEFERRED
+  param surface; the D10-safe path); tables (small or large) → session scratch + `JOIN` was ~~**DEFERRED
   (F2, D89)** — no scratch-write surface exists yet, so a table-intermediate DAG is **rejected
-  pre-dispatch** (scalar-converging DAGs only). No untrusted upstream rows are ever string-interpolated
-  into SQL. Refines D11.
+  pre-dispatch** (scalar-converging DAGs only)~~ — **SUPERSEDED 2026-08-18 (D93 closed F2, ISSUES D1):
+  BUILT.** The producer's rows are materialized to a session-scoped scratch table via the D93
+  side-channel and the consumer's `FROM`/`JOIN` is AST-rewritten to the returned name, **when a
+  `scratch_client` is wired**; pre-dispatch rejection → raw loop is the degrade when it is not. No
+  untrusted upstream rows are ever string-interpolated into SQL. Refines D11.
 - ~~Approval gate `show` inconsistency~~ — **RESOLVED by D59b:** `requires_approval` fires before the
   node runs and references **upstream/completed** outputs only, never the gated node's own un-computed
   output. A post-compute confirmation would be a separate node kind (not added now).
@@ -231,8 +234,12 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
     path over real MCP↔ClickHouse + the real embedder (EARN ranked 0.75 > DEDUCTION 0.35,
     `degraded=False`, provenance carried) **and** the scope-denial path (a JWT excluding `RegisterType`
     → a real `COLUMN_SCOPE_VIOLATION` from the MCP).
-- **Context-budget params (D46):** result preview row cap `N` + history token budget + when
-  compaction triggers. (Mechanism resolved; values TBD.)
+- **Context-budget params (D46):** result preview row cap `N` + history token budget + ~~when
+  compaction triggers~~. (Mechanism resolved; values TBD.) **PARTLY SUPERSEDED (2026-08: the
+  compaction limb was deleted in cleanup Tier 2 — see docs/cleanup/WORKLOG.md #3; ISSUES L3).**
+  There is no compaction trigger to tune: `context/budget.py::fit_request_to_budget` fits the whole
+  rendered request instead. `history_token_budget`/`history_token_budget_ratio` survive in
+  `RuntimeSettings` but have **no reader** (ISSUES L1) — setting them changes nothing.
 - **Loop-budget caps (D47):** max iterations / tokens / wall-clock per turn. (Mechanism resolved;
   values TBD.)
 
@@ -295,7 +302,10 @@ runtime hint/hard threshold remains a compatible later change if traffic shows t
 
 ## Observability ([10](../10-observability.md))
 - Phoenix hosting namespace + trace retention policy.
-- Redactor implementation + attribute allow-list.
+- ~~Redactor implementation + attribute allow-list.~~ **SUPERSEDED (2026-08: the `Redactor` class was
+  deleted in cleanup Tier 2 — see docs/cleanup/WORKLOG.md #3; ISSUES L3).** Span-payload redaction is
+  done at the emit sites (see the `resolveValues` `concept`/period redaction e2es), not by a central
+  redactor class; reopen this as "where does redaction belong" if a central one is wanted again.
 - Online eval judges (live vs. batch) and the canary eval set.
 - Trace sampling rate (100% vs. sampled) given PII + volume.
 

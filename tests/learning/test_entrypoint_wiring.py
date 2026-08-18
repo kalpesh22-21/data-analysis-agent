@@ -43,10 +43,12 @@ from types import SimpleNamespace
 
 import pytest
 
-# The exit code `_serve` reproduces. Imported from the MODULE, not via `uvicorn.main`:
-# the package re-exports a click `Command` named `main` over its own submodule.
+# The exit code `http_daemon` reproduces. Imported from the MODULE, not via
+# `uvicorn.main`: the package re-exports a click `Command` named `main` over its own
+# submodule.
 from uvicorn.main import STARTUP_FAILURE
 
+from data_agent import http_daemon
 from data_agent.learning.observability import log_tracing_status
 
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -370,12 +372,45 @@ def test_no_call_at_module_scope_in_the_inbox_entrypoint():
     assert offenders == [], f"these run at import time in run_inbox_service.py: {offenders}"
 
 
-async def test_the_inbox_app_is_built_inside_the_running_loop(monkeypatch):
-    """The other half of the fix: construction has to happen somewhere, and that
+def _stub_uvicorn(monkeypatch, recorded: dict, *, started: bool):
+    """Stub `uvicorn.Config`/`Server` INSIDE `http_daemon` — the module that now builds
+    them (C3 moved the serve call out of this script and into the shared wrapper, so
+    the seam these tests poke moved with it; the CONTRACTS they pin did not)."""
+
+    class _StubConfig:
+        def __init__(self, app, **kwargs):
+            recorded["app"] = app
+            recorded.update(kwargs)
+
+    class _StubServer:
+        # uvicorn's own post-boot flag, which the wrapper reads to reproduce
+        # `uvicorn.run()`'s STARTUP_FAILURE exit. It is never cleared on shutdown, so
+        # True is the state after any successful boot.
+        def __init__(self, config):
+            recorded["config"] = config
+            self.started = started
+            self.should_exit = False
+
+        async def serve(self):
+            recorded["served"] = True
+
+    monkeypatch.setattr(http_daemon.uvicorn, "Config", _StubConfig)
+    monkeypatch.setattr(http_daemon.uvicorn, "Server", _StubServer)
+
+
+def test_the_inbox_app_is_built_inside_the_running_loop(monkeypatch):
+    """The other half of the H7 fix: construction has to happen somewhere, and that
     somewhere must be inside a running loop. The stub factory calls
     `asyncio.get_running_loop()` — the check acouchbase itself makes — so this test
-    fails with production's exact `RuntimeError` if `_serve` ever builds the app before
-    entering the loop."""
+    fails with production's exact `RuntimeError` if the app is ever built before the
+    loop is entered.
+
+    Driven through `main()` rather than a private serve helper, which is what the C3
+    rework left to poke: the script's whole remaining job is to hand
+    `create_inbox_app` to `run_http_daemon` AS A FACTORY (not to call it and pass an
+    app), and that is precisely the property under test. SYNC now, because
+    `run_http_daemon` owns `asyncio.run` and cannot be re-entered from a running loop.
+    """
     from data_agent.learning.inbox import service
 
     app_sentinel = object()
@@ -388,32 +423,14 @@ async def test_the_inbox_app_is_built_inside_the_running_loop(monkeypatch):
 
     monkeypatch.setattr(service, "create_inbox_app", _factory)
     module = _load_inbox_entrypoint()
+    monkeypatch.setattr(module, "configure_daemon_process", lambda *a, **k: None)
+    monkeypatch.setenv("INBOX_SERVICE_HOST", "0.0.0.0")
+    monkeypatch.setenv("INBOX_SERVICE_PORT", "8100")
 
     recorded: dict = {}
+    _stub_uvicorn(monkeypatch, recorded, started=True)
 
-    class _StubConfig:
-        def __init__(self, app, *, host, port):
-            recorded["app"] = app
-            recorded["host"] = host
-            recorded["port"] = port
-
-    class _StubServer:
-        # `started` is uvicorn's own post-boot flag, which `_serve` reads to reproduce
-        # `uvicorn.run()`'s STARTUP_FAILURE exit. True = the real server's state after a
-        # successful boot (uvicorn never clears it on shutdown), which is the case this
-        # test is about; the failed-boot half is asserted below.
-        started = True
-
-        def __init__(self, config):
-            recorded["config"] = config
-
-        async def serve(self):
-            recorded["served"] = True
-
-    monkeypatch.setattr(module.uvicorn, "Config", _StubConfig)
-    monkeypatch.setattr(module.uvicorn, "Server", _StubServer)
-
-    await module._serve("0.0.0.0", 8100)
+    assert module.main() == 0
 
     assert built == [app_sentinel]
     # The app uvicorn serves is the one the factory just built — not a stale import-time
@@ -423,7 +440,7 @@ async def test_the_inbox_app_is_built_inside_the_running_loop(monkeypatch):
     assert recorded["served"] is True
 
 
-async def test_a_failed_boot_exits_nonzero_like_uvicorn_run(monkeypatch):
+def test_a_failed_boot_exits_nonzero_like_uvicorn_run(monkeypatch):
     """Driving `uvicorn.Server` by hand loses the one thing `uvicorn.run()` does AFTER
     serving. A lifespan `startup` hook that raises does NOT raise out of `serve()` —
     uvicorn logs "Application startup failed. Exiting." and returns normally — and
@@ -432,36 +449,23 @@ async def test_a_failed_boot_exits_nonzero_like_uvicorn_run(monkeypatch):
     Without the check, a process that never served a request exits 0 and Kubernetes
     marks the pod `Completed` instead of restarting it. Pinned at 3 because that is
     uvicorn's own constant; matching it keeps the two ways of running this app
-    indistinguishable to whatever reads the exit code.
+    indistinguishable to whatever reads the exit code. The code is now RETURNED
+    (`__main__` does `raise SystemExit(main())`) rather than raised from inside the
+    serve helper — same number, same reader, one fewer control-flow shape.
 
     Stubbed rather than driven through a real failing hook because the assertion is
     about OUR branch, not uvicorn's: the stub reproduces the trap exactly (`serve()`
     returns None, `started` is False), which a hook that raised out of `serve()` would
     not. That uvicorn really returns normally on this path was confirmed against a live
-    server; the inbox app has no `startup` hook to break, which is why this is the
-    forward guard described in `_serve`.
+    server; the inbox app has no `startup` hook to break, which is why this is a forward
+    guard (see `data_agent/http_daemon.py`).
     """
     from data_agent.learning.inbox import service
 
     monkeypatch.setattr(service, "create_inbox_app", lambda: object())
     module = _load_inbox_entrypoint()
+    monkeypatch.setattr(module, "configure_daemon_process", lambda *a, **k: None)
 
-    class _StubConfig:
-        def __init__(self, app, *, host, port):
-            pass
+    _stub_uvicorn(monkeypatch, {}, started=False)
 
-    class _FailedBootServer:
-        started = False  # uvicorn's state after a bind error / a raising startup hook
-
-        def __init__(self, config):
-            pass
-
-        async def serve(self):
-            return None  # note: NOT an exception — this is the whole trap
-
-    monkeypatch.setattr(module.uvicorn, "Config", _StubConfig)
-    monkeypatch.setattr(module.uvicorn, "Server", _FailedBootServer)
-
-    with pytest.raises(SystemExit) as excinfo:
-        await module._serve("127.0.0.1", 8100)
-    assert excinfo.value.code == STARTUP_FAILURE == 3
+    assert module.main() == STARTUP_FAILURE == 3

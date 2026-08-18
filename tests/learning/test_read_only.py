@@ -44,7 +44,6 @@ async def test_full_cycle_mutates_only_lifecycle_flag(store, queue, settings, se
     before_created = doc.created_at
     before_last_activity = doc.last_activity
     before_checkpoint = copy.deepcopy(doc.pause_checkpoint)
-    before_summary = copy.deepcopy(doc.context_summary_cache)
     expected_hash = compute_content_hash(doc)
 
     sweeper = LearningSweeper(store, queue, settings)
@@ -64,7 +63,6 @@ async def test_full_cycle_mutates_only_lifecycle_flag(store, queue, settings, se
     assert after.created_at == before_created
     assert after.last_activity == before_last_activity  # NOT bumped -> no resurrection
     assert after.pause_checkpoint == before_checkpoint
-    assert after.context_summary_cache == before_summary
     # The full-result pointer + preview on the trail entry are untouched.
     assert after.tool_trail[0].result_full_ref == "result::abc-123"
     assert after.tool_trail[0].result_preview == preview

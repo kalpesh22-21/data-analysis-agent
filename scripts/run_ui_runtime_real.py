@@ -70,13 +70,13 @@ Run:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
-import uvicorn
-
+from data_agent.http_daemon import run_http_daemon
 from data_agent.runtime.app import create_app
 from data_agent.runtime.config import RuntimeSettings, effective_llm_hide
 from data_agent.runtime.mcp.real_client import RealMCPClient
@@ -239,6 +239,25 @@ def build_real_app():
 
 app = build_real_app()
 
+_logger = logging.getLogger(__name__)
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    # `run_http_daemon`, not `uvicorn.run`: uvicorn RE-RAISES the SIGTERM it captured
+    # once `serve()` returns, and the restored default disposition kills the process
+    # right there — exit 143, with nothing after `serve()` reachable. The wrapper chains
+    # that re-raise onto a handler of ours so a stop is exit 0, matching the four
+    # non-HTTP workers (C3). See `data_agent/http_daemon.py`.
+    #
+    # `app` stays built at module scope (this launcher is also served as
+    # `uvicorn scripts.run_ui_runtime_real:app`) and is passed as a factory returning it.
+    raise SystemExit(
+        run_http_daemon(
+            lambda: app,
+            host="0.0.0.0",
+            port=8000,
+            logger=_logger,
+            process="ui-runtime-real",
+            log_level="info",
+        )
+    )

@@ -4,8 +4,7 @@
   - DETERMINISTIC across processes/runs and independent of dict/arg key-order;
   - INVARIANT under the deliberately-excluded fields (all timestamps,
     `learning_status`, `learning_content_hash`, `result_full_ref`,
-    `result_preview`, `pause_checkpoint`, `context_summary_cache`, and every
-    `provenance` set);
+    `result_preview`, `pause_checkpoint`, and every `provenance` set);
   - SENSITIVE to any change in the transcript-identifying subset (a message's
     turn/role/content; a tool entry's turn/tool_call_id/tool_name/args/status/
     error_code).
@@ -129,7 +128,14 @@ def test_hash_ignores_result_ref_preview_and_provenance() -> None:
     assert compute_content_hash(_doc(messages=msgs)) == baseline
 
 
-def test_hash_ignores_pause_checkpoint_and_summary_cache() -> None:
+def test_hash_ignores_pause_checkpoint() -> None:
+    """The `context_summary_cache` half of this test went with the field (L2, cleanup
+    2026-08). Its exclusion needed no replacement pin: `compute_content_hash` builds its
+    payload from an ALLOWLIST (`session_id` + messages + tool trail), so a session-doc
+    field it does not name cannot reach the digest whether or not that field exists.
+    Verified empirically at the removal — the baseline hash of `_doc()` was byte-
+    identical before and after.
+    """
     baseline = compute_content_hash(_doc())
     checkpoint = PauseCheckpoint(
         reason="askUser",
@@ -138,9 +144,6 @@ def test_hash_ignores_pause_checkpoint_and_summary_cache() -> None:
         consumed=False,
     )
     assert compute_content_hash(_doc(pause_checkpoint=checkpoint)) == baseline
-    assert compute_content_hash(
-        _doc(context_summary_cache={"summary": "prior turns", "tokens": 42})
-    ) == baseline
 
 
 # --- SENSITIVITY: any transcript change MUST flip the hash -------------------

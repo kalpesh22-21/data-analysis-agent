@@ -247,7 +247,6 @@ def test_session_doc_roundtrip_full() -> None:
             )
         ],
         pause_checkpoint=None,
-        context_summary_cache=None,
     )
     wire = doc.to_doc()
     assert wire["_id"] == "session::sess-1"
@@ -256,6 +255,37 @@ def test_session_doc_roundtrip_full() -> None:
     assert restored.messages == doc.messages
     assert restored.tool_trail == doc.tool_trail
     assert restored.pause_checkpoint is None
+
+
+def test_session_doc_reader_tolerates_keys_it_has_never_heard_of() -> None:
+    """The persisted-schema contract that let `context_summary_cache` be DELETED (L2).
+
+    A stored Couchbase document outlives the class that wrote it, so the reader has to
+    survive keys the class no longer declares — `from_doc` NAMES every key it reads and
+    never spreads the document into the constructor, which is what makes deleting a
+    persisted field a code change rather than a migration. `context_summary_cache` is
+    the real removed key; the second is a control, so this pin keeps meaning after that
+    name is forgotten.
+
+    The write half matters as much: `to_doc` emits only declared fields and the store
+    writes whole documents, so the stray key is DROPPED the first time the session is
+    written. Old docs converge on their own.
+    """
+    stored = SessionDoc(
+        session_id="sess-old",
+        created_at="2026-07-01T00:00:00+00:00",
+        last_activity="2026-07-01T00:03:41+00:00",
+    ).to_doc()
+    stored["context_summary_cache"] = {"summary": "prior turns", "tokens": 42}
+    stored["a_field_this_class_never_had"] = {"x": 1}
+
+    restored = SessionDoc.from_doc(stored)
+
+    assert restored.session_id == "sess-old"
+    assert not hasattr(restored, "context_summary_cache")
+    rewritten = restored.to_doc()
+    assert "context_summary_cache" not in rewritten
+    assert "a_field_this_class_never_had" not in rewritten
 
 
 # --- analysisState (Release 1, 03 §A/§B) ------------------------------------

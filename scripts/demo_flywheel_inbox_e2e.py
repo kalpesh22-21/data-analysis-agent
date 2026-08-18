@@ -16,8 +16,19 @@ real-LLM outcome, not a hard error:
   PART B — learn from that live session, then HUMAN-ACCEPT via the review inbox
            (the `sampler=True` coin routes the blueprint to `in_review`, so a
            human `inbox.approve(...)` — not an auto-promotion — lands it).
-  PART C — a VARIANT question (a DIFFERENT filter) AUTOPLAYS the learned
-           blueprint through the SAME in-process runtime.
+  PART C — a VARIANT question (a DIFFERENT filter) through the SAME in-process
+           runtime, and the GOVERNED-CORPUS TRUST GATE holding.
+
+           An inbox-approved blueprint lands in the `source='learning'` STAGING
+           tier (`learning/promotion/landing.py`), NOT the trusted MCP canon,
+           and agent recall serves `source='mcp'` ONLY — the fail-closed gate in
+           `runtime/retrieval/vector_index.py`. So the learned blueprint is
+           deliberately NOT recallable end-to-end yet, whatever its
+           status/drift_status: it must first be PROMOTED to canon (a human
+           verify -> re-source to mcp; the governed-corpus Phase-3 hop, not
+           built). PART C therefore shows the RAW-path answer plus the gate
+           doing its job — not an autoplay. If the fast path DOES fire, it fired
+           off the pre-existing MCP-canon corpus, not off what PART B landed.
 
 Run (from the repo root, the l2 stack UP):
 
@@ -114,7 +125,9 @@ _QUESTION_A = "what is the total annual salary for the Sales department?"
 # and filter the model already used, so turn 2 converges cleanly (no new schema,
 # no out-of-scope column) and the session stays learnable.
 _RECTIFY_A = "actually, I want the AVERAGE annual salary per employee in Sales, not the total."
-# PART C: the VARIANT — same shape, DIFFERENT filter — should autoplay the learned bp.
+# PART C: the VARIANT — same shape, DIFFERENT filter. It does NOT autoplay what PART B
+# landed: that blueprint is in the `source='learning'` staging tier and recall serves
+# `source='mcp'` only (the trust gate), so the raw path is the CORRECT outcome here.
 _QUESTION_C = "what is the average annual salary per employee in the Engineering department?"
 
 # --------------------------------------------------------------------------- runtime
@@ -552,7 +565,10 @@ async def _run() -> int:
 
         # ==================================================================== PART C
         print("\n" + "#" * 72)
-        print("# [PART C] a VARIANT question AUTOPLAYS the blueprint through the RUNTIME")
+        print("# [PART C] a VARIANT question through the RUNTIME + the TRUST GATE holding")
+        print("#   the PART B blueprint landed in the source='learning' STAGING tier;")
+        print("#   recall serves source='mcp' ONLY, so it is correctly NOT served until")
+        print("#   promoted to canon. Expect the RAW path — that is the gate working.")
         print("#" * 72)
 
         jwt_c = await mint_bound_token(DEMO_COLUMN_SCOPE, sid_c)
@@ -569,12 +585,18 @@ async def _run() -> int:
         if bpu is not None and bpu.get("blueprint_id"):
             slots = bpu.get("slots") or {}
             print(
-                f"\n[STAGE C2] AUTOPLAY FIRED: blueprint_id={bpu.get('blueprint_id')} slots={slots}"
+                f"\n[STAGE C2] FAST PATH FIRED: blueprint_id={bpu.get('blueprint_id')} "
+                f"slots={slots}"
+            )
+            print(
+                "           NOTE: recall serves source='mcp' only, so this came from the "
+                "MCP-CANON corpus — it is NOT the blueprint PART B just landed (that one "
+                "is source='learning' staging). Compare the id above with keys['blueprint_id']."
             )
             if any(str(v).lower() == "engineering" for v in slots.values()):
                 print(
-                    "           slots bound to department=Engineering — the blueprint "
-                    "learned from 'Sales' autoplayed for 'Engineering'. PAYOFF."
+                    "           slots bound to department=Engineering — a canon blueprint "
+                    "generalized across the filter."
                 )
             part_c = True
         elif ran_blueprint:
@@ -586,14 +608,20 @@ async def _run() -> int:
             part_c = True
         else:
             print(
-                "\n[STAGE C2] the runtime took the RAW path (no runBlueprint) — a valid real-LLM "
-                "outcome (recall may not have surfaced it, or the model chose raw tools). "
-                "Reporting the runtime outcome honestly."
+                "\n[STAGE C2] the runtime took the RAW path (no runBlueprint) — the EXPECTED "
+                "outcome. What PART B landed is a source='learning' STAGING node and recall "
+                "serves source='mcp' only, so the learned blueprint is correctly not served "
+                "until it is PROMOTED to canon. The question is still answered, from raw tools."
             )
 
         # Deterministic recall BACKSTOP (like the learning demo's STAGE 5): does the
         # variant question vector recall the just-landed blueprint node at all?
         print("\n[STAGE C3] deterministic recall backstop (Neo4jVectorIndex.recall):")
+        print(
+            "           NOTE: this is the GATED recall the agent uses — its Cypher carries "
+            "`AND node.source = 'mcp'`. A source='learning' staging node is filtered out "
+            "BEFORE scoring, so absence here is the trust gate, not a ranking result."
+        )
         query_vector = (await infra.embedder.embed([_QUESTION_C]))[0]
         index = Neo4jVectorIndex(
             url=neo4j_uri(),
@@ -606,13 +634,18 @@ async def _run() -> int:
             landed = next((c for c in recalled if c.id == node_id), None)
             if landed is None:
                 print(
-                    f"           the learned blueprint {node_id} was NOT recalled for "
-                    f"{_QUESTION_C!r} (semantic distance) — recall returned {len(recalled)} node(s)."
+                    f"           CORRECTLY WITHHELD: the learned blueprint {node_id} was not "
+                    f"served for {_QUESTION_C!r} — it is source='learning' staging and this "
+                    f"recall serves source='mcp' only. Recall returned {len(recalled)} canon "
+                    f"node(s). It ranks in the RAW vector index (verified live 2026-08-18); the "
+                    f"trust gate, not semantic distance, is what keeps it out. THE GATE HELD."
                 )
             else:
                 print(
                     f"           RECALLED: {_QUESTION_C!r} surfaced {node_id} "
-                    f"(uses={sorted(landed.uses)}) — it IS recallable."
+                    f"(uses={sorted(landed.uses)}) — meaning this node is source='mcp' CANON. "
+                    f"For a freshly-landed learning node that would be a TRUST-GATE FAILURE; "
+                    f"expected only once the promotion hop (staging -> canon) exists and ran."
                 )
         finally:
             await index.close()
@@ -638,7 +671,11 @@ async def _finish(infra, keys, part_a, part_b, part_c) -> None:  # noqa: ANN001
     print("=" * 70)
     print(f"  PART A (live runtime turn + rectify): {'DONE' if part_a else 'not reached'}")
     print(f"  PART B (learn + human inbox approve): {'DONE' if part_b else 'not reached'}")
-    print(f"  PART C (variant autoplay):            {'DONE' if part_c else 'not reached'}")
+    # `part_c` tracks ONLY whether the blueprint fast path fired — which, under the
+    # source='mcp' trust gate, can only ever be a CANON blueprint, never what PART B
+    # landed. A raw-path PART C is the expected, correct outcome (see STAGE C2/C3),
+    # so this line must not read as a failure; it is also False when PART C never ran.
+    print(f"  PART C (variant turn; canon fast path): {'FIRED' if part_c else 'not fired'}")
     print("  key ids:")
     for k, v in keys.items():
         print(f"    {k:14s}: {v}")

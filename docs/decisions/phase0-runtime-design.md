@@ -353,6 +353,18 @@ D71 and is flagged as an open question (§11 OQ-C).
 
 ## 5. Context assembly (non-retrieval, D50 fixed order)
 
+> **SUPERSEDED (2026-08: the compaction seam was deleted in cleanup Tier 2 — see
+> docs/cleanup/WORKLOG.md #3; ISSUES L3).** The sketch below is the Phase-0 design record, kept for
+> the reasoning behind steps 1–2, which still hold. **Step 3 no longer exists:** `budget.compact` /
+> `compact_trail`, `budget.render_messages`, `CompactionResult`/`SummaryCache`, the whole
+> `llm_summarizer.py` module and the `Redactor` class were removed as production-dead — there is no
+> running-summary LLM call in the assembler and no summary cache to persist (§11 OQ-E is moot). What
+> ships instead is a **total-request token budget**, `context/budget.py::fit_request_to_budget`,
+> applied to the rendered request rather than a summarizer over the trail. `ContextAssembler.assemble`
+> also no longer has the signature shown — it takes the turn index, user message, retrieval memo and
+> withheld call-ids, and returns an `AssembledContext`. Read §5.1 onward (the D44 provenance filter)
+> as current; read the step-3 bullets as history.
+
 ```python
 # context/assembly.py
 class ContextAssembler:

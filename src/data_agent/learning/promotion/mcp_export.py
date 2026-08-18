@@ -127,7 +127,13 @@ _PARITY_NOTE = (
 def _blueprint_doc(env: CandidateEnvelope, node_id: str) -> dict[str, Any]:
     """Project a blueprint candidate onto the EXACT MCP blueprint field set. Reuses
     `blueprint_seed_from_candidate` to normalize, then keeps ONLY the MCP fields (drops
-    `source`/`verified`/`created_by`/`source_candidate_id`), in the MCP field order."""
+    `source`/`verified`/`created_by`/`source_candidate_id`/`structural_key` — the last
+    is re-derived by the reseed from the templates), in the MCP field order.
+
+    This whitelist is hand-written, which is precisely how J7's `window_anchor` was lost
+    twice (see `tests/eval/test_harness_field_drift.py`); the field-parity tripwire in
+    `test_mcp_export.py` now derives the required key set from `BlueprintSeed` so the
+    next field added to the seed cannot be dropped here in silence."""
     seed = blueprint_seed_from_candidate(env, id=node_id)
     doc: dict[str, Any] = {
         "id": seed.id,  # the landing id VERBATIM — a reseed MERGEs this same node
@@ -148,6 +154,12 @@ def _blueprint_doc(env: CandidateEnvelope, node_id: str) -> dict[str, Any]:
     result_grain = _result_grain_field(seed.result_grain)
     if result_grain is not None:
         doc["result_grain"] = result_grain
+    # J7c — emitted between `result_grain` and `sql_template` to match the hand-authored
+    # canon field order (clickhouse-api `app/corpus/data/blueprints/bp-hires-per-month.
+    # yaml`). Omitted when absent: `None` means the blueprint makes NO window claim, and
+    # a `window_anchor: null` key in canon would read as a declaration that isn't one.
+    if seed.window_anchor:
+        doc["window_anchor"] = seed.window_anchor
     if seed.sql_template:
         doc["sql_template"] = seed.sql_template
     if seed.resolves:
