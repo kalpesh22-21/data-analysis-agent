@@ -1,6 +1,7 @@
 # summary — the deterministic SessionSummary loader (Track B, Slice 2; D27/D99).
 from .loader import load_session_summary
 from .models import (
+    BOOKKEEPING_TOOLS,
     AcceptedSignal,
     AnswerSql,
     AskUserExchange,
@@ -13,6 +14,7 @@ from .models import (
 from .refs import sql_by_ref
 
 __all__ = [
+    "BOOKKEEPING_TOOLS",
     "AcceptedSignal",
     "AnswerSql",
     "AskUserExchange",

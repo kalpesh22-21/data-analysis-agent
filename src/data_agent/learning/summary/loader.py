@@ -13,14 +13,8 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterator
 from typing import Any, Protocol
 
-from data_agent.runtime.composite.analysis_state import (
-    ANALYSIS_STATE_INVALID_CODE,
-    ANALYSIS_STATE_LATE_INIT_CODE,
-)
 from data_agent.runtime.context.assembly import IDEMPOTENT_READ_ALREADY_SERVED_CODE
-from data_agent.runtime.dispatch.denial_mapping import (
-    FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-)
+from data_agent.runtime.dispatch.denial_mapping import ENFORCEMENT_DENIAL_CODES
 from data_agent.runtime.session.models import ResultPreview, SessionDoc, TrailEntry
 
 from ..models import LearningJob
@@ -62,66 +56,44 @@ _FAILED_STATUSES = ("error", "denied")
 # by which the SQL it designates reaches the summary.
 _ANSWER_TOOL = "answerWithTable"
 
-# ENFORCEMENT codes: the runtime refused (or short-circuited) the call on its own
-# mechanics, BEFORE the executor ran.
+# ENFORCEMENT codes: the runtime refused the call on its own PROTOCOL — the order or
+# the shape of the call — rather than on anything the model asked of the data.
 #
-# IMPORTED where the owning module is one this offline daemon can already afford to
-# load; SPELLED OUT where it is not, naming the symbol that owns the spelling so the
-# drift is findable. The two spelled-out codes DO have exported constants — but only
-# in `loop/agent_loop.py`, which drags the whole request-path dispatch stack into the
-# learning daemons' import graph for two strings. `test_loader.py::test_every_
-# enforcement_code_is_a_code_the_runtime_actually_sets` pins them against
-# `denial_mapping.KNOWN_DENIAL_CODES`, so a rename fails a test rather than silently
-# switching the filter off.
+# DERIVED, not listed. The classification lives on `DenialInfo.enforcement` in
+# `runtime/dispatch/denial_mapping.py`, next to where each code is registered, and this
+# set is a projection of it. That is the whole point: this used to be a hand-written
+# list, and a hand-written list fails loudly on a RENAME (a drift test catches it) and
+# silently on an ADDITION — a new gate code registered upstream quietly starts counting
+# as substantive friction here, the negative bias this filter exists to remove. It had
+# already happened once: `ANSWER_TABLE_NO_TABLE_DESIGNATED` (Release 1, 08 §O) was
+# registered after the list was written and never added to it.
 #
-# The line this set draws is enforcement-mechanics vs SUBSTANTIVE failure, and it is
-# DERIVED FROM WHAT THE TWO READERS BELOW INFER from a non-ok status:
-# `_failed_fixed_pairs` infers analyst friction (it feeds
-# `SessionSignals.failed_fixed_count` and the extractor's `failed_fixed_sql`
-# section — "a query came back wrong and a later one fixed it"), and
-# `_blueprint_usages` infers corpus quality (`outcome == "corrected"` feeds
-# `SessionSignals.corrected_blueprint` and triage, read as "this blueprint was
-# wrong"). A call refused before it ran is evidence for neither: nothing was
-# computed, so there is no bad SQL that got fixed and no blueprint output that got
-# corrected. Release 1 made these routine — a model trips
+# The line the split draws is DERIVED FROM WHAT THE TWO READERS BELOW INFER from a
+# non-ok status: `_failed_fixed_pairs` infers analyst friction (it feeds
+# `SessionSignals.failed_fixed_count` and the extractor's `failed_fixed_sql` section —
+# "a query came back wrong and a later one fixed it"), and `_blueprint_usages` infers
+# corpus quality (`outcome == "corrected"` feeds `SessionSignals.corrected_blueprint`
+# and triage, read as "this blueprint was wrong"). A call refused on protocol is
+# evidence for neither: nothing was computed, so there is no bad SQL that got fixed and
+# no blueprint output that got corrected. Release 1 made these routine — a model trips
 # `BLUEPRINT_DEFINITION_NOT_READ` in normal operation — so counting them would put a
 # permanent negative bias on every post-Release-1 session.
 #
-# A syntax error, a `COLUMN_SCOPE_VIOLATION`, a `CLICKHOUSE_QUERY_ERROR`: the
-# opposite. The call was really attempted and the answer came back wrong, which is
-# exactly the friction both readers exist to record. Those stay failures.
-ENFORCEMENT_ERROR_CODES = frozenset(
-    {
-        # `loop/blueprint_gate.py::BLUEPRINT_DEFINITION_NOT_READ_CODE` (Release 1),
-        # registered in dispatch/denial_mapping.py: `runBlueprint` refused because
-        # `getBlueprint` had not run in the same turn. Retryable, and the executor
-        # never runs — the model has not seen the SQL it was about to execute.
-        "BLUEPRINT_DEFINITION_NOT_READ",
-        # `loop/agent_loop.py::ANSWER_TABLE_BLUEPRINT_NOT_RUN_CODE` (Release 1):
-        # `answerWithTable` named a blueprint it never ran, so there was no terminal
-        # SQL to resolve. Retryable.
-        "ANSWER_TABLE_BLUEPRINT_NOT_RUN",
-        # composite/analysis_state.py (Release 1): `updateAnalysisState` hygiene.
-        # Neither says anything about the data — INVALID is a mis-shaped ledger
-        # update (retryable), LATE_INIT is a declaration that arrived after the work
-        # started (not retryable). Imported: that module adds NOTHING to this
-        # process's import graph (every dependency it has is already loaded here) and
-        # its import-time work is a logger and a table of constants.
-        ANALYSIS_STATE_INVALID_CODE,
-        ANALYSIS_STATE_LATE_INIT_CODE,
-        # loop/agent_loop.py sets it, dispatch/denial_mapping.py registers it: the
-        # turn's terminal call refused while declared intents are still pending.
-        FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
-        # loop/agent_loop.py's repeated-idempotent-read guard, code owned by
-        # context/assembly.py. Persisted `status="ok"` today (and only for
-        # `read_guard.py::IDEMPOTENT_READ_TOOLS`, none of which is a `_DATA_TOOLS`
-        # member), so neither reader below currently reaches it — listed so this set
-        # is the whole enforcement vocabulary rather than the part that happens to be
-        # reachable, which is what a reader adding a tool to `_DATA_TOOLS` will
-        # assume it is.
-        IDEMPOTENT_READ_ALREADY_SERVED_CODE,
-    }
-)
+# A syntax error, a `COLUMN_SCOPE_VIOLATION`, a `CLICKHOUSE_QUERY_ERROR`: the opposite.
+# The model's own query was judged and found wanting, which is exactly the friction both
+# readers exist to record. Those stay failures, and `enforcement` defaults to False
+# upstream so an unclassified addition stays one too.
+ENFORCEMENT_ERROR_CODES = ENFORCEMENT_DENIAL_CODES | {
+    # The ONE enforcement code that is not a `_DENIAL_TABLE` entry: `agent_loop.py`'s
+    # repeated-idempotent-read guard, code owned by `context/assembly.py`. It is a
+    # guard-entry MARKER, not a dispatch denial — persisted `status="ok"` today (and
+    # only for `read_guard.py::IDEMPOTENT_READ_TOOLS`, none of which is a `_DATA_TOOLS`
+    # member), so neither reader below currently reaches it. Imported by symbol from its
+    # owner, and unioned in here so this set is the whole enforcement vocabulary rather
+    # than the part that happens to be reachable — which is what a reader adding a tool
+    # to `_DATA_TOOLS` will assume it is.
+    IDEMPOTENT_READ_ALREADY_SERVED_CODE,
+}
 
 
 class _FullResultReader(Protocol):

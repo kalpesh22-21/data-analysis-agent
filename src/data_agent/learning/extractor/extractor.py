@@ -79,7 +79,7 @@ from dataclasses import dataclass, replace
 from data_agent.runtime.model.client import ModelClient, ModelTurnResult, begin_turn_client
 
 from ..priorart import PriorArtIndex
-from ..summary.models import SessionSummary
+from ..summary.models import BOOKKEEPING_TOOLS, SessionSummary
 from ..triage import TriageVerdict
 from .correction import build_correction_message
 from .grounding import RuleIndex
@@ -167,21 +167,6 @@ _PRIOR_ART_RULES = (
     "number of calls is capped. It is optional: call emit_candidates directly when the "
     "block already answers the question, and always finish by calling emit_candidates."
 )
-
-
-# Tools whose trail entries are dropped from the PAYLOAD's `tool_calls` list (never
-# from the `SessionSummary` itself — that stays a faithful projection other stages
-# read).
-#
-# Derived from what the extractor uses `tool_calls` FOR: the SQL evidence a candidate
-# is built from, and the outcome narrative that says whether a call worked. These two
-# carry neither. `updateAnalysisState` is the intent ledger — `sql: null`, and
-# Release 1 models re-send the WHOLE intent list every round, with the rejected
-# attempts persisted alongside the accepted ones, so a single turn contributes many
-# near-identical entries. `recordAssumptions` echoes the model's own prose back at
-# it. What is left is token bloat in a prompt that already carries the whole session,
-# and a `status: "denied"` count that reads as friction where none happened.
-_PAYLOAD_EXCLUDED_TOOLS = frozenset({"updateAnalysisState", "recordAssumptions"})
 
 
 class ExtractorConfigError(ValueError):
@@ -565,7 +550,16 @@ class LearningExtractor:
                  "tool_name": tc.tool_name, "sql": tc.sql, "status": tc.status,
                  "result_columns": list(tc.result_columns)}
                 for tc in summary.tool_calls
-                if tc.tool_name not in _PAYLOAD_EXCLUDED_TOOLS
+                # Dropped from the PAYLOAD only — never from the `SessionSummary`,
+                # which stays a faithful projection other stages read. Derived from
+                # what the extractor uses `tool_calls` FOR: the SQL evidence a
+                # candidate is built from, and the outcome narrative that says whether
+                # a call worked. Bookkeeping calls carry neither, so what their entries
+                # add is token bloat in a prompt that already holds the whole session
+                # and a `status: "denied"` count that reads as friction that never
+                # happened. The coverage judge's brief drops the SAME set from the
+                # SAME home (`summary/models.py::BOOKKEEPING_TOOLS`).
+                if tc.tool_name not in BOOKKEEPING_TOOLS
             ],
             # The SQL the FINAL answer showed the user (`answerWithTable`, incl. the
             # Release 1 multi-table form). Kept a section of its own rather than

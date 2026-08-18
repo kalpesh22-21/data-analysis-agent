@@ -21,6 +21,17 @@ are all capped. A truncated brief is stated as truncated rather than silently tr
 a judge that cannot see the whole session must not be encouraged to assert novelty
 about the part it did not see, and the prompt says so.
 
+**The tool-call cap is spent on SUBSTANTIVE calls.** `summary/models.py::
+BOOKKEEPING_TOOLS` entries are removed BEFORE the cap, not after, so a Release-1
+session's intent-ledger churn cannot push the queries the judge is actually comparing
+out of the brief — or, worse, flip `truncated` and make the judge discount a verdict it
+had all the evidence for. They are removed rather than capped-around because the judge
+is asked exactly one question ("does the corpus already cover this work?") and a ledger
+update is not work the corpus could cover. Their COUNT is still stated
+(`bookkeeping_calls_omitted`), because "stated, not silently trimmed" is the rule this
+module already lives by and a session with thirty of them is a different session from
+one with none.
+
 **The PRIOR ART block is rendered by 3a's renderer, not re-implemented here.**
 `extractor/prior_art.py::render_prior_art_block` is where the flatten-and-cap guard on
 untrusted corpus text lives, and where the three distinct facts (found nothing / could
@@ -37,7 +48,7 @@ from typing import Any
 from data_agent.untrusted import as_str_list
 
 from ..candidate.models import CandidateEnvelope
-from ..summary.models import SessionSummary
+from ..summary.models import BOOKKEEPING_TOOLS, SessionSummary
 
 # Caps. Every one bounds a PROMPT, and the prompt's cost is the thing being optimized.
 _MAX_TURNS = 12
@@ -106,6 +117,10 @@ def session_brief(summary: SessionSummary) -> str:
     40 tool calls that then asserts "nothing here matches the corpus" is asserting
     something about the 28 it never saw, and the system prompt instructs it to discount
     accordingly — which only works if the brief admits it.
+
+    Bookkeeping calls (`BOOKKEEPING_TOOLS`) are dropped before the cap and counted in
+    `bookkeeping_calls_omitted`; see the module docstring for why that is not the same
+    kind of omission as truncation.
     """
     turns = [
         {
@@ -115,6 +130,15 @@ def session_brief(summary: SessionSummary) -> str:
         }
         for t in summary.turns[:_MAX_TURNS]
     ]
+    # BEFORE the cap, on purpose. `updateAnalysisState`/`recordAssumptions` execute
+    # nothing and carry no SQL, so a slot spent on one is a query the coverage decision
+    # is made without — and on a Release-1 session there are enough of them to consume
+    # the whole allowance and set `truncated`, which the system prompt then tells the
+    # judge to read as a reason to doubt itself. Capping first and filtering after would
+    # keep both faults.
+    substantive_calls = [
+        tc for tc in summary.tool_calls if tc.tool_name not in BOOKKEEPING_TOOLS
+    ]
     tool_calls = [
         {
             "ref": tc.tool_call_ref,
@@ -123,7 +147,7 @@ def session_brief(summary: SessionSummary) -> str:
             "sql": _text(tc.sql, _MAX_SQL_CHARS),
             "result_columns": list(tc.result_columns[:_MAX_LIST_ITEMS]),
         }
-        for tc in summary.tool_calls[:_MAX_TOOL_CALLS]
+        for tc in substantive_calls[:_MAX_TOOL_CALLS]
     ]
     # The query the FINAL answer showed the user (`answerWithTable`, incl. Release 1's
     # multi-table form). Its own section, because it is not in `tool_calls`: the
@@ -140,10 +164,20 @@ def session_brief(summary: SessionSummary) -> str:
         "accepted_signal": summary.accepted_signal,
         "turns": turns,
         "tool_calls": tool_calls,
+        # One line, not the entries: the judge's rubric never reasons about intents or
+        # assumptions, so their CONTENT buys it nothing — but a brief that showed no
+        # trace of them at all would be claiming a session shape that did not happen,
+        # and this is the module that refuses to trim silently.
+        "bookkeeping_calls_omitted": len(summary.tool_calls) - len(substantive_calls),
         "answer_sql": answer_sql,
+        # Counted over the SUBSTANTIVE calls: dropped bookkeeping is not evidence the
+        # judge is missing, and `truncated` is the flag that makes it discount its own
+        # verdict (system prompt rule 6). Over-declaring it is not a safe default here —
+        # it is a thumb on the scale against dropping a duplicate, on exactly the busy
+        # sessions the drop gate exists to pay for.
         "truncated": (
             len(summary.turns) > _MAX_TURNS
-            or len(summary.tool_calls) > _MAX_TOOL_CALLS
+            or len(substantive_calls) > _MAX_TOOL_CALLS
             or len(summary.answer_sqls) > _MAX_LIST_ITEMS
         ),
     }

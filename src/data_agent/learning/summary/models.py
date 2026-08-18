@@ -23,6 +23,27 @@ from typing import Any, Literal
 # surface exists yet, D99).
 AcceptedSignal = Literal["no_correction", "thumbs_up", "explicit_confirm"]
 
+# Tools whose calls are the model's OWN BOOKKEEPING: they execute nothing, carry no SQL,
+# and their result is the model's prose or ledger echoed back at it. `updateAnalysisState`
+# is the intent ledger — `sql: null`, and Release 1 models re-send the WHOLE intent list
+# every round with the rejected attempts persisted alongside the accepted ones, so one
+# turn contributes many near-identical entries. `recordAssumptions` echoes the model's
+# own prose.
+#
+# They are NEVER dropped from `SessionSummary` itself — that stays a faithful projection
+# of the trail, and `loader.py` is the module that must not lie about what happened. The
+# set exists for the two stages that build a MODEL PROMPT out of a summary and are paying
+# per token for it: the extractor's payload (`extractor.py::_build_messages`) and the
+# coverage judge's pre-extraction brief (`judge/prompt.py::session_brief`). Both want the
+# same thing — the SQL evidence and the outcome narrative — and this churn is neither.
+#
+# It lives HERE rather than in either consumer for the reason `loader.py::DATA_TOOLS`
+# does: two stages classifying the same tool names from two private lists is a mirror
+# that goes out of step silently. It is in `models.py`, not `loader.py`, because both
+# consumers already import this module and neither should have to pull the loader's
+# runtime dependencies in to learn a pair of tool names.
+BOOKKEEPING_TOOLS = frozenset({"updateAnalysisState", "recordAssumptions"})
+
 
 @dataclass(frozen=True)
 class ToolCallSummary:

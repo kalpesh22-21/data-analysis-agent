@@ -10,6 +10,7 @@ import pytest
 
 from data_agent.learning.extractor import ExtractedCandidate
 from data_agent.learning.extractor.schema import EXTRACTOR_TOOL_NAME, SchemaMismatchError
+from data_agent.learning.summary.models import BOOKKEEPING_TOOLS
 
 from .helpers import (
     KEEP_VERDICT,
@@ -97,7 +98,10 @@ async def test_exactly_max_retries_plus_one_attempts_are_made():
 # --- Release 1: the payload seam ---------------------------------------------
 
 
-@pytest.mark.parametrize("tool_name", ["updateAnalysisState", "recordAssumptions"])
+# Parametrized FROM the shared set, so a tool added to `BOOKKEEPING_TOOLS` is
+# covered here and in the judge's brief without anyone remembering to widen a
+# literal in two suites.
+@pytest.mark.parametrize("tool_name", sorted(BOOKKEEPING_TOOLS))
 async def test_state_bookkeeping_calls_are_dropped_from_the_payload(tool_name):
     """A Release-1 session carries many of these per turn (the model re-sends the
     whole intent list every round, and rejected attempts are persisted too). They

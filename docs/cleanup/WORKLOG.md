@@ -579,3 +579,37 @@ re-seeded); real questions asked through the BFF:
   export regenerated via scripts/regen_catalog_fixture.py — note the
   catalog direction has NO runtime-side guard, reviewer nit, queued with
   C5). V0 with synced mirrors: **5838 passed / 225 skipped / 1 xfailed**.
+
+## #17 — H1+H2: derived enforcement classification + judge brief decrowding (2026-08-17)
+
+- **H1** — `DenialInfo.enforcement: bool` (default False = substantive, so
+  an unclassified new code can never silently STOP counting); all 21
+  `_DENIAL_TABLE` codes classified on the line "was the model's data work
+  judged, or only its call protocol"; `ENFORCEMENT_DENIAL_CODES` derived
+  from the table; the learning set = derived ∪ {IDEMPOTENT_READ marker
+  (assembly-owned, not a table entry)}. **The predicted drift had already
+  happened**: ANSWER_TABLE_NO_TABLE_DESIGNATED (08 §O) was registered
+  after the hand list and silently counted substantive. Two additions
+  (that one + RETRIEVAL_TOOL_INVALID_ARGS), zero removals, no counted
+  metric moves today (reviewer-verified against both readers); no wire
+  leak of the new field (no DenialInfo serialization anywhere). Old
+  subset-drift test replaced by a derivation test + a per-code rationale
+  map that fails when a new code lands unclassified.
+- **H2** — judge `session_brief`: bookkeeping calls (shared
+  `BOOKKEEPING_TOOLS` in learning/summary/models.py; extractor's private
+  mirror DELETED) filtered before the 12-call cap; `truncated` computed
+  over substantive calls only; `bookkeeping_calls_omitted` always states
+  the omission. Pre-fix repro: 17 recordAssumptions ate 11 of 12 slots and
+  flipped truncated. Extractor behaviour byte-identical after the
+  constant move.
+- Review: APPROVE, 0 blockers; both judgement-call classifications
+  independently confirmed at raise sites. 1 nit queued as **H8** (the
+  enforcement boolean is load-bearing for two readers with different
+  semantics; outage codes strain it).
+- V0 **5869 passed / 225 skipped / 1 xfailed**, ruff clean. Learning-plane
+  slice: no live gate required (classify_denial output unchanged;
+  reviewer-verified).
+
+**Easy×high triage quadrant complete** (H4+H7, E1/E2+M2, J3b+J1, H1+H2 —
+WORKLOG #14–#17). Remaining stack = discussion items: H3/H5/H6 rewrite
+family, J7 product call, Wave B, C5, I1/I2, D2/D3, plus hygiene batch.

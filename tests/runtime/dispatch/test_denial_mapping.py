@@ -6,7 +6,11 @@ from __future__ import annotations
 
 import pytest
 
-from data_agent.runtime.dispatch.denial_mapping import KNOWN_DENIAL_CODES, classify_denial
+from data_agent.runtime.dispatch.denial_mapping import (
+    ENFORCEMENT_DENIAL_CODES,
+    KNOWN_DENIAL_CODES,
+    classify_denial,
+)
 
 _ALL_SEVEN_CODES = {
     "COLUMN_SCOPE_VIOLATION",
@@ -156,3 +160,108 @@ def test_none_code_is_handled() -> None:
     info = classify_denial(None)
     assert info.retryable is False
     assert info.code == "UNKNOWN_ERROR"
+
+
+# --- enforcement: is the refusal about the CALL or about the WORK? --------------
+#
+# `DenialInfo.enforcement` is READ by the offline learning loop
+# (`learning/summary/loader.py::ENFORCEMENT_ERROR_CODES` is derived from it): an
+# enforcement denial is NOT counted as analyst friction — no `failed_fixed` pair, no
+# `corrected` blueprint usage. So a wrong classification here is a silent measurement
+# bug two packages away, in either direction: True on a real failure hides friction that
+# happened, False on a gate invents friction that did not.
+#
+# This map is DELIBERATELY hand-written, one line of rationale per code, and the test
+# below fails if a registered code is missing from it. Mirroring `_DENIAL_TABLE` with a
+# comprehension would assert nothing; the value of this map is that adding a code to the
+# table cannot go green until a human has said, in words, which side it falls on.
+#
+# The line is not "did the executor run" — `COLUMN_SCOPE_VIOLATION` is refused before
+# ClickHouse is touched and is still substantive. It is "was the model's DATA WORK
+# judged (its SQL, its blueprint, the warehouse under them), or only its CALL PROTOCOL
+# (the order of calls, the shape of the envelope)".
+_EXPECTED_ENFORCEMENT = {
+    # --- protocol / gate refusals: nothing was computed, nothing computed was wrong ---
+    # Call ORDER: getBlueprint must precede runBlueprint. The executor never ran, so
+    # this is not evidence that the blueprint is wrong.
+    "BLUEPRINT_DEFINITION_NOT_READ": True,
+    # Answer SHAPE: a blueprint named in the answer that was never run this turn.
+    "ANSWER_TABLE_BLUEPRINT_NOT_RUN": True,
+    # Answer SHAPE: no table designated at all (08 §O).
+    "ANSWER_TABLE_NO_TABLE_DESIGNATED": True,
+    # Finalization ORDER: the turn's work may be perfect; ending the turn with intents
+    # still pending is what was refused.
+    "FINALIZATION_BLOCKED_PENDING_INTENTS": True,
+    # Bookkeeping hygiene: a mis-shaped intent ledger update. `updateAnalysisState`
+    # computes nothing, so it can fail in no data-bearing way.
+    "ANALYSIS_STATE_INVALID": True,
+    # The same ledger refused on TIMING rather than shape. Non-retryable AND
+    # enforcement — the two flags are independent.
+    "ANALYSIS_STATE_LATE_INIT": True,
+    # Envelope validation on the read tools (`_require_text` / `_clamp_k`): a blank
+    # `query`, an out-of-range `k`. Refused before any search ran — the
+    # ANALYSIS_STATE_INVALID shape, not the TABLE_NOT_FOUND one. Unreachable by today's
+    # learning readers (no retrieval tool is a data tool), classified for completeness.
+    "RETRIEVAL_TOOL_INVALID_ARGS": True,
+    # --- substantive failures: the work was judged, or the system under it failed -----
+    # The query asked for columns this scope does not hold — a verdict on the SQL.
+    "COLUMN_SCOPE_VIOLATION": False,
+    # The query referenced another session's scratch data — again, what the SQL named.
+    "SCRATCH_SESSION_VIOLATION": False,
+    # The SQL could not be parsed/validated.
+    "PARSE_FAILED_CLOSED": False,
+    # The query named a database it may not read.
+    "DATABASE_NOT_ALLOWED": False,
+    # The query named a table that does not exist — the canonical failed→fixed shape.
+    "TABLE_NOT_FOUND": False,
+    # A guardrail on the shape of the QUERY (a missing join condition), not of the call.
+    "CARTESIAN_JOIN_FORBIDDEN": False,
+    # The warehouse ran it and rejected it.
+    "CLICKHOUSE_QUERY_ERROR": False,
+    # The system underneath the work failed. That IS friction, and counting it is right.
+    "CLICKHOUSE_UNAVAILABLE": False,
+    # The model named a table/column that does not exist — TABLE_NOT_FOUND reached
+    # through the composite instead of the MCP.
+    "RESOLVE_VALUES_UNKNOWN_TARGET": False,
+    # A crash, not a refusal: attempted, then failed.
+    "RESOLVE_VALUES_INTERNAL_ERROR": False,
+    # A capability outage — the CLICKHOUSE_UNAVAILABLE shape.
+    "RESOLVE_VALUES_UNAVAILABLE": False,
+    # A capability outage: the request was fine, the dependency was not.
+    "RETRIEVAL_TOOL_UNAVAILABLE": False,
+    # A crash that slipped every guard.
+    "RETRIEVAL_TOOL_INTERNAL_ERROR": False,
+    # Registry-seam containment: a runtime tool raised or broke its contract. A real
+    # failure of a real attempt, and the conservative reading of "we do not know what
+    # went wrong".
+    "RUNTIME_TOOL_INTERNAL_ERROR": False,
+}
+
+
+def test_every_registered_code_has_a_stated_enforcement_classification() -> None:
+    """The guard H1 exists for. A code added to `_DENIAL_TABLE` defaults to
+    `enforcement=False` (substantive, the pre-existing behaviour), which is safe but
+    SILENT — the author may have meant to register a gate. This fails until the new
+    code is written down here with a reason, which is the only moment anyone is
+    thinking about the learning loop's friction counters."""
+    assert KNOWN_DENIAL_CODES == frozenset(_EXPECTED_ENFORCEMENT)
+
+
+@pytest.mark.parametrize("code", sorted(_EXPECTED_ENFORCEMENT))
+def test_classify_denial_enforcement(code: str) -> None:
+    assert classify_denial(code).enforcement is _EXPECTED_ENFORCEMENT[code]
+
+
+def test_enforcement_denial_codes_is_the_true_half_of_the_table() -> None:
+    """The derived export the learning loop actually imports."""
+    assert ENFORCEMENT_DENIAL_CODES == frozenset(
+        code for code, is_enforcement in _EXPECTED_ENFORCEMENT.items() if is_enforcement
+    )
+
+
+def test_an_unknown_code_is_not_enforcement() -> None:
+    """Conservative direction, matching `retryable`: an unclassifiable failure stays a
+    failure, so the learning loop keeps counting it as friction rather than quietly
+    forgiving it."""
+    assert classify_denial("SOME_NEW_UNMAPPED_CODE").enforcement is False
+    assert classify_denial(None).enforcement is False

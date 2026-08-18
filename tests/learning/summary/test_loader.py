@@ -12,7 +12,10 @@ from data_agent.learning.summary import load_session_summary
 from data_agent.learning.summary.loader import ENFORCEMENT_ERROR_CODES
 from data_agent.learning.triage import triage
 from data_agent.runtime.context.assembly import IDEMPOTENT_READ_ALREADY_SERVED_CODE
-from data_agent.runtime.dispatch.denial_mapping import KNOWN_DENIAL_CODES
+from data_agent.runtime.dispatch.denial_mapping import (
+    ENFORCEMENT_DENIAL_CODES,
+    KNOWN_DENIAL_CODES,
+)
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview
 
@@ -303,19 +306,38 @@ async def test_blueprint_usage_corrected_on_trailing_correction(store):
 # --- Release 1: enforcement denials are mechanics, not failures --------------
 
 
-def test_every_enforcement_code_is_a_code_the_runtime_actually_sets():
-    """Spelling drift guard, and the reason the two hardcoded literals are allowed to
-    stay hardcoded: the loader's set is a claim about codes another package owns, and
-    a rename there must fail HERE rather than silently switch the filter off. The
-    idempotent-read marker is exempt — it is a guard-entry marker, not a
-    `_DENIAL_TABLE` entry, and it is imported from its owner by symbol.
+def test_the_enforcement_set_is_derived_from_the_denial_table():
+    """H1: ownership of the split lives where codes are REGISTERED
+    (`DenialInfo.enforcement`), not in a list kept here by hand.
 
-    The other half of the invariant (no SUBSTANTIVE code is in this set) is
+    The old test asserted the hand-list was a SUBSET of the runtime's codes, which
+    caught renames and missed additions — a new gate code registered upstream simply
+    never arrived here and started counting as substantive friction. Stating the
+    derivation instead makes an addition impossible to miss: the only thing this module
+    still owns is the union with the one enforcement marker that is not a denial-table
+    entry at all.
+
+    Which codes are on which side is pinned, with a rationale per code, at
+    `tests/runtime/dispatch/test_denial_mapping.py::_EXPECTED_ENFORCEMENT`. The other
+    half of the invariant (no SUBSTANTIVE code is in this set) is
     `test_loader_release1_qa.py::test_no_substantive_failure_code_is_ever_classified_
     as_enforcement`, which states it as set disjointness."""
+    assert ENFORCEMENT_ERROR_CODES == ENFORCEMENT_DENIAL_CODES | {
+        IDEMPOTENT_READ_ALREADY_SERVED_CODE
+    }
+    # The marker is the ONLY member that is not a `_DENIAL_TABLE` entry; everything
+    # else is still a code the runtime demonstrably sets.
     assert ENFORCEMENT_ERROR_CODES - {IDEMPOTENT_READ_ALREADY_SERVED_CODE} <= (
         KNOWN_DENIAL_CODES
     )
+
+
+def test_the_answer_shape_denial_counts_as_enforcement():
+    """The regression H1 predicted and that had already happened: the 08 §O empty-
+    designation refusal was registered in `_DENIAL_TABLE` AFTER the hand-written
+    enforcement list was authored, and was never added to it. It is an answer-shape
+    gate — nothing ran — so it must not read as a failed query."""
+    assert "ANSWER_TABLE_NO_TABLE_DESIGNATED" in ENFORCEMENT_ERROR_CODES
 
 
 async def test_enforcement_denied_blueprint_is_not_a_failed_fixed_pair(store):
