@@ -1,5 +1,5 @@
 {
-  "catalog_sha": "1d86876cf150f1ce92d991ca849aa05f80caaa06",
+  "catalog_sha": "96bf1d0047f98edd976aa7c0709b01c022471c48",
   "catalog": {
     "dbpcm_warehouse.accrual_events": {
       "database": "dbpcm_warehouse",
@@ -2022,7 +2022,7 @@
         },
         "annual_salary": {
           "type": "Nullable(Decimal(18, 6))",
-          "description": "This is the annual salary of the employee. (Estimated for hourly employee",
+          "description": "This is the annual salary of the employee. (Estimated for hourly employee). For a MEDIAN of this column, ClickHouse quantileExact(0.5) returns the UPPER middle value when the group has an even number of rows, not the average of the two middle values; for a true median use (quantileExactLow(0.5)(annual_salary) + quantileExactHigh(0.5)(annual_salary)) / 2.",
           "unit": "USD"
         },
         "scheduled_pay_period_hours": {
@@ -2245,7 +2245,7 @@
             "most_recent_hire_date",
             "rehire_date"
           ],
-          "default": "most_recent_hire_date",
+          "default": "hire_date",
           "clarify_if": "The question distinguishes original hire from most recent hire or rehire."
         },
         {

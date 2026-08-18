@@ -545,3 +545,37 @@ first). This slice: the two production-blocking entrypoint defects.
   warning, boundary tests, TurnAccumulators call-site count).
 - V0 5837 green (+ the expected in-flight canon parity red, stash-proven);
   V1 **8 passed + L3 accepted red** (L1/L2/L4–L7 3/3, multi-intent 3/3).
+
+## #16 — J3b + J1 canon slice, end-to-end verified on the real database (2026-08-17)
+
+User directive mid-wave: verify end-to-end against the real database before
+committing. Full stack stood up (rebuilt l2-mcp from the new canon, corpus
+re-seeded); real questions asked through the BFF:
+
+- **J3b-a PASS** — ambiguity default flipped to `hire_date`; ad-hoc "hires
+  by year" now keys on the populated column (2/2/3). Builder swept all 45
+  ambiguity defaults across 11 catalog files: only this one was a genuine
+  defect (`supervisor`'s default is all-NULL but so is every alternative —
+  warehouse seed gap, left alone).
+- **J1 — failed first, root-caused, fixed, PASS.** Guidance in
+  `annual_salary.description` was IGNORED 2/2 live runs; Phoenix payload
+  proof: the guidance text was absent from 170KB request payloads while the
+  schema was in context. Root cause: `_cap_nontabular_result` keeps only
+  the head of a wide table's column list — late columns lose descriptions
+  entirely (NEW ISSUE **C5**; also affects ambiguities). Fix that works:
+  `kn-clickhouse-median` knowledge entry (recall-surfaced, schema-width
+  independent) — next run the model wrote
+  `(quantileExactLow+quantileExactHigh)/2` unprompted; values match ground
+  truth exactly (125000/62500/115000 vs the old wrong 130000/75000/115000).
+  Column description kept too (correct, visible on narrow tables).
+- **J3b-b/c** — rehire caveat on the three hires intents (byte-identical);
+  blueprint route live: getBlueprint→runBlueprint, data-anchored answer,
+  no re-derivation. Sidecar freshness gate landed as a live-dirs suite test
+  with non-vacuity + served-SHA layers (teeth proven both directions);
+  historical correction: a2c8cb9 was a not-re-run gate, and this repo has
+  NO CI — the suite is the enforcement point.
+- Review (canon): APPROVE. clickhouse-api commit `f838a7f`; this commit
+  carries the fixture mirrors (blueprints intents, knowledge entry, catalog
+  export regenerated via scripts/regen_catalog_fixture.py — note the
+  catalog direction has NO runtime-side guard, reviewer nit, queued with
+  C5). V0 with synced mirrors: **5838 passed / 225 skipped / 1 xfailed**.

@@ -214,7 +214,7 @@
 # `max_value` narrow the safety bounds (default 1..120); an out-of-range or
 # non-integer value → askUser, never an absurd `INTERVAL 999999 MONTH`.
 - id: bp-hires-per-month
-  intent: New hires per month over a trailing window of the last N months
+  intent: New hires per month over a trailing window of the last N months — counts by original hire date; rehires are not re-counted
   slots_summary: window_months
   status: validated
   drift_status: clean
@@ -260,7 +260,7 @@
 # wrong-answer class). The resolver does NO relative→concrete date math — an
 # explicit ISO {start,end} is required; a deictic word ("last month") → askUser.
 - id: bp-hires-in-range
-  intent: New hires per month within an explicit start/end date range
+  intent: New hires per month within an explicit start/end date range — counts by original hire date; rehires are not re-counted
   slots_summary: hire_window
   status: validated
   drift_status: clean
@@ -302,7 +302,7 @@
 # fixed window N), so the empty months never need materializing. `result_grain: []` → a
 # single-row aggregate, so D56 grain-verify is vacuously skipped.
 - id: bp-hires-projection
-  intent: Projected number of hires over the next N months at the current hiring pace (run-rate over a trailing window)
+  intent: Projected number of hires over the next N months at the current hiring pace (run-rate over a trailing window) — counts by original hire date; rehires are not re-counted
   slots_summary: window_months, horizon_months
   status: validated
   drift_status: clean

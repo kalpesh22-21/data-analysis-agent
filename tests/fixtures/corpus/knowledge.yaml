@@ -29,3 +29,8 @@
     The register type classifies each payroll amount, for example regular pay,
     overtime, bonus or deduction. Filtering by register type isolates a single
     category of pay when aggregating amounts.
+- id: kn-clickhouse-median
+  title: Computing a true median in ClickHouse
+  doc_id: sql-guidance
+  status: validated
+  text: ClickHouse quantileExact(0.5) returns the UPPER middle value when a group has an even number of rows, not the average of the two middle values, so medians over even-sized groups read high. For a true median use (quantileExactLow(0.5)(x) + quantileExactHigh(0.5)(x)) / 2. This applies to any median question, for example median annual salary or median payroll amount by department.
