@@ -9,8 +9,9 @@ name, counting as exactly one `tool_calls_made`.
 
 The tool itself is stateless and near-trivial — it does NOT hold the turn's
 assumptions. It only returns a small confirmation `ToolResult`. The agent loop
-folds `clean_assumptions(arguments["assumptions"])` into its `turn_assumptions`
-accumulator on a SUCCESSFUL call (mirroring how it accumulates `turn_sql`), and
+folds `clean_assumptions(arguments["assumptions"])` into the window's
+`TurnAccumulators` on a SUCCESSFUL call (`note_assumptions`, mirroring how the
+same object accumulates the turn's SQL), and
 `session_history.project_history` reconstructs the same set from the trail using
 the SAME `clean_assumptions` helper.
 
@@ -53,7 +54,8 @@ def clean_assumptions(raw: Any) -> list[str]:
       - `raw` must be a list/tuple; anything else → `[]`.
       - keep only `str` items that are non-empty after `.strip()` (stripped form
         is stored); drop non-strings and blanks.
-      - dedupe, preserving FIRST-occurrence order (same discipline as `turn_sql`).
+      - dedupe, preserving FIRST-occurrence order (the same discipline the
+        window applies to the turn's SQL).
       - safety caps: ignore items beyond `_MAX_ASSUMPTIONS`; truncate any single
         item longer than `_MAX_ASSUMPTION_LEN`.
 
@@ -98,7 +100,7 @@ class RecordAssumptionsTool:
     `_run_runtime_tool` also guards, defense in depth) and never holds the
     accumulated assumptions itself — it just returns a small confirmation. The
     loop reads `arguments["assumptions"]` directly (via `clean_assumptions`) to
-    fold into its `turn_assumptions` accumulator.
+    fold into the window's `TurnAccumulators`.
     """
 
     tool_name = TOOL_NAME

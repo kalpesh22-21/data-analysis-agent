@@ -158,6 +158,18 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 **L3 — decision docs describe deleted APIs.** `docs/decisions/phase0-runtime-design.md:362-374` presents the compaction seam (budget.compact/render_messages/Redactor) as live architecture; `learning-loop-wave3-wiring-design.md` §25/26 documents `build_promotion_scheduler`/`build_review_inbox`; `OPEN-QUESTIONS.md` and `release-1/03-analysis-state.md` also name deleted APIs. Docs-only commit; decision docs are partly historical — mark superseded sections rather than rewrite history.
 
+## M. Tier-5 follow-ups (2026-08-17 — queued, not gating)
+
+**M1 — per-tool-call envelope rebuild feeds a branch that almost never fires.**
+`agent_loop._run_loop_body` computes the answer envelope (a
+`rollup_verification` + N `table.to_doc()` calls) unconditionally for EVERY
+tool call in a batch, solely to feed `_pause_from_runtime_tool` when
+`tool_result.pause is not None` (the T5.4 map's site "3161"; after T5.4 the
+same shape is `accum.envelope()` at the same position). Moving the call
+inside the `if pause` branch is behaviour-neutral for outputs but was kept
+verbatim in T5.4 to stay strictly behaviour-identical. Fix in a follow-up
+slice: one-line move + a test that a pause still carries the envelope.
+
 A reviewer document ("Planning and System-Prompt Review") landed the same session, proposing blueprint-first routing over the current SIMPLE/COMPLICATED planning policy. Its questions, the four decisions taken so far, and the follow-on questions those opened are tracked separately in **`docs/decisions/prompt-routing-review-qa.md`** (in-repo, for Lead sign-off) — not here. Issues **A4** (D22 deletes assistant text) and **B1/B3** above are now owned by that document's Decision 4 and Priority-1 workstream.
 
 Related: [[base-prompt-drop-context-budget]] (why the request-fit budget exists), [[l2-dev-stack-traps]], [[phase0-runtime-scope]], [[commit-after-review]].

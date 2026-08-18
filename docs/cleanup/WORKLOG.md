@@ -381,3 +381,35 @@ T5.5 finish(). Eight ordering invariants documented in the builder brief.
   traces in `data-agent-runtime` (23:19).
 - Base trap caught again by the pinning step (worktree spawned at 9558e9e,
   reset to 7f2d51f). Patch applied to main with zero conflicts.
+
+## #11 — T5.4: TurnAccumulators (2026-08-17)
+
+- **T5.4** collapsed the six `seed_*` params + seven window accumulator
+  locals into one window-scoped `TurnAccumulators`
+  (`runtime/loop/turn_accumulators.py`, 455L). Moved+de-underscored:
+  capture_terminal_sql (kept module-level — third windowless call site in
+  _compute_turn_answer_tables), answer_envelope/AnswerEnvelope,
+  accumulate_enrichment; absorbed: _accumulate_answer_tables,
+  _accumulate_assumptions. `_run_loop`/`_run_loop_body` now take ONE
+  `accumulators` param — the mirror's historical seed_blueprint_terminal_sql
+  forwarding hole is now structurally unexpressible (docstring rewritten to
+  record the failure mode). One deliberate reorder: construction hoisted
+  above the AnswerShapeCounter seed read (bool-equivalent, pinned).
+  Deliberate delta: blueprint_use/verification seeds are now copies, not
+  aliases (equal-not-identical on the approval-resume no-table path;
+  reviewer verified no identity-dependent consumer exists). Envelope sites
+  all position-preserved incl. the per-call pause-seam compute — queued as
+  ISSUES.md **M1** rather than optimized here. 30 new unit tests.
+- Review: APPROVE, 0 blockers, 0 suggestions; moved bodies AST-identical;
+  2 optional nits (shallow-copy docstring clause — folded in; three
+  past-tense prose refs in untouched test/fixture files — left as history).
+- V0 **5794 passed / 225 skipped / 1 xfailed** (pre-test-file run matched
+  the 5764 baseline exactly), ruff clean.
+  V1: **9 passed, 16:52 — all green** (L3 2/3, L7 2/3 above floor, rest 3/3).
+  V2: L4's three-intent turn live → **3 blueprint-verified tables** (ideal
+  shape); same-session follow-up answered via fresh scoped runQuery
+  (calendar-window "none" — the known J7 semantics, not a slice issue);
+  traces in `data-agent-runtime` (00:10).
+- Builder hit an API-error stall mid-build; resumed with mandatory
+  containment re-verification (G1 protocol) — clean. Base trap caught by
+  pinning again (worktree at 9558e9e → reset to 2a67102).

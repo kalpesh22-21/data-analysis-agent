@@ -187,7 +187,8 @@ class BlueprintRun:
     answer-table machinery: the query whose rows ARE its result, whether the D56
     gate verified it, and the slots it was run with.
 
-    ONE RECORD, CAPTURED AT ONE SITE (`agent_loop._capture_terminal_sql`), because
+    ONE RECORD, CAPTURED AT ONE SITE (`loop/turn_accumulators.py::
+    capture_terminal_sql`), because
     the alternative — a `blueprint_id -> terminal_sql` map beside a separate
     `blueprint_id -> verification` map — allows a table's SQL and its badge to be
     paired from DIFFERENT runs of the same blueprint later. Here they cannot be:
@@ -505,7 +506,8 @@ class FinalizedDesignation:
 
 
 def finalize_designations(items: Sequence[DesignationItem]) -> FinalizedDesignation:
-    """Dedupe on resolved SQL (first-occurrence order, the `turn_sql` discipline)
+    """Dedupe on resolved SQL (first-occurrence order, the same discipline the
+    turn's SQL accumulator applies)
     and cap at `MAX_ANSWER_TABLES`.
 
     OVERFLOW TRUNCATES, IT DOES NOT REFUSE — and this is the one place 03 §A.4's

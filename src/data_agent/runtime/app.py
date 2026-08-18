@@ -873,7 +873,7 @@ def create_app(
         # unresolved — the turn then reports `answer_sql: null`, exactly as it did
         # before this existed.
         # 08 §C.3: the SAME two keys of the SAME `result_full` the in-window
-        # `_capture_terminal_sql` reads, through the SAME constructor — so a
+        # `capture_terminal_sql` reads, through the SAME constructor — so a
         # reloaded table's badge is the badge the live turn showed, and a blueprint
         # id can never be paired with another run's verification.
         blueprint_runs: dict[str, BlueprintRun] = {}
