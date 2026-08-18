@@ -234,7 +234,7 @@ def test_turn_endpoint_injects_emulated_discovery_end_to_end(monkeypatch) -> Non
     assert [c.tool_name for c in mcp_client.calls] == ["listDatabases", "listTables"]
 
     # ONCE PER SESSION: a SECOND turn on the SAME session must be served from
-    # `EmulatedDiscoveryCache` — no further MCP round-trips. `_run_loop` is
+    # `EmulatedDiscoveryCache` — no further MCP round-trips. `_run_loop_body` is
     # re-entered by run()/resume()/the blueprint approval-resume, so before the cache
     # every budget window re-swept, and the ephemeral pairs re-appeared mid-session
     # after the model had already fetched schemas.

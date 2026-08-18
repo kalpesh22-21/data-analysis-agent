@@ -16,8 +16,9 @@ run map was discarded on every resume and a blueprint that completed before the
 pause was never designatable after it. Nothing failed: the other five seeds
 arrived, every other accumulator behaved, and the turn merely lost its table. With
 ONE object there is no per-accumulator forwarding to get wrong — a hole can only
-drop the whole window's state, which no test survives. `loop/agent_loop.py`'s
-`_run_loop` docstring records the incident at the site that had it.
+drop the whole window's state, which no test survives. The `_run_loop` wrapper
+itself was inlined away in T5.6; `_run_loop_body`'s docstring points back here
+for this incident.
 
 WHAT STAYED IN THE LOOP, and why, following `read_guard.py` /
 `blueprint_gate.py` / `finalization.py`: this owns the STATE and the FOLDS; the

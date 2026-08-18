@@ -444,3 +444,41 @@ T5.5 finish(). Eight ordering invariants documented in the builder brief.
   V2: L2 live → 2 blueprint-verified tables, answer_sql present, done exit
   through _finish; traces in `data-agent-runtime` (02:21).
 - Base trap caught by pinning again (worktree at 9558e9e → reset 1d02276).
+
+## #13 — T5.6: mirror wrapper inlined — TIER 5 COMPLETE (2026-08-17)
+
+- **T5.6** deleted `_run_loop`: its try/finally moved into `_run_loop_body`
+  (try opens as the FIRST statement, so a tools_provider raise still hits
+  the finally; both nesting levels verbatim — CancelledError at the
+  sleep(0) yield still runs the cancel); three callers retargeted.
+  Verified mechanically: `git diff -w` = only the intended hunks; AST
+  comparison (builder's AND reviewer's independent scripts) — all 22 body
+  statements, finalbody, signature dump-identical to base.
+- **Mutation check on the drain tick**: deleting the sleep(0) fails 4
+  existing tests in any realistic run (the tick is load-bearing in a warm
+  process). Residual gap — single-test-in-fresh-process — proven
+  un-pinnable deterministically (prototype passed under mutation; deleted);
+  documented rather than papered over with a flaky test. Also noted: the
+  four progress-summary tests are order-coupled through process-global
+  warm-up (queue-worthy if it ever bites).
+- Review: APPROVE (independent AST proof); 2 comment-only should-fixes
+  folded in (turn_accumulators.py return-pointer repair; the misleading
+  "byte-identical to _run_loop" feature-off comment reworded) plus a
+  22-line mechanical prose rename of stale `_run_loop` references across
+  src+tests (historical past-tense mentions deliberately kept).
+- V0 **5803 passed / 225 skipped / 1 xfailed** (exact baseline — pure
+  inline), ruff clean. V1: 8 passed + L3 accepted red (1/3; L7 3/3).
+  V2: three-intent turn live → 3 blueprint-verified tables; traces 02:45.
+
+**Tier 5 complete.** Six slices, all reviewed-APPROVE, all V0+V1+V2:
+ReadGuard (20c7c48) → BlueprintGate (7f2d51f) → finalization decision layer
+(2a67102) → TurnAccumulators (1d02276) → _finish() (db79498) → this.
+`_run_loop_body` decomposed from a 1,484-line monolith threading ~20
+parallel locals into a ~1,270-line driver coordinating five window-scoped
+collaborators (ReadGuard, BlueprintGate, AnswerShapeCounter,
+FinalizationGate, TurnAccumulators) with 121 new unit tests through their
+interfaces. agent_loop.py 4326→3385. Line-count note: Tier 5 is
+restructuring, not deletion — src net +871 (module docs + interfaces);
+true deletions were the duplicated epilogues, the wrapper, and absorbed
+helper copies. Deferred-by-design: force-block stays a method (resume()
+caller), E1/E2 exits unconverted (documented), ISSUES M2 product question.

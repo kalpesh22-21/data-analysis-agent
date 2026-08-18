@@ -725,7 +725,7 @@ class AgentLoop:
         self._session_store = session_store
         self._tools_provider = tools_provider
         # Emulated-discovery injection (context/discovery_emulation.py): when wired
-        # (app.py, gated on `discovery_emulation_enabled`), `_run_loop` invokes this
+        # (app.py, gated on `discovery_emulation_enabled`), `_run_loop_body` invokes this
         # ONCE per budget window BEFORE the model loop to emulate `listDatabases`+
         # `listTables` and splices the synthetic assistant/tool pairs into every
         # per-round-trip rebuild (ephemeral) AND seeds the repeated-idempotent-read
@@ -771,8 +771,9 @@ class AgentLoop:
         self._clock = clock
         self._observer = observer
         # LLM-generated progress summaries (opt-in, `progress_summary_enabled`).
-        # `None` (default) → the feature is absent and `_run_loop` is byte-identical
-        # to before it existed. When wired (app.py, gated on the flag + an OpenAI
+        # `None` (default) → the feature is behaviorally absent: `_summary_tasks`
+        # stays empty, so the window's `finally` takes no extra tick and the cancel
+        # is a no-op. When wired (app.py, gated on the flag + an OpenAI
         # key), each tool CALL fires a FIRE-AND-FORGET summarization task tracked in
         # `_summary_tasks` so a still-pending task can be best-effort cancelled when
         # the turn ends (never awaited before dispatch, never blocking the result).
@@ -797,7 +798,7 @@ class AgentLoop:
         # otherwise let one turn stomp another's mid-turn. See
         # `model/client.py::begin_turn_client`.
         turn_model_client = begin_turn_client(self._model_client)
-        return await self._run_loop(
+        return await self._run_loop_body(
             session_id=session_id,
             credentials=credentials,
             window_count=1,
@@ -848,7 +849,7 @@ class AgentLoop:
             normalized = answer.strip().lower()
             if normalized.startswith("stop"):
                 # 05 §F — the THIRD `done` return, and the one that inherits
-                # nothing: it returns from inside `resume()` BEFORE `_run_loop` is
+                # nothing: it returns from inside `resume()` BEFORE `_run_loop_body` is
                 # ever entered, with `tool_calls_made=0`, so it needs its own
                 # force-block call. The turn reaches a terminal outcome here, so
                 # the scoped invariant applies and every surviving `pending` intent
@@ -896,7 +897,7 @@ class AgentLoop:
         )
         # B3 per-turn handle — see `model/client.py::begin_turn_client`.
         turn_model_client = begin_turn_client(self._model_client)
-        return await self._run_loop(
+        return await self._run_loop_body(
             session_id=session_id,
             credentials=credentials,
             window_count=window_count,
@@ -943,12 +944,12 @@ class AgentLoop:
         *question*/*user_id*/*retrieval_memo* (Slice-1 retrieval, design §3.3):
         threaded into `assemble` so the retrieval pipeline (when configured)
         pre-injects thin cards + knowledge for this turn's question. The memo is
-        turn-window-local (created fresh in `_run_loop`) so retrieval embeds at
+        turn-window-local (created fresh in `_run_loop_body`) so retrieval embeds at
         most ONCE per window despite the D45 per-round-trip rebuild. When no
         retrieval pipeline is wired, these are inert (assemble short-circuits).
 
         *withheld_call_ids* (D94 Part 2): the same turn-window-local memo pattern
-        as *retrieval_memo* — a `set[str]` created fresh in `_run_loop` so the
+        as *retrieval_memo* — a `set[str]` created fresh in `_run_loop_body` so the
         `loop_result_withheld_provenance` diagnostic fires at most ONCE per
         stranded `tool_call_id` despite the per-round-trip rebuild.
 
@@ -956,7 +957,7 @@ class AgentLoop:
         synthetic `assistant(tool_calls=...)+tool(result)` pairs for
         `listDatabases`+`listTables`, already run through
         `_tool_trail_entry_to_canonical` (or `None`/empty). Computed ONCE in
-        `_run_loop` and threaded in (never recomputed per round-trip, D45).
+        `_run_loop_body` and threaded in (never recomputed per round-trip, D45).
 
         It is spliced in immediately AFTER the CURRENT turn's question (the LAST
         `user` message), so the turn reads sequentially — question, then the
@@ -1617,7 +1618,7 @@ class AgentLoop:
 
         TWO EXITS DO NOT ROUTE THROUGH THIS, deliberately:
 
-          - `resume()`'s budget-cap `"stop"` return. It happens before `_run_loop`
+          - `resume()`'s budget-cap `"stop"` return. It happens before `_run_loop_body`
             is ever entered, so there are no accumulators — routing it here would
             mean constructing an empty `TurnAccumulators()` purely to have its
             reads produce the `None`s that return site writes literally.
@@ -1802,7 +1803,7 @@ class AgentLoop:
         # UI Slice 1 Fix 1: fold this COMPLETED blueprint result into seed
         # enrichment so the resumed loop's FINAL `done` result event carries the
         # same sql_executed/blueprint_use/verification a non-paused blueprint
-        # answer would (a fresh `_run_loop` window would otherwise start empty and
+        # answer would (a fresh `_run_loop_body` window would otherwise start empty and
         # drop it). Raw slots ride the checkpoint's `slot_bindings`. A no-op on a
         # non-`ok` (failed/degraded) resume → no seed, matching a raw-loop fallback.
         seed_sql: list[str] = []
@@ -1875,7 +1876,7 @@ class AgentLoop:
         seed_blueprint_runs = {**trail_runs, **seed_blueprint_runs}
         # B3 per-turn handle — see `model/client.py::begin_turn_client`.
         turn_model_client = begin_turn_client(self._model_client)
-        return await self._run_loop(
+        return await self._run_loop_body(
             session_id=session_id,
             credentials=credentials,
             window_count=window_count,
@@ -2109,74 +2110,6 @@ class AgentLoop:
                 "loop_answer_table_intent_uncovered", {"intent_count": uncovered}
             )
 
-    async def _run_loop(
-        self,
-        *,
-        session_id: str,
-        credentials: RuntimeCredentials,
-        window_count: int,
-        turn_index: int,
-        model_client: ModelClient,
-        question: str | None = None,
-        accumulators: TurnAccumulators | None = None,
-    ) -> TurnOutcome:
-        """Turn-window driver wrapper: guarantees a best-effort cancel of any
-        still-pending fire-and-forget progress-summary tasks when the window ends —
-        on a normal return, a pause, OR an exception — so they never outlive the
-        turn. The turn result is produced entirely by `_run_loop_body`; this
-        wrapper only adds the summary-task cleanup in a `finally`, so it is
-        byte-identical to `_run_loop_body` when the summarizer is not wired (the
-        task set is always empty and the cancel is a no-op).
-
-        The full keyword-only signature is mirrored explicitly (rather than an
-        opaque `**kwargs`) so a typo'd kwarg at any of the three call sites
-        (`run`/`resume`/`_resume_blueprint`) is still caught at type-check time.
-
-        THE MIRROR HAD A HOLE, AND ONE OBJECT IS WHAT CLOSES IT. The mirror exists
-        because this wrapper adds only a `finally`: it must hand `_run_loop_body`
-        every parameter it was given, and spelling them out is what type-checks the
-        three call sites. But an explicit mirror catches a typo at a CALL site and
-        NEVER an omission at THIS one — and there used to be SIX `seed_*` parameters
-        to omit. One of them, `seed_blueprint_terminal_sql` (an ancestor of
-        `accumulators`), was accepted here and then simply not forwarded below, so
-        the blueprint-approval resume's carefully-built run map was discarded on
-        every resume and a blueprint that completed before the pause was never
-        designatable after it. Nothing failed: the other seeds arrived, the window
-        ran, and the turn merely lost the user's table. That is the failure mode of
-        a wide mirror — a per-accumulator hole is invisible because everything else
-        still works. There is now ONE parameter carrying all six seeds, so the hole
-        is not merely fixed but unexpressible: dropping it drops the whole window's
-        state, which no test survives. The regression test lives with the resume
-        tests.
-        """
-        try:
-            return await self._run_loop_body(
-                session_id=session_id,
-                credentials=credentials,
-                window_count=window_count,
-                turn_index=turn_index,
-                model_client=model_client,
-                question=question,
-                accumulators=accumulators,
-            )
-        finally:
-            # Give any ALREADY-FINISHED fire-and-forget summary task a single
-            # event-loop tick to land its emit before we cancel stragglers. This
-            # does NOT wait on an in-flight/slow summary (one `sleep(0)` is one
-            # scheduler iteration — a still-suspended summary stays pending and is
-            # cancelled just below, so the turn result never blocks on it); it only
-            # lets a summary that already completed during dispatch deliver its
-            # line. Gated on a non-empty task set so the feature-off path adds no
-            # extra tick and stays byte-identical. The drain-tick is itself nested
-            # in try/finally so that if the TURN task is being cancelled during
-            # shutdown (the `sleep(0)` then raises CancelledError), the straggler
-            # cancel still ALWAYS runs — a summary task must never outlive the turn.
-            try:
-                if self._summary_tasks:
-                    await asyncio.sleep(0)
-            finally:
-                self._cancel_pending_summaries()
-
     async def _run_loop_body(
         self,
         *,
@@ -2194,695 +2127,712 @@ class AgentLoop:
         # caller with nothing to carry) → a fresh, empty window.
         accumulators: TurnAccumulators | None = None,
     ) -> TurnOutcome:
-        # The live MCP authenticates every request, including tools/list, so
-        # the tools_provider seam is called WITH this turn's credentials on
-        # every window (2026-07-01 fix) — it is expected to cache the fetched
-        # catalogue itself (see mcp/tool_schema.py::ToolSchemaCache) since the
-        # catalogue is scope-independent; this is not a live MCP round-trip
-        # on every call in practice, just a credentialed one the first time.
-        tools = await self._tools_provider(credentials)
+        """The turn-window driver. Its `try` opens as the FIRST statement (above the
+        tools/discovery preamble) because T5.6 inlined the `_run_loop` wrapper that
+        used to wrap the whole call: a `tools_provider` failure has always run the
+        straggler-summary cancel in the `finally` below, and must keep doing so.
+        The wrapper's mirror-hole story lives in `turn_accumulators.py` + WORKLOG.
+        """
+        try:
+            # The live MCP authenticates every request, including tools/list, so
+            # the tools_provider seam is called WITH this turn's credentials on
+            # every window (2026-07-01 fix) — it is expected to cache the fetched
+            # catalogue itself (see mcp/tool_schema.py::ToolSchemaCache) since the
+            # catalogue is scope-independent; this is not a live MCP round-trip
+            # on every call in practice, just a credentialed one the first time.
+            tools = await self._tools_provider(credentials)
 
-        # The loop's OWN turn index, handed to every runtime tool (03 §C.1). It is
-        # built here, from the parameter `run`/`resume` computed, so no tool ever
-        # re-derives it or reads `app.py`'s explicitly non-load-bearing hint.
-        turn_context = TurnContext(turn_index=turn_index)
+            # The loop's OWN turn index, handed to every runtime tool (03 §C.1). It is
+            # built here, from the parameter `run`/`resume` computed, so no tool ever
+            # re-derives it or reads `app.py`'s explicitly non-load-bearing hint.
+            turn_context = TurnContext(turn_index=turn_index)
 
-        # Emulated-discovery injection (context/discovery_emulation.py): emulate
-        # `listDatabases`+`listTables` ONCE per budget window, BEFORE the model loop.
-        # Both run() and resume() re-enter `_run_loop`, so "once per window" is the
-        # right cadence. It is computed HERE — next to `_tools_provider`, DELIBERATELY
-        # ABOVE the `BudgetGuard(...)` below — so its 1 + N MCP round-trips run OUTSIDE the
-        # budget window's wall clock and never consume `max_wall_clock_seconds` (nor
-        # re-charge it on every `continue` resume): this injected context is "never
-        # budgeted". Two effects, both ephemeral (never persisted):
-        #   1. `discovery_canonical` — the synthetic assistant/tool pairs, threaded
-        #      into every per-round-trip rebuild below as the earliest tool history.
-        #   2. `emulation_read_signatures` — seeded into the `ReadGuard` below so a
-        #      model RE-call of either tool is served locally (the "already served"
-        #      nudge) instead of hitting the MCP.
-        # Degrade-not-fail: any failure → no pairs + no seed, and the model falls
-        # back to calling the two tools itself. D5: the sweep goes through the
-        # dispatcher (credentials attached only at the MCP transport boundary),
-        # never through the context assembler.
-        discovery_canonical: list[dict[str, Any]] = []
-        emulation_read_signatures: set[tuple[str, str]] = set()
-        # `signature -> tool_call_id` for the emulated pairs, seeded into the
-        # `ReadGuard` below (see the loop that fills it for why).
-        emulated_served_call_ids: dict[tuple[str, str], str] = {}
-        if self._discovery_emulation_provider is not None:
-            emulation: EmulatedDiscovery | None = None
-            try:
-                emulation = await self._discovery_emulation_provider(credentials)
-            except Exception:
-                _logger.exception(
-                    "discovery-emulation provider failed (session=%s) — injecting nothing",
-                    credentials.session_id,
+            # Emulated-discovery injection (context/discovery_emulation.py): emulate
+            # `listDatabases`+`listTables` ONCE per budget window, BEFORE the model loop.
+            # Both run() and resume() re-enter `_run_loop_body`, so "once per window" is the
+            # right cadence. It is computed HERE — next to `_tools_provider`, DELIBERATELY
+            # ABOVE the `BudgetGuard(...)` below — so its 1 + N MCP round-trips run OUTSIDE the
+            # budget window's wall clock and never consume `max_wall_clock_seconds` (nor
+            # re-charge it on every `continue` resume): this injected context is "never
+            # budgeted". Two effects, both ephemeral (never persisted):
+            #   1. `discovery_canonical` — the synthetic assistant/tool pairs, threaded
+            #      into every per-round-trip rebuild below as the earliest tool history.
+            #   2. `emulation_read_signatures` — seeded into the `ReadGuard` below so a
+            #      model RE-call of either tool is served locally (the "already served"
+            #      nudge) instead of hitting the MCP.
+            # Degrade-not-fail: any failure → no pairs + no seed, and the model falls
+            # back to calling the two tools itself. D5: the sweep goes through the
+            # dispatcher (credentials attached only at the MCP transport boundary),
+            # never through the context assembler.
+            discovery_canonical: list[dict[str, Any]] = []
+            emulation_read_signatures: set[tuple[str, str]] = set()
+            # `signature -> tool_call_id` for the emulated pairs, seeded into the
+            # `ReadGuard` below (see the loop that fills it for why).
+            emulated_served_call_ids: dict[tuple[str, str], str] = {}
+            if self._discovery_emulation_provider is not None:
+                emulation: EmulatedDiscovery | None = None
+                try:
+                    emulation = await self._discovery_emulation_provider(credentials)
+                except Exception:
+                    _logger.exception(
+                        "discovery-emulation provider failed (session=%s) — injecting nothing",
+                        credentials.session_id,
+                    )
+                if emulation is not None:
+                    for rendered_entry in emulation.entries:
+                        discovery_canonical.extend(_tool_trail_entry_to_canonical(rendered_entry))
+                        # Point each emulated signature at the synthetic entry that
+                        # serves it, so the trim-aware re-fetch exemption can see the
+                        # listing IS readable and lets the guard dedup a model re-call —
+                        # the whole point of the sweep. Without a pointer the exemption
+                        # would read "no readable source" and re-dispatch to the MCP,
+                        # undoing the saving. `fit_request_to_budget` pins these pairs by
+                        # id (invariant 7), so they stay readable for the whole window.
+                        emulated_sig = idempotent_read_signature(
+                            rendered_entry["tool_name"], rendered_entry.get("args") or {}
+                        )
+                        emulated_served_call_ids[emulated_sig] = rendered_entry["tool_call_id"]
+                    emulation_read_signatures = emulation.read_signatures
+
+            # A FRESH window per `_run_loop_body` entry — the D55 "fresh window on continue"
+            # seam: both run() and resume() re-enter here, so a granted continue starts
+            # its iteration/token/wall-clock counters from zero.
+            guard = BudgetGuard(
+                max_iterations=self._max_loop_iterations,
+                max_wall_clock_seconds=self._max_wall_clock_seconds,
+                max_token_spend=self._max_token_spend,
+                clock=self._clock,
+            )
+            tool_calls_made = 0
+            last_assistant_text: str | None = None
+            # Turn-window-local retrieval memo (design §3.3): keyed by
+            # (question, scope_hash) inside `assemble`, it makes the pipeline embed/
+            # recall at most ONCE across every round-trip of this window despite the
+            # D45 per-round-trip context rebuild. Not persisted — pure in-turn memo.
+            retrieval_memo: dict[tuple[str, str], Any] = {}
+            # D94 Part 2: turn-window-local de-dup for the withheld-provenance
+            # diagnostic — same lifecycle as `retrieval_memo` (fresh per window,
+            # not persisted) so the event fires at most once per stranded call.
+            withheld_call_ids: set[str] = set()
+            # Repeated-idempotent-read guard (generalizes D94), `loop/read_guard.py`: it
+            # holds the already-served read signatures for THIS turn plus the pointers
+            # and exemption counts the trim-aware re-fetch escape needs. Turn-window-local
+            # like the memos above, BUT seeded from the persisted trail below so it
+            # survives both the D45 per-round-trip rebuild (its state would otherwise
+            # reset every `send_turn`) AND a budget-window `continue` resume (a fresh
+            # `_run_loop_body` window starts here with an empty guard). Seeding from every
+            # prior `ok` idempotent-read entry of this turn is what lets it recognize a
+            # repeat it did not itself serve in the current window.
+            read_guard = ReadGuard(self._observer)
+            # The blueprint-definition gate, `loop/blueprint_gate.py`: it holds every
+            # blueprint id this turn has already EXPANDED with a successful
+            # `getBlueprint`, and `runBlueprint` for an id that is NOT in it is refused
+            # before the executor runs. Turn-window-local like the guard above, and
+            # seeded from the persisted trail below for the same two reasons — the D45
+            # per-round-trip rebuild would otherwise reset it on every `send_turn`, and a
+            # budget-window `continue` resume starts a fresh `_run_loop_body` window with an
+            # empty in-memory set, so a model that expanded the blueprint before the cap
+            # would be refused for work it had done. TURN-SCOPED (the walk below is
+            # turn-filtered); see the class docstring for why that cost is accepted.
+            blueprint_gate = BlueprintGate(self._observer)
+            # ONE read for the trail seed AND the live analysis state (05 §E): the
+            # session doc carries both, and `load_trail` is itself just a read of this
+            # same document, so this is that read — not an extra one.
+            session_doc = await self._session_store.get_or_create_session(session_id)
+            # FINALIZATION ENFORCEMENT reads from HERE (05 §E). The state changes
+            # mid-turn, so a once-per-window read would be wrong — but a store read at
+            # each terminal exit would cost a round-trip on EVERY turn, including the
+            # single-intent ones that never declare a state at all. So it is loaded
+            # once into this window-local and REFRESHED IN PLACE from each
+            # `updateAnalysisState` result below; 03 §E.2's partition guarantees state
+            # calls are dispatched first, so the local is current at both exits, and
+            # the fast path is an `is None` test on a local (`pending_intents`).
+            analysis_state = live_analysis_state(session_doc, turn_index)
+            # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §3) and
+            # 08: this window's answer accumulators, `loop/turn_accumulators.py`. Same
+            # lifecycle as the memos above — fresh per window, never persisted, folded
+            # from each successful tool call below and read at every `TurnOutcome(...)`
+            # return site. Handed in ALREADY SEEDED by a resume (see the parameter), so
+            # the fallback here is the brand-new-turn case.
+            #
+            # CONSTRUCTED HERE, ABOVE THE GATES, because the answer-shape counter's seed
+            # is one of its reads: a resumed window that already has the user's table
+            # must not re-arm a gate whose whole job is to notice a missing one.
+            accum = accumulators if accumulators is not None else TurnAccumulators()
+            # --- ANSWER-SHAPE GATE state (05 §J), `loop/finalization.py` ---------
+            #
+            # How many SUCCESSFUL multi-row `runQuery`/`runBlueprint` calls this TURN has
+            # made, and whether any `answerWithTable` has put a table in front of the
+            # user. Both are TURN-scoped facts held in this window-scoped counter, so
+            # both are seeded — from the trail walk below for the reason the read guard
+            # is seeded (a budget-cap `continue`, an `askUser` resume and a mid-DAG
+            # blueprint resume each start a fresh `_run_loop_body` with an empty counter,
+            # and a gate that forgot the rows the model already has would go silent on
+            # exactly the long turns that produce several tables), and from
+            # the accumulators' seeded designations for the blueprint approval-resume
+            # path, whose designation was made before the pause.
+            #
+            # THE TRAIL WALK IS ALREADY TURN-FILTERED (`prior_entry.turn_index !=
+            # turn_index` skips below), which is also the cross-turn replay protection: a
+            # multi-row query from turn 3 cannot make turn 4's prose answer a defect, and
+            # the `claim_finalization_block` key is `(turn_index, window, kind)` too, so a stale
+            # refusal cannot be replayed onto a later turn.
+            answer_shape = AnswerShapeCounter(accum.has_answer_tables)
+            # The finalization block allowance (05 §C.1/§C.2, §J.3), also
+            # `loop/finalization.py`: the per-round-trip refusal flag and the persisted
+            # per-window claim behind all four refusal sites below. Its three ids are
+            # constant for this whole window, so they are handed over once here rather
+            # than repeated at every call site.
+            finalization_gate = FinalizationGate(
+                self._session_store,
+                self._observer,
+                session_id=session_id,
+                turn_index=turn_index,
+                window_count=window_count,
+            )
+            for prior_entry in session_doc.tool_trail:
+                if prior_entry.turn_index != turn_index or prior_entry.status != "ok":
+                    continue
+                # Repeated-idempotent-read guard seed. Non-read entries are ignored
+                # inside `observe_prior_read` — "what counts as a read" is the guard's
+                # question, not this walk's. `data_free` marks the guard's OWN marker
+                # entry: it proves the signature was served, but the READ it deduped is
+                # where the result lives, so it must not become the pointer the
+                # readability test follows.
+                read_guard.observe_prior_read(
+                    prior_entry.tool_name,
+                    prior_entry.args,
+                    prior_entry.tool_call_id,
+                    data_free=prior_entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE,
                 )
-            if emulation is not None:
-                for rendered_entry in emulation.entries:
-                    discovery_canonical.extend(_tool_trail_entry_to_canonical(rendered_entry))
-                    # Point each emulated signature at the synthetic entry that
-                    # serves it, so the trim-aware re-fetch exemption can see the
-                    # listing IS readable and lets the guard dedup a model re-call —
-                    # the whole point of the sweep. Without a pointer the exemption
-                    # would read "no readable source" and re-dispatch to the MCP,
-                    # undoing the saving. `fit_request_to_budget` pins these pairs by
-                    # id (invariant 7), so they stay readable for the whole window.
-                    emulated_sig = idempotent_read_signature(
-                        rendered_entry["tool_name"], rendered_entry.get("args") or {}
-                    )
-                    emulated_served_call_ids[emulated_sig] = rendered_entry["tool_call_id"]
-                emulation_read_signatures = emulation.read_signatures
+                # NOT an `elif`: `getBlueprint` is BOTH a guarded idempotent read and the
+                # thing the blueprint-definition gate is keyed on, so it seeds both.
+                if prior_entry.tool_name == "getBlueprint":
+                    # `status == "ok"` is the whole predicate — no `found` check. The
+                    # result body sits behind a D46 KV pointer, so reading it here would
+                    # cost a store round-trip per entry, and a `{found: false}` expansion
+                    # cannot make a `runBlueprint` succeed anyway (the executor re-fetches
+                    # the definition and fails on its own merits). The gate's job is
+                    # "did you look", not "did you find".
+                    blueprint_gate.observe_prior_definition_read(prior_entry.args.get("id"))
+                # ANSWER-SHAPE GATE (05 §J), seeded from the same walk — BOTH of its
+                # facts, in one call. `status == "ok"` is guaranteed by the skip above,
+                # and is passed explicitly anyway so the multi-row predicate reads the
+                # same at both of its call sites. The `answerWithTable` half of that seed
+                # is deliberately ASYMMETRIC with the live site (name alone here,
+                # substance there); `AnswerShapeCounter.observe_prior_entry` carries the
+                # rationale, which is about what a persisted entry can cheaply be asked.
+                answer_shape.observe_prior_entry(
+                    prior_entry.tool_name, prior_entry.status, prior_entry.result_preview
+                )
+            # Seed the guard with the emulated-discovery signatures swept above (outside
+            # the budget window) so a model re-call of listDatabases/listTables is served
+            # locally, not re-dispatched to the MCP — together with the pointers to the
+            # synthetic entries that serve them, or the trim-aware exemption would find no
+            # readable source and re-dispatch the very calls the sweep exists to avoid.
+            # Both empty when the feature is off/degraded.
+            read_guard.seed_emulation(emulation_read_signatures, emulated_served_call_ids)
+            # The finalization nudge (05 §B.2/§D), ephemeral and NEVER persisted. It
+            # lives EXACTLY ONE ROUND-TRIP: set when an exit-#1 finalization is
+            # refused, spliced into the next rebuild, and cleared immediately after
+            # that rebuild below.
+            finalization_nudge: str | None = None
 
-        # A FRESH window per `_run_loop` entry — the D55 "fresh window on continue"
-        # seam: both run() and resume() re-enter here, so a granted continue starts
-        # its iteration/token/wall-clock counters from zero.
-        guard = BudgetGuard(
-            max_iterations=self._max_loop_iterations,
-            max_wall_clock_seconds=self._max_wall_clock_seconds,
-            max_token_spend=self._max_token_spend,
-            clock=self._clock,
-        )
-        tool_calls_made = 0
-        last_assistant_text: str | None = None
-        # Turn-window-local retrieval memo (design §3.3): keyed by
-        # (question, scope_hash) inside `assemble`, it makes the pipeline embed/
-        # recall at most ONCE across every round-trip of this window despite the
-        # D45 per-round-trip context rebuild. Not persisted — pure in-turn memo.
-        retrieval_memo: dict[tuple[str, str], Any] = {}
-        # D94 Part 2: turn-window-local de-dup for the withheld-provenance
-        # diagnostic — same lifecycle as `retrieval_memo` (fresh per window,
-        # not persisted) so the event fires at most once per stranded call.
-        withheld_call_ids: set[str] = set()
-        # Repeated-idempotent-read guard (generalizes D94), `loop/read_guard.py`: it
-        # holds the already-served read signatures for THIS turn plus the pointers
-        # and exemption counts the trim-aware re-fetch escape needs. Turn-window-local
-        # like the memos above, BUT seeded from the persisted trail below so it
-        # survives both the D45 per-round-trip rebuild (its state would otherwise
-        # reset every `send_turn`) AND a budget-window `continue` resume (a fresh
-        # `_run_loop` window starts here with an empty guard). Seeding from every
-        # prior `ok` idempotent-read entry of this turn is what lets it recognize a
-        # repeat it did not itself serve in the current window.
-        read_guard = ReadGuard(self._observer)
-        # The blueprint-definition gate, `loop/blueprint_gate.py`: it holds every
-        # blueprint id this turn has already EXPANDED with a successful
-        # `getBlueprint`, and `runBlueprint` for an id that is NOT in it is refused
-        # before the executor runs. Turn-window-local like the guard above, and
-        # seeded from the persisted trail below for the same two reasons — the D45
-        # per-round-trip rebuild would otherwise reset it on every `send_turn`, and a
-        # budget-window `continue` resume starts a fresh `_run_loop` window with an
-        # empty in-memory set, so a model that expanded the blueprint before the cap
-        # would be refused for work it had done. TURN-SCOPED (the walk below is
-        # turn-filtered); see the class docstring for why that cost is accepted.
-        blueprint_gate = BlueprintGate(self._observer)
-        # ONE read for the trail seed AND the live analysis state (05 §E): the
-        # session doc carries both, and `load_trail` is itself just a read of this
-        # same document, so this is that read — not an extra one.
-        session_doc = await self._session_store.get_or_create_session(session_id)
-        # FINALIZATION ENFORCEMENT reads from HERE (05 §E). The state changes
-        # mid-turn, so a once-per-window read would be wrong — but a store read at
-        # each terminal exit would cost a round-trip on EVERY turn, including the
-        # single-intent ones that never declare a state at all. So it is loaded
-        # once into this window-local and REFRESHED IN PLACE from each
-        # `updateAnalysisState` result below; 03 §E.2's partition guarantees state
-        # calls are dispatched first, so the local is current at both exits, and
-        # the fast path is an `is None` test on a local (`pending_intents`).
-        analysis_state = live_analysis_state(session_doc, turn_index)
-        # UI Slice 1 (docs/decisions/ui-slice1-enriched-result-contract.md §3) and
-        # 08: this window's answer accumulators, `loop/turn_accumulators.py`. Same
-        # lifecycle as the memos above — fresh per window, never persisted, folded
-        # from each successful tool call below and read at every `TurnOutcome(...)`
-        # return site. Handed in ALREADY SEEDED by a resume (see the parameter), so
-        # the fallback here is the brand-new-turn case.
-        #
-        # CONSTRUCTED HERE, ABOVE THE GATES, because the answer-shape counter's seed
-        # is one of its reads: a resumed window that already has the user's table
-        # must not re-arm a gate whose whole job is to notice a missing one.
-        accum = accumulators if accumulators is not None else TurnAccumulators()
-        # --- ANSWER-SHAPE GATE state (05 §J), `loop/finalization.py` ---------
-        #
-        # How many SUCCESSFUL multi-row `runQuery`/`runBlueprint` calls this TURN has
-        # made, and whether any `answerWithTable` has put a table in front of the
-        # user. Both are TURN-scoped facts held in this window-scoped counter, so
-        # both are seeded — from the trail walk below for the reason the read guard
-        # is seeded (a budget-cap `continue`, an `askUser` resume and a mid-DAG
-        # blueprint resume each start a fresh `_run_loop_body` with an empty counter,
-        # and a gate that forgot the rows the model already has would go silent on
-        # exactly the long turns that produce several tables), and from
-        # the accumulators' seeded designations for the blueprint approval-resume
-        # path, whose designation was made before the pause.
-        #
-        # THE TRAIL WALK IS ALREADY TURN-FILTERED (`prior_entry.turn_index !=
-        # turn_index` skips below), which is also the cross-turn replay protection: a
-        # multi-row query from turn 3 cannot make turn 4's prose answer a defect, and
-        # the `claim_finalization_block` key is `(turn_index, window, kind)` too, so a stale
-        # refusal cannot be replayed onto a later turn.
-        answer_shape = AnswerShapeCounter(accum.has_answer_tables)
-        # The finalization block allowance (05 §C.1/§C.2, §J.3), also
-        # `loop/finalization.py`: the per-round-trip refusal flag and the persisted
-        # per-window claim behind all four refusal sites below. Its three ids are
-        # constant for this whole window, so they are handed over once here rather
-        # than repeated at every call site.
-        finalization_gate = FinalizationGate(
-            self._session_store,
-            self._observer,
-            session_id=session_id,
-            turn_index=turn_index,
-            window_count=window_count,
-        )
-        for prior_entry in session_doc.tool_trail:
-            if prior_entry.turn_index != turn_index or prior_entry.status != "ok":
-                continue
-            # Repeated-idempotent-read guard seed. Non-read entries are ignored
-            # inside `observe_prior_read` — "what counts as a read" is the guard's
-            # question, not this walk's. `data_free` marks the guard's OWN marker
-            # entry: it proves the signature was served, but the READ it deduped is
-            # where the result lives, so it must not become the pointer the
-            # readability test follows.
-            read_guard.observe_prior_read(
-                prior_entry.tool_name,
-                prior_entry.args,
-                prior_entry.tool_call_id,
-                data_free=prior_entry.error_code == IDEMPOTENT_READ_ALREADY_SERVED_CODE,
-            )
-            # NOT an `elif`: `getBlueprint` is BOTH a guarded idempotent read and the
-            # thing the blueprint-definition gate is keyed on, so it seeds both.
-            if prior_entry.tool_name == "getBlueprint":
-                # `status == "ok"` is the whole predicate — no `found` check. The
-                # result body sits behind a D46 KV pointer, so reading it here would
-                # cost a store round-trip per entry, and a `{found: false}` expansion
-                # cannot make a `runBlueprint` succeed anyway (the executor re-fetches
-                # the definition and fails on its own merits). The gate's job is
-                # "did you look", not "did you find".
-                blueprint_gate.observe_prior_definition_read(prior_entry.args.get("id"))
-            # ANSWER-SHAPE GATE (05 §J), seeded from the same walk — BOTH of its
-            # facts, in one call. `status == "ok"` is guaranteed by the skip above,
-            # and is passed explicitly anyway so the multi-row predicate reads the
-            # same at both of its call sites. The `answerWithTable` half of that seed
-            # is deliberately ASYMMETRIC with the live site (name alone here,
-            # substance there); `AnswerShapeCounter.observe_prior_entry` carries the
-            # rationale, which is about what a persisted entry can cheaply be asked.
-            answer_shape.observe_prior_entry(
-                prior_entry.tool_name, prior_entry.status, prior_entry.result_preview
-            )
-        # Seed the guard with the emulated-discovery signatures swept above (outside
-        # the budget window) so a model re-call of listDatabases/listTables is served
-        # locally, not re-dispatched to the MCP — together with the pointers to the
-        # synthetic entries that serve them, or the trim-aware exemption would find no
-        # readable source and re-dispatch the very calls the sweep exists to avoid.
-        # Both empty when the feature is off/degraded.
-        read_guard.seed_emulation(emulation_read_signatures, emulated_served_call_ids)
-        # The finalization nudge (05 §B.2/§D), ephemeral and NEVER persisted. It
-        # lives EXACTLY ONE ROUND-TRIP: set when an exit-#1 finalization is
-        # refused, spliced into the next rebuild, and cleared immediately after
-        # that rebuild below.
-        finalization_nudge: str | None = None
+            while True:
+                request = await self._build_canonical_messages(
+                    session_id,
+                    credentials.column_scope,
+                    turn_index,
+                    question=question,
+                    user_id=None,
+                    retrieval_memo=retrieval_memo,
+                    withheld_call_ids=withheld_call_ids,
+                    discovery_canonical=discovery_canonical,
+                    finalization_nudge=finalization_nudge,
+                )
+                canonical_messages = request.messages
+                # ONE ROUND-TRIP ONLY (05 §D). `discovery_canonical` is computed once
+                # per window and re-spliced into every rebuild; copying THAT lifetime
+                # would repeat the nudge forever — including after the intents are
+                # closed — and, because it is ephemeral and sits at the tail, would
+                # migrate it to be the newest message on every rebuild, appearing
+                # after tool results it predates.
+                finalization_nudge = None
+                # Hand the guard every tool result the model can actually READ this
+                # round-trip — after `fit_request_to_budget` has had its say, and with
+                # data-free sentinels excluded (see `_CanonicalRequest`). That set is what
+                # the trim-aware re-fetch exemption asks whether an already-served read is
+                # still legible. `begin_round` also clears the guard's served-THIS-BATCH
+                # set; see its docstring for why that reset is load-bearing (a read
+                # dispatched moments ago cannot yet be in `readable_tool_call_ids`, and
+                # must not be mistaken for one the budget trimmed away).
+                read_guard.begin_round(request.readable_tool_call_ids)
+                # Set by a SUCCESSFUL answerWithTable in this iteration's batch; drives
+                # terminal exit #2 below. Reset per iteration — a designation only ends
+                # the turn it was made in.
+                designated_answer_text: str | None = None
+                # Start the blueprint gate's response batch: it stages the ids expanded
+                # by a `getBlueprint` in THIS response and holds them apart from the
+                # committed set until the batch drains (`commit_round`, below the
+                # dispatch loop) — see that site for why a same-response
+                # `[getBlueprint(x), runBlueprint(x)]` pair must NOT pass the gate.
+                # Reset per iteration, beside `designated_answer_text`.
+                blueprint_gate.begin_round()
+                # The window's forced re-round is consumed PER ROUND-TRIP, not per
+                # refused call (05 §C.2) — so a `[answerWithTable, answerWithTable]`
+                # batch is refused twice and advances the persisted counter once. Reset
+                # here, beside `designated_answer_text`, for the same reason.
+                finalization_gate.begin_round()
+                self._observer("loop_model_call_start", {"window": window_count})
+                result = await model_client.send_turn(canonical_messages, tools)
+                last_assistant_text = result.assistant_text
 
-        while True:
-            request = await self._build_canonical_messages(
-                session_id,
-                credentials.column_scope,
-                turn_index,
-                question=question,
-                user_id=None,
-                retrieval_memo=retrieval_memo,
-                withheld_call_ids=withheld_call_ids,
-                discovery_canonical=discovery_canonical,
-                finalization_nudge=finalization_nudge,
-            )
-            canonical_messages = request.messages
-            # ONE ROUND-TRIP ONLY (05 §D). `discovery_canonical` is computed once
-            # per window and re-spliced into every rebuild; copying THAT lifetime
-            # would repeat the nudge forever — including after the intents are
-            # closed — and, because it is ephemeral and sits at the tail, would
-            # migrate it to be the newest message on every rebuild, appearing
-            # after tool results it predates.
-            finalization_nudge = None
-            # Hand the guard every tool result the model can actually READ this
-            # round-trip — after `fit_request_to_budget` has had its say, and with
-            # data-free sentinels excluded (see `_CanonicalRequest`). That set is what
-            # the trim-aware re-fetch exemption asks whether an already-served read is
-            # still legible. `begin_round` also clears the guard's served-THIS-BATCH
-            # set; see its docstring for why that reset is load-bearing (a read
-            # dispatched moments ago cannot yet be in `readable_tool_call_ids`, and
-            # must not be mistaken for one the budget trimmed away).
-            read_guard.begin_round(request.readable_tool_call_ids)
-            # Set by a SUCCESSFUL answerWithTable in this iteration's batch; drives
-            # terminal exit #2 below. Reset per iteration — a designation only ends
-            # the turn it was made in.
-            designated_answer_text: str | None = None
-            # Start the blueprint gate's response batch: it stages the ids expanded
-            # by a `getBlueprint` in THIS response and holds them apart from the
-            # committed set until the batch drains (`commit_round`, below the
-            # dispatch loop) — see that site for why a same-response
-            # `[getBlueprint(x), runBlueprint(x)]` pair must NOT pass the gate.
-            # Reset per iteration, beside `designated_answer_text`.
-            blueprint_gate.begin_round()
-            # The window's forced re-round is consumed PER ROUND-TRIP, not per
-            # refused call (05 §C.2) — so a `[answerWithTable, answerWithTable]`
-            # batch is refused twice and advances the persisted counter once. Reset
-            # here, beside `designated_answer_text`, for the same reason.
-            finalization_gate.begin_round()
-            self._observer("loop_model_call_start", {"window": window_count})
-            result = await model_client.send_turn(canonical_messages, tools)
-            last_assistant_text = result.assistant_text
+                # --- FINALIZATION ENFORCEMENT, terminal exit #1 (05 §B.2) ---------
+                #
+                # The model produced prose, not a tool call, so this turn is about to
+                # end `done` — and there is NO ERROR CHANNEL here: nothing to attach a
+                # denial to, because nothing was called. A synthetic tool message
+                # cannot stand alone either (`_assembled_to_canonical` only ever emits
+                # a `tool` message by expanding a trail entry into an
+                # `assistant(tool_calls) + tool` PAIR), and fabricating such a pair —
+                # which discovery emulation legitimately does — would mean naming a
+                # function the model can see in its tools list, re-splicing/deduping/
+                # pinning it on every rebuild, and routing its text through
+                # `classify_denial` anyway, all for something that should live one
+                # round-trip. So the refusal is an EPHEMERAL `user`-role injection.
+                #
+                # NOTHING IS PERSISTED on this path: not the refused answer, not the
+                # nudge. Both are within-turn control flow, and a persisted nudge would
+                # appear in `/session/history` as something the user said.
+                refused_finalization = False
+                # The fast path, and it must stay this cheap: `pending_intents(None)`
+                # is an `is None` test on a window-local — no store read, on the
+                # overwhelming majority of turns that never declare a state at all.
+                pending_at_exit = pending_intents(analysis_state) if not result.tool_calls else ()
+                if pending_at_exit:
+                    if await finalization_gate.may_refuse("intents"):
+                        refused_finalization = True
+                        self._observer(
+                            "loop_finalization_refused",
+                            {"exit": "no_tool_calls", "pending_count": len(pending_at_exit)},
+                        )
+                        finalization_nudge = finalization_nudge_text(
+                            result.assistant_text, pending_at_exit
+                        )
+                        # CLEAR THE DRAFT. `last_assistant_text` was set above and is
+                        # returned as `assistant_text` on the hard-ceiling and
+                        # budget-cap paths — so a refused, incomplete answer could
+                        # still reach the user there while never appearing in history,
+                        # making live and history disagree on exactly the enforcement
+                        # path.
+                        last_assistant_text = None
+                    else:
+                        # The window's one forced re-round is spent and the intents are
+                        # still pending. Record the disposition the runtime CAN
+                        # establish and let finalization proceed — see
+                        # `_force_block_pending_intents` for what the code does and does
+                        # not claim.
+                        analysis_state = await self._force_block_pending_intents(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            state=analysis_state,
+                            reason_code="ENFORCEMENT_EXHAUSTED",
+                        )
+                        self._observer(
+                            "loop_enforcement_exhausted",
+                            {"intent_count": len(pending_at_exit)},
+                        )
+                elif not result.tool_calls and answer_shape.armed:
+                    # --- THE ANSWER-SHAPE GATE (05 §J) --------------------------
+                    #
+                    # The model is ending the turn in bare prose while holding
+                    # multi-row results it never tabled. "Presenting a table" is an
+                    # UNCONDITIONAL prompt rule and the only strong one with no runtime
+                    # enforcement; measured live it failed ~5/8 of expected-table runs,
+                    # and its worst mode was an APOLOGY — the model asserting it could
+                    # no longer call the tool, on a turn nothing had refused and nothing
+                    # had ended. A belief about turn mechanics is not something a prompt
+                    # can correct from inside the same turn; only the runtime can, by
+                    # refusing the finish once and handing back a round.
+                    #
+                    # `elif`: THE PENDING-INTENTS REFUSAL TAKES PRECEDENCE and its
+                    # behaviour is untouched. It is the more specific complaint (there is
+                    # work the model has not done, not merely work it has not presented),
+                    # so at most one refusal happens per round-trip.
+                    #
+                    # ITS OWN ALLOWANCE, `kind="answer_shape"` (05 §J.3, revised
+                    # 2026-08-12 on live data). This gate SHARED the intents allowance
+                    # for one release, which bounded the worst case at one extra
+                    # round-trip per window and looked like the conservative choice. It
+                    # was not: on multi-intent questions the two gates fire in SEQUENCE,
+                    # not in competition — prose with intents pending (intents nudge,
+                    # allowance gone), then the ledger closed, then prose again with the
+                    # tables still untabled. 2 of 4 live three-part runs went exactly
+                    # that way and this gate could only emit `..._exhausted`, starved on
+                    # the question it exists for (traces `900a85a4`, `16f090db`).
+                    # Separate allowances make that sequence terminate; the price is a
+                    # worst case of TWO extra round-trips per window, still bounded by
+                    # `max_budget_windows`.
+                    if await finalization_gate.may_refuse("answer_shape"):
+                        refused_finalization = True
+                        self._observer(
+                            ANSWER_SHAPE_REFUSED_EVENT,
+                            {"multi_row_calls": answer_shape.multi_row_calls},
+                        )
+                        finalization_nudge = answer_shape_nudge_text(
+                            result.assistant_text, answer_shape.multi_row_calls
+                        )
+                        # CLEAR THE DRAFT, for the reason the pending-intents path
+                        # clears it: `last_assistant_text` is returned as
+                        # `assistant_text` on the hard-ceiling and budget-cap paths, so
+                        # a refused answer could still reach the user there while never
+                        # appearing in history.
+                        last_assistant_text = None
+                    else:
+                        # THIS GATE'S OWN allowance for the window is spent, which now
+                        # means only one thing: it already refused once here and the
+                        # model answered in prose again. (Before the allowances were
+                        # split it also meant "the intents nudge took it", which made
+                        # this counter ambiguous and hid the starvation above.) THE
+                        # PROSE PASSES. The runtime records what it can and never
+                        # hard-locks a turn: the same posture `ENFORCEMENT_EXHAUSTED`
+                        # takes for intents, minus the ledger write, because there is no
+                        # ledger for answer shape and the user's answer is in hand.
+                        self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
 
-            # --- FINALIZATION ENFORCEMENT, terminal exit #1 (05 §B.2) ---------
-            #
-            # The model produced prose, not a tool call, so this turn is about to
-            # end `done` — and there is NO ERROR CHANNEL here: nothing to attach a
-            # denial to, because nothing was called. A synthetic tool message
-            # cannot stand alone either (`_assembled_to_canonical` only ever emits
-            # a `tool` message by expanding a trail entry into an
-            # `assistant(tool_calls) + tool` PAIR), and fabricating such a pair —
-            # which discovery emulation legitimately does — would mean naming a
-            # function the model can see in its tools list, re-splicing/deduping/
-            # pinning it on every rebuild, and routing its text through
-            # `classify_denial` anyway, all for something that should live one
-            # round-trip. So the refusal is an EPHEMERAL `user`-role injection.
-            #
-            # NOTHING IS PERSISTED on this path: not the refused answer, not the
-            # nudge. Both are within-turn control flow, and a persisted nudge would
-            # appear in `/session/history` as something the user said.
-            refused_finalization = False
-            # The fast path, and it must stay this cheap: `pending_intents(None)`
-            # is an `is None` test on a window-local — no store read, on the
-            # overwhelming majority of turns that never declare a state at all.
-            pending_at_exit = pending_intents(analysis_state) if not result.tool_calls else ()
-            if pending_at_exit:
-                if await finalization_gate.may_refuse("intents"):
-                    refused_finalization = True
-                    self._observer(
-                        "loop_finalization_refused",
-                        {"exit": "no_tool_calls", "pending_count": len(pending_at_exit)},
-                    )
-                    finalization_nudge = finalization_nudge_text(
-                        result.assistant_text, pending_at_exit
-                    )
-                    # CLEAR THE DRAFT. `last_assistant_text` was set above and is
-                    # returned as `assistant_text` on the hard-ceiling and
-                    # budget-cap paths — so a refused, incomplete answer could
-                    # still reach the user there while never appearing in history,
-                    # making live and history disagree on exactly the enforcement
-                    # path.
-                    last_assistant_text = None
-                else:
-                    # The window's one forced re-round is spent and the intents are
-                    # still pending. Record the disposition the runtime CAN
-                    # establish and let finalization proceed — see
-                    # `_force_block_pending_intents` for what the code does and does
-                    # not claim.
-                    analysis_state = await self._force_block_pending_intents(
+                if not result.tool_calls and not refused_finalization:
+                    # B1/D44 (2026-07-01 clarification) AND UI Slice 1: the union of
+                    # this turn's tool-result provenance — the tag for the final
+                    # assistant message (so it is scope re-filtered on replay exactly
+                    # like the trail itself) AND the enriched `result` event's lineage.
+                    # Computed ONCE here (the single fail-closed source of truth; do
+                    # not re-derive in-loop).
+                    turn_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
+                    return await self._finish(
                         session_id=session_id,
                         turn_index=turn_index,
-                        state=analysis_state,
-                        reason_code="ENFORCEMENT_EXHAUSTED",
+                        status="done",
+                        assistant_text=result.assistant_text,
+                        tool_calls_made=tool_calls_made,
+                        accum=accum,
+                        provenance=turn_provenance,
+                        # `or None` IS THE APPEND GUARD (`if result.assistant_text:`),
+                        # carried as a value. A model may finish this exit with `None`
+                        # or `""`; either must leave NO assistant message in history,
+                        # while `assistant_text` above still reports it verbatim. The
+                        # `answerWithTable` exit below persists unconditionally — see
+                        # `_finish` for why the two differ and why both are correct.
+                        persist_text=result.assistant_text or None,
+                        event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
                     )
-                    self._observer(
-                        "loop_enforcement_exhausted",
-                        {"intent_count": len(pending_at_exit)},
-                    )
-            elif not result.tool_calls and answer_shape.armed:
-                # --- THE ANSWER-SHAPE GATE (05 §J) --------------------------
-                #
-                # The model is ending the turn in bare prose while holding
-                # multi-row results it never tabled. "Presenting a table" is an
-                # UNCONDITIONAL prompt rule and the only strong one with no runtime
-                # enforcement; measured live it failed ~5/8 of expected-table runs,
-                # and its worst mode was an APOLOGY — the model asserting it could
-                # no longer call the tool, on a turn nothing had refused and nothing
-                # had ended. A belief about turn mechanics is not something a prompt
-                # can correct from inside the same turn; only the runtime can, by
-                # refusing the finish once and handing back a round.
-                #
-                # `elif`: THE PENDING-INTENTS REFUSAL TAKES PRECEDENCE and its
-                # behaviour is untouched. It is the more specific complaint (there is
-                # work the model has not done, not merely work it has not presented),
-                # so at most one refusal happens per round-trip.
-                #
-                # ITS OWN ALLOWANCE, `kind="answer_shape"` (05 §J.3, revised
-                # 2026-08-12 on live data). This gate SHARED the intents allowance
-                # for one release, which bounded the worst case at one extra
-                # round-trip per window and looked like the conservative choice. It
-                # was not: on multi-intent questions the two gates fire in SEQUENCE,
-                # not in competition — prose with intents pending (intents nudge,
-                # allowance gone), then the ledger closed, then prose again with the
-                # tables still untabled. 2 of 4 live three-part runs went exactly
-                # that way and this gate could only emit `..._exhausted`, starved on
-                # the question it exists for (traces `900a85a4`, `16f090db`).
-                # Separate allowances make that sequence terminate; the price is a
-                # worst case of TWO extra round-trips per window, still bounded by
-                # `max_budget_windows`.
-                if await finalization_gate.may_refuse("answer_shape"):
-                    refused_finalization = True
-                    self._observer(
-                        ANSWER_SHAPE_REFUSED_EVENT,
-                        {"multi_row_calls": answer_shape.multi_row_calls},
-                    )
-                    finalization_nudge = answer_shape_nudge_text(
-                        result.assistant_text, answer_shape.multi_row_calls
-                    )
-                    # CLEAR THE DRAFT, for the reason the pending-intents path
-                    # clears it: `last_assistant_text` is returned as
-                    # `assistant_text` on the hard-ceiling and budget-cap paths, so
-                    # a refused answer could still reach the user there while never
-                    # appearing in history.
-                    last_assistant_text = None
-                else:
-                    # THIS GATE'S OWN allowance for the window is spent, which now
-                    # means only one thing: it already refused once here and the
-                    # model answered in prose again. (Before the allowances were
-                    # split it also meant "the intents nudge took it", which made
-                    # this counter ambiguous and hid the starvation above.) THE
-                    # PROSE PASSES. The runtime records what it can and never
-                    # hard-locks a turn: the same posture `ENFORCEMENT_EXHAUSTED`
-                    # takes for intents, minus the ledger write, because there is no
-                    # ledger for answer shape and the user's answer is in hand.
-                    self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
 
-            if not result.tool_calls and not refused_finalization:
-                # B1/D44 (2026-07-01 clarification) AND UI Slice 1: the union of
-                # this turn's tool-result provenance — the tag for the final
-                # assistant message (so it is scope re-filtered on replay exactly
-                # like the trail itself) AND the enriched `result` event's lineage.
-                # Computed ONCE here (the single fail-closed source of truth; do
-                # not re-derive in-loop).
-                turn_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
-                return await self._finish(
-                    session_id=session_id,
-                    turn_index=turn_index,
-                    status="done",
-                    assistant_text=result.assistant_text,
-                    tool_calls_made=tool_calls_made,
-                    accum=accum,
-                    provenance=turn_provenance,
-                    # `or None` IS THE APPEND GUARD (`if result.assistant_text:`),
-                    # carried as a value. A model may finish this exit with `None`
-                    # or `""`; either must leave NO assistant message in history,
-                    # while `assistant_text` above still reports it verbatim. The
-                    # `answerWithTable` exit below persists unconditionally — see
-                    # `_finish` for why the two differ and why both are correct.
-                    persist_text=result.assistant_text or None,
-                    event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+                # A REFUSED EXIT-#1 ROUND FALLS THROUGH FROM HERE — deliberately, and
+                # this is what charges it to the budget (05 §C.3). `result.tool_calls`
+                # is empty on that path, so every step between here and
+                # `guard.record_iteration` below is inert: both partitions produce
+                # empty lists, `ask_user_call` is `None`, the dispatch loop body never
+                # runs, and `designated_answer_text` stays `None`. Control therefore
+                # reaches `record_iteration` and the existing hard-ceiling / budget-cap
+                # handling, and only then loops back for the re-round.
+                #
+                # Returning `continue` here instead would make the forced re-round
+                # FREE — no iteration, no tokens — leaving `BudgetGuard.exceeded` able
+                # to trip only on the 60-second wall clock, which every resume
+                # restarts. Anything added below that is NOT inert for an empty
+                # `tool_calls` list must be guarded explicitly.
+
+                # --- analysisState: PARTITION BEFORE CAPPING (03 §E.2) ------------
+                #
+                # `capped_tool_calls = result.tool_calls[:max_tool_calls_per_iteration]`
+                # below SILENTLY DISCARDS the overflow — no error, no trail entry, no
+                # signal to the model. Partitioning the already-capped list would
+                # therefore lose a state call that follows eight substantive ones,
+                # BEFORE any reordering could help, and the turn would run unprotected
+                # with nothing to show for it. So the partition runs on the RAW list
+                # and only the substantive remainder is capped.
+                #
+                # State calls are EXEMPT from `max_tool_calls_per_iteration` but
+                # BOUNDED at `MAX_STATE_CALLS`: unbounded, N state calls in one
+                # response are N full session-doc CAS read-modify-writes and N trail
+                # entries inside `fit_request_to_budget`'s pinned region, with
+                # `guard.exceeded` checked only AFTER each one. Batching is already
+                # mandatory, so the surplus is the model misbehaving and is rejected
+                # (with a trail entry, so it learns) inside the dispatch loop.
+                #
+                # THE EXEMPTION IS BOUNDED ON THE LIST ITSELF, not only on how many are
+                # DISPATCHED. `MAX_STATE_CALLS` caps the state WRITES at two, but every
+                # surplus call still costs a `append_trail_entry` — a full CAS
+                # read-modify-write each, plus an entry pinned in the current-turn budget
+                # region — so a degenerate response with 20 state calls was 18 store
+                # writes in one round-trip, while over-cap `other_calls` are simply
+                # dropped. The first `_MAX_SURPLUS_STATE_REJECTIONS` surplus calls are
+                # still rejected WITH an entry (the model must learn why); the rest are
+                # dropped exactly as over-cap `other_calls` are — no trail entry, no
+                # response for that call id.
+                #
+                # Dispatching them FIRST reinstates the intent of the original
+                # "commit state, then dispatch" barrier in sequential form. That
+                # barrier was dropped along with bounded concurrency, but the
+                # ORDERING guarantee it carried was never the concurrency part.
+                state_calls = [
+                    tc for tc in result.tool_calls if tc.name == UPDATE_ANALYSIS_STATE_TOOL_NAME
+                ][: MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS]
+                other_calls = [
+                    tc for tc in result.tool_calls if tc.name != UPDATE_ANALYSIS_STATE_TOOL_NAME
+                ][: self._max_tool_calls_per_iteration]
+
+                # SCANNED OVER THE RAW LIST, for the same reason the state partition is
+                # (03 §E.2): `other_calls` is TRUNCATED to
+                # `max_tool_calls_per_iteration`, and capping silently discards the
+                # overflow. Selecting the pause from the capped list meant a batch like
+                # `[runQuery, runQuery, askUser]` at cap 2 dispatched both queries and
+                # NEVER ASKED THE USER — the model's clarifying question swallowed by the
+                # runtime, the turn finishing `done` on a question it should have paused
+                # on. Pre-Release-1 this scan ran over `result.tool_calls`; narrowing it
+                # was an unintended consequence of introducing the partition.
+                #
+                # Selecting it here changes nothing about ORDER: `capped_tool_calls`
+                # below still holds only the state calls when a pause is present, so
+                # state is committed first and the pause is honoured after the loop
+                # (03 §E.1) — an `askUser` past the cap now pauses exactly as one before
+                # the cap always did.
+                ask_user_call = next(
+                    (tc for tc in result.tool_calls if tc.name == "askUser"), None
                 )
 
-            # A REFUSED EXIT-#1 ROUND FALLS THROUGH FROM HERE — deliberately, and
-            # this is what charges it to the budget (05 §C.3). `result.tool_calls`
-            # is empty on that path, so every step between here and
-            # `guard.record_iteration` below is inert: both partitions produce
-            # empty lists, `ask_user_call` is `None`, the dispatch loop body never
-            # runs, and `designated_answer_text` stays `None`. Control therefore
-            # reaches `record_iteration` and the existing hard-ceiling / budget-cap
-            # handling, and only then loops back for the re-round.
-            #
-            # Returning `continue` here instead would make the forced re-round
-            # FREE — no iteration, no tokens — leaving `BudgetGuard.exceeded` able
-            # to trip only on the 60-second wall clock, which every resume
-            # restarts. Anything added below that is NOT inert for an empty
-            # `tool_calls` list must be guarded explicitly.
-
-            # --- analysisState: PARTITION BEFORE CAPPING (03 §E.2) ------------
-            #
-            # `capped_tool_calls = result.tool_calls[:max_tool_calls_per_iteration]`
-            # below SILENTLY DISCARDS the overflow — no error, no trail entry, no
-            # signal to the model. Partitioning the already-capped list would
-            # therefore lose a state call that follows eight substantive ones,
-            # BEFORE any reordering could help, and the turn would run unprotected
-            # with nothing to show for it. So the partition runs on the RAW list
-            # and only the substantive remainder is capped.
-            #
-            # State calls are EXEMPT from `max_tool_calls_per_iteration` but
-            # BOUNDED at `MAX_STATE_CALLS`: unbounded, N state calls in one
-            # response are N full session-doc CAS read-modify-writes and N trail
-            # entries inside `fit_request_to_budget`'s pinned region, with
-            # `guard.exceeded` checked only AFTER each one. Batching is already
-            # mandatory, so the surplus is the model misbehaving and is rejected
-            # (with a trail entry, so it learns) inside the dispatch loop.
-            #
-            # THE EXEMPTION IS BOUNDED ON THE LIST ITSELF, not only on how many are
-            # DISPATCHED. `MAX_STATE_CALLS` caps the state WRITES at two, but every
-            # surplus call still costs a `append_trail_entry` — a full CAS
-            # read-modify-write each, plus an entry pinned in the current-turn budget
-            # region — so a degenerate response with 20 state calls was 18 store
-            # writes in one round-trip, while over-cap `other_calls` are simply
-            # dropped. The first `_MAX_SURPLUS_STATE_REJECTIONS` surplus calls are
-            # still rejected WITH an entry (the model must learn why); the rest are
-            # dropped exactly as over-cap `other_calls` are — no trail entry, no
-            # response for that call id.
-            #
-            # Dispatching them FIRST reinstates the intent of the original
-            # "commit state, then dispatch" barrier in sequential form. That
-            # barrier was dropped along with bounded concurrency, but the
-            # ORDERING guarantee it carried was never the concurrency part.
-            state_calls = [
-                tc for tc in result.tool_calls if tc.name == UPDATE_ANALYSIS_STATE_TOOL_NAME
-            ][: MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS]
-            other_calls = [
-                tc for tc in result.tool_calls if tc.name != UPDATE_ANALYSIS_STATE_TOOL_NAME
-            ][: self._max_tool_calls_per_iteration]
-
-            # SCANNED OVER THE RAW LIST, for the same reason the state partition is
-            # (03 §E.2): `other_calls` is TRUNCATED to
-            # `max_tool_calls_per_iteration`, and capping silently discards the
-            # overflow. Selecting the pause from the capped list meant a batch like
-            # `[runQuery, runQuery, askUser]` at cap 2 dispatched both queries and
-            # NEVER ASKED THE USER — the model's clarifying question swallowed by the
-            # runtime, the turn finishing `done` on a question it should have paused
-            # on. Pre-Release-1 this scan ran over `result.tool_calls`; narrowing it
-            # was an unintended consequence of introducing the partition.
-            #
-            # Selecting it here changes nothing about ORDER: `capped_tool_calls`
-            # below still holds only the state calls when a pause is present, so
-            # state is committed first and the pause is honoured after the loop
-            # (03 §E.1) — an `askUser` past the cap now pauses exactly as one before
-            # the cap always did.
-            ask_user_call = next(
-                (tc for tc in result.tool_calls if tc.name == "askUser"), None
-            )
-
-            # S3: never dispatch an unbounded number of tool calls from one
-            # model response — cap per iteration (RuntimeSettings-configurable,
-            # default 8), applied to `other_calls` above. Any calls beyond the cap
-            # are simply not dispatched this round (best-partial); nothing is
-            # persisted for them, so they leave no trail entry and are not
-            # "silently denied" — the model just does not see a response for them
-            # and may re-request on the next round-trip if it still wants them.
-            #
-            # E.1: when the response ALSO pauses, only the STATE calls are
-            # dispatched and the pause is honoured below — commit the state, then
-            # pause. `askUser` short-circuits the whole response, so a batch of
-            # `updateAnalysisState` + `askUser` (the natural round-1 shape for
-            # "three asks, one ambiguous") used to discard the state write
-            # entirely: no trail entry, no tool result, and D22 discards the
-            # surrounding free text, so after the resume the model had no record
-            # it ever tried, and "clarification cannot broaden the protected set"
-            # would bite on a set that was never created. Everything OTHER than
-            # the state calls still waits for the resume, exactly as before.
-            capped_tool_calls = (
-                list(state_calls)
-                if ask_user_call is not None
-                else [*state_calls, *other_calls]
-            )
-            state_calls_dispatched = 0
-            for tool_call in capped_tool_calls:
-                # --- CALL-TIME INTENT TAGGING: split the tag off FIRST ---------
+                # S3: never dispatch an unbounded number of tool calls from one
+                # model response — cap per iteration (RuntimeSettings-configurable,
+                # default 8), applied to `other_calls` above. Any calls beyond the cap
+                # are simply not dispatched this round (best-partial); nothing is
+                # persisted for them, so they leave no trail entry and are not
+                # "silently denied" — the model just does not see a response for them
+                # and may re-request on the next round-trip if it still wants them.
                 #
-                # `serves_intent` is a runtime concept the model puts on a
-                # `runQuery`/`runBlueprint`/`getTableSchema` to say which tracked
-                # intent the call is for. It must come off the arguments BEFORE
-                # anything else looks at them, and this is the only place it is
-                # removed:
-                #
-                #   - the live MCP server rejects an argument its own schema does
-                #     not declare, and `runBlueprint`'s executor validates its
-                #     arguments too — so an un-stripped tag breaks the real call;
-                #   - the repeated-read guard computes the signature inside
-                #     `ReadGuard.classify` from the args handed to it below, and
-                #     two identical `getTableSchema` fetches tagged for different
-                #     intents must still dedup to one signature;
-                #   - `TrailEntry.args` is what replay re-renders, and the tag has
-                #     its own persisted field there.
-                #
-                # `analysis_state` is the CURRENT window-local, and 03 §E.2 puts
-                # every state call first in this same batch — so a model that
-                # declares its intents and tags its work in ONE message still has
-                # its tags validated against a state that exists by the time the
-                # tagged calls are reached. An unknown/stale tag is DROPPED, not
-                # refused: the work runs, the entry is untagged, and the drop is
-                # reported (never the offending value — D25: an invalid tag is
-                # arbitrary model text, unlike a valid one).
-                call_args, serves_intent, tag_drop_reason = split_serves_intent(
-                    tool_call.name, tool_call.arguments, analysis_state
+                # E.1: when the response ALSO pauses, only the STATE calls are
+                # dispatched and the pause is honoured below — commit the state, then
+                # pause. `askUser` short-circuits the whole response, so a batch of
+                # `updateAnalysisState` + `askUser` (the natural round-1 shape for
+                # "three asks, one ambiguous") used to discard the state write
+                # entirely: no trail entry, no tool result, and D22 discards the
+                # surrounding free text, so after the resume the model had no record
+                # it ever tried, and "clarification cannot broaden the protected set"
+                # would bite on a set that was never created. Everything OTHER than
+                # the state calls still waits for the resume, exactly as before.
+                capped_tool_calls = (
+                    list(state_calls)
+                    if ask_user_call is not None
+                    else [*state_calls, *other_calls]
                 )
-                if tag_drop_reason is not None:
-                    self._observer(
-                        "loop_intent_tag_dropped",
-                        {"tool_name": tool_call.name, "reason": tag_drop_reason},
-                    )
-
-                # Repeated-idempotent-read guard (generalizes D94): the model
-                # re-issued an identical, already-served idempotent read (e.g.
-                # `getTableSchema(employee)` for the Nth time). Its result is
-                # DETERMINED provenance so the D94 ok+None sentinel never fires —
-                # yet re-fetching it is pure waste that can spin to the budget
-                # ceiling. Do NOT re-dispatch to the MCP; instead persist a
-                # data-free guard TrailEntry (ok+None, marked
-                # IDEMPOTENT_READ_ALREADY_SERVED_CODE) that `context/assembly.py`
-                # renders — via the SAME withheld-sentinel path D94 uses — as a
-                # "you already have this, proceed" nudge filling this repeat call's
-                # dangling tool-slot (keeping the OpenAI one-tool_call→one-result
-                # pairing valid). It is counted in `tool_calls_made` for reporting
-                # only; termination is bounded regardless because every round-trip
-                # still records an iteration against the budget window
-                # (`guard.record_iteration` below), so the worst case remains
-                # windows × iterations. The real served read stays in history under
-                # its own tool_call_id.
-                #
-                # AFTER the tag split, never before: two identical `getTableSchema`
-                # fetches tagged for different intents must dedup to ONE signature,
-                # so the guard is handed `call_args` (tag-stripped), not
-                # `tool_call.arguments`.
-                #
-                # `classify` also applies the TRIM-AWARE RE-FETCH EXEMPTION — a repeat
-                # whose serving result is no longer readable is re-dispatched for real,
-                # bounded per signature per window — and emits that decision's own
-                # events. See `ReadGuard.classify` for why the exemption exists and why
-                # it is bounded; `read_decision.declined` is the whole answer here.
-                read_decision = read_guard.classify(tool_call.name, call_args)
-                if read_decision.declined:
-                    # A guarded `getBlueprint` STILL SATISFIES the blueprint-definition
-                    # gate. Being deduped means the definition is already in the
-                    # model's context (the guard's trim-aware exemption is what makes
-                    # that true), which is exactly what the gate asks. Without this a
-                    # deadlock is reachable:
-                    # expand, run refused for an unrelated reason (a missing
-                    # slot), re-expand defensively, get a data-free marker, and never
-                    # satisfy the gate again.
+                state_calls_dispatched = 0
+                for tool_call in capped_tool_calls:
+                    # --- CALL-TIME INTENT TAGGING: split the tag off FIRST ---------
                     #
-                    # NOTE this is the OPPOSITE of 04 condition 5, which REJECTS the
-                    # same marker as completion evidence. The two gates ask different
-                    # questions — "does the model have the definition?" versus "did
-                    # work actually happen?" — and a dedup answers yes to the first
-                    # and no to the second.
-                    if tool_call.name == "getBlueprint":
-                        blueprint_gate.note_definition_in_context(call_args.get("id"))
-                    tool_calls_made += 1
-                    guard_entry = TrailEntry(
-                        turn_index=turn_index,
-                        tool_call_id=tool_call.id,
-                        tool_name=tool_call.name,
-                        args=dict(call_args),
-                        status="ok",
-                        error_code=IDEMPOTENT_READ_ALREADY_SERVED_CODE,
-                        # `None` (undetermined) is deliberate: it routes this
-                        # data-free entry through the D94 stranded-sentinel path.
-                        # `_compute_turn_provenance_union` excludes it by marker so
-                        # it never poisons the turn's replay provenance.
-                        provenance=None,
-                        result_preview=None,
-                        result_full_ref=None,
-                        ts=_now_iso(),
-                        # Recorded even though this entry can NEVER be valid
-                        # evidence (04 condition 5 rejects the guard marker): the
-                        # tag is what the model actually sent, and `resolve_tagged_
-                        # evidence` needs to SEE it to refuse it with the actionable
-                        # "cite the call that actually served this result" message
-                        # rather than the misleading "nothing is tagged for it".
-                        serves_intent=serves_intent,
-                    )
-                    await self._session_store.append_trail_entry(session_id, guard_entry)
-                    self._observer(
-                        "loop_repeated_idempotent_read_guarded",
-                        repeated_read_guard_event(
-                            tool_call.name, tool_call.id, call_args
-                        ),
-                    )
-                    if guard.exceeded:
-                        break
-                    continue
-
-                # --- BLUEPRINT-DEFINITION GATE ---------------------------------
-                #
-                # `runBlueprint` is refused unless this turn already holds a
-                # SUCCESSFUL `getBlueprint` for the same id. A card carries no SQL,
-                # so without this the model routes on an authored prose `intent`
-                # string and can run — and confidently report — an analysis that
-                # measures something else entirely. See `loop/blueprint_gate.py` for
-                # the full rationale; the decision and its event are ITS, and only
-                # the effects below are the loop's.
-                #
-                # DECIDED HERE, BEFORE `_maybe_start_summary` AND BEFORE DISPATCH, so
-                # the executor never runs, no inner `runQuery` is issued, and the
-                # only trail entry written for this call is the refusal itself.
-                #
-                # A DEDUP-GUARDED `getBlueprint` SATISFIES THE GATE (see the guard
-                # branch above, which folds a guarded repeat's id in): being deduped
-                # means the definition is already in the model's context, which is
-                # exactly what the gate asks. That is the OPPOSITE of 04 condition 5,
-                # which REJECTS the same marker as completion evidence — the two
-                # gates ask different questions ("does the model have the
-                # definition?" versus "did work actually happen?").
-                #
-                # THE RESUME PATH DOES NOT PASS THROUGH HERE. A mid-DAG checkpoint
-                # resume re-enters `self._blueprint_executor.resume(...)` directly from
-                # `_resume_blueprint` and appends its own `runBlueprint` trail entry;
-                # it never reaches this dispatch site, so a resumed blueprint is
-                # structurally ungated rather than exempted by a branch. A resume is
-                # the continuation of an already-gated invocation, not a fresh decision
-                # to run a blueprint, so that is the correct outcome — and
-                # `tests/runtime/loop/test_blueprint_definition_gate.py` pins it, so a
-                # refactor that routes resumes through dispatch cannot silently start
-                # gating them.
-                #
-                # NOT APPLIED TO AN UNWIRED `runBlueprint` (`handler is None`): there is
-                # no blueprint stack at all, so "expand it first" would send the model
-                # after a tool that cannot help it, replacing the honest
-                # `RUN_BLUEPRINT_UNAVAILABLE` → raw-loop fallback (§6) with a loop.
-                handler = self._runtime_tools.get(tool_call.name)
-                gate_refusal: ToolResult | None = None
-                if tool_call.name == "runBlueprint" and handler is not None:
-                    gate_refusal = blueprint_gate.check_run_blueprint(call_args)
-
-                # LLM-generated progress summary (opt-in, `progress_summary_enabled`):
-                # fire the value-rich present-tense line CONCURRENTLY, BEFORE dispatch
-                # and WITHOUT awaiting it, so it never adds latency to the tool. The
-                # instant `tool_dispatch_start` template label still fires as today
-                # (inside the dispatcher / the runtime tools); this line is additive,
-                # arriving when ready. No-op when the feature is off. Skipped for a
-                # gated call: nothing is about to run, so narrating it would be a lie.
-                if gate_refusal is None:
-                    self._maybe_start_summary(tool_call.name, call_args)
-
-                # Runtime-tool registry (read-tools-design §2): a runtime tool
-                # (`resolveValues` + the three read tools) is intercepted here —
-                # it never reaches `dispatch` under its own name (only any inner
-                # tool it issues does). It returns the SAME `ToolResult`
-                # dataclass, so the trail/budget path below is unchanged and it
-                # counts as exactly one `tool_calls_made`. An advertised runtime
-                # tool that is not wired returns a clean local unavailable error
-                # (§6), never an incoherent MCP unknown-tool denial.
-                # `handler` was resolved above, at the gate.
-                if gate_refusal is not None:
-                    # First in the chain: nothing else may dispatch this call.
-                    tool_result = gate_refusal
-                elif tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
-                    # 03 §E.2: the cap exemption is BOUNDED. The surplus is
-                    # REJECTED rather than dropped — it gets a trail entry through
-                    # the normal path below, so the model sees why and batches
-                    # next time, instead of silently losing a write.
+                    # `serves_intent` is a runtime concept the model puts on a
+                    # `runQuery`/`runBlueprint`/`getTableSchema` to say which tracked
+                    # intent the call is for. It must come off the arguments BEFORE
+                    # anything else looks at them, and this is the only place it is
+                    # removed:
                     #
-                    # Only the FIRST `_MAX_SURPLUS_STATE_REJECTIONS` of them reach
-                    # here at all: the partition above truncates `state_calls` to
-                    # `MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS`, so the
-                    # number of store writes a single response can force is fixed,
-                    # not proportional to how many calls the model emitted.
-                    state_calls_dispatched += 1
-                    if state_calls_dispatched > MAX_STATE_CALLS:
-                        tool_result = surplus_state_call_rejected()
+                    #   - the live MCP server rejects an argument its own schema does
+                    #     not declare, and `runBlueprint`'s executor validates its
+                    #     arguments too — so an un-stripped tag breaks the real call;
+                    #   - the repeated-read guard computes the signature inside
+                    #     `ReadGuard.classify` from the args handed to it below, and
+                    #     two identical `getTableSchema` fetches tagged for different
+                    #     intents must still dedup to one signature;
+                    #   - `TrailEntry.args` is what replay re-renders, and the tag has
+                    #     its own persisted field there.
+                    #
+                    # `analysis_state` is the CURRENT window-local, and 03 §E.2 puts
+                    # every state call first in this same batch — so a model that
+                    # declares its intents and tags its work in ONE message still has
+                    # its tags validated against a state that exists by the time the
+                    # tagged calls are reached. An unknown/stale tag is DROPPED, not
+                    # refused: the work runs, the entry is untagged, and the drop is
+                    # reported (never the offending value — D25: an invalid tag is
+                    # arbitrary model text, unlike a valid one).
+                    call_args, serves_intent, tag_drop_reason = split_serves_intent(
+                        tool_call.name, tool_call.arguments, analysis_state
+                    )
+                    if tag_drop_reason is not None:
                         self._observer(
-                            "loop_analysis_state_rejected",
-                            {"reason": "surplus_state_call", "intent_count": 0},
+                            "loop_intent_tag_dropped",
+                            {"tool_name": tool_call.name, "reason": tag_drop_reason},
                         )
+
+                    # Repeated-idempotent-read guard (generalizes D94): the model
+                    # re-issued an identical, already-served idempotent read (e.g.
+                    # `getTableSchema(employee)` for the Nth time). Its result is
+                    # DETERMINED provenance so the D94 ok+None sentinel never fires —
+                    # yet re-fetching it is pure waste that can spin to the budget
+                    # ceiling. Do NOT re-dispatch to the MCP; instead persist a
+                    # data-free guard TrailEntry (ok+None, marked
+                    # IDEMPOTENT_READ_ALREADY_SERVED_CODE) that `context/assembly.py`
+                    # renders — via the SAME withheld-sentinel path D94 uses — as a
+                    # "you already have this, proceed" nudge filling this repeat call's
+                    # dangling tool-slot (keeping the OpenAI one-tool_call→one-result
+                    # pairing valid). It is counted in `tool_calls_made` for reporting
+                    # only; termination is bounded regardless because every round-trip
+                    # still records an iteration against the budget window
+                    # (`guard.record_iteration` below), so the worst case remains
+                    # windows × iterations. The real served read stays in history under
+                    # its own tool_call_id.
+                    #
+                    # AFTER the tag split, never before: two identical `getTableSchema`
+                    # fetches tagged for different intents must dedup to ONE signature,
+                    # so the guard is handed `call_args` (tag-stripped), not
+                    # `tool_call.arguments`.
+                    #
+                    # `classify` also applies the TRIM-AWARE RE-FETCH EXEMPTION — a repeat
+                    # whose serving result is no longer readable is re-dispatched for real,
+                    # bounded per signature per window — and emits that decision's own
+                    # events. See `ReadGuard.classify` for why the exemption exists and why
+                    # it is bounded; `read_decision.declined` is the whole answer here.
+                    read_decision = read_guard.classify(tool_call.name, call_args)
+                    if read_decision.declined:
+                        # A guarded `getBlueprint` STILL SATISFIES the blueprint-definition
+                        # gate. Being deduped means the definition is already in the
+                        # model's context (the guard's trim-aware exemption is what makes
+                        # that true), which is exactly what the gate asks. Without this a
+                        # deadlock is reachable:
+                        # expand, run refused for an unrelated reason (a missing
+                        # slot), re-expand defensively, get a data-free marker, and never
+                        # satisfy the gate again.
+                        #
+                        # NOTE this is the OPPOSITE of 04 condition 5, which REJECTS the
+                        # same marker as completion evidence. The two gates ask different
+                        # questions — "does the model have the definition?" versus "did
+                        # work actually happen?" — and a dedup answers yes to the first
+                        # and no to the second.
+                        if tool_call.name == "getBlueprint":
+                            blueprint_gate.note_definition_in_context(call_args.get("id"))
+                        tool_calls_made += 1
+                        guard_entry = TrailEntry(
+                            turn_index=turn_index,
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            args=dict(call_args),
+                            status="ok",
+                            error_code=IDEMPOTENT_READ_ALREADY_SERVED_CODE,
+                            # `None` (undetermined) is deliberate: it routes this
+                            # data-free entry through the D94 stranded-sentinel path.
+                            # `_compute_turn_provenance_union` excludes it by marker so
+                            # it never poisons the turn's replay provenance.
+                            provenance=None,
+                            result_preview=None,
+                            result_full_ref=None,
+                            ts=_now_iso(),
+                            # Recorded even though this entry can NEVER be valid
+                            # evidence (04 condition 5 rejects the guard marker): the
+                            # tag is what the model actually sent, and `resolve_tagged_
+                            # evidence` needs to SEE it to refuse it with the actionable
+                            # "cite the call that actually served this result" message
+                            # rather than the misleading "nothing is tagged for it".
+                            serves_intent=serves_intent,
+                        )
+                        await self._session_store.append_trail_entry(session_id, guard_entry)
+                        self._observer(
+                            "loop_repeated_idempotent_read_guarded",
+                            repeated_read_guard_event(
+                                tool_call.name, tool_call.id, call_args
+                            ),
+                        )
+                        if guard.exceeded:
+                            break
+                        continue
+
+                    # --- BLUEPRINT-DEFINITION GATE ---------------------------------
+                    #
+                    # `runBlueprint` is refused unless this turn already holds a
+                    # SUCCESSFUL `getBlueprint` for the same id. A card carries no SQL,
+                    # so without this the model routes on an authored prose `intent`
+                    # string and can run — and confidently report — an analysis that
+                    # measures something else entirely. See `loop/blueprint_gate.py` for
+                    # the full rationale; the decision and its event are ITS, and only
+                    # the effects below are the loop's.
+                    #
+                    # DECIDED HERE, BEFORE `_maybe_start_summary` AND BEFORE DISPATCH, so
+                    # the executor never runs, no inner `runQuery` is issued, and the
+                    # only trail entry written for this call is the refusal itself.
+                    #
+                    # A DEDUP-GUARDED `getBlueprint` SATISFIES THE GATE (see the guard
+                    # branch above, which folds a guarded repeat's id in): being deduped
+                    # means the definition is already in the model's context, which is
+                    # exactly what the gate asks. That is the OPPOSITE of 04 condition 5,
+                    # which REJECTS the same marker as completion evidence — the two
+                    # gates ask different questions ("does the model have the
+                    # definition?" versus "did work actually happen?").
+                    #
+                    # THE RESUME PATH DOES NOT PASS THROUGH HERE. A mid-DAG checkpoint
+                    # resume re-enters `self._blueprint_executor.resume(...)` directly from
+                    # `_resume_blueprint` and appends its own `runBlueprint` trail entry;
+                    # it never reaches this dispatch site, so a resumed blueprint is
+                    # structurally ungated rather than exempted by a branch. A resume is
+                    # the continuation of an already-gated invocation, not a fresh decision
+                    # to run a blueprint, so that is the correct outcome — and
+                    # `tests/runtime/loop/test_blueprint_definition_gate.py` pins it, so a
+                    # refactor that routes resumes through dispatch cannot silently start
+                    # gating them.
+                    #
+                    # NOT APPLIED TO AN UNWIRED `runBlueprint` (`handler is None`): there is
+                    # no blueprint stack at all, so "expand it first" would send the model
+                    # after a tool that cannot help it, replacing the honest
+                    # `RUN_BLUEPRINT_UNAVAILABLE` → raw-loop fallback (§6) with a loop.
+                    handler = self._runtime_tools.get(tool_call.name)
+                    gate_refusal: ToolResult | None = None
+                    if tool_call.name == "runBlueprint" and handler is not None:
+                        gate_refusal = blueprint_gate.check_run_blueprint(call_args)
+
+                    # LLM-generated progress summary (opt-in, `progress_summary_enabled`):
+                    # fire the value-rich present-tense line CONCURRENTLY, BEFORE dispatch
+                    # and WITHOUT awaiting it, so it never adds latency to the tool. The
+                    # instant `tool_dispatch_start` template label still fires as today
+                    # (inside the dispatcher / the runtime tools); this line is additive,
+                    # arriving when ready. No-op when the feature is off. Skipped for a
+                    # gated call: nothing is about to run, so narrating it would be a lie.
+                    if gate_refusal is None:
+                        self._maybe_start_summary(tool_call.name, call_args)
+
+                    # Runtime-tool registry (read-tools-design §2): a runtime tool
+                    # (`resolveValues` + the three read tools) is intercepted here —
+                    # it never reaches `dispatch` under its own name (only any inner
+                    # tool it issues does). It returns the SAME `ToolResult`
+                    # dataclass, so the trail/budget path below is unchanged and it
+                    # counts as exactly one `tool_calls_made`. An advertised runtime
+                    # tool that is not wired returns a clean local unavailable error
+                    # (§6), never an incoherent MCP unknown-tool denial.
+                    # `handler` was resolved above, at the gate.
+                    if gate_refusal is not None:
+                        # First in the chain: nothing else may dispatch this call.
+                        tool_result = gate_refusal
+                    elif tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
+                        # 03 §E.2: the cap exemption is BOUNDED. The surplus is
+                        # REJECTED rather than dropped — it gets a trail entry through
+                        # the normal path below, so the model sees why and batches
+                        # next time, instead of silently losing a write.
+                        #
+                        # Only the FIRST `_MAX_SURPLUS_STATE_REJECTIONS` of them reach
+                        # here at all: the partition above truncates `state_calls` to
+                        # `MAX_STATE_CALLS + _MAX_SURPLUS_STATE_REJECTIONS`, so the
+                        # number of store writes a single response can force is fixed,
+                        # not proportional to how many calls the model emitted.
+                        state_calls_dispatched += 1
+                        if state_calls_dispatched > MAX_STATE_CALLS:
+                            tool_result = surplus_state_call_rejected()
+                            self._observer(
+                                "loop_analysis_state_rejected",
+                                {"reason": "surplus_state_call", "intent_count": 0},
+                            )
+                        elif handler is not None:
+                            tool_result = await self._run_runtime_tool(
+                                handler,
+                                tool_call.name,
+                                call_args,
+                                credentials,
+                                turn_context,
+                            )
+                        else:  # pragma: no cover - always wired by app.py
+                            tool_result = _runtime_tool_internal_error(tool_call.name)
                     elif handler is not None:
                         tool_result = await self._run_runtime_tool(
                             handler,
@@ -2891,531 +2841,538 @@ class AgentLoop:
                             credentials,
                             turn_context,
                         )
-                    else:  # pragma: no cover - always wired by app.py
-                        tool_result = _runtime_tool_internal_error(tool_call.name)
-                elif handler is not None:
-                    tool_result = await self._run_runtime_tool(
-                        handler,
-                        tool_call.name,
-                        call_args,
-                        credentials,
-                        turn_context,
-                    )
-                elif tool_call.name in _RUNTIME_TOOL_UNAVAILABLE_CODE:
-                    tool_result = _runtime_tool_unavailable(
-                        tool_call.name, _RUNTIME_TOOL_UNAVAILABLE_CODE[tool_call.name]
-                    )
-                else:
-                    tool_result = await self._tool_dispatcher.dispatch(
-                        tool_call.name, call_args, credentials
-                    )
-
-                # REFRESH THE ENFORCEMENT LOCAL (05 §E). The state call just wrote
-                # the state and returned it in full, so the local is updated from
-                # the result rather than re-read from the store. A rejected call
-                # (or an unreadable result) leaves the loaded value standing.
-                if tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
-                    refreshed = refreshed_analysis_state(tool_result, turn_index)
-                    if refreshed is not None:
-                        analysis_state = refreshed
-
-                # --- FINALIZATION ENFORCEMENT, terminal exit #2 (05 §B.1) -----
-                #
-                # A successful `answerWithTable` carrying non-blank prose ENDS the
-                # turn once the batch drains. Refuse it here — BEFORE the trail
-                # entry is written, so the persisted entry IS the refusal — and
-                # crucially BEFORE `_resolve_answer_sql` below, which fires the two
-                # dormant `hooks/answer_table.py` seams: a designation that is
-                # about to be refused must not fire the answer-table lifecycle,
-                # and checking afterwards would also clobber the more actionable
-                # blueprint-not-run message with this one.
-                #
-                # The full terminal condition is mirrored exactly (`ok` + a `dict`
-                # of arguments + non-blank `answer`), because a call that would NOT
-                # have terminated the turn is not a finalization and must not be
-                # refused as one.
-                if (
-                    tool_call.name == ANSWER_TABLE_TOOL_NAME
-                    and tool_result.status == "ok"
-                    and isinstance(call_args, dict)
-                    and clean_answer_text(call_args.get("answer")) is not None
-                ):
-                    pending_at_answer = pending_intents(analysis_state)
-                    if pending_at_answer:
-                        if await finalization_gate.may_refuse("intents"):
-                            self._observer(
-                                "loop_finalization_refused",
-                                {
-                                    "exit": "answer_with_table",
-                                    "pending_count": len(pending_at_answer),
-                                },
-                            )
-                            # A RETRYABLE error, so the turn continues and the
-                            # batch drains normally: `tool_result` is no longer
-                            # `ok`, so neither `_resolve_answer_tables` below nor
-                            # the terminal-exit check fires for this call.
-                            tool_result = finalization_blocked(pending_at_answer)
-                        else:
-                            analysis_state = await self._force_block_pending_intents(
-                                session_id=session_id,
-                                turn_index=turn_index,
-                                state=analysis_state,
-                                reason_code="ENFORCEMENT_EXHAUSTED",
-                            )
-                            self._observer(
-                                "loop_enforcement_exhausted",
-                                {"intent_count": len(pending_at_answer)},
-                            )
-
-                # answerWithTable naming a blueprint it never ran: turn the call
-                # into a retryable NUDGE rather than letting it terminate the turn
-                # with no table. Done HERE, before the trail entry is written, so the
-                # persisted entry IS the nudge and the model sees it on the next
-                # round-trip. Only when there is no raw `sql` to fall back on, and
-                # only after `_resolve_answer_tables` has had its go — which includes
-                # giving the dormant ON_ANSWER_TABLE_UNRESOLVED hook first refusal, so
-                # a registered hook that supplies a replacement wins over the nudge.
-                #
-                # AN ITEM OF `tables` IS TREATED EXACTLY LIKE THE TOP-LEVEL PAIR: it
-                # names a blueprint that did not run, the whole call is refused, and
-                # the model is told which one. Dropping the item instead would
-                # silently lose a deliverable's table, which is the failure
-                # multi-table exists to fix.
-                resolved_answer_tables: list[AnswerTable] = []
-                if (
-                    tool_call.name == ANSWER_TABLE_TOOL_NAME
-                    and tool_result.status == "ok"
-                    and isinstance(call_args, dict)
-                ):
-                    # Resolved ONCE — the hooks fire here and nowhere else.
-                    (
-                        resolved_answer_tables,
-                        unresolved_blueprint,
-                        carried_designation,
-                    ) = await self._resolve_answer_tables(
-                        call_args,
-                        blueprint_runs=accum.blueprint_runs,
-                        credentials=credentials,
-                        session_id=session_id,
-                        turn_index=turn_index,
-                    )
-                    if unresolved_blueprint is not None:
-                        _logger.info(
-                            "answerWithTable named blueprint %r that did not run this "
-                            "turn — nudging the model to run it first (session=%s)",
-                            unresolved_blueprint,
-                            session_id,
+                    elif tool_call.name in _RUNTIME_TOOL_UNAVAILABLE_CODE:
+                        tool_result = _runtime_tool_unavailable(
+                            tool_call.name, _RUNTIME_TOOL_UNAVAILABLE_CODE[tool_call.name]
                         )
-                        tool_result = _answer_table_blueprint_not_run(unresolved_blueprint)
-                    elif (
-                        not carried_designation
-                        and answer_shape.multi_row_calls
+                    else:
+                        tool_result = await self._tool_dispatcher.dispatch(
+                            tool_call.name, call_args, credentials
+                        )
+
+                    # REFRESH THE ENFORCEMENT LOCAL (05 §E). The state call just wrote
+                    # the state and returned it in full, so the local is updated from
+                    # the result rather than re-read from the store. A rejected call
+                    # (or an unreadable result) leaves the loaded value standing.
+                    if tool_call.name == UPDATE_ANALYSIS_STATE_TOOL_NAME:
+                        refreshed = refreshed_analysis_state(tool_result, turn_index)
+                        if refreshed is not None:
+                            analysis_state = refreshed
+
+                    # --- FINALIZATION ENFORCEMENT, terminal exit #2 (05 §B.1) -----
+                    #
+                    # A successful `answerWithTable` carrying non-blank prose ENDS the
+                    # turn once the batch drains. Refuse it here — BEFORE the trail
+                    # entry is written, so the persisted entry IS the refusal — and
+                    # crucially BEFORE `_resolve_answer_sql` below, which fires the two
+                    # dormant `hooks/answer_table.py` seams: a designation that is
+                    # about to be refused must not fire the answer-table lifecycle,
+                    # and checking afterwards would also clobber the more actionable
+                    # blueprint-not-run message with this one.
+                    #
+                    # The full terminal condition is mirrored exactly (`ok` + a `dict`
+                    # of arguments + non-blank `answer`), because a call that would NOT
+                    # have terminated the turn is not a finalization and must not be
+                    # refused as one.
+                    if (
+                        tool_call.name == ANSWER_TABLE_TOOL_NAME
+                        and tool_result.status == "ok"
+                        and isinstance(call_args, dict)
                         and clean_answer_text(call_args.get("answer")) is not None
                     ):
-                        # THE EMPTY DESIGNATION (08 §O). The model called the table
-                        # tool, named no table, and — because the call carries prose
-                        # — would TERMINATE the turn right here, through the exit the
-                        # 05 §J shape gate does not watch. Measured live as
-                        # `status=done`, no table, no event, no log: the user asked
-                        # for a breakdown, the turn held six rows of it, and the
-                        # answer was prose. See `answer_table_no_table_designated`.
-                        #
-                        # `answer_shape.multi_row_calls` SCOPES IT, and the scope is the
-                        # whole of the false-positive protection: with nothing
-                        # multi-row in hand there is no table being withheld, and a
-                        # zero-row "none found" answered in prose is CORRECT (live
-                        # q6). Nudging that would charge a right answer a round-trip.
-                        #
-                        # THE NON-BLANK `answer` CHECK MIRRORS THE TERMINAL
-                        # CONDITION, for the reason the pending-intents refusal just
-                        # above states: a call that would NOT have ended the turn is
-                        # not a finalization and must not be refused as one. A
-                        # blank-`answer` empty call is a habit call, not an answer —
-                        # it does not terminate anything, so nothing is being
-                        # silently lost, and refusing it would burn this window's
-                        # allowance on it and leave the REAL prose finish that
-                        # follows unrefusable. The flag fix below is what covers that
-                        # case: it stops the empty call disarming the exit-#1 gate.
-                        #
-                        # SAME ALLOWANCE AS THE SHAPE GATE (`kind="answer_shape"`),
-                        # because it is the same complaint arriving through the other
-                        # exit — otherwise one mistake could be refused twice in a
-                        # window, once per exit. When the grant is spent the prose
-                        # PASSES and the turn ends: never a hard lock, the posture
-                        # `ENFORCEMENT_EXHAUSTED` takes for intents. The event is
-                        # emitted in `_resolve_answer_tables` either way, so the
-                        # behaviour stays visible after the allowance is gone.
-                        if await finalization_gate.may_refuse("answer_shape"):
+                        pending_at_answer = pending_intents(analysis_state)
+                        if pending_at_answer:
+                            if await finalization_gate.may_refuse("intents"):
+                                self._observer(
+                                    "loop_finalization_refused",
+                                    {
+                                        "exit": "answer_with_table",
+                                        "pending_count": len(pending_at_answer),
+                                    },
+                                )
+                                # A RETRYABLE error, so the turn continues and the
+                                # batch drains normally: `tool_result` is no longer
+                                # `ok`, so neither `_resolve_answer_tables` below nor
+                                # the terminal-exit check fires for this call.
+                                tool_result = finalization_blocked(pending_at_answer)
+                            else:
+                                analysis_state = await self._force_block_pending_intents(
+                                    session_id=session_id,
+                                    turn_index=turn_index,
+                                    state=analysis_state,
+                                    reason_code="ENFORCEMENT_EXHAUSTED",
+                                )
+                                self._observer(
+                                    "loop_enforcement_exhausted",
+                                    {"intent_count": len(pending_at_answer)},
+                                )
+
+                    # answerWithTable naming a blueprint it never ran: turn the call
+                    # into a retryable NUDGE rather than letting it terminate the turn
+                    # with no table. Done HERE, before the trail entry is written, so the
+                    # persisted entry IS the nudge and the model sees it on the next
+                    # round-trip. Only when there is no raw `sql` to fall back on, and
+                    # only after `_resolve_answer_tables` has had its go — which includes
+                    # giving the dormant ON_ANSWER_TABLE_UNRESOLVED hook first refusal, so
+                    # a registered hook that supplies a replacement wins over the nudge.
+                    #
+                    # AN ITEM OF `tables` IS TREATED EXACTLY LIKE THE TOP-LEVEL PAIR: it
+                    # names a blueprint that did not run, the whole call is refused, and
+                    # the model is told which one. Dropping the item instead would
+                    # silently lose a deliverable's table, which is the failure
+                    # multi-table exists to fix.
+                    resolved_answer_tables: list[AnswerTable] = []
+                    if (
+                        tool_call.name == ANSWER_TABLE_TOOL_NAME
+                        and tool_result.status == "ok"
+                        and isinstance(call_args, dict)
+                    ):
+                        # Resolved ONCE — the hooks fire here and nowhere else.
+                        (
+                            resolved_answer_tables,
+                            unresolved_blueprint,
+                            carried_designation,
+                        ) = await self._resolve_answer_tables(
+                            call_args,
+                            blueprint_runs=accum.blueprint_runs,
+                            credentials=credentials,
+                            session_id=session_id,
+                            turn_index=turn_index,
+                        )
+                        if unresolved_blueprint is not None:
                             _logger.info(
-                                "answerWithTable designated no table while %d "
-                                "multi-row result(s) went untabled — nudging "
-                                "(session=%s)",
-                                answer_shape.multi_row_calls,
+                                "answerWithTable named blueprint %r that did not run this "
+                                "turn — nudging the model to run it first (session=%s)",
+                                unresolved_blueprint,
                                 session_id,
                             )
-                            self._observer(
-                                ANSWER_SHAPE_REFUSED_EVENT,
-                                {"multi_row_calls": answer_shape.multi_row_calls},
-                            )
-                            tool_result = answer_table_no_table_designated()
+                            tool_result = _answer_table_blueprint_not_run(unresolved_blueprint)
+                        elif (
+                            not carried_designation
+                            and answer_shape.multi_row_calls
+                            and clean_answer_text(call_args.get("answer")) is not None
+                        ):
+                            # THE EMPTY DESIGNATION (08 §O). The model called the table
+                            # tool, named no table, and — because the call carries prose
+                            # — would TERMINATE the turn right here, through the exit the
+                            # 05 §J shape gate does not watch. Measured live as
+                            # `status=done`, no table, no event, no log: the user asked
+                            # for a breakdown, the turn held six rows of it, and the
+                            # answer was prose. See `answer_table_no_table_designated`.
+                            #
+                            # `answer_shape.multi_row_calls` SCOPES IT, and the scope is the
+                            # whole of the false-positive protection: with nothing
+                            # multi-row in hand there is no table being withheld, and a
+                            # zero-row "none found" answered in prose is CORRECT (live
+                            # q6). Nudging that would charge a right answer a round-trip.
+                            #
+                            # THE NON-BLANK `answer` CHECK MIRRORS THE TERMINAL
+                            # CONDITION, for the reason the pending-intents refusal just
+                            # above states: a call that would NOT have ended the turn is
+                            # not a finalization and must not be refused as one. A
+                            # blank-`answer` empty call is a habit call, not an answer —
+                            # it does not terminate anything, so nothing is being
+                            # silently lost, and refusing it would burn this window's
+                            # allowance on it and leave the REAL prose finish that
+                            # follows unrefusable. The flag fix below is what covers that
+                            # case: it stops the empty call disarming the exit-#1 gate.
+                            #
+                            # SAME ALLOWANCE AS THE SHAPE GATE (`kind="answer_shape"`),
+                            # because it is the same complaint arriving through the other
+                            # exit — otherwise one mistake could be refused twice in a
+                            # window, once per exit. When the grant is spent the prose
+                            # PASSES and the turn ends: never a hard lock, the posture
+                            # `ENFORCEMENT_EXHAUSTED` takes for intents. The event is
+                            # emitted in `_resolve_answer_tables` either way, so the
+                            # behaviour stays visible after the allowance is gone.
+                            if await finalization_gate.may_refuse("answer_shape"):
+                                _logger.info(
+                                    "answerWithTable designated no table while %d "
+                                    "multi-row result(s) went untabled — nudging "
+                                    "(session=%s)",
+                                    answer_shape.multi_row_calls,
+                                    session_id,
+                                )
+                                self._observer(
+                                    ANSWER_SHAPE_REFUSED_EVENT,
+                                    {"multi_row_calls": answer_shape.multi_row_calls},
+                                )
+                                tool_result = answer_table_no_table_designated()
+                            else:
+                                self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
                         else:
-                            self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
-                    else:
-                        self._observe_uncovered_intents(
-                            analysis_state,
-                            tables=resolved_answer_tables,
-                            result_sql_by_call_id=accum.result_sql_by_call_id,
+                            self._observe_uncovered_intents(
+                                analysis_state,
+                                tables=resolved_answer_tables,
+                                result_sql_by_call_id=accum.result_sql_by_call_id,
+                            )
+
+                    # §2.5 pausing-runtime-tool seam: a runtime tool may signal a
+                    # pause (today only `runBlueprint`, on a slot-resolution
+                    # `askUser`). This GENERALIZES the terminal `askUser` branch
+                    # above — the loop writes the checkpoint and returns
+                    # `paused_ask_user` exactly as for `askUser`, before persisting a
+                    # trail entry or counting the call (a paused tool did not
+                    # complete, mirroring `askUser`). A dispatched MCP tool never
+                    # sets `.pause`, so this is inert on the normal path.
+                    if tool_result.pause is not None:
+                        # Computed INSIDE the branch that consumes it. It used to be
+                        # read once per tool call and used on the ~0.1% of them that
+                        # pause; `TurnAccumulators.envelope` is pure (no store, no
+                        # observer — `turn_accumulators.answer_envelope` and
+                        # `rollup_verification`/`AnswerTable.to_doc` below it only build
+                        # values), so where it is called cannot be observed, only how
+                        # often. `tests/runtime/loop/test_turn_exit_contract.py::
+                        # test_an_in_loop_pause_carries_the_envelope_of_the_same_batch`
+                        # pins that it is still read LATE — after the folds of the
+                        # calls that drained before this one.
+                        envelope = accum.envelope()
+                        return await self._pause_from_runtime_tool(
+                            session_id=session_id,
+                            pause=tool_result.pause,
+                            window_count=window_count,
+                            assistant_text=result.assistant_text,
+                            tool_calls_made=tool_calls_made,
+                            # Fix 2: surface whatever succeeded earlier in this window.
+                            sql_executed=accum.sql_executed,
+                            envelope=envelope,
+                            assumptions=accum.assumptions,
+                            # Carry this call's intent tag onto the checkpoint (see
+                            # `_pause_from_runtime_tool`): the trail entry for this work
+                            # is written after the resume, under a new id.
+                            serves_intent=serves_intent,
+                        )
+                    tool_calls_made += 1
+
+                    result_full_ref: str | None = None
+                    if tool_result.result_full is not None:
+                        result_full_ref = await self._session_store.write_full_result(
+                            session_id, str(uuid.uuid4()), tool_result.result_full
                         )
 
-                # §2.5 pausing-runtime-tool seam: a runtime tool may signal a
-                # pause (today only `runBlueprint`, on a slot-resolution
-                # `askUser`). This GENERALIZES the terminal `askUser` branch
-                # above — the loop writes the checkpoint and returns
-                # `paused_ask_user` exactly as for `askUser`, before persisting a
-                # trail entry or counting the call (a paused tool did not
-                # complete, mirroring `askUser`). A dispatched MCP tool never
-                # sets `.pause`, so this is inert on the normal path.
-                if tool_result.pause is not None:
-                    # Computed INSIDE the branch that consumes it. It used to be
-                    # read once per tool call and used on the ~0.1% of them that
-                    # pause; `TurnAccumulators.envelope` is pure (no store, no
-                    # observer — `turn_accumulators.answer_envelope` and
-                    # `rollup_verification`/`AnswerTable.to_doc` below it only build
-                    # values), so where it is called cannot be observed, only how
-                    # often. `tests/runtime/loop/test_turn_exit_contract.py::
-                    # test_an_in_loop_pause_carries_the_envelope_of_the_same_batch`
-                    # pins that it is still read LATE — after the folds of the
-                    # calls that drained before this one.
-                    envelope = accum.envelope()
-                    return await self._pause_from_runtime_tool(
-                        session_id=session_id,
-                        pause=tool_result.pause,
-                        window_count=window_count,
-                        assistant_text=result.assistant_text,
-                        tool_calls_made=tool_calls_made,
-                        # Fix 2: surface whatever succeeded earlier in this window.
-                        sql_executed=accum.sql_executed,
-                        envelope=envelope,
-                        assumptions=accum.assumptions,
-                        # Carry this call's intent tag onto the checkpoint (see
-                        # `_pause_from_runtime_tool`): the trail entry for this work
-                        # is written after the resume, under a new id.
-                        serves_intent=serves_intent,
-                    )
-                tool_calls_made += 1
-
-                result_full_ref: str | None = None
-                if tool_result.result_full is not None:
-                    result_full_ref = await self._session_store.write_full_result(
-                        session_id, str(uuid.uuid4()), tool_result.result_full
-                    )
-
-                entry = TrailEntry(
-                    turn_index=turn_index,
-                    tool_call_id=tool_call.id,
-                    tool_name=tool_call.name,
-                    args=dict(call_args),
-                    status=tool_result.status,
-                    error_code=tool_result.error_code,
-                    provenance=tool_result.provenance,
-                    result_preview=tool_result.result_preview,
-                    result_full_ref=result_full_ref,
-                    ts=_now_iso(),
-                    authoritative=tool_result.authoritative,
-                    denial_detail=tool_result.denial_detail,
-                    # J7 — set only by a `runBlueprint` whose blueprint DECLARES a
-                    # data-anchored window; `None` for every other call, so every other
-                    # entry serialises byte-identically.
-                    window_note=tool_result.window_note,
-                    # The validated tag (or `None`). Persisted on the entry rather
-                    # than left in `args`, so it survives replay/resume and is
-                    # readable by `updateAnalysisState` without re-parsing
-                    # arguments — and so it never re-enters the model's own
-                    # rendered tool call, where it would be noise.
-                    serves_intent=serves_intent,
-                    # 08 §D.2 — ADDITIVE, and deliberately NOT this entry's own
-                    # `provenance` (which stays `frozenset()`): the D44 USES set of
-                    # each designated query, positionally parallel to the tables
-                    # `resolve_designations` reads back out of `args`. It exists so
-                    # a scope narrowing on RELOAD can drop the out-of-scope tables
-                    # instead of nothing, and it must never reach
-                    # `_compute_turn_provenance_union` — that union is fail-closed,
-                    # so one unparseable designated query would collapse it and
-                    # drop the turn's whole answer from every later replay.
-                    answer_table_provenance=(
-                        tuple(table.provenance for table in resolved_answer_tables)
-                        if resolved_answer_tables
-                        else None
-                    ),
-                )
-                await self._session_store.append_trail_entry(session_id, entry)
-
-                # UI Slice 1 (§3.2): accumulate the enriched-result fields from
-                # this SUCCESSFUL tool call (runQuery arg SQL + preview; runBlueprint
-                # `result_full` SQL/blueprint_id/verify + preview). Shared with the
-                # blueprint approval-resume seed path via `accumulate_enrichment`.
-                accum.note_enrichment(tool_call.name, call_args, tool_result)
-                accum.capture_blueprint_run(
-                    tool_call.name,
-                    tool_result,
-                    arguments=call_args if isinstance(call_args, dict) else None,
-                )
-                # The intent-coverage CHECK's raw material (08 §B.1): which query's
-                # rows this call produced, keyed by the id an intent cites as its
-                # evidence. NOT a source for the tables themselves — deriving those
-                # from the evidence call would page the agent's own LIMIT-ed reading
-                # query and silently truncate every grid.
-                accum.note_result_sql(tool_call.name, tool_call.id, call_args, tool_result)
-                # ANSWER-SHAPE GATE (05 §J): count this call if it is a successful
-                # data-returning call with more than one row. Read from the same
-                # `result_preview` that was just persisted on the entry above, so the
-                # in-window count and the trail seed can never disagree about what
-                # happened. Counted AFTER the finalization/blueprint-not-run rewrites
-                # of `tool_result`, so a refused call (now non-`ok`) is not counted.
-                answer_shape.note_call(
-                    tool_call.name, tool_result.status, tool_result.result_preview
-                )
-                # recordAssumptions (docs/decisions/ui-assumptions-contract.md):
-                # fold a SUCCESSFUL call's plain-English assumptions into the
-                # turn accumulator, same discipline as the enrichment above.
-                accum.note_assumptions(tool_call.name, call_args, tool_result)
-                # answerWithTable (composite/answer_with_table.py): the
-                # model-designated answer tables. Same discipline again — read from
-                # the call ARGUMENTS on success — except LAST designation wins,
-                # over the whole SET, since a turn has one answer.
-                accum.note_answer_tables(
-                    tool_call.name, tool_result, resolved_answer_tables
-                )
-                # TERMINAL: a successful `answerWithTable` carries the final prose,
-                # so the turn ends on it. Recorded here and acted on AFTER the whole
-                # tool batch drains, so a model that batches recordAssumptions +
-                # answerWithTable still gets both folded before the turn closes.
-                if (
-                    tool_call.name == ANSWER_TABLE_TOOL_NAME
-                    and tool_result.status == "ok"
-                ):
-                    # ANSWER-SHAPE GATE (05 §J): the turn HAS tabled its answer, so
-                    # the gate is done for this turn.
-                    #
-                    # SET FROM SUBSTANCE, NOT FROM THE CALL (08 §O). This read
-                    # `status == "ok"` alone, and a live probe showed what that
-                    # bought: a mid-turn `{answer: "", tables: []}` succeeds — the
-                    # tool is stateless and refuses nothing — disarmed the gate with
-                    # ZERO designations, and the model's later bare-prose finish then
-                    # passed unrefused. The flag is supposed to mean "the user has a
-                    # grid", so it is set only when one exists.
-                    #
-                    # `accum.has_answer_tables` (the accumulator, folded just above)
-                    # rather than `resolved_answer_tables` alone, because a LATER
-                    # call that designates nothing deliberately leaves an EARLIER
-                    # good set intact (`note_answer_tables`: "a malformed retry
-                    # cannot silently drop a good table"). Reading only this call's
-                    # resolution would re-arm the gate on that retry and refuse a
-                    # turn that has its table.
-                    #
-                    # Still set for the blank-`answer` call that does not terminate,
-                    # PROVIDED it designated something: those tables reach the user
-                    # through the envelope, which is what the gate protects.
-                    if resolved_answer_tables or accum.has_answer_tables:
-                        answer_shape.note_answer_succeeded()
-                    designated_answer_text = (
-                        clean_answer_text(call_args.get("answer"))
-                        if isinstance(call_args, dict)
-                        else None
-                    )
-
-                # Record a SUCCESSFUL idempotent read so an identical repeat later
-                # this turn is caught by the guard above. Only `ok` reads are
-                # "already served" — a denied/errored read is NOT recorded, so a
-                # legitimate retry after a transient failure is never suppressed.
-                # The DECISION is handed back rather than the arguments, so the
-                # signature recorded is provably the one that was tested.
-                if read_decision.is_idempotent_read and tool_result.status == "ok":
-                    read_guard.record_served(read_decision, tool_call.id)
-
-                # Record a SUCCESSFUL `getBlueprint` so the blueprint-definition gate
-                # lets that id run. STAGED in the gate's per-response set, not
-                # committed until the batch drains (see `commit_round` below the
-                # loop).
-                if (
-                    tool_call.name == "getBlueprint"
-                    and tool_result.status == "ok"
-                    and isinstance(call_args, dict)
-                ):
-                    blueprint_gate.note_definition_in_context(call_args.get("id"))
-
-                # S3: also check the budget INSIDE the per-tool-call loop (not
-                # only once per outer iteration) so a slow batch of capped
-                # calls that blows the wall-clock window mid-dispatch stops
-                # cleanly instead of finishing the whole batch regardless.
-                if guard.exceeded:
-                    break
-
-            # BLUEPRINT-DEFINITION GATE, the fold. HERE, once the batch has drained,
-            # and deliberately not mid-batch: ids expanded in THIS response become
-            # runnable only from the NEXT one, because the result of a `getBlueprint`
-            # issued in this response does not reach the model until the next
-            # round-trip. See `BlueprintGate.commit_round` for the full rationale —
-            # the position of this call is the half of it that lives here.
-            blueprint_gate.commit_round()
-
-            # TERMINATION: pause. Honoured AFTER the state calls above have been
-            # committed (03 §E.1) and BEFORE anything else in the batch is
-            # dispatched — `capped_tool_calls` held only the state calls on this
-            # path, so every other call still waits for the resume exactly as it
-            # always did.
-            if ask_user_call is not None:
-                question = str(ask_user_call.arguments.get("question", ""))
-                options = ask_user_call.arguments.get("options")
-                checkpoint = PauseCheckpoint(
-                    reason="askUser",
-                    pending_question={"question": question, "options": options},
-                    awaiting="user_answer",
-                    consumed=False,
-                    budget_window_count=window_count,
-                )
-                # Best-effort partials (§1) ride along; `provenance` is left unset
-                # (the fail-closed union is reused only on the `done` returns).
-                return await self._finish(
-                    session_id=session_id,
-                    turn_index=turn_index,
-                    status="paused_ask_user",
-                    assistant_text=result.assistant_text,
-                    tool_calls_made=tool_calls_made,
-                    accum=accum,
-                    checkpoint=checkpoint,
-                    event=("loop_paused_ask_user", {"question": question}),
-                )
-
-            # TERMINAL EXIT #2 (answerWithTable). The loop's other exit is a model
-            # turn with NO tool calls; this one fires when the model ended the turn
-            # THROUGH a tool, carrying its final prose in the call. It is checked
-            # AFTER the whole batch drains so a batched recordAssumptions +
-            # answerWithTable still folds both before the turn closes.
-            #
-            # Everything below mirrors the no-tool-calls exit exactly — the same
-            # `_compute_turn_provenance_union` (the single fail-closed source of
-            # truth) and the same persisted assistant `TurnMessage` — because
-            # replay, `session_history`, and the D44 scope gate all read that
-            # message. A divergence here would make history disagree with the live
-            # answer for exactly the turns that produced a table.
-            if designated_answer_text is not None:
-                turn_provenance = await self._compute_turn_provenance_union(
-                    session_id, turn_index
-                )
-                return await self._finish(
-                    session_id=session_id,
-                    turn_index=turn_index,
-                    status="done",
-                    assistant_text=designated_answer_text,
-                    tool_calls_made=tool_calls_made,
-                    accum=accum,
-                    provenance=turn_provenance,
-                    # UNCONDITIONAL, unlike the no-tool-calls exit's `or None`, and
-                    # allowed to be: `designated_answer_text` came through
-                    # `clean_answer_text`, which returns `None` for anything that
-                    # strips to empty — so reaching here means a non-empty string.
-                    persist_text=designated_answer_text,
-                    event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
-                )
-
-            # SPEND, not occupancy: `total_tokens` is this round-trip's prompt +
-            # completion, and every round replays the conversation, so the sum is
-            # what the window COST — not how full the model's context is. It is
-            # measured against `max_token_spend` (a spend ceiling), never against
-            # the context window; occupancy is enforced per-request by
-            # `fit_request_to_budget` above. Cached prompt tokens are counted at
-            # full weight on purpose (loop/budget_guard.py module docstring).
-            guard.record_iteration(tokens_used=int(result.usage.get("total_tokens") or 0))
-
-            if guard.exceeded:
-                if window_count >= self._max_budget_windows:
-                    # 05 §F: `stopped_hard_ceiling` IS a terminal outcome, so the
-                    # scoped invariant applies — every surviving `pending` intent
-                    # is recorded `BUDGET_EXHAUSTED` before the turn ends. A no-op
-                    # (no write, no telemetry) when there is no live state or
-                    # nothing pending, which is every ordinary turn.
-                    analysis_state = await self._force_block_pending_intents(
-                        session_id=session_id,
+                    entry = TrailEntry(
                         turn_index=turn_index,
-                        state=analysis_state,
-                        reason_code="BUDGET_EXHAUSTED",
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        args=dict(call_args),
+                        status=tool_result.status,
+                        error_code=tool_result.error_code,
+                        provenance=tool_result.provenance,
+                        result_preview=tool_result.result_preview,
+                        result_full_ref=result_full_ref,
+                        ts=_now_iso(),
+                        authoritative=tool_result.authoritative,
+                        denial_detail=tool_result.denial_detail,
+                        # J7 — set only by a `runBlueprint` whose blueprint DECLARES a
+                        # data-anchored window; `None` for every other call, so every other
+                        # entry serialises byte-identically.
+                        window_note=tool_result.window_note,
+                        # The validated tag (or `None`). Persisted on the entry rather
+                        # than left in `args`, so it survives replay/resume and is
+                        # readable by `updateAnalysisState` without re-parsing
+                        # arguments — and so it never re-enters the model's own
+                        # rendered tool call, where it would be noise.
+                        serves_intent=serves_intent,
+                        # 08 §D.2 — ADDITIVE, and deliberately NOT this entry's own
+                        # `provenance` (which stays `frozenset()`): the D44 USES set of
+                        # each designated query, positionally parallel to the tables
+                        # `resolve_designations` reads back out of `args`. It exists so
+                        # a scope narrowing on RELOAD can drop the out-of-scope tables
+                        # instead of nothing, and it must never reach
+                        # `_compute_turn_provenance_union` — that union is fail-closed,
+                        # so one unparseable designated query would collapse it and
+                        # drop the turn's whole answer from every later replay.
+                        answer_table_provenance=(
+                            tuple(table.provenance for table in resolved_answer_tables)
+                            if resolved_answer_tables
+                            else None
+                        ),
                     )
-                    # Best-effort partials (§1): whatever succeeded before the hard
-                    # ceiling; `provenance` is left unset (done-only).
+                    await self._session_store.append_trail_entry(session_id, entry)
+
+                    # UI Slice 1 (§3.2): accumulate the enriched-result fields from
+                    # this SUCCESSFUL tool call (runQuery arg SQL + preview; runBlueprint
+                    # `result_full` SQL/blueprint_id/verify + preview). Shared with the
+                    # blueprint approval-resume seed path via `accumulate_enrichment`.
+                    accum.note_enrichment(tool_call.name, call_args, tool_result)
+                    accum.capture_blueprint_run(
+                        tool_call.name,
+                        tool_result,
+                        arguments=call_args if isinstance(call_args, dict) else None,
+                    )
+                    # The intent-coverage CHECK's raw material (08 §B.1): which query's
+                    # rows this call produced, keyed by the id an intent cites as its
+                    # evidence. NOT a source for the tables themselves — deriving those
+                    # from the evidence call would page the agent's own LIMIT-ed reading
+                    # query and silently truncate every grid.
+                    accum.note_result_sql(tool_call.name, tool_call.id, call_args, tool_result)
+                    # ANSWER-SHAPE GATE (05 §J): count this call if it is a successful
+                    # data-returning call with more than one row. Read from the same
+                    # `result_preview` that was just persisted on the entry above, so the
+                    # in-window count and the trail seed can never disagree about what
+                    # happened. Counted AFTER the finalization/blueprint-not-run rewrites
+                    # of `tool_result`, so a refused call (now non-`ok`) is not counted.
+                    answer_shape.note_call(
+                        tool_call.name, tool_result.status, tool_result.result_preview
+                    )
+                    # recordAssumptions (docs/decisions/ui-assumptions-contract.md):
+                    # fold a SUCCESSFUL call's plain-English assumptions into the
+                    # turn accumulator, same discipline as the enrichment above.
+                    accum.note_assumptions(tool_call.name, call_args, tool_result)
+                    # answerWithTable (composite/answer_with_table.py): the
+                    # model-designated answer tables. Same discipline again — read from
+                    # the call ARGUMENTS on success — except LAST designation wins,
+                    # over the whole SET, since a turn has one answer.
+                    accum.note_answer_tables(
+                        tool_call.name, tool_result, resolved_answer_tables
+                    )
+                    # TERMINAL: a successful `answerWithTable` carries the final prose,
+                    # so the turn ends on it. Recorded here and acted on AFTER the whole
+                    # tool batch drains, so a model that batches recordAssumptions +
+                    # answerWithTable still gets both folded before the turn closes.
+                    if (
+                        tool_call.name == ANSWER_TABLE_TOOL_NAME
+                        and tool_result.status == "ok"
+                    ):
+                        # ANSWER-SHAPE GATE (05 §J): the turn HAS tabled its answer, so
+                        # the gate is done for this turn.
+                        #
+                        # SET FROM SUBSTANCE, NOT FROM THE CALL (08 §O). This read
+                        # `status == "ok"` alone, and a live probe showed what that
+                        # bought: a mid-turn `{answer: "", tables: []}` succeeds — the
+                        # tool is stateless and refuses nothing — disarmed the gate with
+                        # ZERO designations, and the model's later bare-prose finish then
+                        # passed unrefused. The flag is supposed to mean "the user has a
+                        # grid", so it is set only when one exists.
+                        #
+                        # `accum.has_answer_tables` (the accumulator, folded just above)
+                        # rather than `resolved_answer_tables` alone, because a LATER
+                        # call that designates nothing deliberately leaves an EARLIER
+                        # good set intact (`note_answer_tables`: "a malformed retry
+                        # cannot silently drop a good table"). Reading only this call's
+                        # resolution would re-arm the gate on that retry and refuse a
+                        # turn that has its table.
+                        #
+                        # Still set for the blank-`answer` call that does not terminate,
+                        # PROVIDED it designated something: those tables reach the user
+                        # through the envelope, which is what the gate protects.
+                        if resolved_answer_tables or accum.has_answer_tables:
+                            answer_shape.note_answer_succeeded()
+                        designated_answer_text = (
+                            clean_answer_text(call_args.get("answer"))
+                            if isinstance(call_args, dict)
+                            else None
+                        )
+
+                    # Record a SUCCESSFUL idempotent read so an identical repeat later
+                    # this turn is caught by the guard above. Only `ok` reads are
+                    # "already served" — a denied/errored read is NOT recorded, so a
+                    # legitimate retry after a transient failure is never suppressed.
+                    # The DECISION is handed back rather than the arguments, so the
+                    # signature recorded is provably the one that was tested.
+                    if read_decision.is_idempotent_read and tool_result.status == "ok":
+                        read_guard.record_served(read_decision, tool_call.id)
+
+                    # Record a SUCCESSFUL `getBlueprint` so the blueprint-definition gate
+                    # lets that id run. STAGED in the gate's per-response set, not
+                    # committed until the batch drains (see `commit_round` below the
+                    # loop).
+                    if (
+                        tool_call.name == "getBlueprint"
+                        and tool_result.status == "ok"
+                        and isinstance(call_args, dict)
+                    ):
+                        blueprint_gate.note_definition_in_context(call_args.get("id"))
+
+                    # S3: also check the budget INSIDE the per-tool-call loop (not
+                    # only once per outer iteration) so a slow batch of capped
+                    # calls that blows the wall-clock window mid-dispatch stops
+                    # cleanly instead of finishing the whole batch regardless.
+                    if guard.exceeded:
+                        break
+
+                # BLUEPRINT-DEFINITION GATE, the fold. HERE, once the batch has drained,
+                # and deliberately not mid-batch: ids expanded in THIS response become
+                # runnable only from the NEXT one, because the result of a `getBlueprint`
+                # issued in this response does not reach the model until the next
+                # round-trip. See `BlueprintGate.commit_round` for the full rationale —
+                # the position of this call is the half of it that lives here.
+                blueprint_gate.commit_round()
+
+                # TERMINATION: pause. Honoured AFTER the state calls above have been
+                # committed (03 §E.1) and BEFORE anything else in the batch is
+                # dispatched — `capped_tool_calls` held only the state calls on this
+                # path, so every other call still waits for the resume exactly as it
+                # always did.
+                if ask_user_call is not None:
+                    question = str(ask_user_call.arguments.get("question", ""))
+                    options = ask_user_call.arguments.get("options")
+                    checkpoint = PauseCheckpoint(
+                        reason="askUser",
+                        pending_question={"question": question, "options": options},
+                        awaiting="user_answer",
+                        consumed=False,
+                        budget_window_count=window_count,
+                    )
+                    # Best-effort partials (§1) ride along; `provenance` is left unset
+                    # (the fail-closed union is reused only on the `done` returns).
                     return await self._finish(
                         session_id=session_id,
                         turn_index=turn_index,
-                        status="stopped_hard_ceiling",
+                        status="paused_ask_user",
+                        assistant_text=result.assistant_text,
+                        tool_calls_made=tool_calls_made,
+                        accum=accum,
+                        checkpoint=checkpoint,
+                        event=("loop_paused_ask_user", {"question": question}),
+                    )
+
+                # TERMINAL EXIT #2 (answerWithTable). The loop's other exit is a model
+                # turn with NO tool calls; this one fires when the model ended the turn
+                # THROUGH a tool, carrying its final prose in the call. It is checked
+                # AFTER the whole batch drains so a batched recordAssumptions +
+                # answerWithTable still folds both before the turn closes.
+                #
+                # Everything below mirrors the no-tool-calls exit exactly — the same
+                # `_compute_turn_provenance_union` (the single fail-closed source of
+                # truth) and the same persisted assistant `TurnMessage` — because
+                # replay, `session_history`, and the D44 scope gate all read that
+                # message. A divergence here would make history disagree with the live
+                # answer for exactly the turns that produced a table.
+                if designated_answer_text is not None:
+                    turn_provenance = await self._compute_turn_provenance_union(
+                        session_id, turn_index
+                    )
+                    return await self._finish(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        status="done",
+                        assistant_text=designated_answer_text,
+                        tool_calls_made=tool_calls_made,
+                        accum=accum,
+                        provenance=turn_provenance,
+                        # UNCONDITIONAL, unlike the no-tool-calls exit's `or None`, and
+                        # allowed to be: `designated_answer_text` came through
+                        # `clean_answer_text`, which returns `None` for anything that
+                        # strips to empty — so reaching here means a non-empty string.
+                        persist_text=designated_answer_text,
+                        event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
+                    )
+
+                # SPEND, not occupancy: `total_tokens` is this round-trip's prompt +
+                # completion, and every round replays the conversation, so the sum is
+                # what the window COST — not how full the model's context is. It is
+                # measured against `max_token_spend` (a spend ceiling), never against
+                # the context window; occupancy is enforced per-request by
+                # `fit_request_to_budget` above. Cached prompt tokens are counted at
+                # full weight on purpose (loop/budget_guard.py module docstring).
+                guard.record_iteration(tokens_used=int(result.usage.get("total_tokens") or 0))
+
+                if guard.exceeded:
+                    if window_count >= self._max_budget_windows:
+                        # 05 §F: `stopped_hard_ceiling` IS a terminal outcome, so the
+                        # scoped invariant applies — every surviving `pending` intent
+                        # is recorded `BUDGET_EXHAUSTED` before the turn ends. A no-op
+                        # (no write, no telemetry) when there is no live state or
+                        # nothing pending, which is every ordinary turn.
+                        analysis_state = await self._force_block_pending_intents(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            state=analysis_state,
+                            reason_code="BUDGET_EXHAUSTED",
+                        )
+                        # Best-effort partials (§1): whatever succeeded before the hard
+                        # ceiling; `provenance` is left unset (done-only).
+                        return await self._finish(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            status="stopped_hard_ceiling",
+                            assistant_text=last_assistant_text,
+                            tool_calls_made=tool_calls_made,
+                            accum=accum,
+                            event=("loop_hard_ceiling_stop", {"window": window_count}),
+                        )
+                    # 05 §F, fourth forced path: the budget cap reached DURING A
+                    # REFUSED ROUND. §C.3 created it — the forced re-round is charged,
+                    # so the charge itself can trip the cap, and the model's answer was
+                    # refused a moment ago and its nudge (ephemeral) is already gone.
+                    #
+                    # GATED ON THE REFUSAL, deliberately. An ORDINARY budget-cap pause
+                    # is NOT finalization (§G): it returns a non-`done` status with
+                    # intents legitimately pending, the user may still answer
+                    # "continue", and force-blocking there would write a terminal
+                    # disposition onto a turn that is still running. Only the refused
+                    # round gets it — and if the user answers "stop" instead, `resume()`
+                    # force-blocks with `USER_STOPPED` on its own path.
+                    #
+                    # `ENFORCEMENT_EXHAUSTED`, NOT `BUDGET_EXHAUSTED` (05 §F, reversed
+                    # 2026-08-12 on live evidence). What ran out here is ENFORCEMENT,
+                    # not capacity: the measured turn had its answer at 25s and capped
+                    # at 61.6s on the WALL clock while tokens moved +385 across the
+                    # final three rounds — the 36 seconds went to two rejected
+                    # `updateAnalysisState` calls and one refused `answerWithTable`.
+                    # More budget would have changed nothing, so labelling it
+                    # `BUDGET_EXHAUSTED` told 07 §E.2's reader a capacity story and sent
+                    # them to raise a ceiling that was not the problem. The capacity
+                    # fact is real and is kept — as `budget_cap_reached` on the
+                    # telemetry event, where it informs without misattributing.
+                    # The hard-ceiling branch ABOVE is untouched and still writes
+                    # `BUDGET_EXHAUSTED`: there the ceiling genuinely is the cause.
+                    if finalization_gate.refused_this_round:
+                        # The gate's round flag is now set by the ANSWER-SHAPE
+                        # gate too (05 §J) — which is correct and needs no branch here:
+                        # that gate only fires when NOTHING is pending, so
+                        # `_force_block_pending_intents` finds no pending intent, writes
+                        # nothing and emits nothing. A shape refusal that runs into the
+                        # cap therefore leaves the ledger and the telemetry byte-identical
+                        # to a cap with no refusal at all.
+                        analysis_state = await self._force_block_pending_intents(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            state=analysis_state,
+                            reason_code="ENFORCEMENT_EXHAUSTED",
+                            budget_cap_reached=True,
+                        )
+                    checkpoint = PauseCheckpoint(
+                        reason="budget_cap",
+                        pending_question={
+                            "question": _BUDGET_CAP_QUESTION,
+                            "options": _BUDGET_CAP_OPTIONS,
+                        },
+                        awaiting="user_answer",
+                        consumed=False,
+                        budget_window_count=window_count,
+                    )
+                    # Best-effort partials (§1): whatever succeeded before the cap;
+                    # `provenance` is left unset (done-only).
+                    return await self._finish(
+                        session_id=session_id,
+                        turn_index=turn_index,
+                        status="paused_budget_cap",
                         assistant_text=last_assistant_text,
                         tool_calls_made=tool_calls_made,
                         accum=accum,
-                        event=("loop_hard_ceiling_stop", {"window": window_count}),
+                        checkpoint=checkpoint,
+                        event=("loop_paused_budget_cap", {"window": window_count}),
                     )
-                # 05 §F, fourth forced path: the budget cap reached DURING A
-                # REFUSED ROUND. §C.3 created it — the forced re-round is charged,
-                # so the charge itself can trip the cap, and the model's answer was
-                # refused a moment ago and its nudge (ephemeral) is already gone.
-                #
-                # GATED ON THE REFUSAL, deliberately. An ORDINARY budget-cap pause
-                # is NOT finalization (§G): it returns a non-`done` status with
-                # intents legitimately pending, the user may still answer
-                # "continue", and force-blocking there would write a terminal
-                # disposition onto a turn that is still running. Only the refused
-                # round gets it — and if the user answers "stop" instead, `resume()`
-                # force-blocks with `USER_STOPPED` on its own path.
-                #
-                # `ENFORCEMENT_EXHAUSTED`, NOT `BUDGET_EXHAUSTED` (05 §F, reversed
-                # 2026-08-12 on live evidence). What ran out here is ENFORCEMENT,
-                # not capacity: the measured turn had its answer at 25s and capped
-                # at 61.6s on the WALL clock while tokens moved +385 across the
-                # final three rounds — the 36 seconds went to two rejected
-                # `updateAnalysisState` calls and one refused `answerWithTable`.
-                # More budget would have changed nothing, so labelling it
-                # `BUDGET_EXHAUSTED` told 07 §E.2's reader a capacity story and sent
-                # them to raise a ceiling that was not the problem. The capacity
-                # fact is real and is kept — as `budget_cap_reached` on the
-                # telemetry event, where it informs without misattributing.
-                # The hard-ceiling branch ABOVE is untouched and still writes
-                # `BUDGET_EXHAUSTED`: there the ceiling genuinely is the cause.
-                if finalization_gate.refused_this_round:
-                    # The gate's round flag is now set by the ANSWER-SHAPE
-                    # gate too (05 §J) — which is correct and needs no branch here:
-                    # that gate only fires when NOTHING is pending, so
-                    # `_force_block_pending_intents` finds no pending intent, writes
-                    # nothing and emits nothing. A shape refusal that runs into the
-                    # cap therefore leaves the ledger and the telemetry byte-identical
-                    # to a cap with no refusal at all.
-                    analysis_state = await self._force_block_pending_intents(
-                        session_id=session_id,
-                        turn_index=turn_index,
-                        state=analysis_state,
-                        reason_code="ENFORCEMENT_EXHAUSTED",
-                        budget_cap_reached=True,
-                    )
-                checkpoint = PauseCheckpoint(
-                    reason="budget_cap",
-                    pending_question={
-                        "question": _BUDGET_CAP_QUESTION,
-                        "options": _BUDGET_CAP_OPTIONS,
-                    },
-                    awaiting="user_answer",
-                    consumed=False,
-                    budget_window_count=window_count,
-                )
-                # Best-effort partials (§1): whatever succeeded before the cap;
-                # `provenance` is left unset (done-only).
-                return await self._finish(
-                    session_id=session_id,
-                    turn_index=turn_index,
-                    status="paused_budget_cap",
-                    assistant_text=last_assistant_text,
-                    tool_calls_made=tool_calls_made,
-                    accum=accum,
-                    checkpoint=checkpoint,
-                    event=("loop_paused_budget_cap", {"window": window_count}),
-                )
-            # Under budget — loop back to 3a within the same window.
+                # Under budget — loop back to 3a within the same window.
+        finally:
+            # Give any ALREADY-FINISHED fire-and-forget summary task a single
+            # event-loop tick to land its emit before we cancel stragglers. This
+            # does NOT wait on an in-flight/slow summary (one `sleep(0)` is one
+            # scheduler iteration — a still-suspended summary stays pending and is
+            # cancelled just below, so the turn result never blocks on it); it only
+            # lets a summary that already completed during dispatch deliver its
+            # line. Gated on a non-empty task set so the feature-off path adds no
+            # extra tick and stays byte-identical. The drain-tick is itself nested
+            # in try/finally so that if the TURN task is being cancelled during
+            # shutdown (the `sleep(0)` then raises CancelledError), the straggler
+            # cancel still ALWAYS runs — a summary task must never outlive the turn.
+            try:
+                if self._summary_tasks:
+                    await asyncio.sleep(0)
+            finally:
+                self._cancel_pending_summaries()
 
 
 __all__ = [

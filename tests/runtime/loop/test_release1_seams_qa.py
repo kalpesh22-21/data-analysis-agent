@@ -7,7 +7,7 @@ the real `BlueprintExecutor` and the real stores:
 
   - the window-local `analysis_state` (05 §E) is loaded once at the top of
     `_run_loop_body` — so every path that RE-ENTERS that function must reload it,
-    including the mid-DAG `runBlueprint` resume, which reaches `_run_loop` by a
+    including the mid-DAG `runBlueprint` resume, which reaches `_run_loop_body` by a
     completely different route from `askUser`;
   - the finalization counter is keyed by BUDGET WINDOW (05 §C.1), and a blueprint
     resume keeps `window_count` unchanged — so it must NOT hand out a second
@@ -231,7 +231,7 @@ def _resume_mcp() -> FakeMCPClient:
 
 async def test_the_window_local_state_governs_after_a_blueprint_mid_dag_resume() -> None:
     """05 §E loads `analysis_state` ONCE at the top of `_run_loop_body`. The mid-DAG
-    blueprint resume reaches `_run_loop` through `_resume_blueprint`, a different
+    blueprint resume reaches `_run_loop_body` through `_resume_blueprint`, a different
     route from `run()` and from the `askUser` resume — if that route did not reload
     the local, the resumed window would enforce against `None` and a turn with two
     pending intents would finalize silently."""

@@ -694,7 +694,7 @@ async def test_the_hard_ceiling_force_blocks_with_budget_exhausted() -> None:
 
 async def test_a_stop_answer_at_the_budget_cap_force_blocks_with_user_stopped() -> None:
     """05 §F — the THIRD `done` return, and the one that inherits nothing: it
-    returns from inside `resume()` before `_run_loop` is ever entered, so it needs
+    returns from inside `resume()` before `_run_loop_body` is ever entered, so it needs
     its own force-block call.
 
     UNCHANGED by the 2026-08-12 relabel: the user said stop, and that is a cause

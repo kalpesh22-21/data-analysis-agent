@@ -228,7 +228,7 @@ def _done_loop(store, embedder) -> AgentLoop:
 
 
 async def test_two_agentloops_do_not_share_a_memo() -> None:
-    # Each _run_loop creates its own memo dict; two independent loops (distinct
+    # Each _run_loop_body creates its own memo dict; two independent loops (distinct
     # sessions) each embed exactly once — no cross-turn memo leakage.
     store = InMemorySessionStore()
     emb_a = FakeEmbeddingClient()

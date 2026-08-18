@@ -557,7 +557,7 @@ def create_app(
             async def _discovery_emulation_provider(
                 creds: RuntimeCredentials,
             ) -> EmulatedDiscovery:
-                # ONCE PER SESSION: `_run_loop` is re-entered by run()/resume()/the
+                # ONCE PER SESSION: `_run_loop_body` is re-entered by run()/resume()/the
                 # blueprint approval-resume, so without this the sweep re-dispatched
                 # to the MCP on every budget window. The cache serves the first
                 # non-empty sweep for the rest of the session; a degraded one is not

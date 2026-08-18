@@ -100,7 +100,7 @@ __all__ = ["EmulatedDiscovery", "EmulatedDiscoveryCache", "build_emulated_discov
 class EmulatedDiscoveryCache:
     """Process-wide, session-keyed, bounded cache of the ONCE-PER-SESSION sweep.
 
-    `_run_loop` is re-entered by `run()`, `resume()` AND the blueprint
+    `_run_loop_body` is re-entered by `run()`, `resume()` AND the blueprint
     approval-resume, so an uncached sweep re-dispatched `listDatabases` +
     `listTables` to the MCP on every budget window — and, because the pairs are
     ephemeral and re-spliced per rebuild, the model watched a fresh block of

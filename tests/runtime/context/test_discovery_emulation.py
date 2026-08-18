@@ -356,7 +356,7 @@ def _nonempty() -> EmulatedDiscovery:
 
 
 async def test_cache_sweeps_once_per_session_and_serves_the_rest() -> None:
-    # THE POINT of the cache: `_run_loop` is re-entered by run()/resume()/the
+    # THE POINT of the cache: `_run_loop_body` is re-entered by run()/resume()/the
     # blueprint approval-resume, so an uncached sweep re-dispatched listDatabases +
     # listTables to the MCP on EVERY budget window.
     cache = EmulatedDiscoveryCache()

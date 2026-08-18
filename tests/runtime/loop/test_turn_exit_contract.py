@@ -8,7 +8,7 @@ would therefore be silently re-derivable by anyone consolidating the return site
 
   1. THE EXIT'S EVENT IS NOT A FUNCTION OF ITS STATUS. Two `done` returns emit
      `loop_turn_done`; the third (the budget-cap `"stop"` answer, which returns
-     from inside `resume()` before `_run_loop` is ever entered) emits NOTHING.
+     from inside `resume()` before `_run_loop_body` is ever entered) emits NOTHING.
      Anything that derives the event from the status flips that third one on, and
      every `loop_turn_done` consumer starts counting a turn that produced no
      answer of its own.
@@ -125,7 +125,7 @@ async def test_the_resume_stop_exit_returns_done_and_emits_no_loop_turn_done() -
     """The budget-cap `"stop"` answer is the THIRD `done` return and the only one
     that emits no event at all.
 
-    It returns from inside `resume()` before `_run_loop` is entered: there is no
+    It returns from inside `resume()` before `_run_loop_body` is entered: there is no
     window, no accumulators and no model round-trip behind it — the text is canned
     and `tool_calls_made` is 0. `loop_turn_done` means "a window finished a turn",
     and nothing here did, so the silence is correct.

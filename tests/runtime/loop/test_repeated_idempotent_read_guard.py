@@ -196,7 +196,7 @@ async def test_seeding_catches_repeat_across_a_budget_window_resume() -> None:
     assert _mcp_call_count(mcp, "getTableSchema") == 1
     assert _guard_entries(await store.load_trail(SESSION_ID)) == []
 
-    # Window 2 (fresh `_run_loop`, fresh in-memory set): the model repeats the
+    # Window 2 (fresh `_run_loop_body`, fresh in-memory set): the model repeats the
     # identical read. Only trail-seeding can catch it.
     second = await loop.resume(
         session_id=SESSION_ID, credentials=_credentials(), answer="continue"
