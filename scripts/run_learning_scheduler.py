@@ -49,6 +49,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from data_agent.daemon import run_daemon
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
@@ -247,4 +248,7 @@ async def _main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(_main()))
+    # `run_daemon`, not `asyncio.run`: PID 1 drops an unhandled SIGTERM, so the rollout
+    # would SIGKILL this process mid-cycle and skip the `finally` that closes the neo4j
+    # driver pool. See `data_agent/daemon.py`.
+    raise SystemExit(run_daemon(_main, logger=_logger, process="promotion scheduler"))

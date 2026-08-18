@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import logging
 
+from data_agent.daemon import run_daemon
 from data_agent.learning.config import LearningSettings
 from data_agent.learning.entrypoint import configure_daemon_process
 from data_agent.learning.redis_queue import RedisStreamsLearningQueue
@@ -84,4 +85,7 @@ async def _main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(_main()))
+    # `run_daemon`, not `asyncio.run`: PID 1 drops an unhandled SIGTERM, so a rollout
+    # would wait out the grace period and SIGKILL this loop mid-cycle — a sweep that has
+    # CLAIMED sessions but not yet enqueued them. See `data_agent/daemon.py`.
+    raise SystemExit(run_daemon(_main, logger=_logger, process="learning sweeper"))

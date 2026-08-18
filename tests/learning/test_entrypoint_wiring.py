@@ -18,17 +18,34 @@ Three findings from the wiring audit, each pinned here:
     inert — announced by a single INFO line from the factory and otherwise invisible.
     Guarded here as an AST invariant over EVERY `build_learning_consumer` call site in
     `scripts/`, so the next entrypoint cannot regress it by omission.
+
+  * THE INBOX SERVICE COULD NOT START ITS FULL WRITE PLANE (ISSUES.md H7). Its app was
+    built at MODULE IMPORT, and `acouchbase.Cluster(...)` raises
+    `RuntimeError: Event loop is not running` when constructed outside a loop, so every
+    correctly-provisioned deploy of the reviewer surface died on `import`. The Tier-3
+    lazy Couchbase seam (`b7b21c1`) has since moved that constructor behind the first
+    connect, which defuses THIS instance without removing the hazard: import-time
+    composition of durable infra is still one eager `__init__` away from the same
+    crash, and only ever in the full-plane configuration nothing else exercises.
+    Pinned below as both a behavioural test (importing builds nothing) and an AST
+    invariant (nothing runs at module scope), because what broke is the import-time
+    execution itself rather than any particular value.
 """
 
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib.util
 import logging
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+# The exit code `_serve` reproduces. Imported from the MODULE, not via `uvicorn.main`:
+# the package re-exports a click `Command` named `main` over its own submodule.
+from uvicorn.main import STARTUP_FAILURE
 
 from data_agent.learning.observability import log_tracing_status
 
@@ -258,3 +275,193 @@ def test_every_script_passing_known_rules_also_passes_rule_index():
         "these scripts ground the `rule` role but leave the unknown-id hint machinery "
         f"inert (pass rule_index=rule_index_from_catalog(catalog)): {offenders}"
     )
+
+
+# --- the inbox service is import-clean (H7) -----------------------------------
+
+
+def _load_inbox_entrypoint():
+    spec = importlib.util.spec_from_file_location(
+        "_run_inbox_service_under_test", _SCRIPTS / "run_inbox_service.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_importing_the_inbox_entrypoint_constructs_nothing(monkeypatch):
+    """H7's regression test. The app factory must not run at import.
+
+    The stub raises the EXACT error the real one raised in production — acouchbase's
+    `RuntimeError: Event loop is not running` — so this fails the way the deploy failed
+    rather than on a bare "was it called". A passing import proves the factory moved;
+    the recorded call list proves it did not merely move somewhere else at module scope.
+    """
+    from data_agent.learning.inbox import service
+
+    calls: list[tuple] = []
+
+    def _explode(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise RuntimeError("Event loop is not running")
+
+    monkeypatch.setattr(service, "create_inbox_app", _explode)
+
+    module = _load_inbox_entrypoint()
+
+    assert calls == [], "the app factory ran at import time"
+    assert not hasattr(module, "app"), (
+        "a module-level `app` is the thing that forced construction at import — the "
+        "ASGI factory to point uvicorn at is "
+        "`data_agent.learning.inbox.service:create_inbox_app --factory`"
+    )
+
+
+def test_no_call_at_module_scope_in_the_inbox_entrypoint():
+    """The invariant behind the test above, stated structurally so the next edit cannot
+    reintroduce it in some other guise (a different factory, a store built directly).
+    Module scope may only bind imports, constants and defs — anything that RUNS at
+    import is what H7 was."""
+    tree = ast.parse((_SCRIPTS / "run_inbox_service.py").read_text(encoding="utf-8"))
+
+    def _is_module_docstring(index: int, node: ast.stmt) -> bool:
+        # ONLY the leading docstring. Exempting `ast.Expr` wholesale would wave through
+        # every bare `create_inbox_app()` — a bare call IS an Expr, and that is exactly
+        # the statement this test exists to catch.
+        return index == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+
+    def _is_main_guard(node: ast.stmt) -> bool:
+        # ONLY `if __name__ == "__main__":`. Any other module-scope `if` is a
+        # conditional construction (`if os.environ.get(...): app = create_inbox_app()`),
+        # which runs at import for whoever satisfies the condition.
+        return isinstance(node, ast.If) and ast.unparse(node.test) in (
+            "__name__ == '__main__'",
+            "'__main__' == __name__",
+        )
+
+    def _is_module_logger(node: ast.stmt) -> bool:
+        # `_logger = logging.getLogger(__name__)` — the one call the module makes at
+        # scope. Matched STRUCTURALLY (a substring allowlist would pass anything with
+        # `getLogger` anywhere in it, including a second call on the same line).
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            return False
+        func = node.value.func
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr == "getLogger"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "logging"
+            and [ast.unparse(a) for a in node.value.args] == ["__name__"]
+            and not node.value.keywords
+        )
+
+    executable = [
+        node
+        for index, node in enumerate(tree.body)
+        if not isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef))
+        and not _is_module_docstring(index, node)
+        and not _is_main_guard(node)
+    ]
+    offenders = [
+        ast.unparse(node)
+        for node in executable
+        if any(isinstance(sub, ast.Call) for sub in ast.walk(node)) and not _is_module_logger(node)
+    ]
+    assert offenders == [], f"these run at import time in run_inbox_service.py: {offenders}"
+
+
+async def test_the_inbox_app_is_built_inside_the_running_loop(monkeypatch):
+    """The other half of the fix: construction has to happen somewhere, and that
+    somewhere must be inside a running loop. The stub factory calls
+    `asyncio.get_running_loop()` — the check acouchbase itself makes — so this test
+    fails with production's exact `RuntimeError` if `_serve` ever builds the app before
+    entering the loop."""
+    from data_agent.learning.inbox import service
+
+    app_sentinel = object()
+    built: list[object] = []
+
+    def _factory():
+        asyncio.get_running_loop()  # raises RuntimeError outside a loop, as acouchbase does
+        built.append(app_sentinel)
+        return app_sentinel
+
+    monkeypatch.setattr(service, "create_inbox_app", _factory)
+    module = _load_inbox_entrypoint()
+
+    recorded: dict = {}
+
+    class _StubConfig:
+        def __init__(self, app, *, host, port):
+            recorded["app"] = app
+            recorded["host"] = host
+            recorded["port"] = port
+
+    class _StubServer:
+        # `started` is uvicorn's own post-boot flag, which `_serve` reads to reproduce
+        # `uvicorn.run()`'s STARTUP_FAILURE exit. True = the real server's state after a
+        # successful boot (uvicorn never clears it on shutdown), which is the case this
+        # test is about; the failed-boot half is asserted below.
+        started = True
+
+        def __init__(self, config):
+            recorded["config"] = config
+
+        async def serve(self):
+            recorded["served"] = True
+
+    monkeypatch.setattr(module.uvicorn, "Config", _StubConfig)
+    monkeypatch.setattr(module.uvicorn, "Server", _StubServer)
+
+    await module._serve("0.0.0.0", 8100)
+
+    assert built == [app_sentinel]
+    # The app uvicorn serves is the one the factory just built — not a stale import-time
+    # object, which is what the old module-level `app` would have handed over.
+    assert recorded["app"] is app_sentinel
+    assert (recorded["host"], recorded["port"]) == ("0.0.0.0", 8100)
+    assert recorded["served"] is True
+
+
+async def test_a_failed_boot_exits_nonzero_like_uvicorn_run(monkeypatch):
+    """Driving `uvicorn.Server` by hand loses the one thing `uvicorn.run()` does AFTER
+    serving. A lifespan `startup` hook that raises does NOT raise out of `serve()` —
+    uvicorn logs "Application startup failed. Exiting." and returns normally — and
+    `uvicorn.run` turns that silent return into `sys.exit(STARTUP_FAILURE)`.
+
+    Without the check, a process that never served a request exits 0 and Kubernetes
+    marks the pod `Completed` instead of restarting it. Pinned at 3 because that is
+    uvicorn's own constant; matching it keeps the two ways of running this app
+    indistinguishable to whatever reads the exit code.
+
+    Stubbed rather than driven through a real failing hook because the assertion is
+    about OUR branch, not uvicorn's: the stub reproduces the trap exactly (`serve()`
+    returns None, `started` is False), which a hook that raised out of `serve()` would
+    not. That uvicorn really returns normally on this path was confirmed against a live
+    server; the inbox app has no `startup` hook to break, which is why this is the
+    forward guard described in `_serve`.
+    """
+    from data_agent.learning.inbox import service
+
+    monkeypatch.setattr(service, "create_inbox_app", lambda: object())
+    module = _load_inbox_entrypoint()
+
+    class _StubConfig:
+        def __init__(self, app, *, host, port):
+            pass
+
+    class _FailedBootServer:
+        started = False  # uvicorn's state after a bind error / a raising startup hook
+
+        def __init__(self, config):
+            pass
+
+        async def serve(self):
+            return None  # note: NOT an exception — this is the whole trap
+
+    monkeypatch.setattr(module.uvicorn, "Config", _StubConfig)
+    monkeypatch.setattr(module.uvicorn, "Server", _FailedBootServer)
+
+    with pytest.raises(SystemExit) as excinfo:
+        await module._serve("127.0.0.1", 8100)
+    assert excinfo.value.code == STARTUP_FAILURE == 3

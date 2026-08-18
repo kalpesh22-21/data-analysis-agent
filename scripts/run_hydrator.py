@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from data_agent.daemon import run_daemon
 from data_agent.runtime.config import get_runtime_settings
 from data_agent.runtime.observability import tracing
 from data_agent.runtime.retrieval.hydrator import build_hydrator
@@ -66,4 +67,9 @@ async def _main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(_main()))
+    # `run_daemon`, not `asyncio.run`: PID 1 drops an unhandled SIGTERM, so a rollout
+    # would SIGKILL this daemon mid-seed and skip `hydrator.close()`. It also makes the
+    # IDLE posture above (`asyncio.Event().wait()` forever, when neo4j/embedding are
+    # unconfigured) actually STOPPABLE — that wait answers nothing else.
+    # See `data_agent/daemon.py`.
+    raise SystemExit(run_daemon(_main, logger=_logger, process="hydrator"))

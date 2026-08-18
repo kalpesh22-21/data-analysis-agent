@@ -482,3 +482,37 @@ restructuring, not deletion — src net +871 (module docs + interfaces);
 true deletions were the duplicated epilogues, the wrapper, and absorbed
 helper copies. Deferred-by-design: force-block stays a method (resume()
 caller), E1/E2 exits unconverted (documented), ISSUES M2 product question.
+
+## #14 — H4+H7: worker entrypoint hardening (2026-08-17)
+
+Issue-stack triage began (ease × impact; user picked the easy/high quadrant
+first). This slice: the two production-blocking entrypoint defects.
+
+- **H4** — the four PID-1 workers (hydrator, learning consumer/sweeper/
+  scheduler) dropped SIGTERM → every K8s rollout waited out the grace period
+  then SIGKILLed mid-work, skipping finally cleanup. Fix: shared
+  `src/data_agent/daemon.py::run_daemon` (plane-neutral Tier-1 home) —
+  SIGTERM cancels the main task so existing finallys run; exit 0 on
+  SIGTERM shutdown; second SIGTERM (and SIGTERM-during-SIGINT-cleanup)
+  logged + ignored, never re-cancelled mid-cleanup; SIGINT propagation
+  preserved. Before/after smoke: cleanup never ran → runs, exit 0.
+- **H7** — inbox service built its app at module import. DIAGNOSIS
+  CORRECTED during the build: the crash trigger (eager acouchbase Cluster
+  in CouchbaseCandidateStore.__init__) was already defused incidentally by
+  Tier 3's lazy seam (b7b21c1) — the mechanism is real (reproduced on
+  SDK 4.6.2/py3.14) but was latent, not blocking. Fix removes the CLASS:
+  app construction moved inside the running loop (`_serve` driving
+  uvicorn.Server), module import is side-effect-free (AST-pinned,
+  mutation-verified), startup-failure exits 3 (uvicorn.run parity),
+  dev Ctrl-C caught. Full-plane + offline smokes green; Helm invocations
+  unchanged.
+- Review: APPROVE; 2 should-fixes + 2 nits folded (exit-3 parity, tightened
+  AST invariant — both mutation-verified; SIGINT/SIGTERM interleave guard
+  with its own deterministic test; Ctrl-C catch). 15 new tests total.
+- New follow-ups queued: ISSUES C3 (uvicorn workloads still exit 143 on
+  SIGTERM — policy decision), plus reviewer notes: inbox service still uses
+  deprecated on_event("shutdown"); no terminationGracePeriodSeconds set for
+  the consumer.
+- V0 5837 green (+ the expected cross-repo parity red from the in-flight
+  canon slice, proven by stash-test); ruff clean. V1 not required
+  (no loop/dispatch code); live smokes above are the V2.

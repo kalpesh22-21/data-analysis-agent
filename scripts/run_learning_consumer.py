@@ -40,6 +40,7 @@ import sys
 from pathlib import Path
 
 from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
+from data_agent.daemon import run_daemon
 from data_agent.learning.audit.couchbase_audit_store import CouchbaseAuditStore
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
 from data_agent.learning.config import LearningSettings
@@ -280,4 +281,7 @@ async def _main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(_main()))
+    # `run_daemon`, not `asyncio.run`: this process is PID 1 in its container, where an
+    # unhandled SIGTERM is DROPPED — the rollout would then SIGKILL it mid-drain and the
+    # `finally` above (the neo4j driver close) would never run. See `data_agent/daemon.py`.
+    raise SystemExit(run_daemon(_main, logger=_logger, process="learning consumer"))
