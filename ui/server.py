@@ -16,9 +16,14 @@ Responsibilities (and ONLY these — see docs/08-ui.md / D82):
        `index.html` does that).
 
 Config (env vars, all optional):
-    RUNTIME_URL            default http://localhost:8000
-    TOKEN_SERVICE_URL      default http://localhost:19000/token
-    TOKEN_ISSUER_API_KEY   default issuer-key-abc123
+    RUNTIME_URL                   default http://localhost:8000
+    TOKEN_SERVICE_URL             default http://localhost:19000/token
+    TOKEN_ISSUER_API_KEY          default issuer-key-abc123
+    TOKEN_TTL_SECONDS             default 3600 — MUST match the token service's own
+                                  `token_ttl_seconds` (`clickhouse-api/app/
+                                  token_service.py`). See `_TOKEN_TTL_SECONDS`.
+    TOKEN_REFRESH_AFTER_SECONDS   default TTL-300 — token age at which the next
+                                  proxied call lazily re-mints. See `_jwt_for_session`.
 
 Run:
     uv run uvicorn ui.server:app --host 0.0.0.0 --port 3000
@@ -27,7 +32,9 @@ Run:
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 import urllib.parse
 import uuid
 from collections.abc import AsyncIterator
@@ -46,9 +53,48 @@ from data_agent.learning.promotion.token_minter import (
     TokenMintError,
 )
 
+logger = logging.getLogger(__name__)
+
 RUNTIME_URL = os.environ.get("RUNTIME_URL", "http://localhost:8000")
 TOKEN_SERVICE_URL = os.environ.get("TOKEN_SERVICE_URL", "http://localhost:19000/token")
 TOKEN_ISSUER_API_KEY = os.environ.get("TOKEN_ISSUER_API_KEY", "issuer-key-abc123")
+
+# --- session-token lifetime (E1) ---------------------------------------------
+#
+# THE BFF CANNOT ASK THE TOKEN SERVICE HOW LONG ITS TOKENS LIVE. The mint request
+# deliberately omits `ttl_seconds` (see `_mint_jwt`: the IdP's own configured
+# lifetime governs a UI session), and the mint RESPONSE carries only
+# `access_token` — no `expires_in`. The BFF also never decodes the JWT: it holds
+# the token as an opaque credential and has no verifying key, and parsing `exp`
+# out of an unverified payload to make a security-adjacent decision is the wrong
+# habit to start. So the lifetime is CONFIGURED here and must be kept equal to the
+# token service's `token_ttl_seconds` (`clickhouse-api/app/token_service.py`,
+# default 3600). A value LARGER than the service's is the dangerous direction — it
+# makes the BFF believe a dead token is still alive — which is why the refresh
+# threshold below leaves a wide margin rather than a tight one.
+_TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", "3600"))
+# Re-mint once a held token is this old. Default TTL-300: five minutes of slack
+# for a slow mint, a clock skew (`verify_jwt` allows 60s leeway), and a long
+# streaming turn that started just under the threshold and is still running when
+# the old token would have died.
+_TOKEN_REFRESH_AFTER_SECONDS = int(
+    os.environ.get("TOKEN_REFRESH_AFTER_SECONDS", str(max(_TOKEN_TTL_SECONDS - 300, 1)))
+)
+# Both knobs are env-settable and INDEPENDENT, so a deployment can raise the TTL
+# and forget the threshold (or vice versa) and get a band of zero or negative
+# width. WARN, DO NOT RAISE: a misconfigured band still serves every request in
+# the ordinary case — the loss is only the fallback — and refusing to start would
+# turn a degraded UI into no UI. See `_jwt_for_session` for the bands themselves.
+if not (0 < _TOKEN_REFRESH_AFTER_SECONDS < _TOKEN_TTL_SECONDS):
+    logger.warning(
+        "session-token refresh threshold is not strictly inside the TTL: "
+        "TOKEN_REFRESH_AFTER_SECONDS=%d TOKEN_TTL_SECONDS=%d — the refresh "
+        "shock-absorber band is gone, so a token-service blip in the wrong window "
+        "becomes a user-facing 502 instead of a survivable retry on the still-valid "
+        "held token",
+        _TOKEN_REFRESH_AFTER_SECONDS,
+        _TOKEN_TTL_SECONDS,
+    )
 
 # Warehouse TENANT claims stamped into every minted token.
 #
@@ -132,6 +178,19 @@ _SESSION_SCOPES: dict[str, list[str]] = {}
 # (and thus the same per-user entitlement basis + sid_hash session binding).
 _SESSION_USERS: dict[str, str] = {}
 
+# Server-side-only session_id -> the wall-clock time its CURRENT token was minted
+# (E1). Written by `_store_token` and nowhere else, so `_SESSIONS` can never hold a
+# token whose age is unknown.
+#
+# WALL CLOCK, not `time.monotonic()`. The quantity being approximated is "how much
+# of the IdP's TTL is left", and that TTL is a wall-clock `exp` claim the MCP checks
+# against ITS wall clock. `monotonic()` would be the right choice for measuring an
+# interval in isolation, but on Linux it does not advance across a system suspend —
+# so a suspended-and-resumed process would under-estimate the age of every held
+# token and serve dead ones. An NTP step is bounded and small next to the 300s of
+# slack the refresh threshold leaves.
+_SESSION_TOKEN_MINTED_AT: dict[str, float] = {}
+
 app = FastAPI(title="data-agent-ui-bff")
 
 
@@ -178,6 +237,12 @@ async def _mint_jwt(user_name: str, column_scope: list[str], session_id: str) ->
     (`SQL_tenant`/`user_name`, D82) attributes the session to the right user, and
     it is the identity whose per-user `column_scope` entitlement produced
     *column_scope* (see `ui/entitlements.py`).
+
+    THE THREE CALLERS ALL PASS A **CACHED** SCOPE, and only `create_session`
+    resolves one. `set_session_scope` passes the narrowed scope it validated, and
+    `_refresh_session_token` (E1) passes `_SESSION_SCOPES[session_id]` verbatim —
+    see the comment there for WHY re-resolving on refresh would be a defect rather
+    than a freshening (Decision 7 / Q22, docs/decisions/prompt-routing-review-qa.md).
 
     *session_id* is threaded into the mint request so the token carries a
     `sid_hash` claim (auth-hardening Slice 1): the MCP then rejects any request
@@ -256,8 +321,11 @@ async def create_session(request: Request) -> dict[str, str]:
     underscore-free."""
     session_id = "s" + uuid.uuid4().hex
     identity = resolve_caller_identity(request)
+    # THE ONLY `resolve_column_scope` CALL ON THE REQUEST PATH, and it must stay
+    # that way — E1's token refresh replays the value cached below rather than
+    # calling this again. See `_refresh_session_token`.
     column_scope = resolve_column_scope(identity)
-    _SESSIONS[session_id] = await _mint_jwt(identity, column_scope, session_id)
+    _store_token(session_id, await _mint_jwt(identity, column_scope, session_id))
     _SESSION_SCOPES[session_id] = list(column_scope)
     _SESSION_USERS[session_id] = identity
     return {"session_id": session_id}
@@ -311,16 +379,161 @@ async def set_session_scope(body: ScopeBody) -> dict[str, bool]:
     # sid_hash session binding (Slice 1, invariant §6.5) and the per-user identity
     # (Slice 2) stay valid across the scope narrow: only column_scope changes.
     user_name = _SESSION_USERS[body.session_id]
-    _SESSIONS[body.session_id] = await _mint_jwt(user_name, body.column_scope, body.session_id)
+    _store_token(
+        body.session_id, await _mint_jwt(user_name, body.column_scope, body.session_id)
+    )
     _SESSION_SCOPES[body.session_id] = list(body.column_scope)
     return {"ok": True}
 
 
-def _jwt_for_session(session_id: str) -> str:
+def _store_token(session_id: str, jwt: str) -> None:
+    """THE ONLY writer of `_SESSIONS`, so a stored token always has a known age.
+
+    Every mint site goes through here (session create, the test-only scope narrow,
+    and the E1 refresh). Writing `_SESSIONS[sid]` directly would leave
+    `_SESSION_TOKEN_MINTED_AT` stale, and a stale mint time is the one failure this
+    whole mechanism cannot detect: the token would look older than it is (harmless —
+    an extra re-mint) or, after a re-mint that forgot to stamp, permanently older
+    than the refresh threshold, re-minting on EVERY request forever.
+    """
+    _SESSIONS[session_id] = jwt
+    _SESSION_TOKEN_MINTED_AT[session_id] = time.time()
+
+
+async def _refresh_session_token(session_id: str, age: float) -> str:
+    """Re-mint the session's JWT from its CACHED claims and return the new token.
+
+    ────────────────────────────────────────────────────────────────────────────
+    THIS FUNCTION MUST NEVER CALL `resolve_column_scope` (E2 — Decision 7 / Q22,
+    docs/decisions/prompt-routing-review-qa.md §Q15, §Q22, §D-7).
+    ────────────────────────────────────────────────────────────────────────────
+    It replays `_SESSION_SCOPES[session_id]` and `_SESSION_USERS[session_id]` — the
+    values resolved ONCE at `create_session` — and re-resolving either here would be
+    a defect, not a freshening. The reason is invisible from inside auth code, so it
+    is written out:
+
+      * Decision 7 is a PRODUCT GUARANTEE that a session has ONE `column_scope` for
+        its whole lifetime. It is supplied by this component; the runtime does not
+        assume it (scope is rebuilt per request, and D44(C) exists precisely for
+        mid-session change).
+      * That guarantee is what retired Q15 option (b): materialized scratch tables
+        are NOT stamped with the scope hash they were created under, and reads are
+        NOT re-checked against it, because under Decision 7 the narrow-then-read
+        threat is unreachable. Decision 6 kept only the lineage-recording half.
+      * So a refresh that re-resolved entitlements would let a scope CHANGE land
+        mid-session — and the rows of a scratch table materialized under the old,
+        wider scope stay readable under the new, narrower one. The defect would
+        surface three components away, in a scratch table, with nothing pointing
+        back here.
+
+    Decision 7 held until now only because the BFF minted once and no re-mint path
+    existed (Q22 said so in as many words). This IS that path; it is written to
+    preserve the invariant BY CONSTRUCTION. Q22's option (b) — "a refresh that
+    produces a different scope than the cached one fails closed" — has nothing to
+    compare here, which is the stronger outcome: there is no second resolution to
+    disagree with the first. Any future change that reintroduces one owes a
+    fail-closed comparison AND a revisit of Q15(b).
+
+    The accepted cost is recorded upstream: an entitlement revocation does not take
+    effect until the user's next session (up to 8 hours). That is Decision 7's
+    stated accepted risk, not a gap this function should try to close on its own.
+
+    CONCURRENCY: two in-flight requests can both observe a stale token and both
+    re-mint. That is accepted rather than locked out. Both mints carry identical
+    claims and identical `sid_hash` binding, so both tokens are valid and equivalent;
+    last write wins and the loser's token simply goes unused after the requests that
+    hold it finish. The cost is one redundant mint at most once per refresh window,
+    against an `asyncio.Lock` per session on the hot path of every proxied call.
+    """
+    jwt = await _mint_jwt(
+        _SESSION_USERS[session_id], _SESSION_SCOPES[session_id], session_id
+    )
+    _store_token(session_id, jwt)
+    logger.info(
+        "re-minted session token: session_id=%s previous_age_seconds=%d", session_id, age
+    )
+    return jwt
+
+
+async def _jwt_for_session(session_id: str) -> str:
+    """The session's CURRENT JWT, lazily re-minted when the held one is getting old
+    (E1). Every proxy hop attaches the token through here, so the refresh needs no
+    background task, no scheduler and no per-session timer — the next request the
+    user makes is what renews the session, and a session nobody uses simply expires.
+
+    THREE AGE BANDS, and the difference between the last two is the whole design:
+
+      age <= REFRESH_AFTER      serve the held token; no mint.
+      REFRESH_AFTER < age <= TTL  try to re-mint. On failure, serve the HELD token
+                                  and warn — it is still valid for up to
+                                  `TTL - REFRESH_AFTER` seconds, so a token service
+                                  blip must not break a working session. This band
+                                  exists to be the shock absorber.
+      age > TTL                 the held token is DEAD. Try to re-mint; on failure
+                                  fail the request LOUDLY (502). Proxying a known-
+                                  expired token would surface as a bare `401` from
+                                  the runtime, which the browser renders as an auth
+                                  error and which points at the wrong component
+                                  entirely.
+
+    A session with no token at all is still a 404, unchanged: `_SESSIONS` is the
+    membership test for "this session exists".
+    """
     jwt = _SESSIONS.get(session_id)
     if jwt is None:
         raise HTTPException(status_code=404, detail="Unknown session_id — call POST /api/session first.")
-    return jwt
+    minted_at = _SESSION_TOKEN_MINTED_AT.get(session_id)
+    if minted_at is None:
+        # AN INCOMPLETE SESSION RECORD — a token this process did not mint through
+        # `_store_token`. Its age is not merely unknown, it is UNKNOWABLE here (the
+        # BFF does not decode the JWT), and the cached claims a re-mint would need
+        # are equally likely to be missing. So this serves the held token and
+        # behaves exactly as the BFF did before E1: the session works until the
+        # token dies, then 401s.
+        #
+        # NOT a fail-open weakening: refreshing is an AVAILABILITY feature, and the
+        # only two moves available here are "serve it" and "kill a session that
+        # would otherwise have worked". Nothing about the same-scope invariant (E2)
+        # depends on this branch — it mints nothing. The warning is so that a future
+        # `_SESSIONS` writer (a restart-restore, say) that skipped `_store_token`
+        # shows up as a named gap rather than as sessions that mysteriously still
+        # die at an hour.
+        logger.warning(
+            "session token has no recorded mint time and cannot be refreshed: "
+            "session_id=%s",
+            session_id,
+        )
+        return jwt
+    age = time.time() - minted_at
+    if age <= _TOKEN_REFRESH_AFTER_SECONDS:
+        return jwt
+    expired = age > _TOKEN_TTL_SECONDS
+    try:
+        return await _refresh_session_token(session_id, age)
+    except HTTPException:
+        if expired:
+            # LOUD, and a distinct message from `_mint_jwt`'s own 502: "the token
+            # service is unreachable" and "your session has expired and could not be
+            # renewed" are different things to a person reading the error banner.
+            logger.error(
+                "session token expired and could not be renewed: session_id=%s age_seconds=%d",
+                session_id,
+                age,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Session token expired and could not be renewed — the token "
+                    "service is unavailable. Start a new session once it recovers."
+                ),
+            ) from None
+        logger.warning(
+            "session token refresh failed; serving the still-valid held token: "
+            "session_id=%s age_seconds=%d",
+            session_id,
+            age,
+        )
+        return jwt
 
 
 async def _proxy_stream(path: str, session_id: str, json_body: dict[str, str]) -> StreamingResponse:
@@ -338,7 +551,7 @@ async def _proxy_stream(path: str, session_id: str, json_body: dict[str, str]) -
     `text/event-stream`) so the browser's `!response.ok` branch renders it in
     the error banner instead of trying to SSE-parse it.
     """
-    jwt = _jwt_for_session(session_id)
+    jwt = await _jwt_for_session(session_id)
     headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id}
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None))
@@ -379,7 +592,7 @@ async def history(session_id: str) -> JSONResponse:
     attached server-side (D82/D5: the browser never sees the token). The runtime's
     status + JSON body propagate as-is so a non-2xx (401/400) reaches the browser's
     error branch unchanged."""
-    jwt = _jwt_for_session(session_id)
+    jwt = await _jwt_for_session(session_id)
     headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": session_id}
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -403,7 +616,7 @@ async def query_page(body: QueryPageBody) -> JSONResponse:
     propagate as-is, so a 400 (unparseable/non-SELECT SQL) or 403 (column-scope
     denial) reaches the browser's error branch unchanged rather than being
     flattened into a generic failure."""
-    jwt = _jwt_for_session(body.session_id)
+    jwt = await _jwt_for_session(body.session_id)
     headers = {"Authorization": f"Bearer {jwt}", "X-Session-Id": body.session_id}
     payload = {"sql": body.sql, "limit": body.limit, "offset": body.offset}
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -583,7 +796,7 @@ async def _proxy_upload(path: str, session_id: str, request: Request) -> JSONRes
     status + JSON body propagate as-is (non-JSON -> `{"detail": text}`), so a
     413/400/401 reaches the browser's error branch unchanged.
     """
-    jwt = _jwt_for_session(session_id)
+    jwt = await _jwt_for_session(session_id)
     # The BFF caps the WHOLE multipart body, but the downstream cap (UPLOAD_MAX_BYTES)
     # is on the FILE PART only — so give the BFF slack for the multipart envelope
     # (headers + boundaries, a few hundred bytes) to avoid 413-ing a file downstream

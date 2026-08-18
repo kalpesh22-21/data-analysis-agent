@@ -516,3 +516,32 @@ first). This slice: the two production-blocking entrypoint defects.
 - V0 5837 green (+ the expected cross-repo parity red from the in-flight
   canon slice, proven by stash-test); ruff clean. V1 not required
   (no loop/dispatch code); live smokes above are the V2.
+
+## #15 — E1+E2 token refresh, M2 stop-path parity (2026-08-17)
+
+- **E1** — BFF sessions died at ~61 min (single mint, TTL 3600, product
+  expects 8h). Lazy re-mint at the single token-attach point
+  (`_jwt_for_session`, now async): age > TOKEN_REFRESH_AFTER_SECONDS
+  (default TTL−300) → re-mint with the CACHED claims and swap; stale +
+  mint-fail → serve held token + WARNING (shock-absorber band); past-TTL +
+  mint-fail → loud 502, nothing proxied; rolling refresh, no session cap.
+  Env: TOKEN_TTL_SECONDS (BFF cannot learn the service TTL — mint response
+  carries no expires_in), TOKEN_REFRESH_AFTER_SECONDS; startup warning if
+  the band is misconfigured. **E2 enforced by construction**: the refresh
+  path cannot reach entitlement resolution (reviewer traced the full call
+  graph); the Decision-7 rationale (scratch tables are not scope-stamped —
+  a mid-session scope change would leak) lives as a load-bearing comment at
+  the refresh site. 14 tests incl. raise-style laundering traps
+  (mutation-verified) and exact boundary pins (operator flips each fail
+  exactly one test). LIVE-verified: rolling refresh kept a session
+  answering 200s past its original 30s TTL against the real token service.
+- **M2** (user-approved behaviour change) — resume()'s budget-cap "stop"
+  now returns what "continue" rebuilds: the same two trail producers feed a
+  locally-built TurnAccumulators, so the stop outcome carries assumptions +
+  answer_tables + their envelope projections (internally consistent; a grid
+  without its SQL cannot page). Force-block + no-event contracts unchanged
+  (test_turn_exit_contract untouched). 5 tests.
+- Review: APPROVE, 0 blockers; 1 suggestion + 2 nits folded (env sanity
+  warning, boundary tests, TurnAccumulators call-site count).
+- V0 5837 green (+ the expected in-flight canon parity red, stash-proven);
+  V1 **8 passed + L3 accepted red** (L1/L2/L4–L7 3/3, multi-intent 3/3).

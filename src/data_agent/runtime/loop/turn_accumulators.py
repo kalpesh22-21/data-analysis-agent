@@ -241,9 +241,13 @@ class TurnAccumulators:
     progress (UI Slice 1, `docs/decisions/ui-slice1-enriched-result-contract.md`
     §3; 08 for the multi-table half).
 
-    SEEDED AT CONSTRUCTION AND ONLY THERE. Three call sites build one: `run()`
+    SEEDED AT CONSTRUCTION AND ONLY THERE. Four call sites build one: `run()`
     builds nothing (a brand-new turn knows nothing), `resume()` seeds the three
-    facts it can rebuild from the trail, and `_resume_blueprint` seeds all six —
+    facts it can rebuild from the trail, `resume()`'s budget-cap STOP branch seeds
+    the two of those the stop OUTCOME reads (assumptions + answer tables, rebuilt
+    from the same trail by the same two producers — M2, so a user who answered
+    "stop" keeps the table and assumptions a user who answered "continue" keeps),
+    and `_resume_blueprint` seeds all six —
     including the enrichment of the blueprint that completed *during* the resume,
     which no trail replay could produce because its entry is written moments later.
 

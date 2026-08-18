@@ -862,16 +862,50 @@ class AgentLoop:
                     state=live_analysis_state(updated_doc, turn_index),
                     reason_code="USER_STOPPED",
                 )
+                # M2 (approved behaviour change, 2026-08-17): THE TRAIL REBUILD NOW
+                # SERVES BOTH PATHS. This return used to carry `assumptions=None` /
+                # `answer_tables=None` on the rationale that "the in-loop
+                # accumulators are gone with the prior window" — the premise is
+                # true, but the conclusion was not: the two producers 20 lines
+                # below (`_compute_turn_assumptions` / `_compute_turn_answer_tables`)
+                # rebuild exactly those facts from the persisted trail, and the
+                # "continue" answer has been getting them all along. So a user who
+                # answered "stop" lost the table and the assumptions that a user who
+                # answered "continue" kept, from the same trail, on the same turn.
+                # Same source, same turn, same two calls — now on both branches.
+                stop_assumptions = await self._compute_turn_assumptions(session_id, turn_index)
+                stop_tables, _stop_blueprint_runs = await self._compute_turn_answer_tables(
+                    session_id, turn_index
+                )
+                # Read the outcome fields THROUGH a `TurnAccumulators` rather than
+                # hand-shaping them here: it owns the `[] -> None` forks (§1 fork 1)
+                # and `answer_envelope` is THE ONE PLACE the envelope is computed
+                # (08 §E). Nothing is invented by doing so — `answer_sql` /
+                # `blueprint_use` / `verification` are PROJECTIONS of the designated
+                # tables, never independently accumulated, so they appear exactly
+                # when a rebuilt table supplies them and stay `None` when the trail
+                # designated none. The three seeds this cannot supply (`sql`, and the
+                # turn-level `blueprint_use`/`verification` no-table fallbacks) are
+                # the same three the continue path below cannot supply either, and
+                # for the same reason: only the blueprint approval-resume holds a
+                # `result_full` that no trail entry has been written for yet.
+                stop_accum = TurnAccumulators(
+                    assumptions=stop_assumptions, answer_tables=stop_tables
+                )
+                stop_envelope = stop_accum.envelope()
                 return TurnOutcome(
                     status="done",
                     assistant_text=("Stopping here — here is what I found before the budget cap."),
                     pending_question=None,
                     tool_calls_made=0,
                     # UI Slice 1: a `done` return — surface the turn's lineage from
-                    # the trail (the fail-closed source of truth). The in-loop sql/
-                    # table/blueprint accumulators are gone with the prior window, so
-                    # they stay `None` (best-effort partial, §1 nullability table).
+                    # the trail (the fail-closed source of truth).
                     provenance=await self._compute_turn_provenance_union(session_id, turn_index),
+                    answer_sql=stop_envelope.answer_sql,
+                    blueprint_use=stop_envelope.blueprint_use,
+                    verification=stop_envelope.verification,
+                    answer_tables=stop_envelope.answer_tables,
+                    assumptions=stop_accum.assumptions,
                 )
             window_count = prior_window_count + 1  # D55: "continue"/"refine" grants a fresh window
         else:
@@ -1618,10 +1652,14 @@ class AgentLoop:
 
         TWO EXITS DO NOT ROUTE THROUGH THIS, deliberately:
 
-          - `resume()`'s budget-cap `"stop"` return. It happens before `_run_loop_body`
-            is ever entered, so there are no accumulators — routing it here would
-            mean constructing an empty `TurnAccumulators()` purely to have its
-            reads produce the `None`s that return site writes literally.
+          - `resume()`'s budget-cap `"stop"` return. It happens before
+            `_run_loop_body` is ever entered, so there is no window to have
+            accumulated anything: since M2 it builds a `TurnAccumulators` of its
+            OWN, seeded purely from the trail rebuild, and reads the envelope +
+            assumptions off that. Everything else this function does is a no-op
+            there — no checkpoint, no persisted message, no event (see *event*
+            above) — so routing it here would add three `None` arguments and a
+            reader detour to reach one `TurnOutcome(...)` it already spells out.
           - `_pause_from_runtime_tool`. It is already a single-purpose finisher for
             one exit, and it receives an `AnswerEnvelope` as a PARAMETER (its
             callers, including `_resume_blueprint`, may not have a live window's

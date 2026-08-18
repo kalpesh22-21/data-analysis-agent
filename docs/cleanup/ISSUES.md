@@ -72,10 +72,6 @@ A **running stack of detected issues** in `data-analysis-agent`, opened 2026-08-
 
 ## E. Auth / session lifetime
 
-**E1 — There is no token-refresh path; a session cannot outlive one hour.** The BFF mints once at `POST /api/session` (`ui/server.py:225`) into `_SESSIONS[session_id]`; the only other write to that map is the test-only `POST /api/session/scope` narrowing affordance. `token_ttl_seconds` is **3600** (`clickhouse-api/app/token_service.py:61`) and `verify_jwt` requires `exp` with 60s leeway — so at ~61 minutes the next turn 401s with no recovery. Product expects 8-hour sessions. Found 2026-08-11 while answering Lead Q2.
-
-**E2 — When refresh is built, it must reuse the session's cached `column_scope`.** Not re-resolve `resolve_column_scope(identity)`. A re-resolve would let an entitlement change land mid-session, which breaks the same-scope invariant that Decision 7 (see the Q&A doc) relies on — and that invariant is what justified dropping scope-hash stamping on materialized scratch tables. The dependency is non-obvious from inside the auth code, so it needs a comment at the mint site.
-
 ---
 
 ## G. R4→R6 live sweeps (2026-08-12/13) — most items FIXED same-day, kept here for the record
@@ -169,15 +165,6 @@ same shape is `accum.envelope()` at the same position). Moving the call
 inside the `if pause` branch is behaviour-neutral for outputs but was kept
 verbatim in T5.4 to stay strictly behaviour-identical. Fix in a follow-up
 slice: one-line move + a test that a pause still carries the envelope.
-
-**M2 — "stop" at the budget cap returns less than "continue" rebuilds.**
-`resume()`'s stop path returns `assumptions=None`/`answer_tables=None` with
-the rationale "the in-loop accumulators are gone with the prior window" —
-but the continue path, 20 lines below, reconstructs exactly those from the
-trail (`_compute_turn_assumptions` / `_compute_turn_answer_tables`). A user
-who answers "stop" loses the table/assumptions a user who answers
-"continue" keeps, even though the trail could serve both. Product decision
-+ small fix; T5.5 deliberately reproduced the current behaviour.
 
 A reviewer document ("Planning and System-Prompt Review") landed the same session, proposing blueprint-first routing over the current SIMPLE/COMPLICATED planning policy. Its questions, the four decisions taken so far, and the follow-on questions those opened are tracked separately in **`docs/decisions/prompt-routing-review-qa.md`** (in-repo, for Lead sign-off) — not here. Issues **A4** (D22 deletes assistant text) and **B1/B3** above are now owned by that document's Decision 4 and Priority-1 workstream.
 
