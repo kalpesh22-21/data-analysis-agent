@@ -84,12 +84,19 @@ WritePlaneMode = Literal["full", "offline"]
 # `needs_parameterization` is a candidate the judge passed on merit whose
 # parameterization form could not be filled in; its rows are completed, not adjudicated
 # (`docs/decisions/learning-declined-candidate-review.md`).
+#
+# `promoted` is listable for one reason: `promote` RE-EMITS idempotently from that state
+# (`inbox.py::promote`), so the YAML behind an abandoned or lost PR is always
+# recoverable — but only by a caller who can still FIND the row. Withholding the listing
+# left that affordance reachable by curl and by nothing else, which is the same shape of
+# invisible loss the archive listing was built to end.
 _LISTABLE_STATUSES = frozenset(
     {
         CandidateStatus.IN_REVIEW,
         CandidateStatus.REJECTED,
         CandidateStatus.VALIDATED,
         CandidateStatus.NEEDS_PARAMETERIZATION,
+        CandidateStatus.PROMOTED,
     }
 )
 
@@ -467,15 +474,23 @@ def create_inbox_app(
         """
         selected = status if status is not None else CandidateStatus.IN_REVIEW
         if selected not in _LISTABLE_STATUSES:
+            # Message DERIVED from the allowlist: it named three statuses while the set
+            # held four, which is how a listable status stays invisible to whoever reads
+            # the error instead of the code.
             raise HTTPException(
                 status_code=400,
-                detail="status must be one of {'in_review', 'rejected', 'validated'}.",
+                detail=f"status must be one of {sorted(_LISTABLE_STATUSES)}.",
             )
-        # The durable, unbounded rejected archive lists NEWEST-first so the LIMIT
-        # caps OLD history, not present rejects; the review queue + the validated
-        # (Phase-3 promotable) listing keep ASC (oldest first — FIFO drain). Chosen
-        # explicitly by the caller, per the contract.
-        order = "desc" if selected == CandidateStatus.REJECTED else "asc"
+        # The durable, unbounded terminal archives (rejected, promoted) list NEWEST-first
+        # so the LIMIT caps OLD history rather than present rows — for `promoted` that is
+        # what makes "re-emit the YAML I promoted an hour ago" a top-of-list operation.
+        # The review queue + the validated (Phase-3 promotable) listing keep ASC (oldest
+        # first — FIFO drain). Chosen explicitly by the caller, per the contract.
+        order = (
+            "desc"
+            if selected in (CandidateStatus.REJECTED, CandidateStatus.PROMOTED)
+            else "asc"
+        )
         items = await inbox.list(status=selected, limit=100, order=order)
         wire = [_inbox_item_to_wire(it) for it in items]
         return {"items": wire, "count": len(wire)}

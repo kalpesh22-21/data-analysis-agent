@@ -1041,3 +1041,35 @@ dropped, the generalize package's pre-keep-and-annotate claim corrected.
   L3 re-measure lands with the combined V1 gate (next entries).
 - V0 **6077 passed / 225 skipped / 1 xfailed** (+26 for the slice); ruff
   clean.
+
+## #30 — M4: the promotion hop, exposed end to end (2026-08-19)
+
+- ISSUES M4's "the promotion hop does not exist" was STALE: the mapping
+  pass found verify (service.py:545) and promote (:561) built and tested
+  at the service layer, the YAML emitter preserving the landing id so
+  the canon reseed MERGE flips the SAME Neo4j node learning→mcp in
+  place, and the naive flip-source-in-place shortcut proven self-erasing
+  (GC deletes source='mcp' nodes with stale corpus_sha — the design
+  routes promotion through canon for exactly this reason). The gap was
+  one allowlist: the BFF rejected the verbs and never listed
+  `validated`.
+- Landed: BFF actions += verify/promote (promote may carry the optional
+  {doc_id,title} body; its PromotionEmit response passes through
+  untouched — six string fields, reviewer confirmed nothing sensitive
+  rides in it); list statuses += validated AND promoted; inbox page
+  gains Promotable + Promoted tabs, verify/promote buttons, a YAML panel
+  (textContent-only sinks, zero HTML injection surface, clipboard copy
+  with honest role=status feedback), node_stamped=false re-verify
+  warning, a verified badge on promotable cards, verify disabled after a
+  successful promote, and "Re-emit YAML" on promoted cards — the
+  service's idempotent re-emit means a lost PR is always regenerable.
+  New drift guard: BFF and service status allowlists asserted EQUAL (the
+  exact drift that hid validated).
+- Review: APPROVE; both named follow-ups (promoted-list recovery,
+  verified badge) folded as P1b per the reviewer's own prescriptions.
+  The remaining seam is DESIGNED manual: promote returns YAML → human PR
+  into clickhouse-api canon + parity --write → mcp image rebuild →
+  hydrator reseed flips the node. No git access in the inbox, by design.
+- V0 **6094 passed / 225 skipped / 1 xfailed**; ruff clean. Live
+  proof (verify → promote → canon → recall serves) lands with the
+  campaign-closing mining test.

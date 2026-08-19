@@ -261,6 +261,25 @@
     font-family: ui-monospace, SFMono-Regular, monospace;
   }
 
+  /* The Phase-3 verify state of a promotable card. Same chip as .item-status without
+     the rejected red — an unverified row is the next step, not a failure. */
+  .item-verified {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--color-border);
+    background: var(--color-surface-2);
+    color: var(--color-text-dim);
+    border-radius: 999px;
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.75rem;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .item-verified.is-verified {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+  }
+
   .item-summary {
     margin: 0;
     line-height: 1.5;
@@ -274,7 +293,8 @@
     margin: 0 0 var(--space-1) 0;
   }
 
-  pre.payload-view {
+  pre.payload-view,
+  pre.promotion-yaml {
     background: var(--color-bg);
     border: 1px solid var(--color-border);
     border-radius: var(--radius);
@@ -389,6 +409,78 @@
     color: var(--color-text-dim);
   }
 
+  /* --- Promotion hop (validated -> canon PR) --- */
+  .item-promotion {
+    border: 1px solid var(--color-border);
+    background: var(--color-surface-2);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .promotion-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  .promotion-head .item-field-label {
+    margin: 0;
+    flex: 1 1 auto;
+  }
+
+  button.promotion-copy {
+    background: var(--color-surface);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    font-size: 0.8rem;
+    padding: var(--space-1) var(--space-3);
+  }
+
+  .promotion-copy-status {
+    font-size: 0.75rem;
+    color: var(--color-text-dim);
+  }
+
+  .promotion-meta {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: var(--space-1) var(--space-3);
+    margin: 0;
+    font-size: 0.8rem;
+  }
+
+  .promotion-meta dt {
+    color: var(--color-text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.7rem;
+    align-self: center;
+  }
+
+  .promotion-meta dd {
+    margin: 0;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    word-break: break-all;
+  }
+
+  .verify-note {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+  }
+
+  .verify-note.is-warning {
+    border: 1px solid var(--color-warn-border);
+    background: var(--color-warn-bg);
+    color: var(--color-warn-text);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+  }
+
   .item-actions {
     display: flex;
     flex-wrap: wrap;
@@ -454,6 +546,8 @@
       <div class="status-toggle" data-testid="inbox-status-toggle" role="group" aria-label="Inbox status">
         <button type="button" class="status-btn is-active" data-status="in_review" aria-pressed="true">Review queue</button>
         <button type="button" class="status-btn" data-status="needs_parameterization" aria-pressed="false">Needs parameterization</button>
+        <button type="button" class="status-btn" data-status="validated" aria-pressed="false">Promotable</button>
+        <button type="button" class="status-btn" data-status="promoted" aria-pressed="false">Promoted</button>
         <button type="button" class="status-btn" data-status="rejected" aria-pressed="false">Archived</button>
       </div>
       <div class="type-tabs" data-testid="inbox-tabs" role="tablist" aria-label="Candidate type"></div>
@@ -597,8 +691,9 @@
     tabEls[type].btn.focus();
   }
 
-  // Wire the two-option status toggle (Review queue ↔ Archived). Switching
-  // status REFETCHES the list for that status (contract §Status toggle).
+  // Wire the status toggle (Review queue / Needs parameterization / Promotable /
+  // Promoted / Archived). Switching status REFETCHES the list for that status (contract
+  // §Status toggle) — each one is a different queue with different actions.
   function buildStatusToggle() {
     els.statusToggle.querySelectorAll(".status-btn").forEach(function (btn) {
       btn.addEventListener("click", function () {
@@ -672,17 +767,29 @@
     });
   }
 
-  // Re-enable controls after an error. Approve stays disabled in offline mode
-  // (write plane can't land) and retract stays disabled — neither the
-  // Review-queue (in_review) nor the Archive (rejected) list holds validated
-  // items, and retract only applies to validated items (contract §4).
+  // Re-enable controls after an action. The rules are per-LIST, because a transition
+  // the current list cannot legally make is a 409 waiting to happen:
+  //   approve  — disabled offline (the write plane can't land it, contract §5);
+  //   retract  — disabled wherever it IS rendered (the review-queue row builds it as a
+  //              placeholder); it applies to validated items only, and the promotable
+  //              list does not render it at all (contract §4);
+  //   verify   — validated-only: a promoted candidate has left that state, so verifying
+  //              it can only 409;
+  //   promote  — live on BOTH promotion lists: the first emit from `validated`, and the
+  //              idempotent re-emit from `promoted` that recovers a lost PR.
   function enableActions(actions) {
+    var promotable = state.status === "validated";
+    var promoted = state.status === "promoted";
     actions.querySelectorAll("button").forEach(function (btn) {
       var act = btn.dataset.action;
       if (act === "approve" && state.offline) {
         btn.disabled = true;
       } else if (act === "retract") {
         btn.disabled = true;
+      } else if (act === "verify") {
+        btn.disabled = !promotable;
+      } else if (act === "promote") {
+        btn.disabled = !(promotable || promoted);
       } else {
         btn.disabled = false;
       }
@@ -690,6 +797,15 @@
   }
 
   // --- Action POST + error mapping ----------------------------------------
+
+  // verify and promote answer WITH something the reviewer has to read — the
+  // `node_stamped` outcome, and the canon YAML — so they render in place instead of
+  // taking the usual drop-the-row-and-refresh path, which would destroy the answer
+  // before it could be copied. (verify also leaves the candidate on this list: it flips
+  // `verified`, not `status`.)
+  function keepsRow(action) {
+    return action === "verify" || action === "promote";
+  }
 
   function performAction(candidateId, action, node, actions) {
     clearError();
@@ -700,6 +816,33 @@
     })
       .then(function (response) {
         if (response.ok) {
+          if (keepsRow(action)) {
+            return response.text().then(function (text) {
+              var result = null;
+              try {
+                result = JSON.parse(text);
+              } catch (err) {
+                result = null;
+              }
+              if (action === "promote") {
+                renderPromotionEmit(node, result);
+              } else {
+                renderVerifyResult(node, result);
+              }
+              // Re-arm the row: verify is the step BEFORE promote, and the reviewer
+              // clicks the second button on the same card.
+              resetConfirm(actions);
+              enableActions(actions);
+              if (action === "promote") {
+                // This candidate is `promoted` now. Verify is validated-only, so
+                // re-arming it would hand back a button whose only outcome is a 409.
+                // Promote itself stays live — it re-emits idempotently, which is how a
+                // lost PR is recovered.
+                var verifyBtn = actions.querySelector('button[data-action="verify"]');
+                if (verifyBtn) verifyBtn.disabled = true;
+              }
+            });
+          }
           // A validated/rejected/retired item is no longer in_review: drop it
           // from the DOM for instant feedback, then refresh the authoritative
           // list (which also handles the transition to the empty state).
@@ -717,7 +860,14 @@
           var reason = parsed && (parsed.reason || parsed.detail);
           var message;
           if (response.status === 503) {
-            message = "approve-that-lands is unavailable in this deployment";
+            // 503 means a different thing per verb — no landing plane for approve,
+            // no validation plane for complete, an unconfigured reviewer token for any
+            // of them — so only approve gets the approve sentence and the rest defer to
+            // the server's own reason. Naming the wrong cause is worse than naming none.
+            message =
+              action === "approve"
+                ? "approve-that-lands is unavailable in this deployment"
+                : reason || "that action is unavailable in this deployment";
           } else if (response.status === 409) {
             // hold reason / illegal-transition, surfaced verbatim (contract §2).
             message = reason || "That transition is not allowed right now.";
@@ -766,6 +916,135 @@
     });
 
     return btn;
+  }
+
+  // --- Promotion hop results (verify / promote) ----------------------------
+
+  // The PromotionEmit metadata (contract §8.1), in the order a human needs it to open
+  // the PR by hand. The service does NOT touch git — these fields ARE the handoff.
+  var PROMOTION_FIELDS = [
+    { key: "target_path", label: "target path" },
+    { key: "filename", label: "filename" },
+    { key: "suggested_branch", label: "suggested branch" },
+    { key: "commit_message", label: "commit message" },
+    { key: "note", label: "note" },
+  ];
+
+  // Action results belong ABOVE the actions row (which is always last, under its
+  // border-top), so a card keeps reading top-to-bottom: what it is, what just
+  // happened, what you can do next.
+  function insertResultPanel(node, panel) {
+    var actions = node.querySelector(".item-actions");
+    if (actions) node.insertBefore(panel, actions);
+    else node.appendChild(panel);
+  }
+
+  // The promote response is the MCP-format YAML plus PR metadata — NOT the
+  // {candidate_id, status, reason} shape every other action returns. It is rendered in
+  // place, with a copy button, because the reviewer's next step is outside this app:
+  // open a PR against the MCP corpus repo, regenerate the parity sidecars, rebuild.
+  // A re-promote replaces the previous panel so two emits never read as two candidates.
+  function renderPromotionEmit(node, emit) {
+    var previous = node.querySelector('[data-testid="inbox-promotion"]');
+    if (previous && previous.parentNode) previous.parentNode.removeChild(previous);
+
+    var wrap = document.createElement("div");
+    wrap.className = "item-promotion";
+    wrap.setAttribute("data-testid", "inbox-promotion");
+
+    var head = document.createElement("div");
+    head.className = "promotion-head";
+    var label = document.createElement("p");
+    label.className = "item-field-label";
+    label.textContent = "MCP canon YAML — open the PR by hand";
+    head.appendChild(label);
+
+    var yamlText = emit && typeof emit.yaml === "string" ? emit.yaml : "";
+    var copyStatus = document.createElement("span");
+    copyStatus.className = "promotion-copy-status";
+    copyStatus.setAttribute("data-testid", "inbox-promotion-copy-status");
+    copyStatus.setAttribute("role", "status");
+
+    var copy = document.createElement("button");
+    copy.type = "button";
+    // Deliberately NOT `action-btn`: that class is the two-step-confirm family the
+    // actions row sweeps; this button lives in the panel and copies on first click.
+    copy.className = "promotion-copy";
+    copy.setAttribute("data-testid", "inbox-promotion-copy");
+    copy.setAttribute("aria-label", "Copy the promotion YAML to the clipboard");
+    copy.textContent = "Copy YAML";
+    copy.addEventListener("click", function () {
+      // `navigator.clipboard` does not exist on an insecure origin, and writeText can
+      // still be denied. Say so next to the button — the YAML stays selectable in the
+      // block below, and a silent no-op would look like a copy that worked.
+      if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        copyStatus.textContent = "clipboard unavailable — select the YAML below";
+        return;
+      }
+      navigator.clipboard.writeText(yamlText).then(
+        function () {
+          copyStatus.textContent = "copied";
+        },
+        function (err) {
+          copyStatus.textContent = "copy failed: " + String(err);
+        }
+      );
+    });
+    head.appendChild(copy);
+    head.appendChild(copyStatus);
+    wrap.appendChild(head);
+
+    var pre = document.createElement("pre");
+    pre.className = "promotion-yaml";
+    pre.setAttribute("data-testid", "inbox-promotion-yaml");
+    // The block scrolls horizontally on a long line, so it has to be reachable and
+    // scrollable from the keyboard — and named, or it focuses as an anonymous stop.
+    pre.setAttribute("tabindex", "0");
+    pre.setAttribute("aria-label", "Promotion YAML");
+    // textContent only — this is server-rendered document text, never HTML (contract §4).
+    pre.textContent = yamlText;
+    wrap.appendChild(pre);
+
+    var meta = document.createElement("dl");
+    meta.className = "promotion-meta";
+    meta.setAttribute("data-testid", "inbox-promotion-meta");
+    PROMOTION_FIELDS.forEach(function (field) {
+      var value = emit ? emit[field.key] : null;
+      if (!value) return;
+      var dt = document.createElement("dt");
+      dt.textContent = field.label;
+      meta.appendChild(dt);
+      var dd = document.createElement("dd");
+      dd.setAttribute("data-testid", "inbox-promotion-" + field.key);
+      dd.textContent = String(value);
+      meta.appendChild(dd);
+    });
+    wrap.appendChild(meta);
+
+    insertResultPanel(node, wrap);
+  }
+
+  // verify flips `verified=true` on the landed node. `node_stamped === false` means the
+  // neo4j write did NOT land (the service fails open, so the envelope moved and the node
+  // did not) — that has to be visible, or the reviewer walks away believing a node is
+  // vouched when nothing on it says so.
+  function renderVerifyResult(node, result) {
+    var previous = node.querySelector('[data-testid="inbox-verify-note"]');
+    if (previous && previous.parentNode) previous.parentNode.removeChild(previous);
+
+    var stamped = !(result && result.node_stamped === false);
+    var note = document.createElement("p");
+    note.className = stamped ? "verify-note" : "verify-note is-warning";
+    note.setAttribute("data-testid", "inbox-verify-note");
+    note.setAttribute("role", "status");
+    // Inserted EMPTY, then filled: a live region only announces changes that happen
+    // while it is in the document, so setting the text first would render the outcome
+    // silently for a screen-reader user.
+    insertResultPanel(node, note);
+    note.textContent = stamped
+      ? "verified — human-vouched; promote to emit the canon YAML"
+      : "node not stamped — re-verify: the vouch did not reach the staging node, so " +
+        "nothing on it records that a human signed off";
   }
 
   // --- Item rendering ------------------------------------------------------
@@ -1051,6 +1330,18 @@
         item.status === "rejected" ? "REJECTED" : "NEEDS PARAMETERIZATION";
       header.appendChild(status);
     }
+    // A promotable card carries its verify state, because that state is the whole
+    // difference between the two buttons under it: promote REQUIRES `verified` and 409s
+    // without it, and nothing else on the card says which of the two is the next step.
+    if (item.status === "validated") {
+      var verified = document.createElement("span");
+      verified.className = item.verified ? "item-verified is-verified" : "item-verified";
+      verified.setAttribute("data-testid", "inbox-verified");
+      verified.textContent = item.verified
+        ? "verified — ready to promote"
+        : "awaiting verify";
+      header.appendChild(verified);
+    }
     li.appendChild(header);
 
     // Body: summary.
@@ -1122,17 +1413,38 @@
     actions.setAttribute("data-testid", "inbox-actions");
 
     var id = item.candidate_id;
-    // Approve is pre-disabled offline (contract §5); retract is disabled here
-    // because every listed item is in_review, not validated (contract §4).
-    actions.appendChild(
-      makeActionButton(id, "approve", "Approve", li, actions, state.offline)
-    );
-    actions.appendChild(
-      makeActionButton(id, "reject", "Reject", li, actions, false)
-    );
-    actions.appendChild(
-      makeActionButton(id, "retract", "Retract", li, actions, true)
-    );
+    if (item.status === "validated") {
+      // The promotable list: an auto-landed node's remaining hop is verify (a human
+      // vouches for it) then promote (emit the canon YAML for a manual PR). Approve and
+      // reject are in_review-ONLY at the service, so they are not offered here — the
+      // page never invites a reviewer into a transition that will be refused.
+      actions.appendChild(
+        makeActionButton(id, "verify", "Verify", li, actions, false)
+      );
+      actions.appendChild(
+        makeActionButton(id, "promote", "Promote", li, actions, false)
+      );
+    } else if (item.status === "promoted") {
+      // Terminal, but NOT read-only like the archive: `promote` re-emits from
+      // `promoted` idempotently with no status move, so the YAML behind an abandoned or
+      // lost PR can always be regenerated. That is the ONLY thing offered here — verify
+      // and the adjudication verbs have all left their legal window.
+      actions.appendChild(
+        makeActionButton(id, "promote", "Re-emit YAML", li, actions, false)
+      );
+    } else {
+      // Approve is pre-disabled offline (contract §5); retract is disabled here
+      // because every listed item is in_review, not validated (contract §4).
+      actions.appendChild(
+        makeActionButton(id, "approve", "Approve", li, actions, state.offline)
+      );
+      actions.appendChild(
+        makeActionButton(id, "reject", "Reject", li, actions, false)
+      );
+      actions.appendChild(
+        makeActionButton(id, "retract", "Retract", li, actions, true)
+      );
+    }
 
     var cancel = document.createElement("button");
     cancel.type = "button";
@@ -1152,6 +1464,8 @@
   function emptyMessage() {
     var where = "the review queue";
     if (state.status === "rejected") where = "the archive";
+    else if (state.status === "validated") where = "the promotable list";
+    else if (state.status === "promoted") where = "the promoted list";
     else if (state.status === "needs_parameterization") where = "the parameterization queue";
     return "No " + typeLabel(state.activeType).toLowerCase() + " in " + where;
   }
@@ -1169,6 +1483,14 @@
     if (state.status === "rejected") {
       els.countLine.textContent =
         total === 1 ? "1 archived item" : total + " archived items";
+    } else if (state.status === "validated") {
+      els.countLine.textContent =
+        total === 1
+          ? "1 item awaiting promotion"
+          : total + " items awaiting promotion";
+    } else if (state.status === "promoted") {
+      els.countLine.textContent =
+        total === 1 ? "1 promoted item" : total + " promoted items";
     } else if (state.status === "needs_parameterization") {
       els.countLine.textContent =
         total === 1
@@ -1204,8 +1526,9 @@
 
   // --- Loaders -------------------------------------------------------------
 
-  // Load the list for the active status (?status=in_review | rejected). Called
-  // on bootstrap, on a status switch, and after a successful action.
+  // Load the list for the active status (?status=in_review | needs_parameterization |
+  // validated | promoted | rejected). Called on bootstrap, on a status switch, and after
+  // a successful action.
   function loadInbox() {
     clearError();
     // Capture this call's token; a newer loadInbox() bumps loadSeq and makes

@@ -38,6 +38,10 @@ class _FakeAsyncClient:
     opening a socket. Shared list `captured` collects (method, url, headers)."""
 
     captured: list[dict] = []
+    # The body the fake upstream answers with. Settable because not every inbox route
+    # answers the list shape: `promote` answers a `PromotionEmit` (yaml + PR metadata),
+    # and the proxy has to carry THAT back unchanged.
+    payload: dict = {"items": [], "count": 0}
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         pass
@@ -57,12 +61,13 @@ class _FakeAsyncClient:
         type(self).captured.append(
             {"method": method, "url": url, "headers": headers, "json": json}
         )
-        return _FakeResponse(200, {"items": [], "count": 0})
+        return _FakeResponse(200, type(self).payload)
 
 
 @pytest.fixture
 def fake_httpx(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict]]:
     _FakeAsyncClient.captured = []
+    _FakeAsyncClient.payload = {"items": [], "count": 0}
     monkeypatch.setattr(server.httpx, "AsyncClient", _FakeAsyncClient)
     yield _FakeAsyncClient.captured
 
@@ -125,8 +130,11 @@ def test_list_rejects_unknown_status_at_bff(
     monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
 ) -> None:
     monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
-    # A status outside {in_review, rejected} is a 400 at the BFF — never proxied.
-    assert client.get("/api/inbox", params={"status": "validated"}).status_code == 400
+    # A status outside `_INBOX_LIST_STATUSES` is a 400 at the BFF — never proxied.
+    # (`validated` used to be the example here; it is a listable status since the
+    # promotion hop was exposed, so the example moved to states that are still not.)
+    assert client.get("/api/inbox", params={"status": "retired"}).status_code == 400
+    assert client.get("/api/inbox", params={"status": "quarantined"}).status_code == 400
     assert fake_httpx == []
 
 
@@ -205,9 +213,10 @@ def test_unknown_action_verb_404s_at_bff(
     monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
 ) -> None:
     monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
-    # A verb outside the {approve,reject,retract,complete} allowlist never reaches the
-    # service.
+    # A verb outside the {approve,reject,retract,complete,verify,promote} allowlist never
+    # reaches the service.
     assert client.post("/api/inbox/candidate::x::0/delete").status_code == 404
+    assert client.post("/api/inbox/candidate::x::0/publish").status_code == 404
     assert fake_httpx == []
 
 
@@ -262,13 +271,13 @@ def test_complete_without_a_json_body_is_400_and_never_proxied(
 def test_every_other_action_still_hops_without_a_body(
     monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
 ) -> None:
-    """`complete` is the ONLY action with a body. The others must keep sending none —
-    a `null` body on an upstream route that takes no body is the kind of thing that
-    works until a stricter server rejects it."""
+    """`complete` and `promote` are the only actions with a body. The others must keep
+    sending none — a `null` body on an upstream route that takes no body is the kind of
+    thing that works until a stricter server rejects it."""
     monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
-    for action in ("approve", "reject", "retract"):
+    for action in ("approve", "reject", "retract", "verify"):
         assert client.post(f"/api/inbox/candidate::abc::0/{action}").status_code == 200
-    assert [hop["json"] for hop in fake_httpx] == [None, None, None]
+    assert [hop["json"] for hop in fake_httpx] == [None, None, None, None]
 
 
 def test_the_fail_to_review_work_list_is_a_permitted_status(
@@ -301,3 +310,156 @@ def test_the_complete_route_is_gated_by_the_flag_like_every_other(
     )
     assert resp.status_code == 404
     assert fake_httpx == []
+
+
+# --- the promotion hop: verify + promote through the BFF (M4-P1) ---------------
+
+
+def test_verify_and_promote_are_proxied_with_the_reviewer_token(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """The promotion hop existed in the service and was unreachable from the browser: the
+    BFF allowlist stopped at {approve,reject,retract,complete}, so a reviewer had no way
+    to vouch for an auto-landed node or get its canon YAML. Both verbs now reach the
+    service on the same server-held-token hop as every other action."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "REVIEWER_TOKEN", "bff-held-secret")
+
+    for action in ("verify", "promote"):
+        assert (
+            client.post(f"/api/inbox/candidate::abc::0/{action}").status_code == 200
+        ), action
+
+    assert [hop["url"].rsplit("/", 1)[-1] for hop in fake_httpx] == ["verify", "promote"]
+    for hop in fake_httpx:
+        assert hop["method"] == "POST"
+        # Same id encoding as every other action — one unambiguous path segment.
+        assert "candidate%3A%3Aabc%3A%3A0" in hop["url"]
+        assert hop["headers"]["X-Reviewer-Token"] == "bff-held-secret"
+
+
+def test_the_promote_response_body_passes_through_untouched(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """`promote` is the one action whose RESPONSE is not the `{candidate_id, type, status,
+    reason}` action shape — it is a `PromotionEmit`: the MCP-format YAML plus the metadata
+    a human opens the PR with. The proxy must stay body-agnostic; a BFF that projected
+    the action shape onto it would drop the YAML, which is the entire payload of the hop."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "REVIEWER_TOKEN", "bff-held-secret")
+    emit = {
+        "yaml": "id: bp_abc\nintent: headcount by department\nsql: SELECT 1\n",
+        "filename": "headcount-by-department.yaml",
+        "target_path": "app/corpus/data/blueprints/",
+        "suggested_branch": "learning/promote/bp_abc",
+        "commit_message": "corpus: promote learning blueprint bp_abc",
+        "note": (
+            "regenerate the corpus SHA sidecars (tools/check_corpus_parity.py --write) "
+            "in the PR"
+        ),
+    }
+    _FakeAsyncClient.payload = emit
+
+    resp = client.post("/api/inbox/candidate::abc::0/promote")
+
+    assert resp.status_code == 200
+    # Byte-for-byte the upstream object: every field, unreshaped, YAML included.
+    assert resp.json() == emit
+
+
+def test_the_optional_promote_body_rides_through_to_the_service(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """`promote` accepts `{doc_id, title}` knowledge refinements. They are the human's
+    naming of a document whose landed id is non-semantic, so they must reach the service
+    verbatim — and a bodyless promote (the normal case) must still send NO body, not a
+    `null` one."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "REVIEWER_TOKEN", "bff-held-secret")
+    body = {"doc_id": "payroll-cutoff", "title": "Payroll cutoff is the 25th"}
+
+    with_body = client.post("/api/inbox/candidate::abc::0/promote", json=body)
+    without_body = client.post("/api/inbox/candidate::abc::0/promote")
+
+    assert with_body.status_code == 200
+    assert without_body.status_code == 200
+    assert fake_httpx[0]["json"] == body
+    assert fake_httpx[1]["json"] is None
+
+
+def test_an_oversized_promote_body_is_413_before_any_hop(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """The body cap is the BFF's own resource protection and applies to EVERY body it
+    buffers — `promote` is now one of them, so it cannot be the way around the cap."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "INBOX_BODY_MAX_BYTES", 512)
+
+    resp = client.post(
+        "/api/inbox/candidate::abc::0/promote", json={"title": "x" * 2000}
+    )
+
+    assert resp.status_code == 413
+    assert fake_httpx == []
+
+
+def test_the_promotable_list_is_a_permitted_status(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """`validated` is the promotable set — auto-landed learning nodes awaiting a human
+    verify/promote. The service has listed them all along (`_LISTABLE_STATUSES`); the BFF
+    allowlist was what made them unreachable, so a reviewer could not see the queue the
+    two new verbs act on."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "REVIEWER_TOKEN", "bff-held-secret")
+
+    resp = client.get("/api/inbox", params={"status": "validated"})
+
+    assert resp.status_code == 200
+    assert fake_httpx[0]["url"].endswith("/inbox?status=validated")
+    assert fake_httpx[0]["headers"]["X-Reviewer-Token"] == "bff-held-secret"
+    assert "validated" in server._INBOX_LIST_STATUSES
+
+
+def test_the_promotion_verbs_are_gated_by_the_flag_like_every_other(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """A dormant deployment must not grow a promotion surface: the flag gate is checked
+    before the allowlist and before any body is read."""
+    monkeypatch.delenv("REVIEW_INBOX_ENABLED", raising=False)
+    assert client.post("/api/inbox/candidate::abc::0/verify").status_code == 404
+    assert (
+        client.post("/api/inbox/candidate::abc::0/promote", json={"title": "t"}).status_code
+        == 404
+    )
+    assert fake_httpx == []
+
+
+def test_the_promoted_list_is_a_permitted_status(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """`promoted` is terminal, and listable anyway: `promote` re-emits from it with no
+    status move, so the YAML behind an abandoned PR stays recoverable — but only for a
+    caller who can still find the row. With the status unlistable, that affordance
+    existed in `inbox.py` and was reachable by curl and by nothing else."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "REVIEWER_TOKEN", "bff-held-secret")
+
+    resp = client.get("/api/inbox", params={"status": "promoted"})
+
+    assert resp.status_code == 200
+    assert fake_httpx[0]["url"].endswith("/inbox?status=promoted")
+    assert fake_httpx[0]["headers"]["X-Reviewer-Token"] == "bff-held-secret"
+    assert "promoted" in server._INBOX_LIST_STATUSES
+
+
+def test_the_bff_and_service_status_allowlists_agree(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """Two allowlists, one contract. A status the BFF forwards but the service will not
+    list is a 400 the reviewer sees as an empty tab; a status the service lists but the
+    BFF blocks is a queue nobody can open — which is exactly how `validated` and
+    `promoted` stayed invisible. Pinned as an EQUALITY so neither side can drift alone."""
+    from data_agent.learning.inbox.service import _LISTABLE_STATUSES
+
+    assert set(server._INBOX_LIST_STATUSES) == set(_LISTABLE_STATUSES)

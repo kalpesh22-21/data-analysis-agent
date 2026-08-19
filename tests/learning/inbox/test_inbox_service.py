@@ -261,11 +261,56 @@ def test_reject_then_archive_list_shows_row_with_status_rejected(enabled: None) 
 
 
 def test_list_invalid_status_is_400(enabled: None) -> None:
-    """A status outside {in_review, rejected, validated} is a 400 — the inbox never
-    enumerates an arbitrary lifecycle state (defense-in-depth behind the BFF's own
-    check). `quarantined` is a real lifecycle state that is NOT listable."""
-    resp = _default_client().get("/inbox", headers=AUTH, params={"status": "quarantined"})
+    """A status outside `_LISTABLE_STATUSES` is a 400 — the inbox never enumerates an
+    arbitrary lifecycle state (defense-in-depth behind the BFF's own check).
+    `quarantined` and `retired` are real lifecycle states that are NOT listable."""
+    client = _default_client()
+    resp = client.get("/inbox", headers=AUTH, params={"status": "quarantined"})
     assert resp.status_code == 400
+    assert client.get("/inbox", headers=AUTH, params={"status": "retired"}).status_code == 400
+    # The message is derived from the allowlist, so it cannot name a stale set.
+    assert "promoted" in resp.json()["detail"]
+
+
+def test_list_status_promoted_returns_the_terminal_set_newest_first(
+    enabled: None,
+) -> None:
+    """`promoted` is terminal but NOT invisible: `promote` re-emits from it idempotently,
+    so the YAML behind an abandoned PR is recoverable — by a caller that can still FIND
+    the row. Withholding the listing left that affordance reachable by curl and by
+    nothing else. Newest-first, like the other unbounded terminal archive, because the
+    row you want back is the one you promoted most recently."""
+    store = InMemoryCandidateStore()
+    _populate(
+        store,
+        [
+            make_blueprint_candidate(status=CandidateStatus.IN_REVIEW),
+            *[
+                replace(
+                    make_blueprint_candidate(status=CandidateStatus.PROMOTED),
+                    candidate_id=f"candidate::promoted::{i}",
+                    content_hash=f"hash-promoted-{i}",
+                    created_at=f"2026-07-04T00:00:0{i}+00:00",
+                    verified=True,
+                )
+                for i in range(3)
+            ],
+        ],
+    )
+
+    resp = _client(ReviewInbox(store)).get(
+        "/inbox", headers=AUTH, params={"status": "promoted"}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 3
+    assert [i["candidate_id"] for i in body["items"]] == [
+        "candidate::promoted::2",
+        "candidate::promoted::1",
+        "candidate::promoted::0",
+    ]
+    assert all(i["status"] == "promoted" for i in body["items"])
 
 
 # --- redaction on the wire boundary (§2a: entity spans MUST be blanked) --------

@@ -130,17 +130,31 @@ UPLOAD_MAX_BYTES = int(os.environ.get("UPLOAD_MAX_BYTES", str(8 * 1024 * 1024)))
 # gated OFF unless REVIEW_INBOX_ENABLED=1 (mirrors UI_TEST_AFFORDANCES).
 INBOX_SERVICE_URL = os.environ.get("INBOX_SERVICE_URL", "http://localhost:8100")
 REVIEWER_TOKEN = os.environ.get("REVIEWER_TOKEN", "")
-# `complete` is the fail-to-review action (the reviewer fills in the missing
-# parameterization entries); it is the ONLY one that carries a request body.
-_INBOX_ACTIONS = frozenset({"approve", "reject", "retract", "complete"})
+# `verify` + `promote` are the Phase-3 promotion hop over an auto-landed VALIDATED
+# learning node: a human vouches for it (`verified=true` on the staging node), then asks
+# for the canon YAML to open a manual PR with (the service never touches git).
+_INBOX_ACTIONS = frozenset(
+    {"approve", "reject", "retract", "complete", "verify", "promote"}
+)
+# The actions that carry a request body: `complete` (the reviewer's missing
+# parameterization entries) and `promote` (OPTIONAL `{doc_id, title}` knowledge
+# refinements — a bodyless promote is the normal case). Every other action is a bare POST
+# and must stay one; see `inbox_action`.
+_INBOX_BODY_ACTIONS = frozenset({"complete", "promote"})
 # The only `?status=` values the list surface accepts (ui-inbox-type-archive contract
-# §List API): the live review queue, the durable rejected archive, and the fail-to-review
-# work list. Anything else is rejected at the BFF (400, not proxied); the inbox service
-# validates it again.
-_INBOX_LIST_STATUSES = frozenset({"in_review", "rejected", "needs_parameterization"})
-# Cap on the ONE inbox body the BFF forwards (the `complete` action's parameterization
-# entries). Small on purpose and separate from `UPLOAD_MAX_BYTES`: this is a form a human
-# types, and the largest legitimate one is a few dozen JSON objects. The reviewer is
+# §List API): the live review queue, the durable rejected archive, the promotable set of
+# auto-landed learning nodes awaiting verify/promote, the fail-to-review work list, and
+# the terminal `promoted` set — listable because `promote` re-emits from it idempotently,
+# so the YAML behind a lost PR stays recoverable by someone who can find the row.
+# Anything else is rejected at the BFF (400, not proxied); the inbox service validates it
+# again (`_LISTABLE_STATUSES`).
+_INBOX_LIST_STATUSES = frozenset(
+    {"in_review", "rejected", "validated", "needs_parameterization", "promoted"}
+)
+# Cap on the inbox bodies the BFF forwards (the `complete` action's parameterization
+# entries, the `promote` action's optional refinements). Small on purpose and separate
+# from `UPLOAD_MAX_BYTES`: these are forms a human types, and the largest legitimate one
+# is a few dozen JSON objects. The reviewer is
 # authenticated and the surface is internal, so this is not a defence against an
 # adversary — it is the same rule the upload route already follows, that no request may
 # make the BFF buffer an unbounded amount of memory on a caller's say-so.
@@ -622,18 +636,17 @@ async def inbox_page() -> FileResponse:
 async def inbox_list(status: str | None = None) -> JSONResponse:
     """Proxy the inbox list, optionally filtered by `?status=`. When absent, proxy
     exactly as before (review queue, no param). When present, validate against
-    `{in_review, rejected}` (400 on anything else — do NOT proxy) and forward it as an
+    `_INBOX_LIST_STATUSES` (400 on anything else — do NOT proxy) and forward it as an
     upstream query param (ui-inbox-type-archive contract §List API)."""
     _require_inbox_enabled()
     if status is None:
         return await _proxy_inbox("GET", "/inbox")
     if status not in _INBOX_LIST_STATUSES:
+        # Message DERIVED from the allowlist, so a status added to the set can never be
+        # accepted while the error still names the previous ones.
         raise HTTPException(
             status_code=400,
-            detail=(
-                "status must be one of {'in_review', 'rejected', "
-                "'needs_parameterization'}."
-            ),
+            detail=f"status must be one of {sorted(_INBOX_LIST_STATUSES)}.",
         )
     query = urllib.parse.urlencode({"status": status})
     return await _proxy_inbox("GET", f"/inbox?{query}")
@@ -652,24 +665,29 @@ async def inbox_action(
     _require_inbox_enabled()
     if action not in _INBOX_ACTIONS:
         raise HTTPException(status_code=404, detail="Not found.")
-    # Only `complete` carries a body. Read it here rather than typing it: the shape is
-    # the inbox service's contract (and, under it, the extractor's readers), and a model
+    # `complete` and `promote` carry a body. Read it here rather than typing it: the shape
+    # is the inbox service's contract (and, under it, the extractor's readers), and a model
     # here would reject reviewer input with a message that names no fix. What IS enforced
     # here is the size, because that is the BFF's own resource and nobody downstream can
-    # give it back.
+    # give it back. An EMPTY body stays `None` — `promote`'s refinements are optional, and
+    # the upstream route must see no body at all rather than a `null` one.
     body: Any | None = None
-    if action == "complete":
+    if action in _INBOX_BODY_ACTIONS:
         raw = await _read_bounded_body(request, INBOX_BODY_MAX_BYTES)
         if raw is None:
             raise HTTPException(
-                status_code=413, detail="Completion body exceeds the maximum allowed size."
+                status_code=413, detail="Request body exceeds the maximum allowed size."
             )
         try:
             body = json.loads(raw) if raw else None
         except ValueError:
             raise HTTPException(
-                status_code=400, detail="complete requires a JSON body."
+                status_code=400, detail=f"{action} requires a JSON body."
             ) from None
+    # The RESPONSE goes back body-agnostically through `_proxy_inbox`: `promote` answers a
+    # `PromotionEmit` (yaml + PR metadata), NOT the `{candidate_id, status, reason}` shape
+    # every other action answers. The BFF must never assume one of those two shapes.
+    #
     # Percent-encode the decoded id before re-interpolating it into the upstream path
     # (candidate ids carry `::` and could carry other reserved chars) so it is passed as
     # a single, unambiguous path segment — never able to inject extra path structure.

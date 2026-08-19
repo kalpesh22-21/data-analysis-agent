@@ -530,15 +530,15 @@ Row-count rejection happens at **analyze**, before you render a mapping UI. Uplo
 
 | Route (service) | Purpose |
 |---|---|
-| `GET /inbox?status=` | list; `status ∈ {in_review (default), rejected, validated}` |
+| `GET /inbox?status=` | list; `status ∈ {in_review (default), rejected, validated, needs_parameterization, promoted}` |
 | `GET /inbox/health` | write-plane mode |
 | `POST /inbox/{id}/approve` | `in_review → validated` (lands into the corpus) |
 | `POST /inbox/{id}/reject` | `in_review → rejected` (archived as negative signal, not deleted) |
 | `POST /inbox/{id}/retract` | `validated → retired` (pull from index) |
 | `POST /inbox/{id}/verify` | human vouches for an auto-landed node |
-| `POST /inbox/{id}/promote` | emit MCP-format YAML for a manual PR |
+| `POST /inbox/{id}/promote` | emit MCP-format YAML for a manual PR; **idempotent re-emit** when the candidate is already `promoted` (no status move) |
 
-Ordering: `rejected` lists **newest-first** (the archive is unbounded, so the limit caps old history); `in_review` and `validated` list **oldest-first** (FIFO drain). Limit is 100, not configurable, **no pagination**.
+Ordering: the terminal archives `rejected` and `promoted` list **newest-first** (they are unbounded, so the limit caps old history — and a just-promoted row is the one whose YAML you are most likely to want back); `in_review`, `validated` and `needs_parameterization` list **oldest-first** (FIFO drain). Limit is 100, not configurable, **no pagination**.
 
 ### 8.1 Objects
 
@@ -548,7 +548,7 @@ interface InboxListResponse { items: InboxItem[]; count: number }
 interface InboxItem {
   candidate_id: string;                 // e.g. "candidate::<hash>::0" — contains "::", URL-encode it in paths
   type: "blueprint" | "global_knowledge" | "user_knowledge" | "schema_edit";
-  status: "in_review" | "rejected" | "validated";
+  status: "in_review" | "rejected" | "validated" | "needs_parameterization" | "promoted";
   reason: InboxReason;                  // re-derived, never stored — cannot drift
   summary: string;                      // entity-free one-liner, already redacted
   payload_view: Record<string, unknown>;// REDACTED payload — render verbatim
@@ -608,7 +608,9 @@ interface PromotionEmit {                // POST /inbox/{id}/promote
 }
 ```
 
-`promote` optionally takes `{ "doc_id"?: string, "title"?: string }`. The service **never touches git** — a human opens the PR with the returned metadata.
+`promote` optionally takes `{ "doc_id"?: string, "title"?: string }`. The service **never touches git** — a human opens the PR with the returned metadata: write `yaml` to `target_path + filename` on `suggested_branch`, commit with `commit_message`, and do what `note` says (regenerate the corpus SHA sidecars with `tools/check_corpus_parity.py --write`). The MCP image must then be rebuilt before the promoted node is served as canon.
+
+**`promote` does not answer the action shape.** It is the one action whose success body is a `PromotionEmit`, so a proxy or client that projects `{candidate_id, status, reason}` onto every action response will drop the YAML — which is the whole payload of the hop. Keep the pass-through body-agnostic. `verify` does answer the action shape, plus `node_stamped`: `false` means the neo4j write did not land (the service fails open) and the reviewer must re-verify — surface it, do not swallow it.
 
 ### 8.2 Inbox error codes
 
@@ -636,9 +638,9 @@ If you build your own BFF, mirror these. Paths are what the shipped demo UI call
 | `POST /api/turn/resume` | runtime `POST /turn/resume` | body `{session_id, answer}` |
 | `GET /api/history?session_id=` | runtime `GET /session/history` | JSON passthrough |
 | `POST /api/query/page` | runtime `POST /query/page` | body `{session_id, sql, limit?, offset?}`; JSON passthrough. Status + body propagate, so a `400`/`403` reaches the browser unchanged |
-| `GET /api/inbox?status=` | inbox `GET /inbox` | validates `status ∈ {in_review, rejected}` → else 400 |
+| `GET /api/inbox?status=` | inbox `GET /inbox` | validates `status ∈ {in_review, rejected, validated, needs_parameterization, promoted}` → else 400 |
 | `GET /api/inbox/health` | inbox `GET /inbox/health` | |
-| `POST /api/inbox/{id}/{action}` | inbox | `action ∈ {approve, reject, retract}`; id is URL-encoded on the hop |
+| `POST /api/inbox/{id}/{action}` | inbox | `action ∈ {approve, reject, retract, complete, verify, promote}`; id is URL-encoded on the hop; `complete` and `promote` forward a JSON body (capped by `INBOX_BODY_MAX_BYTES`, 413 over it), the rest send none |
 | `POST /api/upload/analyze?session_id=` | `/scratch/v1/analyze` | **raw multipart passthrough** — do not parse the form |
 | `POST /api/upload?session_id=` | `/scratch/v1/upload` | same |
 | `POST /api/session/scope` | re-mints a narrower JWT | **test-only**; 404 unless `UI_TEST_AFFORDANCES=1`; narrows only, never widens |

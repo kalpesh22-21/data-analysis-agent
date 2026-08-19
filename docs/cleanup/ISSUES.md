@@ -148,10 +148,28 @@ id to compare), and STAGE C3's backstop no longer blames "semantic distance":
 it names `AND node.source = 'mcp'` in the recall Cypher as the reason, reports
 the miss as CORRECTLY WITHHELD / "THE GATE HELD", and flags the found-branch as
 what a trust-gate failure would look like. The SUMMARY line no longer calls the
-expected raw path "not reached". **Still open, unchanged:** the promotion hop
-(staging → canon: human verify → `verified=True` → re-source to mcp) does not
-exist, so there is no autoplay to demo. Build that and PART C can show the real
-payoff.
+expected raw path "not reached". **The "promotion hop does not exist" claim was
+wrong** (2026-08-19): the SERVICE hop has existed all along —
+`inbox/service.py` `verify` (flips `verified=true` on the staging node; source
+stays `learning`) and `promote` (emits the MCP canon YAML + PR metadata via
+`promotion/mcp_export.py`, moves the candidate to terminal `promoted`), with
+`validated` already listable. What did not exist was any way to REACH it: the
+BFF allowlists stopped at `{approve, reject, retract, complete}` /
+`{in_review, rejected, needs_parameterization}`, so no browser could call it.
+**M4-P1 exposes it**: `verify`/`promote` added to `_INBOX_ACTIONS`, `validated`
+to `_INBOX_LIST_STATUSES`, a fourth "Promotable" tab on the inbox page whose
+cards carry a verify-state badge, offer Verify + Promote, and render the returned
+YAML with a copy button. P1b also made the TERMINAL state listable (`promoted`,
+in both the service's `_LISTABLE_STATUSES` and the BFF's) behind a fifth tab
+whose one action is the service's idempotent re-emit ("Re-emit YAML"): that
+affordance existed in `inbox.py` but no list surface could return a promoted
+row, so the YAML behind an abandoned PR was recoverable by curl and nothing else.
+**Still open (by design, not a gap):** the last leg stays manual — a human takes
+the emitted YAML to a PR against the MCP corpus repo, reruns
+`tools/check_corpus_parity.py --write`, and rebuilds the mcp image before the
+node is served as canon. The inbox has no git access and is not getting any.
+PART C can demo the hop up to the emit; the autoplay it wants still needs that
+PR merged and the image rebuilt.
 
 **M1 — FIXED in T5.5 (WORKLOG #12): per-tool-call envelope rebuild feeds a branch that almost never fires.**
 `agent_loop._run_loop_body` computes the answer envelope (a

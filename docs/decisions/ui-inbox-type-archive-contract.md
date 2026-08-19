@@ -19,8 +19,17 @@ frontend-developer (`ui/static/inbox.html`). Disjoint files → parallel.
 
 - New **optional** query param `status`:
   - Allowed values: `in_review` (the default when omitted) and `rejected`.
-  - BFF validates against `{in_review, rejected}`; any other value → HTTP 400
-    (do not proxy). Service also validates defensively.
+    Later slices added three more to the same param: `needs_parameterization`
+    (the fail-to-review work list), `validated` (the **promotable** set —
+    auto-landed learning nodes awaiting a human verify/promote), and `promoted`
+    (the terminal set whose YAML can still be **re-emitted** idempotently, so a
+    lost PR is recoverable by someone who can find the row).
+  - BFF validates against `{in_review, rejected, needs_parameterization,
+    validated, promoted}` (`ui/server.py::_INBOX_LIST_STATUSES`); any other value
+    → HTTP 400 (do not proxy). Service also validates defensively
+    (`inbox/service.py::_LISTABLE_STATUSES`).
+  - Ordering: the terminal archives (`rejected`, `promoted`) list newest-first
+    so the limit caps OLD history; the work lists list oldest-first.
 - Response shape is **unchanged**: `{ "items": [ ... ], "count": <int> }`.
 - Each item gains a **`status`** field (string; here `"in_review"` or
   `"rejected"`). All existing fields stay: `candidate_id`, `type`, `reason`,
@@ -31,7 +40,17 @@ frontend-developer (`ui/static/inbox.html`). Disjoint files → parallel.
 
 ## Actions (unchanged behavior)
 
-- `POST /api/inbox/{id}/{action}`, action ∈ {approve, reject, retract}.
+- `POST /api/inbox/{id}/{action}`, action ∈ {approve, reject, retract}. Later
+  slices added `complete` (fail-to-review) and the promotion hop `verify` +
+  `promote`, both `validated`-only: `verify` flips `verified=true` on the landed
+  staging node (status does NOT move; the response's `node_stamped: false` means
+  the node write did not land and the reviewer should re-verify), and `promote`
+  returns the MCP canon YAML plus PR metadata — **not** the
+  `{candidate_id, status, reason}` action shape — and moves the candidate to
+  terminal `promoted`. A `promote` on an ALREADY-promoted candidate re-emits the
+  same YAML with no status move (idempotent recovery of a lost PR). The BFF
+  proxies the response **body-agnostically**; only `complete` and `promote` carry
+  a request body.
 - Approve/reject remain valid only on `in_review` items. Reject transitions
   `in_review → rejected` and retains the row (no write change needed).
 - In the **Archived** view the frontend hides all action buttons (terminal
@@ -45,6 +64,11 @@ frontend-developer (`ui/static/inbox.html`). Disjoint files → parallel.
   Grouping is computed client-side from `item.type` over the fetched set.
 - **Status toggle:** `Review queue` (fetch `?status=in_review`) ↔ `Archived`
   (fetch `?status=rejected`). Default = Review queue. Switching refetches.
+  Three later tabs share the toggle: `Needs parameterization`
+  (`?status=needs_parameterization`), `Promotable` (`?status=validated`, whose
+  cards carry a verify-state badge and offer Verify + Promote instead of
+  approve/reject), and `Promoted` (`?status=promoted`, whose cards offer exactly
+  one action — `promote`, labelled **Re-emit YAML**).
 - Tab counts are computed from the currently-fetched status set.
 - Archived cards show a `REJECTED` badge (`data-testid="inbox-status"`) and
   omit approve/reject/retract.
