@@ -1,0 +1,35 @@
+{{/*
+Optional persistent volume for the in-chart Redis.
+
+RETAINED ON UNINSTALL (`helm.sh/resource-policy: keep`). The reason to turn
+persistence on at all is the DEAD-LETTER stream — the record of what poisoned the
+loop — and letting `helm uninstall` delete that record is exactly the moment you
+would want to read it. The cost is that the PVC OUTLIVES the release: a
+reinstall re-attaches the old volume (usually what you want), and you must
+`kubectl delete pvc` by hand to actually reclaim the storage. Helm will also
+refuse to adopt it on a reinstall if the labels no longer match.
+
+Resizing this claim after the fact depends on the StorageClass, so size it once,
+up front — the learning stream is small (job ids, not payloads); 1Gi is generous.
+*/}}
+{{- if and .Values.redis.enabled .Values.redis.persistence.enabled }}
+{{- $r := .Values.redis -}}
+{{- $cmpArgs := dict "root" $ "component" "redis" -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "data-agent-learning.componentFullname" $cmpArgs }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "data-agent-learning.componentLabels" $cmpArgs | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- with $r.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $r.persistence.size | quote }}
+{{- end }}

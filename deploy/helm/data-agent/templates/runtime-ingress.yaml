@@ -1,24 +1,24 @@
-{{- if and .Values.uiIngress.enabled .Values.components.ui.enabled -}}
-{{- $cmpArgs := dict "root" $ "component" "ui" -}}
+{{- if and .Values.ingress.enabled .Values.components.runtime.enabled -}}
+{{- $cmpArgs := dict "root" $ "component" "runtime" -}}
 {{- $svcName := include "data-agent.componentFullname" $cmpArgs -}}
-{{- $svcPort := .Values.components.ui.service.port -}}
+{{- $svcPort := .Values.components.runtime.service.port -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ $svcName }}
   labels:
     {{- include "data-agent.componentLabels" $cmpArgs | nindent 4 }}
-  {{- with .Values.uiIngress.annotations }}
+  {{- with .Values.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  {{- with .Values.uiIngress.className }}
+  {{- with .Values.ingress.className }}
   ingressClassName: {{ . }}
   {{- end }}
-  {{- if .Values.uiIngress.tls }}
+  {{- if .Values.ingress.tls }}
   tls:
-    {{- range .Values.uiIngress.tls }}
+    {{- range .Values.ingress.tls }}
     - hosts:
         {{- range .hosts }}
         - {{ . | quote }}
@@ -33,7 +33,7 @@ spec:
     {{- end }}
   {{- end }}
   rules:
-    {{- range .Values.uiIngress.hosts }}
+    {{- range .Values.ingress.hosts }}
     - host: {{ .host | quote }}
       http:
         paths:

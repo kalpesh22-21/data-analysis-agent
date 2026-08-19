@@ -39,14 +39,11 @@ spec:
         - name: runtime
           image: {{ include "data-agent.image" (dict "root" $ "component" $c) }}
           imagePullPolicy: {{ include "data-agent.imagePullPolicy" (dict "root" $ "component" $c) }}
-          # The core agent API, same `create_app` factory as ever — but through the
-          # repo's launcher, NOT the uvicorn CLI. uvicorn re-raises the SIGTERM it
-          # captured onto the SIG_DFL it restores after `serve()` returns, so a clean
-          # rollout shutdown still exited 143 and read as a crash (ISSUES.md C3); the
-          # launcher chains that re-raise and exits 0.
+          # The core agent API. Started via uvicorn's --factory entrypoint.
           command:
-            - python
-            - scripts/run_runtime_api.py
+            - uvicorn
+            - data_agent.runtime.app:create_app
+            - --factory
             - --host
             - "0.0.0.0"
             - --port
@@ -59,8 +56,8 @@ spec:
               protocol: TCP
           envFrom:
             {{- include "data-agent.envFrom" $ | nindent 12 }}
-          {{- with concat (.Values.env | default list) ($c.env | default list) }}
           env:
+          {{- with concat (.Values.env | default list) ($c.env | default list) }}
             {{- toYaml . | nindent 12 }}
           {{- end }}
           # READINESS gates on the graph: GET /ready is unauthenticated and returns 200

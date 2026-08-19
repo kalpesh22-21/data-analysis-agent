@@ -98,6 +98,8 @@ config:
   RUNTIME_URL: ""
 
 # ---- Secrets: reference a Secret you created out-of-band ----
+# The chart renders NO Secret at all, so this step is mandatory, not a hardening
+# upgrade — the pods wedge in CreateContainerConfigError until the Secret exists.
 # Create it first, e.g.:
 #   kubectl create secret generic data-agent-secrets \
 #     --from-literal=OPENAI_API_KEY=... \
@@ -107,7 +109,8 @@ config:
 #     --from-literal=TOKEN_ISSUER_API_KEY=... \
 #     --from-literal=EMBEDDING_API_KEY=... \
 #     --from-literal=RERANKER_API_KEY=...
-# The chart-managed Secret is NOT rendered when existingSecret is set.
+# Leaving `existingSecret` empty does not make the chart create one; it just makes
+# the pods look for `<release>-data-agent-secret` instead.
 #
 # Point the data-agent-learning release at this SAME Secret (it needs
 # COUCHBASE_PASSWORD / NEO4J_PASSWORD / TOKEN_ISSUER_API_KEY / EMBEDDING_API_KEY
@@ -160,7 +163,14 @@ components:
         memory: 1Gi
 
 # ---- Expose the agent UI via Ingress + TLS ----
-ingress:
+# This is the BROWSER-facing door (`uiIngress` -> the ui Service). The BFF mints
+# the warehouse token server-side, so anyone who reaches this host is an agent
+# user — put your human authn (OIDC / forward-auth / IP allowlist) in the
+# annotations. The cluster-issuer annotation below does NOT provision a
+# certificate on its own — cert-manager's ingress-shim needs the `tls[].secretName`
+# to write the issued certificate into. Drop that key only if you want the ingress
+# controller's default certificate instead.
+uiIngress:
   enabled: true
   className: nginx
   annotations:
@@ -172,6 +182,29 @@ ingress:
         - path: /
           pathType: Prefix
   tls:
-    - secretName: data-agent-tls
-      hosts:
+    - hosts:
         - data-agent.acme.com
+      # cert-manager writes the issued certificate here (created by the shim).
+      secretName: data-agent-tls
+
+# ---- Optional: also expose the RUNTIME API ----
+# `ingress` (no prefix) fronts the runtime Service, not the UI. Leave it off
+# unless something OUTSIDE the cluster has to call the agent API directly — the
+# UI reaches the runtime in-cluster and needs none of this. Every route behind it
+# is authenticated by the runtime's own JWT validation (JWKS_URL / JWT_ISSUER /
+# JWT_AUDIENCE), so this publishes an authenticated API, not an open one.
+# ingress:
+#   enabled: true
+#   className: nginx
+#   annotations:
+#     cert-manager.io/cluster-issuer: letsencrypt-prod
+#     nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+#   hosts:
+#     - host: data-agent-api.acme.com
+#       paths:
+#         - path: /
+#           pathType: Prefix
+#   tls:
+#     - hosts:
+#         - data-agent-api.acme.com
+#       secretName: data-agent-api-tls

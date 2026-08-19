@@ -22,7 +22,7 @@ import asyncio
 import logging
 
 from data_agent.daemon import run_daemon
-from data_agent.learning.config import LearningSettings
+from data_agent.learning.config import get_learning_settings
 from data_agent.learning.entrypoint import configure_daemon_process
 from data_agent.learning.redis_queue import RedisStreamsLearningQueue
 from data_agent.learning.sweeper import LearningSweeper
@@ -50,7 +50,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 async def _main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     runtime_settings = get_runtime_settings()
-    learning_settings = LearningSettings()
+    learning_settings = get_learning_settings()
     tracer = configure_daemon_process("sweeper", learning_settings, _logger)
 
     store = CouchbaseSessionStore(runtime_settings)

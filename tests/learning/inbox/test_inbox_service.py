@@ -463,6 +463,9 @@ def test_shipped_offline_construction_refuses_landing_approve_503(
     monkeypatch.setattr(
         "data_agent.learning.config.LearningSettings",
         lambda: SimpleNamespace(
+            # `get_learning_settings()` builds through `load_learning_settings_from_vault()`,
+            # which reads this first and returns the env-built object untouched when False.
+            vault_enabled=False,
             learning_candidates_username="",
             learning_candidates_password="",
             learning_corpus_username="",

@@ -23,8 +23,10 @@ backing infrastructure.
 > that *contains* `data-agent-learning` (e.g. `data-agent-learning-prod`). Helm's
 > fullname rule collapses `<release>-<chart>` to just `<release>` when the release
 > already contains the chart name, so such a release would render Chart A's
-> ServiceAccount, ConfigMap, Secret and test Pod under exactly the names Chart B
-> uses — a silent collision between the two releases.
+> ServiceAccount, ConfigMap and test Pod under exactly the names Chart B uses —
+> a silent collision between the two releases. (It would also point both releases
+> at the same `<fullname>-secret`, which is harmless when that is what you
+> intended and confusing when it is not.)
 
 ## Workloads
 
@@ -32,8 +34,8 @@ backing infrastructure.
 
 | Component | Kind | Command | Service | Scales? |
 |---|---|---|---|---|
-| `runtime` | Deployment | `python scripts/run_runtime_api.py --host 0.0.0.0 --port 8000` | ClusterIP :8000 | yes (HPA) |
-| `ui` | Deployment | `python scripts/run_ui_bff.py --host 0.0.0.0 --port 3000` | ClusterIP :3000 (+ optional Ingress) | yes |
+| `runtime` | Deployment | `uvicorn data_agent.runtime.app:create_app --factory --host 0.0.0.0 --port 8000` | ClusterIP :8000 (+ optional Ingress, `ingress`) | yes (HPA) |
+| `ui` | Deployment | `uvicorn ui.server:app --host 0.0.0.0 --port 3000` | ClusterIP :3000 (+ optional Ingress, `uiIngress`) | yes |
 | `hydrator` | Deployment | `python scripts/run_hydrator.py` | none | **no — pinned to 1** |
 
 ### Chart B — `data-agent-learning` (offline)
@@ -43,14 +45,22 @@ backing infrastructure.
 | `learning-sweeper` | Deployment | `python scripts/run_learning_sweeper.py` | none | **no — pinned to 1** |
 | `learning-consumer` | Deployment | `python scripts/run_learning_consumer.py` | none | yes (HPA) |
 | `learning-scheduler` | Deployment | `python scripts/run_learning_scheduler.py` | none | **no — pinned to 1** |
-| `inbox` | Deployment | `python scripts/run_inbox_service.py` | ClusterIP :8100 | yes |
-| `inbox-ui` | Deployment | `python scripts/run_ui_bff.py --host 0.0.0.0 --port 3000` | ClusterIP :3000 (+ optional Ingress) | yes |
+| `inbox` | Deployment | `uvicorn data_agent.learning.inbox.service:create_inbox_app --factory --host 0.0.0.0 --port 8100` | ClusterIP :8100 | yes |
+| `inbox-ui` | Deployment | `uvicorn ui.server:app --host 0.0.0.0 --port 3000` | ClusterIP :3000 (+ optional Ingress, `uiIngress`) | yes |
+| `redis` | Deployment | `redis-server` (+ `--appendonly yes` when persistence is on) | ClusterIP :6379 | **no — pinned to 1** |
 
-`learning-sweeper`, `learning-scheduler` and `hydrator` are pinned to one replica
-**in the template** (no `replicaCount` knob): a second sweeper double-enqueues, a
-second scheduler double-promotes the same candidate, and a second hydrator races
-the destructive graph rebuild. Only `runtime`, `ui`, `learning-consumer`, `inbox`
-and `inbox-ui` are horizontally scalable.
+The three background daemons keep `python scripts/run_*.py`: they are not HTTP
+servers, and those scripts carry the shared learning-daemon startup preamble.
+
+`learning-sweeper`, `learning-scheduler`, `redis` and `hydrator` are pinned to one
+replica **in the template** (no `replicaCount` knob): a second sweeper
+double-enqueues, a second scheduler double-promotes the same candidate, a second
+redis is a second independent stream behind one Service, and a second hydrator
+races the destructive graph rebuild. Only `runtime`, `ui`, `learning-consumer`,
+`inbox` and `inbox-ui` are horizontally scalable.
+
+`redis` is the one backing service either chart deploys — see
+[External dependencies](#external-dependencies--not-deployed-by-either-chart).
 
 ### One app, two UIs
 
@@ -128,10 +138,16 @@ working on the wrong rows.
 5. **MCP + token service.** Both planes call the same MCP and mint from the same
    IdP: `MCP_URL`, `TOKEN_SERVICE_URL`, `TOKEN_ISSUER_API_KEY`.
 
-### Recommended: one Secret for both releases
+### The Secret is out-of-band — and one Secret can serve both releases
 
-Create **one** Secret out-of-band containing the union of both charts' keys and
-set `secrets.existingSecret` to it in **both** releases. `COUCHBASE_PASSWORD`,
+**Neither chart renders a Secret.** Create it yourself (vault / external-secrets /
+sealed-secrets / `kubectl create secret`) and either name it
+`<release>-<chart>-secret` or point `secrets.existingSecret` at it. It must exist
+**before** the pods start: `envFrom` against a missing Secret leaves them wedged
+in `CreateContainerConfigError`, which looks like a scheduling problem and is not.
+
+The recommended shape is **one** Secret containing the union of both charts' keys,
+referenced from both releases. `COUCHBASE_PASSWORD`,
 `NEO4J_PASSWORD`, `TOKEN_ISSUER_API_KEY` and `EMBEDDING_API_KEY` authenticate the
 same identity in both planes; two hand-maintained Secrets drift, and per point 2
 above the drift has no symptom. Unused keys in a shared Secret are harmless —
@@ -157,17 +173,25 @@ kubectl create secret generic data-agent-secrets \
   --from-literal=REVIEWER_TOKEN=...
 ```
 
-> **Rotation caveat (existingSecret).** Secrets are injected as environment
-> variables via `envFrom`, which Kubernetes does not live-update. Each chart's
-> `checksum/secret` annotation only hashes its own chart-managed Secret, so it
-> cannot detect changes to an external `existingSecret`. After rotating one you
-> must restart the workloads manually, e.g.
-> `kubectl rollout restart deploy -l app.kubernetes.io/instance=<release>`.
+> **Rotation caveat.** Secrets are injected as environment variables via
+> `envFrom`, which Kubernetes does not live-update. **Neither chart renders a
+> Secret**, so neither can hash one: there is no `checksum/secret` annotation and
+> a rotation triggers no rollout. Restart the workloads manually after rotating:
+>
+> ```bash
+> # Chart A
+> kubectl rollout restart deploy -l app.kubernetes.io/instance=<release>
+> # Chart B — exclude redis: it mounts none of this, and restarting it drops the
+> # job stream on the emptyDir default.
+> kubectl rollout restart deploy \
+>   -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component!=redis
+> ```
 
 ## Config split
 
-Each chart renders its **own** ConfigMap + Secret, `envFrom`-mounted into every
-one of its workloads, and each supports `secrets.existingSecret`.
+Each chart renders its **own** ConfigMap, `envFrom`-mounted into every one of its
+workloads, alongside the out-of-band Secret named by `secrets.existingSecret` (or
+the conventional `<fullname>-secret`). **Neither chart renders the Secret.**
 
 | Chart A only | Chart B only | Both (must agree) |
 |---|---|---|
@@ -206,19 +230,36 @@ Provision separately and supply endpoints via `config`, credentials via
 - **OpenAI** (or compatible) — `OPENAI_*` *(A)*, `LEARNING_EXTRACTOR_*` *(B)*
 - **Couchbase** — session bucket *(both)*, learning audit/candidates/corpus buckets *(B)*
 - **Neo4j** — `NEO4J_URL`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` *(both)*
-- **Redis** — `LEARNING_REDIS_URL` *(B only — the agent never touches it)*
 - **Embedding API** — `EMBEDDING_API_URL` *(both)*; **reranker** — `RERANKER_API_URL` *(A)*
 
 No subcharts are bundled for any of these on purpose.
+
+**Redis is the exception — Chart B deploys it.** The learning job stream is the
+learning plane's private transport (the agent never touches it), so chart B ships
+a single-replica Redis of its own under the `redis` values block, on by default,
+and derives `LEARNING_REDIS_URL` from its ClusterIP Service. It is
+**unauthenticated** and in-cluster only: anything that can reach that Service can
+read or drain the stream, so fence it with a NetworkPolicy on a shared cluster.
+Storage is an `emptyDir` unless `redis.persistence.enabled=true` — pending jobs
+survive a restart anyway (the sweeper re-enqueues idle sessions), but the
+consumer group's in-flight PEL and the **dead-letter stream** do not.
+
+To use an external Redis instead: set `redis.enabled=false` **and**
+`config.LEARNING_REDIS_URL` to its URL. A non-empty `LEARNING_REDIS_URL` always
+wins over the in-chart Service, so you can cut over before tearing the in-chart
+one down (drain the old stream first — in-flight jobs do not migrate).
 
 ## Prerequisites
 
 - Kubernetes >= 1.24, Helm 3+.
 - The external services above, reachable from the cluster.
 - A built + pushed application image (see below).
-- (Production) a pre-created Secret, referenced via `secrets.existingSecret` in
-  both releases.
-- (Optional) an Ingress controller + cert-manager if you enable either Ingress.
+- **A pre-created Secret per release** — named `<release>-<chart>-secret` or
+  referenced via `secrets.existingSecret`. This is **required, not a production
+  hardening step**: neither chart renders a Secret, and pods wedge in
+  `CreateContainerConfigError` until it exists. One Secret may serve both
+  releases; see [the Secret section](#the-secret-is-out-of-band--and-one-secret-can-serve-both-releases).
+- (Optional) an Ingress controller + cert-manager if you enable any Ingress.
 
 ## Build and push the image
 
@@ -259,7 +300,121 @@ Turning the learning plane off is `helm uninstall data-agent-learning` (or
 `LEARNING_ENABLED=false`, which every learning daemon re-reads each cycle without
 a restart). Neither affects the agent.
 
-### Migrating from the combined chart (0.1.0)
+## Upgrading from a chart-managed Secret
+
+Four breaking changes landed together. Read all four **before** upgrading an
+existing release — each one is quiet at upgrade time and loud later.
+
+### 1. The chart-managed Secret is gone (both charts)
+
+Both charts used to render `<fullname>-secret` from `secrets.data` whenever
+`secrets.existingSecret` was empty. That template is **deleted**. `secrets.data`
+no longer exists, and values you leave under it are silently ignored.
+
+The pods still `envFrom` the *same name*. So on upgrade:
+
+1. Helm garbage-collects the Secret it owned, because the release no longer
+   renders it.
+2. **Running pods keep working.** Env vars were injected at container start and
+   Kubernetes does not live-update them, so nothing breaks immediately.
+3. The next restart — a node drain, an HPA scale-up, an image bump, any rollout —
+   wedges the new pod in `CreateContainerConfigError`, referencing a Secret that
+   no longer exists. The failure lands hours or days after the change that caused
+   it, on whichever pod happened to churn first.
+
+You **cannot** simply pre-create a Secret under the old name: while the old one
+still exists it is helm-owned, and a same-named object will collide (`kubectl
+create` fails as already-existing; a later `helm upgrade` may refuse to adopt it
+for lacking the ownership metadata). Do one of these instead:
+
+```bash
+# PREFERRED — create a NEW, differently-named Secret first, then point the
+# release at it in the same upgrade that drops the old one.
+kubectl create secret generic data-agent-secrets --namespace data-agent \
+  --from-literal=OPENAI_API_KEY=... # ...all keys, see the Secret section above
+
+helm upgrade data-agent deploy/helm/data-agent \
+  --namespace data-agent -f <your-values.yaml> \
+  --set secrets.existingSecret=data-agent-secrets
+```
+
+```bash
+# ALTERNATIVE — keep the conventional name. Recreate it IMMEDIATELY after the
+# upgrade, before any pod churn. The window between the two commands is a window
+# in which any restart wedges.
+helm upgrade data-agent deploy/helm/data-agent \
+  --namespace data-agent -f <your-values.yaml>
+kubectl create secret generic <release>-data-agent-secret \
+  --namespace data-agent --from-literal=...
+```
+
+Then confirm, for each release, before you walk away:
+
+```bash
+kubectl --namespace data-agent get secret <the-name-envFrom-references>
+```
+
+Because the chart can no longer inspect the Secret, its NOTES can no longer warn
+you about a missing `MCP_SERVICE_KEY`, `REVIEWER_TOKEN` or
+`LEARNING_EXTRACTOR_API_KEY` — each of which fails *silently* (hydrator refuses to
+start; inbox 503s every route; extractor stays dormant). Verifying key presence is
+now yours.
+
+### 2. `ingress` was repurposed in Chart A (data-agent)
+
+`ingress` now publishes the **runtime API**; the agent UI moved to `uiIngress`.
+The keys were not renamed for you, so an existing values file that sets `ingress`
+for the UI will, after upgrade, **publish the runtime API on the UI's hostname**
+and stop publishing the UI. The rendered Ingress name changes too
+(`<release>-data-agent-ui` → `<release>-data-agent-runtime`).
+
+Move your old UI block verbatim to `uiIngress`, and only add an `ingress` block if
+you actually want the API published. Chart A's NOTES now prints a warning whenever
+`ingress.enabled` is true, saying which surface it publishes.
+
+### 3. `ingress` → `uiIngress` in Chart B (data-agent-learning)
+
+The reviewer-UI Ingress reads `uiIngress` instead of `ingress`. Nothing else took
+over the old key, so a stale `ingress` block is **silently ignored** and the
+release renders no Ingress at all — the reviewer UI simply stops being reachable
+from outside the cluster (the Service is still there to port-forward to). Rename
+the block; the shape is unchanged.
+
+In both charts `tls[].secretName` is now **optional** rather than required. Omit
+it to use the ingress controller's default certificate; keep it for a BYO
+certificate or when cert-manager's ingress-shim must provision one — the shim
+needs a `secretName` to write into, and a `cluster-issuer` annotation alone
+provisions nothing.
+
+### 4. Redis default flip (Chart B)
+
+`config.LEARNING_REDIS_URL` used to default to the literal `redis://redis:6379/0`
+and now defaults to `""`, meaning *derive from the in-chart Redis*, which
+`redis.enabled` turns on by default. A release that relied on the old default
+therefore **rolls onto a brand-new, empty in-chart Redis** on upgrade. The old
+Redis keeps running, untouched and unread; every job pending in it and the whole
+**dead-letter stream** are orphaned there.
+
+Pick one, deliberately:
+
+```bash
+# Keep the external Redis you already had.
+helm upgrade data-agent-learning deploy/helm/data-agent-learning \
+  --namespace data-agent -f <your-values.yaml> \
+  --set redis.enabled=false \
+  --set config.LEARNING_REDIS_URL=redis://redis:6379/0
+```
+
+To *move* to the in-chart Redis instead, drain first: set `LEARNING_ENABLED=false`
+(every daemon re-reads it each cycle, no restart needed), let the consumers finish
+the pending stream, copy anything you still want out of the dead-letter stream,
+then upgrade and re-enable. In-flight jobs do not migrate.
+
+Also note the in-chart Redis is **unauthenticated** ClusterIP, and its PVC (when
+`redis.persistence.enabled=true`) is annotated `helm.sh/resource-policy: keep`, so
+it survives `helm uninstall` and must be deleted by hand to reclaim storage.
+
+## Migrating from the combined chart (0.1.0)
 
 If you are running the old single `data-agent` release that carried the learning
 workloads, **order matters**:
@@ -279,11 +434,21 @@ Doing it in the other order runs **two sweepers and two promotion schedulers
 concurrently** — the exact double-enqueue / double-promote the single-replica
 pinning exists to prevent, and neither copy knows about the other.
 
-The gap between the two steps is safe: the Redis stream and its consumer-group
-offsets are external state that survives both releases, so jobs enqueued before
-the upgrade are still pending when the new consumers join. Candidates already in
-the inbox live in Couchbase and are likewise untouched. The only cost of a long
-gap is latency.
+The gap between the two steps is safe **only if the Redis stream outlives both
+releases** — which is no longer automatic. Candidates already in the inbox live in
+Couchbase and are untouched either way, but the job stream now depends on how you
+configure Redis:
+
+- **External Redis** (`redis.enabled=false` + `config.LEARNING_REDIS_URL`) — the
+  stream and its consumer-group offsets are external state, so jobs enqueued
+  before the upgrade are still pending when the new consumers join. The only cost
+  of a long gap is latency.
+- **In-chart Redis** (the default) — the stream belongs to the learning release.
+  A `helm uninstall` takes it with them, and with the default `emptyDir` even a
+  pod restart empties it. Pending jobs come back on their own (the sweeper
+  re-enqueues idle sessions); the **dead-letter stream does not**. Set
+  `redis.persistence.enabled=true` before a migration you care about, and read
+  [Redis default flip](#4-redis-default-flip-chart-b) below.
 
 ## Per-component overrides
 

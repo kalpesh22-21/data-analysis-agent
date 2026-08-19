@@ -16,19 +16,22 @@ Workloads enabled in this release:
 {{- if .Values.components.inboxUi.enabled }}
   - inbox-ui           (reviewer UI, Service on :{{ .Values.components.inboxUi.service.port }})
 {{- end }}
+{{- if .Values.redis.enabled }}
+  - redis              (in-chart job stream, 1 replica, Service on :{{ .Values.redis.service.port }})
+{{- end }}
 
 {{- if .Values.components.inboxUi.enabled }}
 
 Reach the reviewer UI:
-{{- if .Values.ingress.enabled }}
-{{- range .Values.ingress.hosts }}
+{{- if .Values.uiIngress.enabled }}
+{{- range .Values.uiIngress.hosts }}
 {{- $host := .host }}
 {{- /* `first` on a nil/empty `paths` panics, and the panic ERRORS the whole
        install — a host entry with no paths is odd but not a reason to fail.
        Guard the LIST first, then take its head. */}}
 {{- with .paths }}
 {{- with first . }}
-  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host }}{{ .path }}
+  http{{ if $.Values.uiIngress.tls }}s{{ end }}://{{ $host }}{{ .path }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -52,20 +55,59 @@ release — a mismatch produces no error, only a loop that learns from nothing o
 verifies against somebody else's rows.
 
 The external backing services (ClickHouse, MCP, token IdP, OpenAI, Couchbase,
-Neo4j, Redis, embedding API) are NOT deployed by this chart.
-{{- if and (not .Values.secrets.existingSecret) (not .Values.secrets.data.REVIEWER_TOKEN) }}
+Neo4j, embedding API) are NOT deployed by this chart.
+{{- if .Values.redis.enabled }}
 
-WARNING: REVIEWER_TOKEN is EMPTY. It is the ONLY credential guarding the inbox
-routes, and the service FAILS CLOSED without it: every route answers 503, so the
-reviewer UI shows an error page and NOTHING can be approved or rejected. Set
-secrets.data.REVIEWER_TOKEN (or provide REVIEWER_TOKEN via existingSecret).
-{{- end }}
-{{- if and (not .Values.secrets.existingSecret) (not .Values.secrets.data.LEARNING_EXTRACTOR_API_KEY) }}
+Redis IS deployed by this chart — the learning job stream is this plane's private
+transport. LEARNING_REDIS_URL is derived for you:
 
-WARNING: LEARNING_EXTRACTOR_API_KEY is EMPTY. The consumer will start, drain the
-job stream and extract NOTHING (the extractor stays dormant by design rather than
-crash-looping). No candidate will ever reach the inbox.
+  {{ include "data-agent-learning.redisUrl" . }}
+
+It is UNAUTHENTICATED and ClusterIP: anything that can reach that Service can
+read or drain the stream. Restrict it with a NetworkPolicy on a shared cluster.
+{{- if not .Values.redis.persistence.enabled }}
+Storage is an emptyDir — a restart loses in-flight (PEL) jobs and the DEAD-LETTER
+stream. Pending work returns on its own (the sweeper re-enqueues idle sessions);
+the triage record does not. Set redis.persistence.enabled=true to keep it.
 {{- end }}
+
+To use an EXTERNAL Redis instead: set redis.enabled=false AND
+config.LEARNING_REDIS_URL to its URL.
+{{- else }}
+
+Redis is NOT deployed by this release (redis.enabled=false). The workloads are
+using LEARNING_REDIS_URL={{ include "data-agent-learning.redisUrl" . }}
+{{- if not .Values.config.LEARNING_REDIS_URL }}
+
+WARNING: that URL is the chart's last-resort FALLBACK, not something you
+configured. Set config.LEARNING_REDIS_URL to your external Redis, or re-enable
+redis.enabled — otherwise the sweeper and consumer will fail to connect.
+{{- end }}
+{{- end }}
+
+This chart renders NO Secret. Every workload mounts
+`{{ include "data-agent-learning.secretName" . }}` via envFrom; create it out-of-band
+(vault / external-secrets / sealed-secrets) with COUCHBASE_PASSWORD,
+NEO4J_PASSWORD, TOKEN_ISSUER_API_KEY, EMBEDDING_API_KEY,
+LEARNING_EXTRACTOR_API_KEY, LEARNING_AUDIT_PASSWORD,
+LEARNING_CANDIDATES_PASSWORD, LEARNING_CORPUS_PASSWORD and REVIEWER_TOKEN.
+Verify it exists — a missing Secret wedges the pods in
+CreateContainerConfigError rather than failing loudly:
+
+  kubectl --namespace {{ .Release.Namespace }} get secret {{ include "data-agent-learning.secretName" . }}
+
+Two keys are worth checking by hand, because their absence is SILENT rather than
+fatal: REVIEWER_TOKEN (unset ⇒ every inbox route answers 503 and nothing can be
+approved or rejected) and LEARNING_EXTRACTOR_API_KEY (unset ⇒ the consumer starts,
+drains the job stream and extracts NOTHING; no candidate ever reaches the inbox).
+
+Rotating a key in that Secret does NOT restart the pods — the chart cannot see its
+contents, so there is no checksum to change. Roll them yourself — and EXCLUDE the
+redis component, which mounts none of this and whose restart would drop the job
+stream on the emptyDir default:
+
+  kubectl --namespace {{ .Release.Namespace }} rollout restart deploy \
+    -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component!=redis
 {{- if not (and .Values.config.TENANT_CLIENT_CODE .Values.config.TENANT_PROC_CENTER .Values.config.TENANT_JTI) }}
 
 NOTE: one or more TENANT_* claims are blank, so the promotion write plane is in
@@ -76,8 +118,8 @@ release) to activate it.
 {{- end }}
 {{- if not .Values.secrets.existingSecret }}
 
-WARNING: you are using the chart-managed Secret with inline values. For
-production, create a Secret out-of-band and set `secrets.existingSecret` —
-ideally the SAME one the data-agent release uses, so the shared Couchbase/Neo4j
-credentials and the tenant identity cannot drift between the two planes.
+NOTE: `secrets.existingSecret` is unset, so the workloads reference the
+conventional name above. Pointing it at the SAME Secret the data-agent release
+uses is the recommended posture — the shared Couchbase/Neo4j credentials and the
+tenant identity they authenticate then cannot drift between the two planes.
 {{- end }}

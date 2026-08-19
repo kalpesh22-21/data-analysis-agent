@@ -1,0 +1,113 @@
+{{/*
+The learning plane's OWN Redis: the transport between the sweeper (producer) and
+the consumer group, plus the dead-letter stream. The agent never touches it.
+
+UNAUTHENTICATED. There is no `requirepass` here, and the Service is ClusterIP, so
+the only thing standing between this Redis and the rest of the cluster is the
+network. Anything that can reach the Service can read the job stream — which
+carries session ids, not transcripts, but is still enough to enqueue or drain
+work. Fence it with a NetworkPolicy if your cluster is shared.
+
+NO envFrom. Deliberately: every other workload in this chart mounts the shared
+ConfigMap + Secret, and mounting them here would hand a third-party image the
+whole plane's credentials for nothing (redis-server reads none of them, but a
+compromise or a debug shell would).
+*/}}
+{{- if .Values.redis.enabled }}
+{{- $r := .Values.redis -}}
+{{- $cmpArgs := dict "root" $ "component" "redis" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "data-agent-learning.componentFullname" $cmpArgs }}
+  labels:
+    {{- include "data-agent-learning.componentLabels" $cmpArgs | nindent 4 }}
+spec:
+  # Fixed single replica: Streams state lives here, do not scale. A second replica
+  # is a second, independent Redis behind the same Service — jobs would land in one
+  # and be consumed from the other at random. No replicaCount knob by design.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "data-agent-learning.componentSelectorLabels" $cmpArgs | nindent 6 }}
+  # Recreate, not rolling: with persistence on there is ONE RWO volume and a second
+  # pod could not mount it; with persistence off a rolling update would briefly run
+  # two empty Redises behind one Service.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      {{- with $r.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "data-agent-learning.componentSelectorLabels" $cmpArgs | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "data-agent-learning.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      securityContext:
+        {{- toYaml (mergeOverwrite (deepCopy .Values.podSecurityContext) ($r.podSecurityContext | default dict)) | nindent 8 }}
+      containers:
+        - name: redis
+          image: "{{ $r.image.repository }}:{{ $r.image.tag }}"
+          imagePullPolicy: {{ $r.image.pullPolicy }}
+          command:
+            - redis-server
+            {{- if $r.persistence.enabled }}
+            # AOF only makes sense on a real volume; on the emptyDir default it
+            # would just write a journal that dies with the pod.
+            - --appendonly
+            - "yes"
+            {{- end }}
+          securityContext:
+            {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) ($r.securityContext | default dict)) | nindent 12 }}
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          # TCP probes: redis-server accepts connections or it does not. A PING via
+          # `exec` would need a shell in the image and buys nothing here.
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml $r.resources | nindent 12 }}
+          volumeMounts:
+            # Redis writes its dump/AOF here. The global podSecurityContext's
+            # fsGroup (10001) is what makes the volume writable for the non-root
+            # uid the container runs as.
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          {{- if $r.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "data-agent-learning.componentFullname" $cmpArgs }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with (default .Values.nodeSelector $r.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.affinity $r.affinity) }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.tolerations $r.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

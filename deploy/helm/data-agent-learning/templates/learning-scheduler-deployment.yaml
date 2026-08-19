@@ -54,8 +54,8 @@ spec:
             {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) ($c.securityContext | default dict)) | nindent 12 }}
           envFrom:
             {{- include "data-agent-learning.envFrom" $ | nindent 12 }}
-          {{- with concat (.Values.env | default list) ($c.env | default list) }}
           env:
+          {{- with concat (.Values.env | default list) ($c.env | default list) }}
             {{- toYaml . | nindent 12 }}
           {{- end }}
           # No HTTP server -> no readiness/liveness HTTP probe. The Deployment

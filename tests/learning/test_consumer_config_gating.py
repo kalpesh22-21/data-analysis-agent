@@ -109,7 +109,7 @@ def _fake_runtime_settings() -> SimpleNamespace:
 
 def _patch(module, *, learning_settings, user_config, captured):
     module.get_runtime_settings = lambda: _fake_runtime_settings()
-    module.LearningSettings = lambda: learning_settings
+    module.get_learning_settings = lambda: learning_settings
     module.UserKnowledgeStoreConfig = lambda: user_config
     module.configure_learning_tracing = lambda **k: object()
     module.set_global_tracer_provider = lambda p: None

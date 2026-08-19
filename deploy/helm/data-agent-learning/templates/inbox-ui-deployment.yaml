@@ -37,16 +37,14 @@ spec:
         - name: inbox-ui
           image: {{ include "data-agent-learning.image" (dict "root" $ "component" $c) }}
           imagePullPolicy: {{ include "data-agent-learning.imagePullPolicy" (dict "root" $ "component" $c) }}
-          # The reviewer UI is the SAME `ui/server.py` app the data-agent chart runs as
-          # its agent UI — one image, one entrypoint (`scripts/run_ui_bff.py`, which
-          # exits 0 on a rollout's SIGTERM instead of 143 — ISSUES.md C3), zero
-          # application changes. What makes this copy the REVIEWER surface is the env
-          # below: REVIEW_INBOX_ENABLED=1 un-404s GET /inbox + /api/inbox/*, and
-          # INBOX_SERVICE_URL (ConfigMap, derived from this release's inbox Service)
-          # points the proxy at the inbox.
+          # The reviewer UI is the SAME `ui/server.py` app the data-agent chart runs
+          # as its agent UI — one image, zero application changes. What makes this
+          # copy the REVIEWER surface is the env below: REVIEW_INBOX_ENABLED=1
+          # un-404s GET /inbox + /api/inbox/*, and INBOX_SERVICE_URL (ConfigMap,
+          # derived from this release's inbox Service) points the proxy at the inbox.
           command:
-            - python
-            - scripts/run_ui_bff.py
+            - uvicorn
+            - ui.server:app
             - --host
             - "0.0.0.0"
             - --port

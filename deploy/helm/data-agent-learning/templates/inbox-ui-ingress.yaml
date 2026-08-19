@@ -6,38 +6,43 @@ The pod behind it runs the whole `ui/server.py` app, so the agent-chat routes
 EXIST on it — they are simply not routed here. This path list is the fence: it
 defaults to the inbox surface only (`/inbox` + `/api/inbox`), so publishing the
 reviewer UI does not publish a second, unintended door into the agent. Widening
-`ingress.hosts[].paths` (e.g. to `/`) opens that door; see values.yaml.
+`uiIngress.hosts[].paths` (e.g. to `/`) opens that door; see values.yaml.
 */}}
-{{- if and .Values.ingress.enabled .Values.components.inboxUi.enabled -}}
+{{- if and .Values.uiIngress.enabled .Values.components.inboxUi.enabled -}}
 {{- $cmpArgs := dict "root" $ "component" "inbox-ui" -}}
 {{- $svcName := include "data-agent-learning.componentFullname" $cmpArgs -}}
-{{- $svcPort := .Values.components.inboxUi.service.port -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ $svcName }}
   labels:
     {{- include "data-agent-learning.componentLabels" $cmpArgs | nindent 4 }}
-  {{- with .Values.ingress.annotations }}
+  {{- with .Values.uiIngress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  {{- with .Values.ingress.className }}
+  {{- with .Values.uiIngress.className }}
   ingressClassName: {{ . }}
   {{- end }}
-  {{- if .Values.ingress.tls }}
+  {{- if .Values.uiIngress.tls }}
   tls:
-    {{- range .Values.ingress.tls }}
+    {{- range .Values.uiIngress.tls }}
     - hosts:
         {{- range .hosts }}
         - {{ . | quote }}
         {{- end }}
-      secretName: {{ .secretName }}
+      {{- /* OPTIONAL. Omit secretName to use the ingress controller's default
+             certificate; set it for a BYO cert, or to name the Secret
+             cert-manager's ingress-shim should create from the cluster-issuer
+             annotation (the shim needs a name to write to). */}}
+      {{- with .secretName }}
+      secretName: {{ . }}
+      {{- end }}
     {{- end }}
   {{- end }}
   rules:
-    {{- range .Values.ingress.hosts }}
+    {{- range .Values.uiIngress.hosts }}
     - host: {{ .host | quote }}
       http:
         paths:
@@ -48,7 +53,7 @@ spec:
               service:
                 name: {{ $svcName }}
                 port:
-                  number: {{ $svcPort }}
+                  name: http
           {{- end }}
     {{- end }}
 {{- end }}

@@ -125,12 +125,16 @@ Name of the shared ConfigMap holding non-secret env.
 
 {{/*
 Name of the Secret that pods should reference in envFrom.
-When `secrets.existingSecret` is set we defer to that Secret (chart-managed
-Secret is NOT rendered); otherwise the chart-managed Secret name is used.
 
-Pointing this at the SAME existingSecret as the data-agent release is the
-recommended posture: the Couchbase/Neo4j credentials and the tenant identity
-they authenticate are one identity across both planes.
+THE CHART NO LONGER RENDERS A SECRET. `secrets.existingSecret` names one you
+created out-of-band; when it is empty this falls back to the conventional
+`<fullname>-secret`, which you must create yourself with the keys listed in
+values.yaml. Either way the name must EXIST before the pods start — envFrom
+against a missing Secret leaves them stuck in CreateContainerConfigError.
+
+Pointing this at the SAME Secret as the data-agent release is the recommended
+posture: the Couchbase/Neo4j credentials and the tenant identity they
+authenticate are one identity across both planes.
 */}}
 {{- define "data-agent-learning.secretName" -}}
 {{- if .Values.secrets.existingSecret }}
@@ -179,6 +183,31 @@ http://<svc>.<ns>.svc.cluster.local:8100).
 {{- end }}
 
 {{/*
+Effective LEARNING_REDIS_URL for the learning job stream, in precedence order:
+
+  1. `config.LEARNING_REDIS_URL` when non-empty — an EXTERNAL Redis you manage.
+     Always wins, even with the in-chart Redis enabled, so you can point the
+     workloads elsewhere without first tearing the in-chart one down.
+  2. the in-chart Redis Service when `redis.enabled` — rendered by this same
+     release, so its name is knowable (same reasoning as inboxServiceUrl).
+  3. the legacy literal `redis://redis:6379/0` — the previous default, kept so a
+     release that had `redis.enabled=false` and no explicit URL keeps talking to
+     whatever `redis` Service it was already talking to.
+
+Case 3 is a GUESS, not a configuration: if you disable the in-chart Redis you
+should set `config.LEARNING_REDIS_URL` explicitly.
+*/}}
+{{- define "data-agent-learning.redisUrl" -}}
+{{- if .Values.config.LEARNING_REDIS_URL -}}
+{{- .Values.config.LEARNING_REDIS_URL -}}
+{{- else if .Values.redis.enabled -}}
+{{- printf "redis://%s:%d/0" (include "data-agent-learning.componentFullname" (dict "root" . "component" "redis")) (int .Values.redis.service.port) -}}
+{{- else -}}
+redis://redis:6379/0
+{{- end -}}
+{{- end }}
+
+{{/*
 Shared envFrom wiring: the non-secret ConfigMap + the (chart-managed or
 existing) Secret. Render with the root context.
 Usage: {{- include "data-agent-learning.envFrom" . | nindent 12 }}
@@ -191,11 +220,16 @@ Usage: {{- include "data-agent-learning.envFrom" . | nindent 12 }}
 {{- end }}
 
 {{/*
-Pod-template checksum annotations so a change to the shared ConfigMap or Secret
-triggers a rolling restart. Render with the root context.
+Pod-template checksum annotation so a change to the shared ConfigMap triggers a
+rolling restart. Render with the root context.
+
+There is NO secret checksum: the Secret is created out-of-band (see the
+secretName helper), so the chart cannot see its contents and cannot hash them.
+Rotating a key in that Secret does NOT restart the pods — roll them yourself
+(`kubectl rollout restart deploy -l app.kubernetes.io/instance=<release>`).
+
 Usage: {{- include "data-agent-learning.checksumAnnotations" . | nindent 8 }}
 */}}
 {{- define "data-agent-learning.checksumAnnotations" -}}
 checksum/config: {{ include (print .Template.BasePath "/configmap.yaml") . | sha256sum }}
-checksum/secret: {{ include (print .Template.BasePath "/secret.yaml") . | sha256sum }}
 {{- end }}

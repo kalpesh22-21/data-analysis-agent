@@ -18,15 +18,15 @@ release: deploy/helm/data-agent-learning. Nothing in this release runs it.
 {{- if .Values.components.ui.enabled }}
 
 Reach the UI:
-{{- if .Values.ingress.enabled }}
-{{- range .Values.ingress.hosts }}
+{{- if .Values.uiIngress.enabled }}
+{{- range .Values.uiIngress.hosts }}
 {{- $host := .host }}
 {{- /* `first` on a nil/empty `paths` panics, and the panic ERRORS the whole
        install — a host entry with no paths is odd but not a reason to fail.
        Guard the LIST first, then take its head. */}}
 {{- with .paths }}
 {{- with first . }}
-  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host }}{{ .path }}
+  http{{ if $.Values.uiIngress.tls }}s{{ end }}://{{ $host }}{{ .path }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -40,24 +40,65 @@ Reach the UI:
   then open http://127.0.0.1:3000
 {{- end }}
 {{- end }}
+{{- if and .Values.ingress.enabled .Values.components.runtime.enabled }}
+
+The RUNTIME API is also published (this is the agent API itself, not the UI —
+every route behind it is authenticated by the runtime's own JWT validation):
+{{- range .Values.ingress.hosts }}
+{{- $host := .host }}
+{{- /* Same guard as above: `first` on a nil/empty `paths` panics, and the panic
+       ERRORS the whole install. Guard the LIST, then take its head. */}}
+{{- with .paths }}
+{{- with first . }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host }}{{ .path }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
 
 Remember: the external backing services (ClickHouse, MCP, token IdP, OpenAI,
 Couchbase, Neo4j, Redis, embedding/reranker APIs) are NOT deployed by this
-chart. Confirm their endpoints in `config` and credentials in `secrets` /
-your existingSecret are correct.
-{{- if .Values.components.hydrator.enabled }}
-{{- if and (not .Values.secrets.existingSecret) (not .Values.secrets.data.MCP_SERVICE_KEY) }}
+chart. Confirm their endpoints in `config` are correct.
 
-WARNING: the hydrator is enabled but MCP_SERVICE_KEY is EMPTY. The hydrator
-authenticates the MCP export routes with a static service key (it has no user
-JWT); with an empty key it REFUSES to start (blank creds would 401 every poll),
-so neo4j is never seeded and every runtime pod fails its /ready gate FOREVER.
-Set secrets.data.MCP_SERVICE_KEY (or provide MCP_SERVICE_KEY via existingSecret),
-or disable the hydrator (components.hydrator.enabled=false).
+This chart renders NO Secret. Every workload mounts
+`{{ include "data-agent.secretName" . }}` via envFrom; create it out-of-band
+(vault / external-secrets / sealed-secrets) with OPENAI_API_KEY,
+COUCHBASE_PASSWORD, NEO4J_PASSWORD, MCP_SERVICE_KEY, TOKEN_ISSUER_API_KEY,
+EMBEDDING_API_KEY and RERANKER_API_KEY. Verify it exists — a missing Secret
+wedges the pods in CreateContainerConfigError rather than failing loudly:
+
+  kubectl --namespace {{ .Release.Namespace }} get secret {{ include "data-agent.secretName" . }}
+{{- if .Values.components.hydrator.enabled }}
+
+VERIFY MCP_SERVICE_KEY IS IN IT. The chart can no longer inspect the Secret, so
+this is on you: the hydrator authenticates the MCP export routes with that static
+service key (it has no user JWT), and with the key blank or absent it REFUSES to
+start — neo4j is never seeded and every runtime pod fails its /ready gate
+FOREVER. Check it, or disable the hydrator (components.hydrator.enabled=false):
+
+  kubectl --namespace {{ .Release.Namespace }} get secret {{ include "data-agent.secretName" . }} \
+    -o jsonpath='{.data.MCP_SERVICE_KEY}' | wc -c
 {{- end }}
-{{- end }}
+
+Rotating a key in that Secret does NOT restart the pods — the chart cannot see its
+contents, so there is no checksum to change. Roll them yourself:
+
+  kubectl --namespace {{ .Release.Namespace }} rollout restart deploy \
+    -l app.kubernetes.io/instance={{ .Release.Name }}
 {{- if not .Values.secrets.existingSecret }}
 
-WARNING: you are using the chart-managed Secret with inline values. For
-production, create a Secret out-of-band and set `secrets.existingSecret`.
+NOTE: `secrets.existingSecret` is unset, so the workloads reference the
+conventional name above. Pointing it at the SAME Secret the data-agent-learning
+release uses is the recommended posture — the shared Couchbase/Neo4j credentials
+and the tenant identity they authenticate then cannot drift between the two
+planes.
+{{- end }}
+{{- if .Values.ingress.enabled }}
+
+WARNING: `ingress` PUBLISHES THE RUNTIME API, not the UI. It fronts the runtime
+Service, so the host above exposes the agent API itself (authenticated by the
+runtime's own JWT validation — JWKS_URL / JWT_ISSUER / JWT_AUDIENCE — so confirm
+those are set). If what you meant to publish was the browser UI, that key is
+`uiIngress`: values under `ingress` are NOT read by the UI Ingress and are
+silently ignored by it.
 {{- end }}

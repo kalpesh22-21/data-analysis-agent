@@ -1,0 +1,30 @@
+{{/*
+ClusterIP Service for the in-chart Redis. This is the name
+`data-agent-learning.redisUrl` derives LEARNING_REDIS_URL from.
+
+MUST STAY ClusterIP. The server has no password (see redis-deployment.yaml), so a
+NodePort/LoadBalancer here would publish an unauthenticated Redis.
+*/}}
+{{- if .Values.redis.enabled }}
+{{- $r := .Values.redis -}}
+{{- $cmpArgs := dict "root" $ "component" "redis" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "data-agent-learning.componentFullname" $cmpArgs }}
+  labels:
+    {{- include "data-agent-learning.componentLabels" $cmpArgs | nindent 4 }}
+  {{- with $r.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: {{ $r.service.port }}
+      targetPort: redis
+      protocol: TCP
+  selector:
+    {{- include "data-agent-learning.componentSelectorLabels" $cmpArgs | nindent 4 }}
+{{- end }}

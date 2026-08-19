@@ -33,7 +33,7 @@ import sys
 from typing import Any
 
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
-from data_agent.learning.config import LearningSettings
+from data_agent.learning.config import LearningSettings, get_learning_settings
 from data_agent.learning.trace import (
     SessionTrace,
     reconstruct_session_trace,
@@ -141,7 +141,7 @@ async def _main() -> int:
     logging.basicConfig(level=logging.WARNING)
 
     runtime_settings = get_runtime_settings()
-    learning_settings = LearningSettings()
+    learning_settings = get_learning_settings()
 
     session_store = CouchbaseSessionStore(runtime_settings)
     # H1: the read-only guarantee for the REAL store hinges on `_get_doc` existing

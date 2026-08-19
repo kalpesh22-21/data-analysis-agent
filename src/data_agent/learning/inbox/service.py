@@ -282,9 +282,9 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
     a landing-approve honestly 503s. The neo4j driver is returned so the caller can close it on
     shutdown (None in offline mode).
     """
-    from ..config import LearningSettings
+    from ..config import get_learning_settings
 
-    learning_settings = LearningSettings()
+    learning_settings = get_learning_settings()
 
     from data_agent.runtime.config import RuntimeSettings
 

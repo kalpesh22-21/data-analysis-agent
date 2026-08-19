@@ -45,8 +45,9 @@ serviceAccount:
   #    enforced at the pod level so the posture holds when create=false.
   automount: false
 
-# -- Global pod annotations applied to every workload (merged with the
-#    config/secret checksum annotations and any per-component podAnnotations).
+# -- Global pod annotations applied to every workload (merged with the ConfigMap
+#    checksum annotation and any per-component podAnnotations). There is no
+#    secret checksum — the Secret is out-of-band and the chart cannot hash it.
 podAnnotations: {}
 
 # -- Global pod-level securityContext (fsGroup etc.). Sensible non-root defaults.
@@ -217,40 +218,50 @@ config:
 # ---------------------------------------------------------------------------
 # Secret configuration.
 #
-# In PRODUCTION prefer `existingSecret`: create the Secret out-of-band (sealed
-# secrets / external-secrets / vault) with the KEYS listed below, then set
-# `secrets.existingSecret: <name>`. When `existingSecret` is set the
-# chart-managed Secret is NOT rendered and pods reference the named Secret.
+# THIS CHART DOES NOT RENDER A SECRET. Secret material never passes through
+# values, a rendered manifest, or `helm get values` output. Create the Secret
+# OUT-OF-BAND (vault / external-secrets / sealed-secrets) with the keys listed
+# below, and either:
+#   * name it `<fullname>-secret` — i.e. `<release>-data-agent-secret`, truncated
+#     to fit 63 chars — and leave `existingSecret` empty, or
+#   * set `secrets.existingSecret: <name>` and call it whatever you like.
+# Every workload mounts it wholesale via envFrom, so the Secret must EXIST before
+# the pods start: envFrom against a missing Secret leaves them wedged in
+# CreateContainerConfigError, not failing loudly.
 #
-# For dev/testing you may inline values under `secrets.data` — they will be
-# base64-encoded into a chart-managed Secret. NEVER commit real secrets here.
+# NO CHECKSUM, NO AUTO-ROLL. The chart cannot see the Secret's contents, so
+# rotating a key does not restart the pods (the ConfigMap checksum still does its
+# half). Roll them yourself:
+#   kubectl rollout restart deploy -l app.kubernetes.io/instance=<release>
 #
 # RECOMMENDED WITH THE LEARNING CHART: point BOTH `data-agent` and
-# `data-agent-learning` at the SAME `existingSecret`. `COUCHBASE_PASSWORD`,
+# `data-agent-learning` at the SAME Secret. `COUCHBASE_PASSWORD`,
 # `NEO4J_PASSWORD` and the tenant identity they authenticate are the same identity
 # in both planes — the learning replay reads the agent's warehouse as the agent's
 # tenant. Two independently-edited Secrets drift, and the drift is SILENT: the
 # warehouse row policies FILTER rather than error, so the learning plane keeps
-# running and verifies promotions against the wrong (or an empty) row set.
+# running and verifies promotions against the wrong (or an empty) row set. Unused
+# keys in a shared Secret are harmless; each pod only reads what it needs.
+#
+# Keys this chart's workloads read:
+#
+#   OPENAI_API_KEY
+#   COUCHBASE_PASSWORD
+#   NEO4J_PASSWORD
+#   MCP_SERVICE_KEY
+#       Static service key for the MCP export routes (sent as X-Service-Key). Read
+#       via the shared envFrom Secret, so it reaches BOTH the hydrator daemon
+#       (which seeds neo4j with it) and the runtime (its decoupled catalog-handle
+#       fetch). ABSENT ⇒ the hydrator REFUSES to start, neo4j is never seeded, and
+#       every runtime pod fails its /ready gate forever.
+#   TOKEN_ISSUER_API_KEY
+#   EMBEDDING_API_KEY
+#   RERANKER_API_KEY
 # ---------------------------------------------------------------------------
 secrets:
-  # -- Name of a pre-existing Secret to use instead of the chart-managed one.
-  #    When set, `secrets.data` is ignored and NOT rendered.
+  # -- Name of the pre-existing Secret to mount via envFrom. Empty = the
+  #    conventional `<fullname>-secret`, which you still have to create yourself.
   existingSecret: ""
-  # -- Inline secret values (only used when existingSecret is empty). Keys map
-  #    1:1 to env-var names. Empty-string values are SKIPPED (not injected), so
-  #    the app falls back to any ambient/default value rather than seeing "".
-  data:
-    OPENAI_API_KEY: ""
-    COUCHBASE_PASSWORD: ""
-    NEO4J_PASSWORD: ""
-    # Static service key for the MCP export routes (sent as X-Service-Key). Read via
-    # the shared envFrom Secret, so it reaches BOTH the hydrator daemon (which seeds
-    # neo4j with it) and the runtime (its decoupled catalog-handle fetch).
-    MCP_SERVICE_KEY: ""
-    TOKEN_ISSUER_API_KEY: ""
-    EMBEDDING_API_KEY: ""
-    RERANKER_API_KEY: ""
 
 # ---------------------------------------------------------------------------
 # Per-workload configuration.
@@ -335,10 +346,21 @@ components:
     env: []
 
 # ---------------------------------------------------------------------------
-# Ingress for the UI backend-for-frontend. Standard helm-create style.
+# Ingress for the RUNTIME API (templates/runtime-ingress.yaml).
+#
+# This publishes the core agent API itself, not the UI — every route behind it
+# is authenticated by the runtime's own JWT validation (JWKS_URL / JWT_ISSUER /
+# JWT_AUDIENCE above), so leave it disabled unless something outside the cluster
+# genuinely has to call the API directly. The browser surface is `uiIngress`.
+#
+# Adding an entry to `tls` switches the rules to HTTPS. `secretName` in an entry
+# is OPTIONAL: omit it to use the ingress controller's DEFAULT certificate;
+# set it for a BYO certificate, or when cert-manager should provision one — its
+# ingress-shim reads the cluster-issuer annotation below but needs a `secretName`
+# to write the issued certificate into. An annotation alone provisions nothing.
 # ---------------------------------------------------------------------------
 ingress:
-  # -- Enable an Ingress in front of the ui Service.
+  # -- Enable an Ingress in front of the runtime Service.
   enabled: false
   # -- IngressClass name (e.g. nginx, traefik).
   className: ""
@@ -347,12 +369,51 @@ ingress:
     # kubernetes.io/tls-acme: "true"
     # cert-manager.io/cluster-issuer: letsencrypt-prod
   hosts:
+    - host: data-agent-api.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  # -- TLS configuration (list of {hosts[], secretName?}). `secretName` is
+  #    optional — omit it for the controller's default certificate.
+  tls: []
+    # - hosts:
+    #     - data-agent-api.example.com
+    #   secretName: data-agent-api-tls
+
+# ---------------------------------------------------------------------------
+# Ingress for the AGENT UI backend-for-frontend (templates/ui-ingress.yaml).
+#
+# Same shape as `ingress` above, pointed at the ui Service. This is the
+# browser-facing door: the BFF mints the warehouse token server-side, so anyone
+# who reaches this host is an agent user. Put your human authn (OIDC /
+# forward-auth / IP allowlist) in the annotations — the app authenticates the
+# BFF→runtime hop, not the person.
+#
+# NOTE: the reviewer surface is NOT here. `ui/server.py` carries GET /inbox and
+# /api/inbox/* in the same app, but this release sets no REVIEW_INBOX_ENABLED,
+# so those routes 404. The reviewer Ingress belongs to `data-agent-learning`.
+#
+# `tls[].secretName` is optional, exactly as on `ingress` above — omit it for the
+# controller's default certificate, set it for BYO or for cert-manager to write
+# the issued certificate into.
+# ---------------------------------------------------------------------------
+uiIngress:
+  # -- Enable an Ingress in front of the ui Service.
+  enabled: false
+  # -- IngressClass name (e.g. nginx, traefik).
+  className: ""
+  # -- Ingress annotations. Put your reviewer/user authn here.
+  annotations: {}
+    # kubernetes.io/tls-acme: "true"
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
     - host: data-agent.example.com
       paths:
         - path: /
           pathType: Prefix
-  # -- TLS configuration (list of {secretName, hosts[]}).
+  # -- TLS configuration (list of {hosts[], secretName?}). `secretName` is
+  #    optional — omit it for the controller's default certificate.
   tls: []
-    # - secretName: data-agent-tls
-    #   hosts:
+    # - hosts:
     #     - data-agent.example.com
+    #   secretName: data-agent-tls

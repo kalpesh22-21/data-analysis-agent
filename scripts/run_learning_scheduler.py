@@ -42,7 +42,7 @@ import logging
 
 from data_agent.daemon import run_daemon
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
-from data_agent.learning.config import LearningSettings
+from data_agent.learning.config import get_learning_settings
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
 from data_agent.learning.entrypoint import configure_daemon_process
 from data_agent.learning.factory import build_promotion_plane, build_promotion_write_plane
@@ -88,7 +88,7 @@ class _DeferredDependencyResolver:
 
 
 async def _main() -> int:
-    learning_settings = LearningSettings()
+    learning_settings = get_learning_settings()
     # The scheduler does not thread a tracer into its components — it relies on the
     # process-global provider this installs — so the return value is discarded.
     configure_daemon_process("scheduler", learning_settings, _logger)

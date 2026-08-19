@@ -13,6 +13,7 @@ ending windows at a fraction of real occupancy. A single request is bounded sepa
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from pathlib import Path
 
@@ -21,6 +22,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
 from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
+
+# enabled but paycompy is missing.
+try:
+    from paycompy import vault  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - exercised only where paycompy is absent
+    vault = None
 
 # Recognized truthy spellings for a kill-switch env var (case-insensitive). Anything
 # else (including unset → default) resolves per the rules in the switch's own reader —
@@ -41,6 +48,8 @@ from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 # point — do not relax the scan to accommodate prose.
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _TRUTHY = TRUTHY_ENV_VALUES
+
+_logger = logging.getLogger(__name__)
 
 # Headroom multiplier on the request fit budget. The shared chars/4 token
 # estimator (context/budget.py::_estimate_tokens) UNDER-counts real tokens on
@@ -393,6 +402,7 @@ class RuntimeSettings(BaseSettings):
     )
     jwt_issuer: str = Field("", description="Expected JWT 'iss' claim.")
     jwt_audience: str = Field("", description="Expected JWT 'aud' claim.")
+    verify_signature:bool = Field(False, description="Check signature")
 
     # --- Offline token mint for the S9 golden-replay probe (S9-activation §1.3/§4) ---
     # The S9 promotion scheduler mints a per-blueprint JWT scoped to the blueprint's
@@ -714,6 +724,7 @@ class RuntimeSettings(BaseSettings):
     )
     neo4j_username: str = Field("", description="neo4j username (secret).")
     neo4j_password: str = Field("", description="neo4j password (secret).")
+    neo4j_database: str = Field("", description="neo4j database.")
     neo4j_timeout_seconds: float = Field(
         10.0,
         gt=0,
@@ -792,6 +803,46 @@ class RuntimeSettings(BaseSettings):
         ),
     )
 
+    # --- HashiCorp Vault (sensitive-value sourcing) ---
+    # When VAULT_ENABLED=true, sensitive values (the ClickHouse connection, the
+    # scratch/security writer credentials, the Redis URL) are
+    # read from Vault at startup and OVERRIDE anything from the environment.  Each
+    # *_PATH points at a KV secret; a path left empty skips that group (its env or
+    # default value is kept).  See load_settings_from_vault() for the read logic and
+    # fail-closed behaviour.  Defaults keep Vault OFF so existing env-based deploys
+    # are entirely unaffected.
+    vault_enabled: bool = Field(
+        False,
+        description="Read sensitive values from HashiCorp Vault at startup (overrides env).",
+    )
+    neo4j_creds_path: str = Field(
+        "application/datascience/iwant_reporting/neo4j",
+        description=(
+            "Vault KV path holding the Neo4j connection secret"
+        ),
+    )
+    mcp_service_key_vault_path: str = Field(
+        "application/datascience/iwant_reporting/admin",
+        description=(
+            "Vault KV path holding the MCP export service key (key: "
+            "MCP_SERVICE_KEY). Empty → use env/default (and, if that is also "
+            "empty, the service-key path stays OFF / fail-closed)."
+        ),
+    )
+    couchbase_vault_path: str = Field(
+        "application/datascience/iwant_reporting/couchbase",
+        description=(
+            "Vault KV path holding the Couchbase connection"
+            "Empty → use env/default."
+        ),
+    )
+    openai_api_key_path:str = Field(
+        "application/datascience/iwant_reporting/llm",
+        description=(
+            "Vault KV path holding the OpenAI API Key"
+        ),
+    )
+    
     def effective_agent_system_prompt(self) -> str | None:
         """The base system prompt to prepend, or `None` when disabled.
 
@@ -926,7 +977,100 @@ def effective_llm_hide(settings: RuntimeSettings) -> bool:
     return settings.otlp_hide_llm_content and not settings.otlp_disable_redaction
 
 
+def _read_vault_secret(vc, key: str, path: str, current):
+    """Read one KV field from Vault, returning ``current`` (env/default) on failure.
+
+    A per-key failure is logged and swallowed so one missing/renamed key does not
+    take down the whole config load; the caller's fail-closed check still catches a
+    genuinely-absent critical secret (see load_settings_from_vault()).
+    """
+    try:
+        return vc.read_kv_secret(key, path).get_secret_value()
+    except Exception as exc:  # noqa: BLE001 - surface as a warning, keep booting
+        # KEY, PATH and EXCEPTION TYPE only — never the value, and never the exception's
+        # repr/str: a client error may embed the HTTP response body, which is the secret
+        # material this function exists to move around.
+        _logger.warning(
+            "Vault read failed for key %s at path %s (%s); using env/default",
+            key,
+            path,
+            type(exc).__name__,
+        )
+        return current
+
+def load_settings_from_vault() -> RuntimeSettings:
+    """Construct Settings, then override sensitive values from Vault when enabled.
+
+    Priority for each sensitive value:
+
+      1. Vault  — when VAULT_ENABLED and the relevant ``*_PATH`` is set
+      2. Environment variable / ``.env``
+      3. Field default
+
+    Vault runs AFTER construction (it mutates the already-built Settings) because
+    pydantic-settings sources env/defaults at construction time; this mirrors the
+    llm-router pattern.  When Vault is disabled the env-built Settings is returned
+    unchanged, so nothing about the existing env-based deployment path changes.
+    """
+    settings = RuntimeSettings()
+
+    if not settings.vault_enabled:
+        return settings
+
+    if vault is None:
+        raise RuntimeError(
+            "VAULT_ENABLED=true but the internal 'paycompy' package is not "
+            "installed. Install paycompy or set VAULT_ENABLED=false."
+        )
+
+    vc = vault.get_client_using_os_environ()
+
+    # --- Neo4j main connection ---
+    if settings.neo4j_creds_path:
+        p = settings.neo4j_creds_path
+        settings.neo4j_url = _read_vault_secret(
+            vc, "NEO4J_URL", p, settings.neo4j_url
+        )
+        settings.neo4j_username = _read_vault_secret(
+            vc, "NEO4J_USERNAME", p, settings.neo4j_username
+        )
+        settings.neo4j_password = _read_vault_secret(
+            vc, "NEO4J_PASSWORD", p, settings.neo4j_password
+        )
+
+    if settings.mcp_service_key_vault_path:
+        settings.mcp_service_key = _read_vault_secret(
+            vc, "OIDC_PUBLIC_KEY", settings.mcp_service_key_vault_path, settings.mcp_service_key
+        )
+
+    # --- Employee-access Redis URL ---
+    if settings.couchbase_vault_path:
+        p = settings.couchbase_vault_path
+        settings.couchbase_bucket = _read_vault_secret(
+            vc, "COUCHBASE_BUCKET", p, settings.couchbase_bucket
+        )
+        settings.couchbase_connection_string = _read_vault_secret(
+            vc, "COUCHBASE_CONNECTION_STRING", p, settings.couchbase_connection_string
+        )
+        settings.couchbase_username = _read_vault_secret(
+            vc, "COUCHBASE_USERNAME", p, settings.couchbase_username
+        )
+        settings.couchbase_password = _read_vault_secret(
+            vc, "COUCHBASE_PASSWORD", p, settings.couchbase_password
+        )
+    if settings.openai_api_key_path:
+        settings.openai_api_key = _read_vault_secret(
+            vc, "OPENAI_API_KEY", settings.openai_api_key_path, settings.openai_api_key
+        )
+
+    # --- MCP export service key ---
+    if settings.mcp_service_key_vault_path:
+        settings.mcp_service_key = _read_vault_secret(
+            vc, "API_KEY", settings.mcp_service_key_vault_path, settings.mcp_service_key
+        )
+    return settings
+
 @lru_cache(maxsize=1)
 def get_runtime_settings() -> RuntimeSettings:
     """Return a cached RuntimeSettings singleton. Call this everywhere config is needed."""
-    return RuntimeSettings()
+    return load_settings_from_vault()

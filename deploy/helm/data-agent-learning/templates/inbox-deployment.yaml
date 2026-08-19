@@ -37,12 +37,16 @@ spec:
         - name: inbox
           image: {{ include "data-agent-learning.image" (dict "root" $ "component" $c) }}
           imagePullPolicy: {{ include "data-agent-learning.imagePullPolicy" (dict "root" $ "component" $c) }}
-          # Review-inbox HTTP service. Authenticates its callers on the shared
-          # REVIEWER_TOKEN, which the reviewer UI holds server-side and attaches on
-          # the proxy hop — the browser never sees it.
+          # Review-inbox HTTP service, authenticated on the shared REVIEWER_TOKEN.
+          # Started via uvicorn's --factory entrypoint.
           command:
-            - python
-            - scripts/run_inbox_service.py
+            - uvicorn
+            - data_agent.learning.inbox.service:create_inbox_app
+            - --factory
+            - --host
+            - "0.0.0.0"
+            - --port
+            - {{ $c.service.port | quote }}
           securityContext:
             {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) ($c.securityContext | default dict)) | nindent 12 }}
           ports:
@@ -51,8 +55,11 @@ spec:
               protocol: TCP
           envFrom:
             {{- include "data-agent-learning.envFrom" $ | nindent 12 }}
-          # Per-workload env: activate the dormant inbox app and bind it to all
-          # interfaces (code default is 127.0.0.1, unreachable in-cluster).
+          # Per-workload env: REVIEW_INBOX_ENABLED activates the dormant inbox app.
+          # HOST/PORT are redundant under the uvicorn command above (which carries
+          # its own --host/--port) and are kept deliberately: they are what binds the
+          # app to all interfaces if anyone reverts to the launcher script, whose
+          # code default is 127.0.0.1 and unreachable in-cluster.
           env:
             - name: REVIEW_INBOX_ENABLED
               value: "1"

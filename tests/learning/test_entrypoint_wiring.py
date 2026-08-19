@@ -198,7 +198,7 @@ def _load_sweeper_entrypoint():
 def _patch_sweeper_entrypoint(module) -> _FakeQueue:
     queue = _FakeQueue()
     module.get_runtime_settings = lambda: SimpleNamespace()
-    module.LearningSettings = lambda: SimpleNamespace(
+    module.get_learning_settings = lambda: SimpleNamespace(
         otlp_endpoint="",
         learning_service_name="learning-loop",
         learning_sweep_interval_seconds=60.0,

@@ -34,7 +34,7 @@ from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
 from data_agent.daemon import run_daemon
 from data_agent.learning.audit.couchbase_audit_store import CouchbaseAuditStore
 from data_agent.learning.candidate.couchbase_candidate_store import CouchbaseCandidateStore
-from data_agent.learning.config import LearningSettings
+from data_agent.learning.config import get_learning_settings
 from data_agent.learning.dedup.couchbase_corpus import CouchbaseBlueprintCorpus
 from data_agent.learning.entrypoint import configure_daemon_process
 from data_agent.learning.extractor.grounding import (
@@ -61,7 +61,7 @@ _logger = logging.getLogger(__name__)
 
 async def _main() -> int:
     runtime_settings = get_runtime_settings()
-    learning_settings = LearningSettings()
+    learning_settings = get_learning_settings()
     user_config = UserKnowledgeStoreConfig()
     tracer = configure_daemon_process("consumer", learning_settings, _logger)
 

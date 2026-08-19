@@ -348,6 +348,12 @@ async def build_infra(*, stream_prefix: str) -> Infra:
     from data_agent.runtime.retrieval.corpus_loader import apply_schema
     from data_agent.runtime.session.couchbase_store import CouchbaseSessionStore
 
+    # ENV-ONLY BY DESIGN, not an oversight: the harness is a local demo posture, so it
+    # constructs the settings surface DIRECTLY and deliberately bypasses Vault (a demo
+    # run must not depend on a Vault client, and `_env_file=None` is already saying "read
+    # nothing but this process's env"). `get_learning_settings()` is the Vault-aware path
+    # every real entrypoint uses. The `RuntimeSettings(_env_file=None)` line below is the
+    # same posture for the same reason.
     settings = LearningSettings(_env_file=None)
     session_store = CouchbaseSessionStore(RuntimeSettings(_env_file=None))
     candidate_store = CouchbaseCandidateStore(settings)

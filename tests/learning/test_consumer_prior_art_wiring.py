@@ -89,7 +89,7 @@ async def _run(*, neo4j: bool, embedding: bool) -> dict:
     captured: dict = {}
 
     module.get_runtime_settings = lambda: _runtime_settings(neo4j=neo4j, embedding=embedding)
-    module.LearningSettings = _learning_settings
+    module.get_learning_settings = _learning_settings
     module.UserKnowledgeStoreConfig = lambda: SimpleNamespace(
         user_knowledge_username="u", user_knowledge_password="p"
     )

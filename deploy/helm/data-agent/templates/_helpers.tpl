@@ -118,8 +118,16 @@ Name of the shared ConfigMap holding non-secret env.
 
 {{/*
 Name of the Secret that pods should reference in envFrom.
-When `secrets.existingSecret` is set we defer to that Secret (chart-managed
-Secret is NOT rendered); otherwise the chart-managed Secret name is used.
+
+THE CHART NO LONGER RENDERS A SECRET. `secrets.existingSecret` names one you
+created out-of-band; when it is empty this falls back to the conventional
+`<fullname>-secret`, which you must create yourself with the keys listed in
+values.yaml. Either way the name must EXIST before the pods start — envFrom
+against a missing Secret leaves them stuck in CreateContainerConfigError.
+
+Pointing this at the SAME Secret as the data-agent-learning release is the
+recommended posture: the Couchbase/Neo4j credentials and the tenant identity they
+authenticate are one identity across both planes.
 */}}
 {{- define "data-agent.secretName" -}}
 {{- if .Values.secrets.existingSecret }}
@@ -170,8 +178,9 @@ that chart, beside the inbox it derives from.
 */}}
 
 {{/*
-Shared envFrom wiring: the non-secret ConfigMap + the (chart-managed or
-existing) Secret. Render with the root context.
+Shared envFrom wiring: the chart's ConfigMap + the OUT-OF-BAND Secret named by
+the secretName helper (this chart renders no Secret of its own). Render with the
+root context.
 Usage: {{- include "data-agent.envFrom" . | nindent 12 }}
 */}}
 {{- define "data-agent.envFrom" -}}
@@ -182,11 +191,16 @@ Usage: {{- include "data-agent.envFrom" . | nindent 12 }}
 {{- end }}
 
 {{/*
-Pod-template checksum annotations so a change to the shared ConfigMap or Secret
-triggers a rolling restart. Render with the root context.
+Pod-template checksum annotation so a change to the shared ConfigMap triggers a
+rolling restart. Render with the root context.
+
+There is NO secret checksum: the Secret is created out-of-band (see the
+secretName helper), so the chart cannot see its contents and cannot hash them.
+Rotating a key in that Secret does NOT restart the pods — roll them yourself
+(`kubectl rollout restart deploy -l app.kubernetes.io/instance=<release>`).
+
 Usage: {{- include "data-agent.checksumAnnotations" . | nindent 8 }}
 */}}
 {{- define "data-agent.checksumAnnotations" -}}
 checksum/config: {{ include (print .Template.BasePath "/configmap.yaml") . | sha256sum }}
-checksum/secret: {{ include (print .Template.BasePath "/secret.yaml") . | sha256sum }}
 {{- end }}

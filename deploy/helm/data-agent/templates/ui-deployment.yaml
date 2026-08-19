@@ -38,12 +38,9 @@ spec:
           image: {{ include "data-agent.image" (dict "root" $ "component" $c) }}
           imagePullPolicy: {{ include "data-agent.imagePullPolicy" (dict "root" $ "component" $c) }}
           # Thin backend-for-frontend; serves the static page + proxies to runtime.
-          # Launched through the repo script, not the uvicorn CLI: uvicorn re-raises the
-          # captured SIGTERM onto the restored SIG_DFL after `serve()` returns, so a
-          # clean rollout shutdown exited 143 (ISSUES.md C3). Same app, same flags.
           command:
-            - python
-            - scripts/run_ui_bff.py
+            - uvicorn
+            - ui.server:app
             - --host
             - "0.0.0.0"
             - --port

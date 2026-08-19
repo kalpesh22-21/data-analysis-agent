@@ -28,7 +28,7 @@ import logging
 import os
 
 from data_agent.http_daemon import run_http_daemon
-from data_agent.learning.config import LearningSettings
+from data_agent.learning.config import get_learning_settings
 from data_agent.learning.entrypoint import configure_daemon_process
 from data_agent.learning.inbox.service import create_inbox_app
 
@@ -45,7 +45,7 @@ def main() -> int:
     #
     # It now runs on EVERY path into this service, because there is only one (see the
     # module docstring). Sync and loop-free, so it stays out here, ahead of the loop.
-    configure_daemon_process("inbox", LearningSettings(), _logger)
+    configure_daemon_process("inbox", get_learning_settings(), _logger)
     # Loopback by default: the service holds the write plane and its only intended
     # caller is the co-located BFF proxy — bind wider (0.0.0.0) only deliberately.
     host = os.environ.get("INBOX_SERVICE_HOST", "127.0.0.1")

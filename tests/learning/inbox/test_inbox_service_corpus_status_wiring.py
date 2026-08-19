@@ -48,6 +48,9 @@ def full_plane(monkeypatch):
     captured: dict = {}
 
     class _Learning:
+        # `get_learning_settings()` builds through `load_learning_settings_from_vault()`,
+        # which reads this first and returns the env-built object untouched when False.
+        vault_enabled = False
         learning_candidates_username = "u"
         learning_candidates_password = "p"
         learning_corpus_username = "u"
@@ -183,6 +186,8 @@ def test_offline_dev_mode_deliberately_wires_no_status_writer(monkeypatch):
     distinguishable to a future reader."""
 
     class _Learning:
+        # See the full-plane stub: `get_learning_settings()` reads this first.
+        vault_enabled = False
         learning_candidates_username = ""
         learning_candidates_password = ""
         learning_corpus_username = ""

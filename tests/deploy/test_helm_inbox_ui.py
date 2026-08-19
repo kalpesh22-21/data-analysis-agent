@@ -15,9 +15,10 @@ Nothing in the app enforces either one, so if a template edit drops them the fai
 a 404 page or a proxy pointed at `http://localhost:8100` inside the wrong pod. Hence
 these assertions live here rather than in the app suite.
 
-The last test pins the fence: this chart's Ingress publishes the inbox paths ONLY. The
-chat routes exist on the pod and cannot be compiled out, so the path list is the entire
-mechanism keeping the learning release from opening a second door into the agent.
+The last tests pin the fence: this chart's Ingress (`uiIngress`, renamed from `ingress`
+when the two charts were aligned) publishes the inbox paths ONLY. The chat routes exist
+on the pod and cannot be compiled out, so the path list is the entire mechanism keeping
+the learning release from opening a second door into the agent.
 
 Skipped when the `helm` binary is unavailable (a dev box without it).
 """
@@ -38,8 +39,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _docs(*sets: str) -> list[dict]:
+def _docs(*sets: str, values: str | None = None) -> list[dict]:
     args = ["helm", "template", "t", str(_CHART)]
+    if values is not None:
+        args += ["-f", str(_CHART / values)]
     for s in sets:
         args += ["--set", s]
     rendered = subprocess.run(args, capture_output=True, text=True, check=True).stdout
@@ -59,12 +62,13 @@ def test_inbox_ui_runs_the_same_app_with_the_reviewer_flag_on() -> None:
     container = _by_kind_component(docs, "Deployment", "inbox-ui")["spec"]["template"]["spec"][
         "containers"
     ][0]
-    # Same entrypoint as the agent UI — the split is configuration, not code. The
-    # launcher, not the uvicorn CLI: a clean SIGTERM shutdown has to exit 0 (ISSUES.md
-    # C3), and `scripts/run_ui_bff.py` serves the identical `ui.server:app`.
+    # Same entrypoint as the agent UI — the split is configuration, not code. Both charts
+    # serve the identical `ui.server:app` through the uvicorn CLI (the C3 trade-off is
+    # documented in test_helm_launcher_commands.py, which pins every command);
+    # what matters HERE is only that the two surfaces run the same app.
     assert container["command"] == [
-        "python",
-        "scripts/run_ui_bff.py",
+        "uvicorn",
+        "ui.server:app",
         "--host",
         "0.0.0.0",
         "--port",
@@ -150,10 +154,18 @@ def test_every_learning_key_in_the_chart_is_a_real_settings_field() -> None:
         )
 
 
-def test_the_ingress_publishes_the_inbox_surface_only() -> None:
+@pytest.mark.parametrize("values", [None, "values-example.yaml"])
+def test_the_ingress_publishes_the_inbox_surface_only(values: str | None) -> None:
     """The chat routes are on this pod and cannot be removed; the path list is the
-    fence. `/` here would publish the agent UI from the learning release."""
-    docs = _docs("ingress.enabled=true")
+    fence. `/` here would publish the agent UI from the learning release.
+
+    The key is `uiIngress` (it was `ingress` before the two charts were aligned: the
+    data-agent chart needed BOTH a runtime-API `ingress` and a browser-facing
+    `uiIngress`, so the reviewer UI's was renamed to match). The rename is exactly the
+    kind of edit that can quietly widen a fence — a stale `ingress:` block in an
+    operator's values file now renders NOTHING rather than erroring — so the shipped
+    values-example.yaml is checked alongside the defaults."""
+    docs = _docs("uiIngress.enabled=true", values=values)
     ingress = _by_kind_component(docs, "Ingress", "inbox-ui")
     paths = [p["path"] for rule in ingress["spec"]["rules"] for p in rule["http"]["paths"]]
     assert paths == ["/inbox", "/api/inbox"]
@@ -164,3 +176,25 @@ def test_the_ingress_publishes_the_inbox_surface_only() -> None:
         for p in rule["http"]["paths"]
     }
     assert backends == {"t-data-agent-learning-inbox-ui"}
+    # Backends are addressed by PORT NAME now, not number. The name is resolved against
+    # the Service, so the two cannot drift apart; a stale number silently 503s.
+    ports = {
+        tuple(sorted(p["backend"]["service"]["port"].items()))
+        for rule in ingress["spec"]["rules"]
+        for p in rule["http"]["paths"]
+    }
+    assert ports == {(("name", "http"),)}
+    service_ports = {
+        p["name"] for p in _by_kind_component(docs, "Service", "inbox-ui")["spec"]["ports"]
+    }
+    assert "http" in service_ports
+
+
+def test_the_old_ingress_key_no_longer_publishes_anything() -> None:
+    """`ingress.enabled=true` is now a no-op in THIS chart — helm accepts any key, so a
+    values file left over from before the rename produces no Ingress and no error. That
+    is the safe direction of the failure (nothing published rather than something
+    unfenced), and asserting it keeps a future `ingress:` block from being wired up here
+    to mean something different from `uiIngress`."""
+    docs = _docs("ingress.enabled=true")
+    assert not [d for d in docs if d["kind"] == "Ingress"]

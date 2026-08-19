@@ -8,6 +8,8 @@
 #   * repeats the data-agent release's shared config (session bucket, graph,
 #     embeddings, MCP, tenant) — these MUST agree
 #   * exposes the reviewer UI via an Ingress with TLS, inbox paths ONLY
+#   * runs the in-chart Redis with persistence on (so the dead-letter stream
+#     survives a restart) and modest resources
 #   * sets resource requests/limits per component
 #   * enables the learning-consumer HPA and scales the consumer to 2
 #   * references a pre-created Secret (existingSecret) — ideally the same one the
@@ -66,7 +68,10 @@ config:
   TENANT_JTI: "svc-data-agent"
 
   # ---- Learning plane only ----
-  LEARNING_REDIS_URL: "redis://redis-master.data.svc.cluster.local:6379/0"
+  # Left EMPTY on purpose: derived from the in-chart Redis Service enabled at the
+  # bottom of this file. Set it (and redis.enabled=false) to use an external
+  # Redis; a non-empty value here wins over the in-chart one either way.
+  LEARNING_REDIS_URL: ""
   LEARNING_JOBS_STREAM: "learning:jobs"
   LEARNING_DEAD_LETTER_STREAM: "learning:jobs:dead"
   LEARNING_CONSUMER_GROUP: "learning-consumers"
@@ -128,6 +133,8 @@ config:
   INBOX_SERVICE_URL: ""
 
 # ---- Secrets: reference a Secret you created out-of-band ----
+# The chart renders NO Secret at all, so this step is mandatory, not a hardening
+# upgrade — the pods wedge in CreateContainerConfigError until the Secret exists.
 # Best practice is to EXTEND the data-agent release's Secret with the
 # learning-only keys and point both releases at it, so the shared credentials and
 # the tenant they authenticate cannot drift:
@@ -209,12 +216,42 @@ components:
       enabled: true
       minAvailable: 1
 
+# ---- The learning plane's own Redis (the job stream) ----
+# Unauthenticated and ClusterIP — restrict it with a NetworkPolicy on a shared
+# cluster. Persistence is ON here: without it a restart loses the in-flight PEL and
+# the DEAD-LETTER stream, and the dead-letter stream is the record of what poisoned
+# the loop. Pending jobs would come back anyway (the sweeper re-enqueues idle
+# sessions); the triage trail would not.
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      # Redis has no maxmemory policy configured: a backed-up consumer group grows
+      # the stream until the pod is OOMKilled. Alert on stream depth.
+      memory: 512Mi
+  persistence:
+    enabled: true
+    size: 1Gi
+    # Empty = the cluster default StorageClass. Name one explicitly if the default
+    # is not RWO-capable.
+    storageClass: ""
+  service:
+    port: 6379
+
 # ---- Expose the REVIEWER UI via Ingress + TLS ----
 # The paths are the fence: /inbox and /api/inbox only. The pod also serves the
 # agent-chat routes (same app), and adding `/` here would publish them from this
 # release. The app authenticates the UI→inbox hop, NOT the human — put your
 # reviewer authn in the annotations below.
-ingress:
+uiIngress:
   enabled: true
   className: nginx
   annotations:
@@ -229,7 +266,10 @@ ingress:
           pathType: Prefix
         - path: /api/inbox
           pathType: Prefix
+  # The cluster-issuer annotation above does NOT provision a certificate on its
+  # own — cert-manager's ingress-shim needs this secretName to write the issued
+  # certificate into. Drop it only if you want the controller's default cert.
   tls:
-    - secretName: data-agent-inbox-tls
-      hosts:
+    - hosts:
         - data-agent-inbox.acme.com
+      secretName: data-agent-inbox-tls

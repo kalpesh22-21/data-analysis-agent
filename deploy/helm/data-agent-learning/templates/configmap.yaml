@@ -1,8 +1,12 @@
 {{/*
 Shared ConfigMap of NON-SECRET env, mounted into every workload via envFrom.
-Secret keys are intentionally kept out of here (see secret.yaml). The reviewer-UI
-derived value INBOX_SERVICE_URL is computed from the release name when not
-explicitly set in .Values.config.
+Secret keys are intentionally kept out of here — they live in the out-of-band
+Secret named by the secretName helper, which this chart does not render.
+
+Two values are DERIVED rather than copied straight from .Values.config:
+INBOX_SERVICE_URL (this release's inbox Service) and LEARNING_REDIS_URL (the
+in-chart Redis Service). Both fall back to the explicit .Values.config entry
+whenever it is non-empty; see the helpers for the full precedence.
 
 A BLANK value is normally OMITTED from the ConfigMap, so the process falls through
 to whatever default its settings model carries. That is the right rule for almost
@@ -22,8 +26,8 @@ metadata:
     {{- include "data-agent-learning.labels" . | nindent 4 }}
 data:
   {{- range $key, $val := .Values.config }}
-  {{- /* INBOX_SERVICE_URL is handled below via the helper */}}
-  {{- if ne $key "INBOX_SERVICE_URL" }}
+  {{- /* INBOX_SERVICE_URL and LEARNING_REDIS_URL are handled below via helpers */}}
+  {{- if not (has $key (list "INBOX_SERVICE_URL" "LEARNING_REDIS_URL")) }}
   {{- if or (ne (toString $val) "") (has $key $alwaysRender) }}
   {{ $key }}: {{ $val | quote }}
   {{- end }}
@@ -34,3 +38,6 @@ data:
   {{- else if .Values.config.INBOX_SERVICE_URL }}
   INBOX_SERVICE_URL: {{ .Values.config.INBOX_SERVICE_URL | quote }}
   {{- end }}
+  {{- /* Always rendered: the helper's last fallback is still a usable URL, and a
+         learning plane with no LEARNING_REDIS_URL at all has no transport. */}}
+  LEARNING_REDIS_URL: {{ include "data-agent-learning.redisUrl" . | quote }}

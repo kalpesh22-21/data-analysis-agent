@@ -15,7 +15,7 @@ import socket
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from data_agent.runtime.config import TRUTHY_ENV_VALUES
+from data_agent.runtime.config import TRUTHY_ENV_VALUES, _read_vault_secret, vault
 
 # Recognized truthy spellings for the kill-switch (case-insensitive). Anything
 # else (including unset → default) resolves per the rules in `learning_enabled`.
@@ -27,6 +27,11 @@ from data_agent.runtime.config import TRUTHY_ENV_VALUES
 # `BaseSettings` classes, no shared `@lru_cache`d singleton) — only the spelling table
 # an operator types against is shared. The marginal import cost is two modules; the
 # learning package already loads far more of `runtime/` than this.
+#
+# The same import carries the Vault plumbing (`vault`, `_read_vault_secret`) for the
+# same reason and in the same direction: one guarded `paycompy` import and one
+# fail-soft KV reader, shared rather than restated, so both planes read secrets with
+# identical semantics. Only inward-to-outward — see the D58c note above.
 _TRUTHY = TRUTHY_ENV_VALUES
 
 
@@ -497,14 +502,174 @@ class LearningSettings(BaseSettings):
         ),
     )
 
+    # --- HashiCorp Vault (sensitive-value sourcing) ---
+    # When VAULT_ENABLED=true, the sensitive values on THIS surface (the learning Redis
+    # URL, the three per-bucket Couchbase RBAC credentials, the extractor model API key)
+    # are read from Vault at startup and OVERRIDE anything from the environment. Each
+    # *_VAULT_PATH points at a KV secret; a path left empty skips that group (its env or
+    # default value is kept). See load_learning_settings_from_vault() for the read logic.
+    # Defaults keep Vault OFF, so existing env-based deploys are byte-identical.
+    #
+    # `VAULT_ENABLED` is the SAME env var the runtime surface reads, deliberately — the
+    # same rationale as the shared TRUTHY_ENV_VALUES table above: one operator, one
+    # deployment config, one switch that flips BOTH planes. A learning-only spelling
+    # would let an operator turn Vault on for the request path and leave the offline
+    # plane silently on env values (or the reverse), which fails as "the secret is wrong
+    # in one process", the hardest shape to diagnose.
+    vault_enabled: bool = Field(
+        False,
+        description="Read sensitive values from HashiCorp Vault at startup (overrides env).",
+    )
+    learning_redis_vault_path: str = Field(
+        "application/datascience/iwant_reporting/redis",
+        description=(
+            "Vault KV path holding the learning Redis URL (key: LEARNING_REDIS_URL). "
+            "Empty → use env/default."
+        ),
+    )
+    learning_audit_vault_path: str = Field(
+        "application/datascience/iwant_reporting/learning_audit",
+        description=(
+            "Vault KV path holding the learning_audit Couchbase credentials "
+            "(connection string, bucket, username, password). Empty → use env/default."
+        ),
+    )
+    learning_candidates_vault_path: str = Field(
+        "application/datascience/iwant_reporting/learning_candidates",
+        description=(
+            "Vault KV path holding the learning_candidates Couchbase credentials "
+            "(connection string, bucket, username, password). Empty → use env/default."
+        ),
+    )
+    learning_corpus_vault_path: str = Field(
+        "application/datascience/iwant_reporting/learning_corpus",
+        description=(
+            "Vault KV path holding the learning_corpus Couchbase credentials "
+            "(connection string, bucket, username, password). Empty → use env/default."
+        ),
+    )
+    learning_extractor_api_key_vault_path: str = Field(
+        "application/datascience/iwant_reporting/llm",
+        description=(
+            "Vault KV path holding the extractor model API key (key: "
+            "LEARNING_EXTRACTOR_API_KEY). Same path the runtime reads OPENAI_API_KEY "
+            "from, under a different key. Empty → use env/default."
+        ),
+    )
+
+
+def load_learning_settings_from_vault() -> LearningSettings:
+    """Construct LearningSettings, then override sensitive values from Vault when enabled.
+
+    Priority for each sensitive value:
+
+      1. Vault  — when VAULT_ENABLED and the relevant ``*_VAULT_PATH`` is set
+      2. Environment variable / ``.env``
+      3. Field default
+
+    Vault runs AFTER construction (it mutates the already-built LearningSettings) because
+    pydantic-settings sources env/defaults at construction time; this mirrors
+    `runtime/config.py::load_settings_from_vault`.  When Vault is disabled the env-built
+    settings object is returned unchanged, so nothing about the existing env-based
+    deployment path changes.
+    """
+    settings = LearningSettings()
+
+    if not settings.vault_enabled:
+        return settings
+
+    if vault is None:
+        raise RuntimeError(
+            "VAULT_ENABLED=true but the internal 'paycompy' package is not "
+            "installed. Install paycompy or set VAULT_ENABLED=false."
+        )
+
+    vc = vault.get_client_using_os_environ()
+
+    # --- Learning queue Redis URL ---
+    if settings.learning_redis_vault_path:
+        settings.learning_redis_url = _read_vault_secret(
+            vc,
+            "LEARNING_REDIS_URL",
+            settings.learning_redis_vault_path,
+            settings.learning_redis_url,
+        )
+
+    # --- learning_audit bucket credentials (D95) ---
+    if settings.learning_audit_vault_path:
+        p = settings.learning_audit_vault_path
+        settings.learning_audit_connection_string = _read_vault_secret(
+            vc, "LEARNING_AUDIT_CONNECTION_STRING", p, settings.learning_audit_connection_string
+        )
+        settings.learning_audit_bucket = _read_vault_secret(
+            vc, "LEARNING_AUDIT_BUCKET", p, settings.learning_audit_bucket
+        )
+        settings.learning_audit_username = _read_vault_secret(
+            vc, "LEARNING_AUDIT_USERNAME", p, settings.learning_audit_username
+        )
+        settings.learning_audit_password = _read_vault_secret(
+            vc, "LEARNING_AUDIT_PASSWORD", p, settings.learning_audit_password
+        )
+
+    # --- learning_candidates bucket credentials (D101) ---
+    if settings.learning_candidates_vault_path:
+        p = settings.learning_candidates_vault_path
+        settings.learning_candidates_connection_string = _read_vault_secret(
+            vc,
+            "LEARNING_CANDIDATES_CONNECTION_STRING",
+            p,
+            settings.learning_candidates_connection_string,
+        )
+        settings.learning_candidates_bucket = _read_vault_secret(
+            vc, "LEARNING_CANDIDATES_BUCKET", p, settings.learning_candidates_bucket
+        )
+        settings.learning_candidates_username = _read_vault_secret(
+            vc, "LEARNING_CANDIDATES_USERNAME", p, settings.learning_candidates_username
+        )
+        settings.learning_candidates_password = _read_vault_secret(
+            vc, "LEARNING_CANDIDATES_PASSWORD", p, settings.learning_candidates_password
+        )
+
+    # --- learning_corpus bucket credentials (D48) ---
+    if settings.learning_corpus_vault_path:
+        p = settings.learning_corpus_vault_path
+        settings.learning_corpus_connection_string = _read_vault_secret(
+            vc, "LEARNING_CORPUS_CONNECTION_STRING", p, settings.learning_corpus_connection_string
+        )
+        settings.learning_corpus_bucket = _read_vault_secret(
+            vc, "LEARNING_CORPUS_BUCKET", p, settings.learning_corpus_bucket
+        )
+        settings.learning_corpus_username = _read_vault_secret(
+            vc, "LEARNING_CORPUS_USERNAME", p, settings.learning_corpus_username
+        )
+        settings.learning_corpus_password = _read_vault_secret(
+            vc, "LEARNING_CORPUS_PASSWORD", p, settings.learning_corpus_password
+        )
+
+    # --- Extractor model API key ---
+    if settings.learning_extractor_api_key_vault_path:
+        settings.learning_extractor_api_key = _read_vault_secret(
+            vc,
+            "LEARNING_EXTRACTOR_API_KEY",
+            settings.learning_extractor_api_key_vault_path,
+            settings.learning_extractor_api_key,
+        )
+
+    return settings
+
 
 def get_learning_settings() -> LearningSettings:
-    """A fresh `LearningSettings` — deliberately not `@lru_cache`d.
+    """A fresh, Vault-aware `LearningSettings` — deliberately not `@lru_cache`d.
 
     The process-static fields are read once at process start by the entrypoints; the only
     runtime-toggled value is `LEARNING_ENABLED`, served fresh by `learning_enabled()`.
+
+    Un-cached costs nothing even with Vault in the path: every call site is a
+    once-per-process startup construction (the daemon entrypoints and the inbox service
+    build their settings before entering their loops), so a fresh Vault read per call is
+    a handful of KV reads at boot, not per cycle.
     """
-    return LearningSettings()
+    return load_learning_settings_from_vault()
 
 
 def unrecognized_learning_env_vars(environ: dict[str, str] | None = None) -> tuple[str, ...]:
