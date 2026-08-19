@@ -708,6 +708,10 @@ def create_app(
             request_token_budget=settings.request_token_budget(),
             max_tool_calls_per_iteration=settings.max_tool_calls_per_iteration,
             observer=observer,
+            # R7: for the ONE span the loop opens itself — the blueprint
+            # approval-RESUME re-entry, which bypasses `RunBlueprintTool` and so
+            # bypasses the envelope that spans the first call.
+            tracer=tracer,
             runtime_tools=runtime_tools,
             blueprint_executor=blueprint_executor,
             discovery_emulation_provider=discovery_emulation_provider,

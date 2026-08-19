@@ -75,6 +75,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolResult,
     _default_observer,
 )
+from data_agent.runtime.dispatch.tool_envelope import in_tool_span
 from data_agent.runtime.hooks.answer_table import (
     AnswerTableEvent,
     AnswerTableHooks,
@@ -117,6 +118,8 @@ from .turn_accumulators import (
 )
 
 if TYPE_CHECKING:
+    from opentelemetry.trace import Tracer
+
     from data_agent.runtime.context.discovery_emulation import EmulatedDiscovery
 
 ToolsProvider = Callable[[RuntimeCredentials], Awaitable[list[dict[str, Any]]]]
@@ -645,6 +648,7 @@ class AgentLoop:
         max_tool_calls_per_iteration: int = 8,
         clock: Callable[[], float] = time.monotonic,
         observer: ToolObserver = _default_observer,
+        tracer: Tracer | None = None,
         runtime_tools: Mapping[str, RuntimeTool] | None = None,
         blueprint_executor: Any = None,
         discovery_emulation_provider: EmulatedDiscoveryProvider | None = None,
@@ -706,6 +710,12 @@ class AgentLoop:
         self._max_tool_calls_per_iteration = max_tool_calls_per_iteration
         self._clock = clock
         self._observer = observer
+        # R7: the ONE span the loop opens itself — the blueprint approval-RESUME
+        # re-entry (`_resume_blueprint`), which bypasses `RunBlueprintTool` and so
+        # bypasses the envelope that would otherwise open it. Optional exactly like
+        # every other tracer seam (`ToolDispatcher`, `RuntimeToolBase`): `None`
+        # (Layer-1 loop tests, no Phoenix) means the span is simply never created.
+        self._tracer = tracer
         # LLM-generated progress summaries (opt-in, `progress_summary_enabled`).
         # `None` (default) → the feature is behaviorally absent: `_summary_tasks`
         # stays empty, so the window's `finally` takes no extra tick and the cancel
@@ -1688,20 +1698,54 @@ class AgentLoop:
         # (e.g. a neo4j blip on the authoritative re-fetch) must NOT abort the turn
         # and strand the user with a consumed checkpoint — contain it exactly like
         # `_run_runtime_tool` and continue the loop with a canned internal error.
+        async def _resume_work() -> ToolResult:
+            try:
+                outcome = await self._blueprint_executor.resume(
+                    blueprint_id=checkpoint.blueprint_id,
+                    slot_bindings=slot_bindings,
+                    completed_nodes_json=checkpoint.completed_nodes_json,
+                    awaiting_node=checkpoint.awaiting_node,
+                    approval_answer=answer,
+                    credentials=credentials,
+                )
+                return self._blueprint_outcome_to_tool_result(outcome)
+            except Exception:
+                _logger.exception(
+                    "runBlueprint resume raised (session=%s)", credentials.session_id
+                )
+                return _runtime_tool_internal_error("runBlueprint")
+
         self._observer("tool_dispatch_start", {"tool_name": "runBlueprint"})
-        try:
-            outcome = await self._blueprint_executor.resume(
-                blueprint_id=checkpoint.blueprint_id,
-                slot_bindings=slot_bindings,
-                completed_nodes_json=checkpoint.completed_nodes_json,
-                awaiting_node=checkpoint.awaiting_node,
-                approval_answer=answer,
-                credentials=credentials,
-            )
-            tool_result = self._blueprint_outcome_to_tool_result(outcome)
-        except Exception:
-            _logger.exception("runBlueprint resume raised (session=%s)", credentials.session_id)
-            tool_result = _runtime_tool_internal_error("runBlueprint")
+        # R7: the missing HALF of the runBlueprint TOOL span. A turn that paused for
+        # approval reached Phoenix with a span for the first call and NOTHING for the
+        # work the resume actually did. `in_tool_span` and not `tracing.tool_span`
+        # directly, because this IS the envelope's discipline (optimistic `ok`,
+        # `record_exception=False`, the status stamped from the outcome in one
+        # expression) and a hand-rolled copy here is exactly the drift the envelope
+        # was extracted to remove.
+        #
+        # SAME `tool_name` as the first call, so `tool.name` still names the tool the
+        # loop dispatched and agrees with the progress events either side of it; the
+        # resume half is told apart by `tool.args.resumed=True` — the same vocabulary
+        # the resumed trail entry already writes (`args={"id": …, "resumed": True}`),
+        # inside the existing `tool.args.*` namespace rather than a new one.
+        #
+        # D25 fail-closed: an EXPLICIT allowlist of structural scalars, NOT
+        # `tool_span_args(model_args)`. `awaiting_node` is a blueprint-authored node
+        # ORDER and the slot bindings are reported as a COUNT, so no slot VALUE and no
+        # word of the user's approval `answer` has a path onto this span under any
+        # posture — the loop is handed no `otlp_disable_redaction` switch to flip.
+        tool_result = await in_tool_span(
+            self._tracer,
+            tool_name="runBlueprint",
+            args={
+                "id": checkpoint.blueprint_id,
+                "resumed": True,
+                "awaiting_node": checkpoint.awaiting_node,
+                "slot_count": len(slot_bindings),
+            },
+            work=_resume_work,
+        )
         self._observer(
             "tool_dispatch_ok" if tool_result.status == "ok" else "tool_dispatch_error",
             {"tool_name": "runBlueprint", "error_code": tool_result.error_code},

@@ -960,3 +960,27 @@ dropped, the generalize package's pre-keep-and-annotate claim corrected.
 - V0 on main after compose with T4.4: **6029 passed / 225 skipped /
   1 xfailed**; cold imports + ruff clean; V1 **8/9 at/above baseline,
   L3 its accepted 1/3**. Wave B complete — Tier 4 closed.
+
+## #27 — R7: resume-path tool span (2026-08-19)
+
+- The blueprint RESUME path (approval/askUser checkpoint → /turn/resume →
+  executor.resume) ran spanless — the pause and the answer appeared in
+  Phoenix with nothing between. `_resume_blueprint` now lifts the
+  executor re-entry + outcome mapping verbatim into a closure run under
+  `in_tool_span` (the T4.4 envelope discipline: optimistic ok,
+  record_exception=False, single-expression stamp), placed between the
+  PRE-EXISTING tool_dispatch_start/ok/error events. Span name stays
+  `tool.runBlueprint` (groups with the first call); the resume half is
+  `tool.args.resumed=True`; allowlist = id/resumed/awaiting_node/
+  slot_count — reviewer confirmed the approval answer has no path onto
+  the span under any posture and awaiting_node is int-coerced at
+  checkpoint load before this code can run.
+- `AgentLoop.__init__` gained keyword-only `tracer=None` (Layer-1 tests
+  unaffected); app.py passes the composition-root tracer, so the resume
+  span nests under the turn's agent_span. Review: APPROVE, zero
+  blockers — closure byte-identical to the pre-change code, exception
+  flow unchanged in both directions.
+- V0 **6034 passed / 225 skipped / 1 xfailed**; ruff clean. V1 deferred
+  to the combined J7+R7 gate (next entry) — the resume path is not
+  exercised by the routing eval; the L3 re-measure covers the shared
+  surfaces.
