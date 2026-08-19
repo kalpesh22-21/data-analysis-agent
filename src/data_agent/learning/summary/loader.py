@@ -14,7 +14,11 @@ from collections.abc import Awaitable, Callable, Iterator
 from typing import Any, Protocol
 
 from data_agent.runtime.context.assembly import IDEMPOTENT_READ_ALREADY_SERVED_CODE
-from data_agent.runtime.dispatch.denial_mapping import ENFORCEMENT_DENIAL_CODES
+from data_agent.runtime.dispatch.denial_mapping import (
+    ENFORCEMENT_DENIAL_CODES,
+    INFRA_FAILURE_CODES,
+)
+from data_agent.runtime.dispatch.tool_dispatcher import INTERNAL_TRANSPORT_ERROR_CODE
 from data_agent.runtime.session.models import ResultPreview, SessionDoc, TrailEntry
 
 from ..models import LearningJob
@@ -95,6 +99,27 @@ ENFORCEMENT_ERROR_CODES = ENFORCEMENT_DENIAL_CODES | {
     IDEMPOTENT_READ_ALREADY_SERVED_CODE,
 }
 
+# INFRA codes: the system UNDERNEATH the call fell over — a warehouse outage, a
+# dependency down, a crash inside a composite, a transport failure. DERIVED from
+# `DenialInfo.kind is DenialKind.INFRA_FAILED` on the same terms as the set above.
+#
+# This is the THIRD answer the H1 boolean could not give (docs/cleanup/ISSUES.md H8).
+# An enforcement gate says "nothing was computed"; an infra failure says "something was
+# attempted and nothing judged it". The two readers below want OPPOSITE things from that
+# distinction, which is exactly why it cannot live on one flag:
+#
+#   * `_blueprint_usages` asks "was this blueprint's OUTPUT any good?" — an outage is no
+#     evidence either way, so it emits NO usage (the enforcement treatment).
+#   * `_failed_fixed_pairs` asks "did the analyst have to fight the system?" — an outage
+#     IS that fight, so it still counts (the substantive treatment).
+INFRA_ERROR_CODES = INFRA_FAILURE_CODES | {
+    # The ONE infra code that is not a `_DENIAL_TABLE` entry: a raw transport exception
+    # (connection refusal, timeout, malformed response) carries no `[{CODE}]` prefix, so
+    # the dispatcher never looks it up in the denial table and stamps this marker
+    # instead. Imported by symbol from its owner, like the enforcement marker above.
+    INTERNAL_TRANSPORT_ERROR_CODE,
+}
+
 
 class _FullResultReader(Protocol):
     async def read_full_result(
@@ -110,6 +135,16 @@ def _is_enforcement_denial(tc: ToolCallSummary) -> bool:
     conservative direction, where an unclassifiable failure stays a failure.
     """
     return tc.error_code in ENFORCEMENT_ERROR_CODES
+
+
+def _is_infra_failure(tc: ToolCallSummary) -> bool:
+    """Did the system under this call fall over, leaving no verdict on the work?
+
+    Disjoint from `_is_enforcement_denial` by construction (`DenialKind` is one-of), and
+    `None` — every pre-Release-1 entry, every unparseable prefix — is in NEITHER set, so
+    an unclassifiable failure keeps reading as a real failure of real work.
+    """
+    return tc.error_code in INFRA_ERROR_CODES
 
 
 def _extract_sql(tool_name: str, args: dict[str, Any]) -> str | None:
@@ -254,6 +289,13 @@ def _failed_fixed_pairs(tool_calls: tuple[ToolCallSummary, ...]) -> tuple[Failed
     # `ENFORCEMENT_ERROR_CODES`): the query never ran, so the later ok runQuery is
     # the FIRST attempt at that data, not a repair of a broken one. Pairing them
     # would report SQL that was never wrong as "the analyst had to fight it".
+    #
+    # An INFRA failure (`CLICKHOUSE_UNAVAILABLE`, a transport blowup) is DELIBERATELY
+    # not skipped here, and that asymmetry with `_blueprint_usages` is the whole point
+    # of the three-valued `DenialKind`. This reader measures analyst friction, and a
+    # warehouse outage that forced a re-run IS friction the analyst lived through —
+    # something was attempted, it came back unusable, a later query got the data. The
+    # other reader measures corpus quality, where the same outage is no evidence at all.
     pairs: list[FailedFixedSql] = []
     for i, tc in enumerate(tool_calls):
         if tc.tool_name not in _DATA_TOOLS or tc.status not in _FAILED_STATUSES:
@@ -410,9 +452,24 @@ def _blueprint_usages(
     # one: it would let a blueprint that never ran once accumulate a positive usage
     # record, which is the same conflation in the other direction. There was no
     # usage, so there is no `BlueprintUsage`.
+    #
+    # An INFRA failure is skipped for the SAME reason and is NOT the same case (H8).
+    # `CLICKHOUSE_UNAVAILABLE` on a `runBlueprint` used to land here as
+    # `outcome="corrected"` — the warehouse being down was recorded as "this blueprint
+    # was wrong", and that flows to `SessionSignals.corrected_blueprint`, the inbox's
+    # 0.5 ranking penalty and triage K4. The blueprint's SQL was never judged by
+    # anything, so like a gate it supports neither outcome. Same reasoning as above:
+    # emitting `accepted` would be the opposite conflation, so it emits nothing.
+    #
+    # This is where the two readers in this module DIVERGE. `_failed_fixed_pairs` skips
+    # gates and KEEPS infra failures, because it measures a different thing (analyst
+    # friction, which an outage genuinely is). One flag could not have said both, which
+    # is why `DenialKind` is three-valued.
     usages: list[BlueprintUsage] = []
     for tc in tool_calls:
-        if tc.tool_name != "runBlueprint" or _is_enforcement_denial(tc):
+        if tc.tool_name != "runBlueprint":
+            continue
+        if _is_enforcement_denial(tc) or _is_infra_failure(tc):
             continue
         corrected = tc.status != "ok" or _trailing_correction_after(doc, tc.turn_index)
         bp_id = tc.args.get("blueprint_id")

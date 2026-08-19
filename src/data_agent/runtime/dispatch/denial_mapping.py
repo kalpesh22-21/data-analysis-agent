@@ -10,6 +10,22 @@ not free.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
+
+
+class DenialKind(StrEnum):
+    """What a denial says about the model's WORK — the three answers a refusal can give.
+
+    H1 shipped this as a boolean (`enforcement`), which forced the third answer to
+    borrow the second one's slot: a warehouse outage on a `runBlueprint` read as "the
+    model's blueprint was judged and found wanting". The two offline readers want
+    DIFFERENT things from an outage (see `learning/summary/loader.py`), and a boolean
+    cannot give them different answers.
+    """
+
+    GATE = "gate"  # call protocol refused; nothing was computed
+    WORK_JUDGED = "work_judged"  # the model's SQL/blueprint was judged — the DEFAULT
+    INFRA_FAILED = "infra_failed"  # the system under the work failed; no verdict on the work
 
 
 @dataclass(frozen=True)
@@ -19,23 +35,29 @@ class DenialInfo:
     code: str
     retryable: bool
     user_message: str
-    # Is this refusal about the CALL rather than about the WORK?
+    # What does this refusal say about the model's work?
     #
-    # True  — a procedural/protocol gate: the runtime refused because of the ORDER or
-    #         the SHAPE of the call (read the blueprint before running it, resolve your
-    #         intents before finalizing, put a table in your answer, send a well-formed
-    #         ledger update). Nothing substantive was attempted, and nothing the model
-    #         asked OF THE DATA was found wanting. Release 1 made these routine: a
-    #         healthy session trips them.
-    # False — a substantive failure: the query/blueprint the model authored was itself
-    #         rejected or came back wrong (bad SQL, out-of-scope columns, a table that
-    #         does not exist), or the system underneath it failed. This is the DEFAULT
-    #         and the conservative direction — an unclassifiable failure stays a
-    #         failure.
+    # GATE         — a procedural/protocol refusal: the runtime refused because of the
+    #                ORDER or the SHAPE of the call (read the blueprint before running
+    #                it, resolve your intents before finalizing, put a table in your
+    #                answer, send a well-formed ledger update). Nothing substantive was
+    #                attempted, and nothing the model asked OF THE DATA was found
+    #                wanting. Release 1 made these routine: a healthy session trips them.
+    # WORK_JUDGED  — the query/blueprint the model authored was itself rejected or came
+    #                back wrong (bad SQL, out-of-scope columns, a table that does not
+    #                exist). This is the DEFAULT and the conservative direction — an
+    #                unclassifiable failure reads as a real failure of real work, which
+    #                is what every code read as before this field existed.
+    # INFRA_FAILED — the system UNDERNEATH the work fell over (warehouse outage, a
+    #                dependency down, a crash inside a composite). The call was fine and
+    #                the SQL may have been perfect; there is simply no verdict on the
+    #                work, because nothing judged it.
     #
-    # The line is NOT "did the executor run": `COLUMN_SCOPE_VIOLATION` is refused before
-    # ClickHouse is touched and is still substantive, because what was refused is the
-    # model's query. It is "was the model's DATA WORK judged, or only its call protocol".
+    # The GATE/WORK_JUDGED line is NOT "did the executor run": `COLUMN_SCOPE_VIOLATION`
+    # is refused before ClickHouse is touched and is still WORK_JUDGED, because what was
+    # refused is the model's query. It is "was the model's DATA WORK judged, or only its
+    # call protocol". The WORK_JUDGED/INFRA_FAILED line is a different question: did
+    # anything actually FORM a verdict about the work.
     #
     # It lives HERE, where codes are registered, because the offline learning loop needs
     # the split and had been keeping its own hand-written list of it
@@ -43,10 +65,23 @@ class DenialInfo:
     # field). A hand-kept list fails loudly on a rename and silently on an ADDITION: a
     # new gate code counted as substantive friction, putting a permanent negative bias on
     # every session that trips it. Registering a code and classifying it are now the same
-    # edit. Default `False` so the field can never be the reason an addition is silent in
-    # the OTHER direction — an unclassified new code reads as a real failure, which is
-    # what it was before this field existed.
-    enforcement: bool = False
+    # edit. The default is `WORK_JUDGED` so the field can never be the reason an addition
+    # is silent in the OTHER direction — an unclassified new code reads as a real
+    # failure, exactly as it did before this field existed.
+    kind: DenialKind = DenialKind.WORK_JUDGED
+
+    @property
+    def enforcement(self) -> bool:
+        """Is this refusal about the CALL rather than about the WORK?
+
+        DERIVED from `kind`, kept as a property so every existing reader of the H1
+        boolean sees exactly the shape it always did. An outage is NOT enforcement — it
+        never was, and widening this to include `INFRA_FAILED` would tell
+        `_failed_fixed_pairs` that a warehouse outage cost the analyst nothing, which is
+        false. `INFRA_FAILED` is read through `INFRA_FAILURE_CODES` instead, by the one
+        reader that wants it.
+        """
+        return self.kind is DenialKind.GATE
 
 
 # The finalization refusal's code (Release 1, 05 §B.1). It lives HERE, at the
@@ -81,17 +116,17 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "COLUMN_SCOPE_VIOLATION": DenialInfo(
         code="COLUMN_SCOPE_VIOLATION",
         retryable=False,
-        # SUBSTANTIVE: the model's query asked for columns this scope does not hold.
+        # WORK_JUDGED: the model's query asked for columns this scope does not hold.
         # Refused before ClickHouse ran, and still a judgement ON THE QUERY.
-        enforcement=False,
+        kind=DenialKind.WORK_JUDGED,
         user_message="This needs access to columns outside your current permissions.",
     ),
     "SCRATCH_SESSION_VIOLATION": DenialInfo(
         code="SCRATCH_SESSION_VIOLATION",
         retryable=False,
-        # SUBSTANTIVE: the query referenced scratch data belonging to another session —
+        # WORK_JUDGED: the query referenced scratch data belonging to another session —
         # again a fact about what the SQL named, not about call order.
-        enforcement=False,
+        kind=DenialKind.WORK_JUDGED,
         user_message="That data isn't available in this session.",
     ),
     # ANSWER_TABLE_BLUEPRINT_NOT_RUN: the model ended its turn with
@@ -108,9 +143,9 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "ANSWER_TABLE_BLUEPRINT_NOT_RUN": DenialInfo(
         code="ANSWER_TABLE_BLUEPRINT_NOT_RUN",
         retryable=True,
-        # ENFORCEMENT: an answer-shape gate. The blueprint was never run, so there is no
+        # GATE: an answer-shape gate. The blueprint was never run, so there is no
         # blueprint OUTPUT to have been wrong — only a call made out of order.
-        enforcement=True,
+        kind=DenialKind.GATE,
         user_message=(
             "You referenced a blueprint you have not run in this turn, so there is no "
             "table to show. Call runBlueprint with that blueprint first, then call "
@@ -135,9 +170,9 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "ANSWER_TABLE_NO_TABLE_DESIGNATED": DenialInfo(
         code="ANSWER_TABLE_NO_TABLE_DESIGNATED",
         retryable=True,
-        # ENFORCEMENT: the purest answer-SHAPE refusal in the table — the model named no
+        # GATE: the purest answer-SHAPE refusal in the table — the model named no
         # table at all. Nothing was computed and nothing computed was wrong.
-        enforcement=True,
+        kind=DenialKind.GATE,
         user_message=(
             "Your answerWithTable named no table, so there is nothing for the user "
             "to look at. Every table goes in `tables`, one entry per part of your "
@@ -161,10 +196,10 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "BLUEPRINT_DEFINITION_NOT_READ": DenialInfo(
         code="BLUEPRINT_DEFINITION_NOT_READ",
         retryable=True,
-        # ENFORCEMENT: a call-ORDER gate (getBlueprint before runBlueprint). The
-        # executor never ran, so this is not evidence that the blueprint is wrong —
-        # which is exactly what the learning loop would otherwise record.
-        enforcement=True,
+        # GATE: a call-ORDER gate (getBlueprint before runBlueprint). The executor
+        # never ran, so this is not evidence that the blueprint is wrong — which is
+        # exactly what the learning loop would otherwise record.
+        kind=DenialKind.GATE,
         user_message=(
             "You have not read that blueprint in this turn, so you do not know what "
             "it measures. Call getBlueprint with that blueprint id first, check what "
@@ -180,9 +215,9 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "ANALYSIS_STATE_INVALID": DenialInfo(
         code="ANALYSIS_STATE_INVALID",
         retryable=True,
-        # ENFORCEMENT: bookkeeping hygiene. A mis-shaped ledger update says nothing
-        # about the data — `updateAnalysisState` computes nothing in the first place.
-        enforcement=True,
+        # GATE: bookkeeping hygiene. A mis-shaped ledger update says nothing about
+        # the data — `updateAnalysisState` computes nothing in the first place.
+        kind=DenialKind.GATE,
         user_message=(
             "That analysis-state update was rejected. Send one updateAnalysisState "
             "call listing each intent by the id you were given and its new status, "
@@ -195,9 +230,9 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "ANALYSIS_STATE_LATE_INIT": DenialInfo(
         code="ANALYSIS_STATE_LATE_INIT",
         retryable=False,
-        # ENFORCEMENT: the same ledger, refused on TIMING rather than shape. Not
-        # retryable and still not a data failure — the two flags are independent.
-        enforcement=True,
+        # GATE: the same ledger, refused on TIMING rather than shape. Not retryable
+        # and still not a data failure — `retryable` and `kind` are independent.
+        kind=DenialKind.GATE,
         user_message=(
             "The intents for this question can no longer be declared — the analysis is "
             "already under way. Continue and answer everything the user asked."
@@ -214,9 +249,9 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     FINALIZATION_BLOCKED_PENDING_INTENTS_CODE: DenialInfo(
         code=FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
         retryable=True,
-        # ENFORCEMENT: a finalization-ORDER gate. The turn's work may be perfect; what
-        # was refused is ending the turn with the ledger unresolved.
-        enforcement=True,
+        # GATE: a finalization-ORDER gate. The turn's work may be perfect; what was
+        # refused is ending the turn with the ledger unresolved.
+        kind=DenialKind.GATE,
         user_message=(
             "You still have intents that are neither completed nor blocked, so this "
             "cannot be the final answer yet. Resolve each one with "
@@ -228,9 +263,9 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "PARSE_FAILED_CLOSED": DenialInfo(
         code="PARSE_FAILED_CLOSED",
         retryable=True,
-        # SUBSTANTIVE: the SQL itself could not be parsed/validated. The verdict is on
+        # WORK_JUDGED: the SQL itself could not be parsed/validated. The verdict is on
         # the query the model wrote.
-        enforcement=False,
+        kind=DenialKind.WORK_JUDGED,
         user_message=(
             "I couldn't validate that query safely — let me try explainQuery first."
         ),
@@ -238,16 +273,16 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "DATABASE_NOT_ALLOWED": DenialInfo(
         code="DATABASE_NOT_ALLOWED",
         retryable=True,
-        # SUBSTANTIVE: the query named a database it may not read.
-        enforcement=False,
+        # WORK_JUDGED: the query named a database it may not read.
+        kind=DenialKind.WORK_JUDGED,
         user_message="That database isn't available. Let me check what's accessible.",
     ),
     "TABLE_NOT_FOUND": DenialInfo(
         code="TABLE_NOT_FOUND",
         retryable=True,
-        # SUBSTANTIVE: the query named a table that does not exist — the canonical
+        # WORK_JUDGED: the query named a table that does not exist — the canonical
         # "a query came back wrong and a later one fixed it" shape.
-        enforcement=False,
+        kind=DenialKind.WORK_JUDGED,
         user_message="I couldn't find that table. Let me verify the table name.",
     ),
     # CARTESIAN_JOIN_FORBIDDEN: the clickhouse-api guardrail rejects a query that
@@ -262,9 +297,9 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "CARTESIAN_JOIN_FORBIDDEN": DenialInfo(
         code="CARTESIAN_JOIN_FORBIDDEN",
         retryable=True,
-        # SUBSTANTIVE: a guardrail on the SHAPE OF THE QUERY (a missing join
+        # WORK_JUDGED: a guardrail on the SHAPE OF THE QUERY (a missing join
         # condition), not on the shape of the call. The model's SQL was wrong.
-        enforcement=False,
+        kind=DenialKind.WORK_JUDGED,
         user_message=(
             "That query cross-joins two tables without a join condition. Add an ON "
             "or USING clause, or wrap a constant side in a subquery."
@@ -273,16 +308,19 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "CLICKHOUSE_QUERY_ERROR": DenialInfo(
         code="CLICKHOUSE_QUERY_ERROR",
         retryable=True,
-        # SUBSTANTIVE: the executor ran it and the warehouse rejected it.
-        enforcement=False,
+        # WORK_JUDGED: the executor ran it and the warehouse rejected it.
+        kind=DenialKind.WORK_JUDGED,
         user_message="That query didn't run correctly. Let me fix it and try again.",
     ),
     "CLICKHOUSE_UNAVAILABLE": DenialInfo(
         code="CLICKHOUSE_UNAVAILABLE",
         retryable=False,
-        # SUBSTANTIVE: the system underneath the work failed. Nothing about the call
-        # was refused, so counting it as friction is correct — it WAS friction.
-        enforcement=False,
+        # INFRA_FAILED: the warehouse fell over. NO VERDICT ON THE WORK — the SQL may
+        # have been perfect and nothing ever ran it, so a `runBlueprint` that hits this
+        # must not be recorded as a blueprint that produced a wrong answer. It is still
+        # friction the analyst lived through, which is why the two offline readers split
+        # here rather than sharing one flag (`learning/summary/loader.py`).
+        kind=DenialKind.INFRA_FAILED,
         user_message="The data warehouse is temporarily unavailable.",
     ),
     # D77 resolveValues composite codes (L5): these never come from the MCP —
@@ -295,9 +333,9 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "RESOLVE_VALUES_UNKNOWN_TARGET": DenialInfo(
         code="RESOLVE_VALUES_UNKNOWN_TARGET",
         retryable=True,
-        # SUBSTANTIVE: the model named a table/column that does not exist — the
+        # WORK_JUDGED: the model named a table/column that does not exist — the
         # `TABLE_NOT_FOUND` shape, reached through the composite instead of the MCP.
-        enforcement=False,
+        kind=DenialKind.WORK_JUDGED,
         user_message=(
             "That table or column isn't available. Check the exact name with "
             "getTableSchema and try again."
@@ -306,15 +344,17 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "RESOLVE_VALUES_INTERNAL_ERROR": DenialInfo(
         code="RESOLVE_VALUES_INTERNAL_ERROR",
         retryable=False,
-        # SUBSTANTIVE: a crash, not a refusal. The call was attempted and failed.
-        enforcement=False,
+        # INFRA_FAILED: a crash inside the composite, not a refusal. Nothing ever
+        # judged what the model asked for, so there is no verdict on the work.
+        kind=DenialKind.INFRA_FAILED,
         user_message="Something went wrong resolving those values. Please try again.",
     ),
     "RESOLVE_VALUES_UNAVAILABLE": DenialInfo(
         code="RESOLVE_VALUES_UNAVAILABLE",
         retryable=False,
-        # SUBSTANTIVE: a capability outage, the `CLICKHOUSE_UNAVAILABLE` shape.
-        enforcement=False,
+        # INFRA_FAILED: a capability outage, the `CLICKHOUSE_UNAVAILABLE` shape — the
+        # request was fine, the dependency was down, and no verdict on the work exists.
+        kind=DenialKind.INFRA_FAILED,
         user_message="Value resolution is not available right now.",
     ),
     # Read-tools (searchBlueprints/getBlueprint/searchKnowledge, read-tools §6):
@@ -326,27 +366,28 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "RETRIEVAL_TOOL_INVALID_ARGS": DenialInfo(
         code="RETRIEVAL_TOOL_INVALID_ARGS",
         retryable=True,
-        # ENFORCEMENT: arg-SHAPE validation (`retrieval/tools.py::_require_text` /
+        # GATE: arg-SHAPE validation (`retrieval/tools.py::_require_text` /
         # `_clamp_k`) — a blank `query`, an out-of-range `k`. Refused on the envelope
         # before any search ran, the `ANALYSIS_STATE_INVALID` shape. Unreachable by
         # today's learning readers (no retrieval tool is a data tool); classified for
         # completeness so the split is the whole vocabulary, not the reachable part.
-        enforcement=True,
+        kind=DenialKind.GATE,
         user_message="That search request was malformed. Check the arguments and try again.",
     ),
     "RETRIEVAL_TOOL_UNAVAILABLE": DenialInfo(
         code="RETRIEVAL_TOOL_UNAVAILABLE",
         retryable=False,
-        # SUBSTANTIVE: a capability outage — the request was fine, the dependency was
-        # not.
-        enforcement=False,
+        # INFRA_FAILED: a capability outage — the request was fine, the dependency
+        # was not, and nothing formed a verdict on the work.
+        kind=DenialKind.INFRA_FAILED,
         user_message="Blueprint and knowledge search is not available right now.",
     ),
     "RETRIEVAL_TOOL_INTERNAL_ERROR": DenialInfo(
         code="RETRIEVAL_TOOL_INTERNAL_ERROR",
         retryable=False,
-        # SUBSTANTIVE: a crash that slipped every guard. Attempted, then failed.
-        enforcement=False,
+        # INFRA_FAILED: a crash that slipped every guard. The system under the call
+        # broke; nothing judged what was asked for.
+        kind=DenialKind.INFRA_FAILED,
         user_message="Blueprint/knowledge search hit an internal error. Please try again.",
     ),
     # Registry-seam containment (read-tools §2 hardening): a runtime tool that
@@ -354,10 +395,10 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
     "RUNTIME_TOOL_INTERNAL_ERROR": DenialInfo(
         code="RUNTIME_TOOL_INTERNAL_ERROR",
         retryable=False,
-        # SUBSTANTIVE: the registry-seam containment code — a runtime tool raised or
-        # returned a contract-violating result. A real failure of a real attempt, and
-        # the conservative reading of "something went wrong and we do not know what".
-        enforcement=False,
+        # INFRA_FAILED: the registry-seam containment code — a runtime tool raised or
+        # returned a contract-violating result. The TOOL broke, which is a fact about
+        # the runtime and not a judgement of the model's data work.
+        kind=DenialKind.INFRA_FAILED,
         user_message="That tool hit an internal error. Please try again.",
     ),
 }
@@ -369,11 +410,19 @@ KNOWN_DENIAL_CODES = frozenset(_DENIAL_TABLE)
 # enforcement marker that is not a denial-table entry at all), so the set of codes that
 # do not count as analyst friction is a projection of the registrations above rather
 # than a second list kept in step by a test. Adding a code to `_DENIAL_TABLE` without
-# thinking about `enforcement` now yields the pre-existing behaviour (substantive), and
-# `tests/runtime/dispatch/test_denial_mapping.py::_EXPECTED_ENFORCEMENT` fails until the
-# author states the classification out loud.
+# thinking about `kind` now yields the pre-existing behaviour (`WORK_JUDGED`), and
+# `tests/runtime/dispatch/test_denial_mapping.py::_EXPECTED_KIND` fails until the author
+# states the classification out loud.
 ENFORCEMENT_DENIAL_CODES = frozenset(
     code for code, info in _DENIAL_TABLE.items() if info.enforcement
+)
+
+# The INFRA_FAILED third of the table, DERIVED on the same terms. Read by
+# `learning/summary/loader.py::INFRA_ERROR_CODES` (plus the one transport marker that is
+# not a denial-table entry at all) so an outage stops being recorded as a blueprint that
+# produced a wrong answer, while STILL counting as the analyst friction it was.
+INFRA_FAILURE_CODES = frozenset(
+    code for code, info in _DENIAL_TABLE.items() if info.kind is DenialKind.INFRA_FAILED
 )
 
 

@@ -23,7 +23,7 @@ import pytest
 
 from data_agent.learning.candidate.signals import SessionSignals
 from data_agent.learning.summary import load_session_summary
-from data_agent.learning.summary.loader import ENFORCEMENT_ERROR_CODES
+from data_agent.learning.summary.loader import ENFORCEMENT_ERROR_CODES, INFRA_ERROR_CODES
 from data_agent.learning.triage import triage
 
 from .helpers import make_doc, make_job, make_message, make_trail_entry
@@ -31,15 +31,18 @@ from .helpers import make_doc, make_job, make_message, make_trail_entry
 HEADCOUNT_SQL = "SELECT count(*) FROM hr.employee WHERE department = 'Analytics'"
 PAYROLL_SQL = "SELECT sum(gross_pay) FROM payroll.payroll_fact WHERE toYear(pay_period) = 2025"
 
-# Codes a runQuery/runBlueprint can come back with where the call REALLY RAN and the
-# answer was wrong — the friction both readers exist to record. Derived from
-# `denial_mapping._DENIAL_TABLE` by asking, of each entry, "could the executor have
-# already been reached?", not copied from a list.
+# Codes a runQuery/runBlueprint can come back with where the model's OWN WORK was judged
+# and found wanting — the friction both readers exist to record. Derived from
+# `denial_mapping._DENIAL_TABLE` by asking, of each entry, "was a verdict formed on the
+# query or the blueprint?", not copied from a list.
+#
+# `CLICKHOUSE_UNAVAILABLE` used to sit here and no longer does (H8). It is INFRA, not
+# substantive: the warehouse was down, so nothing judged the SQL. It keeps ONE of the two
+# behaviours below — see `test_an_infra_outage_is_friction_but_not_a_corrected_blueprint`.
 SUBSTANTIVE_DATA_CODES = frozenset({
     "COLUMN_SCOPE_VIOLATION",
     "SCRATCH_SESSION_VIOLATION",
     "CLICKHOUSE_QUERY_ERROR",
-    "CLICKHOUSE_UNAVAILABLE",
     "CARTESIAN_JOIN_FORBIDDEN",
     "TABLE_NOT_FOUND",
     "DATABASE_NOT_ALLOWED",
@@ -58,12 +61,18 @@ def test_no_substantive_failure_code_is_ever_classified_as_enforcement():
     assert ENFORCEMENT_ERROR_CODES.isdisjoint(SUBSTANTIVE_DATA_CODES)
 
 
-@pytest.mark.parametrize("error_code", sorted(SUBSTANTIVE_DATA_CODES))
-async def test_every_substantive_code_still_counts_as_friction(store, error_code):
-    """The other half of the same invariant, exercised through the real loader: each
-    of these still yields a failed→fixed pair AND a `corrected` blueprint usage,
-    i.e. behaviour identical to before the slice."""
-    doc = make_doc(
+def test_no_substantive_failure_code_is_ever_classified_as_infra():
+    """The H8 twin. `INFRA_ERROR_CODES` suppresses blueprint usages, so a substantive
+    code leaking into it would silently stop recording blueprints that really did produce
+    wrong answers — the same class of loss as the enforcement invariant above, through
+    the other set."""
+    assert INFRA_ERROR_CODES.isdisjoint(SUBSTANTIVE_DATA_CODES)
+
+
+def _denied_blueprint_then_ok_query(error_code):
+    """One `runBlueprint` refused with `error_code`, then a clean `runQuery` — the shape
+    that exercises BOTH readers at once (the pair and the usage) off one trail."""
+    return make_doc(
         tool_trail=[
             make_trail_entry(turn_index=0, tool_call_id="bp", tool_name="runBlueprint",
                              args={"blueprint_id": "bp-x"}, status="denied",
@@ -72,10 +81,40 @@ async def test_every_substantive_code_still_counts_as_friction(store, error_code
                              args={"sql": HEADCOUNT_SQL}, status="ok"),
         ],
     )
-    summary = await _load(store, doc)
+
+
+@pytest.mark.parametrize("error_code", sorted(SUBSTANTIVE_DATA_CODES))
+async def test_every_substantive_code_still_counts_as_friction(store, error_code):
+    """The other half of the same invariant, exercised through the real loader: each
+    of these still yields a failed→fixed pair AND a `corrected` blueprint usage,
+    i.e. behaviour identical to before the slice."""
+    summary = await _load(store, _denied_blueprint_then_ok_query(error_code))
     assert [p.failed_tool_call_ref for p in summary.failed_fixed_sql] == ["bp"]
     assert [u.outcome for u in summary.blueprint_usages] == ["corrected"]
     assert SessionSignals.from_summary(summary).corrected_blueprint is True
+
+
+@pytest.mark.parametrize("error_code", sorted(INFRA_ERROR_CODES))
+async def test_an_infra_outage_is_friction_but_not_a_corrected_blueprint(store, error_code):
+    """H8, pinned as the ASYMMETRY it is — the same trail, the two readers disagreeing.
+
+    An outage still pairs failed→fixed (the analyst really did hit a wall and re-run: that
+    is friction they lived through), but emits NO blueprint usage at all, because nothing
+    ever judged the blueprint's SQL. Before this, `CLICKHOUSE_UNAVAILABLE` on a
+    `runBlueprint` produced `outcome="corrected"` → `SessionSignals.corrected_blueprint`
+    → a 0.5 inbox ranking penalty and a triage K4 keep, all from a warehouse being down.
+
+    Emitting `accepted` instead would be the opposite conflation (a blueprint that never
+    ran accruing a positive record), so the usage list is EMPTY, not merely non-corrected.
+
+    Parametrized over the whole derived set rather than one code, for the reason the
+    enforcement suite is: a per-code fixture only covers what someone remembered.
+    """
+    summary = await _load(store, _denied_blueprint_then_ok_query(error_code))
+    assert summary.blueprint_usages == ()
+    assert SessionSignals.from_summary(summary).corrected_blueprint is False
+    assert [p.failed_tool_call_ref for p in summary.failed_fixed_sql] == ["bp"]
+    assert SessionSignals.from_summary(summary).failed_fixed_count == 1
 
 
 # --- §2.4: an enforcement denial must not stand between a failure and its fix ---

@@ -8,7 +8,9 @@ import pytest
 
 from data_agent.runtime.dispatch.denial_mapping import (
     ENFORCEMENT_DENIAL_CODES,
+    INFRA_FAILURE_CODES,
     KNOWN_DENIAL_CODES,
+    DenialKind,
     classify_denial,
 )
 
@@ -162,106 +164,153 @@ def test_none_code_is_handled() -> None:
     assert info.code == "UNKNOWN_ERROR"
 
 
-# --- enforcement: is the refusal about the CALL or about the WORK? --------------
+# --- kind: what does the refusal say about the model's WORK? --------------------
 #
-# `DenialInfo.enforcement` is READ by the offline learning loop
-# (`learning/summary/loader.py::ENFORCEMENT_ERROR_CODES` is derived from it): an
-# enforcement denial is NOT counted as analyst friction — no `failed_fixed` pair, no
-# `corrected` blueprint usage. So a wrong classification here is a silent measurement
-# bug two packages away, in either direction: True on a real failure hides friction that
-# happened, False on a gate invents friction that did not.
+# `DenialInfo.kind` is READ by the offline learning loop (both
+# `learning/summary/loader.py::ENFORCEMENT_ERROR_CODES` and `::INFRA_ERROR_CODES` are
+# derived from it): an enforcement denial is NOT counted as analyst friction and emits no
+# blueprint usage, and an INFRA failure emits no blueprint usage while STILL counting as
+# friction. So a wrong classification here is a silent measurement bug two packages away,
+# in every direction: GATE on a real failure hides friction that happened, WORK_JUDGED on
+# a gate invents friction that did not, and WORK_JUDGED on an outage records "this
+# blueprint was wrong" about a warehouse that was down.
 #
 # This map is DELIBERATELY hand-written, one line of rationale per code, and the test
 # below fails if a registered code is missing from it. Mirroring `_DENIAL_TABLE` with a
 # comprehension would assert nothing; the value of this map is that adding a code to the
 # table cannot go green until a human has said, in words, which side it falls on.
 #
-# The line is not "did the executor run" — `COLUMN_SCOPE_VIOLATION` is refused before
-# ClickHouse is touched and is still substantive. It is "was the model's DATA WORK
-# judged (its SQL, its blueprint, the warehouse under them), or only its CALL PROTOCOL
-# (the order of calls, the shape of the envelope)".
-_EXPECTED_ENFORCEMENT = {
-    # --- protocol / gate refusals: nothing was computed, nothing computed was wrong ---
+# The GATE/WORK_JUDGED line is not "did the executor run" — `COLUMN_SCOPE_VIOLATION` is
+# refused before ClickHouse is touched and is still WORK_JUDGED. It is "was the model's
+# DATA WORK judged (its SQL, its blueprint), or only its CALL PROTOCOL (the order of
+# calls, the shape of the envelope)". The WORK_JUDGED/INFRA_FAILED line is the H8 one:
+# did anything actually form a verdict on the work, or did the floor give way under it.
+_EXPECTED_KIND = {
+    # --- GATE: protocol refusals — nothing was computed, nothing computed was wrong ---
     # Call ORDER: getBlueprint must precede runBlueprint. The executor never ran, so
     # this is not evidence that the blueprint is wrong.
-    "BLUEPRINT_DEFINITION_NOT_READ": True,
+    "BLUEPRINT_DEFINITION_NOT_READ": DenialKind.GATE,
     # Answer SHAPE: a blueprint named in the answer that was never run this turn.
-    "ANSWER_TABLE_BLUEPRINT_NOT_RUN": True,
+    "ANSWER_TABLE_BLUEPRINT_NOT_RUN": DenialKind.GATE,
     # Answer SHAPE: no table designated at all (08 §O).
-    "ANSWER_TABLE_NO_TABLE_DESIGNATED": True,
+    "ANSWER_TABLE_NO_TABLE_DESIGNATED": DenialKind.GATE,
     # Finalization ORDER: the turn's work may be perfect; ending the turn with intents
     # still pending is what was refused.
-    "FINALIZATION_BLOCKED_PENDING_INTENTS": True,
+    "FINALIZATION_BLOCKED_PENDING_INTENTS": DenialKind.GATE,
     # Bookkeeping hygiene: a mis-shaped intent ledger update. `updateAnalysisState`
     # computes nothing, so it can fail in no data-bearing way.
-    "ANALYSIS_STATE_INVALID": True,
-    # The same ledger refused on TIMING rather than shape. Non-retryable AND
-    # enforcement — the two flags are independent.
-    "ANALYSIS_STATE_LATE_INIT": True,
+    "ANALYSIS_STATE_INVALID": DenialKind.GATE,
+    # The same ledger refused on TIMING rather than shape. Non-retryable AND a gate —
+    # `retryable` and `kind` are independent.
+    "ANALYSIS_STATE_LATE_INIT": DenialKind.GATE,
     # Envelope validation on the read tools (`_require_text` / `_clamp_k`): a blank
     # `query`, an out-of-range `k`. Refused before any search ran — the
     # ANALYSIS_STATE_INVALID shape, not the TABLE_NOT_FOUND one. Unreachable by today's
     # learning readers (no retrieval tool is a data tool), classified for completeness.
-    "RETRIEVAL_TOOL_INVALID_ARGS": True,
-    # --- substantive failures: the work was judged, or the system under it failed -----
+    "RETRIEVAL_TOOL_INVALID_ARGS": DenialKind.GATE,
+    # --- WORK_JUDGED: the model's own query or blueprint was judged and found wanting -
     # The query asked for columns this scope does not hold — a verdict on the SQL.
-    "COLUMN_SCOPE_VIOLATION": False,
+    "COLUMN_SCOPE_VIOLATION": DenialKind.WORK_JUDGED,
     # The query referenced another session's scratch data — again, what the SQL named.
-    "SCRATCH_SESSION_VIOLATION": False,
+    "SCRATCH_SESSION_VIOLATION": DenialKind.WORK_JUDGED,
     # The SQL could not be parsed/validated.
-    "PARSE_FAILED_CLOSED": False,
+    "PARSE_FAILED_CLOSED": DenialKind.WORK_JUDGED,
     # The query named a database it may not read.
-    "DATABASE_NOT_ALLOWED": False,
+    "DATABASE_NOT_ALLOWED": DenialKind.WORK_JUDGED,
     # The query named a table that does not exist — the canonical failed→fixed shape.
-    "TABLE_NOT_FOUND": False,
+    "TABLE_NOT_FOUND": DenialKind.WORK_JUDGED,
     # A guardrail on the shape of the QUERY (a missing join condition), not of the call.
-    "CARTESIAN_JOIN_FORBIDDEN": False,
+    "CARTESIAN_JOIN_FORBIDDEN": DenialKind.WORK_JUDGED,
     # The warehouse ran it and rejected it.
-    "CLICKHOUSE_QUERY_ERROR": False,
-    # The system underneath the work failed. That IS friction, and counting it is right.
-    "CLICKHOUSE_UNAVAILABLE": False,
+    "CLICKHOUSE_QUERY_ERROR": DenialKind.WORK_JUDGED,
     # The model named a table/column that does not exist — TABLE_NOT_FOUND reached
     # through the composite instead of the MCP.
-    "RESOLVE_VALUES_UNKNOWN_TARGET": False,
-    # A crash, not a refusal: attempted, then failed.
-    "RESOLVE_VALUES_INTERNAL_ERROR": False,
+    "RESOLVE_VALUES_UNKNOWN_TARGET": DenialKind.WORK_JUDGED,
+    # --- INFRA_FAILED: the floor gave way; nothing formed a verdict on the work -------
+    # The warehouse was down. The SPLIT VERDICT this kind exists for (H8): friction YES —
+    # the analyst hit a wall and had to re-run, so `_failed_fixed_pairs` still pairs it —
+    # but `corrected` NO, because the blueprint's SQL was never judged by anything. As a
+    # boolean this had to pick one, and it picked the wrong one for the second reader:
+    # a `runBlueprint` during an outage was recorded as a blueprint that produced a wrong
+    # answer, penalising the corpus for a warehouse being unreachable.
+    "CLICKHOUSE_UNAVAILABLE": DenialKind.INFRA_FAILED,
+    # A crash inside the composite: attempted, then the code under it broke.
+    "RESOLVE_VALUES_INTERNAL_ERROR": DenialKind.INFRA_FAILED,
     # A capability outage — the CLICKHOUSE_UNAVAILABLE shape.
-    "RESOLVE_VALUES_UNAVAILABLE": False,
+    "RESOLVE_VALUES_UNAVAILABLE": DenialKind.INFRA_FAILED,
     # A capability outage: the request was fine, the dependency was not.
-    "RETRIEVAL_TOOL_UNAVAILABLE": False,
+    "RETRIEVAL_TOOL_UNAVAILABLE": DenialKind.INFRA_FAILED,
     # A crash that slipped every guard.
-    "RETRIEVAL_TOOL_INTERNAL_ERROR": False,
-    # Registry-seam containment: a runtime tool raised or broke its contract. A real
-    # failure of a real attempt, and the conservative reading of "we do not know what
-    # went wrong".
-    "RUNTIME_TOOL_INTERNAL_ERROR": False,
+    "RETRIEVAL_TOOL_INTERNAL_ERROR": DenialKind.INFRA_FAILED,
+    # Registry-seam containment: a runtime tool raised or broke its contract. The TOOL
+    # broke — a fact about the runtime, not a judgement of the model's data work.
+    "RUNTIME_TOOL_INTERNAL_ERROR": DenialKind.INFRA_FAILED,
 }
 
 
-def test_every_registered_code_has_a_stated_enforcement_classification() -> None:
-    """The guard H1 exists for. A code added to `_DENIAL_TABLE` defaults to
-    `enforcement=False` (substantive, the pre-existing behaviour), which is safe but
-    SILENT — the author may have meant to register a gate. This fails until the new
-    code is written down here with a reason, which is the only moment anyone is
-    thinking about the learning loop's friction counters."""
-    assert KNOWN_DENIAL_CODES == frozenset(_EXPECTED_ENFORCEMENT)
+def test_every_registered_code_has_a_stated_kind_classification() -> None:
+    """The guard H1 exists for, widened by H8. A code added to `_DENIAL_TABLE` defaults
+    to `kind=WORK_JUDGED` (substantive, the pre-existing behaviour), which is safe but
+    SILENT — the author may have meant to register a gate, or an outage. This fails until
+    the new code is written down here with a reason, which is the only moment anyone is
+    thinking about the learning loop's friction and corpus-quality counters."""
+    assert KNOWN_DENIAL_CODES == frozenset(_EXPECTED_KIND)
 
 
-@pytest.mark.parametrize("code", sorted(_EXPECTED_ENFORCEMENT))
-def test_classify_denial_enforcement(code: str) -> None:
-    assert classify_denial(code).enforcement is _EXPECTED_ENFORCEMENT[code]
+@pytest.mark.parametrize("code", sorted(_EXPECTED_KIND))
+def test_classify_denial_kind(code: str) -> None:
+    assert classify_denial(code).kind is _EXPECTED_KIND[code]
 
 
-def test_enforcement_denial_codes_is_the_true_half_of_the_table() -> None:
+def test_the_three_kinds_partition_the_table() -> None:
+    """Exhaustive AND pairwise disjoint over every registered code. `DenialKind` is
+    one-of by construction, so this cannot fail on today's shape — it is here to fail
+    LOUDLY the day someone reaches for a fourth answer (a set, a bitmask, a `None`) and
+    the two derived exports below silently stop covering the vocabulary between them."""
+    by_kind = {
+        kind: frozenset(c for c in KNOWN_DENIAL_CODES if classify_denial(c).kind is kind)
+        for kind in DenialKind
+    }
+    assert frozenset().union(*by_kind.values()) == KNOWN_DENIAL_CODES
+    kinds = list(DenialKind)
+    for i, a in enumerate(kinds):
+        for b in kinds[i + 1 :]:
+            assert by_kind[a].isdisjoint(by_kind[b]), (a, b)
+    # Every kind is actually USED — a partition with an empty part means a class of
+    # failure nobody has classified yet, not a clean taxonomy.
+    assert all(by_kind[kind] for kind in DenialKind)
+
+
+def test_enforcement_denial_codes_is_the_gate_third_of_the_table() -> None:
     """The derived export the learning loop actually imports."""
     assert ENFORCEMENT_DENIAL_CODES == frozenset(
-        code for code, is_enforcement in _EXPECTED_ENFORCEMENT.items() if is_enforcement
+        code for code, kind in _EXPECTED_KIND.items() if kind is DenialKind.GATE
     )
 
 
-def test_an_unknown_code_is_not_enforcement() -> None:
+def test_infra_failure_codes_is_the_infra_third_of_the_table() -> None:
+    """The H8 twin of the export above: `loader.py::INFRA_ERROR_CODES` is built from it,
+    and it is what stops a warehouse outage being recorded as a wrong blueprint."""
+    assert INFRA_FAILURE_CODES == frozenset(
+        code for code, kind in _EXPECTED_KIND.items() if kind is DenialKind.INFRA_FAILED
+    )
+
+
+@pytest.mark.parametrize("code", sorted(_EXPECTED_KIND))
+def test_enforcement_property_is_exactly_the_gate_kind(code: str) -> None:
+    """`DenialInfo.enforcement` survives as a DERIVED property so no H1-era reader
+    changed shape. Pinned per code, both directions: an INFRA failure must NOT read as
+    enforcement — `_failed_fixed_pairs` skips enforcement denials, and forgiving an
+    outage there would erase real analyst friction."""
+    info = classify_denial(code)
+    assert info.enforcement is (info.kind is DenialKind.GATE)
+
+
+def test_an_unknown_code_is_work_judged() -> None:
     """Conservative direction, matching `retryable`: an unclassifiable failure stays a
-    failure, so the learning loop keeps counting it as friction rather than quietly
-    forgiving it."""
+    failure of real work, so the learning loop keeps counting it as friction and keeps
+    reading a denied blueprint as corrected, rather than quietly forgiving either."""
+    assert classify_denial("SOME_NEW_UNMAPPED_CODE").kind is DenialKind.WORK_JUDGED
+    assert classify_denial(None).kind is DenialKind.WORK_JUDGED
     assert classify_denial("SOME_NEW_UNMAPPED_CODE").enforcement is False
     assert classify_denial(None).enforcement is False
