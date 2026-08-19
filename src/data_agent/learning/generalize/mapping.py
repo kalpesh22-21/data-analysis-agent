@@ -12,9 +12,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...corpus.seeds import BlueprintSeed, KnowledgeSeed
 from ...runtime.blueprint.models import Blueprint
 from ...runtime.blueprint.structural_key import structural_key_from_templates
-from ...runtime.retrieval.corpus_loader import BlueprintSeed, KnowledgeSeed
 from ..candidate.generalization import BlueprintGeneralization
 from ..candidate.models import CandidateEnvelope
 from ..leakage.gate import _collect_text
@@ -177,7 +177,7 @@ def blueprint_seed_from_candidate(
         # J7c — taken from the PARSED blueprint, not re-read from the payload, so the
         # landed seed can only ever carry a value `Blueprint.parse` already accepted
         # against the closed `WINDOW_ANCHORS` set (the corpus loader's write-time
-        # `_validate_blueprint_dag` rejects anything else anyway; agreeing here means
+        # `compiler.validate_blueprint_dag` rejects anything else anyway; agreeing here means
         # a malformed anchor fails at build, not at the neo4j write).
         window_anchor=blueprint.window_anchor,
     )

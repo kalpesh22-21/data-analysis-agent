@@ -38,6 +38,10 @@ import pytest
 import yaml
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.blueprint.compiler import (
+    dag_properties,
+    validate_blueprint_dag,
+)
 from data_agent.runtime.blueprint.executor import BlueprintExecutor, ExecCompleted
 from data_agent.runtime.blueprint.models import (
     DATA_ANCHORED_RESULT_NOTE,
@@ -60,8 +64,6 @@ from data_agent.runtime.retrieval.corpus_loader import (
     _UPSERT_BLUEPRINT,
     BlueprintSeed,
     CorpusLoadError,
-    _dag_properties,
-    _validate_blueprint_dag,
 )
 from data_agent.runtime.retrieval.models import BlueprintDetail
 from data_agent.runtime.retrieval.tools import GetBlueprintTool
@@ -243,9 +245,9 @@ def test_the_declaration_helper_is_total_and_never_prints_a_bare_value(bad: Any)
 
 @pytest.mark.parametrize("anchor", sorted(WINDOW_ANCHORS))
 def test_the_seed_carries_the_anchor_to_the_node_property(anchor: str) -> None:
-    """`_dag_properties` is what the upsert spreads, so a field it does not carry is
+    """`dag_properties` is what the upsert spreads, so a field it does not carry is
     a field the graph never sees — no matter how well it parsed."""
-    props = _dag_properties(_seed(window_anchor=anchor))
+    props = dag_properties(_seed(window_anchor=anchor))
     assert props["window_anchor"] == anchor
     assert "$window_anchor" in _UPSERT_BLUEPRINT
 
@@ -254,22 +256,22 @@ def test_an_undeclared_anchor_writes_null_so_a_re_seed_clears_a_stale_claim() ->
     """`None`, not `""`. neo4j REMOVES a property set to null, which is what makes a
     re-seed that DROPS the declaration actually retract it; an empty string would
     leave a third state (`""`) that matches no anchor and is not absent either."""
-    assert _dag_properties(_seed())["window_anchor"] is None
-    assert _dag_properties(_seed(window_anchor=""))["window_anchor"] is None
+    assert dag_properties(_seed())["window_anchor"] is None
+    assert dag_properties(_seed(window_anchor=""))["window_anchor"] is None
 
 
 @pytest.mark.parametrize("anchor", sorted(WINDOW_ANCHORS))
 def test_write_time_validation_accepts_a_declared_anchor(anchor: str) -> None:
-    _validate_blueprint_dag(_seed(window_anchor=anchor))
+    validate_blueprint_dag(_seed(window_anchor=anchor))
 
 
 def test_write_time_validation_rejects_an_unknown_anchor_for_every_write_path() -> None:
-    """`_validate_blueprint_dag` runs over EVERY seed in `load_corpus`'s pre-write
+    """`validate_blueprint_dag` runs over EVERY seed in `load_corpus`'s pre-write
     pass — fixture seed, MCP-export hydration and the learning landing writer alike
     — so this one gate is why the read side never has to ask whether a stored anchor
     is renderable."""
     with pytest.raises(CorpusLoadError, match="window_anchor"):
-        _validate_blueprint_dag(_seed(window_anchor="yesterday"))
+        validate_blueprint_dag(_seed(window_anchor="yesterday"))
 
 
 # ---------------------------------------------------------------------------

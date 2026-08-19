@@ -3,7 +3,8 @@
 Four deterministic checks over the rewritten template(s): `read_only_select` (a single
 read-only SELECT, no `*`, no dict-family funcs — D52); `explain_ok` (the template resolves
 against the current catalog — the D69 provenance qualify IS the schema check here);
-`binds_to_subset_uses` (the corpus_loader assertion); and `dag_ok` for composites (single
+`binds_to_subset_uses` (the blueprint-compiler assertion); and `dag_ok` for composites
+(single
 blueprints trivially pass). ANY false ⇒ `outcome="fail_to_review"` (D52/D97) with a STABLE
 machine reason tag for the FIRST failing check — the value S7 routes on. Never raises;
 never auto-promotes.

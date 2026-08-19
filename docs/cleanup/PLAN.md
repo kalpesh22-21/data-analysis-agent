@@ -170,4 +170,4 @@ helpers) → **T5.5 single `finish()`** (7 `TurnOutcome` sites) →
 | Docstring trim (−6,670 lines, contracts kept) | done, AST-proven docstring-only | #23 |
 | **Wave B: T4.2 executor collapse** | done — equivalence-audited, cross-binary resume proven | #24 |
 | **Wave B: T4.4 span envelope** | done — six-path equivalence traced, R1 leak belt proven, fold applied | #25 |
-| Wave B: T4.1 compiler extraction | built (pure-move byte-proven), in review | — |
+| **Wave B: T4.1 compiler extraction** | done — byte-proven move ×2 (builder+reviewer AST diff), learning edge cut | #26 |

@@ -77,13 +77,13 @@ from data_agent.learning.generalize.stage import GeneralizeStage
 from data_agent.learning.stage import StageContext
 from data_agent.learning.summary.models import SessionSummary, ToolCallSummary, TurnSummary
 from data_agent.learning.triage import TriageVerdict
+from data_agent.runtime.blueprint.compiler import validate_blueprint_dag
 from data_agent.runtime.blueprint.models import Blueprint, BlueprintParseError, SlotSpec
 from data_agent.runtime.blueprint.slots import slot_token_names
 from data_agent.runtime.blueprint.template import referenced_slots
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
-    _validate_blueprint_dag,
 )
 
 _KEEP = TriageVerdict(decision="keep", reason="K1", target_hints=("blueprint",))
@@ -198,7 +198,7 @@ def _land(payload: dict, template: str) -> None:
         id="bp-x", intent="i", resolves=None, slots=slots, uses_rules=[],
         sql_template=template, composes=None, result_grain=["month"],
     )
-    _validate_blueprint_dag(
+    validate_blueprint_dag(
         BlueprintSeed(
             id="bp-x", intent="i", slots_summary="", uses=_USES, status="validated",
             slots=slots, sql_template=template, uses_rules=[], composes=[],
@@ -390,4 +390,4 @@ def test_the_landing_gates_this_file_relies_on_still_say_what_it_says_they_do():
         uses_rules=[], composes=[], result_grain=[], resolves={},
     )
     with pytest.raises(CorpusLoadError, match="undeclared slot"):
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)

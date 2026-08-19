@@ -135,7 +135,7 @@ def test_canon_shape_and_learning_shape_agree():
     """THE load-bearing assertion. Two descriptions of ONE blueprint:
 
       * canon    — a bare-list grain + a `{slot}` `sql_template`, no `canonical_ast_norm`
-                   (derived here by the seeder helper, exactly as `_dag_properties` does);
+                   (derived here by the seeder helper, exactly as `dag_properties` does);
       * learning — the D56 `{columns, verifiable}` grain + the S4-computed
                    `canonical_ast_norm` string.
 

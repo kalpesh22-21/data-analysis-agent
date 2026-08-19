@@ -1,5 +1,5 @@
 """S4 `check_dag` vs the two authorities it claims to mirror: the corpus LOADER
-(`_validate_blueprint_dag`, landing) and the EXECUTOR (`_has_table_intermediate` /
+(`validate_blueprint_dag`, landing) and the EXECUTOR (`_has_table_intermediate` /
 `_table_consumed_orders`, replay).
 
 `check_dag` is an OFFLINE re-implementation of invariants owned elsewhere. That is a
@@ -30,6 +30,7 @@ from typing import Any
 import pytest
 
 from data_agent.learning.generalize.validate import check_dag
+from data_agent.runtime.blueprint.compiler import validate_blueprint_dag
 from data_agent.runtime.blueprint.executor import (
     _has_table_intermediate,
     _table_consumed_orders,
@@ -39,7 +40,6 @@ from data_agent.runtime.blueprint.models import Blueprint, BlueprintParseError, 
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
-    _validate_blueprint_dag,
 )
 
 _REAL_CANON_DIR = Path("/Users/kalpeshmulye/Development/clickhouse-api/app/corpus/data/blueprints")
@@ -96,7 +96,7 @@ def _loader_verdict(composes: list[dict[str, Any]]) -> str:
         composes=composes,
     )
     try:
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)
     except CorpusLoadError as exc:
         return f"reject: {exc}"
     return "ok"
@@ -224,7 +224,7 @@ def test_a_table_producer_with_no_template_fails_the_load_as_a_corpus_load_error
     ]
     assert check_dag(_plan(composes)) is True
     with pytest.raises(CorpusLoadError):
-        _validate_blueprint_dag(
+        validate_blueprint_dag(
             BlueprintSeed(
                 id="bp-probe", intent="p", slots_summary="", uses=list(_USES),
                 result_grain=["d"], sql_template=None, composes=composes,
@@ -321,7 +321,7 @@ def test_node_parse_rejects_an_unhashable_node_kind_cleanly(node_kind: Any) -> N
     """WAS a strict xfail (HIGH, runtime, pre-existing — the landing-side twin of the
     extractor finding in test_validation_composes_adversarial_qa): `Node.parse` tested
     `node_kind not in NODE_KINDS` with the RAW value, so an unhashable one raised
-    TypeError instead of `BlueprintParseError`, escaping `_validate_blueprint_dag`'s
+    TypeError instead of `BlueprintParseError`, escaping `validate_blueprint_dag`'s
     `except BlueprintParseError` and aborting the whole corpus load with an un-wrapped
     exception. FIXED; `SlotSpec.parse`'s `type` and `WhenClause.parse`'s
     `on_violation` carried the identical bug and were fixed in the same pass (pinned
@@ -366,13 +366,12 @@ def test_every_other_closed_set_test_in_the_parse_layer_is_unhashable_safe(
 
 def _consumers_of_the_grammar() -> dict[str, Any]:
     from data_agent.learning.generalize import validate as learning_validate
-    from data_agent.runtime.blueprint import executor, models
-    from data_agent.runtime.retrieval import corpus_loader
+    from data_agent.runtime.blueprint import compiler, executor, models
 
     return {
         "learning/generalize/validate.py": learning_validate,
         "runtime/blueprint/executor.py": executor,
-        "runtime/retrieval/corpus_loader.py": corpus_loader,
+        "runtime/blueprint/compiler.py": compiler,
         "runtime/blueprint/models.py": models,
     }
 

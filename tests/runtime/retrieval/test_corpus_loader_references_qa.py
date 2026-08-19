@@ -31,12 +31,14 @@ from typing import Any
 
 import pytest
 
+from data_agent.runtime.blueprint.compiler import (
+    dag_properties,
+    validate_blueprint_dag,
+)
 from data_agent.runtime.blueprint.models import Blueprint, BlueprintParseError, Node
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
-    _dag_properties,
-    _validate_blueprint_dag,
     load_corpus,
     load_seed_fixtures,
     resolve_blueprint_references,
@@ -255,9 +257,9 @@ def test_inlining_moves_no_other_canon_blueprint(request: Any) -> None:
     rebuilds every seed's list. A key that moved on an unrelated blueprint would mean
     the resolver is not the identity on reference-free input."""
     seeds = load_seed_fixtures(_FIXTURE_DIR)[0]
-    before = {bp.id: _dag_properties(bp)["structural_key"] for bp in seeds if bp.id != _COMPOSITE}
+    before = {bp.id: dag_properties(bp)["structural_key"] for bp in seeds if bp.id != _COMPOSITE}
     after = {
-        bp.id: _dag_properties(bp)["structural_key"]
+        bp.id: dag_properties(bp)["structural_key"]
         for bp in resolve_blueprint_references(seeds)
         if bp.id != _COMPOSITE
     }
@@ -422,7 +424,7 @@ def test_a_null_bodied_reference_never_reaches_the_stored_composes_json() -> Non
         resolved = resolve_blueprint_references([bp])[0]
     except CorpusLoadError:
         return  # the load was refused: nothing can be written, which is the fix
-    props = _dag_properties(resolved)
+    props = dag_properties(resolved)
     assert '"ref"' not in (props["composes_json"] or "")
     assert props["structural_key"], "the blueprint lands with no structural key"
 
@@ -474,11 +476,11 @@ def test_the_referenced_scratch_gate_is_not_defeated_by_the_databases_spelling(d
     until someone wrote the caps: sqlglot's `normalize_identifiers` is NOT applied here,
     and `qualify_tables`/`qualify_columns` both leave `SCRATCH` exactly as written
     before gate (c) sees it (measured; see the note on
-    `corpus_loader._assert_canonical_scratch_spelling`).
+    `compiler._assert_canonical_scratch_spelling`).
 
     NOTE ON COVERAGE: for every spelling here — `scratch` included — it is the
     REFERENCE gate inside `_inline_reference` that raises, before
-    `_validate_blueprint_dag` runs at all. The direct (non-reference) path through
+    `validate_blueprint_dag` runs at all. The direct (non-reference) path through
     `_assert_canonical_scratch_spelling` is therefore untouched by this test and is
     covered separately below."""
     child = BlueprintSeed(
@@ -501,7 +503,7 @@ def test_the_referenced_scratch_gate_is_not_defeated_by_the_databases_spelling(d
     )
     with pytest.raises(CorpusLoadError, match="scratch"):
         for bp in resolve_blueprint_references([child, parent]):
-            _validate_blueprint_dag(bp)
+            validate_blueprint_dag(bp)
 
 
 def _direct_scratch_reader(db: str) -> BlueprintSeed:
@@ -532,7 +534,7 @@ def test_a_non_reference_blueprint_cannot_spell_the_scratch_db_uncanonically(db:
     and the executor's rewrite) describe the same set. It is therefore the reason
     keeping `_scratch_placeholder_names` exact-match is safe — and until this test it
     had no firing coverage at all: the parametrization above never reaches
-    `_validate_blueprint_dag`, because `_inline_reference` raises first for every
+    `validate_blueprint_dag`, because `_inline_reference` raises first for every
     spelling.
 
     Escaping this gate is not cosmetic. `SCRATCH.borrowed` reads as an ordinary
@@ -545,7 +547,7 @@ def test_a_non_reference_blueprint_cannot_spell_the_scratch_db_uncanonically(db:
     gate (or reorders it behind the scope check, which passes on this shape) breaks
     here rather than silently handing the refusal to a different rule."""
     with pytest.raises(CorpusLoadError, match="must be spelled exactly"):
-        _validate_blueprint_dag(_direct_scratch_reader(db))
+        validate_blueprint_dag(_direct_scratch_reader(db))
 
 
 def test_the_canonical_scratch_spelling_is_not_refused_by_the_spelling_gate() -> None:
@@ -559,7 +561,7 @@ def test_the_canonical_scratch_spelling_is_not_refused_by_the_spelling_gate() ->
     not a scope escape). Asserted as "not refused for the SPELLING reason" rather than
     "loads", so closing that gap does not turn this control red."""
     try:
-        _validate_blueprint_dag(_direct_scratch_reader("scratch"))
+        validate_blueprint_dag(_direct_scratch_reader("scratch"))
     except CorpusLoadError as exc:
         assert "must be spelled exactly" not in str(exc), (
             "the canonical spelling was refused BY THE SPELLING GATE — the gate is "
@@ -571,7 +573,7 @@ def test_the_canonical_scratch_spelling_is_not_refused_by_the_spelling_gate() ->
 # 5. the `uses` UNION rule — genuinely independent of gate (c)?
 # ==========================================================================
 #
-# Gate (c) (`_validate_blueprint_dag`) re-derives the inlined SQL's column footprint
+# Gate (c) (`validate_blueprint_dag`) re-derives the inlined SQL's column footprint
 # and checks it against the parent's `uses`. So EVERY under-declaration test where
 # the child's SQL reads the omitted column is satisfied by either gate, and proves
 # nothing about which one fired. The shape that separates them is a column the child
@@ -641,7 +643,7 @@ def test_gate_c_passes_on_exactly_the_shape_the_union_rule_refused() -> None:
             }
         ],
     )
-    _validate_blueprint_dag(equivalent_inline)  # must not raise
+    validate_blueprint_dag(equivalent_inline)  # must not raise
 
 
 def test_the_same_escape_two_hops_down_is_refused_and_names_the_direct_child() -> None:
@@ -903,4 +905,4 @@ def test_the_simultaneous_swap_survives_a_round_trip_through_the_parse_layer() -
     sql = parsed.composes[0].sql_template or ""
     assert ">= {hi}" in sql and "<= {lo}" in sql
     assert sql.count("{lo}") == 1 and sql.count("{hi}") == 1
-    _validate_blueprint_dag(resolved)
+    validate_blueprint_dag(resolved)

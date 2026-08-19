@@ -61,7 +61,7 @@ def test_use_edges_trailing_dot_yields_empty_column_name() -> None:
 def test_use_edges_non_str_key_raises_typeerror() -> None:
     # `_use_edges` itself is a low-level helper and still raises TypeError on a
     # non-str key. In `load_corpus` this is now UNREACHABLE: S2's
-    # `_validate_blueprint_uses` runs first and rejects a non-str key with a
+    # `validate_blueprint_uses` runs first and rejects a non-str key with a
     # clear `CorpusLoadError` (see test_corpus_loader_write_validation below).
     with pytest.raises(TypeError):
         _use_edges([123])  # type: ignore[list-item]
@@ -100,7 +100,7 @@ def test_check_model_parity_none_target_treats_stored_as_conflict() -> None:
 
 def test_blueprint_seed_accepts_garbage_uses_but_loader_rejects_it() -> None:
     # The seed DATACLASS is still permissive (no field validation) — dotless /
-    # over-qualified keys are stored verbatim. But S2's `_validate_blueprint_uses`
+    # over-qualified keys are stored verbatim. But S2's `validate_blueprint_uses`
     # in `load_corpus` now REJECTS them at write with a clear CorpusLoadError, so
     # the §8 silent-scope-drop foot-gun no longer reaches recall via the loader.
     seed = BlueprintSeed(

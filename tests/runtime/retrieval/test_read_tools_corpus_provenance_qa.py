@@ -50,7 +50,7 @@ def _seeds() -> list[BlueprintSeed]:
 def _recall_record(seed: BlueprintSeed) -> dict[str, Any]:
     """One seed as the RECALL ROW neo4j returns for it.
 
-    The three `*_json` props mirror `corpus_loader._dag_properties` exactly —
+    The three `*_json` props mirror `compiler.dag_properties` exactly —
     `json.dumps(value) if value else None`, and `result_grain` encoded whenever it
     is not `None` (an authored `[]` is stored, not dropped). Going through the real
     `map_blueprint_record` from here means the decode/type-coercion path is the

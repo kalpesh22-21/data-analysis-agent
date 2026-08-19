@@ -5,7 +5,7 @@ is a VERIFIED single-row-aggregate blueprint, NOT a bespoke tool. This module pi
 the write-time guarantees the corpus loader must hold for it:
 
   * it loads out of the shipped seed corpus (present in `load_seed_fixtures`);
-  * `_validate_blueprint_uses` + `_validate_blueprint_dag` accept it (template
+  * `validate_blueprint_uses` + `validate_blueprint_dag` accept it (template
     parses under the ClickHouse dialect, its column footprint ⊆ the declared
     `uses`, both `relative_window` slots are referenced by the template);
   * `result_grain: []` (a single-row aggregate) round-trips as an empty JSON list,
@@ -20,11 +20,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from data_agent.runtime.blueprint.compiler import (
+    dag_properties,
+    validate_blueprint_dag,
+    validate_blueprint_uses,
+)
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
-    _dag_properties,
-    _validate_blueprint_dag,
-    _validate_blueprint_uses,
     load_seed_fixtures,
 )
 
@@ -58,8 +60,8 @@ def test_projection_seed_passes_uses_and_dag_validation() -> None:
     # The two write-time gates the design (§2) calls out: uses-key shape + the full
     # template/footprint/slot DAG check. Neither raises for the shipped seed.
     seed = _projection_seed()
-    _validate_blueprint_uses(seed)  # no raise
-    _validate_blueprint_dag(seed)  # no raise
+    validate_blueprint_uses(seed)  # no raise
+    validate_blueprint_dag(seed)  # no raise
 
 
 def test_projection_seed_uses_footprint_is_the_two_hire_columns() -> None:
@@ -99,7 +101,7 @@ def test_projection_seed_result_grain_roundtrips_empty_list() -> None:
     # skipped. The property serialization stores it as an empty JSON list (never
     # null, which is the DAG-less legacy shape).
     seed = _projection_seed()
-    props = _dag_properties(seed)
+    props = dag_properties(seed)
     assert props["sql_template"] is not None
     assert json.loads(props["result_grain_json"]) == []
 

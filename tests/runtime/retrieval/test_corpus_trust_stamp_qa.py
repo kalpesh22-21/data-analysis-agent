@@ -26,11 +26,11 @@ from __future__ import annotations
 
 import pytest
 
-from data_agent.runtime.retrieval.corpus_loader import (
+from data_agent.corpus.seeds import (
     _seed_from_entry,
     _seeds_from_entries,
-    schema_statements,
 )
+from data_agent.runtime.retrieval.corpus_loader import schema_statements
 
 _MIN_BLUEPRINT = {
     "intent": "total earnings by department",

@@ -12,12 +12,12 @@ from pathlib import Path
 
 import pytest
 
+from data_agent.runtime.blueprint.compiler import validate_blueprint_uses
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
     KnowledgeSeed,
     _use_edges,
-    _validate_blueprint_uses,
     check_model_parity,
     load_seed_fixtures,
     schema_statements,
@@ -113,18 +113,18 @@ def _seed_with_uses(uses: list) -> BlueprintSeed:
 
 
 def test_validate_uses_accepts_three_part_scope_keys() -> None:
-    _validate_blueprint_uses(_seed_with_uses(["a.b.c", "dbpcm_warehouse.payroll.Amount"]))
+    validate_blueprint_uses(_seed_with_uses(["a.b.c", "dbpcm_warehouse.payroll.Amount"]))
 
 
 @pytest.mark.parametrize("bad", ["nodots", "a.b", "a.b.", ".b.c", "a..c", ""])
 def test_validate_uses_rejects_malformed_scope_keys(bad: str) -> None:
     with pytest.raises(CorpusLoadError):
-        _validate_blueprint_uses(_seed_with_uses([bad]))
+        validate_blueprint_uses(_seed_with_uses([bad]))
 
 
 def test_validate_uses_rejects_non_str_entry_with_context() -> None:
     with pytest.raises(CorpusLoadError) as exc:
-        _validate_blueprint_uses(_seed_with_uses([123]))
+        validate_blueprint_uses(_seed_with_uses([123]))
     assert "bp" in str(exc.value)  # the offending blueprint id is in the message
 
 

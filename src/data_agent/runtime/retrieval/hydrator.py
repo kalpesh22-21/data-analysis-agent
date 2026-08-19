@@ -35,11 +35,11 @@ from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.retrieval.corpus_client import HttpCorpusClient
 from data_agent.runtime.retrieval.corpus_loader import (
     DimensionMismatchError,
-    _fetch_existing_models,
-    _fetch_existing_vector_dims,
     apply_schema,
     corpus_seeds_from_export,
     effective_corpus_sha,
+    fetch_existing_models,
+    fetch_existing_vector_dims,
     load_catalog_graph,
     load_corpus,
     rebuild_mcp_corpus_partition,
@@ -174,8 +174,8 @@ class Hydrator:
                 writes. An empty graph yields two empty sets, i.e. the normal seed path.
         """
         async with self._driver.session(database=self._database) as session:
-            models = await _fetch_existing_models(session)
-            dims = await _fetch_existing_vector_dims(session)
+            models = await fetch_existing_models(session)
+            dims = await fetch_existing_vector_dims(session)
         return models, dims
 
     async def _seed(

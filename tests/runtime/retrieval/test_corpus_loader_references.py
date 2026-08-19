@@ -38,6 +38,10 @@ from typing import Any
 import pytest
 import yaml
 
+from data_agent.runtime.blueprint.compiler import (
+    dag_properties,
+    validate_blueprint_dag,
+)
 from data_agent.runtime.blueprint.models import (
     DEFAULT_NODE_KIND,
     BlueprintParseError,
@@ -46,8 +50,6 @@ from data_agent.runtime.blueprint.models import (
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
-    _dag_properties,
-    _validate_blueprint_dag,
     load_seed_fixtures,
     resolve_blueprint_references,
 )
@@ -274,7 +276,7 @@ def test_a_chain_within_the_cap_resolves_through_a_single_node_composite() -> No
     assert "{dept}" in resolved["bp-parent"].composes[0]["sql_template"]
     assert "{mid_dept}" not in resolved["bp-parent"].composes[0]["sql_template"]
     for bp in resolved.values():
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_a_reference_to_a_missing_blueprint_fails_the_load() -> None:
@@ -534,7 +536,7 @@ def test_a_period_range_maps_both_bind_tokens() -> None:
     sql = resolved["bp-parent"].composes[0]["sql_template"]
     assert "{hire_window_start}" in sql and "{hire_window_end}" in sql
     assert "{w_start}" not in sql and "{w_end}" not in sql
-    _validate_blueprint_dag(resolved["bp-parent"])
+    validate_blueprint_dag(resolved["bp-parent"])
 
 
 def test_a_period_range_mapped_onto_a_scalar_slot_fails_on_arity() -> None:
@@ -763,7 +765,7 @@ def test_a_malformed_uses_rules_raises_on_the_path_that_actually_reads_it() -> N
     """`uses_rules` is read only when a residual (non-slot) bind token survives the
     rename — so the guard is asserted on THAT path, not on a scenario where the field
     is never touched. Off that path a non-list `uses_rules` is still fail-closed, just
-    later: `Blueprint.parse` rejects it inside `_validate_blueprint_dag`."""
+    later: `Blueprint.parse` rejects it inside `validate_blueprint_dag`."""
     child = BlueprintSeed(
         id="bp-child",
         intent="earnings",
@@ -909,7 +911,7 @@ def test_the_resolved_node_is_indistinguishable_from_a_hand_written_inline_one()
     assert "ref" not in node
     assert set(node) == {"order", "output", "sql_template"}
     assert "bp-child" not in json.dumps(resolved.composes)
-    assert "bp-child" not in (_dag_properties(resolved)["composes_json"] or "")
+    assert "bp-child" not in (dag_properties(resolved)["composes_json"] or "")
 
 
 def test_the_loader_and_the_parse_layer_share_one_definition_of_both_constants() -> None:
@@ -919,11 +921,10 @@ def test_the_loader_and_the_parse_layer_share_one_definition_of_both_constants()
     both; disagree about `DEFAULT_NODE_KIND` and an approval node inlines as a plain
     query. `DEFAULT_NODE_KIND` is additionally pinned to the value `Node.parse` actually
     defaults to, which is the thing the loader's `!= DEFAULT_NODE_KIND` gate assumes."""
-    from data_agent.runtime.blueprint import models
-    from data_agent.runtime.retrieval import corpus_loader
+    from data_agent.runtime.blueprint import compiler, models
 
-    assert corpus_loader.NODE_REF_KEY is models.NODE_REF_KEY
-    assert corpus_loader.DEFAULT_NODE_KIND is models.DEFAULT_NODE_KIND
+    assert compiler.NODE_REF_KEY is models.NODE_REF_KEY
+    assert compiler.DEFAULT_NODE_KIND is models.DEFAULT_NODE_KIND
     assert models.DEFAULT_NODE_KIND in models.NODE_KINDS
     assert Node.parse({"order": 0}).node_kind == models.DEFAULT_NODE_KIND
 
@@ -951,7 +952,7 @@ def test_the_validation_gates_still_run_over_the_inlined_sql() -> None:
     )
     resolved = _resolved([child, _parent()])
     with pytest.raises(CorpusLoadError, match="outside the declared uses"):
-        _validate_blueprint_dag(resolved["bp-parent"])
+        validate_blueprint_dag(resolved["bp-parent"])
 
 
 # -- the real canon corpus --------------------------------------------------
@@ -975,7 +976,7 @@ def test_the_canon_composite_inlines_to_exactly_what_it_used_to_declare_inline()
     # The pre-2b key of the composite, recomputed from its then-inline templates. It is
     # pinned as a literal on purpose: it is the single clearest evidence that inlining
     # is semantics-preserving, and a future edit to either file must move it knowingly.
-    assert _dag_properties(composite)["structural_key"] == (
+    assert dag_properties(composite)["structural_key"] == (
         "sha256:a7217b34f3af191e6f81226b3dde93c2cc545111f9933ebc51a7d32d9c849799"
     )
 
@@ -986,4 +987,4 @@ def test_the_canon_child_is_a_runnable_blueprint_in_its_own_right() -> None:
     seeds = {bp.id: bp for bp in load_seed_fixtures(_FIXTURE_DIR)[0]}
     child = seeds["bp-employee-check-detail-for-period"]
     assert child.sql_template and not child.composes
-    _validate_blueprint_dag(child)
+    validate_blueprint_dag(child)

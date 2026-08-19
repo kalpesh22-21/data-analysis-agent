@@ -2,7 +2,7 @@
 
 `Blueprint.parse` is the fail-loud READ side (§2.1): every malformed stored shape
 raises `BlueprintParseError`, which is the ONE exception the corpus loader catches
-(`_validate_blueprint_dag` → `CorpusLoadError`). A `TypeError` escapes that handler
+(`validate_blueprint_dag` → `CorpusLoadError`). A `TypeError` escapes that handler
 and aborts `load_corpus` un-wrapped — and per the loader's own contract that does not
 fail one blueprint, it bricks the corpus indefinitely: the hydration cache re-arms and
 retries the same poisoned entry on every turn.
@@ -24,11 +24,11 @@ from typing import Any
 
 import pytest
 
+from data_agent.runtime.blueprint.compiler import validate_blueprint_dag
 from data_agent.runtime.blueprint.models import Blueprint, BlueprintParseError
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
-    _validate_blueprint_dag,
 )
 
 _OK: dict[str, Any] = {
@@ -79,7 +79,7 @@ def test_a_poisoned_seed_fails_the_load_as_a_corpus_load_error(field: str) -> No
         **{field: 5},
     )
     with pytest.raises(CorpusLoadError, match="malformed DAG"):
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)
 
 
 @pytest.mark.parametrize("empty", [None, [], ()])

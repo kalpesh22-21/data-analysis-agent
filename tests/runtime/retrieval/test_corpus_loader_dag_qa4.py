@@ -23,10 +23,10 @@ from __future__ import annotations
 
 import pytest
 
+from data_agent.runtime.blueprint.compiler import validate_blueprint_dag
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
-    _validate_blueprint_dag,
 )
 
 _USES = [
@@ -67,7 +67,7 @@ def test_alias_mask_reading_out_of_scope_column_should_be_rejected() -> None:
         )
     )
     with pytest.raises(CorpusLoadError):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 # PROMOTED (review FIX 1a): a `*` is rejected outright — a blueprint must name
@@ -77,7 +77,7 @@ def test_select_star_reading_all_columns_should_be_rejected() -> None:
         sql_template="SELECT * FROM dbpcm_warehouse.employee WHERE Department = {department}"
     )
     with pytest.raises(CorpusLoadError):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 # PROMOTED (review FIX 1a): the `*` guard walks the whole tree, so a star inside
@@ -90,7 +90,7 @@ def test_subquery_select_star_should_be_rejected() -> None:
         )
     )
     with pytest.raises(CorpusLoadError):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 # -- DAG-shape attacks (these ARE rejected — confirm) -----------------------
@@ -110,7 +110,7 @@ def test_self_edge_rejected_as_cycle() -> None:
         ],
     )
     with pytest.raises(CorpusLoadError, match="cycle"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_duplicate_node_order_rejected() -> None:
@@ -131,7 +131,7 @@ def test_duplicate_node_order_rejected() -> None:
         ],
     )
     with pytest.raises(CorpusLoadError, match="duplicate node 'order'"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 # PROMOTED (review FIX 3): a hard node-count cap + iterative DFS — a huge/adversarial
@@ -149,7 +149,7 @@ def test_deep_forward_ref_chain_fails_cleanly_not_with_recursionerror() -> None:
     ]
     bp = _seed(sql_template=None, slots=[], composes=composes)
     with pytest.raises(CorpusLoadError):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 # -- declared-but-unreferenced slot (accepted at load — pin) ----------------
@@ -167,7 +167,7 @@ def test_declared_but_unreferenced_required_slot_is_now_rejected() -> None:
         ]
     )
     with pytest.raises(CorpusLoadError, match="ghost"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 # -- result_grain columns are NOT checked against uses (pin) ----------------
@@ -179,4 +179,4 @@ def test_result_grain_column_not_in_uses_is_accepted_at_load() -> None:
     # not checked against the template's output columns — a grain naming a column
     # absent from the SELECT would only fail at the Slice-B probe. Flagged.
     bp = _seed(result_grain=["TotallyMadeUpColumn"])
-    _validate_blueprint_dag(bp)  # no raise today
+    validate_blueprint_dag(bp)  # no raise today

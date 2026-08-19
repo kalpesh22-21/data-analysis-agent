@@ -5,7 +5,7 @@ covers the two things that only show up at the LOAD level:
 
   1. WHAT THE FAIL-SOFT ACTUALLY DOES AT LOAD SCALE — and it is NOT what the phrase
      suggests. `_seed_structural_key` is fail-soft, but `load_corpus` never reaches it
-     with a bad template: `_validate_blueprint_dag` rejects unparseable SQL in the
+     with a bad template: `validate_blueprint_dag` rejects unparseable SQL in the
      unconditional pre-write pass and aborts the WHOLE load (fail-CLOSED, pre-existing).
      Both policies are pinned here so they are not mistaken for one another. Also pinned:
      each blueprint gets its OWN key across a batch, which is the live risk introduced by
@@ -24,14 +24,16 @@ from typing import Any
 
 import pytest
 
+from data_agent.runtime.blueprint.compiler import (
+    dag_properties,
+    validate_blueprint_dag,
+)
 from data_agent.runtime.blueprint.structural_key import structural_key_from_templates
 from data_agent.runtime.retrieval.corpus_loader import (
     _UPSERT_BLUEPRINT,
     BlueprintSeed,
     CorpusLoadError,
     KnowledgeSeed,
-    _dag_properties,
-    _validate_blueprint_dag,
     corpus_seeds_from_export,
     load_corpus,
     resolve_blueprint_references,
@@ -141,9 +143,9 @@ def _distinct_seed(i: int) -> BlueprintSeed:
 async def test_an_unparseable_template_aborts_the_entire_load_fail_closed() -> None:
     """CORRECTS A LIKELY MISREADING OF THE FAIL-SOFT CLAIM.
 
-    `structural_key_from_templates` is fail-soft, and `_dag_properties` maps its miss to
+    `structural_key_from_templates` is fail-soft, and `dag_properties` maps its miss to
     an absent property — but that is NOT what happens when an unparseable blueprint
-    reaches `load_corpus`. `_validate_blueprint_dag` runs UNCONDITIONALLY in the pre-write
+    reaches `load_corpus`. `validate_blueprint_dag` runs UNCONDITIONALLY in the pre-write
     pass (corpus_loader.py:2021-2023) and raises `CorpusLoadError` for any template that
     does not parse, taking down the WHOLE load.
 
@@ -183,7 +185,7 @@ def test_every_template_the_key_recipe_rejects_is_also_rejected_by_loader_valida
     template,
 ) -> None:
     """Why the fail-soft branch never fires on the load path: the loader's own
-    `_validate_blueprint_dag` gate is STRICTLY EARLIER and at least as strict, so a
+    `validate_blueprint_dag` gate is STRICTLY EARLIER and at least as strict, so a
     template that would yield no structural key never survives to the derivation.
 
     If a future change ever makes the key recipe stricter than loader validation (e.g.
@@ -194,18 +196,18 @@ def test_every_template_the_key_recipe_rejects_is_also_rejected_by_loader_valida
     assert structural_key_from_templates(["Department"], template) == ""
     bad = _seed("bp-x", template)
     with pytest.raises(CorpusLoadError):
-        _validate_blueprint_dag(bad)
+        validate_blueprint_dag(bad)
 
 
 def test_a_dagless_or_broken_seed_binds_none_not_empty_string() -> None:
     """An empty-string key stored on EVERY keyless blueprint would make a naive
     `MATCH (b {structural_key: $k})` match them all as false prior art. Asserted at
-    `_dag_properties` (the only layer that can produce a keyless seed, since
+    `dag_properties` (the only layer that can produce a keyless seed, since
     `load_corpus` rejects unparseable templates outright)."""
     broken = _seed("bp-broken", _BAD)
     legacy = BlueprintSeed(id="bp-legacy", intent="i", slots_summary="", uses=["a.b.c"])
     for seed in (broken, legacy):
-        value = _dag_properties(seed)["structural_key"]
+        value = dag_properties(seed)["structural_key"]
         assert value is None
         assert value != ""
 
@@ -239,7 +241,7 @@ async def test_each_blueprint_receives_its_own_key_across_a_large_batch() -> Non
     THAT blueprint alone.
     """
     seeds = [_distinct_seed(i) for i in range(20)]
-    expected = {bp.id: _dag_properties(bp)["structural_key"] for bp in seeds}
+    expected = {bp.id: dag_properties(bp)["structural_key"] for bp in seeds}
     assert len(set(expected.values())) == 20  # genuinely distinguishable
 
     driver = _RecordingDriver()
@@ -260,7 +262,7 @@ async def test_the_key_is_derived_once_before_the_write_txn_opens() -> None:
     (`dag_props = [...]` before `session()`), and the derived value must still arrive
     intact on the upsert."""
     seed = _seed("bp-one", _GOOD)
-    expected = _dag_properties(seed)["structural_key"]
+    expected = dag_properties(seed)["structural_key"]
     assert expected
 
     driver = _RecordingDriver()
@@ -366,7 +368,7 @@ def test_every_real_canon_blueprint_mints_a_distinct_structural_key() -> None:
 
     seeds, _ = corpus_seeds_from_export({"blueprints": canon})
     assert len(seeds) == len(canon), "the export projection dropped a canon blueprint"
-    keys = {bp.id: _dag_properties(bp)["structural_key"] for bp in resolve_blueprint_references(seeds)}
+    keys = {bp.id: dag_properties(bp)["structural_key"] for bp in resolve_blueprint_references(seeds)}
 
     keyless = [bid for bid, key in keys.items() if not key]
     assert not keyless, f"real canon blueprints with NO structural key: {keyless}"

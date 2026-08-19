@@ -31,7 +31,7 @@ pinned sqlglot version. `canonical_json` and the `sha256:` prefix match
 `compute_canonical_key` exactly, so the digest is deterministic across processes.
 
 It lives under `runtime/blueprint/` because the two writers that must agree byte-for-byte
-are `runtime/retrieval/corpus_loader.py` and `learning/generalize/mapping.py`, and the D58c
+are `runtime/blueprint/compiler.py` and `learning/generalize/mapping.py`, and the D58c
 no-import invariant forbids any module under `runtime/` from importing the learning package.
 So the single definition sits on the runtime side and is imported DOWNWARD — a duplicated
 implementation is the one failure mode that would defeat the whole point of the key.
@@ -326,7 +326,7 @@ def structural_key_from_templates(
         `canonical_ast_norm` string in hand would silently mint a non-matching key.
 
         FAIL-SOFT: an unparseable template returns `""` rather than raising. This is defensive
-        DEPTH, not the active load-path policy — `corpus_loader._validate_blueprint_dag` already
+        DEPTH, not the active load-path policy — `compiler.validate_blueprint_dag` already
         rejects every template this recipe would reject, in an earlier unconditional pass. The
         guard matters only if the recipe ever becomes stricter than loader validation.
     """

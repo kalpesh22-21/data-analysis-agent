@@ -56,7 +56,7 @@ class StaticValidation:
     """
 
     explain_ok: bool  # explainQuery dry-run parsed vs. current schema
-    binds_to_subset_uses: bool  # every slot.binds_to ∈ uses (corpus_loader assertion)
+    binds_to_subset_uses: bool  # every slot.binds_to ∈ uses (blueprint-compiler assertion)
     dag_ok: bool  # composite: feeds_from/cycles/cap/terminal-approval/scalar-converge
     read_only_select: bool  # single read-only SELECT; no '*', no dict-family funcs (D52)
     outcome: Literal["ok", "fail_to_review"]  # ANY false above ⇒ fail_to_review

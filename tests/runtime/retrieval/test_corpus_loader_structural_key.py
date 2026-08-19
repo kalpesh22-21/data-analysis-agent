@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from data_agent.runtime.blueprint.compiler import dag_properties
 from data_agent.runtime.blueprint.structural_key import (
     structural_key_from_templates,
     structural_key_recipe,
@@ -19,7 +20,6 @@ from data_agent.runtime.blueprint.structural_key import (
 from data_agent.runtime.retrieval.corpus_loader import (
     _UPSERT_BLUEPRINT,
     BlueprintSeed,
-    _dag_properties,
     load_seed_fixtures,
     resolve_blueprint_references,
 )
@@ -41,7 +41,7 @@ def test_every_canon_fixture_produces_a_structural_key() -> None:
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
     blueprints = resolve_blueprint_references(blueprints)
     assert len(blueprints) == 11
-    keyed = {bp.id: _dag_properties(bp)["structural_key"] for bp in blueprints}
+    keyed = {bp.id: dag_properties(bp)["structural_key"] for bp in blueprints}
     assert all(key and key.startswith("sha256:") for key in keyed.values()), keyed
     # Distinct blueprints must not collide (several share the `Department` grain, so
     # this also proves the AST half of the digest is doing real work).
@@ -51,7 +51,7 @@ def test_every_canon_fixture_produces_a_structural_key() -> None:
 def test_derivation_is_deterministic_across_calls() -> None:
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
     bp = blueprints[0]
-    assert _dag_properties(bp)["structural_key"] == _dag_properties(bp)["structural_key"]
+    assert dag_properties(bp)["structural_key"] == dag_properties(bp)["structural_key"]
 
 
 def test_an_explicit_structural_key_wins_over_a_re_derive() -> None:
@@ -68,14 +68,14 @@ def test_an_explicit_structural_key_wins_over_a_re_derive() -> None:
         sql_template="SELECT department_name FROM dbpcm_warehouse.employee",
         structural_key="sha256:pinned-by-s4",
     )
-    assert _dag_properties(bp)["structural_key"] == "sha256:pinned-by-s4"
+    assert dag_properties(bp)["structural_key"] == "sha256:pinned-by-s4"
 
 
 def test_a_dag_less_seed_carries_no_structural_key() -> None:
     """`None`, not `""` — an empty-string key stored on many nodes would make a naive
     equality lookup match them all as false prior art."""
     bp = BlueprintSeed(id="legacy", intent="x", slots_summary="", uses=["a.b.c"])
-    assert _dag_properties(bp)["structural_key"] is None
+    assert dag_properties(bp)["structural_key"] is None
 
 
 def test_an_unparseable_template_fails_soft(caplog) -> None:
@@ -89,7 +89,7 @@ def test_an_unparseable_template_fails_soft(caplog) -> None:
         sql_template="SELECT FROM WHERE ((",
     )
     with caplog.at_level("WARNING"):
-        props = _dag_properties(bp)
+        props = dag_properties(bp)
     assert props["structural_key"] is None
     assert "bp-broken" in caplog.text
 
@@ -103,7 +103,7 @@ def test_every_keyed_node_carries_the_recipe_stamp() -> None:
     because adding it later would mean backfilling nodes whose seeds are long gone."""
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
     for bp in blueprints:
-        props = _dag_properties(bp)
+        props = dag_properties(bp)
         assert props["structural_key"]
         assert props["structural_key_recipe"] == structural_key_recipe()
 
@@ -132,7 +132,7 @@ def test_a_keyless_node_carries_no_recipe_stamp_either() -> None:
         sql_template="SELECT FROM WHERE ((",
     )
     for seed in (legacy, broken):
-        props = _dag_properties(seed)
+        props = dag_properties(seed)
         assert props["structural_key"] is None
         assert props["structural_key_recipe"] is None
 
@@ -149,7 +149,7 @@ def test_the_upsert_binds_the_recipe_parameter() -> None:
         result_grain=["Department"],
         sql_template="SELECT a FROM db.t",
     )
-    assert "structural_key_recipe" in _dag_properties(bp)
+    assert "structural_key_recipe" in dag_properties(bp)
 
 
 def test_a_composite_seed_keys_off_its_node_templates() -> None:
@@ -175,4 +175,4 @@ def test_a_composite_seed_keys_off_its_node_templates() -> None:
         [(0, "SELECT AVG(x) AS a FROM db.t"), (2, "SELECT y FROM db.t WHERE y > {a}")],
     )
     assert expected
-    assert _dag_properties(bp)["structural_key"] == expected
+    assert dag_properties(bp)["structural_key"] == expected

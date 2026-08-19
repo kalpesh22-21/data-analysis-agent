@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import pytest
 
+from data_agent.runtime.blueprint.compiler import validate_blueprint_dag
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
-    _validate_blueprint_dag,
 )
 
 _E = "dbpcm_warehouse.employee"
@@ -87,7 +87,7 @@ def test_consumes_node_reading_column_outside_uses_rejected() -> None:
         uses=[_DEPT, _CODE],
     )
     with pytest.raises(CorpusLoadError, match="outside the declared uses footprint"):
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)
 
 
 def test_consumes_node_select_star_rejected() -> None:
@@ -96,7 +96,7 @@ def test_consumes_node_select_star_rejected() -> None:
         uses=[_DEPT, _CODE],
     )
     with pytest.raises(CorpusLoadError, match=r"uses `\*`"):
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)
 
 
 def test_consumes_node_alias_mask_group_by_fails_closed() -> None:
@@ -108,7 +108,7 @@ def test_consumes_node_alias_mask_group_by_fails_closed() -> None:
         uses=[_DEPT, _CODE],
     )
     with pytest.raises(CorpusLoadError):
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)
 
 
 def test_consumes_node_join_to_unlisted_table_rejected() -> None:
@@ -120,7 +120,7 @@ def test_consumes_node_join_to_unlisted_table_rejected() -> None:
         uses=[_DEPT, _CODE],
     )
     with pytest.raises(CorpusLoadError, match="source table|uses footprint"):
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +137,7 @@ def test_resolve_via_node_reading_column_outside_uses_rejected() -> None:
         uses=[_DEPT, _CODE, _STATUS],
     )
     with pytest.raises(CorpusLoadError, match="outside the declared uses footprint"):
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)
 
 
 def test_resolve_via_node_filtering_column_outside_uses_rejected() -> None:
@@ -149,7 +149,7 @@ def test_resolve_via_node_filtering_column_outside_uses_rejected() -> None:
         uses=[_DEPT, _CODE, _STATUS],
     )
     with pytest.raises(CorpusLoadError, match="outside the declared uses footprint"):
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)
 
 
 def test_resolve_via_node_join_to_unlisted_table_rejected() -> None:
@@ -160,7 +160,7 @@ def test_resolve_via_node_join_to_unlisted_table_rejected() -> None:
         uses=[_DEPT, _CODE, _STATUS],
     )
     with pytest.raises(CorpusLoadError, match="source table|uses footprint"):
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +175,7 @@ def test_scope_clean_consumes_dag_accepts() -> None:
         "WHERE Department = {tok} GROUP BY Department",
         uses=[_DEPT, _CODE],
     )
-    _validate_blueprint_dag(seed)  # no raise
+    validate_blueprint_dag(seed)  # no raise
 
 
 def test_scope_clean_resolve_via_node_accepts() -> None:
@@ -184,4 +184,4 @@ def test_scope_clean_resolve_via_node_accepts() -> None:
         "WHERE StatusCode IN {status_codes} GROUP BY Department",
         uses=[_DEPT, _CODE, _STATUS],
     )
-    _validate_blueprint_dag(seed)  # no raise
+    validate_blueprint_dag(seed)  # no raise

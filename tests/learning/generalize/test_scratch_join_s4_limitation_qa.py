@@ -16,7 +16,7 @@ extractor rejects ANY `scratch.*` reference that has no bound `session_id`, so
 registering the scratch table in `catalog_schema` does not help either (pinned
 below). The corpus loader solves the same problem differently — it never calls the
 provenance extractor for composites; it builds a synthetic per-node scratch schema
-(`corpus_loader._scratch_schema_for_node`) and hands it to `qualify_columns`. S4 has
+(`compiler._scratch_schema_for_node`) and hands it to `qualify_columns`. S4 has
 no equivalent seam.
 
 So: fix 1 is PREPARATORY for the shape that motivated it. The one capability it does
@@ -179,7 +179,7 @@ def test_the_loader_has_the_seam_s4_lacks() -> None:
     columns as a `scratch.<placeholder>` schema. `builder`/`validate` import no such
     helper — S4 goes straight to `extract_column_provenance`."""
     import data_agent.learning.generalize.builder as builder
-    from data_agent.runtime.retrieval.corpus_loader import _scratch_schema_for_node
+    from data_agent.runtime.blueprint.compiler import _scratch_schema_for_node
 
     class _Src:
         sql_template = _SQL_PRODUCER

@@ -24,16 +24,16 @@ from data_agent.learning.candidate.models import CandidateStatus
 from data_agent.learning.dedup.canonical_key import compute_canonical_key
 from data_agent.learning.generalize.canonical import canonical_ast_norm
 from data_agent.learning.generalize.mapping import blueprint_seed_from_candidate
+from data_agent.runtime.blueprint.compiler import (
+    _compose_node_templates,
+    _seed_structural_key,
+    dag_properties,
+)
 from data_agent.runtime.blueprint.structural_key import (
     normalize_structural_grain,
     structural_key_from_templates,
 )
-from data_agent.runtime.retrieval.corpus_loader import (
-    BlueprintSeed,
-    _compose_node_templates,
-    _dag_properties,
-    _seed_structural_key,
-)
+from data_agent.runtime.retrieval.corpus_loader import BlueprintSeed
 
 from ..promotion.helpers import make_blueprint_candidate
 
@@ -210,7 +210,7 @@ def test_an_unusable_grain_lands_as_an_absent_property_not_an_empty_string(grain
         result_grain=grain,
         sql_template="SELECT a AS department FROM db.t",
     )
-    value = _dag_properties(seed)["structural_key"]
+    value = dag_properties(seed)["structural_key"]
     assert value is None
     assert value != ""
 
@@ -241,7 +241,7 @@ def test_an_absent_or_unrecognized_grain_container_still_mints_a_key(grain) -> N
         result_grain=grain,
         sql_template="SELECT a AS department FROM db.t",
     )
-    value = _dag_properties(seed)["structural_key"]
+    value = dag_properties(seed)["structural_key"]
     assert value is not None
     assert value.startswith("sha256:")
 
@@ -252,10 +252,10 @@ def test_broken_and_absent_grain_are_not_the_same_outcome() -> None:
     minting a confident key from a guess — the exact failure the split prevents."""
     template = "SELECT a AS department FROM db.t"
     common = {"id": "bp-x", "intent": "i", "slots_summary": "", "uses": ["db.t.a"]}
-    broken = _dag_properties(
+    broken = dag_properties(
         BlueprintSeed(**common, result_grain={"columns": [None]}, sql_template=template)
     )["structural_key"]
-    absent = _dag_properties(
+    absent = dag_properties(
         BlueprintSeed(**common, result_grain=[], sql_template=template)
     )["structural_key"]
     assert broken is None
@@ -283,7 +283,8 @@ def test_a_broken_grain_never_reaches_the_learning_landing_seed_at_all() -> None
         blueprint_seed_from_candidate(env, id=f"bp::{_BP_KEY}")
 
     # And the canon/loader tier rejects the same shape in its own pre-write pass.
-    from data_agent.runtime.retrieval.corpus_loader import CorpusLoadError, _validate_blueprint_dag
+    from data_agent.runtime.blueprint.compiler import validate_blueprint_dag
+    from data_agent.runtime.retrieval.corpus_loader import CorpusLoadError
 
     seed = BlueprintSeed(
         id="bp-x",
@@ -294,7 +295,7 @@ def test_a_broken_grain_never_reaches_the_learning_landing_seed_at_all() -> None
         sql_template="SELECT a AS department FROM db.t",
     )
     with pytest.raises(CorpusLoadError, match="non-empty strings"):
-        _validate_blueprint_dag(seed)
+        validate_blueprint_dag(seed)
 
 
 def test_the_keyless_warning_names_the_grain_when_the_grain_is_what_failed(caplog) -> None:

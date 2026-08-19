@@ -6,7 +6,7 @@ on one side still yields a permanent cross-tier miss:
 
   * the learning landing seed (`generalize/mapping.py::blueprint_seed_from_candidate`),
     which stamps the key from the S4-computed `canonical_ast_norm`; and
-  * the MCP-canon seeder (`runtime/retrieval/corpus_loader.py::_dag_properties`), which
+  * the MCP-canon seeder (`runtime/blueprint/compiler.py::dag_properties`), which
     derives it from a bare `sql_template` + a bare-list `result_grain`.
 
 Feed both the SAME blueprint in their OWN native authoring shapes and demand one digest.
@@ -17,7 +17,8 @@ from __future__ import annotations
 from data_agent.learning.candidate.generalization import BlueprintGeneralization
 from data_agent.learning.candidate.models import CandidateStatus
 from data_agent.learning.generalize.mapping import blueprint_seed_from_candidate
-from data_agent.runtime.retrieval.corpus_loader import BlueprintSeed, _dag_properties
+from data_agent.runtime.blueprint.compiler import dag_properties
+from data_agent.runtime.retrieval.corpus_loader import BlueprintSeed
 
 from ..promotion.helpers import make_blueprint_candidate
 
@@ -29,7 +30,7 @@ def test_landed_seed_carries_a_structural_key() -> None:
     seed = blueprint_seed_from_candidate(env, id=f"bp::{_BP_KEY}")
     assert seed.structural_key.startswith("sha256:")
     # The seed's explicit key survives the loader untouched (never re-derived).
-    assert _dag_properties(seed)["structural_key"] == seed.structural_key
+    assert dag_properties(seed)["structural_key"] == seed.structural_key
 
 
 def test_learning_seed_matches_the_canon_seed_for_the_same_blueprint() -> None:
@@ -53,7 +54,7 @@ def test_learning_seed_matches_the_canon_seed_for_the_same_blueprint() -> None:
         sql_template=gen.sql_template,
     )
 
-    canon_key = _dag_properties(canon_seed)["structural_key"]
+    canon_key = dag_properties(canon_seed)["structural_key"]
     assert canon_key
     assert canon_key == learning_seed.structural_key
 
@@ -100,4 +101,4 @@ def test_the_s4_fixtures_lowercase_aggregate_matches_canons_uppercase_one() -> N
         result_grain=list(gen.result_grain.columns),
         sql_template=(gen.sql_template or "").replace("sum(", "SUM("),
     )
-    assert _dag_properties(canon_uppercased)["structural_key"] == learning_seed.structural_key
+    assert dag_properties(canon_uppercased)["structural_key"] == learning_seed.structural_key

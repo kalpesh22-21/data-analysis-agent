@@ -191,7 +191,7 @@ ORDER BY score DESC
 #
 # CARD ENRICHMENT (release-1 §02): `resolves_json` / `slots_json` /
 # `result_grain_json` in the RETURN above are ALREADY stored on the node
-# (`corpus_loader._dag_properties`) — recall simply did not select them. Adding
+# (`blueprint/compiler.dag_properties`) — recall simply did not select them. Adding
 # them to the projection costs NO extra round-trip and no N+1: the same single
 # `queryNodes` call returns three more properties per row. A node that stored
 # none of them returns nulls, which `_decode_json` degrades to `None`, so a
@@ -342,7 +342,8 @@ RETURN b.id AS id, b.intent AS intent, b.slots_summary AS slots_summary,
 #     matches), next to the `MERGE` that writes it.
 #
 # It lives in THIS module, the lighter of the two, because `corpus_loader` pulls yaml and
-# the sqlglot optimizer while `vector_index` sits on the request path and in
+# (via `blueprint/compiler`) the sqlglot optimizer, while `vector_index` sits on the
+# request path and in
 # `retrieval/__init__`. The dependency therefore runs loader -> index.
 READ_CORPUS_META_QUERY = """
 MATCH (m:CorpusMeta {id: 'singleton'}) RETURN m.corpus_sha AS corpus_sha
@@ -405,7 +406,7 @@ def map_blueprint_detail_record(record: Mapping[str, Any]) -> BlueprintDetail:
         composes=composes if isinstance(composes, list) else None,
         result_grain=result_grain if isinstance(result_grain, (list, dict)) else None,
         # J7: coerced against the CLOSED anchor set, not merely type-checked. The write
-        # side already rejects an unknown anchor (`_validate_blueprint_dag`), so this is
+        # side already rejects an unknown anchor (`compiler.validate_blueprint_dag`), so this is
         # the read-side backstop for a hand-edited/foreign-written node — and the guard is
         # derived from what the value is FOR: every surfacing site glosses the anchor out
         # of `WINDOW_ANCHOR_GLOSS`, so a value with no gloss has nothing to say and is

@@ -47,13 +47,13 @@ from data_agent.learning.priorart.neo4j_index import Neo4jPriorArtIndex
 from data_agent.learning.stage import StageContext
 from data_agent.learning.summary.models import SessionSummary
 from data_agent.learning.triage import TriageVerdict
+from data_agent.runtime.blueprint.compiler import _seed_structural_key
 from data_agent.runtime.blueprint.structural_key import (
     structural_key_from_templates,
     structural_key_recipe,
 )
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 from data_agent.runtime.retrieval.corpus_loader import (
-    _seed_structural_key,
     load_corpus,
     load_seed_fixtures,
     resolve_blueprint_references,

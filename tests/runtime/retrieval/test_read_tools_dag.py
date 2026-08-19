@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from data_agent.runtime.auth.credentials import RuntimeCredentials
+from data_agent.runtime.blueprint.compiler import dag_properties
 from data_agent.runtime.retrieval.corpus_loader import (
-    _dag_properties,
     load_seed_fixtures,
     resolve_blueprint_references,
 )
@@ -233,14 +233,14 @@ async def test_get_blueprint_never_teaches_the_model_that_composition_is_nameabl
     thing that actually reaches the model, since `getBlueprint` chooses independently
     what to serialize.
 
-    Built from the real fixture through the real projection (`_dag_properties` →
+    Built from the real fixture through the real projection (`dag_properties` →
     `map_blueprint_detail_record`), so a future field that starts carrying reference
     provenance onto the node fails here."""
     seeds = resolve_blueprint_references(load_seed_fixtures(_FIXTURE_DIR)[0])
     composite = next(
         bp for bp in seeds if bp.id == "bp-compare-employee-check-detail-two-periods"
     )
-    props = _dag_properties(composite)
+    props = dag_properties(composite)
     detail = map_blueprint_detail_record(
         {
             "id": composite.id,

@@ -368,7 +368,7 @@ def test_an_empty_node_list_composite_yields_no_key() -> None:
 
 def test_no_key_is_the_empty_string_never_none_at_this_layer() -> None:
     """The function-level contract is `""`; converting to an ABSENT graph property is
-    the CALLER's job (`_dag_properties` maps `"" -> None`). Pinned because a caller that
+    the CALLER's job (`dag_properties` maps `"" -> None`). Pinned because a caller that
     stored the empty string would make a naive `MATCH (b {structural_key: $k})` match
     every keyless blueprint as false prior art."""
     assert structural_key_from_templates(["m"], "SELECT FROM WHERE ((") == ""

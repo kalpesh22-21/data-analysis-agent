@@ -244,7 +244,7 @@ _AVERAGE_SALARY_ID = "bp-average-salary-by-department"
 
 
 async def test_search_blueprints_card_enrichment_round_trips(seeded_corpus: bool) -> None:
-    """The three enrichment props are stored by `corpus_loader._dag_properties`
+    """The three enrichment props are stored by `compiler.dag_properties`
     and now SELECTED by `_BLUEPRINT_RECALL_QUERY`. This is the only proof that
     the property NAMES on the node match the ones recall reads — a typo there is
     invisible in Layer-1 (which hands the mapper a hand-built row) and would

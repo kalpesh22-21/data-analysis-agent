@@ -56,7 +56,7 @@ class _FakeRunner:
     """A session OR managed-transaction stand-in — anything with `.run`."""
 
     async def run(self, query: str, **_kwargs: Any) -> _FakeResult:
-        # `_fetch_existing_models` expects a `{"models": [...]}` row; everything
+        # `fetch_existing_models` expects a `{"models": [...]}` row; everything
         # else (DDL, upserts, awaitIndexes) just needs an awaitable no-op result.
         if "embedding_model" in query or "models" in query.lower():
             return _FakeResult({"models": []})  # fresh index -> no parity conflict
@@ -90,7 +90,7 @@ class _FakeEmbeddingClient:
 
 def _bp(bp_id: str, uses: list[str]) -> BlueprintSeed:
     # A single-node seed with NO sql_template and NO composes: passes
-    # `_validate_blueprint_dag` vacuously, so the skew check is what's under test.
+    # `validate_blueprint_dag` vacuously, so the skew check is what's under test.
     return BlueprintSeed(id=bp_id, intent="an intent", slots_summary="", uses=uses)
 
 

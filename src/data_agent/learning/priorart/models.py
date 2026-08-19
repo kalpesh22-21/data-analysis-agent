@@ -38,7 +38,7 @@ PriorArtKind = CandidateKind
 #   mcp        — the git-versioned MCP canon. The agent ALREADY recalls this.
 #   learning   — the learning staging tier (landed, but recall ignores it).
 #   unsourced  — a node with no usable `source` property. Both writers always stamp one
-#                (`corpus_loader._blueprint_params` / `generalize/mapping.py`), so this
+#                (`corpus_loader._UPSERT_BLUEPRINT` / `generalize/mapping.py`), so this
 #                can only be a hand edit or a foreign writer. It is surfaced rather than
 #                dropped — prior art wants to know the artifact exists — but it is NEVER
 #                treated as canon, so it can never trigger the drop-the-candidate verdict.

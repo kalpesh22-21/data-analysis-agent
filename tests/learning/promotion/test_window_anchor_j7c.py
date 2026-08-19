@@ -32,6 +32,7 @@ from typing import Any, Union, get_args, get_origin
 import pytest
 import yaml
 
+from data_agent.corpus.seeds import _seed_from_entry
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.candidate.verdicts import DriftStamp
 from data_agent.learning.generalize.mapping import blueprint_seed_from_candidate
@@ -39,7 +40,7 @@ from data_agent.learning.promotion import mcp_export
 from data_agent.learning.promotion.landing import landing_id
 from data_agent.learning.promotion.mcp_export import build_promotion_emit
 from data_agent.runtime.blueprint.models import WINDOW_ANCHORS, BlueprintParseError
-from data_agent.runtime.retrieval.corpus_loader import BlueprintSeed, _seed_from_entry
+from data_agent.runtime.retrieval.corpus_loader import BlueprintSeed
 
 from .helpers import make_blueprint_candidate
 

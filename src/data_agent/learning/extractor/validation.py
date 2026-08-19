@@ -1029,7 +1029,8 @@ def _validate_roles(
                 )
             # Well-formedness (Slice C): a PRESENT optional_pattern must be a
             # self-contained boolean SQL fragment carrying NO placeholder — the SAME
-            # gate the corpus loader/runtime apply (corpus_loader validates whenever a
+            # gate the blueprint compiler/runtime apply (`validate_blueprint_dag`
+            # validates whenever a
             # pattern is present, regardless of `required`, so a REQUIRED slot that
             # still carries a malformed pattern is caught here too rather than only at
             # load). Catch a malformed pattern as a fail-to-review decline rather than

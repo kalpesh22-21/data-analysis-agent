@@ -921,3 +921,42 @@ dropped, the generalize package's pre-keep-and-annotate claim corrected.
   — low-tail, not regression (the slice is span-plumbing only); ruff
   clean. Follow-up on record: R7 resume-path span (agent_loop) still
   unspanned.
+
+## #26 — T4.1: blueprint compiler extracted from corpus_loader (2026-08-18)
+
+- `corpus_loader.py` 3,249 → 1,396: the compile bucket (~1,640 lines)
+  moved to NEW `runtime/blueprint/compiler.py` (1,668); seed DTOs +
+  `CorpusLoadError`/`DimensionMismatchError` + the entry→seed parsers
+  moved to NEW cycle-proof `data_agent/corpus/seeds.py` (252, deps:
+  dataclasses/typing/logging only). Pure move proven twice, mechanically:
+  builder's re-extract-and-byte-compare against the base sha, AND the
+  reviewer's independent full-coverage AST byte-diff — zero body diffs
+  modulo five name promotions (`validate_blueprint_uses`,
+  `validate_blueprint_dag`, `dag_properties`, `fetch_existing_models`,
+  `fetch_existing_vector_dims`). The 356-line `validate_blueprint_dag`
+  god-gate moved unsplit (per-gate split = its own future slice).
+- The point of the slice: `learning/generalize/mapping.py`'s edge to the
+  loader is fully cut (DTOs from `corpus.seeds`); `promotion/landing.py`
+  keeps only the legitimate `load_corpus` writer edge. Honest caveat
+  (reviewer-measured): package-level `import data_agent.learning` still
+  pulls the loader via `learning/__init__` eager re-exports → landing —
+  pre-existing property, not this slice's defect.
+- Traps dodged by design: `_warn_on_catalog_skew` deliberately NOT moved
+  (skew tests filter caplog by the literal loader logger name — moving it
+  would make their negative assertions pass vacuously); `CorpusLoadError`
+  single-class-object invariant verified (`is` across all three modules);
+  compiler imports nothing from `runtime.retrieval.*` (the pre-existing
+  retrieval↔blueprint import cycle is order-load-bearing); cold-import
+  gates run in three separate processes. Identity tests edited honestly
+  (consumers map → compiler) instead of re-exporting dead constants.
+- Review: APPROVE, zero blockers/suggestions. Two informational nits on
+  record: four moved warnings now log under
+  `data_agent.runtime.blueprint.compiler` (ops filters keyed on the old
+  name go quiet for those messages); the grammar parity sweep no longer
+  watches corpus_loader (unreachable today — the loader has zero grammar
+  references left).
+- Worktree env note for future slices: fresh worktrees need
+  `uv run --extra dev pytest` (pytest-asyncio lives in the dev extra).
+- V0 on main after compose with T4.4: **6029 passed / 225 skipped /
+  1 xfailed**; cold imports + ruff clean; V1 **8/9 at/above baseline,
+  L3 its accepted 1/3**. Wave B complete — Tier 4 closed.

@@ -14,11 +14,13 @@ from pathlib import Path
 
 import pytest
 
+from data_agent.runtime.blueprint.compiler import (
+    dag_properties,
+    validate_blueprint_dag,
+)
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
-    _dag_properties,
-    _validate_blueprint_dag,
     load_seed_fixtures,
     resolve_blueprint_references,
 )
@@ -48,7 +50,7 @@ def _seed(**overrides: object) -> BlueprintSeed:
 def test_seed_fixtures_all_validate_and_serialize() -> None:
     """`resolve_blueprint_references` runs first, exactly as `load_corpus` orders it:
     a `composes` node may name another blueprint rather than carry SQL (plan §2b), and
-    `_validate_blueprint_dag` deliberately REFUSES an unresolved one (`Node.parse`'s
+    `validate_blueprint_dag` deliberately REFUSES an unresolved one (`Node.parse`'s
     backstop) — a node reaching validation with a live reference would otherwise parse
     as a silently template-less step."""
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
@@ -78,8 +80,8 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
         "bp-earnings-by-department-via-scratch-join",
     }
     for bp in blueprints:
-        _validate_blueprint_dag(bp)  # no raise
-        props = _dag_properties(bp)
+        validate_blueprint_dag(bp)  # no raise
+        props = dag_properties(bp)
         if bp.id not in department_seeds:
             continue
         # result_grain round-trips as a JSON list; sql_template stored verbatim.
@@ -94,7 +96,7 @@ def test_seed_fixtures_all_validate_and_serialize() -> None:
 
 
 def test_valid_synthetic_seed_passes() -> None:
-    _validate_blueprint_dag(_seed())
+    validate_blueprint_dag(_seed())
 
 
 def test_dag_less_seed_still_valid_and_serializes_null() -> None:
@@ -102,8 +104,8 @@ def test_dag_less_seed_still_valid_and_serializes_null() -> None:
     bp = BlueprintSeed(
         id="legacy", intent="x", slots_summary="", uses=["a.b.c"],
     )
-    _validate_blueprint_dag(bp)
-    props = _dag_properties(bp)
+    validate_blueprint_dag(bp)
+    props = dag_properties(bp)
     assert props["sql_template"] is None
     assert props["result_grain_json"] is None
     assert props["slots_json"] is None
@@ -118,7 +120,7 @@ def test_undeclared_slot_token_rejected() -> None:
         "WHERE Department = {department} AND x = {undeclared}"
     )
     with pytest.raises(CorpusLoadError, match="undeclared slot"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_column_outside_uses_rejected() -> None:
@@ -128,25 +130,25 @@ def test_column_outside_uses_rejected() -> None:
         "WHERE Department = {department}"
     )
     with pytest.raises(CorpusLoadError, match="outside the declared uses footprint"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_unparseable_template_rejected() -> None:
     bp = _seed(sql_template="SELECT FROM WHERE {department}")
     with pytest.raises(CorpusLoadError, match="does not parse"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_bad_result_grain_rejected() -> None:
     bp = _seed(result_grain=[1, 2, 3])
     with pytest.raises(CorpusLoadError, match="malformed DAG"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_bad_slot_type_rejected() -> None:
     bp = _seed(slots=[{"name": "department", "type": "nonsense"}])
     with pytest.raises(CorpusLoadError, match="malformed DAG"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_composes_cycle_rejected() -> None:
@@ -161,7 +163,7 @@ def test_composes_cycle_rejected() -> None:
         ],
     )
     with pytest.raises(CorpusLoadError, match="cycle"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_composes_dangling_feeds_from_rejected() -> None:
@@ -174,7 +176,7 @@ def test_composes_dangling_feeds_from_rejected() -> None:
         ],
     )
     with pytest.raises(CorpusLoadError, match="feeds_from unknown node"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_entity_valued_when_clause_rejected() -> None:
@@ -188,7 +190,7 @@ def test_entity_valued_when_clause_rejected() -> None:
         ],
     )
     with pytest.raises(CorpusLoadError, match="when-clause invalid"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_node_template_column_outside_uses_rejected() -> None:
@@ -200,7 +202,7 @@ def test_node_template_column_outside_uses_rejected() -> None:
         ],
     )
     with pytest.raises(CorpusLoadError, match="node 1 sql_template"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_multi_statement_injection_rejected() -> None:
@@ -210,7 +212,7 @@ def test_multi_statement_injection_rejected() -> None:
         sql_template="SELECT Department FROM dbpcm_warehouse.employee; DROP TABLE payroll"
     )
     with pytest.raises(CorpusLoadError, match="does not parse"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_dict_function_rejected() -> None:
@@ -220,13 +222,13 @@ def test_dict_function_rejected() -> None:
         "WHERE Department = {department}"
     )
     with pytest.raises(CorpusLoadError, match="dictionary function"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_select_star_rejected() -> None:
     bp = _seed(sql_template="SELECT * FROM dbpcm_warehouse.employee WHERE Department = {department}")
     with pytest.raises(CorpusLoadError, match=r"uses `\*`"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 _USES2 = [
@@ -260,7 +262,7 @@ def test_qualified_join_to_unlisted_table_rejected() -> None:
         )
     )
     with pytest.raises(CorpusLoadError, match="source table 'dbpcm_warehouse.secretpayroll'"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_fully_qualified_join_to_unlisted_table_rejected() -> None:
@@ -274,7 +276,7 @@ def test_fully_qualified_join_to_unlisted_table_rejected() -> None:
         )
     )
     with pytest.raises(CorpusLoadError, match="not in the declared uses footprint"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_cross_join_to_unlisted_table_rejected() -> None:
@@ -285,12 +287,12 @@ def test_cross_join_to_unlisted_table_rejected() -> None:
         )
     )
     with pytest.raises(CorpusLoadError, match="source table"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_legit_join_both_tables_in_uses_accepted() -> None:
     # A JOIN across two tables BOTH declared in `uses`, every column in uses → OK.
-    _validate_blueprint_dag(
+    validate_blueprint_dag(
         _seed2(
             "SELECT e.Department AS dept, SUM(p.Amount) AS total "
             "FROM dbpcm_warehouse.employee AS e "
@@ -303,7 +305,7 @@ def test_legit_join_both_tables_in_uses_accepted() -> None:
 def test_cte_source_is_not_treated_as_an_unlisted_table() -> None:
     # A CTE name is the query's own derived table, not a warehouse source — it must
     # not be flagged as "not in uses"; the CTE's REAL table columns are still checked.
-    _validate_blueprint_dag(
+    validate_blueprint_dag(
         _seed(
             sql_template=(
                 "WITH x AS (SELECT Department, EmployeeCode FROM dbpcm_warehouse.employee) "
@@ -324,7 +326,7 @@ def test_ambiguous_bare_column_across_two_in_scope_tables_rejected() -> None:
         "WHERE Department = {department}"
     )
     with pytest.raises(CorpusLoadError):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_group_by_output_alias_rejected_constraint_pin() -> None:
@@ -340,11 +342,11 @@ def test_group_by_output_alias_rejected_constraint_pin() -> None:
         )
     )
     with pytest.raises(CorpusLoadError):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_group_by_real_column_accepted() -> None:
-    _validate_blueprint_dag(
+    validate_blueprint_dag(
         _seed(
             slots=[],  # B3(a): this template uses no {department} filter → no declared slot
             sql_template=(
@@ -365,7 +367,7 @@ def test_cross_database_reference_rejected() -> None:
         "WHERE Department = {department}",
     )
     with pytest.raises(CorpusLoadError, match="source table 'dbpcm_warehouse.employee'"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_deep_compose_dag_over_cap_rejected() -> None:
@@ -378,7 +380,7 @@ def test_deep_compose_dag_over_cap_rejected() -> None:
     ]
     bp = _seed(sql_template=None, slots=[], composes=composes)
     with pytest.raises(CorpusLoadError, match="node cap"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_valid_when_clause_accepted() -> None:
@@ -393,7 +395,7 @@ def test_valid_when_clause_accepted() -> None:
              "when": {"expr": "count($1) > 0", "on_violation": "skip"}},
         ],
     )
-    _validate_blueprint_dag(replace(bp))  # no raise
+    validate_blueprint_dag(replace(bp))  # no raise
 
 
 # -- Slice-C review: additional load-time gates ------------------------------
@@ -412,7 +414,7 @@ def test_hybrid_sql_template_and_composes_rejected() -> None:
         # inherits the base top-level sql_template → hybrid
     )
     with pytest.raises(CorpusLoadError, match="BOTH a top-level sql_template and a composes"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_resolve_via_rule_probing_column_outside_uses_rejected() -> None:
@@ -429,7 +431,7 @@ def test_resolve_via_rule_probing_column_outside_uses_rejected() -> None:
         result_grain=[],
     )
     with pytest.raises(CorpusLoadError, match="resolve_via rule .* probes .* NOT in the declared uses"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_consumes_referencing_non_scalar_upstream_rejected() -> None:
@@ -444,7 +446,7 @@ def test_consumes_referencing_non_scalar_upstream_rejected() -> None:
         ],
     )
     with pytest.raises(CorpusLoadError, match="no declared SCALAR output"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_consumes_from_non_feeds_from_node_rejected() -> None:
@@ -459,7 +461,7 @@ def test_consumes_from_non_feeds_from_node_rejected() -> None:
         ],
     )
     with pytest.raises(CorpusLoadError, match="not in its feeds_from"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_terminal_approval_node_rejected() -> None:
@@ -473,7 +475,7 @@ def test_terminal_approval_node_rejected() -> None:
         ],
     )
     with pytest.raises(CorpusLoadError, match="TERMINAL approval gate"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_non_terminal_approval_gating_a_query_is_accepted() -> None:
@@ -486,7 +488,7 @@ def test_non_terminal_approval_gating_a_query_is_accepted() -> None:
              "sql_template": "SELECT Department AS department FROM dbpcm_warehouse.employee GROUP BY Department"},  # approval WITH its own query
         ],
     )
-    _validate_blueprint_dag(bp)  # no raise — the approval runs its own query
+    validate_blueprint_dag(bp)  # no raise — the approval runs its own query
 
 
 def test_count_threshold_over_scalar_output_rejected() -> None:
@@ -501,4 +503,4 @@ def test_count_threshold_over_scalar_output_rejected() -> None:
         ],
     )
     with pytest.raises(CorpusLoadError, match="count.* to a SCALAR-output node"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)

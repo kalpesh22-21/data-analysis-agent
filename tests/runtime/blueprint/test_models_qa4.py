@@ -5,7 +5,7 @@ node referencing an undefined node / self-edge / duplicate order (these DAG-shap
 invariants are enforced by the LOADER, not the parse layer — pinned here), a
 deeply-nested composes list (no crash at parse), and the `result_grain` shape
 matrix. The parse layer is STRUCTURAL + fail-loud; it does NOT do DAG-graph
-validation (that is `corpus_loader._validate_dag_structure`).
+validation (that is `compiler._validate_dag_structure`).
 
 ADD-only; does not modify the reviewer-owned `test_models.py`.
 """

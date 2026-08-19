@@ -16,10 +16,10 @@ from pathlib import Path
 
 import pytest
 
+from data_agent.runtime.blueprint.compiler import validate_blueprint_dag
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
-    _validate_blueprint_dag,
     load_seed_fixtures,
 )
 
@@ -40,8 +40,8 @@ def test_windowed_seed_fixtures_present_and_validate() -> None:
     assert "bp-hires-per-month" in by_id
     assert "bp-hires-in-range" in by_id
     # Both validate without raising (the full §1.2 write-time gate).
-    _validate_blueprint_dag(by_id["bp-hires-per-month"])
-    _validate_blueprint_dag(by_id["bp-hires-in-range"])
+    validate_blueprint_dag(by_id["bp-hires-per-month"])
+    validate_blueprint_dag(by_id["bp-hires-in-range"])
 
 
 def test_windowed_seed_slot_types() -> None:
@@ -87,7 +87,7 @@ def _window_seed(*, sql_template: str) -> BlueprintSeed:
 
 def test_period_range_both_bounds_referenced_validates() -> None:
     # Positive control — BOTH tokens referenced → the seed validates.
-    _validate_blueprint_dag(
+    validate_blueprint_dag(
         _range_seed(
             sql_template=(
                 "SELECT MostRecentHireDate FROM dbpcm_warehouse.employee "
@@ -110,7 +110,7 @@ def test_period_range_only_start_referenced_rejected() -> None:
         )
     )
     with pytest.raises(CorpusLoadError, match="only part of period_range slot"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_period_range_bare_token_rejected_as_undeclared() -> None:
@@ -123,7 +123,7 @@ def test_period_range_bare_token_rejected_as_undeclared() -> None:
         )
     )
     with pytest.raises(CorpusLoadError, match="undeclared slot"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_required_relative_window_unreferenced_rejected() -> None:
@@ -133,12 +133,12 @@ def test_required_relative_window_unreferenced_rejected() -> None:
         sql_template="SELECT MostRecentHireDate FROM dbpcm_warehouse.employee"
     )
     with pytest.raises(CorpusLoadError, match="referenced by NO template"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_relative_window_referenced_validates() -> None:
     # Positive control for relative_window — the {window_months} token is present.
-    _validate_blueprint_dag(
+    validate_blueprint_dag(
         _window_seed(
             sql_template=(
                 "SELECT MostRecentHireDate FROM dbpcm_warehouse.employee "

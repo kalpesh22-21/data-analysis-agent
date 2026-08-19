@@ -17,10 +17,10 @@ from pathlib import Path
 
 import pytest
 
+from data_agent.runtime.blueprint.compiler import validate_blueprint_dag
 from data_agent.runtime.retrieval.corpus_loader import (
     BlueprintSeed,
     CorpusLoadError,
-    _validate_blueprint_dag,
     load_seed_fixtures,
     resolve_blueprint_references,
 )
@@ -56,7 +56,7 @@ def test_unreferenced_required_slot_fails_load() -> None:
         ]
     )
     with pytest.raises(CorpusLoadError, match="ghost"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_unreferenced_optional_slot_is_allowed() -> None:
@@ -70,7 +70,7 @@ def test_unreferenced_optional_slot_is_allowed() -> None:
             {"name": "maybe", "type": "string", "required": False},
         ]
     )
-    _validate_blueprint_dag(bp)  # no raise
+    validate_blueprint_dag(bp)  # no raise
 
 
 # -- Slice C: optional_pattern validated at LOAD (fail loud, not per-hit) ----
@@ -83,7 +83,7 @@ def test_valid_optional_pattern_loads() -> None:
             {"name": "region", "type": "string", "required": False, "optional_pattern": "TRUE"},
         ]
     )
-    _validate_blueprint_dag(bp)  # no raise
+    validate_blueprint_dag(bp)  # no raise
 
 
 def test_malformed_optional_pattern_rejected_at_load() -> None:
@@ -97,7 +97,7 @@ def test_malformed_optional_pattern_rejected_at_load() -> None:
         ]
     )
     with pytest.raises(CorpusLoadError, match="optional_pattern"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_placeholder_bearing_optional_pattern_rejected_at_load() -> None:
@@ -110,7 +110,7 @@ def test_placeholder_bearing_optional_pattern_rejected_at_load() -> None:
         ]
     )
     with pytest.raises(CorpusLoadError, match="optional_pattern"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 # -- e2: a REFERENCED optional slot MUST carry an optional_pattern -----------
@@ -127,7 +127,7 @@ def test_referenced_optional_slot_without_pattern_fails_load() -> None:
         ]
     )
     with pytest.raises(CorpusLoadError, match="optional_pattern"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_referenced_optional_slot_with_pattern_loads() -> None:
@@ -139,7 +139,7 @@ def test_referenced_optional_slot_with_pattern_loads() -> None:
              "optional_pattern": "TRUE"},
         ]
     )
-    _validate_blueprint_dag(bp)  # no raise
+    validate_blueprint_dag(bp)  # no raise
 
 
 def test_unreferenced_optional_slot_without_pattern_still_loads() -> None:
@@ -152,7 +152,7 @@ def test_unreferenced_optional_slot_without_pattern_still_loads() -> None:
             {"name": "maybe", "type": "string", "required": False},  # unreferenced, no pattern
         ]
     )
-    _validate_blueprint_dag(bp)  # no raise
+    validate_blueprint_dag(bp)  # no raise
 
 
 # -- S1: binds_to ⊆ uses ----------------------------------------------------
@@ -166,7 +166,7 @@ def test_binds_to_outside_uses_fails_load() -> None:
         slots=[{"name": "department", "type": "string", "required": True, "binds_to": f"{_E}.SecretCol"}]
     )
     with pytest.raises(CorpusLoadError, match="binds_to"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 def test_binds_to_within_uses_passes() -> None:
@@ -174,7 +174,7 @@ def test_binds_to_within_uses_passes() -> None:
         uses=[f"{_E}.Department", f"{_E}.EmployeeCode"],
         slots=[{"name": "department", "type": "string", "required": True, "binds_to": f"{_E}.Department"}],
     )
-    _validate_blueprint_dag(bp)  # no raise
+    validate_blueprint_dag(bp)  # no raise
 
 
 # -- S3: slot cap -----------------------------------------------------------
@@ -184,7 +184,7 @@ def test_too_many_slots_fails_load() -> None:
     many = [{"name": f"s{i}", "type": "string", "required": False} for i in range(17)]
     bp = _seed(slots=many)
     with pytest.raises(CorpusLoadError, match="slot"):
-        _validate_blueprint_dag(bp)
+        validate_blueprint_dag(bp)
 
 
 # -- the 3 seed fixtures still load (the B3 fixture check) -------------------
@@ -212,5 +212,5 @@ def test_all_seed_fixtures_still_validate_under_b3_s1_s3() -> None:
         "bp-employee-check-detail-for-period",
     }
     for bp in blueprints:
-        _validate_blueprint_dag(bp)  # no raise — every required slot (incl. both
+        validate_blueprint_dag(bp)  # no raise — every required slot (incl. both
         # period_range tokens) is referenced, every binds_to ∈ uses, ≤ 16 slots.

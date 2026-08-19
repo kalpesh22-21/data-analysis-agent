@@ -20,11 +20,8 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
-from data_agent.runtime.retrieval.corpus_loader import (
-    BlueprintSeed,
-    KnowledgeSeed,
-    load_corpus,
-)
+from data_agent.corpus.seeds import BlueprintSeed, KnowledgeSeed
+from data_agent.runtime.retrieval.corpus_loader import load_corpus
 
 from ..candidate.models import CandidateEnvelope
 from ..generalize.mapping import (
