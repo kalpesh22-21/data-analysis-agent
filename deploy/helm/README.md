@@ -32,8 +32,8 @@ backing infrastructure.
 
 | Component | Kind | Command | Service | Scales? |
 |---|---|---|---|---|
-| `runtime` | Deployment | `uvicorn data_agent.runtime.app:create_app --factory --host 0.0.0.0 --port 8000` | ClusterIP :8000 | yes (HPA) |
-| `ui` | Deployment | `uvicorn ui.server:app --host 0.0.0.0 --port 3000` | ClusterIP :3000 (+ optional Ingress) | yes |
+| `runtime` | Deployment | `python scripts/run_runtime_api.py --host 0.0.0.0 --port 8000` | ClusterIP :8000 | yes (HPA) |
+| `ui` | Deployment | `python scripts/run_ui_bff.py --host 0.0.0.0 --port 3000` | ClusterIP :3000 (+ optional Ingress) | yes |
 | `hydrator` | Deployment | `python scripts/run_hydrator.py` | none | **no — pinned to 1** |
 
 ### Chart B — `data-agent-learning` (offline)
@@ -44,7 +44,7 @@ backing infrastructure.
 | `learning-consumer` | Deployment | `python scripts/run_learning_consumer.py` | none | yes (HPA) |
 | `learning-scheduler` | Deployment | `python scripts/run_learning_scheduler.py` | none | **no — pinned to 1** |
 | `inbox` | Deployment | `python scripts/run_inbox_service.py` | ClusterIP :8100 | yes |
-| `inbox-ui` | Deployment | `uvicorn ui.server:app --host 0.0.0.0 --port 3000` | ClusterIP :3000 (+ optional Ingress) | yes |
+| `inbox-ui` | Deployment | `python scripts/run_ui_bff.py --host 0.0.0.0 --port 3000` | ClusterIP :3000 (+ optional Ingress) | yes |
 
 `learning-sweeper`, `learning-scheduler` and `hydrator` are pinned to one replica
 **in the template** (no `replicaCount` knob): a second sweeper double-enqueues, a
@@ -224,7 +224,7 @@ No subcharts are bundled for any of these on purpose.
 
 The repo root ships a production `Dockerfile` that builds the one image both
 charts deploy (it contains the installed `data_agent` package, `ui/` and
-`scripts/`, with `uvicorn` and `python` on PATH, running as uid 10001).
+`scripts/`, with `python` on PATH, running as uid 10001).
 
 ```bash
 docker build -t ghcr.io/acme/data-agent:1.4.2 .

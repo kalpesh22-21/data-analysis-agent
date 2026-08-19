@@ -39,11 +39,14 @@ spec:
         - name: runtime
           image: {{ include "data-agent.image" (dict "root" $ "component" $c) }}
           imagePullPolicy: {{ include "data-agent.imagePullPolicy" (dict "root" $ "component" $c) }}
-          # The core agent API. Started via uvicorn's --factory entrypoint.
+          # The core agent API, same `create_app` factory as ever — but through the
+          # repo's launcher, NOT the uvicorn CLI. uvicorn re-raises the SIGTERM it
+          # captured onto the SIG_DFL it restores after `serve()` returns, so a clean
+          # rollout shutdown still exited 143 and read as a crash (ISSUES.md C3); the
+          # launcher chains that re-raise and exits 0.
           command:
-            - uvicorn
-            - data_agent.runtime.app:create_app
-            - --factory
+            - python
+            - scripts/run_runtime_api.py
             - --host
             - "0.0.0.0"
             - --port

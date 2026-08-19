@@ -984,3 +984,31 @@ dropped, the generalize package's pre-keep-and-annotate claim corrected.
   to the combined J7+R7 gate (next entry) — the resume path is not
   exercised by the routing eval; the L3 re-measure covers the shared
   surfaces.
+
+## #28 — C3 closed: production workloads off the uvicorn CLI (2026-08-19)
+
+- The residual from the hygiene wave: runtime/ui/inbox-ui deployed as bare
+  `uvicorn <module>:<app>` — no repo code brackets serve(), so SIGTERM
+  exits 143 and orchestrators read a rollout as a crash. NEW
+  `scripts/run_runtime_api.py` + `scripts/run_ui_bff.py` (one launcher
+  serves ui AND inbox-ui — they ran the identical command, split by env)
+  on `run_http_daemon`; chart commands + Dockerfile CMD migrated; helm
+  README table updated. Rendered output: zero uvicorn across all 8
+  workloads; helm lint clean.
+- Load-bearing detail: each launcher DEFERS the heavy import into the
+  factory body — uvicorn calls the factory from config.load() inside
+  serve(), i.e. inside the SIGTERM-captured region; a module-scope
+  import would boot seconds of app outside any handler. Review fold: the
+  AST guard now pins that placement (module-scope Import/ImportFrom
+  naming ui/data_agent.runtime = failure; the in-factory import must
+  exist) — proven to fail on both hoisted-import forms while every other
+  test stayed green, which is why it exists. Guarded at three seams:
+  adoption, rendered-command, placement.
+- Real SIGTERM smoke (builder + reviewer independently): BFF serves,
+  SIGTERM → "graceful shutdown complete, exiting 0" in stdout, exit 0.
+  Reviewer ruled all four flagged assumptions SOUND (argv host/port,
+  Dockerfile CMD in scope, run_ui.sh stays dev-only, process-name change
+  harmless). Note for ops: root logger now INFO in pods (was
+  WARNING-via-lastResort) — deliberate, matches daemon workers.
+- V0 **6051 passed / 225 skipped / 1 xfailed**; ruff clean; review
+  APPROVE.

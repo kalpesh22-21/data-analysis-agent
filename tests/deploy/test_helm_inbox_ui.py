@@ -59,10 +59,12 @@ def test_inbox_ui_runs_the_same_app_with_the_reviewer_flag_on() -> None:
     container = _by_kind_component(docs, "Deployment", "inbox-ui")["spec"]["template"]["spec"][
         "containers"
     ][0]
-    # Same entrypoint as the agent UI — the split is configuration, not code.
+    # Same entrypoint as the agent UI — the split is configuration, not code. The
+    # launcher, not the uvicorn CLI: a clean SIGTERM shutdown has to exit 0 (ISSUES.md
+    # C3), and `scripts/run_ui_bff.py` serves the identical `ui.server:app`.
     assert container["command"] == [
-        "uvicorn",
-        "ui.server:app",
+        "python",
+        "scripts/run_ui_bff.py",
         "--host",
         "0.0.0.0",
         "--port",

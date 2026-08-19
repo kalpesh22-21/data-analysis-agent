@@ -52,13 +52,17 @@ _logger = logging.getLogger("test.http_daemon")
 
 _SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 
-# The in-repo launchers that own their own `serve()` call and can therefore chain the
-# re-raise. NOT here, and deliberately: `runtime`, `ui` and `inbox-ui` are deployed as
-# `uvicorn <module>:<app>`, where uvicorn owns `main()` and no repo code brackets
-# `serve()` — see the `http_daemon` module docstring for why an import-time handler is
-# not a substitute (it would land INSIDE the captured region and break the graceful
-# shutdown itself).
+# Every in-repo launcher that owns a `serve()` call, i.e. every process that can chain
+# the re-raise. The list is the whole point: for as long as a deployed workload entered
+# through the uvicorn CLI, uvicorn owned `main()`, no repo code bracketed `serve()`, and
+# there was nowhere to put the fix (an import-time handler is not a substitute — it would
+# land INSIDE the captured region and break the graceful shutdown itself). The last three
+# holes, `runtime`/`ui`/`inbox-ui`, are closed by the first two entries here: the charts
+# now run `python scripts/run_runtime_api.py` and `python scripts/run_ui_bff.py`, and
+# `ui` + `inbox-ui` share the second one (they are the same app, split by env).
 _UVICORN_LAUNCHERS = (
+    "run_runtime_api.py",
+    "run_ui_bff.py",
     "run_inbox_service.py",
     "run_ui_runtime.py",
     "run_ui_runtime_real.py",
@@ -344,7 +348,7 @@ def test_every_in_repo_uvicorn_launcher_goes_through_the_wrapper(script: str) ->
     OpenAI Responses API at import). The claim is narrow and structural: the process
     entry is `run_http_daemon`, not `uvicorn.run` and not a bare `Server.serve()` —
     which is exactly the difference between a rollout that exits 0 and one that exits
-    143. Parameterized so a fourth in-repo launcher cannot quietly ship without it.
+    143. Parameterized so the next in-repo launcher cannot quietly ship without it.
     """
     source = (_SCRIPTS / script).read_text(encoding="utf-8")
     assert "run_http_daemon(" in source

@@ -52,10 +52,11 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app
 
-# WORKDIR /app is load-bearing, not cosmetic: scripts are launched by relative
-# path, uvicorn puts the working directory on sys.path for `ui.server:app`
-# (ui/ ships as source — it is not part of the wheel), and the editable install
-# above points at /app/src.
+# WORKDIR /app is load-bearing, not cosmetic: every workload is launched by a
+# relative script path (`python scripts/run_*.py`) and the editable install above
+# points at /app/src. `ui/` ships as source rather than in the wheel;
+# scripts/run_ui_bff.py puts the repo root on sys.path itself, because running a
+# script by path prepends the SCRIPT's directory, not the working directory.
 WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
@@ -76,4 +77,7 @@ EXPOSE 8000 3000 8100
 # readOnlyRootFilesystem=true, so the image needs no writable paths.
 USER 10001
 
-CMD ["uvicorn", "data_agent.runtime.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+# The launcher, not `uvicorn` — a bare CLI serve dies by signal at 143 on a clean
+# SIGTERM shutdown (ISSUES.md C3). The chart overrides this per Deployment; the
+# default is what `docker run <image>` (and any compose file without a command) gets.
+CMD ["python", "scripts/run_runtime_api.py", "--host", "0.0.0.0", "--port", "8000"]
