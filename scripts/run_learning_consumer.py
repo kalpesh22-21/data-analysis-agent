@@ -209,6 +209,7 @@ async def _main() -> int:
                     driver=neo4j_driver,
                     embedding_client=embedder,
                     expected_model=runtime_settings.embedding_model,
+                    database=runtime_settings.neo4j_database,
                 )
             else:
                 _logger.warning(

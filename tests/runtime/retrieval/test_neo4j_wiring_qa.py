@@ -87,6 +87,21 @@ def test_neo4j_and_embedder_wires_the_index_with_expected_args(monkeypatch) -> N
     assert kwargs["url"] == "bolt://localhost:7687"
     assert kwargs["auth"] == ("neo4j", "pw")
     assert kwargs["expected_model"] == "all-mpnet-base-v2"
+    # Unset NEO4J_DATABASE == the driver default the reader used before the setting
+    # was honoured, so a deploy that never set it is byte-identical.
+    assert kwargs["database"] == "neo4j"
+
+
+def test_configured_database_reaches_the_index(monkeypatch) -> None:
+    """NEO4J_DATABASE is honoured, not just declared: the reader must open the SAME
+    database the hydrator/learning writers seed, or recall runs against an empty one."""
+    _build(
+        monkeypatch,
+        neo4j_url="bolt://localhost:7687",
+        embedding_url=_EMBED_URL,
+        neo4j_database="reporting",
+    )
+    assert _RecordingIndex.instances[0]["database"] == "reporting"
 
 
 def test_injected_retrieval_is_not_rebuilt(monkeypatch) -> None:

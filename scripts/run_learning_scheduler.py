@@ -48,7 +48,7 @@ from data_agent.learning.entrypoint import configure_daemon_process
 from data_agent.learning.factory import build_promotion_plane, build_promotion_write_plane
 from data_agent.learning.promotion.models import ProbeResult
 from data_agent.learning.promotion.token_minter import HttpTokenMinter, TenantClaims
-from data_agent.runtime.config import RuntimeSettings
+from data_agent.runtime.config import get_runtime_settings
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.model.embedding_client import HttpEmbeddingClient
 
@@ -122,7 +122,11 @@ async def _main() -> int:
     # blueprint LANDS into the neo4j retrieval corpus (becomes recallable) BEFORE its
     # `validated` status write. Missing ANY port ⇒ keep the fail-closed deferred stubs
     # with no landing writer (auto-promotion stays dormant, fail-closed).
-    runtime_settings = RuntimeSettings()
+    # The VAULT-AWARE loader, not a bare `RuntimeSettings()`: every port gated below
+    # (the mint credential, the neo4j creds) is a sensitive value that lives in Vault
+    # in a deployed environment. Constructing settings directly reads env only, so a
+    # Vault-sourced deployment would gate on blanks and sit dormant forever.
+    runtime_settings = get_runtime_settings()
     write_plane_ready = bool(
         runtime_settings.mcp_url
         and runtime_settings.token_service_url
@@ -188,6 +192,7 @@ async def _main() -> int:
                 ),
             ),
             neo4j_driver=neo4j_driver,
+            neo4j_database=runtime_settings.neo4j_database,
             embedding_client=HttpEmbeddingClient(
                 url=runtime_settings.embedding_api_url,
                 api_key=runtime_settings.embedding_api_key,

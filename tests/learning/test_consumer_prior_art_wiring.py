@@ -72,6 +72,8 @@ def _runtime_settings(*, neo4j: bool, embedding: bool) -> SimpleNamespace:
         neo4j_url="bolt://neo4j:7687" if neo4j else "",
         neo4j_username="neo4j" if neo4j else "",
         neo4j_password="pw" if neo4j else "",
+        # The prior-art index must open the SAME database the runtime recalls from.
+        neo4j_database="reporting",
         neo4j_timeout_seconds=10.0,
     )
 
@@ -161,6 +163,10 @@ async def test_a_configured_graph_wires_the_prior_art_index_and_closes_its_drive
     # The driver is closed on shutdown — mirroring how the scheduler entrypoint owns and
     # closes its own driver in a `finally`.
     assert captured["driver"].closed is True
+    # NEO4J_DATABASE is honoured here too: a prior-art search against the default
+    # database while the corpus lives elsewhere returns nothing and every already-owned
+    # blueprint is re-proposed as new.
+    assert prior_art._database == "reporting"
 
 
 async def test_the_prior_art_index_reuses_the_dedup_embedding_client_and_model():

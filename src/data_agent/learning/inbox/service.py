@@ -286,9 +286,12 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
 
     learning_settings = get_learning_settings()
 
-    from data_agent.runtime.config import RuntimeSettings
+    from data_agent.runtime.config import get_runtime_settings
 
-    runtime_settings = RuntimeSettings()
+    # Vault-aware, matching the consumer and scheduler entrypoints: the ports gated
+    # below are sensitive values, and a bare `RuntimeSettings()` reads env only — a
+    # Vault-sourced deployment would fall into offline mode with no way to tell why.
+    runtime_settings = get_runtime_settings()
     write_plane_ready = bool(
         learning_settings.learning_candidates_username
         and learning_settings.learning_candidates_password
@@ -390,6 +393,7 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
             ),
         ),
         neo4j_driver=neo4j_driver,
+        neo4j_database=runtime_settings.neo4j_database,
         embedding_client=embedding_client,
         model_id=runtime_settings.embedding_model,
         # The fail-to-review completion plane: re-validation + the blueprint half of the

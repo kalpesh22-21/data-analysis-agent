@@ -408,6 +408,7 @@ def create_app(
             url=settings.neo4j_url,
             auth=(settings.neo4j_username, settings.neo4j_password),
             expected_model=settings.embedding_model,
+            database=settings.neo4j_database,
             timeout_seconds=settings.neo4j_timeout_seconds,
             tracer=tracer,
         )

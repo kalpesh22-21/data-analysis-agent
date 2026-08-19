@@ -2,12 +2,18 @@
 # This is a YAML-formatted file.
 # Every value is documented inline. See deploy/helm/README.md for the big picture.
 #
-# IMPORTANT: All of the workloads in this chart (learning-sweeper,
+# IMPORTANT: All of the FIRST-PARTY workloads in this chart (learning-sweeper,
 # learning-consumer, learning-scheduler, inbox, inbox-ui) run from the SAME image
 # the sibling `data-agent` chart deploys — one image, different launch commands.
 # External backing services (ClickHouse, MCP/clickhouse-api, token IdP, OpenAI,
-# Couchbase, Neo4j, Redis, embedding APIs) are NOT deployed by this chart —
-# provision them separately and point to them via `config` + `secrets`.
+# Couchbase, Neo4j, embedding APIs) are NOT deployed by this chart — provision
+# them separately and point to them via `config` + `secrets`.
+#
+# THE ONE EXCEPTION IS REDIS. The learning job stream is this plane's private
+# transport (the agent never touches it), so the chart ships a single-replica
+# Redis of its own — see the `redis` block below. It is on by default and
+# LEARNING_REDIS_URL is derived from its Service; disable it and set
+# `config.LEARNING_REDIS_URL` to use an external Redis instead.
 #
 # THIS CHART READS THE AGENT'S DATA. The sweeper scans the `data-agent` release's
 # Couchbase SESSION bucket for idle sessions, and the scheduler/inbox replay
@@ -47,8 +53,9 @@ serviceAccount:
   #    enforced at the pod level so the posture holds when create=false.
   automount: false
 
-# -- Global pod annotations applied to every workload (merged with the
-#    config/secret checksum annotations and any per-component podAnnotations).
+# -- Global pod annotations applied to every workload (merged with the ConfigMap
+#    checksum annotation and any per-component podAnnotations). There is no
+#    secret checksum — the Secret is out-of-band and the chart cannot hash it.
 podAnnotations: {}
 
 # -- Global pod-level securityContext (fsGroup etc.). Sensible non-root defaults.
@@ -148,6 +155,10 @@ config:
   NEO4J_URL: "bolt://neo4j:7687"
   # -- Neo4j username.
   NEO4J_USERNAME: "neo4j"
+  # -- Neo4j database name (multi-database deployments). MUST match the data-agent
+  #    release for the same reason NEO4J_URL must: a blueprint landed in another
+  #    database is invisible to the agent's recall.
+  NEO4J_DATABASE: "neo4j"
   # -- Embedding API base URL. EXTERNAL. Backs dedup, the prior-art index and the
   #    landing writer's vectors.
   EMBEDDING_API_URL: "http://embedding:8080/embed"
@@ -192,9 +203,19 @@ config:
   # === LEARNING PLANE ONLY =================================================
 
   # --- transport (sweeper -> consumer) ---
-  # -- Redis URL backing the learning job stream. EXTERNAL. Owned by this plane
-  #    alone (the agent never touches it).
-  LEARNING_REDIS_URL: "redis://redis:6379/0"
+  # -- Redis URL backing the learning job stream. Owned by this plane alone (the
+  #    agent never touches it).
+  #
+  #    EMPTY (the default) = AUTO-DERIVE from the in-chart Redis Service rendered
+  #    by the `redis` block below. If you set `redis.enabled: false` you MUST set
+  #    this to your external Redis — the chart's last-resort fallback is the old
+  #    literal `redis://redis:6379/0`, which is a guess about your cluster, not a
+  #    configuration.
+  #
+  #    A non-empty value ALWAYS WINS, even with the in-chart Redis enabled, so you
+  #    can cut over to an external Redis without tearing the in-chart one down
+  #    first (drain the old stream before you do — in-flight jobs do not migrate).
+  LEARNING_REDIS_URL: ""
   # -- Redis stream key for learning jobs.
   LEARNING_JOBS_STREAM: "learning:jobs"
   # -- Terminal parking stream for poison jobs (past LEARNING_MAX_DELIVERIES).
@@ -346,48 +367,60 @@ config:
 # ---------------------------------------------------------------------------
 # Secret configuration.
 #
-# In PRODUCTION prefer `existingSecret`: create the Secret out-of-band (sealed
-# secrets / external-secrets / vault) with the KEYS listed below, then set
-# `secrets.existingSecret: <name>`. When `existingSecret` is set the
-# chart-managed Secret is NOT rendered and pods reference the named Secret.
+# THIS CHART DOES NOT RENDER A SECRET. Secret material never passes through
+# values, a rendered manifest, or `helm get values` output. Create the Secret
+# OUT-OF-BAND (vault / external-secrets / sealed-secrets) with the keys listed
+# below, and either:
+#   * name it `<fullname>-secret` — i.e. `<release>-data-agent-learning-secret`,
+#     truncated to fit 63 chars — and leave `existingSecret` empty, or
+#   * set `secrets.existingSecret: <name>` and call it whatever you like.
+# Every workload mounts it wholesale via envFrom, so the Secret must EXIST before
+# the pods start: envFrom against a missing Secret leaves them wedged in
+# CreateContainerConfigError, not failing loudly.
 #
-# STRONGLY RECOMMENDED: point this at the SAME Secret as the `data-agent`
-# release, extended with the learning-only keys. `COUCHBASE_PASSWORD`,
-# `NEO4J_PASSWORD`, `TOKEN_ISSUER_API_KEY` and `EMBEDDING_API_KEY` authenticate
-# the SAME identity in both planes, and the tenant that identity reads as is the
-# same tenant. Two hand-maintained Secrets drift, and the drift is SILENT: the
-# warehouse row policies FILTER rather than error, so a learning plane holding a
-# stale credential/tenant keeps running and verifies promotions against the wrong
-# (or an empty) row set — a green that means nothing.
+# NO CHECKSUM, NO AUTO-ROLL. The chart cannot see the Secret's contents, so
+# rotating a key does not restart the pods (the ConfigMap checksum still does its
+# half). Roll them yourself:
+#   kubectl rollout restart deploy -l app.kubernetes.io/instance=<release>
 #
-# For dev/testing you may inline values under `secrets.data` — they will be
-# base64-encoded into a chart-managed Secret. NEVER commit real secrets here.
+# STRONGLY RECOMMENDED: use the SAME Secret as the `data-agent` release, extended
+# with the learning-only keys. `COUCHBASE_PASSWORD`, `NEO4J_PASSWORD`,
+# `TOKEN_ISSUER_API_KEY` and `EMBEDDING_API_KEY` authenticate the SAME identity in
+# both planes, and the tenant that identity reads as is the same tenant. Two
+# hand-maintained Secrets drift, and the drift is SILENT: the warehouse row
+# policies FILTER rather than error, so a learning plane holding a stale
+# credential/tenant keeps running and verifies promotions against the wrong (or an
+# empty) row set — a green that means nothing. Unused keys in a shared Secret are
+# harmless; each pod only reads what it needs.
+#
+# Keys this chart's workloads read:
+#
+#   --- shared with the data-agent release ---
+#   COUCHBASE_PASSWORD
+#   NEO4J_PASSWORD
+#   TOKEN_ISSUER_API_KEY
+#   EMBEDDING_API_KEY
+#
+#   --- learning plane only ---
+#   LEARNING_EXTRACTOR_API_KEY
+#       API key for the extractor/judge model client. ABSENT ⇒ the extractor is
+#       DORMANT: the consumer runs, drains the stream and extracts nothing.
+#   LEARNING_AUDIT_PASSWORD
+#   LEARNING_CANDIDATES_PASSWORD
+#   LEARNING_CORPUS_PASSWORD
+#   REVIEWER_TOKEN
+#       The ONE shared bearer token guarding every inbox route. The reviewer UI
+#       holds it server-side and attaches it on the proxy hop — the browser never
+#       sees it. Unset ⇒ the inbox service FAILS CLOSED (503 on every route)
+#       rather than collapsing to a passing empty-string compare.
+#
+# The in-chart Redis is deliberately absent from this list: it is
+# unauthenticated, and it does NOT mount this Secret (see the `redis` block).
 # ---------------------------------------------------------------------------
 secrets:
-  # -- Name of a pre-existing Secret to use instead of the chart-managed one.
-  #    When set, `secrets.data` is ignored and NOT rendered.
+  # -- Name of the pre-existing Secret to mount via envFrom. Empty = the
+  #    conventional `<fullname>-secret`, which you still have to create yourself.
   existingSecret: ""
-  # -- Inline secret values (only used when existingSecret is empty). Keys map
-  #    1:1 to env-var names. Empty-string values are SKIPPED (not injected), so
-  #    the app falls back to any ambient/default value rather than seeing "".
-  data:
-    # --- shared with the data-agent release ---
-    COUCHBASE_PASSWORD: ""
-    NEO4J_PASSWORD: ""
-    TOKEN_ISSUER_API_KEY: ""
-    EMBEDDING_API_KEY: ""
-    # --- learning plane only ---
-    # API key for the extractor/judge model client. EMPTY ⇒ the extractor is
-    # DORMANT: the consumer runs, drains the stream and extracts nothing.
-    LEARNING_EXTRACTOR_API_KEY: ""
-    LEARNING_AUDIT_PASSWORD: ""
-    LEARNING_CANDIDATES_PASSWORD: ""
-    LEARNING_CORPUS_PASSWORD: ""
-    # The ONE shared bearer token guarding every inbox route. The reviewer UI
-    # holds it server-side and attaches it on the proxy hop — the browser never
-    # sees it. Unset ⇒ the inbox service FAILS CLOSED (503 on every route) rather
-    # than collapsing to a passing empty-string compare.
-    REVIEWER_TOKEN: ""
 
 # ---------------------------------------------------------------------------
 # Per-workload configuration.
@@ -528,8 +561,14 @@ components:
 # Add `/` here and you have published the agent chat UI from the learning
 # release. If you need both surfaces on one host, do it in the data-agent
 # release, which owns the chat side.
+#
+# Adding an entry to `tls` switches the rules to HTTPS. `secretName` in an entry
+# is OPTIONAL: omit it to use the ingress controller's DEFAULT certificate; set it
+# for a BYO certificate, or when cert-manager should provision one — its
+# ingress-shim reads the cluster-issuer annotation below but needs a `secretName`
+# to write the issued certificate into. An annotation alone provisions nothing.
 # ---------------------------------------------------------------------------
-ingress:
+uiIngress:
   # -- Enable an Ingress in front of the inbox-ui Service.
   enabled: false
   # -- IngressClass name (e.g. nginx, traefik).
@@ -547,8 +586,71 @@ ingress:
           pathType: Prefix
         - path: /api/inbox
           pathType: Prefix
-  # -- TLS configuration (list of {secretName, hosts[]}).
+  # -- TLS configuration (list of {hosts[], secretName?}). `secretName` is
+  #    optional — omit it for the controller's default certificate.
   tls: []
-    # - secretName: data-agent-inbox-tls
-    #   hosts:
+    # - hosts:
     #     - data-agent-inbox.example.com
+    #   secretName: data-agent-inbox-tls
+
+# ---------------------------------------------------------------------------
+# In-chart Redis — the learning job stream (sweeper -> consumer group) and its
+# dead-letter stream. THE ONLY BACKING SERVICE THIS CHART DEPLOYS.
+#
+# It is here because this transport is not shared with anything: the agent never
+# reads it, no other release writes to it, and its entire contents are session
+# ids the sweeper just enqueued. Couchbase/Neo4j/ClickHouse are shared systems
+# with their own lifecycles and stay external.
+#
+# UNAUTHENTICATED, ClusterIP, in-cluster only. There is no `requirepass` and no
+# TLS: anything that can reach the Service can read and drain the job stream. It
+# is owned by the learning plane and should be reachable only from it — add a
+# NetworkPolicy if your cluster is shared. Never expose it via
+# NodePort/LoadBalancer, and note it does NOT mount this chart's ConfigMap or
+# Secret (a third-party image has no business holding the plane's credentials).
+#
+# Set `enabled: false` to use an external Redis instead — then you MUST set
+# `config.LEARNING_REDIS_URL`.
+# ---------------------------------------------------------------------------
+redis:
+  # -- Deploy a single-replica Redis for the learning job stream. The Deployment
+  #    pins replicas to 1: Streams state lives in this process, and a second
+  #    replica behind the same Service is a second, independent Redis.
+  enabled: true
+  image:
+    # -- Redis image repository (any redis-compatible server image).
+    repository: redis
+    # -- Image tag. Redis Streams need >= 5.0; 7.x is what this is tested against.
+    tag: "7-alpine"
+    # -- Image pull policy (IfNotPresent | Always | Never).
+    pullPolicy: IfNotPresent
+  # -- Resource requests/limits for the Redis container. Empty by default so the
+  #    chart installs on small clusters; SET THESE in production. Sizing is driven
+  #    by stream depth, not throughput — a backed-up consumer group is what grows
+  #    memory, and Redis with no maxmemory policy will grow until the pod is OOMed.
+  resources: {}
+  # -- Scheduling controls. Each falls back to the chart-global value when empty.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # -- Extra pod annotations for the Redis pod (the chart's config/secret checksum
+  #    annotations are deliberately NOT applied — it mounts neither).
+  podAnnotations: {}
+  persistence:
+    # -- Persist /data on a PVC. FALSE (emptyDir) is the default and is a
+    #    considered trade, not an oversight: a lost stream costs re-work, not
+    #    data. The sweeper re-enqueues an idle session on its next scan, so
+    #    pending jobs come back on their own. What does NOT come back is the
+    #    consumer group's PEL (in-flight jobs mid-extraction) and the DEAD-LETTER
+    #    stream — the record of what poisoned the loop. Turn this on if you rely
+    #    on the dead-letter stream for triage.
+    enabled: false
+    # -- PVC size. The stream carries ids, not transcripts; 1Gi is generous.
+    size: 1Gi
+    # -- StorageClass for the PVC. Empty = the cluster default.
+    storageClass: ""
+  service:
+    # -- ClusterIP Service port. LEARNING_REDIS_URL is derived from this.
+    port: 6379
+    # -- Extra Service annotations.
+    annotations: {}

@@ -473,7 +473,10 @@ def test_shipped_offline_construction_refuses_landing_approve_503(
         ),
     )
     monkeypatch.setattr(
-        "data_agent.runtime.config.RuntimeSettings",
+        # The Vault-aware LOADER, not the class: it is `@lru_cache`d, so a patch on
+        # `RuntimeSettings` underneath it is a no-op whenever the singleton is already
+        # warm — and this test would then read the real environment.
+        "data_agent.runtime.config.get_runtime_settings",
         lambda: SimpleNamespace(
             mcp_url="",
             token_service_url="",

@@ -229,7 +229,7 @@ Provision separately and supply endpoints via `config`, credentials via
 - **Warehouse tenant** — `TENANT_CLIENT_CODE`, `TENANT_PROC_CENTER`, `TENANT_JTI` *(both — see coupling point 2; you must set all three, identically)*
 - **OpenAI** (or compatible) — `OPENAI_*` *(A)*, `LEARNING_EXTRACTOR_*` *(B)*
 - **Couchbase** — session bucket *(both)*, learning audit/candidates/corpus buckets *(B)*
-- **Neo4j** — `NEO4J_URL`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` *(both)*
+- **Neo4j** — `NEO4J_URL`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` *(both — the database must match too, or B lands blueprints A cannot recall)*
 - **Embedding API** — `EMBEDDING_API_URL` *(both)*; **reranker** — `RERANKER_API_URL` *(A)*
 
 No subcharts are bundled for any of these on purpose.

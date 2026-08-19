@@ -83,6 +83,9 @@ def full_plane(monkeypatch):
         neo4j_url = "bolt://neo4j:7687"
         neo4j_username = "neo4j"
         neo4j_password = "pw"
+        # A blueprint must LAND in the database the agent recalls from, so the inbox
+        # carries the runtime's database through to the landing writer.
+        neo4j_database = "reporting"
         neo4j_timeout_seconds = 10.0
         embedding_api_url = "http://embed"
         embedding_api_key = ""
@@ -104,7 +107,11 @@ def full_plane(monkeypatch):
     import data_agent.runtime.config as runtime_config
 
     monkeypatch.setattr(learning_config, "LearningSettings", _Learning)
-    monkeypatch.setattr(runtime_config, "RuntimeSettings", _Runtime)
+    # The LOADER, not the class: `_build_inbox_from_env` now goes through the
+    # Vault-aware `get_runtime_settings()`, which is `@lru_cache`d — patching the class
+    # underneath it does nothing once any earlier test in the session has warmed the
+    # singleton (it silently produced the OFFLINE mode instead of the full plane).
+    monkeypatch.setattr(runtime_config, "get_runtime_settings", _Runtime)
 
     import neo4j
 
@@ -147,6 +154,13 @@ def full_plane(monkeypatch):
 def test_the_full_write_plane_passes_the_corpus_as_the_terminal_status_writer(full_plane):
     kwargs = full_plane.captured["kwargs"]
     assert kwargs["corpus_status"] is full_plane.corpus
+
+
+def test_the_runtime_neo4j_database_reaches_the_landing_writer(full_plane):
+    """The learning plane has no database setting of its own — it shares the runtime's
+    NEO4J_DATABASE. Left unpassed, the landing writer defaults to "neo4j" and an approved
+    blueprint lands in a database the agent never recalls from."""
+    assert full_plane.captured["kwargs"]["neo4j_database"] == "reporting"
 
 
 def test_it_is_the_same_object_as_the_hit_count_reader(full_plane):
@@ -211,7 +225,11 @@ def test_offline_dev_mode_deliberately_wires_no_status_writer(monkeypatch):
     import data_agent.runtime.config as runtime_config
 
     monkeypatch.setattr(learning_config, "LearningSettings", _Learning)
-    monkeypatch.setattr(runtime_config, "RuntimeSettings", _Runtime)
+    # The LOADER, not the class: `_build_inbox_from_env` now goes through the
+    # Vault-aware `get_runtime_settings()`, which is `@lru_cache`d — patching the class
+    # underneath it does nothing once any earlier test in the session has warmed the
+    # singleton (it silently produced the OFFLINE mode instead of the full plane).
+    monkeypatch.setattr(runtime_config, "get_runtime_settings", _Runtime)
 
     inbox, mode, driver = service_module._build_inbox_from_env()
     assert mode == "offline"

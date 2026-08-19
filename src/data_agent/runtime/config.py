@@ -17,7 +17,7 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
@@ -58,6 +58,20 @@ _logger = logging.getLogger(__name__)
 # the front-truncation bug. Applied ONLY at `request_token_budget()` (the request
 # fit seam), never to the shared estimator, so trail-compaction math is unchanged.
 _REQUEST_BUDGET_HEADROOM = 0.8
+
+_DEFAULT_NEO4J_DATABASE = "neo4j"
+
+
+def _neo4j_database_or_default(value: str) -> str:
+    """Blank/whitespace database name → the explicit default.
+
+    An empty string is NOT the same as unset to the neo4j driver: it means "the
+    server's home database", which is a THIRD behaviour an operator never asked for
+    and cannot see in the config. `NEO4J_DATABASE=""` in a values file (or a Vault
+    key that exists but holds "") reads exactly like "not configured", so it is
+    normalised to what "not configured" means everywhere else.
+    """
+    return value.strip() or _DEFAULT_NEO4J_DATABASE
 
 
 class _HydratorKillSwitchSettings(BaseSettings):
@@ -724,7 +738,21 @@ class RuntimeSettings(BaseSettings):
     )
     neo4j_username: str = Field("", description="neo4j username (secret).")
     neo4j_password: str = Field("", description="neo4j password (secret).")
-    neo4j_database: str = Field("", description="neo4j database.")
+    neo4j_database: str = Field(
+        _DEFAULT_NEO4J_DATABASE,
+        description=(
+            "neo4j database name the runtime reads and the hydrator/learning write "
+            "(multi-database deployments). The default is the driver-level default "
+            "every call site used before this was honoured, so unset == today. Blank "
+            "is normalised to it as well (see _neo4j_database_or_default)."
+        ),
+    )
+
+    @field_validator("neo4j_database")
+    @classmethod
+    def _default_blank_neo4j_database(cls, value: str) -> str:
+        return _neo4j_database_or_default(value)
+
     neo4j_timeout_seconds: float = Field(
         10.0,
         gt=0,
@@ -1036,6 +1064,12 @@ def load_settings_from_vault() -> RuntimeSettings:
         )
         settings.neo4j_password = _read_vault_secret(
             vc, "NEO4J_PASSWORD", p, settings.neo4j_password
+        )
+        # Normalised HERE too: Vault writes the field after construction, so the
+        # field validator never sees this value, and a KV key that exists but holds
+        # "" would reach the driver as "the server's home database".
+        settings.neo4j_database = _neo4j_database_or_default(
+            _read_vault_secret(vc, "NEO4J_DATABASE", p, settings.neo4j_database)
         )
 
     if settings.mcp_service_key_vault_path:

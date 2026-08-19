@@ -441,3 +441,30 @@ def test_build_hydrator_wires_service_key_clients(monkeypatch) -> None:
     assert h._corpus_client._auth_headers(jwt="j", session_id="s") == {
         "X-Service-Key": "svc-key"
     }
+
+
+def test_build_hydrator_seeds_the_configured_database(monkeypatch) -> None:
+    """NEO4J_DATABASE must reach the index the hydrator writes through. The seed and
+    the runtime's recall are only "the same graph" because BOTH read this one setting;
+    a dropped `database=` here writes the corpus into a database nobody reads."""
+
+    class _Index:
+        def __init__(self, **kwargs: Any) -> None:
+            self.driver = _Driver()
+            # Mirror the real index: the database it was handed is the one it uses.
+            self.database = kwargs["database"]
+
+    monkeypatch.setattr(hydrator_mod, "Neo4jVectorIndex", _Index)
+    settings = RuntimeSettings(
+        _env_file=None,
+        neo4j_url="bolt://localhost:7687",
+        neo4j_username="neo4j",
+        neo4j_password="pw",
+        neo4j_database="reporting",
+        embedding_api_url="http://e/embed",
+        embedding_model="all-mpnet-base-v2",
+        mcp_service_key="svc-key",
+    )
+    h = build_hydrator(settings)
+    assert h is not None
+    assert h._database == "reporting"
