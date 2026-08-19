@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, replace
+from datetime import date, datetime
 from typing import Any
 
 from sqlglot import exp
@@ -47,7 +49,13 @@ from .grain_probe import (
     map_grain_columns,
     unpack_grain_probe,
 )
-from .models import TABLE_CONSUME_REF, Blueprint, BlueprintParseError, Node
+from .models import (
+    DATA_WINDOW_ANCHOR,
+    TABLE_CONSUME_REF,
+    Blueprint,
+    BlueprintParseError,
+    Node,
+)
 from .rules import (
     _GAP_THRESHOLD as _DEFAULT_GAP_THRESHOLD,
 )
@@ -810,7 +818,14 @@ class BlueprintExecutor:
             "terminal_sql": terminal_sql,
             "verify": _verify_block(verify_out, row_count),
         }
-        _stamp_window_anchor(result_full, blueprint)
+        _stamp_window_anchor(
+            result_full,
+            blueprint,
+            template_sql=terminal_template,
+            columns=columns,
+            rows=rows,
+            truncated=truncated,
+        )
         preview = _build_preview(terminal_result, self._preview_row_count)
         return ExecCompleted(
             result_full=result_full,
@@ -1037,8 +1052,80 @@ def _parse_detail(detail: BlueprintDetail) -> Blueprint:
     )
 
 
-def _stamp_window_anchor(result_full: dict[str, Any], blueprint: Blueprint) -> None:
-    """Record the EXECUTED blueprint's window-anchor declaration on the result (J7).
+# A `YYYY-MM-DD` head, optionally followed by a ` ` or `T` separator and ANY tail — the
+# tail is discarded, so it is not parsed (`2021-06-01 00:00:00`, `2021-06-01T00:00:00Z`
+# and `2021-06-01 whatever` are all the date `2021-06-01`). Deliberate: only the DATE
+# part is ever stamped, and a stricter time grammar would buy nothing but a rejection of
+# a warehouse timestamp format nobody has seen yet. A value with no such head is not a
+# window bound this executor will claim.
+_ISO_DATE_HEAD_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:[ T].*)?")
+
+
+def _iso_date_part(value: Any) -> str | None:
+    """The `YYYY-MM-DD` date part of *value*, or `None` when it is not a date.
+
+    `date.fromisoformat` does the calendar validation (`2021-13-45` is refused)."""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if not isinstance(value, str):
+        return None
+    matched = _ISO_DATE_HEAD_RE.fullmatch(value.strip())
+    if matched is None:
+        return None
+    try:
+        return date.fromisoformat(matched.group(1)).isoformat()
+    except ValueError:
+        return None
+
+
+def _data_window_bounds(
+    blueprint: Blueprint,
+    template_sql: str,
+    columns: list[str],
+    rows: list[list[Any]],
+    truncated: bool,
+) -> tuple[str, str] | None:
+    """The `(min, max)` date the returned rows actually cover, or `None` when they do
+    not license the claim (J7-anchor). NO new query — this reads the rows the executor
+    already holds, mapping the DECLARED grain to its output column with the same
+    `_map_grain_columns` the D56 gate uses.
+
+    FAIL-CLOSED to `None` on: no declared grain, a grain of more than one column (which
+    of them is the window is not knowable here), an unmappable column, a truncated
+    result (the max row is not the max value), no rows, or any value that is not an ISO
+    date. A wrong date in the note is worse than no date."""
+    grain_columns = blueprint.result_grain.columns
+    if len(grain_columns) != 1 or truncated or not rows:
+        return None
+    mapped = _map_grain_columns(template_sql, grain_columns)
+    if mapped is None or len(mapped) != 1 or mapped[0] not in columns:
+        return None
+    index = columns.index(mapped[0])
+    bounds: list[str] = []
+    for row in rows:
+        if index >= len(row):
+            return None
+        parsed = _iso_date_part(row[index])
+        if parsed is None:
+            return None
+        bounds.append(parsed)
+    # `YYYY-MM-DD` orders lexicographically exactly as it orders chronologically.
+    return min(bounds), max(bounds)
+
+
+def _stamp_window_anchor(
+    result_full: dict[str, Any],
+    blueprint: Blueprint,
+    *,
+    template_sql: str,
+    columns: list[str],
+    rows: list[list[Any]],
+    truncated: bool,
+) -> None:
+    """Record the EXECUTED blueprint's window-anchor declaration on the result, plus the
+    CONCRETE window the rows cover when it can be derived (J7 / J7-anchor).
 
         ONE writer for both finish paths (single-node and DAG `_finalize`) so the two cannot
         describe the same blueprint's window differently. The key is written only when the
@@ -1047,10 +1134,24 @@ def _stamp_window_anchor(result_full: dict[str, Any], blueprint: Blueprint) -> N
         This is the value the model-facing note is DERIVED from (`tool.window_note_for_result`)
         rather than a second copy of the note: `result_full` is persisted behind a D46 KV pointer
         and re-read on the D45 resume path, so storing the raw declaration lets a resumed run
-        re-derive the identical note instead of carrying prose through the checkpoint.
+        re-derive the identical note instead of carrying prose through the checkpoint. The
+        `window_start`/`window_end` dates are stamped for the same reason and computed HERE,
+        once, from the terminal rows — never recomputed downstream, where the rows are gone.
+
+        The dates are stamped only for a `data` anchor (a calendar window's bounds are the
+        caller's own slot values, already known to the model) and only when
+        `_data_window_bounds` can derive them; otherwise the result is exactly what it was
+        before this slice and the static note ships.
     """
-    if blueprint.window_anchor is not None:
-        result_full["window_anchor"] = blueprint.window_anchor
+    if blueprint.window_anchor is None:
+        return
+    result_full["window_anchor"] = blueprint.window_anchor
+    if blueprint.window_anchor != DATA_WINDOW_ANCHOR:
+        return
+    bounds = _data_window_bounds(blueprint, template_sql, columns, rows, truncated)
+    if bounds is None:
+        return
+    result_full["window_start"], result_full["window_end"] = bounds
 
 
 def _is_present(raw: Any) -> bool:

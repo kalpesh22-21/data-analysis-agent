@@ -37,7 +37,7 @@ from .executor import (
     ExecOutcome,
     ExecPaused,
 )
-from .models import DATA_ANCHORED_RESULT_NOTE, DATA_WINDOW_ANCHOR
+from .models import DATA_WINDOW_ANCHOR, data_anchored_result_note
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
@@ -88,12 +88,18 @@ def window_note_for_result(result_full: Any) -> str | None:
     silently re-derived), not to annotate windows in general.
 
     Fail-closed on any surprise (a non-dict, a missing/unknown anchor) → `None`, so the
-    tool result is unchanged for every blueprint that does not declare `data`."""
+    tool result is unchanged for every blueprint that does not declare `data`.
+
+    The note is CONCRETE when the executor could derive the window's last day from the
+    rows (`window_end`) and the static constant otherwise — naming the date is what turns
+    "is this result responsive?" from an inference into a read. The choice is made HERE,
+    in the shared mapper, so a resumed mid-DAG run renders byte-identically from the
+    persisted `result_full` (same argument as `authoritative`)."""
     if not isinstance(result_full, dict):
         return None
     if result_full.get("window_anchor") != DATA_WINDOW_ANCHOR:
         return None
-    return DATA_ANCHORED_RESULT_NOTE
+    return data_anchored_result_note(result_full.get("window_end"))
 
 
 def blueprint_outcome_to_tool_result(outcome: ExecOutcome) -> ToolResult | None:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 # Valid slot `type`s (D41/D49). Kept as a frozenset so the parse layer and the
@@ -111,6 +112,42 @@ DATA_ANCHORED_RESULT_NOTE = (
     "from today's date. Present it as 'as of the latest data' — do not re-derive "
     "with a calendar-anchored query."
 )
+
+# The SAME note once the executor could name the window's last day (J7-anchor). The
+# static note above states that the window is data-anchored but leaves WHICH dates it
+# covers to be read off the rows, so whether the result answers the question asked stays
+# an inference — and 2-of-3 live runs inferred it wrong and re-derived with calendar SQL.
+# Naming the date is the whole difference; the register and the closing instruction are
+# deliberately identical to the static note, which is still what ships whenever the date
+# could not be derived fail-closed.
+DATA_ANCHORED_RESULT_NOTE_TEMPLATE = (
+    "Window is data-anchored: it counts back from the latest data on record, which "
+    "ends {window_end} — not from today's date. Present it as 'as of the latest data "
+    "({window_end})' and state in prose when that differs from the calendar period the "
+    "user asked about; do not re-derive with a calendar-anchored query."
+)
+
+# `YYYY-MM-DD` and nothing else. `result_full` is persisted behind a D46 pointer and
+# re-read on the D45 resume path, so the note derivation treats the stamped window end as
+# UNTRUSTED input and refuses to interpolate anything else into a model-facing sentence.
+# The SHAPE check alone is not enough — `\d` matches Unicode digits and the pattern would
+# pass "9999-99-99" — so `date.fromisoformat` does the calendar validation after it.
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def data_anchored_result_note(window_end: Any) -> str:
+    """The data-anchored window note, concrete when *window_end* is a real `YYYY-MM-DD`
+    calendar date and the static `DATA_ANCHORED_RESULT_NOTE` for every other value.
+
+    Total: never raises, always returns a note (the caller has already decided the
+    window IS data-anchored, so silence is not an option here)."""
+    if not isinstance(window_end, str) or not _ISO_DATE_RE.fullmatch(window_end):
+        return DATA_ANCHORED_RESULT_NOTE
+    try:
+        date.fromisoformat(window_end)
+    except (TypeError, ValueError):
+        return DATA_ANCHORED_RESULT_NOTE
+    return DATA_ANCHORED_RESULT_NOTE_TEMPLATE.format(window_end=window_end)
 
 
 def window_anchor_declaration(anchor: Any) -> str | None:

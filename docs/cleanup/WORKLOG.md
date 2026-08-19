@@ -1012,3 +1012,32 @@ dropped, the generalize package's pre-keep-and-annotate claim corrected.
   WARNING-via-lastResort) — deliberate, matches daemon workers.
 - V0 **6051 passed / 225 skipped / 1 xfailed**; ruff clean; review
   APPROVE.
+
+## #29 — J7: concrete window anchor on data-anchored results (2026-08-19)
+
+- The queued J7 lever: the static "window is data-anchored" note left
+  responsiveness an inference, and 2-of-3 live runs re-derived with
+  calendar SQL despite reading it. Now `_stamp_window_anchor` computes
+  `window_start`/`window_end` from the terminal rows' grain column
+  (max/min of the mapped column — the executor holds the FULL rows;
+  runBlueprint passes no query_limit) and the note names the date:
+  "…ends {window_end} … state in prose when that differs from the
+  calendar period the user asked about; do not re-derive". Zero new
+  queries, no prompt change (154-char ceiling headroom untouched), no
+  YAML change — the ledger had already pre-authorized detail-on-result.
+- Fail-closed everywhere derivation isn't safe: no/multi-column grain,
+  unmappable column (reachable via verifiable:false grains — reviewer
+  caught the reachability claim), truncated, empty/short rows, NULL or
+  non-date values (a NULL aborts the WHOLE derivation — naming a window
+  while dropping rows would lie), impossible dates. Values normalized to
+  ISO strings BEFORE min/max (no mixed-type compare). Read side:
+  `data_anchored_result_note` treats persisted `window_end` as untrusted
+  — regex shape + `date.fromisoformat` calendar check, 11-case poisoned
+  parametrize (Unicode digits, 9999-99-99, 2021-02-30, injection text).
+  D45 resume parity by construction (shared mapper); pre-slice
+  checkpoints render the static note byte-identically.
+- Review: APPROVE, zero blockers; both should-fixes + both nits folded.
+  bp-hires-projection (grainless) stays on the static note by design.
+  L3 re-measure lands with the combined V1 gate (next entries).
+- V0 **6077 passed / 225 skipped / 1 xfailed** (+26 for the slice); ruff
+  clean.

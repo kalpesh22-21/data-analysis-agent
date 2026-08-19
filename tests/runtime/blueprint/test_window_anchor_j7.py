@@ -42,9 +42,14 @@ from data_agent.runtime.blueprint.compiler import (
     dag_properties,
     validate_blueprint_dag,
 )
-from data_agent.runtime.blueprint.executor import BlueprintExecutor, ExecCompleted
+from data_agent.runtime.blueprint.executor import (
+    BlueprintExecutor,
+    ExecCompleted,
+    _stamp_window_anchor,
+)
 from data_agent.runtime.blueprint.models import (
     DATA_ANCHORED_RESULT_NOTE,
+    DATA_ANCHORED_RESULT_NOTE_TEMPLATE,
     WINDOW_ANCHOR_GLOSS,
     WINDOW_ANCHORS,
     Blueprint,
@@ -118,7 +123,9 @@ def _rq(columns: list[str], rows: list[list[Any]]) -> dict[str, Any]:
     return {"columns": columns, "rows": rows, "row_count": len(rows), "truncated": False}
 
 
-def _detail(*, window_anchor: str | None) -> BlueprintDetail:
+def _detail(
+    *, window_anchor: str | None, result_grain: list[str] | None = None
+) -> BlueprintDetail:
     return BlueprintDetail(
         id="bp-hires-per-month",
         intent="New hires per month over a trailing window of the last N months",
@@ -130,7 +137,7 @@ def _detail(*, window_anchor: str | None) -> BlueprintDetail:
         catalog_sha="",
         slots=[_WINDOW_SLOT],
         sql_template=_HIRES_SQL,
-        result_grain=["month"],
+        result_grain=["month"] if result_grain is None else result_grain,
         window_anchor=window_anchor,
     )
 
@@ -169,6 +176,40 @@ async def _run(detail: BlueprintDetail) -> ExecCompleted:
     )
     assert isinstance(outcome, ExecCompleted)
     return outcome
+
+
+async def _run_terminal(
+    detail: BlueprintDetail,
+    columns: list[str],
+    rows: list[list[Any]],
+    *,
+    truncated: bool = False,
+) -> ExecCompleted:
+    """One single-node run whose TERMINAL result is exactly *columns*/*rows* — the input
+    the concrete window is derived from. The grain probe is scripted CONSISTENT
+    (total == distinct) so verify always passes and every assertion below is about the
+    window derivation rather than about the D56 gate."""
+    node = _rq(columns, rows)
+    node["truncated"] = truncated
+    mcp = FakeMCPClient(
+        scripted={"runQuery": [node, _rq(["__bp_n", "__bp_d"], [[len(rows), len(rows)]])]}
+    )
+    outcome = await _executor(mcp, detail).execute(
+        blueprint_id=detail.id, slot_bindings={"window_months": 6}, credentials=_creds()
+    )
+    assert isinstance(outcome, ExecCompleted)
+    return outcome
+
+
+# The note as the model actually receives it for the fixture's `2021-06-01` window,
+# written out longhand rather than formatted — the wording IS the deliverable, and a
+# test that builds it from the same template it is checking asserts nothing.
+_CONCRETE_NOTE = (
+    "Window is data-anchored: it counts back from the latest data on record, which "
+    "ends 2021-06-01 — not from today's date. Present it as 'as of the latest data "
+    "(2021-06-01)' and state in prose when that differs from the calendar period the "
+    "user asked about; do not re-derive with a calendar-anchored query."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -424,9 +465,187 @@ async def test_the_dag_finalize_path_stamps_the_anchor_the_same_way() -> None:
 
     assert isinstance(outcome, ExecCompleted)
     assert outcome.result_full["window_anchor"] == "data"
+    # J7-anchor: the terminal node's own rows name the window, so a COMPOSED blueprint
+    # gets the concrete date too — it is derived from the result, not from the SQL.
+    assert outcome.result_full["window_end"] == "2021-06-01"
+    assert outcome.result_full["window_start"] == "2021-06-01"
     mapped = blueprint_outcome_to_tool_result(outcome)
     assert mapped is not None
-    assert mapped.window_note == DATA_ANCHORED_RESULT_NOTE
+    assert mapped.window_note == _CONCRETE_NOTE
+
+
+async def test_a_data_anchored_run_stamps_the_concrete_window_from_the_rows() -> None:
+    """J7-anchor, the whole point. The static note said the window was data-anchored
+    but not WHICH dates it covered, so whether the result answered the question asked
+    stayed an inference off the rows — and 2-of-3 live runs inferred it wrong and
+    re-derived with calendar SQL anyway. The executor already holds the rows; the max
+    of the grain column IS the window end, so it is stamped rather than left to be read.
+
+    The rows are deliberately OUT OF ORDER: the derivation is a max over the column,
+    not "the last row", which a `GROUP BY` without an `ORDER BY` does not promise."""
+    outcome = await _run_terminal(
+        _detail(window_anchor="data"),
+        ["month", "hires"],
+        [["2021-04-01", 2], ["2021-06-01", 4], ["2021-05-01", 3]],
+    )
+    assert outcome.result_full["window_end"] == "2021-06-01"
+    assert outcome.result_full["window_start"] == "2021-04-01"
+
+
+async def test_the_note_names_the_date_so_responsiveness_is_read_not_inferred() -> None:
+    """The delivered sentence, word for word. `window_end` is only worth stamping if it
+    reaches the model, and this is the surface it reaches it on."""
+    result = blueprint_outcome_to_tool_result(await _run(_detail(window_anchor="data")))
+    assert result is not None
+    assert result.window_note == _CONCRETE_NOTE
+    assert _CONCRETE_NOTE == DATA_ANCHORED_RESULT_NOTE_TEMPLATE.format(
+        window_end="2021-06-01"
+    )
+
+
+async def test_a_datetime_valued_anchor_column_is_stored_as_a_date() -> None:
+    """ClickHouse hands back a `DateTime` grain column as `YYYY-MM-DD hh:mm:ss`. The
+    date part is the window end; the zero time is noise that would read, in the note,
+    as a precision the window does not have."""
+    outcome = await _run_terminal(
+        _detail(window_anchor="data"), ["month", "hires"], [["2021-06-01 00:00:00", 4]]
+    )
+    assert outcome.result_full["window_end"] == "2021-06-01"
+    mapped = blueprint_outcome_to_tool_result(outcome)
+    assert mapped is not None
+    assert mapped.window_note == _CONCRETE_NOTE
+
+
+@pytest.mark.parametrize(
+    ("case", "grain", "columns", "rows", "truncated"),
+    [
+        # `bp-hires-projection`'s shape: a data-anchored window with NO declared grain,
+        # so there is no column that means "the window" and nothing to take a max over.
+        ("no declared grain", [], ["month", "hires"], [["2021-06-01", 4]], False),
+        # More than one grain column: one of them may be the window and the other a
+        # dimension, and which is which is not knowable here. Guessing is the failure.
+        (
+            "multi-column grain",
+            ["month", "hires"],
+            ["month", "hires"],
+            [["2021-06-01", 4]],
+            False,
+        ),
+        # A truncated result's max ROW is not the max VALUE — the rows are a prefix.
+        ("truncated", ["month"], ["month", "hires"], [["2021-06-01", 4]], True),
+        # Nothing to take a max over. (The J6a empty-result note carries this case.)
+        ("empty result", ["month"], ["month", "hires"], [], False),
+        # A grain column that is not a date at all (a `period` key, a label).
+        ("non-date anchor", ["month"], ["month", "hires"], [["June 2021", 4]], False),
+        # A well-formed-looking value that is not a real date.
+        ("impossible date", ["month"], ["month", "hires"], [["2021-13-45", 4]], False),
+        # A NULL in the anchor column (`Nullable(Date)` is the warehouse's own type for
+        # `hire_date`). The whole derivation fails — NOT "skip the NULL and take the max
+        # of the rest", which would name a window end while silently dropping rows the
+        # answer contains.
+        ("null anchor value", ["month"], ["month", "hires"], [["2021-06-01", 4], [None, 2]], False),
+        # A row shorter than the column list. Nothing in the pipeline promises this, but
+        # the derivation indexes into every row and an IndexError here would crash a turn
+        # that the pre-slice code answered.
+        ("short row", ["month"], ["month", "hires"], [["2021-06-01", 4], []], False),
+    ],
+)
+async def test_the_concrete_window_fails_closed_to_the_static_note(
+    case: str,
+    grain: list[str],
+    columns: list[str],
+    rows: list[list[Any]],
+    truncated: bool,
+) -> None:
+    """Every case where the rows do not LICENSE a date. A wrong date in the note is
+    strictly worse than no date — it would be a specific, confident, checkable claim
+    about coverage that the model would then present to the user — so each of these
+    degrades to exactly the pre-slice behaviour: the anchor string, no window keys,
+    and the static note byte-for-byte."""
+    outcome = await _run_terminal(
+        _detail(window_anchor="data", result_grain=grain),
+        columns,
+        rows,
+        truncated=truncated,
+    )
+    assert outcome.result_full["window_anchor"] == "data", case
+    assert "window_end" not in outcome.result_full, case
+    assert "window_start" not in outcome.result_full, case
+    mapped = blueprint_outcome_to_tool_result(outcome)
+    assert mapped is not None
+    assert mapped.window_note == DATA_ANCHORED_RESULT_NOTE, case
+    assert mapped.window_note == (
+        "Window is data-anchored: it counts back from the latest data on record, "
+        "not from today's date. Present it as 'as of the latest data' — do not "
+        "re-derive with a calendar-anchored query."
+    ), case
+
+
+async def test_a_calendar_anchored_run_gains_no_window_dates() -> None:
+    """No behaviour change for the anchor that was never the problem: a calendar
+    window's bounds ARE the slot values the caller supplied, already known to the
+    model, and stamping the rows' own extent there would invite it to describe the
+    data's coverage as the window it asked for."""
+    outcome = await _run_terminal(
+        _detail(window_anchor="calendar"), ["month", "hires"], [["2021-06-01", 4]]
+    )
+    assert outcome.result_full["window_anchor"] == "calendar"
+    assert "window_end" not in outcome.result_full
+    mapped = blueprint_outcome_to_tool_result(outcome)
+    assert mapped is not None
+    assert mapped.window_note is None
+
+
+def test_an_unmappable_grain_column_stamps_the_anchor_only() -> None:
+    """A declared grain column with no matching output column.
+
+    Asserted directly on the writer because that is the shortest statement of the rule,
+    but it is NOT an unreachable branch: a `result_grain` declaring `verifiable: false`
+    skips the D56 mapping entirely (executor `_verify`, the `not grain.verifiable`
+    arm) and reaches the stamp with a grain that was never mapped. On a `verifiable:
+    true` grain the gate happens to refuse the result first (`distinct=None` →
+    VERIFY_FAILED), and the window derivation must fail closed on its OWN terms rather
+    than inherit that ordering."""
+    blueprint = Blueprint.parse(
+        id="bp-x",
+        intent="i",
+        slots=[dict(_WINDOW_SLOT)],
+        sql_template=_HIRES_SQL,
+        result_grain=["not_an_output_column"],
+        window_anchor="data",
+    )
+    result_full: dict[str, Any] = {}
+    _stamp_window_anchor(
+        result_full,
+        blueprint,
+        template_sql=_HIRES_SQL,
+        columns=["month", "hires"],
+        rows=[["2021-06-01", 4]],
+        truncated=False,
+    )
+    assert result_full == {"window_anchor": "data"}
+
+
+def test_an_undeclared_anchor_stamps_nothing_at_all() -> None:
+    """The additive guarantee at the writer itself: rows that WOULD yield a window end
+    do not put one on a blueprint that declared no anchor."""
+    blueprint = Blueprint.parse(
+        id="bp-x",
+        intent="i",
+        slots=[dict(_WINDOW_SLOT)],
+        sql_template=_HIRES_SQL,
+        result_grain=["month"],
+    )
+    result_full: dict[str, Any] = {}
+    _stamp_window_anchor(
+        result_full,
+        blueprint,
+        template_sql=_HIRES_SQL,
+        columns=["month", "hires"],
+        rows=[["2021-06-01", 4]],
+        truncated=False,
+    )
+    assert result_full == {}
 
 
 async def test_an_undeclared_blueprints_result_is_byte_identical_to_before() -> None:
@@ -443,12 +662,7 @@ async def test_the_tool_result_carries_the_note_only_for_a_data_anchored_window(
     to annotate windows in general."""
     data_result = blueprint_outcome_to_tool_result(await _run(_detail(window_anchor="data")))
     assert data_result is not None
-    assert data_result.window_note == DATA_ANCHORED_RESULT_NOTE
-    assert data_result.window_note == (
-        "Window is data-anchored: it counts back from the latest data on record, "
-        "not from today's date. Present it as 'as of the latest data' — do not "
-        "re-derive with a calendar-anchored query."
-    )
+    assert data_result.window_note == _CONCRETE_NOTE
 
     for anchor in (None, "calendar"):
         other = blueprint_outcome_to_tool_result(await _run(_detail(window_anchor=anchor)))
@@ -461,6 +675,42 @@ async def test_the_tool_result_carries_the_note_only_for_a_data_anchored_window(
 )
 def test_the_note_derivation_fails_closed_on_any_other_shape(result_full: Any) -> None:
     assert window_note_for_result(result_full) is None
+
+
+@pytest.mark.parametrize(
+    "window_end",
+    [
+        None,
+        17,
+        True,
+        "",
+        "9999-99-99",  # right shape, not a date on any calendar
+        "2021-02-30",  # right shape, not a date in that month
+        "2021-6-1",  # unpadded
+        "20210601",  # `date.fromisoformat` accepts this; the note must not
+        "\u0662\u0660\u0662\u0661-\u0660\u0666-\u0660\u0661",  # Arabic-Indic digits: `\d` matches them
+        "2021-06-01 00:00:00",  # the STAMP is a bare date; a time here means poisoned
+        "2021-06-01'; DROP",
+    ],
+)
+def test_a_poisoned_window_end_degrades_to_the_static_note(window_end: Any) -> None:
+    """`result_full` is persisted behind a D46 pointer and re-read on the D45 resume
+    path, so by the time the note is derived the window end is UNTRUSTED JSON — and it
+    is interpolated verbatim into a sentence the model reads as fact. Validated by what
+    the note needs (a real `YYYY-MM-DD` calendar date) rather than by rejecting the bad
+    values anyone happened to think of: shape check THEN `date.fromisoformat`, because
+    each alone passes values the other catches."""
+    result_full = {"window_anchor": "data", "window_end": window_end}
+    assert window_note_for_result(result_full) == DATA_ANCHORED_RESULT_NOTE
+
+
+def test_a_missing_window_end_is_the_ordinary_pre_slice_case_not_a_poisoning() -> None:
+    """Every fail-closed derivation lands here, plus every result written before this
+    slice existed. It is the SAME static note, and that is deliberate."""
+    assert window_note_for_result({"window_anchor": "data"}) == DATA_ANCHORED_RESULT_NOTE
+    assert window_note_for_result({"window_anchor": "data", "window_end": "2021-06-01"}) == (
+        _CONCRETE_NOTE
+    )
 
 
 def test_the_note_rides_the_shared_mapper_so_a_resumed_run_cannot_lose_it() -> None:
