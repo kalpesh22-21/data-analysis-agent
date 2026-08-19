@@ -37,7 +37,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -45,6 +45,8 @@ from data_agent.runtime.answer_scrub import ANSWER_PROSE_REDACTED_EVENT, scrub_a
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.composite.analysis_state import (
     MAX_STATE_CALLS,
+    SUBSTANTIVE_TOOLS,
+    find_locking_tool,
     split_serves_intent,
     surplus_state_call_rejected,
 )
@@ -478,13 +480,49 @@ class _NoLiveStateToForceError(Exception):
     """
 
 
-def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]]:
+# K2 (live-eval L5): the model tags a call with `serves_intent` BEFORE it has
+# declared any intents. `split_serves_intent` strips the tag and reports
+# `no_live_state` — degrade-not-fail, so the work still runs — but the ONLY record
+# of the drop was an observer event the model cannot see. The observed
+# consequence: the model believes its work is tracked, never calls
+# `updateAnalysisState`, and the turn finishes untracked.
+#
+# This is the feedback the model was missing. It names the tool that repairs the
+# situation AND the deadline, because the deadline is real: `analysis_state.py`
+# locks late initialization once a SUBSTANTIVE tool has run (`SUBSTANTIVE_TOOLS`,
+# `find_locking_tool`), so "declare them later" is only true until then.
+#
+# ⚠ THE ADVICE IS ONLY TRUE WHILE THAT DOOR IS OPEN, so the note is GATED on it:
+# it fires only when NO substantive tool has run this turn (see `_run_loop_body`'s
+# `substantive_ran`). Once one has, `updateAnalysisState` would be refused
+# NON-RETRYABLY, and telling the model to call it would turn a silent drop into an
+# instructed dead end. In that state no true corrective advice exists — the turn
+# cannot be tracked any more — so the note is SUPPRESSED and the pre-slice
+# behaviour (silent drop + `loop_intent_tag_dropped`) stands. Telemetry is
+# unaffected either way: every drop is still reported.
+_INTENT_TAG_DROPPED_NOTE = (
+    "Note: your serves_intent tag was ignored — no intents are declared yet. Call "
+    "updateAnalysisState to declare your intents before your next substantive call "
+    "(runQuery/runBlueprint), or the turn will finish untracked."
+)
+
+
+def _tool_trail_entry_to_canonical(
+    entry: dict[str, Any], intent_note_call_ids: Collection[str] = ()
+) -> list[dict[str, Any]]:
     """One rendered tool-trail entry -> a synthetic `[assistant-with-tool_calls,
         tool-result]` canonical pair.
 
         Required because D22 discards the model's original free text around a tool call, so
         replay must synthesize a minimal, API-valid exchange rather than replaying the
         original verbatim.
+
+        *intent_note_call_ids* (K2, the silent-drop feedback seam): the `tool_call_id`s
+        whose result must carry `_INTENT_TAG_DROPPED_NOTE` — the model tagged the call with
+        `serves_intent` while NO analysisState existed, so the tag was stripped and, until
+        now, nothing told it. See `_run_loop_body`'s window-local of the same name for the
+        once-per-round selection and the one-round-trip lifetime. Defaults to empty so the
+        emulated-discovery caller (and every existing test) renders byte-identically.
     """
     tool_call_id = entry["tool_call_id"]
     assistant_message = {
@@ -570,6 +608,20 @@ def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]
         # what period they COVER.
         if entry.get("window_note"):
             content["window_note"] = entry["window_note"]
+        # K2: the corrective note for a `serves_intent` tag dropped because no
+        # analysisState existed. It gets its OWN key, never `note` (and never
+        # `window_note`): the three are independent — a verified blueprint result can
+        # itself carry a dropped tag — and overwriting the authoritative note would
+        # trade a do-not-re-derive instruction for a bookkeeping one.
+        #
+        # Only this JSON branch carries it — a `withheld_sentinel` entry renders its
+        # content VERBATIM (D94), and appending to that string would corrupt a contract
+        # other code matches on. A tagged call that renders as a sentinel therefore
+        # loses this round's note; that is self-correcting, because the selection at the
+        # drop site re-fires on any LATER round where the model tags again without a
+        # state.
+        if tool_call_id in intent_note_call_ids:
+            content["runtime_note"] = _INTENT_TAG_DROPPED_NOTE
         tool_message = {
             "role": "tool",
             "tool_call_id": tool_call_id,
@@ -578,7 +630,9 @@ def _tool_trail_entry_to_canonical(entry: dict[str, Any]) -> list[dict[str, Any]
     return [assistant_message, tool_message]
 
 
-def _assembled_to_canonical(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _assembled_to_canonical(
+    messages: list[dict[str, Any]], intent_note_call_ids: Collection[str] = ()
+) -> list[dict[str, Any]]:
     """`AssembledContext.messages` (the interleaved render list) -> the canonical
         `ModelClient.send_turn` message shape.
 
@@ -621,7 +675,7 @@ def _assembled_to_canonical(messages: list[dict[str, Any]]) -> list[dict[str, An
                 continue
             if isinstance(tool_call_id, str):
                 seen_tool_call_ids.add(tool_call_id)
-            canonical.extend(_tool_trail_entry_to_canonical(message))
+            canonical.extend(_tool_trail_entry_to_canonical(message, intent_note_call_ids))
         else:  # pragma: no cover - assemble only ever emits system/user/assistant/tool
             raise ValueError(f"Unexpected assembled-context message role: {role!r}")
     return canonical
@@ -910,6 +964,7 @@ class AgentLoop:
         withheld_call_ids: set[str],
         discovery_canonical: list[dict[str, Any]] | None = None,
         finalization_nudge: str | None = None,
+        intent_note_call_ids: Collection[str] = (),
     ) -> _CanonicalRequest:
         """Rebuild the canonical `send_turn` message list for ONE round-trip (D45: rebuilt
                 every round-trip, never carried across a pause).
@@ -938,6 +993,14 @@ class AgentLoop:
                 after this call), because a once-per-window value would repeat the nudge forever,
                 including after the intents were closed, and — being anchored at the tail — would
                 migrate to be the newest message on every rebuild.
+
+                *intent_note_call_ids* (K2) shares the nudge's EXACTLY-ONE-ROUND-TRIP lifetime
+                and for the same reason — the caller clears it immediately after this call, so a
+                note the model has already been shown is not re-attached to the same tool result
+                on every later rebuild of the window. Unlike the nudge it is not a standalone
+                message: it rides the tool result of the call that was tagged (see
+                `_tool_trail_entry_to_canonical`), which is what makes it legible as feedback ON
+                that call.
 
                 SPLICE ORDER, which this loop owns as the later insertion: `ContextAssembler`
                 inserts the `analysisState` block immediately BEFORE the current question, and the
@@ -969,7 +1032,7 @@ class AgentLoop:
             and message.get("withheld_sentinel")
             and isinstance(message.get("tool_call_id"), str)
         }
-        canonical = _assembled_to_canonical(assembled.messages)
+        canonical = _assembled_to_canonical(assembled.messages, intent_note_call_ids)
         if discovery_canonical:
             # The emulated pairs are spliced in AFTER `_assembled_to_canonical`'s
             # §6.2 duplicate-`tool_call_id` dedup already ran over the real trail, so
@@ -2289,6 +2352,32 @@ class AgentLoop:
             # refused, spliced into the next rebuild, and cleared immediately after
             # that rebuild below.
             finalization_nudge: str | None = None
+            # K2: the `tool_call_id`s whose next-round tool result must carry
+            # `_INTENT_TAG_DROPPED_NOTE`. Same ephemeral, never-persisted,
+            # EXACTLY-ONE-ROUND-TRIP lifetime as `finalization_nudge`: filled during
+            # this round's dispatch (the drop site below), read by the NEXT rebuild,
+            # and emptied immediately after that rebuild. The drop happens while the
+            # round's tool results do not exist yet, which is why the feedback is
+            # necessarily deferred one round rather than injected inline.
+            intent_note_call_ids: set[str] = set()
+            # K2, THE GATE ON THAT NOTE: has a SUBSTANTIVE tool run on this TURN? Once
+            # one has, `analysis_state.py` refuses a first declaration NON-RETRYABLY, so
+            # the note's "call updateAnalysisState before your next substantive call"
+            # becomes an instruction to earn a refusal — worse than the silence it
+            # replaces. The note is suppressed at the end of the dispatch batch below
+            # whenever this is true.
+            #
+            # TURN-SCOPED, NOT WINDOW-SCOPED, and therefore SEEDED — the lock it mirrors
+            # is a property of the persisted trail for this `turn_index`, and a budget-cap
+            # `continue`, an askUser resume and a blueprint resume each enter a fresh
+            # `_run_loop_body`. An unseeded window-local would read False in window 2 while
+            # window 1's runQuery had already closed the door, which is exactly the false
+            # advice this gate exists to prevent. `find_locking_tool` is the runtime's OWN
+            # predicate (so the two cannot drift), over the doc already loaded above — no
+            # extra store read. Note it does NOT filter on `status`: the walk below skips
+            # non-`ok` entries, but a FAILED runQuery locks late init just the same, which
+            # is why this is a separate call and not folded into that walk.
+            substantive_ran = find_locking_tool(session_doc.tool_trail, turn_index) is not None
 
             while True:
                 request = await self._build_canonical_messages(
@@ -2301,6 +2390,7 @@ class AgentLoop:
                     withheld_call_ids=withheld_call_ids,
                     discovery_canonical=discovery_canonical,
                     finalization_nudge=finalization_nudge,
+                    intent_note_call_ids=intent_note_call_ids,
                 )
                 canonical_messages = request.messages
                 # ONE ROUND-TRIP ONLY (05 §D). `discovery_canonical` is computed once
@@ -2310,6 +2400,10 @@ class AgentLoop:
                 # migrate it to be the newest message on every rebuild, appearing
                 # after tool results it predates.
                 finalization_nudge = None
+                # K2, same one-round-trip rule: the note has now been rendered into the
+                # request the model is about to see. A REBIND, not `.clear()`, because
+                # the set was just handed to the builder.
+                intent_note_call_ids = set()
                 # Hand the guard every tool result the model can actually READ this
                 # round-trip — after `fit_request_to_budget` has had its say, and with
                 # data-free sentinels excluded (see `_CanonicalRequest`). That set is what
@@ -2578,6 +2672,15 @@ class AgentLoop:
                 )
                 state_calls_dispatched = 0
                 for tool_call in capped_tool_calls:
+                    # K2 gate: this call, if it is one of the four, closes the late-init
+                    # door for the rest of the turn. Recorded on the NAME and BEFORE
+                    # dispatch, deliberately: `find_locking_tool` keys on the persisted
+                    # entry's `tool_name` regardless of status, so a denial, an error and
+                    # a guard-served repeat all lock it just as a success does. Erring
+                    # toward suppression costs at most one note; erring the other way
+                    # costs the model a non-retryable refusal it was told to walk into.
+                    if tool_call.name in SUBSTANTIVE_TOOLS:
+                        substantive_ran = True
                     # --- CALL-TIME INTENT TAGGING: split the tag off FIRST ---------
                     #
                     # `serves_intent` is a runtime concept the model puts on a
@@ -2612,6 +2715,17 @@ class AgentLoop:
                             "loop_intent_tag_dropped",
                             {"tool_name": tool_call.name, "reason": tag_drop_reason},
                         )
+                        # K2: select this call to carry the corrective note on the
+                        # NEXT rebuild. `no_live_state` ONLY — the other two reasons
+                        # (`unknown_intent_id`, `not_a_string`) mean a state DOES
+                        # exist and the tag was merely wrong, for which "declare your
+                        # intents" is false advice. At most ONE per round: the set is
+                        # emptied after each rebuild, so an empty set here means no
+                        # call in THIS batch has claimed the note yet — a
+                        # `[getTableSchema, getTableSchema]` batch tagged against no
+                        # state says it once, not once per call.
+                        if tag_drop_reason == "no_live_state" and not intent_note_call_ids:
+                            intent_note_call_ids.add(tool_call.id)
 
                     # Repeated-idempotent-read guard (generalizes D94): the model
                     # re-issued an identical, already-served idempotent read (e.g.
@@ -3166,6 +3280,20 @@ class AgentLoop:
                     # iteration cap should not have to re-derive this from the ordering.
                     if guard.exceeded:
                         break
+
+                # K2 SUPPRESSION, the fold. HERE, once the batch has drained, and NOT at
+                # the drop site: within one batch the tagged call and the substantive one
+                # can arrive in EITHER order — `[tagged getTableSchema, untagged runQuery]`
+                # selects the note before the runQuery is seen, and the tagged call may
+                # itself BE the runQuery — so a decision made per call would be right only
+                # half the time. Draining first makes the batch's ordering irrelevant.
+                #
+                # The note is dropped, not reworded: with the door shut there is no true
+                # corrective advice to give, and the pre-slice behaviour (silent drop, plus
+                # `loop_intent_tag_dropped`, which fired above and is untouched) is the
+                # correct fallback.
+                if substantive_ran:
+                    intent_note_call_ids.clear()
 
                 # BLUEPRINT-DEFINITION GATE, the fold. HERE, once the batch has drained,
                 # and deliberately not mid-batch: ids expanded in THIS response become

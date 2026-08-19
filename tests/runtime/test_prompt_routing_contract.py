@@ -174,6 +174,23 @@ def test_late_init_boundary_is_named_as_the_four_substantive_tools() -> None:
     assert "discovery does not close that door" in boundary
 
 
+def test_the_boundary_teaches_declare_before_tag() -> None:
+    """K2/G1 (live-eval L5). The model tagged a `getTableSchema` with `serves_intent`
+    before declaring anything; the tag was silently dropped and the turn finished
+    untracked. The runtime now says so in the tool result
+    (`loop/agent_loop.py::_INTENT_TAG_DROPPED_NOTE`) — the prompt's half is the
+    ORDERING, stated imperatively, which is the part no runtime check can enforce
+    before the fact."""
+    boundary = AGENT_SYSTEM_PROMPT[
+        AGENT_SYSTEM_PROMPT.index("## Tracking a multi-part request") :
+    ].split("\n- ")[0]
+    assert "DECLARE THEM FIRST" in boundary
+    # The tag is DROPPED, not refused — the prompt must not imply the call fails,
+    # or a model reading this will avoid tagging rather than reorder its calls.
+    assert "a serves_intent tag sent before any declaration is IGNORED" in boundary
+    assert "REFUSED" not in boundary.split("then declare —")[1]
+
+
 def test_state_contract_lines_are_present() -> None:
     """01 §"Additions the state contract requires" — each of these is the prompt's
     half of a runtime rule the model is otherwise refused by."""
@@ -927,6 +944,29 @@ def test_prompt_stays_within_its_token_budget() -> None:
     The same clause rides the schema payload's own `_truncated` marker
     (`dispatch/schema_preview.py::_marker_text`), which is unbudgeted here and
     carries the detail; the prompt states only the standing rule.
+
+    **2026-08-19, ceiling UNCHANGED at 17,400.** 17,246 -> **17,314** (+68, K2/G1):
+    "declare them all with" became "DECLARE THEM FIRST with" (+3, it stated a
+    requirement without stating an ORDER, and live-eval L5 failed purely on order),
+    plus "— and a serves_intent tag sent before any declaration is IGNORED" (+65).
+    The model tagged a `getTableSchema` with `serves_intent` before declaring any
+    intents, the tag was silently dropped, and the turn finished untracked. The
+    runtime half is a note on that call's tool result
+    (`loop/agent_loop.py::_INTENT_TAG_DROPPED_NOTE`), which is unbudgeted here; the
+    prompt carries only the ordering, which no runtime check can enforce ahead of
+    time. PAID OUT OF THE EXISTING 154, not with a raise.
+
+    THE SECOND HALF OF THAT SLICE WAS DROPPED FOR SIZE, deliberately and on this
+    ceiling's own terms. G2 would add the conjunctive-decomposition example ("the
+    employee columns, and the average salary by department" is TWO deliverables,
+    +150 as drafted) because the decomposition trigger under-fires on "X and Y"
+    phrasing. 154 - 68 = 86 spare cannot hold 150. Tightening it to ~78 by deleting
+    the example fits arithmetically and leaves 8 spare, which is BELOW the 21 this
+    ledger already called "no headroom at all" two entries up — and the example is
+    the instruction, since the abstract rule ("a conjunctive ask can be multi-part")
+    is what the section's opening line already implies and the model already
+    ignores. So it is not shipped shaved: it waits for a ceiling argument of its
+    own. **86 chars spare.**
     """
     assert len(AGENT_SYSTEM_PROMPT) <= 17_400
 

@@ -1108,3 +1108,32 @@ dropped, the generalize package's pre-keep-and-annotate claim corrected.
   registrations + executor.py:762 retryable reconciliation.
 - V0 after patch 1 **6124**, after patch 2 **6156 passed / 225 skipped /
   1 xfailed**; ruff clean at both points.
+
+## #32 — G1 landed (rebuilt): corrective note on dropped intent tags (2026-08-19)
+
+- The K2 residual: a `serves_intent` tag sent before any declaration was
+  dropped SILENTLY (`loop_intent_tag_dropped{no_live_state}`) and
+  nothing told the model — latent behind gpt-5.5's good behavior. The
+  old built-but-unlanded slice was re-derived against the current tree
+  (594-line reference from its worktree; the tree had moved through the
+  loop decomposition + T4.4 + J7). Note text rides its OWN `runtime_note`
+  key (never `note`, never J7's `window_note`), fires only for
+  `no_live_state`, at most once per round, lives exactly one round-trip.
+- Review found a REAL BLOCKER the original reviewed slice shared: when
+  the dropped tag rides a SUBSTANTIVE call (runQuery), that same call
+  closes the late-init door — the note's advice ("declare next") would
+  be refused non-retryably. Fixed by suppression gated on the door:
+  seed `substantive_ran` TURN-scoped from the trail via the refusal's
+  own `find_locking_tool` predicate (gate and refusal share one
+  implementation — cannot drift; covers pause/resume windows), SET on
+  tool name before dispatch, CLEAR end-of-batch (ordering-independent
+  for mixed batches). Re-verdict: APPROVE, no new findings. 11 new loop
+  tests, all guards mutation-verified (incl. the seed via the
+  pause/resume shape).
+- Prompt: G1's half only (+68 chars → **17,314/17,400**): "DECLARE THEM
+  FIRST" + "a tag sent before any declaration is IGNORED". **G2 skipped
+  honestly for headroom** — the conjunctive-example sentence needs +150
+  against 86 spare, and every variant that fits deletes the example
+  that IS the instruction; on record in K2 as size-blocked, awaiting its
+  own ceiling argument.
+- V0 **6168 passed / 225 skipped / 1 xfailed**; ruff clean.

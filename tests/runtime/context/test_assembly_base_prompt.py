@@ -79,7 +79,7 @@ def test_base_prompt_state_survives_where_the_models_own_notes_do_not() -> None:
     # durable carrier is `updateAnalysisState`, and the prompt must tell the model
     # to declare a multi-part request there BEFORE the late-init boundary closes,
     # since crossing it leaves the turn untracked with no recovery.
-    assert "declare them all with updateAnalysisState" in AGENT_SYSTEM_PROMPT
+    assert "DECLARE THEM FIRST with updateAnalysisState" in AGENT_SYSTEM_PROMPT
     assert "before any substantive tool call" in AGENT_SYSTEM_PROMPT
     assert "a first declaration is REFUSED and the turn goes untracked" in AGENT_SYSTEM_PROMPT
 
