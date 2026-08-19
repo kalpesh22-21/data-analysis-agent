@@ -113,10 +113,13 @@ ENFORCEMENT_ERROR_CODES = ENFORCEMENT_DENIAL_CODES | {
 #   * `_failed_fixed_pairs` asks "did the analyst have to fight the system?" — an outage
 #     IS that fight, so it still counts (the substantive treatment).
 INFRA_ERROR_CODES = INFRA_FAILURE_CODES | {
-    # The ONE infra code that is not a `_DENIAL_TABLE` entry: a raw transport exception
-    # (connection refusal, timeout, malformed response) carries no `[{CODE}]` prefix, so
-    # the dispatcher never looks it up in the denial table and stamps this marker
-    # instead. Imported by symbol from its owner, like the enforcement marker above.
+    # A raw transport exception (connection refusal, timeout, malformed response) carries
+    # no `[{CODE}]` prefix, so the dispatcher never looks it up in the denial table on the
+    # LIVE turn and stamps this marker directly. It IS registered in `_DENIAL_TABLE` (for
+    # replay, where every entry does come back through the table), so this union is
+    # REDUNDANT rather than load-bearing — kept, and imported by symbol from its owner
+    # like the enforcement marker above, so that this set stays correct on its own terms
+    # if the registration is ever reverted.
     INTERNAL_TRANSPORT_ERROR_CODE,
 }
 

@@ -39,6 +39,15 @@ PAYROLL_SQL = "SELECT sum(gross_pay) FROM payroll.payroll_fact WHERE toYear(pay_
 # `CLICKHOUSE_UNAVAILABLE` used to sit here and no longer does (H8). It is INFRA, not
 # substantive: the warehouse was down, so nothing judged the SQL. It keeps ONE of the two
 # behaviours below — see `test_an_infra_outage_is_friction_but_not_a_corrected_blueprint`.
+#
+# The three `RUN_BLUEPRINT_*` codes joined it in the same slice, from the other direction:
+# they were never in `_DENIAL_TABLE` at all, so asking the derivation question of them was
+# impossible until H8 patch 2 registered them. All three answer "a verdict WAS formed" —
+# the model named a blueprint that is not in its scope, chose a slot value that could not
+# bind, or got a result that D56 verification rejected — so they belong here, and the
+# parametrized test below is the only loader-behaviour coverage NOT_FOUND and SLOT_INVALID
+# have. Their two GATE siblings (`_UNSUPPORTED`, `_ABORTED`) stay out and are pinned by
+# `test_a_declined_run_blueprint_emits_no_usage`.
 SUBSTANTIVE_DATA_CODES = frozenset({
     "COLUMN_SCOPE_VIOLATION",
     "SCRATCH_SESSION_VIOLATION",
@@ -47,6 +56,9 @@ SUBSTANTIVE_DATA_CODES = frozenset({
     "TABLE_NOT_FOUND",
     "DATABASE_NOT_ALLOWED",
     "PARSE_FAILED_CLOSED",
+    "RUN_BLUEPRINT_NOT_FOUND",
+    "RUN_BLUEPRINT_SLOT_INVALID",
+    "RUN_BLUEPRINT_VERIFY_FAILED",
 })
 
 
@@ -348,3 +360,46 @@ async def test_an_ok_answer_table_with_no_designation_at_all_is_not_an_error(sto
     )
     summary = await _load(store, doc)
     assert summary.answer_sqls == ()
+
+
+# --- H8 patch 2: the runBlueprint codes that were never registered at all --------
+
+
+@pytest.mark.parametrize(
+    "error_code", ["RUN_BLUEPRINT_UNSUPPORTED", "RUN_BLUEPRINT_ABORTED"]
+)
+async def test_a_declined_run_blueprint_emits_no_usage(store, error_code):
+    """The metric this patch deliberately moves.
+
+    Both codes reach real `runBlueprint` trail entries and neither was in `_DENIAL_TABLE`,
+    so `classify_denial` returned the unregistered fallback and the loader filed them as
+    substantive: `outcome="corrected"` → `SessionSignals.corrected_blueprint` → a 0.5
+    inbox ranking penalty and a triage K4 keep. For `RUN_BLUEPRINT_ABORTED` that means a
+    USER declining an approval gate was recorded as the blueprint being wrong.
+
+    Now both are GATE: the fast path declined (capability) or stopped before producing an
+    answer (consent), so nothing judged the blueprint and no usage is emitted. They are
+    also not friction — an enforcement gate is skipped by `_failed_fixed_pairs` too, which
+    is where these differ from the INFRA case above.
+    """
+    summary = await _load(store, _denied_blueprint_then_ok_query(error_code))
+    assert summary.blueprint_usages == ()
+    assert summary.failed_fixed_sql == ()
+    signals = SessionSignals.from_summary(summary)
+    assert signals.corrected_blueprint is False
+    assert signals.failed_fixed_count == 0
+
+
+async def test_a_blueprint_that_failed_verification_is_still_corrected(store):
+    """The other side of the same registration, so the patch is not read as "runBlueprint
+    denials stopped counting". `RUN_BLUEPRINT_VERIFY_FAILED` means the fast path RAN and
+    D56 verification rejected its terminal result — the blueprint's own output was judged
+    and found wanting, which is exactly what `corrected` is for.
+
+    Deliberately kept alongside the `SUBSTANTIVE_DATA_CODES` sweep, which now covers this
+    code too: the sweep asserts a SET property and would go green if someone dropped the
+    code from the set, whereas this names it."""
+    summary = await _load(store, _denied_blueprint_then_ok_query("RUN_BLUEPRINT_VERIFY_FAILED"))
+    assert [u.outcome for u in summary.blueprint_usages] == ["corrected"]
+    assert [p.failed_tool_call_ref for p in summary.failed_fixed_sql] == ["bp"]
+    assert SessionSignals.from_summary(summary).corrected_blueprint is True

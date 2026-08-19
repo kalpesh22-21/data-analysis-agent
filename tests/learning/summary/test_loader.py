@@ -318,7 +318,7 @@ def test_the_enforcement_set_is_derived_from_the_denial_table():
     entry at all.
 
     Which codes are on which side is pinned, with a rationale per code, at
-    `tests/runtime/dispatch/test_denial_mapping.py::_EXPECTED_ENFORCEMENT`. The other
+    `tests/runtime/dispatch/test_denial_mapping.py::_EXPECTED_KIND`. The other
     half of the invariant (no SUBSTANTIVE code is in this set) is
     `test_loader_release1_qa.py::test_no_substantive_failure_code_is_ever_classified_
     as_enforcement`, which states it as set disjointness."""

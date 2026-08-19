@@ -48,6 +48,21 @@ _READ_TOOL_CODES = {
     "RUNTIME_TOOL_INTERNAL_ERROR",
 }
 
+# The runBlueprint executor family (§5.4, `blueprint/executor.py`) + the B4 raw-transport
+# marker (`dispatch/tool_dispatcher.py`). These reach real trail entries and were absent
+# from the table until H8 patch 2 — so on replay they all rendered the generic "Something
+# went wrong processing that request.", and the learning loop filed every one of them
+# under the unregistered default.
+_RUN_BLUEPRINT_CODES = {
+    "RUN_BLUEPRINT_NOT_FOUND",
+    "RUN_BLUEPRINT_SLOT_INVALID",
+    "RUN_BLUEPRINT_UNSUPPORTED",
+    "RUN_BLUEPRINT_VERIFY_FAILED",
+    "RUN_BLUEPRINT_ABORTED",
+}
+
+_TRANSPORT_CODES = {"INTERNAL_TRANSPORT_ERROR"}
+
 _EXPECTED_RETRYABLE = {
     # RETRYABLE on purpose: the fix is one runBlueprint call away and the model can
     # make it inside the same turn.
@@ -69,6 +84,21 @@ _EXPECTED_RETRYABLE = {
     "RETRIEVAL_TOOL_UNAVAILABLE": False,
     "RETRIEVAL_TOOL_INTERNAL_ERROR": False,
     "RUNTIME_TOOL_INTERNAL_ERROR": False,
+    # runBlueprint executor family: each flag MATCHES the live
+    # `ExecFailed(..., retryable=…)` at its production site, for the same reason the
+    # composite codes above do — a replay that contradicts the live semantics teaches the
+    # model the opposite lesson from the one it learned on the turn.
+    "RUN_BLUEPRINT_NOT_FOUND": True,
+    "RUN_BLUEPRINT_SLOT_INVALID": True,
+    # NOT retryable: the fast path declined the blueprint as a CAPABILITY matter, so
+    # re-issuing the identical call cannot help — the model must fall back to raw tools.
+    # (One passthrough site in `executor.py` sets True; the table takes the dominant and
+    # conservative reading.)
+    "RUN_BLUEPRINT_UNSUPPORTED": False,
+    "RUN_BLUEPRINT_VERIFY_FAILED": True,
+    "RUN_BLUEPRINT_ABORTED": True,
+    # B4 raw transport blowup: the dispatcher itself sets retryable=False.
+    "INTERNAL_TRANSPORT_ERROR": False,
     # analysisState (Release 1, 03 §C.3). The split is load-bearing: a rejected
     # UPDATE is fixable inside the same turn, but a LATE INIT is not — the
     # substantive work has already started, so the boundary has passed and no
@@ -130,6 +160,8 @@ _ALL_KNOWN_CODES = (
     | _ANALYSIS_STATE_CODES
     | _FINALIZATION_CODES
     | _BLUEPRINT_DEFINITION_CODES
+    | _RUN_BLUEPRINT_CODES
+    | _TRANSPORT_CODES
 )
 
 
@@ -245,6 +277,26 @@ _EXPECTED_KIND = {
     # Registry-seam containment: a runtime tool raised or broke its contract. The TOOL
     # broke — a fact about the runtime, not a judgement of the model's data work.
     "RUNTIME_TOOL_INTERNAL_ERROR": DenialKind.INFRA_FAILED,
+    # --- the runBlueprint executor family (H8 patch 2), which the three kinds split ----
+    # The model named a blueprint id that is not in its scope — the TABLE_NOT_FOUND shape
+    # one layer up, and the searchBlueprints that follows is a real repair.
+    "RUN_BLUEPRINT_NOT_FOUND": DenialKind.WORK_JUDGED,
+    # A slot VALUE the model chose could not be bound. The call was well-formed and what
+    # was inside it was wrong, which is the bad-SQL class, not the envelope-shape class.
+    "RUN_BLUEPRINT_SLOT_INVALID": DenialKind.WORK_JUDGED,
+    # The fast path DECLINED (unsupported node/shape/rule) before forming any opinion of
+    # the blueprint. A capability refusal: nothing ran, so nothing can have been wrong.
+    "RUN_BLUEPRINT_UNSUPPORTED": DenialKind.GATE,
+    # The run STOPPED cleanly before an answer — `when…on_violation: abort`, a user
+    # DENYING an approval gate, or every node skipped. Filing a human saying "no" as a
+    # blueprint that produced a wrong answer punishes the corpus for its own consent seam.
+    "RUN_BLUEPRINT_ABORTED": DenialKind.GATE,
+    # The one in this family where the blueprint's OUTPUT was examined and rejected (D56
+    # verification of the terminal node). This is what `outcome="corrected"` should mean,
+    # and it is why the other four could not be left sharing the unregistered fallback.
+    "RUN_BLUEPRINT_VERIFY_FAILED": DenialKind.WORK_JUDGED,
+    # B4: a connection refusal / timeout / malformed response. The wire broke.
+    "INTERNAL_TRANSPORT_ERROR": DenialKind.INFRA_FAILED,
 }
 
 
@@ -314,3 +366,32 @@ def test_an_unknown_code_is_work_judged() -> None:
     assert classify_denial(None).kind is DenialKind.WORK_JUDGED
     assert classify_denial("SOME_NEW_UNMAPPED_CODE").enforcement is False
     assert classify_denial(None).enforcement is False
+
+
+# --- the late registrations must not drift from their production sites ----------
+
+
+def test_late_registered_codes_render_their_live_message_on_replay() -> None:
+    """H8 patch 2. These six codes are SPELLED in `denial_mapping.py`, not imported:
+    `blueprint/executor.py` imports `dispatch/tool_dispatcher.py`, which imports the
+    denial table, so importing the constants back would close a cycle.
+
+    A test CAN import both sides, which is where the duplication is made safe. Every
+    entry must be byte-identical to what the live turn told the model — the whole reason
+    `user_message` is re-derived here at all is that it is not persisted on `TrailEntry`,
+    so a drift would have the replay contradict the turn rather than fail."""
+    from data_agent.runtime.blueprint import executor as _ex
+    from data_agent.runtime.dispatch import tool_dispatcher as _td
+
+    live = {
+        _ex.NOT_FOUND_CODE: _ex._NOT_FOUND_MESSAGE,
+        _ex.SLOT_INVALID_CODE: _ex._SLOT_INVALID_MESSAGE,
+        _ex.UNSUPPORTED_CODE: _ex._UNSUPPORTED_MESSAGE,
+        _ex.VERIFY_FAILED_CODE: _ex._VERIFY_FAILED_MESSAGE,
+        _ex.ABORTED_CODE: _ex._ABORTED_MESSAGE,
+        _td.INTERNAL_TRANSPORT_ERROR_CODE: _td._INTERNAL_TRANSPORT_ERROR_MESSAGE,
+    }
+    assert frozenset(live) == _RUN_BLUEPRINT_CODES | _TRANSPORT_CODES
+    for code, message in live.items():
+        assert classify_denial(code).user_message == message
+        assert classify_denial(code).user_message != "Something went wrong processing that request."

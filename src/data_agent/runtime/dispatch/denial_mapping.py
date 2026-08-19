@@ -23,7 +23,7 @@ class DenialKind(StrEnum):
     cannot give them different answers.
     """
 
-    GATE = "gate"  # call protocol refused; nothing was computed
+    GATE = "gate"  # the runtime declined; no verdict was formed on the work
     WORK_JUDGED = "work_judged"  # the model's SQL/blueprint was judged — the DEFAULT
     INFRA_FAILED = "infra_failed"  # the system under the work failed; no verdict on the work
 
@@ -40,9 +40,13 @@ class DenialInfo:
     # GATE         — a procedural/protocol refusal: the runtime refused because of the
     #                ORDER or the SHAPE of the call (read the blueprint before running
     #                it, resolve your intents before finalizing, put a table in your
-    #                answer, send a well-formed ledger update). Nothing substantive was
-    #                attempted, and nothing the model asked OF THE DATA was found
-    #                wanting. Release 1 made these routine: a healthy session trips them.
+    #                answer, send a well-formed ledger update), or declined to run at
+    #                all (an unsupported blueprint, a user denying an approval gate).
+    #                Nothing the model asked OF THE DATA was found wanting. Usually
+    #                nothing ran either, but that is a common consequence, NOT the test:
+    #                a mid-run `when … on_violation: abort` stops after real nodes have
+    #                executed and is still a GATE, because no verdict was formed on the
+    #                work. Release 1 made these routine: a healthy session trips them.
     # WORK_JUDGED  — the query/blueprint the model authored was itself rejected or came
     #                back wrong (bad SQL, out-of-scope columns, a table that does not
     #                exist). This is the DEFAULT and the conservative direction — an
@@ -400,6 +404,112 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
         # the runtime and not a judgement of the model's data work.
         kind=DenialKind.INFRA_FAILED,
         user_message="That tool hit an internal error. Please try again.",
+    ),
+    # runBlueprint executor family (§5.4) — `blueprint/executor.py`, which sets each of
+    # these on an `ExecFailed`. Registered LATE (H8 patch 2): they land on real
+    # `runBlueprint` trail entries and were never in this table, so they took the
+    # unregistered path in BOTH readers of it — the model saw the generic "Something went
+    # wrong processing that request." on every replay, and the learning loop's
+    # `classify_denial` fallback filed all five as `WORK_JUDGED`, recording a
+    # user-declined approval as a blueprint that produced a wrong answer.
+    #
+    # The codes and the messages are SPELLED here rather than imported. `executor.py`
+    # imports `dispatch/tool_dispatcher.py`, which imports this module, so importing the
+    # constants back would close a cycle — the same constraint `loader.py` works under
+    # for its non-table markers. Each entry names its definition site instead, and the
+    # `user_message` is byte-identical to the executor's live one so replay says exactly
+    # what the model was told on the turn itself.
+    #
+    # Retryable flags MATCH the live `ExecFailed(..., retryable=…)` at each site, for the
+    # reason the D77 composite codes do: a replay that contradicts the live semantics
+    # teaches the model the opposite lesson from the one it learned.
+    #
+    # `RUN_BLUEPRINT_NOT_FOUND` (`executor.py::NOT_FOUND_CODE`, raised at the scope
+    # filter and the load): the model named a blueprint id that is not in its scope.
+    "RUN_BLUEPRINT_NOT_FOUND": DenialInfo(
+        code="RUN_BLUEPRINT_NOT_FOUND",
+        retryable=True,
+        # WORK_JUDGED: the model named a blueprint that does not exist for it — the
+        # `TABLE_NOT_FOUND` shape one layer up. A verdict on what the model asked for,
+        # and the search that follows is a genuine repair of a genuine mistake.
+        kind=DenialKind.WORK_JUDGED,
+        user_message="That blueprint is not available. Search for one with searchBlueprints.",
+    ),
+    # `RUN_BLUEPRINT_SLOT_INVALID` (`executor.py::SLOT_INVALID_CODE`): a slot value the
+    # model supplied could not be bound — wrong type, failed a rule, resolved to nothing.
+    "RUN_BLUEPRINT_SLOT_INVALID": DenialInfo(
+        code="RUN_BLUEPRINT_SLOT_INVALID",
+        retryable=True,
+        # WORK_JUDGED: the ARGUMENTS the model chose were judged and rejected. This is
+        # not envelope shape (that would be a gate) — the call was well-formed and the
+        # value inside it was wrong, which is the same class as bad SQL.
+        kind=DenialKind.WORK_JUDGED,
+        user_message="A value for this blueprint could not be used. Please rephrase or retry.",
+    ),
+    # `RUN_BLUEPRINT_UNSUPPORTED` (`executor.py::UNSUPPORTED_CODE`): the fast path
+    # declined — an unsupported node type, a shape the compiler will not emit, a rule it
+    # cannot honour. NOT retryable at almost every site (the model must fall back to the
+    # raw tools; one passthrough site sets True), so the table takes the dominant and
+    # conservative reading: re-issuing the same call cannot help.
+    "RUN_BLUEPRINT_UNSUPPORTED": DenialInfo(
+        code="RUN_BLUEPRINT_UNSUPPORTED",
+        retryable=False,
+        # GATE: a CAPABILITY refusal. The executor declined before forming any opinion
+        # about the blueprint — it is not that the blueprint is wrong, it is that this
+        # path will not run it. Nothing was computed, so there is no output to judge.
+        kind=DenialKind.GATE,
+        user_message=(
+            "This blueprint can't run on the fast path yet — answer it with the raw "
+            "tools (getTableSchema / runQuery)."
+        ),
+    ),
+    # `RUN_BLUEPRINT_VERIFY_FAILED` (`executor.py::VERIFY_FAILED_CODE`): the fast path
+    # RAN and the D56 verification of its final node rejected the result, so it was never
+    # returned. Retryable — the raw loop can still answer the question.
+    "RUN_BLUEPRINT_VERIFY_FAILED": DenialInfo(
+        code="RUN_BLUEPRINT_VERIFY_FAILED",
+        retryable=True,
+        # WORK_JUDGED: the ONLY code in this family where the blueprint's own output was
+        # examined and found wanting. This is precisely what `outcome="corrected"` is
+        # supposed to mean, and it is why the other four had to be classified rather than
+        # left to share the fallback with it.
+        kind=DenialKind.WORK_JUDGED,
+        user_message=(
+            "The fast path produced a result that failed verification, so it was not "
+            "returned. Answer this from the raw tools (getTableSchema / runQuery) instead."
+        ),
+    ),
+    # `RUN_BLUEPRINT_ABORTED` (`executor.py::ABORTED_CODE`): a `when … on_violation:
+    # abort` fired, an approval gate was DENIED by the user, or every node was
+    # skipped/gated leaving nothing terminal. Retryable, matching the live sites.
+    "RUN_BLUEPRINT_ABORTED": DenialInfo(
+        code="RUN_BLUEPRINT_ABORTED",
+        retryable=True,
+        # GATE: the run stopped cleanly BEFORE producing an answer, most often because a
+        # human said no at an approval gate. Recording that as a blueprint that produced
+        # a wrong answer would punish the corpus for a user exercising the consent seam
+        # the corpus itself asked for.
+        kind=DenialKind.GATE,
+        user_message=(
+            "The fast path stopped before producing an answer — answer this from the "
+            "raw tools (getTableSchema / runQuery) instead."
+        ),
+    ),
+    # `INTERNAL_TRANSPORT_ERROR` (`dispatch/tool_dispatcher.py::
+    # INTERNAL_TRANSPORT_ERROR_CODE`, the B4 raw-exception path): a connection refusal, a
+    # timeout, a malformed response — no `[{CODE}]` prefix, so the dispatcher never looks
+    # it up here on the LIVE turn and stamps the marker directly. It is registered anyway
+    # because the trail keeps it and every later REPLAY does come through this table.
+    # Spelled, not imported: `tool_dispatcher.py` imports this module.
+    "INTERNAL_TRANSPORT_ERROR": DenialInfo(
+        code="INTERNAL_TRANSPORT_ERROR",
+        retryable=False,
+        # INFRA_FAILED: the wire broke. `loader.py::INFRA_ERROR_CODES` already unioned
+        # this literal in by hand for exactly this reason; registering it makes that
+        # union redundant rather than load-bearing, which is the direction H1 pushed
+        # every one of these lists.
+        kind=DenialKind.INFRA_FAILED,
+        user_message="Something went wrong reaching the data warehouse. Please try again.",
     ),
 }
 

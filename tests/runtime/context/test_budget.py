@@ -116,6 +116,32 @@ def test_render_entry_resolve_values_unknown_target_uses_specific_message() -> N
     assert tool_msg["user_message"] != "Something went wrong processing that request."
 
 
+def test_render_entry_run_blueprint_aborted_uses_the_registered_message() -> None:
+    """H8 patch 2, the latent replay bug the registrations fixed. `RUN_BLUEPRINT_ABORTED`
+    reaches real trail entries (a user DENIED an approval gate) and was absent from the
+    denial table, so every later rebuild rendered the generic "Something went wrong
+    processing that request." — telling the model something went wrong when in fact a
+    human had declined. It now renders the executor's own live text."""
+    entry = TrailEntry(
+        turn_index=0,
+        tool_call_id="c1",
+        tool_name="runBlueprint",
+        args={"blueprint_id": "bp-headcount"},
+        status="error",
+        error_code="RUN_BLUEPRINT_ABORTED",
+        provenance=None,
+        result_preview=None,
+        result_full_ref=None,
+        ts="2026-07-01T00:00:00+00:00",
+    )
+    tool_msg = _render_entry(entry, 20)
+    assert tool_msg["user_message"] == (
+        "The fast path stopped before producing an answer — answer this from the "
+        "raw tools (getTableSchema / runQuery) instead."
+    )
+    assert tool_msg["user_message"] != "Something went wrong processing that request."
+
+
 def test_render_entry_user_message_is_none_for_ok_status() -> None:
     assert _render_entry(_entry("c1", "SELECT 1"), 20)["user_message"] is None
 

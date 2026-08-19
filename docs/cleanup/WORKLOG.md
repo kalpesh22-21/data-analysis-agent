@@ -1073,3 +1073,38 @@ dropped, the generalize package's pre-keep-and-annotate claim corrected.
 - V0 **6094 passed / 225 skipped / 1 xfailed**; ruff clean. Live
   proof (verify → promote → canon → recall serves) lands with the
   campaign-closing mining test.
+
+## #31 — H8: three-way denial taxonomy, two commits (2026-08-19)
+
+- Patch 1 (2b01d3e): `DenialKind` (GATE / WORK_JUDGED / INFRA_FAILED)
+  replaces `DenialInfo.enforcement` at the single H1 derivation seam;
+  `enforcement` survives as a derived property (kind is GATE) so every
+  reader keeps its shape; GATE == exactly the old True set, zero
+  movement. The ONE behavior change: `_blueprint_usages` also skips
+  infra failures — a CLICKHOUSE_UNAVAILABLE outage no longer records
+  `outcome="corrected"` against a blueprint's reputation (triage K4 keep
+  + 0.5 inbox ranking penalty stop firing on outages) while
+  `_failed_fixed_pairs` deliberately still counts it as analyst
+  friction. The asymmetry the boolean could not express, pinned
+  four-ways in one parametrized test over the whole derived infra set.
+- Patch 2: the map's bigger find — SIX codes landing on
+  runQuery/runBlueprint trail entries were never registered
+  (RUN_BLUEPRINT_NOT_FOUND/SLOT_INVALID/UNSUPPORTED/VERIFY_FAILED/
+  ABORTED, INTERNAL_TRANSPORT_ERROR), so the unknown-code fallback
+  filed them all work-judged→"corrected" — UNSUPPORTED/NOT_FOUND being
+  the dominant real-world source of false corrections, worse than the
+  outage H8 named. Registered with kinds (UNSUPPORTED/ABORTED → GATE,
+  reviewer upheld both with reasoning; INTERNAL_TRANSPORT_ERROR →
+  infra; rest work-judged), honest replay user_messages byte-identical
+  to the live production strings (import cycle → strings spelled +
+  byte-equality test importing both sides), which also fixes the latent
+  bug where all six rendered the generic "Something went wrong" on
+  replay. Deliberate metric movement, stated.
+- Review: APPROVE ×2; folds: SUBSTANTIVE_DATA_CODES extended with the
+  three new work-judged codes (the set's own derivation rule demanded
+  it); GATE comment reworded to "no verdict was formed on the work"
+  (mid-run when-abort runs nodes before stopping). Deferred, on record
+  in ISSUES: RUN_BLUEPRINT_INVALID_ARGS/INTERNAL_ERROR/UNAVAILABLE
+  registrations + executor.py:762 retryable reconciliation.
+- V0 after patch 1 **6124**, after patch 2 **6156 passed / 225 skipped /
+  1 xfailed**; ruff clean at both points.
