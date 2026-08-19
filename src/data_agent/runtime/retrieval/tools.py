@@ -42,7 +42,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     _build_preview,
     _default_observer,
 )
-from data_agent.runtime.observability import tracing
+from data_agent.runtime.dispatch.tool_envelope import RuntimeToolBase
 from data_agent.runtime.observability.redaction import tool_span_args
 
 from . import scope_filter
@@ -72,13 +72,19 @@ _INTERNAL_ERROR_MESSAGE = "Blueprint/knowledge search hit an internal error. Ple
 _logger = logging.getLogger(__name__)
 
 
-class _ReadTool:
-    """Shared plumbing for the three read tools: one TOOL span (with `query`
-    redacted, §5), symmetric `tool_dispatch_start`/`ok`/`error` progress, a
-    B4-parity crash guard, and the `provenance = frozenset()` guarantee baked
-    into every `ToolResult` these tools ever return."""
+class _ReadTool(RuntimeToolBase):
+    """The three read tools' own plumbing on top of the shared envelope
+    (`dispatch/tool_envelope.py`, which owns the span + progress + crash guard): the
+    `query`-redacted span args (§5), the preview cap, and the `provenance = frozenset()`
+    guarantee baked into every `ToolResult` these tools ever return."""
 
     tool_name: str = ""
+
+    _INTERNAL_ERROR_CODE = INTERNAL_ERROR_CODE
+    _INTERNAL_ERROR_MESSAGE = _INTERNAL_ERROR_MESSAGE
+    # Determined-empty: an error from these tools names no column, so the trail entry
+    # survives any later scope narrowing rather than being dropped as undetermined.
+    _ERROR_PROVENANCE = frozenset()
 
     def __init__(
         self,
@@ -88,8 +94,14 @@ class _ReadTool:
         disable_redaction: bool = False,
         max_result_tokens: int = _DEFAULT_MAX_TOOL_RESULT_TOKENS,
     ) -> None:
-        self._observer = observer
-        self._tracer = tracer
+        # `disable_redaction` is the access-controlled TELEMETRY DEBUG switch
+        # (RuntimeSettings.otlp_disable_redaction): default False keeps the D25 span
+        # (`query` redacted, §5); True puts the REAL `query` on the span. The envelope
+        # always hands `_execute` the raw model_args, so the search/scope-filter path is
+        # unaffected either way.
+        super().__init__(
+            observer=observer, tracer=tracer, disable_redaction=disable_redaction
+        )
         # Per-result preview SIZE cap (tokens), the SAME operator lever
         # `ToolDispatcher` takes (`RuntimeSettings.max_tool_result_tokens`). It is
         # threaded here because `_build_preview` defaults it: without this the read
@@ -98,65 +110,11 @@ class _ReadTool:
         # actually needs it — an enriched `searchBlueprints` card list at a large
         # `k` (release-1 §02).
         self._max_result_tokens = max_result_tokens
-        # Access-controlled TELEMETRY DEBUG switch (RuntimeSettings.
-        # otlp_disable_redaction). Default False keeps the D25 span (`query`
-        # redacted, §5). When True the span carries the REAL `query` free text —
-        # telemetry-only; `_guarded` below always gets the raw model_args, so the
-        # search/scope-filter path is unaffected.
-        self._disable_redaction = disable_redaction
 
-    async def run(
-        self,
-        model_args: dict[str, Any],
-        credentials: RuntimeCredentials,
-        turn: TurnContext | None = None,
-    ) -> ToolResult:
-        # *turn* (03 §C.1): the loop threads its own `TurnContext` to every
-        # runtime tool. This one does not need it — accepted and ignored so the
-        # `RuntimeTool` protocol has ONE signature rather than two shapes the
-        # dispatch site has to tell apart.
-        self._observer("tool_dispatch_start", {"tool_name": self.tool_name})
-        if self._tracer is None:
-            result = await self._guarded(model_args, credentials)
-        else:
-            with tracing.tool_span(
-                self._tracer,
-                tool_name=self.tool_name,
-                args=tool_span_args(
-                    self.tool_name, model_args, disable_redaction=self._disable_redaction
-                ),
-                status="ok",
-                error_code=None,
-                reveal_complex_args=self._disable_redaction,
-            ) as span:
-                result = await self._guarded(model_args, credentials)
-                span.set_attribute("tool.status", result.status)
-                if result.error_code is not None:
-                    span.set_attribute("tool.error_code", result.error_code)
-        if result.status == "ok":
-            self._observer("tool_dispatch_ok", {"tool_name": self.tool_name})
-        else:
-            self._observer(
-                "tool_dispatch_error",
-                {"tool_name": self.tool_name, "error_code": result.error_code},
-            )
-        return result
-
-    async def _guarded(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
-    ) -> ToolResult:
-        try:
-            return await self._execute(model_args, credentials)
-        except Exception:  # noqa: BLE001 - B4-parity: never abort the turn / leak str(exc)
-            _logger.exception(
-                "%s internal error (session=%s)", self.tool_name, credentials.session_id
-            )
-            return self._error(INTERNAL_ERROR_CODE, _INTERNAL_ERROR_MESSAGE, retryable=False)
-
-    async def _execute(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
-    ) -> ToolResult:  # pragma: no cover - overridden
-        raise NotImplementedError
+    def _span_args(self, model_args: dict[str, Any]) -> dict[str, Any]:
+        return tool_span_args(
+            self.tool_name, model_args, disable_redaction=self._disable_redaction
+        )
 
     # -- ToolResult builders --------------------------------------------------
 
@@ -189,18 +147,6 @@ class _ReadTool:
                 tool_name=self.tool_name,
             ),
             result_full=result_full,
-        )
-
-    def _error(self, code: str, message: str, *, retryable: bool) -> ToolResult:
-        return ToolResult(
-            status="error",
-            tool_name=self.tool_name,
-            error_code=code,
-            retryable=retryable,
-            user_message=message,
-            provenance=frozenset(),
-            result_preview=None,
-            result_full=None,
         )
 
 
@@ -591,7 +537,10 @@ class SearchBlueprintsTool(_ReadTool):
         self._preview_row_count = preview_row_count
 
     async def _execute(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn: TurnContext | None = None,
     ) -> ToolResult:
         query, err = _require_text(model_args.get("query"), "query")
         if err is not None:
@@ -670,7 +619,10 @@ class SearchKnowledgeTool(_ReadTool):
         self._preview_row_count = preview_row_count
 
     async def _execute(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn: TurnContext | None = None,
     ) -> ToolResult:
         query, err = _require_text(model_args.get("query"), "query")
         if err is not None:
@@ -717,7 +669,10 @@ class GetBlueprintTool(_ReadTool):
         self._preview_row_count = preview_row_count
 
     async def _execute(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
+        self,
+        model_args: dict[str, Any],
+        credentials: RuntimeCredentials,
+        turn: TurnContext | None = None,
     ) -> ToolResult:
         blueprint_id, err = _require_text(model_args.get("id"), "id")
         if err is not None:

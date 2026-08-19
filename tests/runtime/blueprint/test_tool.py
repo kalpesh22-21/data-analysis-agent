@@ -180,6 +180,35 @@ async def test_invalid_args_fail_closed_before_execution() -> None:
     assert stub.calls == []  # the executor was never reached
 
 
+async def test_every_locally_built_error_is_provenance_undetermined() -> None:
+    """D44, and the ONE property the envelope adoption could silently flip.
+
+    `RunBlueprintTool` builds two errors itself — invalid args, and the crash guard's
+    last resort — and both carry `provenance=None`, i.e. UNDETERMINED, which D44 drops
+    from replay unconditionally. The alternative, a determined-empty `frozenset()`, is
+    the shape the retrieval read tools use and is WRONG here: a runBlueprint error is not
+    footprint-free (an `ExecFailed` passes an inner denial through verbatim, arising from
+    per-node SQL over columns this layer cannot enumerate), so claiming "this entry names
+    no column" would keep it in replay forever, including after the caller's scope
+    narrowed past whatever it touched.
+
+    Pinned because the two tools now share one `_error` builder parameterised by a class
+    attribute (`_ERROR_PROVENANCE`): the difference between the two sites is a single
+    token, and nothing else in this file was asserting it."""
+    tool, stub = _tool(None)
+    invalid = await tool.run({"slot_bindings": {}}, _creds())  # missing id
+    assert invalid.error_code == INVALID_ARGS_CODE
+    assert invalid.provenance is None, (
+        "an invalid-args error must stay UNDETERMINED, not determined-empty"
+    )
+    assert stub.calls == []
+
+    crashed_tool, _ = _tool(raises=True)
+    crashed = await crashed_tool.run({"id": "bp", "slot_bindings": {}}, _creds())
+    assert crashed.error_code == INTERNAL_ERROR_CODE
+    assert crashed.provenance is None
+
+
 async def test_missing_slot_bindings_defaults_to_empty() -> None:
     tool, stub = _tool(ExecFailed(NOT_FOUND_CODE, "x", retryable=True))
     await tool.run({"id": "bp"}, _creds())  # no slot_bindings key

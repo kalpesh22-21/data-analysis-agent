@@ -19,7 +19,6 @@ never a nested call.
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.dispatch.tool_dispatcher import (
@@ -28,7 +27,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolResult,
     _default_observer,
 )
-from data_agent.runtime.observability import tracing
+from data_agent.runtime.dispatch.tool_envelope import RuntimeToolBase
 from data_agent.runtime.observability.redaction import tool_span_args
 
 from .executor import (
@@ -52,8 +51,6 @@ INVALID_ARGS_CODE = "RUN_BLUEPRINT_INVALID_ARGS"
 INTERNAL_ERROR_CODE = "RUN_BLUEPRINT_INTERNAL_ERROR"
 _INVALID_ARGS_MESSAGE = "runBlueprint needs a blueprint 'id' and a 'slot_bindings' object."
 _INTERNAL_ERROR_MESSAGE = "The fast path hit an internal error — answer from the raw tools instead."
-
-_logger = logging.getLogger(__name__)
 
 
 def _is_verified_blueprint_result(result_full: Any) -> bool:
@@ -171,10 +168,22 @@ def blueprint_outcome_to_tool_result(outcome: ExecOutcome) -> ToolResult | None:
     return None  # outside the closed union → caller supplies its internal-error fallback
 
 
-class RunBlueprintTool:
-    """The `runBlueprint(id, slot_bindings)` runtime tool (§5.1)."""
+class RunBlueprintTool(RuntimeToolBase):
+    """The `runBlueprint(id, slot_bindings)` runtime tool (§5.1) — arg validation and the
+    `ExecOutcome` mapping over the shared envelope (`dispatch/tool_envelope.py`, which owns
+    the TOOL span, the symmetric progress events and the crash guard)."""
 
     tool_name = TOOL_NAME
+
+    _INTERNAL_ERROR_CODE = INTERNAL_ERROR_CODE
+    _INTERNAL_ERROR_MESSAGE = _INTERNAL_ERROR_MESSAGE
+    # UNDETERMINED, and it must STAY undetermined (D44). A runBlueprint error is not
+    # necessarily footprint-free the way a retrieval error is: `ExecFailed` passes an INNER
+    # denial through verbatim, and that denial arose from per-node SQL over columns this
+    # layer cannot enumerate. `None` is dropped from replay unconditionally, which is the
+    # fail-closed reading; a determined-empty `frozenset()` would claim "this entry names
+    # no column" about a result that may well have, and keep it in replay forever.
+    _ERROR_PROVENANCE = None
 
     def __init__(
         self,
@@ -184,66 +193,26 @@ class RunBlueprintTool:
         tracer: Tracer | None = None,
         disable_redaction: bool = False,
     ) -> None:
+        # `disable_redaction` is the access-controlled TELEMETRY DEBUG switch
+        # (RuntimeSettings.otlp_disable_redaction): default False keeps the D25 span
+        # (slot_bindings values redacted, slot NAMES kept); True puts the REAL slot values
+        # on the span. The envelope always hands `_execute` the raw model_args, so the
+        # executor's per-node runQuery/enforcement is unaffected either way.
+        super().__init__(
+            observer=observer, tracer=tracer, disable_redaction=disable_redaction
+        )
         self._executor = executor
-        self._observer = observer
-        self._tracer = tracer
-        # Access-controlled TELEMETRY DEBUG switch (RuntimeSettings.
-        # otlp_disable_redaction). Default False keeps the D25 span (slot_bindings
-        # values redacted, slot NAMES kept). When True the span carries the REAL
-        # slot values — telemetry-only; `_guarded` below always gets the raw
-        # model_args, so the executor's per-node runQuery/enforcement is unaffected.
-        self._disable_redaction = disable_redaction
 
-    async def run(
+    def _span_args(self, model_args: dict[str, Any]) -> dict[str, Any]:
+        return tool_span_args(
+            TOOL_NAME, model_args, disable_redaction=self._disable_redaction
+        )
+
+    async def _execute(
         self,
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         turn: TurnContext | None = None,
-    ) -> ToolResult:
-        # *turn* (03 §C.1): the loop threads its own `TurnContext` to every
-        # runtime tool. This one does not need it — accepted and ignored so the
-        # `RuntimeTool` protocol has ONE signature rather than two shapes the
-        # dispatch site has to tell apart.
-        self._observer("tool_dispatch_start", {"tool_name": TOOL_NAME})
-        if self._tracer is None:
-            result = await self._guarded(model_args, credentials)
-        else:
-            with tracing.tool_span(
-                self._tracer,
-                tool_name=TOOL_NAME,
-                args=tool_span_args(
-                    TOOL_NAME, model_args, disable_redaction=self._disable_redaction
-                ),
-                status="ok",
-                error_code=None,
-                reveal_complex_args=self._disable_redaction,
-            ) as span:
-                result = await self._guarded(model_args, credentials)
-                span.set_attribute("tool.status", result.status)
-                if result.error_code is not None:
-                    span.set_attribute("tool.error_code", result.error_code)
-        if result.status == "ok":
-            self._observer("tool_dispatch_ok", {"tool_name": TOOL_NAME})
-        else:
-            self._observer(
-                "tool_dispatch_error",
-                {"tool_name": TOOL_NAME, "error_code": result.error_code},
-            )
-        return result
-
-    async def _guarded(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
-    ) -> ToolResult:
-        try:
-            return await self._execute(model_args, credentials)
-        except Exception:  # noqa: BLE001 - B4-parity: never abort the turn / leak str(exc)
-            _logger.exception(
-                "runBlueprint internal error (session=%s)", credentials.session_id
-            )
-            return self._error(INTERNAL_ERROR_CODE, _INTERNAL_ERROR_MESSAGE, retryable=False)
-
-    async def _execute(
-        self, model_args: dict[str, Any], credentials: RuntimeCredentials
     ) -> ToolResult:
         blueprint_id = model_args.get("id")
         slot_bindings = model_args.get("slot_bindings", {})
@@ -267,18 +236,6 @@ class RunBlueprintTool:
             return mapped
         # Unreachable for the closed ExecOutcome union — fail-closed.
         return self._error(INTERNAL_ERROR_CODE, _INTERNAL_ERROR_MESSAGE, retryable=False)
-
-    def _error(self, code: str, message: str, *, retryable: bool) -> ToolResult:
-        return ToolResult(
-            status="error",
-            tool_name=TOOL_NAME,
-            error_code=code,
-            retryable=retryable,
-            user_message=message,
-            provenance=None,
-            result_preview=None,
-            result_full=None,
-        )
 
 
 __all__ = [

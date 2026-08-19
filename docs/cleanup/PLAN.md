@@ -157,7 +157,7 @@ helpers) → **T5.5 single `finish()`** (7 `TurnOutcome` sites) →
 | J7(b) window_anchor | done, reviewed, landed 25429a8 (+ ch-api 11258a9); delivery proven, behaviour 1/3 — follow-up queued (ISSUES.md J7) | #7 |
 | Tier 4 Wave A (T4.3/4.5/4.6/4.7) | done, reviewed, landed ae17803 | #7 |
 | Eval conftest field-drop fix | done (tests-only, mutation-verified), 6b30465 | #7 |
-| **Tier 4 Wave B (T4.1 compiler, T4.2 executor, T4.4 span envelope)** | **HELD (user, 2026-08-17)** | — |
+| Tier 4 Wave B (T4.1/T4.2/T4.4) | un-held by user 2026-08-18 ("Yes lets do Wave B after hygiene lands") | — |
 | Tier 5 loop decomposition | **COMPLETE** — T5.1–T5.6 all reviewed, V0+V1+V2 green | #8–#13 |
 | G1/G2 L5 robustness slice | built+contained in worktree, unlanded; optional post-5.5 | — |
 | Issues stack | committed to docs/cleanup/ISSUES.md (source of truth going forward) | — |
@@ -169,5 +169,5 @@ helpers) → **T5.5 single `finish()`** (7 `TurnOutcome` sites) →
 | Hygiene wave (J7c/L1/L2/B5/A2/C3 + docs alignment) | done, two commits, reviewed | #22 |
 | Docstring trim (−6,670 lines, contracts kept) | done, AST-proven docstring-only | #23 |
 | **Wave B: T4.2 executor collapse** | done — equivalence-audited, cross-binary resume proven | #24 |
-| Wave B: T4.4 span envelope | next | — |
-| Wave B: T4.1 compiler extraction | queued | — |
+| **Wave B: T4.4 span envelope** | done — six-path equivalence traced, R1 leak belt proven, fold applied | #25 |
+| Wave B: T4.1 compiler extraction | built (pure-move byte-proven), in review | — |

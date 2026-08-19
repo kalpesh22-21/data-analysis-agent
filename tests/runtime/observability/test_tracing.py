@@ -8,7 +8,9 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
+from data_agent.runtime.dispatch.tool_envelope import in_tool_span
 from data_agent.runtime.observability import tracing
 
 
@@ -196,3 +198,58 @@ def test_instrument_openai_is_idempotent() -> None:
     provider = tracing.configure_tracing(otlp_endpoint="", service_name="data-agent-runtime")
     tracing.instrument_openai(provider)
     tracing.instrument_openai(provider)  # must not raise on a second call
+
+
+# ---------------------------------------------------------------------------
+# The envelope's `record_exception=False` belt (dispatch/tool_envelope.py)
+# ---------------------------------------------------------------------------
+
+
+async def test_the_tool_envelope_keeps_exception_text_off_the_span() -> None:
+    """D25 on the ERROR path of a TOOL span, which the redaction tests do not reach.
+
+    Every runtime tool guards its own work, so an exception normally never escapes into
+    the span — but OTel's DEFAULT (`record_exception=True`) writes the exception MESSAGE
+    and STACKTRACE as a span event if one ever does, and a tool's exception message is
+    derived from a query, a slot value or a row. The span STATUS must still be ERROR:
+    the belt withholds the detail, it does not hide the failure.
+
+    Both halves are asserted, because "no exception event" is only meaningful next to
+    proof that the default posture DOES record one — otherwise this test would pass just
+    as happily against a tracer that records nothing at all."""
+    provider, exporter = _provider_with_memory_exporter()
+    tracer = tracing.get_tracer(provider)
+    secret = "SELECT AnnualSalary FROM employee WHERE name = 'Jane Doe'"
+
+    async def _boom() -> None:
+        raise RuntimeError(secret)
+
+    try:
+        await in_tool_span(tracer, tool_name="runQuery", args={}, work=_boom)
+    except RuntimeError:
+        pass
+
+    (span,) = exporter.get_finished_spans()
+    assert [event.name for event in span.events] == []
+    assert secret not in str(
+        [dict(span.attributes or {}), [dict(e.attributes or {}) for e in span.events]]
+    )
+    # The failure itself stays visible — only the content-bearing detail is withheld.
+    assert span.status.status_code is StatusCode.ERROR
+
+
+def test_tool_span_still_records_exceptions_by_default() -> None:
+    """The other half: the POST-HOC callers (`ToolDispatcher._emit_tool_span`) keep the
+    default, so this parameter is a per-caller choice rather than a global change. It is
+    also what makes the test above prove something."""
+    provider, exporter = _provider_with_memory_exporter()
+    tracer = tracing.get_tracer(provider)
+
+    try:
+        with tracing.tool_span(tracer, tool_name="runQuery", args={}, status="ok", error_code=None):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+
+    (span,) = exporter.get_finished_spans()
+    assert [event.name for event in span.events] == ["exception"]

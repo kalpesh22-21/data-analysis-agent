@@ -55,7 +55,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolResult,
     _default_observer,
 )
-from data_agent.runtime.observability import tracing
+from data_agent.runtime.dispatch.tool_envelope import RuntimeToolBase
 from data_agent.runtime.sanitize import sanitize_text
 from data_agent.runtime.session.models import (
     INTENT_STATUSES,
@@ -1249,13 +1249,14 @@ def _state_result(state: AnalysisState) -> ToolResult:
     )
 
 
-class UpdateAnalysisStateTool:
+class UpdateAnalysisStateTool(RuntimeToolBase):
     """The `updateAnalysisState(intents)` runtime tool.
 
-        It takes `observer` AND `tracer` and SELF-EMITS `tool_dispatch_start`/`ok`/`error`,
-        like the three retrieval read tools: `_run_runtime_tool` emits no dispatch events on a
-        runtime tool's behalf, so following the other composite tools' precedent would ship a
-        silently-mute tool for the one feature whose telemetry is the point of measuring it.
+        It takes `observer` AND `tracer` and SELF-EMITS `tool_dispatch_start`/`ok`/`error`
+        through the shared envelope (`dispatch/tool_envelope.py`), like the three retrieval
+        read tools: `_run_runtime_tool` emits no dispatch events on a runtime tool's behalf,
+        so following the other composite tools' precedent would ship a silently-mute tool for
+        the one feature whose telemetry is the point of measuring it.
 
         It reads the TRAIL ITSELF at execution (`session_store.load_trail`), filtered to
         `turn_index`. The trail the loop already holds is unusable: its only load sits ABOVE
@@ -1267,6 +1268,14 @@ class UpdateAnalysisStateTool:
 
     tool_name = TOOL_NAME
 
+    _INTERNAL_ERROR_CODE = _INTERNAL_ERROR_CODE
+    _INTERNAL_ERROR_MESSAGE = "Tracking the analysis state hit an internal error."
+    # A rejection is a VALIDATION failure, not a crash: it is raised from inside the store's
+    # merge callback (and locally for the payload-only rules), so the envelope hands it to
+    # `_on_guarded_exception` BEFORE the generic internal-error arm. Routing it through the
+    # generic arm would report a model mistake as a runtime fault and lose the reason.
+    _GUARDED_EXCEPTIONS = (AnalysisStateRejectedError,)
+
     def __init__(
         self,
         *,
@@ -1274,73 +1283,48 @@ class UpdateAnalysisStateTool:
         observer: ToolObserver = _default_observer,
         tracer: Tracer | None = None,
     ) -> None:
+        # NO `disable_redaction`: this tool has no redaction switch to turn off, because
+        # `_span_args` never forwards the model's args in the first place. See there.
+        super().__init__(observer=observer, tracer=tracer)
         self._session_store = session_store
-        self._observer = observer
-        self._tracer = tracer
 
-    async def run(
-        self,
-        model_args: dict[str, Any],
-        credentials: RuntimeCredentials,
-        turn: TurnContext | None = None,
-    ) -> ToolResult:
-        self._observer("tool_dispatch_start", {"tool_name": TOOL_NAME})
-        # D25: the span carries SHAPE ONLY. `description` is model-authored text
-        # derived from the user's question, so it never reaches a span — not even
-        # under `otlp_disable_redaction`, which is why this builds its own args
-        # dict instead of forwarding `model_args`.
-        span_args = {"intent_count": _safe_intent_count(model_args)}
-        if self._tracer is None:
-            result = await self._guarded(model_args, credentials, turn)
-        else:
-            with tracing.tool_span(
-                self._tracer,
-                tool_name=TOOL_NAME,
-                args=span_args,
-                status="ok",
-                error_code=None,
-            ) as span:
-                result = await self._guarded(model_args, credentials, turn)
-                span.set_attribute("tool.status", result.status)
-                if result.error_code is not None:
-                    span.set_attribute("tool.error_code", result.error_code)
-        if result.status == "ok":
-            self._observer("tool_dispatch_ok", {"tool_name": TOOL_NAME})
-        else:
-            self._observer(
-                "tool_dispatch_error",
-                {"tool_name": TOOL_NAME, "error_code": result.error_code},
-            )
-        return result
+    def _span_args(self, model_args: dict[str, Any]) -> dict[str, Any]:
+        """D25: the span carries SHAPE ONLY.
 
-    async def _guarded(
-        self,
-        model_args: dict[str, Any],
-        credentials: RuntimeCredentials,
-        turn: TurnContext | None,
+                `description` is model-authored text derived from the user's question, so it never
+                reaches a span — not even under `otlp_disable_redaction`. That is why this builds
+                its own dict instead of forwarding `model_args` through `tool_span_args`: the
+                redactor is a per-ARGUMENT policy, and the only safe policy for this payload is
+                that none of it goes. A count is the whole shape.
+        """
+        return {"intent_count": _safe_intent_count(model_args)}
+
+    def _error(self, code: str, message: str, *, retryable: bool) -> ToolResult:
+        """`denial_detail` is the ONLY channel that reaches the model here (`TrailEntry` has
+        no `user_message` field), so every error this tool returns is built by
+        `_error_result` rather than by the envelope's plain error shape.
+
+        This replaces the base entirely, so the inherited `_ERROR_PROVENANCE` is INERT for
+        this tool — the provenance of these errors is whatever `_error_result` sets
+        (`frozenset()`), not the class attribute."""
+        return _error_result(code, message, retryable=retryable)
+
+    def _on_guarded_exception(
+        self, exc: Exception, model_args: dict[str, Any]
     ) -> ToolResult:
-        try:
-            return await self._execute(model_args, credentials, turn)
-        except AnalysisStateRejectedError as rejected:
-            self._observer(
-                "loop_analysis_state_rejected",
-                {
-                    "reason": rejected.reason,
-                    "intent_count": _safe_intent_count(model_args),
-                },
-            )
-            return _error_result(
-                ANALYSIS_STATE_INVALID_CODE, rejected.detail, retryable=True
-            )
-        except Exception:  # noqa: BLE001 - never abort the turn / leak str(exc)
-            _logger.exception(
-                "updateAnalysisState internal error (session=%s)", credentials.session_id
-            )
-            return _error_result(
-                _INTERNAL_ERROR_CODE,
-                "Tracking the analysis state hit an internal error.",
-                retryable=False,
-            )
+        if not isinstance(exc, AnalysisStateRejectedError):
+            # Only `_GUARDED_EXCEPTIONS` reach here, so this is a belt-and-braces guard:
+            # a raise out of this hook is caught by the envelope and returned as this
+            # tool's own internal error, rather than reported as a validation rejection.
+            raise exc
+        self._observer(
+            "loop_analysis_state_rejected",
+            {
+                "reason": exc.reason,
+                "intent_count": _safe_intent_count(model_args),
+            },
+        )
+        return self._error(ANALYSIS_STATE_INVALID_CODE, exc.detail, retryable=True)
 
     async def _execute(
         self,

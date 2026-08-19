@@ -1,6 +1,8 @@
 """`otlp_disable_redaction` extended to the OUTER RuntimeTool span sites —
 `resolveValues` (concept + period), `searchBlueprints` (query), and
-`runBlueprint` (slot_bindings). Companion to the dispatcher-scoped
+`runBlueprint` (slot_bindings) — plus `updateAnalysisState`, the one outer site
+the flag CANNOT reach, whose span carries a count and nothing else under either
+posture. Companion to the dispatcher-scoped
 `tests/runtime/dispatch/test_tool_dispatcher_disable_redaction.py`.
 
 For each tool: default OFF keeps the D25-redacted span byte-identical; ON reveals
@@ -31,8 +33,13 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from data_agent.runtime.auth.credentials import RuntimeCredentials
 from data_agent.runtime.blueprint.executor import BlueprintExecutor
 from data_agent.runtime.blueprint.tool import RunBlueprintTool
+from data_agent.runtime.composite.analysis_state import (
+    ANALYSIS_STATE_INVALID_CODE,
+    UpdateAnalysisStateTool,
+)
 from data_agent.runtime.composite.resolve_values import ResolveValuesComposite
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
+from data_agent.runtime.loop.agent_loop import TurnContext
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
 from data_agent.runtime.observability import tracing
@@ -46,6 +53,7 @@ from data_agent.runtime.retrieval.tools import (
 )
 from data_agent.runtime.retrieval.user_memory import NullUserMemoryProvider
 from data_agent.runtime.retrieval.vector_index import FakeVectorIndex
+from data_agent.runtime.session.memory_store import InMemorySessionStore
 
 JWT = "jwt-should-never-leak"
 SESSION_ID = "sess-outer-disable-redaction"
@@ -372,6 +380,91 @@ async def test_run_blueprint_on_reveals_slot_bindings() -> None:
     assert span.attributes.get("tool.args.id") == _BID
     slot_bindings = json.loads(span.attributes["tool.args.slot_bindings"])
     assert slot_bindings == {"department": PII_SLOT_VALUE}
+
+
+# ===========================================================================
+# updateAnalysisState — the tool the flag CANNOT reach
+# ===========================================================================
+#
+# Every other site above answers "what does the flag reveal?". This one answers
+# "what does it reveal when it is ON and should reveal NOTHING?" — the leak class
+# the other three cases structurally cannot cover, because they all forward
+# `model_args` through `tool_span_args` and differ only in how much of it is
+# masked. `updateAnalysisState`'s args are intent DESCRIPTIONS: model-authored
+# prose restating the user's question, with no structural half worth tracing. So
+# its `_span_args` builds `{"intent_count": n}` and forwards nothing, which means
+# the redaction flag has no surface to act on at all.
+
+PII_DESCRIPTION = "attrition for Jane Doe in Radiology"
+_STATE_TURN = 7
+
+
+async def _run_update_analysis_state(disable_redaction: bool):  # noqa: ANN202
+    tracer, exporter = _tracer_with_exporter()
+    tool = UpdateAnalysisStateTool(session_store=InMemorySessionStore(), tracer=tracer)
+    # THE FLAG-ON POSTURE, forced. The constructor deliberately exposes no
+    # `disable_redaction` parameter, so this reaches past it to the envelope's own
+    # attribute — which is exactly the regression being pinned: if someone later
+    # wires the operator switch into this tool "for consistency", the span must
+    # STILL carry only the count, because `_span_args` and not the flag is what
+    # keeps the descriptions off it.
+    tool._disable_redaction = disable_redaction  # noqa: SLF001
+    result = await tool.run(
+        {"intents": [{"description": PII_DESCRIPTION}, {"description": "headcount"}]},
+        _creds(),
+        turn=TurnContext(turn_index=_STATE_TURN),
+    )
+    return result, _tool_span(exporter, "updateAnalysisState")
+
+
+@pytest.mark.parametrize("disable_redaction", [False, True])
+async def test_update_analysis_state_span_carries_only_the_intent_count(
+    disable_redaction: bool,
+) -> None:
+    """otlp-redaction-on-by-default + otlp-disable-redaction-shows-real-tool-calls,
+    in the one place the second tag does NOT apply: `tool.args.*` is exactly
+    `intent_count` under BOTH postures.
+
+    Asserted as a whole-namespace equality rather than "description is absent", so
+    a future enrichment field on this span has to be declared here — the same
+    deny-by-default posture the retrieval printed-column guard takes."""
+    result, span = await _run_update_analysis_state(disable_redaction)
+
+    assert result.status == "ok"
+    arg_attributes = {k: v for k, v in span.attributes.items() if k.startswith("tool.args.")}
+    assert arg_attributes == {"tool.args.intent_count": 2}
+    assert PII_DESCRIPTION not in str(dict(span.attributes))
+
+
+async def test_update_analysis_state_span_is_status_stamped_on_a_rejection() -> None:
+    """The envelope's status overwrite, on the site whose errors are VALIDATION
+    rejections rather than crashes: the span opens optimistically as `ok`, so a
+    rejected call that skipped the stamp would report a refusal as a success.
+
+    A second initialize is the cheapest real rejection — and it also proves the
+    rejection arm still runs ahead of the generic internal-error arm, since the
+    error code is the retryable `ANALYSIS_STATE_INVALID`, not the crash code."""
+    tracer, exporter = _tracer_with_exporter()
+    store = InMemorySessionStore()
+    tool = UpdateAnalysisStateTool(session_store=store, tracer=tracer)
+    turn = TurnContext(turn_index=_STATE_TURN)
+    args = {"intents": [{"description": PII_DESCRIPTION}]}
+
+    first = await tool.run(args, _creds(), turn=turn)
+    second = await tool.run(args, _creds(), turn=turn)
+
+    assert first.status == "ok"
+    assert second.status == "error"
+    assert second.error_code == ANALYSIS_STATE_INVALID_CODE
+    spans = [
+        s
+        for s in exporter.get_finished_spans()
+        if s.attributes.get("tool.name") == "updateAnalysisState"
+    ]
+    assert [s.attributes.get("tool.status") for s in spans] == ["ok", "error"]
+    assert spans[1].attributes.get("tool.error_code") == ANALYSIS_STATE_INVALID_CODE
+    assert "tool.error_code" not in spans[0].attributes
+    assert PII_DESCRIPTION not in str([dict(s.attributes) for s in spans])
 
 
 async def test_run_blueprint_flag_is_telemetry_only() -> None:

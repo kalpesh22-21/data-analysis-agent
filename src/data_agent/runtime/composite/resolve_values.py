@@ -46,8 +46,8 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     _default_observer,
     resolve_catalog,
 )
+from data_agent.runtime.dispatch.tool_envelope import in_tool_span
 from data_agent.runtime.model.embedding_client import EmbeddingClient, EmbeddingError
-from data_agent.runtime.observability import tracing
 from data_agent.runtime.observability.redaction import tool_span_args
 from data_agent.runtime.provenance.catalog_handle import CatalogHandle
 
@@ -165,24 +165,22 @@ class ResolveValuesComposite:
                 never propagates out to abort the turn or leak `str(exc)`, degrading instead to a
                 clean `status="error"` result, logged server-side only.
         """
-        if self._tracer is None:
-            outcome = await self._safe_run_inner(model_args, credentials)
-        else:
-            with tracing.tool_span(
-                self._tracer,
-                tool_name=TOOL_NAME,
-                args=tool_span_args(
-                    TOOL_NAME, model_args, disable_redaction=self._disable_redaction
-                ),
-                status="ok",
-                error_code=None,
-                reveal_complex_args=self._disable_redaction,
-            ) as span:
-                outcome = await self._safe_run_inner(model_args, credentials)
-                span.set_attribute("tool.status", outcome.status)
-                if outcome.error_code is not None:
-                    span.set_attribute("tool.error_code", outcome.error_code)
-
+        # The SPAN HALF only, from the shared envelope. This tool does not subclass
+        # `RuntimeToolBase`: its progress events fire DEEP inside `resolve()` at their own
+        # points in the pipeline (not symmetrically around the call), and the
+        # `ResolveOutcome` -> `ToolResult` mapping must stay OUTSIDE the span — the span
+        # measures the resolution, not the serialization. `in_tool_span` is typed over the
+        # two-field `SpanOutcome` protocol precisely so `ResolveOutcome` can close a span
+        # without first becoming a `ToolResult`.
+        outcome = await in_tool_span(
+            self._tracer,
+            tool_name=TOOL_NAME,
+            args=tool_span_args(
+                TOOL_NAME, model_args, disable_redaction=self._disable_redaction
+            ),
+            reveal_complex_args=self._disable_redaction,
+            work=lambda: self._safe_run_inner(model_args, credentials),
+        )
         return self._outcome_to_tool_result(outcome)
 
     async def _safe_run_inner(

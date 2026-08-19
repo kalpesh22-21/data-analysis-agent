@@ -343,6 +343,7 @@ def tool_span(
     error_code: str | None,
     result_preview: Any = None,
     reveal_complex_args: bool = False,
+    record_exception: bool = True,
 ) -> Any:
     """Each tool call (`TOOL`).
 
@@ -359,6 +360,15 @@ def tool_span(
         JSON-serialized onto `tool.result.preview_rows`, because a span attribute cannot
         hold a ragged list-of-lists — the same reason *reveal_complex_args* JSON-serializes
         each non-scalar arg value onto `tool.args.{key}`.
+
+        *record_exception* is forwarded to `span` and every caller that WRAPS REAL WORK
+        passes False (`dispatch/tool_envelope.py`). A tool crash-guard means an exception
+        normally never reaches the span, but OTel's default would write
+        `exception.message`/`exception.stacktrace` — free text derived from a query, a slot
+        value or a row — onto a TOOL span if one ever did. The span status is still set on
+        exception, so the error stays visible; only the content-bearing detail is withheld.
+        It stays True by default for the POST-HOC callers, which open the span around
+        nothing and so have no exception to record either way.
     """
     attributes: dict[str, Any] = {"tool.name": tool_name, "tool.status": status}
     if error_code is not None:
@@ -382,7 +392,13 @@ def tool_span(
         attributes["tool.result.preview_rows"] = json.dumps(
             result_preview.preview_rows, default=str
         )
-    return span(tracer, f"tool.{tool_name}", OpenInferenceSpanKindValues.TOOL, attributes)
+    return span(
+        tracer,
+        f"tool.{tool_name}",
+        OpenInferenceSpanKindValues.TOOL,
+        attributes,
+        record_exception=record_exception,
+    )
 
 
 def guardrail_span(

@@ -886,3 +886,38 @@ dropped, the generalize package's pre-keep-and-annotate claim corrected.
   drive the loop pre-assembly, which is why CI never saw it).
 - V0 **6021 passed / 225 skipped / 1 xfailed**; V1 8 cases at/above
   baseline (L3 its accepted 1/3); ruff clean.
+
+## #25 — T4.4: tool span envelope (2026-08-18)
+
+- `RuntimeToolBase(ABC)` in `dispatch/tool_envelope.py`: observer events +
+  `in_tool_span` + guarded dispatch behind one seam. Honest scope: 3 clean
+  adoptions (retrieval read tools −45, blueprint tool −43, analysis_state
+  −21) + 1 partial (resolve_values takes only the span-half via
+  `in_tool_span`; deliberately not subclassed, rationale in-file) + 1
+  leave-in-place. Review: APPROVE after tracing all six outcome paths
+  (ok/denied/error/raise/guarded-raise/tracer-None) byte-equivalent
+  against the old per-site code.
+- Fail-closed by construction: `_span_args` is abstract with NO default —
+  forgetting it is a TypeError at instantiation, not a silent D25 leak;
+  `__init_subclass__` makes empty `tool_name`/internal-error identity fail
+  at class-definition time (reviewer's snippet corrected by the builder:
+  `__abstractmethods__` is unreadable inside `__init_subclass__`, so it
+  probes the base's abstract names for still-abstract methods).
+- Review fold: (1) a guarded-hook re-raise used to escape `_guarded`
+  entirely (Python never consults the sibling except arm), landing in the
+  loop's outer guard with observer symmetry broken — now wrapped, routing
+  to the tool's own single-sourced `_internal_error` arm, comments in
+  analysis_state corrected to match; (2) `_EMITS_OWN_PROGRESS` deleted
+  (zero users — the flag failed the deletion test).
+- R1 belt proven real, not theoretical: under the old default a SQL-shaped
+  secret in an exception landed verbatim on span events;
+  `record_exception=False` on envelope spans withholds the text and keeps
+  ERROR status. Both belt tests kept incl. the positive control
+  (dispatcher post-hoc markers keep the recording default — per-caller,
+  not global). `_ERROR_PROVENANCE` frozenset-vs-None pins D44 replay
+  semantics per tool.
+- V0 **6029 passed / 225 skipped / 1 xfailed**; V1 7/9 with the two known
+  oscillators red → isolated rerun L3 2/3 (accepted baseline 1/3), L7 3/3
+  — low-tail, not regression (the slice is span-plumbing only); ruff
+  clean. Follow-up on record: R7 resume-path span (agent_loop) still
+  unspanned.
