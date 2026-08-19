@@ -1137,3 +1137,38 @@ dropped, the generalize package's pre-keep-and-annotate claim corrected.
   that IS the instruction; on record in K2 as size-blocked, awaiting its
   own ceiling argument.
 - V0 **6168 passed / 225 skipped / 1 xfailed**; ruff clean.
+
+## #33 — queued-slice campaign closed: V1 9/9 + the flywheel's first full lap (2026-08-19)
+
+- Six slices landed this campaign (#27-#32: R7 span, C3 launchers, J7
+  concrete anchor, M4 promotion exposure, H8 ×2 taxonomy, G1 corrective
+  note). Combined V1: **9/9 — the first fully green live gate on
+  record.** L3 at 2/3, up from its accepted-red 1/3: the J7 concrete
+  window anchor flipped a re-deriving run to compliant prose, exactly
+  the lever's design. L4 2/3, all else 3/3, multi-intent 3/3 with zero
+  false positives.
+- **The flywheel closed its first full lap, live:** the avg-salary-by-
+  status blueprint (mined from a live session in #20) went
+  verify (node_stamped=true) → promote via the NEW BFF/UI surface
+  (PromotionEmit with the landing id preserved) → YAML into
+  clickhouse-api canon + parity --write (BLUEPRINTS_SHA ab127a7f, 12
+  entries) → l2-mcp image rebuild → hydrator reseed → the SAME Neo4j
+  node flipped in place (source learning→mcp, corpus_sha stamped — no
+  duplicate, GC-safe, zero re-embedding) → trust gate passes → a fresh
+  session's question routed straight to runBlueprint on
+  bp::sha256:1b72b2… with employee_status="R" bound from the question.
+  Recall now serves learned knowledge. The manual seam behaved exactly
+  as designed (ops note: the l2 dev stack needed MCP_SERVICE_KEY via a
+  compose override for the hydrator's export auth — the compose file
+  doesn't carry it).
+- **Mining re-proven on the new code:** two fresh questions → fresh SQL
+  (no covering blueprint) → sweep (scanned=2 claimed=2) → REAL
+  extractor → both persisted to in_review: quarterly-hires judged
+  existing-plus-delta over bp-hires-in-range (honest re-grain
+  attribution), dept-hire-ranges judged new. Inbox now holds 14
+  in_review + 3 needs_parameterization + 1 promoted.
+- Env freshness enforced start-to-finish: RLS re-seed (pull_id 3),
+  every server restarted onto post-campaign code (the BFF via the new
+  C3 launcher — dogfooded), inbox service brought up with the FULL
+  write plane (the offline-mode gate caught two missing env groups
+  before it silently degraded).

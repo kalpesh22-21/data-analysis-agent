@@ -171,3 +171,5 @@ helpers) → **T5.5 single `finish()`** (7 `TurnOutcome` sites) →
 | **Wave B: T4.2 executor collapse** | done — equivalence-audited, cross-binary resume proven | #24 |
 | **Wave B: T4.4 span envelope** | done — six-path equivalence traced, R1 leak belt proven, fold applied | #25 |
 | **Wave B: T4.1 compiler extraction** | done — byte-proven move ×2 (builder+reviewer AST diff), learning edge cut | #26 |
+| Queued-slice campaign (R7/C3/J7/M4/H8/G1) | done — all six reviewed+landed; V1 **9/9 first full green**, L3 2/3 via J7 anchor | #27–#32 |
+| Flywheel first full lap (mine→approve→verify→promote→canon→reseed→SERVE) | **PROVEN LIVE** — promoted node flipped in place, autoplay on a fresh session | #33 |
