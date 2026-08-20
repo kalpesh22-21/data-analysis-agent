@@ -140,16 +140,34 @@ config:
   #    at it; a stale snapshot means the extractor grounds rule ids against an old
   #    schema.
   CATALOG_FIXTURE_PATH: ""
-  # -- Couchbase connection string for the AGENT'S SESSION bucket. EXTERNAL.
-  #    The sweeper scans this bucket for idle sessions to learn from — it MUST be
-  #    the same cluster/bucket/credentials the data-agent release writes sessions
-  #    to. Point it at an empty or wrong bucket and the loop is simply idle: no
-  #    error, no sessions, nothing learned.
+  # -- Couchbase connection string for the AGENT'S SESSION KEYSPACE. EXTERNAL.
+  #    The sweeper scans that keyspace for idle sessions to learn from — it MUST be
+  #    the same cluster/credentials/bucket/scope/collection the data-agent release
+  #    writes sessions to. Point it at an empty or wrong keyspace and the loop is
+  #    simply idle: no error, no sessions, nothing learned.
+  #
+  #    THE OTHER HALF OF THIS PAIRING lives in the data-agent chart's values.yaml,
+  #    on its own COUCHBASE_* block — read that warning too. The five keys below are
+  #    the SAME env vars the runtime reads (both processes build `RuntimeSettings`),
+  #    so they must be given the same values in both releases.
   COUCHBASE_CONNECTION_STRING: "couchbase://couchbase"
-  # -- Couchbase username for the session bucket.
+  # -- Couchbase username for the session keyspace.
   COUCHBASE_USERNAME: "data_agent"
   # -- Couchbase session bucket (must match the data-agent release).
   COUCHBASE_BUCKET: "data_agent"
+  # -- Scope + sessions collection (must match the data-agent release). The sweeper
+  #    builds `CouchbaseSessionStore(RuntimeSettings())` from these vars and scans a
+  #    THREE-part `bucket`.`scope`.`collection`, so a bucket that matches while the
+  #    scope does not is the silent-idle failure above: in the consolidated layout the
+  #    runtime writes `pcm_iwant`.`sessions`.`sessions` and a sweeper left on the
+  #    default would scan `pcm_iwant`.`_default`.`sessions` and find nothing, forever.
+  #    Set COUCHBASE_SCOPE here whenever you set it there.
+  COUCHBASE_SCOPE: "_default"
+  COUCHBASE_SESSIONS_COLLECTION: "sessions"
+  # -- The D46 full-result collection. The sweeper itself never reads it, but the
+  #    same `RuntimeSettings` carries it and the session store binds BOTH collections
+  #    at construction — an unset/mismatched value fails at bind time, not at use.
+  COUCHBASE_RESULTS_COLLECTION: "session_results"
   # -- Neo4j bolt URL (retrieval graph). EXTERNAL. A validated blueprint LANDS
   #    here — same graph the agent recalls from, so it must be the agent's.
   NEO4J_URL: "bolt://neo4j:7687"
@@ -317,30 +335,88 @@ config:
   #    a "moderate-sounding" 0.5 would hide the ENTIRE queue. 0.0 = no cutoff.
   LEARNING_REVIEW_SCORE_CUTOFF: "0.0"
 
-  # --- learning-owned Couchbase buckets (separate RBAC + retention clocks) ---
-  # These are the learning plane's OWN buckets — not shared with the agent. Each
+  # --- learning-owned Couchbase KEYSPACES (separate RBAC + retention clocks) ---
+  # These are the learning plane's OWN keyspaces — not shared with the agent. Each
   # has its own RBAC user scoped to it alone.
   #
-  # -- Couchbase connection string for the learning AUDIT bucket. EXTERNAL.
+  # A keyspace is BUCKET + SCOPE + COLLECTION, and the deployment picks one of two
+  # layouts:
+  #
+  #   (a) bucket-per-store (these defaults) — one bucket each, scope/collection
+  #       left at "_default". `_default`/`_default` is the SAME collection a bare
+  #       bucket handle has always resolved to, so this is byte-identical to the
+  #       chart before the scope/collection keys existed.
+  #   (b) ONE shared bucket, named scopes — e.g.
+  #         BUCKET=pcm_iwant  SCOPE=learning  COLLECTION=audit|candidates|corpus
+  #         BUCKET=pcm_iwant  SCOPE=user      COLLECTION=knowledge
+  #         BUCKET=pcm_iwant  SCOPE=sessions  COLLECTION=sessions|session_results
+  #
+  # TWO CONSTRAINTS IF YOU CHOOSE (b):
+  #   1. The shared bucket MUST be created with maxTTL=0. A bucket-level maxTTL caps
+  #      EVERY document's expiry in every scope, silently — the corpus and
+  #      user-knowledge stores write with NO expiry on purpose (durable), and a cap
+  #      would delete them on the bucket's clock with nothing raised anywhere. Audit
+  #      and candidates set 90 days per WRITE and are unaffected either way.
+  #   2. RBAC STAYS FOUR SEPARATE SCOPED CREDENTIALS — one per store, granted at
+  #      `bucket:scope:collection` (Couchbase 7.x supports that granularity), NOT one
+  #      shared bucket-wide superuser. Collapsing them would re-merge the four
+  #      boundaries the separate buckets used to draw, and the user-knowledge one is
+  #      load-bearing (D17: it is the only entity-bearing store). The per-store
+  #      *_USERNAME keys below and *_PASSWORD Secret keys already carry four
+  #      identities; keep them four. `scripts/learning-*-init.sh` provision exactly
+  #      this and take the same names from env.
+  #
+  # -- Couchbase connection string for the learning AUDIT keyspace. EXTERNAL.
   LEARNING_AUDIT_CONNECTION_STRING: "couchbase://couchbase"
   LEARNING_AUDIT_BUCKET: "learning_audit"
+  LEARNING_AUDIT_SCOPE: "_default"
+  LEARNING_AUDIT_COLLECTION: "_default"
   LEARNING_AUDIT_USERNAME: "learning_audit"
   # -- Audit retention floor (90 days): audit_TTL >= max candidate lifetime.
   LEARNING_AUDIT_TTL_SECONDS: "7776000"
-  # -- Couchbase connection string for the learning CANDIDATES bucket. EXTERNAL.
+  # -- Couchbase connection string for the learning CANDIDATES keyspace. EXTERNAL.
   LEARNING_CANDIDATES_CONNECTION_STRING: "couchbase://couchbase"
   LEARNING_CANDIDATES_BUCKET: "learning_candidates"
+  # -- The scope/collection are interpolated into the inbox and promotion-scan N1QL
+  #    AND into the GSIs `scripts/learning-candidates-init.sh` creates. Change them
+  #    together or the scan loses its index (or, worse, reads another scope's rows).
+  LEARNING_CANDIDATES_SCOPE: "_default"
+  LEARNING_CANDIDATES_COLLECTION: "_default"
   LEARNING_CANDIDATES_USERNAME: "learning_candidates"
   # -- Candidate retention (90 days). MUST outlive the review-inbox dwell, or a
   #    candidate expires out from under the reviewer looking at it.
   LEARNING_CANDIDATES_TTL_SECONDS: "7776000"
-  # -- Couchbase connection string for the learning CORPUS bucket. EXTERNAL.
+  # -- Couchbase connection string for the learning CORPUS keyspace. EXTERNAL.
   LEARNING_CORPUS_CONNECTION_STRING: "couchbase://couchbase"
   LEARNING_CORPUS_BUCKET: "learning_corpus"
+  LEARNING_CORPUS_SCOPE: "_default"
+  LEARNING_CORPUS_COLLECTION: "_default"
   LEARNING_CORPUS_USERNAME: "learning_corpus"
   # -- Corpus retention: 0 = NO EXPIRY. A landed artifact and its cross-session
   #    hit_count must outlive every candidate and session. Do not set this.
+  #    (See constraint 1 above: a bucket maxTTL overrides this from underneath.)
   LEARNING_CORPUS_TTL_SECONDS: "0"
+
+  # --- per-user knowledge store (S8/D17) — the ONE entity-bearing keyspace ---
+  # Read by the learning CONSUMER (`UserKnowledgeStoreConfig`, USER_KNOWLEDGE_*), which
+  # auto-commits per-user facts the extractor targets at scope "user". These keys were
+  # missing from this chart entirely, so the consumer fell back to the field defaults —
+  # `couchbase://localhost` with an EMPTY username, which cannot connect in-cluster.
+  #
+  # Its RBAC user is granted this keyspace and NOTHING else, and that grant is the
+  # boundary: this is the only store holding entities (employee ids, names), so it must
+  # not be reachable from the audit/candidate/corpus credentials, sharing a bucket or
+  # not. USER_KNOWLEDGE_PASSWORD comes from the Secret (see below), never from here —
+  # and, unlike the other three store passwords, it is NOT Vault-backed even when
+  # VAULT_ENABLED=true. See the Secret key list below.
+  USER_KNOWLEDGE_CONNECTION_STRING: "couchbase://couchbase"
+  USER_KNOWLEDGE_BUCKET: "user_knowledge"
+  USER_KNOWLEDGE_SCOPE: "_default"
+  USER_KNOWLEDGE_COLLECTION: "_default"
+  USER_KNOWLEDGE_USERNAME: "user_knowledge"
+  # -- Per-user knowledge retention: 0 = NO EXPIRY. A durable per-user fact outlives
+  #    sessions by design. (See constraint 1 above.)
+  USER_KNOWLEDGE_TTL_SECONDS: "0"
 
   # --- observability ---
   # -- OTel service.name / Phoenix project for the learning daemons.
@@ -408,6 +484,20 @@ config:
 #   LEARNING_AUDIT_PASSWORD
 #   LEARNING_CANDIDATES_PASSWORD
 #   LEARNING_CORPUS_PASSWORD
+#   USER_KNOWLEDGE_PASSWORD
+#       The per-user knowledge store's credential. FOUR separate credentials, not one
+#       shared superuser, even when all four keyspaces live in one bucket — this one
+#       guards the only entity-bearing store (D17). ABSENT ⇒ the consumer builds the
+#       store with an empty password and every user-knowledge commit fails at the
+#       cluster on first use.
+#
+#       NOT VAULT-BACKED, unlike its three siblings. `UserKnowledgeStoreConfig` is a
+#       standalone settings surface with no `*_VAULT_PATH` field and no Vault loader, so
+#       USER_KNOWLEDGE_PASSWORD is read from the ENVIRONMENT (i.e. this Secret) and
+#       nothing else — including when VAULT_ENABLED=true, where
+#       LEARNING_{AUDIT,CANDIDATES,CORPUS}_PASSWORD ARE sourced from Vault and this one
+#       silently is not. Turning Vault on does not cover this key; it must still be in
+#       the Secret, and rotating it in Vault alone changes nothing.
 #   REVIEWER_TOKEN
 #       The ONE shared bearer token guarding every inbox route. The reviewer UI
 #       holds it server-side and attaches it on the proxy hop — the browser never

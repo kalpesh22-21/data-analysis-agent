@@ -1,6 +1,6 @@
 """S8 per-user knowledge store + auto-commit stage (D17) — Layer-1.
 
-Covers: provisioning + the D95-style RBAC boundary (denied on other buckets),
+Covers: provisioning + the D95-style RBAC boundary (denied on other keyspaces),
 per-user scoping (no cross-user surface), auto-commit, and the `control="drop"`
 that keeps a user_knowledge candidate out of the review inbox.
 """
@@ -41,19 +41,35 @@ def _ctx() -> StageContext:
 # --- RBAC boundary (D95-style) -----------------------------------------------
 
 
-async def test_store_open_bucket_denies_other_buckets():
-    store = InMemoryUserKnowledgeStore(bucket="user_knowledge")
-    # its own bucket is allowed ...
-    assert store.open_bucket("user_knowledge") is store
-    # ... every other bucket is denied (the scoped RBAC role)
-    for other in ("learning_audit", "learning_candidates", "sessions", "_default"):
+async def test_store_open_keyspace_denies_other_keyspaces():
+    store = InMemoryUserKnowledgeStore(keyspace="`pcm_iwant`.`user`.`knowledge`")
+    # its own keyspace is allowed ...
+    assert store.open_keyspace("`pcm_iwant`.`user`.`knowledge`") is store
+    # ... every other keyspace is denied (the scoped RBAC role). Note the FIRST three:
+    # they share the granted BUCKET and differ only in scope/collection, which is the
+    # shared-bucket layout the guard has to survive. A bucket-name compare would have
+    # admitted all three.
+    for other in (
+        "`pcm_iwant`.`learning`.`audit`",
+        "`pcm_iwant`.`learning`.`candidates`",
+        "`pcm_iwant`.`sessions`.`sessions`",
+        "`pcm_iwant`.`user`.`_default`",
+        "`user_knowledge`.`_default`.`_default`",
+        "`pcm_iwant`",
+    ):
         with pytest.raises(UserKnowledgeAccessError):
-            store.open_bucket(other)
+            store.open_keyspace(other)
 
 
-async def test_store_reports_its_single_granted_bucket():
-    store = InMemoryUserKnowledgeStore(bucket="user_knowledge")
-    assert store.bucket() == "user_knowledge"
+async def test_store_reports_its_single_granted_keyspace():
+    store = InMemoryUserKnowledgeStore(keyspace="`pcm_iwant`.`user`.`knowledge`")
+    assert store.keyspace() == "`pcm_iwant`.`user`.`knowledge`"
+
+
+async def test_default_keyspace_is_the_bucket_per_store_layout():
+    """The shipped default reproduces the pre-scope deployment: the dedicated
+    `user_knowledge` bucket's default scope + collection."""
+    assert InMemoryUserKnowledgeStore().keyspace() == "`user_knowledge`.`_default`.`_default`"
 
 
 # --- per-user scoping --------------------------------------------------------

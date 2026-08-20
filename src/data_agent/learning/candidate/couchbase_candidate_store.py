@@ -1,10 +1,13 @@
 """CouchbaseCandidateStore — the real `CandidateStore` (D101).
 
-Its OWN `Cluster`, authenticated as `learning_candidates_writer` against the dedicated
-`learning_candidates` bucket — a separate RBAC boundary from the session/audit stores. `put`
-is a KV upsert with the candidate TTL; `list_by_status` is a parameterized N1QL query needing
-the provisioned primary index; `touch_scanned`/`stamp_drift` are TTL-preserving sub-document
-writes of the two S9-owned bookkeeping fields.
+Its OWN `Cluster`, authenticated as `learning_candidates_writer` against the configured
+candidates KEYSPACE — a separate RBAC boundary from the session/audit stores. That keyspace is
+`learning_candidates`.`_default`.`_default` by default (the bucket-per-store layout) or a named
+scope in a shared bucket (`pcm_iwant`.`learning`.`candidates`); only configuration differs, and
+every N1QL statement below names all three parts (see `_keyspace`). `put` is a KV upsert with
+the candidate TTL; `list_by_status` is a parameterized N1QL query needing the provisioned
+primary index; `touch_scanned`/`stamp_drift` are TTL-preserving sub-document writes of the two
+S9-owned bookkeeping fields.
 
 Import-guarded (imports without the SDK; constructing raises), gated per public coroutine by
 `CouchbaseConnectGate`, and built through `CouchbaseStoreBase` so `__init__` does no I/O.
@@ -82,13 +85,15 @@ except ImportError:  # pragma: no cover
 
 
 class CouchbaseCandidateStore(CouchbaseStoreBase):
-    """Real `CandidateStore` backed by the dedicated `learning_candidates` bucket."""
+    """Real `CandidateStore` backed by the dedicated candidates keyspace."""
 
     def __init__(self, settings: LearningSettings, cluster: Any = None) -> None:
+        # Set BEFORE `_init_couchbase_store`: with an injected cluster that call binds
+        # handles EAGERLY, and `_bind_collections` below reads `self._settings`.
         self._settings = settings
-        # KV + N1QL over the bucket's default collection = the base's default
-        # `_bind_collections`. No I/O here: with no injected cluster the handles are
-        # built by the first `_ensure_connected()`.
+        # KV + N1QL over the ONE configured collection — see `_bind_collections` for the
+        # KV handle and `_keyspace` for the query side. No I/O here: with no injected
+        # cluster the handles are built by the first `_ensure_connected()`.
         self._init_couchbase_store(
             cluster=cluster,
             connection_string=settings.learning_candidates_connection_string,
@@ -96,6 +101,37 @@ class CouchbaseCandidateStore(CouchbaseStoreBase):
             password=settings.learning_candidates_password,
             bucket=settings.learning_candidates_bucket,
             ttl_seconds=settings.learning_candidates_ttl_seconds,
+        )
+
+    def _bind_collections(self, bucket: Any) -> None:
+        """The ONE candidates collection, from the configured scope + collection.
+
+        Overrides the base's `bucket.default_collection()`. The defaults are
+        `_default`/`_default`, which yields the IDENTICAL handle the base built, so a
+        bucket-per-store deployment is unaffected; a shared-bucket deployment points this
+        at e.g. `pcm_iwant`.`learning`.`candidates` with no code change.
+        """
+        scope = bucket.scope(self._settings.learning_candidates_scope)
+        self._collection = scope.collection(self._settings.learning_candidates_collection)
+
+    def _keyspace(self) -> str:
+        """The THREE-part N1QL keyspace this store may query — never the bucket alone.
+
+        A one-part `` `bucket` `` keyspace means "every scope and collection in this
+        bucket". Under the bucket-per-store layout that happened to be right; in a SHARED
+        bucket it is a silent correctness bug, not a performance one: `list_by_status`
+        would return session documents, audit snapshots and corpus artifacts alongside
+        candidates, and `CandidateEnvelope.from_doc` would either decline them or
+        mis-parse them — and `supersede`, which KV-REMOVES every id its query returns,
+        would delete other stores' documents outright.
+
+        Naming the scope and collection makes the statement mean what the store's RBAC
+        grant means. Same construction as `CouchbaseSessionStore.scan_idle_sessions`.
+        """
+        return (
+            f"`{self._bucket_name}`"
+            f".`{self._settings.learning_candidates_scope}`"
+            f".`{self._settings.learning_candidates_collection}`"
         )
 
     async def put(self, envelope: CandidateEnvelope) -> None:
@@ -157,7 +193,7 @@ class CouchbaseCandidateStore(CouchbaseStoreBase):
             f"c.{column} {direction}" for column in _SORT_KEYS[order_by]
         )
         statement = (
-            f"SELECT c.* FROM `{self._bucket_name}` c "
+            f"SELECT c.* FROM {self._keyspace()} c "
             "WHERE c.status = $status "
             f"ORDER BY {sort_clause} LIMIT $limit"
         )
@@ -216,7 +252,7 @@ class CouchbaseCandidateStore(CouchbaseStoreBase):
         # (data_writer) — avoids needing query_delete on the writer role. A doc
         # already gone (concurrent removal) is a tolerated no-op.
         statement = (
-            f"SELECT META(c).id AS id FROM `{self._bucket_name}` c "
+            f"SELECT META(c).id AS id FROM {self._keyspace()} c "
             "WHERE c.content_hash = $content_hash"
         )
         result = self._cluster.query(

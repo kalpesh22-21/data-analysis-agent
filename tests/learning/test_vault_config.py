@@ -93,14 +93,20 @@ _ALL_FIELDS = (
     ("learning_redis_url", "LEARNING_REDIS_URL"),
     ("learning_audit_connection_string", "LEARNING_AUDIT_CONNECTION_STRING"),
     ("learning_audit_bucket", "LEARNING_AUDIT_BUCKET"),
+    ("learning_audit_scope", "LEARNING_AUDIT_SCOPE"),
+    ("learning_audit_collection", "LEARNING_AUDIT_COLLECTION"),
     ("learning_audit_username", "LEARNING_AUDIT_USERNAME"),
     ("learning_audit_password", "LEARNING_AUDIT_PASSWORD"),
     ("learning_candidates_connection_string", "LEARNING_CANDIDATES_CONNECTION_STRING"),
     ("learning_candidates_bucket", "LEARNING_CANDIDATES_BUCKET"),
+    ("learning_candidates_scope", "LEARNING_CANDIDATES_SCOPE"),
+    ("learning_candidates_collection", "LEARNING_CANDIDATES_COLLECTION"),
     ("learning_candidates_username", "LEARNING_CANDIDATES_USERNAME"),
     ("learning_candidates_password", "LEARNING_CANDIDATES_PASSWORD"),
     ("learning_corpus_connection_string", "LEARNING_CORPUS_CONNECTION_STRING"),
     ("learning_corpus_bucket", "LEARNING_CORPUS_BUCKET"),
+    ("learning_corpus_scope", "LEARNING_CORPUS_SCOPE"),
+    ("learning_corpus_collection", "LEARNING_CORPUS_COLLECTION"),
     ("learning_corpus_username", "LEARNING_CORPUS_USERNAME"),
     ("learning_corpus_password", "LEARNING_CORPUS_PASSWORD"),
     ("learning_extractor_api_key", "LEARNING_EXTRACTOR_API_KEY"),
@@ -108,7 +114,12 @@ _ALL_FIELDS = (
 
 
 def test_every_sensitive_field_is_overridden_from_vault(vault_on) -> None:
-    """All 14 sensitive values come from Vault, each read under its documented key."""
+    """All 20 values come from Vault, each read under its documented key.
+
+    Six of them (`*_SCOPE`/`*_COLLECTION`) are not secret material. They are read from the
+    same KV path anyway because a credential and the keyspace it is granted on are ONE
+    deployment fact — see `load_learning_settings_from_vault`.
+    """
     client = vault_on(_StubVaultClient())
 
     settings = load_learning_settings_from_vault()
@@ -304,3 +315,93 @@ def test_vault_enabled_is_the_same_env_var_on_both_surfaces(
 
     assert LearningSettings().vault_enabled is True
     assert RuntimeSettings().vault_enabled is True
+
+
+# --- (e) Vault cannot walk around the keyspace validator ---------------------
+#
+# The loader ASSIGNS onto an already-constructed settings object, and pydantic does not
+# re-run a `mode="after"` validator on assignment. So `LearningSettings.__init__`'s check
+# saw the ENV values and nothing Vault wrote over them — and `_read_vault_secret` is
+# fail-soft, so an absent or misspelled KV key silently keeps the current value. A KV path
+# holding a scope with no collection beside it therefore produced the unprovisionable
+# `<scope>`.`_default` pair on the PRIMARY production path (every daemon reaches
+# `load_learning_settings_from_vault` through `get_learning_settings()`), while the env-var
+# spelling of the identical typo failed at boot.
+
+
+class _PartialVaultClient(_StubVaultClient):
+    """A Vault whose KV path holds SOME of the keys the loader asks for.
+
+    `absent` names keys the path does not carry. `_read_vault_secret` is fail-soft on a
+    read that raises, which is how a missing key behaves, so this reproduces "the operator
+    set the scope in Vault and never added the collection" — or misspelled it, which is the
+    same thing from the loader's side.
+    """
+
+    def __init__(self, *, absent: frozenset[str], overrides: dict[str, str]) -> None:
+        super().__init__(raise_on=absent)
+        self._overrides = overrides
+
+    def read_kv_secret(self, key: str, path: str) -> _Secret:
+        secret = super().read_kv_secret(key, path)  # records + raises for absent keys
+        return _Secret(self._overrides[key]) if key in self._overrides else secret
+
+
+@pytest.mark.parametrize("group", ["AUDIT", "CANDIDATES", "CORPUS"])
+def test_a_vault_scope_without_its_collection_key_is_refused(vault_on, group: str) -> None:
+    """The blocker: a named scope from Vault + a missing collection key must RAISE.
+
+    Before the loader re-validated, this returned a settings object naming a keyspace
+    Couchbase cannot hold, and the first KV write against it failed with
+    keyspace-not-found — arbitrarily far from the KV path that caused it.
+    """
+    vault_on(
+        _PartialVaultClient(
+            absent=frozenset({f"LEARNING_{group}_COLLECTION"}),
+            overrides={f"LEARNING_{group}_SCOPE": "learning"},
+        )
+    )
+
+    with pytest.raises(ValueError) as exc:
+        load_learning_settings_from_vault()
+
+    # Names the KV key to add, not the one that was set correctly.
+    assert f"LEARNING_{group}_COLLECTION" in str(exc.value)
+
+
+def test_a_complete_vault_keyspace_still_loads(vault_on) -> None:
+    """The shared-bucket deployment this slice exists for must pass the new gate.
+
+    Guards against fixing the blocker with something that refuses any non-default scope:
+    scope AND collection both present is the configuration the loader has to allow.
+    """
+    client = _PartialVaultClient(
+        absent=frozenset(),
+        overrides={
+            "LEARNING_AUDIT_SCOPE": "learning",
+            "LEARNING_AUDIT_COLLECTION": "audit",
+            "LEARNING_CANDIDATES_SCOPE": "learning",
+            "LEARNING_CANDIDATES_COLLECTION": "candidates",
+            "LEARNING_CORPUS_SCOPE": "learning",
+            "LEARNING_CORPUS_COLLECTION": "corpus",
+        },
+    )
+    vault_on(client)
+
+    settings = load_learning_settings_from_vault()
+
+    assert settings.learning_audit_scope == "learning"
+    assert settings.learning_audit_collection == "audit"
+    assert settings.learning_corpus_collection == "corpus"
+
+
+def test_the_default_vault_path_shape_still_loads(vault_on) -> None:
+    """The stub's default `vault:<KEY>` values give every scope AND collection a non-default
+    name, so the re-validation must not fire — the gate rejects one specific PAIR, not
+    "anything that came from Vault"."""
+    vault_on(_StubVaultClient())
+
+    settings = load_learning_settings_from_vault()
+
+    assert settings.learning_audit_scope == "vault:LEARNING_AUDIT_SCOPE"
+    assert settings.learning_audit_collection == "vault:LEARNING_AUDIT_COLLECTION"

@@ -28,17 +28,27 @@ a memory fake + a Couchbase impl — exactly the audit/candidate port shape:
 |---|---|
 | `store.py` | `UserKnowledgeStore` Protocol + `UserKnowledgeAccessError` (the RBAC boundary) |
 | `memory_user_store.py` | `InMemoryUserKnowledgeStore` — Layer-1 fake |
-| `couchbase_user_store.py` | `CouchbaseUserKnowledgeStore` — own `Cluster` authed as `user_knowledge_writer` against its own bucket; import-guarded like `couchbase_audit_store` |
+| `couchbase_user_store.py` | `CouchbaseUserKnowledgeStore` — own `Cluster` authed as `user_knowledge_writer` against its own keyspace (bucket/scope/collection); import-guarded like `couchbase_audit_store` |
 | `config.py` | `UserKnowledgeStoreConfig` — dedicated settings (kept out of the shared `learning/config.py` to avoid a cross-track edit) |
 | `models.py` | `UserKnowledgeRecord` — the committed per-user row |
 
 **RBAC boundary (D95-style), load-bearing because this is the ONE entity-bearing
-store.** The store models a Couchbase RBAC role scoped to exactly one bucket:
-`open_bucket(b)` returns the store iff `b` is the grant, else raises
-`UserKnowledgeAccessError`. `list_for_user(user_id)` is the only read surface and
-is always `user_id`-scoped — no cross-user surface. The Couchbase impl authenticates
-as a bucket-scoped user and its `list_for_user` is a `user_id`-parameterized N1QL
-query.
+store.** The store models a Couchbase RBAC role scoped to exactly one KEYSPACE
+(`bucket`.`scope`.`collection`): `open_keyspace(k)` returns the store iff `k` is the
+grant, else raises `UserKnowledgeAccessError`. `list_for_user(user_id)` is the only read
+surface and is always `user_id`-scoped — no cross-user surface. The Couchbase impl
+authenticates as a keyspace-scoped user and its `list_for_user` is a
+`user_id`-parameterized N1QL query against the three-part keyspace.
+
+> AMENDED (shared-bucket layout). This was originally a BUCKET-scoped grant and
+> `open_bucket(b)`. The deployment may now put all five stores in ONE bucket separated by
+> named scopes (`pcm_iwant`.`user`.`knowledge` beside `pcm_iwant`.`learning`.`audit`),
+> and there a bucket-name comparison is vacuous — it passes for the audit, candidate and
+> corpus keyspaces, i.e. exactly the boundary this guard exists to defend. The guard and
+> the N1QL keyspace are both built from all three parts now. `open_bucket` was renamed,
+> not aliased: a vacuous guard that still looks like a guard is worse than none. The
+> bucket-per-store layout is unchanged — its scope/collection are `_default`/`_default`,
+> which is the same collection `bucket.default_collection()` always returned.
 
 **Idempotency (D17).** `mint_record_id(user_id, candidate_id)` →
 `userknow::<user_id>::<candidate_id>`; a re-commit UPSERTs the same key.
@@ -101,7 +111,8 @@ Payload tolerance: `SchemaEditPatch.from_payload` accepts the fixture shape
 
 ## Tests (Layer-1)
 
-- **User store:** RBAC boundary (`open_bucket` denies every non-granted bucket),
+- **User store:** RBAC boundary (`open_keyspace` denies every non-granted keyspace,
+  including sibling scopes in the SAME bucket),
   per-user scoping (`list_for_user` returns only that user's rows, no cross-user
   surface), deterministic/idempotent record id, auto-commit + `control="drop"`,
   pass-through for non-user targets, doc round-trip.

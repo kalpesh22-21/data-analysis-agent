@@ -12,10 +12,15 @@ import logging
 import os
 import socket
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from data_agent.runtime.config import TRUTHY_ENV_VALUES, _read_vault_secret, vault
+from data_agent.runtime.config import (
+    TRUTHY_ENV_VALUES,
+    _read_vault_secret,
+    check_settings_keyspaces,
+    vault,
+)
 
 # Recognized truthy spellings for the kill-switch (case-insensitive). Anything
 # else (including unset → default) resolves per the rules in `learning_enabled`.
@@ -28,10 +33,16 @@ from data_agent.runtime.config import TRUTHY_ENV_VALUES, _read_vault_secret, vau
 # an operator types against is shared. The marginal import cost is two modules; the
 # learning package already loads far more of `runtime/` than this.
 #
-# The same import carries the Vault plumbing (`vault`, `_read_vault_secret`) for the
-# same reason and in the same direction: one guarded `paycompy` import and one
-# fail-soft KV reader, shared rather than restated, so both planes read secrets with
-# identical semantics. Only inward-to-outward — see the D58c note above.
+# The same import carries the Vault plumbing (`vault`, `_read_vault_secret`) and the
+# Couchbase keyspace validator (`check_settings_keyspaces`) for the same reason and in the
+# same direction: one guarded `paycompy` import, one fail-soft KV reader, and one
+# definition of which scope/collection pairs a store may be pointed at — shared rather
+# than restated, so both planes read secrets and validate keyspaces with identical
+# semantics. The validator in particular has to be ONE function: all five stores bind
+# the same kind of handle, and two copies of "which keyspaces are legal" that drifted
+# would accept a config on one plane that the other refuses. Only inward-to-outward —
+# see the D58c note above; that is why it lives on the runtime side even though this
+# plane has three of the four learning keyspaces.
 _TRUTHY = TRUTHY_ENV_VALUES
 
 
@@ -145,6 +156,33 @@ class LearningSettings(BaseSettings):
     learning_audit_bucket: str = Field(
         "learning_audit", description="Dedicated audit bucket (D95) — separate retention/RBAC clock."
     )
+    # --- KEYSPACE, not just a bucket. Every learning store below carries a
+    # `*_scope`/`*_collection` pair alongside its bucket, because the D95/D101/D48/D17
+    # boundary is a KEYSPACE boundary and Couchbase 7.x can draw it two ways: one bucket
+    # per store (what these defaults describe), or ONE bucket whose named scopes separate
+    # the planes (`pcm_iwant`.`learning`.`audit`, `.sessions`.`sessions`, `.user`.`knowledge`).
+    # The second layout is what a consolidated cluster wants, and it costs nothing here —
+    # `bucket.scope("_default").collection("_default")` is the SAME handle
+    # `bucket.default_collection()` returns, so a deployment that never sets these fields
+    # behaves exactly as it did before they existed.
+    #
+    # These are NOT decorative: the N1QL statements in the candidate/corpus/user stores
+    # interpolate the full three-part keyspace from them. A one-part `FROM `bucket`` in a
+    # SHARED bucket scans every scope in it — see those call sites for what that breaks.
+    learning_audit_scope: str = Field(
+        "_default",
+        description=(
+            "Scope holding the audit collection. `_default` = the bucket's default scope "
+            "(bucket-per-store layout); set it (e.g. `learning`) for a shared bucket."
+        ),
+    )
+    learning_audit_collection: str = Field(
+        "_default",
+        description=(
+            "Collection inside `learning_audit_scope`. `_default` = the bucket's default "
+            "collection; set it (e.g. `audit`) for a shared bucket."
+        ),
+    )
     learning_audit_username: str = Field(
         "", description="RBAC user scoped to learning_audit ONLY (learning_audit_writer)."
     )
@@ -166,6 +204,21 @@ class LearningSettings(BaseSettings):
     )
     learning_candidates_bucket: str = Field(
         "learning_candidates", description="Dedicated candidate-holding bucket (D101)."
+    )
+    learning_candidates_scope: str = Field(
+        "_default",
+        description=(
+            "Scope holding the candidates collection (see `learning_audit_scope`). "
+            "`_default` = the bucket's default scope; set it (e.g. `learning`) for a shared bucket."
+        ),
+    )
+    learning_candidates_collection: str = Field(
+        "_default",
+        description=(
+            "Collection inside `learning_candidates_scope`. `_default` = the bucket's default "
+            "collection; set it (e.g. `candidates`) for a shared bucket. The `list_by_status` / "
+            "`supersede` N1QL keyspaces AND the provisioned GSIs are built from this pair."
+        ),
     )
     learning_candidates_username: str = Field(
         "", description="RBAC user scoped to learning_candidates ONLY (learning_candidates_writer)."
@@ -194,6 +247,43 @@ class LearningSettings(BaseSettings):
     learning_corpus_bucket: str = Field(
         "learning_corpus", description="Dedicated landed-artifact corpus bucket (D48)."
     )
+    learning_corpus_scope: str = Field(
+        "_default",
+        description=(
+            "Scope holding the corpus collection (see `learning_audit_scope`). "
+            "`_default` = the bucket's default scope; set it (e.g. `learning`) for a shared bucket."
+        ),
+    )
+    learning_corpus_collection: str = Field(
+        "_default",
+        description=(
+            "Collection inside `learning_corpus_scope`. `_default` = the bucket's default "
+            "collection; set it (e.g. `corpus`) for a shared bucket. `list_artifacts`' N1QL "
+            "keyspace is built from this pair."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _reject_unprovisionable_keyspaces(self) -> LearningSettings:
+        """Each of the three keyspaces must be one Couchbase can actually hold.
+
+        The three groups are NOT listed here. `check_settings_keyspaces` derives every
+        pair from the fields declared above, so a fourth learning keyspace is guarded by
+        declaring it — the failure mode this repo keeps hitting is a hand-maintained list
+        that the author of the new field forgets to extend.
+
+        `mode="after"` so all six fields are populated: the defect is a RELATIONSHIP
+        between a scope and its collection, not a bad value in either one alone — both
+        `learning` and `_default` are perfectly good names, and only the pair is wrong.
+        See `check_keyspace_pair` for what makes it unprovisionable and why it fails here
+        rather than at the first KV op.
+
+        THIS IS NOT THE ONLY GATE. `load_learning_settings_from_vault` re-runs the same
+        check after its assignments, because a model validator does not re-fire on
+        assignment — see that function.
+        """
+        check_settings_keyspaces(self)
+        return self
     learning_corpus_username: str = Field(
         "", description="RBAC user scoped to learning_corpus ONLY (learning_corpus_writer)."
     )
@@ -531,21 +621,24 @@ class LearningSettings(BaseSettings):
         "application/datascience/iwant_reporting/learning_audit",
         description=(
             "Vault KV path holding the learning_audit Couchbase credentials "
-            "(connection string, bucket, username, password). Empty → use env/default."
+            "(connection string, bucket, scope, collection, username, password). "
+            "Empty → use env/default."
         ),
     )
     learning_candidates_vault_path: str = Field(
         "application/datascience/iwant_reporting/learning_candidates",
         description=(
             "Vault KV path holding the learning_candidates Couchbase credentials "
-            "(connection string, bucket, username, password). Empty → use env/default."
+            "(connection string, bucket, scope, collection, username, password). "
+            "Empty → use env/default."
         ),
     )
     learning_corpus_vault_path: str = Field(
         "application/datascience/iwant_reporting/learning_corpus",
         description=(
             "Vault KV path holding the learning_corpus Couchbase credentials "
-            "(connection string, bucket, username, password). Empty → use env/default."
+            "(connection string, bucket, scope, collection, username, password). "
+            "Empty → use env/default."
         ),
     )
     learning_extractor_api_key_vault_path: str = Field(
@@ -595,7 +688,12 @@ def load_learning_settings_from_vault() -> LearningSettings:
             settings.learning_redis_url,
         )
 
-    # --- learning_audit bucket credentials (D95) ---
+    # --- learning_audit KEYSPACE + credentials (D95) ---
+    # `*_SCOPE`/`*_COLLECTION` are not secret material, and they are read from the same
+    # KV path anyway: a credential and the keyspace it is granted on are ONE deployment
+    # fact, and splitting them across two sources is how a scoped RBAC user ends up
+    # pointed at a collection it has no grant on. `_read_vault_secret` is fail-soft with
+    # a default, so an operator whose KV path predates these keys keeps `_default`.
     if settings.learning_audit_vault_path:
         p = settings.learning_audit_vault_path
         settings.learning_audit_connection_string = _read_vault_secret(
@@ -603,6 +701,12 @@ def load_learning_settings_from_vault() -> LearningSettings:
         )
         settings.learning_audit_bucket = _read_vault_secret(
             vc, "LEARNING_AUDIT_BUCKET", p, settings.learning_audit_bucket
+        )
+        settings.learning_audit_scope = _read_vault_secret(
+            vc, "LEARNING_AUDIT_SCOPE", p, settings.learning_audit_scope
+        )
+        settings.learning_audit_collection = _read_vault_secret(
+            vc, "LEARNING_AUDIT_COLLECTION", p, settings.learning_audit_collection
         )
         settings.learning_audit_username = _read_vault_secret(
             vc, "LEARNING_AUDIT_USERNAME", p, settings.learning_audit_username
@@ -623,6 +727,12 @@ def load_learning_settings_from_vault() -> LearningSettings:
         settings.learning_candidates_bucket = _read_vault_secret(
             vc, "LEARNING_CANDIDATES_BUCKET", p, settings.learning_candidates_bucket
         )
+        settings.learning_candidates_scope = _read_vault_secret(
+            vc, "LEARNING_CANDIDATES_SCOPE", p, settings.learning_candidates_scope
+        )
+        settings.learning_candidates_collection = _read_vault_secret(
+            vc, "LEARNING_CANDIDATES_COLLECTION", p, settings.learning_candidates_collection
+        )
         settings.learning_candidates_username = _read_vault_secret(
             vc, "LEARNING_CANDIDATES_USERNAME", p, settings.learning_candidates_username
         )
@@ -639,6 +749,12 @@ def load_learning_settings_from_vault() -> LearningSettings:
         settings.learning_corpus_bucket = _read_vault_secret(
             vc, "LEARNING_CORPUS_BUCKET", p, settings.learning_corpus_bucket
         )
+        settings.learning_corpus_scope = _read_vault_secret(
+            vc, "LEARNING_CORPUS_SCOPE", p, settings.learning_corpus_scope
+        )
+        settings.learning_corpus_collection = _read_vault_secret(
+            vc, "LEARNING_CORPUS_COLLECTION", p, settings.learning_corpus_collection
+        )
         settings.learning_corpus_username = _read_vault_secret(
             vc, "LEARNING_CORPUS_USERNAME", p, settings.learning_corpus_username
         )
@@ -654,6 +770,25 @@ def load_learning_settings_from_vault() -> LearningSettings:
             settings.learning_extractor_api_key_vault_path,
             settings.learning_extractor_api_key,
         )
+
+    # RE-VALIDATE the keyspaces. Every assignment above went straight onto an
+    # already-constructed model, and pydantic does NOT re-run a `mode="after"` validator on
+    # assignment unless `validate_assignment` is set — which is deliberately off here, since
+    # it would re-validate the whole model on each of the ~20 assignments above, most of
+    # them against half-updated state. So `LearningSettings.__init__`'s check covered the
+    # ENV values and nothing that Vault subsequently wrote over them.
+    #
+    # That gap was the primary production path, not a corner: every daemon entrypoint
+    # reaches this function through `get_learning_settings()`, and `_read_vault_secret` is
+    # FAIL-SOFT — an absent or misspelled KV key keeps the current value. So a KV path
+    # holding LEARNING_AUDIT_SCOPE=learning with no LEARNING_AUDIT_COLLECTION beside it
+    # leaves the collection at its `_default` default and produces exactly the
+    # unprovisionable `learning`.`_default` pair this slice exists to refuse — silently,
+    # surfacing as a keyspace-not-found at the first write. The env-var spelling of that
+    # same typo failed at construction; this makes the Vault spelling fail here.
+    #
+    # Same derived check the constructor runs, so the two cannot drift.
+    check_settings_keyspaces(settings)
 
     return settings
 

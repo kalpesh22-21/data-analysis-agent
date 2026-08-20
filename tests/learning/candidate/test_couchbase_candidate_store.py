@@ -45,8 +45,22 @@ class _FakeCollection:
 
 
 class _FakeBucket:
+    """One collection, reachable through EITHER binding path.
+
+    The learning stores now bind `bucket.scope(...).collection(...)` (defaults
+    `_default`/`_default`, the same handle `default_collection()` returns), so this
+    double answers both and ignores the names — what these tests assert is the store's
+    behaviour against a collection, not which one it picked.
+    """
+
     def __init__(self, collection) -> None:
         self._collection = collection
+
+    def scope(self, _name):
+        return self
+
+    def collection(self, _name):
+        return self._collection
 
     def default_collection(self):
         return self._collection

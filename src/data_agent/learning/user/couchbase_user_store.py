@@ -1,10 +1,15 @@
 """CouchbaseUserKnowledgeStore — the real per-user store (S8, D17; mirrors D95).
 
-Its OWN `Cluster`, authenticated as `user_knowledge_writer` against the dedicated
-`user_knowledge` bucket — a separate RBAC boundary from the session, audit and candidate
-stores. This is the ONE store that holds entity-bearing facts, so the scoped role is
-load-bearing: `open_bucket` refuses any bucket but its grant, and `list_for_user` is a
-`user_id`-parameterized N1QL query with no cross-user surface.
+Its OWN `Cluster`, authenticated as `user_knowledge_writer` against the configured
+user-knowledge KEYSPACE — a separate RBAC boundary from the session, audit and candidate
+stores. That keyspace is `user_knowledge`.`_default`.`_default` by default (the
+bucket-per-store layout) or a named scope in a shared bucket (`pcm_iwant`.`user`.`knowledge`);
+only configuration differs.
+
+This is the ONE store that holds entity-bearing facts, so the scoped role is load-bearing:
+`open_keyspace` refuses any keyspace but its grant, and `list_for_user` is a
+`user_id`-parameterized N1QL query — against the THREE-part keyspace, so it cannot read the
+other stores' scopes when they share a bucket — with no cross-user surface.
 
 Import-guarded (imports without the SDK; constructing raises), gated per public coroutine by
 `CouchbaseConnectGate`, and built through `CouchbaseStoreBase` so `__init__` does no I/O.
@@ -32,13 +37,16 @@ except ImportError:  # pragma: no cover
 
 
 class CouchbaseUserKnowledgeStore(CouchbaseStoreBase):
-    """Real `UserKnowledgeStore` backed by the dedicated `user_knowledge` bucket."""
+    """Real `UserKnowledgeStore` backed by the dedicated user-knowledge keyspace."""
 
     def __init__(self, config: UserKnowledgeStoreConfig, cluster: Any = None) -> None:
+        # Set BEFORE `_init_couchbase_store`: with an injected cluster that call binds
+        # handles EAGERLY, and `_bind_collections` below reads `self._config`.
         self._config = config
-        # KV-only default collection = the base's default `_bind_collections`. A
-        # non-positive TTL means NO expiry here (`ttl_none_when_not_positive`), which
-        # the writes below turn into options built without `expiry=`.
+        # KV reads/writes plus the one per-user N1QL scan — see `_bind_collections` for
+        # the KV handle and `keyspace()` for the query side. A non-positive TTL means NO
+        # expiry here (`ttl_none_when_not_positive`), which the writes below turn into
+        # options built without `expiry=`.
         self._init_couchbase_store(
             cluster=cluster,
             connection_string=config.user_knowledge_connection_string,
@@ -49,14 +57,35 @@ class CouchbaseUserKnowledgeStore(CouchbaseStoreBase):
             ttl_none_when_not_positive=True,
         )
 
-    def bucket(self) -> str:
-        return self._bucket_name
+    def _bind_collections(self, bucket: Any) -> None:
+        """The ONE knowledge collection, from the configured scope + collection.
 
-    def open_bucket(self, bucket: str) -> CouchbaseUserKnowledgeStore:
-        if bucket != self._bucket_name:
+        Overrides the base's `bucket.default_collection()`. The defaults are
+        `_default`/`_default`, which yields the IDENTICAL handle the base built, so a
+        bucket-per-store deployment is unaffected; a shared-bucket deployment points this
+        at e.g. `pcm_iwant`.`user`.`knowledge` with no code change.
+        """
+        scope = bucket.scope(self._config.user_knowledge_scope)
+        self._collection = scope.collection(self._config.user_knowledge_collection)
+
+    def keyspace(self) -> str:
+        """The single THREE-part keyspace this store's RBAC role is granted.
+
+        Backtick-quoted so it can be interpolated straight into N1QL and compared as one
+        string by `open_keyspace`. ONE definition, so the guard and the query can never
+        disagree about what this store is allowed to touch.
+        """
+        return (
+            f"`{self._bucket_name}`"
+            f".`{self._config.user_knowledge_scope}`"
+            f".`{self._config.user_knowledge_collection}`"
+        )
+
+    def open_keyspace(self, keyspace: str) -> CouchbaseUserKnowledgeStore:
+        if keyspace != self.keyspace():
             raise UserKnowledgeAccessError(
-                f"user_knowledge_writer is scoped to {self._bucket_name!r}; "
-                f"access to {bucket!r} is denied"
+                f"user_knowledge_writer is scoped to {self.keyspace()}; "
+                f"access to {keyspace} is denied"
             )
         return self
 
@@ -74,8 +103,14 @@ class CouchbaseUserKnowledgeStore(CouchbaseStoreBase):
         self, user_id: str, *, limit: int = 100
     ) -> list[UserKnowledgeRecord]:
         await self._ensure_connected()
+        # THREE-part keyspace, never the bucket alone. A one-part `` `bucket` `` means
+        # "every scope and collection in this bucket": in a SHARED bucket this scan would
+        # read the audit, candidate and corpus scopes — and the session scope — and hand
+        # whatever it found to `UserKnowledgeRecord.from_doc`. That is precisely the
+        # cross-store surface the scoped RBAC role exists to remove (D17), so the guard
+        # and the statement are built from the SAME `keyspace()`.
         statement = (
-            f"SELECT r.* FROM `{self._bucket_name}` r "
+            f"SELECT r.* FROM {self.keyspace()} r "
             "WHERE r.user_id = $user_id "
             "ORDER BY r.committed_at ASC LIMIT $limit"
         )

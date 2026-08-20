@@ -51,19 +51,32 @@ def _record(user_id: str, rid: str) -> UserKnowledgeRecord:
 # --- user-store RBAC boundary -------------------------------------------------
 
 
-def test_user_store_denies_any_bucket_but_its_grant():
-    """The RBAC role is scoped to ONE bucket; open_bucket raises for anything else —
-    the store cannot be steered to touch the audit / candidate / global buckets."""
-    store = InMemoryUserKnowledgeStore(bucket="user_knowledge")
-    assert store.open_bucket("user_knowledge") is store
-    for forbidden in ("learning_audit", "learning_candidates", "global_knowledge", "neo4j"):
+def test_user_store_denies_any_keyspace_but_its_grant():
+    """The RBAC role is scoped to ONE keyspace; open_keyspace raises for anything else —
+    the store cannot be steered to touch the audit / candidate / global keyspaces.
+
+    The grant is compared on all THREE parts (bucket.scope.collection). That matters most
+    in the SHARED-bucket layout exercised here: every forbidden keyspace below sits in the
+    SAME bucket as the grant, so a bucket-name compare — what this guard used to do —
+    would have returned the store for all of them and defended nothing.
+    """
+    store = InMemoryUserKnowledgeStore(keyspace="`pcm_iwant`.`user`.`knowledge`")
+    assert store.open_keyspace("`pcm_iwant`.`user`.`knowledge`") is store
+    for forbidden in (
+        "`pcm_iwant`.`learning`.`audit`",
+        "`pcm_iwant`.`learning`.`candidates`",
+        "`pcm_iwant`.`learning`.`corpus`",
+        "`pcm_iwant`.`sessions`.`sessions`",
+        "`pcm_iwant`.`user`.`shadow`",
+        "`global_knowledge`.`_default`.`_default`",
+    ):
         with pytest.raises(UserKnowledgeAccessError):
-            store.open_bucket(forbidden)
+            store.open_keyspace(forbidden)
 
 
 async def test_user_store_read_never_crosses_users():
     """list_for_user returns ONLY the requested user's rows — no cross-user surface,
-    even though all users share the one bucket."""
+    even though all users share the one keyspace."""
     store = InMemoryUserKnowledgeStore()
     await store.commit(_record("user-A", "userknow::user-A::c1"))
     await store.commit(_record("user-A", "userknow::user-A::c2"))

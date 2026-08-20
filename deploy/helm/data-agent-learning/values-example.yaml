@@ -48,6 +48,13 @@ config:
   COUCHBASE_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
   COUCHBASE_USERNAME: "data_agent"
   COUCHBASE_BUCKET: "data_agent"
+  # The sweeper scans a THREE-part session keyspace, so all five keys must match the
+  # data-agent release — a matching bucket with a mismatched scope finds no sessions and
+  # reports no error. In the consolidated layout: COUCHBASE_BUCKET "pcm_iwant" +
+  # COUCHBASE_SCOPE "sessions", set identically in BOTH charts.
+  COUCHBASE_SCOPE: "_default"
+  COUCHBASE_SESSIONS_COLLECTION: "sessions"
+  COUCHBASE_RESULTS_COLLECTION: "session_results"
 
   NEO4J_URL: "bolt://neo4j.data.svc.cluster.local:7687"
   NEO4J_USERNAME: "neo4j"
@@ -112,18 +119,42 @@ config:
   # Leave at 0.0 until you have measured the score distribution in your corpus.
   LEARNING_REVIEW_SCORE_CUTOFF: "0.0"
 
+  # Bucket-per-store layout: scope/collection stay "_default", which is the same
+  # collection a bare bucket handle always resolved to. For ONE shared bucket set e.g.
+  # BUCKET=pcm_iwant with SCOPE=learning/user and COLLECTION=audit/candidates/corpus/
+  # knowledge — and create that bucket with maxTTL=0, or the TTL-0 corpus and
+  # user-knowledge documents get capped and silently deleted. See values.yaml for the
+  # full note, including why the four credentials must stay four.
   LEARNING_AUDIT_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
   LEARNING_AUDIT_BUCKET: "learning_audit"
+  LEARNING_AUDIT_SCOPE: "_default"
+  LEARNING_AUDIT_COLLECTION: "_default"
   LEARNING_AUDIT_USERNAME: "learning_audit"
   LEARNING_AUDIT_TTL_SECONDS: "7776000"
   LEARNING_CANDIDATES_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
   LEARNING_CANDIDATES_BUCKET: "learning_candidates"
+  LEARNING_CANDIDATES_SCOPE: "_default"
+  LEARNING_CANDIDATES_COLLECTION: "_default"
   LEARNING_CANDIDATES_USERNAME: "learning_candidates"
   LEARNING_CANDIDATES_TTL_SECONDS: "7776000"
   LEARNING_CORPUS_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
   LEARNING_CORPUS_BUCKET: "learning_corpus"
+  LEARNING_CORPUS_SCOPE: "_default"
+  LEARNING_CORPUS_COLLECTION: "_default"
   LEARNING_CORPUS_USERNAME: "learning_corpus"
   LEARNING_CORPUS_TTL_SECONDS: "0"
+
+  # The per-user knowledge store (S8/D17) — the ONE entity-bearing keyspace, with its
+  # OWN credential. Required by the learning consumer; without it the store falls back
+  # to couchbase://localhost with an empty username. Note USER_KNOWLEDGE_PASSWORD is
+  # read from the Secret ONLY — it is not Vault-backed the way the other three store
+  # passwords are, so VAULT_ENABLED=true does not cover it.
+  USER_KNOWLEDGE_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
+  USER_KNOWLEDGE_BUCKET: "user_knowledge"
+  USER_KNOWLEDGE_SCOPE: "_default"
+  USER_KNOWLEDGE_COLLECTION: "_default"
+  USER_KNOWLEDGE_USERNAME: "user_knowledge"
+  USER_KNOWLEDGE_TTL_SECONDS: "0"
 
   LEARNING_SERVICE_NAME: "learning-loop"
   # The learning spans carry the analyst's question, SQL and evidence quotes.
@@ -148,6 +179,7 @@ config:
 #     --from-literal=LEARNING_AUDIT_PASSWORD=... \
 #     --from-literal=LEARNING_CANDIDATES_PASSWORD=... \
 #     --from-literal=LEARNING_CORPUS_PASSWORD=... \
+#     --from-literal=USER_KNOWLEDGE_PASSWORD=... \
 #     --from-literal=REVIEWER_TOKEN=... \
 #     ...plus the data-agent-only keys (OPENAI_API_KEY, MCP_SERVICE_KEY, ...)
 # Unused keys in a shared Secret are harmless: each pod only reads what it needs.

@@ -16,8 +16,9 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from data_agent.runtime.observability.tracing import DEFAULT_DROP_SPAN_NAMES
@@ -59,6 +60,55 @@ _logger = logging.getLogger(__name__)
 # fit seam), never to the shared estimator, so trail-compaction math is unchanged.
 _REQUEST_BUDGET_HEADROOM = 0.8
 
+# The name Couchbase gives the default scope AND the default collection. Spelled ONCE,
+# here, for every settings surface that names a keyspace; the claim that it is genuinely
+# the SDK's own name for both is pinned against `Scope.default_name()` /
+# `Collection.default_name()` in `tests/runtime/test_couchbase_keyspace_binding.py`. A
+# plain literal rather than an SDK import, because every settings class that uses it must
+# stay importable with no `couchbase` package installed.
+_DEFAULT_KEYSPACE_PART = "_default"
+
+
+def check_keyspace_pair(
+    scope: str, collection: str, *, scope_env: str, collection_env: str
+) -> None:
+    """Refuse a scope/collection pair that names a keyspace Couchbase CANNOT hold.
+
+    Shared plumbing, like `TRUTHY_ENV_VALUES` and `_read_vault_secret` above: every
+    Couchbase-backed store on either plane is pointed at a `bucket`.`scope`.`collection`,
+    and there must be exactly ONE definition of which of those triples are legal. It lives
+    on this side because the shared direction only runs inward-to-outward.
+
+    Only the `_default` SCOPE has a `_default` COLLECTION. A named scope is created empty,
+    so `sessions`.`_default` is a keyspace that can be spelled but never provisioned — and
+    nothing downstream would say so: `bucket.scope("learning").collection("_default")` is
+    a lazily-resolved handle that constructs happily and fails at the FIRST operation with
+    a keyspace-not-found, arbitrarily far from the misconfiguration. The provisioning
+    scripts make it worse: they create the scope and then skip collection creation for the
+    `_default` name, so provisioning reports success.
+
+    That combination is reachable by ordinary typo. Every settings surface here is
+    `extra="ignore"`, so a misspelled `COUCHBASE_SESSIONS_COLLECTIION=sessions` is
+    DISCARDED in silence, the collection falls back to its `_default` default, and the
+    scope — spelled right — makes the pair unprovisionable. Failing at construction turns
+    that into a boot-time error naming the variable to fix.
+
+    The REVERSE is legal and stays allowed: `_default`.`sessions` is an ordinary named
+    collection in the default scope, and it is the SHIPPED DEFAULT of the session store
+    below — a rule that rejected it would refuse this file's own defaults.
+    """
+    if scope != _DEFAULT_KEYSPACE_PART and collection == _DEFAULT_KEYSPACE_PART:
+        raise ValueError(
+            f"{scope_env}={scope!r} names a non-default scope, but {collection_env} is "
+            f"{_DEFAULT_KEYSPACE_PART!r}. A named scope has no {_DEFAULT_KEYSPACE_PART!r} "
+            f"collection, so that keyspace cannot exist. Set {collection_env} to the "
+            f"collection's real name (check for a typo in {collection_env} — these "
+            f"settings ignore unknown variables, so a misspelled one is dropped silently), "
+            f"or leave {scope_env} at {_DEFAULT_KEYSPACE_PART!r} for the "
+            "bucket-per-store layout."
+        )
+
+
 _DEFAULT_NEO4J_DATABASE = "neo4j"
 
 
@@ -72,6 +122,72 @@ def _neo4j_database_or_default(value: str) -> str:
     normalised to what "not configured" means everywhere else.
     """
     return value.strip() or _DEFAULT_NEO4J_DATABASE
+
+
+def keyspace_pairs(settings: Any) -> list[tuple[str, str]]:
+    """DERIVE every (scope field, collection field) pair a settings class declares.
+
+    Hand-maintained lists of "the keyspaces to check" are how this repo has shipped the
+    same defect repeatedly: the person who adds `learning_metrics_scope` without a
+    validator entry is the same person who would have had to remember to add it. So
+    nothing here is named. A field ending `_scope` is paired with EVERY field named
+    `<its prefix>_*_collection` or `<its prefix>_collection`, and a pair discovered this
+    way is checked whether or not anyone thought to write it down.
+
+    One scope, MANY collections is deliberate and not a quirk: the session store binds
+    `sessions` and `session_results` out of one `couchbase_scope`, so a scope named
+    without renaming BOTH leaves one of them unprovisionable. Keying on the scope alone
+    would have covered that store once and missed exactly that case.
+
+    A `*_scope` field with NO collection sibling yields no pairs and is silently skipped —
+    that is a field about some other kind of scope (an OAuth grant, say), not a Couchbase
+    keyspace, and this must not invent a rule for it.
+    """
+    # Read `model_fields` off the CLASS: pydantic 2.11 deprecates the instance attribute.
+    # Accepting a class as well as an instance keeps this usable from a test that wants the
+    # pair list without constructing anything.
+    model = settings if isinstance(settings, type) else type(settings)
+    fields = list(model.model_fields)
+    pairs: list[tuple[str, str]] = []
+    for scope_field in fields:
+        if not scope_field.endswith("_scope"):
+            continue
+        prefix = scope_field[: -len("_scope")]
+        pairs.extend(
+            (scope_field, name)
+            for name in fields
+            if name.endswith("_collection") and name.startswith(f"{prefix}_")
+        )
+    return pairs
+
+
+def check_settings_keyspaces(settings: Any) -> None:
+    """Run `check_keyspace_pair` over every pair `keyspace_pairs` derives from *settings*.
+
+    THE one entry point, called from two places that must never disagree: each settings
+    class's `@model_validator(mode="after")`, and `load_learning_settings_from_vault`.
+
+    That second caller is not belt-and-braces, it is the PRIMARY production path. The Vault
+    loader assigns onto an already-constructed settings object, and pydantic does not
+    re-run a model validator on assignment unless `validate_assignment` is set — which none
+    of these classes set, and turning it on would re-validate the whole model on every one
+    of the loader's ~20 assignments, most of them against half-updated state. `_read_vault_secret`
+    is fail-soft by design, so a KV path holding a scope but missing (or misspelling) its
+    collection key silently produces the very pair this refuses. Env-var typos were caught
+    at construction; without this call the Vault spelling of the same typo reached a live
+    cluster and failed at the first operation instead.
+
+    The env var name is derived from the field name (upper-cased), which is exactly the
+    mapping pydantic-settings uses to populate it — so the message names the variable the
+    operator actually set, on every surface, with nothing to keep in sync.
+    """
+    for scope_field, collection_field in keyspace_pairs(settings):
+        check_keyspace_pair(
+            getattr(settings, scope_field),
+            getattr(settings, collection_field),
+            scope_env=scope_field.upper(),
+            collection_env=collection_field.upper(),
+        )
 
 
 class _HydratorKillSwitchSettings(BaseSettings):
@@ -316,6 +432,24 @@ class RuntimeSettings(BaseSettings):
         "session_results",
         description="Collection name for full (non-preview) tool results, keyed by UUID.",
     )
+
+    @model_validator(mode="after")
+    def _reject_unprovisionable_keyspaces(self) -> RuntimeSettings:
+        """BOTH session keyspaces must be ones Couchbase can actually hold.
+
+        TWO pairs here, not one: the store binds `sessions` and `session_results` from the
+        SAME scope, so a scope named without renaming BOTH collections leaves one of them
+        unprovisionable — and the one that breaks would be whichever the next request
+        happened to touch. Neither pair is named in this method; `check_settings_keyspaces`
+        DERIVES both from the fields declared above, so a third collection added to this
+        scope is guarded the moment it is declared.
+
+        `mode="after"` so the fields are populated: the defect is a RELATIONSHIP between a
+        scope and a collection, not a bad value in either alone. See `check_keyspace_pair`
+        for why it must fail here and not at the first KV op.
+        """
+        check_settings_keyspaces(self)
+        return self
 
     # --- Observability (D23/D24/D25, Phoenix/OTLP — wired in app.py) ---
     # `app.py::create_app` calls `configure_tracing(otlp_endpoint=..., service_name=...,

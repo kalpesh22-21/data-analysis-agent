@@ -1,7 +1,9 @@
 """CouchbaseAuditStore — the real `AuditStore` (D95, §4.2).
 
-Its OWN `Cluster`, authenticated as `learning_audit_writer` against the dedicated
-`learning_audit` bucket — a separate RBAC boundary and retention clock from the session store.
+Its OWN `Cluster`, authenticated as `learning_audit_writer` against the configured audit
+KEYSPACE — a separate RBAC boundary and retention clock from the session store. That keyspace
+is `learning_audit`.`_default`.`_default` by default (the bucket-per-store layout) or a named
+scope in a shared bucket (`pcm_iwant`.`learning`.`audit`); only configuration differs.
 KV-only: `snapshot` upserts with the audit TTL set FRESH on every write (the audit clock is
 independent, unlike the session transitions that `preserve_expiry`), and `read` returns `None`
 on a missing document.
@@ -34,13 +36,16 @@ except ImportError:  # pragma: no cover
 
 
 class CouchbaseAuditStore(CouchbaseStoreBase):
-    """Real `AuditStore` backed by the dedicated `learning_audit` bucket."""
+    """Real `AuditStore` backed by the dedicated audit keyspace (bucket/scope/collection)."""
 
     def __init__(self, settings: LearningSettings, cluster: Any = None) -> None:
+        # Set BEFORE `_init_couchbase_store`: with an injected cluster that call binds
+        # handles EAGERLY, and `_bind_collections` below reads `self._settings`.
         self._settings = settings
-        # KV-only, default scope/collection (no GSI needed — §4.1) = the base's
-        # default `_bind_collections`. No I/O here: with no injected cluster the
-        # handles are built by the first `_ensure_connected()`.
+        # KV-only (the loop reads evidence + verdicts by key; the §4.1 GSIs exist for
+        # human queries, not for this client), but the ONE collection it binds now comes
+        # from the configured scope/collection — see `_bind_collections`. No I/O here:
+        # with no injected cluster the handles are built by the first `_ensure_connected()`.
         self._init_couchbase_store(
             cluster=cluster,
             connection_string=settings.learning_audit_connection_string,
@@ -57,6 +62,18 @@ class CouchbaseAuditStore(CouchbaseStoreBase):
         # accumulates — the composable-blueprint question is answered by months of rows,
         # not by 90 days of them.
         self._judgement_ttl = couchbase_ttl(settings.learning_judge_record_ttl_seconds)
+
+    def _bind_collections(self, bucket: Any) -> None:
+        """The ONE audit collection, from the configured scope + collection.
+
+        Overrides the base's `bucket.default_collection()` so this store reaches either
+        layout by configuration: the defaults are `_default`/`_default`, which yields the
+        IDENTICAL handle the base built, and a shared-bucket deployment points it at e.g.
+        `pcm_iwant`.`learning`.`audit` without touching this code. Same seam
+        `CouchbaseSessionStore` uses for its two collections.
+        """
+        scope = bucket.scope(self._settings.learning_audit_scope)
+        self._collection = scope.collection(self._settings.learning_audit_collection)
 
     def mint_evidence_ref(self, session_id: str) -> str:
         return mint_evidence_ref(session_id)
@@ -75,7 +92,7 @@ class CouchbaseAuditStore(CouchbaseStoreBase):
     async def record_judgement(self, record: JudgeRecord) -> None:
         """Upsert one coverage judgement under its content-derived key.
 
-        Same collection and RBAC boundary as the evidence snapshots — the `record_type`
+        Same keyspace and RBAC boundary as the evidence snapshots — the `record_type`
         discriminator keeps the two families apart in N1QL — but its OWN, much longer TTL.
         DELIBERATELY NOT swallowed: the caller drops a candidate only if this returns. Note what that
         does not guarantee — a plain upsert acks from the managed cache, and persistence is

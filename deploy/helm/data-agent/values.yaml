@@ -127,15 +127,35 @@ config:
   # -- Model context window (tokens) the runtime plans against.
   MODEL_CONTEXT_WINDOW: "128000"
   # -- Couchbase connection string (primary session store). EXTERNAL.
-  #    SHARED WITH THE LEARNING CHART: the learning sweeper scans THIS bucket for
+  #    SHARED WITH THE LEARNING CHART: the learning sweeper scans THIS KEYSPACE for
   #    idle sessions, so `data-agent-learning` must point at the same cluster,
-  #    bucket and credentials. A mismatch is silent — the sweeper just never finds
-  #    a session to learn from.
+  #    credentials and — since the sweeper builds a three-part
+  #    `bucket`.`scope`.`collection` for its N1QL scan — the same bucket, scope AND
+  #    sessions collection. A mismatch in ANY of the four is silent: the sweeper just
+  #    never finds a session to learn from. Changing the scope/collection below
+  #    without changing them on the learning side is exactly that failure.
   COUCHBASE_CONNECTION_STRING: "couchbase://couchbase"
   # -- Couchbase username.
   COUCHBASE_USERNAME: "data_agent"
   # -- Couchbase bucket for sessions.
   COUCHBASE_BUCKET: "data_agent"
+  # -- Scope + the two collections inside it. The session store binds
+  #    `bucket.scope(SCOPE).collection(...)`, and `_default` is the same handle
+  #    `bucket.default_collection()` returns — so leaving SCOPE at "_default" is
+  #    byte-identical to a deployment predating these keys.
+  #    Set them for a CONSOLIDATED bucket, where every store lives in one bucket
+  #    separated by named scopes, e.g.
+  #      COUCHBASE_BUCKET: "pcm_iwant"
+  #      COUCHBASE_SCOPE: "sessions"
+  #    alongside the learning chart's `learning` and `user` scopes. Provisioning must
+  #    create the scope + BOTH collections and grant this credential on them; the
+  #    shared bucket must also be created with maxTTL=0 (see the learning chart's
+  #    values.yaml for why — the durable corpus/user-knowledge docs are capped by it).
+  COUCHBASE_SCOPE: "_default"
+  # -- Session documents (`session::<id>`), and the D46 full tool results
+  #    (`result::<uuid>`) the preview shape points at. TWO collections, one scope.
+  COUCHBASE_SESSIONS_COLLECTION: "sessions"
+  COUCHBASE_RESULTS_COLLECTION: "session_results"
   # -- OTLP traces endpoint. Empty disables OTLP export.
   OTLP_ENDPOINT: ""
   # -- Service name reported to the OTLP collector.

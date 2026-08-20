@@ -1,7 +1,10 @@
 """CouchbaseBlueprintCorpus — the DURABLE `BlueprintCorpus` (Wave 3b-(i), D48).
 
-Its OWN `Cluster`, authenticated as `learning_corpus_writer` against the dedicated
-`learning_corpus` bucket — a separate RBAC boundary from the session/audit/candidate stores.
+Its OWN `Cluster`, authenticated as `learning_corpus_writer` against the configured corpus
+KEYSPACE — a separate RBAC boundary from the session/audit/candidate stores. That keyspace is
+`learning_corpus`.`_default`.`_default` by default (the bucket-per-store layout) or a named
+scope in a shared bucket (`pcm_iwant`.`learning`.`corpus`); only configuration differs, and the
+one N1QL scan below names all three parts (see `_keyspace`).
 It also duck-types the S9 `HitCountReader`/`RecurrenceCountReader` ports, so the scheduler
 and the dedup stage read one source of truth.
 
@@ -40,7 +43,7 @@ except ImportError:  # pragma: no cover
 
 
 def _doc_id(canonical_key: str) -> str:
-    """The KV doc id for an artifact — namespaced so the corpus bucket can be
+    """The KV doc id for an artifact — namespaced so the corpus collection can be
     inspected/co-located cleanly. `canonical_key` is a `sha256:`-prefixed digest
     (well under Couchbase's 250-byte id limit)."""
     return f"corpus::{canonical_key}"
@@ -68,7 +71,7 @@ def _to_doc(artifact: CorpusArtifact) -> dict[str, Any]:
 
 
 class CouchbaseBlueprintCorpus(CouchbaseStoreBase):
-    """Real `BlueprintCorpus` backed by the dedicated `learning_corpus` bucket.
+    """Real `BlueprintCorpus` backed by the dedicated corpus keyspace.
 
     Also duck-types the S9 `HitCountReader` port, so the promotion scheduler reads the SAME
     durable artifacts the S6 stage seeds and increments — one source of truth for the
@@ -76,10 +79,13 @@ class CouchbaseBlueprintCorpus(CouchbaseStoreBase):
     """
 
     def __init__(self, settings: LearningSettings, cluster: Any = None) -> None:
+        # Set BEFORE `_init_couchbase_store`: with an injected cluster that call binds
+        # handles EAGERLY, and `_bind_collections` below reads `self._settings`.
         self._settings = settings
-        # KV-only default collection = the base's default `_bind_collections`. A
-        # non-positive TTL means NO expiry here (`ttl_none_when_not_positive`), which
-        # `seed_artifact` turns into `InsertOptions()` with no `expiry=`.
+        # KV for every hot path plus ONE N1QL fallback scan — see `_bind_collections`
+        # for the KV handle and `_keyspace` for the query side. A non-positive TTL means
+        # NO expiry here (`ttl_none_when_not_positive`), which `seed_artifact` turns into
+        # `InsertOptions()` with no `expiry=`.
         self._init_couchbase_store(
             cluster=cluster,
             connection_string=settings.learning_corpus_connection_string,
@@ -88,6 +94,35 @@ class CouchbaseBlueprintCorpus(CouchbaseStoreBase):
             bucket=settings.learning_corpus_bucket,
             ttl_seconds=settings.learning_corpus_ttl_seconds,
             ttl_none_when_not_positive=True,
+        )
+
+    def _bind_collections(self, bucket: Any) -> None:
+        """The ONE corpus collection, from the configured scope + collection.
+
+        Overrides the base's `bucket.default_collection()`. The defaults are
+        `_default`/`_default`, which yields the IDENTICAL handle the base built, so a
+        bucket-per-store deployment is unaffected; a shared-bucket deployment points this
+        at e.g. `pcm_iwant`.`learning`.`corpus` with no code change.
+        """
+        scope = bucket.scope(self._settings.learning_corpus_scope)
+        self._collection = scope.collection(self._settings.learning_corpus_collection)
+
+    def _keyspace(self) -> str:
+        """The THREE-part N1QL keyspace `list_artifacts` scans — never the bucket alone.
+
+        A one-part `` `bucket` `` keyspace means "every scope and collection in this
+        bucket". In a SHARED bucket that turns the fallback scan into a read of the
+        session, audit and candidate documents too — every one of which
+        `CorpusArtifact.from_doc` would try to interpret, and whose `intent` the caller
+        would then EMBED and compare against. The dedup stage's near-miss decision would
+        be made against documents that are not artifacts at all. Naming the scope and
+        collection makes the statement mean what the store's RBAC grant means; same
+        construction as `CouchbaseSessionStore.scan_idle_sessions`.
+        """
+        return (
+            f"`{self._bucket_name}`"
+            f".`{self._settings.learning_corpus_scope}`"
+            f".`{self._settings.learning_corpus_collection}`"
         )
 
     async def get_by_canonical_key(self, canonical_key: str) -> CorpusArtifact | None:
@@ -127,7 +162,7 @@ class CouchbaseBlueprintCorpus(CouchbaseStoreBase):
         #
         # `create_parents=True` is LOAD-BEARING here in a way it is not for `hit_count`.
         # Every artifact seeded before this slice has NO `recurrence_count` path at all
-        # and the corpus bucket is durable and never migrated, so a counter mutation
+        # and the corpus collection is durable and never migrated, so a counter mutation
         # against a legacy document would otherwise fail on a missing path. With the flag
         # the path is created and initialized to the delta, which is the correct starting
         # value for "this is the first soft sighting we have recorded".
@@ -174,7 +209,7 @@ class CouchbaseBlueprintCorpus(CouchbaseStoreBase):
         # remains as the FAIL-OPEN fallback for a deployment with no graph configured
         # (or a graph that is transiently unreachable) — the loop must keep learning
         # when a read fails, and degraded-but-running beats stopped.
-        statement = f"SELECT c.* FROM `{self._bucket_name}` c"
+        statement = f"SELECT c.* FROM {self._keyspace()} c"
         result = self._cluster.query(statement, QueryOptions())
         out: list[CorpusArtifact] = []
         async for row in result:

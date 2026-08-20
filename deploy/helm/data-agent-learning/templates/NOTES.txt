@@ -90,7 +90,8 @@ This chart renders NO Secret. Every workload mounts
 (vault / external-secrets / sealed-secrets) with COUCHBASE_PASSWORD,
 NEO4J_PASSWORD, TOKEN_ISSUER_API_KEY, EMBEDDING_API_KEY,
 LEARNING_EXTRACTOR_API_KEY, LEARNING_AUDIT_PASSWORD,
-LEARNING_CANDIDATES_PASSWORD, LEARNING_CORPUS_PASSWORD and REVIEWER_TOKEN.
+LEARNING_CANDIDATES_PASSWORD, LEARNING_CORPUS_PASSWORD, USER_KNOWLEDGE_PASSWORD and
+REVIEWER_TOKEN.
 Verify it exists — a missing Secret wedges the pods in
 CreateContainerConfigError rather than failing loudly:
 

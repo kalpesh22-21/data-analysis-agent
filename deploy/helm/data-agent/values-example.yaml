@@ -55,6 +55,14 @@ config:
   COUCHBASE_CONNECTION_STRING: "couchbases://couchbase.data.svc.cluster.local"
   COUCHBASE_USERNAME: "data_agent"
   COUCHBASE_BUCKET: "data_agent"
+  # The session keyspace is bucket + scope + collection. "_default" is the same
+  # collection a bare bucket handle always resolved to. For ONE consolidated bucket use
+  # COUCHBASE_BUCKET: "pcm_iwant" with COUCHBASE_SCOPE: "sessions". The learning chart
+  # MUST be given the identical bucket/scope/sessions-collection or its sweeper scans a
+  # keyspace with no sessions in it and reports nothing to learn — silently.
+  COUCHBASE_SCOPE: "_default"
+  COUCHBASE_SESSIONS_COLLECTION: "sessions"
+  COUCHBASE_RESULTS_COLLECTION: "session_results"
 
   OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4317"
   OTLP_SERVICE_NAME: "data-agent-runtime"

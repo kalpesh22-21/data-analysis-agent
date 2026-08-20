@@ -309,8 +309,22 @@ class _FakeCluster:
 
 
 class _FakeBucket:
+    """One collection, reachable through EITHER binding path.
+
+    The learning stores now bind `bucket.scope(...).collection(...)` (defaults
+    `_default`/`_default`, the same handle `default_collection()` returns), so this
+    double answers both and ignores the names — what these tests assert is the store's
+    behaviour against a collection, not which one it picked.
+    """
+
     def __init__(self, collection) -> None:
         self._collection = collection
+
+    def scope(self, _name):
+        return self
+
+    def collection(self, _name):
+        return self._collection
 
     def default_collection(self):
         return self._collection
@@ -324,20 +338,51 @@ def _cb_store():
 
 
 @pytestmark_cb
-async def test_default_n1ql_is_byte_identical_to_the_pre_rotation_statement():
-    """The inbox/archive query must not change at all — a sort key is interpolated
-    into the statement, so this pins that the DEFAULT interpolation is the same text
-    that shipped before the rotation existed."""
+async def test_default_n1ql_pins_the_whole_inbox_archive_statement():
+    """The inbox/archive query is pinned WHOLE — a sort key and the keyspace are both
+    interpolated, so this is the guard that neither drifts unnoticed.
+
+    The keyspace is now THREE parts. Against the default settings that is
+    ``learning_candidates`.`_default`.`_default``, which is what a bare
+    ``learning_candidates`` already meant: N1QL resolves a one-part keyspace to the
+    bucket's default scope + collection, and `CREATE PRIMARY INDEX ON `learning_candidates``
+    provisions the index on that same collection. So the TEXT changed and the plan did
+    not — an existing bucket-per-store deployment is unaffected. Naming all three parts is
+    what makes the statement correct in a SHARED bucket, where the one-part form would
+    scan the sessions/audit/corpus scopes too (see `CouchbaseCandidateStore._keyspace`).
+    """
     store, cluster, _ = _cb_store()
 
     await store.list_by_status(CandidateStatus.IN_REVIEW, limit=50)
 
     statement, _ = cluster.queries[0]
     assert statement == (
-        "SELECT c.* FROM `learning_candidates` c "
+        "SELECT c.* FROM `learning_candidates`.`_default`.`_default` c "
         "WHERE c.status = $status "
         "ORDER BY c.created_at ASC LIMIT $limit"
     )
+
+
+@pytestmark_cb
+async def test_n1ql_keyspace_follows_the_configured_scope_and_collection():
+    """A shared-bucket deployment reaches its own scope by CONFIG alone — and the
+    statement must name all three parts, or `list_by_status` would return other stores'
+    documents from the same bucket."""
+    settings = LearningSettings(
+        _env_file=None,
+        learning_candidates_bucket="pcm_iwant",
+        learning_candidates_scope="learning",
+        learning_candidates_collection="candidates",
+    )
+    collection = _FakeCollection()
+    cluster = _FakeCluster(collection)
+    store = CouchbaseCandidateStore(settings, cluster=cluster)
+
+    await store.list_by_status(CandidateStatus.IN_REVIEW, limit=50)
+    await store.supersede("hash-1")
+
+    for statement, *_ in cluster.queries:
+        assert "`pcm_iwant`.`learning`.`candidates`" in statement
 
 
 @pytestmark_cb

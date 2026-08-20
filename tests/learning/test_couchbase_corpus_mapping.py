@@ -69,8 +69,22 @@ class _FakeCollection:
 
 
 class _FakeBucket:
+    """One collection, reachable through EITHER binding path.
+
+    The learning stores now bind `bucket.scope(...).collection(...)` (defaults
+    `_default`/`_default`, the same handle `default_collection()` returns), so this
+    double answers both and ignores the names — what these tests assert is the store's
+    behaviour against a collection, not which one it picked.
+    """
+
     def __init__(self, collection) -> None:
         self._collection = collection
+
+    def scope(self, _name):
+        return self
+
+    def collection(self, _name):
+        return self._collection
 
     def default_collection(self):
         return self._collection
@@ -188,3 +202,65 @@ async def test_hit_count_reader_role():
     assert await corpus.hit_count(art.canonical_key) == 4
     # Absent artifact ⇒ 0 (nothing has accrued).
     assert await corpus.hit_count("sha256:none") == 0
+
+
+# --- the N1QL keyspace `list_artifacts` scans --------------------------------
+#
+# `_FakeCluster` above answers no queries, so the store's ONE N1QL statement had no
+# Layer-1 coverage at all. It needs some: `list_artifacts` is the dedup stage's soft
+# layer, and a one-part `` FROM `bucket` `` keyspace means "every scope and collection
+# in this bucket". In a shared bucket that scan would return session, audit and
+# candidate documents, `CorpusArtifact.from_doc` would try to interpret each one, and
+# the near-miss decision would be taken against documents that are not artifacts.
+
+
+class _QueryRecordingCluster(_FakeCluster):
+    """`_FakeCluster` plus a query recorder returning an empty result set."""
+
+    def __init__(self, collection) -> None:
+        super().__init__(collection)
+        self.queries: list[tuple[str, object]] = []
+
+    def query(self, statement, options):
+        self.queries.append((statement, options))
+
+        class _Empty:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        return _Empty()
+
+
+def _corpus_with_queries(**overrides):
+    cluster = _QueryRecordingCluster(_FakeCollection())
+    settings = LearningSettings(_env_file=None, **overrides)
+    return CouchbaseBlueprintCorpus(settings, cluster=cluster), cluster
+
+
+async def test_list_artifacts_scans_the_default_keyspace():
+    """NO REGRESSION: with nothing configured the scan names the dedicated corpus
+    bucket's default scope + collection — what the previous one-part
+    ``FROM `learning_corpus``` already resolved to in N1QL."""
+    corpus, cluster = _corpus_with_queries()
+
+    await corpus.list_artifacts()
+
+    statement, _ = cluster.queries[0]
+    assert statement == "SELECT c.* FROM `learning_corpus`.`_default`.`_default` c"
+
+
+async def test_list_artifacts_keyspace_follows_the_configured_scope_and_collection():
+    """A shared-bucket deployment reaches its own scope by CONFIG alone."""
+    corpus, cluster = _corpus_with_queries(
+        learning_corpus_bucket="pcm_iwant",
+        learning_corpus_scope="learning",
+        learning_corpus_collection="corpus",
+    )
+
+    await corpus.list_artifacts()
+
+    statement, _ = cluster.queries[0]
+    assert statement == "SELECT c.* FROM `pcm_iwant`.`learning`.`corpus` c"
