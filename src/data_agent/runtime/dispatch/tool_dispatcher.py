@@ -562,6 +562,7 @@ class ToolDispatcher:
         model_args: dict[str, Any],
         credentials: RuntimeCredentials,
         *,
+        tool_call_id: str | None = None,
         emit_progress: bool = True,
         question: str | None = None,
     ) -> ToolResult:
@@ -590,7 +591,7 @@ class ToolDispatcher:
         # so a future event added to this method cannot silently escape the gate by
         # forgetting to check the flag — it has to pick an observer.
         emit = self._observer if emit_progress else _default_observer
-        emit("tool_dispatch_start", {"tool_name": tool_name})
+        emit("tool_dispatch_start", {"tool_name": tool_name, "tool_call_id": tool_call_id})
 
         try:
             raw_result = await self._mcp_client.call_tool(
@@ -629,7 +630,10 @@ class ToolDispatcher:
             if denial.code == "COLUMN_SCOPE_VIOLATION" and exc.message:
                 denial_detail = exc.message
             user_message = denial_detail or denial.user_message
-            emit("tool_dispatch_denied", {"tool_name": tool_name, "error_code": denial.code})
+            emit(
+                "tool_dispatch_denied",
+                {"tool_name": tool_name, "error_code": denial.code, "tool_call_id": tool_call_id},
+            )
             self._emit_tool_span(tool_name, model_args, status="denied", error_code=denial.code)
             return ToolResult(
                 status="denied",
@@ -655,7 +659,11 @@ class ToolDispatcher:
             )
             emit(
                 "tool_dispatch_error",
-                {"tool_name": tool_name, "error_code": INTERNAL_TRANSPORT_ERROR_CODE},
+                {
+                    "tool_name": tool_name,
+                    "error_code": INTERNAL_TRANSPORT_ERROR_CODE,
+                    "tool_call_id": tool_call_id,
+                },
             )
             self._emit_tool_span(
                 tool_name, model_args, status="error", error_code=INTERNAL_TRANSPORT_ERROR_CODE
@@ -685,7 +693,7 @@ class ToolDispatcher:
             schema_columns_token_budget=self._schema_columns_token_budget,
         )
 
-        emit("tool_dispatch_ok", {"tool_name": tool_name})
+        emit("tool_dispatch_ok", {"tool_name": tool_name, "tool_call_id": tool_call_id})
         self._emit_tool_span(
             tool_name, model_args, status="ok", error_code=None, result_preview=preview
         )

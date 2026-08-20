@@ -142,11 +142,13 @@ async def test_dispatch_emits_both_template_label_and_summary() -> None:
     summary_payload = next(p for e, p in events if e == "tool_progress_summary")
     assert summary_payload["summary"] == "Querying employee codes"
     assert summary_payload["tool_name"] == "runQuery"
+    # The model's tool_call_id rides the summary event too, for UI start↔complete pairing.
+    assert summary_payload["tool_call_id"] == "call_1"
     # It maps to a verbatim, value-rich progress line (bypassing _STEP_LABELS).
     progress = to_progress_event("tool_progress_summary", summary_payload)
     assert progress is not None
     assert progress.step == "Querying employee codes"
-    assert progress.shape == {"tool_name": "runQuery"}
+    assert progress.shape == {"tool_name": "runQuery", "tool_call_id": "call_1"}
 
 
 async def test_slow_summarizer_does_not_block_dispatch_or_turn() -> None:

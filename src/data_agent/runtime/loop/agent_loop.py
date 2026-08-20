@@ -1318,7 +1318,9 @@ class AgentLoop:
             ]
         return designated, blueprint_runs
 
-    def _maybe_start_summary(self, tool_name: str, arguments: dict[str, Any]) -> None:
+    def _maybe_start_summary(
+        self, tool_name: str, tool_call_id: str, arguments: dict[str, Any]
+    ) -> None:
         """Fire a FIRE-AND-FORGET progress-summary task for one tool CALL (opt-in).
 
                 Non-blocking is load-bearing: the LLM call is scheduled CONCURRENTLY and the
@@ -1331,12 +1333,14 @@ class AgentLoop:
         if self._progress_summarizer is None:
             return
         task: asyncio.Task[None] = asyncio.create_task(
-            self._summarize_and_emit(tool_name, dict(arguments))
+            self._summarize_and_emit(tool_name, tool_call_id, dict(arguments))
         )
         self._summary_tasks.add(task)
         task.add_done_callback(self._summary_tasks.discard)
 
-    async def _summarize_and_emit(self, tool_name: str, arguments: dict[str, Any]) -> None:
+    async def _summarize_and_emit(
+        self, tool_name: str, tool_call_id: str, arguments: dict[str, Any]
+    ) -> None:
         """Await the summarizer and emit the value-rich progress line — fail-soft: an error or
                 timeout yields `None` (dropped), and even the observer emit is guarded, so a late
                 arrival after the emitter is closed can never raise into this fire-and-forget task.
@@ -1355,7 +1359,8 @@ class AgentLoop:
             # safe against a turn that has already ended. The broad guard is defense
             # in depth so no observer wiring can ever break the turn from here.
             self._observer(
-                "tool_progress_summary", {"summary": summary, "tool_name": tool_name}
+                "tool_progress_summary",
+                {"summary": summary, "tool_name": tool_name, "tool_call_id": tool_call_id},
             )
         except Exception:
             _logger.debug("progress-summary emit failed for %s (ignored)", tool_name)
@@ -2858,7 +2863,7 @@ class AgentLoop:
                     # arriving when ready. No-op when the feature is off. Skipped for a
                     # gated call: nothing is about to run, so narrating it would be a lie.
                     if gate_refusal is None:
-                        self._maybe_start_summary(tool_call.name, call_args)
+                        self._maybe_start_summary(tool_call.name, tool_call.id, call_args)
 
                     # Runtime-tool registry (read-tools-design §2): a runtime tool
                     # (`resolveValues` + the three read tools) is intercepted here —
@@ -2921,7 +2926,11 @@ class AgentLoop:
                         # the result, the trail, or a span (D25). This is the only
                         # dispatch call site that supplies it.
                         tool_result = await self._tool_dispatcher.dispatch(
-                            tool_call.name, call_args, credentials, question=question
+                            tool_call.name,
+                            call_args,
+                            credentials,
+                            tool_call_id=tool_call.id,
+                            question=question,
                         )
 
                     # REFRESH THE ENFORCEMENT LOCAL (05 §E). The state call just wrote

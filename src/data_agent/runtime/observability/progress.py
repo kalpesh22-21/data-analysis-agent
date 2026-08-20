@@ -20,6 +20,7 @@ from typing import Any
 # added later never accidentally leaks a sensitive field by default.
 _SHAPE_ALLOWLIST = (
     "tool_name",
+    "tool_call_id",
     "error_code",
     "window",
     "tool_calls_made",

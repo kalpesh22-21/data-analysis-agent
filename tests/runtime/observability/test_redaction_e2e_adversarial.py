@@ -100,10 +100,13 @@ async def test_dispatcher_observer_never_receives_pii_sql_or_result_rows() -> No
 
     blob = _blob_of(events)
     _assert_no_pii(blob)
-    # The dispatcher's own observer contract carries only tool_name/error_code
-    # (see tool_dispatcher.py) — args/results are never forwarded to it at all.
+    # The dispatcher's own observer contract carries only tool_name/error_code plus
+    # the opaque model tool_call_id (see tool_dispatcher.py) — args/results are never
+    # forwarded to it at all. The tool_call_id is a model-generated call handle
+    # (e.g. "call_1"), not derived from SQL, scope or a result row, so it cannot
+    # carry PII; the `_assert_no_pii` scan above is what actually guards that.
     for _event, payload in events:
-        assert set(payload.keys()) <= {"tool_name", "error_code"}
+        assert set(payload.keys()) <= {"tool_name", "error_code", "tool_call_id"}
 
 
 async def test_progress_emitter_wired_into_a_real_turn_never_carries_pii() -> None:
