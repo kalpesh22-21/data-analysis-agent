@@ -34,6 +34,8 @@ from data_agent.runtime.loop.agent_loop import AgentLoop, TurnContext
 from data_agent.runtime.loop.finalization import (
     ANSWER_SHAPE_EXHAUSTED_EVENT,
     ANSWER_SHAPE_REFUSED_EVENT,
+    EMPTY_ANSWER_EXHAUSTED_EVENT,
+    EMPTY_ANSWER_REFUSED_EVENT,
 )
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
@@ -459,6 +461,72 @@ async def test_the_answer_shape_events_survive_the_real_guardrail_observer() -> 
     )
     # D25: the gate reads row counts and emits a count. No SQL, no cell value, no
     # question text reaches any span this turn.
+    for finished_span in spans:
+        for value in finished_span.attributes.values():
+            assert "headcount by department" not in str(value)
+
+
+async def test_the_empty_answer_events_survive_the_real_guardrail_observer() -> None:
+    """THE PREFIX IS THE TEST, fourth instance (05 §K, 06) — and the instance where
+    it matters most, because THIS GATE'S EVENTS ARE THE ONLY ARTIFACT ITS FAILURE
+    HAS. A silent finish persists no assistant message and makes no tool call; if
+    these two spans were dropped for a missing `loop_` prefix, the runtime would go
+    back to correcting silent turns in production while reporting nothing at all,
+    and the raw-recorder tests in `tests/runtime/loop/test_empty_answer_gate.py`
+    would stay green throughout.
+
+    It also proves `incomplete_reason` EXPORTS. `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST`
+    is a strict allowlist, so a correctly-named span can arrive carrying nothing —
+    and this field is the entire diagnostic value of both events: it is what
+    separates "the model chose to say nothing" from "the completion was cut off at
+    the token cap", two failures with opposite fixes.
+    """
+    tracer, exporter = _tracer_with_memory_exporter()
+    observer = tracing.guardrail_observer(tracer)
+
+    store = InMemorySessionStore()
+    model = ScriptedModelClient(
+        [
+            # Silent finish -> refused once...
+            ModelTurnResult(assistant_text=None, incomplete_reason="max_output_tokens"),
+            # ...and silent again on the round handed back -> exhausted, substituted.
+            ModelTurnResult(assistant_text=None, incomplete_reason="max_output_tokens"),
+        ]
+    )
+    loop = AgentLoop(
+        model_client=model,
+        tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=observer, tracer=tracer),
+        context_assembler=ContextAssembler(store, tracer=tracer),
+        session_store=store,
+        tools_provider=_query_tools_provider,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        observer=combine_observers(observer),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="headcount by department"
+    )
+    assert outcome.status == "done"
+
+    spans = exporter.get_finished_spans()
+    refused = [s for s in spans if s.name == EMPTY_ANSWER_REFUSED_EVENT]
+    assert len(refused) == 1, (
+        "the empty-answer refusal did not survive guardrail_observer — check the "
+        f"`loop_` prefix on {EMPTY_ANSWER_REFUSED_EVENT!r}"
+    )
+    assert dict(refused[0].attributes)["incomplete_reason"] == "max_output_tokens", (
+        "the refusal span exported no `incomplete_reason` — the key is missing from "
+        "_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST, so the span carries nothing"
+    )
+    exhausted = [s for s in spans if s.name == EMPTY_ANSWER_EXHAUSTED_EVENT]
+    assert len(exhausted) == 1, (
+        "the exhausted counter did not survive guardrail_observer — check the "
+        f"`loop_` prefix on {EMPTY_ANSWER_EXHAUSTED_EVENT!r}"
+    )
+    # D25: a provider status word and nothing else. The user's question never
+    # reaches a span on this turn.
     for finished_span in spans:
         for value in finished_span.attributes.values():
             assert "headcount by department" not in str(value)

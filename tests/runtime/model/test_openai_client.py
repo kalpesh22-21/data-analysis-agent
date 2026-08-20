@@ -238,3 +238,186 @@ async def test_chat_fallback_gives_up_after_max_retries() -> None:
     with pytest.raises(openai.InternalServerError):
         await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
     assert len(fake_client.chat.completions.calls) == 3  # initial + 2 retries
+
+
+# --- the SILENT-TURN parsing gaps (05 §K.2) ---------------------------------
+#
+# Each of these produced `assistant_text=None` with no tool calls, which the loop
+# reads as "the model said nothing" and used to finish `done` with a blank bubble —
+# while the trace, whose instrumentor reads all of these shapes, showed the words.
+
+
+def _responses_refusal_result(refusal: str) -> SimpleNamespace:
+    """A Responses message whose content block is a REFUSAL: it carries `.refusal`
+    and NO `.text` at all. The parser read `.text` only, so the model's answer went
+    on the floor."""
+    return SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="refusal", refusal=refusal)],
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+    )
+
+
+async def test_a_responses_refusal_becomes_the_assistant_text() -> None:
+    """A refusal IS the assistant's turn-ending prose. Nothing downstream
+    distinguishes it and nothing should — the alternative is the silence that hid
+    it."""
+    fake_client = _FakeOpenAIClient(
+        responses_effects=[_responses_refusal_result("I can't help with that.")]
+    )
+    model_client = OpenAIModelClient(fake_client, model="gpt-4.1", sleep=_no_sleep)
+
+    result = await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
+
+    assert result.assistant_text == "I can't help with that."
+    assert result.tool_calls == []
+    assert result.incomplete_reason is None
+
+
+async def test_a_chat_refusal_becomes_the_assistant_text() -> None:
+    """Same rule on the fallback transport, where the shape differs: Chat carries
+    the refusal as a SIBLING FIELD of `content`, and `content` is `None` whenever it
+    is set."""
+    message = SimpleNamespace(content=None, tool_calls=None, refusal="I can't help with that.")
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        usage=SimpleNamespace(prompt_tokens=12, completion_tokens=6, total_tokens=18),
+    )
+    fake_client = _FakeOpenAIClient(
+        responses_effects=[_connection_error()], chat_effects=[response]
+    )
+    model_client = OpenAIModelClient(fake_client, model="gpt-4.1", sleep=_no_sleep)
+
+    result = await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
+
+    assert result.assistant_text == "I can't help with that."
+    assert result.incomplete_reason is None
+
+
+async def test_an_incomplete_response_reports_the_providers_reason() -> None:
+    """`status="incomplete"` can carry an `output` list with NO message item at all,
+    which is indistinguishable from a model that chose to say nothing — until the
+    reason comes with it. Telemetry only; nothing branches on it."""
+    response = SimpleNamespace(
+        output=[SimpleNamespace(type="reasoning", summary=[])],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=900, total_tokens=910),
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+    )
+    fake_client = _FakeOpenAIClient(responses_effects=[response])
+    model_client = OpenAIModelClient(fake_client, model="gpt-4.1", sleep=_no_sleep)
+
+    result = await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
+
+    assert result.assistant_text is None
+    assert result.tool_calls == []
+    assert result.incomplete_reason == "max_output_tokens"
+
+
+async def test_an_incomplete_response_without_a_reason_still_reports_one() -> None:
+    """`""` would read as "ordinary completion" at every `if reason:` downstream —
+    the one thing this must never do."""
+    response = SimpleNamespace(
+        output=[],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=0, total_tokens=10),
+        status="incomplete",
+        incomplete_details=None,
+    )
+    fake_client = _FakeOpenAIClient(responses_effects=[response])
+    model_client = OpenAIModelClient(fake_client, model="gpt-4.1", sleep=_no_sleep)
+
+    result = await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
+
+    assert result.incomplete_reason == "incomplete"
+
+
+async def test_a_completed_response_reports_no_incomplete_reason() -> None:
+    """The negative half: an ordinary completion must leave the field `None`, or the
+    two events that carry it stop meaning anything."""
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="hi")])
+        ],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        status="completed",
+        incomplete_details=None,
+    )
+    fake_client = _FakeOpenAIClient(responses_effects=[response])
+    model_client = OpenAIModelClient(fake_client, model="gpt-4.1", sleep=_no_sleep)
+
+    result = await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
+
+    assert result.assistant_text == "hi"
+    assert result.incomplete_reason is None
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "expected"),
+    [
+        ("length", "length"),
+        ("content_filter", "content_filter"),
+        ("stop", None),
+        ("tool_calls", None),
+    ],
+)
+async def test_chat_finish_reasons_map_to_the_same_field(
+    finish_reason: str, expected: str | None
+) -> None:
+    """One telemetry field across both transports: `stop`/`tool_calls` are ordinary
+    completions and must stay `None`."""
+    message = SimpleNamespace(content=None, tool_calls=None)
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+        usage=SimpleNamespace(prompt_tokens=12, completion_tokens=6, total_tokens=18),
+    )
+    fake_client = _FakeOpenAIClient(
+        responses_effects=[_connection_error()], chat_effects=[response]
+    )
+    model_client = OpenAIModelClient(fake_client, model="gpt-4.1", sleep=_no_sleep)
+
+    result = await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
+
+    assert result.incomplete_reason == expected
+
+
+async def test_output_text_rescues_a_shape_the_walk_does_not_know() -> None:
+    """LAST RESORT, and only on the empty path: `output_text` is the SDK's own join
+    over the output items, so it can carry a content block type this parser has
+    never seen."""
+    response = SimpleNamespace(
+        output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="future_thing")])],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        output_text="  the answer  ",
+    )
+    fake_client = _FakeOpenAIClient(responses_effects=[response])
+    model_client = OpenAIModelClient(fake_client, model="gpt-4.1", sleep=_no_sleep)
+
+    result = await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
+
+    assert result.assistant_text == "the answer"
+
+
+async def test_output_text_is_not_consulted_when_there_are_tool_calls() -> None:
+    """Empty prose beside tool calls is the NORMAL shape, and `output_text` on such a
+    response is `""` anyway — but the guard is explicit so a provider that puts
+    narration there cannot turn a working tool round-trip into a finish."""
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="function_call", call_id="c1", name="runQuery", arguments='{"sql": "SELECT 1"}'
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        output_text="thinking out loud",
+    )
+    fake_client = _FakeOpenAIClient(responses_effects=[response])
+    model_client = OpenAIModelClient(fake_client, model="gpt-4.1", sleep=_no_sleep)
+
+    result = await model_client.send_turn([{"role": "user", "content": "hi"}], RESPONSES_TOOLS)
+
+    assert result.assistant_text is None
+    assert len(result.tool_calls) == 1

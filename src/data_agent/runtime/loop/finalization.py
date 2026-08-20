@@ -47,10 +47,14 @@ from data_agent.runtime.session.store import SessionStore
 __all__ = [
     "ANSWER_SHAPE_EXHAUSTED_EVENT",
     "ANSWER_SHAPE_REFUSED_EVENT",
+    "EMPTY_ANSWER_EXHAUSTED_EVENT",
+    "EMPTY_ANSWER_FALLBACK_TEXT",
+    "EMPTY_ANSWER_REFUSED_EVENT",
     "AnswerShapeCounter",
     "FinalizationGate",
     "answer_shape_nudge_text",
     "answer_table_no_table_designated",
+    "empty_answer_nudge_text",
     "finalization_blocked",
     "finalization_nudge_text",
     "pending_intents",
@@ -80,6 +84,39 @@ _DATA_ANSWER_TOOLS = frozenset({"runBlueprint", "runQuery"})
 # real observer's output against the same symbol the emit site uses.
 ANSWER_SHAPE_REFUSED_EVENT = "loop_answer_shape_refused"
 ANSWER_SHAPE_EXHAUSTED_EVENT = "loop_answer_shape_exhausted"
+
+# The EMPTY-ANSWER gate's two events (05 §K), named under the same `loop_` rule as
+# the pair above — and for this gate the naming matters more than for any other,
+# because a silent finish produces NO other artifact: no persisted assistant
+# message, no tool call, no denial. Before these events existed the failure was
+# invisible end to end — the trace showed a `Response` span and a `loop_turn_done`,
+# and the only witness was a user looking at a blank bubble.
+EMPTY_ANSWER_REFUSED_EVENT = "loop_empty_answer_refused"
+EMPTY_ANSWER_EXHAUSTED_EVENT = "loop_empty_answer_exhausted"
+
+# What the user is shown when the model finishes silently TWICE — the gate refused
+# once, the re-round came back empty as well, and the turn has to end.
+#
+# THE ALTERNATIVE WAS THE BLANK BUBBLE, which is what shipped: `assistant_text=None`
+# rode the `result` event out and the UI rendered `text || ""` beside `status: done`,
+# so a total failure was indistinguishable from an answer that had not loaded. This
+# says the true thing instead, and says it in the agent's voice because that is the
+# channel the user is reading.
+#
+# IT IS PERSISTED, unlike the empty string it replaces (see the exit-#1 `persist_text`
+# comment): a live answer that `/session/history` does not have is the divergence the
+# whole scrub-before-persist discipline exists to prevent, and "the turn is simply
+# missing from history" is the worst version of it — tomorrow the session reads as
+# though the user was never answered at all, with nothing to say why.
+#
+# NO IDENTIFIER SHAPES IN IT, deliberately: it goes through `scrub_answer_prose` like
+# every other answer, and a marker-mangled apology would be a second defect wearing
+# the first one's clothes.
+EMPTY_ANSWER_FALLBACK_TEXT = (
+    "I was not able to produce an answer for that — my last two attempts came back "
+    "with nothing at all. Please send the question again; if it covered several "
+    "things at once, asking for one of them at a time is more likely to get through."
+)
 
 
 def _is_multi_row_answer_call(
@@ -319,6 +356,49 @@ def answer_shape_nudge_text(draft: str | None, multi_row_calls: int) -> str:
     return "\n".join(lines)
 
 
+def empty_answer_nudge_text(incomplete_reason: str | None = None) -> str:
+    """The ephemeral `user`-role message injected when a round-trip ends with NO prose and
+        NO tool calls — the model said nothing at all.
+
+        NO DRAFT IS ECHOED, which is the one structural difference from the other two
+        nudges: there is nothing to echo. That also removes the "re-send what you wrote"
+        escape hatch they rely on, so this message has to be self-sufficient — it states the
+        one fact the model needs (its last response was empty and the user saw nothing) and
+        names the two acceptable shapes of a next response, rather than asking it to repair
+        something it cannot see.
+
+        IT DOES NOT SAY "TRY HARDER". A silent response usually means the model believes it
+        has already answered — the same class of belief about turn mechanics the answer-shape
+        nudge corrects — so the correction has to be about the CHANNEL: the words did not
+        arrive, and text is the only way they can.
+
+        *incomplete_reason* is `ModelTurnResult.incomplete_reason`, and it changes the ask
+        rather than decorating it: a completion cut off at the token cap does not need to be
+        told it was silent, it needs to be told to be SHORTER. `None` (an ordinary
+        completion that carried no words) gets the plain form.
+    """
+    lines: list[str] = [
+        "Your last response was EMPTY — no text and no tool call. The user saw a blank "
+        "answer, so nothing you may have intended to say reached them.",
+    ]
+    if incomplete_reason:
+        lines.append(
+            f"The provider reported that response as incomplete ({incomplete_reason}), "
+            "which usually means the answer was cut off before it began. Keep this one "
+            "SHORT: lead with the finding in a sentence or two."
+        )
+    lines.append(
+        "The turn is NOT over and every tool is still available to you. Your next "
+        "response must be one of exactly two things: the final answer as TEXT, or a "
+        "tool call that gets you closer to it."
+    )
+    lines.append(
+        "If you cannot answer the question, say so in text and say what blocked you — "
+        "that is a valid, complete answer. Silence is not."
+    )
+    return "\n".join(lines)
+
+
 def refreshed_analysis_state(
     tool_result: ToolResult, turn_index: int
 ) -> AnalysisState | None:
@@ -503,10 +583,11 @@ class FinalizationGate:
                 OF THIS TURN PER KIND, CONSUMED PER ROUND-TRIP. On `True` the round is marked
                 refused, which is what makes the second and later refusals of one batch free.
 
-                TWO INDEPENDENT ALLOWANCES, SELECTED BY `kind`:
+                THREE INDEPENDENT ALLOWANCES, SELECTED BY `kind`:
 
                   `intents`      | the pending-intents refusals, exits #1 and #2
                   `answer_shape` | the untabled-multi-row refusal, exit #1 only
+                  `empty_answer` | the no-prose-no-tool-calls refusal, exit #1 only
 
                 They must stay independent. On the multi-intent questions this release exists for,
                 the two gates fire in SEQUENCE rather than in competition — finish with intents
@@ -530,10 +611,17 @@ class FinalizationGate:
                 asked twice about. So later refusals in one batch return the same retryable error
                 but make no store call, advance no counter and emit no event.
 
-                THE ROUND FLAG STAYS ONE FLAG ACROSS BOTH KINDS: `answer_shape` lives only at exit
-                #1 and only in the `elif` of the pending-intents branch, while the batched exit-#2
-                refusals the flag exists for require tool calls — so a round-trip has at most one
-                refusing kind.
+                THE ROUND FLAG STAYS ONE FLAG ACROSS ALL THREE KINDS, and for `empty_answer` the
+                flag is what enforces it. `answer_shape` is a later branch of the SAME `if/elif`
+                chain the pending-intents branch opens, so the chain excludes it structurally.
+                `empty_answer` is deliberately NOT in that chain — it is a post-chain `if` guarded
+                on `refused_finalization`, because the chain's branches are entered when their
+                complaint QUALIFIES rather than when they refuse, and an `elif` would silence the
+                gate on every round where an earlier allowance was already spent (05 §K.4; it is
+                §J.3's starvation one gate later). The guard keeps the same invariant the chain
+                gives the other two: at most one refusing kind per round-trip, with the more
+                specific complaint winning the round it fires in. The batched exit-#2 refusals the
+                flag exists for require tool calls and are unaffected.
 
                 DEGRADE-NEVER-FAIL. `claim_finalization_block` is a CAS read-modify-write that can
                 raise `CASMismatchError` after lost retries or a transient connection error, and

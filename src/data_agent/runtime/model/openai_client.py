@@ -112,6 +112,28 @@ def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[st
     return items
 
 
+def _responses_incomplete_reason(response: Any) -> str | None:
+    """Why the provider ended this Responses round-trip early, or `None` for an ordinary
+        completion.
+
+        A Responses object carries `status="incomplete"` with an `incomplete_details.reason`
+        (`max_output_tokens`, `content_filter`, ...) and, crucially, an `output` list that may
+        hold NO message item at all — so the turn arrives at the loop looking exactly like a
+        model that chose to say nothing. The reason is the only thing that tells those two
+        apart, and it is carried out for TELEMETRY, not for branching (see
+        `ModelTurnResult.incomplete_reason`).
+
+        `"incomplete"` is the fallback when the status says the response was cut short but no
+        reason is given: an empty string here would read as "ordinary completion" at every
+        `if reason:` downstream, which is the one thing this must never do.
+    """
+    if getattr(response, "status", None) != "incomplete":
+        return None
+    details = getattr(response, "incomplete_details", None)
+    reason = getattr(details, "reason", None) if details is not None else None
+    return reason or "incomplete"
+
+
 def _responses_result_to_turn(response: Any) -> ModelTurnResult:
     assistant_text_parts: list[str] = []
     tool_calls: list[ToolCallRequest] = []
@@ -119,7 +141,16 @@ def _responses_result_to_turn(response: Any) -> ModelTurnResult:
         item_type = getattr(item, "type", None)
         if item_type == "message":
             for block in getattr(item, "content", None) or []:
-                text = getattr(block, "text", None)
+                # BOTH CONTENT SHAPES, and the second one is the bug this reads for.
+                # An `output_text` block carries `.text`; a REFUSAL block carries
+                # `.refusal` and NO `.text` at all, so a `.text`-only read dropped
+                # every refusal on the floor — the model had answered, the runtime
+                # finished the turn `done` with `assistant_text=None`, and the user
+                # got a blank bubble while the trace (which reads refusals) showed
+                # the words. A refusal IS the assistant's turn-ending prose here:
+                # nothing downstream distinguishes it, and nothing should — the
+                # alternative is the silence that hid it.
+                text = getattr(block, "text", None) or getattr(block, "refusal", None)
                 if text:
                     assistant_text_parts.append(text)
         elif item_type == "function_call":
@@ -131,8 +162,21 @@ def _responses_result_to_turn(response: Any) -> ModelTurnResult:
                 )
             )
     assistant_text = "\n".join(assistant_text_parts) if assistant_text_parts else None
+    if assistant_text is None and not tool_calls:
+        # LAST RESORT, and deliberately only on the empty path: `output_text` is the
+        # SDK's own convenience join over the output items, so it can rescue a shape
+        # the walk above does not know (a future content block type). It is NOT
+        # consulted when the walk found text — that would risk a same-text double
+        # source disagreeing about ordering — and NOT when there are tool calls,
+        # where empty prose is the normal, correct shape.
+        assistant_text = (getattr(response, "output_text", None) or "").strip() or None
     usage = _extract_usage(getattr(response, "usage", None), style="responses")
-    return ModelTurnResult(assistant_text=assistant_text, tool_calls=tool_calls, usage=usage)
+    return ModelTurnResult(
+        assistant_text=assistant_text,
+        tool_calls=tool_calls,
+        usage=usage,
+        incomplete_reason=_responses_incomplete_reason(response),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +226,17 @@ def _tools_to_chat(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return chat_tools
 
 
+# `finish_reason` values that mean the completion was CUT SHORT rather than
+# finished — the Chat-Completions counterpart of a Responses `status="incomplete"`,
+# and reported through the same `ModelTurnResult.incomplete_reason` channel so one
+# telemetry field covers both transports. `"stop"` and `"tool_calls"` are ordinary
+# completions and are deliberately absent.
+_CHAT_INCOMPLETE_FINISH_REASONS = frozenset({"length", "content_filter"})
+
+
 def _chat_result_to_turn(response: Any) -> ModelTurnResult:
-    message = response.choices[0].message
+    choice = response.choices[0]
+    message = choice.message
     tool_calls: list[ToolCallRequest] = []
     for tool_call in getattr(message, "tool_calls", None) or []:
         function = tool_call.function
@@ -194,9 +247,20 @@ def _chat_result_to_turn(response: Any) -> ModelTurnResult:
                 arguments=_safe_json_loads(function.arguments),
             )
         )
+    # THE REFUSAL, on this transport too: a Chat message carries it as a sibling
+    # FIELD of `content` (not as a content block), and `content` is `None` whenever
+    # it is set. Same rule as the Responses walk — a refusal is turn-ending prose,
+    # and dropping it is what produced a blank `done`.
+    assistant_text = getattr(message, "content", None) or getattr(message, "refusal", None)
+    finish_reason = getattr(choice, "finish_reason", None)
     usage = _extract_usage(getattr(response, "usage", None), style="chat")
     return ModelTurnResult(
-        assistant_text=getattr(message, "content", None), tool_calls=tool_calls, usage=usage
+        assistant_text=assistant_text,
+        tool_calls=tool_calls,
+        usage=usage,
+        incomplete_reason=(
+            finish_reason if finish_reason in _CHAT_INCOMPLETE_FINISH_REASONS else None
+        ),
     )
 
 

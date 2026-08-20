@@ -16,6 +16,7 @@ from data_agent.runtime.dispatch.denial_mapping import (
     ENFORCEMENT_DENIAL_CODES,
     KNOWN_DENIAL_CODES,
 )
+from data_agent.runtime.loop.finalization import EMPTY_ANSWER_FALLBACK_TEXT
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import ResultPreview
 
@@ -662,3 +663,65 @@ async def test_same_doc_twice_is_identical(store):
     s1 = await _load(store, doc)
     s2 = await _load(store, doc)
     assert s1 == s2
+
+
+# --- L15: the silent-finish fallback is not an answer (05 §K.6) -------------
+
+
+async def test_the_empty_answer_fallback_is_not_loaded_as_assistant_text(store):
+    """A turn whose model went silent twice persists `EMPTY_ANSWER_FALLBACK_TEXT` —
+    a RUNTIME-AUTHORED apology, not the assistant's words — where it used to persist
+    nothing at all. The learning plane must see those turns exactly as it did
+    before: unanswered.
+
+    THE SHARP EDGE IS `_infer_accepted_signal`, asserted below: it counts a data
+    turn carrying ANY `assistant_text` as successfully answered, so without the
+    filter the WORST possible turn — the one where the model produced nothing twice
+    — would start supplying the accepted signal for the session. The transcript,
+    judge-prompt and preview leaks are the quieter half: one constant string,
+    verbatim, on every such turn in every session.
+    """
+    doc = make_doc(
+        "sess-empty-answer",
+        messages=[
+            make_message(0, "user", "overtime by dept?"),
+            make_message(0, "assistant", EMPTY_ANSWER_FALLBACK_TEXT),
+        ],
+        tool_trail=[
+            make_trail_entry(
+                turn_index=0,
+                tool_call_id="call_A",
+                tool_name="runQuery",
+                args={"sql": "SELECT dept FROM hr.pay"},
+                status="ok",
+            ),
+        ],
+    )
+
+    summary = await _load(store, doc)
+
+    assert summary.turns[0].assistant_text is None, (
+        "the runtime's own apology was loaded as if the assistant had answered"
+    )
+    assert summary.accepted_signal is None, (
+        "a twice-silent turn supplied the accepted signal — row 1 (nothing "
+        "successfully answered) must still apply"
+    )
+
+
+async def test_a_real_answer_on_the_same_turn_still_loads(store):
+    """The filter is content-exact, not a blanket skip: it must not eat a real
+    answer that happens to follow the fallback in the same turn, and it must not
+    change any ordinary turn."""
+    doc = make_doc(
+        "sess-empty-answer-2",
+        messages=[
+            make_message(0, "user", "overtime by dept?"),
+            make_message(0, "assistant", EMPTY_ANSWER_FALLBACK_TEXT),
+            make_message(0, "assistant", "Sales 3, Eng 2."),
+        ],
+    )
+
+    summary = await _load(store, doc)
+
+    assert summary.turns[0].assistant_text == "Sales 3, Eng 2."

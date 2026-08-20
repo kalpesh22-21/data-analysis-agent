@@ -102,10 +102,14 @@ from .budget_guard import BudgetGuard
 from .finalization import (
     ANSWER_SHAPE_EXHAUSTED_EVENT,
     ANSWER_SHAPE_REFUSED_EVENT,
+    EMPTY_ANSWER_EXHAUSTED_EVENT,
+    EMPTY_ANSWER_FALLBACK_TEXT,
+    EMPTY_ANSWER_REFUSED_EVENT,
     AnswerShapeCounter,
     FinalizationGate,
     answer_shape_nudge_text,
     answer_table_no_table_designated,
+    empty_answer_nudge_text,
     finalization_blocked,
     finalization_nudge_text,
     pending_intents,
@@ -1566,11 +1570,14 @@ class AgentLoop:
                 goes through this function, so one call covers all five and the SAME scrubbed
                 string necessarily feeds both the outcome and the persisted message.
 
-                *persist_text* is likewise a value, not a flag, and it carries the ONE difference
-                between the two `done` exits. The no-tool-calls exit appends only when there is
-                text — a model may finish with `None`/`""` and must not leave an empty assistant
-                message in history — while the `answerWithTable` exit appends UNCONDITIONALLY,
-                because its text came through `clean_answer_text` and is non-empty by construction.
+                *persist_text* is a value, not a flag, and BOTH `done` exits now pass it
+                unconditionally: the `answerWithTable` exit because `clean_answer_text` already
+                returned a non-empty string, the no-tool-calls exit because the empty-answer gate
+                (05 §K) substitutes `EMPTY_ANSWER_FALLBACK_TEXT` before the call. The invariant it
+                used to carry — no EMPTY assistant message in history, which `context/assembly.py`
+                would replay into every later turn — is unchanged and simply moved upstream to
+                that substitution. It stays a value rather than becoming unconditional here
+                because the PAUSE exits pass `None`: a pause has no answer to persist.
 
                 WHAT STAYED AT THE SITES: everything whose POSITION relative to this call is the
                 behaviour — `_force_block_pending_intents` (unconditional at the hard ceiling, only
@@ -1601,11 +1608,9 @@ class AgentLoop:
         )
         if persist_text is not None:
             # THE SCRUBBED STRING, REUSED — never a second scrub. Both call sites
-            # that persist pass the same string they pass as *assistant_text* (the
-            # no-tool-calls exit's `or None` differs only when there is nothing to
-            # persist at all), so this assignment is an identity for them and
-            # fail-closed for anything else: an unscrubbed string can never be the
-            # thing that gets written.
+            # that persist pass the same string they pass as *assistant_text*, so
+            # this assignment is an identity for them and fail-closed for anything
+            # else: an unscrubbed string can never be the thing that gets written.
             persist_text = assistant_text
         if checkpoint is not None:
             await self._session_store.write_pause_checkpoint(session_id, checkpoint)
@@ -2551,6 +2556,84 @@ class AgentLoop:
                         # ledger for answer shape and the user's answer is in hand.
                         self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
 
+                # --- THE EMPTY-ANSWER GATE (05 §K) ------------------------------
+                #
+                # NOT AN `elif`, and that is the whole placement decision. The two
+                # branches above are entered when their complaint QUALIFIES, not when
+                # they actually refuse — an exhausted allowance still takes the branch
+                # and falls into its `else`. As an `elif` this gate would therefore go
+                # silent on any round where an earlier gate had already spent its grant,
+                # which is §J.3's starvation argument arriving one gate later: a silent
+                # finish is exactly the outcome that must always get a second word in.
+                #
+                # `not refused_finalization` KEEPS THE ONE-REFUSAL-PER-ROUND-TRIP RULE
+                # the chain expressed structurally: if either gate above refused, this
+                # round already has its nudge and its cleared draft, and a second
+                # refusal would overwrite the more specific complaint with a vaguer one.
+                if (
+                    not result.tool_calls
+                    and not refused_finalization
+                    and not (result.assistant_text or "").strip()
+                ):
+                    #
+                    # The model ended the turn with NO tool calls AND NO prose. Nothing
+                    # was refused, nothing failed, no error was raised — the round-trip
+                    # simply carried no words, and every downstream stage handles that
+                    # silently: exit #1 below persists nothing (`or None`), the `result`
+                    # event carries `assistant_text: null`, and the UI renders
+                    # `text || ""` beside `status: done`. The user gets a blank bubble
+                    # labelled as a completed answer, and NOTHING anywhere records that
+                    # it happened. It is the only turn outcome that produces no
+                    # artifact of any kind.
+                    #
+                    # Measured causes are three, and this gate is deliberately blind to
+                    # which: a genuinely empty completion, a completion cut short by the
+                    # provider (`incomplete_reason`), and — until the same change fixed
+                    # it in `model/openai_client.py` — a REFUSAL whose text the parser
+                    # dropped, which looked identical from here. The response to all
+                    # three is the same one round-trip back.
+                    #
+                    # LAST, and the ordering is not arbitrary: pending intents and
+                    # untabled results are both MORE SPECIFIC complaints about a turn
+                    # that at least said something, and each already clears the draft
+                    # when it refuses. This check is what remains — the model said
+                    # nothing anyone can act on — so it yields to a refusal made above
+                    # it and fires whenever none was.
+                    #
+                    # ITS OWN ALLOWANCE (`kind="empty_answer"`), for the reason
+                    # `session/models.py` records at the enum: sharing would make the
+                    # silent finish the one failure the runtime could never get a
+                    # second word in about, precisely because it is checked last.
+                    if await finalization_gate.may_refuse("empty_answer"):
+                        refused_finalization = True
+                        self._observer(
+                            EMPTY_ANSWER_REFUSED_EVENT,
+                            # `""`, never `None`: the observer's allowlist filter keeps
+                            # `str | int | float | bool` and drops everything else, so a
+                            # `None` would vanish from the span and make "ordinary
+                            # completion" indistinguishable from "attribute missing".
+                            {"incomplete_reason": result.incomplete_reason or ""},
+                        )
+                        finalization_nudge = empty_answer_nudge_text(result.incomplete_reason)
+                        # NO DRAFT TO CLEAR — `last_assistant_text` is already empty by
+                        # the branch condition. Assigned anyway, and NOT as ceremony:
+                        # the hard-ceiling and budget-cap paths return it verbatim, and
+                        # `""` reaching them would be a blank answer surfacing on
+                        # exactly the enforcement path this gate exists to close.
+                        last_assistant_text = None
+                    else:
+                        # THIS GATE'S allowance for the window is spent: it refused once,
+                        # handed back a round, and the model came back empty AGAIN. The
+                        # posture is the answer-shape gate's — record and let the turn
+                        # finish, never hard-lock — but the finish itself differs, and
+                        # must: there is no answer in hand to pass through. The exit
+                        # below substitutes `EMPTY_ANSWER_FALLBACK_TEXT` so the user is
+                        # told what happened instead of shown a blank.
+                        self._observer(
+                            EMPTY_ANSWER_EXHAUSTED_EVENT,
+                            {"incomplete_reason": result.incomplete_reason or ""},
+                        )
+
                 if not result.tool_calls and not refused_finalization:
                     # B1/D44 (2026-07-01 clarification) AND UI Slice 1: the union of
                     # this turn's tool-result provenance — the tag for the final
@@ -2559,22 +2642,40 @@ class AgentLoop:
                     # Computed ONCE here (the single fail-closed source of truth; do
                     # not re-derive in-loop).
                     turn_provenance = await self._compute_turn_provenance_union(session_id, turn_index)
+                    # THE SILENT-FINISH SUBSTITUTION (05 §K). Reaching here with empty
+                    # prose means the empty-answer gate above already spent its
+                    # allowance on this window — it refused one finish, handed back a
+                    # round, and the model came back with nothing a second time. The
+                    # turn must end, so the only question left is WHAT THE USER IS
+                    # SHOWN, and the honest sentence beats the blank bubble that
+                    # shipped before it.
+                    #
+                    # `.strip()`, not a truthiness test: `"   "` renders exactly as
+                    # blank as `""` does and must take the same path.
+                    final_text = result.assistant_text
+                    if not (final_text or "").strip():
+                        final_text = EMPTY_ANSWER_FALLBACK_TEXT
                     return await self._finish(
                         session_id=session_id,
                         turn_index=turn_index,
                         status="done",
                         exit_label="no_tool_calls",
-                        assistant_text=result.assistant_text,
+                        assistant_text=final_text,
                         tool_calls_made=tool_calls_made,
                         accum=accum,
                         provenance=turn_provenance,
-                        # `or None` IS THE APPEND GUARD (`if result.assistant_text:`),
-                        # carried as a value. A model may finish this exit with `None`
-                        # or `""`; either must leave NO assistant message in history,
-                        # while `assistant_text` above still reports it verbatim. The
-                        # `answerWithTable` exit below persists unconditionally — see
-                        # `_finish` for why the two differ and why both are correct.
-                        persist_text=result.assistant_text or None,
+                        # PERSISTED UNCONDITIONALLY NOW, like the `answerWithTable`
+                        # exit — and for that exit's reason: `final_text` is non-empty
+                        # by construction above, so the `or None` append guard this
+                        # carried has nothing left to guard against. It existed to keep
+                        # an EMPTY assistant message out of history; the substitution
+                        # removes the empty message rather than the record of the turn.
+                        # What it used to produce was a turn that reached the user as a
+                        # blank bubble and reached `/session/history` as nothing at all
+                        # — live and history disagreeing on exactly the turns that
+                        # failed, which is the divergence `_finish` scrubs before
+                        # persisting to prevent.
+                        persist_text=final_text,
                         event=("loop_turn_done", {"tool_calls_made": tool_calls_made}),
                     )
 

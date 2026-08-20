@@ -299,11 +299,12 @@ REASON_CODES = MODEL_REASON_CODES | RUNTIME_REASON_CODES
 # imported by the stores without a cycle (`agent_loop` imports `store`).
 MAX_FINALIZATION_BLOCKS_PER_WINDOW = 1
 
-# WHAT a forced re-round was claimed FOR (05 §C.1, §J.3). Two independent gates
+# WHAT a forced re-round was claimed FOR (05 §C.1, §J.3, §K). Three independent gates
 # refuse a finish, and as of 2026-08-12 they hold SEPARATE per-window allowances:
 #
 #   `intents`      — pending intents at either terminal exit (05 §B).
 #   `answer_shape` — a bare-text finish holding untabled multi-row results (05 §J).
+#   `empty_answer` — a finish with NO prose and NO tool calls at all (05 §K).
 #
 # They shared ONE allowance for exactly one release, and live measurement killed it:
 # on three-part questions the intents nudge consumed the window's only grant in 2 of
@@ -312,8 +313,21 @@ MAX_FINALIZATION_BLOCKS_PER_WINDOW = 1
 # for. A closed enum rather than a free string because it becomes part of a
 # PERSISTED key: an unrecognised value would mint a brand-new, unbounded allowance
 # and no test would see it.
-FinalizationBlockKind = Literal["intents", "answer_shape"]
-FINALIZATION_BLOCK_KINDS: tuple[FinalizationBlockKind, ...] = ("intents", "answer_shape")
+#
+# `empty_answer` GETS ITS OWN for the same measured reason, not by symmetry: it is
+# checked at the same exit as the other two but LAST — after their `if/elif` chain,
+# guarded on the round's refusal flag rather than joining the chain (05 §K.4) — so
+# any window where it has something to say is by construction a window where one of
+# the others may already have spent its grant. Sharing would make the silent finish
+# the one failure the runtime can never get a second word in about. Worst case stays
+# bounded — one extra round-trip per kind per window, and `max_budget_windows`
+# bounds the windows.
+FinalizationBlockKind = Literal["intents", "answer_shape", "empty_answer"]
+FINALIZATION_BLOCK_KINDS: tuple[FinalizationBlockKind, ...] = (
+    "intents",
+    "answer_shape",
+    "empty_answer",
+)
 
 
 def finalization_block_key(

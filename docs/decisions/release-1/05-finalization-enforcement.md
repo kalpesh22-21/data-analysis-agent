@@ -345,6 +345,93 @@ Grant spent ⇒ record `loop_answer_shape_exhausted` and finalize. **The runtime
 
 **The seeding proof is `test_a_budget_cap_resume_reseeds_the_count_from_the_persisted_trail`, and it has to be a dedicated test.** Window 1 runs both multi-row queries and caps; window 2 does nothing but finish in prose, and must still be refused with `multi_row_calls: 2`. An earlier draft of this section claimed the blueprint resume tests proved it — **they do not**. They resume a two-row blueprint and finish in prose, so they exercise the seed, but `ScriptedModelClient` does not raise on leftover turns: a seed regression there just leaves the helper's second turn unconsumed and the suite stays green. Those tests now assert `resume_model.calls_made == 2` so the exercise is at least *observed*; the proof lives in the dedicated test, which fails on a seeded-count regression and is the only thing that does.
 
+## K. The empty-answer gate (added 2026-08-20, on a live report)
+
+**The third and last thing that can go wrong at exit #1.** §B asks *"did you do the work?"*; §J asks *"did you deliver it in the required form?"*; this one asks the question underneath both: **did you say anything at all?**
+
+### K.1 The report
+
+A turn ended `done` with a **blank answer bubble** in the UI. Not an error, not a pause — `status: done`, `tool_calls_made: N`, and no text.
+
+**It left no artifact anywhere**, which is the part that made it worth a section:
+
+- exit #1 persisted **nothing** (`persist_text=result.assistant_text or None`), so `/session/history` shows the user's question and **no assistant message on that turn**;
+- the `result` SSE event carried `assistant_text: null` and the UI rendered `text || ""` beside `status: done` (`ui/static/index.html`);
+- **no event fired.** `loop_turn_done` is emitted for every ordinary finish and says nothing about the prose.
+
+So the only witness was a person looking at the screen. Live *and* history agreed the turn was fine; the trace showed a `Response` span and a clean finish.
+
+### K.2 Three causes, one of them ours
+
+The question asked of the trace was *"is the assistant response Arize shows the real model output?"* — **it is**: the `LLM` span is written by OpenInference's instrumentor wrapping `AsyncOpenAI.request` at the transport boundary, and `otlp_hide_llm_content` defaults to REVEAL, so nothing of ours touches it. That makes the trace the arbiter, and it separates three causes that are identical from inside the loop:
+
+1. **The model really returned nothing.** Empty message, no tool calls. Trace and UI agree.
+2. **A REFUSAL whose text we dropped — our bug.** A Responses refusal block carries `.refusal`, **not** `.text`, and `_responses_result_to_turn` read `.text` only; a Chat refusal is a sibling field of `content`, which is `None` whenever it is set. Both produced `assistant_text=None` while the **trace showed the words** — the instrumentor reads refusals (`_responses_api.py`). The model had answered and the user got a blank. **Fixed at the parser**, both transports.
+3. **A completion cut short.** `status="incomplete"` (or Chat `finish_reason` `length`/`content_filter`) can carry an `output` list with no message item at all. Nothing inspected either field.
+
+**The distinguishing evidence is the LAST `Response` span of the trace**: output messages carrying text ⇒ (2) or (3) and the loss was ours; no output messages but completion tokens > 0 ⇒ (3); no output messages and ~0 completion tokens ⇒ (1).
+
+### K.3 `incomplete_reason` is telemetry, not control flow
+
+`ModelTurnResult` gains `incomplete_reason: str | None` — the provider's own word (`max_output_tokens`, `content_filter`, `incomplete`), `None` for an ordinary completion. **It is not branched on.** (1) and (3) get the identical response — one round handed back — because the runtime cannot act on the difference; only an operator can, and "the model chose silence" and "the answer was cut off at the token cap" call for **opposite** fixes. It rides both events as an attribute (allowlisted in `observability/tracing.py`) and is `""`, never `None`, on the payload: the observer's filter keeps `str | int | float | bool` and drops the rest, so a `None` would vanish and make *ordinary completion* indistinguishable from *attribute missing*.
+
+The field is **free text for telemetry, not an enum** — providers own the vocabulary.
+
+### K.4 The condition, and why it is last
+
+At exit #1 (`not result.tool_calls`), **after** the `if/elif` chain §B.2 opens and **guarded on `not refused_finalization`**: refuse when the prose is empty or whitespace and the window's `empty_answer` allowance is unspent.
+
+**Last is correct.** Pending intents and untabled rows are more specific complaints about a turn that at least *said* something, and each already clears the draft when it refuses. This check is what remains.
+
+**But NOT an `elif`, and the distinction is load-bearing.** The two branches above are entered when their complaint **qualifies**, not when they actually refuse — an exhausted allowance still takes the branch and falls into its `else`. As an `elif` this gate would go silent on every round where an earlier gate had already spent its grant, and the measured sequence is exactly that: shape gate refuses a silent finish (round 2), the model is silent again (round 3), the shape complaint is spent, and the *silence* — never yet answered — would pass unchallenged. That is §J.3's starvation, arriving one gate later. `not refused_finalization` preserves what the chain expressed structurally: **at most one refusal per round-trip**, and the more specific complaint wins the round it fires in.
+
+**Its own allowance (`kind="empty_answer"`), and here that is not symmetry** — it follows directly from being checked last. Any window where this gate has something to say is by construction a window where an earlier branch may already have spent its grant, so sharing would make the silent finish **the one failure the runtime could never get a second word in about**. This is §J.3's starvation argument, arriving before the starvation does. New bound: **three** extra round-trips per window, one per kind, still multiplied only by `max_budget_windows`.
+
+**It can fire on the same round an earlier gate EXHAUSTED, and that is deliberate.** Sequence: prose with an intent pending (intents refusal, grant spent) → **empty** prose, intent still pending → the intents branch takes its exhausted `else`, force-blocks the ledger `ENFORCEMENT_EXHAUSTED` and emits `loop_enforcement_exhausted`, and then this gate — which nothing has refused this round — hands back one more round anyway. So **a turn can answer after its intent ledger was terminally closed**, and the §F.0 record will read `ENFORCEMENT_EXHAUSTED` on a turn that then produced an answer. That is the right trade (the alternative is shipping the blank), it stays bounded by the same per-kind allowance, and the budget-cap force-block that follows correctly finds nothing left pending. A reader of `ENFORCEMENT_EXHAUSTED` should not infer that the turn ended there.
+
+### K.5 What the nudge says
+
+Ephemeral `user`-role injection, one round-trip, never persisted — §B.3/§D unchanged. **No draft is echoed**, the one structural difference from the other two: there is nothing to echo, which also removes the *"re-send what you wrote"* escape hatch they lean on. So it must be self-sufficient:
+
+1. **Your last response was EMPTY** — no text, no tool call, and *the user saw a blank answer*. The correction is about the **channel**, not about effort: a silent response usually means the model believes it has already answered.
+2. **The turn is not over**, every tool still available; the next response must be **either** the final answer as text **or** a tool call.
+3. **If you cannot answer, say so in text and say what blocked you** — that is a valid, complete answer. **Silence is not.**
+
+When `incomplete_reason` is set, one extra line: the provider reported the response as incomplete, so **keep it short and lead with the finding**. That is the only place the field changes behaviour, and it changes the *ask*, not the decision.
+
+### K.6 A second silent finish substitutes prose
+
+Grant spent ⇒ `loop_empty_answer_exhausted` and finalize. **The runtime never hard-locks a turn** (§J.5) — but unlike every other exhausted path, **there is no answer in hand to pass through**. So the exit substitutes `EMPTY_ANSWER_FALLBACK_TEXT`: it names what happened and asks for the question again, one part at a time.
+
+**It is persisted, and that is the change to exit #1's `or None`.** That guard existed to keep an *empty* assistant message out of history; the substitution removes the empty message rather than the record of the turn. What the old shape produced was a turn that reached the user as a blank bubble and reached `/session/history` as **nothing at all** — live and history disagreeing on exactly the turns that failed, which is the divergence `_finish`'s scrub-before-persist ordering exists to prevent. The fallback carries **no identifier shapes**, so the scrub passes it through untouched.
+
+**The learning plane is told about it, at one place.** The fallback is persisted, so it enters `load_session_summary` as `TurnSummary.assistant_text` — where four downstream reads would change meaning silently: `_infer_accepted_signal` counts a data turn with *any* assistant text as **successfully answered**, and the extractor transcript, the judge prompt and `consumer._transcript_preview` would each carry one constant runtime-authored apology, verbatim, on every such turn in every session. `summary/loader.py` drops it at the single point where the field is populated, so those turns keep exactly the learning-plane meaning they had when they persisted nothing — and nothing downstream has to know the constant exists.
+
+### K.7 Not gated
+
+Everything §J.6 excludes, for the same reasons — pauses, the hard ceiling, the `"stop"` resume — plus: **a response with tool calls and no prose is normal and untouched**. That is what most round-trips look like.
+
+### K.8 Tests
+
+`tests/runtime/loop/test_empty_answer_gate.py` and `tests/runtime/model/test_openai_client.py`:
+
+| Case | Expect |
+|---|---|
+| Empty prose, no tool calls | Refused once; nudge injected (user role, one round-trip, not persisted); a real answer next round is accepted verbatim |
+| Whitespace-only prose | Same — `.strip()`, not truthiness |
+| Same, empty again | `loop_empty_answer_exhausted`; `done` carries `EMPTY_ANSWER_FALLBACK_TEXT`; **history holds the same string** (live/history parity) |
+| `incomplete_reason` set | Rides both events; the nudge gains the be-shorter line |
+| Tool calls with no prose | **Untouched** — no refusal, no event, no store round-trip |
+| Pending intent **and** empty prose | Intents nudge fires (precedence); the empty-answer gate keeps **its own** grant |
+| Untabled rows **and** empty prose | Shape gate fires (precedence); same |
+| Responses **refusal** block | Becomes `assistant_text`; the turn finishes with the refusal as its answer and the gate never fires |
+| Chat **refusal** field | Same, via `message.refusal` |
+| Responses `status="incomplete"` | `incomplete_reason` from `incomplete_details.reason`; `"incomplete"` when the reason is absent |
+| Chat `finish_reason` `length` / `content_filter` | Same field; `stop` / `tool_calls` leave it `None` |
+| Empty output, `output_text` populated | Rescued — the last-resort join, consulted **only** when the walk found nothing and there are no tool calls |
+| `test_tool_span_wiring_e2e.py` | Both events survive the **real** `guardrail_observer` and `incomplete_reason` actually exports |
+
+
 ---
 
 ## I. Review corrections

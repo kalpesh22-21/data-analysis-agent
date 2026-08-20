@@ -588,6 +588,16 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     # that forgot a table and one that abandoned the format entirely.
     # (`loop_answer_shape_exhausted` carries no payload at all.)
     "multi_row_calls",
+    # --- the empty-answer gate (05 §K) ---
+    # `loop_empty_answer_refused.incomplete_reason` /
+    # `loop_empty_answer_exhausted.incomplete_reason` — the PROVIDER'S OWN word for why
+    # a round-trip ended early (`max_output_tokens`, `content_filter`, `incomplete`),
+    # or `""` for an ordinary completion that simply carried no text. It is the whole
+    # value of these two events: "the model chose to say nothing" and "the completion
+    # was cut off at the token cap" look identical from the loop and need opposite
+    # fixes. D25-safe — a provider-vocabulary status word, containing no prompt, no
+    # answer and no identifier, and the model's own (absent) text is never placed here.
+    "incomplete_reason",
     # --- the answer-prose scrub (ISSUES I1) ---
     # `loop_answer_prose_redacted.redaction_count` — HOW MANY identifier-shaped
     # tokens were replaced with a visible marker in the prose that reached the

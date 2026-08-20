@@ -37,11 +37,24 @@ class ModelTurnResult:
         Empty `tool_calls` means the turn is complete and `assistant_text` is the final
         answer. `usage` carries whatever token counters the provider reports;
         `loop/budget_guard.py` reads `total_tokens` if present.
+
+        `incomplete_reason` IS A DIAGNOSTIC, NEVER CONTROL FLOW. A provider can end a
+        round-trip with NO text and NO tool calls — a truncated completion, a response the
+        provider marked `incomplete` — and from the loop's side that is indistinguishable
+        from a model that simply said nothing. The loop's empty-answer gate treats both the
+        same way (it refuses the finish once either way); this field exists so the event it
+        emits says WHICH it was, because "the model returned nothing" and "the completion
+        was cut off at the token cap" call for opposite fixes. `None` means the provider
+        reported an ordinary completion — it does NOT mean the text is non-empty.
+
+        Providers set it from their own vocabulary (`max_output_tokens`,
+        `content_filter`, ...), so it is free text for telemetry, not an enum to branch on.
     """
 
     assistant_text: str | None = None
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
+    incomplete_reason: str | None = None
 
 
 class ModelClient(Protocol):

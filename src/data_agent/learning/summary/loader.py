@@ -19,6 +19,7 @@ from data_agent.runtime.dispatch.denial_mapping import (
     INFRA_FAILURE_CODES,
 )
 from data_agent.runtime.dispatch.tool_dispatcher import INTERNAL_TRANSPORT_ERROR_CODE
+from data_agent.runtime.loop.finalization import EMPTY_ANSWER_FALLBACK_TEXT
 from data_agent.runtime.session.models import ResultPreview, SessionDoc, TrailEntry
 
 from ..models import LearningJob
@@ -268,7 +269,24 @@ def _build_turns(doc: SessionDoc) -> tuple[TurnSummary, ...]:
         if message.role == "user" and message.turn_index not in user_nl:
             user_nl[message.turn_index] = message.content
         elif message.role == "assistant" and message.turn_index not in assistant_text:
-            assistant_text[message.turn_index] = message.content
+            # THE SILENT-FINISH FALLBACK IS NOT AN ANSWER (05 §K.6). A turn whose
+            # model went silent twice now persists `EMPTY_ANSWER_FALLBACK_TEXT` — a
+            # runtime-authored apology, not the assistant's own words — where it used
+            # to persist NOTHING at all. Every downstream read of `assistant_text`
+            # would otherwise change meaning silently:
+            #
+            #   - `_infer_accepted_signal` below counts a data turn with any
+            #     `assistant_text` as SUCCESSFULLY ANSWERED, so the worst possible
+            #     turn would start supplying the accepted signal;
+            #   - the extractor's transcript, the judge's prompt and
+            #     `consumer._transcript_preview` would all carry one constant string,
+            #     verbatim, on every such turn across every session.
+            #
+            # Dropping it here rather than at those four sites is the guard derived
+            # from the downstream reads: this is the single point where the field is
+            # populated, so nothing downstream has to know the constant exists.
+            if message.content != EMPTY_ANSWER_FALLBACK_TEXT:
+                assistant_text[message.turn_index] = message.content
     for entry in doc.tool_trail:
         _touch(entry.turn_index)
         tool_refs[entry.turn_index].append(entry.tool_call_id)

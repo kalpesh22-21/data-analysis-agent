@@ -37,6 +37,11 @@ from data_agent.runtime.composite.answer_with_table import AnswerWithTableTool
 from data_agent.runtime.context.assembly import ContextAssembler
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolPause, ToolResult
 from data_agent.runtime.loop.agent_loop import AgentLoop, TurnContext
+from data_agent.runtime.loop.finalization import (
+    EMPTY_ANSWER_EXHAUSTED_EVENT,
+    EMPTY_ANSWER_FALLBACK_TEXT,
+    EMPTY_ANSWER_REFUSED_EVENT,
+)
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.model.client import ModelTurnResult, ToolCallRequest
 from data_agent.runtime.model.scripted_client import ScriptedModelClient
@@ -177,34 +182,52 @@ async def test_the_two_in_body_done_exits_do_emit_loop_turn_done() -> None:
 # --- 1b. the no-tool-calls exit's append is CONDITIONAL ---------------------
 
 
-async def test_a_blank_final_answer_persists_no_assistant_message() -> None:
-    """The no-tool-calls `done` exit appends its assistant `TurnMessage` only if
-    there IS one — and "is there one" is FALSINESS, not `is not None`.
+async def test_a_blank_final_answer_never_persists_an_empty_assistant_message() -> None:
+    """The no-tool-calls `done` exit must never append an EMPTY assistant
+    `TurnMessage` — and "empty" is FALSINESS (plus whitespace), not `is not None`.
 
-    A model can end a turn with `assistant_text=""` as easily as with `None` (an
-    empty completion is a completion), and the two must behave identically: the
-    outcome reports the text verbatim, history gets nothing. An empty assistant
-    message is not harmless — `context/assembly.py` replays persisted messages into
-    every later turn, `session_history` renders them, and a blank one is a blank
-    bubble in the transcript plus a content-free entry in the model's context.
+    An empty assistant message is not harmless: `context/assembly.py` replays
+    persisted messages into every later turn, `session_history` renders them, and a
+    blank one is a blank bubble in the transcript plus a content-free entry in the
+    model's context.
 
-    THE `""` CASE IS THE ONE THAT NEEDS PINNING. `None` is caught by any
+    WHAT CHANGED, AND WHAT DID NOT (05 §K). The exit used to satisfy this by
+    persisting NOTHING, which held the invariant and produced a worse failure one
+    level up: the turn reached the user as a blank bubble labelled `done` and
+    reached `/session/history` as nothing at all, with no event anywhere saying it
+    had happened. The empty-answer gate now refuses that finish once, and a SECOND
+    empty response is substituted with `EMPTY_ANSWER_FALLBACK_TEXT`. So the
+    invariant this test has always defended is unchanged — no empty message is ever
+    written — while the turn it describes now leaves an honest record instead of a
+    hole.
+
+    THE `""` CASE IS STILL THE ONE THAT NEEDS PINNING. `None` is caught by any
     `is not None` guard as well as by falsiness, so a guard that has quietly
     weakened from one to the other still passes every `None` test in the suite —
-    `""` is the only input that tells them apart.
+    `""` (and `"   "`) are the only inputs that tell them apart.
     """
-    for blank in ("", None):
-        loop, store, _events = _build([ModelTurnResult(assistant_text=blank)])
+    for blank in ("", None, "   "):
+        # TWO scripted turns: the gate spends its one grant on the first, and the
+        # model comes back just as empty on the handed-back round.
+        loop, store, events = _build(
+            [ModelTurnResult(assistant_text=blank), ModelTurnResult(assistant_text=blank)]
+        )
 
         outcome = await loop.run(
             session_id=SESSION_ID, credentials=_credentials(), user_message="go"
         )
 
         assert outcome.status == "done"
-        assert outcome.assistant_text == blank, "the outcome reports it verbatim"
+        assert outcome.assistant_text == EMPTY_ANSWER_FALLBACK_TEXT, (
+            f"a twice-blank final answer ({blank!r}) must be substituted, not shipped blank"
+        )
+        assert _names(events).count(EMPTY_ANSWER_REFUSED_EVENT) == 1
+        assert _names(events).count(EMPTY_ANSWER_EXHAUSTED_EVENT) == 1
         doc = await store.get_or_create_session(SESSION_ID)
-        assert [m.role for m in doc.messages] == ["user"], (
-            f"a blank final answer ({blank!r}) must leave NO assistant message"
+        assistant = [m for m in doc.messages if m.role == "assistant"]
+        assert [m.content for m in assistant] == [EMPTY_ANSWER_FALLBACK_TEXT], (
+            "history must hold exactly what the user saw — never an empty message, "
+            "and never nothing at all"
         )
 
 

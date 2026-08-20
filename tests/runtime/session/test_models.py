@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from typing import get_args
+
 import pytest
 
 from data_agent.runtime.session.models import (
+    FINALIZATION_BLOCK_KINDS,
     INTENT_STATUSES,
     MODEL_REASON_CODES,
     REASON_CODES,
     RUNTIME_REASON_CODES,
     AnalysisState,
+    FinalizationBlockKind,
     PauseCheckpoint,
     ResultPreview,
     SessionDoc,
@@ -382,8 +386,29 @@ def test_the_finalization_block_key_spells_out_every_kind() -> None:
     """
     assert finalization_block_key(0, 1, "intents") == "0:1:intents"
     assert finalization_block_key(3, 2, "answer_shape") == "3:2:answer_shape"
-    # Distinct keys is the whole mechanism — one map, two independent budgets.
-    assert finalization_block_key(0, 1, "intents") != finalization_block_key(0, 1, "answer_shape")
+    assert finalization_block_key(0, 1, "empty_answer") == "0:1:empty_answer"
+    # Distinct keys is the whole mechanism — one map, N independent budgets. Every
+    # declared kind against every other, so a third (05 §K) cannot collide with the
+    # two that predate it.
+    keys = {finalization_block_key(0, 1, kind) for kind in FINALIZATION_BLOCK_KINDS}
+    assert len(keys) == len(FINALIZATION_BLOCK_KINDS)
+
+
+def test_every_declared_block_kind_is_registered_in_the_tuple() -> None:
+    """THE LITERAL AND THE TUPLE ARE ONE DECLARATION IN TWO PLACES, and only the
+    tuple is enforced at runtime — `finalization_block_key` validates against it.
+
+    A kind added to `FinalizationBlockKind` alone type-checks everywhere, reads as
+    wired, and then FAILS SILENTLY IN EXACTLY ONE DIRECTION: the key mint raises,
+    `FinalizationGate._grant_forced_reround` catches everything and degrades to "no
+    re-round available", and the new gate never refuses anything. No event, no
+    error, no test — the gate simply does not exist in production while every unit
+    test of its own logic passes.
+
+    So the two lists are pinned to each other here, at the only place that can see
+    both.
+    """
+    assert get_args(FinalizationBlockKind) == FINALIZATION_BLOCK_KINDS
 
 
 def test_an_unknown_finalization_block_kind_is_rejected_at_the_key() -> None:
