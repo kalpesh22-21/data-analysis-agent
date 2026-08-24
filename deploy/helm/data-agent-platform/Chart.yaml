@@ -1,0 +1,72 @@
+apiVersion: v2
+name: data-agent-platform
+description: >-
+  Umbrella chart deploying BOTH data-agent planes as ONE Helm release: the online
+  plane (data-agent — agent runtime API, agent UI, neo4j hydrator) and the offline
+  learning plane (data-agent-learning — sweeper, consumer, promotion scheduler,
+  review inbox, reviewer UI, in-chart Redis). It adds no workloads of its own. Its
+  entire reason to exist is `global.config`: 18 keys that MUST be identical in both
+  planes or the learning plane silently works on the wrong data, set ONCE here
+  instead of twice. Either plane can be switched off with its `enabled` flag, and
+  each subchart's own values remain reachable under its name. External backing
+  services (ClickHouse, MCP, token IdP, OpenAI, Couchbase, Neo4j, embedding /
+  reranker APIs) are NOT deployed — provision them separately.
+type: application
+
+# Chart version — bump on every chart change (SemVer).
+version: 0.1.0
+
+# The application version this chart deploys by default. Tracks both subcharts'
+# appVersion: all three deploy the SAME image.
+appVersion: "0.1.0"
+
+# Tested against Kubernetes 1.24+ — the same floor both subcharts declare. Helm
+# checks THIS chart's kubeVersion for the umbrella install; keeping it identical
+# to the subcharts' means a cluster that can take one plane can take both.
+kubeVersion: ">=1.24.0-0"
+
+# ---------------------------------------------------------------------------
+# Subcharts.
+#
+# THE `version:` PINS BELOW MUST MATCH THE SUBCHARTS' `version:` FIELDS EXACTLY.
+# `file://` dependencies are still version-checked: helm reads the local chart's
+# Chart.yaml and refuses to resolve a dependency whose constraint it does not
+# satisfy. So bumping `deploy/helm/data-agent/Chart.yaml`'s version WITHOUT
+# bumping the pin here breaks `helm dependency update` outright — a loud failure,
+# deliberately, because the alternative (a floating `>=` range) would let the
+# umbrella silently package a subchart nobody meant to ship.
+#
+# After ANY bump on either side, re-run:
+#
+#   helm dependency update deploy/helm/data-agent-platform
+#
+# That repackages the subcharts into ./charts/*.tgz. Those tarballs are BUILD
+# ARTIFACTS and are gitignored: helm renders from `charts/` in preference to the
+# `file://` source, so a stale committed tgz would quietly deploy yesterday's
+# subchart while the directory beside it says otherwise.
+#
+# The `condition:` on each dependency is what makes a plane switchable. Note the
+# quoting: `data-agent.enabled` is a PATH into values (`.Values.data-agent.enabled`),
+# not a key with a dot in it.
+# ---------------------------------------------------------------------------
+dependencies:
+  - name: data-agent
+    version: "0.2.0"
+    repository: "file://../data-agent"
+    condition: data-agent.enabled
+  - name: data-agent-learning
+    version: "0.1.0"
+    repository: "file://../data-agent-learning"
+    condition: data-agent-learning.enabled
+
+home: https://github.com/example/data-agent
+sources:
+  - https://github.com/example/data-agent
+maintainers:
+  - name: data-agent maintainers
+keywords:
+  - hr
+  - data-analysis
+  - agent
+  - umbrella
+  - fastapi

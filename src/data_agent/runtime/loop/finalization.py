@@ -50,6 +50,7 @@ __all__ = [
     "EMPTY_ANSWER_EXHAUSTED_EVENT",
     "EMPTY_ANSWER_FALLBACK_TEXT",
     "EMPTY_ANSWER_REFUSED_EVENT",
+    "MAX_NUDGE_DRAFT_CHARS",
     "AnswerShapeCounter",
     "FinalizationGate",
     "answer_shape_nudge_text",
@@ -67,7 +68,7 @@ _logger = logging.getLogger(__name__)
 # Generous: the point is that the model does not have to REGENERATE the answer it
 # just wrote (exit #1 persists nothing and D22 discards free text around tool
 # calls), so a truncated quote costs a rewrite of the tail only.
-_MAX_NUDGE_DRAFT_CHARS = 2000
+MAX_NUDGE_DRAFT_CHARS = 2000
 
 # The tools whose SUCCESSFUL result IS an answer's rows, for the ANSWER-SHAPE gate
 # (05 §J). Deliberately just two: `sampleRows`, `getTableSchema` and the listings
@@ -294,7 +295,7 @@ def finalization_nudge_text(draft: str | None, pending: Sequence[TrackedIntent])
     """
     lines: list[str] = []
     if draft and draft.strip():
-        lines.append(f"You drafted: {draft.strip()[:_MAX_NUDGE_DRAFT_CHARS]}")
+        lines.append(f"You drafted: {draft.strip()[:MAX_NUDGE_DRAFT_CHARS]}")
         lines.append("")
     lines.append(
         f"That is not your final answer yet — {len(pending)} intent(s) you are "
@@ -332,7 +333,7 @@ def answer_shape_nudge_text(draft: str | None, multi_row_calls: int) -> str:
     lines: list[str] = []
     if draft and draft.strip():
         stripped = draft.strip()
-        echo = stripped[:_MAX_NUDGE_DRAFT_CHARS]
+        echo = stripped[:MAX_NUDGE_DRAFT_CHARS]
         if len(echo) < len(stripped):
             echo += " …[truncated]"
         lines.append(f"You drafted: {echo}")

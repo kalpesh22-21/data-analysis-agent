@@ -112,6 +112,16 @@ def build_real_app():
     model = pick_openai_model(api_key, label=_PREFLIGHT_LABEL)
 
     retrieval_on = os.environ.get("REAL_RETRIEVAL") == "1"
+    # LLM progress summaries (docs/08-ui.md): ON by default for THIS dev launcher
+    # (production RuntimeSettings default stays False). Relaxes D25 for the progress
+    # channel only — the streamed line may carry business values from tool args.
+    # Disable with PROGRESS_SUMMARY_ENABLED=0.
+    progress_summaries_on = os.environ.get("PROGRESS_SUMMARY_ENABLED", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     # Access-controlled TELEMETRY DEBUG switch (default OFF = D25 shape-only). When
     # OTLP_DISABLE_REDACTION=1, Phoenix shows the REAL tool calls (actual SQL WITH
     # literals + the result preview) AND the LLM Q/A — for a debugging operator
@@ -146,6 +156,13 @@ def build_real_app():
         max_loop_iterations=15,
         max_wall_clock_seconds=60,
         max_budget_windows=3,
+        # Value-rich progress lines via a cheap side LLM (openai_summary_model);
+        # fire-and-forget, never blocks dispatch. Explicitly wired (this launcher
+        # sets _env_file=None, so the flag must not rely on `.env`).
+        progress_summary_enabled=progress_summaries_on,
+        progress_summary_timeout_seconds=float(
+            os.environ.get("PROGRESS_SUMMARY_TIMEOUT_SECONDS", "") or 10.0
+        ),
         # Retrieval / scratch: both off unless REAL_RETRIEVAL=1.
         #
         # `scratch_enabled` was hardcoded False here while the comment claimed it
@@ -181,6 +198,10 @@ def build_real_app():
             "REAL tool calls (SQL+values), results, and LLM Q/A. ACCESS-CONTROL this server."
         )
     print(f"[run_ui_runtime_real] retrieval      = {'ON (neo4j)' if retrieval_on else 'OFF'}")
+    print(
+        f"[run_ui_runtime_real] progress_summaries = "
+        f"{'ON (' + settings.openai_summary_model + ')' if progress_summaries_on else 'OFF'}"
+    )
     print(f"[run_ui_runtime_real] model          = {settings.openai_model}")
 
     # REAL components — mirrors demo_runtime_turn_traced.py's proven wiring. Every

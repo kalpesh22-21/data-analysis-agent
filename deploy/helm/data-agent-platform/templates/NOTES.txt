@@ -1,0 +1,108 @@
+{{- $agent := (index .Values "data-agent") | default dict -}}
+{{- $learning := (index .Values "data-agent-learning") | default dict -}}
+Release "{{ .Release.Name }}" of data-agent-platform has been deployed.
+
+Planes in this release:
+{{- if $agent.enabled }}
+  - data-agent           (ONLINE:  runtime API, agent UI, neo4j hydrator)
+{{- else }}
+  - data-agent           DISABLED — no runtime, no agent UI, no hydrator. With no
+                         agent writing sessions there is nothing for the learning
+                         plane to sweep; it will idle, correctly and permanently.
+{{- end }}
+{{- if $learning.enabled }}
+  - data-agent-learning  (OFFLINE: sweeper, consumer, promotion scheduler, review
+                         inbox, reviewer UI, in-chart Redis)
+{{- else }}
+  - data-agent-learning  DISABLED — nothing learns from finished sessions and
+                         nothing reaches the review inbox. The agent is unaffected.
+{{- end }}
+
+YOU ARE NOT SEEING THE SUBCHARTS' OWN NOTES. Helm prints only the top-level
+chart's, so the per-plane detail each subchart used to greet you with — how to
+reach the two UIs, the Redis posture and its dead-letter caveat, the per-key
+Secret warnings (REVIEWER_TOKEN, LEARNING_EXTRACTOR_API_KEY, MCP_SERVICE_KEY,
+each of which fails SILENTLY when absent) — is suppressed here. Print it with:
+
+  # all three sets of notes, at install/upgrade time:
+  helm upgrade --install ... --render-subchart-notes
+
+  # this page again, later:
+  helm get notes {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+
+Read them at least once. This page covers only what ONE RELEASE changes.
+
+WHAT THE UMBRELLA GUARANTEES: the {{ len ((.Values.global).config | default dict) }} keys under `global.config` are merged
+into BOTH subcharts' ConfigMaps and OVERRULE whatever each subchart's own
+values.yaml carries. The COUCHBASE_* / NEO4J_* / EMBEDDING_* / TENANT_* drift
+that used to be a discipline across two releases is now impossible to introduce
+here — the learning plane cannot be pointed at a different session keyspace,
+graph, embedding model or tenant than the agent, because there is only one place
+to say it. Verify what actually landed:
+
+  kubectl --namespace {{ .Release.Namespace }} get configmap \
+    -l app.kubernetes.io/instance={{ .Release.Name }} \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.data.COUCHBASE_SCOPE}{"\t"}{.data.NEO4J_DATABASE}{"\n"}{end}'
+
+Both rows must agree. (Setting one of those keys under `data-agent:` or
+`data-agent-learning:` instead does NOT take effect — global wins, by design.)
+
+WHAT IT DOES NOT: `SESSION_TTL_SECONDS` (online) and
+`LEARNING_IDLE_THRESHOLD_SECONDS` (offline) are per-plane keys that must still be
+reasoned about TOGETHER — the TTL must exceed the idle threshold plus
+P95(dwell + processing), or sessions expire before they are learned from. No
+merge can check that for you.
+{{- if not ((.Values.global).secrets).existingSecret }}
+
+TWO SECRETS, NOT ONE. `global.secrets.existingSecret` is unset, so each plane
+falls back to its own conventional `<fullname>-secret` name:
+{{- if $agent.enabled }}
+    online   {{ .Release.Name }}-data-agent-secret (truncated to 63 chars)
+{{- end }}
+{{- if $learning.enabled }}
+    offline  {{ .Release.Name }}-data-agent-learning-secret (truncated to 63 chars)
+{{- end }}
+You must create BOTH, out-of-band, and keep the shared credentials in them
+identical by hand — COUCHBASE_PASSWORD, NEO4J_PASSWORD, TOKEN_ISSUER_API_KEY and
+EMBEDDING_API_KEY authenticate the SAME identity in both planes, and their drift
+has no symptom. Set `global.secrets.existingSecret` to ONE Secret holding the
+union of both planes' keys and that whole class goes away.
+{{- else }}
+
+ONE SECRET SERVES BOTH PLANES: {{ ((.Values.global).secrets).existingSecret }}
+It must hold the UNION of both planes' keys; unused keys are harmless, because
+each pod only reads what it needs. Verify it EXISTS — nothing here renders a
+Secret, and envFrom against a missing one wedges every pod in
+CreateContainerConfigError rather than failing loudly:
+
+  kubectl --namespace {{ .Release.Namespace }} get secret {{ ((.Values.global).secrets).existingSecret }}
+{{- end }}
+
+Rotating a key in that Secret does NOT restart the pods — nothing here renders
+the Secret, so there is no checksum to change. Roll them yourself, and EXCLUDE
+the learning plane's redis, which mounts none of it and whose restart drops the
+job stream on the emptyDir default:
+
+  kubectl --namespace {{ .Release.Namespace }} rollout restart deploy \
+    -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component!=redis
+{{- if and $agent.enabled $learning.enabled }}
+{{- if not (and ((.Values.global).config).TENANT_CLIENT_CODE ((.Values.global).config).TENANT_PROC_CENTER ((.Values.global).config).TENANT_JTI) }}
+
+NOTE: one or more `global.config.TENANT_*` claims are blank, so the promotion
+write plane is in its LOGGED DORMANT posture: candidates still reach the review
+inbox, but the golden-replay verification gate cannot run and nothing
+auto-promotes. This is the deliberate safe default — set all three to activate
+it. Under this umbrella you set them ONCE and both planes get the same triple,
+which is the whole point: a divergent tenant reads a different (or empty) row set
+and the replay's grain check still passes, 0 == 0.
+{{- end }}
+{{- end }}
+
+The external backing services (ClickHouse, MCP, token IdP, OpenAI, Couchbase,
+Neo4j, embedding / reranker APIs) are NOT deployed by this umbrella or by either
+subchart. The learning plane's Redis is the one exception and stays owned by that
+subchart. Confirm the endpoints in `global.config` are correct.
+
+Re-run `helm dependency update deploy/helm/data-agent-platform` after ANY change
+to a subchart: this release renders from the packaged copies in `charts/`, which
+WIN over the subchart directories beside them.

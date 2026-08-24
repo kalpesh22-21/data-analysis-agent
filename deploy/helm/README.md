@@ -1,18 +1,27 @@
 # data-agent Helm charts
 
-Two production-quality Helm charts for **data-agent**, the HR data-analysis agent
-(Python/FastAPI):
+Production-quality Helm charts for **data-agent**, the HR data-analysis agent
+(Python/FastAPI) — two workload charts and an umbrella that installs both:
 
 | Chart | Path | Plane | Deploys |
 |---|---|---|---|
+| `data-agent-platform` | [`data-agent-platform/`](./data-agent-platform) | **both** — *recommended* | nothing of its own; pulls in the two below as subcharts of ONE release, with the config they must share set once |
 | `data-agent` | [`data-agent/`](./data-agent) | **online** | agent runtime API, agent UI, neo4j hydrator |
 | `data-agent-learning` | [`data-agent-learning/`](./data-agent-learning) | **offline** | learning sweeper, learning consumer, learning scheduler, review-inbox service, reviewer UI |
 
-They are split because the two planes have different lifecycles, different
-blast radii and different reasons to be scaled or turned off: you can stop the
-entire learning loop without touching the agent serving traffic, and you can
-redeploy the agent without disturbing a reviewer's queue. They are **not**
-independent — see [How the two charts couple](#how-the-two-charts-couple).
+The two workload charts are split because the two planes have different
+lifecycles, different blast radii and different reasons to be scaled or turned
+off: you can stop the entire learning loop without touching the agent serving
+traffic, and you can redeploy the agent without disturbing a reviewer's queue.
+They are **not** independent — see
+[How the two charts couple](#how-the-two-charts-couple).
+
+**`data-agent-platform` is the recommended way to install them.** The split
+lifecycles survive it (each plane has an `enabled` flag), but the 18 keys that
+must be identical in both planes move to one `global.config` block, so the
+drift class that coupling section describes stops being a discipline and starts
+being impossible. Two separate releases remain fully supported and unchanged —
+see [Install / upgrade](#install--upgrade) for both paths.
 
 **Both charts ship the SAME image**, built from the repo-root `Dockerfile`. One
 image, eight workloads (3 Deployments in Chart A + 5 in Chart B): each Deployment
@@ -27,6 +36,13 @@ backing infrastructure.
 > a silent collision between the two releases. (It would also point both releases
 > at the same `<fullname>-secret`, which is harmless when that is what you
 > intended and confusing when it is not.)
+>
+> Under the umbrella this is **enforced**, not advised: one release means one
+> `.Release.Name` for both subcharts, so the collision lands inside a single
+> manifest where helm renders both objects and the API server simply keeps the
+> last apply. `data-agent-platform` computes both subchart fullnames and refuses
+> to render when they match — see
+> [the collision guard](#the-release-name-collision-guard).
 
 ## Workloads
 
@@ -114,6 +130,30 @@ Chart B reads Chart A's data. This is the part a split makes easy to get wrong,
 and every failure mode below is **silent** — no error, no crash, just a plane
 working on the wrong rows.
 
+> **The umbrella removes this drift class by construction.** Under
+> `data-agent-platform` the 18 keys both planes must agree on are set ONCE, in
+> `global.config`, and both subcharts' ConfigMap templates merge that map over
+> their own `config` with **global winning**. There is no longer a second place
+> to write them, so points 1, 2, 3 and 5 below cannot diverge — not because
+> someone kept them in sync, but because there is nothing to keep in sync. The
+> keys are `CATALOG_FIXTURE_PATH`, `COUCHBASE_BUCKET`,
+> `COUCHBASE_CONNECTION_STRING`, `COUCHBASE_RESULTS_COLLECTION`,
+> `COUCHBASE_SCOPE`, `COUCHBASE_SESSIONS_COLLECTION`, `COUCHBASE_USERNAME`,
+> `EMBEDDING_API_URL`, `EMBEDDING_MODEL`, `MCP_URL`, `NEO4J_DATABASE`,
+> `NEO4J_URL`, `NEO4J_USERNAME`, `OTLP_ENDPOINT`, `TENANT_CLIENT_CODE`,
+> `TENANT_JTI`, `TENANT_PROC_CENTER` and `TOKEN_SERVICE_URL`.
+>
+> Global winning is forced, not stylistic: both subcharts ship a default for
+> nearly all 18 in their own `values.yaml`, so a local-wins merge would leave
+> `global.config` a knob helm accepts and nothing reads. The corollary is worth
+> stating plainly — under the umbrella, setting one of those 18 under
+> `data-agent.config` or `data-agent-learning.config` **does nothing**. It is not
+> an error; it is overruled.
+>
+> **Point 4 is not covered.** `SESSION_TTL_SECONDS` and
+> `LEARNING_IDLE_THRESHOLD_SECONDS` are per-plane keys that hold different values
+> and still have to be reasoned about together. No merge can check an inequality.
+
 1. **Couchbase session bucket.** The sweeper scans the *agent's* session bucket
    for idle sessions. Chart B's `COUCHBASE_CONNECTION_STRING` / `COUCHBASE_USERNAME`
    / `COUCHBASE_BUCKET` / `COUCHBASE_PASSWORD` must be Chart A's. Point them
@@ -147,7 +187,12 @@ sealed-secrets / `kubectl create secret`) and either name it
 in `CreateContainerConfigError`, which looks like a scheduling problem and is not.
 
 The recommended shape is **one** Secret containing the union of both charts' keys,
-referenced from both releases. `COUCHBASE_PASSWORD`,
+referenced from both planes. Under the umbrella that is a single value —
+`global.secrets.existingSecret` — which each subchart's `secretName` helper picks
+up when its own `secrets.existingSecret` is empty. (Local beats global here,
+unlike `config`: `secrets.existingSecret` ships empty in both subcharts, so a
+local value can only exist because somebody typed it, and it stays an escape
+hatch for a plane whose credentials genuinely differ.) `COUCHBASE_PASSWORD`,
 `NEO4J_PASSWORD`, `TOKEN_ISSUER_API_KEY` and `EMBEDDING_API_KEY` authenticate the
 same identity in both planes; two hand-maintained Secrets drift, and per point 2
 above the drift has no symptom. Unused keys in a shared Secret are harmless —
@@ -191,7 +236,13 @@ kubectl create secret generic data-agent-secrets \
 
 Each chart renders its **own** ConfigMap, `envFrom`-mounted into every one of its
 workloads, alongside the out-of-band Secret named by `secrets.existingSecret` (or
-the conventional `<fullname>-secret`). **Neither chart renders the Secret.**
+`global.secrets.existingSecret`, or the conventional `<fullname>-secret`).
+**Neither chart renders the Secret**, and neither does the umbrella.
+
+Both ConfigMap templates build their data from `merge(global.config, config)`
+with **global winning**, so the "Both (must agree)" column below is exactly what
+`global.config` carries. Standalone, `.Values.global` is absent and the merge
+reduces to `.Values.config` unchanged.
 
 | Chart A only | Chart B only | Both (must agree) |
 |---|---|---|
@@ -254,11 +305,15 @@ one down (drain the old stream first — in-flight jobs do not migrate).
 - Kubernetes >= 1.24, Helm 3+.
 - The external services above, reachable from the cluster.
 - A built + pushed application image (see below).
-- **A pre-created Secret per release** — named `<release>-<chart>-secret` or
-  referenced via `secrets.existingSecret`. This is **required, not a production
-  hardening step**: neither chart renders a Secret, and pods wedge in
-  `CreateContainerConfigError` until it exists. One Secret may serve both
-  releases; see [the Secret section](#the-secret-is-out-of-band--and-one-secret-can-serve-both-releases).
+- **A pre-created Secret** — named `<release>-<chart>-secret` or referenced via
+  `secrets.existingSecret` / `global.secrets.existingSecret`. This is
+  **required, not a production hardening step**: nothing here renders a Secret,
+  and pods wedge in `CreateContainerConfigError` until it exists. One Secret may
+  serve both planes and should; see
+  [the Secret section](#the-secret-is-out-of-band--and-one-secret-can-serve-both-releases).
+- For the umbrella only: `helm dependency update deploy/helm/data-agent-platform`
+  before the first render, and after any subchart change. The `charts/*.tgz` it
+  writes are gitignored build artifacts.
 - (Optional) an Ingress controller + cert-manager if you enable any Ingress.
 
 ## Build and push the image
@@ -278,6 +333,133 @@ deliberately staging a rollout.
 
 ## Install / upgrade
 
+Two supported paths. Pick one and stay on it — they produce different object
+names, so moving between them is a rename, not an upgrade.
+
+### Recommended — one release, via the umbrella
+
+```bash
+# REQUIRED FIRST, and again after ANY change to either subchart. This packages
+# the file:// subcharts into deploy/helm/data-agent-platform/charts/*.tgz, which
+# is what actually gets rendered — a stale tarball there silently wins over the
+# subchart directory beside it. Those artifacts are gitignored, so a fresh clone
+# has none and `helm template` refuses outright until you run this.
+helm dependency update deploy/helm/data-agent-platform
+
+# Dry-run render to inspect manifests
+helm template platform deploy/helm/data-agent-platform -f <your-values.yaml>
+
+# Install / upgrade — BOTH planes, one release, one ordering decision fewer.
+helm upgrade --install platform deploy/helm/data-agent-platform \
+  --namespace data-agent --create-namespace \
+  -f <your-values.yaml>
+```
+
+Your values file has three parts (see
+[`data-agent-platform/values.yaml`](./data-agent-platform/values.yaml) for the
+fully documented defaults):
+
+```yaml
+global:
+  config:                       # the 18 shared keys. THE place to set them.
+    COUCHBASE_BUCKET: pcm_iwant
+    COUCHBASE_SCOPE: sessions
+    NEO4J_DATABASE: prod
+    TENANT_CLIENT_CODE: CLIENT_A
+    TENANT_PROC_CENTER: PC01
+    TENANT_JTI: analyst-svc
+  secrets:
+    existingSecret: data-agent-secrets   # ONE out-of-band Secret, both planes
+
+data-agent:                     # per-plane pass-through: this subchart's own
+  enabled: true                 # values.yaml surface, verbatim, under its name
+  image:
+    repository: ghcr.io/acme/data-agent
+    tag: "1.4.2"
+  config:
+    OPENAI_MODEL: gpt-4o
+    SESSION_TTL_SECONDS: "3600"
+  uiIngress:
+    enabled: true
+    hosts: [{ host: agent.example.com, paths: [{ path: /, pathType: Prefix }] }]
+
+data-agent-learning:
+  enabled: true
+  image:
+    repository: ghcr.io/acme/data-agent
+    tag: "1.4.2"
+  config:
+    LEARNING_JUDGE_ENABLED: "true"
+    LEARNING_IDLE_THRESHOLD_SECONDS: "900"
+  redis:
+    persistence:
+      enabled: true
+```
+
+Helm prints only the umbrella's `NOTES.txt`, so the two subcharts' notes — the
+per-plane detail about reaching the UIs, the Redis dead-letter caveat and the
+Secret keys whose absence is silent — are suppressed. Pass
+`--render-subchart-notes` to see all three; the umbrella's own notes say so too.
+
+Anything either chart documents is reachable by prefixing it with the subchart
+name — `data-agent.config.OPENAI_MODEL`, `data-agent.ingress.enabled`,
+`data-agent-learning.config.LEARNING_JUDGE_ENABLED`,
+`data-agent-learning.redis.enabled`, and so on. Command line too:
+
+```bash
+helm upgrade --install platform deploy/helm/data-agent-platform \
+  --set global.config.COUCHBASE_SCOPE=sessions \
+  --set data-agent.components.runtime.replicaCount=4 \
+  --set data-agent-learning.config.LEARNING_ENABLED=false
+```
+
+Turning a plane off is `--set data-agent-learning.enabled=false` (its `enabled`
+key is the dependency `condition:` in `Chart.yaml`, so the whole subchart stops
+rendering — its ConfigMap included). `LEARNING_ENABLED=false` remains the
+lighter-weight switch: every learning daemon re-reads it each cycle without a
+restart, and the workloads stay up.
+
+**The image is not global.** Both planes run the same image built from the
+repo-root `Dockerfile`, but neither subchart reads a `global.image`, so set it in
+both blocks and keep the tags equal unless you are deliberately staging a
+rollout.
+
+#### The release-name collision guard
+
+One release means one `.Release.Name` for both subcharts. Both fullname helpers
+collapse `<release>-<chart>` to just `<release>` when the release name already
+contains the chart name, so a release called `data-agent-learning-prod` gives
+**both** planes the same fullname and renders their ConfigMap, ServiceAccount and
+helm-test Pod under identical names — inside one manifest, where helm raises
+nothing and the API server keeps whichever applied last. One plane then mounts
+the other plane's env.
+
+The umbrella refuses to render that. It computes both fullnames the way the
+subcharts do (`fullnameOverride` and `nameOverride` included) and fails with the
+two names and a suggested rename. Computing rather than string-matching
+`data-agent-learning` also catches a second class: at a release name near Helm's
+53-character maximum both fullnames truncate to the same 63 characters, which
+contains neither chart name.
+
+```bash
+$ helm template data-agent-learning-prod deploy/helm/data-agent-platform
+Error: execution error at (data-agent-platform/templates/validate.yaml:87:4):
+data-agent-platform: RELEASE NAME COLLISION — refusing to render.
+...
+```
+
+Name the release something that contains neither chart name (`platform`, `prod`,
+`dap-eu-west-1`), or — if the release name is not yours to choose — pin one plane
+explicitly with `--set data-agent.fullnameOverride=<something-else>`.
+
+A second guard refuses `RUNTIME_URL`, `INBOX_SERVICE_URL` and
+`LEARNING_REDIS_URL` in `global.config`. Each is DERIVED by one subchart from
+Services that subchart renders, and a global value would be silently discarded —
+and in `INBOX_SERVICE_URL`'s case would additionally hand the agent UI the
+reviewer inbox's address. Set them under the owning subchart or not at all.
+
+### Still supported — two separate releases
+
 ```bash
 # Dry-run render to inspect manifests
 helm template data-agent deploy/helm/data-agent \
@@ -295,6 +477,15 @@ helm upgrade --install data-agent-learning deploy/helm/data-agent-learning \
   --namespace data-agent \
   -f deploy/helm/data-agent-learning/values-example.yaml
 ```
+
+Nothing about this path changed. Both charts render byte-for-byte what they
+rendered before they were made umbrella-aware — `.Values.global` is simply absent
+and the merge reduces to `.Values.config`
+(`tests/deploy/test_helm_platform_umbrella.py` pins that by rendering against a
+reconstructed pre-change template and comparing bytes). What you keep is the
+obligation the umbrella takes away: the 18 keys in
+[How the two charts couple](#how-the-two-charts-couple) must be written twice,
+identically, and nothing checks it.
 
 Turning the learning plane off is `helm uninstall data-agent-learning` (or
 `LEARNING_ENABLED=false`, which every learning daemon re-reads each cycle without
@@ -460,6 +651,10 @@ falling back to that chart's global defaults.
 ## Testing a release
 
 ```bash
+# Umbrella (one release, both planes' test Pods run)
+helm test platform --namespace data-agent
+
+# Two separate releases
 helm test data-agent --namespace data-agent
 helm test data-agent-learning --namespace data-agent
 ```
@@ -471,4 +666,8 @@ routes require the reviewer token, so an unauthenticated request could only ever
 assert a 401.
 
 Render-level regression tests live in `tests/deploy/` (they skip when the `helm`
-binary is absent).
+binary is absent). `test_helm_chart_split.py` covers the seam between the two
+charts as separate releases; `test_helm_platform_umbrella.py` covers the umbrella
+— the shared-key precedence, the collision guard, and the proof that standalone
+renders are byte-identical to what they were before the charts became
+global-aware.

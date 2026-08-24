@@ -8,6 +8,34 @@ INBOX_SERVICE_URL (this release's inbox Service) and LEARNING_REDIS_URL (the
 in-chart Redis Service). Both fall back to the explicit .Values.config entry
 whenever it is non-empty; see the helpers for the full precedence.
 
+GLOBAL MERGE — `global.config` WINS over `.Values.config`.
+When this chart runs as a subchart of `data-agent-platform`, Helm injects the
+umbrella's `.Values.global` here, and `global.config` carries the 18 keys BOTH
+planes must agree on (Couchbase, Neo4j, embedding, MCP, token service, OTLP, the
+tenant triple). Global has to beat local, and that is FORCED rather than chosen:
+this chart ships a non-empty default for nearly all 18 in its own values.yaml, so
+if local won, `global.config` could never take effect and would be dead weight —
+a knob the deployer sets, helm accepts, and nothing reads. The whole point of the
+umbrella is that those keys are set ONCE; a losing global would reinstate exactly
+the silent drift this chart's values.yaml spends paragraphs warning about.
+
+Sprig `merge dst src` lets DST win and mutates dst, hence the deepCopy of the
+global map. But it delegates to mergo, which treats "" as EMPTY and fills it from
+src — so a DELIBERATELY BLANK global value (blanking the tenant triple, say)
+would lose to a non-blank subchart value. That is the same silent asymmetry in
+miniature, so the range below re-asserts every global key over the merge result
+and makes the precedence TOTAL.
+
+Standalone installs are unaffected: `.Values.global` is absent, the parenthesised
+access yields nil, `default dict` makes it an empty map, and both the merge and
+the re-assert reduce to `.Values.config` unchanged.
+
+Neither derived key is a shared key, and neither belongs in `global.config`:
+INBOX_SERVICE_URL is the reviewer surface's own address (leaking it into the
+online plane's ConfigMap is the second door the split exists to keep shut) and
+LEARNING_REDIS_URL is this plane's private transport. The umbrella refuses both
+outright (see its templates/validate.yaml) rather than mis-applying them here.
+
 A BLANK value is normally OMITTED from the ConfigMap, so the process falls through
 to whatever default its settings model carries. That is the right rule for almost
 everything here and the WRONG one for the tenant claims: their code defaults are the
@@ -18,6 +46,11 @@ rendered even when blank, so "unset" reaches the process AS blank and trips the
 readiness gates in run_learning_scheduler.py / learning/inbox/service.py.
 */}}
 {{- $alwaysRender := list "TENANT_CLIENT_CODE" "TENANT_PROC_CENTER" "TENANT_JTI" }}
+{{- $globalConfig := ((.Values.global).config) | default dict }}
+{{- $config := merge (deepCopy $globalConfig) (.Values.config | default dict) }}
+{{- range $key, $val := $globalConfig }}
+{{- $_ := set $config $key $val }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -25,7 +58,7 @@ metadata:
   labels:
     {{- include "data-agent-learning.labels" . | nindent 4 }}
 data:
-  {{- range $key, $val := .Values.config }}
+  {{- range $key, $val := $config }}
   {{- /* INBOX_SERVICE_URL and LEARNING_REDIS_URL are handled below via helpers */}}
   {{- if not (has $key (list "INBOX_SERVICE_URL" "LEARNING_REDIS_URL")) }}
   {{- if or (ne (toString $val) "") (has $key $alwaysRender) }}

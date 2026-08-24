@@ -322,11 +322,18 @@ MAX_FINALIZATION_BLOCKS_PER_WINDOW = 1
 # the one failure the runtime can never get a second word in about. Worst case stays
 # bounded — one extra round-trip per kind per window, and `max_budget_windows`
 # bounds the windows.
-FinalizationBlockKind = Literal["intents", "answer_shape", "empty_answer"]
+FinalizationBlockKind = Literal[
+    "intents", "answer_shape", "empty_answer", "ungrounded_answer"
+]
 FINALIZATION_BLOCK_KINDS: tuple[FinalizationBlockKind, ...] = (
     "intents",
     "answer_shape",
     "empty_answer",
+    # The finish-time ANSWER RULES (05 §L). ONE kind for every GROUNDING rule, not
+    # one per rule: N rules with N allowances would be N extra round-trips per
+    # window. A rule whose complaint is about answer FORM charges to `answer_shape`
+    # instead — see `loop/answer_rules.py::ANSWER_RULES`.
+    "ungrounded_answer",
 )
 
 

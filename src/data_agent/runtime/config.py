@@ -409,11 +409,16 @@ class RuntimeSettings(BaseSettings):
         ),
     )
     progress_summary_timeout_seconds: float = Field(
-        3.0,
+        10.0,
         gt=0,
         description=(
             "Per-call timeout for the progress-line summarization LLM call. On timeout "
-            "the summary is dropped (fail-soft) and the instant template label stands."
+            "the summary is dropped (fail-soft) and the instant template label stands. "
+            "Generous BY DESIGN: the call is fire-and-forget and is already bounded by "
+            "turn-end cancellation, so this only has to stop a hung request — it is not "
+            "a latency budget. It was 3.0s, which sat on top of the summarizer's own "
+            "measured latency (p50 ~1.9s, tail >4s when a parallel tool batch puts "
+            "several calls in flight at once) and silently dropped ~1 line in 5."
         ),
     )
 
@@ -1004,7 +1009,7 @@ class RuntimeSettings(BaseSettings):
             "Vault KV path holding the OpenAI API Key"
         ),
     )
-    
+
     def effective_agent_system_prompt(self) -> str | None:
         """The base system prompt to prepend, or `None` when disabled.
 

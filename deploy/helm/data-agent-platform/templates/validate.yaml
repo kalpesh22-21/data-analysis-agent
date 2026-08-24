@@ -1,0 +1,228 @@
+{{/*
+RENDER-TIME GUARDS. This file emits NO objects — it either renders nothing or it
+calls `fail`, which aborts `helm template` / `install` / `upgrade` before any of
+it reaches the cluster. Both guards exist because the failure they catch is
+otherwise SILENT.
+
+---------------------------------------------------------------------------
+GUARD 1 — the release-name collision.
+
+One release means one `.Release.Name` for both subcharts, and that makes a
+previously-documented trap REACHABLE INSIDE A SINGLE RELEASE. Each subchart's
+`fullname` helper collapses `<release>-<chart>` to just `<release>` whenever
+`contains $chartName .Release.Name`. So for a release named
+`data-agent-learning` — or `data-agent-learning-prod`, or anything containing
+that string:
+
+  * Chart A: "data-agent" IS contained in "data-agent-learning…" → fullname is
+    the release name;
+  * Chart B: "data-agent-learning" IS contained → fullname is the SAME release
+    name.
+
+Both subcharts then render their ConfigMap, ServiceAccount and helm-test Pod
+under IDENTICAL names. Helm does not complain: it renders both and hands them to
+the API server, where the second apply overwrites the first. One plane ends up
+mounting the other plane's ConfigMap — the learning daemons reading the online
+plane's env, or the reverse — and nothing anywhere reports it. Across two
+releases this was merely a warning in the README; under one release it is a
+footgun the chart can and does refuse.
+
+The guard COMPUTES both fullnames with the subcharts' own rule rather than
+string-matching "data-agent-learning", because the substring test would miss a
+SECOND collision class it also catches: at a long-but-legal release name (53
+chars, Helm's own maximum) `<release>-data-agent` and `<release>-data-agent-learning`
+BOTH truncate to the same 63-character string, so even the ServiceAccount — the
+one object named with the BARE fullname — renders twice. Computing catches both
+classes with one comparison; a substring match catches only the first.
+
+And a THIRD class, which is why the comparison below is not made at 63 chars.
+Only the ServiceAccount is named with the bare fullname. Every other object goes
+through each subchart's `suffixedName` helper, which truncates the FULLNAME (not
+the result) so the suffix always survives:
+
+    $budget := int (sub 62 (len $suffix))
+    printf "%s-%s" (include "<chart>.fullname" .root | trunc $budget | trimSuffix "-") $suffix
+
+The base is therefore cut to `62 - len(suffix)`, a budget MUCH tighter than 63,
+and it gets tighter the longer the suffix. Two fullnames that are still distinct
+at 63 characters can be identical at a suffix's budget — at which point those
+objects collide while a 63-char guard says nothing. Both subcharts render objects
+under three of the same suffixes, so three name classes are exposed:
+
+  * "test-connection" (the helm-test Pod)   -> budget 47   <-- TIGHTEST
+  * "config"          (the ConfigMap)       -> budget 56
+  * ""                (the ServiceAccount)  -> budget 63
+
+Empirically, on the pre-fix guard, a release name of 35 characters containing
+NEITHER chart name already rendered both planes' test Pods as
+`<release>-data-agent-test-connection`, silently; at 44 both ConfigMaps
+collided; only at 51 did the 63-char comparison finally fire. Sixteen characters
+of release name in which one plane mounts the other plane's env with no error
+anywhere.
+
+The comparison is therefore made at the TIGHTEST budget shared by both charts.
+That is sound in one direction only, and it is the direction that matters: the
+truncations of one fullname are prefixes of each other, so equality at a LOOSER
+budget implies equality at every tighter one. Gating on the tightest budget
+catches all three classes with a single comparison, and it is exact rather than
+conservative for that suffix — matching there means the two helm-test Pods DO
+render under one name.
+
+If a longer suffix is ever added to BOTH subcharts, it becomes the tightest and
+`$tightestSharedSuffix` below must be changed to it, or the guard goes silent for
+that new class exactly as it did for this one. A longer suffix added to only ONE
+subchart changes nothing: the other plane renders no object under it, so there is
+nothing for it to collide with.
+
+It also honours `fullnameOverride` / `nameOverride`, which is what makes the
+escape hatch in the failure message real rather than a guess — though an override
+must now differ from the other plane's name within the FIRST 47 CHARACTERS, not
+merely somewhere inside 63.
+
+---------------------------------------------------------------------------
+GUARD 2 — per-plane keys must not be set globally.
+
+Three keys are DERIVED by their own subchart from objects that release renders,
+and each subchart's configmap.yaml excludes them from the merged range and
+resolves them through a helper reading `.Values.config`. Put one in
+`global.config` and the merge carries it into the map, the exclusion drops it,
+and the helper never sees it: a value the deployer set, helm accepted, and
+nothing read.
+
+For INBOX_SERVICE_URL the silent no-op is not even the worst outcome. The ONLINE
+plane does not exclude that key, so a global one would render into the agent UI's
+ConfigMap — handing the agent UI the address of the reviewer inbox. It would not
+work today (the agent UI leaves REVIEW_INBOX_ENABLED unset, so its inbox routes
+still 404) but it is half of the second door the split exists to keep shut, and
+half a door installed silently is how the other half gets added later. Refuse it.
+*/}}
+
+{{/*
+Reproduce a subchart's `fullname` helper from the umbrella's context. Kept
+IDENTICAL to `data-agent.fullname` / `data-agent-learning.fullname` — if either
+of those ever changes, this must change with it or the guard silently stops
+matching what actually renders.
+Usage: {{ include "data-agent-platform.subchartFullname" (dict "chartName" "data-agent" "values" $v "releaseName" $.Release.Name) }}
+*/}}
+{{- define "data-agent-platform.subchartFullname" -}}
+{{- $values := .values | default dict -}}
+{{- if $values.fullnameOverride -}}
+{{- $values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default .chartName $values.nameOverride -}}
+{{- if contains $name .releaseName -}}
+{{- .releaseName | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .releaseName $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- $agent := (index .Values "data-agent") | default dict -}}
+{{- $learning := (index .Values "data-agent-learning") | default dict -}}
+
+{{- if and $agent.enabled $learning.enabled -}}
+{{- $agentFullname := include "data-agent-platform.subchartFullname" (dict "chartName" "data-agent" "values" $agent "releaseName" .Release.Name) -}}
+{{- $learningFullname := include "data-agent-platform.subchartFullname" (dict "chartName" "data-agent-learning" "values" $learning "releaseName" .Release.Name) -}}
+{{/*
+The LONGEST suffix both subcharts pass to their `suffixedName` helper, and so the
+TIGHTEST base budget any object of theirs is named under. Both charts render:
+
+    "test-connection" (Pod, templates/tests/) -> budget 62 - 15 = 47  <-- this one
+    "config"          (ConfigMap)             -> budget 62 -  6 = 56
+    "secret"          (referenced, not rendered)                  = 56
+    ""                (ServiceAccount, bare fullname)             = 63
+
+The budget is DERIVED from the suffix string, not written as 47, so that this
+stays true by construction if the suffix is ever renamed. If a LONGER suffix is
+ever shared by both charts, put it here: its budget is tighter still, and a guard
+comparing at a looser budget would wave its collision through.
+*/}}
+{{- $tightestSharedSuffix := "test-connection" -}}
+{{- $budget := int (sub 62 (len $tightestSharedSuffix)) -}}
+{{- $agentBase := $agentFullname | trunc $budget | trimSuffix "-" -}}
+{{- $learningBase := $learningFullname | trunc $budget | trimSuffix "-" -}}
+{{- if eq $agentBase $learningBase -}}
+{{/*
+Two shapes of the same failure, and the message has to tell them apart: identical
+fullnames means EVERY object of both planes collides, whereas equal-only-when-
+truncated means the objects built on the tight budgets do — starting with the
+helm-test Pod, which this comparison is exact for.
+*/}}
+{{- $collidingName := printf "%s-%s" $agentBase $tightestSharedSuffix -}}
+{{/*
+The rule of thumb the message hands the operator, DERIVED rather than typed. With
+neither chart name in the release, data-agent's fullname is `<release>-data-agent`
+and it stops being distinguishable from `<release>-data-agent-learning` the moment
+it fills the base budget — i.e. at `len(release) + len("-data-agent") >= budget`,
+one character earlier once `trimSuffix "-"` is applied. Deriving it keeps the
+advice true if the tightest shared suffix ever changes. (A release name that
+CONTAINS a chart name collides at any length; that is the first class above and
+the message says so separately.)
+*/}}
+{{- $safeReleaseLen := int (sub $budget (add 1 (len "-data-agent"))) -}}
+{{- $scope := "" -}}
+{{- if eq $agentFullname $learningFullname -}}
+{{- $scope = printf "EVERY object of both planes, starting with the ServiceAccount \"%s\"" $agentFullname -}}
+{{- else -}}
+{{- $scope = printf "every object whose name is built on a base of %d characters or fewer — the two fullnames differ only PAST character %d" $budget $budget -}}
+{{- end -}}
+{{- fail (printf `
+data-agent-platform: RELEASE NAME COLLISION — refusing to render.
+
+  release name .............. %s
+  data-agent fullname ....... %s
+  data-agent-learning ....... %s
+  both truncate (%d chars) to  %s   <-- the same base
+
+Both subcharts name their objects from that base, so both would render
+  * the helm-test Pod as "%s"
+and more generally %s.
+
+Helm renders both and the API server keeps the LAST one applied, so one plane
+silently mounts the other plane's ConfigMap. Nothing reports it.
+
+Two rules combine to cause it. The fullname rule both subcharts share collapses
+"<release>-<chart>" to just "<release>" when the release name already CONTAINS
+the chart name. And every object except the ServiceAccount is named
+"<fullname truncated to 62-len(suffix)>-<suffix>", so the two fullnames must stay
+distinct within the first %d characters — NOT merely within 63.
+
+Fix it either way:
+
+  * rename the release so it contains neither chart name and is short enough that
+    the two fullnames stay distinct inside %d characters — with these chart names
+    that means under %d characters, e.g.
+
+        helm upgrade --install platform deploy/helm/data-agent-platform
+                             ^^^^^^^^ renders platform-data-agent and
+                                      platform-data-agent-learning
+
+  * or, if the release name is fixed, pin one plane's names explicitly — the
+    override has to differ from the other plane's fullname inside those same
+    %d characters:
+
+        --set data-agent.fullnameOverride=<something-else>
+` .Release.Name $agentFullname $learningFullname $budget $agentBase $collidingName $scope $budget $budget $safeReleaseLen $budget) -}}
+{{- end -}}
+{{- end -}}
+
+{{- $perPlaneKeys := dict
+      "RUNTIME_URL" "the online plane derives it from its own runtime Service; set data-agent.config.RUNTIME_URL to point elsewhere"
+      "INBOX_SERVICE_URL" "the learning plane derives it from its own inbox Service, and a global value would ALSO be handed to the agent UI; set data-agent-learning.config.INBOX_SERVICE_URL to point elsewhere"
+      "LEARNING_REDIS_URL" "it is the learning plane's private transport, derived from its in-chart Redis; set data-agent-learning.config.LEARNING_REDIS_URL for an external Redis"
+-}}
+{{- $globalConfig := ((.Values.global).config) | default dict -}}
+{{- range $key, $why := $perPlaneKeys -}}
+{{- if hasKey $globalConfig $key -}}
+{{- fail (printf `
+data-agent-platform: global.config.%s IS NOT A SHARED KEY — refusing to render.
+
+%s.
+
+Placed in global.config it is silently DISCARDED: the subchart's configmap
+template excludes it from the shared merge and resolves it from that subchart's
+own config instead. Move it to the per-subchart block named above.
+` $key $why) -}}
+{{- end -}}
+{{- end -}}

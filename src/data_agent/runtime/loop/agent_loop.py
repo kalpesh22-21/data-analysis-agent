@@ -97,6 +97,11 @@ from data_agent.runtime.session.models import (
 from data_agent.runtime.session.store import SessionStore
 from data_agent.timeutil import now_iso
 
+from .answer_rules import (
+    ANSWER_RULE_EXHAUSTED_EVENT,
+    ANSWER_RULE_REFUSED_EVENT,
+    first_match,
+)
 from .blueprint_gate import BlueprintGate
 from .budget_guard import BudgetGuard
 from .finalization import (
@@ -2555,6 +2560,51 @@ class AgentLoop:
                         # takes for intents, minus the ledger write, because there is no
                         # ledger for answer shape and the user's answer is in hand.
                         self._observer(ANSWER_SHAPE_EXHAUSTED_EVENT, {})
+
+                # --- THE ANSWER RULES (05 §L) -----------------------------------
+                #
+                # NOT AN `elif`, for §K.4's reason: the branches above are entered when
+                # their complaint QUALIFIES, not when they refuse, so chaining would
+                # silence this on any round where an earlier gate had already spent its
+                # grant. `not refused_finalization` keeps the one-refusal-per-round-trip
+                # rule the chain expresses structurally.
+                #
+                # BEFORE THE EMPTY-ANSWER GATE, though the order is free: `first_match`
+                # returns `None` for blank prose, so the two conditions are disjoint by
+                # construction and neither can pre-empt the other.
+                #
+                # THE ALLOWANCE IS THE RULE'S, not this site's — a grounding rule spends
+                # `ungrounded_answer`, a form rule spends the shape gate's own grant. So
+                # adding a rule does not add a round-trip to the window's worst case
+                # unless it is a genuinely new complaint.
+                answer_rule = (
+                    first_match(result.assistant_text, accum.sql_executed)
+                    if not result.tool_calls and not refused_finalization
+                    else None
+                )
+                if answer_rule is not None:
+                    if await finalization_gate.may_refuse(answer_rule.charges_to):
+                        refused_finalization = True
+                        self._observer(
+                            ANSWER_RULE_REFUSED_EVENT, {"rule": answer_rule.name}
+                        )
+                        finalization_nudge = answer_rule.nudge(result.assistant_text)
+                        # CLEAR THE DRAFT, for the reason the two gates above clear it:
+                        # `last_assistant_text` is returned as `assistant_text` on the
+                        # hard-ceiling and budget-cap paths, so a refused answer could
+                        # otherwise reach the user there while never entering history.
+                        last_assistant_text = None
+                    else:
+                        # The kind's allowance for this window is spent. THE PROSE
+                        # PASSES — the runtime records what it can and never hard-locks
+                        # a turn (§J.5), and here that posture is load-bearing rather
+                        # than inherited: these rules read SHAPE, not truth, so a second
+                        # refusal would be the runtime destroying an answer it cannot
+                        # prove is wrong. The event is what makes the pass visible, and
+                        # its rate is what says whether a rule is tuned right.
+                        self._observer(
+                            ANSWER_RULE_EXHAUSTED_EVENT, {"rule": answer_rule.name}
+                        )
 
                 # --- THE EMPTY-ANSWER GATE (05 §K) ------------------------------
                 #

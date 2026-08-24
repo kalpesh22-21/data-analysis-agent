@@ -598,6 +598,16 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     # fixes. D25-safe — a provider-vocabulary status word, containing no prompt, no
     # answer and no identifier, and the model's own (absent) text is never placed here.
     "incomplete_reason",
+    # --- the finish-time answer rules (05 §L) ---
+    # `loop_answer_rule_refused.rule` / `loop_answer_rule_exhausted.rule` — WHICH rule
+    # the finishing prose tripped (`ungrounded_quantity`, `markdown_table`). A closed
+    # set of RUNTIME-AUTHORED slugs from `loop/answer_rules.py::ANSWER_RULES`, never
+    # derived from the model's text or the user's question, so D25-safe by construction.
+    # It is the whole value of both events: the rules share two event names and two
+    # allowance kinds, so without it neither a refusal nor a pass can be attributed to
+    # the rule that caused it — which is the number that says whether a predicate is
+    # tuned right. The MATCHED PROSE is not and must not be added.
+    "rule",
     # --- the answer-prose scrub (ISSUES I1) ---
     # `loop_answer_prose_redacted.redaction_count` — HOW MANY identifier-shaped
     # tokens were replaced with a visible marker in the prose that reached the

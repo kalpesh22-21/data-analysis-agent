@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from typing import Any
 
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
+
+_logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
     "You write a single short present-tense progress line (max ~12 words) for a "
@@ -280,10 +283,22 @@ class ProgressSummarizer:
             return await asyncio.wait_for(
                 self._summarize(tool_name, arguments), timeout=self._timeout_seconds
             )
+        except TimeoutError:
+            # The dominant drop cause whenever the budget is set near the model's
+            # own latency: the line is abandoned in flight and that tool call gets
+            # NO line at all, which reads as a random UI flake. Logged rather than
+            # swallowed silently so the drop rate is visible in the logs.
+            _logger.debug(
+                "progress summary timed out after %.1fs for %s (dropped)",
+                self._timeout_seconds,
+                tool_name,
+            )
+            return None
         except Exception:
-            # Fail-soft: a timeout (asyncio.TimeoutError), a transport error, or
-            # any other failure drops the summary — the instant template label
-            # already streamed, so the UI degrades to "running <tool>…".
+            # Fail-soft: a transport error or any other failure drops the summary —
+            # the instant template label already streamed, so the UI degrades to
+            # "running <tool>…".
+            _logger.debug("progress summary failed for %s (dropped)", tool_name, exc_info=True)
             return None
 
     async def _summarize(self, tool_name: str, arguments: dict[str, Any]) -> str | None:

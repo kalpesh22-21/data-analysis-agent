@@ -432,6 +432,120 @@ Everything §J.6 excludes, for the same reasons — pauses, the hard ceiling, th
 | `test_tool_span_wiring_e2e.py` | Both events survive the **real** `guardrail_observer` and `incomplete_reason` actually exports |
 
 
+
+## L. The answer rules (added 2026-08-21, on a live trace)
+
+> **EXTENDED 2026-08-24 — a third rule, `sql_in_answer` ([§L.3](#l3-a-registry-not-a-fourth-gate--and-the-reason-is-the-second-rule)).** A live turn measured correctly and pasted its `SELECT` into the answer prose. One table entry, one predicate, no new allowance — which is the registry shape being paid for.
+
+**The fourth thing that can go wrong at exit #1, and the first that is EXTENSIBLE.** §B asks *"did you do the work?"*; §J *"did you deliver it in the required form?"*; §K *"did you say anything at all?"* This one asks: **does what you said stand on anything?**
+
+### L.1 The report
+
+A turn answered *"The current active employee count is 9,184"*. The number existed nowhere — not in the warehouse, not in a fixture, not in an earlier turn. The trace shows the whole turn: emulated `listDatabases` + `listTables` (runtime-injected, never model-chosen), **one** model tool call — `getTableSchema(employee)` — and then the answer. No `runQuery`, no `runBlueprint`, no nudge, no refusal.
+
+**No gate qualified**, and each for a structural reason rather than a bug:
+
+- **§B** — single-deliverable request, so the prompt forbids `updateAnalysisState`; `pending_intents(None)` is empty and the whole evidence ledger is switched off.
+- **§J** — `armed` requires `multi_row_calls > 0` over `{runQuery, runBlueprint}`. **Zero data calls ⇒ disarmed.** The gate that checks answer form is keyed on having data, so it is blindest when there is none.
+- **§K** — the prose was non-empty.
+- `answer_scrub.py` redacts identifier SHAPES and never refuses; `9,184` is not identifier-shaped.
+
+**Every existing gate tests the SHAPE of the finish. None tests grounding.**
+
+### L.2 What the check can and cannot key on
+
+Two signals look usable and are not:
+
+- **`tool_calls_made`** was 1 (the emulated pairs are not persisted to the trail). Non-zero.
+- **`_compute_turn_provenance_union`** returns a NON-EMPTY set — `getTableSchema(employee)` carries real table/column provenance.
+
+So "did this turn touch data" passes on exactly the turn that fabricated its answer. The signal that works is the one `turn_accumulators.py` already computes: **`turn_sql` is empty**, appended to only by a successful `runQuery` or `runBlueprint`. Such a turn finishes with `answer_sql: []` — an answer with no SQL panel at all in the D56 surface.
+
+### L.3 A registry, not a fourth gate — and the reason is the SECOND rule
+
+The obvious shape is one more gate in the §B/§J/§K chain. It is the wrong shape, and the second rule proves it: **a markdown table in an ordinary-message finish is wrong whether or not a query ran** — and is likeliest when one DID, because that is the model pasting real rows instead of calling `answerWithTable`. §J catches that only when `row_count > 1`; the single-row and zero-row cases fall through.
+
+So `turn_sql is empty` **must not be hoisted into a shared condition**. Each rule carries its own precondition; the site's shared condition is only `not result.tool_calls and not refused_finalization`. `loop/answer_rules.py` holds the registry; adding a rule is a table entry.
+
+**The third rule (`sql_in_answer`, added 2026-08-24 on a live trace) is what the shape bought.** A turn ran its query, answered correctly, and pasted the `SELECT` into the prose beside the answer. The prompt's rule is unconditional — *"database, table and column names, DDL and SQL text never belong in your answer text"* (`prompts.py`, Trust boundary) — and, like §J's "present a table", it was a strong rule with no runtime enforcement. `answer_scrub.py` is NOT that enforcement and reading it as such is the trap: it matches identifier SHAPES, so on a pasted query it redacts the names *inside* the statement and leaves the keywords standing. The user is handed `SELECT count() FROM [schema detail withheld]` — neither an answer nor a runnable query, and *worse* than the unscrubbed leak because it looks like a defect. Adding it cost one table entry and one predicate; no gate, no allowance, no new event.
+
+### L.4 Rules charge to an existing allowance KIND
+
+`finalization_block_key` warns that two gates sharing a key share an allowance (§J.3's starvation). **The inverse is just as real**: one allowance per rule means N rules ⇒ N extra round-trips per window, on a wall-clock-bounded turn.
+
+Rules therefore declare which kind they charge to rather than minting one:
+
+| Rule | Complaint | Charges to |
+|---|---|---|
+| `ungrounded_quantity` | grounding | `ungrounded_answer` (**new**, the only kind added) |
+| `sql_in_answer` | form | `answer_shape` (existing) |
+| `markdown_table` | form | `answer_shape` (existing) |
+
+Worst case stays at **four** extra round-trips per window, not four-plus-N — and the third rule is the proof, because it added none.
+
+### L.5 The condition, the placement, and the precedence
+
+At exit #1, **after** the §B/§J chain, **before** §K, a plain `if` guarded on `not refused_finalization` — §K.4's reasoning verbatim: the branches above are entered when their complaint QUALIFIES, not when they refuse, so an `elif` would go silent on any round where an earlier gate had already spent its grant.
+
+**The order against §K is free.** `first_match` returns `None` for blank prose, so the two conditions are disjoint by construction and neither can pre-empt the other.
+
+**Within the registry, order IS precedence.** `first_match` returns at most one rule per round-trip, and a fabricated table matches every rule: the grounding complaint wins, because telling the model to reformat would be correcting the presentation of an invented answer.
+
+**Between the two FORM rules, content beats channel** — `sql_in_answer` before `markdown_table`. One says text that must not be in an answer at all is in it; the other says the right content went out the wrong door. The first is fixed by a deletion the model can always make, so the round spent on it almost always lands, where the second asks for a tool call.
+
+⚠ **The honest cost, since both charge `answer_shape`:** a finish that pastes rows AND the query behind them gets one refusal, and the second complaint meets a spent allowance and ships its half. Ordering the other way only moves which half survives — and moves it somewhere worse, because a model that answers the markdown nudge by calling `answerWithTable` leaves at exit #2, which §L.9 does not gate at all. A mixed finish is rarer than either alone; this is a trade, not a free win.
+
+### L.6 The quantity predicate is deliberately narrow
+
+**The asymmetry decides the tuning.** A false negative costs nothing beyond the status quo. A false positive burns a round-trip and tells a model that answered correctly that it fabricated — which, by §K.5's own argument about beliefs, is the more expensive direction.
+
+So a number qualifies only at **three digits or a thousands separator**, with bare years in 1900–2100 and date-shaped runs excluded. That catches a warehouse figure (`412`, `9,184`) and lets through the small numbers a KNOWLEDGE-grounded answer legitimately carries with no query behind it — *"overtime is 1.5 times base rate"*, *"beyond 40 hours in a week"*. **Widen it on the exhausted-event rate, not before.**
+
+**`contains_sql` is tuned the same way, against a worse word list.** `select`, `from` and `where` are among the commonest words in an English answer — *"the data comes FROM the employee table WHERE department is Sales"* is a CORRECT business-language answer — so keyword membership is unusable at any threshold. What ordinary prose does not produce is a keyword pair in CAPS, a code fence, or a code span, and those are the three shapes matched: a fence tagged `sql`; a fence whose first word is a statement keyword, any case; and `SELECT`…`FROM` uppercase (capped at 400 chars apart so two unrelated capitalised words cannot pair up) or the same pair, any case, inside single backticks.
+
+**Accepted false negative:** bare lowercase `select … from …` with no fence and no backticks. Catching it means matching those two verbs in running prose. Widen on the exhausted rate.
+
+⚠ **The separator only counts BETWEEN digits.** A looser `\d[\d,]*` scan reads the comma in *"Sales 3, Eng 2"* as a thousands separator — caught by two existing tests when the first version shipped, and pinned by its own regression now. Ordinary prose carries that shape constantly.
+
+### L.7 Corroboration is DESIGNED FOR, not built
+
+The tempting next step is to search prior tool results for the figure and let a corroborated one through. **Under `turn_sql is empty` it is dead code** — there are no results to search. Making it live means dropping that precondition and checking every figure against every result, which is numeric provenance: derived figures (*"rose 12% year over year"*) never match literally, rounding breaks it (`9184` → *"about 9,200"*), formatting diverges, and `result_preview` holds ~20 rows while the full result sits behind a D46 KV pointer.
+
+It works far better as an **escape hatch than a trigger** — rule fires, corroboration exonerates. That is the shape to build when the exhausted rate justifies widening, and the `AnswerRule` interface leaves room for it.
+
+### L.8 What this does NOT do
+
+**The exhausted path still ships the answer.** These rules read shape, not truth, so a second refusal would be the runtime destroying an answer it cannot prove wrong — §J.5's posture, load-bearing here rather than inherited. The gate reduces the rate; it does not close the hole.
+
+**It catches the consequence, not the cause.** The turn was already off-route at `getTableSchema`: `bp-active-headcount-by-department` was offered and covered the question exactly. Routing enforcement was considered and deferred — gating `listDatabases`/`listTables` is pointless (they are emulated, never model-chosen), and gating `getTableSchema` would refuse the one legitimate grounding route the prompt offers.
+
+**A hypothesis worth testing separately:** emulated discovery attributes two calls to the model that it never made, with deliberate shape fidelity. A turn that opens holding synthetic completed work may FEEL further along than the model's own work has taken it. Cheap A/B — same question, emulation off.
+
+### L.9 Not gated
+
+Everything §J.6/§K.7 exclude, for the same reasons — pauses, the hard ceiling, the `"stop"` resume, and responses that carry tool calls. **Exit #2 is out of scope**: a designated `sql` the model never executed is the same class of hole with a table around it, and needs its own check.
+
+### L.10 Tests
+
+`tests/runtime/loop/test_answer_rules.py` and `tests/runtime/observability/test_tool_span_wiring_e2e.py`:
+
+| Case | Expect |
+|---|---|
+| Figure, no query in the turn | Refused once; nudge carries the draft back; a grounded answer next round accepted verbatim |
+| Same, ungrounded again | `loop_answer_rule_exhausted`; the prose PASSES |
+| Figure **with** a query behind it | Untouched; `store.claims == []` |
+| Markdown table **with** a one-row query | Refused — the case a shared `turn_sql` precondition would have excluded |
+| Markdown table | Charges `answer_shape`, not a fourth kind |
+| SQL fence **with** a one-row query | Refused; charges `answer_shape`; draft echoed; a second leak EXHAUSTS and ships |
+| Fabricated table or fabricated SQL (matches two rules) | `ungrounded_quantity` wins |
+| Rows AND the query behind them | `sql_in_answer` wins — content before channel |
+| Empty prose | §K fires; the registry stays out of it |
+| Tool calls, no prose | Untouched, no store round-trip |
+| Knowledge figures (`1.5`, `40`), bare years, dates | Not reported figures |
+| `"comes from the employee table where…"`, `"select from the following options"` | **Not SQL** — the false-positive class `contains_sql` is tuned against |
+| `"Sales 3, Eng 2."` | **Regression** — prose punctuation is not a thousands separator |
+| Span e2e | Both events survive the real `guardrail_observer`; `rule` exports; neither the question nor the refused figure reaches a span |
+
 ---
 
 ## I. Review corrections

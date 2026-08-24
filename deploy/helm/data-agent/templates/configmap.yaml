@@ -5,6 +5,32 @@ Secret named by the secretName helper, which this chart does not render. The
 UI-only derived value RUNTIME_URL is computed from the release name when not
 explicitly set in .Values.config.
 
+GLOBAL MERGE — `global.config` WINS over `.Values.config`.
+When this chart runs as a subchart of `data-agent-platform`, Helm injects the
+umbrella's `.Values.global` here, and `global.config` carries the 18 keys BOTH
+planes must agree on (Couchbase, Neo4j, embedding, MCP, token service, OTLP, the
+tenant triple). Global has to beat local, and that is FORCED rather than chosen:
+this chart ships a non-empty default for nearly all 18 in its own values.yaml, so
+if local won, `global.config` could never take effect and would be dead weight —
+a knob the deployer sets, helm accepts, and nothing reads. The whole point of the
+umbrella is that those keys are set ONCE; a losing global would reinstate exactly
+the silent drift it exists to remove.
+
+Sprig `merge dst src` lets DST win and mutates dst, hence the deepCopy of the
+global map. But it delegates to mergo, which treats "" as EMPTY and fills it from
+src — so a DELIBERATELY BLANK global value (blanking the tenant triple, say)
+would lose to a non-blank subchart value. That is the same silent asymmetry in
+miniature, so the range below re-asserts every global key over the merge result
+and makes the precedence TOTAL.
+
+Standalone installs are unaffected: `.Values.global` is absent, the parenthesised
+access yields nil, `default dict` makes it an empty map, and both the merge and
+the re-assert reduce to `.Values.config` unchanged.
+
+RUNTIME_URL is NOT a shared key and must not be placed in `global.config` — it
+names a Service scoped to one release. The umbrella refuses such a value outright
+(see its templates/validate.yaml) rather than dropping it silently here.
+
 A BLANK value is normally OMITTED from the ConfigMap, so the process falls through
 to whatever default its settings model carries. That is the right rule for almost
 everything here and the WRONG one for the tenant claims: their code defaults are the
@@ -15,6 +41,11 @@ rendered even when blank, so "unset" reaches the process AS blank and trips the
 readiness gates in run_learning_scheduler.py / learning/inbox/service.py.
 */}}
 {{- $alwaysRender := list "TENANT_CLIENT_CODE" "TENANT_PROC_CENTER" "TENANT_JTI" }}
+{{- $globalConfig := ((.Values.global).config) | default dict }}
+{{- $config := merge (deepCopy $globalConfig) (.Values.config | default dict) }}
+{{- range $key, $val := $globalConfig }}
+{{- $_ := set $config $key $val }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -22,7 +53,7 @@ metadata:
   labels:
     {{- include "data-agent.labels" . | nindent 4 }}
 data:
-  {{- range $key, $val := .Values.config }}
+  {{- range $key, $val := $config }}
   {{- /* RUNTIME_URL is handled below via the helper */}}
   {{- if ne $key "RUNTIME_URL" }}
   {{- if or (ne (toString $val) "") (has $key $alwaysRender) }}

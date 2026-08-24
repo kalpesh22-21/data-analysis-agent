@@ -31,6 +31,10 @@ from data_agent.runtime.context.assembly import (
 )
 from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
 from data_agent.runtime.loop.agent_loop import AgentLoop, TurnContext
+from data_agent.runtime.loop.answer_rules import (
+    ANSWER_RULE_EXHAUSTED_EVENT,
+    ANSWER_RULE_REFUSED_EVENT,
+)
 from data_agent.runtime.loop.finalization import (
     ANSWER_SHAPE_EXHAUSTED_EVENT,
     ANSWER_SHAPE_REFUSED_EVENT,
@@ -530,6 +534,66 @@ async def test_the_empty_answer_events_survive_the_real_guardrail_observer() -> 
     for finished_span in spans:
         for value in finished_span.attributes.values():
             assert "headcount by department" not in str(value)
+
+
+async def test_the_answer_rule_events_survive_the_real_guardrail_observer() -> None:
+    """THE PREFIX IS THE TEST, fifth instance (05 §L, 06), and it also proves `rule`
+    EXPORTS. The two answer-rule events share ONE name pair across every rule in the
+    registry, so without that attribute a refusal cannot be attributed to the rule
+    that caused it — and the per-rule refused/exhausted rate is the only signal that
+    says whether a predicate is tuned right.
+    """
+    tracer, exporter = _tracer_with_memory_exporter()
+    observer = tracing.guardrail_observer(tracer)
+
+    store = InMemorySessionStore()
+    model = ScriptedModelClient(
+        [
+            # A figure with no query behind it -> refused once...
+            ModelTurnResult(assistant_text="The active employee count is 9,184."),
+            # ...and again on the round handed back -> exhausted, prose passes.
+            ModelTurnResult(assistant_text="The active employee count is 9,184."),
+        ]
+    )
+    loop = AgentLoop(
+        model_client=model,
+        tool_dispatcher=ToolDispatcher(FakeMCPClient(), CATALOG, observer=observer, tracer=tracer),
+        context_assembler=ContextAssembler(store, tracer=tracer),
+        session_store=store,
+        tools_provider=_query_tools_provider,
+        max_loop_iterations=15,
+        max_wall_clock_seconds=60,
+        max_budget_windows=3,
+        observer=combine_observers(observer),
+    )
+
+    outcome = await loop.run(
+        session_id=SESSION_ID, credentials=_credentials(), user_message="headcount by department"
+    )
+    assert outcome.status == "done"
+
+    spans = exporter.get_finished_spans()
+    refused = [s for s in spans if s.name == ANSWER_RULE_REFUSED_EVENT]
+    assert len(refused) == 1, (
+        "the answer-rule refusal did not survive guardrail_observer — check the "
+        f"`loop_` prefix on {ANSWER_RULE_REFUSED_EVENT!r}"
+    )
+    assert dict(refused[0].attributes)["rule"] == "ungrounded_quantity", (
+        "the refusal span exported no `rule` — the key is missing from "
+        "_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST, so the span cannot say which rule fired"
+    )
+    exhausted = [s for s in spans if s.name == ANSWER_RULE_EXHAUSTED_EVENT]
+    assert len(exhausted) == 1, (
+        "the exhausted counter did not survive guardrail_observer — check the "
+        f"`loop_` prefix on {ANSWER_RULE_EXHAUSTED_EVENT!r}"
+    )
+    assert dict(exhausted[0].attributes)["rule"] == "ungrounded_quantity"
+    # D25: a runtime-authored rule slug and nothing else. Neither the user's question
+    # nor the refused prose reaches a span.
+    for finished_span in spans:
+        for value in finished_span.attributes.values():
+            assert "headcount by department" not in str(value)
+            assert "9,184" not in str(value)
 
 
 async def test_the_answer_prose_scrub_event_survives_the_observer_without_its_tokens() -> None:

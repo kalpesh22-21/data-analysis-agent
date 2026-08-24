@@ -124,21 +124,34 @@ Name of the shared ConfigMap holding non-secret env.
 {{- end }}
 
 {{/*
-Name of the Secret that pods should reference in envFrom.
+Name of the Secret that pods should reference in envFrom, in precedence order:
 
-THE CHART NO LONGER RENDERS A SECRET. `secrets.existingSecret` names one you
-created out-of-band; when it is empty this falls back to the conventional
-`<fullname>-secret`, which you must create yourself with the keys listed in
-values.yaml. Either way the name must EXIST before the pods start — envFrom
-against a missing Secret leaves them stuck in CreateContainerConfigError.
+  1. `secrets.existingSecret` — this chart's own override.
+  2. `global.secrets.existingSecret` — set once by the `data-agent-platform`
+     umbrella so ONE out-of-band Secret serves both planes.
+  3. the conventional `<fullname>-secret`.
 
-Pointing this at the SAME Secret as the data-agent release is the recommended
-posture: the Couchbase/Neo4j credentials and the tenant identity they
-authenticate are one identity across both planes.
+THE CHART NO LONGER RENDERS A SECRET. Whichever name wins, you create it
+out-of-band with the keys listed in values.yaml, and it must EXIST before the
+pods start — envFrom against a missing Secret leaves them stuck in
+CreateContainerConfigError.
+
+LOCAL BEATS GLOBAL HERE, the opposite of the config merge in configmap.yaml, and
+the asymmetry is deliberate. `secrets.existingSecret` ships EMPTY, so a local
+override can only exist because someone typed it — deferring to it costs the
+global nothing and leaves an escape hatch for a plane whose credentials genuinely
+differ. The 18 shared `config` keys ship NON-EMPTY defaults in both charts, so
+letting local win there would mean `global.config` could never take effect at all.
+
+Pointing this at the SAME Secret as the data-agent release (which is what
+`global.secrets.existingSecret` does for you) is the recommended posture: the
+Couchbase/Neo4j credentials and the tenant identity they authenticate are one
+identity across both planes.
 */}}
 {{- define "data-agent-learning.secretName" -}}
-{{- if .Values.secrets.existingSecret }}
-{{- .Values.secrets.existingSecret }}
+{{- $existing := default ((.Values.global).secrets).existingSecret .Values.secrets.existingSecret }}
+{{- if $existing }}
+{{- $existing }}
 {{- else }}
 {{- include "data-agent-learning.suffixedName" (dict "root" . "suffix" "secret") }}
 {{- end }}

@@ -22,3 +22,12 @@ build/
 
 # Layer-3 e2e subprocess logs (runtime/BFF stdout captured by the fixtures)
 tests/e2e/*.log
+
+# Helm dependency build artifacts.
+# `helm dependency update deploy/helm/data-agent-platform` REPACKAGES the file://
+# subcharts into charts/*.tgz and writes Chart.lock. Both are derived from files
+# already tracked here, and a rendered tgz WINS OVER the live subchart directory
+# beside it — so a committed, stale one quietly deploys yesterday's subchart while
+# the source says otherwise. Re-run the command instead of committing the output.
+deploy/helm/*/charts/*.tgz
+deploy/helm/*/Chart.lock

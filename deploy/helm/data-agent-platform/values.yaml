@@ -1,0 +1,236 @@
+# Default values for data-agent-platform — the UMBRELLA chart.
+# This is a YAML-formatted file.
+# See deploy/helm/README.md for the big picture.
+#
+# This chart renders NO objects of its own. It exists so that the configuration
+# the two planes MUST agree on is written ONCE, in `global.config` below, and so
+# that ONE out-of-band Secret can serve both, via `global.secrets.existingSecret`.
+#
+# Everything else stays where it was: each subchart's full values surface is
+# reachable under its own name (`data-agent:` / `data-agent-learning:` further
+# down), and the subcharts are unchanged for anyone who still installs them as two
+# separate releases.
+
+# ===========================================================================
+# 1. SHARED CONFIG — the 18 keys BOTH planes must agree on.
+#
+# Helm injects `global` into every subchart, and both subcharts' configmap.yaml
+# merges it OVER their own `config` block. SET THESE HERE, not in the per-chart
+# blocks below.
+#
+# GLOBAL WINS over a subchart's `config`. That precedence is forced, not
+# stylistic: both subcharts ship a default for every key below in their own
+# values.yaml, so if local won, nothing you write here could ever take effect.
+# The corollary is worth stating plainly — setting one of these 18 keys under
+# `data-agent:` or `data-agent-learning:` DOES NOTHING under this umbrella. It is
+# not an error, it is simply overruled. Change it here.
+#
+# The defaults below are the defaults both subcharts already ship, so an umbrella
+# install with no overrides renders exactly what two separate default installs
+# would. They are DEV-SHAPED placeholders, not production values.
+#
+# WHY THESE 18. Each one names an external system or an identity that the online
+# plane WRITES and the learning plane READS, and every divergence is SILENT — no
+# error, no crash, just a plane working on the wrong rows:
+#   * COUCHBASE_* — the sweeper scans the AGENT'S session keyspace. It builds a
+#     three-part `bucket`.`scope`.`collection`; a mismatch in any part means the
+#     learning loop simply idles forever with nothing to learn from. (This is the
+#     failure that motivated the umbrella: a Couchbase connect failure in the
+#     sweeper, from a scope set on one side only.)
+#   * NEO4J_* — a validated blueprint must LAND in the graph the agent RECALLS
+#     from. A different database is a blueprint the agent cannot see.
+#   * EMBEDDING_* — vectors written by one model and searched by another compare
+#     as noise.
+#   * TENANT_* — the warehouse row policies FILTER rather than error, so a
+#     divergent tenant reads a different (or empty) row set and the golden
+#     replay's grain check still passes: 0 == 0.
+#   * MCP_URL / TOKEN_SERVICE_URL / CATALOG_FIXTURE_PATH / OTLP_ENDPOINT — one
+#     warehouse, one IdP, one catalog snapshot, one trace backend.
+# ===========================================================================
+global:
+  config:
+    # --- MCP + catalog ---
+    # -- URL of the MCP (clickhouse-api) service. EXTERNAL.
+    MCP_URL: "http://clickhouse-api:8000/mcp"
+    # -- Path to the offline catalog-export JSON snapshot. Empty = the committed
+    #    repo fixture. The learning plane ALWAYS reads the snapshot (it holds no
+    #    per-request MCP JWT); the online plane reads it only when
+    #    `data-agent.config.CATALOG_SOURCE` is "fixture".
+    CATALOG_FIXTURE_PATH: ""
+
+    # --- Couchbase: the agent's session keyspace, which the sweeper scans ---
+    # -- Couchbase connection string. EXTERNAL.
+    COUCHBASE_CONNECTION_STRING: "couchbase://couchbase"
+    # -- Couchbase username.
+    COUCHBASE_USERNAME: "data_agent"
+    # -- Couchbase bucket for sessions.
+    COUCHBASE_BUCKET: "data_agent"
+    # -- Scope holding the two collections below. "_default" is byte-identical to
+    #    a deployment predating these keys. For a CONSOLIDATED bucket (one bucket,
+    #    named scopes) set e.g. COUCHBASE_BUCKET: "pcm_iwant" +
+    #    COUCHBASE_SCOPE: "sessions"; provisioning must create the scope, BOTH
+    #    collections, and grant this credential on them.
+    COUCHBASE_SCOPE: "_default"
+    # -- Session documents (`session::<id>`).
+    COUCHBASE_SESSIONS_COLLECTION: "sessions"
+    # -- Full tool results (`result::<uuid>`) the preview shape points at. The
+    #    sweeper never reads it, but the session store binds BOTH collections at
+    #    construction — a mismatch fails at bind time, not at use.
+    COUCHBASE_RESULTS_COLLECTION: "session_results"
+
+    # --- Neo4j: the retrieval graph the agent reads and the scheduler writes ---
+    # -- Neo4j bolt URL. EXTERNAL.
+    NEO4J_URL: "bolt://neo4j:7687"
+    # -- Neo4j username.
+    NEO4J_USERNAME: "neo4j"
+    # -- Neo4j database name (multi-database deployments).
+    NEO4J_DATABASE: "neo4j"
+
+    # --- Embedding API: one model, or the vectors do not compare ---
+    # -- Embedding API base URL. EXTERNAL.
+    EMBEDDING_API_URL: "http://embedding:8080/embed"
+    # -- Embedding model name.
+    EMBEDDING_MODEL: "text-embedding-3-small"
+
+    # --- Token IdP ---
+    # -- Token service (IdP) token endpoint. EXTERNAL.
+    TOKEN_SERVICE_URL: "http://token:8000/token"
+
+    # --- Observability ---
+    # -- OTLP traces endpoint. Empty disables OTLP export in both planes.
+    #    (`OTLP_SERVICE_NAME` is per-plane and is NOT shared — the two planes
+    #    should be distinguishable in the trace backend.)
+    OTLP_ENDPOINT: ""
+
+    # --- The warehouse tenant triple ---
+    # DELIBERATELY BLANK. There is no safe default for "which tenant is this?",
+    # and the code defaults are the LOCAL DEV SEED (CLIENT_A / PC01 / TESTJTI001).
+    # Blank makes the readiness gates in `scripts/run_learning_scheduler.py` and
+    # `learning/inbox/service.py` fire and drops the learning plane into its
+    # LOGGED dormant posture — nothing auto-promotes. That is the SAFE failure; a
+    # wrong value is the unsafe one. Set all three, or set none.
+    #
+    # These three are also the carve-out in both configmap templates: they render
+    # into the ConfigMap EVEN WHEN BLANK, so "unset" reaches the process as blank
+    # rather than falling through to the dev seed.
+    #
+    # -- Warehouse tenant claim 'clientcode' (→ paycom_client_code).
+    TENANT_CLIENT_CODE: ""
+    # -- Warehouse tenant claim 'proc_center' (→ paycom_proc_center).
+    TENANT_PROC_CENTER: ""
+    # -- Warehouse tenant claim 'jti' (→ paycom_authenticated_user).
+    TENANT_JTI: ""
+
+  # =========================================================================
+  # 2. THE SHARED SECRET.
+  #
+  # NOTHING HERE RENDERS A SECRET — not this chart, not either subchart. Create
+  # it out-of-band (vault / external-secrets / sealed-secrets / `kubectl create
+  # secret`) with the UNION of both planes' keys, and name it here. Both planes
+  # then envFrom the SAME Secret, which is the posture deploy/helm/README.md
+  # already recommends and which this umbrella makes the default rather than a
+  # discipline: `COUCHBASE_PASSWORD`, `NEO4J_PASSWORD`, `TOKEN_ISSUER_API_KEY`
+  # and `EMBEDDING_API_KEY` authenticate the SAME identity in both planes, and two
+  # hand-maintained Secrets drift with no symptom.
+  #
+  # The Secret must EXIST BEFORE the pods start. envFrom against a missing Secret
+  # wedges them in CreateContainerConfigError, which looks like a scheduling
+  # problem and is not.
+  #
+  # Leave this EMPTY and each plane falls back to its own conventional
+  # `<release>-<chart>-secret` — TWO Secrets you must create and keep in sync by
+  # hand. That is supported, and it is the thing this key exists to avoid.
+  #
+  # Precedence, per subchart: `<subchart>.secrets.existingSecret` (if set) beats
+  # this, which beats the conventional name. Local wins here — unlike `config`
+  # above — because `secrets.existingSecret` ships EMPTY in both subcharts, so a
+  # local value can only exist because someone typed it deliberately.
+  # =========================================================================
+  secrets:
+    # -- Name of the pre-existing Secret BOTH planes mount via envFrom.
+    existingSecret: ""
+
+# ===========================================================================
+# 3. PER-SUBCHART PASS-THROUGH.
+#
+# Everything under these two keys is that subchart's own values.yaml surface,
+# verbatim. Read `deploy/helm/data-agent/values.yaml` and
+# `deploy/helm/data-agent-learning/values.yaml` for the full documented set; only
+# the entry points are shown here.
+#
+# `enabled` is NOT a value either subchart reads — it is the `condition:` in
+# Chart.yaml that includes or excludes the whole subchart. Setting it false is
+# how you run one plane from this release; the other plane's objects simply are
+# not rendered.
+#
+# REMINDER: the 18 keys in `global.config` are overruled here. Anything else is
+# not.
+# ===========================================================================
+
+data-agent:
+  # -- Deploy the ONLINE plane (runtime API, agent UI, neo4j hydrator).
+  enabled: true
+
+  # Reach any of this chart's values by prefixing them, e.g.
+  #   data-agent.config.OPENAI_MODEL
+  #   data-agent.config.SESSION_TTL_SECONDS
+  #   data-agent.config.CATALOG_SOURCE
+  #   data-agent.ingress.enabled          (publishes the RUNTIME API)
+  #   data-agent.uiIngress.enabled        (publishes the agent UI)
+  #   data-agent.components.runtime.replicaCount
+  #   data-agent.components.hydrator.enabled
+  #
+  # The image is NOT global: set it on each subchart. Both planes run the SAME
+  # image built from the repo-root Dockerfile, so keep the two tags equal unless
+  # you are deliberately staging a rollout.
+  image: {}
+  #  repository: ghcr.io/acme/data-agent
+  #  tag: "1.4.2"
+
+  config: {}
+  #  OPENAI_MODEL: "gpt-4o"
+  #  SESSION_TTL_SECONDS: "3600"     # must exceed the learning plane's
+  #                                  # LEARNING_IDLE_THRESHOLD_SECONDS + P95
+  #                                  # (dwell + processing), or sessions expire
+  #                                  # before they are learned from.
+
+  # DO NOT ADD `INBOX_SERVICE_URL` OR `REVIEW_INBOX_ENABLED` HERE.
+  # `ui/server.py` carries BOTH surfaces — the agent chat shell and the reviewer
+  # inbox — in one app, and the inbox routes 404 on the agent UI only because
+  # this plane sets neither key. That is deliberate, and the umbrella is exactly
+  # where it becomes tempting to "fix": one release means the inbox Service name
+  # IS now derivable from `.Release.Name`, which it never was across two
+  # releases. Deriving it would open a SECOND DOOR into the reviewer surface,
+  # published on the agent UI's own hostname and behind whatever (or whichever)
+  # auth fronts it. Reviewer access is fenced by Chart B's Ingress path list and
+  # by the shared REVIEWER_TOKEN on the UI→inbox hop; nothing in the app
+  # distinguishes a reviewer from an analyst. Leave both keys unset.
+
+data-agent-learning:
+  # -- Deploy the OFFLINE learning plane (sweeper, consumer, promotion scheduler,
+  #    review inbox, reviewer UI, and its in-chart Redis).
+  enabled: true
+
+  # Reach any of this chart's values by prefixing them, e.g.
+  #   data-agent-learning.config.LEARNING_JUDGE_ENABLED
+  #   data-agent-learning.config.LEARNING_IDLE_THRESHOLD_SECONDS
+  #   data-agent-learning.config.LEARNING_ENABLED
+  #   data-agent-learning.uiIngress.enabled   (publishes the REVIEWER UI — put
+  #                                            your SSO / forward-auth here)
+  #   data-agent-learning.components.learningConsumer.replicaCount
+  #   data-agent-learning.redis.enabled
+  #   data-agent-learning.redis.persistence.enabled
+  image: {}
+  #  repository: ghcr.io/acme/data-agent
+  #  tag: "1.4.2"
+
+  config: {}
+  #  LEARNING_JUDGE_ENABLED: "true"
+  #  LEARNING_IDLE_THRESHOLD_SECONDS: "900"
+
+  # The in-chart Redis stays owned by this subchart. It is the learning plane's
+  # PRIVATE transport (the agent never touches it), it is UNAUTHENTICATED and
+  # ClusterIP-only, and one release does not change either fact — fence it with a
+  # NetworkPolicy on a shared cluster. This umbrella deploys no other backing
+  # infrastructure: Couchbase, Neo4j and ClickHouse are external, on purpose.
+  redis: {}
