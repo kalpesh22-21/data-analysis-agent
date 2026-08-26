@@ -205,6 +205,9 @@ config:
   NEO4J_URL: "bolt://neo4j:7687"
   # -- Neo4j username.
   NEO4J_USERNAME: "neo4j"
+  # -- Neo4j database name (multi-database deployments). MUST match the
+  #    data-agent-learning release — the reader and the writer share one graph.
+  NEO4J_DATABASE: "neo4j"
   # -- Embedding API base URL. EXTERNAL.
   EMBEDDING_API_URL: "http://embedding:8080/embed"
   # -- Embedding model name.
