@@ -28,6 +28,15 @@ because the SQL metadata paths really are closed: `SHOW`/`DESCRIBE`/`EXPLAIN` pa
 statement-prefix allowlist and are then rejected by provenance extraction, which admits only
 SELECT/WITH/UNION, and `system.*` is denied by keyword and excluded from the catalog.
 
+THE `explainQuery` TOOL IS DELIBERATELY UNMENTIONED HERE, and the omission is a size
+decision rather than an oversight. Its plan now arrives as ONE row of newline-joined text
+instead of one row per plan line (clickhouse-api `service.py::_collapse_explain_plan`), and
+that fact is carried in the MCP TOOL DESCRIPTION, which `mcp/tool_schema.py` copies verbatim
+(D75) and which is re-sent beside this constant every round-trip WITHOUT counting against the
+17,400 ceiling. Restating it here would spend budgeted chars on something the model already
+reads, and per the ceiling ledger in `tests/runtime/test_prompt_routing_contract.py` a new
+instruction must re-argue the ceiling rather than squeeze into the remaining 86.
+
 The rendered text and the rationale for each section are reviewed in
 `docs/decisions/release-1/01a-prompt-draft.md`.
 """
