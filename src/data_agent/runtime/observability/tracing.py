@@ -408,6 +408,31 @@ def guardrail_span(
     return span(tracer, name, OpenInferenceSpanKindValues.GUARDRAIL, attributes)
 
 
+def answer_judge_span(tracer: Tracer, *, site: str) -> Any:
+    """The ANSWER JUDGE's own model call (`CHAIN`, doc 09).
+
+        WHY A SPAN OF ITS OWN, when the auto-instrumentor already covers the call. The
+        judge goes through the same `AsyncOpenAI` client as the agent, so `instrument_openai`
+        emits an `LLM` span for it either way — and that is exactly the problem: in the turn
+        trace it is INDISTINGUISHABLE from the agent's own round-trips. A turn that made five
+        model calls and a turn that made four plus a judgement look the same, which is the
+        one thing an operator watching judge cost or judge latency needs to tell apart.
+
+        Opening this span makes the auto LLM span its CHILD (ambient context), so the trace
+        reads `agent.turn -> answer_judge -> LLM` and the judge's tokens and latency are
+        attributable without any new plumbing at the model seam.
+
+        SHAPE ONLY (D25). `site` here, and `approved`/`violation`/`tokens` set on the span
+        after the verdict is parsed — every one of them a runtime-authored closed vocabulary
+        or a count. `feedback` is model-composed prose about the user's question and MUST
+        NEVER be set on this span; nor is the brief, which carries the draft answer and
+        warehouse rows. This is the same rule `_GUARDRAIL_OBSERVER_ATTR_ALLOWLIST` enforces
+        for the events, restated here because a span attribute bypasses that allowlist
+        entirely.
+    """
+    return span(tracer, "answer_judge", OpenInferenceSpanKindValues.CHAIN, {"site": site})
+
+
 def embedding_span(tracer: Tracer, *, model: str, input_count: int) -> Any:
     """The custom embedding-API call (`resolveValues` ranking, D24/D71).
 
@@ -598,6 +623,28 @@ _GUARDRAIL_OBSERVER_ATTR_ALLOWLIST = (
     # fixes. D25-safe — a provider-vocabulary status word, containing no prompt, no
     # answer and no identifier, and the model's own (absent) text is never placed here.
     "incomplete_reason",
+    # --- the answer judge (09 §K) ---
+    # `loop_answer_judge_refused.violation` / `loop_ask_user_judge_refused.violation` —
+    # WHICH complaint the judge made, from the closed, RUNTIME-AUTHORED vocabulary in
+    # `loop/answer_judge.py` (`unrecorded_assumption`, `unexplained_gap`,
+    # `contradicts_result`, `non_contextual_question`). D25-safe because the set is
+    # fixed in our own source: the parser rejects any slug outside it and fails open, so
+    # a model-composed string can never arrive here. It is also the GROUP BY key of
+    # every distribution query this feature will be tuned on.
+    #
+    # `loop_answer_judge_called.site` — which terminal moment was judged (`exit_prose`,
+    # `exit_table`, `ask_user`), likewise a closed runtime vocabulary. Without it the
+    # call-rate cannot be split by exit, which is the first thing to look at when judge
+    # spend climbs (spend is deliberately outside `max_window_token_spend`, 09 §I, so
+    # these events are the ONLY place it is observable).
+    #
+    # `feedback` IS DELIBERATELY ABSENT and must stay absent: it is model-composed prose
+    # about the user's question and the turn's figures, and 05 §L's span test asserts
+    # that neither the question nor a refused figure reaches a span.
+    "violation",
+    "site",
+    # `loop_answer_judge_called.tokens` — the judge call's own spend, telemetry only.
+    "tokens",
     # --- the finish-time answer rules (05 §L) ---
     # `loop_answer_rule_refused.rule` / `loop_answer_rule_exhausted.rule` — WHICH rule
     # the finishing prose tripped (`ungrounded_quantity`, `markdown_table`). A closed
@@ -649,6 +696,7 @@ __all__ = [
     "DEFAULT_DROP_SPAN_NAMES",
     "LLMExceptionEventScrubber",
     "agent_span",
+    "answer_judge_span",
     "chain_span",
     "configure_tracing",
     "context_from_traceparent",

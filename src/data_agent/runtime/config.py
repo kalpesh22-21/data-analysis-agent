@@ -422,6 +422,55 @@ class RuntimeSettings(BaseSettings):
         ),
     )
 
+    # --- The answer judge (09) ---
+    answer_judge_enabled: bool = Field(
+        False,
+        description=(
+            "Enable the LLM answer judge at the terminal exits and the askUser pause "
+            "(doc 09). OFF BY DEFAULT, and the default is a design position rather "
+            "than caution: the loop is byte-deterministic by construction (D45) and "
+            "this is a NON-DETERMINISTIC gate on the terminal path, so the "
+            "scripted-mechanics suite and every replay run with it off unless they are "
+            "driving the judge on purpose. When False no judge object is constructed "
+            "at all and every exit is byte-identical to before the feature existed."
+        ),
+    )
+    answer_judge_model: str = Field(
+        "",
+        description=(
+            "Model id for the answer judge. EMPTY means reuse the main agent model. A "
+            "second OpenAIModelClient is built on this id when set, sharing the OpenAI "
+            "api_key/base_url with the main client — the same arrangement "
+            "progress_summary_model uses."
+        ),
+    )
+    answer_judge_timeout_seconds: float = Field(
+        20.0,
+        gt=0,
+        description=(
+            "Per-call timeout for the judge. On timeout the answer is APPROVED and "
+            "shipped (fail-open) — the judge may only ever ADD a round-trip on positive "
+            "evidence, never withhold an answer because it could not be reached. Sized "
+            "against the wall-clock window rather than against typical latency: a judge "
+            "still running at this point has already eaten the headroom a rejection "
+            "would need to be actionable."
+        ),
+    )
+    answer_judge_min_headroom_seconds: float = Field(
+        25.0,
+        ge=0,
+        description=(
+            "Wall-clock seconds that must REMAIN in the budget window for the judge to "
+            "run at all (09 §H). Below this it is skipped and the answer ships. A "
+            "rejection issued at 168s of a 180s window buys a regeneration the guard "
+            "cuts off mid-round, after which the turn returns paused_budget_cap with "
+            "the draft already cleared — the user is asked 'continue, refine, or stop?' "
+            "and shown nothing, having had a serviceable answer moments earlier. "
+            "Roughly one model round-trip plus the judge call itself; raise it if "
+            "regenerations are observed being cut off."
+        ),
+    )
+
     # --- Couchbase session store (D22/D44/D45) ---
     couchbase_connection_string: str = Field(
         "couchbase://localhost", description="Couchbase cluster connection string."

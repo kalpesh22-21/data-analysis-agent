@@ -115,6 +115,9 @@ _EXPECTED_RETRYABLE = {
     # 05 §J shape-gate allowance rather than by this flag — a non-retryable refusal
     # would end the turn this exists to hand back.
     "ANSWER_TABLE_NO_TABLE_DESIGNATED": True,
+    # The answer judge's exit-#2 refusal (09 §G.2): retryable, and bounded by its
+    # own `answer_judge` allowance rather than by this flag.
+    "ANSWER_JUDGE_REJECTED": True,
 }
 
 # `answerWithTable(blueprint_id=…)` naming a blueprint that never ran this turn.
@@ -128,9 +131,13 @@ _EXPECTED_RETRYABLE = {
 # the empty call otherwise SUCCEEDS and terminates the turn through exit #2, which
 # the 05 §J shape gate does not watch. Measured live as `done` with no table and no
 # event at all.
+# ANSWER_JUDGE_REJECTED (09 §G.2) is registered for the same persistence reason as the
+# rest, though its live refusal always carries a specific `denial_detail` — the judge's
+# own sentence — so the table entry is the replay fallback only.
 _ANSWER_TABLE_CODES = {
     "ANSWER_TABLE_BLUEPRINT_NOT_RUN",
     "ANSWER_TABLE_NO_TABLE_DESIGNATED",
+    "ANSWER_JUDGE_REJECTED",
 }
 
 # `updateAnalysisState` rejections. Registered for the same reason: both codes
@@ -226,6 +233,9 @@ _EXPECTED_KIND = {
     "ANSWER_TABLE_BLUEPRINT_NOT_RUN": DenialKind.GATE,
     # Answer SHAPE: no table designated at all (08 §O).
     "ANSWER_TABLE_NO_TABLE_DESIGNATED": DenialKind.GATE,
+    # Finalization: the turn's WORK may be perfect. What the judge refused is
+    # finishing with this answer (09 §G.2).
+    "ANSWER_JUDGE_REJECTED": DenialKind.GATE,
     # Finalization ORDER: the turn's work may be perfect; ending the turn with intents
     # still pending is what was refused.
     "FINALIZATION_BLOCKED_PENDING_INTENTS": DenialKind.GATE,

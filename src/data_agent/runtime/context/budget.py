@@ -97,6 +97,23 @@ def _render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
     return rendered
 
 
+def render_entry(entry: TrailEntry, preview_row_count: int) -> dict[str, Any]:
+    """`_render_entry` under a PUBLIC name, for callers outside the model-request path.
+
+        There is exactly one such caller — `loop/answer_judge.py` (09 §D.3) — and the export
+        exists to make its contract enforceable rather than merely stated. The judge must see
+        a result EXACTLY as the model saw it: `preview_row_count` rows, never the
+        `result_full_ref` behind it. A judge holding more than the model held faults the model
+        for the preview cap and manufactures false rejections, which 05 §L.6 establishes as
+        the expensive direction.
+
+        Sharing the producer makes that parity structural: there is no second renderer to
+        drift, and a change to what the model sees changes what the judge sees in the same
+        commit. Nothing here is judge-specific — do not add anything judge-specific to it.
+    """
+    return _render_entry(entry, preview_row_count)
+
+
 # Prefix of a compaction-summary block. No producer exists on the Phase-1 path
 # (compaction is bypassed); `_unit_kind` below still recognizes it so a summary
 # block, if a later phase reintroduces one, is classified and drop-prioritized

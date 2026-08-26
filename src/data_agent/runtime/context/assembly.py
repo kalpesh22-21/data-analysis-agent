@@ -22,6 +22,7 @@ from datetime import date
 from typing import TYPE_CHECKING, Any
 
 from data_agent.runtime.dispatch.denial_mapping import (
+    ANSWER_JUDGE_REJECTED_CODE,
     ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
     FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
 )
@@ -516,6 +517,33 @@ def _last_user_index(messages: list[dict[str, Any]]) -> int:
 DATE_ANCHOR_PREFIX = "Today's date is "
 
 
+def turn_date_anchor_day(
+    raw_messages: Sequence[TurnMessage], current_turn_index: int
+) -> str | None:
+    """The ISO day this turn is anchored to (`"2026-08-26"`), or `None` when there is no
+        usable one.
+
+        THE SINGLE DERIVATION, shared by the model-facing anchor message below and by the
+        answer judge's brief (09 §D.2). A second derivation is not a duplication risk in the
+        abstract — it is a specific, silent failure: the judge would grade "this year"
+        against a different today than the model was given, and would then fault a correct
+        answer for a disagreement it created itself.
+
+        See `_turn_date_anchor` for why the date comes from the turn's own first `user`
+        message `ts` rather than `date.today()`, and why a malformed stamp yields `None`
+        instead of a confidently-rendered non-date.
+    """
+    for message in raw_messages:
+        if message.turn_index == current_turn_index and message.role == "user":
+            day = message.ts[:10]
+            try:
+                date.fromisoformat(day)
+            except (TypeError, ValueError):
+                return None
+            return day
+    return None
+
+
 def _turn_date_anchor(
     raw_messages: Sequence[TurnMessage], current_turn_index: int
 ) -> dict[str, Any] | None:
@@ -541,19 +569,15 @@ def _turn_date_anchor(
         not a readable date. The slice is VALIDATED, not trusted — no anchor is better than
         confidently rendering `Today's date is not-a-dat.` from a malformed stamp.
     """
-    for message in raw_messages:
-        if message.turn_index == current_turn_index and message.role == "user":
-            # `ts` is produced by `_now_iso()` (`datetime.now(UTC).isoformat()`), so
-            # the first 10 characters ARE the ISO date — the slice is the cheap
-            # path, and `date.fromisoformat` is the guard that keeps a hand-built
-            # or corrupted stamp from being rendered as if it were one.
-            day = message.ts[:10]
-            try:
-                date.fromisoformat(day)
-            except (TypeError, ValueError):
-                return None
-            return {"role": "user", "content": f"{DATE_ANCHOR_PREFIX}{day}."}
-    return None
+    # `ts` is produced by `_now_iso()` (`datetime.now(UTC).isoformat()`), so the first
+    # 10 characters ARE the ISO date — the slice is the cheap path, and
+    # `date.fromisoformat` is the guard that keeps a hand-built or corrupted stamp from
+    # being rendered as if it were one. Both live in `turn_date_anchor_day`, which the
+    # judge reads too, so the two can never disagree about what "today" is.
+    day = turn_date_anchor_day(raw_messages, current_turn_index)
+    if day is None:
+        return None
+    return {"role": "user", "content": f"{DATE_ANCHOR_PREFIX}{day}."}
 
 
 def render_analysis_state_block(state: AnalysisState) -> dict[str, Any]:
@@ -624,6 +648,16 @@ _STALE_CROSS_TURN_ERROR_CODES = frozenset(
         # narrowed. It only ever needs to survive its OWN turn: the whole point is
         # that the model reads it on the next round-trip and sends the table.
         ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
+        # The FIFTH and SIXTH, added with the answer judge (09 §G.2). Both are
+        # persisted under `answerWithTable` and both carry the refused draft answer
+        # in `args`, so both belong here for the reason the two above do.
+        #
+        # `ANSWER_JUDGE_REJECTED` carries a SECOND channel the others do not: its
+        # `denial_detail` is the JUDGE'S OWN sentence about this answer, model-
+        # authored prose written after reading warehouse rows. It is the most
+        # scope-sensitive text this set holds, and it is useful for exactly one
+        # round-trip.
+        ANSWER_JUDGE_REJECTED_CODE,
     }
 )
 

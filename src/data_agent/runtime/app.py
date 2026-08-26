@@ -59,6 +59,7 @@ from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolObserver,
 )
 from data_agent.runtime.loop.agent_loop import AgentLoop, RuntimeTool, TurnOutcome
+from data_agent.runtime.loop.answer_judge import AnswerJudge
 from data_agent.runtime.mcp.client import MCPClient
 from data_agent.runtime.mcp.real_client import RealMCPClient
 from data_agent.runtime.mcp.scratch_client import ScratchClient
@@ -318,6 +319,41 @@ def create_app(
         progress_summarizer = ProgressSummarizer(
             summary_model_client,
             timeout_seconds=settings.progress_summary_timeout_seconds,
+        )
+
+    # The ANSWER JUDGE (doc 09), opt-in via `answer_judge_enabled`. Built ONCE here,
+    # on the main model client unless `answer_judge_model` names another — the same
+    # arrangement the summarizer above uses, and for the same reason: a second cheap
+    # client is a deployment choice, not a code path.
+    #
+    # ONLY THE CLIENT IS BUILT HERE. The `AnswerJudge` itself is constructed per
+    # request inside `_build_agent_loop`, because it carries the request's `observer`
+    # — the judge emits its own `..._called` / `..._failed` events, and an
+    # app-lifetime judge would emit them into whichever request happened to build it.
+    # It is a dataclass over an already-constructed client, so per-request
+    # construction costs nothing.
+    #
+    # `None` WHEN OFF, rather than a disabled judge object. Both approve everything,
+    # but `None` is the stronger statement — no object on the terminal path, no
+    # per-exit branch to reason about — and it is what every Layer-1 loop test gets by
+    # default, so "the feature is absent" and "the tests pass" mean the same thing.
+    #
+    # ITS SPEND IS DELIBERATELY OUTSIDE `max_window_token_spend` (09 §I): the judge's
+    # call does not go through `BudgetGuard.record_iteration`, so it cannot end a
+    # window. Three bounds stand in that ceiling's place — one refusal per window per
+    # kind, the allowance peek that skips the call once it is spent, and the
+    # wall-clock headroom skip — and `loop_answer_judge_called.tokens` is the only
+    # place the spend is observable at all.
+    judge_model_client: Any = None
+    if settings.answer_judge_enabled and settings.openai_api_key:
+        judge_model_client = (
+            build_openai_model_client(
+                api_key=settings.openai_api_key,
+                model=settings.answer_judge_model,
+                base_url=settings.openai_base_url,
+            )
+            if settings.answer_judge_model
+            else model_client
         )
 
     # The effective LLM-content hide (config.effective_llm_hide): normally
@@ -717,6 +753,28 @@ def create_app(
             blueprint_executor=blueprint_executor,
             discovery_emulation_provider=discovery_emulation_provider,
             progress_summarizer=progress_summarizer,
+            # 09: `None` unless `answer_judge_enabled` AND a key is present, in which
+            # case every terminal exit is byte-identical to before the feature existed.
+            answer_judge=(
+                AnswerJudge(
+                    model_client=judge_model_client,
+                    token_budget=settings.request_token_budget(),
+                    timeout_seconds=settings.answer_judge_timeout_seconds,
+                    observer=observer,
+                    # The judge opens its OWN `answer_judge` CHAIN span, so the
+                    # auto-instrumented OpenAI `LLM` span nests under it instead of
+                    # sitting beside the agent's own round-trips, indistinguishable
+                    # from them. `agent.turn` is ambient, so the whole thing lands in
+                    # the turn trace with no propagation wiring.
+                    tracer=tracer,
+                )
+                if judge_model_client is not None
+                else None
+            ),
+            answer_judge_min_headroom_seconds=settings.answer_judge_min_headroom_seconds,
+            # 09 §D.3: the SAME number the assembler renders the model's context with,
+            # so the judge's view of a result is byte-identical to the model's.
+            preview_row_count=settings.preview_row_count,
         )
 
     # Close the neo4j driver pool on shutdown (design §2.4, N1: lifespan not the

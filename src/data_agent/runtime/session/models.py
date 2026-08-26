@@ -323,7 +323,12 @@ MAX_FINALIZATION_BLOCKS_PER_WINDOW = 1
 # bounded — one extra round-trip per kind per window, and `max_budget_windows`
 # bounds the windows.
 FinalizationBlockKind = Literal[
-    "intents", "answer_shape", "empty_answer", "ungrounded_answer"
+    "intents",
+    "answer_shape",
+    "empty_answer",
+    "ungrounded_answer",
+    "answer_judge",
+    "ask_user_judge",
 ]
 FINALIZATION_BLOCK_KINDS: tuple[FinalizationBlockKind, ...] = (
     "intents",
@@ -334,6 +339,18 @@ FINALIZATION_BLOCK_KINDS: tuple[FinalizationBlockKind, ...] = (
     # window. A rule whose complaint is about answer FORM charges to `answer_shape`
     # instead — see `loop/answer_rules.py::ANSWER_RULES`.
     "ungrounded_answer",
+    # The ANSWER JUDGE (09 §F), SHARED BY BOTH TERMINAL EXITS. Exit #1 and exit #2
+    # are two doors out of one finish, not two complaints: a model pushed from the
+    # prose exit to `answerWithTable` by an earlier nudge (05 §L.5's documented
+    # route) must not be judged twice for the same answer. Sharing also bounds the
+    # judge at ONE model call per window even when the turn tries both exits.
+    "answer_judge",
+    # The askUser-question judge (09 §C.3), DELIBERATELY SEPARATE from the one
+    # above. It is a different complaint made at a different moment, and rejecting
+    # it costs the user nothing — the pause has not happened, so they have not seen
+    # the question. Sharing would let a rejected answer silence the check that
+    # keeps a schema-worded question from reaching them.
+    "ask_user_judge",
 )
 
 

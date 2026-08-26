@@ -80,6 +80,31 @@ def _is_year(token: str) -> bool:
     return len(token) == 4 and token.isdigit() and 1900 <= int(token) <= 2100
 
 
+def reported_figures(prose: str) -> list[str]:
+    """Every measured figure the prose reports, digits only (`"9,184"` -> `"9184"`),
+        first-occurrence order, deduped.
+
+        THE SAME PREDICATE `asserts_quantity` APPLIES, extracted so the two cannot drift:
+        that function is exactly "is this list non-empty", and the corroboration pass
+        (09 §D.4) needs the members rather than the boolean. Both therefore inherit the
+        narrowness argued at `asserts_quantity` — three digits or a thousands separator,
+        bare years and date shapes excluded.
+
+        DIGITS ONLY, because the only use is comparison against warehouse cells: `9,184` in
+        prose and `9184` in a result row are the same figure, and the separator is a
+        presentation choice made on one side only.
+    """
+    figures: list[str] = []
+    for token in _NUMERIC.findall(_DATE_SHAPES.sub(" ", prose)):
+        if _is_year(token):
+            continue
+        digits = token.replace(",", "")
+        if "," in token or len(digits.replace(".", "")) >= 3:
+            if digits not in figures:
+                figures.append(digits)
+    return figures
+
+
 def asserts_quantity(prose: str) -> bool:
     """Whether the prose reports a measured figure.
 
@@ -91,12 +116,10 @@ def asserts_quantity(prose: str) -> bool:
     carries with no query behind it ("overtime is 1.5 times base rate", "beyond 40 hours
     in a week"). Widen it on the exhausted-event rate, not before.
     """
-    for token in _NUMERIC.findall(_DATE_SHAPES.sub(" ", prose)):
-        if _is_year(token):
-            continue
-        if "," in token or len(token.replace(",", "").replace(".", "")) >= 3:
-            return True
-    return False
+    # DELEGATED, not re-implemented. This function is exactly "is that list non-empty",
+    # and a second copy of the scan is the "two enforcers for one rule" shape doc 09 §B
+    # warns about — they agree today and there is nothing structural keeping them so.
+    return bool(reported_figures(prose))
 
 
 # A header row (two or more pipes) immediately followed by a pipe-bearing separator rule.

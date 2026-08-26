@@ -126,6 +126,35 @@ config:
   OPENAI_BASE_URL: ""
   # -- Model context window (tokens) the runtime plans against.
   MODEL_CONTEXT_WINDOW: "128000"
+  # -- Enable the LLM answer judge at the terminal exits and the askUser pause
+  #    (docs/decisions/release-1/09-answer-judge.md). OFF by default, and the
+  #    default is a design position rather than caution: the loop is
+  #    byte-deterministic by construction (D45) and this is a NON-DETERMINISTIC
+  #    gate on the terminal path. With it off no judge is constructed at all and
+  #    every exit behaves exactly as it did before the feature existed.
+  #
+  #    ITS TOKENS ARE OUTSIDE MAX_WINDOW_TOKEN_SPEND by deliberate decision (09
+  #    §I), so enabling it adds model spend that the window ceiling does NOT
+  #    bound. Three other bounds do — one refusal per window per kind, the
+  #    allowance peek, and the wall-clock headroom below — and the only place the
+  #    spend is observable is the `loop_answer_judge_called.tokens` span.
+  ANSWER_JUDGE_ENABLED: "false"
+  # -- Model id for the judge. Empty = reuse OPENAI_MODEL. Set this to run the
+  #    judge on a cheaper model than the agent; it shares the OpenAI key and base
+  #    URL either way.
+  ANSWER_JUDGE_MODEL: ""
+  # -- Per-call timeout for the judge (seconds). On timeout the answer is
+  #    APPROVED and shipped: the judge may only ever ADD a round-trip on positive
+  #    evidence, never withhold an answer because it could not be reached.
+  ANSWER_JUDGE_TIMEOUT_SECONDS: "20"
+  # -- Wall-clock seconds that must REMAIN in the budget window for the judge to
+  #    run at all (09 §H). Below this it is skipped and the answer ships. A
+  #    rejection issued near the cap buys a regeneration the budget guard cuts off
+  #    mid-round, after which the turn pauses with the draft already cleared — the
+  #    user is asked "continue, refine, or stop?" and shown nothing, having had a
+  #    serviceable answer moments earlier. Roughly one model round-trip plus the
+  #    judge call; raise it if regenerations are seen being cut off.
+  ANSWER_JUDGE_MIN_HEADROOM_SECONDS: "25"
   # -- Couchbase connection string (primary session store). EXTERNAL.
   #    SHARED WITH THE LEARNING CHART: the learning sweeper scans THIS KEYSPACE for
   #    idle sessions, so `data-agent-learning` must point at the same cluster,

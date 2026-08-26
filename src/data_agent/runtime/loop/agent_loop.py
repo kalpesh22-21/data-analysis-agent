@@ -65,11 +65,13 @@ from data_agent.runtime.composite.answer_with_table import (
     terminal_sql_by_id,
 )
 from data_agent.runtime.composite.record_assumptions import fold_assumptions
+from data_agent.runtime.context import scope_filter
 from data_agent.runtime.context.assembly import (
     IDEMPOTENT_READ_ALREADY_SERVED_CODE,
     ContextAssembler,
+    turn_date_anchor_day,
 )
-from data_agent.runtime.context.budget import fit_request_to_budget
+from data_agent.runtime.context.budget import fit_request_to_budget, render_entry
 from data_agent.runtime.dispatch.tool_dispatcher import (
     ToolDispatcher,
     ToolObserver,
@@ -88,6 +90,7 @@ from data_agent.runtime.observability.progress_summarizer import ProgressSummari
 from data_agent.runtime.observability.redaction import hash_scope
 from data_agent.runtime.session.models import (
     AnalysisState,
+    FinalizationBlockKind,
     PauseCheckpoint,
     TrackedIntent,
     TrailEntry,
@@ -97,21 +100,39 @@ from data_agent.runtime.session.models import (
 from data_agent.runtime.session.store import SessionStore
 from data_agent.timeutil import now_iso
 
+from .answer_judge import (
+    ANSWER_JUDGE_EXHAUSTED_EVENT,
+    ANSWER_JUDGE_FAILED_EVENT,
+    ANSWER_JUDGE_REFUSED_EVENT,
+    ANSWER_JUDGE_SKIPPED_EVENT,
+    APPROVED,
+    ASK_USER_JUDGE_EXHAUSTED_EVENT,
+    ASK_USER_JUDGE_REFUSED_EVENT,
+    AnswerJudge,
+    JudgeBrief,
+    JudgeSite,
+    JudgeVerdict,
+    answer_judge_nudge_text,
+    ask_user_judge_nudge_text,
+)
 from .answer_rules import (
     ANSWER_RULE_EXHAUSTED_EVENT,
     ANSWER_RULE_REFUSED_EVENT,
     first_match,
+    reported_figures,
 )
 from .blueprint_gate import BlueprintGate
 from .budget_guard import BudgetGuard
 from .finalization import (
     ANSWER_SHAPE_EXHAUSTED_EVENT,
     ANSWER_SHAPE_REFUSED_EVENT,
+    DATA_ANSWER_TOOLS,
     EMPTY_ANSWER_EXHAUSTED_EVENT,
     EMPTY_ANSWER_FALLBACK_TEXT,
     EMPTY_ANSWER_REFUSED_EVENT,
     AnswerShapeCounter,
     FinalizationGate,
+    answer_judge_rejected,
     answer_shape_nudge_text,
     answer_table_no_table_designated,
     empty_answer_nudge_text,
@@ -481,6 +502,13 @@ ANSWER_TABLE_EMPTY_DESIGNATION_EVENT = "loop_answer_table_empty_designation"
 # left the rejection WRITES unbounded).
 _MAX_SURPLUS_STATE_REJECTIONS = 2
 
+# How many of a turn's full results the figure-corroboration pass (09 §D.4) may read
+# back from the KV before giving up. A CAP, not a budget: the pass short-circuits on
+# the first match, so this only bounds the miss case — a long turn holding a dozen
+# results, where reading all of them would put a dozen store round-trips on the
+# terminal path to establish a fact that is optional by construction.
+_MAX_CORROBORATION_READS = 4
+
 
 class _NoLiveStateToForceError(Exception):
     """Raised from inside the force-block merge when the live state vanished between the
@@ -721,6 +749,26 @@ class AgentLoop:
         # having them. `app.py` does not populate it; activating one is a
         # deliberate registration, never a config flag.
         answer_table_hooks: AnswerTableHooks | None = None,
+        # The ANSWER JUDGE (09). `None` = the feature is ABSENT and every terminal
+        # exit is byte-identical to before it existed — which is what every Layer-1
+        # loop test that does not wire one gets, and what `app.py` wires when
+        # `answer_judge_enabled` is False. A judge object that is itself disabled
+        # would also approve everything, but it would still be an object on the
+        # terminal path; `None` is the stronger statement and the cheaper one.
+        answer_judge: AnswerJudge | None = None,
+        # Seconds of wall clock a judge rejection needs to be worth making (09 §H).
+        # Below this the judge is SKIPPED and the answer ships: a rejection issued at
+        # 168s of a 180s window buys a regeneration the guard cuts off mid-round, and
+        # the user is then asked "continue, refine, or stop?" having been shown
+        # nothing — a serviceable answer converted into an empty pause.
+        answer_judge_min_headroom_seconds: float = 25.0,
+        # How many preview rows the judge's brief carries per result. THE SAME NUMBER
+        # THE MODEL'S CONTEXT USES, and that is the entire requirement (09 §D.3) —
+        # a judge holding more rows than the model held faults it for the preview cap.
+        # Defaulted to `RuntimeSettings.preview_row_count`'s own default so a Layer-1
+        # loop test that wires neither still agrees with a deployment that wires both;
+        # `app.py` passes `settings.preview_row_count` to this AND to the assembler.
+        preview_row_count: int = 20,
     ) -> None:
         self._model_client = model_client
         self._tool_dispatcher = tool_dispatcher
@@ -771,6 +819,9 @@ class AgentLoop:
         # while K protects the D94 re-fetch/self-correct loop. Default 3.
         self._request_budget_pinned_recent_tool_pairs = request_budget_pinned_recent_tool_pairs
         self._max_tool_calls_per_iteration = max_tool_calls_per_iteration
+        self._answer_judge = answer_judge
+        self._answer_judge_min_headroom_seconds = answer_judge_min_headroom_seconds
+        self._preview_row_count = preview_row_count
         self._clock = clock
         self._observer = observer
         # R7: the ONE span the loop opens itself — the blueprint approval-RESUME
@@ -1528,6 +1579,250 @@ class AgentLoop:
                 force_blocked["budget_cap_reached"] = True
             self._observer("loop_intent_force_blocked", force_blocked)
         return new_state
+
+    def _judge_would_run(
+        self,
+        *,
+        guard: BudgetGuard,
+        gate: FinalizationGate,
+        kind: FinalizationBlockKind,
+    ) -> bool:
+        """Whether a judge call at this moment could change anything. SYNC AND FREE, and
+                separated from `_judge` so it can be answered BEFORE the brief is built.
+
+                THE SEPARATION IS THE POINT, not a refactor. Building a brief costs a session
+                load plus up to `_MAX_CORROBORATION_READS` KV reads; doing that first and
+                deciding afterwards put real store I/O on every terminal exit of every turn —
+                INCLUDING with the feature switched off, which is the shipped default. Both
+                halves of the cost have to sit behind the same test.
+
+                THREE REASONS TO SKIP, and each is provably pointless rather than merely
+                cheap:
+
+                  FEATURE ABSENT — nothing to ask.
+
+                  ALLOWANCE SPENT — a rejection cannot act, so the verdict would be bought and
+                  then discarded. `has_spent` is window-local by design; see its docstring for
+                  the one path it under-reports on and why that costs at most one call.
+
+                  NO WALL-CLOCK HEADROOM (09 §H) — a rejection issued near the cap buys a
+                  regeneration `guard.exceeded` cuts off mid-round, and the turn then returns
+                  `paused_budget_cap` with the draft already cleared. The user is asked
+                  "continue, refine, or stop?" and shown NOTHING, having had a serviceable answer
+                  moments earlier. That is the judge making the product worse, and it is the
+                  single failure mode most likely to make the feature net-negative.
+        """
+        if self._answer_judge is None:
+            return False
+        if gate.has_spent(kind):
+            self._observer(ANSWER_JUDGE_SKIPPED_EVENT, {"reason": "allowance_spent"})
+            return False
+        usage = guard.usage()
+        if (
+            usage.max_wall_clock_seconds - usage.elapsed_seconds
+            < self._answer_judge_min_headroom_seconds
+        ):
+            self._observer(ANSWER_JUDGE_SKIPPED_EVENT, {"reason": "wall_clock"})
+            return False
+        return True
+
+    async def _judge(
+        self,
+        make_brief: Callable[[], Awaitable[JudgeBrief]],
+        *,
+        guard: BudgetGuard,
+        gate: FinalizationGate,
+        kind: FinalizationBlockKind,
+    ) -> JudgeVerdict:
+        """Run the answer judge for one site, or APPROVE without spending anything (09).
+
+                *make_brief* IS A FACTORY, NOT A BRIEF, so the store reads it performs happen
+                only after `_judge_would_run` has said a verdict could be acted on. An eagerly
+                built brief is a session load and up to four KV reads charged to every terminal
+                exit, disabled deployments included.
+
+                THE FACTORY IS ALSO GUARDED. `_judge_results` reads the session document, and a
+                transient store error there would otherwise propagate out of `_run_loop_body`
+                AND ABORT A TURN WHOSE ANSWER IS ALREADY IN HAND — the exact fail-open violation
+                this feature must never commit, arriving through the call site rather than
+                through `review()`. Degrading to `APPROVED` costs one un-judged answer.
+
+                Every skip and every failure returns the SAME `APPROVED` object as the judge's
+                own fail-open paths, so no caller can branch on why (09 §E).
+        """
+        if not self._judge_would_run(guard=guard, gate=gate, kind=kind):
+            return APPROVED
+        try:
+            brief = await make_brief()
+        except Exception:
+            _logger.exception(
+                "could not assemble the answer-judge brief — approving and shipping"
+            )
+            self._observer(ANSWER_JUDGE_FAILED_EVENT, {"reason": "brief_failed"})
+            return APPROVED
+        assert self._answer_judge is not None  # `_judge_would_run` established it
+        return await self._answer_judge.review(brief)
+
+    async def _judge_results(
+        self, session_id: str, turn_index: int, column_scope: frozenset[str]
+    ) -> tuple[tuple[Mapping[str, Any], ...], str | None, tuple[TrailEntry, ...]]:
+        """This turn's data-bearing results as the MODEL saw them, plus the date anchor —
+                the two brief fields that cannot be read off a window-local (09 §D).
+
+                SCOPE-FILTERED FIRST, RENDERED SECOND, and the order is the contract
+                `context/budget.py` states for the model-request path: `render_entry` has no
+                scope information of its own and performs no filtering, so handing it a raw
+                trail would put warehouse rows the caller is not entitled to in front of the
+                judge. `filter_trail` is called with `current_turn_index=None` — the
+                current-turn exemption exists to let the MODEL see its own denials and
+                self-correct, and a judge has nothing to self-correct; a `None`-provenance
+                entry is undetermined and must stay dropped.
+
+                `DATA_ANSWER_TOOLS` ONLY, successful ones. Those are the results the answer was
+                written FROM; a `getTableSchema` grounds the model, not the answer, and a wide
+                one is ~4k tokens of column documentation the judge has no criterion for. The
+                set is imported rather than re-spelled so it cannot drift from the answer-shape
+                gate's.
+
+                ⚠ ONE EXTRA `load_trail` PER JUDGED EXIT (issues-stack A3 already counts three
+                per window). It is paid ONLY when the judge is enabled AND reached a terminal
+                exit AND passed both skips — at most once per window — and the alternative is
+                threading a growing trail snapshot through `_run_loop_body` for a feature that
+                is off by default.
+        """
+        doc = await self._session_store.get_or_create_session(session_id)
+        in_scope = scope_filter.filter_trail(doc.tool_trail, column_scope)
+        rendered = tuple(
+            render_entry(entry, self._preview_row_count)
+            for entry in in_scope
+            if entry.turn_index == turn_index
+            and entry.status == "ok"
+            and entry.tool_name in DATA_ANSWER_TOOLS
+        )
+        # The IN-SCOPE entries ride along so `_corroborated_figures` can reuse this one
+        # read (issues-stack A3 counts three per window already) — it needs
+        # `result_full_ref`, which the rendered view deliberately does not carry.
+        #
+        # `in_scope`, NEVER `doc.tool_trail`. Corroboration only ever ADDS a `True`, so a
+        # raw-trail scan could not leak content — but it could derive that `True` from a
+        # result the scope filter dropped, i.e. state a fact about data the model's own
+        # context no longer holds. The judge would then weigh a figure against evidence
+        # neither it nor the model was entitled to see.
+        return (
+            rendered,
+            turn_date_anchor_day(doc.messages, turn_index),
+            tuple(in_scope),
+        )
+
+    async def _corroborated_figures(
+        self, session_id: str, turn_index: int, prose: str, trail: Sequence[TrailEntry]
+    ) -> bool | None:
+        """`True` when a figure the prose reports is FOUND in what this turn's queries
+                actually returned; `None` when nothing was established. **Never `False`.**
+
+                THIS IS 05 §L.7's ESCAPE HATCH, BUILT AS AN ESCAPE HATCH. That section works
+                through why corroboration cannot be a TRIGGER and the reasoning is unchanged: a
+                derived figure never matches literally ("rose 12% year over year"), rounding
+                breaks it (`9184` reported as "about 9,200"), and formatting diverges. Every one
+                of those produces a NON-match on a perfectly good answer.
+
+                So the absence of a match is not evidence and is never reported as any. A `False`
+                would be read by the judge as "this figure was looked for and is not in the
+                data", which is a finding the runtime cannot support and which would push it
+                toward `contradicts_result` on exactly the answers §L.7 lists. `True` is the only
+                thing this can honestly say, and it says it so a judge weighing a figure it
+                cannot verify from 20 preview rows has one fact it can trust.
+
+                IT READS `result_full`, the one place in this feature that does — and 09 §D.3's
+                rule survives it, because the judge never SEES the full result. It sees a
+                boolean derived from it. The full result is where a corroborating row lives when
+                the preview cap cut it, which is the entire reason for the read.
+
+                COSTS ONE `read_full_result` PER DATA CALL, capped, and short-circuits on the
+                first match. Skipped entirely when the prose reports no figure — most answers.
+        """
+        figures = reported_figures(prose)
+        if not figures:
+            return None
+        refs = [
+            entry.result_full_ref
+            for entry in trail
+            if entry.turn_index == turn_index
+            and entry.status == "ok"
+            and entry.tool_name in DATA_ANSWER_TOOLS
+            and entry.result_full_ref is not None
+        ][:_MAX_CORROBORATION_READS]
+        for ref in refs:
+            try:
+                full = await self._session_store.read_full_result(session_id, ref)
+            except Exception:
+                # DEGRADE-NEVER-FAIL, and here the degradation is already the honest
+                # answer: a failed read establishes nothing, which is what `None` means.
+                _logger.warning(
+                    "could not read a full result for figure corroboration "
+                    "(session=%s, turn=%d) — reporting 'not checked'",
+                    session_id,
+                    turn_index,
+                )
+                continue
+            if full is None:
+                continue
+            haystack = json.dumps(full, default=str)
+            # Digits-only on BOTH sides: a result cell serialises as `9184` while the
+            # prose writes `9,184`, and the separator is a presentation choice made on
+            # one side only.
+            stripped = haystack.replace(",", "")
+            if any(figure in stripped for figure in figures):
+                return True
+        return None
+
+    def _judge_brief(
+        self,
+        site: JudgeSite,
+        *,
+        question: str,
+        accum: TurnAccumulators,
+        analysis_state: AnalysisState | None,
+        date_anchor: str | None = None,
+        draft: str = "",
+        pending_question: str = "",
+        results: tuple[Mapping[str, Any], ...] = (),
+        designated_tables: tuple[tuple[str | None, str], ...] = (),
+        figure_corroborated: bool | None = None,
+    ) -> JudgeBrief:
+        """Assemble the judge's brief from what the loop already holds (09 §D.2).
+
+                PURE, AND NO STORE READS. Every field is a window-local or an accumulator at the
+                moment a terminal exit is reached, which is what keeps the common case at ~2-4k
+                tokens and one model round-trip rather than a re-assembly of the turn.
+
+                `results` AND `date_anchor` ARE THE CALLER'S, from `_judge_results` — the only
+                two fields that need I/O and the only two that need a scope decision. Building
+                them here would put a `filter_trail` call inside a brief builder where nobody
+                would look for it, and would make this method impossible to test without a
+                store. The `ask_user` site passes neither.
+        """
+        return JudgeBrief(
+            site=site,
+            question=question,
+            date_anchor=date_anchor,
+            intents=tuple(
+                (
+                    intent.intent_id,
+                    intent.description,
+                    intent.status,
+                    intent.reason_code,
+                )
+                for intent in (analysis_state.intents if analysis_state else ())
+            ),
+            assumptions=tuple(accum.assumptions or ()),
+            sql_executed=tuple(accum.sql_executed or ()),
+            results=results,
+            draft=draft,
+            designated_tables=designated_tables,
+            figure_corroborated=figure_corroborated,
+            pending_question=pending_question,
+        )
 
     async def _finish(
         self,
@@ -2432,6 +2727,17 @@ class AgentLoop:
                 # terminal exit #2 below. Reset per iteration — a designation only ends
                 # the turn it was made in.
                 designated_answer_text: str | None = None
+                # The judge's feedback if it refused an `answerWithTable` EARLIER IN THIS
+                # BATCH. Reset per iteration beside `designated_answer_text`, and for the
+                # same reason: it describes one response, not one turn.
+                #
+                # A model response can carry up to 8 tool calls, and a batch of two
+                # `answerWithTable`s is the shape 05 §C.2 built the per-round free-refusal
+                # path for. The judge cannot use that path — its cost-avoidance peek
+                # (`has_spent`) runs before `may_refuse` and turns the second call into a
+                # SKIP, which approves — so without this local the second call terminated
+                # the turn in the round the judge had just refused it.
+                judge_refusal_this_round: str | None = None
                 # Start the blueprint gate's response batch: it stages the ids expanded
                 # by a `getBlueprint` in THIS response and holds them apart from the
                 # committed set until the batch drains (`commit_round`, below the
@@ -2683,6 +2989,86 @@ class AgentLoop:
                             EMPTY_ANSWER_EXHAUSTED_EVENT,
                             {"incomplete_reason": result.incomplete_reason or ""},
                         )
+
+                # --- THE ANSWER JUDGE, exit #1 (09 §C.1) ------------------------
+                #
+                # LAST, AFTER EVERY FREE CHECK, and the ordering is the cost model
+                # rather than a precedence claim. §B/§J/§L/§K are regexes and counters;
+                # this one is a MODEL CALL. `not refused_finalization` means the judge
+                # is never paid for on a round some cheaper check already won — a
+                # pasted markdown table costs zero judge tokens — and it keeps the
+                # one-refusal-per-round-trip rule the chain expresses structurally.
+                #
+                # THE ORDER AGAINST §K IS FREE, for §L.5's reason: this requires
+                # non-blank prose and §K fires only on blank, so the two conditions are
+                # disjoint by construction. Placed after it anyway, so a silent finish
+                # never reaches a model call.
+                #
+                # THE TWO SKIPS ARE INSIDE `_judge`, not here: a spent allowance and a
+                # wall clock with no room for a rejection to act in both make the call
+                # pointless, and both are invisible from the verdict.
+                if (
+                    not result.tool_calls
+                    and not refused_finalization
+                    and (result.assistant_text or "").strip()
+                ):
+                    # A FACTORY, so the session load and the corroboration KV reads
+                    # happen only if a verdict could be acted on — see `_judge`.
+                    async def _prose_brief(
+                        _q: str = question,
+                        _state: AnalysisState | None = analysis_state,
+                        _draft: str = result.assistant_text or "",
+                    ) -> JudgeBrief:
+                        results, anchor, in_scope = await self._judge_results(
+                            session_id, turn_index, credentials.column_scope
+                        )
+                        return self._judge_brief(
+                            "exit_prose",
+                            question=_q,
+                            accum=accum,
+                            analysis_state=_state,
+                            date_anchor=anchor,
+                            draft=_draft,
+                            results=results,
+                            # 09 §D.4 / 05 §L.7: `True` or "not checked", never `False`.
+                            figure_corroborated=await self._corroborated_figures(
+                                session_id, turn_index, _draft, in_scope
+                            ),
+                        )
+
+                    verdict = await self._judge(
+                        _prose_brief,
+                        guard=guard,
+                        gate=finalization_gate,
+                        kind="answer_judge",
+                    )
+                    if not verdict.approved:
+                        if await finalization_gate.may_refuse("answer_judge"):
+                            refused_finalization = True
+                            self._observer(
+                                ANSWER_JUDGE_REFUSED_EVENT,
+                                {"violation": verdict.violation, "site": "exit_prose"},
+                            )
+                            finalization_nudge = answer_judge_nudge_text(
+                                result.assistant_text, verdict.feedback
+                            )
+                            # CLEAR THE DRAFT, for the reason all three gates above
+                            # clear it: `last_assistant_text` is returned as
+                            # `assistant_text` on the hard-ceiling and budget-cap paths,
+                            # so a refused answer could otherwise reach the user there
+                            # while never entering history.
+                            last_assistant_text = None
+                        else:
+                            # THE PROSE PASSES. §J.5/§L.8's posture, and load-bearing
+                            # here rather than inherited: this check reads MEANING, and
+                            # a second refusal would be the runtime destroying an answer
+                            # on the say-so of a model it cannot appeal. The event is
+                            # what makes the pass visible — see 09 §F.1 for why this
+                            # branch is reached only across a resume.
+                            self._observer(
+                                ANSWER_JUDGE_EXHAUSTED_EVENT,
+                                {"violation": verdict.violation, "site": "exit_prose"},
+                            )
 
                 if not result.tool_calls and not refused_finalization:
                     # B1/D44 (2026-07-01 clarification) AND UI Slice 1: the union of
@@ -3240,6 +3626,141 @@ class AgentLoop:
                                 tables=resolved_answer_tables,
                                 result_sql_by_call_id=accum.result_sql_by_call_id,
                             )
+                    # --- THE ANSWER JUDGE, exit #2 (09 §C.2) --------------------
+                    #
+                    # THE SITE THAT MATTERS MOST, and the one 05 §L.9 leaves
+                    # entirely unchecked today: no answer rule runs here, so a
+                    # multi-part answer that closes both intents, designates one
+                    # table and discusses one subject ends `done` with no event and
+                    # no log line. That is the population where "was every part
+                    # answered" has teeth — and §L.5 records the route into it, the
+                    # `markdown_table` nudge telling the model to call
+                    # answerWithTable instead.
+                    #
+                    # THE TERMINAL CONDITION IS MIRRORED EXACTLY (`ok` + a `dict` of
+                    # arguments + non-blank `answer`), as the pending-intents
+                    # refusal above mirrors it: a call that would NOT have ended the
+                    # turn is not a finalization and must not be judged as one. The
+                    # `ok` half also means every refusal above — pending intents,
+                    # blueprint-not-run, empty designation, the unrun query — has
+                    # already rewritten `tool_result` and the judge is not paid for.
+                    #
+                    # THE ALLOWANCE IS SHARED WITH EXIT #1 (`kind="answer_judge"`):
+                    # the two exits are two doors out of ONE finish, so a model
+                    # pushed here by an exit-#1 nudge must not be judged twice for
+                    # the same answer.
+                    if (
+                        tool_call.name == ANSWER_TABLE_TOOL_NAME
+                        and tool_result.status == "ok"
+                        and isinstance(call_args, dict)
+                        and clean_answer_text(call_args.get("answer")) is not None
+                    ):
+                        table_draft = clean_answer_text(call_args.get("answer")) or ""
+                        if judge_refusal_this_round is not None:
+                            # A SECOND `answerWithTable` IN THE SAME BATCH, after the
+                            # judge already refused one. It gets the SAME refusal for
+                            # free — no second model call, no second claim.
+                            #
+                            # THIS BRANCH IS THE WHOLE FIX for a defect that shipped
+                            # past review once. Without it the sequence was: call A
+                            # judged and refused (which records the grant), call B
+                            # reaches `_judge`, `has_spent` reports the allowance gone,
+                            # the judge is SKIPPED, and skipping returns APPROVED — so
+                            # B stayed `ok` and TERMINATED THE TURN in the very round
+                            # the judge had refused it. The user received a near-copy of
+                            # the refused answer and the feedback reached the model
+                            # never. `may_refuse`'s own free-refusal path exists for
+                            # exactly this shape (05 §C.2) and the judge could not reach
+                            # it, because its cost-avoidance peek runs first.
+                            tool_result = answer_judge_rejected(judge_refusal_this_round)
+                        elif finalization_gate.refused_this_round:
+                            # ANOTHER gate refused earlier in this same round-trip (the
+                            # empty-designation nudge, say). One refusal per round-trip
+                            # is the rule the whole chain expresses, so the judge does
+                            # not run — and, unlike the shape above, has nothing to
+                            # re-issue. Skipping here also keeps the judge off the
+                            # free-grant path, where a refusal would be issued without a
+                            # claim and the window's bound would quietly become two.
+                            self._observer(
+                                ANSWER_JUDGE_SKIPPED_EVENT, {"reason": "round_refused"}
+                            )
+                        else:
+
+                            async def _table_brief(
+                                _q: str = question,
+                                _state: AnalysisState | None = analysis_state,
+                                _draft: str = table_draft,
+                                _tables: tuple[AnswerTable, ...] = tuple(
+                                    resolved_answer_tables
+                                ),
+                            ) -> JudgeBrief:
+                                results, anchor, in_scope = await self._judge_results(
+                                    session_id, turn_index, credentials.column_scope
+                                )
+                                return self._judge_brief(
+                                    "exit_table",
+                                    question=_q,
+                                    accum=accum,
+                                    analysis_state=_state,
+                                    date_anchor=anchor,
+                                    draft=_draft,
+                                    results=results,
+                                    designated_tables=tuple(
+                                        (table.caption, table.sql) for table in _tables
+                                    ),
+                                    figure_corroborated=await self._corroborated_figures(
+                                        session_id, turn_index, _draft, in_scope
+                                    ),
+                                )
+
+                            table_verdict = await self._judge(
+                                _table_brief,
+                                guard=guard,
+                                gate=finalization_gate,
+                                kind="answer_judge",
+                            )
+                            if not table_verdict.approved:
+                                if await finalization_gate.may_refuse("answer_judge"):
+                                    self._observer(
+                                        ANSWER_JUDGE_REFUSED_EVENT,
+                                        {
+                                            "violation": table_verdict.violation,
+                                            "site": "exit_table",
+                                        },
+                                    )
+                                    # A RETRYABLE error, so the turn continues and the
+                                    # batch drains normally — `tool_result` is no longer
+                                    # `ok`, so the terminal-exit check below does not
+                                    # fire for this call and the persisted entry IS the
+                                    # refusal. NO DRAFT CLEAR is needed: exit #2 keeps
+                                    # the model's prose in `TrailEntry.args`.
+                                    tool_result = answer_judge_rejected(
+                                        table_verdict.feedback
+                                    )
+                                    # Remembered for the REST OF THIS BATCH, so a second
+                                    # answerWithTable is refused with the same words
+                                    # rather than sailing through the skip above.
+                                    judge_refusal_this_round = table_verdict.feedback
+                                else:
+                                    # THE ANSWER PASSES. §J.5/§L.8's posture — the runtime
+                                    # never hard-locks a turn, and this check reads MEANING
+                                    # rather than truth.
+                                    #
+                                    # ⚠ THIS `else` BINDS TO `may_refuse`, NOT TO
+                                    # `approved`. It sat one level out for a while and the
+                                    # consequence was invisible offline: an APPROVED answer
+                                    # took this branch and published
+                                    # `loop_answer_judge_exhausted` with an empty
+                                    # `violation`, so the metric that says "the judge was
+                                    # overruled" fired on every clean tabled answer. Caught
+                                    # by reading a live Phoenix trace, not by a test.
+                                    self._observer(
+                                        ANSWER_JUDGE_EXHAUSTED_EVENT,
+                                        {
+                                            "violation": table_verdict.violation,
+                                            "site": "exit_table",
+                                        },
+                                    )
 
                     # §2.5 pausing-runtime-tool seam: a runtime tool may signal a
                     # pause (today only `runBlueprint`, on a slot-resolution
@@ -3469,6 +3990,98 @@ class AgentLoop:
                 # path, so every other call still waits for the resume exactly as it
                 # always did.
                 if ask_user_call is not None:
+                    # --- THE askUser JUDGE (09 §C.3) ------------------------
+                    #
+                    # THE CHEAPEST SITE IN THE DESIGN TO REJECT AT, and the only one
+                    # where the proposed "the question names a COLUMN instead of a
+                    # THING" complaint can be made at all: `askUser` is intercepted
+                    # here and never reaches either terminal exit, so 05 §L.9's
+                    # "pauses are not gated" leaves it unchecked today.
+                    #
+                    # NOTHING IS AT RISK. The pause has not happened, so the user has
+                    # seen nothing; a rejection costs one round-trip that is invisible
+                    # to them, where a rejection at an answer exit risks an answer the
+                    # model already had.
+                    #
+                    # JUDGED ON THE RAW ARGUMENT, BEFORE THE SCRUB BELOW, and the
+                    # ordering is the whole point. `scrub_answer_prose` already turns
+                    # "which AnnualSalary did you mean?" into "which [schema detail
+                    # withheld] did you mean?" — 05 §L.3's trap exactly, a
+                    # half-redacted string that is neither usable nor honest. Judging
+                    # the scrubbed form would ask the model to repair a string it did
+                    # not write; judging the raw one gets a question that never needed
+                    # redacting.
+                    raw_question = str(ask_user_call.arguments.get("question", ""))
+                    async def _ask_brief(
+                        _q: str = question,
+                        _state: AnalysisState | None = analysis_state,
+                        _asked: str = raw_question,
+                    ) -> JudgeBrief:
+                        # No store reads at this site — the question is judged on the
+                        # turn's own bookkeeping — but the factory shape is kept so all
+                        # three sites read identically.
+                        return self._judge_brief(
+                            "ask_user",
+                            question=_q,
+                            accum=accum,
+                            analysis_state=_state,
+                            pending_question=_asked,
+                        )
+
+                    ask_verdict = await self._judge(
+                        _ask_brief,
+                        guard=guard,
+                        gate=finalization_gate,
+                        kind="ask_user_judge",
+                    )
+                    if not ask_verdict.approved:
+                        # ITS OWN ALLOWANCE (`ask_user_judge`), never the answer
+                        # judge's: a rejected ANSWER earlier in this window must not
+                        # silence the check that keeps a schema-worded question off
+                        # the user's screen, and the two complaints are made at
+                        # different moments about different text.
+                        if await finalization_gate.may_refuse("ask_user_judge"):
+                            self._observer(
+                                ASK_USER_JUDGE_REFUSED_EVENT,
+                                {"violation": ask_verdict.violation},
+                            )
+                            finalization_nudge = ask_user_judge_nudge_text(
+                                raw_question, ask_verdict.feedback
+                            )
+                            # NO DRAFT TO CLEAR — `last_assistant_text` belongs to the
+                            # ANSWER exits and this path does not finish. What is
+                            # discarded is the `askUser` call itself, which was never
+                            # persisted (it is intercepted, never dispatched), so the
+                            # nudge's echo is the model's only surviving copy.
+                            #
+                            # The state calls of this batch HAVE been dispatched and
+                            # persisted already (03 §E.1) — they are on the trail and
+                            # replay normally on the next round-trip, so re-rounding
+                            # here does not lose the ledger update that rode along.
+                            continue
+                        # THE WINDOW'S ALLOWANCE IS SPENT. THE PAUSE PROCEEDS — the
+                        # runtime never hard-locks a turn (05 §J.5), and here shipping
+                        # the question is strictly better than the alternatives:
+                        # refusing again spends the window on a disagreement, and
+                        # suppressing the pause would end the turn with no answer and
+                        # no question.
+                        #
+                        # ⚠ REACHED ONLY WHEN THE PERSISTED CLAIM IS SPENT AND THIS
+                        # GATE DOES NOT KNOW IT. Within one `_run_loop_body` the
+                        # `has_spent` peek inside `_judge` pre-empts this branch and no
+                        # model call is made at all — so the ordinary
+                        # refuse-then-ask-again sequence emits `..._skipped`, NOT this
+                        # event. What lands here is the askUser RESUME: `window_count`
+                        # is unchanged across one (D55), a fresh gate is built on
+                        # re-entry, and the claim it finds was spent by the previous
+                        # invocation. Keeping both is deliberate — the peek is the
+                        # cheap common case, and this is the honest handler for the
+                        # case the peek cannot see, which would otherwise drop a
+                        # judged rejection with no event at all.
+                        self._observer(
+                            ASK_USER_JUDGE_EXHAUSTED_EVENT,
+                            {"violation": ask_verdict.violation},
+                        )
                     # THE QUESTION IS MODEL PROSE SHOWN TO THE USER, so it is
                     # scrubbed exactly like an answer (ISSUES I1) — "which
                     # department_id did you mean?" discloses as much as an answer

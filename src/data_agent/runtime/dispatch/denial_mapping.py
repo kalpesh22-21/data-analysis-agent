@@ -107,6 +107,13 @@ FINALIZATION_BLOCKED_PENDING_INTENTS_CODE = "FINALIZATION_BLOCKED_PENDING_INTENT
 # persisted under `answerWithTable`, whose SUCCESSFUL entries must keep replaying.
 ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE = "ANSWER_TABLE_NO_TABLE_DESIGNATED"
 
+# The exit-#2 code added by the ANSWER JUDGE slice (09 §G.2). It belongs to the SAME
+# model-authored-text-crossing-turns class as the two above and for the same reason:
+# it is persisted under `answerWithTable`, whose SUCCESSFUL entries must keep
+# replaying, so `_is_stale_model_text_entry` can only drop it by matching this
+# literal — and it carries the model's refused draft answer in `args`.
+ANSWER_JUDGE_REJECTED_CODE = "ANSWER_JUDGE_REJECTED"
+
 
 _DENIAL_TABLE: dict[str, DenialInfo] = {
     # COLUMN_SCOPE_VIOLATION: on the LIVE turn the dispatcher
@@ -262,6 +269,22 @@ _DENIAL_TABLE: dict[str, DenialInfo] = {
             "updateAnalysisState — mark it completed if a call answered it, or "
             "blocked if a call for it was refused or came back empty — then answer "
             "again."
+        ),
+    ),
+    ANSWER_JUDGE_REJECTED_CODE: DenialInfo(
+        code=ANSWER_JUDGE_REJECTED_CODE,
+        retryable=True,
+        # GATE for the same reason as the pending-intents refusal above: the turn's
+        # WORK may be perfect. What was refused is finishing with this answer.
+        kind=DenialKind.GATE,
+        # THE REPLAY FALLBACK ONLY. The live refusal always carries `denial_detail`
+        # with the judge's own sentence about THIS answer, which is what
+        # `_render_entry` reads; this generic string appears only if that detail is
+        # ever absent. It deliberately says nothing specific — a fabricated
+        # specificity would send the model to fix something the judge never said.
+        user_message=(
+            "That answer was reviewed against this turn and sent back. Re-read the "
+            "question and the results you have, then answer again."
         ),
     ),
     "PARSE_FAILED_CLOSED": DenialInfo(

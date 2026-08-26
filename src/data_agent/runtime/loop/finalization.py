@@ -31,6 +31,7 @@ from collections.abc import Sequence
 
 from data_agent.runtime.composite.answer_with_table import TOOL_NAME as ANSWER_TABLE_TOOL_NAME
 from data_agent.runtime.dispatch.denial_mapping import (
+    ANSWER_JUDGE_REJECTED_CODE,
     ANSWER_TABLE_NO_TABLE_DESIGNATED_CODE,
     FINALIZATION_BLOCKED_PENDING_INTENTS_CODE,
 )
@@ -47,12 +48,14 @@ from data_agent.runtime.session.store import SessionStore
 __all__ = [
     "ANSWER_SHAPE_EXHAUSTED_EVENT",
     "ANSWER_SHAPE_REFUSED_EVENT",
+    "DATA_ANSWER_TOOLS",
     "EMPTY_ANSWER_EXHAUSTED_EVENT",
     "EMPTY_ANSWER_FALLBACK_TEXT",
     "EMPTY_ANSWER_REFUSED_EVENT",
     "MAX_NUDGE_DRAFT_CHARS",
     "AnswerShapeCounter",
     "FinalizationGate",
+    "answer_judge_rejected",
     "answer_shape_nudge_text",
     "answer_table_no_table_designated",
     "empty_answer_nudge_text",
@@ -74,7 +77,14 @@ MAX_NUDGE_DRAFT_CHARS = 2000
 # (05 §J). Deliberately just two: `sampleRows`, `getTableSchema` and the listings
 # are DISCOVERY — a model that peeks at ten sample rows and then answers a single
 # figure in prose is behaving correctly, and counting those would refuse it.
-_DATA_ANSWER_TOOLS = frozenset({"runBlueprint", "runQuery"})
+#
+# PUBLIC because the ANSWER JUDGE selects the same set (09 §D.2): the results it is
+# shown are the ones the answer was written FROM, and discovery reads ground the
+# MODEL rather than the answer. Two definitions of "a data-bearing result" would let
+# the gate and the judge disagree about which turns hold one, which is the difference
+# between a judge that can check a figure and one that cannot see it.
+DATA_ANSWER_TOOLS = frozenset({"runBlueprint", "runQuery"})
+_DATA_ANSWER_TOOLS = DATA_ANSWER_TOOLS
 
 # The answer-shape gate's two events, NAMED because the `loop_` prefix is
 # load-bearing rather than a convention: `observability/tracing.py::
@@ -272,6 +282,47 @@ def answer_table_no_table_designated() -> ToolResult:
         # reads no warehouse data, and `_compute_turn_provenance_union` is
         # fail-closed, so `None` would collapse the turn's union and drop the
         # user's own answer from every later replay.
+        provenance=frozenset(),
+        result_preview=None,
+        result_full=None,
+        denial_detail=detail,
+    )
+
+
+def answer_judge_rejected(feedback: str) -> ToolResult:
+    """The ANSWER JUDGE's refusal at exit #2 (09 §G.2).
+
+        MECHANICALLY IDENTICAL to `finalization_blocked` and `answer_table_no_table_
+        designated`, and every one of those mechanics is load-bearing: non-`ok` so the
+        terminal exit does not fire and `filter_trail`'s status-gated current-turn exemption
+        keeps it visible this same turn; `denial_detail` because that is the only channel
+        `context/budget.py::_render_entry` reads (`ToolResult.user_message` has no
+        `TrailEntry` field at all); `frozenset()` provenance for the fail-closed-union
+        reason above; and registered in `dispatch/denial_mapping.py` +
+        `context/assembly.py::_STALE_CROSS_TURN_ERROR_CODES` so `classify_denial` does not
+        degrade and the text does not replay into a later turn under a narrowed scope.
+
+        NO DRAFT ECHO, unlike every exit-#1 nudge. Exit #2 preserves the model's prose for
+        free — it is in `TrailEntry.args` and `_render_entry` replays it — so quoting it
+        back would be a second copy in the same request.
+
+        *feedback* IS ALREADY SANITISED by `answer_judge.py::parse_verdict`, which is where
+        that has to happen: this text was composed by a model that had just read tool
+        results, and a newline in it could otherwise forge a structural line in the message
+        it lands in. Nothing here re-sanitises, because a second, differently-tuned pass is
+        how the two silently diverge.
+    """
+    detail = (
+        f"That answer was reviewed against this turn and sent back. {feedback} "
+        "Send your answer again with that fixed, the rest of it unchanged — including "
+        "the tables you designated, which are still what the user needs to see."
+    )
+    return ToolResult(
+        status="error",
+        tool_name=ANSWER_TABLE_TOOL_NAME,
+        error_code=ANSWER_JUDGE_REJECTED_CODE,
+        retryable=True,
+        user_message=detail,
         provenance=frozenset(),
         result_preview=None,
         result_full=None,
@@ -561,6 +612,38 @@ class FinalizationGate:
         self._turn_index = turn_index
         self._window_count = window_count
         self._refused_this_round = False
+        self._granted_kinds: set[FinalizationBlockKind] = set()
+
+    def has_spent(self, kind: FinalizationBlockKind) -> bool:
+        """Whether THIS GATE has already been granted *kind*'s re-round — a NON-CONSUMING
+                read, added for the answer judge (09 §F.1) and useful only to a check that costs
+                something to run.
+
+                WHY IT EXISTS AT ALL. Every other gate's predicate is a regex or a counter, so
+                asking `may_refuse` and being told `False` is free. The judge's predicate is a
+                MODEL CALL, and once the allowance is gone a rejection cannot act: the call would
+                buy a verdict nothing is permitted to use. So the judge asks this first and skips
+                itself, which is the whole reason the answer-judge kinds do not simply reuse the
+                ask-and-be-refused shape.
+
+                IT IS WINDOW-LOCAL, NOT A STORE READ, and the difference is a real one that the
+                caller must not paper over. `_run_loop_body` builds a fresh gate on every entry —
+                including every resume — while `SessionDoc.finalization_blocks` persists, so this
+                reads `False` for a kind an EARLIER invocation of the same window already spent.
+                That is not a correctness bug: the caller then runs the judge, `may_refuse`
+                returns `False` against the persisted claim, and the answer ships exactly as it
+                should. The only cost is one judge call that could have been skipped, on the one
+                path that reaches a second finish inside one window without re-entering the loop
+                — an askUser resume. A store read to close that gap would put a Couchbase
+                round-trip on every terminal exit to save a rare model call, and would mean a new
+                `SessionStore` Protocol method for a question the loop can already answer about
+                itself.
+
+                THE PRIMARY CASE IS EXACT. A judge rejection hands the round back INSIDE this
+                same `_run_loop_body`, so the second finish of that window meets this same gate
+                object and is skipped without a call.
+        """
+        return kind in self._granted_kinds
 
     @property
     def refused_this_round(self) -> bool:
@@ -668,4 +751,9 @@ class FinalizationGate:
                 "loop_finalization_block_spent", {"window": self._window_count}
             )
             self._refused_this_round = True
+            # Recorded ONLY on a real grant, and deliberately not on the
+            # `_refused_this_round` short-circuit above: that path returns `True` for a
+            # SECOND kind in one batch without claiming anything, so recording there
+            # would make `has_spent` report an allowance that is still available.
+            self._granted_kinds.add(kind)
         return granted

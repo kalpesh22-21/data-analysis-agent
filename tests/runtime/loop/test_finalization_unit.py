@@ -47,10 +47,12 @@ from data_agent.runtime.loop.finalization import (
     refreshed_analysis_state,
 )
 from data_agent.runtime.session.models import (
+    FINALIZATION_BLOCK_KINDS,
     AnalysisState,
     FinalizationBlockKind,
     ResultPreview,
     TrackedIntent,
+    finalization_block_key,
 )
 
 SESSION_ID = "sess-finalization-unit"
@@ -383,6 +385,89 @@ async def test_the_claim_failed_event_carries_only_shape() -> None:
     await _gate_obj.may_refuse("answer_shape")
     (payload,) = recorder.payloads("loop_finalization_block_claim_failed")
     assert set(payload) == {"turn_index", "window", "reason"}
+
+
+# --- FinalizationGate.has_spent (09 §F.1) ------------------------------------
+
+
+async def test_has_spent_is_false_before_anything_is_claimed() -> None:
+    gate, store, _ = _gate()
+    assert gate.has_spent("answer_judge") is False
+    assert store.calls == [], "a PEEK must never touch the store"
+
+
+async def test_has_spent_records_a_granted_kind_and_only_that_kind() -> None:
+    """The judge asks this to decide whether running is worth a MODEL CALL. Reporting a
+    kind that was never granted would silence the judge on a window where a rejection
+    could still have acted."""
+    gate, _store, _ = _gate()
+    assert await gate.may_refuse("answer_judge") is True
+    assert gate.has_spent("answer_judge") is True
+    assert gate.has_spent("ask_user_judge") is False
+    assert gate.has_spent("intents") is False
+
+
+async def test_a_denied_claim_is_not_recorded_as_spent() -> None:
+    """`may_refuse` returning `False` because the STORE says the window is exhausted does
+    not mean this gate spent it — but it is still gone, so the judge must skip. The
+    caller's contract is therefore `has_spent(kind) or not await may_refuse(kind)`, and
+    this test pins that `has_spent` alone does not claim to answer it."""
+    gate, _store, _ = _gate(_CountingStore(granted=[False]))
+    assert await gate.may_refuse("answer_judge") is False
+    assert gate.has_spent("answer_judge") is False
+
+
+async def test_a_free_batched_refusal_is_not_recorded_as_spent() -> None:
+    """The `_refused_this_round` short-circuit returns `True` for a SECOND kind in one
+    batch without claiming anything. Recording it would report an allowance as gone while
+    it is still available — the judge would then skip a window it could have used."""
+    gate, store, _ = _gate()
+    assert await gate.may_refuse("intents") is True
+    assert await gate.may_refuse("answer_judge") is True, "free inside one round"
+    assert len(store.calls) == 1
+    assert gate.has_spent("answer_judge") is False
+
+
+async def test_has_spent_survives_begin_round_within_the_window() -> None:
+    """`begin_round` clears the PER-ROUND-TRIP flag; the allowance is PER WINDOW. The
+    judge's skip must survive the round boundary or it would re-run on exactly the second
+    finish it exists to skip."""
+    gate, _store, _ = _gate()
+    await gate.may_refuse("answer_judge")
+    gate.begin_round()
+    assert gate.refused_this_round is False
+    assert gate.has_spent("answer_judge") is True
+
+
+async def test_a_store_failure_is_not_recorded_as_spent() -> None:
+    gate, _store, _ = _gate(_CountingStore(raises=True))
+    assert await gate.may_refuse("answer_judge") is False
+    assert gate.has_spent("answer_judge") is False
+
+
+# --- the allowance vocabulary (09 §F) ----------------------------------------
+
+
+def test_the_two_judge_kinds_are_claimable_and_independent() -> None:
+    """Both must be in `FINALIZATION_BLOCK_KINDS` or `finalization_block_key` RAISES —
+    which `may_refuse` catches and treats as no re-round, so a missing kind disables the
+    judge silently rather than loudly."""
+    assert "answer_judge" in FINALIZATION_BLOCK_KINDS
+    assert "ask_user_judge" in FINALIZATION_BLOCK_KINDS
+    assert finalization_block_key(TURN, WINDOW, "answer_judge") != finalization_block_key(
+        TURN, WINDOW, "ask_user_judge"
+    )
+
+
+async def test_both_answer_exits_share_one_judge_allowance() -> None:
+    """09 §F: exit #1 and exit #2 are two doors out of ONE finish, not two complaints. A
+    model pushed from the prose exit to answerWithTable by an earlier nudge (05 §L.5's
+    documented route) must not be judged twice for the same answer."""
+    gate, store, _ = _gate(_CountingStore(granted=[True, False]))
+    assert await gate.may_refuse("answer_judge") is True  # exit #1
+    gate.begin_round()
+    assert await gate.may_refuse("answer_judge") is False  # exit #2, same window
+    assert [call[3] for call in store.calls] == ["answer_judge", "answer_judge"]
 
 
 # --- pending_intents ---------------------------------------------------------
