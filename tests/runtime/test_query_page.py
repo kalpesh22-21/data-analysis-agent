@@ -26,6 +26,7 @@ from data_agent.runtime.query_page import (
     QueryPageError,
     build_page_sql,
     clamp_page_params,
+    page_rows,
 )
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 
@@ -88,6 +89,34 @@ def test_clamp_page_params_is_total_and_bounded() -> None:
     assert clamp_page_params(10**9, 20) == (MAX_PAGE_SIZE, 20)
 
 
+def test_page_rows_reads_the_full_result_not_the_truncated_preview() -> None:
+    """The unit behind the endpoint regression: the preview is the model's 20-row
+    window, `result_full` is the page. `page_rows` must never serve the former."""
+    full = {"columns": ["a"], "rows": [[i] for i in range(74)], "row_count": 74}
+    preview_rows = [[i] for i in range(20)]
+    assert len(page_rows(full, preview_rows, limit=100)) == 74
+
+
+def test_page_rows_trims_a_backend_that_over_returns() -> None:
+    """The page bounds are OURS. The wrapped LIMIT bounds this server-side already,
+    but nothing above this line re-checks it once the preview cap is gone."""
+    full = {"columns": ["a"], "rows": [[i] for i in range(74)]}
+    assert len(page_rows(full, [], limit=50)) == 50
+    assert len(page_rows(list(range(74)), [], limit=50)) == 50
+
+
+def test_page_rows_falls_back_to_the_preview_for_a_non_tabular_result() -> None:
+    """A size-capped non-tabular dict has no rows to page — the dispatcher's own
+    single preview row is the whole result, and this must not try to unwrap it."""
+    assert page_rows({"table": "employees"}, [["capped"]], limit=50) == [["capped"]]
+    assert page_rows(None, [["capped"]], limit=50) == [["capped"]]
+
+
+def test_page_rows_shapes_a_bare_list_one_item_per_row() -> None:
+    """Matches how `_build_preview` shapes a list result, minus the truncation."""
+    assert page_rows(["a", "b", "c"], [], limit=50) == [["a"], ["b"], ["c"]]
+
+
 # --- the endpoint ----------------------------------------------------------
 
 
@@ -133,6 +162,64 @@ def test_endpoint_returns_a_page_of_rows(monkeypatch) -> None:
     assert body["offset"] == 0
     # A full page implies there may be more — a hint, not a count.
     assert body["has_more"] is True
+
+
+def test_endpoint_page_is_not_capped_by_the_model_preview_row_count(monkeypatch) -> None:
+    """THE REGRESSION: a page must carry every row the page query returned.
+
+        The endpoint used to serve `result_preview.preview_rows`, which the dispatcher
+        truncates to `preview_row_count` (the MODEL-CONTEXT cap, default 20). A 50-row
+        page over a 74-row table came back with 20 rows — and `has_more` (20 >= 50) went
+        false, so the UI disabled "next" and the remaining 54 rows were unreachable.
+        Asserts a page LARGER than that cap, or the bug reappears untested.
+    """
+    rows = [[f"dept-{i}", i] for i in range(74)]
+    client, _ = _client(
+        monkeypatch,
+        scripted={
+            "runQuery": [
+                {"columns": ["department", "n"], "rows": rows[:50], "row_count": 50,
+                 "truncated": False}
+            ]
+        },
+    )
+    resp = client.post(
+        "/query/page",
+        json={"sql": "SELECT department, count() AS n FROM db.t GROUP BY department",
+              "limit": 50, "offset": 0},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["rows"]) == 50
+    assert body["rows"][0] == ["dept-0", 0]
+    assert body["rows"][-1] == ["dept-49", 49]
+    # A full page — the UI must be told it can keep going.
+    assert body["has_more"] is True
+
+
+def test_endpoint_last_short_page_reports_no_more(monkeypatch) -> None:
+    """The tail of that same 74-row table: 24 rows for a 50-row page ends the paging."""
+    rows = [[f"dept-{i}", i] for i in range(50, 74)]
+    client, _ = _client(
+        monkeypatch,
+        scripted={
+            "runQuery": [
+                {"columns": ["department", "n"], "rows": rows, "row_count": 24,
+                 "truncated": False}
+            ]
+        },
+    )
+    resp = client.post(
+        "/query/page",
+        json={"sql": "SELECT department, count() AS n FROM db.t GROUP BY department",
+              "limit": 50, "offset": 50},
+        headers=HEADERS,
+    )
+    body = resp.json()
+    assert len(body["rows"]) == 24
+    assert body["offset"] == 50
+    assert body["has_more"] is False
 
 
 def test_endpoint_dispatches_the_wrapped_sql_not_the_raw_sql(monkeypatch) -> None:

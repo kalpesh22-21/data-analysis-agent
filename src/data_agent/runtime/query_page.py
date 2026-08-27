@@ -16,6 +16,7 @@ and a malformed or multi-statement payload fails at parse time, before dispatch.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 import sqlglot
@@ -34,6 +35,7 @@ __all__ = [
     "QueryPageError",
     "build_page_sql",
     "clamp_page_params",
+    "page_rows",
 ]
 
 MAX_PAGE_SIZE = _MAX_PAGE_SIZE
@@ -99,3 +101,36 @@ def build_page_sql(sql: str, *, limit: int, offset: int) -> str:
         .offset(offset)
     )
     return page_query.sql(dialect="clickhouse")
+
+
+def page_rows(
+    result_full: Any, preview_rows: Sequence[Sequence[Any]], *, limit: int
+) -> list[list[Any]]:
+    """The rows to serve for ONE page, taken from the FULL result, not the preview.
+
+        `ToolResult.result_preview` is truncated to `preview_row_count` — the cap on what
+        reaches MODEL CONTEXT (default 20). Serving a page from it capped EVERY page at 20
+        rows however large the requested `limit`, and made `has_more` (`len(rows) >= limit`)
+        false for any page size above that, so the rest of the table was unreachable from
+        the UI: the fixed-preview problem paging exists to solve, reintroduced one layer up.
+
+        `result_full` is the same authorized MCP result the preview is derived from — column
+        scope is enforced at dispatch, which DENIES the query rather than filtering rows, so
+        the full result carries nothing the preview was hiding. Its size is already bounded
+        by OUR OWN wrapped `LIMIT` (`build_page_sql`), never by what the model can hold.
+
+        Falls back to *preview_rows* for any other shape: a non-tabular result (the
+        size-capped dict `_build_preview` produces) has no page to serve beyond the one
+        row the dispatcher already built, and this must not be the thing that unwraps it.
+
+        Trimmed to *limit* on every path. The wrapped `LIMIT` already bounds this
+        server-side, so the slice is a belt: dropping the preview cap removed the
+        incidental ceiling that used to sit here, and a page is OURS to bound — a
+        backend that over-returns must not turn into an unbounded response body.
+    """
+    if isinstance(result_full, dict) and isinstance(result_full.get("rows"), list):
+        return [list(row) for row in result_full["rows"][:limit]]
+    # A bare list result, shaped one-item-per-row exactly as `_build_preview` shapes it.
+    if isinstance(result_full, list):
+        return [[item] for item in result_full[:limit]]
+    return [list(row) for row in preview_rows[:limit]]

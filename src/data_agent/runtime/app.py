@@ -77,6 +77,7 @@ from data_agent.runtime.query_page import (
     QueryPageError,
     build_page_sql,
     clamp_page_params,
+    page_rows,
 )
 from data_agent.runtime.retrieval.pipeline import RetrievalPipeline
 from data_agent.runtime.retrieval.tools import (
@@ -1019,16 +1020,23 @@ def create_app(
                          "error_code": result.error_code},
             )
         preview = result.result_preview
+        # Rows come from `result_full`, NOT `preview.preview_rows`: the preview is
+        # truncated to `preview_row_count` (the MODEL-CONTEXT cap, default 20), which
+        # silently capped every page at 20 rows and — via `has_more` below — made the
+        # rest of the table unreachable at any page size above it. `result_full` is the
+        # same authorized result, bounded by our own wrapped LIMIT. Columns still come
+        # from the preview: that field is a shape, never row-truncated.
+        rows = page_rows(result.result_full, preview.preview_rows, limit=limit)
         return JSONResponse(
             content={
                 "columns": list(preview.columns),
-                "rows": [list(row) for row in preview.preview_rows],
+                "rows": rows,
                 "limit": limit,
                 "offset": offset,
                 # `has_more` is a HINT derived from a full page, not a total count:
                 # counting all rows would mean a second aggregate query per page.
                 # The UI shows "next" while a page comes back full.
-                "has_more": len(preview.preview_rows) >= limit,
+                "has_more": len(rows) >= limit,
             }
         )
 
