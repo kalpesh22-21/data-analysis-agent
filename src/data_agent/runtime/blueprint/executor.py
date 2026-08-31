@@ -1000,6 +1000,25 @@ class BlueprintExecutor:
                    passes; one that materialized 812 and expired to 0 — or to 300 mid-merge —
                    is refused.
 
+                   POINT-IN-TIME, NOT HELD (TOCTOU residual). The count and the consumer's
+                   JOIN are two separate dispatches with no lock, no snapshot and no shared
+                   session, so a TTL merge committing between them still shrinks the table
+                   after a passing count, silently and with the same failure mode. Be precise
+                   about the size of what is left: that window is IN-PROCESS and sub-second
+                   (one round trip), against the unbounded one this gate closes — a 3600s row
+                   TTL under a checkpoint that can sit in a 7-day session doc. A real
+                   narrowing, not a full close. Closing it fully needs the count and the JOIN
+                   to share ONE statement's parts snapshot — e.g. folding a scalar
+                   `(SELECT count() FROM scratch.t) = <expected>` predicate into the consumer
+                   — which is named here as the option and deliberately NOT built.
+
+                   The count/JOIN equivalence also rests on the D93 DDL being a plain
+                   MergeTree with a row TTL: `COUNT(*)` is answered from part metadata, and
+                   the JOIN reads the same committed parts, so at one instant the two cannot
+                   disagree. That would break if scratch tables ever gained lightweight
+                   DELETEs (a part-metadata count ignores `_row_exists`) or a `FINAL` read.
+                   Neither applies today; both would need this gate revisited.
+
                 Only orders that are actually table-consumed are considered, so a refused or
                 irrelevant record costs no dispatch at all.
         """
@@ -1009,18 +1028,35 @@ class BlueprintExecutor:
             if record is None:
                 continue  # not rehydrated — this producer runs live and materializes itself
             table = record.get("table")
-            if not isinstance(table, str) or not _is_own_session_scratch_table(
-                table, credentials.session_id
-            ):
-                # Log it: this is the branch that detects a tampered checkpoint naming
-                # another session's scratch table, and the non-raising ownership
-                # predicate deliberately swallows the `ScratchSessionError` whose
-                # message was the only other signal. Identifier + node order ONLY —
-                # never the table name or any warehouse data (D25).
+            # TWO refusals, not one, and they are not the same event. Collapsing them
+            # sends on-call chasing a tamper alarm for the routine case.
+            if not isinstance(table, str):
+                # BENIGN and expected: a checkpoint written before the table carry
+                # existed, or a producer that was `when`-skipped and recorded no table.
+                # Ordinary fail-closed degradation to the raw loop — `info`, matching
+                # the other benign degrades in `_execute_dag`.
+                _logger.info(
+                    "blueprint %s node %s carried no scratch table (legacy checkpoint or "
+                    "a skipped producer); NOT restored — the consumer will fail closed "
+                    "to SLOT_INVALID",
+                    blueprint_id,
+                    order,
+                )
+                continue
+            if not _is_own_session_scratch_table(table, credentials.session_id):
+                # A POSSIBLE TAMPER SIGNAL, and the only place it is visible: the
+                # checkpoint named a scratch table this session does not own, which no
+                # correctly-produced checkpoint can contain (the endpoint derives the
+                # `s_<sid>_` prefix server-side from X-Session-Id). The non-raising
+                # ownership predicate deliberately swallows the `ScratchSessionError`
+                # whose message was the only other signal, so this line is it. Kept at
+                # `warning` for that reason. Identifier + node order ONLY — never the
+                # table name (it embeds the OTHER session's id) or any warehouse data
+                # (D25).
                 _logger.warning(
-                    "blueprint %s node %s carried a scratch table this session does not "
-                    "own (or no table at all); NOT restored — the consumer will fail "
-                    "closed to SLOT_INVALID",
+                    "blueprint %s node %s carried a scratch table this session does NOT "
+                    "own; NOT restored — cross-session scratch access refused (D64), "
+                    "possible checkpoint tampering",
                     blueprint_id,
                     order,
                 )
@@ -1101,16 +1137,33 @@ class BlueprintExecutor:
         if len(rows) != 1 or len(rows[0]) != 1:
             return None
         value = rows[0][0]
+        # EXACTLY TWO shapes are a count. Everything else — including a float — is a
+        # surprise, and this function's contract is that a surprise is `None`.
         if isinstance(value, bool):
             return None  # a bool is not a count, and `int(True)` would say 1
-        try:
-            # `int(...)` rather than an isinstance check, matching
-            # `unpack_grain_probe`: a live ClickHouse may hand a UInt64 back as a
-            # decimal STRING over JSON, and refusing that would fail every real
-            # resume. A non-numeric value raises and becomes `None`.
-            return int(value)
-        except (TypeError, ValueError):
-            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            # The load-bearing tolerance (matching `unpack_grain_probe`): a live
+            # ClickHouse hands a UInt64 back as a DECIMAL STRING over JSON, and
+            # refusing that would fail every real resume. `int()` on a str is exact —
+            # it never truncates; "1.9" and "x" both raise and become `None`.
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        # EVERY float is refused, not just a fractional one, and `int(...)` is never
+        # applied to a non-str. Coercing here used to TRUNCATE: a probe returning 1.9
+        # became 1 and licensed a bind against a stored 1 — the two sides of the
+        # equality validated to different standards, since `_rehydrate_completed`
+        # rejects a float on the STORED side precisely because 1.0 == 1.
+        # `COUNT(*)` is never fractional and no transport produces a float for it, so
+        # "the probe returned a float" is itself the surprise; refusing the integral
+        # ones too costs nothing real and avoids the subtler trap that a UInt64 above
+        # 2**53 cannot round-trip through a float, so an "integral" float could be a
+        # DIFFERENT integer than the one the table actually holds. Same reasoning
+        # refuses `Decimal`/`Fraction`, which `int()` would also truncate in silence.
+        return None
 
     async def _materialize_node(
         self,

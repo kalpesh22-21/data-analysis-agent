@@ -31,6 +31,8 @@ materialize-and-join path, all with fakes (no infra):
 from __future__ import annotations
 
 import json
+import logging
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -46,9 +48,10 @@ from data_agent.runtime.blueprint.executor import (
     ExecPaused,
     _dumps_completed,
     _infer_scratch_columns,
+    _node_record,
     _rehydrate_completed,
 )
-from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher
+from data_agent.runtime.dispatch.tool_dispatcher import ToolDispatcher, ToolResult
 from data_agent.runtime.mcp.client import MCPToolError
 from data_agent.runtime.mcp.fake_client import FakeMCPClient
 from data_agent.runtime.mcp.scratch_client import (
@@ -1415,6 +1418,12 @@ async def test_a_row_expired_intermediate_is_refused_not_answered_verified(
     [
         pytest.param(MCPToolError("TABLE_NOT_FOUND", "gone"), id="table-gone"),
         pytest.param(MCPToolError("CLICKHOUSE_QUERY_ERROR", "boom"), id="query-error"),
+        # A DENIAL, distinct from an error: the probe goes through the same runQuery
+        # choke point as every other query, so D57 scope / D64 isolation can refuse it
+        # on its own terms. A denied probe COUNTED NOTHING and must not be read as a
+        # pass — nor may it be passed through as the run's error code (the seed is
+        # simply refused and the pre-existing SLOT_INVALID stands).
+        pytest.param(MCPToolError("COLUMN_SCOPE_VIOLATION", "denied"), id="scope-denied"),
         pytest.param(RuntimeError("transport"), id="transport-blip"),
         pytest.param(_rq(["count()"], []), id="no-rows"),
         pytest.param(_rq(["count()"], [[1], [1]]), id="two-rows"),
@@ -1449,6 +1458,126 @@ async def test_a_restore_probe_that_cannot_answer_refuses_the_seed(probe: Any) -
     )
 
 
+@pytest.mark.parametrize(
+    "probe",
+    [
+        pytest.param(MCPToolError("TABLE_NOT_FOUND", "gone"), id="table-gone"),
+        pytest.param(MCPToolError("COLUMN_SCOPE_VIOLATION", "denied"), id="scope-denied"),
+        pytest.param(RuntimeError("transport"), id="transport-blip"),
+        pytest.param(_rq(["count()"], []), id="no-rows"),
+        pytest.param(_rq(["count()"], [[1], [1]]), id="two-rows"),
+        pytest.param(_rq(["count()", "x"], [[1, 2]]), id="two-columns"),
+        pytest.param(_rq(["count()"], [["not-a-number"]]), id="non-numeric"),
+        pytest.param(_rq(["count()"], [[None]]), id="null"),
+        pytest.param("not-a-result", id="not-a-dict"),
+    ],
+)
+async def test_an_empty_intermediates_unanswerable_probe_is_still_refused(probe: Any) -> None:
+    """THE SAME MATRIX as the test above, but against an intermediate that legitimately
+    materialized ZERO rows — and it is a genuinely different test, not a duplicate.
+
+    Every other probe-failure case here carries a stored count of 1, so a
+    `_count_scratch_rows` that fell open by returning `0` instead of `None` on a
+    surprise would still be caught by `0 != 1`. At a stored count of 0 that safety net
+    is gone: `0` is BOTH the natural fail-open default for "I could not read a count"
+    AND the correct answer for an empty table, so the two become indistinguishable and
+    an unverified table gets bound.
+
+    That is not hypothetical arithmetic — every refusal branch in `_count_scratch_rows`
+    is a bare `return None`, and `return 0` is the single most likely thing for it to
+    become under a "simplify the Optional away" refactor. Only the zero-row carry can
+    tell the difference, so it is pinned separately.
+
+    An unknown must stay an unknown: no seed, no JOIN, the pre-existing SLOT_INVALID.
+    (`True` and a stringified count are absent here for the same reasons as above —
+    `int(True) == 1` is not a 0-row match, and a numeric string is a legitimate pass.)
+    """
+    detail = _detail(composes=_APPROVAL_GATED_COMPOSES)
+    scratch1 = FakeScratchClient()
+    mcp1 = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["Department"], [["Sales"]]),
+                _rq(["EmployeeCode", "earnings"], []),  # producer: 0 rows
+            ]
+        }
+    )
+    paused = await _executor(mcp1, scratch_client=scratch1, detail=detail).execute(
+        blueprint_id="bp-table", slot_bindings={"department": "Sales"}, credentials=_creds()
+    )
+    assert isinstance(paused, ExecPaused)
+    assert _records(paused.completed_nodes_json)[0]["row_count"] == 0
+
+    resumed, mcp2, _ = await _resume_fresh(
+        detail,
+        paused.completed_nodes_json,
+        counts=[probe],
+        # Scripted but unreachable: the empty "verified" answer a fail-open would give.
+        consumer_result=_rq(["department", "total_earnings"], []),
+        grain=_rq(["__bp_n", "__bp_d"], [[0, 0]]),
+    )
+    assert isinstance(resumed, ExecFailed)
+    assert resumed.error_code == SLOT_INVALID_CODE
+    bare = _materialized_name(scratch1).split(".", 1)[1]
+    assert not any(
+        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp2.calls
+    )
+
+
+class _DeniedWithABodyDispatcher:
+    """A dispatcher double whose DENIAL nonetheless carries a well-formed count body —
+    a shape the real `ToolDispatcher` cannot produce today (every non-ok return sets
+    `result_full=None`), constructed here precisely because it cannot."""
+
+    def __init__(self, status: str) -> None:
+        self.status = status
+        self.dispatched: list[str] = []
+
+    async def dispatch(self, tool_name: str, args: dict[str, Any], credentials: Any, **kw: Any) -> Any:
+        self.dispatched.append(str(args.get("sql", "")))
+        return ToolResult(
+            status=self.status,
+            tool_name=tool_name,
+            error_code="COLUMN_SCOPE_VIOLATION",
+            retryable=False,
+            user_message="denied",
+            provenance=None,
+            result_preview=None,
+            result_full={"columns": ["count()"], "rows": [[1]], "row_count": 1},
+        )
+
+
+@pytest.mark.parametrize("status", ["denied", "error"])
+async def test_a_probe_denial_is_not_read_as_a_count_even_if_it_carries_a_body(
+    status: str,
+) -> None:
+    """`_count_scratch_rows` checks `probe.status` BEFORE it reads `probe.result_full`,
+    and that ordering is load-bearing rather than decorative.
+
+    It is unobservable through the executor today: the dispatcher nulls `result_full`
+    on every denial and error, so dropping the status check leaves the shape check to
+    return `None` anyway — an equivalent mutant, and therefore a guard a coverage-led
+    cleanup would delete with nothing going red. It stops being equivalent the moment
+    a denial carries any body at all (a partial result, a cached page, an error
+    envelope that happens to parse), and then a REFUSAL would be read as a COUNT.
+
+    So the boundary is pinned where the promise is made, with a double that produces
+    exactly the shape the real dispatcher currently cannot."""
+    dispatcher = _DeniedWithABodyDispatcher(status)
+    executor = BlueprintExecutor(
+        tool_dispatcher=dispatcher,  # type: ignore[arg-type]
+        vector_index=FakeVectorIndex(),
+        scratch_client=FakeScratchClient(),
+    )
+    table = f"scratch.s_{_SID}_bp_{'a' * 32}"
+
+    assert await executor._count_scratch_rows(table, _creds()) is None
+    assert dispatcher.dispatched == [f"SELECT COUNT(*) FROM scratch.{table.split('.', 1)[1]}"]
+    # …and the caller refuses on it: a carried count of 1 is NOT matched by the body.
+    completed = {0: _node_record({}, frozenset(), "SELECT 1", table, 1)}
+    assert await executor._restore_materialized("bp-table", completed, {0}, _creds()) == {}
+
+
 async def test_a_stringified_count_from_clickhouse_still_verifies() -> None:
     """ClickHouse's `count()` is a UInt64 and can arrive as a decimal STRING over the
     JSON transport. The gate coerces with `int(...)` — the same tolerance
@@ -1466,6 +1595,72 @@ async def test_a_stringified_count_from_clickhouse_still_verifies() -> None:
         grain=_rq(["__bp_n", "__bp_d"], [[1, 1]]),
     )
     assert isinstance(resumed, ExecCompleted)
+
+
+@pytest.mark.parametrize(
+    ("live", "stored"),
+    [
+        pytest.param(1.0, 1, id="integral-float"),
+        pytest.param(1.9, 1, id="fractional-float-would-truncate-down"),
+        pytest.param(0.5, 0, id="fraction-would-truncate-to-zero"),
+        pytest.param(Decimal("1"), 1, id="integral-decimal"),
+        pytest.param(Decimal("1.9"), 1, id="fractional-decimal"),
+        pytest.param("1.9", 1, id="fractional-string"),
+    ],
+)
+async def test_a_live_count_that_is_not_an_integer_is_refused(live: Any, stored: int) -> None:
+    """THE TWO SIDES OF THE EQUALITY ARE NOW HELD TO THE SAME STANDARD. This was a real
+    defect, pinned by QA as a known gap and closed here.
+
+    `_rehydrate_completed` refuses a float on the STORED side precisely because `1.0`
+    compares equal to `1` — but the LIVE side was coerced with a bare `int(...)`, which
+    accepts that very float AND TRUNCATES it, so a probe returning `1.9` became `1`,
+    matched a stored `1`, and licensed the bind. `0.5` against a stored `0` likewise.
+
+    `COUNT(*)` is never fractional, so a float means the probe read something that is
+    not a count, and `_count_scratch_rows`'s own rule — any surprise is `None` — must
+    apply. EVERY float is refused, not merely the fractional ones: no transport
+    produces one for a count, so its arrival is itself the surprise, and a UInt64 above
+    2**53 cannot round-trip through a float, which makes an "integral" float a possibly
+    DIFFERENT integer. `Decimal` is in here for the same reason (`int()` truncates it
+    just as silently).
+
+    The `int()` tolerance that mattered is untouched and still applies where it was
+    written for — a decimal STRING, kept alive by the sibling test above. A
+    FRACTIONAL string is refused too, and always was: `int("1.9")` raises."""
+    detail = _detail(composes=_APPROVAL_GATED_COMPOSES)
+    scratch1 = FakeScratchClient()
+    mcp1 = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["Department"], [["Sales"]]),
+                _rq(["EmployeeCode", "earnings"], [["1001", 100.0]][:stored]),
+            ]
+        }
+    )
+    paused = await _executor(mcp1, scratch_client=scratch1, detail=detail).execute(
+        blueprint_id="bp-table", slot_bindings={"department": "Sales"}, credentials=_creds()
+    )
+    assert isinstance(paused, ExecPaused)
+    assert _records(paused.completed_nodes_json)[0]["row_count"] == stored
+
+    rows = [["Sales", 100.0]][:stored]
+    resumed, mcp2, _ = await _resume_fresh(
+        detail,
+        paused.completed_nodes_json,
+        counts=[_count(live)],
+        # Scripted but never reached — the seed is refused before the JOIN.
+        consumer_result=_rq(["department", "total_earnings"], rows),
+        grain=_rq(["__bp_n", "__bp_d"], [[len(rows), len(rows)]]),
+    )
+    assert isinstance(resumed, ExecFailed)
+    assert resumed.error_code == SLOT_INVALID_CODE
+    bare = _materialized_name(scratch1).split(".", 1)[1]
+    assert _count_probes(mcp2) == [f"SELECT COUNT(*) FROM scratch.{bare}"]
+    # The JOIN was never dispatched — a truncated value bound nothing.
+    assert not any(
+        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp2.calls
+    )
 
 
 async def test_a_checkpoint_with_a_table_but_no_row_count_is_refused() -> None:
@@ -1494,6 +1689,50 @@ async def test_a_checkpoint_with_a_table_but_no_row_count_is_refused() -> None:
     assert not any(c.op == "materialize" for c in scratch2.calls)
 
 
+async def test_a_tamper_refusal_and_an_absent_table_log_differently(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The two ownership-adjacent refusals are DIFFERENT EVENTS and must be legible as
+    such to whoever reads the logs at 3am.
+
+      * a carried table naming ANOTHER SESSION cannot occur in a correctly-produced
+        checkpoint — the endpoint derives the `s_<sid>_` prefix server-side — so it is a
+        possible tamper signal and stays a `warning`. It is also the ONLY visible signal:
+        the ownership predicate is non-raising by design and swallows the
+        `ScratchSessionError` message that used to carry it;
+      * a record with NO table is routine — a checkpoint from before the table carry, or
+        a `when`-skipped producer — and is ordinary fail-closed degradation, so it logs at
+        `info` like the other benign degrades.
+
+    They shared one line once, which sent a tamper alarm up for the benign case. Both
+    outcomes are identical (SLOT_INVALID); only the operator-facing signal differs, which
+    is exactly the kind of thing nothing else would catch.
+
+    D25 is asserted too: neither line may carry the table NAME — the foreign one embeds
+    another session's id — nor any warehouse data."""
+    detail = _detail(composes=_APPROVAL_GATED_COMPOSES)
+    paused = await _pause_after_producer(detail, FakeScratchClient())
+    foreign = "scratch.s" + "9" * 32 + "_bp_" + "0" * 32
+
+    with caplog.at_level(logging.INFO, logger="data_agent.runtime.blueprint.executor"):
+        caplog.clear()
+        await _resume_fresh(detail, _retable(paused.completed_nodes_json, 0, foreign))
+        tamper = [r for r in caplog.records if "node 0" in r.getMessage()]
+        caplog.clear()
+        await _resume_fresh(detail, _retable(paused.completed_nodes_json, 0, None))
+        absent = [r for r in caplog.records if "node 0" in r.getMessage()]
+
+    assert [r.levelno for r in tamper] == [logging.WARNING]
+    assert [r.levelno for r in absent] == [logging.INFO]
+    assert "does NOT" in tamper[0].getMessage() and "tampering" in tamper[0].getMessage()
+    assert "no scratch table" in absent[0].getMessage()
+    assert "tamper" not in absent[0].getMessage()  # no alarm for the routine case
+    # D25: identifier + node order only — never the table name, never warehouse data.
+    for record in (*tamper, *absent):
+        assert foreign.split(".", 1)[1] not in record.getMessage()
+        assert _W not in record.getMessage()
+
+
 async def test_a_fresh_run_never_dispatches_a_restore_probe() -> None:
     """The gate is resume-only. A first-call `runBlueprint` materializes its own
     intermediate in-process and holds the name in memory, so there is nothing to restore
@@ -1509,6 +1748,247 @@ async def test_a_fresh_run_never_dispatches_a_restore_probe() -> None:
     )
     assert isinstance(outcome, ExecCompleted)
     assert _count_probes(mcp) == []
+
+
+async def test_a_negative_carried_count_is_refused_before_the_probe() -> None:
+    """The `expected < 0` half of the row-count type gate, pinned at ITS OWN SITE.
+
+    It cannot be driven through `resume`: `_rehydrate_completed` already normalizes a
+    negative `row_count` to `None`, so by the time the checkpoint reaches
+    `_restore_materialized` the value is gone. That makes the guard REDUNDANT today —
+    and a redundant guard is precisely the one a refactor deletes because nothing
+    failed. `_restore_materialized` is therefore called directly, exactly as
+    `test_rehydrate_normalizes_an_unusable_row_count_to_none` pins the rehydrator's
+    half where the promise is made rather than only where it happens to be enforced.
+
+    The probe is scripted to ECHO the negative back. That is what gives this test
+    teeth: without the `< 0` arm, `-1` is "an int", the table gets probed, `-1 == -1`
+    compares EQUAL, and a name whose stored count is nonsense is seeded into the JOIN
+    — the count gate licensing a bind on a number that is not a row count. Both
+    assertions catch it: nothing restored, and no dispatch paid for."""
+    table = f"scratch.s_{_SID}_bp_{'a' * 32}"
+    mcp = FakeMCPClient(scripted={"runQuery": [_count(-1)]})
+    executor = _executor(mcp, scratch_client=FakeScratchClient())
+    completed = {0: _node_record({}, frozenset(), "SELECT 1", table, -1)}
+
+    restored = await executor._restore_materialized("bp-table", completed, {0}, _creds())
+    assert restored == {}
+    assert _count_probes(mcp) == []
+
+
+async def test_the_stored_count_is_the_rows_handed_to_the_endpoint_not_the_reported_one() -> None:
+    """`_materialize_node` returns `len(rows)` — the length of the list it actually
+    handed the scratch endpoint — and NOT the `row_count` its input result claimed.
+    The two are the same in every other test here (the `_rq` helper derives one from
+    the other), which is exactly why this needs its own case.
+
+    They can differ live: `_unpack_result` takes `row_count` from the payload whenever
+    it is an int, so an MCP that reports a pre-cap total, or any result whose
+    `row_count` field drifts from its `rows`, would store a number that was never
+    written to scratch. Everything downstream compares that number to a live
+    `COUNT(*)` of the table, so recording the REPORTED count would refuse every
+    subsequent resume of that blueprint — a silent, permanent loss of the table-
+    intermediate resume path, with a fail-closed symptom nobody would trace back here.
+
+    Driven with a producer result claiming 812 rows while carrying 1."""
+    detail = _detail(composes=_APPROVAL_GATED_COMPOSES)
+    scratch1 = FakeScratchClient()
+    mcp1 = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["Department"], [["Sales"]]),
+                {
+                    "columns": ["EmployeeCode", "earnings"],
+                    "rows": [["1001", 100.0]],
+                    "row_count": 812,  # disagrees with `rows`
+                    "truncated": False,
+                },
+            ]
+        }
+    )
+    paused = await _executor(mcp1, scratch_client=scratch1, detail=detail).execute(
+        blueprint_id="bp-table", slot_bindings={"department": "Sales"}, credentials=_creds()
+    )
+    assert isinstance(paused, ExecPaused)
+    assert len(next(c for c in scratch1.calls if c.op == "materialize").rows or []) == 1
+    assert _records(paused.completed_nodes_json)[0]["row_count"] == 1  # not 812
+
+    # …and the resume verifies against the number of rows the table really holds.
+    resumed, _mcp2, _ = await _resume_fresh(
+        detail,
+        paused.completed_nodes_json,
+        counts=[_count(1)],
+        consumer_result=_rq(["department", "total_earnings"], [["Sales", 100.0]]),
+        grain=_rq(["__bp_n", "__bp_d"], [[1, 1]]),
+    )
+    assert isinstance(resumed, ExecCompleted)
+
+
+async def test_two_intermediates_with_one_count_refusal_binds_neither() -> None:
+    """The all-or-nothing rule, driven through the COUNT gate rather than the ownership
+    one (`test_two_intermediates_with_one_poisoned_binds_neither` covers that half).
+    Both carried names are genuine and own-session, so both reach the probe; order 1's
+    table has expired to 0 rows.
+
+    A per-node gate could plausibly have been written to bind what it could verify and
+    leave the rest — which would emit a JOIN with one real table and one unbound
+    `scratch.<placeholder>`, or worse, silently drop the failed side's rows. Neither
+    happens: `_node_table_bindings` refuses the whole consumer, so NO statement is
+    dispatched that joins a scratch table to the warehouse at all."""
+    scratch1 = FakeScratchClient()
+    detail, paused = await _pause_after_two_producers(scratch1)
+    first, second = _materialized_name(scratch1, 0), _materialized_name(scratch1, 1)
+
+    resumed, mcp2, _ = await _resume_fresh(
+        detail,
+        paused.completed_nodes_json,
+        counts=[_count(1), _count(0)],  # order 0 intact; order 1 expired to empty
+        awaiting_node=2,
+    )
+    assert isinstance(resumed, ExecFailed)
+    assert resumed.error_code == SLOT_INVALID_CODE
+    # Each was verified on its own name — the failure of one did not short-circuit the
+    # other's probe, nor did one probe stand in for both.
+    assert _count_probes(mcp2) == [
+        f"SELECT COUNT(*) FROM scratch.{first.split('.', 1)[1]}",
+        f"SELECT COUNT(*) FROM scratch.{second.split('.', 1)[1]}",
+    ]
+    # NEITHER was bound: no half-built JOIN was ever dispatched.
+    assert not any(
+        "scratch." in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp2.calls
+    )
+
+
+_CONSUMER_SELF_JOIN_SQL = (
+    "SELECT e.Department AS department, SUM(x.earnings) AS total_earnings "
+    "FROM scratch.emp_earnings AS x "
+    "JOIN scratch.emp_again AS y ON y.EmployeeCode = x.EmployeeCode "
+    "JOIN dbpcm_warehouse.employee AS e ON e.EmployeeCode = x.EmployeeCode "
+    "WHERE e.Department = {department} GROUP BY e.Department"
+)
+
+
+async def test_a_producer_consumed_twice_is_counted_once() -> None:
+    """Probe ECONOMY, the axis the fresh-run test does not cover. The unit of work is
+    the restorable table-consumed ORDER, not the node and not the consume: a consumer
+    that names the SAME producer under TWO placeholders (a self-join over one
+    intermediate) still costs exactly ONE `SELECT COUNT(*)`.
+
+    `_table_consumed_orders` returns a SET and `_restore_materialized` iterates it, so
+    this holds today. Pinned because the obvious "verify each binding as you build it"
+    refactor of `_node_table_bindings` would make the probe count scale with
+    placeholders instead of tables, and nothing else would notice."""
+    detail = _detail(
+        composes=[
+            {"order": 0, "output": {"emp_earnings": "table"}, "sql_template": _PRODUCER_SQL},
+            {
+                "order": 1,
+                "node_kind": "approval",
+                "feeds_from": [0],
+                "output": {},
+                "requires_approval": {"prompt": "Proceed with the join?"},
+            },
+            {
+                "order": 2,
+                "feeds_from": [1],
+                "consumes": {"emp_earnings": "$0", "emp_again": "$0"},
+                "output": {},
+                "sql_template": _CONSUMER_SELF_JOIN_SQL,
+            },
+        ]
+    )
+    scratch1 = FakeScratchClient()
+    paused = await _pause_after_producer(detail, scratch1)
+
+    resumed, mcp2, _ = await _resume_fresh(
+        detail,
+        paused.completed_nodes_json,
+        counts=[_count(1)],
+        consumer_result=_rq(["department", "total_earnings"], [["Sales", 100.0]]),
+        grain=_rq(["__bp_n", "__bp_d"], [[1, 1]]),
+    )
+    assert isinstance(resumed, ExecCompleted)
+    bare = _materialized_name(scratch1).split(".", 1)[1]
+    assert _count_probes(mcp2) == [f"SELECT COUNT(*) FROM scratch.{bare}"]
+    # Both placeholders were rewritten to the one restored table.
+    consumer_sql = _consumer_sql(mcp2)
+    assert consumer_sql.count(bare) == 2
+    assert "scratch.emp_earnings" not in consumer_sql
+    assert "scratch.emp_again" not in consumer_sql
+
+
+def _tamper_foreign_table(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
+    return _retable(cp, 0, "scratch.s" + "9" * 32 + "_bp_" + "0" * 32), creds
+
+
+def _tamper_wrong_db(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
+    return _retable(cp, 0, f"{_W}.s_{_SID}_bp_x"), creds
+
+
+def _tamper_drop_count(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
+    return (
+        json.dumps([{k: v for k, v in r.items() if k != "row_count"} for r in _records(cp)]),
+        creds,
+    )
+
+
+def _tamper_null_count(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
+    return _repatch(cp, 0, row_count=None), creds
+
+
+def _resume_as_other_session(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
+    return cp or "[]", RuntimeCredentials(
+        session_id="s" + "9" * 32, jwt="jwt-secret", column_scope=frozenset()
+    )
+
+
+def _resume_as_prefix_claimant(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
+    return cp or "[]", RuntimeCredentials(
+        session_id=f"{_SID}_bp", jwt="jwt-secret", column_scope=frozenset()
+    )
+
+
+def _resume_sessionless(cp: str | None, creds: RuntimeCredentials) -> tuple[str, RuntimeCredentials]:
+    return cp or "[]", RuntimeCredentials(
+        session_id="", jwt="jwt-secret", column_scope=frozenset()
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(_tamper_foreign_table, id="foreign-session-table"),
+        pytest.param(_tamper_wrong_db, id="wrong-database"),
+        pytest.param(_tamper_drop_count, id="count-key-missing"),
+        pytest.param(_tamper_null_count, id="count-null"),
+        pytest.param(_resume_as_other_session, id="resumed-by-another-session"),
+        pytest.param(_resume_as_prefix_claimant, id="resumed-by-a-prefix-claimant"),
+        pytest.param(_resume_sessionless, id="resumed-with-no-session"),
+    ],
+)
+async def test_every_cheap_gate_refusal_costs_no_probe(tamper: Any) -> None:
+    """THE ORDERING CONTRACT of the three gates, asserted as a COST rather than as an
+    outcome. Ownership (D64) and the carried-count type check are both pure local
+    predicates; the live `COUNT(*)` is a round trip. Cheapest-first means every
+    refusal reachable without touching the network takes it — a tampered or foreign
+    checkpoint must not be able to make the runtime dispatch a query on its behalf.
+
+    Outcome-only assertions cannot see this: all seven arms already land on
+    SLOT_INVALID whichever order the gates run in. `_count_probes(...) == []` is what
+    distinguishes them, and it is also the only thing that catches the live gate being
+    hoisted above the ownership one — a reordering that would send a probe naming
+    ANOTHER SESSION'S table to the MCP and make the D64 read gate there the first line
+    of defense instead of the second."""
+    detail = _detail(composes=_APPROVAL_GATED_COMPOSES)
+    scratch1 = FakeScratchClient()
+    paused = await _pause_after_producer(detail, scratch1)
+    checkpoint, credentials = tamper(paused.completed_nodes_json, _creds())
+
+    resumed, mcp2, scratch2 = await _resume_fresh(detail, checkpoint, credentials=credentials)
+    assert isinstance(resumed, ExecFailed)
+    assert resumed.error_code == SLOT_INVALID_CODE
+    assert _count_probes(mcp2) == []
+    assert not any(c.op == "materialize" for c in scratch2.calls)
 
 
 async def test_a_resumed_run_unions_provenance_across_the_whole_dag() -> None:
@@ -1577,16 +2057,228 @@ async def test_the_d56_grain_gate_still_bites_on_a_resumed_run() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 5c. REPAUSE — a DAG that stops TWICE. Every test above makes exactly one round
+#     trip, so the carried table+count are only ever read from a checkpoint the
+#     LIVE walk wrote. A second pause re-serializes records that were themselves
+#     REHYDRATED, which is the first time `_dumps_completed` is handed values it
+#     did not produce, and the first time the gate runs against a checkpoint that
+#     has been through the JSON boundary twice.
+# ---------------------------------------------------------------------------
+
+
+_TWO_APPROVAL_COMPOSES: list[dict[str, Any]] = [
+    {"order": 0, "output": {"emp_earnings": "table"}, "sql_template": _PRODUCER_SQL},
+    {
+        "order": 1,
+        "node_kind": "approval",
+        "feeds_from": [0],
+        "output": {},
+        "requires_approval": {"prompt": "Proceed past the first gate?"},
+    },
+    {
+        "order": 2,
+        "node_kind": "approval",
+        "feeds_from": [1],
+        "output": {},
+        "requires_approval": {"prompt": "Proceed past the second gate?"},
+    },
+    {
+        "order": 3,
+        "feeds_from": [2],
+        "consumes": {"emp_earnings": "$0"},
+        "output": {},
+        "sql_template": _CONSUMER_SQL,
+    },
+]
+
+
+async def test_a_twice_paused_intermediate_survives_and_is_re_gated_each_time() -> None:
+    """pause → resume → pause → resume, over a DAG with TWO approval gates between the
+    producer and its consumer. Three separate executors and three separate scratch
+    clients: the ONLY thing crossing each gap is the checkpoint string.
+
+    What this pins that a single round trip cannot:
+      (a) the carried `table` + `row_count` survive being RE-serialized from rehydrated
+          records — the second `_dumps_completed` is writing values it read rather than
+          values it computed, so a carry that only worked for live records would lose
+          the name here and resurrect the original SLOT_INVALID blocker one gate later;
+      (b) the gate is re-run on EVERY resume, not once per run. Each resume dispatches
+          exactly one count probe, so an intermediate that expires between the second
+          pause and the second resume is still caught — a "verify once, then trust"
+          cache would reopen the whole row-TTL wrong-answer class for any blueprint
+          with more than one gate;
+      (c) the producer is never re-materialized, at either resume (exactly-once, D45);
+      (d) nothing is DOUBLE-counted. The producer's SQL and provenance ride the
+          checkpoint through two round trips and must still appear once each: the
+          transparency list is exactly [producer, consumer] and the footprint union is
+          the plain union, not a list that grew a copy per pause."""
+    detail = _detail(composes=_TWO_APPROVAL_COMPOSES)
+    scratch1 = FakeScratchClient()
+    mcp1 = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["Department"], [["Sales"]]),
+                _rq(["EmployeeCode", "earnings"], [["1001", 100.0]]),
+            ]
+        }
+    )
+    first_pause = await _executor(mcp1, scratch_client=scratch1, detail=detail).execute(
+        blueprint_id="bp-table", slot_bindings={"department": "Sales"}, credentials=_creds()
+    )
+    assert isinstance(first_pause, ExecPaused)
+    assert first_pause.awaiting_node == 1
+    table = _materialized_name(scratch1)
+    bare = table.split(".", 1)[1]
+
+    # --- first resume: approve gate 1, re-pause at gate 2 --------------------
+    mcp2 = FakeMCPClient(
+        scripted={"runQuery": [_rq(["Department"], [["Sales"]]), _count(1)]}
+    )
+    scratch2 = FakeScratchClient()
+    second_pause = await _executor(mcp2, scratch_client=scratch2, detail=detail).resume(
+        blueprint_id="bp-table",
+        slot_bindings={"department": "Sales"},
+        completed_nodes_json=first_pause.completed_nodes_json,
+        awaiting_node=1,
+        approval_answer="approve",
+        credentials=_creds(),
+    )
+    assert isinstance(second_pause, ExecPaused)
+    assert second_pause.awaiting_node == 2
+    assert _count_probes(mcp2) == [f"SELECT COUNT(*) FROM scratch.{bare}"]  # (b)
+    assert not any(c.op == "materialize" for c in scratch2.calls)  # (c)
+    # (a) the RE-serialized checkpoint still carries the producer's name and count,
+    # unchanged, alongside the newly-completed approval node.
+    carried = {r["order"]: r for r in _records(second_pause.completed_nodes_json)}
+    assert sorted(carried) == [0, 1]
+    assert carried[0]["table"] == table
+    assert carried[0]["row_count"] == 1
+    assert carried[1]["table"] is None and carried[1]["row_count"] is None
+
+    # --- second resume: approve gate 2, complete -----------------------------
+    mcp3 = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["Department"], [["Sales"]]),
+                _count(1),
+                _rq(["department", "total_earnings"], [["Sales", 100.0]]),
+                _rq(["__bp_n", "__bp_d"], [[1, 1]]),
+            ]
+        }
+    )
+    scratch3 = FakeScratchClient()
+    done = await _executor(mcp3, scratch_client=scratch3, detail=detail).resume(
+        blueprint_id="bp-table",
+        slot_bindings={"department": "Sales"},
+        completed_nodes_json=second_pause.completed_nodes_json,
+        awaiting_node=2,
+        approval_answer="approve",
+        credentials=_creds(),
+    )
+    assert isinstance(done, ExecCompleted)
+    assert done.result_full["preview_rows"] == [["Sales", 100.0]]
+    assert _count_probes(mcp3) == [f"SELECT COUNT(*) FROM scratch.{bare}"]  # (b) again
+    assert not any(c.op == "materialize" for c in scratch3.calls)  # (c)
+    assert bare in _consumer_sql(mcp3)
+    # (d) two round trips, still exactly two node SQLs — the producer's carried once.
+    assert len(done.result_full["sql"]) == 2
+    assert done.result_full["sql"].count(done.result_full["sql"][0]) == 1
+    assert "'EARN'" in done.result_full["sql"][0]
+    assert done.result_full["terminal_sql"] == done.result_full["sql"][1]
+    # …and the footprint spans both nodes, with no scratch pair leaking in.
+    assert done.provenance is not None
+    assert (_PAY, "Amount") in done.provenance
+    assert (_EMP, "Department") in done.provenance
+    assert not any(t.startswith("scratch.") for t, _c in done.provenance)
+
+
+async def test_an_intermediate_that_expires_between_the_second_pause_and_its_resume() -> None:
+    """The reason (b) above matters, driven end to end: the table is verified intact at
+    the FIRST resume, the run re-pauses, and the row TTL fires during the SECOND wait.
+
+    A gate that ran only on the first resume would treat the second as already-proven
+    and JOIN an emptied table into a `verified` answer — the exact blocker, merely
+    delayed by one approval. Because the gate re-runs, the second resume refuses:
+    SLOT_INVALID, and no JOIN is dispatched."""
+    detail = _detail(composes=_TWO_APPROVAL_COMPOSES)
+    scratch1 = FakeScratchClient()
+    mcp1 = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["Department"], [["Sales"]]),
+                _rq(["EmployeeCode", "earnings"], [["1001", 100.0]]),
+            ]
+        }
+    )
+    first_pause = await _executor(mcp1, scratch_client=scratch1, detail=detail).execute(
+        blueprint_id="bp-table", slot_bindings={"department": "Sales"}, credentials=_creds()
+    )
+    assert isinstance(first_pause, ExecPaused)
+    bare = _materialized_name(scratch1).split(".", 1)[1]
+
+    mcp2 = FakeMCPClient(
+        scripted={"runQuery": [_rq(["Department"], [["Sales"]]), _count(1)]}  # still intact
+    )
+    second_pause = await _executor(
+        mcp2, scratch_client=FakeScratchClient(), detail=detail
+    ).resume(
+        blueprint_id="bp-table",
+        slot_bindings={"department": "Sales"},
+        completed_nodes_json=first_pause.completed_nodes_json,
+        awaiting_node=1,
+        approval_answer="approve",
+        credentials=_creds(),
+    )
+    assert isinstance(second_pause, ExecPaused)
+
+    # The rows expire during the second wait.
+    mcp3 = FakeMCPClient(
+        scripted={
+            "runQuery": [
+                _rq(["Department"], [["Sales"]]),
+                _count(0),  # row TTL fired
+                # Scripted but unreachable: the under-counted, verifiable wrong answer.
+                _rq(["department", "total_earnings"], []),
+                _rq(["__bp_n", "__bp_d"], [[0, 0]]),
+            ]
+        }
+    )
+    done = await _executor(mcp3, scratch_client=FakeScratchClient(), detail=detail).resume(
+        blueprint_id="bp-table",
+        slot_bindings={"department": "Sales"},
+        completed_nodes_json=second_pause.completed_nodes_json,
+        awaiting_node=2,
+        approval_answer="approve",
+        credentials=_creds(),
+    )
+    assert isinstance(done, ExecFailed)
+    assert done.error_code == SLOT_INVALID_CODE
+    assert _count_probes(mcp3) == [f"SELECT COUNT(*) FROM scratch.{bare}"]
+    assert not any(
+        bare in (sql := str(c.args.get("sql", ""))) and _W in sql for c in mcp3.calls
+    )
+
+
+# ---------------------------------------------------------------------------
 # 6. KNOWN GAPS of the checkpoint-carried table name.
 #
 #    The test below asserts the CURRENT behaviour and says why it is wrong, so
 #    closing the gap makes the test FAIL loudly and forces a deliberate update
 #    (the `known_gaps` convention already used elsewhere in this suite).
 #
-#    Its sibling — a row-TTL-expired intermediate answering `verified` — WAS here
-#    and is now closed: the checkpoint carries the producer's row count and the
-#    resume re-counts the live table (§5b). What remains is the other axis: the
-#    checkpoint pins no VERSION of the definition that produced the table.
+#    TWO siblings WERE here and are now closed. A row-TTL-expired intermediate
+#    answering `verified`: the checkpoint carries the producer's row count and the
+#    resume re-counts the live table (§5b). And the live side coercing where the
+#    stored side validates (a float `1.9` truncating into a matching `1`): both sides
+#    now hold to `int`-or-decimal-string, pinned by
+#    `test_a_live_count_that_is_not_an_integer_is_refused` in §5b.
+#
+#    What remains are the axes a COUNT cannot speak to: the checkpoint pins no
+#    VERSION of the definition that produced the table, a count proves cardinality
+#    and not IDENTITY, and the check is POINT-IN-TIME rather than held. All three are
+#    narrower than what was closed; none are closed. The point-in-time residual is
+#    now DOCUMENTED at the gate (`_restore_materialized`, gate 3) — documented is not
+#    closed, so the test below stays.
 # ---------------------------------------------------------------------------
 
 
@@ -1630,3 +2322,83 @@ async def test_a_blueprint_redefined_during_the_pause_binds_the_old_table_is_a_k
     assert _materialized_name(scratch1).split(".", 1)[1] in _consumer_sql(mcp2)
     assert "'EARN'" in resumed.result_full["sql"][0]  # the superseded producer's SQL
     assert redefined_producer not in resumed.result_full["sql"]
+
+
+async def test_the_count_gate_proves_cardinality_not_identity_is_a_known_gap() -> None:
+    """A count is not a fingerprint. The gate answers "does the named table hold as
+    many rows as the producer wrote", which is exactly what distinguishes an intact
+    intermediate from a row-TTL-expired one — and says nothing at all about WHICH
+    table it is.
+
+    So a checkpoint whose `table` is swapped for a DIFFERENT own-session scratch table
+    holding the same number of rows passes all three gates and is joined as if it were
+    this run's intermediate. Here order 0's genuine name is replaced with another
+    well-formed `s_<sid>_bp_…`, the probe reports the matching count, and the resume
+    completes `verified` over a table this run never produced.
+
+    NOT a widening introduced by the count gate, and deliberately in scope-of-nothing:
+    `_restore_materialized`'s own contract says the D64 gate proves the table belongs
+    to THIS SESSION, not that it is the one this run wrote, and that within-session
+    integrity belongs to the session document — a party who can rewrite `table` can
+    equally rewrite the record's `output` scalars or its carried `sql`. It is pinned
+    because "the gate re-verifies the table" reads, wrongly, like it also
+    re-identifies it. Closing it (a content digest, or a name minted into the
+    checkpoint before the endpoint call) makes this test fail."""
+    detail = _detail(composes=_APPROVAL_GATED_COMPOSES)
+    scratch1 = FakeScratchClient()
+    paused = await _pause_after_producer(detail, scratch1)
+    genuine = _materialized_name(scratch1)
+    impostor = f"scratch.s_{_SID}_bp_{'e' * 32}"
+    assert impostor != genuine
+    swapped = _retable(paused.completed_nodes_json, 0, impostor)
+
+    resumed, mcp2, _ = await _resume_fresh(
+        detail,
+        swapped,
+        counts=[_count(1)],  # same cardinality, different table
+        consumer_result=_rq(["department", "total_earnings"], [["Sales", 999.0]]),
+        grain=_rq(["__bp_n", "__bp_d"], [[1, 1]]),
+    )
+    # KNOWN GAP: a same-count substitution is indistinguishable from the real thing.
+    assert isinstance(resumed, ExecCompleted)
+    assert resumed.result_full["status"] == "verified"
+    assert impostor.split(".", 1)[1] in _consumer_sql(mcp2)
+    assert genuine.split(".", 1)[1] not in _dispatched_sql(mcp2)
+
+
+async def test_the_count_gate_is_point_in_time_and_leaves_a_toctou_window_is_a_known_gap() -> None:
+    """The gate is a SEPARATE statement from the JOIN, so it proves the table was
+    intact at probe time — not that it still is when the consumer reads it. Nothing
+    holds a lock, a snapshot or a session between the two dispatches.
+
+    The window is small (two round trips) where the original blocker's was unbounded
+    (up to the 7-day session TTL against a 3600s row TTL), and a ClickHouse background
+    merge landing exactly there is unlikely. But the FAILURE MODE is identical and
+    fully silent, which is why it is pinned rather than argued away: here the probe
+    reports the written 812 and the JOIN then aggregates a merged-down subset to
+    `50.0`, and the D56 grain gate — a SHAPE check on the terminal result — reads
+    1 row / 1 distinct Department and passes it as `verified`. A plausible number,
+    wrong, with a verified badge.
+
+    Closing it needs something the count cannot give: a read that spans both
+    statements, or an intermediate that does not expire under a live checkpoint (a
+    TTL longer than the session, or a touch-on-resume). Any of those makes this fail."""
+    detail = _detail(composes=_APPROVAL_GATED_COMPOSES)
+    paused = await _pause_after_producer(detail, FakeScratchClient())
+    stored = _repatch(paused.completed_nodes_json, 0, row_count=812)
+
+    resumed, _mcp2, _ = await _resume_fresh(
+        detail,
+        stored,
+        counts=[_count(812)],  # intact AT PROBE TIME — the gate passes…
+        # …and the JOIN, dispatched next, sees a merged-away subset.
+        consumer_result=_rq(["department", "total_earnings"], [["Sales", 50.0]]),
+        grain=_rq(["__bp_n", "__bp_d"], [[1, 1]]),
+    )
+    # KNOWN GAP: verified, and wrong, on rows that expired after the count.
+    assert isinstance(resumed, ExecCompleted)
+    assert resumed.result_full["status"] == "verified"
+    assert resumed.result_full["verify"]["grain_ok"] is True
+    assert resumed.result_full["preview_rows"] == [["Sales", 50.0]]
+
+
