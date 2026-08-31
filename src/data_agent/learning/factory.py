@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from data_agent.runtime.session.store import SessionStore
 
@@ -662,6 +662,7 @@ def build_promotion_plane(
     tracer: object | None = None,
     completer: ParameterizationCompleter | None = None,
     reviser: BlueprintReviser | None = None,
+    trial_probes: dict[str, Any] | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the S9 promotion plane (scheduler + review inbox) over ONE `candidate_store`.
 
@@ -708,6 +709,9 @@ def build_promotion_plane(
         # form still accepts entries typed directly, so this costs a convenience rather than a
         # capability — which is why it has no wiring assertion beside the completer's.
         reviser=reviser,
+        # Per-tenant probes for the reviewer-driven TRIAL only. The scheduler's own probe —
+        # the one the promotion replay uses — is untouched.
+        trial_probes=trial_probes,
     )
     return scheduler, inbox
 
@@ -729,6 +733,7 @@ def build_promotion_write_plane(
     tracer: object | None = None,
     completer: ParameterizationCompleter | None = None,
     reviser: BlueprintReviser | None = None,
+    trial_probes: dict[str, Any] | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the FULLY-ACTIVATED S9 promotion WRITE plane (S9-activation Slice 2, §4).
 
@@ -766,6 +771,7 @@ def build_promotion_write_plane(
         tracer=tracer,
         completer=completer,
         reviser=reviser,
+        trial_probes=trial_probes,
     )
 
 

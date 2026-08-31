@@ -178,3 +178,73 @@ async def test_the_round_trip_survives_the_store() -> None:
     assert CandidateEnvelope.from_doc(stored.to_doc()).leakage_attestation == (
         stored.leakage_attestation
     )
+
+
+# --- trial run: structure only, and an empty result is NOT a pass -------------
+
+
+def test_an_empty_result_is_inconclusive_not_verified() -> None:
+    """⚠ THE D56 GATE PASSES VACUOUSLY ON NOTHING.
+
+    Zero rows satisfies the grain teeth, and the signature check is SKIPPED when a candidate
+    declares no `result_signature.shape` — which most do. So `verify_passed` alone would put a
+    green tick on a run that proved only that the SQL parses and is authorized.
+
+    Not hypothetical: on the live stack the dev warehouse's row-level grant returned zero rows
+    to the replay tenant (`SELECT count()` came back 0 against 33 real rows), so every trial
+    would have reported "✓ ran and verified".
+    """
+    from data_agent.learning.inbox.inbox import TrialRunResult
+
+    empty = TrialRunResult(ok=True, row_count=0, columns=(), verify_passed=True)
+    assert empty.inconclusive is True
+    assert empty.to_wire()["inconclusive"] is True
+
+    real = TrialRunResult(
+        ok=True, row_count=3, columns=("department", "total_pay"), verify_passed=True
+    )
+    assert real.inconclusive is False
+
+
+def test_a_failed_run_is_never_called_inconclusive() -> None:
+    """`inconclusive` is a statement about a run that HAPPENED. A refusal already carries its
+    own reason, and blurring the two would hide the actionable one."""
+    from data_agent.learning.inbox.inbox import TrialRunResult
+
+    assert TrialRunResult(ok=False, reason="missing_bindings").inconclusive is False
+
+
+# --- trial tenants: an allowlist, and column scope is never selectable --------
+
+
+def test_the_deployment_default_leads_the_tenant_list() -> None:
+    """`""` is the tenant the PROMOTION replay uses, so it is the only choice that predicts
+    the real gate. It leads so the honest prediction is offered first and the alternatives
+    read as "and what about…"."""
+    from data_agent.learning.inbox import ReviewInbox
+
+    inbox = ReviewInbox(InMemoryCandidateStore(), trial_probes={"CLIENT_B/PC02": object()})
+    assert inbox.trial_tenants()[0] == ""
+    assert "CLIENT_B/PC02" in inbox.trial_tenants()
+
+
+def test_no_configured_tenants_means_the_default_only() -> None:
+    """Unchanged behaviour until an operator opts in."""
+    from data_agent.learning.inbox import ReviewInbox
+
+    assert ReviewInbox(InMemoryCandidateStore()).trial_tenants() == ("",)
+
+
+async def test_a_tenant_outside_the_allowlist_is_refused() -> None:
+    """⚠ THE BROWSER SENDS A LABEL, NEVER CLAIMS. A reviewer choosing a tenant is asking
+    "does it work for them too"; a reviewer CONSTRUCTING tenant claims would be minting
+    authority. The lookup is what keeps those different."""
+    from data_agent.learning.inbox import ReviewInbox
+
+    env = _quarantined()
+    store = InMemoryCandidateStore()
+    await store.put(env)
+    inbox = ReviewInbox(store)
+    result = await inbox.trial_run(env.candidate_id, bindings={}, tenant="CLIENT_X/PC99")
+    assert result.ok is False
+    assert result.reason == "unknown_tenant"

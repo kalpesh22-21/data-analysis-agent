@@ -181,6 +181,18 @@ class PromotionScheduler:
         self._trace_verbose = trace_verbose
 
     @property
+    def probe(self) -> WarehouseProbe:
+        """The injected warehouse probe.
+
+        Exposed so the review inbox can offer a REVIEWER-DRIVEN trial run against the same
+        transport the promotion gate uses — same scoped JWT, same MCP `runQuery`, same
+        structure-only result. A second probe built beside this one could drift into a
+        different scope or a different tenant, and the whole value of the trial is that it
+        proves what the real replay will do.
+        """
+        return self._probe
+
+    @property
     def store(self) -> CandidateStore:
         """The candidate store this scheduler reads + CAS-writes, exposed read-only.
 

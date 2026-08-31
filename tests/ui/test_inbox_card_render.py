@@ -664,9 +664,16 @@ def test_a_proposal_loads_into_the_form_rather_than_being_applied(render: Any) -
     page = render([_form_item()])
     page.locator('[data-testid="inbox-revise-feedback"]').fill("inline the denominator guard")
     page.locator('[data-testid="inbox-revise"]').click()
-    page.wait_for_selector('[data-testid="inbox-revise-diff"]')
+    # ATTACHED, not visible: the diff is collapsed under a toggle now that the preview
+    # states the same change in the card's own terms.
+    page.wait_for_selector('[data-testid="inbox-revise-diff"]', state="attached")
 
-    assert "denominator guard" in page.locator('[data-testid="inbox-revise-diff"]').inner_text()
+    # `text_content`, not `inner_text`: the diff is COLLAPSED under a toggle now that the
+    # preview states the same change in the card's own terms, and a closed `<details>`
+    # renders no text.
+    assert "denominator guard" in (
+        page.locator('[data-testid="inbox-revise-diff"]').text_content() or ""
+    )
     # The entries box now holds the proposal, ready to be reviewed and edited.
     loaded = page.locator('[data-testid="inbox-complete-entries"]').input_value()
     assert "total_earnings" in loaded
@@ -744,7 +751,9 @@ def test_a_conflicting_proposal_warns_even_though_it_has_entries(render: Any) ->
     assert "replace" in page.locator('[data-testid="inbox-revise-warning"]').inner_text()
     # The entries still loaded — the proposal is usable, it just needs the other mode.
     assert "record_type" in page.locator('[data-testid="inbox-complete-entries"]').input_value()
-    assert "conflict" in page.locator('[data-testid="inbox-revise-diff"]').inner_text()
+    assert "conflict" in (
+        page.locator('[data-testid="inbox-revise-diff"]').text_content() or ""
+    )
 
 
 # --- the leakage override (reviewer attestation) ----------------------------
@@ -796,3 +805,170 @@ def test_an_attested_card_says_so_instead_of_offering_it_again(render: Any) -> N
     assert page.locator('[data-testid="inbox-scan-override"]').count() == 0
     said = page.locator('[data-testid="inbox-scan-attested"]').inner_text()
     assert "false positive" in said and "leave-type enum" in said
+
+
+# --- the pager (one card at a time) -----------------------------------------
+
+
+def _many(n: int) -> list:
+    return [
+        _item(candidate_id=f"c{i}", summary=f"blueprint number {i}",
+              payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS)
+        for i in range(n)
+    ]
+
+
+def test_only_one_card_is_shown_at_a_time(render: Any) -> None:
+    """A review queue is a WORKLIST, not a feed: the reviewer adjudicates one candidate and
+    moves on. The rest stay ATTACHED — paging must not refetch, and the type filter already
+    depended on the whole set being in the DOM."""
+    page = render(_many(4))
+    assert page.locator('[data-testid="inbox-item"]').count() == 4
+    assert page.locator('[data-testid="inbox-item"]:visible').count() == 1
+    assert page.locator('[data-testid="inbox-pager-position"]').inner_text() == "1 of 4"
+
+
+def test_next_and_prev_walk_the_queue(render: Any) -> None:
+    page = render(_many(3))
+    def shown() -> str | None:
+        return page.locator('[data-testid="inbox-item"]:visible').get_attribute(
+            "data-candidate-id"
+        )
+    assert shown() == "c0"
+    page.click('[data-testid="inbox-pager-next"]')
+    assert shown() == "c1"
+    assert page.locator('[data-testid="inbox-pager-position"]').inner_text() == "2 of 3"
+    page.click('[data-testid="inbox-pager-prev"]')
+    assert shown() == "c0"
+
+
+def test_the_ends_of_the_queue_disable_their_button(render: Any) -> None:
+    """Rather than wrapping around. A worklist has an end, and silently looping would make
+    "have I seen them all?" unanswerable."""
+    page = render(_many(2))
+    assert page.locator('[data-testid="inbox-pager-prev"]').is_disabled()
+    assert page.locator('[data-testid="inbox-pager-next"]').is_enabled()
+    page.click('[data-testid="inbox-pager-next"]')
+    assert page.locator('[data-testid="inbox-pager-next"]').is_disabled()
+
+
+def test_a_single_card_hides_the_pager_entirely(render: Any) -> None:
+    """"1 of 1" between two dead buttons is furniture, not navigation."""
+    page = render(_many(1))
+    assert page.locator('[data-testid="inbox-pager"]:visible').count() == 0
+
+
+def test_arrow_keys_page_but_never_while_typing(render: Any) -> None:
+    """⚠ The fail-to-review form and the assistant's feedback box both take free text. A
+    global Left/Right handler that did not check the focus target would make them unusable —
+    every attempt to move the caret would change the card underneath."""
+    page = render(_many(3))
+    page.keyboard.press("ArrowRight")
+    assert page.locator('[data-testid="inbox-pager-position"]').inner_text() == "2 of 3"
+
+    page.locator('[data-testid="inbox-revise-feedback"]:visible').first.click()
+    page.keyboard.press("ArrowLeft")
+    assert page.locator('[data-testid="inbox-pager-position"]').inner_text() == "2 of 3"
+
+
+def test_switching_tab_resets_the_position(render: Any) -> None:
+    """Position 7 of the blueprints means nothing among the knowledge candidates."""
+    items = _many(3) + [
+        _item(candidate_id="k1", type="global_knowledge",
+              payload_view={"statement": "a rule"}, template_parts=[])
+    ]
+    page = render(items)
+    page.click('[data-testid="inbox-pager-next"]')
+    assert page.locator('[data-testid="inbox-pager-position"]').inner_text() == "2 of 3"
+    page.click('button[data-type="global_knowledge"]')
+    page.click('button[data-type="blueprint"]')
+    assert page.locator('[data-testid="inbox-pager-position"]').inner_text() == "1 of 3"
+
+
+# --- the on-card preview ----------------------------------------------------
+
+
+def _proposal(**over) -> tuple:
+    body = {
+        "entries": [{
+            "locator": {"table": "payroll.payroll_fact", "column": "record_type",
+                        "value": "EARNING"},
+            "role": "inline", "why": "defines the metric earnings",
+        }],
+        "replace": True,
+        "rationale": "record_type defines the metric",
+        "reason": "",
+        "diff": [{"kind": "role_changed", "locator": "payroll.payroll_fact.record_type",
+                  "before": "… → slot record_type", "after": "… → inline — defines the metric"}],
+    }
+    body.update(over)
+    return (200, body)
+
+
+def _over_slotted() -> dict:
+    payload = json.loads(json.dumps(_HEALTHY_PAYLOAD))
+    payload["parameterization"][1] = {
+        "locator": {"table": "payroll.payroll_fact", "column": "record_type",
+                    "value": "EARNING"},
+        "role": "slot",
+        "slot": {"name": "record_type", "type": "entity",
+                 "binds_to": "payroll.payroll_fact.record_type", "required": True},
+        "why": None,
+    }
+    return payload
+
+
+def test_the_proposal_is_previewed_in_the_cards_own_terms(render: Any) -> None:
+    """⚠ THE POINT OF PREVIEWING ON THE CARD. A diff row says
+    `role_changed | payroll.payroll_fact.record_type`. The card says which SLOTS the template
+    takes and which filters are FROZEN — the terms the reviewer is judging in. So the preview
+    re-renders those sections with the proposal applied: record_type leaves the slot table and
+    arrives under frozen filters."""
+    _SERVED["revise"] = _proposal()
+    page = render([_item(payload_view=_over_slotted(), template_parts=_PARTS)])
+    card = page.locator('[data-testid="inbox-item"]:visible')
+    card.locator('[data-testid="inbox-revise-feedback"]').fill("freeze the metric definition")
+    card.locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector('[data-testid="inbox-preview"]')
+
+    preview = card.locator('[data-testid="inbox-preview"]')
+    # Lower-cased: the section labels are uppercased by `text-transform`, which `inner_text`
+    # faithfully reports and which says nothing about what the renderer produced.
+    text = preview.inner_text().lower()
+    assert "not yet applied" in text
+    # record_type is now a FROZEN FILTER in the preview, with its reason...
+    assert "record_type = earning" in text
+    assert "defines the metric earnings" in text
+    # The preview's sections are addressable under their OWN prefix — rendering the card's
+    # sections twice would otherwise make `inbox-bp-slots` ambiguous for every selector on
+    # the page, not just for this test.
+    assert card.locator('[data-testid="preview-inbox-bp-inline"]').count() == 1
+    # ...and the LIVE card still shows record_type as a slot, so the two panes read as
+    # before/after rather than replacing one another.
+    assert "record_type" in card.locator('[data-testid="inbox-bp-slots"]').inner_text()
+
+
+def test_the_preview_does_not_invent_a_sql_template(render: Any) -> None:
+    """⚠ The template is DERIVED by the S4 AST rewrite from the accepted SQL. This page cannot
+    reproduce that, and a spliced approximation would be the "model writes the template"
+    failure the whole design refuses, wearing a UI costume. The preview says so instead."""
+    _SERVED["revise"] = _proposal()
+    page = render([_item(payload_view=_over_slotted(), template_parts=_PARTS)])
+    card = page.locator('[data-testid="inbox-item"]:visible')
+    card.locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector('[data-testid="inbox-preview"]')
+
+    preview = card.locator('[data-testid="inbox-preview"]')
+    assert preview.locator('[data-testid="preview-inbox-bp-template"]').count() == 0
+    assert preview.locator('[data-testid="inbox-bp-template"]').count() == 0
+    assert "regenerated by the server" in preview.inner_text().lower()
+
+
+def test_the_changed_rows_are_marked_on_both_sides(render: Any) -> None:
+    """So the eye can pair them without hunting for the matching line."""
+    _SERVED["revise"] = _proposal()
+    page = render([_item(payload_view=_over_slotted(), template_parts=_PARTS)])
+    card = page.locator('[data-testid="inbox-item"]:visible')
+    card.locator('[data-testid="inbox-revise"]').click()
+    page.wait_for_selector('[data-testid="inbox-preview"]')
+    assert card.locator(".is-preview-changed").count() >= 2

@@ -20,9 +20,16 @@ raises `InboxTransitionError`, so a mis-routed action never silently mutates a c
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
-from typing import Literal
+from dataclasses import dataclass, replace
+from typing import Any, Literal
 
+from data_agent.runtime.blueprint.models import ResultGrain
+from data_agent.runtime.blueprint.template import (
+    TemplateBindError,
+    bind_template,
+    referenced_slots,
+)
+from data_agent.runtime.blueprint.verify import verify_result
 from data_agent.timeutil import now_iso
 
 from ..candidate.models import CandidateEnvelope, CandidateStatus
@@ -69,6 +76,79 @@ class _ZeroHitCounts:
         return 0
 
 
+@dataclass(frozen=True)
+class TrialRunResult:
+    """What one reviewer-driven trial run produced. STRUCTURE ONLY — never rows."""
+
+    ok: bool
+    reason: str = ""
+    detail: str = ""
+    missing: tuple[str, ...] = ()
+    columns: tuple[str, ...] = ()
+    row_count: int = 0
+    distinct_grain_count: int | None = None
+    verify_passed: bool = False
+    verify_reason: str | None = None
+    # WHICH tenant answered. On the result because "3 rows" means nothing without it — the
+    # same query is 3 rows for one principal and 0 for another, and that difference is the
+    # entitlement question the selector exists to ask.
+    tenant: str = ""
+
+    @property
+    def inconclusive(self) -> bool:
+        """Did the run PROVE anything about the shape?
+
+        ⚠ `verify_passed` IS TRUE ON AN EMPTY RESULT, and reporting that as a green tick would
+        be the worst possible answer to "does it function as we think". The D56 gate passes
+        vacuously when there is nothing to check: the grain teeth are satisfied by zero rows,
+        and the signature check is SKIPPED when the candidate declares no `result_signature.shape`
+        — which most do.
+
+        Observed immediately on the live stack: the dev warehouse's row-level grant returns
+        zero rows to the replay tenant (`SELECT count()` came back 0 against 33 real rows), so
+        every trial would have shown "✓ verified" while proving only that the SQL parses and is
+        authorized. That is a true and much weaker claim, and the reviewer has to be told which
+        one they got.
+        """
+        return self.ok and self.row_count == 0 and not self.columns
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "reason": self.reason,
+            "detail": self.detail,
+            "missing": list(self.missing),
+            "columns": list(self.columns),
+            "row_count": self.row_count,
+            "distinct_grain_count": self.distinct_grain_count,
+            "verify_passed": self.verify_passed,
+            "verify_reason": self.verify_reason,
+            "inconclusive": self.inconclusive,
+            "tenant": self.tenant,
+        }
+
+
+def _result_grain_columns(payload: dict[str, Any]) -> tuple[str, ...]:
+    """The declared result grain, read defensively (the payload is rehydrated JSON)."""
+    generalization = payload.get("generalization")
+    grain = generalization.get("result_grain") if isinstance(generalization, dict) else None
+    if not isinstance(grain, dict):
+        signature = payload.get("result_signature")
+        grain = signature.get("grain") if isinstance(signature, dict) else None
+    columns = grain.get("columns") if isinstance(grain, dict) else None
+    return tuple(str(c) for c in columns) if isinstance(columns, list) else ()
+
+
+def _expected_columns(payload: dict[str, Any]) -> list[str] | None:
+    """The declared result column names, or `None` to skip the signature check."""
+    signature = payload.get("result_signature")
+    shape = signature.get("shape") if isinstance(signature, dict) else None
+    if not isinstance(shape, list) or not shape:
+        return None
+    names = [c.get("column") for c in shape if isinstance(c, dict) and c.get("column")]
+    return [str(n) for n in names] or None
+
+
 # The statuses a parameterization revision may be proposed for and applied to.
 #
 # `needs_parameterization` is the form: entries are MISSING and the decline names which.
@@ -98,6 +178,7 @@ class ReviewInbox:
         policy: PromotionPolicy | None = None,
         completer: ParameterizationCompleter | None = None,
         reviser: BlueprintReviser | None = None,
+        trial_probes: dict[str, Any] | None = None,
     ) -> None:
         self._store = store
         # The fail-to-review completion plane. OPTIONAL and default-absent, so an inbox
@@ -112,6 +193,10 @@ class ReviewInbox:
         # reviewer can accomplish: the raw-entries form still works. It writes nothing; see
         # `propose_revision`.
         self._reviser = reviser
+        # label -> a WarehouseProbe bound to that tenant's claims, for the reviewer-driven
+        # trial ONLY. Empty means the deployment tenant only (the scheduler's own probe),
+        # which is the unchanged behaviour. The promotion replay never consults this.
+        self._trial_probes = dict(trial_probes or {})
         # The SINGLE approve/reject implementation (R4). Defaulted for an unwired
         # inbox; production injects the wired scheduler.
         self._scheduler = scheduler or PromotionScheduler(
@@ -419,6 +504,99 @@ class ReviewInbox:
                 "re-validated against the accepted SQL"
             )
         return await self._completer.complete(env, entries=entries, replace_all=True)
+
+    def trial_tenants(self) -> tuple[str, ...]:
+        """Tenant labels a reviewer may trial against, deployment default first.
+
+        `""` is the default — the scheduler's own probe, i.e. exactly what the promotion
+        replay will use. It leads the list so the honest prediction of the real gate is the
+        first thing offered, and the alternatives read as "and what about…".
+        """
+        return ("", *sorted(self._trial_probes))
+
+    async def trial_run(
+        self, candidate_id: str, *, bindings: dict[str, Any], tenant: str = ""
+    ) -> TrialRunResult:
+        """Run this blueprint with REVIEWER-CHOSEN slot values and report what came back.
+
+        The question a reviewer actually has before approving — "does it still run, and does it
+        produce the shape I expect, with values I chose" — which no existing surface answered.
+        The promotion gate replays with SYNTHETIC samples, and that is exactly how a badly-typed
+        `period` sample went unnoticed until it blocked every approve.
+
+        ⚠ STRUCTURE, NEVER VALUES. Columns, a row count and a distinct-grain count come back;
+        rows do not. That is `replay.py`'s rule verbatim — "there is no value oracle here, and
+        adding one would breach D17" — and it holds here for the same reason: this surface is
+        access-controlled for CANDIDATES, which are redacted artifacts, and returning warehouse
+        rows would quietly turn it into a data-browsing surface. Whether it should become one is
+        a separate decision, not a side effect of adding a trial button.
+
+        REUSES the scheduler's own probe, so the trial runs through the same scoped JWT and the
+        same MCP `runQuery` the real replay uses. A probe built beside it could drift into a
+        different scope or tenant, and the entire value of a trial is that it predicts the real
+        thing.
+
+        Allowed on `in_review` and `validated`: the two states where a human is deciding whether
+        this artifact should go further. A `needs_parameterization` candidate has no template to
+        bind, and says so rather than failing obscurely.
+        """
+        env = await self._require_one_of(
+            candidate_id, (CandidateStatus.IN_REVIEW, CandidateStatus.VALIDATED)
+        )
+        generalization = env.payload.get("generalization")
+        template = (
+            generalization.get("sql_template") if isinstance(generalization, dict) else None
+        )
+        if not isinstance(template, str) or not template.strip():
+            return TrialRunResult(ok=False, reason="no_template")
+
+        required = sorted(referenced_slots(template))
+        missing = [name for name in required if not str(bindings.get(name, "")).strip()]
+        if missing:
+            return TrialRunResult(ok=False, reason="missing_bindings", missing=tuple(missing))
+        try:
+            sql = bind_template(template, {k: bindings[k] for k in required})
+        except TemplateBindError as exc:
+            return TrialRunResult(ok=False, reason=f"bind_failed:{exc}")
+
+        uses = tuple(
+            (generalization.get("uses") or []) if isinstance(generalization, dict) else ()
+        )
+        if not uses:
+            # The same backstop `golden_replay` carries: an empty `uses` would mint an
+            # UNRESTRICTED token, running reviewer-supplied input against live ClickHouse with
+            # no column scope. Refuse with an honest reason rather than widen the scope.
+            return TrialRunResult(ok=False, reason="no_uses_scope")
+
+        grain = _result_grain_columns(env.payload)
+        # ⚠ AN ALLOWLIST LOOKUP, never claims assembled from the request. The browser sends a
+        # LABEL; the server holds the claims. A reviewer choosing a tenant is asking "does it
+        # work for them too"; a reviewer CONSTRUCTING tenant claims would be minting authority.
+        if tenant and tenant not in self._trial_probes:
+            return TrialRunResult(ok=False, reason="unknown_tenant")
+        try:
+            probe = self._trial_probes[tenant] if tenant else self._scheduler.probe
+            result = await probe.run(sql, grain_columns=grain, column_scope=uses)
+        except Exception as exc:  # noqa: BLE001 — a trial is diagnostic; it may not 500 a review
+            _logger.info("trial run for %s failed: %r", candidate_id, exc)
+            return TrialRunResult(ok=False, reason="warehouse_error", detail=str(exc)[:400])
+
+        verdict = verify_result(
+            result_grain=ResultGrain(columns=grain, verifiable=bool(grain)),
+            row_count=result.row_count,
+            distinct_grain_count=result.distinct_grain_count,
+            columns=list(result.columns),
+            expected_columns=_expected_columns(env.payload),
+        )
+        return TrialRunResult(
+            ok=True,
+            tenant=tenant,
+            columns=tuple(result.columns),
+            row_count=result.row_count,
+            distinct_grain_count=result.distinct_grain_count,
+            verify_passed=verdict.passed,
+            verify_reason=verdict.reason,
+        )
 
     async def attest_scan(self, candidate_id: str, *, note: str) -> CandidateEnvelope:
         """Record a reviewer's statement that a leakage finding is a FALSE POSITIVE.

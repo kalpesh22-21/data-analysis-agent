@@ -136,14 +136,16 @@ REVIEWER_TOKEN = os.environ.get("REVIEWER_TOKEN", "")
 _INBOX_ACTIONS = frozenset(
     {
         "approve", "reject", "retract", "complete", "revise",
-        "apply_revision", "attest_scan", "verify", "promote",
+        "apply_revision", "attest_scan", "trial_run", "verify", "promote",
     }
 )
 # The actions that carry a request body: `complete` (the reviewer's missing
 # parameterization entries) and `promote` (OPTIONAL `{doc_id, title}` knowledge
 # refinements — a bodyless promote is the normal case). Every other action is a bare POST
 # and must stay one; see `inbox_action`.
-_INBOX_BODY_ACTIONS = frozenset({"complete", "promote", "revise", "apply_revision", "attest_scan"})
+_INBOX_BODY_ACTIONS = frozenset(
+    {"complete", "promote", "revise", "apply_revision", "attest_scan", "trial_run"}
+)
 # The only `?status=` values the list surface accepts (ui-inbox-type-archive contract
 # §List API): the live review queue, the durable rejected archive, the promotable set of
 # auto-landed learning nodes awaiting verify/promote, the fail-to-review work list, and
@@ -612,6 +614,11 @@ _INBOX_CONNECT_TIMEOUT_SECONDS = 5.0
 # graceful 'timed out; try again' reaches the browser instead of a bare 502.
 _INBOX_MODEL_HOP_TIMEOUT_SECONDS = 180.0
 _INBOX_MODEL_ACTIONS = frozenset({"revise"})
+# A WAREHOUSE hop, not a model one: `trial_run` binds the template and executes it through the
+# MCP. Its own budget because it is neither a fast store read nor a model call — a real query
+# against live ClickHouse, which can legitimately take tens of seconds on a wide scan.
+_INBOX_WAREHOUSE_ACTIONS = frozenset({"trial_run"})
+_INBOX_WAREHOUSE_HOP_TIMEOUT_SECONDS = 90.0
 
 
 def _hop_timeout(path: str) -> httpx.Timeout:
@@ -623,11 +630,12 @@ def _hop_timeout(path: str) -> httpx.Timeout:
     service either works immediately or is not going to.
     """
     action = path.rsplit("/", 1)[-1].split("?", 1)[0]
-    read = (
-        _INBOX_MODEL_HOP_TIMEOUT_SECONDS
-        if action in _INBOX_MODEL_ACTIONS
-        else _INBOX_HOP_TIMEOUT_SECONDS
-    )
+    if action in _INBOX_MODEL_ACTIONS:
+        read = _INBOX_MODEL_HOP_TIMEOUT_SECONDS
+    elif action in _INBOX_WAREHOUSE_ACTIONS:
+        read = _INBOX_WAREHOUSE_HOP_TIMEOUT_SECONDS
+    else:
+        read = _INBOX_HOP_TIMEOUT_SECONDS
     return httpx.Timeout(read, connect=_INBOX_CONNECT_TIMEOUT_SECONDS)
 
 
@@ -689,6 +697,14 @@ async def inbox_list(status: str | None = None) -> JSONResponse:
         )
     query = urllib.parse.urlencode({"status": status})
     return await _proxy_inbox("GET", f"/inbox?{query}")
+
+
+@app.get("/api/inbox/trial_tenants")
+async def inbox_trial_tenants() -> JSONResponse:
+    """Proxy the trial tenant labels. A GET with no body — the browser needs the LABELS to
+    build a selector; the claims behind them never leave the service."""
+    _require_inbox_enabled()
+    return await _proxy_inbox("GET", "/inbox/trial_tenants")
 
 
 @app.get("/api/inbox/health")

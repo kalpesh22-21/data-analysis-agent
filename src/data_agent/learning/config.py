@@ -569,6 +569,31 @@ class LearningSettings(BaseSettings):
         ),
     )
 
+    # --- Trial-run tenants (the reviewer-driven blueprint check). ---
+    learning_trial_tenants: str = Field(
+        "",
+        description=(
+            "Tenants a reviewer may run a TRIAL against: a COMMA-SEPARATED list of "
+            "`clientcode:proc_center:jti` triples, e.g. "
+            "`CLIENT_A:PC01:JTI001,CLIENT_B:PC02:JTI002`. Empty (the default) means the "
+            "deployment tenant only, so behaviour is unchanged until an operator opts in.\n\n"
+            "A plain string rather than a `list[str]`, deliberately: pydantic parses a list "
+            "field from JSON, so the env value would need embedded quotes that a shell strips "
+            "on the way in — the whole process then fails to START with a parse error naming "
+            "the field and nothing about the quoting. Comma-separated has no such edge.\n\n"
+            "An ALLOWLIST, never free-form input: the browser sends a label and the server "
+            "looks up the claims, so a reviewer can never assemble arbitrary tenant claims. "
+            "The COLUMN scope is unaffected — it is always minted from the blueprint's own "
+            "`uses`, because that is the contract the trial exists to test.\n\n"
+            "This applies to the trial ONLY. The promotion replay's tenant stays process "
+            "config: it carries no user's authority and asks one structural question "
+            "(`TenantClaims`). What the trial adds is the ability to ASK the question that "
+            "docstring names as its own limit — 'the blueprint is verified against THAT "
+            "TENANT'S DATA only' — which is invisible when there is one hardcoded tenant, and "
+            "which cost us a silent green gate when its row grant expired."
+        ),
+    )
+
     # --- LLM-assisted parameterization revision (design §C). ---
     #
     # SEPARATE from the judge's switch on purpose: this one is human-gated and

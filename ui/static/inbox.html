@@ -183,6 +183,50 @@
     color: var(--color-accent-text);
   }
 
+  /* --- The pager (one card at a time) -------------------------------------
+     A review queue is a WORKLIST, not a feed: a reviewer adjudicates one candidate and
+     moves on. Scrolling past two dozen full cards to reach the next undecided one made
+     the position in the queue invisible and the act of moving on implicit. */
+
+  .inbox-pager {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+  }
+
+  .inbox-pager[hidden] { display: none; }
+
+  .pager-btn {
+    background: var(--color-surface-2);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-4);
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  .pager-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  .pager-btn:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  .pager-position {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+  }
+
   /* --- Inbox list --- */
   #inbox-list {
     list-style: none;
@@ -637,6 +681,89 @@
     color: var(--color-accent);
   }
 
+  /* The card re-rendered with a proposal applied. Bordered and labelled, because the
+     reviewer must never be unsure whether they are looking at the stored candidate or a
+     suggestion — the whole value of previewing on the card is that it reads in the same
+     terms as the card, which is also exactly how it could be mistaken for it. */
+  .preview-block {
+    border: 1px solid var(--color-accent);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .preview-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-accent);
+  }
+
+  /* A row the proposal moves. Marked in BOTH panes so the eye can pair them. */
+  .is-preview-changed {
+    background: rgba(91, 140, 255, 0.12);
+    border-left: 2px solid var(--color-accent);
+    padding-left: var(--space-2);
+  }
+
+  .trial-block {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+  }
+
+  .trial-binding {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: 0.8rem;
+  }
+
+  .trial-binding label {
+    min-width: 14em;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    color: var(--color-text-dim);
+  }
+
+  .trial-binding input {
+    flex: 1;
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8rem;
+  }
+
+  .trial-result {
+    font-size: 0.8rem;
+    border-radius: var(--radius);
+    padding: var(--space-2);
+    border: 1px solid var(--color-border);
+  }
+
+  .trial-result.is-pass {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+  }
+
+  .trial-result.is-fail {
+    border-color: var(--color-error-border);
+    background: var(--color-error-bg);
+    color: var(--color-error-text);
+  }
+
   .revise-warning {
     font-size: 0.8rem;
     margin: 0;
@@ -892,6 +1019,11 @@
       <div class="type-tabs" data-testid="inbox-tabs" role="tablist" aria-label="Candidate type"></div>
     </div>
 
+    <nav id="inbox-pager" class="inbox-pager" data-testid="inbox-pager" hidden>
+      <button type="button" id="pager-prev" class="pager-btn" data-testid="inbox-pager-prev">‹ Prev</button>
+      <span id="pager-position" class="pager-position" data-testid="inbox-pager-position"></span>
+      <button type="button" id="pager-next" class="pager-btn" data-testid="inbox-pager-next">Next ›</button>
+    </nav>
     <ul id="inbox-list" data-testid="inbox-list" aria-live="polite"></ul>
     <div id="inbox-empty" data-testid="inbox-empty" role="status" hidden></div>
   </section>
@@ -903,7 +1035,17 @@
 
   // write_plane === "offline" pre-disables approve so a reviewer never clicks
   // into a 503 (contract §5). Set by loadHealth() before the list renders.
-  var state = { offline: false, status: "in_review", activeType: "blueprint", items: [] };
+  var state = {
+    offline: false,
+    status: "in_review",
+    activeType: "blueprint",
+    items: [],
+    trialTenants: [""],
+    // Index into the ACTIVE (type-filtered) list — the card the reviewer is on. Reset to
+    // 0 whenever the filtered set changes identity (a tab or status switch, a reload),
+    // because position 7 of the old queue means nothing in the new one.
+    cursor: 0
+  };
 
   // Fixed, always-shown candidate types (contract §Frontend): stable order,
   // readable labels, live count badges. Grouping is client-side on item.type.
@@ -924,6 +1066,10 @@
     empty: document.getElementById("inbox-empty"),
     tabs: document.querySelector('[data-testid="inbox-tabs"]'),
     statusToggle: document.querySelector('[data-testid="inbox-status-toggle"]'),
+    pager: document.getElementById("inbox-pager"),
+    pagerPrev: document.getElementById("pager-prev"),
+    pagerNext: document.getElementById("pager-next"),
+    pagerPosition: document.getElementById("pager-position"),
   };
 
   // Per-type tab controls, built once at init and keyed by candidate type.
@@ -1556,6 +1702,277 @@
     return wrap;
   }
 
+  // --- Previewing a proposal ON the card ------------------------------------
+  //
+  // A diff list says `role_changed | payroll.register_type`. The card says which SLOTS the
+  // template takes and which FILTERS are frozen — the terms the reviewer is actually judging
+  // in. So the proposal is applied to a COPY of the payload and those sections are
+  // re-rendered from it, with the moved entries marked on both sides.
+  //
+  // ⚠ THE TEMPLATE IS NOT REGENERATED, and that is deliberate rather than laziness. The
+  // `sql_template` is DERIVED by the S4 AST rewrite from the accepted SQL; this page cannot
+  // reproduce that, and a hand-spliced approximation of the resulting SQL would be the exact
+  // "model writes the template" failure the whole design refuses, wearing a UI costume. The
+  // preview says the template is regenerated on apply and shows the current one unchanged.
+  function previewPayload(view, entries, replace) {
+    var current = (isObject(view) && Array.isArray(view.parameterization))
+      ? view.parameterization : [];
+    var merged = replace ? entries.slice() : current.concat(entries);
+    // Under APPEND a proposal that touches an existing locator produces a duplicate, which
+    // is the `conflict` the diff already names. For the PREVIEW the honest rendering is the
+    // proposal winning, because that is what the reviewer is being asked to picture — the
+    // warning beside it says the apply needs `replace`.
+    var byKey = {};
+    var out = [];
+    merged.forEach(function (entry) {
+      var loc = isObject(entry) && isObject(entry.locator) ? entry.locator : {};
+      var key = String(loc.table) + "." + String(loc.column) + "=" + String(loc.value);
+      if (Object.prototype.hasOwnProperty.call(byKey, key)) {
+        out[byKey[key]] = entry;
+        return;
+      }
+      byKey[key] = out.length;
+      out.push(entry);
+    });
+    var copy = {};
+    Object.keys(view || {}).forEach(function (k) { copy[k] = view[k]; });
+    copy.parameterization = out;
+    return copy;
+  }
+
+  // The locators a proposal touches, so both panes can mark the same rows.
+  function changedLocators(diff) {
+    var keys = {};
+    (Array.isArray(diff) ? diff : []).forEach(function (row) {
+      if (isObject(row) && row.kind && row.kind !== "unchanged") keys[row.locator] = true;
+    });
+    return keys;
+  }
+
+  function markChanged(node, changed) {
+    if (!node) return node;
+    node.querySelectorAll("tbody tr, li").forEach(function (row) {
+      var text = row.textContent || "";
+      Object.keys(changed).forEach(function (loc) {
+        if (loc && loc !== "(no locator)" && text.indexOf(loc) !== -1) {
+          row.classList.add("is-preview-changed");
+        }
+      });
+    });
+    return node;
+  }
+
+  function renderPreview(item, payload, diff) {
+    var changed = changedLocators(diff);
+    var entries = paramEntries(payload);
+    var block = el("div", "preview-block");
+    block.setAttribute("data-testid", "inbox-preview");
+
+    var head = el("div", "preview-head");
+    head.appendChild(el("span", "", "proposed — not yet applied"));
+    block.appendChild(head);
+
+    block.appendChild(section("slots (proposed)", markChanged(renderSlots(entries), changed), null));
+    block.appendChild(
+      section("frozen filters (proposed)", markChanged(renderInline(entries), changed), null)
+    );
+    var rules = markChanged(renderRules(entries), changed);
+    if (rules) block.appendChild(section("rule filters (proposed)", rules, null));
+    block.appendChild(
+      el("p", "card-empty",
+        "the SQL template is regenerated by the server when you apply — it is not " +
+        "previewed here, because this page does not author SQL")
+    );
+    // ⚠ NAMESPACE THE PREVIEW'S TESTIDS. `renderSlots`/`renderInline`/`renderRules` stamp the
+    // card's own ids, so rendering them twice made `inbox-bp-slots` resolve to TWO elements —
+    // ambiguous for every selector on the page, not just for a test. The preview keeps its
+    // sections addressable under its own prefix and leaves the live card's ids unique.
+    block.querySelectorAll("[data-testid]").forEach(function (node) {
+      var id = node.getAttribute("data-testid");
+      if (id && id.indexOf("inbox-preview") !== 0) {
+        node.setAttribute("data-testid", "preview-" + id);
+      }
+    });
+    return block;
+  }
+
+  // --- Trial run (does it still execute, with values I chose?) ---------------
+  //
+  // The promotion gate replays with SYNTHETIC samples, which is how a badly-typed `period`
+  // sample went unnoticed until it blocked every approve. This lets a reviewer bind the slots
+  // themselves and see what comes back.
+  //
+  // ⚠ STRUCTURE, NEVER ROWS. Columns, a row count and a distinct-grain count — the server
+  // refuses to return rows, and this pane could not show them if it wanted to. That is
+  // `replay.py`'s rule: returning warehouse rows would turn a review surface for REDACTED
+  // candidates into a data-browsing surface, which is a decision to take deliberately rather
+  // than as a side effect of adding a button.
+  function renderTrialRun(item) {
+    var parts = Array.isArray(item.template_parts) ? item.template_parts : [];
+    var slots = [];
+    parts.forEach(function (part) {
+      if (isObject(part) && typeof part.slot === "string" && slots.indexOf(part.slot) === -1) {
+        slots.push(part.slot);
+      }
+    });
+    var gen = isObject(item.payload_view) ? item.payload_view.generalization : null;
+    if (!isObject(gen) || !gen.sql_template) return null;
+
+    var block = el("div", "trial-block");
+    block.setAttribute("data-testid", "inbox-trial");
+    block.appendChild(el("p", "item-field-label", "trial run — does it execute?"));
+
+    // WHICH TENANT answers. The column scope is NOT selectable — it is always minted from
+    // this blueprint's own `uses`, because that is the contract the trial exists to test.
+    // What varies is the row entitlement, which is what actually decides whether a query
+    // returns anything: the same SQL is 3 rows for one principal and 0 for another, and an
+    // expired grant on the single hardcoded tenant is what made this gate silently green.
+    var tenantSelect = null;
+    if (state.trialTenants.length > 1) {
+      var row = el("div", "trial-binding");
+      row.appendChild(el("label", "", "as tenant"));
+      tenantSelect = document.createElement("select");
+      tenantSelect.setAttribute("data-testid", "inbox-trial-tenant");
+      state.trialTenants.forEach(function (label) {
+        var opt = document.createElement("option");
+        opt.value = label;
+        // The default LEADS and says what it is: it is the tenant the promotion replay will
+        // use, so it is the only choice that predicts the real gate.
+        opt.textContent = label || "deployment default (what promotion will use)";
+        tenantSelect.appendChild(opt);
+      });
+      row.appendChild(tenantSelect);
+      block.appendChild(row);
+    }
+
+    var inputs = {};
+    slots.forEach(function (name) {
+      var row = el("div", "trial-binding");
+      var label = el("label", "", name);
+      label.setAttribute("for", "trial-" + item.candidate_id + "-" + name);
+      row.appendChild(label);
+      var input = document.createElement("input");
+      input.type = "text";
+      input.id = "trial-" + item.candidate_id + "-" + name;
+      input.setAttribute("data-testid", "inbox-trial-binding");
+      input.setAttribute("data-slot", name);
+      input.placeholder = "a value to bind";
+      inputs[name] = input;
+      row.appendChild(input);
+      block.appendChild(row);
+    });
+    if (!slots.length) {
+      block.appendChild(
+        el("p", "card-empty", "this template takes no arguments — run it as-is")
+      );
+    }
+
+    var out = el("div");
+    out.setAttribute("data-testid", "inbox-trial-output");
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "action-complete";
+    btn.setAttribute("data-testid", "inbox-trial-run");
+    btn.textContent = "Run it";
+    btn.addEventListener("click", function () {
+      clearError();
+      clearNode(out);
+      btn.disabled = true;
+      btn.textContent = "Running…";
+      var bindings = {};
+      Object.keys(inputs).forEach(function (n) { bindings[n] = inputs[n].value; });
+      fetch("/api/inbox/" + encodeURIComponent(item.candidate_id) + "/trial_run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bindings: bindings,
+          tenant: tenantSelect ? tenantSelect.value : ""
+        })
+      })
+        .then(function (response) {
+          return response.text().then(function (text) {
+            var parsed = null;
+            try { parsed = JSON.parse(text); } catch (err) { parsed = null; }
+            if (!response.ok) {
+              showError("HTTP_" + response.status,
+                (parsed && parsed.detail) || text || response.statusText);
+              return;
+            }
+            out.appendChild(renderTrialResult(parsed));
+          });
+        })
+        .catch(function (err) { showError("NETWORK", String(err)); })
+        .then(function () { btn.disabled = false; btn.textContent = "Run it"; });
+    });
+    block.appendChild(btn);
+    block.appendChild(out);
+    return block;
+  }
+
+  function renderTrialResult(r) {
+    if (!isObject(r)) return el("p", "trial-result is-fail", "no result");
+    if (!r.ok) {
+      // A run that could NOT happen is not a failed blueprint. The reasons are kept apart
+      // because they need different fixes: missing bindings is the reviewer's next action,
+      // `no_uses_scope` is a refusal to mint an unrestricted token, and `warehouse_error` is
+      // the only one that says anything about the SQL.
+      var why = String(r.reason || "unknown");
+      if (why === "missing_bindings") {
+        why = "fill in: " + (r.missing || []).join(", ");
+      } else if (why === "no_uses_scope") {
+        why = "this blueprint declares no column footprint, so a scoped token cannot be " +
+              "minted — it is refused rather than run unscoped";
+      } else if (why === "warehouse_error") {
+        why = "the warehouse rejected it: " + String(r.detail || "");
+      } else if (why === "unknown_tenant") {
+        why = "that tenant is not in the configured allowlist";
+      } else if (why === "no_template") {
+        why = "no SQL template on this candidate";
+      }
+      var fail = el("p", "trial-result is-fail", why);
+      fail.setAttribute("data-testid", "inbox-trial-result");
+      return fail;
+    }
+    // ⚠ AN EMPTY RESULT IS NOT A PASS. The D56 gate is satisfied vacuously by zero rows —
+    // the grain teeth hold and the signature check is skipped when the candidate declares no
+    // `shape` — so `verify_passed` alone would put a green tick on a run that proved only
+    // that the SQL parses and is authorized. The server computes `inconclusive`; this states
+    // it in the reviewer's words rather than implying success.
+    var verdictClass = r.inconclusive
+      ? "trial-result"
+      : (r.verify_passed ? "trial-result is-pass" : "trial-result is-fail");
+    var pass = el("div", verdictClass);
+    pass.setAttribute("data-testid", "inbox-trial-result");
+    if (r.inconclusive) {
+      pass.appendChild(el("p", "", "~ it ran, but returned no rows and no columns"));
+      pass.appendChild(
+        el("p", "card-empty",
+          "that proves the SQL parses and the scoped token is allowed to run it — and " +
+          "nothing about its shape. A row-level grant that excludes the replay tenant looks " +
+          "exactly like this.")
+      );
+    } else {
+      pass.appendChild(
+        el("p", "", (r.verify_passed ? "✓ ran and verified" : "✗ ran, but the shape check failed"
+          + (r.verify_reason ? " (" + r.verify_reason + ")" : "")))
+      );
+    }
+    if (r.tenant) {
+      pass.appendChild(el("p", "card-empty", "as tenant " + String(r.tenant) +
+        " — the deployment default is what promotion will use"));
+    }
+    pass.appendChild(el("p", "", "rows: " + String(r.row_count) +
+      (r.distinct_grain_count === null || r.distinct_grain_count === undefined
+        ? "" : "  ·  distinct grain: " + String(r.distinct_grain_count))));
+    var cols = renderChips(r.columns, "inbox-trial-columns");
+    if (cols) pass.appendChild(cols);
+    // Stated, not implied: a reviewer who sees a row COUNT will wonder where the rows are.
+    pass.appendChild(
+      el("p", "card-empty", "structure only — no rows are returned to this surface")
+    );
+    return pass;
+  }
+
   // --- Type tabs + status toggle ------------------------------------------
 
   function typeLabel(type) {
@@ -1649,6 +2066,9 @@
 
   // Filter the rendered list to a type (client-side; no refetch).
   function setActiveType(type) {
+    // A tab switch is a NEW queue, so the position resets. Position 7 of the blueprints
+    // means nothing among the knowledge candidates.
+    if (type !== state.activeType) state.cursor = 0;
     state.activeType = type;
     render();
   }
@@ -2165,7 +2585,7 @@
               showError("HTTP_" + response.status, detail || response.statusText);
               return;
             }
-            renderProposal(parsed, out, area, replaceBox);
+            renderProposal(parsed, out, area, replaceBox, item, node);
             if (apply) {
               // Shown only once there is something to apply, and it carries the entries it
               // was shown with — not a re-read of the card — so what the reviewer approved
@@ -2190,7 +2610,7 @@
   // Show the proposal and LOAD IT INTO THE FORM. The reviewer reads the diff, edits the
   // entries if they want, and applies with the button they would have used anyway — so an
   // assistant that proposed something wrong costs a glance, not a bad write.
-  function renderProposal(payload, out, area, replaceBox) {
+  function renderProposal(payload, out, area, replaceBox, item, node) {
     clearNode(out);
     if (!isObject(payload)) return;
     var entries = Array.isArray(payload.entries) ? payload.entries : [];
@@ -2213,6 +2633,13 @@
     }
     var diff = Array.isArray(payload.diff) ? payload.diff.filter(isObject) : [];
     if (diff.length) {
+      // COLLAPSED, now that the preview below states the same change in the card's own
+      // terms. The row-level diff is the precise record — locator, before, after — and it is
+      // worth keeping for a reviewer checking exactly what will be posted; it is not worth
+      // three wrapped lines of prose above the thing that actually reads well.
+      var fold = el("details", "card-raw");
+      fold.setAttribute("data-testid", "inbox-revise-diff-toggle");
+      fold.appendChild(el("summary", "", "entry-level diff"));
       var list = el("ul", "revise-diff");
       list.setAttribute("data-testid", "inbox-revise-diff");
       diff.forEach(function (row) {
@@ -2225,16 +2652,38 @@
         li.appendChild(document.createTextNode(String(row.after || row.before || "")));
         list.appendChild(li);
       });
-      out.appendChild(list);
+      fold.appendChild(list);
+      out.appendChild(fold);
     }
-    // The proposal becomes the form's contents. `replace` is mirrored onto the checkbox
-    // because it changes what applying MEANS — append versus replace-the-whole-array — and a
-    // proposal whose flag silently disagreed with the box would apply the other operation.
-    area.value = stringifyPayload(entries);
-    if (replaceBox) replaceBox.checked = payload.replace === true;
-    out.appendChild(
-      el("p", "card-empty", "loaded into the entries box above — review, edit, then complete")
-    );
+    // THE PREVIEW: the card's own sections, re-rendered with the proposal applied, and the
+    // affected rows marked on BOTH sides so the eye can pair them. This is the difference
+    // between "role_changed | payroll.register_type" and seeing register_type leave the slot
+    // table and arrive under frozen filters.
+    if (item && node) {
+      var preview = renderPreview(
+        item, previewPayload(item.payload_view, entries, payload.replace === true), payload.diff
+      );
+      out.appendChild(preview);
+      // Mark the same rows on the LIVE card, so the before/after pairing is visible without
+      // hunting for the matching line.
+      markChanged(node.querySelector('[data-testid="inbox-bp-slots"]'), changedLocators(payload.diff));
+      markChanged(node.querySelector('[data-testid="inbox-bp-inline"]'), changedLocators(payload.diff));
+    }
+
+    // ON THE FORM the proposal becomes the textarea's contents, and `replace` is mirrored
+    // onto the checkbox because it changes what applying MEANS — append versus
+    // replace-the-whole-array — and a proposal whose flag silently disagreed with the box
+    // would apply the other operation.
+    //
+    // ON THE REVIEW QUEUE there is no textarea: the card is not a form, so the block carries
+    // its own apply button and the entries never round-trip through an editable field.
+    if (area) {
+      area.value = stringifyPayload(entries);
+      if (replaceBox) replaceBox.checked = payload.replace === true;
+      out.appendChild(
+        el("p", "card-empty", "loaded into the entries box above — review, edit, then complete")
+      );
+    }
   }
 
   // POST an accepted proposal for a candidate already under review. Same three outcomes as
@@ -2530,6 +2979,17 @@
       return li;
     }
 
+    // The trial run: offered wherever a human is deciding whether this artifact goes
+    // further — the review queue and the promotable list. `validated` is the one the
+    // "before promoting" case actually needs.
+    if (
+      item.type === "blueprint" &&
+      (item.status === "in_review" || item.status === "validated")
+    ) {
+      var trial = renderTrialRun(item);
+      if (trial) li.appendChild(trial);
+    }
+
     // The assistant on the REVIEW QUEUE (design §C.4). Offered on a blueprint a human is
     // adjudicating — the reviewer who can SEE a bad role on the card is exactly who should be
     // able to fix it there, rather than rejecting the candidate and losing the work.
@@ -2637,17 +3097,33 @@
 
     clearNode(els.list);
     // Active-type items first (stable), so the first DOM row is always the first
-    // visible row; other types follow, hidden. Keeps the whole set in the DOM.
+    // visible row; other types follow, hidden. THE WHOLE SET STAYS IN THE DOM — the pager
+    // narrows what is SHOWN, and keeping the rest attached is what lets a reviewer page
+    // without a refetch, and what the existing tab filter already relied on.
     var ordered = state.items.slice().sort(function (a, b) {
       var ai = a.type === state.activeType ? 0 : 1;
       var bi = b.type === state.activeType ? 0 : 1;
       return ai - bi;
     });
+    var active = ordered.filter(function (item) { return item.type === state.activeType; });
+    // Clamp rather than reset: an approve/reject shortens the list under the cursor, and
+    // landing on the NEXT undecided card is the behaviour a worklist wants — sending the
+    // reviewer back to the top after every decision is what makes a queue feel endless.
+    if (state.cursor > active.length - 1) state.cursor = Math.max(0, active.length - 1);
+    if (state.cursor < 0) state.cursor = 0;
+
+    var shownIndex = 0;
     ordered.forEach(function (item) {
       var li = renderItem(item);
-      li.hidden = item.type !== state.activeType;
+      if (item.type !== state.activeType) {
+        li.hidden = true;
+      } else {
+        li.hidden = shownIndex !== state.cursor;
+        shownIndex += 1;
+      }
       els.list.appendChild(li);
     });
+    updatePager(active.length);
 
     // Empty state is per active tab + per status.
     if (counts[state.activeType] === 0) {
@@ -2656,6 +3132,32 @@
     } else {
       els.empty.hidden = true;
     }
+  }
+
+  // The pager's own state. Hidden for a single card — a "1 of 1" with two dead buttons is
+  // furniture, not navigation.
+  function updatePager(total) {
+    if (total <= 1) {
+      els.pager.hidden = true;
+      return;
+    }
+    els.pager.hidden = false;
+    els.pagerPosition.textContent = (state.cursor + 1) + " of " + total;
+    els.pagerPrev.disabled = state.cursor <= 0;
+    els.pagerNext.disabled = state.cursor >= total - 1;
+  }
+
+  function step(delta) {
+    var total = state.items.filter(function (i) {
+      return i.type === state.activeType;
+    }).length;
+    var next = state.cursor + delta;
+    if (next < 0 || next > total - 1) return;
+    state.cursor = next;
+    render();
+    // Bring the new card into view: paging from a long card would otherwise leave the
+    // reviewer scrolled to the middle of one they have already dealt with.
+    if (els.list.firstChild) window.scrollTo({ top: 0, behavior: "instant" });
   }
 
   // --- Loaders -------------------------------------------------------------
@@ -2668,6 +3170,9 @@
     // Capture this call's token; a newer loadInbox() bumps loadSeq and makes
     // any earlier (still in-flight) response stale, so it bails out below.
     var seq = ++loadSeq;
+    // A refetch is a new queue: reset the position rather than restoring a cursor into a
+    // list that may no longer contain the same candidates.
+    state.cursor = 0;
     var url = "/api/inbox?status=" + encodeURIComponent(state.status);
     return fetch(url, { headers: { Accept: "application/json" } })
       .then(function (response) {
@@ -2720,10 +3225,31 @@
       });
   }
 
+  els.pagerPrev.addEventListener("click", function () { step(-1); });
+  els.pagerNext.addEventListener("click", function () { step(1); });
+  // Arrow keys page the queue, but NOT while the reviewer is typing — the fail-to-review
+  // form and the assistant's feedback box both take free text, and stealing Left/Right
+  // there would make them unusable.
+  document.addEventListener("keydown", function (event) {
+    var tag = (event.target && event.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || event.target.isContentEditable) return;
+    if (event.key === "ArrowLeft") step(-1);
+    else if (event.key === "ArrowRight") step(1);
+  });
+
   // Bootstrap: build the static controls, learn write-plane health (gates
   // approve), then load the default Review-queue list.
   buildTabs();
   buildStatusToggle();
+  // The trial tenant labels, fetched once. Failure is silent and falls back to the
+  // deployment default — a missing selector must never stop a reviewer running a trial.
+  fetch("/api/inbox/trial_tenants", { headers: { Accept: "application/json" } })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) {
+      if (d && Array.isArray(d.tenants) && d.tenants.length) state.trialTenants = d.tenants;
+    })
+    .catch(function () {});
+
   loadHealth().then(loadInbox);
 })();
 </script>

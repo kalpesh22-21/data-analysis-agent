@@ -72,6 +72,20 @@ class CompleteParameterizationRequest(BaseModel):
     replace: bool = False
 
 
+class TrialRunRequest(BaseModel):
+    """The trial-run body: one value per slot the template references.
+
+    Typed as loosely as the values it binds — they are literals a reviewer chose, and the
+    template binder validates them the same way a live `runBlueprint` would. A schema here
+    would be a second vocabulary for the same mistake.
+    """
+
+    bindings: dict[str, Any] = {}
+    # A LABEL from the allowlist, not tenant claims. Empty = the deployment tenant, which is
+    # what the promotion replay will use.
+    tenant: str = ""
+
+
 class AttestScanRequest(BaseModel):
     """The leakage-override body: WHY this finding is a false positive.
 
@@ -307,6 +321,60 @@ def _build_completion_param_judge(learning_settings: Any) -> Any:
             exc_info=True,
         )
         return None
+
+
+def _build_trial_probes(learning_settings: Any, runtime_settings: Any) -> dict[str, Any]:
+    """One probe per allowlisted trial tenant, keyed by label.
+
+    Empty by default, so a deployment that sets nothing behaves exactly as before: the trial
+    uses the scheduler's own probe and therefore predicts the promotion replay exactly.
+
+    ⚠ ONLY THE TENANT VARIES. Each probe still mints its COLUMN scope from the blueprint's own
+    `uses` at call time — that is the contract the trial exists to test, and making it
+    selectable would let a trial pass for a blueprint whose declared footprint is wrong.
+
+    A malformed entry is SKIPPED with a warning rather than failing startup: a typo in an
+    operator convenience must not take the inbox down, and the label simply is not offered.
+    """
+    configured = str(getattr(learning_settings, "learning_trial_tenants", "") or "").strip()
+    if not configured:
+        return {}
+    from data_agent.runtime.mcp.real_client import RealMCPClient
+
+    from ..promotion.token_minter import HttpTokenMinter, TenantClaims
+    from ..promotion.warehouse_probe import MCPWarehouseProbe
+
+    probes: dict[str, Any] = {}
+    for entry in (e.strip() for e in configured.split(",")):
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) != 3:
+            _logger.warning(
+                "inbox service: trial tenant %r is not clientcode:proc_center:jti — skipped",
+                entry,
+            )
+            continue
+        try:
+            claims = TenantClaims(*(part.strip() for part in parts))
+        except ValueError:
+            _logger.warning("inbox service: trial tenant %r has a blank claim — skipped", entry)
+            continue
+        probes[f"{claims.clientcode}/{claims.proc_center}"] = MCPWarehouseProbe(
+            mcp_client=RealMCPClient(runtime_settings.mcp_url),
+            token_minter=HttpTokenMinter(
+                runtime_settings.token_service_url,
+                runtime_settings.token_issuer_api_key,
+                tenant=claims,
+            ),
+        )
+    if probes:
+        _logger.info(
+            "inbox service: trial runs may be run as %s (the COLUMN scope is still minted "
+            "from each blueprint's own `uses`; only the tenant varies)",
+            ", ".join(sorted(probes)),
+        )
+    return probes
 
 
 def _build_reviser(learning_settings: Any, runtime_settings: Any) -> Any:
@@ -592,6 +660,7 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         # own switch: it is human-gated and human-committed, so it can be enabled much
         # earlier — and its absence costs a convenience, not a capability.
         reviser=_build_reviser(learning_settings, runtime_settings),
+        trial_probes=_build_trial_probes(learning_settings, runtime_settings),
         # PriorArt Slice 2 — THE process where humans actually reject. `reject` and
         # `retract` reach the scheduler through THIS service, not through
         # `run_learning_scheduler.py`, so omitting this made the whole
@@ -685,6 +754,12 @@ def create_inbox_app(
         items = await inbox.list(status=selected, limit=100, order=order)
         wire = [_inbox_item_to_wire(it) for it in items]
         return {"items": wire, "count": len(wire)}
+
+    @app.get("/inbox/trial_tenants", dependencies=guard)
+    async def trial_tenants() -> dict[str, Any]:
+        """The tenant labels a reviewer may trial against. `""` is the deployment default —
+        the same tenant the promotion replay uses, so it predicts the real gate."""
+        return {"tenants": list(inbox.trial_tenants())}
 
     @app.get("/inbox/health", dependencies=guard)
     async def inbox_health() -> dict[str, str]:
@@ -811,6 +886,35 @@ def create_inbox_app(
         except CompletionInputError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _completion_result(result)
+
+    @app.post("/inbox/{candidate_id}/trial_run", dependencies=guard)
+    async def trial_run(
+        candidate_id: str, body: TrialRunRequest | None = None
+    ) -> dict[str, Any]:
+        """TRIAL RUN: execute this blueprint with reviewer-chosen slot values.
+
+        The question a reviewer has before approving — "does it still run, and is the shape
+        what I expect, with values I picked" — which nothing answered. The promotion gate
+        replays with SYNTHETIC samples, which is how a badly-typed `period` sample went
+        unnoticed until it blocked every approve.
+
+        ⚠ STRUCTURE, NEVER ROWS: columns, a row count and a distinct-grain count. That is
+        `replay.py`'s rule verbatim, and it holds here for the same reason — this surface is
+        access-controlled for redacted CANDIDATES, and returning warehouse rows would turn it
+        into a data-browsing surface as a side effect of adding a button.
+
+        A run that could not happen answers 200 with `ok=false` and a machine reason
+        (`no_template`, `missing_bindings`, `no_uses_scope`, `warehouse_error`): the reviewer
+        did nothing wrong, and the reason is the next step rather than an error banner.
+        """
+        req = body or TrialRunRequest()
+        try:
+            result = await inbox.trial_run(
+                candidate_id, bindings=req.bindings or {}, tenant=req.tenant or ""
+            )
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        return result.to_wire()
 
     @app.post("/inbox/{candidate_id}/attest_scan", dependencies=guard)
     async def attest_scan(
