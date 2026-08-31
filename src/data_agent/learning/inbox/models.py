@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
-from data_agent.runtime.blueprint.template import SLOT_TOKEN
+from data_agent.runtime.blueprint.template import iter_slot_tokens
 
 from ..audit.judgement import ParamAssessment
 from ..candidate.decline import DeclineBlock
@@ -37,6 +37,11 @@ InboxReason = Literal[
     # The reviewer's task is to COMPLETE it, not to adjudicate it — see
     # `docs/decisions/learning-declined-candidate-review.md`.
     "needs_parameterization",
+    # An expert wrote this one at the minting page. NOT a defect — it is why the row exists,
+    # and it is the reason a hand-authored blueprint is never auto-landed: a mined candidate
+    # earned its place by being observed answering a real question, and this one has no
+    # session behind it at all.
+    "hand_authored",
 ]
 
 
@@ -126,11 +131,14 @@ def _template_parts(payload_view: dict[str, Any]) -> tuple[dict[str, str], ...]:
         return ()
     parts: list[dict[str, str]] = []
     cursor = 0
-    for match in SLOT_TOKEN.finditer(template):
-        if match.start() > cursor:
-            parts.append({"text": template[cursor : match.start()]})
-        parts.append({"slot": match.group(1)})
-        cursor = match.end()
+    # STRING-AWARE spans: a `{x}` inside a string constant is not a slot, and rendering a
+    # chip for it offered the reviewer a box whose value the trial run then dropped —
+    # binding derives its required set from `referenced_slots`, which does not see it.
+    for name, start, end in iter_slot_tokens(template):
+        if start > cursor:
+            parts.append({"text": template[cursor:start]})
+        parts.append({"slot": name})
+        cursor = end
     if cursor < len(template):
         parts.append({"text": template[cursor:]})
     return tuple(parts)

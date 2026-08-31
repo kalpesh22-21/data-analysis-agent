@@ -22,6 +22,12 @@ from data_agent.learning.inbox import ReviewInbox
 from data_agent.learning.inbox.models import InboxItem
 from data_agent.learning.writer.routing import route_candidate
 
+# Approving REPLAYS against the live warehouse, and this surface mints no tokens — the
+# reviewer pastes one. Any non-blank string does here; `probe_factory` decides what the replay
+# actually runs through, which is the fake the test already wired.
+REVIEWER_TRIAL_TOKEN = "reviewer-pasted-token"
+
+
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "learning"
 
 
@@ -72,7 +78,7 @@ async def test_approve_strips_entity_from_payload_before_validated():
     await store.put(env)
     inbox = ReviewInbox(store)
 
-    promoted = await inbox.approve(env.candidate_id)
+    promoted = await inbox.approve(env.candidate_id, token=REVIEWER_TRIAL_TOKEN)
 
     assert promoted.status == CandidateStatus.VALIDATED
     # SECURE: the entity is gone from the promotable payload. Currently FAILS
@@ -125,7 +131,7 @@ async def test_approve_does_blank_the_audit_entity_spans():
     await store.put(env)
     inbox = ReviewInbox(store)
 
-    promoted = await inbox.approve(env.candidate_id)
+    promoted = await inbox.approve(env.candidate_id, token=REVIEWER_TRIAL_TOKEN)
     verdict = LeakageVerdict.from_doc(promoted.entity_scan)
     assert verdict.hits  # the hit record is retained (field/kind), for audit
     assert all(h.span == "" for h in verdict.hits)  # but the entity value is blanked

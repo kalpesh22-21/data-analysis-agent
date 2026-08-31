@@ -55,10 +55,11 @@ FORBIDDEN_KEYS = frozenset({"sql_template", "template", "sql", "canonical_ast_no
 _MAX_SWEEP_DEPTH = 8
 
 
-_PARAMETERS = {
-    "type": "object",
-    "properties": {
-        "entries": {
+# The parameterization-entry array, PUBLIC because the minting tool (`learning/mint`) emits
+# entries for the same `to_candidate` validator and a second copy of this shape would drift from
+# it silently — the two would disagree about a field the validator reads, and only one of the two
+# callers would start failing.
+ENTRIES_SCHEMA: dict[str, Any] = {
             "type": "array",
             "description": (
                 "The parameterization entries to add (or, with replace=true, the COMPLETE "
@@ -118,7 +119,12 @@ _PARAMETERS = {
                 },
                 "required": ["locator", "role"],
             },
-        },
+}
+
+_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "entries": ENTRIES_SCHEMA,
         "replace": {
             "type": "boolean",
             "description": (
@@ -312,6 +318,27 @@ def _normalize_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def coerce_entries(raw: Any) -> list[dict[str, Any]]:
+    """A model's `entries` array, normalized and capped. Shared with `learning/mint`.
+
+    PUBLIC because the minting tool emits entries for the SAME `to_candidate` validator, and the
+    normalizations here are not cosmetic — they are the difference between a proposal that
+    validates and one that comes back declined naming a predicate the author plainly addressed.
+    A second implementation would re-learn the quoted-locator and placeholder-slot bugs
+    independently, and only in whichever caller a live model happened to hit first.
+
+    Returns `[]` for anything unusable; the caller decides whether that is a degrade or an error.
+    """
+    if not isinstance(raw, list):
+        return []
+    return [_normalize_entry(e) for e in raw[:MAX_ENTRIES] if isinstance(e, dict)]
+
+
+def forbidden_keys_anywhere(value: Any) -> set[str]:
+    """Public alias of the template-edit sweep — see `FORBIDDEN_KEYS`."""
+    return _forbidden_keys_anywhere(value)
+
+
 def parse_proposal(result: ModelTurnResult) -> tuple[list[dict[str, Any]], bool, str] | None:
     """One reviser turn → `(entries, replace, rationale)`, or `None` when unusable.
 
@@ -363,9 +390,7 @@ def parse_proposal(result: ModelTurnResult) -> tuple[list[dict[str, Any]], bool,
             "reviser: entries was %s, not a list — no proposal", type(entries).__name__
         )
         return None
-    clean_entries = [
-        _normalize_entry(e) for e in entries[:MAX_ENTRIES] if isinstance(e, dict)
-    ]
+    clean_entries = coerce_entries(entries)
     if not clean_entries:
         _logger.info("reviser: the proposal contained no usable entries — no proposal")
         return None

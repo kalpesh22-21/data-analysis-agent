@@ -569,31 +569,6 @@ class LearningSettings(BaseSettings):
         ),
     )
 
-    # --- Trial-run tenants (the reviewer-driven blueprint check). ---
-    learning_trial_tenants: str = Field(
-        "",
-        description=(
-            "Tenants a reviewer may run a TRIAL against: a COMMA-SEPARATED list of "
-            "`clientcode:proc_center:jti` triples, e.g. "
-            "`CLIENT_A:PC01:JTI001,CLIENT_B:PC02:JTI002`. Empty (the default) means the "
-            "deployment tenant only, so behaviour is unchanged until an operator opts in.\n\n"
-            "A plain string rather than a `list[str]`, deliberately: pydantic parses a list "
-            "field from JSON, so the env value would need embedded quotes that a shell strips "
-            "on the way in — the whole process then fails to START with a parse error naming "
-            "the field and nothing about the quoting. Comma-separated has no such edge.\n\n"
-            "An ALLOWLIST, never free-form input: the browser sends a label and the server "
-            "looks up the claims, so a reviewer can never assemble arbitrary tenant claims. "
-            "The COLUMN scope is unaffected — it is always minted from the blueprint's own "
-            "`uses`, because that is the contract the trial exists to test.\n\n"
-            "This applies to the trial ONLY. The promotion replay's tenant stays process "
-            "config: it carries no user's authority and asks one structural question "
-            "(`TenantClaims`). What the trial adds is the ability to ASK the question that "
-            "docstring names as its own limit — 'the blueprint is verified against THAT "
-            "TENANT'S DATA only' — which is invisible when there is one hardcoded tenant, and "
-            "which cost us a silent green gate when its row grant expired."
-        ),
-    )
-
     # --- LLM-assisted parameterization revision (design §C). ---
     #
     # SEPARATE from the judge's switch on purpose: this one is human-gated and
@@ -616,6 +591,33 @@ class LearningSettings(BaseSettings):
             "Model id for the revision proposal. EMPTY => reuse the extractor's model."
         ),
     )
+    # --- Hand-authored blueprints (the minting page). ---
+    learning_mint_model: str = Field(
+        "",
+        description=(
+            "Model for the blueprint MINTING page. Empty (the default) falls back to the "
+            "revise model, then the extractor's.\n\n"
+            "DECLARED, not merely read: `_build_minter` reads this with `getattr`, and "
+            "settings use `extra=\"ignore\"` — so while the field did not exist, setting "
+            "LEARNING_MINT_MODEL in the environment did nothing at all, silently, and the "
+            "minter always used the fallback. That is a trap this repo has already been "
+            "bitten by; a field that is read must be declared."
+        ),
+    )
+    learning_mint_timeout_seconds: float = Field(
+        150.0,
+        gt=0.0,
+        description=(
+            "Hard ceiling on one minting call. Larger than the reviser's because the work is "
+            "larger: a drafting turn writes a whole query — several, for a composite DAG — "
+            "rather than re-classifying literals in one that already exists.\n\n"
+            "Must stay BELOW the BFF's `_INBOX_MODEL_HOP_TIMEOUT_SECONDS` (180s) so the "
+            "upstream's own graceful message reaches the browser instead of a bare 502. It was "
+            "briefly EQUAL to it, which is not below: the BFF's read budget starts first, so it "
+            "expired first and produced exactly the 502 this field exists to avoid."
+        ),
+    )
+
     learning_revise_timeout_seconds: float = Field(
         120.0,
         gt=0.0,

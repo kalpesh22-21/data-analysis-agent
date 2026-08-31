@@ -229,3 +229,69 @@ def test_verify_is_dead_on_a_row_that_just_promoted() -> None:
     branch = _HTML[_HTML.index(marker) :]
     branch = branch[: branch.index("});")]
     assert "verifyBtn.disabled = true" in branch
+
+
+# --- the revise modal ---------------------------------------------------------------------
+
+
+def test_the_revise_proposal_opens_a_modal_rather_than_applying_on_trust() -> None:
+    """The inline proposal asked a reviewer to read a row-level diff and commit on it. The
+    modal shows the candidate AS IT WOULD BE and lets them adjust first, so the assistant's
+    answer is a starting point rather than take-it-or-leave-it.
+
+    On BOTH surfaces. Wiring it only to the review queue put it on the path least likely to
+    open it: a queue card is usually already classified and the assistant has nothing to add,
+    while a `needs_parameterization` row exists BECAUSE something is unclassified."""
+    assert "function openReviseModal(" in _HTML
+    assert 'data-testid", "inbox-revise-modal"' in _HTML
+    assert 'apply.textContent = "Review the change…"' in _HTML
+    assert "openReviseModal(item, parsed, node, function (entries, replace)" in _HTML
+
+
+def test_the_modal_shows_the_sql_and_offers_no_way_to_edit_it() -> None:
+    """⚠ THE GUARANTEE THE REVISER'S TOOL MAKES, held at the UI too. The template is DERIVED
+    from the accepted query by AST rewrite, so `explain_ok`, `binds_to_subset_uses` and
+    `read_only_select` only mean something because they check a provenance chain back to a
+    query that really ran. A hand-edited template leaves all three validating prose.
+
+    Shown in a `<pre>`, never an input — a reviewer must be able to READ the query they are
+    classifying without being offered a box that would invalidate the checks."""
+    assert '"pre", "modal-sql", template' in _HTML
+    assert "Not editable — the template is derived" in _HTML
+
+
+def test_the_modal_writes_nothing_until_apply_and_goes_through_the_same_validation() -> None:
+    """It is a better keyboard, not a second write path: apply posts to `apply_revision`,
+    which re-validates exactly as a hand-typed array does."""
+    assert "Nothing is written until you apply." in _HTML
+    assert "performRevisionApply(item.candidate_id, entries, node, apply)" in _HTML
+
+
+def test_the_modal_drops_fields_the_chosen_role_does_not_use() -> None:
+    """The documented live-model failure, now reachable by a HUMAN: switch a role and leave the
+    old boxes populated, and an `inline` entry carries an empty `slot` object — which reads as
+    a slot declaration and fails validation. `readModalEntries` rebuilds from the role."""
+    assert "ROLE_FIELDS" in _HTML
+    assert "var wanted = ROLE_FIELDS[role] || [];" in _HTML
+
+
+def test_the_modal_can_be_dismissed_without_committing() -> None:
+    """Escape and click-outside both cancel. A modal dismissable only by its own button is a
+    trap on a surface where walking away is the safe action."""
+    assert 'if (ev.target === backdrop) closeReviseModal();' in _HTML
+    assert 'ev.key === "Escape"' in _HTML
+
+
+def test_the_modal_commits_through_the_verb_its_surface_owns() -> None:
+    """The review queue REPLACES (`apply_revision` — idempotent, which is what lets it be
+    offered on a status whose guard cannot protect an append); the form APPENDS what the
+    reviewer was missing (`complete`). Same modal, same edits, different commit."""
+    assert "performRevisionApply(item.candidate_id, entries, node, apply)" in _HTML
+    assert "performCompletion(item.candidate_id, area.value, replace, node," in _HTML
+
+
+def test_the_form_modal_writes_back_through_the_visible_textarea() -> None:
+    """So the modal never becomes a hidden second source of truth for what is about to be
+    posted — the reviewer can still see and edit exactly what will be sent, and
+    `performCompletion` stays the one submit path."""
+    assert "area.value = JSON.stringify(entries, null, 2)" in _HTML

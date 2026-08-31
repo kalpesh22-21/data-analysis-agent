@@ -1,27 +1,26 @@
-"""KNOWN LIMITATION: `check_dag` now accepts a table intermediate, but S4 still
-cannot validate one — the loop STILL cannot learn a scratch-join composite.
+"""CLOSED: S4 can now validate a table intermediate, so the loop CAN learn a scratch join.
 
-Fixing `check_dag` moved `dag_ok` from False to True for the canon's
-`bp-earnings-by-department-via-scratch-join` shape. It did not make that shape
-learnable, because `dag_ok` is the THIRD check `decide_outcome` consults and the
-FIRST one (`explain_ok`) fails first:
+This file was written to document the opposite. `check_dag` accepted the canon's
+`bp-earnings-by-department-via-scratch-join` shape, but `explain_ok` is consulted FIRST and
+failed, so the shape stayed unlearnable:
 
     builder._provenance_uses(templates, catalog_schema)
       -> sqlparse.extract_column_provenance(node_1_template, catalog)
       -> ProvenanceExtractionError  (D64, scratch fail-closed)
       -> explain_ok=False -> ("fail_to_review", "explain_failed")
 
-And the mechanism is harder than "the scratch table is not in the catalog": the
-extractor rejects ANY `scratch.*` reference that has no bound `session_id`, so
-registering the scratch table in `catalog_schema` does not help either (pinned
-below). The corpus loader solves the same problem differently — it never calls the
-provenance extractor for composites; it builds a synthetic per-node scratch schema
-(`compiler._scratch_schema_for_node`) and hands it to `qualify_columns`. S4 has
-no equivalent seam.
+And the mechanism was harder than "the scratch table is not in the catalog": the extractor
+rejected ANY `scratch.*` reference with no bound `session_id`, so registering the table in
+`catalog_schema` did not help either — it raises before any schema is consulted.
 
-So: fix 1 is PREPARATORY for the shape that motivated it. The one capability it does
-deliver today is the TERMINAL table output (last test) — previously rejected by the
-blanket `any(v != "scalar")` rule.
+THE FIX IS THE ONE THIS FILE PREDICTED: `_provenance_uses` now hands the extractor the scratch
+placeholders each node DECLARES it consumes (`declared_scratch`), plus a per-node column schema
+built the loader's way (`compiler._scratch_schema_for_node` / `_template_output_columns`). A
+declared placeholder names an intermediate the blueprint produces itself — no session owns it
+and nothing is materialized until the DAG runs — so the ownership question does not apply.
+Anything NOT declared still fail-closes, so the omit-the-header bypass D64 exists for stays shut.
+
+The tests below are kept, flipped from documenting the limitation to guarding the fix.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ import pytest
 
 from data_agent.learning.generalize.builder import generalize_blueprint
 from data_agent.learning.generalize.rewrite import rewrite_sql_to_template
-from data_agent.learning.generalize.validate import REASON_DAG, REASON_EXPLAIN, check_dag
+from data_agent.learning.generalize.validate import check_dag
 from data_agent.sqlparse import ProvenanceExtractionError, extract_column_provenance
 
 _CATALOG: dict[str, dict[str, str]] = {
@@ -132,26 +131,28 @@ def test_the_dag_gate_now_passes_for_the_scratch_join_shape() -> None:
     assert check_dag(_scratch_join_payload()["composes"]) is True
 
 
-def test_a_scratch_join_composite_still_fails_to_review_on_explain_not_dag() -> None:
-    """KNOWN LIMITATION. `explain_ok` is checked before `dag_ok`, so the outcome and
-    the S7 routing tag are unchanged from before fix 1 — only the tag's REASON moved
-    from `dag_invalid` to `explain_failed`."""
+def test_a_scratch_join_composite_now_validates_instead_of_failing_on_explain() -> None:
+    """CLOSED. `_provenance_uses` now declares the node's TABLE consumes, so the extractor
+    exempts them from the D64 ownership check and the walk reaches the warehouse columns."""
     sv = _generalize().static_validation
-    assert sv.outcome == "fail_to_review"
-    assert sv.reason == REASON_EXPLAIN
-    assert sv.reason != REASON_DAG
-    assert sv.explain_ok is False
+    assert sv.outcome == "ok"
+    assert sv.reason is None
+    assert sv.explain_ok is True
 
 
-def test_the_whole_generalization_is_degraded_not_just_the_explain_flag() -> None:
-    """`_provenance_uses` returning `(False, ())` cascades: `uses` is empty, so
-    `binds_to_subset_uses` is False and `read_only_select` is short-circuited False
-    too. Nothing downstream of S4 has anything to work with."""
+def test_the_whole_generalization_is_populated_not_just_the_explain_flag() -> None:
+    """The cascade ran the other way before: `(False, ())` emptied `uses`, which forced
+    `binds_to_subset_uses` and `read_only_select` False too, so nothing downstream had
+    anything to work with. All three recover together.
+
+    ⚠ `uses` NAMES ONLY WAREHOUSE COLUMNS. The scratch table is this blueprint's own
+    intermediate, so including it would inflate a footprint that access control reads — the
+    D69/OQ-4 scope-honesty split the loader makes, made the same way in S4."""
     gen = _generalize()
-    assert gen.uses == ()
-    assert gen.static_validation.binds_to_subset_uses is False
-    assert gen.static_validation.read_only_select is False
-    # The per-node templates DID rewrite — the rewrite is not the blocker.
+    assert gen.uses
+    assert not any(u.startswith("scratch.") for u in gen.uses)
+    assert gen.static_validation.binds_to_subset_uses is True
+    assert gen.static_validation.read_only_select is True
     assert len(gen.node_templates) == 2
 
 
@@ -193,17 +194,6 @@ def test_the_loader_has_the_seam_s4_lacks() -> None:
     assert builder.extract_column_provenance is extract_column_provenance
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "KNOWN LIMITATION (not a regression — pre-dates this slice and is NOT closed "
-        "by it): the learning loop cannot emit a scratch-join composite because S4's "
-        "explain check has no scratch seam. Closing it means giving `_provenance_uses` "
-        "the loader's treatment — either a per-node scratch schema (the "
-        "`_scratch_schema_for_node` equivalent) or a session_id-bearing provenance "
-        "call. When that lands, this flips to XPASS and the guard becomes real."
-    ),
-)
 def test_the_loop_can_learn_the_canon_scratch_join_blueprint() -> None:
     gen = _generalize()
     assert gen.static_validation.outcome == "ok"
@@ -278,3 +268,23 @@ def test_the_old_scalar_only_rule_would_have_rejected_that_same_shape() -> None:
     )
     assert old_rule_rejects is True
     assert check_dag(composes) is True
+
+
+def test_a_placeholder_shaped_like_a_materialized_table_is_not_declared() -> None:
+    """DEFENCE IN DEPTH, and deliberately conservative in the fail-closed direction.
+
+    A `consumes` key is LLM-authored on the mined path, so nothing stops a model naming a
+    placeholder `s_victim_bp_abc`. Traced end to end such a name is inert — every use is a
+    membership key or the identifier `_rewrite_scratch_tables` REPLACES with the caller's own
+    materialized table, so it never reaches warehouse SQL — but it is a lie to anyone auditing
+    the corpus later, and an intermediate should carry a semantic name anyway.
+
+    Refusing to DECLARE it means it falls through to the ordinary D64 fail-closed path rather
+    than being special-cased: the blueprint is refused, not quietly accepted.
+    """
+    from data_agent.learning.generalize.builder import _declared_scratch
+
+    assert _declared_scratch({"consumes": {"emp_earnings": "$0"}}) == {"emp_earnings"}
+    assert _declared_scratch({"consumes": {"s_victim_bp_abc": "$0"}}) == frozenset()
+    # A SCALAR consume is a bound token, never a table source, so it is never declared either.
+    assert _declared_scratch({"consumes": {"total": "$0.total"}}) == frozenset()

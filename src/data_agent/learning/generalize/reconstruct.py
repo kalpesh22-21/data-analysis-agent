@@ -35,7 +35,10 @@ from typing import Any
 
 import sqlglot
 
-from data_agent.runtime.blueprint.template import SLOT_TOKEN
+from data_agent.runtime.blueprint.template import (
+    slot_tokens_outside_strings,
+    sub_slot_tokens,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -105,14 +108,17 @@ def _substitute(template: str, values: dict[str, tuple[Any, str]], *, bare: bool
     reconstruction tries the quoted reading first and falls back — see `reconstruct_accepted_sql`.
     """
 
-    def _one(match: re.Match[str]) -> str:
-        value, slot_type = values.get(match.group(1), ("", ""))
+    def _one_named(name: str) -> str:
+        value, slot_type = values.get(name, ("", ""))
         text = "" if value is None else str(value)
         if bare and slot_type not in _LIST_TYPES and _NUMERIC.match(text):
             return text
         return _render(value, slot_type)
 
-    return SLOT_TOKEN.sub(_one, template)
+    # STRING-AWARE. Substituting into a `{x}` that lives inside a string constant
+    # produced `''VALUE''`, which does not parse — so the whole candidate came back
+    # unrebuildable and the reviser could never act on it.
+    return sub_slot_tokens(template, _one_named)
 
 
 def reconstruct_accepted_sql(payload: dict[str, Any]) -> str | None:
@@ -134,7 +140,11 @@ def reconstruct_accepted_sql(payload: dict[str, Any]) -> str | None:
         return None
 
     values = _slot_values(payload)
-    missing = [name for name in SLOT_TOKEN.findall(template) if name not in values]
+    missing = [
+        name
+        for name in slot_tokens_outside_strings(template)
+        if name not in values
+    ]
     if missing:
         # A token with no entry means the plan and the template disagree — exactly what the
         # totality walk exists to catch. Refuse rather than invent a value for it.

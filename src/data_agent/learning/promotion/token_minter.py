@@ -127,6 +127,52 @@ class TokenMinter(Protocol):
     async def mint(self, column_scope: list[str], *, session_id: str) -> str: ...
 
 
+class SuppliedTokenMinter:
+    """A `TokenMinter` that returns a token SOMEONE ELSE ALREADY HOLDS, unchanged.
+
+    For the reviewer-driven TRIAL only, and it exists because the trial surface must never mint
+    authority. A reviewer pastes a token they already have; this hands it to the probe. Nothing
+    here contacts the IdP, so no scope is requested, no `sid_hash` is bound, and no credential
+    is created by the act of reviewing.
+
+    ⚠ **`column_scope` IS IGNORED, AND THAT IS THE WHOLE TRADE.** A minted replay token carries
+    EXACTLY the blueprint's declared `uses`, so the MCP's D57 teeth reject a query that reads
+    outside its own footprint. A pasted token carries whatever its holder was given — usually
+    broader — so during a trial those teeth do not bite, and a template reading an undeclared
+    column can still return rows.
+
+    WHAT STILL CATCHES THAT, and why the trade is acceptable rather than merely convenient: the
+    column-scope contract is enforced at LANDING by
+    `runtime/blueprint/compiler.py::_assert_template_reads_within_uses`, which resolves every
+    table and column the template reads against a schema built only from `uses` and refuses the
+    blueprint outright. That check is static, runs on the promotion path, and cannot be
+    influenced by which token a reviewer pasted. So the footprint is still enforced before
+    anything is served — the trial simply stops being a second place it is enforced.
+
+    WHAT A TRIAL THEREFORE PROVES, stated precisely: this SQL executes and returns this shape,
+    for a principal with this token's entitlements. It does NOT prove the declared footprint is
+    honest, and the UI must not imply that it does.
+
+    NEVER PERSISTED, NEVER LOGGED, NEVER ECHOED. The token lives for one request. `__repr__` is
+    overridden because a dataclass-style repr in a traceback or a debug log is exactly how a
+    bearer credential escapes.
+    """
+
+    __slots__ = ("_token",)
+
+    def __init__(self, token: str) -> None:
+        token = (token or "").strip()
+        if not token:
+            raise ValueError("a trial token cannot be blank")
+        self._token = token
+
+    async def mint(self, column_scope: list[str], *, session_id: str) -> str:
+        return self._token
+
+    def __repr__(self) -> str:  # pragma: no cover - defensive
+        return "SuppliedTokenMinter(<redacted>)"
+
+
 class HttpTokenMinter:
     """Real `TokenMinter` over the token IdP's `POST /token` (Layer 2+).
 
@@ -219,4 +265,10 @@ class HttpTokenMinter:
         return token
 
 
-__all__ = ["HttpTokenMinter", "TenantClaims", "TokenMintError", "TokenMinter"]
+__all__ = [
+    "HttpTokenMinter",
+    "SuppliedTokenMinter",
+    "TenantClaims",
+    "TokenMintError",
+    "TokenMinter",
+]

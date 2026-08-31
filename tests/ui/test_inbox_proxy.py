@@ -611,3 +611,7 @@ def test_every_model_backed_action_is_in_the_body_allowlist() -> None:
     a second such route cannot be added to one list and forgotten in the other."""
     assert server._INBOX_MODEL_ACTIONS <= server._INBOX_BODY_ACTIONS
     assert server._INBOX_MODEL_ACTIONS <= server._INBOX_ACTIONS
+    # The timeout set is a SUPERSET, and the gap is the point: it also covers model-backed
+    # routes that are not per-candidate actions (`mint`), which must get the long read budget
+    # WITHOUT being admitted to the action allowlist above.
+    assert server._INBOX_MODEL_ACTIONS <= server._INBOX_MODEL_PATH_SEGMENTS

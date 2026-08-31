@@ -23,6 +23,12 @@ from data_agent.learning.candidate.verdicts import LeakageVerdict
 from data_agent.learning.inbox import InboxTransitionError, ReviewInbox
 from data_agent.learning.inbox.models import InboxItem
 
+# Approving REPLAYS against the live warehouse, and this surface mints no tokens — the
+# reviewer pastes one. Any non-blank string does here; `probe_factory` decides what the replay
+# actually runs through, which is the fake the test already wired.
+REVIEWER_TRIAL_TOKEN = "reviewer-pasted-token"
+
+
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "learning"
 
 
@@ -190,7 +196,7 @@ async def test_approve_promotes_to_validated_and_strips_entity_spans():
     before = await store.get(cid)
     assert LeakageVerdict.from_doc(before.entity_scan).hits[0].span == "E12345"
 
-    promoted = await inbox.approve(cid)
+    promoted = await inbox.approve(cid, token=REVIEWER_TRIAL_TOKEN)
     assert promoted.status == CandidateStatus.VALIDATED
     # The span is blanked; the field/kind (reviewer context) survive.
     hit = LeakageVerdict.from_doc(promoted.entity_scan).hits[0]
@@ -204,7 +210,7 @@ async def test_retract_moves_validated_to_retired():
     store = await _store_with_all_reasons()
     inbox = ReviewInbox(store)
     cid = "candidate::reason-blueprint_sampled::0"
-    await inbox.approve(cid)  # in_review → validated
+    await inbox.approve(cid, token=REVIEWER_TRIAL_TOKEN)  # in_review → validated
     retired = await inbox.retract(cid)  # validated → retired
     assert retired.status == CandidateStatus.RETIRED
 
@@ -216,9 +222,9 @@ async def test_approve_requires_in_review():
     store = await _store_with_all_reasons()
     inbox = ReviewInbox(store)
     cid = "candidate::reason-blueprint_sampled::0"
-    await inbox.approve(cid)  # now validated
+    await inbox.approve(cid, token=REVIEWER_TRIAL_TOKEN)  # now validated
     with pytest.raises(InboxTransitionError):
-        await inbox.approve(cid)  # can't approve a validated candidate
+        await inbox.approve(cid, token=REVIEWER_TRIAL_TOKEN)  # can't approve a validated candidate
 
 
 async def test_retract_requires_validated():

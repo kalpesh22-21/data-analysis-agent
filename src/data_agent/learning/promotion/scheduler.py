@@ -17,6 +17,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime
+from typing import Any
 
 from data_agent.timeutil import now_iso as _now_iso
 
@@ -541,7 +542,7 @@ class PromotionScheduler:
     # -- caller-driven transitions (human review / user correction) -----------
 
     async def apply_human_decision(
-        self, env: CandidateEnvelope, decision: str
+        self, env: CandidateEnvelope, decision: str, *, probe: Any = None
     ) -> CandidateDecision:
         """Apply a human `in_review` decision: approve → validated, reject → rejected.
 
@@ -682,7 +683,12 @@ class PromotionScheduler:
                     env.candidate_id, env.type, "hold", env.status, env.status,
                     reason="approve_blocked_static_not_ok",
                 )
-            replay = await golden_replay(env, probe=self._probe)
+            # THE CALLER'S PROBE when one is supplied. A human approve runs the golden replay
+            # as the REVIEWER — against a warehouse token they pasted — rather than as a
+            # service principal this process minted. The scheduler's own probe stays the
+            # default for every UNATTENDED path (`apply_scheduled`, retract), which has no
+            # human to ask.
+            replay = await golden_replay(env, probe=probe or self._probe)
             if not replay.passed:
                 return CandidateDecision(
                     env.candidate_id, env.type, "hold", env.status, env.status,

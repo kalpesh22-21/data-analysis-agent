@@ -43,6 +43,7 @@ from data_agent.runtime.provenance.catalog_handle import SemanticCatalogHandle
 from data_agent.runtime.retrieval.models import BlueprintDetail, Candidate
 from data_agent.runtime.retrieval.scope_filter import is_blueprint_in_scope
 from data_agent.runtime.session.models import ResultPreview
+from data_agent.sqlparse import is_own_session_scratch_table
 
 from .grain_probe import (
     build_grain_probe_sql,
@@ -77,6 +78,7 @@ from .slots import (
     slot_token_names,
 )
 from .template import (
+    SCRATCH_DB,
     TemplateBindError,
     assert_read_only_select,
     bind_template,
@@ -152,11 +154,15 @@ class ExecPaused:
         via the model loop.
 
         An approval gate (`blueprint_approval`) or a `when…on_violation:ask`
-        (`blueprint_when_ask`) carries `completed_nodes_json` — the SCALAR outputs, provenance
-        and SQL of the nodes already run — plus `awaiting_node`, so `AgentLoop.resume` re-enters
+        (`blueprint_when_ask`) carries `completed_nodes_json` — the SCALAR outputs, provenance,
+        SQL and (for a table producer) the materialized `scratch.…` table name + row count of
+        the nodes already run — plus `awaiting_node`, so `AgentLoop.resume` re-enters
         `resume()` with completed nodes rehydrated and never re-runs them (exactly-once,
-        surviving a process restart). A `resolve_via` degrade does NOT pause; it falls back to
-        the raw loop.
+        surviving a process restart). It comes back as persisted, therefore untrusted, JSON:
+        the carried table is re-validated for session ownership (D64) AND re-counted live
+        before anything binds it, because the intermediate's TTL expires ROWS while leaving
+        the table standing. A `resolve_via` degrade does NOT pause; it falls back to the raw
+        loop.
     """
 
     reason: str  # "blueprint_slot" | "blueprint_approval" | "blueprint_when_ask"
@@ -398,7 +404,29 @@ class BlueprintExecutor:
         if _has_table_intermediate(blueprint.composes) and not table_consumed_orders:
             _logger.info("blueprint %s has a table intermediate with no table consume; UNSUPPORTED", bid)
             return ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
-        materialized: dict[int, str] = {}  # node order → full "scratch.s_<sid>_bp_<uuid>"
+        # node order → full "scratch.s_<sid>_bp_<uuid>". Populated live by
+        # `_materialize_node` AND — since the mid-DAG-pause fix — re-seeded on resume
+        # from the checkpoint (see `_restore_materialized` below).
+        #
+        # THE SCRATCH TABLE DOES NOT RELIABLY SURVIVE THE PAUSE, and an earlier
+        # version of this comment claimed it did. The real semantics, read off the
+        # DDL (ch-api `scratch_ingest.build_scratch_create_sql`): the intermediate is
+        # `ENGINE = MergeTree … TTL <created_at> + INTERVAL <scratch_ttl_seconds>
+        # SECOND` — a ROW-level TTL, not a table TTL. ClickHouse expires ROWS on
+        # background merges and never drops the table, so after the TTL the name
+        # still RESOLVES (no dispatch error to pass through) while the JOIN sees
+        # zero rows, or an arbitrary partially-merged subset. And nothing bounds the
+        # window: `scratch_ttl_seconds` defaults to 3600 while the session doc
+        # carrying this checkpoint lives `session_ttl_seconds` = 604_800 (7 days),
+        # and no layer stamps or checks a pause age. An approval answered the next
+        # morning would otherwise return a silently under-counted aggregate that the
+        # D56 grain gate — a SHAPE check on the terminal result — validates just as
+        # happily, i.e. `status: "verified"` on a wrong answer.
+        #
+        # So a restored name is never trusted on AGE. It is verified against a LIVE
+        # COUNT of the table it names, matched exactly against the row count the
+        # producer materialized (carried on the same record).
+        materialized: dict[int, str] = {}
 
         provenances: list[frozenset[tuple[str, str]] | None] = []
         all_referenced = _all_referenced_slots(blueprint)
@@ -429,6 +457,12 @@ class BlueprintExecutor:
         # final union + the `sql` transparency list span the WHOLE DAG, not just
         # the post-resume tail. Seed both from the rehydrated records (in order); a
         # `None` provenance POISONS the union exactly as a live undetermined call.
+        # The materialized TABLE NAME + row count of a table-producing node ride the
+        # same records, for the same reason: a rehydrated producer is skipped below
+        # (exactly-once, D45) and so never re-materializes, and without its name the
+        # consumer's `$N` had no binding and every paused table-intermediate
+        # blueprint died on SLOT_INVALID at resume. They are re-validated, not
+        # trusted — `_restore_materialized`.
         node_sqls: list[str] = []
         for order in sorted(running):
             record = running[order]
@@ -436,6 +470,9 @@ class BlueprintExecutor:
             carried_sql = record.get("sql")
             if isinstance(carried_sql, str):
                 node_sqls.append(carried_sql)
+        materialized.update(
+            await self._restore_materialized(bid, running, table_consumed_orders, credentials)
+        )
         terminal: tuple[str, str, Any] | None = None  # (template, bound_sql, result)
 
         for node in topo:
@@ -510,9 +547,11 @@ class BlueprintExecutor:
                 )
                 if decision != "approve":
                     if decision == "deny":
-                        # on_deny: skip_remaining — stop. The pre-pause result is
-                        # NOT carried across the checkpoint (scalar-only, F2), so a
-                        # denied approval always falls back to the raw loop rather
+                        # on_deny: skip_remaining — stop. Result ROWS are not carried
+                        # across the checkpoint (F2 — the records carry scalars,
+                        # provenance, SQL and a table intermediate's name+count, never
+                        # a result set), so a denied approval always falls back to the
+                        # raw loop rather
                         # than returning a best-partial (S4 honest call — a terminal
                         # approval is rejected at load, and every approval decision
                         # happens on RESUME where pre-pause query nodes are
@@ -602,16 +641,24 @@ class BlueprintExecutor:
             # dispatch) is folded into the union above; scratch columns are excluded
             # downstream by the MCP's D69/OQ-4 filter (§Q1/§5.3).
             if node.order in table_consumed_orders:
-                table_name, mat_fail = await self._materialize_node(
+                table_name, mat_rows, mat_fail = await self._materialize_node(
                     bid, node, result.result_full, credentials
                 )
                 if mat_fail is not None:
                     return mat_fail
-                assert table_name is not None  # mat_fail is None ⇒ table_name set
+                # mat_fail is None ⇒ both are set
+                assert table_name is not None and mat_rows is not None
                 materialized[node.order] = table_name
                 # A materialized intermediate is neither a scalar producer nor the
-                # terminal — record it (empty scalar output) and move on.
-                running[node.order] = _node_record({}, result.provenance, node_sql)
+                # terminal — record it (empty scalar output) and move on. The table
+                # NAME and its ROW COUNT go on the record so the intermediate can
+                # survive a mid-DAG pause: this node is rehydrated-skipped on resume
+                # and never re-materializes, and the count is what lets the resume
+                # prove the table still holds what it wrote rather than a
+                # row-TTL-expired remnant (see `_restore_materialized`).
+                running[node.order] = _node_record(
+                    {}, result.provenance, node_sql, table_name, mat_rows
+                )
                 _record_empty_output(node, node_outputs)
                 continue
             # B1/F2: a node with a declared SCALAR output MUST return a single cell
@@ -845,8 +892,12 @@ class BlueprintExecutor:
         options: list[str],
         show: dict[str, Any] | None = None,
     ) -> ExecPaused:
-        """Build a mid-DAG `ExecPaused` — the completed SCALAR outputs + the node
-        to resume at are serialized into the checkpoint (D45 durability, §2.5)."""
+        """Build a mid-DAG `ExecPaused` — the completed-node records (their SCALAR
+        outputs, captured provenance, bound SQL, and a table producer's materialized
+        `scratch.…` name + row count) plus the node to resume at are serialized into
+        the checkpoint (D45 durability, §2.5). Serialization shape and its
+        re-validation on the way back live in `_dumps_completed` /
+        `_restore_materialized`."""
         pending: dict[str, Any] = {"question": question, "options": options}
         if show is not None:
             pending["show"] = show
@@ -899,28 +950,197 @@ class BlueprintExecutor:
         values = [str(row[0]) for row in rows if row and row[0] is not None]
         return values, [probe.provenance]  # append UNCONDITIONALLY (None poisons the union)
 
+    async def _restore_materialized(
+        self,
+        blueprint_id: str,
+        completed: dict[int, dict[str, Any]],
+        table_consumed_orders: set[int],
+        credentials: RuntimeCredentials,
+    ) -> dict[int, str]:
+        """Re-seed `materialized` on resume from the checkpoint's completed-node records
+                — the ONLY way a table intermediate can survive a mid-DAG pause, since its
+                producer is rehydrated-skipped and never re-materializes (exactly-once, D45).
+
+                Nothing here is trusted. Three gates, cheapest first, and a failure of any one
+                simply does NOT seed that order: the consumer then finds no binding for its
+                `$N`, `_node_table_bindings` returns the pre-existing SLOT_INVALID, and the raw
+                loop answers. No new error code, no partial bind.
+
+                1. OWNERSHIP (D64) — the trust boundary. Every OTHER value that ever reached
+                   `materialized` came straight back from the scratch endpoint, which derives
+                   the `s_<sid>_` prefix server-side from X-Session-Id. THIS one comes from
+                   persisted checkpoint JSON, which a tampered session document could author,
+                   and it flows on into `_node_table_bindings` -> `bind_template` -> an
+                   identifier in dispatched SQL. It is AST-quoted, so not an injection surface
+                   — but a name reading `scratch.s_<OTHERSID>_bp_…` would be rewritten into the
+                   JOIN as a cross-session scratch read. So the SAME ownership rule the
+                   provenance extractor enforces on a read is re-applied at the point the
+                   untrusted name re-enters the runtime. Defense in depth: the MCP's own D64
+                   read gate would also deny it at dispatch; we do not make that the only check.
+
+                   WHAT THIS GATE DOES NOT COVER: it proves the named table belongs to THIS
+                   session, not that it is the table this run produced. WITHIN-session
+                   integrity belongs to the session document — a tamperer with write access to
+                   it can swap in a different own-session scratch table, exactly as they can
+                   rewrite the `output` scalars or the carried `sql`. That is the pre-existing
+                   trust model for the checkpoint, not something the table carry widens.
+
+                2. A CARRIED ROW COUNT must be present and well-typed. A checkpoint written by
+                   code older than this gate has a table but no count; the count cannot be
+                   verified, so the name is refused (fail-closed on the deploy boundary).
+
+                3. A LIVE COUNT of the named table must match it EXACTLY. This is the TTL
+                   gate. The intermediate carries a ROW-level TTL on a MergeTree (ch-api
+                   `build_scratch_create_sql`), so after `scratch_ttl_seconds` (3600 by
+                   default, against a 7-day session doc) the table still resolves while its
+                   rows are gone — no dispatch error, a smaller JOIN, and a D56 shape check
+                   that validates the smaller result happily. Exact equality in BOTH
+                   directions distinguishes the two cases an emptiness check would conflate: a
+                   producer that legitimately materialized ZERO rows stores 0, probes 0 and
+                   passes; one that materialized 812 and expired to 0 — or to 300 mid-merge —
+                   is refused.
+
+                Only orders that are actually table-consumed are considered, so a refused or
+                irrelevant record costs no dispatch at all.
+        """
+        restored: dict[int, str] = {}
+        for order in sorted(table_consumed_orders):
+            record = completed.get(order)
+            if record is None:
+                continue  # not rehydrated — this producer runs live and materializes itself
+            table = record.get("table")
+            if not isinstance(table, str) or not _is_own_session_scratch_table(
+                table, credentials.session_id
+            ):
+                # Log it: this is the branch that detects a tampered checkpoint naming
+                # another session's scratch table, and the non-raising ownership
+                # predicate deliberately swallows the `ScratchSessionError` whose
+                # message was the only other signal. Identifier + node order ONLY —
+                # never the table name or any warehouse data (D25).
+                _logger.warning(
+                    "blueprint %s node %s carried a scratch table this session does not "
+                    "own (or no table at all); NOT restored — the consumer will fail "
+                    "closed to SLOT_INVALID",
+                    blueprint_id,
+                    order,
+                )
+                continue
+            expected = record.get("row_count")
+            if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
+                _logger.warning(
+                    "blueprint %s node %s carried a scratch table with no usable row "
+                    "count (legacy or tampered checkpoint); NOT restored — the table's "
+                    "contents cannot be verified against its TTL",
+                    blueprint_id,
+                    order,
+                )
+                continue
+            live = await self._count_scratch_rows(table, credentials)
+            if live != expected:
+                _logger.warning(
+                    "blueprint %s node %s materialized %d rows but its scratch table now "
+                    "counts %s; NOT restored — a row-TTL-expired or altered intermediate "
+                    "would under-count the JOIN into a 'verified' wrong answer",
+                    blueprint_id,
+                    order,
+                    expected,
+                    live,
+                )
+                continue
+            restored[order] = table
+        return restored
+
+    async def _count_scratch_rows(
+        self, full_table: str, credentials: RuntimeCredentials
+    ) -> int | None:
+        """`SELECT COUNT(*)` the named scratch table through the runQuery choke point →
+                its live row count, or `None` on ANY surprise (a denial, an error, a vanished
+                table, an unreadable result). The caller treats `None` as "do not restore".
+
+                Dispatched exactly as `_probe_domain` dispatches its DISTINCT probe: through
+                `ToolDispatcher.dispatch` so D64 scratch isolation, D57 column scope and D5
+                credential injection come free, and with `emit_progress=False` so it stays an
+                internal query that costs no model budget. The table is built as an AST
+                identifier, never string-interpolated — the ownership rule constrains the
+                name's SHAPE (`s_<sid>_<suffix>`) but not its character set, so the suffix is
+                still endpoint-returned-or-persisted text and gets the same structural
+                treatment the JOIN rewrite gives it.
+
+                PROVENANCE: unlike `_probe_domain` (which appends its probe's provenance
+                UNCONDITIONALLY on success, so an undetermined footprint POISONS the union),
+                this probe contributes NOTHING to `provenances`. Deliberate, and the asymmetry
+                is real rather than an oversight: a domain probe READS A WAREHOUSE COLUMN, so
+                an undetermined provenance there means "we read warehouse data and cannot say
+                what" and must poison. This probe reads exactly one table, in the `scratch`
+                database, pinned by the gate above — no warehouse column is touched, scratch
+                pairs are excluded from the USES set by construction (D69/OQ-4), and the
+                warehouse lineage of the rows it counts is the PRODUCER's provenance, which is
+                carried on the same checkpoint record and already folded into the union. So
+                folding this probe could only ever add an empty set, or spuriously poison an
+                otherwise-honest footprint because an internal integrity check hiccuped. The
+                answer's footprint claim is unchanged and still complete either way.
+
+                The number returned is COUNT(*), not a row of data: it is compared against a
+                stored integer and never reaches the model, the answer or a binding.
+        """
+        db, _sep, name = full_table.partition(".")
+        probe_sql = (
+            exp.select(exp.Count(this=exp.Star()))
+            .from_(exp.Table(this=exp.to_identifier(name), db=exp.to_identifier(db)))
+            .sql(dialect="clickhouse")
+        )
+        probe = await self._tool_dispatcher.dispatch(
+            "runQuery",
+            {"sql": probe_sql, "limit": None},
+            credentials,
+            emit_progress=False,  # internal blueprint query — see the emit_progress note at the top of this module
+        )
+        if probe.status != "ok":
+            return None
+        _columns, rows, _row_count, _truncated = _unpack_result(probe.result_full)
+        if len(rows) != 1 or len(rows[0]) != 1:
+            return None
+        value = rows[0][0]
+        if isinstance(value, bool):
+            return None  # a bool is not a count, and `int(True)` would say 1
+        try:
+            # `int(...)` rather than an isinstance check, matching
+            # `unpack_grain_probe`: a live ClickHouse may hand a UInt64 back as a
+            # decimal STRING over JSON, and refusing that would fail every real
+            # resume. A non-numeric value raises and becomes `None`.
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     async def _materialize_node(
         self,
         blueprint_id: str,
         node: Node,
         result_full: Any,
         credentials: RuntimeCredentials,
-    ) -> tuple[str | None, ExecFailed | None]:
+    ) -> tuple[str | None, int | None, ExecFailed | None]:
         """Materialize a table-output node's result into a session-scoped scratch table via the
                 D93 side-channel.
 
-                Returns `(full_scratch_table_name, None)` on success — the RETURNED
-                `scratch.s_<sid>_bp_<uuid>` name, used VERBATIM and never reconstructed — or
-                `(None, ExecFailed(UNSUPPORTED))` on a structural over-cap or a rejected materialize.
+                Returns `(full_scratch_table_name, row_count, None)` on success — the RETURNED
+                `scratch.s_<sid>_bp_<uuid>` name, used VERBATIM and never reconstructed, and the
+                number of rows ACTUALLY sent to the endpoint — or `(None, None,
+                ExecFailed(UNSUPPORTED))` on a structural over-cap or a rejected materialize.
                 Both fail closed to the raw loop: never a runaway materialization, never a wrong
                 answer.
+
+                The row count is returned (rather than re-derived at the call site from
+                `result_full`) so it can only ever be the length of the list this function
+                handed the endpoint. It is stored on the checkpoint record and is what a resume
+                re-counts the table against — see `_restore_materialized`; a count computed from
+                a different vantage point could drift from what was actually written.
         """
         columns, rows, _rc, truncated = _unpack_result(result_full)
         if not columns:
             _logger.info(
                 "blueprint node %s produced no columns to materialize; UNSUPPORTED", node.order
             )
-            return None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+            return None, None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
         # TRUNCATION guard (BLOCKER fix): the MCP's runQuery HARD-caps rows at
         # max_response_rows (service.py `_compact_result`) regardless of any caller
         # LIMIT, and runBlueprint passes no query_limit. A producer returning more
@@ -936,7 +1156,7 @@ class BlueprintExecutor:
                 "UNSUPPORTED (a partial scratch table would under-count the JOIN)",
                 node.order,
             )
-            return None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+            return None, None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
         # Structural guard (mirrors the D89(d) scalar guard): an oversized
         # intermediate → raw loop, never a runaway. An EMPTY result is allowed (an
         # empty scratch table JOINs to nothing — a legitimate "no rows" answer the
@@ -948,7 +1168,7 @@ class BlueprintExecutor:
                 len(rows),
                 len(columns),
             )
-            return None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+            return None, None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
         typed_cols = _infer_scratch_columns(columns, rows)
         assert self._scratch_client is not None  # gated at _execute_dag entry
         self._observer(
@@ -966,8 +1186,8 @@ class BlueprintExecutor:
                 node.order,
                 exc.code,
             )
-            return None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
-        return table, None
+            return None, None, ExecFailed(UNSUPPORTED_CODE, _UNSUPPORTED_MESSAGE, retryable=False)
+        return table, len(rows), None
 
     async def _verify(
         self,
@@ -1305,7 +1525,14 @@ def _node_table_bindings(
     table name (`s_<sid>_bp_<uuid>`) for the AST JOIN rewrite (§2.2 step 3). An
     upstream node not (yet) materialized → SLOT_INVALID (fail-closed — never a JOIN
     against a non-existent scratch table). Scalar consumes are ignored here (they
-    are value bindings, handled by `_node_bindings`)."""
+    are value bindings, handled by `_node_bindings`).
+
+    This is ALSO where every refused RESTORE lands: a checkpoint whose carried table
+    is missing, malformed, cross-session, countless, or whose live row count no
+    longer matches what the producer wrote (a row-TTL-expired intermediate) is not
+    seeded by `_restore_materialized`, so `materialized` simply has no entry for `$N`
+    and the run takes this same pre-existing SLOT_INVALID exit — no new error code,
+    raw loop answers."""
     bindings: dict[str, str] = {}
     for placeholder, ref in node.consumes.items():
         match = TABLE_CONSUME_REF.match(str(ref))
@@ -1546,11 +1773,55 @@ def _node_record(
     output: dict[str, Any],
     provenance: frozenset[tuple[str, str]] | None,
     sql: str | None,
+    table: str | None = None,
+    row_count: int | None = None,
 ) -> dict[str, Any]:
-    """A completed-node record: its SCALAR `output`, the captured `provenance`, and
-    the bound `sql` — ALL three carried across a mid-DAG pause (B2) so the resumed
-    final union + `sql` transparency span the WHOLE DAG, not just the resumed tail."""
-    return {"output": output, "provenance": provenance, "sql": sql}
+    """A completed-node record: its SCALAR `output`, the captured `provenance`, the
+    bound `sql`, and — for a table PRODUCER only — the full
+    `scratch.s_<sid>_bp_<uuid>` name it materialized to plus the number of rows it
+    wrote there. All five are carried across a mid-DAG pause (B2) so the resumed
+    final union + `sql` transparency span the WHOLE DAG, and so the consumer of a
+    table intermediate can still bind its JOIN after the pause (the producer is
+    rehydrated-skipped and never re-materializes).
+
+    `table` and `row_count` travel TOGETHER and are only useful together: the name
+    alone cannot be trusted, because the intermediate carries a ROW-level TTL and the
+    table outlives its own rows. The count is what a resume re-verifies the table
+    against (`_restore_materialized`).
+
+    Both are `None` for EVERY non-producer node — a skipped/gated node, an approval
+    node, and a scalar producer alike."""
+    return {
+        "output": output,
+        "provenance": provenance,
+        "sql": sql,
+        "table": table,
+        "row_count": row_count,
+    }
+
+
+def _is_own_session_scratch_table(full_table: str, session_id: str | None) -> bool:
+    """True iff *full_table* is a FULLY-qualified `scratch.<name>` owned by
+    *session_id* — the gate a checkpoint-carried materialized table name must pass
+    before it is bound into a JOIN (D64).
+
+    Two independent conditions, both fail-closed:
+      1. exactly `<db>.<name>` with `db == SCRATCH_DB`. Exactly two dot-parts, so a
+         crafted `scratch.s_<sid>_bp_1.something` (which sqlglot would happily emit
+         as ONE quoted identifier) is rejected, as is any other database — the
+         producer only ever writes to `scratch`;
+      2. `<name>` passes the shared D64 ownership rule for this session.
+
+    The rule in (2) is NOT re-implemented here: it is `sqlparse`'s
+    `is_own_session_scratch_table`, the same exact-session-extraction the provenance
+    extractor enforces on every scratch READ. Two copies of an ownership check drift;
+    this one has already been tightened once (a former `startswith` prefix test), and
+    a second copy would have kept the loose form alive.
+    """
+    parts = full_table.split(".")
+    if len(parts) != 2 or parts[0] != SCRATCH_DB:
+        return False
+    return is_own_session_scratch_table(parts[1], session_id)
 
 
 def _prov_to_jsonable(
@@ -1580,15 +1851,24 @@ def _prov_from_jsonable(raw: Any) -> frozenset[tuple[str, str]] | None:
 
 def _dumps_completed(running: dict[int, dict[str, Any]]) -> str | None:
     """Serialize the completed nodes for the checkpoint (§2.5/B2) — an order-sorted
-    `[{order, output, provenance, sql}]` list (deterministic, restart-durable).
-    Provenance + SQL are carried so a resumed DAG's final union/transparency cover
-    the pre-pause nodes that never re-run."""
+    `[{order, output, provenance, sql, table, row_count}]` list (deterministic,
+    restart-durable). Provenance + SQL are carried so a resumed DAG's final
+    union/transparency cover the pre-pause nodes that never re-run.
+
+    `table` + `row_count` (the producer's materialized `scratch.…` name and the
+    number of rows it wrote; `null` on every other node) are carried so the
+    post-pause consumer can bind its JOIN to a table it can PROVE is intact. Both are
+    needed: the intermediate's TTL is ROW-level on a MergeTree, so the table survives
+    the pause while its rows may not, and only a live count matched against this
+    stored one tells the two apart."""
     payload = [
         {
             "order": order,
             "output": running[order].get("output", {}),
             "provenance": _prov_to_jsonable(running[order].get("provenance")),
             "sql": running[order].get("sql"),
+            "table": running[order].get("table"),
+            "row_count": running[order].get("row_count"),
         }
         for order in sorted(running)
     ]
@@ -1596,11 +1876,19 @@ def _dumps_completed(running: dict[int, dict[str, Any]]) -> str | None:
 
 
 def _rehydrate_completed(completed_nodes_json: str | None) -> dict[int, dict[str, Any]]:
-    """Reverse `_dumps_completed` on resume → `{order: {output, provenance, sql}}`.
-    A malformed/absent payload rehydrates as empty (defensive — the walk re-runs
-    from the top, still correct because every node is read-only + idempotent).
-    A record with a missing/`null` provenance rehydrates as `None` (poisons the
-    union — the pre-pause footprint is undetermined, so the answer must drop)."""
+    """Reverse `_dumps_completed` on resume →
+    `{order: {output, provenance, sql, table, row_count}}`. A malformed/absent payload
+    rehydrates as empty (defensive — the walk re-runs from the top, still correct
+    because every node is read-only + idempotent). A record with a missing/`null`
+    provenance rehydrates as `None` (poisons the union — the pre-pause footprint is
+    undetermined, so the answer must drop). A `table` that is not a `str`, or a
+    `row_count` that is not a non-negative `int` (missing, `null`, a bool, a float, a
+    string, an object), rehydrates as `None`.
+
+    TYPE is all that is checked here. This payload is untrusted persisted JSON, so
+    the D64 OWNERSHIP of the name and the LIVE row count of the table it names are
+    both re-checked in `_restore_materialized` — the point where the values would
+    otherwise re-enter the runtime."""
     if not completed_nodes_json:
         return {}
     try:
@@ -1616,10 +1904,14 @@ def _rehydrate_completed(completed_nodes_json: str | None) -> dict[int, dict[str
             output = entry.get("output")
             if isinstance(order, int) and not isinstance(order, bool):
                 sql = entry.get("sql")
+                table = entry.get("table")
+                rows = entry.get("row_count")
                 completed[order] = _node_record(
                     dict(output) if isinstance(output, dict) else {},
                     _prov_from_jsonable(entry.get("provenance")),
                     sql if isinstance(sql, str) else None,
+                    table if isinstance(table, str) else None,
+                    rows if isinstance(rows, int) and not isinstance(rows, bool) and rows >= 0 else None,
                 )
     return completed
 
@@ -1628,9 +1920,12 @@ def _load_completed_into_outputs(
     completed: dict[int, dict[str, Any]], node_outputs: dict[str, Any]
 ) -> None:
     """Rehydrate completed nodes' SCALAR outputs into the `when`/`consumes` env on
-    resume. Only scalars survive the checkpoint (F2 buys this simplification), so
-    `$N` is a synthetic row-shape marker (non-empty ⇒ row_count 1) for
-    `count`/`empty`, and `$N.<name>` is the stored scalar."""
+    resume. Only scalar OUTPUTS feed this env — no result ROWS cross the checkpoint
+    (F2 buys this simplification) — so `$N` is a synthetic row-shape marker
+    (non-empty ⇒ row_count 1) for `count`/`empty`, and `$N.<name>` is the stored
+    scalar. Unchanged by the table-intermediate resume fix: a producer's materialized
+    table NAME also crosses the checkpoint now, but it is a JOIN binding, not a
+    value, and is consumed by `_node_table_bindings` — never by this env."""
     for order, record in completed.items():
         output = record.get("output", {})
         has_value = any(v is not None for v in output.values())

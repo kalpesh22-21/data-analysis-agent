@@ -175,6 +175,7 @@ def _build_alias_map(
     cte_names: set[str],
     catalog_schema: dict[str, dict[str, str]],
     session_id: str | None,
+    declared_scratch: frozenset[str] = frozenset(),
 ) -> dict[str, tuple[str, str]]:
     """Build alias -> (table_name, database) mapping for all real (non-CTE) table refs.
 
@@ -221,7 +222,18 @@ def _build_alias_map(
 
         # Handle scratch tables
         if tbl_db == _SCRATCH_DB:
-            _validate_scratch_name(tbl_name, session_id)
+            # A DECLARED placeholder is not a session read. `scratch.emp_earnings` in a
+            # blueprint TEMPLATE names an intermediate the blueprint itself produces one node
+            # earlier; it is not `s_<sid>_<suffix>`, has no owning session, and nothing has been
+            # materialized yet. The ownership check is about a caller READING somebody's
+            # scratch table, which is a different question, and fail-closing on it made every
+            # table-intermediate blueprint unvalidatable offline.
+            #
+            # The caller must NAME the placeholders it vouches for, so an undeclared
+            # `scratch.*` still fail-closes exactly as before. Default empty ⇒ every runtime
+            # path is unchanged.
+            if tbl_name not in declared_scratch:
+                _validate_scratch_name(tbl_name, session_id)
             # Map alias -> (tbl_name, scratch_db)
             if alias:
                 alias_map[alias] = (tbl_name, tbl_db)
@@ -300,6 +312,37 @@ def _validate_scratch_name(tbl_name: str, session_id: str | None) -> None:
             f"session_id '{session_id}' (expected {_SCRATCH_DB}.s_{session_id}_<suffix> pattern). "
             "Cross-session or malformed scratch access rejected (D64)."
         )
+
+
+def is_own_session_scratch_table(tbl_name: str, session_id: str | None) -> bool:
+    """The D64 scratch-ownership rule as a PREDICATE — `True` iff *tbl_name* (a BARE
+    scratch table name, no `scratch.` prefix) is owned by *session_id*.
+
+    A thin, non-raising wrapper over `_validate_scratch_name` so the rule itself
+    lives in exactly ONE place. It is exported from the `sqlparse` package because a
+    SECOND caller now needs it outside the extractor: the blueprint executor
+    re-validates a materialized scratch table name that came back from a PERSISTED
+    pause checkpoint before it will bind that name into a JOIN (D45 mid-DAG resume).
+    Two hand-written copies of an ownership check are exactly how a tightened rule
+    (this one replaced a loose `startswith` prefix test) drifts back open on one side.
+
+    PREDICATE, not a raising validator, deliberately: the executor's use is a
+    seed-it-or-not BRANCH, not an error path — an unowned name is simply not restored
+    and the existing `_node_table_bindings` miss fails the run closed to SLOT_INVALID
+    with the already-pinned error code. Making it raise would push every caller into a
+    try/except whose only body is `pass`, and the extractor (which DOES want the
+    raise, with its specific message) keeps calling `_validate_scratch_name` directly.
+
+    Fail-closed on anything that is not a `str` and on every falsy *session_id*,
+    inheriting `_validate_scratch_name`'s guarantees verbatim.
+    """
+    if not isinstance(tbl_name, str):
+        return False
+    try:
+        _validate_scratch_name(tbl_name, session_id)
+    except ScratchSessionError:
+        return False
+    return True
 
 
 def _has_select_star(ast: exp.Expression) -> bool:
@@ -602,6 +645,7 @@ def extract_column_provenance(
     catalog_schema: dict[str, dict[str, str]],
     *,
     session_id: str | None = None,
+    declared_scratch: frozenset[str] = frozenset(),
 ) -> frozenset[tuple[str, str]]:
     """Extract the column USES set from a ClickHouse SQL query.
 
@@ -614,6 +658,14 @@ def extract_column_provenance(
         Dict keyed at ``database.table`` granularity (D69/OQ-3), mapping to
         {column: type_string}.  Produced by
         catalog.loader.build_sqlglot_schema_from_catalog().
+    declared_scratch:
+        Scratch PLACEHOLDER names the caller declares this artifact produces itself — the
+        `output: {name: table}` of an earlier node in the same composite. Such a reference is
+        exempt from the session-ownership check, because it names an intermediate that does not
+        exist yet and belongs to no session; the corpus loader makes the same distinction by
+        qualifying against `_scratch_schema_for_node`. Anything NOT named here still
+        fail-closes, so the omit-the-header bypass stays shut. Empty by default, so every
+        runtime caller behaves exactly as before.
     session_id:
         Optional session identifier for scratch-table isolation checks (D64/OQ-4).
         When supplied, any scratch table reference whose name does not match
@@ -729,7 +781,9 @@ def extract_column_provenance(
     # Step 6: Build alias -> (table, database) map; validate scratch names
     # ------------------------------------------------------------------
     try:
-        alias_map = _build_alias_map(ast_qt, cte_names, catalog_schema, session_id)
+        alias_map = _build_alias_map(
+            ast_qt, cte_names, catalog_schema, session_id, declared_scratch
+        )
     except (ScratchSessionError, ProvenanceExtractionError):
         raise
     except Exception as exc:
@@ -959,6 +1013,14 @@ def _infer_default_db(catalog_schema: dict[str, dict[str, str]]) -> str:
     for key in catalog_schema:
         if "." in key:
             db, _ = key.split(".", 1)
+            # SCRATCH IS NOT A DATABASE FOR THIS PURPOSE. A caller registering a
+            # `scratch.<placeholder>` schema so a table intermediate can resolve would otherwise
+            # push the key count to two, collapsing the inference to `_DEFAULT_DB` — so a node's
+            # own scratch registration silently changed how its SIBLING nodes' bare warehouse
+            # names qualified, and a single-database catalog that is not `dbpcm_warehouse` sent
+            # the whole candidate to review. The default db is a fact about the WAREHOUSE.
+            if db == _SCRATCH_DB:
+                continue
             databases.add(db)
     if len(databases) == 1:
         return next(iter(databases))

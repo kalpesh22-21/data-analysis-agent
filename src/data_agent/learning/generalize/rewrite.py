@@ -20,10 +20,13 @@ import re
 from collections import Counter
 from typing import Any
 
-import sqlglot
 import sqlglot.expressions as exp
 
-from ...runtime.blueprint.template import SLOT_TOKEN
+from ...runtime.blueprint.template import (
+    TemplateBindError,
+    parse_template,
+    referenced_slots,
+)
 from ..extractor.sql_predicates import literal_predicates
 
 # Comparison / membership predicates whose literal operand a slot can parameterize.
@@ -68,16 +71,20 @@ def parse_accepted_sql(accepted_sql: str) -> exp.Expression:
     """Parse a single accepted SQL statement (ClickHouse dialect), fail-loud."""
     if not accepted_sql or not accepted_sql.strip():
         raise RewriteError("accepted SQL is empty — cannot rewrite (fail-to-review).")
+    # `parse_template`, NOT a bare `parse_one`. The accepted SQL of a COMPOSITE node can
+    # legitimately already carry a `{token}` — the placeholder the DAG binds an upstream node's
+    # output into — and `{name}` alone parses in ClickHouse as an EMPTY MAP LITERAL, so a bare
+    # parse silently turns `x / {dept_total}` into `x / map()`. The runtime already solved this
+    # for the corpus loader by rewriting `{name}` -> `:name` first; reusing that helper is what
+    # keeps the two halves agreeing about what a template is.
+    #
+    # Nothing changes for the ordinary mined path: SQL with no braces parses identically.
     try:
-        ast = sqlglot.parse_one(
-            accepted_sql, dialect="clickhouse", error_level=sqlglot.ErrorLevel.RAISE
-        )
-    except (sqlglot.errors.ParseError, sqlglot.errors.TokenError) as exc:
+        ast = parse_template(accepted_sql)
+    except TemplateBindError as exc:
         raise RewriteError(f"unparseable accepted SQL: {exc}") from exc
     except Exception as exc:  # pragma: no cover — defensive
         raise RewriteError(f"unexpected parse error: {exc}") from exc
-    if ast is None:
-        raise RewriteError("accepted SQL parsed to None — cannot rewrite.")
     return ast
 
 
@@ -149,18 +156,15 @@ def _check_rewritten(
     output no longer has: dropping a whole predicate legally removes a `toYear` call, while
     `sumIf/2 → sumIf/1` legally removes nothing and is the bug.
     """
-    colon_form = SLOT_TOKEN.sub(lambda m: f":{m.group(1)}", rendered)
+    # `parse_template` owns the `{name}` -> `:name` rewrite this used to re-implement inline.
+    # One definition, so the check and the loader cannot disagree about what parses.
     try:
-        reparsed = sqlglot.parse_one(
-            colon_form, dialect="clickhouse", error_level=sqlglot.ErrorLevel.RAISE
-        )
+        parse_template(rendered)
     except Exception as exc:
         raise RewriteError(
             f"the rewritten template does not parse ({exc}) — the rewrite produced "
             f"invalid SQL: {rendered!r} (fail-to-review)."
         ) from exc
-    if reparsed is None:  # pragma: no cover — defensive
-        raise RewriteError("the rewritten template parsed to None (fail-to-review).")
     grown = [
         shape for shape, count in _function_shapes(after).items() if count > before[shape]
     ]
@@ -373,7 +377,12 @@ def rewrite_sql_to_template(
             f"the rewritten AST could not be rendered as SQL ({exc!r}) — the drop left a "
             "shape sqlglot cannot emit (fail-to-review)."
         ) from exc
-    for name in slot_names:
+    # `slot_names` are the tokens THIS rewrite created; `referenced_slots` adds the ones the
+    # accepted SQL already carried (a composite node's upstream placeholder). Both round-trip
+    # through sqlglot as ClickHouse's own `{name: Type}` parameter form, so both need restoring
+    # — restoring only the first left `{dept_total: }` in the template, which matches no slot
+    # and binds to nothing.
+    for name in set(slot_names) | referenced_slots(accepted_sql):
         rendered = rendered.replace("{" + name + ": }", "{" + name + "}")
     _check_rewritten(rendered, before, ast)
     return rendered

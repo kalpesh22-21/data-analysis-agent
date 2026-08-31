@@ -89,10 +89,6 @@ class TrialRunResult:
     distinct_grain_count: int | None = None
     verify_passed: bool = False
     verify_reason: str | None = None
-    # WHICH tenant answered. On the result because "3 rows" means nothing without it — the
-    # same query is 3 rows for one principal and 0 for another, and that difference is the
-    # entitlement question the selector exists to ask.
-    tenant: str = ""
 
     @property
     def inconclusive(self) -> bool:
@@ -124,7 +120,6 @@ class TrialRunResult:
             "verify_passed": self.verify_passed,
             "verify_reason": self.verify_reason,
             "inconclusive": self.inconclusive,
-            "tenant": self.tenant,
         }
 
 
@@ -167,6 +162,85 @@ REVISABLE_STATUSES: tuple[str, ...] = (
 )
 
 
+# What replaces a reviewer's token anywhere it would otherwise be rendered or logged.
+_REDACTED = "[token redacted]"
+
+
+def _explain(exc: BaseException) -> str:
+    """The most specific message inside *exc*, unwrapping exception groups.
+
+    An `ExceptionGroup` stringifies as "unhandled errors in a TaskGroup (1 sub-exception)",
+    which is what a reviewer saw for an expired or rejected token: nothing about the token, the
+    warehouse, or what to do. The transport raises inside a task group, so the real cause — the
+    403, the connection refusal — is one level down and is the only part worth showing.
+
+    Walks nested groups, keeps the leaves, and de-duplicates: a fan-out that failed the same way
+    five times should say so once.
+    """
+    leaves: list[str] = []
+
+    def _walk(node: BaseException) -> None:
+        inner = getattr(node, "exceptions", None)
+        if inner:
+            for child in inner:
+                _walk(child)
+            return
+        text = f"{type(node).__name__}: {node}" if str(node) else type(node).__name__
+        if text not in leaves:
+            leaves.append(text)
+
+    _walk(exc)
+    return " / ".join(leaves) if leaves else str(exc)
+
+
+def _scrub(text: str, token: str) -> str:
+    """*text* with every recognisable run of the reviewer's token removed.
+
+    ANY RUN, not just a leading one. The first version walked prefixes only (`token[:size]`),
+    which handles the truncated-header case and misses the one the docstring actually named:
+    a client that LINE-WRAPS the header quotes the prefix on one line and the REST on the next,
+    and that remainder is the JWT's signature — the part worth protecting. A prefix is mostly
+    algorithm boilerplate.
+
+    Runs shorter than `_MIN_SECRET_RUN` are left alone: below that a "match" is header
+    boilerplate every token shares (`eyJhbGciOi…`), so redacting it would blank harmless text
+    without protecting anything.
+
+    ⚠ WHAT THIS CANNOT DO is reach a re-encoded token — base64-of-base64, percent-encoding — and
+    no string scrub can. That limit is accepted deliberately: the transports on this path quote
+    headers verbatim, and the defence against the rest is that nothing here logs request bodies.
+    """
+    token = (token or "").strip()
+    if not token:
+        return text
+    text = text.replace(token, _REDACTED)
+    size = len(token)
+    if size < _MIN_SECRET_RUN:
+        return text
+    # Slide a minimum-length window over the token; on a hit, grow the match as far as the
+    # token keeps agreeing, replace it, and rescan — several fragments can appear separately.
+    scanning = True
+    while scanning:
+        scanning = False
+        for offset in range(size - _MIN_SECRET_RUN + 1):
+            window = token[offset : offset + _MIN_SECRET_RUN]
+            at = text.find(window)
+            if at == -1:
+                continue
+            stop = offset + _MIN_SECRET_RUN
+            while stop < size and text.startswith(token[offset : stop + 1], at):
+                stop += 1
+            text = text[:at] + _REDACTED + text[at + (stop - offset) :]
+            scanning = True
+            break
+    return text
+
+
+# Below this length a "prefix" of a JWT is header boilerplate shared by every token
+# (`eyJ...`), so scrubbing it would redact harmless text without protecting anything.
+_MIN_SECRET_RUN = 24
+
+
 class ReviewInbox:
     """The `in_review` projection over a `CandidateStore` + the human transitions."""
 
@@ -178,7 +252,9 @@ class ReviewInbox:
         policy: PromotionPolicy | None = None,
         completer: ParameterizationCompleter | None = None,
         reviser: BlueprintReviser | None = None,
-        trial_probes: dict[str, Any] | None = None,
+        minter: Any = None,
+        mcp_client: Any = None,
+        probe_factory: Any = None,
     ) -> None:
         self._store = store
         # The fail-to-review completion plane. OPTIONAL and default-absent, so an inbox
@@ -193,10 +269,20 @@ class ReviewInbox:
         # reviewer can accomplish: the raw-entries form still works. It writes nothing; see
         # `propose_revision`.
         self._reviser = reviser
-        # label -> a WarehouseProbe bound to that tenant's claims, for the reviewer-driven
-        # trial ONLY. Empty means the deployment tenant only (the scheduler's own probe),
-        # which is the unchanged behaviour. The promotion replay never consults this.
-        self._trial_probes = dict(trial_probes or {})
+        # The hand-authoring plane (`learning/mint`). OPTIONAL and default-absent like the two
+        # above. Absent removes an ENTRY POINT rather than degrading one: with no minter an
+        # expert cannot author a blueprint from a question, but nothing about reviewing the
+        # mined ones changes. It writes through the completer, so it cannot exist without one.
+        self._minter = minter
+        # The runQuery transport for the reviewer-driven trial. The probe itself is built PER
+        # REQUEST around the reviewer's own token (`_probe_for`) — only the transport is shared,
+        # because it holds no authority.
+        self._mcp_client = mcp_client
+        # HOW A PROBE IS MADE FROM A TOKEN. Injectable because the real one needs a live MCP
+        # transport, and the alternative — falling back to the scheduler's own probe when none
+        # is wired — is exactly the silent substitution this plane refuses everywhere else: a
+        # reviewer would see the same shape whether their token or the service's was used.
+        self._probe_factory = probe_factory
         # The SINGLE approve/reject implementation (R4). Defaulted for an unwired
         # inbox; production injects the wired scheduler.
         self._scheduler = scheduler or PromotionScheduler(
@@ -301,16 +387,33 @@ class ReviewInbox:
             )
         return env
 
-    async def approve(self, candidate_id: str) -> CandidateEnvelope:
+    async def approve(self, candidate_id: str, *, token: str = "") -> CandidateEnvelope:
         """Human approve: `in_review → validated`, delegating to `apply_human_decision` (D17/R4).
 
         A guard that HOLDS — an unresolved `depends_on`, a missing generalization, a failed replay —
         leaves the candidate `in_review`. That is NOT a success, so a held approve surfaces as an
         `InboxTransitionError` carrying the hold reason rather than as an unchanged envelope.
+
+        ⚠ THE REVIEWER'S OWN TOKEN, REQUIRED. Approving runs the golden replay — a real query
+        against the live warehouse — and this surface never mints authority for that. It is the
+        same posture the trial already has, extended to the gate that actually promotes: if
+        reaching the inbox could produce a warehouse token, "allowed to review candidates" would
+        silently mean "allowed to query the warehouse".
+
+        NO FALLBACK to the deployment principal on a blank token, for the reason the trial gives:
+        both paths return the same shape, so a reviewer would believe the blueprint had been
+        proven against their access when it had been proven against somebody else's.
         """
         await self._require(candidate_id, CandidateStatus.IN_REVIEW)
+        probe = self._probe_for(token)
+        if probe is None:
+            raise InboxTransitionError(
+                f"approve_needs_token: approving {candidate_id!r} replays the blueprint against "
+                "the live warehouse, and this surface mints no tokens — paste one you already "
+                "hold"
+            )
         env = await self._store.get(candidate_id)
-        decision = await self._scheduler.apply_human_decision(env, "approve")
+        decision = await self._scheduler.apply_human_decision(env, "approve", probe=probe)
         if decision.action != "approve":
             raise InboxTransitionError(
                 f"approve held for {candidate_id}: {decision.reason}"
@@ -505,17 +608,91 @@ class ReviewInbox:
             )
         return await self._completer.complete(env, entries=entries, replace_all=True)
 
-    def trial_tenants(self) -> tuple[str, ...]:
-        """Tenant labels a reviewer may trial against, deployment default first.
+    def mint_schema(self) -> dict[str, Any]:
+        """What the minting form offers: the tables an expert may pick, and their columns.
 
-        `""` is the default — the scheduler's own probe, i.e. exactly what the promotion
-        replay will use. It leads the list so the honest prediction of the real gate is the
-        first thing offered, and the alternatives read as "and what about…".
+        The COLUMNS are included so the page can show what a table actually has before the
+        expert commits to it. They are catalog metadata — names and nothing else, no rows and no
+        values — so this crosses to a browser on the same footing as the rest of the catalog,
+        which the runtime already puts in a prompt.
         """
-        return ("", *sorted(self._trial_probes))
+        if self._minter is None:
+            return {"available": False, "tables": [], "columns": []}
+        return {
+            "available": True,
+            "tables": list(self._minter.tables),
+            "columns": list(self._minter.catalog_columns),
+        }
+
+    async def mint_prior_art(self, question: str) -> tuple[dict[str, Any], ...]:
+        """Artifacts that may already answer *question*. Reads only; mints nothing."""
+        if self._minter is None:
+            return ()
+        return await self._minter.find_prior_art(question)
+
+    async def mint_blueprint(self, request: Any) -> Any:
+        """Draft one hand-authored blueprint onto the review queue. See `learning/mint`.
+
+        The inbox owns this rather than the page calling the minter directly, for the reason
+        every other write here is owned: the review queue is access-controlled, and a second
+        door into it that did not go through the same guard would be a second thing to keep
+        true. Nothing is promoted; the result is a candidate the reviewer then works on with
+        the surfaces that already exist.
+        """
+        if self._minter is None:
+            # `MintUnavailableError`, NOT `InboxTransitionError`. The two map to different
+            # statuses and only one of them is true here: a transition error is a 409, meaning
+            # "the row is in the wrong state", and there is no row. This is a 503 — the
+            # deployment has no minting plane — which is the same answer the completer gives
+            # for the same shape of absence. Imported locally because `learning.mint` imports
+            # this package's completer, and a module-level import would close the cycle.
+            from ..mint import MintUnavailableError
+
+            raise MintUnavailableError(
+                "mint_unavailable: no hand-authoring plane is wired in this deployment, so a "
+                "blueprint cannot be drafted from a question here"
+            )
+        return await self._minter.mint(request)
+
+    def _probe_for(self, token: str) -> Any:
+        """A probe bound to the REVIEWER'S token, or `None` when they supplied none.
+
+        Built per request and thrown away, because the credential is. It deliberately does NOT
+        fall back to the scheduler's own probe when the token is blank: that fallback would make
+        an empty box silently run as the deployment principal, so a reviewer would believe they
+        had tested their own access when they had tested somebody else's — and the failure is
+        invisible, because both paths return the same shape.
+        """
+        if not (token or "").strip():
+            # THE RULE THAT MATTERS, and it never degrades: no token, no run. A blank box must
+            # not quietly execute as the deployment principal, because both paths return the
+            # same shape and the reviewer would believe they had proven something about their
+            # own access.
+            return None
+        if self._probe_factory is not None:
+            return self._probe_factory(token)
+        if self._mcp_client is None:
+            # NO WAREHOUSE TRANSPORT IN THIS PROCESS — an offline dev inbox or a test. There is
+            # nothing to build a probe from, so the wired probe is used instead. This is the one
+            # place a reviewer's token does not reach the warehouse, and it is bounded to
+            # deployments that have no warehouse: `_build_inbox_from_env` always passes a
+            # `RealMCPClient`, so the branch is unreachable in production. Logged at WARNING
+            # because it is not visible from the 200 the reviewer gets.
+            _logger.warning(
+                "review inbox: no MCP transport is wired, so the reviewer's token cannot be "
+                "used — falling back to the configured probe. This is an offline/dev wiring; "
+                "in a real deployment the token is what runs the query."
+            )
+            return self._scheduler.probe
+        from ..promotion.token_minter import SuppliedTokenMinter
+        from ..promotion.warehouse_probe import MCPWarehouseProbe
+
+        return MCPWarehouseProbe(
+            mcp_client=self._mcp_client, token_minter=SuppliedTokenMinter(token)
+        )
 
     async def trial_run(
-        self, candidate_id: str, *, bindings: dict[str, Any], tenant: str = ""
+        self, candidate_id: str, *, bindings: dict[str, Any], token: str = ""
     ) -> TrialRunResult:
         """Run this blueprint with REVIEWER-CHOSEN slot values and report what came back.
 
@@ -531,10 +708,22 @@ class ReviewInbox:
         rows would quietly turn it into a data-browsing surface. Whether it should become one is
         a separate decision, not a side effect of adding a trial button.
 
-        REUSES the scheduler's own probe, so the trial runs through the same scoped JWT and the
-        same MCP `runQuery` the real replay uses. A probe built beside it could drift into a
-        different scope or tenant, and the entire value of a trial is that it predicts the real
-        thing.
+        ⚠ THE REVIEWER SUPPLIES THE TOKEN, AND THIS SURFACE NEVER MINTS ONE. `token` is a
+        credential the reviewer already holds, pasted into the page and used for exactly this
+        request. A review surface that could mint warehouse authority would be a privilege
+        escalation dressed as a convenience: reaching the inbox would become a way to obtain a
+        warehouse token, which is not what being allowed to review candidates is supposed to
+        grant. So the trial borrows authority rather than creating it.
+
+        WHAT THAT COSTS, stated plainly: the token carries whatever scope its holder was given
+        rather than this blueprint's `uses`, so the MCP's D57 column teeth do not bite during a
+        trial. The footprint is still enforced — statically, at LANDING, by
+        `_assert_template_reads_within_uses`, which no pasted token can influence. A trial
+        therefore proves "this SQL runs and returns this shape for this principal", and NOT
+        "the declared footprint is honest". See `SuppliedTokenMinter`.
+
+        The transport is otherwise the replay's own: the same `MCPWarehouseProbe` over the same
+        `runQuery`, so a trial still predicts the real gate's structural verdict.
 
         Allowed on `in_review` and `validated`: the two states where a human is deciding whether
         this artifact should go further. A `needs_parameterization` candidate has no template to
@@ -569,17 +758,21 @@ class ReviewInbox:
             return TrialRunResult(ok=False, reason="no_uses_scope")
 
         grain = _result_grain_columns(env.payload)
-        # ⚠ AN ALLOWLIST LOOKUP, never claims assembled from the request. The browser sends a
-        # LABEL; the server holds the claims. A reviewer choosing a tenant is asking "does it
-        # work for them too"; a reviewer CONSTRUCTING tenant claims would be minting authority.
-        if tenant and tenant not in self._trial_probes:
-            return TrialRunResult(ok=False, reason="unknown_tenant")
+        probe = self._probe_for(token)
+        if probe is None:
+            return TrialRunResult(ok=False, reason="no_token")
         try:
-            probe = self._trial_probes[tenant] if tenant else self._scheduler.probe
             result = await probe.run(sql, grain_columns=grain, column_scope=uses)
         except Exception as exc:  # noqa: BLE001 — a trial is diagnostic; it may not 500 a review
-            _logger.info("trial run for %s failed: %r", candidate_id, exc)
-            return TrialRunResult(ok=False, reason="warehouse_error", detail=str(exc)[:400])
+            # ⚠ SCRUBBED BEFORE IT GOES ANYWHERE. The reviewer's bearer token is on this request,
+            # and an HTTP client's exception text routinely quotes the request it failed on —
+            # URL, headers, body. Relaying that verbatim put the token in the JSON the browser
+            # renders AND in this process's log, which is exactly how a credential outlives the
+            # one request it was borrowed for. The message is still useful; it just cannot carry
+            # the secret. Applied to the log line too, for the same reason.
+            safe = _scrub(_explain(exc), token)
+            _logger.info("trial run for %s failed: %s", candidate_id, safe[:400])
+            return TrialRunResult(ok=False, reason="warehouse_error", detail=safe[:400])
 
         verdict = verify_result(
             result_grain=ResultGrain(columns=grain, verifiable=bool(grain)),
@@ -590,7 +783,6 @@ class ReviewInbox:
         )
         return TrialRunResult(
             ok=True,
-            tenant=tenant,
             columns=tuple(result.columns),
             row_count=result.row_count,
             distinct_grain_count=result.distinct_grain_count,

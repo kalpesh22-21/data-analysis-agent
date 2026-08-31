@@ -55,6 +55,12 @@ from ..extractor.helpers import (
     payroll_parameterization,
 )
 
+# Approving REPLAYS against the live warehouse, and this surface mints no tokens — the
+# reviewer pastes one. Any non-blank string does here; `probe_factory` decides what the replay
+# actually runs through, which is the fake the test already wired.
+REVIEWER_TRIAL_TOKEN = "reviewer-pasted-token"
+
+
 TOKEN = "reviewer-secret"
 AUTH = {"X-Reviewer-Token": TOKEN}
 
@@ -383,7 +389,9 @@ async def test_it_cannot_be_approved() -> None:
     store = await _store_with(_declined_envelope())
     inbox = ReviewInbox(store)
     with pytest.raises(InboxTransitionError, match="needs_parameterization"):
-        await inbox.approve(mint_review_candidate_id("hash-ratio", 0))
+        await inbox.approve(
+            mint_review_candidate_id("hash-ratio", 0), token=REVIEWER_TRIAL_TOKEN
+        )
 
 
 async def test_a_candidate_with_no_snapshot_refuses_rather_than_guesses() -> None:

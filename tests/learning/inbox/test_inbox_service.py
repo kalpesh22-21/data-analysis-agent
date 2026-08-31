@@ -42,6 +42,11 @@ from ..promotion.helpers import (
     with_type,
 )
 
+# Approve REPLAYS against the warehouse and this service mints no token for it — the reviewer
+# pastes one. The offline app has no MCP transport, so the wired probe still runs the replay;
+# what the token changes is that the request is not refused before reaching the case under test.
+REVIEWER_TRIAL_TOKEN = "reviewer-pasted-token"
+
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "learning"
 TOKEN = "reviewer-secret"
 
@@ -455,7 +460,11 @@ def test_offline_approve_of_landing_target_503(enabled: None) -> None:
     )
     client = _client(ReviewInbox(store, scheduler=scheduler))
 
-    resp = client.post(f"/inbox/{env.candidate_id}/approve", headers=AUTH)
+    resp = client.post(
+        f"/inbox/{env.candidate_id}/approve",
+        json={"token": REVIEWER_TRIAL_TOKEN},
+        headers=AUTH,
+    )
     assert resp.status_code == 503
     assert resp.json()["detail"] == "landing plane unavailable"
     # The candidate was NOT faked into `validated`.
@@ -511,7 +520,11 @@ def test_shipped_offline_construction_refuses_landing_approve_503(
     asyncio.run(inbox._store.put(env))
     client = _client(inbox)
 
-    resp = client.post(f"/inbox/{env.candidate_id}/approve", headers=AUTH)
+    resp = client.post(
+        f"/inbox/{env.candidate_id}/approve",
+        json={"token": REVIEWER_TRIAL_TOKEN},
+        headers=AUTH,
+    )
     assert resp.status_code == 503
     assert asyncio.run(inbox._store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
 
@@ -558,7 +571,11 @@ def test_approve_happy_path_returns_action_result(enabled: None) -> None:
     )
     client = _client(ReviewInbox(store, scheduler=scheduler), write_plane="full")
 
-    resp = client.post(f"/inbox/{env.candidate_id}/approve", headers=AUTH)
+    resp = client.post(
+        f"/inbox/{env.candidate_id}/approve",
+        json={"token": REVIEWER_TRIAL_TOKEN},
+        headers=AUTH,
+    )
     assert resp.status_code == 200
     assert resp.json() == {
         "candidate_id": env.candidate_id,

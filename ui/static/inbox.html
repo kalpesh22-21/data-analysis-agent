@@ -989,6 +989,54 @@
     white-space: nowrap;
     border: 0;
   }
+
+  /* --- the revise modal: the candidate as it WOULD be, before committing to it --- */
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    display: flex; align-items: center; justify-content: center;
+    padding: var(--space-4); z-index: 100;
+  }
+  .modal {
+    background: var(--color-surface); border: 1px solid var(--color-border);
+    border-radius: var(--radius); width: 100%; max-width: 860px;
+    max-height: 90vh; display: flex; flex-direction: column;
+  }
+  .modal-head, .modal-foot {
+    padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--color-border);
+  }
+  .modal-foot { border-bottom: 0; border-top: 1px solid var(--color-border);
+                display: flex; gap: var(--space-3); align-items: center; }
+  .modal-body { padding: var(--space-4); overflow-y: auto; }
+  .modal h3 { margin: 0 0 var(--space-1); font-size: 15px; }
+  .modal .modal-sub { margin: 0; font-size: 12px; color: var(--color-text-dim); line-height: 1.5; }
+  .modal-sql {
+    background: var(--color-bg); border: 1px solid var(--color-border);
+    border-radius: var(--radius); padding: var(--space-3);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+    margin: var(--space-2) 0 var(--space-4);
+  }
+  .modal-entry {
+    border: 1px solid var(--color-border); border-radius: var(--radius);
+    padding: var(--space-3); margin-bottom: var(--space-3); background: var(--color-bg);
+  }
+  .modal-entry.is-changed { border-color: var(--color-accent); }
+  .modal-entry .who {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    display: block; margin-bottom: var(--space-2);
+  }
+  .modal-entry .badge {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--color-accent); margin-left: var(--space-2);
+  }
+  .modal-grid { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+  .modal-grid > label { flex: 1 1 150px; font-size: 11px; color: var(--color-text-dim); }
+  .modal-grid input, .modal-grid select {
+    width: 100%; background: var(--color-surface); color: var(--color-text);
+    border: 1px solid var(--color-border); border-radius: 4px;
+    padding: 4px 6px; font-size: 12px; font-family: inherit;
+  }
+  .modal-note { font-size: 12px; color: var(--color-text-dim); line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -996,7 +1044,13 @@
   <header>
     <h1>Data Agent — Review Inbox</h1>
     <p class="session-line" id="count-line" data-testid="inbox-count-line">loading…</p>
+    <p class="session-line">
+      Know a question the loop has not mined yet?
+      <a href="/mint" data-testid="mint-link">Author a blueprint</a> — it lands here for review.
+    </p>
   </header>
+
+  <div id="revise-modal-host"></div>
 
   <div id="error-banner" data-testid="error-banner" role="alert" hidden>
     <span id="error-code" class="error-code" data-testid="error-code"></span>
@@ -1040,7 +1094,6 @@
     status: "in_review",
     activeType: "blueprint",
     items: [],
-    trialTenants: [""],
     // Index into the ACTIVE (type-filtered) list — the card the reviewer is on. Reset to
     // 0 whenever the filtered set changes identity (a tab or status switch, a reload),
     // because position 7 of the old queue means nothing in the new one.
@@ -1822,28 +1875,29 @@
     block.setAttribute("data-testid", "inbox-trial");
     block.appendChild(el("p", "item-field-label", "trial run — does it execute?"));
 
-    // WHICH TENANT answers. The column scope is NOT selectable — it is always minted from
-    // this blueprint's own `uses`, because that is the contract the trial exists to test.
-    // What varies is the row entitlement, which is what actually decides whether a query
-    // returns anything: the same SQL is 3 rows for one principal and 0 for another, and an
-    // expired grant on the single hardcoded tenant is what made this gate silently green.
-    var tenantSelect = null;
-    if (state.trialTenants.length > 1) {
-      var row = el("div", "trial-binding");
-      row.appendChild(el("label", "", "as tenant"));
-      tenantSelect = document.createElement("select");
-      tenantSelect.setAttribute("data-testid", "inbox-trial-tenant");
-      state.trialTenants.forEach(function (label) {
-        var opt = document.createElement("option");
-        opt.value = label;
-        // The default LEADS and says what it is: it is the tenant the promotion replay will
-        // use, so it is the only choice that predicts the real gate.
-        opt.textContent = label || "deployment default (what promotion will use)";
-        tenantSelect.appendChild(opt);
-      });
-      row.appendChild(tenantSelect);
-      block.appendChild(row);
-    }
+    // THE REVIEWER PASTES THEIR OWN TOKEN. This page never mints one and never asks the
+    // server to: a review surface that could produce warehouse authority would turn "allowed
+    // to review candidates" into "allowed to obtain a warehouse token", which is not the same
+    // grant. The trial BORROWS authority for one request.
+    //
+    // Held in a local only — never written to storage, never put in a URL, and never sent
+    // anywhere but this one POST. It is cleared from the field after a run so a shared screen
+    // or a browser restore cannot leak it.
+    var tokenInput = document.createElement("input");
+    tokenInput.type = "password";
+    tokenInput.setAttribute("data-testid", "inbox-trial-token");
+    tokenInput.setAttribute("autocomplete", "off");
+    tokenInput.placeholder = "paste a warehouse token you already hold";
+    var tokenRow = el("div", "trial-binding");
+    tokenRow.appendChild(el("label", "", "run as"));
+    tokenRow.appendChild(tokenInput);
+    block.appendChild(tokenRow);
+    block.appendChild(
+      el("p", "card-empty",
+        "the token's own entitlements decide what this returns — a trial proves the SQL runs " +
+        "and what shape it returns, not that the declared column footprint is honest (that is " +
+        "checked separately before anything is served)")
+    );
 
     var inputs = {};
     slots.forEach(function (name) {
@@ -1884,10 +1938,7 @@
       fetch("/api/inbox/" + encodeURIComponent(item.candidate_id) + "/trial_run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          bindings: bindings,
-          tenant: tenantSelect ? tenantSelect.value : ""
-        })
+        body: JSON.stringify({ bindings: bindings, token: tokenInput.value })
       })
         .then(function (response) {
           return response.text().then(function (text) {
@@ -1902,7 +1953,14 @@
           });
         })
         .catch(function (err) { showError("NETWORK", String(err)); })
-        .then(function () { btn.disabled = false; btn.textContent = "Run it"; });
+        .then(function () {
+          btn.disabled = false;
+          btn.textContent = "Run it";
+          // CLEARED once the request has settled, win or lose. A bearer credential left in a
+          // focused field survives a shared screen, a screenshot and a browser session
+          // restore; re-pasting it costs one keystroke.
+          tokenInput.value = "";
+        });
     });
     block.appendChild(btn);
     block.appendChild(out);
@@ -1920,12 +1978,13 @@
       if (why === "missing_bindings") {
         why = "fill in: " + (r.missing || []).join(", ");
       } else if (why === "no_uses_scope") {
-        why = "this blueprint declares no column footprint, so a scoped token cannot be " +
-              "minted — it is refused rather than run unscoped";
+        why = "this blueprint declares no column footprint, so there is nothing to check the " +
+              "query against — it is refused rather than run unscoped";
       } else if (why === "warehouse_error") {
         why = "the warehouse rejected it: " + String(r.detail || "");
-      } else if (why === "unknown_tenant") {
-        why = "that tenant is not in the configured allowlist";
+      } else if (why === "no_token") {
+        why = "paste a warehouse token to run the trial — this page never mints one, so it " +
+              "runs as you rather than as the service";
       } else if (why === "no_template") {
         why = "no SQL template on this candidate";
       }
@@ -1948,18 +2007,13 @@
       pass.appendChild(
         el("p", "card-empty",
           "that proves the SQL parses and the scoped token is allowed to run it — and " +
-          "nothing about its shape. A row-level grant that excludes the replay tenant looks " +
-          "exactly like this.")
+          "nothing about its shape. A filter that matches no rows looks exactly like this.")
       );
     } else {
       pass.appendChild(
         el("p", "", (r.verify_passed ? "✓ ran and verified" : "✗ ran, but the shape check failed"
           + (r.verify_reason ? " (" + r.verify_reason + ")" : "")))
       );
-    }
-    if (r.tenant) {
-      pass.appendChild(el("p", "card-empty", "as tenant " + String(r.tenant) +
-        " — the deployment default is what promotion will use"));
     }
     pass.appendChild(el("p", "", "rows: " + String(r.row_count) +
       (r.distinct_grain_count === null || r.distinct_grain_count === undefined
@@ -2163,10 +2217,29 @@
 
   function performAction(candidateId, action, node, actions) {
     clearError();
+    // APPROVE REPLAYS AGAINST THE WAREHOUSE, so it needs the reviewer's own token — nothing
+    // here or upstream mints one. Read from the trial box on the same card when it is filled
+    // in (the common flow: trial it, then approve it), and asked for otherwise.
+    var body = {};
+    if (action === "approve") {
+      var box = node.querySelector("[data-testid=inbox-trial-token]");
+      var token = (box && box.value.trim()) || window.prompt(
+        "Approving runs this blueprint against the warehouse as YOU.\n" +
+        "Paste a warehouse token (nothing here mints one):"
+      );
+      if (!token) {
+        showError("NO_TOKEN", "Approve needs a warehouse token — nothing was changed.");
+        resetConfirm(actions);
+        return;
+      }
+      body.token = token;
+      if (box) box.value = "";
+    }
     disableActions(actions);
     fetch("/api/inbox/" + encodeURIComponent(candidateId) + "/" + action, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     })
       .then(function (response) {
         if (response.ok) {
@@ -2556,16 +2629,21 @@
     // form. The block carries its own apply button, which posts the proposal to
     // `apply_revision`: REPLACE-only, and therefore idempotent, which is what lets it be
     // offered on a status whose guard cannot protect an append (see `ReviewInbox`).
-    var apply = null;
-    if (!area) {
-      apply = document.createElement("button");
-      apply.type = "button";
-      apply.className = "action-complete";
-      apply.setAttribute("data-testid", "inbox-revise-apply");
-      apply.textContent = "Re-validate & apply";
-      apply.hidden = true;
-      block.appendChild(apply);
-    }
+    // OPENS THE MODAL rather than posting straight through, on BOTH surfaces. The old button
+    // asked a reviewer to read a row-level diff and commit on trust; the modal shows the
+    // candidate as it WOULD be and lets them adjust first.
+    //
+    // The FORM gets it too, and that is where it matters most: a `needs_parameterization` row
+    // exists BECAUSE something is unclassified, so a proposal is near-certain there — while the
+    // review queue's cards are usually already complete and the assistant often has nothing to
+    // add. Wiring it only to the queue put it on the path least likely to open it.
+    var apply = document.createElement("button");
+    apply.type = "button";
+    apply.className = "action-complete";
+    apply.setAttribute("data-testid", "inbox-revise-apply");
+    apply.textContent = "Review the change…";
+    apply.hidden = true;
+    block.appendChild(apply);
 
     ask.addEventListener("click", function () {
       clearError();
@@ -2593,7 +2671,19 @@
               var proposed = (parsed && parsed.entries) || [];
               apply.hidden = !proposed.length;
               apply.onclick = function () {
-                performRevisionApply(item.candidate_id, proposed, node, apply);
+                openReviseModal(item, parsed, node, function (entries, replace) {
+                  if (area) {
+                    // THE FORM. Route through the textarea the reviewer can still see and edit,
+                    // so the modal never becomes a hidden second source of truth for what is
+                    // about to be posted — and `performCompletion` stays the one submit path.
+                    area.value = JSON.stringify(entries, null, 2);
+                    if (replaceBox) replaceBox.checked = replace;
+                    performCompletion(item.candidate_id, area.value, replace, node,
+                                      node, apply);
+                  } else {
+                    performRevisionApply(item.candidate_id, entries, node, apply);
+                  }
+                });
               };
             }
           });
@@ -2690,6 +2780,195 @@
   // a completion, and the same reason for each: `completed` re-entered the pipeline so the
   // row is gone; `declined` means the revision still does not validate and the FRESH reason
   // belongs on the card, not in a banner; an HTTP error is the usual banner.
+  // --- the revise modal ------------------------------------------------------------------
+  //
+  // The inline proposal asked a reviewer to read a diff and trust it. This shows the candidate
+  // AS IT WOULD BE and lets them adjust before committing — the assistant's answer becomes a
+  // starting point rather than a take-it-or-leave-it.
+  //
+  // ⚠ THE SQL IS SHOWN AND NOT EDITABLE, which is the same guarantee the reviser's tool makes.
+  // The template is DERIVED from the accepted query by AST rewrite, so `explain_ok`,
+  // `binds_to_subset_uses` and `read_only_select` only mean something because they check a
+  // provenance chain back to a query that really ran. A hand-edited template would leave all
+  // three validating prose. Change what a literal MEANS and the template follows.
+  //
+  // Apply goes through `apply_revision` — the same re-validation a hand-typed array faces. The
+  // modal is a better keyboard, not a second write path.
+
+  var ROLE_FIELDS = {
+    slot: ["name", "type", "binds_to"],
+    inline: ["why"],
+    rule: ["rule_id"]
+  };
+
+  function closeReviseModal() {
+    clearNode(document.getElementById("revise-modal-host"));
+  }
+
+  function entryLocatorKey(entry) {
+    var l = (entry && entry.locator) || {};
+    return [l.table, l.column, l.value].join("|");
+  }
+
+  function modalField(label, value, testid) {
+    var wrap = el("label", "", label);
+    var input = document.createElement("input");
+    input.type = "text";
+    input.value = value == null ? "" : String(value);
+    input.setAttribute("data-field", testid);
+    wrap.appendChild(input);
+    return wrap;
+  }
+
+  function renderModalEntry(entry, changedKeys) {
+    var card = el("div", "modal-entry");
+    var key = entryLocatorKey(entry);
+    if (changedKeys.indexOf(key) !== -1) {
+      card.classList.add("is-changed");
+    }
+    card.setAttribute("data-locator", key);
+
+    var l = entry.locator || {};
+    var who = el("span", "who", [l.table, l.column].filter(Boolean).join(".") +
+      " = " + String(l.value));
+    if (changedKeys.indexOf(key) !== -1) {
+      who.appendChild(el("span", "badge", "changed by the assistant"));
+    }
+    card.appendChild(who);
+
+    var grid = el("div", "modal-grid");
+    var roleWrap = el("label", "", "role");
+    var role = document.createElement("select");
+    role.setAttribute("data-field", "role");
+    ["slot", "inline", "rule"].forEach(function (r) {
+      var o = document.createElement("option");
+      o.value = r; o.textContent = r;
+      if (entry.role === r) o.selected = true;
+      role.appendChild(o);
+    });
+    roleWrap.appendChild(role);
+    grid.appendChild(roleWrap);
+
+    var slot = entry.slot || {};
+    grid.appendChild(modalField("slot name", slot.name, "name"));
+    grid.appendChild(modalField("type", slot.type, "type"));
+    grid.appendChild(modalField("binds_to", slot.binds_to, "binds_to"));
+    grid.appendChild(modalField("why (inline)", entry.why, "why"));
+    grid.appendChild(modalField("rule_id (rule)", entry.rule_id, "rule_id"));
+    card.appendChild(grid);
+    return card;
+  }
+
+  function readModalEntries(host) {
+    // REBUILT from the form, keeping only the fields the chosen role uses. An `inline` entry
+    // carrying an empty `slot` object reads as a slot declaration and fails validation — the
+    // documented live-model failure, reachable here by a reviewer switching a role and leaving
+    // the old boxes populated.
+    var out = [];
+    var cards = host.querySelectorAll(".modal-entry");
+    for (var i = 0; i < cards.length; i += 1) {
+      var card = cards[i];
+      var parts = String(card.getAttribute("data-locator")).split("|");
+      var role = card.querySelector('[data-field="role"]').value;
+      var entry = {
+        locator: { table: parts[0], column: parts[1], value: parts[2] },
+        role: role
+      };
+      var wanted = ROLE_FIELDS[role] || [];
+      if (role === "slot") {
+        var slot = {};
+        wanted.forEach(function (f) {
+          var v = card.querySelector('[data-field="' + f + '"]').value.trim();
+          if (v) slot[f] = v;
+        });
+        if (Object.keys(slot).length) entry.slot = slot;
+      } else {
+        wanted.forEach(function (f) {
+          var v = card.querySelector('[data-field="' + f + '"]').value.trim();
+          if (v) entry[f] = v;
+        });
+      }
+      out.push(entry);
+    }
+    return out;
+  }
+
+  function openReviseModal(item, payload, node, commit) {
+    // *commit* is `function (entries, replace)` — the ONLY thing that differs between the two
+    // surfaces. The review queue REPLACES (`apply_revision`, idempotent, safe on a status whose
+    // guard cannot protect an append); the form APPENDS what the reviewer was missing
+    // (`complete`, which is why its guard is an equality against `needs_parameterization`).
+    // Everything the reviewer sees and edits is identical.
+    var host = document.getElementById("revise-modal-host");
+    clearNode(host);
+    var proposed = Array.isArray(payload.entries) ? payload.entries.filter(isObject) : [];
+    if (!proposed.length) return;
+    var changedKeys = (Array.isArray(payload.diff) ? payload.diff : [])
+      .filter(isObject)
+      .map(function (d) { return entryLocatorKey(d); });
+
+    var backdrop = el("div", "modal-backdrop");
+    backdrop.setAttribute("data-testid", "inbox-revise-modal");
+    var modal = el("div", "modal");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+
+    var head = el("div", "modal-head");
+    head.appendChild(el("h3", "", "Review the change before it is applied"));
+    head.appendChild(el("p", "modal-sub",
+      "The assistant's answer, shown in place. Adjust anything, then apply — it goes through " +
+      "the same validation a hand-typed array does."));
+    modal.appendChild(head);
+
+    var body = el("div", "modal-body");
+    if (payload.rationale) {
+      body.appendChild(el("p", "modal-note", payload.rationale));
+    }
+    var template = ((item.payload_view || {}).generalization || {}).sql_template ||
+      (item.template_parts || []).map(function (p) {
+        return p.slot ? "{" + p.slot + "}" : (p.text || "");
+      }).join("");
+    if (template) {
+      body.appendChild(el("p", "modal-sub",
+        "The query this classifies. Not editable — the template is derived from it by rewrite, " +
+        "which is what makes the static checks mean anything."));
+      body.appendChild(el("pre", "modal-sql", template));
+    }
+    proposed.forEach(function (entry) {
+      body.appendChild(renderModalEntry(entry, changedKeys));
+    });
+    modal.appendChild(body);
+
+    var foot = el("div", "modal-foot");
+    var apply = el("button", "action-btn", "Apply to the blueprint");
+    apply.type = "button";
+    apply.setAttribute("data-testid", "inbox-revise-modal-apply");
+    var cancel = el("button", "action-btn action-cancel", "Cancel");
+    cancel.type = "button";
+    cancel.setAttribute("data-testid", "inbox-revise-modal-cancel");
+    cancel.addEventListener("click", closeReviseModal);
+    apply.addEventListener("click", function () {
+      var entries = readModalEntries(body);
+      closeReviseModal();
+      commit(entries, payload.replace === true);
+    });
+    foot.appendChild(apply);
+    foot.appendChild(cancel);
+    foot.appendChild(el("span", "modal-note", "Nothing is written until you apply."));
+    modal.appendChild(foot);
+
+    backdrop.appendChild(modal);
+    // Click-outside and Escape both cancel: a modal that can only be dismissed by a button is
+    // a trap on a surface where the safe action is to walk away.
+    backdrop.addEventListener("click", function (ev) {
+      if (ev.target === backdrop) closeReviseModal();
+    });
+    document.addEventListener("keydown", function onKey(ev) {
+      if (ev.key === "Escape") { closeReviseModal(); document.removeEventListener("keydown", onKey); }
+    });
+    host.appendChild(backdrop);
+  }
+
   function performRevisionApply(candidateId, entries, node, button) {
     clearError();
     button.disabled = true;
@@ -3241,15 +3520,6 @@
   // approve), then load the default Review-queue list.
   buildTabs();
   buildStatusToggle();
-  // The trial tenant labels, fetched once. Failure is silent and falls back to the
-  // deployment default — a missing selector must never stop a reviewer running a trial.
-  fetch("/api/inbox/trial_tenants", { headers: { Accept: "application/json" } })
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (d) {
-      if (d && Array.isArray(d.tenants) && d.tenants.length) state.trialTenants = d.tenants;
-    })
-    .catch(function () {});
-
   loadHealth().then(loadInbox);
 })();
 </script>

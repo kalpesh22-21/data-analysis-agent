@@ -51,6 +51,12 @@ from .generalize.helpers import CATALOG
 from .leakage.helpers import ScriptedSemanticScanner
 from .schema_edit.test_pr_bot import ScriptedGitClient
 
+# Approving REPLAYS against the live warehouse, and this surface mints no tokens — the
+# reviewer pastes one. Any non-blank string does here; `probe_factory` decides what the replay
+# actually runs through, which is the fake the test already wired.
+REVIEWER_TRIAL_TOKEN = "reviewer-pasted-token"
+
+
 # Frozen order (D102 §7.1); the two target-specific writers use their *_writer ids.
 FROZEN_STAGE_IDS = (
     "generalize",
@@ -386,7 +392,7 @@ async def test_promotion_plane_wired_to_scheduler_runs_guarded_approve(
 
     items = await inbox.list()
     assert len(items) == 1
-    approved = await inbox.approve(items[0].candidate_id)
+    approved = await inbox.approve(items[0].candidate_id, token=REVIEWER_TRIAL_TOKEN)
     # A non-replayable (knowledge) target approves directly through the guarded path.
     assert approved.status == "validated"
 

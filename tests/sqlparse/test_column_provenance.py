@@ -1292,3 +1292,55 @@ def test_select_star_over_a_generator_still_fails_closed() -> None:
     writes — work; widening star-expansion is a bigger change than this."""
     with pytest.raises(ProvenanceExtractionError):
         extract_column_provenance("SELECT * FROM numbers(6)", CATALOG_SCHEMA)
+
+
+# --- `declared_scratch`: the exemption, and what it must NOT exempt --------------------
+
+
+def test_a_declared_scratch_placeholder_is_exempt_from_the_ownership_check() -> None:
+    """A blueprint TEMPLATE's `scratch.<placeholder>` names an intermediate the blueprint
+    PRODUCES ITSELF one node earlier. It is not `s_<sid>_<suffix>`, no session owns it, and
+    nothing is materialized until the DAG runs — so D64's question ("does this caller own the
+    table they are reading") is malformed for it. Fail-closing there made every table
+    intermediate unvalidatable offline."""
+    schema = {"scratch.emp_pay": {"employee_code": "String", "earnings": "Float64"}}
+    pairs = extract_column_provenance(
+        "SELECT x.earnings FROM scratch.emp_pay AS x",
+        schema,
+        declared_scratch=frozenset({"emp_pay"}),
+    )
+    assert ("scratch.emp_pay", "earnings") in pairs
+
+
+def test_an_undeclared_scratch_name_still_fails_closed_beside_a_declared_one() -> None:
+    """⚠ THE INVARIANT THE WHOLE RELAXATION RESTS ON, asserted at the layer that enforces it.
+
+    Declaring one placeholder must not open the door for another. This is the test that would
+    catch a future refactor inverting the membership check — every other test in this file
+    would still pass, because none of them declares anything.
+    """
+    schema = {
+        "scratch.emp_pay": {"employee_code": "String"},
+        "scratch.s_victim_bp_abc": {"employee_code": "String"},
+    }
+    with pytest.raises(ScratchSessionError, match="s_victim_bp_abc"):
+        extract_column_provenance(
+            "SELECT a.employee_code FROM scratch.emp_pay AS a "
+            "JOIN scratch.s_victim_bp_abc AS b ON a.employee_code = b.employee_code",
+            schema,
+            declared_scratch=frozenset({"emp_pay"}),
+        )
+
+
+def test_the_default_is_unchanged_fail_closed_behaviour() -> None:
+    """No caller that does not opt in sees any difference — the D64 guarantees byte-for-byte.
+    Both halves: no session at all, and a session that does not own the table."""
+    schema = {"scratch.s_alice_bp_1": {"c": "String"}}
+    sql = "SELECT c FROM scratch.s_alice_bp_1"
+
+    with pytest.raises(ScratchSessionError):
+        extract_column_provenance(sql, schema)  # no session, no declaration
+    with pytest.raises(ScratchSessionError):
+        extract_column_provenance(sql, schema, session_id="bob")  # cross-session
+    # And the owner still resolves.
+    assert extract_column_provenance(sql, schema, session_id="alice")

@@ -24,7 +24,7 @@ from data_agent.runtime.blueprint.models import (
     SCALAR_CONSUME_REF,
     TABLE_CONSUME_REF,
 )
-from data_agent.runtime.blueprint.template import SLOT_TOKEN
+from data_agent.runtime.blueprint.template import sub_slot_tokens
 
 from ..extractor.sql_predicates import literal_predicate_of
 
@@ -238,7 +238,8 @@ def check_no_frozen_date_literal(template: str) -> bool:
     SQL). An UNPARSEABLE template passes here: the parse is already `_check_rewritten`'s
     failure to report, and double-reporting it would move the reason tag S7 routes on.
     """
-    colon_form = SLOT_TOKEN.sub(lambda m: f":{m.group(1)}", template)
+    # STRING-AWARE: a `{word}` inside a string constant is data, not a bind site.
+    colon_form = sub_slot_tokens(template, lambda name: f":{name}")
     try:
         ast = sqlglot.parse_one(
             colon_form, dialect="clickhouse", error_level=sqlglot.ErrorLevel.RAISE

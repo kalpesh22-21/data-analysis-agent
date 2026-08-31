@@ -214,37 +214,143 @@ def test_a_failed_run_is_never_called_inconclusive() -> None:
     assert TrialRunResult(ok=False, reason="missing_bindings").inconclusive is False
 
 
-# --- trial tenants: an allowlist, and column scope is never selectable --------
+# --- the trial runs on the REVIEWER'S token, and this surface never mints one ---------
 
 
-def test_the_deployment_default_leads_the_tenant_list() -> None:
-    """`""` is the tenant the PROMOTION replay uses, so it is the only choice that predicts
-    the real gate. It leads so the honest prediction is offered first and the alternatives
-    read as "and what about…"."""
-    from data_agent.learning.inbox import ReviewInbox
+async def test_a_trial_without_a_token_is_refused_rather_than_run_as_the_service() -> None:
+    """⚠ THE LOAD-BEARING ONE. There is deliberately no fallback to the deployment principal
+    when the box is empty.
 
-    inbox = ReviewInbox(InMemoryCandidateStore(), trial_probes={"CLIENT_B/PC02": object()})
-    assert inbox.trial_tenants()[0] == ""
-    assert "CLIENT_B/PC02" in inbox.trial_tenants()
-
-
-def test_no_configured_tenants_means_the_default_only() -> None:
-    """Unchanged behaviour until an operator opts in."""
-    from data_agent.learning.inbox import ReviewInbox
-
-    assert ReviewInbox(InMemoryCandidateStore()).trial_tenants() == ("",)
-
-
-async def test_a_tenant_outside_the_allowlist_is_refused() -> None:
-    """⚠ THE BROWSER SENDS A LABEL, NEVER CLAIMS. A reviewer choosing a tenant is asking
-    "does it work for them too"; a reviewer CONSTRUCTING tenant claims would be minting
-    authority. The lookup is what keeps those different."""
+    A fallback would be invisible: both paths return the same shape, so a reviewer would see a
+    green trial and believe they had tested their OWN access when they had tested the service's.
+    Refusing makes "I ran this as me" the only thing a passing trial can mean."""
     from data_agent.learning.inbox import ReviewInbox
 
     env = _quarantined()
     store = InMemoryCandidateStore()
     await store.put(env)
-    inbox = ReviewInbox(store)
-    result = await inbox.trial_run(env.candidate_id, bindings={}, tenant="CLIENT_X/PC99")
+
+    # A TRANSPORT IS WIRED, because without one the inbox answers `no_warehouse` and the test
+    # would pass while never reaching the blank-token branch it is named for.
+    result = await ReviewInbox(store, mcp_client=object()).trial_run(
+        env.candidate_id, bindings={}, token=""
+    )
+
     assert result.ok is False
-    assert result.reason == "unknown_tenant"
+    assert result.reason == "no_token"
+
+
+async def test_a_blank_token_is_the_same_as_none() -> None:
+    """Whitespace is not a credential. Checked because an autofilled or partly-cleared field
+    is the realistic way a blank one arrives, and it must not read as "supplied"."""
+    from data_agent.learning.inbox import ReviewInbox
+
+    env = _quarantined()
+    store = InMemoryCandidateStore()
+    await store.put(env)
+
+    result = await ReviewInbox(store, mcp_client=object()).trial_run(
+        env.candidate_id, bindings={}, token="   "
+    )
+
+    assert result.reason == "no_token"
+
+
+def test_the_supplied_token_minter_ignores_column_scope_and_hides_the_token() -> None:
+    """Two properties of the borrowed-authority path, together because they are the trade:
+
+    it returns the token VERBATIM whatever scope is asked for — which is why the trial cannot
+    prove the declared footprint is honest, and why `_assert_template_reads_within_uses` at
+    landing remains the check that can — and it never renders the credential, because a
+    dataclass-style repr in a traceback is exactly how a bearer token escapes."""
+    import asyncio
+
+    from data_agent.learning.promotion.token_minter import SuppliedTokenMinter
+
+    minter = SuppliedTokenMinter("secret-token-value")
+
+    assert asyncio.run(minter.mint(["a.b.c"], session_id="s")) == "secret-token-value"
+    assert asyncio.run(minter.mint([], session_id="s")) == "secret-token-value"
+    assert "secret-token-value" not in repr(minter)
+
+
+def test_a_blank_supplied_token_cannot_be_constructed() -> None:
+    """Fails at construction rather than producing a probe that mints an empty Authorization
+    header, which the MCP would reject with an error naming neither cause."""
+    import pytest
+
+    from data_agent.learning.promotion.token_minter import SuppliedTokenMinter
+
+    with pytest.raises(ValueError):
+        SuppliedTokenMinter("  ")
+
+
+def test_the_trial_result_never_carries_the_token_back() -> None:
+    """The wire shape is what reaches a browser and what a proxy may log. A credential echoed
+    on the response would be persisted by any of them."""
+    from data_agent.learning.inbox.inbox import TrialRunResult
+
+    wire = TrialRunResult(ok=True, columns=("a",), row_count=1).to_wire()
+
+    assert "token" not in wire
+    assert "tenant" not in wire
+
+
+def test_a_trial_failure_reports_the_real_cause_not_the_task_group_wrapper() -> None:
+    """The transport raises inside a task group, so `str(exc)` was "unhandled errors in a
+    TaskGroup (1 sub-exception)" — a reviewer whose token had expired was told nothing about
+    the token, the warehouse, or what to do. The leaf is the only part worth showing.
+
+    Measured live before the fix: a rejected token produced the TaskGroup string; after it,
+    `HTTPStatusError: Client error '401 Unauthorized' for url '…/mcp'`.
+    """
+    from data_agent.learning.inbox.inbox import _explain
+
+    group = ExceptionGroup("unhandled errors in a TaskGroup", [RuntimeError("401 rejected")])
+    assert _explain(group) == "RuntimeError: 401 rejected"
+    # Nested groups flatten, and identical leaves are said once — a fan-out that failed the
+    # same way five times is one fact, not five.
+    nested = ExceptionGroup("outer", [ExceptionGroup("inner", [ValueError("same")] * 3)])
+    assert _explain(nested) == "ValueError: same"
+    assert _explain(ValueError("plain")) == "ValueError: plain"
+
+
+async def test_approve_will_not_replay_without_the_reviewers_token() -> None:
+    """⚠ NOTHING ON THIS PLANE MINTS A TOKEN FOR A QUERY THE REVIEWER ASKED FOR.
+
+    Approving runs the golden replay — a real query against the live warehouse. It used to run
+    as a service principal this process minted, which made "allowed to review candidates"
+    silently mean "allowed to query the warehouse". It now runs as the reviewer, on a token
+    they already hold, and refuses rather than substituting.
+    """
+    from data_agent.learning.candidate.models import CandidateStatus
+    from data_agent.learning.inbox import InboxTransitionError, ReviewInbox
+
+    env = replace(_quarantined(), status=CandidateStatus.IN_REVIEW)
+    store = InMemoryCandidateStore()
+    await store.put(env)
+    inbox = ReviewInbox(store, mcp_client=object())
+
+    with pytest.raises(InboxTransitionError, match="approve_needs_token"):
+        await inbox.approve(env.candidate_id, token="")
+    # Whitespace is not a credential.
+    with pytest.raises(InboxTransitionError, match="approve_needs_token"):
+        await inbox.approve(env.candidate_id, token="   ")
+    # And nothing moved.
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+
+
+def test_the_human_approve_replays_through_the_reviewers_probe() -> None:
+    """The token has to reach the REPLAY, not merely be validated at the door.
+
+    `apply_human_decision` takes the caller's probe; the scheduler's own stays the default for
+    the UNATTENDED paths (`apply_scheduled`, retract), which have no human to ask.
+    """
+    import inspect
+
+    from data_agent.learning.promotion.scheduler import PromotionScheduler
+
+    signature = inspect.signature(PromotionScheduler.apply_human_decision)
+    assert "probe" in signature.parameters
+    source = inspect.getsource(PromotionScheduler.apply_human_decision)
+    assert "probe or self._probe" in source

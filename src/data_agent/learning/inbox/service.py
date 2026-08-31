@@ -31,6 +31,14 @@ from data_agent.runtime.blueprint.models import BlueprintParseError
 
 from ..candidate.memory_candidate_store import InMemoryCandidateStore
 from ..candidate.models import CandidateStatus
+from ..mint import (
+    MAX_QUESTION_CHARS,
+    MintConflictError,
+    MintInputError,
+    MintRequest,
+    MintResponseError,
+    MintUnavailableError,
+)
 from ..observability import get_learning_tracer
 from ..promotion.scheduler import PromotionScheduler
 from ..revise import ForbiddenTemplateEditError, ReviserUnavailableError
@@ -81,9 +89,19 @@ class TrialRunRequest(BaseModel):
     """
 
     bindings: dict[str, Any] = {}
-    # A LABEL from the allowlist, not tenant claims. Empty = the deployment tenant, which is
-    # what the promotion replay will use.
-    tenant: str = ""
+    # ⚠ THE REVIEWER'S OWN WAREHOUSE TOKEN, borrowed for one request. This service never mints
+    # one for a trial — see `ReviewInbox.trial_run`. It is used and dropped: never persisted,
+    # never logged, and never echoed back on the response.
+    token: str = ""
+
+
+class ApproveRequest(BaseModel):
+    """The approve body: the reviewer's warehouse token, borrowed for the golden replay.
+
+    Used and dropped — never persisted, never logged, never echoed on the response.
+    """
+
+    token: str = ""
 
 
 class AttestScanRequest(BaseModel):
@@ -107,6 +125,35 @@ class ReviseParameterizationRequest(BaseModel):
     """
 
     feedback: str = ""
+
+
+class MintBlueprintRequest(BaseModel):
+    """The MINTING body: what an expert knows about a question they can already answer.
+
+    Deliberately loose about `steps` and `assumptions` — they are prose, and the model is the
+    thing that reads them. What IS pinned is `tables`, because the drafting brief's closed column
+    list is built from it, and `sql_mode`, because it decides whether the model is offered a tool
+    that can write SQL at all. Both are re-checked in `MintRequest.__post_init__`, which is the
+    validator that matters; this class exists so FastAPI can parse the body, not so it can be the
+    second place the rules live.
+    """
+
+    question: str = ""
+    tables: list[str] = []
+    steps: list[str] = []
+    assumptions: list[str] = []
+    sql: str = ""
+    sql_mode: str = "none"
+    # ⚠ THE COMPOSITE DAG. Its absence made multi-step minting UNREACHABLE over HTTP without
+    # failing anything: pydantic drops an undeclared field, so `model_dump()` never carried the
+    # steps, `MintRequest.from_doc` saw none, and every composite submission was quietly minted
+    # as a single blueprint. The page sent them; nothing received them.
+    #
+    # Typed loosely on purpose — `MintNode` owns the real validation (output-name grammar,
+    # backward-only edges, the node cap derived from `check_dag`), and a second schema here
+    # would be a second vocabulary for the same mistake.
+    nodes: list[dict[str, Any]] = []
+
 
 _logger = logging.getLogger(__name__)
 
@@ -323,60 +370,6 @@ def _build_completion_param_judge(learning_settings: Any) -> Any:
         return None
 
 
-def _build_trial_probes(learning_settings: Any, runtime_settings: Any) -> dict[str, Any]:
-    """One probe per allowlisted trial tenant, keyed by label.
-
-    Empty by default, so a deployment that sets nothing behaves exactly as before: the trial
-    uses the scheduler's own probe and therefore predicts the promotion replay exactly.
-
-    ⚠ ONLY THE TENANT VARIES. Each probe still mints its COLUMN scope from the blueprint's own
-    `uses` at call time — that is the contract the trial exists to test, and making it
-    selectable would let a trial pass for a blueprint whose declared footprint is wrong.
-
-    A malformed entry is SKIPPED with a warning rather than failing startup: a typo in an
-    operator convenience must not take the inbox down, and the label simply is not offered.
-    """
-    configured = str(getattr(learning_settings, "learning_trial_tenants", "") or "").strip()
-    if not configured:
-        return {}
-    from data_agent.runtime.mcp.real_client import RealMCPClient
-
-    from ..promotion.token_minter import HttpTokenMinter, TenantClaims
-    from ..promotion.warehouse_probe import MCPWarehouseProbe
-
-    probes: dict[str, Any] = {}
-    for entry in (e.strip() for e in configured.split(",")):
-        if not entry:
-            continue
-        parts = entry.split(":")
-        if len(parts) != 3:
-            _logger.warning(
-                "inbox service: trial tenant %r is not clientcode:proc_center:jti — skipped",
-                entry,
-            )
-            continue
-        try:
-            claims = TenantClaims(*(part.strip() for part in parts))
-        except ValueError:
-            _logger.warning("inbox service: trial tenant %r has a blank claim — skipped", entry)
-            continue
-        probes[f"{claims.clientcode}/{claims.proc_center}"] = MCPWarehouseProbe(
-            mcp_client=RealMCPClient(runtime_settings.mcp_url),
-            token_minter=HttpTokenMinter(
-                runtime_settings.token_service_url,
-                runtime_settings.token_issuer_api_key,
-                tenant=claims,
-            ),
-        )
-    if probes:
-        _logger.info(
-            "inbox service: trial runs may be run as %s (the COLUMN scope is still minted "
-            "from each blueprint's own `uses`; only the tenant varies)",
-            ", ".join(sorted(probes)),
-        )
-    return probes
-
-
 def _build_reviser(learning_settings: Any, runtime_settings: Any) -> Any:
     """Build the LLM typing aid for the fail-to-review form, or `None`.
 
@@ -455,6 +448,107 @@ def _build_reviser(learning_settings: Any, runtime_settings: Any) -> Any:
         # about the UNREDACTED accepted SQL. Same switch, same posture, same D51 standard as
         # every other entity-bearing span on this plane.
         trace_verbose=getattr(learning_settings, "learning_trace_verbose", False),
+    )
+
+
+def _build_minter(
+    learning_settings: Any,
+    runtime_settings: Any,
+    *,
+    completer: Any,
+    prior_art: Any = None,
+) -> Any:
+    """Build the hand-authoring plane, or `None` when it cannot be grounded.
+
+    THREE THINGS ARE REQUIRED and each absence is a different kind of no:
+
+      * a COMPLETER — the minter writes through it, so without one it could only file review
+        rows carrying no generalization and an unsettled scan, which every downstream guard
+        refuses. That is a row a reviewer cannot act on and cannot distinguish from an unread
+        one, so the honest answer is to offer no page at all;
+      * an API KEY — every mode calls a model, `exact` included (something has to classify the
+        literals), so unlike the reviser there is no degraded typing-aid version of this;
+      * the CATALOG — the drafting brief's closed column list is what stops a model inventing
+        a column the rewrite then rejects, blaming the expert for a table they never chose.
+
+    FAIL-OPEN and logged, exactly like `_build_reviser`: no minter means `POST /inbox/mint`
+    answers 503 and the page says so, rather than the service refusing to start.
+    """
+    api_key = getattr(learning_settings, "learning_extractor_api_key", "") or getattr(
+        runtime_settings, "openai_api_key", ""
+    )
+    if completer is None or not api_key:
+        _logger.info(
+            "inbox service: blueprint MINTING is off (%s)",
+            "no completion plane" if completer is None else "no model API key",
+        )
+        return None
+
+    import json
+
+    from data_agent.runtime.model.openai_client import build_openai_model_client
+
+    from ..extractor.grounding import known_rule_ids_from_catalog
+    from ..mint import BlueprintMinter
+
+    try:
+        path = runtime_settings.catalog_fixture_file()
+        with path.open(encoding="utf-8") as fh:
+            catalog = json.load(fh)["catalog"]
+    except (OSError, ValueError, KeyError, TypeError):
+        _logger.info(
+            "inbox service: the semantic catalog snapshot could not be read, so blueprint "
+            "MINTING is disabled (an ungrounded draft invents columns the validator rejects)",
+            exc_info=True,
+        )
+        return None
+
+    model = (
+        learning_settings.learning_mint_model
+        or getattr(learning_settings, "learning_revise_model", "")
+        or getattr(learning_settings, "learning_extractor_model", "")
+    )
+    _logger.info("inbox service: blueprint MINTING is ON (model=%s)", model)
+    return BlueprintMinter(
+        model_client=build_openai_model_client(
+            api_key=api_key,
+            model=model,
+            base_url=getattr(learning_settings, "learning_extractor_base_url", ""),
+        ),
+        completer=completer,
+        known_rules=known_rule_ids_from_catalog(catalog),
+        catalog_columns=_catalog_columns(catalog),
+        # The duplicate WARNING. Optional by design: absent, the page still mints — which is
+        # the right degrade for something that was never a gate.
+        prior_art=prior_art,
+        timeout_seconds=learning_settings.learning_mint_timeout_seconds,
+    )
+
+
+def _catalog_columns(catalog: Any) -> tuple[str, ...]:
+    """Every `database.table.column` the catalog declares, flattened and sorted.
+
+    DERIVED FROM `build_sqlglot_schema_from_catalog` rather than by walking the catalog shape
+    again. The first version of this function walked a `catalog["tables"]` list that does not
+    exist — the catalog is keyed BY `database.table` — and it did not fail: it returned an empty
+    tuple, which is a legal value meaning "no grounding available", so the minting page would
+    have shipped with its column list silently switched off. Reusing the canonical reader makes
+    that class of mistake impossible, because the same projection already feeds the rewrite's
+    column-scope check.
+    """
+    from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
+
+    try:
+        schema = build_sqlglot_schema_from_catalog(catalog)
+    except (AttributeError, TypeError):
+        _logger.info("inbox service: catalog columns could not be projected", exc_info=True)
+        return ()
+    return tuple(
+        sorted(
+            f"{table}.{column}"
+            for table, columns in schema.items()
+            for column in (columns or {})
+        )
     )
 
 
@@ -606,6 +700,7 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
     from ..candidate.couchbase_candidate_store import CouchbaseCandidateStore
     from ..dedup.couchbase_corpus import CouchbaseBlueprintCorpus
     from ..factory import build_promotion_write_plane
+    from ..priorart.neo4j_index import Neo4jPriorArtIndex
     from ..promotion.token_minter import HttpTokenMinter, TenantClaims
 
     candidate_store = CouchbaseCandidateStore(learning_settings)
@@ -622,6 +717,17 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         connection_timeout=runtime_settings.neo4j_timeout_seconds,
         connection_acquisition_timeout=runtime_settings.neo4j_timeout_seconds,
         max_transaction_retry_time=runtime_settings.neo4j_timeout_seconds,
+    )
+    # HOISTED so the minter can share the EXACT instance rather than build a second one.
+    # Two completers would mean two copies of the write-router stages over one store, and a
+    # minted candidate adjudicated by a different instance than a reviewed one is a difference
+    # nobody would notice until the two disagreed about a dedup verdict.
+    completer = _build_completer(
+        learning_settings,
+        runtime_settings,
+        candidate_store=candidate_store,
+        corpus=corpus,
+        embedding_client=embedding_client,
     )
     # Same recipe as the scheduler entrypoint; we hold the returned INBOX (the
     # scheduler is wired into it and shares the one candidate store).
@@ -649,18 +755,26 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         model_id=runtime_settings.embedding_model,
         # The fail-to-review completion plane: re-validation + the blueprint half of the
         # write router, over the SAME candidate store this inbox reads.
-        completer=_build_completer(
-            learning_settings,
-            runtime_settings,
-            candidate_store=candidate_store,
-            corpus=corpus,
-            embedding_client=embedding_client,
-        ),
+        completer=completer,
         # The LLM typing aid for that same form (design §C). Independent of the completer's
         # own switch: it is human-gated and human-committed, so it can be enabled much
         # earlier — and its absence costs a convenience, not a capability.
         reviser=_build_reviser(learning_settings, runtime_settings),
-        trial_probes=_build_trial_probes(learning_settings, runtime_settings),
+        # The hand-authoring plane. Gated on the completer because it WRITES through it: a
+        # minter without one would file review rows that can never be approved.
+        minter=_build_minter(
+            learning_settings,
+            runtime_settings,
+            completer=completer,
+            # The SAME neo4j driver and embedding client the rest of this process holds, so
+            # the duplicate check reads the corpus the promotion path writes.
+            prior_art=Neo4jPriorArtIndex(
+                driver=neo4j_driver,
+                embedding_client=embedding_client,
+                expected_model=runtime_settings.embedding_model,
+                database=runtime_settings.neo4j_database,
+            ),
+        ),
         # PriorArt Slice 2 — THE process where humans actually reject. `reject` and
         # `retract` reach the scheduler through THIS service, not through
         # `run_learning_scheduler.py`, so omitting this made the whole
@@ -755,20 +869,91 @@ def create_inbox_app(
         wire = [_inbox_item_to_wire(it) for it in items]
         return {"items": wire, "count": len(wire)}
 
-    @app.get("/inbox/trial_tenants", dependencies=guard)
-    async def trial_tenants() -> dict[str, Any]:
-        """The tenant labels a reviewer may trial against. `""` is the deployment default —
-        the same tenant the promotion replay uses, so it predicts the real gate."""
-        return {"tenants": list(inbox.trial_tenants())}
+    @app.get("/inbox/mint/schema", dependencies=guard)
+    async def mint_schema() -> dict[str, Any]:
+        """The tables and columns the minting form may offer, or `available: false`.
+
+        A 200 either way. "This deployment cannot mint" is a fact about the page, not an error
+        the expert caused, and it lets the UI say so in place of the form rather than rendering
+        a form whose submit button always fails.
+        """
+        return inbox.mint_schema()
+
+    @app.post("/inbox/mint/prior_art", dependencies=guard)
+    async def mint_prior_art(body: MintBlueprintRequest | None = None) -> dict[str, Any]:
+        """What already exists for this question. READS ONLY — nothing is drafted or written.
+
+        Separate from `mint` so the page can warn BEFORE the expert pays for a drafting turn.
+        A 200 with an empty list either way: "nothing matched" and "the index is down" are both
+        non-events for a warning, and the minter logs the difference.
+        """
+        req = body or MintBlueprintRequest()
+        # CAPPED HERE because this is where the read happens: the question goes straight to an
+        # embedding call, and unlike the mint route this one never builds a `MintRequest`, so it
+        # inherits none of that model's limits. A megabyte body would become a megabyte embed.
+        question = (req.question or "")[:MAX_QUESTION_CHARS]
+        return {"prior_art": [dict(c) for c in await inbox.mint_prior_art(question)]}
+
+    @app.post("/inbox/mint", dependencies=guard)
+    async def mint(body: MintBlueprintRequest | None = None) -> dict[str, Any]:
+        """MINT: draft a hand-authored blueprint onto the review queue.
+
+        NOTHING IS PROMOTED. The result is a candidate the expert then works on with the
+        surfaces that already exist — the card, the assistant, the trial run, approve — which is
+        why this returns a `candidate_id` rather than a blueprint. A draft that does not
+        validate is a 200 with `outcome="declined"` and the validator's complaint, for the same
+        reason a still-incomplete completion is: the row exists, the complaint is on it, and the
+        next step is on the page rather than in an error banner.
+
+        400 a form that cannot be drafted from, 502 a model that answered off-contract,
+        503 no minting plane in this deployment.
+        """
+        req = body or MintBlueprintRequest()
+        try:
+            request = MintRequest.from_doc(req.model_dump())
+        except MintInputError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            result = await inbox.mint_blueprint(request)
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        except MintConflictError as exc:
+            # 409: the submission is well-formed, but its row already exists.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except MintInputError as exc:
+            # 400: something about the form itself is wrong and the expert can fix it.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except CompletionRaceError as exc:
+            # 409, the SAME mapping the completion route gives it. Two concurrent identical
+            # submissions can both pass the pre-flight check and both enter the completer; the
+            # loser's guarded write raises here, and an unmapped raise would 500 a race the
+            # system handled correctly.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except MintUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except MintResponseError as exc:
+            # 502 and VERBATIM. The expert did nothing wrong and the deployment is not broken —
+            # a model answered against a contract this system does not have, and the sentence
+            # saying so is more useful than "the assistant failed".
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return result.to_doc()
 
     @app.get("/inbox/health", dependencies=guard)
     async def inbox_health() -> dict[str, str]:
         return {"write_plane": app.state.write_plane}
 
     @app.post("/inbox/{candidate_id}/approve", dependencies=guard)
-    async def approve(candidate_id: str) -> dict[str, Any]:
+    async def approve(
+        candidate_id: str, body: ApproveRequest | None = None
+    ) -> dict[str, Any]:
+        """Approve: `in_review -> validated`, replaying the blueprint against the warehouse.
+
+        ⚠ CARRIES THE REVIEWER'S OWN TOKEN. That replay is a real query, and this service mints
+        nothing for it — the same posture the trial has, on the gate that actually promotes.
+        """
+        req = body or ApproveRequest()
         try:
-            env = await inbox.approve(candidate_id)
+            env = await inbox.approve(candidate_id, token=req.token or "")
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc
         return _action_result(env)
@@ -910,7 +1095,7 @@ def create_inbox_app(
         req = body or TrialRunRequest()
         try:
             result = await inbox.trial_run(
-                candidate_id, bindings=req.bindings or {}, tenant=req.tenant or ""
+                candidate_id, bindings=req.bindings or {}, token=req.token or ""
             )
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc

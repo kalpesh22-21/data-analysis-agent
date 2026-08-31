@@ -37,6 +37,63 @@ _SLOT_TOKEN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # (not a reimplementation) to translate `{slot}` → `:slot` before AST-normalizing.
 SLOT_TOKEN = _SLOT_TOKEN
 
+# ⚠ A SLOT TOKEN IS ONLY A SLOT TOKEN OUTSIDE A STRING LITERAL OR A COMMENT.
+#
+# `_SLOT_TOKEN` is raw-text, so on its own it fires anywhere the characters appear — including
+# inside quoted text, where the braces are DATA. A real accepted query doing
+# `WHERE note LIKE '%{cfg}%'` was rewritten to `'%:cfg%'`: a different string constant, carried
+# into the template, with the walk and the entries agreeing about the corrupted value so nothing
+# downstream could notice. The blueprint then answers a different question for ever, which is
+# precisely the silent-wrong-answer class this module exists to prevent.
+#
+# The alternation below is scanned LEFT TO RIGHT and a string/comment arm matches FIRST, so a
+# `{name}` inside one is consumed as part of that arm and never reaches the token arm. Ordering
+# is the whole mechanism — put the token arm first and it wins inside strings again.
+#
+#   1. a single-quoted string, with '' and backslash escapes;
+#   2. a line comment through end of line;
+#   3. a block comment;
+#   4. the slot token itself — the ONLY arm that gets substituted.
+_SKIP_OR_SLOT = re.compile(
+    r"""('(?:[^'\\]|\\.|'')*')"""      # 1
+    r"""|(--[^\n]*)"""                    # 2
+    r"""|(/\*(?:.|\n)*?\*/)"""          # 3
+    r"""|(\{([A-Za-z_][A-Za-z0-9_]*)\})""",  # 4
+    re.VERBOSE,
+)
+
+
+def sub_slot_tokens(sql: str, repl) -> str:
+    """Apply *repl* to every slot token OUTSIDE strings and comments; leave the rest verbatim."""
+
+    def _one(match: re.Match[str]) -> str:
+        if match.group(4) is None:  # a string or a comment — data, not a bind site
+            return match.group(0)
+        return repl(match.group(5))
+
+    return _SKIP_OR_SLOT.sub(_one, sql)
+
+
+_sub_slot_tokens = sub_slot_tokens  # internal alias
+
+
+def slot_tokens_outside_strings(sql: str) -> list[str]:
+    """Slot names that are real bind sites — see `_SKIP_OR_SLOT`."""
+    return [m.group(5) for m in _SKIP_OR_SLOT.finditer(sql) if m.group(4) is not None]
+
+
+def iter_slot_tokens(sql: str):
+    """`(name, start, end)` for every real bind site, in order.
+
+    The `finditer` equivalent for callers that need SPANS — the review card slices the template
+    around each token to render it. Using the raw regex there put a slot chip on `{x}` inside a
+    string constant, and the trial run then silently dropped whatever the reviewer typed into
+    it, because binding derives its required set from `referenced_slots`.
+    """
+    for match in _SKIP_OR_SLOT.finditer(sql):
+        if match.group(4) is not None:
+            yield match.group(5), match.start(4), match.end(4)
+
 # Non-SELECT statement node kinds that must NEVER appear in a blueprint template
 # (a blueprint is a READ-ONLY query). `exp.Block` is the multi-statement wrapper
 # (`SELECT 1; DROP TABLE payroll` parses to a Block) — rejecting it closes the
@@ -101,8 +158,13 @@ def contains_star(tree: exp.Expression) -> bool:
 
 
 def referenced_slots(sql_template: str) -> set[str]:
-    """The set of `{slot}` names a template references (order-independent)."""
-    return set(_SLOT_TOKEN.findall(sql_template))
+    """The set of `{slot}` names a template references (order-independent).
+
+    Braces inside a string literal or a comment are DATA and are not slots — see
+    `_SKIP_OR_SLOT`. Reading them as slots made `WHERE note = '{dept_total}'` look like a bound
+    bind site to every caller that checks "is this slot referenced".
+    """
+    return set(slot_tokens_outside_strings(sql_template))
 
 
 def parse_template(sql_template: str) -> exp.Expression:
@@ -111,7 +173,7 @@ def parse_template(sql_template: str) -> exp.Expression:
         validation to prove a template parses and to read its column footprint. Raises
         `TemplateBindError` on a parse failure.
     """
-    placeholder_sql = _SLOT_TOKEN.sub(lambda m: f":{m.group(1)}", sql_template)
+    placeholder_sql = _sub_slot_tokens(sql_template, lambda name: f":{name}")
     try:
         tree = sqlglot.parse_one(placeholder_sql, dialect="clickhouse")
     except Exception as exc:  # noqa: BLE001 - any parse failure is fail-closed
@@ -151,7 +213,10 @@ def _to_literal(name: str, value: Any) -> exp.Expression:
 # template (`FROM scratch.<placeholder> …`). The loader treats `scratch.*` sources
 # as session-gated (D69/OQ-4 — not required in `uses`); the executor rewrites the
 # placeholder table to the runtime-controlled materialized scratch table.
-_SCRATCH_DB = "scratch"
+# The database a materialized table intermediate lives under. PUBLIC because three modules
+# already needed it and each had defined its own copy; a fourth was about to be added.
+SCRATCH_DB = "scratch"
+_SCRATCH_DB = SCRATCH_DB
 
 
 def _rewrite_scratch_tables(
@@ -487,6 +552,10 @@ def bind_template(
 
 
 __all__ = [
+    "SCRATCH_DB",
+    "iter_slot_tokens",
+    "slot_tokens_outside_strings",
+    "sub_slot_tokens",
     "SLOT_TOKEN",
     "TemplateBindError",
     "assert_read_only_select",

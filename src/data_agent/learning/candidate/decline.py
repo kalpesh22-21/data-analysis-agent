@@ -143,6 +143,21 @@ class ValidationSnapshot:
     # how much a `completed` outcome proves needs to be able to tell the two apart.
     reconstructed: bool = False
 
+    # ⚠ TRUE when the SQL was AUTHORED BY AN EXPERT at a minting page rather than observed on a
+    # session. A third provenance state, and it needed its own field rather than reusing
+    # `reconstructed`, because the two make OPPOSITE claims about the same walk.
+    #
+    # A reconstruction is circular and its first totality walk cannot fail — the SQL is derived
+    # from the entries being checked. An authored snapshot is the reverse: the SQL arrived from
+    # outside the entries entirely, so the walk is the STRONGEST it ever is here. Every literal
+    # the expert typed must be classified by someone who did not get to see the classification
+    # first. Marking a minted snapshot `reconstructed` would tell a reader its walk proved
+    # nothing, when in fact that walk is the whole gate.
+    #
+    # What it does NOT claim is that the query ever ran. `verified` stays False and promotion
+    # still replays; see `learning/mint/engine.py`.
+    authored: bool = False
+
     @classmethod
     def from_summary(
         cls, summary: SessionSummary, *, evidence: tuple[EvidencePointer, ...] = ()
@@ -193,6 +208,7 @@ class ValidationSnapshot:
             "sql_by_ref": {ref: list(sqls) for ref, sqls in self.sql_by_ref.items()},
             "evidence": [e.to_doc() for e in self.evidence],
             "reconstructed": self.reconstructed,
+            "authored": self.authored,
         }
 
     @classmethod
@@ -252,6 +268,7 @@ class ValidationSnapshot:
             sql_by_ref=sql_by_ref,
             evidence=tuple(evidence),
             reconstructed=bool(doc.get("reconstructed", False)),
+            authored=bool(doc.get("authored", False)),
         )
 
 

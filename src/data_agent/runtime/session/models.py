@@ -466,7 +466,12 @@ class PauseCheckpoint:
     # --- additive, the runBlueprint brick (D45 mid-DAG durability, §2.5) ---
     blueprint_id: str | None = None
     slot_bindings_json: str | None = None  # the raw model-proposed slot_bindings (deterministic re-fill)
-    completed_nodes_json: str | None = None  # [{order, output_scalar}] — SCALAR outputs only (Slice C)
+    # [{order, output, provenance, sql, table, row_count}] — the executor's completed-node
+    # records (Slice C). OPAQUE here: the loop persists and returns the string VERBATIM,
+    # with no key whitelist, so the executor owns its shape end-to-end and re-validates the
+    # untrusted parts on the way back in (the D64 ownership of `table`, and `row_count`
+    # against a live count of the table it names).
+    completed_nodes_json: str | None = None
     awaiting_node: int | None = None  # the node order to resume at (Slice C)
     # The `serves_intent` tag of the `runBlueprint` call that paused (additive,
     # call-time intent tagging). A pausing tool writes NO trail entry — the entry is

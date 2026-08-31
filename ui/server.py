@@ -144,7 +144,17 @@ _INBOX_ACTIONS = frozenset(
 # refinements — a bodyless promote is the normal case). Every other action is a bare POST
 # and must stay one; see `inbox_action`.
 _INBOX_BODY_ACTIONS = frozenset(
-    {"complete", "promote", "revise", "apply_revision", "attest_scan", "trial_run"}
+    # `approve` carries a body now: the reviewer's warehouse token for the golden replay. The
+    # inbox mints nothing for that query, so without the body the approve is refused upstream.
+    {
+        "approve",
+        "complete",
+        "promote",
+        "revise",
+        "apply_revision",
+        "attest_scan",
+        "trial_run",
+    }
 )
 # The only `?status=` values the list surface accepts (ui-inbox-type-archive contract
 # §List API): the live review queue, the durable rejected archive, the promotable set of
@@ -168,6 +178,7 @@ INBOX_BODY_MAX_BYTES = int(os.environ.get("INBOX_BODY_MAX_BYTES", str(256 * 1024
 _STATIC_DIR = Path(__file__).parent / "static"
 _INDEX_HTML = _STATIC_DIR / "index.html"
 _INBOX_HTML = _STATIC_DIR / "inbox.html"
+_MINT_HTML = _STATIC_DIR / "mint.html"
 
 # Server-side-only session_id -> JWT map (D82/D5: the browser never receives
 # this). In-memory is fine for this minimal, single-process dev UI — no
@@ -620,6 +631,15 @@ _INBOX_MODEL_ACTIONS = frozenset({"revise"})
 _INBOX_WAREHOUSE_ACTIONS = frozenset({"trial_run"})
 _INBOX_WAREHOUSE_HOP_TIMEOUT_SECONDS = 90.0
 
+# Path segments that reach a model, for the TIMEOUT lookup only. A superset of
+# `_INBOX_MODEL_ACTIONS` and deliberately a separate name: that set means "a per-candidate
+# ACTION that calls a model", and every member of it must also be in `_INBOX_ACTIONS` and
+# `_INBOX_BODY_ACTIONS` — an invariant with its own test. `mint` calls a model but is NOT a
+# per-candidate action; it has no candidate id and its own route. Adding it to the action set
+# to buy the longer timeout would have broken that invariant to describe something it was
+# never about, so the two concerns get two names.
+_INBOX_MODEL_PATH_SEGMENTS = _INBOX_MODEL_ACTIONS | frozenset({"mint"})
+
 
 def _hop_timeout(path: str) -> httpx.Timeout:
     """The timeout for one inbox hop, by whether the upstream will call a model.
@@ -630,13 +650,33 @@ def _hop_timeout(path: str) -> httpx.Timeout:
     service either works immediately or is not going to.
     """
     action = path.rsplit("/", 1)[-1].split("?", 1)[0]
-    if action in _INBOX_MODEL_ACTIONS:
+    if action in _INBOX_MODEL_PATH_SEGMENTS:
         read = _INBOX_MODEL_HOP_TIMEOUT_SECONDS
     elif action in _INBOX_WAREHOUSE_ACTIONS:
         read = _INBOX_WAREHOUSE_HOP_TIMEOUT_SECONDS
     else:
         read = _INBOX_HOP_TIMEOUT_SECONDS
     return httpx.Timeout(read, connect=_INBOX_CONNECT_TIMEOUT_SECONDS)
+
+
+async def _inbox_json_body(request: Request, action: str) -> Any:
+    """One inbox request body, size-capped and parsed. Shared by the minting routes.
+
+    SIZE-CAPPED with the same budget every other inbox write uses. A minting body is the
+    largest this BFF accepts — a whole query plus prose — which makes it the one most worth
+    bounding, and the cap is the BFF's own resource that nothing downstream can give back.
+    """
+    raw = await _read_bounded_body(request, INBOX_BODY_MAX_BYTES)
+    if raw is None:
+        raise HTTPException(
+            status_code=413, detail="Request body exceeds the maximum allowed size."
+        )
+    try:
+        return json.loads(raw) if raw else None
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail=f"{action} requires a JSON body."
+        ) from None
 
 
 async def _proxy_inbox(
@@ -699,12 +739,43 @@ async def inbox_list(status: str | None = None) -> JSONResponse:
     return await _proxy_inbox("GET", f"/inbox?{query}")
 
 
-@app.get("/api/inbox/trial_tenants")
-async def inbox_trial_tenants() -> JSONResponse:
-    """Proxy the trial tenant labels. A GET with no body — the browser needs the LABELS to
-    build a selector; the claims behind them never leave the service."""
+@app.get("/mint")
+async def mint_page() -> FileResponse:
+    """Serve the blueprint AUTHORING page. HTML shell only; its data calls go to
+    `/api/inbox/mint*` below. Behind the same inbox switch as the reviewer page, because it
+    writes to the same access-controlled review queue."""
     _require_inbox_enabled()
-    return await _proxy_inbox("GET", "/inbox/trial_tenants")
+    return FileResponse(_MINT_HTML)
+
+
+@app.get("/api/inbox/mint/schema")
+async def inbox_mint_schema() -> JSONResponse:
+    """Proxy the tables and columns the minting form may offer.
+
+    Declared BEFORE the generic `POST /api/inbox/{candidate_id}/{action}` route below. They do
+    not collide today (that one is POST-only, this is GET), but the shapes overlap —
+    `mint/schema` reads as `candidate_id="mint", action="schema"` — and relying on the method to
+    keep them apart is a coincidence rather than a design."""
+    _require_inbox_enabled()
+    return await _proxy_inbox("GET", "/inbox/mint/schema")
+
+
+@app.post("/api/inbox/mint/prior_art")
+async def inbox_mint_prior_art(request: Request) -> JSONResponse:
+    """Proxy the duplicate check. Reads only — it drafts nothing and writes nothing."""
+    _require_inbox_enabled()
+    return await _proxy_inbox(
+        "POST", "/inbox/mint/prior_art", await _inbox_json_body(request, "prior_art")
+    )
+
+
+@app.post("/api/inbox/mint")
+async def inbox_mint(request: Request) -> JSONResponse:
+    """Proxy one minting submission. The body is forwarded VERBATIM — the inbox service owns
+    the validation, and a second schema here would be a second vocabulary for the same
+    mistake."""
+    _require_inbox_enabled()
+    return await _proxy_inbox("POST", "/inbox/mint", await _inbox_json_body(request, "mint"))
 
 
 @app.get("/api/inbox/health")

@@ -32,6 +32,12 @@ from .helpers import (
     with_type,
 )
 
+# Approving REPLAYS against the live warehouse, and this surface mints no tokens — the
+# reviewer pastes one. Any non-blank string does here; `probe_factory` decides what the replay
+# actually runs through, which is the fake the test already wired.
+REVIEWER_TRIAL_TOKEN = "reviewer-pasted-token"
+
+
 KEY = "sha256:single-bp"
 CLOCK = "2026-08-10T12:00:00+00:00"
 
@@ -95,7 +101,7 @@ async def test_the_human_approve_completes_the_path_into_the_corpus():
     scheduler, inbox = _plane(store, writer=writer)
 
     await scheduler.run_once()
-    approved = await inbox.approve(env.candidate_id)
+    approved = await inbox.approve(env.candidate_id, token=REVIEWER_TRIAL_TOKEN)
 
     assert approved.status == CandidateStatus.VALIDATED
     assert len(writer.landed) == 1

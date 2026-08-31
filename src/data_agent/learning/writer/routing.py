@@ -135,7 +135,26 @@ def derive_inbox_reason(env: CandidateEnvelope) -> str:
         return "leakage_near_miss"
     if _entity_scan_unsettled(env):
         return "fail_to_review"
+    # LAST among the blueprint rules, mirroring `route_candidate`'s precedence exactly: every
+    # reason above describes something WRONG with the row, and those stay the reviewer's task
+    # whether a human wrote it or the loop mined it. `hand_authored` is not a defect — it is
+    # why this row is here at all.
+    if _is_authored(env):
+        return "hand_authored"
     return "blueprint_sampled"
+
+
+def _is_authored(env: CandidateEnvelope) -> bool:
+    """Whether this candidate was hand-authored at the minting page rather than mined.
+
+    Read off the VALIDATION SNAPSHOT's `authored` flag, which is stamped where the accepted SQL
+    is recorded — the one place that knows the SQL came from a person rather than a session.
+    Deliberately NOT keyed on the `mint::` session prefix: that is a display convention, and a
+    routing rule that depends on the shape of an id string breaks the first time somebody
+    renames it, silently and in the permissive direction.
+    """
+    snapshot = env.revalidation
+    return bool(snapshot is not None and getattr(snapshot, "authored", False))
 
 
 def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> RoutingDecision:
@@ -168,6 +187,17 @@ def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> Routi
             # human review; a blueprint must never auto-land on an unsettled scan (S4).
             return RoutingDecision(
                 CandidateStatus.IN_REVIEW, "route_inbox", "fail_to_review"
+            )
+        if _is_authored(env):
+            # A HAND-AUTHORED blueprint is ALWAYS reviewed, never auto-landed, and the
+            # asymmetry with a mined candidate is the whole argument: a mined one earned its
+            # way here by being OBSERVED answering a real user's question, which is the
+            # evidence the auto-land path is built on. An authored one has no such session —
+            # and in `pseudo`/`none` mode its SQL was written by a model from prose and has
+            # never run at all. Auto-landing it would let a page that says "you review the
+            # draft there" quietly promote something nobody looked at.
+            return RoutingDecision(
+                CandidateStatus.IN_REVIEW, "route_inbox", "hand_authored"
             )
         if sampled_for_inbox:
             return RoutingDecision(

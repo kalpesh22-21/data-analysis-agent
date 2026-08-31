@@ -662,7 +662,12 @@ def build_promotion_plane(
     tracer: object | None = None,
     completer: ParameterizationCompleter | None = None,
     reviser: BlueprintReviser | None = None,
-    trial_probes: dict[str, Any] | None = None,
+    minter: Any = None,
+    # The runQuery transport for the reviewer-driven trial. It carries NO authority on its own:
+    # the trial's probe is built per request around the reviewer's OWN pasted token, so what is
+    # shared here is a connection, not a credential.
+    mcp_client: Any = None,
+    probe_factory: Any = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the S9 promotion plane (scheduler + review inbox) over ONE `candidate_store`.
 
@@ -709,9 +714,9 @@ def build_promotion_plane(
         # form still accepts entries typed directly, so this costs a convenience rather than a
         # capability — which is why it has no wiring assertion beside the completer's.
         reviser=reviser,
-        # Per-tenant probes for the reviewer-driven TRIAL only. The scheduler's own probe —
-        # the one the promotion replay uses — is untouched.
-        trial_probes=trial_probes,
+        minter=minter,
+        mcp_client=mcp_client,
+        probe_factory=probe_factory,
     )
     return scheduler, inbox
 
@@ -733,7 +738,7 @@ def build_promotion_write_plane(
     tracer: object | None = None,
     completer: ParameterizationCompleter | None = None,
     reviser: BlueprintReviser | None = None,
-    trial_probes: dict[str, Any] | None = None,
+    minter: Any = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the FULLY-ACTIVATED S9 promotion WRITE plane (S9-activation Slice 2, §4).
 
@@ -771,7 +776,8 @@ def build_promotion_write_plane(
         tracer=tracer,
         completer=completer,
         reviser=reviser,
-        trial_probes=trial_probes,
+        minter=minter,
+        mcp_client=mcp_client,
     )
 
 

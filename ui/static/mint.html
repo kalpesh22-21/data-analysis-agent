@@ -1,0 +1,892 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Author a blueprint</title>
+<style>
+  :root {
+    --color-bg: #0f1117;
+    --color-surface: #171a23;
+    --color-surface-2: #1f2330;
+    --color-border: #2a2f3d;
+    --color-text: #e6e8ee;
+    --color-text-dim: #9aa1b2;
+    --color-accent: #5b8cff;
+    --color-accent-text: #ffffff;
+    --color-ok-bg: #16301f;
+    --color-ok-border: #2f7a4a;
+    --color-ok-text: #93e0b0;
+    --color-error-bg: #3a1c1c;
+    --color-error-border: #b33a3a;
+    --color-error-text: #ffb4b4;
+    --color-warn-bg: #332816;
+    --color-warn-border: #a5772a;
+    --color-warn-text: #f0c987;
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --radius: 8px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--color-bg);
+    color: var(--color-text);
+    display: flex;
+    justify-content: center;
+    padding: var(--space-5);
+  }
+
+  main { width: 100%; max-width: 820px; }
+
+  h1 { font-size: 20px; margin: 0 0 var(--space-2); }
+  h2 { font-size: 15px; margin: 0 0 var(--space-2); }
+
+  .lede {
+    color: var(--color-text-dim);
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 0 0 var(--space-5);
+  }
+
+  .lede a { color: var(--color-accent); }
+
+  section {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-4);
+    margin-bottom: var(--space-4);
+  }
+
+  label { display: block; font-size: 13px; margin-bottom: var(--space-1); }
+
+  .hint {
+    color: var(--color-text-dim);
+    font-size: 12px;
+    line-height: 1.5;
+    margin: 0 0 var(--space-3);
+  }
+
+  input[type="text"], textarea, select {
+    width: 100%;
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+    font-size: 13px;
+    font-family: inherit;
+  }
+
+  textarea { resize: vertical; line-height: 1.5; }
+  textarea.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+  input:focus, textarea:focus, select:focus {
+    outline: 2px solid var(--color-accent);
+    outline-offset: -1px;
+  }
+
+  .row { display: flex; gap: var(--space-3); flex-wrap: wrap; }
+  .row > * { flex: 1 1 240px; }
+
+  button {
+    background: var(--color-accent);
+    color: var(--color-accent-text);
+    border: 0;
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-4);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  button.secondary {
+    background: transparent;
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    font-weight: 400;
+  }
+
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .tables {
+    max-height: 220px;
+    overflow-y: auto;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2);
+    background: var(--color-bg);
+  }
+
+  .table-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    border-radius: 4px;
+  }
+
+  .table-row:hover { background: var(--color-surface-2); }
+  .table-row input { flex: 0 0 auto; margin: 0; }
+  .table-row label { margin: 0; font-size: 13px; cursor: pointer; flex: 1; }
+  .table-row .count { color: var(--color-text-dim); font-size: 11px; }
+
+  .columns {
+    margin-top: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    color: var(--color-text-dim);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    line-height: 1.6;
+    max-height: 140px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .lines > div {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+    margin-bottom: var(--space-2);
+  }
+
+  .lines .idx {
+    color: var(--color-text-dim);
+    font-size: 12px;
+    width: 18px;
+    flex: 0 0 auto;
+    text-align: right;
+  }
+
+  .lines input { flex: 1; }
+
+  .lines button {
+    flex: 0 0 auto;
+    background: transparent;
+    color: var(--color-text-dim);
+    border: 1px solid var(--color-border);
+    padding: var(--space-1) var(--space-2);
+    font-size: 12px;
+  }
+
+  .banner {
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    font-size: 13px;
+    line-height: 1.5;
+    margin-bottom: var(--space-4);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .banner.ok {
+    background: var(--color-ok-bg);
+    border: 1px solid var(--color-ok-border);
+    color: var(--color-ok-text);
+  }
+
+  .banner.warn {
+    background: var(--color-warn-bg);
+    border: 1px solid var(--color-warn-border);
+    color: var(--color-warn-text);
+  }
+
+  .banner.error {
+    background: var(--color-error-bg);
+    border: 1px solid var(--color-error-border);
+    color: var(--color-error-text);
+  }
+
+  .banner a { color: inherit; font-weight: 600; }
+
+  pre {
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-x: auto;
+    margin: var(--space-2) 0 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .entry {
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2) var(--space-3);
+    margin-bottom: var(--space-2);
+    font-size: 12px;
+    background: var(--color-bg);
+  }
+
+  .entry .who { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .entry .role { color: var(--color-accent); font-weight: 600; }
+  .entry .why { color: var(--color-text-dim); display: block; margin-top: var(--space-1); }
+
+  .actions { display: flex; gap: var(--space-3); align-items: center; }
+  .status { color: var(--color-text-dim); font-size: 12px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Author a blueprint</h1>
+  <p class="lede">
+    Describe a question you already know how to answer. This drafts a blueprint from it and files
+    it on the <a href="/inbox">review queue</a> — it does <strong>not</strong> publish anything.
+    You review the draft there, trial-run it, and approve it like any other candidate.
+  </p>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <form id="form">
+    <section>
+      <h2>The question</h2>
+      <p class="hint">
+        What should this blueprint answer? Write it the way someone would ask it.
+      </p>
+      <textarea id="question" rows="2"
+        placeholder="What was the average annual salary by employment status for a department?"></textarea>
+    </section>
+
+    <section>
+      <h2>Tables</h2>
+      <p class="hint">
+        Pick the tables to answer it from. The draft is grounded on their columns — an
+        unselected table cannot be read, and its columns cannot be cited.
+      </p>
+      <div id="tables" class="tables"></div>
+      <div id="columns" class="columns" hidden></div>
+    </section>
+
+    <section>
+      <h2>Steps</h2>
+      <p class="hint">
+        How you would answer it, in order. These shape the query; they are not stored as a
+        separate field, so anything that changes what the number MEANS belongs in an assumption
+        or the question itself.
+      </p>
+      <div id="steps" class="lines"></div>
+      <button type="button" class="secondary" id="add-step">Add a step</button>
+    </section>
+
+    <section>
+      <h2>Shape</h2>
+      <p class="hint">
+        Most blueprints are one query. Choose several steps when a later step needs an
+        <em>earlier step's result</em> — a ratio against a total, a rollup over a per-employee
+        table. You declare the steps and which feeds which; the assistant only writes the SQL,
+        because a model guessing the dependency edges produces a graph nothing can check.
+        <br><br>
+        A step passes on either <strong>one value</strong> (a total, an average) or its
+        <strong>whole result set</strong> (choose "a table" when many rows flow onward). The
+        wiring notation is generated for you — the assistant writes <code>{name}</code> for a
+        single value, or reads <code>scratch.name</code> for a table.
+      </p>
+      <div class="row">
+        <div>
+          <label for="shape">How many queries?</label>
+          <select id="shape">
+            <option value="single">One query</option>
+            <option value="composite">Several steps that feed each other</option>
+          </select>
+        </div>
+      </div>
+      <div id="nodes-panel" hidden style="margin-top: var(--space-4);">
+        <div id="nodes"></div>
+        <button type="button" class="secondary" id="add-node">Add a step</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Assumptions</h2>
+      <p class="hint">
+        What has to be true for the answer to be right — "excludes terminated employees",
+        "earnings only, not deductions". Ones that change the meaning of the number are folded
+        into the blueprint's intent.
+      </p>
+      <div id="assumptions" class="lines"></div>
+      <button type="button" class="secondary" id="add-assumption">Add an assumption</button>
+    </section>
+
+    <section>
+      <h2>SQL</h2>
+      <p class="hint">
+        If you have a query that <em>ran</em>, say so — it is used verbatim and the assistant is
+        given no way to rewrite it. A sketch is corrected and completed instead.
+      </p>
+      <div class="row">
+        <div>
+          <label for="sql-mode">What is this SQL?</label>
+          <select id="sql-mode">
+            <option value="none">I have none — write it from my steps</option>
+            <option value="pseudo">A sketch — correct and complete it</option>
+            <option value="exact">A query that ran — use it verbatim</option>
+          </select>
+        </div>
+      </div>
+      <div id="sql-whole" style="margin-top: var(--space-3);">
+        <textarea id="sql" class="code" rows="8"
+          placeholder="SELECT ..."></textarea>
+      </div>
+      <p id="sql-per-step" class="hint" hidden style="margin-top: var(--space-3);">
+        A multi-step blueprint is built from its steps, so each step carries its own query —
+        write them in the Shape section above. There is no whole-query box for a DAG.
+      </p>
+    </section>
+
+    <section>
+      <div class="actions">
+        <button type="submit" id="submit">Draft the blueprint</button>
+        <span class="status" id="status"></span>
+      </div>
+    </section>
+  </form>
+
+  <section id="prior-art" hidden>
+    <h2>This may already exist</h2>
+    <p class="hint">
+      A warning, not a block — the same question at a different grain is a real blueprint of its
+      own. Check these before approving your draft.
+    </p>
+    <div id="prior-art-list"></div>
+  </section>
+
+  <section id="result" hidden>
+    <h2>The draft</h2>
+    <div id="result-intent"></div>
+    <pre id="result-sql"></pre>
+    <div id="result-rationale" class="hint" style="margin-top: var(--space-3);"></div>
+    <h2 style="margin-top: var(--space-4);">How each literal was classified</h2>
+    <div id="result-entries"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// Every server value on this page reaches the DOM through `textContent`. The drafted SQL and
+// the validator's decline detail both carry literals lifted from a real query, so an HTML sink
+// anywhere here would turn an authoring surface into an injection surface — the identical
+// argument `inbox.html` is pinned on, and the identical test guards this file.
+
+var schema = { available: false, tables: [], columns: [] };
+var selectedTables = [];
+
+function el(tag, className, text) {
+  var node = document.createElement(tag);
+  if (className) { node.className = className; }
+  if (text !== undefined && text !== null) { node.textContent = String(text); }
+  return node;
+}
+
+function clear(node) {
+  while (node.firstChild) { node.removeChild(node.firstChild); }
+}
+
+function showBanner(kind, text, linkHref, linkText) {
+  var banner = document.getElementById("banner");
+  clear(banner);
+  banner.className = "banner " + kind;
+  banner.appendChild(document.createTextNode(text));
+  if (linkHref) {
+    banner.appendChild(document.createTextNode(" "));
+    var link = el("a", null, linkText || "Open it");
+    link.href = linkHref;
+    banner.appendChild(link);
+  }
+  banner.hidden = false;
+}
+
+function hideBanner() {
+  document.getElementById("banner").hidden = true;
+}
+
+// --- the repeated-line editors (steps, assumptions) ------------------------------------
+
+function addLine(containerId, placeholder) {
+  var container = document.getElementById(containerId);
+  var row = el("div");
+  var idx = el("span", "idx");
+  var input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = placeholder;
+  var remove = el("button", null, "Remove");
+  remove.type = "button";
+  remove.addEventListener("click", function () {
+    container.removeChild(row);
+    renumber(containerId);
+  });
+  row.appendChild(idx);
+  row.appendChild(input);
+  row.appendChild(remove);
+  container.appendChild(row);
+  renumber(containerId);
+  input.focus();
+}
+
+function renumber(containerId) {
+  var rows = document.getElementById(containerId).children;
+  for (var i = 0; i < rows.length; i += 1) {
+    rows[i].querySelector(".idx").textContent = String(i + 1) + ".";
+  }
+}
+
+function readLines(containerId) {
+  var inputs = document.getElementById(containerId).querySelectorAll("input");
+  var out = [];
+  for (var i = 0; i < inputs.length; i += 1) {
+    var value = inputs[i].value.trim();
+    if (value) { out.push(value); }
+  }
+  return out;
+}
+
+// --- the table picker -------------------------------------------------------------------
+
+function countColumns(table) {
+  var prefix = table + ".";
+  var total = 0;
+  for (var i = 0; i < schema.columns.length; i += 1) {
+    if (schema.columns[i].indexOf(prefix) === 0) { total += 1; }
+  }
+  return total;
+}
+
+function renderTables() {
+  var container = document.getElementById("tables");
+  clear(container);
+  if (!schema.tables.length) {
+    container.appendChild(el("div", "hint", "No tables are available in this deployment."));
+    return;
+  }
+  schema.tables.forEach(function (table, index) {
+    var row = el("div", "table-row");
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.id = "table-" + index;
+    box.value = table;
+    box.addEventListener("change", onTableToggle);
+    var label = el("label", null, table);
+    label.htmlFor = box.id;
+    row.appendChild(box);
+    row.appendChild(label);
+    row.appendChild(el("span", "count", countColumns(table) + " columns"));
+    container.appendChild(row);
+  });
+}
+
+function onTableToggle() {
+  var boxes = document.getElementById("tables").querySelectorAll("input[type=checkbox]");
+  selectedTables = [];
+  for (var i = 0; i < boxes.length; i += 1) {
+    if (boxes[i].checked) { selectedTables.push(boxes[i].value); }
+  }
+  renderColumns();
+}
+
+function renderColumns() {
+  var panel = document.getElementById("columns");
+  clear(panel);
+  if (!selectedTables.length) {
+    panel.hidden = true;
+    return;
+  }
+  var shown = schema.columns.filter(function (column) {
+    return selectedTables.some(function (table) {
+      return column.indexOf(table + ".") === 0;
+    });
+  });
+  panel.appendChild(document.createTextNode(shown.join("\n")));
+  panel.hidden = false;
+}
+
+// --- the composite step editor ----------------------------------------------------------
+
+// The expert owns the DAG. Each step declares what it answers, what its result is called, and
+// which EARLIER steps it needs — backward edges only, so the graph is acyclic by construction
+// rather than by check. The `$n.name` consume grammar is derived server-side; nobody types it.
+var nodeSeq = 0;
+
+function nodeRows() {
+  return document.getElementById("nodes").children;
+}
+
+function addNode() {
+  var container = document.getElementById("nodes");
+  var row = el("div", "entry");
+  row.style.marginBottom = "var(--space-3)";
+  nodeSeq += 1;
+
+  var head = el("div");
+  head.style.display = "flex";
+  head.style.gap = "var(--space-2)";
+  head.style.alignItems = "center";
+  var badge = el("span", "idx");
+  var intent = document.createElement("input");
+  intent.type = "text";
+  intent.className = "node-intent";
+  intent.placeholder = "what this step answers";
+  intent.style.flex = "1";
+  var remove = el("button", null, "Remove");
+  remove.type = "button";
+  remove.className = "secondary";
+  remove.addEventListener("click", function () {
+    container.removeChild(row);
+    renumberNodes();
+  });
+  head.appendChild(badge);
+  head.appendChild(intent);
+  head.appendChild(remove);
+  row.appendChild(head);
+
+  var nameRow = el("div");
+  nameRow.style.marginTop = "var(--space-2)";
+  nameRow.style.display = "flex";
+  nameRow.style.gap = "var(--space-2)";
+  var name = document.createElement("input");
+  name.type = "text";
+  name.className = "node-name";
+  name.placeholder = "name for this step's result (optional)";
+  nameRow.appendChild(name);
+  // ONE VALUE or the WHOLE RESULT SET — the two things the executor can pass between steps
+  // (`NODE_OUTPUT_KINDS`). A table becomes `scratch.<name>` for the steps that read it.
+  var kind = document.createElement("select");
+  kind.className = "node-kind";
+  kind.style.flex = "0 0 auto";
+  // Both `NODE_OUTPUT_KINDS` members are live. `table` was disabled while S4 could not
+  // validate one — its provenance walk fail-closed on `scratch.*` with no bound session — and
+  // is enabled now that a node's DECLARED table consumes are exempted from that check.
+  [
+    ["scalar", "passes on one value"],
+    ["table", "passes on a table"],
+  ].forEach(function (spec) {
+    var opt = document.createElement("option");
+    opt.value = spec[0];
+    opt.textContent = spec[1];
+    kind.appendChild(opt);
+  });
+  nameRow.appendChild(kind);
+  row.appendChild(nameRow);
+
+  var sql = document.createElement("textarea");
+  sql.className = "code node-sql";
+  sql.rows = 4;
+  sql.placeholder = stepSqlPlaceholder();
+  sql.style.marginTop = "var(--space-2)";
+  row.appendChild(sql);
+
+  var deps = el("div", "node-deps");
+  deps.style.marginTop = "var(--space-2)";
+  row.appendChild(deps);
+
+  container.appendChild(row);
+  renumberNodes();
+  intent.focus();
+}
+
+function renumberNodes() {
+  var rows = nodeRows();
+  for (var i = 0; i < rows.length; i += 1) {
+    rows[i].querySelector(".idx").textContent = "step " + String(i + 1);
+    var deps = rows[i].querySelector(".node-deps");
+    clear(deps);
+    if (i === 0) {
+      deps.appendChild(el("span", "hint", "the first step cannot depend on anything"));
+      continue;
+    }
+    // BACKWARD EDGES ONLY — a checkbox per PRIOR step and none for the first, so the graph is
+    // acyclic by construction rather than by validation.
+    deps.appendChild(el("span", "hint", "needs the result of:"));
+    for (var j = 0; j < i; j += 1) {
+      var wrap = el("span", "table-row");
+      wrap.style.display = "inline-flex";
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.className = "node-dep";
+      box.value = String(j);
+      var lab = el("label", null, "step " + String(j + 1));
+      lab.style.cursor = "pointer";
+      lab.addEventListener("click", function (b) {
+        return function () { b.checked = !b.checked; };
+      }(box));
+      wrap.appendChild(box);
+      wrap.appendChild(lab);
+      deps.appendChild(wrap);
+    }
+  }
+}
+
+function readNodes() {
+  if (document.getElementById("shape").value !== "composite") { return []; }
+  // An empty `nodes` array is indistinguishable from "not a composite", so removing every step
+  // row used to mint a ONE-QUERY blueprint while the selector still said "several steps".
+  // Caught in `onSubmit`; this only reports what is there.
+  var rows = nodeRows();
+  var out = [];
+  for (var i = 0; i < rows.length; i += 1) {
+    var deps = rows[i].querySelectorAll(".node-dep");
+    var feeds = [];
+    for (var j = 0; j < deps.length; j += 1) {
+      if (deps[j].checked) { feeds.push(parseInt(deps[j].value, 10)); }
+    }
+    out.push({
+      step_intent: rows[i].querySelector(".node-intent").value.trim(),
+      output_name: rows[i].querySelector(".node-name").value.trim(),
+      sql: rows[i].querySelector(".node-sql").value.trim(),
+      output_kind: rows[i].querySelector(".node-kind").value,
+      feeds_from: feeds
+    });
+  }
+  return out;
+}
+
+function stepSqlPlaceholder() {
+  // "leave blank" is FALSE in exact mode — the server refuses a step with no SQL, because that
+  // mode promises queries that ran. The two controls live in different sections, so without
+  // this the only place their combination is adjudicated is a 400 after the form is filled in.
+  return document.getElementById("sql-mode").value === "exact"
+    ? "SQL for this step (required — you said these queries ran)"
+    : "SQL for this step (leave blank to have it written for you)";
+}
+
+function refreshStepPlaceholders() {
+  var boxes = document.getElementById("nodes").querySelectorAll(".node-sql");
+  for (var i = 0; i < boxes.length; i += 1) { boxes[i].placeholder = stepSqlPlaceholder(); }
+}
+
+function onShapeChange() {
+  var composite = document.getElementById("shape").value === "composite";
+  document.getElementById("nodes-panel").hidden = !composite;
+  // The whole-query box and the per-step boxes are MUTUALLY EXCLUSIVE server-side; showing both
+  // invited a 400 that only appeared after every step had been filled in.
+  document.getElementById("sql-whole").hidden = composite;
+  document.getElementById("sql-per-step").hidden = !composite;
+  if (composite && nodeRows().length === 0) { addNode(); addNode(); }
+}
+
+// --- prior art ---------------------------------------------------------------------------
+
+function renderPriorArt(cards) {
+  var section = document.getElementById("prior-art");
+  var list = document.getElementById("prior-art-list");
+  clear(list);
+  if (!cards || !cards.length) {
+    section.hidden = true;
+    return;
+  }
+  cards.forEach(function (card) {
+    var row = el("div", "entry");
+    row.appendChild(el("span", "role", card.tier === "mcp" ? "already in canon" : "in review"));
+    row.appendChild(document.createTextNode("  "));
+    row.appendChild(el("span", "who", String(card.id)));
+    row.appendChild(el("span", "why", String(card.intent || "")));
+    row.appendChild(
+      el("span", "why", "status " + String(card.status) + "  ·  similarity " +
+        String(card.confidence))
+    );
+    list.appendChild(row);
+  });
+  section.hidden = false;
+}
+
+function checkPriorArt() {
+  var question = document.getElementById("question").value.trim();
+  if (!question) { return; }
+  fetch("/api/inbox/mint/prior_art", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: question })
+  })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) { if (d) { renderPriorArt(d.prior_art); } })
+    .catch(function () {});
+}
+
+// --- the result -------------------------------------------------------------------------
+
+function renderEntries(entries) {
+  var container = document.getElementById("result-entries");
+  clear(container);
+  if (!entries || !entries.length) {
+    container.appendChild(el("div", "hint", "No literals were classified."));
+    return;
+  }
+  entries.forEach(function (entry) {
+    var locator = entry.locator || {};
+    var card = el("div", "entry");
+    var who = [locator.table, locator.column].filter(Boolean).join(".");
+    card.appendChild(el("span", "who", who + " = " + String(locator.value)));
+    card.appendChild(document.createTextNode("  "));
+    card.appendChild(el("span", "role", String(entry.role || "")));
+    if (entry.slot && entry.slot.name) {
+      card.appendChild(el("span", "why", "fills as {" + entry.slot.name + "}"));
+    }
+    if (entry.why) { card.appendChild(el("span", "why", entry.why)); }
+    if (entry.rule_id) { card.appendChild(el("span", "why", "rule: " + entry.rule_id)); }
+    container.appendChild(card);
+  });
+}
+
+function renderResult(body) {
+  document.getElementById("result-intent").textContent = body.intent || "";
+  document.getElementById("result-sql").textContent = body.accepted_sql || "";
+  document.getElementById("result-rationale").textContent = body.rationale || "";
+  renderEntries(body.entries);
+  document.getElementById("result").hidden = false;
+
+  var link = "/inbox";
+  if (body.outcome === "completed") {
+    showBanner(
+      "ok",
+      "Drafted and filed for review. Nothing is published yet — open the queue to trial-run "
+        + "it and approve it.",
+      link,
+      "Open the review queue"
+    );
+  } else {
+    showBanner(
+      "warn",
+      "The draft did not validate: "
+        + (body.decline_detail || body.decline_reason || "the validator refused it")
+        + "\n\nIt is on the queue anyway, carrying that complaint. Open it there and ask the "
+        + "assistant to fix the parameterization.",
+      link,
+      "Open the review queue"
+    );
+  }
+}
+
+// --- submit ------------------------------------------------------------------------------
+
+function setBusy(busy, message) {
+  document.getElementById("submit").disabled = busy;
+  document.getElementById("status").textContent = message || "";
+}
+
+function onSubmit(event) {
+  event.preventDefault();
+  hideBanner();
+  document.getElementById("result").hidden = true;
+
+  var payload = {
+    question: document.getElementById("question").value.trim(),
+    tables: selectedTables,
+    steps: readLines("steps"),
+    assumptions: readLines("assumptions"),
+    sql: document.getElementById("sql").value.trim(),
+    sql_mode: document.getElementById("sql-mode").value,
+    nodes: readNodes()
+  };
+
+  // Checked here ONLY to save a round trip on the two mistakes that are certain. The server
+  // re-checks everything and owns the verdict; this is not a second validator.
+  if (!payload.question) {
+    showBanner("error", "A question is required — it becomes the blueprint's intent.");
+    return;
+  }
+  if (!payload.tables.length) {
+    showBanner("error", "Select at least one table so the draft can be grounded on its columns.");
+    return;
+  }
+  if (document.getElementById("shape").value === "composite" && !payload.nodes.length) {
+    showBanner(
+      "error",
+      "You chose several steps but there are none. Add a step, or switch back to one query."
+    );
+    return;
+  }
+  if (payload.nodes.length && payload.sql) {
+    showBanner(
+      "error",
+      "A multi-step blueprint is built from its steps, so the whole-query box must be empty."
+    );
+    return;
+  }
+
+  setBusy(true, "Drafting — this calls a model and can take a minute.");
+  fetch("/api/inbox/mint", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  })
+    .then(function (response) {
+      return response.json().then(function (body) {
+        return { ok: response.ok, body: body };
+      });
+    })
+    .then(function (result) {
+      setBusy(false, "");
+      if (!result.ok) {
+        showBanner("error", String((result.body && result.body.detail) || "The draft failed."));
+        return;
+      }
+      renderPriorArt(result.body.prior_art);
+      renderResult(result.body);
+    })
+    .catch(function (error) {
+      setBusy(false, "");
+      showBanner("error", "The draft could not be sent: " + String(error));
+    });
+}
+
+// --- boot --------------------------------------------------------------------------------
+
+function boot() {
+  document.getElementById("add-step").addEventListener("click", function () {
+    addLine("steps", "e.g. join employees to departments on department_code");
+  });
+  document.getElementById("add-assumption").addEventListener("click", function () {
+    addLine("assumptions", "e.g. excludes terminated employees");
+  });
+  document.getElementById("form").addEventListener("submit", onSubmit);
+  document.getElementById("shape").addEventListener("change", onShapeChange);
+  document.getElementById("sql-mode").addEventListener("change", refreshStepPlaceholders);
+  document.getElementById("add-node").addEventListener("click", addNode);
+  // Checked when they finish writing the question — early enough to matter, and it costs one
+  // read-only lookup rather than a drafting turn.
+  document.getElementById("question").addEventListener("blur", checkPriorArt);
+
+  addLine("steps", "e.g. join employees to departments on department_code");
+  addLine("assumptions", "e.g. excludes terminated employees");
+
+  fetch("/api/inbox/mint/schema")
+    .then(function (response) { return response.json(); })
+    .then(function (body) {
+      schema = {
+        available: !!body.available,
+        tables: body.tables || [],
+        columns: body.columns || []
+      };
+      if (!schema.available) {
+        showBanner(
+          "error",
+          "This deployment cannot author blueprints — no drafting plane is configured. "
+            + "The review queue still works."
+        );
+        document.getElementById("submit").disabled = true;
+      }
+      renderTables();
+    })
+    .catch(function (error) {
+      showBanner("error", "The table list could not be loaded: " + String(error));
+    });
+}
+
+boot();
+</script>
+</body>
+</html>

@@ -10,8 +10,11 @@ for a bad candidate and never auto-promotes.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
+from ...runtime.blueprint.models import TABLE_CONSUME_REF
+from ...runtime.blueprint.template import SCRATCH_DB
 from ...sqlparse import ProvenanceExtractionError, extract_column_provenance
 from ..candidate.generalization import (
     BlueprintGeneralization,
@@ -84,20 +87,127 @@ def _slot_binds_to(parameterization: list[dict[str, Any]]) -> tuple[str, ...]:
     return tuple(binds)
 
 
+# A name shaped like a MATERIALIZED scratch table (`s_<sid>_<suffix>`), which a declared
+# placeholder must never be. Traced end to end and such a name is inert — every use is either a
+# membership key or the identifier `_rewrite_scratch_tables` REPLACES, so it never reaches
+# warehouse SQL — but refusing it keeps the corpus honest: a promoted blueprint whose
+# placeholder masquerades as another session's table is a lie to whoever audits it later, and
+# an intermediate should carry a semantic name (`emp_earnings`) anyway.
+#
+# Refusing here means the name is simply NOT declared, so it falls through to the ordinary D64
+# fail-closed path rather than being special-cased — the conservative direction.
+_MATERIALIZED_SCRATCH_NAME = re.compile(r"^s_.+_.+$")
+
+
+def _declared_scratch(node: dict[str, Any] | None) -> frozenset[str]:
+    """The scratch placeholders *node* consumes AS TABLES — the `$n` (not `$n.name`) consumes.
+
+    These name intermediates the blueprint produces itself one node earlier, so they are exempt
+    from the extractor's session-ownership check: there is no session, and nothing is
+    materialized until the DAG runs. Anything not named here still fail-closes.
+    """
+    if not isinstance(node, dict):
+        return frozenset()
+    consumes = node.get("consumes")
+    if not isinstance(consumes, dict):
+        return frozenset()
+    return frozenset(
+        str(placeholder)
+        for placeholder, ref in consumes.items()
+        if TABLE_CONSUME_REF.match(str(ref))
+        and not _MATERIALIZED_SCRATCH_NAME.match(str(placeholder))
+    )
+
+
+def _scratch_column_schema(
+    node: dict[str, Any] | None,
+    templates_by_order: dict[Any, str],
+) -> dict[str, dict[str, str]]:
+    """`{scratch.<placeholder>: {column: TEXT}}` for *node*'s TABLE consumes.
+
+    MIRRORS `compiler._scratch_schema_for_node`, which does exactly this at LOAD time, and
+    reuses its `_template_output_columns` reader so the two cannot disagree about what columns a
+    materialized scratch table carries. The producer's SQL comes from the TEMPLATES, not from the
+    plan node — an S3 `composes` entry carries `source_tool_call_ref` and never SQL, and reading
+    it there registered the placeholder with zero columns, which fails to qualify identically.
+    """
+    from ...runtime.blueprint.compiler import _template_output_columns
+
+    if not isinstance(node, dict):
+        return {}
+    schema: dict[str, dict[str, str]] = {}
+    for placeholder, ref in (node.get("consumes") or {}).items():
+        match = TABLE_CONSUME_REF.match(str(ref))
+        if match is None:
+            continue
+        columns = _template_output_columns(templates_by_order.get(int(match.group(1))))
+        schema[f"{SCRATCH_DB}.{placeholder}"] = {c: "TEXT" for c in columns}
+    return schema
+
+
+def _catalog_table_names(catalog_schema: dict[str, dict[str, str]]) -> frozenset[str]:
+    """The BARE table names the catalog declares — what an alias key can collide with."""
+    return frozenset(key.split(".", 1)[1] for key in catalog_schema if "." in key)
+
+
 def _provenance_uses(
-    templates: list[str], catalog_schema: dict[str, dict[str, str]]
+    templates: list[str],
+    catalog_schema: dict[str, dict[str, str]],
+    *,
+    per_node: list[tuple[frozenset[str], dict[str, dict[str, str]]]] | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
     """Transitive `uses` across the template(s) via the D69/D87 extractor.
 
     Returns `(ok, uses)`; `ok=False` (a provenance failure) drives `explain_ok=False`.
+
+    *per_node* supplies, per template, the scratch placeholders that template DECLARES it
+    consumes and the columns each carries. Without it a composite whose consumer reads
+    `scratch.<name>` stamped `explain_ok=False, uses=()` — the extractor fail-closes on any
+    `scratch.*` with no bound session (D64) — and with an empty footprint the loader then also
+    refused the PRODUCER for reading a warehouse table outside it. So a shape the executor,
+    `check_dag` and the corpus loader all support could never be promoted.
+
+    ⚠ SCRATCH COLUMNS ARE EXCLUDED FROM `uses`. The footprint is a claim about the WAREHOUSE,
+    and a scratch table is this blueprint's own intermediate — including it would inflate the
+    declared footprint with names no access check can mean anything about. That is the
+    D69/OQ-4 scope-honesty split the compiler makes at load time, made the same way here.
     """
     uses: set[str] = set()
-    for template in templates:
+    for index, template in enumerate(templates):
+        declared, scratch_schema = (
+            per_node[index] if per_node else (frozenset(), {})
+        )
+        # ⚠ A PLACEHOLDER MAY NOT SHADOW A CATALOG TABLE NAME, and this is the FAIL-OPEN one.
+        # `_build_alias_map` keys aliases by BARE table name, so `scratch.payroll` and
+        # `dbpcm_warehouse.payroll` collide and the last source wins. When scratch wins, every
+        # warehouse column reference is attributed to the scratch table and then dropped by the
+        # scope-honesty filter below — `uses=()` with `outcome="ok"`, an UNDERSTATED footprint,
+        # which is the direction that silently passes any scope check. When the warehouse wins,
+        # the producer's model-chosen aliases are written into `database.table.column` keys for
+        # columns that do not exist.
+        #
+        # `consumes` keys are model-authored on the mined path, so the shadowing name is free to
+        # an attacker and reachable by accident. Undeclaring it drops the reference back onto the
+        # ordinary D64 fail-closed path.
+        shadowed = {name for name in declared if name in _catalog_table_names(catalog_schema)}
+        if shadowed:
+            _logger.info(
+                "generalize: scratch placeholder(s) %s shadow a catalog table name — refusing "
+                "to exempt them, so the candidate fails to review rather than under-declaring "
+                "its footprint",
+                sorted(shadowed),
+            )
+            declared = declared - shadowed
+        schema = {**catalog_schema, **scratch_schema} if scratch_schema else catalog_schema
         try:
-            pairs = extract_column_provenance(template, catalog_schema)
+            pairs = extract_column_provenance(
+                template, schema, declared_scratch=declared
+            )
         except ProvenanceExtractionError:
             return False, ()
         for table, column in pairs:
+            if table.split(".", 1)[0] == SCRATCH_DB:
+                continue
             uses.add(f"{table}.{column}")
     return True, tuple(sorted(uses))
 
@@ -376,7 +486,19 @@ def _generalize_composite(
         return _fail_to_review(payload, parameterization, REASON_UNREWRITABLE)
 
     templates = [n.sql_template for n in node_templates]
-    provenance_ok, uses = _provenance_uses(templates, catalog_schema)
+    by_order = {n.get("order"): n for n in composes if isinstance(n, dict)}
+    templates_by_order = {t.order: t.sql_template for t in node_templates}
+    provenance_ok, uses = _provenance_uses(
+        templates,
+        catalog_schema,
+        per_node=[
+            (
+                _declared_scratch(by_order.get(t.order)),
+                _scratch_column_schema(by_order.get(t.order), templates_by_order),
+            )
+            for t in node_templates
+        ],
+    )
     binds = _slot_binds_to(parameterization)
     uses_set = set(uses)
     binds_ok = provenance_ok and all(b in uses_set for b in binds)

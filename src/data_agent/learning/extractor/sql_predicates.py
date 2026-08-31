@@ -17,6 +17,8 @@ from dataclasses import dataclass
 import sqlglot
 import sqlglot.expressions as exp
 
+from ...runtime.blueprint.template import parse_template
+
 
 @dataclass(frozen=True)
 class LiteralPredicate:
@@ -153,11 +155,14 @@ def literal_predicates(sql: str) -> list[LiteralPredicate] | None:
 
     `None` if *sql* cannot be parsed (→ fail-to-review, D52).
     """
+    # `parse_template`, for the same reason `parse_accepted_sql` uses it: a COMPOSITE node's
+    # accepted SQL can carry the `{token}` the DAG binds an upstream output into, and `{name}`
+    # alone parses as an empty ClickHouse map literal. Under a bare parse the totality walk would
+    # enumerate predicates of a query that says `map()` where the real one says `{dept_total}`.
+    # Identical behaviour for brace-free SQL, which is every mined candidate.
     try:
-        ast = sqlglot.parse_one(sql, dialect="clickhouse")
+        ast = parse_template(sql)
     except Exception:  # noqa: BLE001 - un-parseable SQL → caller fails to review
-        return None
-    if ast is None:
         return None
 
     predicates: list[LiteralPredicate] = []
