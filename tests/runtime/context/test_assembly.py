@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from data_agent.runtime.context.assembly import DATE_ANCHOR_PREFIX, ContextAssembler
+from data_agent.runtime.context.assembly import (
+    DATE_ANCHOR_PREFIX,
+    DATE_ANCHOR_SQL_NOTE,
+    ContextAssembler,
+)
+from data_agent.runtime.context.budget import fit_request_to_budget
+from data_agent.runtime.loop.agent_loop import _assembled_to_canonical
+from data_agent.runtime.prompts import AGENT_SYSTEM_PROMPT
 from data_agent.runtime.session.memory_store import InMemorySessionStore
 from data_agent.runtime.session.models import (
     AnalysisState,
@@ -359,7 +366,7 @@ async def test_the_date_anchor_is_present_and_correctly_formatted() -> None:
     assembler = ContextAssembler(store, base_system_prompt="BASE")
     assembled = await assembler.assemble("sess-1", frozenset(), current_turn_index=0)
 
-    assert _anchor(assembled) == "Today's date is 2026-08-12."
+    assert _anchor(assembled) == f"Today's date is 2026-08-12.{DATE_ANCHOR_SQL_NOTE}"
     anchor_message = next(
         m for m in assembled.messages if str(m.get("content", "")).startswith(DATE_ANCHOR_PREFIX)
     )
@@ -468,7 +475,7 @@ async def test_the_anchor_is_derived_from_the_turn_not_from_the_clock() -> None:
     first = await assembler.assemble("sess-1", frozenset(), current_turn_index=0)
     second = await assembler.assemble("sess-1", frozenset(), current_turn_index=0)
 
-    assert _anchor(first) == "Today's date is 2021-03-04."
+    assert _anchor(first) == f"Today's date is 2021-03-04.{DATE_ANCHOR_SQL_NOTE}"
     assert first.messages == second.messages  # byte-stable across the rebuild
 
 
@@ -491,7 +498,7 @@ async def test_a_resumed_turn_keeps_the_date_it_opened_with() -> None:
     assembler = ContextAssembler(store)
     assembled = await assembler.assemble("sess-1", frozenset(), current_turn_index=0)
 
-    assert _anchor(assembled) == "Today's date is 2026-08-12."
+    assert _anchor(assembled) == f"Today's date is 2026-08-12.{DATE_ANCHOR_SQL_NOTE}"
 
 
 async def test_the_anchor_tracks_the_current_turn_not_the_session_start() -> None:
@@ -505,7 +512,7 @@ async def test_the_anchor_tracks_the_current_turn_not_the_session_start() -> Non
     assembler = ContextAssembler(store)
     assembled = await assembler.assemble("sess-1", frozenset(), current_turn_index=1)
 
-    assert _anchor(assembled) == "Today's date is 2026-08-12."
+    assert _anchor(assembled) == f"Today's date is 2026-08-12.{DATE_ANCHOR_SQL_NOTE}"
 
 
 async def test_no_anchor_without_a_turn_index_or_a_question() -> None:
@@ -547,3 +554,68 @@ async def test_an_unusable_timestamp_drops_the_anchor_rather_than_the_turn() -> 
         assert _anchor(assembled) is None, stamp
         # Not merely absent from the anchor slot — the garbage never appears at all.
         assert all(stamp not in str(m.get("content", "")) for m in assembled.messages)
+
+
+async def test_one_rendered_turn_carries_both_halves_of_the_date_rule() -> None:
+    """THE TWO CARRIERS MEET ONLY HERE. The rule "read the day from the anchor, but write
+    `today()`/`now()` in SQL" is split across two constants that no single module owns:
+    the positive half is a line in `AGENT_SYSTEM_PROMPT` (budgeted, in the runQuery
+    section) and the prohibition rides `DATE_ANCHOR_SQL_NOTE` on the per-turn anchor
+    message (unbudgeted, because "never as THIS literal" needs the literal beside it).
+
+    `tests/runtime/test_prompt_routing_contract.py` pins each constant's TEXT; nothing
+    pinned that an assembled turn actually carries both, which is the only form in which
+    the model ever sees them. Wiring the assembler to a different base prompt (every other
+    test here passes `"BASE"`) would satisfy the constant-level tests and ship a turn with
+    one half.
+    """
+    store = InMemorySessionStore()
+    await _anchor_session(store, "sess-1", "2026-08-12T09:41:07.123456+00:00")
+
+    assembler = ContextAssembler(store, base_system_prompt=AGENT_SYSTEM_PROMPT)
+    assembled = await assembler.assemble("sess-1", frozenset(), current_turn_index=0)
+
+    system = [m for m in assembled.messages if m.get("role") == "system"]
+    assert len(system) == 1  # the base prompt is the SOLE system message (head-pin)
+    assert "prefer dateDiff against `today()`/`now()`" in system[0]["content"]
+
+    assert _anchor(assembled) == f"Today's date is 2026-08-12.{DATE_ANCHOR_SQL_NOTE}"
+    assert "never as this literal" in _anchor(assembled)
+
+
+async def test_the_anchor_note_survives_the_send_seam_under_budget_pressure() -> None:
+    """The note is UNBUDGETED by design — it is not part of `AGENT_SYSTEM_PROMPT`, so it
+    does not count against the prompt ceiling. That argument holds only if the message it
+    rides is undroppable: a note that the fitter sheds under pressure would leave the
+    prompt's half of the rule ("prefer dateDiff") standing alone on exactly the long,
+    tool-heavy turns where the model starts pasting dates.
+
+    It survives because `fit_request_to_budget` pins the current turn from its FIRST
+    `user` message, and the anchor is inserted immediately BEFORE the turn's question —
+    so the anchor IS that first message. Asserted through the real send seam
+    (`_assembled_to_canonical` → `fit_request_to_budget`) at a budget far below the base
+    prompt alone, not by reading the pinning rule.
+    """
+    store = InMemorySessionStore()
+    for turn in range(3):  # three answered turns of droppable prior history
+        for role, text in (("user", "prior question"), ("assistant", "prior answer")):
+            await store.append_message(
+                "sess-1",
+                TurnMessage(
+                    turn_index=turn,
+                    role=role,
+                    content=f"{text} {turn} " + "filler " * 400,
+                    ts=f"2026-08-1{turn}T09:00:00+00:00",
+                ),
+            )
+    await _anchor_session(store, "sess-1", "2026-08-14T09:00:00+00:00", turn_index=3)
+
+    assembler = ContextAssembler(store, base_system_prompt=AGENT_SYSTEM_PROMPT)
+    assembled = await assembler.assemble("sess-1", frozenset(), current_turn_index=3)
+    canonical = _assembled_to_canonical(assembled.messages)
+
+    fitted = fit_request_to_budget(list(canonical), token_budget=200)
+    contents = [str(m.get("content", "")) for m in fitted.messages]
+    assert any(DATE_ANCHOR_SQL_NOTE in c for c in contents)
+    assert any("how many hires in the last 6 months?" in c for c in contents)
+    assert fitted.dropped_messages > 0  # the pressure was real: prior turns went

@@ -26,6 +26,7 @@ from .validate import (
     REASON_UNREWRITABLE,
     REASON_WHEN_COMPOSITE,
     check_dag,
+    check_no_frozen_date_literal,
     check_read_only_select,
     decide_outcome,
 )
@@ -194,6 +195,15 @@ def _fail_to_review(
             binds_to_subset_uses=False,
             dag_ok=False,
             read_only_select=False,
+            # VACUOUS on this path: no template was produced, so there is no frozen date
+            # literal to have found. False here would name a fault this candidate does not
+            # have, and `reason` above already carries the one it does. DELIBERATELY
+            # divergent from the four all-False neighbours, which are equally unchecked
+            # here — do not "fix" either side to match the other. Nothing reads the
+            # individual flags (routing, render and the scheduler all read `outcome`), so
+            # the only audience is a human reading the stamp, and to them False on a
+            # never-run check reads as a finding.
+            date_literal_ok=True,
             outcome="fail_to_review",
             reason=reason,
         ),
@@ -285,11 +295,13 @@ def _generalize_single(
     uses_set = set(uses)
     binds_ok = provenance_ok and all(b in uses_set for b in binds)
     read_only = check_read_only_select(sql_template)
+    date_literal_ok = check_no_frozen_date_literal(sql_template)
     outcome, reason = decide_outcome(
         explain_ok=provenance_ok,
         binds_to_subset_uses=binds_ok,
         dag_ok=True,
         read_only_select=read_only,
+        date_literal_ok=date_literal_ok,
     )
     return BlueprintGeneralization(
         sql_template=sql_template,
@@ -302,6 +314,7 @@ def _generalize_single(
             binds_to_subset_uses=binds_ok,
             dag_ok=True,
             read_only_select=read_only,
+            date_literal_ok=date_literal_ok,
             outcome=outcome,
             reason=reason,
         ),
@@ -368,12 +381,17 @@ def _generalize_composite(
     uses_set = set(uses)
     binds_ok = provenance_ok and all(b in uses_set for b in binds)
     read_only = provenance_ok and all(check_read_only_select(t) for t in templates)
+    # EVERY node template: a composite's top-level `sql_template` is None by construction, so
+    # the node templates are the only SQL this candidate carries — one frozen date in one node
+    # ages the whole blueprint.
+    date_literal_ok = all(check_no_frozen_date_literal(t) for t in templates)
     dag_ok = True  # proven by the gate at the top; a False here returned already
     outcome, reason = decide_outcome(
         explain_ok=provenance_ok,
         binds_to_subset_uses=binds_ok,
         dag_ok=dag_ok,
         read_only_select=read_only,
+        date_literal_ok=date_literal_ok,
     )
     return BlueprintGeneralization(
         sql_template=None,
@@ -386,6 +404,7 @@ def _generalize_composite(
             binds_to_subset_uses=binds_ok,
             dag_ok=dag_ok,
             read_only_select=read_only,
+            date_literal_ok=date_literal_ok,
             outcome=outcome,
             reason=reason,
         ),

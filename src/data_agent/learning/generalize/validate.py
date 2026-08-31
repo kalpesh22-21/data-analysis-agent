@@ -1,17 +1,19 @@
 """Static validation — the S4 dry-run stamp (`StaticValidation`, Contract A).
 
-Four deterministic checks over the rewritten template(s): `read_only_select` (a single
+Five deterministic checks over the rewritten template(s): `read_only_select` (a single
 read-only SELECT, no `*`, no dict-family funcs — D52); `explain_ok` (the template resolves
 against the current catalog — the D69 provenance qualify IS the schema check here);
-`binds_to_subset_uses` (the blueprint-compiler assertion); and `dag_ok` for composites
+`binds_to_subset_uses` (the blueprint-compiler assertion); `dag_ok` for composites
 (single
-blueprints trivially pass). ANY false ⇒ `outcome="fail_to_review"` (D52/D97) with a STABLE
-machine reason tag for the FIRST failing check — the value S7 routes on. Never raises;
-never auto-promotes.
+blueprints trivially pass); and `date_literal_ok` (no frozen absolute date pasted outside a
+comparison — a template that answers a different question every day it ages). ANY false ⇒
+`outcome="fail_to_review"` (D52/D97) with a STABLE machine reason tag for the FIRST failing
+check — the value S7 routes on. Never raises; never auto-promotes.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import sqlglot
@@ -22,6 +24,9 @@ from data_agent.runtime.blueprint.models import (
     SCALAR_CONSUME_REF,
     TABLE_CONSUME_REF,
 )
+from data_agent.runtime.blueprint.template import SLOT_TOKEN
+
+from ..extractor.sql_predicates import literal_predicate_of
 
 # Mirrors runtime/blueprint/models._MAX_SLOTS posture: each node is an unbudgeted
 # warehouse query at replay, so a poisoned READ record with N nodes = N queries.
@@ -34,6 +39,26 @@ REASON_DAG = "dag_invalid"
 REASON_READ_ONLY = "not_read_only_select"
 REASON_UNREWRITABLE = "unrewritable_sql"
 REASON_WHEN_COMPOSITE = "when_bearing_composite"
+REASON_DATE_LITERAL = "frozen_date_literal"
+
+# A full ISO date, optionally with a time — DELIBERATELY not a bare year: `toYear(x) = 2024`
+# is a comparison predicate anyway, and matching bare numbers would false-positive on every
+# threshold, id and cent amount in the corpus. The time part is OPTIONAL and covers the ISO-
+# 8601 spellings a model actually emits — `T` or space separator, minute OR second precision,
+# fractional seconds, and a `Z`/`±hh:mm` zone — because the incident's own spelling being
+# matched says nothing about the next one's. Still SCOPED to ISO: non-ISO (`28/08/2026`),
+# compact (`20260828`) and unpadded (`2026-8-28`) frozen dates pass this check. Every ISO
+# spelling IS caught, because sqlglot preserves `Literal.this` byte-for-byte — the shape
+# survives the parse in whatever form it was written.
+_DATE_SHAPED = re.compile(
+    r"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$"
+)
+
+# NOTE — there is deliberately NO local list of "comparison" node types here. Which
+# comparisons count is `sql_predicates.literal_predicate_of`'s decision and only its decision
+# (see `check_no_frozen_date_literal`): a hand-kept set here would be a second definition of
+# "adjudicated" that drifts from the enumerator it is supposed to mirror, which is exactly the
+# bug the first version of this check shipped.
 
 
 def _is_dict_family(node: exp.Expression) -> bool:
@@ -175,19 +200,93 @@ def check_dag(composes: list[dict[str, Any]]) -> bool:
     return True
 
 
+def check_no_frozen_date_literal(template: str) -> bool:
+    """No absolute date literal sits OUTSIDE a comparison predicate (a frozen run date).
+
+    The incident: an extractor pasted the session's run date into the template body —
+    `DATE_DIFF(DAY, seniority_date, toDateTime64('2026-08-28 00:00:00', 6))` — and S4 stamped
+    it `ok`. That blueprint answers a DIFFERENT question every day it ages, silently, which is
+    the D97 wrong-answer class. A sentinel floor in the same statement
+    (`seniority_date > toDateTime64('1900-01-01 00:00:00', 6)`) is legitimate.
+
+    THE MECHANICAL DISTINCTION IS WHETHER S3 ACTUALLY ADJUDICATED THE LITERAL, and it is asked
+    of S3 rather than re-derived here — `sql_predicates.literal_predicate_of` IS the
+    enumerator's decision. Two conditions, and both are load-bearing:
+
+      (a) some ancestor is a comparison THE ENUMERATOR RECOGNIZES
+          (`literal_predicate_of(ancestor) is not None`), and
+      (b) the literal's OWN SIDE of that comparison is COLUMN-FREE.
+
+    (a) is not "is there a comparison above it". A literal predicate needs a constant on one
+    side AND exactly one column on the OTHER, so `coalesce(termination_date, seniority_date) <
+    '2026-08-28'` — an ordinary HR shape — enumerates NOTHING: two columns, no single-column
+    side. Ditto `greatest(a, b) > '<date>'`, tuple compares, and `concat(a, b) BETWEEN ... AND
+    '<date>'`. A comparison-ancestor test would hand all of those to a reviewer that never saw
+    them.
+
+    (b) covers the mirror image — an enumerated predicate whose adjudicated literal is a
+    DIFFERENT one: `WHERE 30 = DATE_DIFF(DAY, seniority_date, toDateTime64('2026-08-28
+    00:00:00', 6))` IS a literal predicate (`seniority_date = 30`), and the run date rides
+    along inside the column side, adjudicated by nobody. The sentinel passes both: `toDateTime64
+    ('1900-01-01 00:00:00', 6)` is a column-free side of a `GT` that enumerates.
+
+    Purely structural — `parameterization` is deliberately not consulted. What a role plan then
+    DOES with an adjudicated literal (`inline` freezes it) is S3's half of the division of
+    labour; this check owns the shapes S3 structurally cannot see.
+
+    Reads the template in colon-form exactly as `rewrite._check_rewritten` does (`{slot}` is not
+    SQL). An UNPARSEABLE template passes here: the parse is already `_check_rewritten`'s
+    failure to report, and double-reporting it would move the reason tag S7 routes on.
+    """
+    colon_form = SLOT_TOKEN.sub(lambda m: f":{m.group(1)}", template)
+    try:
+        ast = sqlglot.parse_one(
+            colon_form, dialect="clickhouse", error_level=sqlglot.ErrorLevel.RAISE
+        )
+    except Exception:
+        return True
+    if ast is None:
+        return True
+    for literal in ast.find_all(exp.Literal):
+        if not literal.is_string:
+            continue
+        if not _DATE_SHAPED.match(str(literal.this)):
+            continue
+        node, child = literal.parent, literal
+        while node is not None:
+            if literal_predicate_of(node) is not None:
+                # (b) `child` is the literal's whole SIDE of this predicate. A column in it
+                # means the constant S3 adjudicated came from the OTHER side, not from here.
+                if list(child.find_all(exp.Column)):
+                    return False
+                break
+            child, node = node, node.parent
+        else:  # (a) no predicate the enumerator recognizes, anywhere above it
+            return False
+    return True
+
+
 def decide_outcome(
-    *, explain_ok: bool, binds_to_subset_uses: bool, dag_ok: bool, read_only_select: bool
+    *,
+    explain_ok: bool,
+    binds_to_subset_uses: bool,
+    dag_ok: bool,
+    read_only_select: bool,
+    date_literal_ok: bool,
 ) -> tuple[str, str | None]:
-    """Map the four checks to `(outcome, reason)`.
+    """Map the five checks to `(outcome, reason)`.
 
     First failing check wins, in the Contract-A field order (explain → binds → dag →
-    read_only).
+    read_only). `date_literal_ok` is APPENDED last: the order of the original four is pinned
+    (tests and triage read the reason tag), so a new check joins the end rather than
+    re-ranking them.
     """
     for ok, reason in (
         (explain_ok, REASON_EXPLAIN),
         (binds_to_subset_uses, REASON_BINDS),
         (dag_ok, REASON_DAG),
         (read_only_select, REASON_READ_ONLY),
+        (date_literal_ok, REASON_DATE_LITERAL),
     ):
         if not ok:
             return "fail_to_review", reason

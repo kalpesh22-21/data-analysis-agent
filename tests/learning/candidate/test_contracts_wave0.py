@@ -225,10 +225,31 @@ def _sample_generalization() -> BlueprintGeneralization:
         result_grain=ResultGrainStamp(columns=(), verifiable=False),
         static_validation=StaticValidation(
             explain_ok=True, binds_to_subset_uses=True, dag_ok=True,
-            read_only_select=True, outcome="ok",
+            read_only_select=True, date_literal_ok=True, outcome="ok",
         ),
         canonical_ast_norm="SELECT sum(gross_pay) FROM t WHERE department = {d: }",
     )
+
+
+def test_static_validation_date_literal_ok_is_additive_for_stored_docs():
+    """A candidate persisted BEFORE the frozen-date check existed carries no
+    `date_literal_ok` key. It must rehydrate as passing — the check never ran on it, and
+    False would retroactively invent a fault its stamped `outcome` does not mention — and
+    re-serialize with the field present (`to_doc` always emits it)."""
+    legacy = {
+        "explain_ok": True,
+        "binds_to_subset_uses": True,
+        "dag_ok": True,
+        "read_only_select": True,
+        "outcome": "ok",
+        "reason": None,
+    }
+    sv = StaticValidation.from_doc(legacy)
+    assert sv.date_literal_ok is True
+    doc = sv.to_doc()
+    assert doc["date_literal_ok"] is True
+    assert doc == {**legacy, "date_literal_ok": True}
+    assert StaticValidation.from_doc(doc) == sv
 
 
 def test_generalization_round_trips_inside_payload():
@@ -250,7 +271,8 @@ def test_generalization_composite_node_templates_round_trip():
         result_grain=ResultGrainStamp(columns=("a",), verifiable=True),
         static_validation=StaticValidation(
             explain_ok=False, binds_to_subset_uses=True, dag_ok=False,
-            read_only_select=True, outcome="fail_to_review", reason="dag_cycle",
+            read_only_select=True, date_literal_ok=True,
+            outcome="fail_to_review", reason="dag_cycle",
         ),
         canonical_ast_norm="SELECT 1\nSELECT 2",
     )
@@ -300,6 +322,13 @@ def test_s4_enriched_blueprint_fixture_round_trips():
 
 
 def test_envelopes_each_reason_fixture_round_trips():
+    """NOTE — `envelopes_each_reason.json` deliberately keeps the LEGACY `static_validation`
+    shape, WITHOUT `date_literal_ok`. That is not an oversight a consistency sweep should
+    tidy up: it is the only place a pre-check persisted doc is exercised end-to-end through
+    `CandidateEnvelope`, so it doubles as regression coverage for the additive default
+    (`test_static_validation_date_literal_ok_is_additive_for_stored_docs` pins the unit).
+    `s4_enriched_blueprint.json` carries the key because golden tests compare S4's DERIVED
+    output against it; this fixture is compared against nothing derived."""
     reasons = _load("envelopes_each_reason.json")
     expected = {
         "knowledge_pre_gate", "schema_edit", "leakage_near_miss",

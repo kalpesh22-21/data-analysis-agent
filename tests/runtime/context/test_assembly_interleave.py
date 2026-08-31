@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from data_agent.runtime.context.assembly import ContextAssembler
+from data_agent.runtime.context.assembly import DATE_ANCHOR_SQL_NOTE, ContextAssembler
 from data_agent.runtime.context.budget import fit_request_to_budget
 from data_agent.runtime.loop.agent_loop import _assembled_to_canonical
 from data_agent.runtime.session.memory_store import InMemorySessionStore
@@ -42,7 +42,7 @@ def _ts(n: int) -> str:
 # than spelled out at each call site so these lists stay about ORDER, which is
 # what they exist to lock — and derived from `_ts` so the date and the fixture
 # clock cannot drift apart.
-_ANCHOR = f"user:Today's date is {_ts(0)[:10]}."
+_ANCHOR = f"user:Today's date is {_ts(0)[:10]}.{DATE_ANCHOR_SQL_NOTE}"
 
 
 def _msg(turn: int, role: str, content: str, ts: str, provenance=_IN_SCOPE) -> TurnMessage:

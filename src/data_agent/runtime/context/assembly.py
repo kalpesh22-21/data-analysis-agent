@@ -516,6 +516,18 @@ def _last_user_index(messages: list[dict[str, Any]]) -> int:
 
 DATE_ANCHOR_PREFIX = "Today's date is "
 
+# THE ANCHOR IS A FRAME, NOT A VALUE TO PASTE. Live turns copied the rendered day
+# straight into SQL (`toDateTime64('2026-08-28 00:00:00', 6)` as a dateDiff bound),
+# which the learning plane then froze into blueprint templates that go stale the next
+# morning. The note rides the anchor rather than `AGENT_SYSTEM_PROMPT` because "this
+# literal" needs the literal beside it — and because it is then unbudgeted against the
+# prompt ceiling. `today()`/`now()` were probed live: both pass the SQL validator,
+# scope enforcement and `explainQuery`.
+DATE_ANCHOR_SQL_NOTE = (
+    " Use it to interpret the question; in SQL express the current date or time as "
+    "`today()`/`now()`, never as this literal."
+)
+
 
 def turn_date_anchor_day(
     raw_messages: Sequence[TurnMessage], current_turn_index: int
@@ -547,7 +559,8 @@ def turn_date_anchor_day(
 def _turn_date_anchor(
     raw_messages: Sequence[TurnMessage], current_turn_index: int
 ) -> dict[str, Any] | None:
-    """`Today's date is YYYY-MM-DD.` as ONE `user`-role message, or `None`.
+    """`Today's date is YYYY-MM-DD.` plus `DATE_ANCHOR_SQL_NOTE`, as ONE `user`-role
+        message, or `None`.
 
         The model has no grounded present: without this, "last 6 months" or "this quarter"
         resolves against training-frozen time and nothing downstream can detect the wrong
@@ -577,7 +590,7 @@ def _turn_date_anchor(
     day = turn_date_anchor_day(raw_messages, current_turn_index)
     if day is None:
         return None
-    return {"role": "user", "content": f"{DATE_ANCHOR_PREFIX}{day}."}
+    return {"role": "user", "content": f"{DATE_ANCHOR_PREFIX}{day}.{DATE_ANCHOR_SQL_NOTE}"}
 
 
 def render_analysis_state_block(state: AnalysisState) -> dict[str, Any]:

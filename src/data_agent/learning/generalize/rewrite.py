@@ -16,6 +16,7 @@ reason tags are frozen, so WHY a rewrite refused belongs in the exception MESSAG
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from typing import Any
 
@@ -44,6 +45,16 @@ _COMPARISONS: tuple[type[exp.Expression], ...] = (
 # belt-and-braces (no `Unary`/`Paren` subclass is a `Func` in the pinned version) and
 # are kept so the census stays right if that changes.
 _OPERATOR_NODES: tuple[type[exp.Expression], ...] = (exp.Binary, exp.Unary, exp.Paren)
+
+
+# The slot-name grammar: exactly the identifier `SLOT_TOKEN` can match back out of a
+# rendered template. Spelled out rather than sliced off `SLOT_TOKEN.pattern`, because that
+# slicing is string surgery on a regex and would break silently the first time the token
+# pattern gains a group or an escape. The two are held in step by a PARITY TEST
+# (`tests/learning/generalize/test_slot_name_grammar.py`) rather than by a clever
+# expression: a name this accepts must round-trip through `SLOT_TOKEN`, and one it rejects
+# must not.
+_BARE_SLOT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class RewriteError(Exception):
@@ -304,6 +315,27 @@ def rewrite_sql_to_template(
             # true for any other caller.
             if not isinstance(name, str) or not name:
                 raise RewriteError("role=slot param is missing a string slot.name.")
+            # ⚠ THE NAME BECOMES TEMPLATE TEXT — it is rendered into the SQL as a
+            # placeholder and then string-patched into `{name}` below. So a name that is
+            # not a bare identifier is model-authored SQL entering the template through
+            # the one field nobody was checking: `slot.name = "x} OR 1 = 1 --"` renders
+            # `department = {x} OR 1 = 1 --}`, which nullifies the filter and comments out
+            # the rest — and it passes ALL FIVE static checks, because `SLOT_TOKEN` reads
+            # `{x}` as an ordinary slot, `read_only_select` still sees one SELECT, and the
+            # injected `OR` adds no function shape for `_check_rewritten` to compare.
+            #
+            # CHECKED HERE, at the single point where a name becomes text, so it covers
+            # every author on the chain — the S3 extractor, the S7 completion path, and
+            # the §C reviser — rather than once per caller. A name this rejects is one
+            # `SLOT_TOKEN` could not have matched back out of the rendered template, so
+            # the alternative to raising is emitting a template whose own slots cannot be
+            # recovered from it.
+            if not _BARE_SLOT_NAME.fullmatch(name):
+                raise RewriteError(
+                    f"slot.name {name!r} is not a bare identifier — a name is rendered "
+                    "into the template as text, so anything else is SQL authored by "
+                    "whoever wrote the plan (fail-to-review)."
+                )
             literal.replace(exp.Placeholder(this=name))
             slot_names.append(name)
         # role == "rule": KEEP THE PREDICATE, ANNOTATE THE BLUEPRINT. The literal was

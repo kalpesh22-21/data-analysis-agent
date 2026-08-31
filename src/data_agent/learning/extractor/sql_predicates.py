@@ -126,7 +126,19 @@ def _between_predicate(node: exp.Between) -> LiteralPredicate | None:
     )
 
 
-def _predicate_of(node: exp.Expression) -> LiteralPredicate | None:
+def literal_predicate_of(node: exp.Expression) -> LiteralPredicate | None:
+    """The literal predicate this ONE node is, or `None` — the enumerator's whole decision.
+
+    PUBLIC because it is the only honest answer to "did S3 adjudicate this literal?", and S4's
+    frozen-date check (`generalize/validate.py::check_no_frozen_date_literal`) has to ask
+    exactly that: a date literal is left alone iff the comparison enclosing it is one this
+    function recognizes. Asking it here rather than re-deriving the conditions there is what
+    keeps the two stages from drifting — both halves matter and both are easy to half-copy
+    (`_constant_text` on one side AND `_single_column` on the OTHER, which is why
+    `coalesce(a, b) < '<date>'` is not a literal predicate at all).
+
+    Was `_predicate_of`; the rename is the only change.
+    """
     if isinstance(node, exp.In):
         return _in_predicate(node)
     if isinstance(node, exp.Between):
@@ -152,7 +164,7 @@ def literal_predicates(sql: str) -> list[LiteralPredicate] | None:
     # Single DFS over the WHOLE statement (WHERE + JOIN-ON + HAVING + nested
     # sub-SELECTs) — deterministic order, all nesting levels.
     for node in ast.walk():
-        pred = _predicate_of(node)
+        pred = literal_predicate_of(node)
         if pred is not None:
             predicates.append(pred)
     return predicates
@@ -174,4 +186,4 @@ def sole_literal_predicate(fragment: str) -> LiteralPredicate | None:
         return None
     if root is None:
         return None
-    return _predicate_of(root)
+    return literal_predicate_of(root)

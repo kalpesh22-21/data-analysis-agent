@@ -772,6 +772,30 @@ def test_the_accepted_statement_shape_is_stated_without_over_deterring() -> None
     assert "external table functions (url, file, s3, remote, merge, view)" in section
 
 
+def test_the_current_date_reaches_sql_as_a_function_never_as_the_anchor_literal() -> None:
+    """ONE instruction, TWO carriers, so both are asserted together.
+
+    Live turns pasted the rendered date anchor into the SQL itself
+    (`toDateTime64('2026-08-28 00:00:00', 6)` as a `dateDiff` bound). That is not a
+    query the guard can reject — it parses, runs and verifies — and the learning
+    plane then froze it into blueprint templates that are wrong the next morning.
+    The prompt carries the positive rule (use `dateDiff` against `today()`/`now()`);
+    the anchor message carries the prohibition, because "never as this literal"
+    only means anything beside the literal. Neither half alone is the instruction.
+    """
+    from data_agent.runtime.context.assembly import DATE_ANCHOR_SQL_NOTE
+
+    section = AGENT_SYSTEM_PROMPT[AGENT_SYSTEM_PROMPT.index("## What runQuery accepts") :]
+    section = section[: section.index("## Tracking a multi-part request")]
+    assert "prefer dateDiff against `today()`/`now()`" in section
+    assert "subtracting dates by hand or pasting in a fixed date" in section
+    # The anchor's half: the frame is for reading the question, not for pasting.
+    assert "in SQL express the current date or time as `today()`/`now()`" in (
+        DATE_ANCHOR_SQL_NOTE
+    )
+    assert "never as this literal" in DATE_ANCHOR_SQL_NOTE
+
+
 def test_the_sql_guard_section_names_no_error_codes() -> None:
     """The model receives codes through `denial_detail` at the moment of failure
     (`dispatch/denial_mapping.py`); the prompt teaches behaviour. Asserted for the
@@ -967,8 +991,26 @@ def test_prompt_stays_within_its_token_budget() -> None:
     is what the section's opening line already implies and the model already
     ignores. So it is not shipped shaved: it waits for a ceiling argument of its
     own. **86 chars spare.**
+
+    **2026-08-28, ceiling RE-ARGUED and raised 17,400 -> 17,550.** 17,314 ->
+    **17,474** (+160): one line in `## What runQuery accepts` telling the model to
+    do date arithmetic with `dateDiff` against `today()`/`now()` instead of
+    subtracting dates by hand or pasting a fixed one. Live turns took the per-turn
+    date anchor and pasted the rendered day INTO the SQL
+    (`toDateTime64('2026-08-28 00:00:00', 6)` as a `dateDiff` bound), which the
+    learning plane then froze into blueprint templates that go stale the next
+    morning — a wrong answer that still parses, still runs and still verifies.
+    RAISED RATHER THAN SHAVED, per this ledger's own rule: 86 spare cannot hold
+    any honest wording of it, and the two clauses are one instruction (naming the
+    function without forbidding the hand-rolled alternative leaves the observed
+    behaviour permitted). THE OTHER HALF OF THE FIX IS UNBUDGETED: "never as this
+    literal" needs the literal beside it, so it rides the anchor message itself
+    (`context/assembly.py::DATE_ANCHOR_SQL_NOTE`), which is a per-turn `user`
+    message and not part of this constant. `today()`/`now()` were probed against
+    the live MCP first — both pass the SQL validator, scope enforcement and
+    `explainQuery`. **76 chars spare.**
     """
-    assert len(AGENT_SYSTEM_PROMPT) <= 17_400
+    assert len(AGENT_SYSTEM_PROMPT) <= 17_550
 
 
 def test_the_prompt_draft_doc_matches_the_shipped_constant_byte_for_byte() -> None:

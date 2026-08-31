@@ -33,9 +33,9 @@ decision rather than an oversight. Its plan now arrives as ONE row of newline-jo
 instead of one row per plan line (clickhouse-api `service.py::_collapse_explain_plan`), and
 that fact is carried in the MCP TOOL DESCRIPTION, which `mcp/tool_schema.py` copies verbatim
 (D75) and which is re-sent beside this constant every round-trip WITHOUT counting against the
-17,400 ceiling. Restating it here would spend budgeted chars on something the model already
+17,550 ceiling. Restating it here would spend budgeted chars on something the model already
 reads, and per the ceiling ledger in `tests/runtime/test_prompt_routing_contract.py` a new
-instruction must re-argue the ceiling rather than squeeze into the remaining 86.
+instruction must re-argue the ceiling rather than squeeze into the remaining 76.
 
 The rendered text and the rationale for each section are reviewed in
 `docs/decisions/release-1/01a-prompt-draft.md`.
@@ -91,6 +91,9 @@ AGENT_SYSTEM_PROMPT = (
     "WITH ... SELECT. Joins, subqueries, CTEs and UNION are fine, and the server "
     "adds a LIMIT if you omit one. Writes, DDL, SET/SETTINGS/FORMAT clauses and "
     "external table functions (url, file, s3, remote, merge, view) are rejected.\n"
+    "For date arithmetic — tenure, age, day counts, intervals — prefer dateDiff "
+    "against `today()`/`now()` over subtracting dates by hand or pasting in a "
+    "fixed date.\n"
     "A rejected query costs a full round-trip and the turn is bounded by a wall "
     "clock, so guessing at what the guard allows is expensive: a few rejects can "
     "end a turn with no answer at all.\n"

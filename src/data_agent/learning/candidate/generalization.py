@@ -59,6 +59,7 @@ class StaticValidation:
     binds_to_subset_uses: bool  # every slot.binds_to ∈ uses (blueprint-compiler assertion)
     dag_ok: bool  # composite: feeds_from/cycles/cap/terminal-approval/scalar-converge
     read_only_select: bool  # single read-only SELECT; no '*', no dict-family funcs (D52)
+    date_literal_ok: bool  # no frozen absolute date outside a comparison (a pasted run date)
     outcome: Literal["ok", "fail_to_review"]  # ANY false above ⇒ fail_to_review
     reason: str | None = None  # stable machine tag for the first failing check
 
@@ -68,6 +69,7 @@ class StaticValidation:
             "binds_to_subset_uses": self.binds_to_subset_uses,
             "dag_ok": self.dag_ok,
             "read_only_select": self.read_only_select,
+            "date_literal_ok": self.date_literal_ok,
             "outcome": self.outcome,
             "reason": self.reason,
         }
@@ -79,6 +81,9 @@ class StaticValidation:
             binds_to_subset_uses=bool(doc["binds_to_subset_uses"]),
             dag_ok=bool(doc["dag_ok"]),
             read_only_select=bool(doc["read_only_select"]),
+            # ADDITIVE: a candidate persisted before this check existed carries no key, and
+            # defaulting it to True keeps its stamped `outcome` self-consistent on rehydrate.
+            date_literal_ok=bool(doc.get("date_literal_ok", True)),
             outcome=doc["outcome"],
             reason=doc.get("reason"),
         )

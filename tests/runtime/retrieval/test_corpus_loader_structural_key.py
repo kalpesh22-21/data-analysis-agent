@@ -40,7 +40,11 @@ def test_every_canon_fixture_produces_a_structural_key() -> None:
     composite on its remaining nodes only."""
     blueprints, _ = load_seed_fixtures(_FIXTURE_DIR)
     blueprints = resolve_blueprint_references(blueprints)
-    assert len(blueprints) == 11
+    # 11 became 12 on 2026-08-28 when `bp-average-annual-salary-by-status` was mirrored in
+    # from the canon (clickhouse-api 3e1bfb9). A deliberate checkpoint, like the sibling in
+    # `test_corpus_loader_structural_key_qa.py`: a corpus addition stops here once and is
+    # acknowledged rather than passing silently.
+    assert len(blueprints) == 12
     keyed = {bp.id: dag_properties(bp)["structural_key"] for bp in blueprints}
     assert all(key and key.startswith("sha256:") for key in keyed.values()), keyed
     # Distinct blueprints must not collide (several share the `Department` grain, so

@@ -199,7 +199,21 @@ def test_the_realistic_match_rate_is_all_but_the_two_known_rewriter_misses() -> 
     readable.
     """
     docs = _canon_docs()
-    assert len(docs) == 11
+    # NON-VACUITY, not a size. The docstring above already argues that pinning a literal lets
+    # a corpus edit look like a rewriter regression — and `len(docs) == 11` was that argument's
+    # own leftover, which is what fired when the canon grew to 12 on 2026-08-28.
+    #
+    # What the assertion below actually needs is that the corpus LOADED and that the named
+    # misses are really in it; without this it would pass vacuously on an empty read
+    # (`set() - MISSES == set()`), which is the failure a bare count was standing in for.
+    # Both properties are corpus-size independent, so a canon addition no longer reads as a
+    # regression here — the guard that OWNS canon/mirror drift is
+    # `test_corpus_loader_structural_key_qa.py`, and it derives from the two directories.
+    assert docs, "the canon read returned nothing — the round-trip claim would be vacuous"
+    assert _KNOWN_ROUNDTRIP_MISSES <= set(docs), (
+        "a named round-trip miss is not in the canon any more; retire it from "
+        "_KNOWN_ROUNDTRIP_MISSES rather than leaving it asserted against nothing"
+    )
     matched = {bid for bid, doc in docs.items() if _learning_twin_key(doc) == _canon_key(doc)}
     assert matched == set(docs) - _KNOWN_ROUNDTRIP_MISSES, (
         f"round-trip match set moved: {len(matched)}/{len(docs)} matched; "

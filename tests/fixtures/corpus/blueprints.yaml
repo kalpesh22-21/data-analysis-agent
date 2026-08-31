@@ -455,3 +455,32 @@
     WHERE employee_code = {employee}
       AND pay_period_end_date = {period}
     GROUP BY register_type, type_code
+
+# SYNCED FROM THE CANON 2026-08-28 (`clickhouse-api` commit 3e1bfb9). The 12th blueprint —
+# this mirror had 11, and four drift-guard tests across two suites fired until it did not.
+# Copied field-for-field from
+# `clickhouse-api/app/corpus/data/blueprints/bp-average-annual-salary-by-status.yaml`; the
+# canon is the source of truth and this file follows it, per the header above.
+#
+# NOTE the shapes this one is the first to exercise here: an `enum` slot carrying
+# `enum_values`, and no `result_grain` (the template returns a single scalar row, so there is
+# no grain to declare).
+- id: bp-average-annual-salary-by-status
+  intent: Calculate the average annual salary per employee filtered by employee status.
+  slots_summary: employee_status
+  status: validated
+  drift_status: clean
+  catalog_sha: ""
+  uses:
+    - dbpcm_warehouse.employee.annual_salary
+    - dbpcm_warehouse.employee.employee_status
+  resolves:
+    average annual salary per employee: dbpcm_warehouse.employee.annual_salary
+  slots:
+    - name: employee_status
+      type: enum
+      binds_to: dbpcm_warehouse.employee.employee_status
+      required: true
+      enum_values: [ A, D, I, R, T, V ]
+  sql_template: SELECT avg(annual_salary) AS average_annual_salary_per_employee FROM
+    dbpcm_warehouse.employee WHERE employee_status = {employee_status}

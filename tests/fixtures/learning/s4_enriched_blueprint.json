@@ -119,6 +119,7 @@
             "binds_to_subset_uses": true,
             "dag_ok": true,
             "read_only_select": true,
+            "date_literal_ok": true,
             "outcome": "ok",
             "reason": null
           },
@@ -175,6 +176,7 @@
         "binds_to_subset_uses": true,
         "dag_ok": true,
         "read_only_select": true,
+        "date_literal_ok": true,
         "outcome": "ok",
         "reason": null
       },
@@ -209,6 +211,7 @@
         "binds_to_subset_uses": true,
         "dag_ok": true,
         "read_only_select": true,
+        "date_literal_ok": true,
         "outcome": "ok",
         "reason": null
       },

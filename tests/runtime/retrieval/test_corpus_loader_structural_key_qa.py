@@ -355,7 +355,10 @@ def test_every_real_canon_blueprint_mints_a_distinct_structural_key() -> None:
 
     HISTORY: 10 became 11 when plan §2b extracted
     `bp-employee-check-detail-for-period` from
-    `bp-compare-employee-check-detail-two-periods`. The seeds are built through the
+    `bp-compare-employee-check-detail-two-periods`. 11 became 12 on 2026-08-28 when
+    `bp-average-annual-salary-by-status` was registered in the canon (`clickhouse-api`
+    commit 3e1bfb9); the count is a DELIBERATE checkpoint, so a canon addition is meant to
+    stop here once and be acknowledged rather than pass silently. The seeds are built through the
     PRODUCTION projection + resolver (`corpus_seeds_from_export` →
     `resolve_blueprint_references`) rather than a local `node_pairs` reader, and that
     swap is the point of the edit, not incidental: a `composes` node may now name
@@ -364,7 +367,7 @@ def test_every_real_canon_blueprint_mints_a_distinct_structural_key() -> None:
     class of silent mirror drift this file exists to catch. Measured: the composite's
     key is byte-identical before and after the extraction."""
     canon = _real_canon_docs()
-    assert len(canon) == 11
+    assert len(canon) == 12
 
     seeds, _ = corpus_seeds_from_export({"blueprints": canon})
     assert len(seeds) == len(canon), "the export projection dropped a canon blueprint"

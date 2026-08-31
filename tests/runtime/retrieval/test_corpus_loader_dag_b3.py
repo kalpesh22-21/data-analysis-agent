@@ -201,6 +201,9 @@ def test_all_seed_fixtures_still_validate_under_b3_s1_s3() -> None:
     assert {b.id for b in blueprints} == {
         "bp-overtime-by-department",
         "bp-active-headcount-by-department",
+        # Registered in the canon 2026-08-28 (clickhouse-api 3e1bfb9) and mirrored into
+        # tests/fixtures/corpus/blueprints.yaml.
+        "bp-average-annual-salary-by-status",
         "bp-average-salary-by-department",
         "bp-total-earnings-by-department",
         "bp-departments-above-company-average-salary",
