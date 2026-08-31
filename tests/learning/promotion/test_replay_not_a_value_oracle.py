@@ -71,9 +71,21 @@ async def test_replay_binds_synthetic_values_never_stored_entities():
     await sched.run_once()
 
     replay_sql, _grain_cols = probe.calls[0]
-    # Synthetic sampled tokens are bound (D17: no stored entity input is replayed).
+    # Synthetic sampled values are bound (D17: no stored entity input is replayed).
     assert "__replay_sample_department__" in replay_sql
-    assert "__replay_sample_year__" in replay_sql
+    assert "__replay_sample_region__" in replay_sql
+    # The `year` slot is declared `period`, which samples as a fixed ISO date rather than a
+    # `__replay_sample_*` token (see `_sample_value`) — synthetic either way, which is what
+    # this test is about. The date form is what makes `toDate({slot})` replay at all, and
+    # this fixture is the reason the change is not free: it binds into `toYear(...) = {year}`,
+    # where NEITHER a date nor a string is a well-typed comparand.
+    #
+    # ⚠ THE REAL LIMITATION, recorded here because this is where it is visible: a single
+    # sample per slot TYPE cannot satisfy every bind SITE. The right value depends on the
+    # expression the slot sits inside, and the sampler cannot see it. The live corpus binds
+    # `period` inside date functions (3 of 3), so a date is the better default — but a
+    # `toYear(x) = {period}` blueprint would still hold at `probe_unavailable`.
+    assert "2020-01-01" in replay_sql
     # The fixture's stored entity VALUES (0420 / 2025 / NA) must never appear.
     assert "0420" not in replay_sql
     assert "2025" not in replay_sql

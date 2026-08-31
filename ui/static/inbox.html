@@ -308,6 +308,315 @@
     word-break: break-word;
   }
 
+  /* --- Typed candidate card (payload rendering) ---------------------------
+     The payload used to be one `JSON.stringify(payload_view, null, 2)` dump, which
+     put the thing a reviewer is actually deciding about — is this literal frozen for
+     a good reason? — on line 34 of eighty. These sections split it into the
+     comparison the review is: SLOTS beside FROZEN FILTERS. The raw dump survives
+     verbatim under `<details>`; nothing is removed, only ranked. */
+
+  .card-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .card-sections {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  /* The generalized template. Slot tokens are `<span>` chips built from the
+     server-supplied `template_parts` split — never from a regex here, and never
+     from an HTML-string sink (see the JS note on the page's textContent posture). */
+  .card-template {
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    margin: 0;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .card-template .slot {
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-accent);
+    color: var(--color-accent);
+    border-radius: 999px;
+    padding: 0 var(--space-2);
+    font-size: 0.75rem;
+    white-space: nowrap;
+  }
+
+  /* The slot table SCROLLS IN ITS OWN BOX rather than pushing the card wide. `binds_to` is a
+     fully-qualified `database.table.column`, so three slots is enough to overflow 720px and
+     clip the REQUIRED column off the right edge — which is exactly the column that says
+     whether a caller MUST supply the slot. Short fixture names hid this; live data showed it
+     immediately. */
+  .card-table-wrap {
+    overflow-x: auto;
+    max-width: 100%;
+  }
+
+  .card-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+
+  .card-table td.mono {
+    white-space: nowrap;
+  }
+
+  .card-table th,
+  .card-table td {
+    text-align: left;
+    padding: var(--space-1) var(--space-2);
+    border-bottom: 1px solid var(--color-border);
+    vertical-align: top;
+  }
+
+  .card-table th {
+    font-weight: 600;
+    color: var(--color-text-dim);
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .card-table td.mono,
+  .card-table th.mono {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .card-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    font-size: 0.8rem;
+  }
+
+  .card-list .value {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    color: var(--color-text);
+    word-break: break-all;
+  }
+
+  .card-list .why {
+    color: var(--color-text-dim);
+  }
+
+  /* A frozen filter with no stated reason. NOT an error — plenty are legitimate
+     metric definitions — but it is the one thing on this card worth a reviewer's
+     eye, so it is marked rather than left to read as an ordinary row. */
+  .card-list .why.is-missing {
+    color: var(--color-warn-text);
+  }
+
+  .card-empty {
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+    font-style: italic;
+  }
+
+  .card-checks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  .check-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    border: 1px solid var(--color-border);
+    background: var(--color-surface-2);
+    color: var(--color-text-dim);
+    border-radius: 999px;
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.75rem;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .check-pill.is-fail {
+    border-color: var(--color-error-border);
+    background: var(--color-error-bg);
+    color: var(--color-error-text);
+  }
+
+  .card-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    font-size: 0.75rem;
+  }
+
+  .card-chip {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--color-border);
+    border-radius: 999px;
+    padding: var(--space-1) var(--space-3);
+    color: var(--color-text-dim);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  /* The raw payload, kept verbatim and collapsed. It is the fallback for anything
+     the typed sections do not know how to show, so it is never removed. */
+  .card-raw > summary {
+    cursor: pointer;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-dim);
+    padding: var(--space-1) 0;
+  }
+
+  .card-raw > summary:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  .card-raw[open] > summary {
+    margin-bottom: var(--space-2);
+  }
+
+  /* --- The parameterization judge's marker (design §D, phase D-1) -----------
+     It observes; it cannot drop, route or repair. The marker exists so the reviewer's
+     ordinary approve/reject BECOMES the agree/disagree half of the measurement,
+     without asking anybody to do extra work. */
+
+  .item-judge {
+    border: 1px solid var(--color-border);
+    background: var(--color-surface-2);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    font-size: 0.8rem;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  /* Only a Class A finding says the blueprint is WRONG rather than merely narrow. That
+     is the distinction the whole judge is built around, so it is the one the card
+     colours on — not the verdict, which says `revise` for a naming nit too. */
+  .item-judge.is-serious {
+    border-color: var(--color-warn-border);
+    background: var(--color-warn-bg);
+    color: var(--color-warn-text);
+  }
+
+  .item-judge .judge-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    align-items: center;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.75rem;
+  }
+
+  .item-judge .judge-findings {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .item-judge .finding-class {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-weight: 600;
+  }
+
+  /* --- The revise assistant on the fail-to-review form (design §C) ---------- */
+
+  .revise-block {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+  }
+
+  .revise-block textarea {
+    width: 100%;
+    min-height: 60px;
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2);
+    font-family: inherit;
+    font-size: 0.85rem;
+  }
+
+  .revise-diff {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: 0.78rem;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .revise-diff .kind {
+    display: inline-block;
+    min-width: 7em;
+    color: var(--color-text-dim);
+  }
+
+  .revise-diff .added .kind,
+  .revise-diff .role_changed .kind,
+  .revise-diff .slot_changed .kind {
+    color: var(--color-accent);
+  }
+
+  .revise-diff .removed .kind {
+    color: var(--color-error-text);
+  }
+
+  .revise-diff .conflict .kind {
+    color: var(--color-warn-text);
+  }
+
+  /* The BEFORE side of a diff row. Dimmed, NOT struck through: these rows carry a full
+     `why` sentence, and a line through three wrapped lines of prose is unreadable — which
+     defeats the point of showing the reviewer what they are replacing. */
+  .revise-diff .before {
+    color: var(--color-text-dim);
+  }
+
+  .revise-rationale {
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+    margin: 0;
+  }
+
+  /* A proposal that carries entries AND a warning — the append/replace conflict. Coloured,
+     because the reviewer is one click from an apply that will decline. */
+  .revise-warning {
+    font-size: 0.8rem;
+    margin: 0;
+    color: var(--color-warn-text);
+    background: var(--color-warn-bg);
+    border: 1px solid var(--color-warn-border);
+    border-radius: var(--radius);
+    padding: var(--space-2);
+  }
+
   .item-evidence,
   .item-scan,
   .item-dedup {
@@ -620,6 +929,520 @@
     } catch (err) {
       return String(view);
     }
+  }
+
+  // --- Typed candidate card ------------------------------------------------
+  //
+  // The payload used to reach the reviewer as one `stringifyPayload(payload_view)`
+  // dump. Everything below splits it into the comparison the review actually is —
+  // SLOTS beside FROZEN FILTERS — and leaves that dump intact, collapsed, at the
+  // bottom of every card.
+  //
+  // NO HTML SINK, anywhere in here: every server value reaches the DOM through
+  // `textContent` or `createTextNode`. `tests/ui/test_inbox_markup.py` pins that for
+  // the whole file, and the slot chips are the reason it matters more now than it
+  // did — they are the one place a template string is split apart and reassembled.
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  function isObject(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  }
+
+  // A labelled section, or null for an absent body — so callers can append
+  // unconditionally instead of repeating the emptiness test at every call site.
+  function section(label, body, testid) {
+    if (!body) return null;
+    var wrap = el("div", "card-section");
+    if (testid) wrap.setAttribute("data-testid", testid);
+    wrap.appendChild(el("p", "item-field-label", label));
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  // The generalized SQL, with `{slot}` tokens as chips.
+  //
+  // `template_parts` arrives PRE-SPLIT from the service, tokenized there from the
+  // redacted payload_view by the same `SLOT_TOKEN` the runtime uses. So this page
+  // never spells that grammar, and a template is never concatenated into markup.
+  // The fallback renders the plain string when the field is absent (an older service,
+  // or a candidate whose generalization carries no template).
+  function renderTemplate(item) {
+    var pre = el("pre", "card-template");
+    pre.setAttribute("data-testid", "inbox-bp-template");
+    var parts = item.template_parts;
+    if (Array.isArray(parts) && parts.length) {
+      parts.forEach(function (part) {
+        if (!isObject(part)) return;
+        if (typeof part.slot === "string") {
+          pre.appendChild(el("span", "slot", part.slot));
+        } else if (typeof part.text === "string") {
+          pre.appendChild(document.createTextNode(part.text));
+        }
+      });
+      return pre;
+    }
+    var gen = isObject(item.payload_view) ? item.payload_view.generalization : null;
+    var raw = isObject(gen) ? gen.sql_template : null;
+    if (typeof raw !== "string" || !raw) return null;
+    pre.appendChild(document.createTextNode(raw));
+    return pre;
+  }
+
+  function paramEntries(view) {
+    var entries = isObject(view) ? view.parameterization : null;
+    return Array.isArray(entries) ? entries.filter(isObject) : [];
+  }
+
+  function locatorText(entry) {
+    var loc = isObject(entry.locator) ? entry.locator : {};
+    var parts = [loc.table, loc.column].filter(function (piece) {
+      return typeof piece === "string" && piece;
+    });
+    return parts.length ? parts.join(".") : "(no locator)";
+  }
+
+  function textCell(value, mono) {
+    var td = el("td", mono ? "mono" : "");
+    td.textContent =
+      value === null || value === undefined || value === "" ? "—" : String(value);
+    return td;
+  }
+
+  // role=slot — the fillable holes. Empty means the template takes no arguments,
+  // which is legitimate (a fixed report) and is shown rather than hidden.
+  function renderSlots(entries) {
+    var slots = entries.filter(function (entry) { return entry.role === "slot"; });
+    // No slots: the SENTENCE, not an empty table. A header row over "none" is four column
+    // labels describing nothing — it reads as a rendering fault rather than as the fact it
+    // is stating. The fact still gets its section, because "this template takes no
+    // arguments" is information about the blueprint.
+    if (!slots.length) {
+      var none = el("p", "card-empty", "none — this template takes no arguments");
+      none.setAttribute("data-testid", "inbox-bp-slots");
+      return none;
+    }
+    var table = el("table", "card-table");
+    var thead = el("thead");
+    var head = el("tr");
+    // `binds to` LAST, because it is the only unbounded column — a fully-qualified
+    // `database.table.column` — and whichever column follows it is the one that scrolls out of
+    // sight. `required` is the fact a reviewer is deciding on (must a caller supply this?), so
+    // it must not be that column.
+    ["name", "type", "required", "binds to"].forEach(function (label) {
+      head.appendChild(el("th", "", label));
+    });
+    thead.appendChild(head);
+    table.appendChild(thead);
+    var tbody = el("tbody");
+    slots.forEach(function (entry) {
+      var slot = isObject(entry.slot) ? entry.slot : {};
+      var row = el("tr");
+      row.appendChild(textCell(slot.name, true));
+      row.appendChild(textCell(slot.type, true));
+      row.appendChild(textCell(slot.required === false ? "optional" : "required", false));
+      row.appendChild(textCell(slot.binds_to, true));
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    var wrap = el("div", "card-table-wrap");
+    wrap.setAttribute("data-testid", "inbox-bp-slots");
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  // role=inline — the literals FROZEN into the template, with the model's stated
+  // reason. Rendered even when empty, deliberately: "no frozen filters" on a
+  // blueprint whose intent names a specific metric is information — it says nothing
+  // in the query still defines that metric — and a section that vanishes when empty
+  // cannot say it. An entry with no `why` is marked, not flagged: plenty of frozen
+  // literals are legitimate, but an unexplained one is the thing worth a second look.
+  function renderInline(entries) {
+    var inline = entries.filter(function (entry) { return entry.role === "inline"; });
+    var list = el("ul", "card-list");
+    list.setAttribute("data-testid", "inbox-bp-inline");
+    if (!inline.length) {
+      list.appendChild(el("li", "card-empty", "none — nothing in this template is frozen"));
+      return list;
+    }
+    inline.forEach(function (entry) {
+      var loc = isObject(entry.locator) ? entry.locator : {};
+      var item = el("li");
+      item.appendChild(el("span", "value", locatorText(entry) + " = " + String(loc.value)));
+      var why = typeof entry.why === "string" ? entry.why.trim() : "";
+      item.appendChild(
+        el("span", why ? "why" : "why is-missing", why ? " — " + why : " — no reason given")
+      );
+      list.appendChild(item);
+    });
+    return list;
+  }
+
+  // role=rule — literals a catalog rule accounts for. Omitted when empty; unlike the
+  // frozen filters, an absent rule citation carries no signal of its own.
+  function renderRules(entries) {
+    var rules = entries.filter(function (entry) { return entry.role === "rule"; });
+    if (!rules.length) return null;
+    var list = el("ul", "card-list");
+    list.setAttribute("data-testid", "inbox-bp-rules");
+    rules.forEach(function (entry) {
+      var item = el("li");
+      item.appendChild(el("span", "value", locatorText(entry)));
+      item.appendChild(el("span", "why", " — rule " + String(entry.rule_id)));
+      list.appendChild(item);
+    });
+    return list;
+  }
+
+  // The five S4 static checks, in `decide_outcome`'s precedence order rather than a
+  // prettier one: the FIRST failing check is the reason tag the write router routes
+  // on, so a reviewer reading left to right reads them in the order that produced the
+  // routing they are looking at.
+  var STATIC_CHECKS = [
+    { key: "explain_ok", label: "explain" },
+    // ASCII on purpose: "⊆" has no glyph in this page's monospace stack and renders as
+    // a substitution box, which reads as a rendering fault rather than as a check name.
+    { key: "binds_to_subset_uses", label: "binds in uses" },
+    { key: "dag_ok", label: "dag" },
+    { key: "read_only_select", label: "read-only" },
+    { key: "date_literal_ok", label: "no frozen date" }
+  ];
+
+  function renderChecks(view) {
+    var gen = isObject(view) ? view.generalization : null;
+    var checks = isObject(gen) ? gen.static_validation : null;
+    if (!isObject(checks)) return null;
+    var wrap = el("div", "card-checks");
+    wrap.setAttribute("data-testid", "inbox-bp-checks");
+    STATIC_CHECKS.forEach(function (check) {
+      var value = checks[check.key];
+      // An ABSENT check is not a passing one. It renders as a failure pill with a
+      // "?" so a payload missing a check reads as unknown rather than as clean.
+      var passed = value === true;
+      var mark = value === true ? "✓" : value === false ? "✗" : "?";
+      wrap.appendChild(
+        el("span", passed ? "check-pill" : "check-pill is-fail", mark + " " + check.label)
+      );
+    });
+    if (checks.outcome && checks.outcome !== "ok") {
+      wrap.appendChild(
+        el("span", "check-pill is-fail", String(checks.outcome) + ": " + String(checks.reason))
+      );
+    }
+    return wrap;
+  }
+
+  function renderChips(values, testid) {
+    var list = Array.isArray(values) ? values.filter(function (v) {
+      return typeof v === "string" && v;
+    }) : [];
+    if (!list.length) return null;
+    var wrap = el("div", "card-chips");
+    if (testid) wrap.setAttribute("data-testid", testid);
+    list.forEach(function (value) { wrap.appendChild(el("span", "card-chip", value)); });
+    return wrap;
+  }
+
+  // Is there anything to say about this value? `[]`, `{}`, `""` and null are the shapes a
+  // model emits for "I had nothing here", and rendering them puts `shape: [ ]` and
+  // `invariants: [ ]` on every single card — noise that trains a reviewer to skim past the
+  // section that sometimes carries the grain.
+  function isEmptyValue(value) {
+    if (value === null || value === undefined) return true;
+    if (typeof value === "string") return !value.trim();
+    if (Array.isArray(value)) return value.every(isEmptyValue);
+    if (isObject(value)) return Object.keys(value).every(function (k) {
+      return isEmptyValue(value[k]);
+    });
+    return false;
+  }
+
+  // One value, rendered by SHAPE rather than by schema.
+  //
+  // Shape-driven on purpose: `result_signature` is MODEL-AUTHORED on the fail-to-review path,
+  // and the live corpus carries `grain`, `shape`, `invariants`, `measures`, `ordering`,
+  // `limit`, and `dimensions`/`metrics` that are a dict on one card and a list of objects on
+  // the next. There is no schema to render against — but there are only a few SHAPES, and each
+  // has an obvious reading. Anything genuinely unrecognized still falls back to JSON, so a new
+  // key is unpretty rather than invisible.
+  function renderValue(value) {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      return el("span", "value", String(value));
+    }
+    if (Array.isArray(value)) {
+      var scalars = value.every(function (v) {
+        return typeof v === "string" || typeof v === "number" || typeof v === "boolean";
+      });
+      if (scalars) return el("span", "value", value.join(", "));
+      // A list of small flat objects — `shape: [{column, type}]`, `metrics: [{name, ...}]`.
+      var flat = value.every(function (v) {
+        return isObject(v) && Object.keys(v).every(function (k) { return !isObject(v[k]) && !Array.isArray(v[k]); });
+      });
+      if (flat) {
+        var list = el("ul", "card-list");
+        value.forEach(function (row) {
+          list.appendChild(el("li", "value", Object.keys(row).map(function (k) {
+            return k + "=" + String(row[k]);
+          }).join("  ")));
+        });
+        return list;
+      }
+      return el("pre", "payload-view", stringifyPayload(value));
+    }
+    if (isObject(value)) {
+      var flatObj = Object.keys(value).every(function (k) {
+        var v = value[k];
+        return !isObject(v) && (!Array.isArray(v) || v.every(function (x) { return !isObject(x); }));
+      });
+      if (flatObj) {
+        var rows = el("ul", "card-list");
+        Object.keys(value).forEach(function (k) {
+          if (isEmptyValue(value[k])) return;
+          var li = el("li");
+          li.appendChild(el("span", "why", k + ": "));
+          li.appendChild(el("span", "value", Array.isArray(value[k])
+            ? value[k].join(", ")
+            : String(value[k])));
+          rows.appendChild(li);
+        });
+        return rows;
+      }
+      return el("pre", "payload-view", stringifyPayload(value));
+    }
+    return el("span", "value", String(value));
+  }
+
+  // A labelled block per non-empty key. Returns null when EVERY key is empty, so the whole
+  // section disappears rather than rendering a header over nothing.
+  function renderKeyValues(obj, testid) {
+    if (!isObject(obj)) return null;
+    var keys = Object.keys(obj).filter(function (k) { return !isEmptyValue(obj[k]); });
+    if (!keys.length) return null;
+    var list = el("ul", "card-list");
+    if (testid) list.setAttribute("data-testid", testid);
+    keys.forEach(function (key) {
+      var item = el("li");
+      item.appendChild(el("span", "why", key.replace(/_/g, " ") + ": "));
+      item.appendChild(renderValue(obj[key]));
+      list.appendChild(item);
+    });
+    return list;
+  }
+
+  function renderText(value) {
+    if (typeof value !== "string" || !value.trim()) return null;
+    return el("p", "item-summary", value);
+  }
+
+  // Whatever the typed sections above did not consume.
+  //
+  // This is not tidiness — it is the correctness argument for typed rendering at all.
+  // A renderer shows the fields it knows about, so a payload key added upstream would
+  // become INVISIBLE rather than merely ugly. Accounting for the remainder means the
+  // worst a new key can do is land in a plain block at the bottom.
+  function renderOtherFields(view, consumed) {
+    if (!isObject(view)) return null;
+    var rest = {};
+    var found = false;
+    Object.keys(view).forEach(function (key) {
+      if (consumed.indexOf(key) === -1) {
+        rest[key] = view[key];
+        found = true;
+      }
+    });
+    if (!found) return null;
+    var pre = el("pre", "payload-view", stringifyPayload(rest));
+    pre.setAttribute("data-testid", "inbox-other-fields");
+    return pre;
+  }
+
+  // The original dump, verbatim, collapsed. It keeps `data-testid` so the assertions
+  // written against it still point at the raw JSON they were written for, and it is
+  // never omitted for any card: the typed view is a ranking of the payload, not a
+  // replacement for it.
+  function renderRawPayload(item) {
+    var details = el("details", "card-raw");
+    details.setAttribute("data-testid", "inbox-raw-toggle");
+    details.appendChild(el("summary", "", "raw JSON"));
+    var pre = el("pre", "payload-view", stringifyPayload(item.payload_view));
+    pre.setAttribute("data-testid", "inbox-payload-view");
+    details.appendChild(pre);
+    return details;
+  }
+
+  // Keys the blueprint card renders explicitly. Anything else falls to
+  // `renderOtherFields`. `intent` is here because the card header already shows it as
+  // the summary — consumed, not ignored.
+  var BLUEPRINT_KEYS = [
+    "intent", "kind", "resolves", "notes", "composes", "parameterization",
+    "generalization", "result_signature", "source_tool_call_refs", "accepted_signal",
+    "withheld",
+    // Present on the FAIL-TO-REVIEW payload only (it is the model's raw plan, not the
+    // S4-enriched one), and rendered by the sections below — `uses` falls back into the USES
+    // chips when there is no generalization to take them from, and `grain`/`tables` are shown
+    // beside the result. Listed here so they stop landing in "other fields" as a JSON dump.
+    "uses", "tables", "grain"
+  ];
+
+  function blueprintSections(item) {
+    var view = item.payload_view;
+    if (!isObject(view)) return null;
+    var entries = paramEntries(view);
+    var gen = isObject(view.generalization) ? view.generalization : {};
+    var out = [];
+
+    // A withheld payload leads, because every section under it will be empty and a
+    // card that renders blank reads as a candidate with nothing in it — the exact
+    // failure the unscanned-notice exists to prevent.
+    if (typeof view.withheld === "string" && view.withheld) {
+      out.push(section("withheld", el("p", "card-empty", view.withheld), "inbox-bp-withheld"));
+    }
+
+    out.push(section("template", renderTemplate(item), null));
+    out.push(section("slots", renderSlots(entries), null));
+    out.push(section("frozen filters", renderInline(entries), null));
+    out.push(section("rule filters", renderRules(entries), null));
+    out.push(section("checks", renderChecks(view), null));
+    out.push(section("resolves", renderKeyValues(view.resolves, "inbox-bp-resolves"), null));
+    out.push(
+      section(
+        "result",
+        renderKeyValues(
+          // The fail-to-review payload carries a top-level `grain` beside the signature;
+          // merged here so one section describes the result rather than two.
+          isObject(view.result_signature) || view.grain
+            ? Object.assign({}, view.result_signature || {},
+                view.grain && !(isObject(view.result_signature) && view.result_signature.grain)
+                  ? { grain: view.grain } : {})
+            : null,
+          "inbox-bp-result"
+        ),
+        null
+      )
+    );
+    // `generalization.uses` is the S4-resolved transitive set; the payload-level `uses` is the
+    // model's own declaration and is all a fail-to-review card has. Prefer the resolved one.
+    out.push(
+      section("uses", renderChips(gen.uses || view.uses, "inbox-bp-uses"), null)
+    );
+    out.push(section("tables", renderChips(view.tables, null), null));
+    out.push(section("rules used", renderChips(gen.uses_rules, null), null));
+    out.push(section("composes", renderChips(view.composes, null), null));
+    out.push(section("notes", renderText(view.notes), null));
+    out.push(section("other fields", renderOtherFields(view, BLUEPRINT_KEYS), null));
+    return out;
+  }
+
+  // Knowledge and schema-edit payloads have no fixed shape this page can rely on, so
+  // they get a typed-by-VALUE rendering — one labelled block per top-level key,
+  // scalars as prose and structures as JSON — rather than a guessed schema. Still a
+  // large improvement on one blob, and it cannot be wrong about a field it does not
+  // claim to understand.
+  function genericSections(item) {
+    var view = item.payload_view;
+    if (!isObject(view)) return null;
+    var keys = Object.keys(view);
+    if (!keys.length) return null;
+    return keys.map(function (key) {
+      var value = view[key];
+      var body =
+        typeof value === "string"
+          ? (value.trim() ? el("p", "item-summary", value) : el("p", "card-empty", "—"))
+          : typeof value === "number" || typeof value === "boolean"
+            ? el("p", "item-summary", String(value))
+            : value === null || value === undefined
+              ? el("p", "card-empty", "—")
+              : el("pre", "payload-view", stringifyPayload(value));
+      return section(key.replace(/_/g, " "), body, null);
+    });
+  }
+
+  // Dispatch on candidate type. The unknown-type leg is load-bearing: a typed
+  // renderer shows only what it recognizes, so a candidate type added later must fall
+  // ALL the way back to the dump rather than render a confident, partial view of
+  // itself.
+  function renderPayload(item) {
+    var wrap = el("div", "card-sections");
+    wrap.setAttribute("data-testid", "inbox-payload");
+    var sections = null;
+    if (item.type === "blueprint") {
+      sections = blueprintSections(item);
+    } else if (
+      item.type === "global_knowledge" ||
+      item.type === "user_knowledge" ||
+      item.type === "schema_edit"
+    ) {
+      sections = genericSections(item);
+    }
+    if (!sections) {
+      wrap.appendChild(el("p", "item-field-label", "payload"));
+      var pre = el("pre", "payload-view", stringifyPayload(item.payload_view));
+      pre.setAttribute("data-testid", "inbox-payload-view");
+      wrap.appendChild(pre);
+      return wrap;
+    }
+    sections.forEach(function (node) { if (node) wrap.appendChild(node); });
+    wrap.appendChild(renderRawPayload(item));
+    return wrap;
+  }
+
+  // --- The parameterization judge's marker (design §D, phase D-1) ----------
+  //
+  // The judge OBSERVES. It cannot drop, route or repair anything, and nothing on this card
+  // changes because of it — which is exactly why the marker has to be here. The rollout
+  // decision needs to know how often the judge and a human disagree, and the cheapest way to
+  // collect that is to show the reviewer the verdict on the card they were already going to
+  // approve or reject.
+  //
+  // It colours on a CLASS A finding rather than on the verdict: `revise` is also what a slot
+  // naming nit produces, and Class A is the only class that means the blueprint is WRONG
+  // rather than merely narrower.
+  function renderJudge(item) {
+    var judge = item.param_judge;
+    if (!isObject(judge) || !judge.verdict) return null;
+    var findings = Array.isArray(judge.findings) ? judge.findings.filter(isObject) : [];
+    var serious = findings.some(function (f) { return f.class === "A"; });
+
+    var wrap = el("div", serious ? "item-judge is-serious" : "item-judge");
+    wrap.setAttribute("data-testid", "inbox-judge");
+
+    var head = el("div", "judge-head");
+    head.appendChild(el("span", "", "parameterization judge (shadow)"));
+    head.appendChild(el("span", "", "· " + String(judge.verdict)));
+    if (typeof judge.confidence === "number") {
+      head.appendChild(el("span", "", "· " + judge.confidence.toFixed(2)));
+    }
+    if (serious) {
+      // The phrasing is deliberate: it names what phase D-2 WOULD do, in a phase where
+      // nothing was done. A marker that read like an action taken would misdescribe the
+      // candidate sitting under it.
+      var flag = el("span", "", "· would be discarded under D-2");
+      flag.setAttribute("data-testid", "inbox-judge-would-discard");
+      head.appendChild(flag);
+    }
+    wrap.appendChild(head);
+
+    if (judge.feedback) wrap.appendChild(el("p", "revise-rationale", judge.feedback));
+
+    if (findings.length) {
+      var list = el("ul", "judge-findings");
+      list.setAttribute("data-testid", "inbox-judge-findings");
+      findings.forEach(function (f) {
+        var row = el("li");
+        row.appendChild(el("span", "finding-class", String(f.class) + " "));
+        row.appendChild(
+          document.createTextNode(String(f.criterion || "") + " — " + String(f.note || ""))
+        );
+        list.appendChild(row);
+      });
+      wrap.appendChild(list);
+    }
+    return wrap;
   }
 
   // --- Type tabs + status toggle ------------------------------------------
@@ -1162,6 +1985,187 @@
   // and the server RE-VALIDATES them against the accepted SQL. Nothing here is a
   // shortcut — a form that still does not cover every predicate comes back declined
   // with the fresh reason, and the row stays put.
+  // --- The revise assistant (design §C) ------------------------------------
+  //
+  // A reviewer describes what is wrong in a sentence; the assistant proposes entries. It
+  // WRITES NOTHING: the proposal lands in the entries textarea below it, and the reviewer
+  // applies it with the SAME "Re-validate & complete" button a hand-typed array uses. That
+  // two-step is the design, not a rough edge — `complete` stays the only write path into a
+  // candidate's payload, so the model's output faces the identical re-validation.
+  //
+  // A 503 (no reviser wired) is not an error state for this page: the form still works, so
+  // the block simply reports that the assistant is unavailable and gets out of the way.
+  function renderReviseBlock(item, area, replaceBox, node) {
+    var block = el("div", "revise-block");
+    block.setAttribute("data-testid", "inbox-revise-block");
+    block.appendChild(
+      el("p", "item-field-label", "describe the fix (the assistant proposes entries)")
+    );
+
+    var feedback = document.createElement("textarea");
+    feedback.setAttribute("data-testid", "inbox-revise-feedback");
+    feedback.setAttribute("aria-label", "describe what is wrong with the parameterization");
+    feedback.placeholder =
+      "e.g. total_earnings != '0' guards the ratio's own denominator — inline it. " +
+      "register_type spans two catalog rules, so it cannot cite one.";
+    block.appendChild(feedback);
+
+    var ask = document.createElement("button");
+    ask.type = "button";
+    ask.className = "action-complete";
+    ask.setAttribute("data-testid", "inbox-revise");
+    ask.textContent = "Ask the assistant";
+    block.appendChild(ask);
+
+    var out = el("div");
+    out.setAttribute("data-testid", "inbox-revise-output");
+    block.appendChild(out);
+
+    // On the REVIEW QUEUE there is no entries textarea to load into — the card is not a
+    // form. The block carries its own apply button, which posts the proposal to
+    // `apply_revision`: REPLACE-only, and therefore idempotent, which is what lets it be
+    // offered on a status whose guard cannot protect an append (see `ReviewInbox`).
+    var apply = null;
+    if (!area) {
+      apply = document.createElement("button");
+      apply.type = "button";
+      apply.className = "action-complete";
+      apply.setAttribute("data-testid", "inbox-revise-apply");
+      apply.textContent = "Re-validate & apply";
+      apply.hidden = true;
+      block.appendChild(apply);
+    }
+
+    ask.addEventListener("click", function () {
+      clearError();
+      ask.disabled = true;
+      ask.textContent = "Asking…";
+      fetch("/api/inbox/" + encodeURIComponent(item.candidate_id) + "/revise", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ feedback: feedback.value })
+      })
+        .then(function (response) {
+          return response.text().then(function (text) {
+            var parsed = null;
+            try { parsed = JSON.parse(text); } catch (err) { parsed = null; }
+            if (!response.ok) {
+              var detail = parsed && parsed.detail ? parsed.detail : text;
+              showError("HTTP_" + response.status, detail || response.statusText);
+              return;
+            }
+            renderProposal(parsed, out, area, replaceBox);
+            if (apply) {
+              // Shown only once there is something to apply, and it carries the entries it
+              // was shown with — not a re-read of the card — so what the reviewer approved
+              // is exactly what is posted.
+              var proposed = (parsed && parsed.entries) || [];
+              apply.hidden = !proposed.length;
+              apply.onclick = function () {
+                performRevisionApply(item.candidate_id, proposed, node, apply);
+              };
+            }
+          });
+        })
+        .catch(function (err) { showError("NETWORK", String(err)); })
+        .then(function () {
+          ask.disabled = false;
+          ask.textContent = "Ask the assistant";
+        });
+    });
+    return block;
+  }
+
+  // Show the proposal and LOAD IT INTO THE FORM. The reviewer reads the diff, edits the
+  // entries if they want, and applies with the button they would have used anyway — so an
+  // assistant that proposed something wrong costs a glance, not a bad write.
+  function renderProposal(payload, out, area, replaceBox) {
+    clearNode(out);
+    if (!isObject(payload)) return;
+    var entries = Array.isArray(payload.entries) ? payload.entries : [];
+    if (!entries.length) {
+      out.appendChild(
+        el("p", "card-empty", payload.reason || "the assistant had no suggestion")
+      );
+      return;
+    }
+    if (payload.rationale) {
+      out.appendChild(el("p", "revise-rationale", payload.rationale));
+    }
+    // A proposal can arrive WITH entries and still carry a reason — the append/replace
+    // conflict. Shown here rather than only on the empty-proposal path, because that is the
+    // case where the reviewer is about to click a button that will decline.
+    if (payload.reason) {
+      var warn = el("p", "revise-warning", payload.reason);
+      warn.setAttribute("data-testid", "inbox-revise-warning");
+      out.appendChild(warn);
+    }
+    var diff = Array.isArray(payload.diff) ? payload.diff.filter(isObject) : [];
+    if (diff.length) {
+      var list = el("ul", "revise-diff");
+      list.setAttribute("data-testid", "inbox-revise-diff");
+      diff.forEach(function (row) {
+        var li = el("li", String(row.kind || ""));
+        li.appendChild(el("span", "kind", String(row.kind || "")));
+        if (row.before && row.kind !== "unchanged") {
+          li.appendChild(el("span", "before", String(row.before)));
+          li.appendChild(document.createTextNode("  →  "));
+        }
+        li.appendChild(document.createTextNode(String(row.after || row.before || "")));
+        list.appendChild(li);
+      });
+      out.appendChild(list);
+    }
+    // The proposal becomes the form's contents. `replace` is mirrored onto the checkbox
+    // because it changes what applying MEANS — append versus replace-the-whole-array — and a
+    // proposal whose flag silently disagreed with the box would apply the other operation.
+    area.value = stringifyPayload(entries);
+    if (replaceBox) replaceBox.checked = payload.replace === true;
+    out.appendChild(
+      el("p", "card-empty", "loaded into the entries box above — review, edit, then complete")
+    );
+  }
+
+  // POST an accepted proposal for a candidate already under review. Same three outcomes as
+  // a completion, and the same reason for each: `completed` re-entered the pipeline so the
+  // row is gone; `declined` means the revision still does not validate and the FRESH reason
+  // belongs on the card, not in a banner; an HTTP error is the usual banner.
+  function performRevisionApply(candidateId, entries, node, button) {
+    clearError();
+    button.disabled = true;
+    button.textContent = "Re-validating…";
+    fetch("/api/inbox/" + encodeURIComponent(candidateId) + "/apply_revision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entries: entries })
+    })
+      .then(function (response) {
+        return response.text().then(function (text) {
+          var parsed = null;
+          try { parsed = JSON.parse(text); } catch (err) { parsed = null; }
+          if (!response.ok) {
+            showError("HTTP_" + response.status,
+              (parsed && parsed.detail) || text || response.statusText);
+            return;
+          }
+          if (parsed && parsed.outcome === "declined") {
+            var why = el("p", "revise-warning",
+              "still declined: " + ((parsed.decline || {}).reason || "(no reason)") +
+              " — " + ((parsed.decline || {}).detail || ""));
+            why.setAttribute("data-testid", "inbox-revise-declined");
+            node.appendChild(why);
+            return;
+          }
+          loadInbox();
+        });
+      })
+      .catch(function (err) { showError("NETWORK", String(err)); })
+      .then(function () {
+        button.disabled = false;
+        button.textContent = "Re-validate & apply";
+      });
+  }
+
   function renderCompleteForm(item, node) {
     var form = document.createElement("div");
     form.className = "complete-form";
@@ -1191,6 +2195,11 @@
       "replace the whole parameterization array (default: append to what the model wrote)";
     options.appendChild(optText);
     form.appendChild(options);
+
+    // The assistant sits between the raw entries and the submit button: it FILLS the textarea
+    // above it, and the reviewer commits with the button below. Built last because it needs
+    // both controls to write into.
+    form.appendChild(renderReviseBlock(item, area, replace, node));
 
     var submit = document.createElement("button");
     submit.type = "button";
@@ -1353,16 +2362,16 @@
       li.appendChild(summary);
     }
 
-    // Body: payload_view rendered verbatim (already redacted, D17).
-    var payloadLabel = document.createElement("p");
-    payloadLabel.className = "item-field-label";
-    payloadLabel.textContent = "payload";
-    li.appendChild(payloadLabel);
-    var payload = document.createElement("pre");
-    payload.className = "payload-view";
-    payload.setAttribute("data-testid", "inbox-payload-view");
-    payload.textContent = stringifyPayload(item.payload_view);
-    li.appendChild(payload);
+    // Body: the typed candidate card. Every value is still the already-redacted
+    // `payload_view` (D17) and still reaches the DOM through textContent; what
+    // changed is the RANKING — slots beside frozen filters, with the verbatim dump
+    // collapsed at the bottom of the card rather than standing in for it.
+    li.appendChild(renderPayload(item));
+
+    // The parameterization judge's observation, ABOVE the evidence and below the payload:
+    // it is about the payload the reviewer just read, and it is not evidence.
+    var judge = renderJudge(item);
+    if (judge) li.appendChild(judge);
 
     // Evidence: count + identifiers.
     li.appendChild(renderEvidence(item));
@@ -1405,6 +2414,17 @@
       completeActions.appendChild(completeCancel);
       li.appendChild(completeActions);
       return li;
+    }
+
+    // The assistant on the REVIEW QUEUE (design §C.4). Offered on a blueprint a human is
+    // adjudicating — the reviewer who can SEE a bad role on the card is exactly who should be
+    // able to fix it there, rather than rejecting the candidate and losing the work.
+    //
+    // Blueprints only: there is nothing to re-parameterize on a knowledge or schema-edit
+    // candidate. `in_review` only: a validated or promoted artifact has passed golden replay
+    // and may be landed, so editing it is a re-verify-and-re-land (that is `retract`).
+    if (item.status === "in_review" && item.type === "blueprint") {
+      li.appendChild(renderReviseBlock(item, null, null, li));
     }
 
     // Actions.

@@ -569,6 +569,84 @@ class LearningSettings(BaseSettings):
         ),
     )
 
+    # --- LLM-assisted parameterization revision (design §C). ---
+    #
+    # SEPARATE from the judge's switch on purpose: this one is human-gated and
+    # human-committed — a reviewer reads a diff and clicks apply, and the applied entries face
+    # the same validation a hand-typed array faces — so it can be turned on much earlier and
+    # with much less ceremony than a judge that acts on its own.
+    learning_revise_enabled: bool = Field(
+        False,
+        description=(
+            "Enable the LLM typing aid on the fail-to-review form: a reviewer describes what "
+            "is wrong in a sentence and gets proposed `parameterization` entries plus a diff. "
+            "It WRITES NOTHING — the proposal is applied through the existing complete route, "
+            "so it faces the same to_candidate re-validation and write-router stages. OFF: the "
+            "form still accepts entries directly, exactly as before."
+        ),
+    )
+    learning_revise_model: str = Field(
+        "",
+        description=(
+            "Model id for the revision proposal. EMPTY => reuse the extractor's model."
+        ),
+    )
+    learning_revise_timeout_seconds: float = Field(
+        30.0,
+        gt=0.0,
+        description=(
+            "Hard ceiling on one revision call. On expiry the reviewer is told the assistant "
+            "timed out and the form still accepts entries typed by hand."
+        ),
+    )
+
+    # --- S4 parameterization judge (design §D), PHASE D-1: OBSERVE ONLY. ---
+    #
+    # Two settings this block deliberately DOES NOT have: `max_rounds` and
+    # `discard_confidence`. Both belong to phase D-2, and both are OUTPUTS of the D-1
+    # measurement rather than inputs to it — rounds from the observed revise-then-pass rate,
+    # the bar from the observed agreement rate per confidence decile. Defaulting them here
+    # would mean tuning the data to numbers chosen before it existed.
+    learning_param_judge_enabled: bool = Field(
+        False,
+        description=(
+            "Master switch for the S4 PARAMETERIZATION judge — the model call that asks "
+            "whether a blueprint's literal ROLES are right (is a metric-defining value "
+            "sitting in a fillable slot?). OFF: the stage is not built at all. ON: it runs "
+            "in SHADOW, writing one `param_judgement` row per clean blueprint to "
+            "learning_audit and stamping the reviewer card. IT CANNOT DROP, ROUTE OR REPAIR "
+            "ANYTHING — there is no such code path in phase D-1. Default OFF because this is "
+            "a measurement, and a measurement nobody asked for should not start running "
+            "because its dependencies happen to be present."
+        ),
+    )
+    learning_param_judge_shadow_mode: bool = Field(
+        True,
+        description=(
+            "Reserved for phase D-2. In D-1 there is no non-shadow code path to switch to, "
+            "so setting this False changes NOTHING; it exists so D-2 does not have to invent "
+            "the flag and so the audit row is self-describing across the rollout."
+        ),
+    )
+    learning_param_judge_model: str = Field(
+        "",
+        description=(
+            "Model id for the parameterization judge's structured-output call. EMPTY => "
+            "reuse the extractor's model, as learning_judge_model does. The judge sees one "
+            "blueprint and its accepted SQL, not a whole transcript, so a cheaper model is a "
+            "reasonable choice here."
+        ),
+    )
+    learning_param_judge_timeout_seconds: float = Field(
+        30.0,
+        gt=0.0,
+        description=(
+            "Hard ceiling on one parameterization-judge model call. On expiry the judge "
+            "fails OPEN and records nothing — it observes, so the only cost of a timeout is "
+            "the observation."
+        ),
+    )
+
     # --- Observability (D23/D24) ---
     otlp_endpoint: str = Field(
         "", description="OTLP collector endpoint (Phoenix). Empty => no-op provider."

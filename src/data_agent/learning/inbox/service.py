@@ -31,7 +31,9 @@ from data_agent.runtime.blueprint.models import BlueprintParseError
 
 from ..candidate.memory_candidate_store import InMemoryCandidateStore
 from ..candidate.models import CandidateStatus
+from ..observability import get_learning_tracer
 from ..promotion.scheduler import PromotionScheduler
+from ..revise import ForbiddenTemplateEditError, ReviserUnavailableError
 from .completion import (
     CompletionInputError,
     CompletionRaceError,
@@ -68,6 +70,18 @@ class CompleteParameterizationRequest(BaseModel):
 
     entries: list[dict[str, Any]] = []
     replace: bool = False
+
+
+class ReviseParameterizationRequest(BaseModel):
+    """The REVISE body: a reviewer's sentence about what is wrong.
+
+    One field, and free text, because that is the whole interface: the reviewer says what they
+    would say to a colleague ("the register_type predicate spans two rules — inline it") and the
+    reviser turns it into entries. Nothing here reaches a store; the proposal comes back for the
+    reviewer to apply through `complete`, which stays the only write path.
+    """
+
+    feedback: str = ""
 
 _logger = logging.getLogger(__name__)
 
@@ -146,6 +160,19 @@ def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
         # `InboxItem.decline_view` owns that rule and states why the wire surface is
         # narrower than the store.
         "decline": item.decline_view(),
+        # The generalized template pre-split into text / `{slot}` parts, so the card can render
+        # slot chips without re-spelling `SLOT_TOKEN` in JS. Derived from the REDACTED
+        # `payload_view` (see `InboxItem._template_parts`) — it carries inline literals, so it
+        # is exactly as entity-sensitive as the payload beside it and is redacted by the same
+        # pass. `[]` for every candidate without a template.
+        "template_parts": [dict(part) for part in item.template_parts],
+        # The S4 parameterization judge's verdict (design §D), or null when it did not run.
+        # Part of the EXACT wire shape for the same reason `decline` is: a client cannot
+        # branch on a field it cannot know exists. In phase D-1 this is the ONLY thing the
+        # judge does that a human ever sees, and the reviewer's agree/disagree with it — via
+        # the ordinary approve/reject they were going to make anyway — is half the
+        # measurement the whole phase exists to collect.
+        "param_judge": item.param_judge.to_doc() if item.param_judge is not None else None,
     }
 
 
@@ -211,6 +238,137 @@ def _map_transition_error(exc: InboxTransitionError) -> HTTPException:
     return HTTPException(status_code=409, detail=message)
 
 
+def _build_completion_param_judge(learning_settings: Any) -> Any:
+    """The S4 parameterization judge for the COMPLETION path, or `None`.
+
+    ⚠ THE COMPLETION PATH NEEDS ITS OWN, and leaving it out is not a small omission. Design
+    §D.1 puts the stage in both callers, and `build_write_router_stages` says so in its own
+    docstring — because phase D-1 is a MEASUREMENT and its population must be the population it
+    claims to measure. A judge wired only into the consumer would score extracted blueprints and
+    never human-completed ones, which is precisely the biased sample the measurement is supposed
+    to avoid.
+
+    LAZY AND FAIL-SOFT. Nothing here is constructed unless the judge is switched on, so a
+    deployment with it off (the default) gains no Couchbase audit connection and no model client
+    in this process. Every missing precondition degrades to `None` with a log line, because a
+    completion that re-validates is worth strictly more than an observation about it.
+    """
+    if not getattr(learning_settings, "learning_param_judge_enabled", False):
+        return None
+    api_key = getattr(learning_settings, "learning_extractor_api_key", "")
+    if not api_key:
+        _logger.warning(
+            "inbox service: the parameterization judge is enabled but no extractor API key "
+            "is configured — human-completed candidates will be MISSING from the phase-D-1 "
+            "dataset"
+        )
+        return None
+    try:
+        from data_agent.runtime.model.openai_client import build_openai_model_client
+
+        from ..audit.couchbase_audit_store import CouchbaseAuditStore
+        from ..factory import build_param_judge
+
+        return build_param_judge(
+            learning_settings,
+            model_client=build_openai_model_client(
+                api_key=api_key,
+                model=getattr(learning_settings, "learning_extractor_model", ""),
+                base_url=getattr(learning_settings, "learning_extractor_base_url", ""),
+            ),
+            audit_store=CouchbaseAuditStore(learning_settings),
+        )
+    except Exception:  # noqa: BLE001 — an observation may not break the completion plane
+        _logger.warning(
+            "inbox service: the parameterization judge could not be built for the "
+            "completion path; completions still re-validate and re-run the write router, "
+            "but they will be missing from the phase-D-1 dataset",
+            exc_info=True,
+        )
+        return None
+
+
+def _build_reviser(learning_settings: Any, runtime_settings: Any) -> Any:
+    """Build the LLM typing aid for the fail-to-review form, or `None`.
+
+    FAIL-SOFT at every precondition, and that is the difference between this and
+    `_build_completer`: without a completer a reviewer CANNOT clear a form (so its absence 503s
+    loudly); without a reviser they simply type the entries themselves, exactly as they did
+    before this existed. So a missing key, a missing catalog or an unreadable one all degrade to
+    "no assistant", logged at INFO rather than WARNING.
+
+    The catalog is the GROUNDING (rule ids and bindable columns) and comes from the SAME frozen
+    snapshot the completer uses — a reviser offering rule ids the completer's validator does not
+    recognize would propose entries that are rejected on apply, which is worse than proposing
+    none.
+    """
+    if not getattr(learning_settings, "learning_revise_enabled", False):
+        _logger.info(
+            "inbox service: LLM-assisted revision is OFF (LEARNING_REVISE_ENABLED=false); "
+            "the parameterization form still accepts entries directly"
+        )
+        return None
+    api_key = getattr(learning_settings, "learning_extractor_api_key", "")
+    if not api_key:
+        _logger.info(
+            "inbox service: LLM-assisted revision is enabled but no extractor API key is "
+            "configured — no assistant; the form still works"
+        )
+        return None
+
+    import json
+
+    from data_agent.catalog.loader import build_sqlglot_schema_from_catalog
+    from data_agent.runtime.model.openai_client import build_openai_model_client
+
+    from ..extractor.grounding import known_rule_ids_from_catalog
+    from ..revise import BlueprintReviser
+
+    try:
+        path = runtime_settings.catalog_fixture_file()
+        with path.open(encoding="utf-8") as fh:
+            catalog = json.load(fh)["catalog"]
+    except (OSError, ValueError, KeyError, TypeError):
+        _logger.info(
+            "inbox service: the semantic catalog snapshot could not be read, so "
+            "LLM-assisted revision is disabled (an ungrounded reviser would invent rule ids "
+            "and column bindings the validator then rejects)",
+            exc_info=True,
+        )
+        return None
+
+    model = (
+        getattr(learning_settings, "learning_revise_model", "")
+        or getattr(learning_settings, "learning_extractor_model", "")
+    )
+    _logger.info("inbox service: LLM-assisted revision is ON (model=%s)", model)
+    # The tracer the daemon preamble already installed globally (`configure_daemon_process`
+    # calls OTel's `set_tracer_provider`, which is what `set_global_tracer_provider` aliases).
+    # Read from the global rather than threaded down from `main()`, because
+    # `create_inbox_app` is built inside the event loop and this is the only consumer on the
+    # path. With no OTLP endpoint the preamble installs a NO-OP provider, so an untraced
+    # deployment is unchanged rather than special-cased.
+    from opentelemetry import trace as _otel_trace
+
+    tracer = get_learning_tracer(_otel_trace.get_tracer_provider())
+    return BlueprintReviser(
+        model_client=build_openai_model_client(
+            api_key=api_key,
+            model=model,
+            base_url=getattr(learning_settings, "learning_extractor_base_url", ""),
+        ),
+        known_rules=known_rule_ids_from_catalog(catalog),
+        catalog_schema=build_sqlglot_schema_from_catalog(catalog),
+        timeout_seconds=getattr(learning_settings, "learning_revise_timeout_seconds", 30.0),
+        model=model,
+        tracer=tracer,
+        # ⚠ The verbose payload on `learning.revise` is a human's free text plus model prose
+        # about the UNREDACTED accepted SQL. Same switch, same posture, same D51 standard as
+        # every other entity-bearing span on this plane.
+        trace_verbose=getattr(learning_settings, "learning_trace_verbose", False),
+    )
+
+
 # --- default (env-driven) construction ---------------------------------------
 
 
@@ -268,6 +426,10 @@ def _build_completer(
             blueprint_corpus=corpus,
             catalog_schema=build_sqlglot_schema_from_catalog(catalog),
             embedder=embedding_client,
+            # The SECOND composition root design §D.1 names. See
+            # `_build_completion_param_judge` for why the completion path needs one of its
+            # own rather than inheriting the consumer's.
+            param_judge=_build_completion_param_judge(learning_settings),
             include_target_specific=False,
         ),
     )
@@ -405,6 +567,10 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
             corpus=corpus,
             embedding_client=embedding_client,
         ),
+        # The LLM typing aid for that same form (design §C). Independent of the completer's
+        # own switch: it is human-gated and human-committed, so it can be enabled much
+        # earlier — and its absence costs a convenience, not a capability.
+        reviser=_build_reviser(learning_settings, runtime_settings),
         # PriorArt Slice 2 — THE process where humans actually reject. `reject` and
         # `retract` reach the scheduler through THIS service, not through
         # `run_learning_scheduler.py`, so omitting this made the whole
@@ -556,6 +722,70 @@ def create_inbox_app(
             # 409, like every other "the row is not in the state you think it is" — but
             # with the reason surfaced verbatim, because the reviewer did nothing wrong
             # and the only useful next step is to re-read the row.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except CompletionInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _completion_result(result)
+
+    @app.post("/inbox/{candidate_id}/revise", dependencies=guard)
+    async def revise(
+        candidate_id: str, body: ReviseParameterizationRequest | None = None
+    ) -> dict[str, Any]:
+        """FAIL-TO-REVIEW REVISE: ask the assistant for entries. WRITES NOTHING.
+
+        Returns a PROPOSAL — entries, a replace flag, a rationale and a slot-level diff — which
+        the reviewer then applies through `complete`. That two-step is the design (§C.3), not an
+        oversight: `complete` stays the ONLY write path into a candidate's payload, so a model's
+        output faces the identical `to_candidate` re-validation and write-router stages that a
+        hand-typed array faces.
+
+        "The assistant had no suggestion" is a 200 with empty `entries` and a `reason`, for the
+        same reason a still-incomplete completion is a 200: the reviewer did nothing wrong, and
+        the useful next step belongs on the page rather than in an error banner. 404 unknown id,
+        409 wrong status, 422 the model tried to write SQL, 503 no reviser in this deployment.
+        """
+        req = body or ReviseParameterizationRequest()
+        try:
+            proposal = await inbox.propose_revision(candidate_id, feedback=req.feedback)
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        except ReviserUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail="LLM-assisted revision unavailable"
+            ) from exc
+        except ForbiddenTemplateEditError as exc:
+            # 422, surfaced VERBATIM. The model worked against a contract this system does not
+            # have — the template is DERIVED from the accepted query, never authored — and a
+            # reviewer reading that sentence learns something true about the system rather than
+            # "the assistant failed".
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return proposal.to_wire()
+
+    @app.post("/inbox/{candidate_id}/apply_revision", dependencies=guard)
+    async def apply_revision(
+        candidate_id: str, body: CompleteParameterizationRequest | None = None
+    ) -> dict[str, Any]:
+        """Apply a revision to a candidate already under review (`in_review`).
+
+        Distinct from `complete`, which fills a FORM and appends. This REPLACES, which is both
+        the right semantics for correcting a role and idempotent — see
+        `ReviewInbox.apply_revision`. The request body's `replace` field is IGNORED here; the
+        operation has only one mode by design.
+
+        Same outcome vocabulary as `complete`: a revision that still does not validate answers
+        200 with `outcome="declined"` and the fresh reason, because that is the result the
+        reviewer needs in order to make the next attempt.
+        """
+        req = body or CompleteParameterizationRequest()
+        try:
+            result = await inbox.apply_revision(candidate_id, entries=req.entries)
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        except CompletionUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail="parameterization completion unavailable"
+            ) from exc
+        except CompletionRaceError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except CompletionInputError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

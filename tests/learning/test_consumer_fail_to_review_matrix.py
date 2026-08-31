@@ -443,7 +443,10 @@ async def test_a_session_that_extracts_and_parks_keeps_the_two_rows_apart() -> N
     kept_env = by_id[mint_candidate_id("hash-both", 0)]
     parked = by_id[mint_review_candidate_id("hash-both", 0)]
     assert kept_env.status == CandidateStatus.EXTRACTED
-    assert kept_env.decline is None and kept_env.revalidation is None
+    # The DECLINE is what separates the two rows; the snapshot is on BOTH now, because
+    # a kept candidate now carries its own `ValidationSnapshot` (`build_candidate_envelope`), and a completion no longer clears it — that is what makes the review queue editable at all (design §C.4).
+    assert kept_env.decline is None
+    assert kept_env.revalidation is not None
     assert parked.status == CandidateStatus.NEEDS_PARAMETERIZATION
     assert parked.decline is not None
     # Two rows about DIFFERENT work: the parked form is not a copy of the kept one.

@@ -43,8 +43,14 @@ class _FakeAsyncClient:
     # and the proxy has to carry THAT back unchanged.
     payload: dict = {"items": [], "count": 0}
 
+    # The timeout the client was constructed with, per instance. Recorded because the
+    # inbox proxy varies it by action and the only way to assert that end-to-end is to see
+    # what the proxy actually handed httpx — see
+    # `test_the_revise_hop_is_constructed_with_the_long_read_timeout`.
+    timeouts: list[object] = []
+
     def __init__(self, *args: object, **kwargs: object) -> None:
-        pass
+        _FakeAsyncClient.timeouts.append(kwargs.get("timeout"))
 
     async def __aenter__(self) -> _FakeAsyncClient:
         return self
@@ -67,6 +73,7 @@ class _FakeAsyncClient:
 @pytest.fixture
 def fake_httpx(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict]]:
     _FakeAsyncClient.captured = []
+    _FakeAsyncClient.timeouts = []
     _FakeAsyncClient.payload = {"items": [], "count": 0}
     monkeypatch.setattr(server.httpx, "AsyncClient", _FakeAsyncClient)
     yield _FakeAsyncClient.captured
@@ -463,3 +470,144 @@ def test_the_bff_and_service_status_allowlists_agree(
     from data_agent.learning.inbox.service import _LISTABLE_STATUSES
 
     assert set(server._INBOX_LIST_STATUSES) == set(_LISTABLE_STATUSES)
+
+
+# --- revise (design §C): a THIRD response shape on this route ----------------
+
+
+def test_the_revise_body_is_forwarded_verbatim(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """The reviewer's sentence is the whole input, and the BFF holds no schema for it — same
+    posture as `complete`. What is pinned is that it survives the hop unreshaped, and that the
+    server-held reviewer token rides with it so the browser never sees one."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "REVIEWER_TOKEN", "bff-held-secret")
+    body = {"feedback": "register_type spans two catalog rules, so it cannot cite one"}
+
+    resp = client.post("/api/inbox/candidate::abc::review-0/revise", json=body)
+
+    assert resp.status_code == 200
+    hop = fake_httpx[0]
+    assert hop["method"] == "POST"
+    assert hop["url"].endswith("/inbox/candidate%3A%3Aabc%3A%3Areview-0/revise")
+    assert hop["json"] == body
+    assert hop["headers"]["X-Reviewer-Token"] == "bff-held-secret"
+
+
+def test_an_oversized_revise_body_is_413_before_any_hop(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """A free-text field is the easiest place to paste a novel into. The cap is the BFF's OWN
+    resource and nobody downstream can give it back, which is why it is enforced before the
+    hop rather than after it."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "INBOX_BODY_MAX_BYTES", 128)
+
+    resp = client.post(
+        "/api/inbox/candidate::abc::review-0/revise",
+        json={"feedback": "x" * 5000},
+    )
+
+    assert resp.status_code == 413
+    assert fake_httpx == []
+
+
+def test_revise_answers_a_proposal_shape_not_an_action_result(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """⚠ THREE response shapes now ride this one route: the `{candidate_id, status, reason}`
+    every adjudication verb answers, `promote`'s YAML emit, and this — a PROPOSAL, carrying no
+    status at all because nothing was written. The BFF must keep passing bodies through
+    without assuming any of them."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    proposal = {
+        "entries": [{"locator": {"table": "t", "column": "c", "value": "v"}, "role": "inline"}],
+        "replace": False,
+        "rationale": "it guards the ratio's own denominator",
+        "reason": "",
+        "diff": [{"kind": "added", "locator": "t.c", "before": "", "after": "t.c = v → inline"}],
+    }
+    _FakeAsyncClient.payload = proposal
+
+    resp = client.post("/api/inbox/candidate::abc::review-0/revise", json={"feedback": "x"})
+
+    assert resp.status_code == 200
+    # Byte-for-byte the upstream object: entries, flag, rationale and diff, unreshaped.
+    assert resp.json() == proposal
+    # ...and NO status, because nothing was written. A BFF that projected the action shape
+    # onto this would invent one.
+    assert "status" not in resp.json()
+
+
+def test_the_revise_hop_is_constructed_with_the_long_read_timeout(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """⚠ ASSERTED THROUGH THE PROXY, not on the helper.
+
+    The first version of this fix tested `_hop_timeout` in isolation, and it passed while the
+    call site was wrong: the edit landed on the FIRST `timeout=10.0` in the file, which is the
+    chat-history proxy, leaving the inbox proxy untouched AND `history()` referencing a
+    `path` variable it does not have — a NameError on a route that had nothing to do with the
+    change. A helper test cannot see any of that; this one can, because it reads what the
+    proxy actually handed httpx.
+    """
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    client.post("/api/inbox/candidate::abc::review-0/revise", json={"feedback": "f"})
+    assert len(_FakeAsyncClient.timeouts) == 1
+    timeout = _FakeAsyncClient.timeouts[0]
+    assert timeout.read == server._INBOX_MODEL_HOP_TIMEOUT_SECONDS
+    # CONNECT stays short: a service that is DOWN must still fail fast. A scalar timeout
+    # would have set all four phases and traded the fast-failure case for the slow-success one.
+    assert timeout.connect == server._INBOX_CONNECT_TIMEOUT_SECONDS
+
+
+def test_a_non_model_hop_keeps_the_fast_crud_timeout(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    client.post("/api/inbox/candidate::abc::0/approve")
+    assert _FakeAsyncClient.timeouts[0].read == server._INBOX_HOP_TIMEOUT_SECONDS
+
+
+def test_the_chat_history_proxy_still_builds_its_own_client(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """The route the misplaced edit broke. It shares no state with the inbox proxy and must
+    not have acquired a dependency on one."""
+    import inspect
+
+    source = inspect.getsource(server.history)
+    assert "_hop_timeout" not in source, "history() has no `path`; this would NameError"
+
+
+def test_the_model_backed_hop_outlasts_the_upstreams_own_deadline() -> None:
+    """⚠ Found live: "Ask the assistant" rendered `502 Inbox service unreachable` while the
+    upstream was still answering — it logged `POST /v1/responses 200` after the browser had
+    given up.
+
+    `revise` is the only route on this surface whose upstream calls a model. The reviser gives
+    itself `learning_revise_timeout_seconds` (30s) and converts its OWN expiry into a 200
+    carrying "the assistant timed out; try again" — a result a reviewer can act on. A BFF
+    deadline shorter than that preempts it: the proposal is produced and discarded, and the
+    error blames the wrong component.
+
+    So the invariant is a RELATIONSHIP, not a number — the hop must outlast the upstream's own
+    deadline with headroom, and every other action keeps the fast CRUD timeout because a quick
+    failure is the right answer there.
+    """
+    from data_agent.learning.config import LearningSettings
+
+    reviser_deadline = LearningSettings().learning_revise_timeout_seconds
+    assert server._hop_timeout("/inbox/abc/revise").read > reviser_deadline, (
+        "the BFF would abandon the hop while the reviser is still working"
+    )
+    for path in ("/inbox/abc/approve", "/inbox/abc/complete", "/inbox?status=in_review"):
+        assert server._hop_timeout(path).read == server._INBOX_HOP_TIMEOUT_SECONDS, path
+
+
+def test_every_model_backed_action_is_in_the_body_allowlist() -> None:
+    """A model-backed action carries a prompt, so it needs a body. Pinned as a subset check so
+    a second such route cannot be added to one list and forgotten in the other."""
+    assert server._INBOX_MODEL_ACTIONS <= server._INBOX_BODY_ACTIONS
+    assert server._INBOX_MODEL_ACTIONS <= server._INBOX_ACTIONS

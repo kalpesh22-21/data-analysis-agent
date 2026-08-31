@@ -57,6 +57,13 @@ def _learning_settings() -> SimpleNamespace:
         learning_judge_band_low=0.70,
         learning_judge_band_high=0.97,
         learning_judge_timeout_seconds=30.0,
+        # S4 parameterization judge (design §D), phase D-1. OFF, mirroring the production
+        # default: it is a MEASUREMENT, and these tests assert the SHAPE of the default
+        # pipeline. Its own wiring tests turn it on explicitly.
+        learning_param_judge_enabled=False,
+        learning_param_judge_shadow_mode=True,
+        learning_param_judge_model="",
+        learning_param_judge_timeout_seconds=30.0,
         otlp_endpoint="", learning_service_name="learning-loop",
         learning_consumer_group="g", learning_consumer_name="w", learning_batch_size=10,
         learning_trace_verbose=False,

@@ -124,6 +124,16 @@ def test_list_returns_exact_wire_shape(enabled: None) -> None:
         # `needs_parameterization` items — a client cannot branch on a field it cannot
         # know exists, and the whole slice is about a surface that said nothing.
         "decline",
+        # The generalized template pre-split into text / `{slot}` parts for the reviewer
+        # card. Part of the EXACT shape (`[]` on every row without a template) for the
+        # `decline` reason above, and derived from the REDACTED `payload_view` — see
+        # `test_template_parts_are_tokenized_from_the_redacted_view`, which is the guard
+        # that matters, since this field carries inline literals.
+        "template_parts",
+        # The S4 parameterization judge's verdict (design §D), null on every row where it did
+        # not run — which in phase D-1 is most of them. Part of the EXACT shape for the
+        # `decline` reason above: a client cannot branch on a field it cannot know exists.
+        "param_judge",
     }
     assert set(item["score"]) == {
         "score",

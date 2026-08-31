@@ -12,7 +12,10 @@ does, and a port method nothing calls is a method nothing tests.
 
 `record_judgement`/`read_judgement` are additive — existing implementations without them keep
 working, because the judge is optional — but any store handed to a WIRED judge must implement
-both, which the factory's fail-fast enforces at composition.
+both, which the factory's fail-fast enforces at composition. `record_param_judgement`/
+`read_param_judgement` are the same shape for the S4 parameterization judge (design §D) and
+are duck-typed at the call site with `getattr`, so a store predating them degrades to "the
+verdict is lost" with a loud log rather than to an AttributeError in a queue worker.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from __future__ import annotations
 import uuid
 from typing import Protocol
 
-from .judgement import JudgeRecord
+from .judgement import JudgeRecord, ParamJudgeRecord
 from .models import EvidenceSnapshot
 
 
@@ -64,6 +67,32 @@ class AuditStore(Protocol):
         level, which costs latency on every judgement and is not exercisable on a single-node dev
         cluster, so it is deliberately NOT set today. Read the precondition as "the store accepted
         it", not "the store kept it".
+        """
+        ...
+
+    async def record_param_judgement(self, record: ParamJudgeRecord) -> None:
+        """KV-upsert a PARAMETERIZATION judgement (design §D), with the judgement retention.
+
+        MUST RAISE on failure, for the same reason `record_judgement` does — but note the
+        difference in what currently depends on it. In phase D-1 the judge takes no action, so a
+        failed write costs an OBSERVATION rather than an unrecorded drop. That row is the phase's
+        entire product, though, so a silent loss here is the one way D-1 can fail while
+        everything looks healthy; the judge logs it at WARNING and reports it on its outcome.
+
+        Phase D-2 promotes this to the same precondition `record_judgement` already is: a
+        discard may not be taken unless this returned. The signature is built for that now so
+        the guarantee does not have to be retrofitted onto a fire-and-forget write later.
+        """
+        ...
+
+    async def read_param_judgement(self, ref: str) -> ParamJudgeRecord | None:
+        """Read a parameterization judgement, or `None` if absent, expired or unrecognized.
+
+        The redelivery read-through: a re-processed session finds its prior verdict instead of
+        paying for a second non-idempotent model call — which would also put two rows with
+        different verdicts into the dataset the D-1 measurement is computed over. An EXCEPTION
+        means "could not look", which the judge treats as `None`: a failed read is
+        indistinguishable from an absence, and the direction that fails safe is judging again.
         """
         ...
 

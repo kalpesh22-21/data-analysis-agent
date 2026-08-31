@@ -108,7 +108,7 @@ def test_every_learning_entrypoint_reports_its_tracing_posture(script):
     This used to scan for `configure_learning_tracing(` + `log_tracing_status(`
     directly, back when each script carried its own ~20-line copy of the block. The
     copies are gone; asserting on the call to `configure_daemon_process` is the same
-    guard one level up, and `test_the_daemon_preamble_does_all_four_things` below
+    guard one level up, and `test_the_daemon_preamble_does_all_five_things` below
     holds the helper itself to the full contract.
 
     `run_inbox_service.py` is in the list as of the dedup — it is a learning-plane
@@ -117,10 +117,16 @@ def test_every_learning_entrypoint_reports_its_tracing_posture(script):
     assert "configure_daemon_process(" in source
 
 
-def test_the_daemon_preamble_does_all_four_things(caplog, monkeypatch):
-    """The contract the per-script guard above now delegates to. All four steps are
+def test_the_daemon_preamble_does_all_five_things(caplog, monkeypatch):
+    """The contract the per-script guard above now delegates to. All five steps are
     diagnostics-or-wiring that fail SILENTLY when omitted, which is why they are pinned
     behaviourally rather than by reading source.
+
+    The FIFTH is OpenAI auto-instrumentation, and its silent-failure mode is the reason it is
+    here: without it every learning model call — the extractor, the coverage judge, the
+    parameterization judge, the reviser — emits a CHAIN span describing the DECISION and
+    nothing describing the CALL, so a trace shows a verdict with no prompt, no completion and
+    no token counts under it. Nothing errors; the traces are simply half a story.
 
     `basicConfig` is asserted as a CALL rather than by inspecting root-logger handlers,
     and that is deliberate: `basicConfig` is a documented no-op once the root logger has
@@ -137,7 +143,17 @@ def test_the_daemon_preamble_does_all_four_things(caplog, monkeypatch):
     monkeypatch.setattr(logging, "basicConfig", lambda **kw: basic_config_calls.append(kw))
     monkeypatch.setattr(entrypoint, "set_global_tracer_provider", installed.append)
     monkeypatch.setenv("LEARNING_MAX_DELIVERES", "3")  # a plausible typo
-    settings = SimpleNamespace(otlp_endpoint="", learning_service_name="learning-loop")
+    instrumented: list[tuple] = []
+    monkeypatch.setattr(
+        entrypoint,
+        "instrument_openai",
+        lambda provider, *, hide_content: instrumented.append((provider, hide_content)),
+    )
+    settings = SimpleNamespace(
+        otlp_endpoint="",
+        learning_service_name="learning-loop",
+        learning_trace_verbose=True,
+    )
     logger = logging.getLogger("test.daemon.preamble")
 
     with caplog.at_level(logging.INFO, logger="test.daemon.preamble"):
@@ -154,6 +170,44 @@ def test_the_daemon_preamble_does_all_four_things(caplog, monkeypatch):
     assert any("tracing OFF" in m and "inbox" in m for m in messages)
     # 4. the ignored-env-var warning
     assert any("LEARNING_MAX_DELIVERES" in m for m in messages)
+    # 5. the OpenAI SDK is instrumented, with `hide_content` the INVERSE of
+    #    `learning_trace_verbose` — the mirror `RuntimeSettings.otlp_hide_llm_content` names
+    #    in its own docstring, so the two planes cannot take opposite content postures.
+    assert len(instrumented) == 1
+    assert instrumented[0][1] is False, "verbose settings must REVEAL prompt + completion"
+    # ...and the posture is LOGGED, because "no prompt on the span" reads identically whether
+    # the call was uninstrumented or the content was withheld.
+    assert any("CONTENT REVEALED" in m for m in messages)
+
+
+def test_the_preamble_withholds_llm_content_when_verbose_is_off(caplog, monkeypatch):
+    """The other half of the gate. `learning_trace_verbose=False` restores the D25 shape-only
+    posture, and it must reach the OpenAI instrumentation too — the LLM span is where the raw
+    prompt actually lives, so a gate that governed only the learning spans would leave the
+    entity-bearing content on the one span nobody had gated."""
+    from types import SimpleNamespace
+
+    from data_agent.learning import entrypoint
+
+    instrumented: list[tuple] = []
+    monkeypatch.setattr(logging, "basicConfig", lambda **kw: None)
+    monkeypatch.setattr(entrypoint, "set_global_tracer_provider", lambda p: None)
+    monkeypatch.setattr(
+        entrypoint,
+        "instrument_openai",
+        lambda provider, *, hide_content: instrumented.append((provider, hide_content)),
+    )
+    settings = SimpleNamespace(
+        otlp_endpoint="",
+        learning_service_name="learning-loop",
+        learning_trace_verbose=False,
+    )
+    logger = logging.getLogger("test.daemon.preamble.quiet")
+    with caplog.at_level(logging.INFO, logger="test.daemon.preamble.quiet"):
+        entrypoint.configure_daemon_process("consumer", settings, logger)
+
+    assert instrumented[0][1] is True, "shape-only settings must HIDE prompt + completion"
+    assert any("shape only" in r.getMessage() for r in caplog.records)
 
 
 # --- the sweeper's --once flag ------------------------------------------------

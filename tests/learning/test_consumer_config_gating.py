@@ -72,8 +72,19 @@ def _fake_learning_settings(
         learning_judge_band_low=0.70,
         learning_judge_band_high=0.97,
         learning_judge_timeout_seconds=30.0,
+        # S4 parameterization judge (design §D), phase D-1. OFF, mirroring the production
+        # default: it is a MEASUREMENT, and these tests assert the SHAPE of the default
+        # pipeline. Its own wiring tests turn it on explicitly.
+        learning_param_judge_enabled=False,
+        learning_param_judge_shadow_mode=True,
+        learning_param_judge_model="",
+        learning_param_judge_timeout_seconds=30.0,
         otlp_endpoint="",
         learning_service_name="learning-loop",
+        # The D25 content gate. Drives BOTH the learning spans' verbose attrs and
+        # (since the daemon preamble auto-instruments the SDK) whether the OpenAI
+        # spans carry the raw prompt + completion. True is the shipped default.
+        learning_trace_verbose=True,
         learning_consumer_group="learning-workers",
         learning_consumer_name="worker-test",
         learning_batch_size=10,

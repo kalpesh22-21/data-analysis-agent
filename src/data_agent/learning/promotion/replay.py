@@ -12,6 +12,7 @@ not a correctness proof.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +43,9 @@ class ReplayOutcome:
     replay_sql: str | None
     sampled_slots: tuple[str, ...]
     reason: str | None = None  # stable machine tag when not passed
+
+
+_logger = logging.getLogger(__name__)
 
 
 def _pick_template(gen: BlueprintGeneralization) -> str | None:
@@ -106,12 +110,27 @@ def _slot_types(payload: dict[str, Any]) -> dict[str, str]:
 
 def _sample_value(name: str, slot_type: str) -> Any:
     """A SYNTHETIC value typed per the slot's declared type (R7) — never a stored
-    entity input (D17). `as_of_date` and each bound of a `period_range` → a fixed ISO
-    date; `relative_window` → a bare INTEGER (the unit lives in the template, so the
-    bind site is a number literal); `list` → a one-element set (so `IN {slot}` binds);
-    every other type (string/entity/enum/period) → a synthetic string token that binds
-    as a typed literal (F1)."""
-    if slot_type in ("as_of_date", "period_range"):
+    entity input (D17). `as_of_date`, `period`, and each bound of a `period_range` → a
+    fixed ISO date; `relative_window` → a bare INTEGER (the unit lives in the template,
+    so the bind site is a number literal); `list` → a one-element set (so `IN {slot}`
+    binds); every other type (string/entity/enum) → a synthetic string token that binds
+    as a typed literal (F1).
+
+    ⚠ `period` MOVED into the date branch on 2026-08-28, from live evidence. The gloss in
+    `runtime/blueprint/models.py` calls a period "a warehouse pay-period key, NOT a calendar
+    date", and on that reading a string token looked right — but S4 emits `period` for
+    date-window slots and binds them straight into `toDate({slot})`. Every live blueprint
+    carrying a period slot (3 of 3 in the review queue) did exactly that, so the replay sent
+    `toDate('__replay_sample_pay_period_end_start__')` to ClickHouse and got
+    `Code: 38 ... Cannot parse Date from String`. `golden_replay` catches that into
+    `probe_unavailable`, so EVERY period-windowed blueprint was unapprovable and unpromotable,
+    and the reviewer saw only `approve_blocked_replay:probe_unavailable` with no clue why.
+
+    An ISO date is correct under BOTH readings: it parses inside a date function, and it is
+    still a plain string where a period is a key column. Matching zero rows is fine either way
+    — the probe is a STRUCTURE oracle (columns + grain counts), not a data one, which is the
+    same reason `as_of_date`'s fixed 2020-01-01 has always been acceptable."""
+    if slot_type in ("as_of_date", "period", "period_range"):
         return _SAMPLE_DATE
     if slot_type == "relative_window":
         return _SAMPLE_RELATIVE_WINDOW
@@ -199,6 +218,19 @@ async def golden_replay(
         # The warehouse or query service is unreachable (or the deferred stub probe
         # is wired). Degrade to a clean non-promoting outcome so BOTH the cron scan
         # and the human approve path hold cleanly — never an uncaught raise.
+        #
+        # ⚠ LOGGED, and it was not. `probe_unavailable` is the reason a reviewer sees on a
+        # refused approve, and it names the CATEGORY while discarding the only thing that
+        # identifies the fault — one badly-typed sample value produced a ClickHouse
+        # `Cannot parse Date from String` that reached nobody, and the queue simply stopped
+        # promoting. A fail-closed path still has to say what it closed on.
+        _logger.warning(
+            "golden replay: the probe raised for %s — holding at probe_unavailable. "
+            "Replay SQL: %s",
+            getattr(env, "candidate_id", "<unknown>"),
+            replay_sql,
+            exc_info=True,
+        )
         return ReplayOutcome(False, None, replay_sql, sampled, reason="probe_unavailable")
     verify = verify_result(
         result_grain=grain,

@@ -23,6 +23,7 @@ a model call, not a dedup key — `DedupStage`'s hash key remains the race-safe 
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -375,3 +376,275 @@ __all__ = [
     "post_extraction_ref",
     "pre_extraction_ref",
 ]
+
+
+# --- The S4 parameterization judge's assessment (design §D) -------------------
+# HERE, not in `candidate/verdicts.py` where the envelope's other stage stamps live, for
+# the same reason `CoverageAssessment` is here: the ENVELOPE imports this module, so this
+# module may not import the envelope's package. `verdicts.py` is the right home by theme
+# and the wrong one by import direction, and the direction wins.
+
+# The closed verdict vocabulary. Equality-compared and used as the audit dataset's `GROUP BY`
+# key, so it is a MEMBER test at the parse boundary: anything else would silently become its own
+# bucket in every distribution query anybody writes over these rows.
+ParamVerdict = Literal["ok", "revise", "reject"]
+PARAM_VERDICTS: tuple[ParamVerdict, ...] = ("ok", "revise", "reject")
+
+# The severity ladder. `A` is the only one that could ever authorize a destructive action, which
+# is exactly why the parse boundary down-casts anything unrecognized to `C`.
+FindingClass = Literal["A", "B", "C"]
+FINDING_CLASSES: tuple[FindingClass, ...] = ("A", "B", "C")
+WEAKEST_FINDING_CLASS: FindingClass = "C"
+
+# Bounds. Every one of these is a JSON leaf in a retained document and an interpolation in a log
+# line, so each is capped: a runaway generation must not be able to inflate the audit bucket one
+# row at a time.
+MAX_FEEDBACK_CHARS = 600
+MAX_NOTE_CHARS = 300
+MAX_CRITERION_CHARS = 80
+MAX_FINDINGS = 12
+
+
+@dataclass(frozen=True)
+class ParamFinding:
+    """One objection, with the parameterization entry it is about.
+
+    `entry_index` points into `payload["parameterization"]`. It is advisory: an out-of-range
+    index drops the FINDING and never the verdict, because a model miscounting a list position
+    says nothing about whether its objection is real.
+    """
+
+    finding_class: FindingClass
+    criterion: str
+    note: str
+    entry_index: int | None = None
+
+    def to_doc(self) -> dict[str, Any]:
+        return {
+            "class": self.finding_class,
+            "criterion": self.criterion,
+            "note": self.note,
+            "entry_index": self.entry_index,
+        }
+
+    @classmethod
+    def from_doc(cls, doc: dict[str, Any]) -> ParamFinding:
+        raw_class = doc.get("class")
+        index = doc.get("entry_index")
+        return cls(
+            finding_class=(
+                raw_class if raw_class in FINDING_CLASSES else WEAKEST_FINDING_CLASS
+            ),
+            # Same rehydration guards as the assessment's `feedback`: these are rendered on
+            # a card and serialized in a listing response, so a stored surrogate here is the
+            # same 500 one field over.
+            criterion=_rehydrated_text(doc.get("criterion"), limit=MAX_CRITERION_CHARS),
+            note=_rehydrated_text(doc.get("note"), limit=MAX_NOTE_CHARS),
+            entry_index=(
+                index if isinstance(index, int) and not isinstance(index, bool) else None
+            ),
+        )
+
+
+def _rehydrated_text(raw: Any, *, limit: int) -> str:
+    """A store string that is SAFE TO SERIALIZE, capped. See `ParamAssessment.from_doc`.
+
+    Two hazards a plain `str(...)[:n]` does not survive, both reachable from a document a human
+    edited through cbq and neither caught by the model-output parse boundary (which never sees
+    a stored doc):
+
+      * a LONE SURROGATE (an unpaired UTF-16 half) — legal in a Python str, and json.dumps
+        will emit it, but encoding the response body raises `UnicodeEncodeError`, surfacing
+        as a 500 from a LISTING endpoint. One poisoned row makes the whole queue unreadable.
+      * CONTROL CHARACTERS — this text reaches log lines, where a newline is a forged entry.
+
+    Surrogates are dropped rather than escaped: the character carries no meaning to recover,
+    and the reviewer-facing question is whether the row renders at all.
+    """
+    if not isinstance(raw, str):
+        return ""
+    cleaned = "".join(
+        " " if unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Zl", "Zp") else ch
+        for ch in raw
+    )
+    return " ".join(cleaned.split())[:limit]
+
+
+def _rehydrated_confidence(raw: Any) -> float:
+    """A stored confidence as a usable float, or `0.0`.
+
+    ⚠ `float(raw)` RAISES `OverflowError` for an int too large to convert — and the range test
+    that was supposed to reject it called `float()` to do so, so the guard was the crash. The
+    parse boundary (`paramjudge/schema.py::_confidence`) already wraps the conversion; this path
+    did not, and this is the path that reads what a human can type into the store.
+
+    Same three guards, same order: TYPE (`bool` first — it passes `isinstance(x, int)`),
+    CONVERSION, then RANGE, which rejects NaN without a separate test.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0.0
+    try:
+        value = float(raw)
+    except (OverflowError, ValueError):
+        return 0.0
+    return value if 0.0 <= value <= 1.0 else 0.0
+
+
+@dataclass(frozen=True)
+class ParamAssessment:
+    """What the judge said about one blueprint's parameterization."""
+
+    verdict: ParamVerdict
+    feedback: str
+    confidence: float
+    findings: tuple[ParamFinding, ...] = ()
+
+    @property
+    def has_class_a(self) -> bool:
+        """Is there a finding that says the blueprint is WRONG, not merely narrow?
+
+        Phase D-2's discard gate (design §D.4 precondition 6) and the card's marker both read
+        this. It lives here rather than at either call site so the two can never disagree about
+        what "serious" means.
+        """
+        return any(f.finding_class == "A" for f in self.findings)
+
+    def to_doc(self) -> dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "feedback": self.feedback,
+            "confidence": self.confidence,
+            "findings": [f.to_doc() for f in self.findings],
+        }
+
+    @classmethod
+    def from_doc(cls, doc: dict[str, Any]) -> ParamAssessment:
+        """Rehydrate, NORMALIZING rather than trusting.
+
+        Every field here has been through a KV store a human can write to directly, so this
+        mirrors the parse boundary's posture: an unusable verdict reads as `ok` (the inert one)
+        and an unusable confidence as 0.0, because the alternative — raising inside a listing
+        endpoint — turns one bad document into an unreadable queue.
+
+        ⚠ THIS PATH NEEDS GUARDS THE PARSE BOUNDARY DOES NOT, and the first draft assumed the
+        reverse. `paramjudge/schema.py` reads MODEL output; this reads STORED output, which has
+        strictly more failure shapes — an int too large to convert to a float, and a lone
+        surrogate that serializes to an unencodable response body. Both 500 a listing endpoint
+        from one poisoned row. See `_rehydrated_text` / `_rehydrated_confidence`.
+        """
+        verdict = doc.get("verdict")
+        confidence = doc.get("confidence")
+        raw_findings = doc.get("findings")
+        return cls(
+            verdict=verdict if verdict in PARAM_VERDICTS else "ok",  # type: ignore[arg-type]
+            feedback=_rehydrated_text(doc.get("feedback"), limit=MAX_FEEDBACK_CHARS),
+            confidence=_rehydrated_confidence(confidence),
+            findings=tuple(
+                ParamFinding.from_doc(f)
+                for f in (raw_findings if isinstance(raw_findings, list) else [])
+                if isinstance(f, dict)
+            ),
+        )
+
+
+# --- The S4 PARAMETERIZATION judgement (design §D) ----------------------------
+# Its own record family, deliberately not a widening of `JudgeRecord`: that row is shaped
+# around coverage (covered_by, best_similarity, cards_shown, authorizing_similarity) and
+# not one of those fields means anything here. Two record types in one bucket, kept apart
+# by `record_type`, is what this keyspace already does.
+
+def param_judgement_ref(content_hash: str, candidate_id: str) -> str:
+    """The deterministic audit key for one candidate's parameterization judgement.
+
+    Keyed on CONTENT plus the candidate, so a redelivery of the same session re-reads the same
+    row instead of paying for a second non-idempotent model call — the same idempotency the
+    coverage judge gets from `judgement_fingerprint`, at the granularity this judge works on
+    (one verdict per candidate, not one per session).
+    """
+    return f"paramjudge::{content_hash}::{candidate_id}"
+
+
+@dataclass(frozen=True)
+class ParamJudgeRecord:
+    """One parameterization judgement as it lands in `learning_audit`.
+
+    ⚠ ENTITY-BEARING via `feedback`, `findings[].note` AND `template` — an inline predicate keeps
+    its literal value in the template body. That is precisely why this row lives in
+    `learning_audit` (access-controlled, D51) and never on a span.
+
+    `template` is on the row deliberately, and it is the field that makes the D-1 measurement
+    possible at all: a verdict without the artifact it was about cannot be graded later, and the
+    candidate it points at may have been approved, rejected or mutated by a completion since.
+
+    THE MEASUREMENT'S JOIN IS `candidate_id` → THE CANDIDATE'S TERMINAL STATUS. There is
+    deliberately no "was a human going to see this anyway" flag: the judge runs before the
+    leakage and dedup stages, so at judgement time NOTHING has decided where the candidate
+    routes, and a field that is structurally always `False` is worse than no field. A reviewer
+    approving a candidate this judge flagged is the disagreement that matters, and it is
+    recoverable by joining these rows to the candidate store on the id.
+    """
+
+    judgement_ref: str
+    candidate_id: str
+    session_id: str
+    content_hash: str
+    trace_id: str
+    assessment: ParamAssessment
+    # The template the verdict was taken about. See the class docstring.
+    template: str
+    # The judge model id. Verdicts are compared across time and models change; without this
+    # the dataset silently mixes two judges.
+    model: str
+    judged_at: str  # ISO-8601
+    # WOULD this verdict have discarded the candidate, under the phase D-2 rules? In D-1
+    # there is no discard code path at all, so this is the ONLY output of the whole stage —
+    # the column the rollout decision is read from.
+    would_discard: bool = False
+    # Always True in D-1. On the row so a dataset spanning the rollout is self-describing
+    # rather than silently a mix of two regimes.
+    shadow: bool = True
+    record_type: str = "param_judgement"
+
+    def to_doc(self) -> dict[str, Any]:
+        return {
+            "record_type": self.record_type,
+            "judgement_ref": self.judgement_ref,
+            "candidate_id": self.candidate_id,
+            "session_id": self.session_id,
+            "content_hash": self.content_hash,
+            "trace_id": self.trace_id,
+            "template": self.template,
+            "model": self.model,
+            "judged_at": self.judged_at,
+            "would_discard": self.would_discard,
+            "shadow": self.shadow,
+            **self.assessment.to_doc(),
+        }
+
+    @classmethod
+    def from_doc(cls, doc: dict[str, Any]) -> ParamJudgeRecord | None:
+        """Rehydrate, or `None` for a document that is not one of these.
+
+        `None` rather than an exception, and it means "no verdict on file, judge it again" — the
+        same three-shapes-collapse-to-one posture `read_judgement` documents. A row that cannot
+        be read is indistinguishable from a row that is not there, and the direction that fails
+        safe is doing the work twice.
+        """
+        if not isinstance(doc, dict) or doc.get("record_type") != "param_judgement":
+            return None
+        ref = doc.get("judgement_ref")
+        if not isinstance(ref, str) or not ref:
+            return None
+        return cls(
+            judgement_ref=ref,
+            candidate_id=str(doc.get("candidate_id") or ""),
+            session_id=str(doc.get("session_id") or ""),
+            content_hash=str(doc.get("content_hash") or ""),
+            trace_id=str(doc.get("trace_id") or ""),
+            assessment=ParamAssessment.from_doc(doc),
+            template=str(doc.get("template") or ""),
+            model=str(doc.get("model") or ""),
+            judged_at=str(doc.get("judged_at") or ""),
+            would_discard=bool(doc.get("would_discard", False)),
+            shadow=bool(doc.get("shadow", True)),
+        )

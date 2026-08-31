@@ -9,7 +9,7 @@ cannot exercise the branch that IS the mitigation.
 
 from __future__ import annotations
 
-from .judgement import JudgeRecord
+from .judgement import JudgeRecord, ParamJudgeRecord
 from .models import EvidenceSnapshot
 from .store import mint_evidence_ref
 
@@ -18,16 +18,22 @@ class InMemoryAuditStore:
     """Dict-backed `AuditStore` fake — no I/O, deterministic, Layer-1 only."""
 
     def __init__(
-        self, *, fail_judgements: bool = False, fail_judgement_reads: bool = False
+        self,
+        *,
+        fail_judgements: bool = False,
+        fail_judgement_reads: bool = False,
+        fail_param_judgements: bool = False,
     ) -> None:
         self._snapshots: dict[str, EvidenceSnapshot] = {}
         self._judgements: dict[str, JudgeRecord] = {}
+        self._param_judgements: dict[str, ParamJudgeRecord] = {}
         # Call counters so wiring tests can assert "provisioned, not yet wired"
         # (§4.3 A5): the S2 consumer path must never call `snapshot`.
         self.snapshot_calls = 0
         self.mint_calls = 0
         self._fail_judgements = fail_judgements
         self._fail_judgement_reads = fail_judgement_reads
+        self._fail_param_judgements = fail_param_judgements
 
     def mint_evidence_ref(self, session_id: str) -> str:
         self.mint_calls += 1
@@ -49,6 +55,24 @@ class InMemoryAuditStore:
         if self._fail_judgement_reads:
             raise RuntimeError("in-memory audit store scripted to fail judgement reads")
         return self._judgements.get(ref)
+
+    async def record_param_judgement(self, record: ParamJudgeRecord) -> None:
+        if self._fail_param_judgements:
+            raise RuntimeError("in-memory audit store scripted to fail param judgement writes")
+        self._param_judgements[record.judgement_ref] = record
+
+    async def read_param_judgement(self, ref: str) -> ParamJudgeRecord | None:
+        return self._param_judgements.get(ref)
+
+    @property
+    def param_judgements(self) -> tuple[ParamJudgeRecord, ...]:
+        """Every parameterization judgement written, in insertion order.
+
+        The assertion surface for the ONE thing phase D-1 produces — "the stage observed, and
+        the observation is durable". A test that only checks the stage returned `continue` would
+        pass against a stage that does nothing at all.
+        """
+        return tuple(self._param_judgements.values())
 
     @property
     def judgements(self) -> tuple[JudgeRecord, ...]:

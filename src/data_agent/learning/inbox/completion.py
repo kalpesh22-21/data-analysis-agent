@@ -262,9 +262,9 @@ class ParameterizationCompleter:
         which `build_envelope` would recompute from a RECONSTRUCTED summary whose transcript is empty
         by design.
 
-        THREE FIELDS ARE DELIBERATELY CLEARED: `decline`, because a block left here would keep the
-        inbox rendering an outstanding task for ever; `revalidation`, whose only reader is this path;
-        and `entity_scan`, back to the S3 `pending` sentinel because THE PAYLOAD CHANGED — carrying
+        TWO FIELDS ARE DELIBERATELY CLEARED: `decline`, because a block left here would keep the
+        inbox rendering an outstanding task for ever; and `entity_scan`, back to the S3 `pending`
+        sentinel because THE PAYLOAD CHANGED — carrying
         the old verdict forward would let text nobody scanned ride a `pass` settled about different
         content. The status returns to `extracted` for the same reason: it is what the pipeline
         expects to be handed, and the router decides where it goes from there.
@@ -285,7 +285,16 @@ class ParameterizationCompleter:
                 ),
             },
             decline=None,
-            revalidation=None,
+            # `revalidation` is KEPT, and used to be cleared here on the stated grounds that
+            # "its only reader is this path". That stopped being true: the §C reviser reads it
+            # to propose against the accepted SQL, now on the review queue as well as the form.
+            # Clearing it would make a candidate editable exactly once and then never again —
+            # and silently, because the reviser degrades to "no snapshot" rather than erroring.
+            #
+            # Nothing about the entity posture changes: same field, same access-controlled
+            # store, still never projected to the wire. It describes the SESSION, which a
+            # completion does not alter, so it stays as true after the round trip as before.
+            revalidation=env.revalidation,
         )
         if not self.stages:
             _logger.warning(

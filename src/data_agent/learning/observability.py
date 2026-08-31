@@ -443,6 +443,133 @@ def judge_span(
     return _learning_span(tracer, "learning.judge", OpenInferenceSpanKindValues.CHAIN, attrs)
 
 
+def param_judge_span(
+    tracer: Tracer,
+    *,
+    candidate_id: str,
+    session_id: str,
+    outcome: str,
+    verdict: str | None = None,
+    confidence: float = 0.0,
+    findings: int = 0,
+    class_a_findings: int = 0,
+    would_discard: bool = False,
+    shadow: bool = True,
+    recorded: bool = False,
+    reused: bool = False,
+    model: str = "",
+    verbose: bool = False,
+    feedback: str | None = None,
+    template: str | None = None,
+) -> Any:
+    """The S4 parameterization judge's verdict (design §D, `learning.param_judge`, CHAIN).
+
+    THE SPAN IS THE DENOMINATOR, the audit record the numerator — the same relationship
+    `judge_span` documents, and it matters more here because phase D-1 IS a measurement. The
+    store holds only verdicts a judge actually gave, so the reasons a candidate was NOT judged
+    (`skipped_not_blueprint`, `skipped_failed_validation`, `skipped_no_entries`, `failed`)
+    exist ONLY on this span. Reading the flag rate off the audit rows alone would divide by
+    the wrong number.
+
+    `class_a_findings` is separate from `findings` and always present, because it is the count
+    the phase-D-2 decision turns on — Class A means the blueprint is WRONG rather than merely
+    narrow, and a `revise` carrying only naming nits is a different event entirely.
+
+    SHAPE-only by default. Under *verbose* it also carries what the model SAID (`feedback`) and
+    what it judged (`template`) — both ENTITY-BEARING, the template because an inline predicate
+    keeps its literal value in it, so the same D51 access-control standard applies as for
+    `judge_span`.
+    """
+    attrs: dict[str, Any] = {
+        "session.id": session_id,
+        "learning.candidate_id": candidate_id,
+        "learning.param_judge.outcome": outcome,
+        # "" / 0 rather than None throughout, so every attribute is ALWAYS present and a
+        # Phoenix filter never distinguishes "no value" from "no data" via a missing key.
+        "learning.param_judge.verdict": verdict or "",
+        "learning.param_judge.confidence": confidence,
+        "learning.param_judge.findings": findings,
+        "learning.param_judge.class_a_findings": class_a_findings,
+        "learning.param_judge.would_discard": would_discard,
+        "learning.param_judge.shadow": shadow,
+        "learning.param_judge.recorded": recorded,
+        "learning.param_judge.reused": reused,
+        "learning.param_judge.model": model,
+    }
+    attrs.update(
+        _verbose_attrs(
+            verbose,
+            {
+                "learning.param_judge.feedback": feedback,
+                "learning.param_judge.template": template,
+            },
+        )
+    )
+    return _learning_span(
+        tracer, "learning.param_judge", OpenInferenceSpanKindValues.CHAIN, attrs
+    )
+
+
+def revise_span(
+    tracer: Tracer,
+    *,
+    candidate_id: str,
+    outcome: str,
+    status: str = "",
+    entries: int = 0,
+    replace: bool = False,
+    conflicts: int = 0,
+    model: str = "",
+    verbose: bool = False,
+    feedback: str | None = None,
+    rationale: str | None = None,
+    reason: str | None = None,
+) -> Any:
+    """One LLM revision proposal (design §C, `learning.revise`, CHAIN).
+
+    The only model call on this plane a HUMAN triggers, which is what the span is for: it is
+    the sole record that the assistant was asked at all. Nothing is written by this path (the
+    proposal goes back for a reviewer to apply through `complete`/`apply_revision`), so without
+    a span a refused or empty proposal leaves no trace anywhere — and "the assistant keeps
+    suggesting nothing" is exactly the complaint an operator would need to substantiate.
+
+    `outcome` separates the ways it can produce nothing, because they need different fixes:
+    `proposed`, `no_snapshot` (the candidate predates the stamp — a MIGRATION signal, not a
+    model failure), `withheld_scan` (the leakage gate refused to quote the SQL), `unusable`,
+    `timeout`, `failed`, `refused_template_edit` (the model tried to write SQL).
+
+    `conflicts` counts diff rows that append cannot apply — the case a reviewer must resolve by
+    switching to replace, and worth watching because a high rate means the PROMPT is steering
+    toward the wrong mode rather than the reviewer doing anything wrong.
+
+    ⚠ SHAPE-only by default, and the verbose payload here is the sharpest on the plane:
+    `feedback` is free text a human typed into a browser and `rationale` is model prose ABOUT
+    the unredacted accepted SQL. Both are entity-bearing and neither is leakage-scanned.
+    """
+    attrs: dict[str, Any] = {
+        "learning.candidate_id": candidate_id,
+        "learning.revise.outcome": outcome,
+        "learning.revise.status": status,
+        "learning.revise.entries": entries,
+        "learning.revise.replace": replace,
+        "learning.revise.conflicts": conflicts,
+        "learning.revise.model": model,
+    }
+    attrs.update(
+        _verbose_attrs(
+            verbose,
+            {
+                "learning.revise.feedback": feedback,
+                "learning.revise.rationale": rationale,
+                "learning.revise.reason": reason,
+            },
+        )
+    )
+    return _learning_span(
+        tracer, "learning.revise", OpenInferenceSpanKindValues.CHAIN, attrs
+    )
+
+
 def promote_span(
     tracer: Tracer,
     *,
@@ -549,7 +676,9 @@ __all__ = [
     "land_span",
     "learning_recall_span",
     "log_tracing_status",
+    "param_judge_span",
     "promote_span",
+    "revise_span",
     "sweep_span",
     "triage_span",
 ]

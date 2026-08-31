@@ -272,7 +272,10 @@ async def test_a_completed_form_re_validates_and_re_runs_the_pipeline(enabled) -
     env = await store.get(cid)
     assert env.status != CandidateStatus.NEEDS_PARAMETERIZATION
     assert env.decline is None
-    assert env.revalidation is None
+    # The SNAPSHOT is kept, unlike the decline. A decline left here would render an
+    # outstanding task for ever; the snapshot describes the SESSION, which a completion
+    # does not alter — and a kept candidate now carries its own `ValidationSnapshot` (`build_candidate_envelope`), and a completion no longer clears it — that is what makes the review queue editable at all (design §C.4).
+    assert env.revalidation is not None
     # ADDITIVE CONTRACT: this row was built with NO `evidence_refs` — the shape every
     # review item written before the audit snapshot was wired has — and it still
     # completes, because the citations are rebuilt from the snapshot's entity-free

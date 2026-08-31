@@ -27,8 +27,9 @@ from ..candidate.store import CandidateStore
 from ..promotion.mcp_export import PromotionEmit, build_promotion_emit
 from ..promotion.models import ProbeResult, PromotionPolicy
 from ..promotion.scheduler import PromotionScheduler
+from ..revise import BlueprintReviser, ReviseProposal, ReviserUnavailableError
 from .completion import CompletionResult, ParameterizationCompleter
-from .models import InboxItem
+from .models import InboxItem, _leakage_cleared
 from .ranking import rank_key
 
 _logger = logging.getLogger(__name__)
@@ -60,6 +61,24 @@ class _ZeroHitCounts:
         return 0
 
 
+# The statuses a parameterization revision may be proposed for and applied to.
+#
+# `needs_parameterization` is the form: entries are MISSING and the decline names which.
+# `in_review` is a candidate a human is adjudicating and can see is wrong — a slot that should
+# be frozen, a `why` that explains nothing. Both re-run the SAME `to_candidate` re-validation
+# and the SAME write-router stages, so neither is a way around a check; the second one was
+# impossible until kept candidates started carrying a `ValidationSnapshot`
+# (`build_candidate_envelope`), because there was no accepted SQL to re-validate against.
+#
+# ⚠ NOT `validated` or `promoted`. Those have passed golden replay and may already be landed,
+# so editing one means re-verifying and re-landing an artifact the corpus is serving — a
+# different operation with a different blast radius, and `retract` is how that is expressed.
+REVISABLE_STATUSES: tuple[str, ...] = (
+    CandidateStatus.NEEDS_PARAMETERIZATION,
+    CandidateStatus.IN_REVIEW,
+)
+
+
 class ReviewInbox:
     """The `in_review` projection over a `CandidateStore` + the human transitions."""
 
@@ -70,6 +89,7 @@ class ReviewInbox:
         scheduler: PromotionScheduler | None = None,
         policy: PromotionPolicy | None = None,
         completer: ParameterizationCompleter | None = None,
+        reviser: BlueprintReviser | None = None,
     ) -> None:
         self._store = store
         # The fail-to-review completion plane. OPTIONAL and default-absent, so an inbox
@@ -79,6 +99,11 @@ class ReviewInbox:
         # candidate that already passed validation, and this one owns re-running the
         # validation itself.
         self._completer = completer
+        # The LLM typing aid for that same form (design §C). OPTIONAL and default-absent,
+        # like the completer — and, unlike the completer, absent changes NOTHING about what a
+        # reviewer can accomplish: the raw-entries form still works. It writes nothing; see
+        # `propose_revision`.
+        self._reviser = reviser
         # The SINGLE approve/reject implementation (R4). Defaulted for an unwired
         # inbox; production injects the wired scheduler.
         self._scheduler = scheduler or PromotionScheduler(
@@ -247,6 +272,13 @@ class ReviewInbox:
         guarded the other way round, so the two surfaces cannot be crossed. Returns the
         `CompletionResult` rather than an envelope, because "the form is still incomplete" is an
         outcome the caller must be able to SHOW, not an error to map to a status code.
+
+        ⚠ The APPEND mode is why this guard stays an equality. `_merged_parameterization`
+        concatenates, so a second submission — a double-click, a stale tab, a redelivery —
+        would double the entries of a candidate that has already moved on. The status is what
+        makes that unreachable. Editing an `in_review` candidate is a DIFFERENT operation with
+        a different safety argument: see `apply_revision`, which is replace-only and therefore
+        idempotent.
         """
         env = await self._require(candidate_id, CandidateStatus.NEEDS_PARAMETERIZATION)
         if self._completer is None:
@@ -258,6 +290,96 @@ class ReviewInbox:
         return await self._completer.complete(
             env, entries=entries, replace_all=replace_all
         )
+
+    async def propose_revision(
+        self, candidate_id: str, *, feedback: str
+    ) -> ReviseProposal:
+        """Ask the reviser for parameterization entries. WRITES NOTHING.
+
+        Guarded on `REVISABLE_STATUSES` — the SAME guard as `complete_parameterization`, so the
+        assistant is never offered toward an operation the completer would then refuse.
+
+        Both statuses became reachable once `build_candidate_envelope` started stamping a
+        `ValidationSnapshot` on kept candidates. Before that, `in_review` was structurally
+        impossible rather than merely disallowed: the snapshot was written at DECLINE time
+        only, so such a candidate had no accepted SQL to propose against. That was design
+        §C.4's deferral, and stamping it is what §C.4 named as the unlock.
+
+        ⚠ A candidate carrying no snapshot at all (extracted before that change) still degrades
+        cleanly — `BlueprintReviser.propose` returns a proposal with a reason saying so, rather
+        than raising.
+
+        The proposal is returned, not applied. The reviewer applies it through `complete`,
+        which is and remains the only write path into a candidate's payload.
+        """
+        env = await self._require_one_of(candidate_id, REVISABLE_STATUSES)
+        if self._reviser is None:
+            raise ReviserUnavailableError(
+                f"revise_unavailable: no reviser is wired for {candidate_id!r}; the "
+                "parameterization entries can still be supplied directly"
+            )
+        # ⚠ THE SAME WITHHOLDING RULE THE DECLINE DETAIL OBEYS (`InboxItem.decline_view`).
+        #
+        # A proposal is entity-BEARING BY CONSTRUCTION and cannot be redacted the way the
+        # payload view and the judge verdict are: every entry carries a `locator.value` lifted
+        # verbatim from the accepted SQL, the diff interpolates those values into its rows, and
+        # the rationale is model prose about the unredacted query. Redacting them would also
+        # destroy them — an entry whose value is `[redacted]` matches no literal and applies to
+        # nothing.
+        #
+        # So this surface REFUSES where the others redact. Without it, a candidate whose scan
+        # settled `quarantine` renders a card that withholds its decline detail and then hands
+        # back the same literals the moment the reviewer clicks the assistant — through a route
+        # added to make that form easier, past the one rule the form is careful about. An
+        # UNSETTLED scan refuses for the stronger reason: nobody looked.
+        if not _leakage_cleared(env):
+            return self._reviser.refuse_withheld(
+                env,
+                reason=(
+                    "the assistant is unavailable for this candidate: its entity scan has not "
+                    "settled a clean pass, and a proposal necessarily quotes the accepted "
+                    "SQL's literal values — the same ones this row's decline detail is "
+                    "withholding. Supply the entries directly, or clear the scan first."
+                ),
+            )
+        return await self._reviser.propose(env, feedback=feedback)
+
+    async def apply_revision(
+        self, candidate_id: str, *, entries: list
+    ) -> CompletionResult:
+        """Apply a revision to a candidate ALREADY under review (`in_review`).
+
+        A SEPARATE verb from `complete_parameterization`, and the split is the safety argument
+        rather than tidiness:
+
+          * `complete` fills in a FORM. Its entries APPEND, because the reviewer is supplying
+            what is missing and must not have to retype the model's valid classifications. That
+            makes it non-idempotent, which is exactly why its guard is an equality against
+            `needs_parameterization` — a double-click on a row that has moved on would double
+            the entries.
+          * this REPLACES the parameterization of a candidate whose form is already complete.
+            The reviewer is correcting a role, not filling a gap, so `replace_all=True` is both
+            the right semantics AND idempotent: applying the same entries twice yields the same
+            payload. A stale tab or a double-click costs one redundant re-validation, never a
+            corrupted array.
+
+        `replace_all` is therefore NOT a parameter. Offering it would reintroduce the append
+        mode on the one status whose guard cannot protect it.
+
+        Everything else is the completer's usual path — `to_candidate` (totality walk included)
+        then the full write-router stages — so the revision is RE-ADJUDICATED, not admitted: a
+        payload whose leakage scan still fails routes back to review, and one whose dedup
+        verdict changes re-routes on the writer's rules. Nothing here moves a candidate
+        FORWARD; `approve` remains the only thing that does, and it stays `in_review`-only.
+        """
+        env = await self._require(candidate_id, CandidateStatus.IN_REVIEW)
+        if self._completer is None:
+            raise InboxTransitionError(
+                f"completion_unavailable: no validation plane is wired for "
+                f"{candidate_id!r}, so the revised parameterization cannot be "
+                "re-validated against the accepted SQL"
+            )
+        return await self._completer.complete(env, entries=entries, replace_all=True)
 
     async def retract(self, candidate_id: str) -> CandidateEnvelope:
         """Retract a promoted artifact: `validated → retired` (a leak/drift pull).

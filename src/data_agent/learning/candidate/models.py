@@ -14,7 +14,7 @@ from typing import Any
 
 from data_agent.timeutil import now_iso as _now
 
-from ..audit.judgement import CoverageAssessment
+from ..audit.judgement import CoverageAssessment, ParamAssessment
 from ..extractor.models import Decline, ExtractedCandidate
 from ..extractor.shape import ShapeError, as_int, as_object, as_text, require
 from ..summary.models import SessionSummary
@@ -144,6 +144,13 @@ class CandidateEnvelope:
     # Additive, defaults None, emitted only when set so a pre-slice candidate doc
     # round-trips byte-identically (mirrors `traceparent`).
     judge: CoverageAssessment | None = None
+
+    # The S4 PARAMETERIZATION judge's verdict (design §D), or `None` when it did not run —
+    # not wired, not a blueprint, a candidate that already failed static validation, or a
+    # fail-open path. ADDITIVE AND INERT: no routing rule, static check or dedup key reads
+    # it. It is carried so the reviewer card can show what the judge said about the very
+    # candidate in front of the reviewer, which is half of the phase-D-1 measurement.
+    param_judge: ParamAssessment | None = None
     # --- inbox-ranking inputs (plan §4). Two separate stamps because two different
     # stages own them and neither can compute the other's:
     #   * `session_signals` is stamped ONCE at `build_envelope` from the in-memory
@@ -222,6 +229,11 @@ class CandidateEnvelope:
         # not run", which must stay distinguishable from a stored `new` verdict.
         if self.judge is not None:
             doc["judge"] = self.judge.to_doc()
+        # Same additive+optional posture as `judge` above: absent means the S4 parameterization
+        # judge did not run, which is the shape of every candidate written before it existed
+        # and of every deployment with it switched off.
+        if self.param_judge is not None:
+            doc["param_judge"] = self.param_judge.to_doc()
         # Additive + OPTIONAL, same rule as the four above: an absent key means "this
         # stamp was never written", which the ranking treats differently from a stamp
         # whose values happen to be zero.
@@ -305,6 +317,14 @@ class CandidateEnvelope:
                 if isinstance(doc.get("judge"), dict)
                 else None
             ),
+            # A non-dict `param_judge` (a hand edit, a foreign writer, a doc written
+            # before this field existed) reads back as "the judge did not run" rather
+            # than raising inside a queue worker — the same posture as `judge` above.
+            param_judge=(
+                ParamAssessment.from_doc(doc["param_judge"])
+                if isinstance(doc.get("param_judge"), dict)
+                else None
+            ),
             # Same normalize-do-not-trust posture as `last_scanned_at`/`judge`: a
             # non-dict stamp (hand edit, foreign writer) reads back as "nobody looked"
             # rather than raising inside the cron scan or the inbox projection. The
@@ -375,6 +395,34 @@ def build_envelope(
         content_hash=summary.content_hash,
         traceparent=traceparent,
         session_signals=SessionSignals.from_summary(summary),
+        # The SAME argument the `session_signals` note above makes, applied to the other
+        # thing only derivable here: the summary is an in-process value dropped when
+        # extraction ends, so a candidate that does not carry its own validation context
+        # can never be RE-validated afterwards.
+        #
+        # It used to be stamped by `build_declined_envelope` alone, which made the LLM
+        # revise surface (design §C) structurally impossible on anything but the
+        # fail-to-review queue — an `in_review` candidate had no accepted SQL to propose
+        # against and nothing to re-check a revision with. Stamping it here is what §C.4
+        # deferred and named as the unlock.
+        #
+        # ⚠ ENTITY-BEARING (`sql_by_ref` holds the query's literals), and that is not a new
+        # boundary: it is the same field, in the same access-controlled candidate store
+        # (D101), that every declined candidate has always carried. It is never projected to
+        # the wire — `InboxItem` does not read it — and `strip_entity_bearing` governs the
+        # promotion boundary as before.
+        revalidation=ValidationSnapshot.from_summary(
+            summary,
+            # REAL pointers, not `()`. `ValidationSnapshot.from_doc` REFUSES a snapshot with
+            # no citations — "an empty one read back is damage, not a legitimate shape" — so an
+            # empty tuple round-trips to `None` and the field is silently useless. `header.evidence`
+            # is mandatory and non-empty by D31, and carries exactly the two pointer fields; the
+            # QUOTES stay out (D51), which is the same projection `build_declined_envelope` makes.
+            evidence=tuple(
+                EvidencePointer(turn_ref=ref.turn_ref, tool_call_ref=ref.tool_call_ref)
+                for ref in header.evidence
+            ),
+        ),
     )
 
 

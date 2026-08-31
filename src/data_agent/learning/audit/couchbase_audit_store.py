@@ -23,7 +23,7 @@ from data_agent.runtime.couchbase_connect import (
 )
 
 from ..config import LearningSettings
-from .judgement import JudgeRecord
+from .judgement import JudgeRecord, ParamJudgeRecord
 from .models import EvidenceSnapshot
 from .store import mint_evidence_ref
 
@@ -109,3 +109,25 @@ class CouchbaseAuditStore(CouchbaseStoreBase):
         await self._ensure_connected()
         result = await get_or_none(self._collection, ref)
         return None if result is None else JudgeRecord.from_doc(result.content_as[dict])
+
+    async def record_param_judgement(self, record: ParamJudgeRecord) -> None:
+        """Upsert one PARAMETERIZATION judgement (design §D) under its content-derived key.
+
+        Same keyspace, RBAC boundary and judgement TTL as the coverage judgement above; the
+        `record_type` discriminator (`param_judgement`) keeps the families apart in N1QL, which
+        matters here more than usual because these rows exist to BE aggregated — the phase-D-1
+        rollout decision is a `GROUP BY verdict` over them.
+        """
+        await self._ensure_connected()
+        await self._collection.upsert(
+            record.judgement_ref,
+            record.to_doc(),
+            UpsertOptions(expiry=self._judgement_ttl),
+        )
+
+    async def read_param_judgement(self, ref: str) -> ParamJudgeRecord | None:
+        await self._ensure_connected()
+        result = await get_or_none(self._collection, ref)
+        return (
+            None if result is None else ParamJudgeRecord.from_doc(result.content_as[dict])
+        )

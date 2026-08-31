@@ -134,13 +134,16 @@ REVIEWER_TOKEN = os.environ.get("REVIEWER_TOKEN", "")
 # learning node: a human vouches for it (`verified=true` on the staging node), then asks
 # for the canon YAML to open a manual PR with (the service never touches git).
 _INBOX_ACTIONS = frozenset(
-    {"approve", "reject", "retract", "complete", "verify", "promote"}
+    {
+        "approve", "reject", "retract", "complete", "revise",
+        "apply_revision", "verify", "promote",
+    }
 )
 # The actions that carry a request body: `complete` (the reviewer's missing
 # parameterization entries) and `promote` (OPTIONAL `{doc_id, title}` knowledge
 # refinements — a bodyless promote is the normal case). Every other action is a bare POST
 # and must stay one; see `inbox_action`.
-_INBOX_BODY_ACTIONS = frozenset({"complete", "promote"})
+_INBOX_BODY_ACTIONS = frozenset({"complete", "promote", "revise", "apply_revision"})
 # The only `?status=` values the list surface accepts (ui-inbox-type-archive contract
 # §List API): the live review queue, the durable rejected archive, the promotable set of
 # auto-landed learning nodes awaiting verify/promote, the fail-to-review work list, and
@@ -592,6 +595,40 @@ async def _read_bounded_body(request: Request, cap: int) -> bytes | None:
     return b"".join(chunks)
 
 
+# How long the BFF waits on an inbox hop. Everything on this surface is a fast store
+# operation EXCEPT `revise`, which makes a model call upstream.
+#
+# ⚠ THE BFF MUST OUTLAST THE UPSTREAM'S OWN DEADLINE, or it preempts it. The reviser gives
+# itself `learning_revise_timeout_seconds` (30s default) and converts its own expiry into a
+# 200 carrying "the assistant timed out; try again" — a result the reviewer can act on. With
+# the CRUD timeout applied here, the BFF abandoned the hop at 10s and rendered
+# `502 Inbox service unreachable` while the model was still answering (observed live: the
+# upstream logged `POST /v1/responses 200` after the browser had already given up). The
+# proposal was produced and thrown away, and the error blamed the wrong component.
+_INBOX_HOP_TIMEOUT_SECONDS = 10.0
+# A dead local service must still fail FAST, whatever the read budget is.
+_INBOX_CONNECT_TIMEOUT_SECONDS = 5.0
+_INBOX_MODEL_HOP_TIMEOUT_SECONDS = 60.0
+_INBOX_MODEL_ACTIONS = frozenset({"revise"})
+
+
+def _hop_timeout(path: str) -> httpx.Timeout:
+    """The timeout for one inbox hop, by whether the upstream will call a model.
+
+    ⚠ READ is what varies; CONNECT never does. A scalar `timeout=60.0` sets all four httpx
+    phases, so a service that is DOWN would take a full minute to report "unreachable" — the
+    fast-failure case would be sacrificed to fix the slow-success one. Connecting to a local
+    service either works immediately or is not going to.
+    """
+    action = path.rsplit("/", 1)[-1].split("?", 1)[0]
+    read = (
+        _INBOX_MODEL_HOP_TIMEOUT_SECONDS
+        if action in _INBOX_MODEL_ACTIONS
+        else _INBOX_HOP_TIMEOUT_SECONDS
+    )
+    return httpx.Timeout(read, connect=_INBOX_CONNECT_TIMEOUT_SECONDS)
+
+
 async def _proxy_inbox(
     method: str, path: str, json_body: Any | None = None
 ) -> JSONResponse:
@@ -604,7 +641,7 @@ async def _proxy_inbox(
     it: the inbox service validates it, and the extractor's own readers do behind that —
     a second schema here would just be a second vocabulary for the same mistake."""
     headers = {"X-Reviewer-Token": REVIEWER_TOKEN}
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=_hop_timeout(path)) as client:
         try:
             response = await client.request(
                 method, f"{INBOX_SERVICE_URL}{path}", headers=headers, json=json_body
@@ -685,8 +722,9 @@ async def inbox_action(
                 status_code=400, detail=f"{action} requires a JSON body."
             ) from None
     # The RESPONSE goes back body-agnostically through `_proxy_inbox`: `promote` answers a
-    # `PromotionEmit` (yaml + PR metadata), NOT the `{candidate_id, status, reason}` shape
-    # every other action answers. The BFF must never assume one of those two shapes.
+    # `PromotionEmit` (yaml + PR metadata) and `revise` answers a PROPOSAL (entries + diff,
+    # with nothing written), NEITHER of which is the `{candidate_id, status, reason}` shape
+    # every other action answers. The BFF must never assume any of those THREE shapes.
     #
     # Percent-encode the decoded id before re-interpolating it into the upstream path
     # (candidate ids carry `::` and could carry other reserved chars) so it is passed as

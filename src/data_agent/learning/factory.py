@@ -31,6 +31,11 @@ from .leakage import (
     NullSemanticEntityScanner,
     SemanticEntityScanner,
 )
+from .paramjudge import (
+    ParameterizationJudge,
+    ParameterizationJudgeStage,
+    ParamJudgeConfig,
+)
 from .priorart import PriorArtIndex
 from .promotion import (
     CandidateStoreDependencyResolver,
@@ -47,6 +52,7 @@ from .promotion import (
     policy_from_settings,
 )
 from .queue import LearningQueue
+from .revise import BlueprintReviser
 from .schema_edit import AllPassChecks, GitPullRequestClient, SchemaEditChecks
 from .schema_edit.models import PullRequestResult, PullRequestSpec
 from .schema_edit.pr_stage import SchemaEditPRStage
@@ -295,6 +301,12 @@ def build_learning_consumer(
         tracer=tracer,
     )
 
+    param_judge = build_param_judge(
+        settings,
+        model_client=judge_model_client if judge_model_client is not None else model_client,
+        audit_store=audit_store,
+    )
+
     # The FROZEN write-router order (D102 §7.1). The SAME `candidate_store` /
     # `user_store` instances thread through the stages that need them and the
     # consumer — a split-brain store would strand candidates (§1).
@@ -312,6 +324,7 @@ def build_learning_consumer(
         checks=checks,
         sampler=sampler,
         tracer=tracer,
+        param_judge=param_judge,
     )
 
     _logger.info(
@@ -349,6 +362,7 @@ def build_write_router_stages(
     checks: SchemaEditChecks | None = None,
     sampler: Sampler | None = None,
     tracer: object | None = None,
+    param_judge: ParameterizationJudge | None = None,
     include_target_specific: bool = True,
 ) -> tuple[CandidateStage, ...]:
     """The FROZEN write-router order (D102 §7.1), assembled in ONE place.
@@ -358,9 +372,34 @@ def build_write_router_stages(
     that must not fork. `include_target_specific=False` omits `schema_edit_pr` and
     `user_commit`: the completion path only ever re-runs a `blueprint`, so neither would do
     anything except require a git client and a per-user store that plane has no reason to hold.
+
+    *param_judge* is passed to BOTH callers on purpose: a human-completed form should face the
+    same observation as an extracted candidate, and a judge wired into only one of the two
+    would make the phase-D-1 dataset a biased sample of the population it is measuring.
     """
     stages: list[CandidateStage] = [
         GeneralizeStage(catalog_schema=catalog_schema),
+    ]
+    # The S4 PARAMETERIZATION judge (design §D), phase D-1: OBSERVE ONLY. Absent by default and
+    # absent entirely when the kill-switch is off — a stage that is not built cannot act, which
+    # is a stronger guarantee than a stage that is built and told not to.
+    #
+    # POSITION, not merely presence, is the thing to hold: AFTER generalize, because every
+    # finding it can make is about the rewritten template; BEFORE leakage, because the phase-D-2
+    # repair loop mutates the payload and settling an entity scan before that happens is the bug
+    # `inbox/completion.py::_still_declined` had to add a re-settle to fix.
+    if param_judge is not None:
+        stages.append(
+            ParameterizationJudgeStage(
+                judge=param_judge,
+                tracer=tracer,
+                # ONE switch, ONE posture, decided here — the same reason `CoverageJudge` reads
+                # it at the composition root rather than defaulting it internally: a session's
+                # spans must not end up half entity-bearing.
+                trace_verbose=settings.learning_trace_verbose,
+            )
+        )
+    stages.extend([
         LeakageGateStage(
             candidate_store=candidate_store,
             semantic_scanner=(
@@ -384,7 +423,7 @@ def build_write_router_stages(
             judge=judge,
             tracer=tracer,
         ),
-    ]
+    ])
     if include_target_specific:
         if user_store is None:
             raise LearningWiringError(
@@ -403,6 +442,92 @@ def build_write_router_stages(
         stages.append(UserKnowledgeCommitStage(store=user_store))
     stages.append(WriterStage(sampler=sampler))
     return tuple(stages)
+
+
+def build_param_judge(
+    settings: LearningSettings,
+    *,
+    model_client: object | None,
+    audit_store: AuditStore | None,
+) -> ParameterizationJudge | None:
+    """Build the S4 parameterization judge (design §D), or `None` when a precondition is missing.
+
+    PUBLIC, unlike `_build_judge`, because TWO composition roots need it: the consumer here and
+    the inbox service's completion plane. A form a human completed must face the same observation
+    an extracted candidate does, or the phase-D-1 dataset is a biased sample of the population it
+    exists to measure.
+
+    THREE preconditions, each logged separately so an operator knows which of three things to
+    fix. `enabled` is off by default: this judge is a MEASUREMENT (design §D.0), and a
+    measurement nobody asked for should not start running because a dependency happened to be
+    present.
+    """
+    if not settings.learning_param_judge_enabled:
+        _logger.info(
+            "learning: the parameterization judge is OFF "
+            "(LEARNING_PARAM_JUDGE_ENABLED=false) — the stage is not built"
+        )
+        return None
+    if model_client is None:
+        _logger.warning(
+            "learning: the parameterization judge is enabled but no model client is "
+            "wired — the stage is not built"
+        )
+        return None
+    if audit_store is None:
+        _logger.warning(
+            "learning: the parameterization judge is enabled but no audit store is wired "
+            "— the stage is not built. The durable record is this phase's ONLY output, so "
+            "running without one would burn model calls and produce nothing"
+        )
+        return None
+    config = ParamJudgeConfig(
+        model=_param_judge_model_id(settings),
+        timeout_seconds=settings.learning_param_judge_timeout_seconds,
+        # HARD-WIRED. Phase D-1 has no non-shadow code path to switch to; the setting exists
+        # so D-2 does not have to invent it, and so the record is self-describing.
+        shadow=True,
+    )
+    _logger.info(
+        "learning: the parameterization judge is ON in SHADOW mode (model=%s, timeout=%.1fs) "
+        "— it observes and records; it cannot drop, route or repair anything",
+        config.model or "(extractor default)",
+        config.timeout_seconds,
+    )
+    return ParameterizationJudge(
+        model_client=model_client,  # type: ignore[arg-type]
+        audit_store=audit_store,
+        config=config,
+    )
+
+
+def _param_judge_model_id(settings: LearningSettings) -> str:
+    """The model id STAMPED ON EVERY parameterization verdict — it must name the client that
+    will actually ANSWER, not the one an operator configured.
+
+    Same rule and same failure as `_judge_model_id`, and this judge cares about it MORE: phase
+    D-1 produces nothing but these rows, and the rollout decision is a distribution over them.
+    A `model` column naming a model that never answered would silently pool two judges in the
+    one dataset the ship/don't-ship call is read from.
+
+    Today `build_param_judge` is only ever handed the extractor's (or the coverage judge's)
+    client — nothing constructs a client FROM `learning_param_judge_model` — so a configured
+    value is always unused, and saying so loudly beats recording it as if it were true.
+    """
+    configured = settings.learning_param_judge_model
+    answering = settings.learning_extractor_model
+    if configured and configured != answering:
+        _logger.warning(
+            "LEARNING_PARAM_JUDGE_MODEL=%r is set, but no client is built from it — the "
+            "wired client (%r) answers every parameterization judgement. Recording %r on "
+            "the verdicts, not %r: these rows ARE the phase-D-1 measurement, and a model "
+            "field naming a model that never answered would pool two judges in it.",
+            configured,
+            answering,
+            answering,
+            configured,
+        )
+    return answering
 
 
 def _build_judge(
@@ -536,6 +661,7 @@ def build_promotion_plane(
     clock: Callable[[], str] | None = None,
     tracer: object | None = None,
     completer: ParameterizationCompleter | None = None,
+    reviser: BlueprintReviser | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the S9 promotion plane (scheduler + review inbox) over ONE `candidate_store`.
 
@@ -578,6 +704,10 @@ def build_promotion_plane(
         scheduler=scheduler,
         policy=scheduler.policy,
         completer=completer,
+        # The LLM typing aid for the fail-to-review form (design §C). OPTIONAL: absent, the
+        # form still accepts entries typed directly, so this costs a convenience rather than a
+        # capability — which is why it has no wiring assertion beside the completer's.
+        reviser=reviser,
     )
     return scheduler, inbox
 
@@ -598,6 +728,7 @@ def build_promotion_write_plane(
     clock: Callable[[], str] | None = None,
     tracer: object | None = None,
     completer: ParameterizationCompleter | None = None,
+    reviser: BlueprintReviser | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the FULLY-ACTIVATED S9 promotion WRITE plane (S9-activation Slice 2, §4).
 
@@ -634,6 +765,7 @@ def build_promotion_write_plane(
         clock=clock,
         tracer=tracer,
         completer=completer,
+        reviser=reviser,
     )
 
 
