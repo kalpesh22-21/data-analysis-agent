@@ -607,6 +607,36 @@
 
   /* A proposal that carries entries AND a warning — the append/replace conflict. Coloured,
      because the reviewer is one click from an apply that will decline. */
+  /* The leakage override. Styled as a WARNING, never as a neutral control: it is the only
+     action on this page that steps past an entity gate, and it should not look like a
+     convenience button. */
+  .scan-override {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    border: 1px solid var(--color-warn-border);
+    background: var(--color-warn-bg);
+    color: var(--color-warn-text);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+    font-size: 0.8rem;
+  }
+
+  .scan-override input[type="text"] {
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2);
+    font-family: inherit;
+    font-size: 0.85rem;
+  }
+
+  .scan-attested {
+    font-size: 0.8rem;
+    color: var(--color-accent);
+  }
+
   .revise-warning {
     font-size: 0.8rem;
     margin: 0;
@@ -1442,6 +1472,87 @@
       });
       wrap.appendChild(list);
     }
+    return wrap;
+  }
+
+  // --- The leakage override (reviewer attestation) --------------------------
+  //
+  // Shown only where it can do anything: a SETTLED, NON-PASS verdict on a card a human is
+  // adjudicating. The scanner is a regex+NER pass over generalized SQL, so it flags enum
+  // literals as people — the case that prompted this was `event_type = '<leave type> Request'`
+  // read as a `person`, which quarantined a time-off blueprint with no way to unblock it.
+  //
+  // The note is REQUIRED and the button stays disabled without one. This is the only control
+  // on the page that steps past a D17 gate, so the reason is part of the operation.
+  function renderScanOverride(item, node) {
+    var scan = item.entity_scan || {};
+    var settled = scan.result && scan.result !== "pending";
+    if (!settled || scan.result === "pass") return null;
+
+    // Already attested: say so instead of offering it again. The server only sends an
+    // attestation that still BINDS to the current finding, so this can never read as
+    // "signed off" for a verdict that has since changed.
+    if (isObject(item.leakage_attestation)) {
+      var done = el("p", "scan-attested");
+      done.setAttribute("data-testid", "inbox-scan-attested");
+      done.textContent =
+        "entity finding attested as a false positive (" +
+        String(item.leakage_attestation.hit_count) + " hit(s), " +
+        String(item.leakage_attestation.attested_at) + ") — " +
+        String(item.leakage_attestation.note);
+      return done;
+    }
+
+    var wrap = el("div", "scan-override");
+    wrap.setAttribute("data-testid", "inbox-scan-override");
+    wrap.appendChild(
+      el("p", "", "the entity scan flagged this candidate, so the assistant is unavailable. " +
+        "If these are false positives, say why and override — the verdict itself is kept, " +
+        "and this does NOT make the candidate auto-promotable.")
+    );
+    var note = document.createElement("input");
+    note.type = "text";
+    note.setAttribute("data-testid", "inbox-scan-override-note");
+    note.setAttribute("aria-label", "why this entity finding is a false positive");
+    note.placeholder = "e.g. 'Vacation' is a leave-type enum in event_type, not a person";
+    wrap.appendChild(note);
+
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "action-complete";
+    btn.setAttribute("data-testid", "inbox-scan-override-apply");
+    btn.textContent = "Attest false positive";
+    btn.disabled = true;
+    note.addEventListener("input", function () {
+      btn.disabled = !note.value.trim();
+    });
+    btn.addEventListener("click", function () {
+      clearError();
+      btn.disabled = true;
+      fetch("/api/inbox/" + encodeURIComponent(item.candidate_id) + "/attest_scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note: note.value })
+      })
+        .then(function (response) {
+          return response.text().then(function (text) {
+            if (!response.ok) {
+              var parsed = null;
+              try { parsed = JSON.parse(text); } catch (err) { parsed = null; }
+              showError("HTTP_" + response.status,
+                (parsed && parsed.detail) || text || response.statusText);
+              btn.disabled = false;
+              return;
+            }
+            loadInbox();
+          });
+        })
+        .catch(function (err) {
+          showError("NETWORK", String(err));
+          btn.disabled = false;
+        });
+    });
+    wrap.appendChild(btn);
     return wrap;
   }
 
@@ -2379,6 +2490,9 @@
     // Quiet attention markers.
     var scan = renderScan(item);
     if (scan) li.appendChild(scan);
+    // Directly under the scan chips: the override is about the finding they name.
+    var override = renderScanOverride(item, li);
+    if (override) li.appendChild(override);
     var dedup = renderDedup(item);
     if (dedup) li.appendChild(dedup);
 

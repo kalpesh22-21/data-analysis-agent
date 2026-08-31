@@ -18,7 +18,11 @@ from ..audit.judgement import ParamAssessment
 from ..candidate.decline import DeclineBlock
 from ..candidate.models import CandidateEnvelope
 from ..candidate.redaction import entity_free_payload_view, entity_spans, redact_payload
-from ..candidate.verdicts import DedupVerdict, LeakageVerdict
+from ..candidate.verdicts import (
+    DedupVerdict,
+    LeakageAttestation,
+    LeakageVerdict,
+)
 from ..writer.routing import derive_inbox_reason
 from .ranking import RankedScore, review_score
 
@@ -132,6 +136,19 @@ def _template_parts(payload_view: dict[str, Any]) -> tuple[dict[str, str], ...]:
     return tuple(parts)
 
 
+def _attestation_view(env: CandidateEnvelope) -> LeakageAttestation | None:
+    """The reviewer's leakage override, or `None` when it does not apply RIGHT NOW.
+
+    Re-checked against the current verdict rather than shown because it is stored: a stale
+    attestation on a re-settled scan clears nothing, so a card that displayed it would tell a
+    reviewer this finding had been signed off when it has not.
+    """
+    attestation = env.leakage_attestation
+    if attestation is None or not attestation.applies_to(env.entity_scan):
+        return None
+    return attestation
+
+
 def _param_judge_view(env: CandidateEnvelope) -> ParamAssessment | None:
     """The parameterization judge's verdict as it may cross to a browser.
 
@@ -177,7 +194,21 @@ def _leakage_cleared(env: CandidateEnvelope) -> bool:
     surface that must fail closed would open on the exact case where nothing is known.
     """
     scan = env.entity_scan
-    return LeakageVerdict.is_settled(scan) and scan.get("result") == "pass"
+    if LeakageVerdict.is_settled(scan) and scan.get("result") == "pass":
+        return True
+    # A REVIEWER ATTESTATION clears this gate, and this is the ONLY predicate it clears.
+    #
+    # `promotion/scheduler.py` already separates the human-present path from the automatic one
+    # — `_entity_scan_is_clean` exists for the edge where "nobody is looking there". An
+    # attestation is precisely a statement that somebody looked, so it belongs on this side of
+    # that line and must never cross to the other: it does NOT make a candidate
+    # auto-promotable, and it does not stop `redact_payload`, which costs nothing when the
+    # attestation is right and saves everything when it is wrong.
+    #
+    # `applies_to` re-checks the binding on every read rather than trusting a stored boolean,
+    # so an attestation stops clearing the gate the instant the finding it covered changes.
+    attestation = env.leakage_attestation
+    return attestation is not None and attestation.applies_to(scan)
 
 
 @dataclass(frozen=True)
@@ -255,6 +286,9 @@ class InboxItem:
     # judge is shown the UNREDACTED payload, so its `feedback` and its findings' `note` can
     # quote the very entity span the payload view withholds.
     param_judge: ParamAssessment | None = None
+    # The reviewer's leakage override, ONLY when it still binds to the current finding — see
+    # `_attestation_view`. Entity-free, so it crosses to the wire verbatim.
+    leakage_attestation: LeakageAttestation | None = None
 
     def decline_view(self) -> dict[str, Any] | None:
         """The fail-to-review block AS IT MAY CROSS TO A BROWSER, or `None` for a non-decline row.
@@ -314,4 +348,5 @@ class InboxItem:
             judge_covered_by=env.judge.covered_by if env.judge is not None else "",
             template_parts=_template_parts(payload_view),
             param_judge=_param_judge_view(env),
+            leakage_attestation=_attestation_view(env),
         )

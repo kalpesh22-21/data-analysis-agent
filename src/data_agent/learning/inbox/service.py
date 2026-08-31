@@ -72,6 +72,17 @@ class CompleteParameterizationRequest(BaseModel):
     replace: bool = False
 
 
+class AttestScanRequest(BaseModel):
+    """The leakage-override body: WHY this finding is a false positive.
+
+    `note` is required and non-blank at the route, not optional-with-a-default. An override
+    with no stated reason is not an audit trail — and this is the one action on the surface
+    that lets a human step past a D17 gate, so the record of why has to exist before it does.
+    """
+
+    note: str = ""
+
+
 class ReviseParameterizationRequest(BaseModel):
     """The REVISE body: a reviewer's sentence about what is wrong.
 
@@ -173,6 +184,16 @@ def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
         # the ordinary approve/reject they were going to make anyway — is half the
         # measurement the whole phase exists to collect.
         "param_judge": item.param_judge.to_doc() if item.param_judge is not None else None,
+        # The reviewer override, when one is in force. ENTITY-FREE by construction — a
+        # digest, a timestamp, a count and the reviewer's own note; never a span, which is
+        # the value being withheld. Null when absent OR when a stored attestation no longer
+        # binds to the current finding, so the card can never show "attested" for a verdict
+        # that has since changed.
+        "leakage_attestation": (
+            item.leakage_attestation.to_doc()
+            if item.leakage_attestation is not None
+            else None
+        ),
     }
 
 
@@ -790,6 +811,36 @@ def create_inbox_app(
         except CompletionInputError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _completion_result(result)
+
+    @app.post("/inbox/{candidate_id}/attest_scan", dependencies=guard)
+    async def attest_scan(
+        candidate_id: str, body: AttestScanRequest | None = None
+    ) -> dict[str, Any]:
+        """LEAKAGE OVERRIDE: a reviewer attests that a finding is a false positive.
+
+        The scanner's verdict is UNCHANGED — the attestation is stored beside it, bound to the
+        exact findings it covers, and lapses if they change. It clears one gate (the assistant
+        and the decline-detail display); it does NOT make the candidate auto-promotable.
+
+        422 on a blank `note`: this is the only action that steps past a D17 gate, so the
+        reason is part of the operation rather than an optional extra. 409 when there is no
+        settled non-pass verdict to attest to.
+        """
+        req = body or AttestScanRequest()
+        note = (req.note or "").strip()
+        if not note:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "a leakage override requires a note saying why the finding is a false "
+                    "positive — it is the audit trail for stepping past an entity gate"
+                ),
+            )
+        try:
+            env = await inbox.attest_scan(candidate_id, note=note)
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        return _action_result(env)
 
     @app.post("/inbox/{candidate_id}/verify", dependencies=guard)
     async def verify(candidate_id: str) -> dict[str, Any]:

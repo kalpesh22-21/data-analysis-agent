@@ -592,11 +592,17 @@ class LearningSettings(BaseSettings):
         ),
     )
     learning_revise_timeout_seconds: float = Field(
-        30.0,
+        120.0,
         gt=0.0,
         description=(
             "Hard ceiling on one revision call. On expiry the reviewer is told the assistant "
-            "timed out and the form still accepts entries typed by hand."
+            "timed out and the form still accepts entries typed by hand. "
+            "MEASURED, not guessed: the same request against gpt-5.5 completed in 12s and "
+            "also exceeded 30s on a different attempt — a reasoning model's latency is "
+            "variable, and 2.5x the median is not headroom. A timeout here is the WORST "
+            "outcome available: the call is paid for and then discarded, and the reviewer is "
+            "told to try again on work that had already finished. A human who clicked a "
+            "button will wait; keep this generous."
         ),
     )
 
@@ -638,12 +644,15 @@ class LearningSettings(BaseSettings):
         ),
     )
     learning_param_judge_timeout_seconds: float = Field(
-        30.0,
+        120.0,
         gt=0.0,
         description=(
             "Hard ceiling on one parameterization-judge model call. On expiry the judge "
-            "fails OPEN and records nothing — it observes, so the only cost of a timeout is "
-            "the observation."
+            "fails OPEN and records nothing. Raised alongside the reviser's for the same "
+            "measured reason (reasoning-model latency is variable), and the cost of clipping "
+            "it is higher than it looks: in phase D-1 the observation IS the product, so a "
+            "timeout does not merely skip work, it silently shrinks the dataset the "
+            "ship/don't-ship decision is read from."
         ),
     )
 

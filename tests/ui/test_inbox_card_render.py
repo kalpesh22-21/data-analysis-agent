@@ -202,6 +202,7 @@ def _item(**overrides: Any) -> dict[str, Any]:
         "decline": None,
         "template_parts": [],
         "param_judge": None,
+        "leakage_attestation": None,
     }
     base.update(overrides)
     return base
@@ -744,3 +745,54 @@ def test_a_conflicting_proposal_warns_even_though_it_has_entries(render: Any) ->
     # The entries still loaded — the proposal is usable, it just needs the other mode.
     assert "record_type" in page.locator('[data-testid="inbox-complete-entries"]').input_value()
     assert "conflict" in page.locator('[data-testid="inbox-revise-diff"]').inner_text()
+
+
+# --- the leakage override (reviewer attestation) ----------------------------
+
+_QUARANTINED = {
+    "result": "quarantine",
+    "hits": [{"field": "generalization.sql_template", "kind": "person", "span": ""}],
+    "scanned_fields": ["generalization.sql_template"],
+    "scanner": "regex+ner",
+}
+
+
+def test_the_override_is_offered_only_on_a_flagged_card(render: Any) -> None:
+    """A clean pass has nothing to override, and an unsettled scan must not be attested to at
+    all — vouching for content nobody scanned is the opposite of the point."""
+    page = render([
+        _item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS),  # clean pass
+        _item(candidate_id="c2", payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS,
+              entity_scan={"result": "pending", "hits": []}),
+        _item(candidate_id="c3", payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS,
+              entity_scan=_QUARANTINED),
+    ])
+    assert page.locator('[data-testid="inbox-scan-override"]').count() == 1
+    card = page.locator('[data-candidate-id="c3"]')
+    assert card.locator('[data-testid="inbox-scan-override"]').count() == 1
+
+
+def test_the_override_button_is_dead_without_a_reason(render: Any) -> None:
+    """⚠ This is the only control on the page that steps past a D17 gate, so the reason is
+    part of the operation rather than an optional extra — an override with no stated reason is
+    not an audit trail. The server 422s on a blank note; the button never sends one."""
+    page = render([_item(payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS,
+                         entity_scan=_QUARANTINED)])
+    btn = page.locator('[data-testid="inbox-scan-override-apply"]')
+    assert btn.is_disabled()
+    page.locator('[data-testid="inbox-scan-override-note"]').fill("leave-type enum")
+    assert btn.is_enabled()
+
+
+def test_an_attested_card_says_so_instead_of_offering_it_again(render: Any) -> None:
+    """The server only sends an attestation that still BINDS to the current finding, so this
+    can never read as "signed off" for a verdict that has since changed."""
+    page = render([_item(
+        payload_view=_HEALTHY_PAYLOAD, template_parts=_PARTS, entity_scan=_QUARANTINED,
+        leakage_attestation={"scan_fingerprint": "abc", "attested_at": "2026-08-28T00:00:00Z",
+                             "note": "leave-type enum, not a person", "hit_count": 1,
+                             "attested_by": "reviewer-token"},
+    )])
+    assert page.locator('[data-testid="inbox-scan-override"]').count() == 0
+    said = page.locator('[data-testid="inbox-scan-attested"]').inner_text()
+    assert "false positive" in said and "leave-type enum" in said

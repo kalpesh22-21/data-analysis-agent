@@ -20,10 +20,18 @@ raises `InboxTransitionError`, so a mis-routed action never silently mutates a c
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Literal
+
+from data_agent.timeutil import now_iso
 
 from ..candidate.models import CandidateEnvelope, CandidateStatus
 from ..candidate.store import CandidateStore
+from ..candidate.verdicts import (
+    LeakageAttestation,
+    LeakageVerdict,
+    leakage_fingerprint,
+)
 from ..promotion.mcp_export import PromotionEmit, build_promotion_emit
 from ..promotion.models import ProbeResult, PromotionPolicy
 from ..promotion.scheduler import PromotionScheduler
@@ -333,13 +341,44 @@ class ReviewInbox:
         # added to make that form easier, past the one rule the form is careful about. An
         # UNSETTLED scan refuses for the stronger reason: nobody looked.
         if not _leakage_cleared(env):
+            scan = env.entity_scan if isinstance(env.entity_scan, dict) else {}
+            flagged = ", ".join(
+                sorted(
+                    {
+                        f"{hit.get('field')} ({hit.get('kind')})"
+                        for hit in (scan.get("hits") or [])
+                        if isinstance(hit, dict) and hit.get("field")
+                    }
+                )
+            )
+            # ⚠ SAY ONLY WHAT IS TRUE AND ACTIONABLE. The first version of this message ended
+            # "or clear the scan first", which named an operation that DOES NOT EXIST anywhere
+            # in the plane — there is no re-scan or override action on any surface. It also
+            # said "supply the entries directly", which is only possible on the FORM: a review
+            # queue card has no entries box, so on `in_review` it advised a control that is not
+            # on the page either. Both readings sent a reviewer looking for a button.
+            #
+            # What is true: the scan verdict is the gate, a reviewer cannot change it, and the
+            # only way it is re-evaluated is a re-extraction of the session. Naming the flagged
+            # FIELD AND KIND (never the span — that is the value being withheld) is what turns
+            # this from a refusal into something a human can judge: `sql_template (person)` on
+            # a query full of enum literals reads as the false positive it usually is.
+            supply = (
+                " You can still type the entries into the form below."
+                if env.status == CandidateStatus.NEEDS_PARAMETERIZATION
+                else ""
+            )
             return self._reviser.refuse_withheld(
                 env,
                 reason=(
-                    "the assistant is unavailable for this candidate: its entity scan has not "
-                    "settled a clean pass, and a proposal necessarily quotes the accepted "
-                    "SQL's literal values — the same ones this row's decline detail is "
-                    "withholding. Supply the entries directly, or clear the scan first."
+                    "the assistant is unavailable for this candidate: its entity scan settled "
+                    f"{scan.get('result') or 'unsettled'}"
+                    + (f" on {flagged}" if flagged else "")
+                    + ". A proposal necessarily quotes the accepted SQL's literal values — the "
+                    "same ones this row is withholding — so it is refused rather than redacted "
+                    "(a redacted literal matches no predicate). The verdict is not something "
+                    "this surface can change; it is re-evaluated only when the session is "
+                    "re-extracted." + supply
                 ),
             )
         return await self._reviser.propose(env, feedback=feedback)
@@ -380,6 +419,67 @@ class ReviewInbox:
                 "re-validated against the accepted SQL"
             )
         return await self._completer.complete(env, entries=entries, replace_all=True)
+
+    async def attest_scan(self, candidate_id: str, *, note: str) -> CandidateEnvelope:
+        """Record a reviewer's statement that a leakage finding is a FALSE POSITIVE.
+
+        Motivated by a real case: an NER scanner flagged an 8-character leave-type enum inside
+        `event_type = '<...> Request'` as a `person`, quarantining a time-off blueprint with no
+        way to unblock it. Nothing in the plane could clear a verdict, so a false positive
+        blocked the assistant permanently.
+
+        WHAT IT DOES NOT DO, and each is deliberate:
+
+          * it does NOT rewrite `entity_scan`. The scanner's finding is the record of what a
+            machine saw; a human disagreeing is a second fact stored beside it, so both survive
+            and the disagreement itself is queryable;
+          * it does NOT make the candidate auto-promotable. `_entity_scan_is_clean` — the
+            AUTOMATIC edge, which exists for the path where "nobody is looking there" — never
+            consults it;
+          * it does NOT stop redaction. The strip costs nothing if the attestation is right.
+
+        The one gate it clears is `inbox/models.py::_leakage_cleared`: the assistant and the
+        decline-detail display, both of which a human is looking at when it happens.
+
+        REQUIRES A SETTLED, NON-PASS VERDICT. Attesting to an unsettled scan would be a human
+        vouching for content NOBODY has looked at, which is the opposite of the point; a clean
+        pass has nothing to attest to. And the attestation binds to THESE findings, so it
+        lapses the moment the scan re-settles differently.
+        """
+        env = await self._require_one_of(candidate_id, REVISABLE_STATUSES)
+        scan = env.entity_scan if isinstance(env.entity_scan, dict) else {}
+        if not LeakageVerdict.is_settled(scan):
+            raise InboxTransitionError(
+                f"candidate {candidate_id!r} has no SETTLED leakage verdict to attest to — "
+                "attesting to an unscanned candidate would vouch for content nobody has "
+                "looked at"
+            )
+        if scan.get("result") == "pass":
+            raise InboxTransitionError(
+                f"candidate {candidate_id!r} already has a clean leakage pass; there is "
+                "nothing to override"
+            )
+        hits = scan.get("hits") if isinstance(scan.get("hits"), list) else []
+        attestation = LeakageAttestation(
+            scan_fingerprint=leakage_fingerprint(scan),
+            attested_at=now_iso(),
+            note=note,
+            hit_count=len(hits),
+        )
+        _logger.warning(
+            "leakage OVERRIDE on %s: a reviewer attested %d finding(s) (%s) are false "
+            "positives — reason: %s. The verdict itself is unchanged and the candidate is "
+            "still not auto-promotable.",
+            candidate_id,
+            len(hits),
+            ", ".join(
+                sorted({f"{h.get('field')}/{h.get('kind')}" for h in hits if isinstance(h, dict)})
+            )
+            or "none",
+            note,
+        )
+        await self._store.put(replace(env, leakage_attestation=attestation))
+        return await self._store.get(candidate_id)
 
     async def retract(self, candidate_id: str) -> CandidateEnvelope:
         """Retract a promoted artifact: `validated → retired` (a leak/drift pull).

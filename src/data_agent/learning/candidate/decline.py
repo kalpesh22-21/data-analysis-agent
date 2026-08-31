@@ -131,6 +131,17 @@ class ValidationSnapshot:
     accepted_signal: str | None
     sql_by_ref: dict[str, tuple[str, ...]] = field(default_factory=dict)
     evidence: tuple[EvidencePointer, ...] = ()
+    # ⚠ TRUE when `sql_by_ref` was REBUILT FROM THE CANDIDATE rather than recorded off the
+    # session (`generalize/reconstruct.py`). The class docstring calls this "everything
+    # re-validation reads off the session"; a reconstruction is NOT that, and the difference
+    # has to live in the data rather than only in a migration note.
+    #
+    # It matters because re-validating against reconstructed SQL is CIRCULAR: the SQL is
+    # derived from the very entries the totality walk checks, so the first walk cannot fail.
+    # Backfilled candidates had already passed the genuine walk at extraction time, and every
+    # subsequent revision is checked properly against the stored query — but a reader deciding
+    # how much a `completed` outcome proves needs to be able to tell the two apart.
+    reconstructed: bool = False
 
     @classmethod
     def from_summary(
@@ -181,6 +192,7 @@ class ValidationSnapshot:
             "accepted_signal": self.accepted_signal,
             "sql_by_ref": {ref: list(sqls) for ref, sqls in self.sql_by_ref.items()},
             "evidence": [e.to_doc() for e in self.evidence],
+            "reconstructed": self.reconstructed,
         }
 
     @classmethod
@@ -239,6 +251,7 @@ class ValidationSnapshot:
             accepted_signal=accepted if isinstance(accepted, str) else None,
             sql_by_ref=sql_by_ref,
             evidence=tuple(evidence),
+            reconstructed=bool(doc.get("reconstructed", False)),
         )
 
 

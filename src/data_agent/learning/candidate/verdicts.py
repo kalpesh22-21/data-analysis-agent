@@ -10,6 +10,8 @@ round-trip fidelity; no stage logic lives here.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -171,4 +173,107 @@ class DriftStamp:
             last_drift_check_at=doc.get("last_drift_check_at"),
             probes=tuple(doc.get("probes", []) or []),
             failed_probe=doc.get("failed_probe"),
+        )
+
+
+# --- The human attestation over a leakage finding (reviewer override) ---------
+
+
+def leakage_fingerprint(scan: Any) -> str:
+    """A digest of exactly WHAT a settled verdict found: the (field, kind, span) triples.
+
+    ⚠ THIS IS THE BINDING, and it is the whole safety of the override. An attestation says "I
+    read these findings and they are not entities" — a statement about SPECIFIC content, not a
+    permanent property of the candidate. Bind it to anything looser and the attestation
+    outlives its subject: a reviewer clears a false positive, a revision then introduces a real
+    entity, the gate re-settles with new hits, and a stale "I checked this" would keep it open.
+
+    Sorted, so ordering noise from a re-scan cannot invalidate an honest attestation; over the
+    SPAN as well as the field/kind, because two different values in the same field are two
+    different judgements. `""` for anything unsettled — nothing to attest to.
+    """
+    if not LeakageVerdict.is_settled(scan):
+        return ""
+    hits = scan.get("hits") if isinstance(scan, dict) else None
+    triples = sorted(
+        (
+            str(h.get("field") or ""),
+            str(h.get("kind") or ""),
+            str(h.get("span") or ""),
+        )
+        for h in (hits or [])
+        if isinstance(h, dict)
+    )
+    payload = json.dumps(
+        {"result": (scan or {}).get("result"), "hits": triples}, sort_keys=True
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class LeakageAttestation:
+    """A reviewer's statement that a settled leakage finding is a FALSE POSITIVE.
+
+    Additive, and it NEVER rewrites the verdict: the scanner's finding is the durable record of
+    what a machine saw, and a human disagreeing with it is a second fact, not a correction of
+    the first. Both stay on the envelope.
+
+    ⚠ WHAT IT UNBLOCKS IS DELIBERATELY NARROW — one reader, `inbox/models.py::_leakage_cleared`,
+    which gates the assistant and the decline-detail display. It does NOT feed
+    `_entity_scan_is_clean`, the AUTOMATIC promotion edge, and the distinction is the one
+    `promotion/scheduler.py` already draws: that predicate exists for the path where "nobody is
+    looking there", and an attestation is precisely a statement that somebody looked. Nor does
+    it stop `redact_payload` — the strip costs nothing if the attestation is right and saves
+    everything if it is wrong.
+
+    ⚠ `attested_by` IS NOT A USER. The inbox authenticates with a single shared
+    `REVIEWER_TOKEN`; there is no per-reviewer identity to record, and inventing a field that
+    looked like one would be worse than admitting it. What is recorded is that an authenticated
+    reviewer did this, when, and why — and `note` is mandatory at the route, because an
+    override with no stated reason is not an audit trail.
+    """
+
+    scan_fingerprint: str  # `leakage_fingerprint` of the verdict this attests to
+    attested_at: str  # ISO-8601
+    note: str  # the reviewer's reason — REQUIRED; see the class docstring
+    hit_count: int = 0  # how many findings were covered, for the card and for queries
+    attested_by: str = "reviewer-token"  # see the class docstring: NOT an identity
+
+    def applies_to(self, scan: Any) -> bool:
+        """Does this attestation still describe *scan*?
+
+        False the moment the findings change, which is what stops a cleared false positive from
+        covering a later real one. An empty fingerprint on either side never matches.
+        """
+        current = leakage_fingerprint(scan)
+        return bool(current) and current == self.scan_fingerprint
+
+    def to_doc(self) -> dict[str, Any]:
+        return {
+            "scan_fingerprint": self.scan_fingerprint,
+            "attested_at": self.attested_at,
+            "note": self.note,
+            "hit_count": self.hit_count,
+            "attested_by": self.attested_by,
+        }
+
+    @classmethod
+    def from_doc(cls, doc: Any) -> LeakageAttestation | None:
+        """Rehydrate, or `None` for anything unusable.
+
+        A fingerprint is the one field with no safe default: without it `applies_to` cannot
+        bind, and an attestation that binds to nothing would apply to everything.
+        """
+        if not isinstance(doc, dict):
+            return None
+        fingerprint = doc.get("scan_fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            return None
+        count = doc.get("hit_count")
+        return cls(
+            scan_fingerprint=fingerprint,
+            attested_at=str(doc.get("attested_at") or ""),
+            note=str(doc.get("note") or ""),
+            hit_count=count if isinstance(count, int) and not isinstance(count, bool) else 0,
+            attested_by=str(doc.get("attested_by") or "reviewer-token"),
         )

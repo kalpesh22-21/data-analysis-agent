@@ -136,14 +136,14 @@ REVIEWER_TOKEN = os.environ.get("REVIEWER_TOKEN", "")
 _INBOX_ACTIONS = frozenset(
     {
         "approve", "reject", "retract", "complete", "revise",
-        "apply_revision", "verify", "promote",
+        "apply_revision", "attest_scan", "verify", "promote",
     }
 )
 # The actions that carry a request body: `complete` (the reviewer's missing
 # parameterization entries) and `promote` (OPTIONAL `{doc_id, title}` knowledge
 # refinements — a bodyless promote is the normal case). Every other action is a bare POST
 # and must stay one; see `inbox_action`.
-_INBOX_BODY_ACTIONS = frozenset({"complete", "promote", "revise", "apply_revision"})
+_INBOX_BODY_ACTIONS = frozenset({"complete", "promote", "revise", "apply_revision", "attest_scan"})
 # The only `?status=` values the list surface accepts (ui-inbox-type-archive contract
 # §List API): the live review queue, the durable rejected archive, the promotable set of
 # auto-landed learning nodes awaiting verify/promote, the fail-to-review work list, and
@@ -608,7 +608,9 @@ async def _read_bounded_body(request: Request, cap: int) -> bytes | None:
 _INBOX_HOP_TIMEOUT_SECONDS = 10.0
 # A dead local service must still fail FAST, whatever the read budget is.
 _INBOX_CONNECT_TIMEOUT_SECONDS = 5.0
-_INBOX_MODEL_HOP_TIMEOUT_SECONDS = 60.0
+# Must stay ABOVE `learning_revise_timeout_seconds` (120s) so the upstream's own
+# graceful 'timed out; try again' reaches the browser instead of a bare 502.
+_INBOX_MODEL_HOP_TIMEOUT_SECONDS = 180.0
 _INBOX_MODEL_ACTIONS = frozenset({"revise"})
 
 

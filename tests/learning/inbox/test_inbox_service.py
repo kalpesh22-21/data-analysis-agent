@@ -134,6 +134,9 @@ def test_list_returns_exact_wire_shape(enabled: None) -> None:
         # not run — which in phase D-1 is most of them. Part of the EXACT shape for the
         # `decline` reason above: a client cannot branch on a field it cannot know exists.
         "param_judge",
+        # The reviewer's leakage override, null unless one is in force AND still binds to the
+        # current finding. Entity-free (digest, timestamp, count, note) — never a span.
+        "leakage_attestation",
     }
     assert set(item["score"]) == {
         "score",

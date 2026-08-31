@@ -20,7 +20,7 @@ from ..extractor.shape import ShapeError, as_int, as_object, as_text, require
 from ..summary.models import SessionSummary
 from .decline import DeclineBlock, EvidencePointer, ValidationSnapshot
 from .signals import NoveltyStamp, SessionSignals
-from .verdicts import DedupVerdict, DriftStamp
+from .verdicts import DedupVerdict, DriftStamp, LeakageAttestation
 
 
 class CandidateStatus:
@@ -151,6 +151,13 @@ class CandidateEnvelope:
     # it. It is carried so the reviewer card can show what the judge said about the very
     # candidate in front of the reviewer, which is half of the phase-D-1 measurement.
     param_judge: ParamAssessment | None = None
+
+    # A reviewer's statement that a settled leakage finding is a FALSE POSITIVE (option 1 of
+    # the 2026-08-28 decision). ADDITIVE — it never rewrites `entity_scan`, because the
+    # scanner's finding is the durable record of what a machine saw and a human disagreeing is
+    # a second fact, not a correction of the first. Bound to the finding it covers via
+    # `LeakageAttestation.applies_to`, so it lapses the moment the scan re-settles differently.
+    leakage_attestation: LeakageAttestation | None = None
     # --- inbox-ranking inputs (plan §4). Two separate stamps because two different
     # stages own them and neither can compute the other's:
     #   * `session_signals` is stamped ONCE at `build_envelope` from the in-memory
@@ -234,6 +241,11 @@ class CandidateEnvelope:
         # and of every deployment with it switched off.
         if self.param_judge is not None:
             doc["param_judge"] = self.param_judge.to_doc()
+        # Additive + optional, like the stamps above: absent means nobody has overridden a
+        # leakage finding on this candidate, which is the shape of every candidate written
+        # before the reviewer override existed.
+        if self.leakage_attestation is not None:
+            doc["leakage_attestation"] = self.leakage_attestation.to_doc()
         # Additive + OPTIONAL, same rule as the four above: an absent key means "this
         # stamp was never written", which the ranking treats differently from a stamp
         # whose values happen to be zero.
@@ -324,6 +336,11 @@ class CandidateEnvelope:
                 ParamAssessment.from_doc(doc["param_judge"])
                 if isinstance(doc.get("param_judge"), dict)
                 else None
+            ),
+            # `from_doc` returns None for anything without a usable fingerprint — an
+            # attestation that binds to nothing would apply to everything.
+            leakage_attestation=LeakageAttestation.from_doc(
+                doc.get("leakage_attestation")
             ),
             # Same normalize-do-not-trust posture as `last_scanned_at`/`judge`: a
             # non-dict stamp (hand edit, foreign writer) reads back as "nobody looked"

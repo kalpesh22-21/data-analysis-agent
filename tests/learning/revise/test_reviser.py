@@ -461,3 +461,77 @@ async def test_an_unquoted_or_oddly_quoted_value_is_left_alone() -> None:
         )
         proposal = await reviser.propose(declined_blueprint(), feedback="")
         assert proposal.entries[0]["locator"]["value"] == expected, raw
+
+
+# --- the leakage refusal's MESSAGE (found by a reviewer hitting it live) ----------
+
+
+async def _refusal_reason(status: str, hits: list[dict]) -> str:
+    from data_agent.learning.candidate.memory_candidate_store import InMemoryCandidateStore
+    from data_agent.learning.candidate.verdicts import EntityHit, LeakageVerdict
+    from data_agent.learning.inbox import ReviewInbox
+
+    env = replace(
+        declined_blueprint(),
+        status=status,
+        entity_scan=LeakageVerdict(
+            result="quarantine",
+            hits=tuple(EntityHit(**h) for h in hits),
+            scanned_fields=("generalization.sql_template",),
+            scanner="regex+ner",
+        ).to_doc(),
+    )
+    store = InMemoryCandidateStore()
+    await store.put(env)
+    reviser, _ = make_reviser([proposal_turn()])
+    inbox = ReviewInbox(store, reviser=reviser)
+    proposal = await inbox.propose_revision(env.candidate_id, feedback="x")
+    return proposal.reason
+
+
+async def test_the_refusal_names_the_flagged_field_and_kind_never_the_span() -> None:
+    """⚠ WHAT A REVIEWER NEEDS TO JUDGE IT.
+
+    Observed live: an NER scanner flagged an 8-character leave-type enum inside
+    `event_type = '<redacted> Request'` as a `person`, quarantining a time-off blueprint. The
+    reviewer saw only "the scan has not settled a clean pass" — no way to tell a real leak from
+    the false positive it was.
+
+    Field and kind are entity-FREE by construction and are already on the card; the SPAN is the
+    value being withheld and must never appear here. `sql_template (person)` on a query full of
+    enum literals reads as what it usually is.
+    """
+    reason = await _refusal_reason(
+        CandidateStatus.NEEDS_PARAMETERIZATION,
+        [{"field": "generalization.sql_template", "kind": "person", "span": "Vacation"}],
+    )
+    assert "generalization.sql_template" in reason
+    assert "person" in reason
+    assert "quarantine" in reason
+    assert "Vacation" not in reason, "the refusal leaked the very span it is withholding"
+
+
+async def test_the_refusal_promises_no_action_that_does_not_exist() -> None:
+    """The first version ended "or clear the scan first". THERE IS NO SUCH OPERATION — no
+    re-scan, no override, on any surface — so it sent reviewers hunting for a button. A refusal
+    that invents a remedy is worse than one that admits there is none."""
+    reason = await _refusal_reason(
+        CandidateStatus.IN_REVIEW,
+        [{"field": "generalization.sql_template", "kind": "person", "span": "Vacation"}],
+    )
+    assert "clear the scan" not in reason
+    assert "re-extracted" in reason, "it must say what actually re-evaluates the verdict"
+
+
+async def test_the_refusal_only_offers_the_form_where_there_is_one() -> None:
+    """"Supply the entries directly" is true on the fail-to-review FORM and false on the review
+    queue, which has no entries box — the second is a control that is not on the page."""
+    on_form = await _refusal_reason(
+        CandidateStatus.NEEDS_PARAMETERIZATION,
+        [{"field": "intent", "kind": "person", "span": "X"}],
+    )
+    on_queue = await _refusal_reason(
+        CandidateStatus.IN_REVIEW, [{"field": "intent", "kind": "person", "span": "X"}]
+    )
+    assert "type the entries into the form" in on_form
+    assert "type the entries into the form" not in on_queue
