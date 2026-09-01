@@ -29,7 +29,7 @@ from ..candidate.verdicts import DriftStamp, LeakageVerdict
 from ..config import learning_enabled
 from ..observability import context_from_traceparent, land_span, promote_span
 from .drift import drift_from_replay, reusable_replay_verdict, user_correction_stamp
-from .landing import landing_id
+from .landing import LandingEntityError, LandingInvalidError, landing_id
 from .models import (
     BLUEPRINT_TYPE,
     HUMAN_GATED_TYPES,
@@ -709,7 +709,8 @@ class PromotionScheduler:
             # SAME land-then-status invariant the auto edge uses. `env` was already
             # stripped (Guard 2); `_land_and_promote` re-strips idempotently. The
             # forbidden spans were captured PRE-strip above. A landing failure HOLDS
-            # `landing_failed`, leaving the candidate at `in_review`.
+            # (under whichever of the three reasons `_land_and_promote` classifies it as),
+            # leaving the candidate at `in_review`.
             if self._landing_writer is not None:
                 return await self._land_and_promote(
                     env,
@@ -724,7 +725,7 @@ class PromotionScheduler:
             # "approve → retrievable" action is a silent no-op. Route it through the SAME
             # type-agnostic land-then-status machinery the blueprint edge uses: LAND FIRST
             # into the neo4j retrieval corpus, THEN write `validated` (a landing failure
-            # HOLDS `landing_failed`, never a fake validate). When `require_landing` is set
+            # HOLDS — see `_land_and_promote` for which reason — never a fake validate). When `require_landing` is set
             # but no writer is wired (dormant), HOLD honestly — never a fake validate for a
             # never-recallable chunk. `forbidden_spans` were captured PRE-strip above.
             if env.type == "global_knowledge" and self._landing_writer is not None:
@@ -958,8 +959,9 @@ class PromotionScheduler:
 
         Order is LOAD-BEARING: land into the neo4j retrieval corpus FIRST, then write
         `status = validated`. Invariant "not landed ⇒ not validated" — a landing failure HOLDs
-        `landing_failed` and never writes a half state, and a crash between the two is safe because
-        the next cycle re-lands idempotently (MERGE by the deterministic id) then writes status.
+        (under one of the three reasons below) and never writes a half state, and a crash between
+        the two is safe because the next cycle re-lands idempotently (MERGE by the deterministic
+        id) then writes status.
 
         The status write is a plain upsert, not a CAS: S9 assumes a SINGLE promotion writer, since
         the cron scan and the human-approve path both serialize through this scheduler over the
@@ -969,6 +971,34 @@ class PromotionScheduler:
         BEFORE the strip — drive the writer's last-gate defense, which RAISES if the strip
         regressed. *verified* is stamped onto BOTH the node and the envelope so the two never
         diverge.
+
+        EVERY landing failure HOLDS at *from_status* — that invariant is unconditional — but the
+        three REASONS are not interchangeable, because a hold is honest only if its reason says
+        what could clear it:
+
+          * `landing_entity_leak` — the D17 last gate fired: a settled entity span survived into
+            the seed. DETERMINISTIC (the same envelope leaks the same span every cycle) and NOT
+            reviewer-fixable — it means the entity strip regressed — so it is logged loudly and
+            the candidate parks until someone reads that log. Not infra: nothing is unavailable.
+          * `landing_invalid` — the payload cannot be MAPPED onto a seed (a `global_knowledge`
+            payload carrying no `statement`; a blueprint the parser refuses). Also deterministic:
+            a retry re-reads the same stored payload and fails identically, forever. The inbox
+            turns this one into a 409 telling the reviewer the payload must be repaired or the
+            candidate rejected, which are the only actions that can help.
+          * `landing_failed` — everything else, i.e. INFRA: neo4j down, the embedding endpoint
+            timing out. Genuinely transient, retried next cycle, surfaced as 503.
+
+        Classification is by PHASE, not by exception type at a distance: the writer wraps its
+        MAP step (before any driver/embedder touch) and re-raises `LandingInvalidError`, so
+        this method never has to guess whether a raw `ValueError` came from a mapper or from
+        some infra client that leaked one mid-write — an unwrapped exception from an unknown
+        phase is treated as transient (fail-safe: a retried outage beats a healthy candidate
+        told its payload is malformed).
+
+        The split exists because the first two used to be the third. A `global_knowledge`
+        candidate whose payload never had a `statement` answered "landing plane unavailable" to
+        every approve while the landing plane was perfectly healthy, and the retry that reply
+        invites could not have terminated at any point.
         """
         from_status = env.status
         # Stamp the fresh drift BEFORE landing so the landed seed carries it (§8.1);
@@ -985,6 +1015,37 @@ class PromotionScheduler:
                     await self._landing_writer.land(
                         landed, forbidden_spans=forbidden_spans, verified=verified
                     )
+            except LandingEntityError:
+                # FIRST, and above the deterministic-invalid branch deliberately: this is the
+                # D17 tripwire, not a shape complaint, and it must never be reported as
+                # something a reviewer can edit their way out of.
+                _logger.error(
+                    "ENTITY LEAK blocked at landing for candidate %s; holding (status stays "
+                    "%s) — the entity strip regressed; this will NOT clear on retry",
+                    landed.candidate_id,
+                    from_status,
+                    exc_info=True,
+                )
+                return CandidateDecision(
+                    landed.candidate_id, landed.type, "hold", from_status, from_status,
+                    reason="landing_entity_leak",
+                )
+            except LandingInvalidError:
+                # The mapping/payload defects, raised by the writer's MAP step only — the
+                # phase boundary (nothing infra has been touched yet) is what makes this
+                # branch safe; a raw ValueError from deeper in the write path falls through
+                # to `landing_failed` below.
+                _logger.error(
+                    "landing INVALID for candidate %s; holding (status stays %s) — the "
+                    "candidate payload cannot be mapped onto a seed, so a retry cannot help",
+                    landed.candidate_id,
+                    from_status,
+                    exc_info=True,
+                )
+                return CandidateDecision(
+                    landed.candidate_id, landed.type, "hold", from_status, from_status,
+                    reason="landing_invalid",
+                )
             except Exception:  # noqa: BLE001 - any landing failure HOLDS; never a half state
                 _logger.warning(
                     "landing failed for candidate %s; holding (status stays %s, "

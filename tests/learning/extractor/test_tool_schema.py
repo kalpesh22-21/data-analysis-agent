@@ -30,15 +30,19 @@ def _candidate_item_schema() -> dict:
     return tool["parameters"]["properties"]["candidates"]["items"]
 
 
-def _blueprint_payload_schema() -> dict:
-    """The payload schema a blueprint candidate is steered toward — reached via the
-    type-conditional `allOf[*].then` in the candidate schema."""
+def _payload_schema(candidate_type: str) -> dict:
+    """The payload schema a *candidate_type* candidate is steered toward — reached via
+    the type-conditional `allOf[*].then` in the candidate schema."""
     item = _candidate_item_schema()
     for branch in item.get("allOf", []):
         cond = branch.get("if", {}).get("properties", {}).get("type", {})
-        if cond.get("const") == "blueprint":
+        if cond.get("const") == candidate_type:
             return branch["then"]["properties"]["payload"]
-    raise AssertionError("no blueprint-conditional payload schema wired into the tool")
+    raise AssertionError(f"no {candidate_type}-conditional payload schema wired into the tool")
+
+
+def _blueprint_payload_schema() -> dict:
+    return _payload_schema("blueprint")
 
 
 def test_blueprint_payload_requires_kind_and_parameterization():
@@ -81,8 +85,49 @@ def test_result_signature_documents_the_scalar_aggregate_null_rule():
 
 
 def test_non_blueprint_payload_is_not_forced_to_blueprint_shape():
-    # The other three candidate types keep a generic-object payload — the conditional
-    # must not impose `kind` on them.
+    # The BASE payload property stays a generic object: the shape is imposed per type by
+    # the `allOf` conditionals, so `kind` is never required of a knowledge candidate.
     item = _candidate_item_schema()
     assert item["properties"]["payload"]["type"] == "object"
     assert "required" not in item["properties"]["payload"]
+    for ctype in ("global_knowledge", "user_knowledge", "schema_edit"):
+        assert "kind" not in set(_payload_schema(ctype).get("required", []))
+
+
+@pytest.mark.parametrize(
+    "candidate_type", ["global_knowledge", "user_knowledge", "schema_edit"]
+)
+def test_every_non_blueprint_payload_requires_statement(candidate_type):
+    """The regression this closes: these three were a bare `{"type": "object"}`, so the
+    model was told "payload = any object" and emitted a `global_knowledge` payload keyed
+    {definition, fact_type, intent, scope} — which nothing rejected until the approve
+    that should have landed it raised on the missing `statement`."""
+    payload = _payload_schema(candidate_type)
+    assert "statement" in set(payload.get("required", []))
+    assert payload["properties"]["statement"]["type"] == "string"
+
+
+def test_global_knowledge_payload_is_a_closed_key_set():
+    """CLOSED for this type alone: it lands in the GLOBAL, scope-bypassed knowledge
+    index and the S5 leakage gate scans four named fields, so any other key would be an
+    unscanned text surface. The other two targets stay open (entity-bearing by
+    contract)."""
+    from data_agent.learning.extractor.validation import _GLOBAL_KNOWLEDGE_KEYS
+
+    payload = _payload_schema("global_knowledge")
+    assert payload["additionalProperties"] is False
+    # The SAME closed set intake enforces — one contract, stated on both sides.
+    assert set(payload["properties"]) == set(_GLOBAL_KNOWLEDGE_KEYS)
+    for ctype in ("user_knowledge", "schema_edit"):
+        assert "additionalProperties" not in _payload_schema(ctype)
+
+
+def test_schema_edit_payload_names_the_fields_the_pr_bot_reads():
+    """`SchemaEditPatch.from_payload` reads each of these under two names, so `required`
+    can only carry `statement` — the disjunction is enforced at intake. The DESCRIPTIONS
+    still have to name them, or the model has no way to know they are mandatory."""
+    payload = _payload_schema("schema_edit")
+    properties = payload["properties"]
+    assert {"edit_kind", "target", "patch"} <= set(properties)
+    for field in ("edit_kind", "target", "patch"):
+        assert "REQUIRED" in properties[field]["description"]

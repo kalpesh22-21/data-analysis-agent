@@ -28,11 +28,18 @@ from dataclasses import replace
 import pytest
 
 import data_agent.learning.promotion.scheduler as scheduler_mod
+from data_agent.corpus.seeds import CorpusLoadError
 from data_agent.learning.candidate import InMemoryCandidateStore
 from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.promotion import PromotionScheduler
-from data_agent.learning.promotion.landing import CorpusLandingWriter, landing_id
-from data_agent.runtime.model.embedding_client import FakeEmbeddingClient
+from data_agent.learning.promotion.landing import (
+    BlueprintParseError,
+    CorpusLandingWriter,
+    LandingEntityError,
+    LandingInvalidError,
+    landing_id,
+)
+from data_agent.runtime.model.embedding_client import EmbeddingError, FakeEmbeddingClient
 
 from .helpers import (
     FakeHitCountReader,
@@ -40,6 +47,7 @@ from .helpers import (
     FakeWarehouseProbe,
     make_blueprint_candidate,
     promotion_policy,
+    with_type,
 )
 
 KEY = "sha256:single-bp"
@@ -99,6 +107,146 @@ async def test_landing_failure_holds_and_never_validates() -> None:
     assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
     assert decision.action == "hold"
     assert decision.reason == "landing_failed"
+
+
+# --- the hold TAXONOMY: deterministic-invalid vs entity-leak vs transient-infra ----
+#
+# Every landing failure holds at `in_review` — that never changed. What these pin is
+# that the three hold REASONS are told apart, because the inbox maps them to different
+# answers and a reviewer acts on the answer. A `global_knowledge` payload with no
+# `statement` used to report `landing_failed` → 503 "landing plane unavailable", so the
+# only advice the page could give was "retry", which could never work.
+
+
+async def test_deterministic_mapping_failure_holds_landing_invalid() -> None:
+    """A `LandingInvalidError` out of the writer is a payload that cannot be MAPPED onto
+    a seed — deterministic, so it must NOT be reported as the transient-infra reason.
+    The writer raises the TYPED error from its map step; the scheduler never guesses
+    from a raw exception class."""
+    store = InMemoryCandidateStore()
+    env = make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY)
+    await store.put(env)
+    writer = FakeLandingWriter(
+        fail=LandingInvalidError("candidate has an empty knowledge statement"),
+        fail_times=99,
+    )
+    sched = _scheduler(store, writer=writer)
+
+    decision = await sched.apply_human_decision(env, "approve")
+
+    assert writer.calls == 1  # the land was ATTEMPTED
+    assert decision.action == "hold"
+    assert decision.reason == "landing_invalid"
+    # Not landed ⇒ not validated: the store was never written past `in_review`.
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+    assert writer.landed == []
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ValueError("no statement"),
+        KeyError("statement"),
+        TypeError("payload is not a mapping"),
+        AttributeError("'list' object has no attribute 'get'"),
+        BlueprintParseError("slot is missing a non-empty 'name'"),
+    ],
+)
+async def test_a_raw_mapping_exception_from_the_writer_is_treated_as_transient(exc) -> None:
+    """Classification is by PHASE, not by exception type at a distance: only the writer's
+    own map step may declare `landing_invalid` (by raising `LandingInvalidError`). A raw
+    `ValueError` reaching the scheduler could just as well be an infra client leaking one
+    mid-write, so an UNWRAPPED exception from an unknown writer phase holds the fail-safe
+    way — `landing_failed`, retried — rather than telling a reviewer to fix a payload
+    that may be healthy."""
+    store = InMemoryCandidateStore()
+    env = make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY)
+    await store.put(env)
+    sched = _scheduler(store, writer=FakeLandingWriter(fail=exc, fail_times=99))
+
+    decision = await sched.apply_human_decision(env, "approve")
+
+    assert decision.reason == "landing_failed"
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("neo4j down"),
+        EmbeddingError("embedding endpoint returned 502"),
+        CorpusLoadError("MERGE failed: session expired"),
+    ],
+)
+async def test_infra_failure_still_holds_landing_failed(exc) -> None:
+    """The transient branch is unchanged, pinned against the REAL infra exception types
+    (`EmbeddingError` wraps everything the embed client raises — including the
+    `JSONDecodeError` that is secretly a `ValueError` — and `CorpusLoadError` wraps the
+    loader's): each is still `landing_failed` → 503 → retried next cycle. The split must
+    not have swallowed them."""
+    store = InMemoryCandidateStore()
+    env = make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY)
+    await store.put(env)
+    sched = _scheduler(store, writer=FakeLandingWriter(fail=exc, fail_times=99))
+
+    decision = await sched.apply_human_decision(env, "approve")
+
+    assert decision.reason == "landing_failed"
+
+
+async def test_entity_error_holds_landing_entity_leak() -> None:
+    """The D17 tripwire gets its OWN reason: deterministic like `landing_invalid`, but
+    not something a reviewer can edit the payload out of."""
+    store = InMemoryCandidateStore()
+    env = make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY)
+    await store.put(env)
+    writer = FakeLandingWriter(
+        fail=LandingEntityError("entity content leaked into the generalized seed"),
+        fail_times=99,
+    )
+    sched = _scheduler(store, writer=writer)
+
+    decision = await sched.apply_human_decision(env, "approve")
+
+    assert decision.action == "hold"
+    assert decision.reason == "landing_entity_leak"
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+
+
+async def test_real_knowledge_mapper_on_a_statementless_payload_holds_landing_invalid(
+) -> None:
+    """THE STUCK CANDIDATE, end to end through the real mapper (S9 §3.4).
+
+    Not a scripted exception: a `global_knowledge` envelope whose payload carries
+    {definition, fact_type, intent, scope} is handed to the REAL `CorpusLandingWriter`,
+    whose `land` calls the REAL `knowledge_seed_from_candidate` — which raises
+    `ValueError` on the absent `statement` BEFORE the driver is ever opened (the
+    `_NoSessionDriver` asserts that). This is the exact sequence that answered 503 to
+    every approve; it must now be `landing_invalid` (→ 409, fix the payload)."""
+    store = InMemoryCandidateStore()
+    env = replace(
+        with_type(
+            make_blueprint_candidate(status=CandidateStatus.IN_REVIEW, canonical_key=KEY),
+            "global_knowledge",
+        ),
+        payload={
+            "definition": "an active employee is one with no termination date",
+            "fact_type": "business_rule",
+            "intent": "define active employee",
+            "scope": "employee",
+        },
+    )
+    await store.put(env)
+    embedder = FakeEmbeddingClient()
+    writer = CorpusLandingWriter(_NoSessionDriver(), embedder, model_id="all-mpnet-base-v2")
+    sched = _scheduler(store, writer=writer)
+
+    decision = await sched.apply_human_decision(env, "approve")
+
+    assert decision.action == "hold"
+    assert decision.reason == "landing_invalid"
+    assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+    assert embedder.calls == []  # it failed at the MAP, before any embed/neo4j write
 
 
 async def test_the_auto_path_never_lands_anything() -> None:
@@ -240,9 +388,14 @@ async def test_landed_env_carries_fresh_drift_not_stale() -> None:
 async def test_entity_last_gate_fires_through_scheduler_if_strip_regresses(monkeypatch) -> None:
     """If the entity strip REGRESSES to a no-op, the last gate STILL blocks the write:
     the scheduler captures the forbidden spans BEFORE the strip, the (regressed) strip
-    leaves the entity in the seed, the real writer RAISES → `landing_failed`, and the
-    candidate never validates. Proven through the REAL `apply_human_decision` path — the
-    only path that lands anything since plan §4."""
+    leaves the entity in the seed, the real writer RAISES, and the candidate never
+    validates. Proven through the REAL `apply_human_decision` path — the
+    only path that lands anything since plan §4.
+
+    The reason is `landing_entity_leak`, NOT `landing_failed`: the gate fired on a
+    DETERMINISTIC property of this envelope (the same span leaks on every retry), and
+    reporting it as the transient-infra reason would have the inbox answer 503 — "the
+    landing plane is unavailable" — about a plane that is working perfectly."""
     # Simulate a strip regression: strip becomes identity, so "0420" survives into the
     # seed. The pre-strip forbidden-span capture is what makes the gate still fire.
     monkeypatch.setattr(scheduler_mod, "strip_entity_bearing", lambda env: env)
@@ -257,7 +410,7 @@ async def test_entity_last_gate_fires_through_scheduler_if_strip_regresses(monke
     decision = await sched.apply_human_decision(env, "approve")
 
     assert decision.action == "hold"
-    assert decision.reason == "landing_failed"
+    assert decision.reason == "landing_entity_leak"
     assert (await store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
     assert embedder.calls == []  # the gate fired BEFORE any embed/neo4j write
 

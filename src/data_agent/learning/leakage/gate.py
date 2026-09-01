@@ -48,7 +48,17 @@ _HARD_REJECT_TYPES = frozenset({"global_knowledge"})
 # pre-generalization slot values by design (they are templated out downstream), so
 # scanning them would false-positive on every candidate.
 _ENTITY_FREE_SURFACES: dict[str, tuple[str, ...]] = {
-    "global_knowledge": ("statement", "structured", "related_terms", "scope"),
+    # This tuple IS the intake contract: `_global_knowledge_payload` closes the payload
+    # key set over exactly these surfaces (plus nothing), so every key intake permits is
+    # a surface this gate scans. `knowledge_type` is a short label the mapper never
+    # lands, scanned anyway so the invariant is exact rather than exact-minus-one.
+    "global_knowledge": (
+        "statement",
+        "knowledge_type",
+        "structured",
+        "related_terms",
+        "scope",
+    ),
     # `notes` is extractor free text that lands with the artifact — an entity there
     # with a clean `intent` must NOT slip through as `pass` (Q1 rework).
     "blueprint": ("intent", "result_signature", "notes"),

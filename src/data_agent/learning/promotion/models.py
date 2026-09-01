@@ -273,8 +273,11 @@ class LandingWriter(Protocol):
     """Materializes a validated candidate into the neo4j retrieval corpus (S9 §3).
 
     `land` MERGE-upserts by a deterministic id (idempotent re-land) and RAISES on any failure —
-    a model-parity violation, an entity leaking into the seed, or a neo4j write error — so the
-    scheduler HOLDS `landing_failed` and NEVER writes `validated`. `forbidden_spans` are the
+    a model-parity violation, an entity leaking into the seed, a payload that cannot be mapped
+    onto a seed, or a neo4j write error — so the scheduler HOLDS and NEVER writes `validated`.
+    WHICH exception it raises decides the hold's reason, and therefore what the inbox tells the
+    reviewer: see `scheduler._land_and_promote` for the deterministic/entity-leak/infra
+    taxonomy. `forbidden_spans` are the
     entity spans S5 identified, captured BEFORE `strip_entity_bearing` blanks them, so the
     last-gate defense can fire even though a validated candidate's own `entity_scan` is blanked.
 

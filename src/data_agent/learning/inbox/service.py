@@ -295,6 +295,7 @@ def _map_transition_error(exc: InboxTransitionError) -> HTTPException:
     """Map an `InboxTransitionError` to the contract §2/§6 status codes.
 
       * message contains "not found"          → 404 (unknown id)
+      * a HELD approve for a malformed payload → 409 (repair in the store, or reject)
       * a HELD approve for landing-unavailable → 503 ("landing plane unavailable")
       * anything else                          → 409 (illegal transition / held
                                                  approve — reason surfaced verbatim)
@@ -302,6 +303,27 @@ def _map_transition_error(exc: InboxTransitionError) -> HTTPException:
     message = str(exc)
     if "not found" in message:
         return HTTPException(status_code=404, detail=message)
+    # BEFORE the 503 branch, and the order is the whole point: `landing_invalid` is a
+    # DETERMINISTIC landing refusal — the candidate's payload cannot be mapped onto a seed
+    # — so calling it "landing plane unavailable" would send the reviewer to check a plane
+    # that is perfectly healthy and invite an approve-retry that can never succeed. (It
+    # would also match the 503 test below if that ever grew a looser substring; keeping
+    # this first makes the intended precedence explicit rather than incidental.) 409: the
+    # request cannot be satisfied in the candidate's current state. The detail names the
+    # two actions that exist — repair the stored payload (there is no payload-edit
+    # endpoint; the store-side repair script is the tool) or reject — because "revise"
+    # would point at the parameterization reviser, which cannot touch payload keys.
+    if "landing_invalid" in message:
+        return HTTPException(
+            status_code=409,
+            detail=(
+                "candidate payload cannot be landed (malformed for its type); repair it "
+                "in the store or reject it — approving again will not help"
+            ),
+        )
+    # `landing_entity_leak` gets NO branch: it falls through to the 409-verbatim default,
+    # which is right — the reason names the D17 tripwire that fired, and that is exactly
+    # what the reviewer and the log both need to see.
     # A held approve whose reason is the honest landing-plane gap is a DEGRADE, not an
     # illegal transition — surface it as 503 so the page shows "approve-that-lands is
     # unavailable in this deployment" rather than a transition error (contract §5/§6).

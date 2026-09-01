@@ -81,7 +81,9 @@ async def test_hard_entity_in_global_knowledge_rejects():
     assert verdict.result == "reject"
     assert result.envelope.status == "rejected"
     assert result.control == "route_inbox"
-    assert verdict.scanned_fields == ("statement",)
+    # `knowledge_type` joined the scanned surfaces when intake closed the payload key
+    # set over them — every key intake permits is now a surface this gate scans.
+    assert verdict.scanned_fields == ("statement", "knowledge_type")
 
 
 async def test_settled_verdict_records_scanner_provenance():

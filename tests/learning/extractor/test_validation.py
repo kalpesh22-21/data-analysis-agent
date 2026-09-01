@@ -10,6 +10,7 @@ import pytest
 from data_agent.learning.extractor.models import BlueprintPayload, Decline, ExtractedCandidate
 from data_agent.learning.extractor.validation import (
     REASON_BAD_ROLE,
+    REASON_MALFORMED,
     REASON_MISSING_RULE,
     REASON_NO_ACCEPTANCE,
     REASON_NO_EVIDENCE,
@@ -21,6 +22,7 @@ from data_agent.learning.extractor.validation import (
 from .helpers import (
     PAYROLL_SQL,
     blueprint_raw,
+    evidence_item,
     make_answer_sql,
     make_summary,
     make_tool_call,
@@ -455,3 +457,214 @@ def test_non_object_payload_is_declined_malformed_not_a_crash():
     out = _validate(raw)
     assert isinstance(out, Decline)
     assert out.reason == "malformed_candidate"
+
+
+# --- the NON-blueprint payloads: checked against what LANDING reads -----------
+#
+# The regression these pin: a `global_knowledge` candidate whose payload read
+# {definition, fact_type, intent, scope} passed intake (which asked only that the
+# payload BE an object), passed the leakage gate (which scans a fixed four-field
+# list and so never read `definition` or `intent`), reached a reviewer, and died on
+# APPROVE inside `knowledge_seed_from_candidate` — reported as a landing failure,
+# i.e. as infra, so the approve 503'd and retried forever.
+
+
+def _typed_raw(ctype: str, payload: dict) -> dict:
+    """One non-blueprint candidate envelope carrying *payload* (evidence present, so
+    the D31 gate is not what declines)."""
+    return {
+        "type": ctype,
+        "confidence": 0.9,
+        "evidence": [evidence_item()],
+        "rationale": "worth learning",
+        "proposed_action": "new",
+        "entity_self_check": {"contains_entities": False, "found": []},
+        "payload": payload,
+    }
+
+
+def test_global_knowledge_without_statement_is_declined_naming_statement():
+    out = _validate(_typed_raw("global_knowledge", {"knowledge_type": "business_rule"}))
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_MALFORMED
+    assert out.correctable
+    assert "candidate.payload.statement" in out.detail
+
+
+def test_the_stuck_candidates_exact_payload_is_declined():
+    """The shape that actually reached the inbox and jammed it (2026-09). It must
+    decline at INTAKE, where the model can still be re-asked — not on approve."""
+    out = _validate(
+        _typed_raw(
+            "global_knowledge",
+            {
+                "definition": "an active employee is one with no termination date",
+                "fact_type": "business_rule",
+                "intent": "define active employee",
+                "scope": "employee",
+            },
+        )
+    )
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_MALFORMED
+    assert out.correctable
+    # The message names the offending keys AND why they are refused, because it is
+    # the corrective prompt.
+    assert "'definition'" in out.detail and "'intent'" in out.detail
+    assert "statement" in out.detail
+
+
+def test_well_formed_global_knowledge_payload_passes():
+    out = _validate(
+        _typed_raw(
+            "global_knowledge",
+            {
+                "statement": "an active employee is one with no termination date",
+                "knowledge_type": "business_rule",
+                "related_terms": ["active", "headcount"],
+                "scope": "employee",
+            },
+        )
+    )
+    assert isinstance(out, ExtractedCandidate)
+    # The payload is forwarded UNCHANGED — these readers check, they never rewrite.
+    assert out.payload["statement"].startswith("an active employee")
+
+
+def test_global_knowledge_unknown_key_is_declined_as_an_unscanned_surface():
+    """An off-contract key ALONGSIDE a valid statement is still refused: the leakage
+    gate scans four named fields, so anything else is a text surface nothing scans."""
+    out = _validate(
+        _typed_raw(
+            "global_knowledge",
+            {
+                "statement": "an active employee is one with no termination date",
+                "definition": "employees in dept 0420 are active",
+            },
+        )
+    )
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_MALFORMED
+    assert "'definition'" in out.detail
+    assert "leakage gate" in out.detail
+    # The refused key's VALUE is never echoed back (it is the thing nothing scanned).
+    assert "0420" not in out.detail
+
+
+def test_global_knowledge_related_terms_as_a_string_is_declined():
+    # `knowledge_seed_from_candidate` walks this for string leaves; a bare string
+    # would iterate as characters.
+    out = _validate(
+        _typed_raw("global_knowledge", {"statement": "a fact", "related_terms": "active"})
+    )
+    assert isinstance(out, Decline)
+    assert "candidate.payload.related_terms" in out.detail
+
+
+def test_global_knowledge_keys_match_the_leakage_gate_surfaces():
+    """The closed key set is EXACTLY what the S5 gate scans — every key intake permits
+    is a scanned surface, with no exception (`knowledge_type` was the one delta until
+    the gate grew it). Spelled in two modules to avoid the import; pinned here so a
+    change to either is a failing test rather than a silent unscanned surface."""
+    from data_agent.learning.extractor.validation import _GLOBAL_KNOWLEDGE_KEYS
+    from data_agent.learning.leakage.gate import _ENTITY_FREE_SURFACES
+
+    assert set(_ENTITY_FREE_SURFACES["global_knowledge"]) == _GLOBAL_KNOWLEDGE_KEYS
+
+
+def test_every_non_blueprint_type_has_a_payload_reader():
+    """A fifth candidate type must not silently re-open the accept-any-object hole."""
+    from data_agent.learning.extractor.validation import _PAYLOAD_READERS, CANDIDATE_TYPES
+
+    assert set(_PAYLOAD_READERS) == set(CANDIDATE_TYPES) - {"blueprint"}
+
+
+def test_user_knowledge_without_statement_is_declined():
+    """`UserKnowledgeRecord.from_candidate` DEFAULTS `statement` to "" — so without
+    this check a malformed payload commits a blank per-user fact, silently."""
+    out = _validate(_typed_raw("user_knowledge", {"fact_type": "preference"}))
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_MALFORMED
+    assert "candidate.payload.statement" in out.detail
+
+
+def test_user_knowledge_with_an_extra_key_still_passes():
+    """No closed key set on the entity-BEARING, per-user target — and `user_id` in
+    particular is accepted here and then discarded by the commit (R6/D17)."""
+    out = _validate(
+        _typed_raw(
+            "user_knowledge",
+            {"statement": "I mean the NA region", "scope": "user", "user_id": "user-1"},
+        )
+    )
+    assert isinstance(out, ExtractedCandidate)
+
+
+def _schema_edit_payload(**overrides) -> dict:
+    payload = {
+        "edit_kind": "add_rule",
+        "target": {"database": "payroll"},
+        "patch": "rules:\n  - id: active_employee",
+        "statement": "define active_employee",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_schema_edit_without_a_patch_is_declined():
+    """An absent patch opens an EMPTY pull request — `SchemaEditPatch.from_payload`
+    defaults `proposed_yaml` to "" and nothing downstream objects."""
+    payload = _schema_edit_payload()
+    del payload["patch"]
+    out = _validate(_typed_raw("schema_edit", payload))
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_MALFORMED
+    # BOTH accepted names are offered: declining on `patch` alone would ask a model
+    # that sent `proposed_yaml` to add a field it had not omitted.
+    assert "candidate.payload.patch" in out.detail
+    assert "candidate.payload.proposed_yaml" in out.detail
+
+
+def test_schema_edit_without_a_target_catalog_is_declined():
+    payload = _schema_edit_payload()
+    del payload["target"]
+    out = _validate(_typed_raw("schema_edit", payload))
+    assert isinstance(out, Decline)
+    assert "candidate.payload.target_catalog" in out.detail
+    assert "candidate.payload.target.database" in out.detail
+
+
+def test_valid_schema_edit_passes():
+    out = _validate(_typed_raw("schema_edit", _schema_edit_payload()))
+    assert isinstance(out, ExtractedCandidate)
+
+
+def test_schema_edit_passes_under_the_alias_field_names():
+    """The Locked names and the fixture names are both live (`from_payload` reads
+    `edit_kind or edit_type`, `proposed_yaml or patch`, `target_catalog or
+    target.database`), so intake must accept the same disjunction."""
+    out = _validate(
+        _typed_raw(
+            "schema_edit",
+            {
+                "edit_type": "add_rule",
+                "target_catalog": "payroll",
+                "proposed_yaml": "rules:\n  - id: active_employee",
+                "statement": "define active_employee",
+            },
+        )
+    )
+    assert isinstance(out, ExtractedCandidate)
+
+
+def test_schema_edit_wrong_typed_proposed_yaml_beside_a_valid_patch_is_declined():
+    """Intake checks the aliases in the WRITER'S precedence (`proposed_yaml or patch`).
+    A wrong-typed `proposed_yaml` next to a valid `patch` must decline: the writer
+    would SELECT the wrong-typed value, so letting the pair pass on the strength of
+    `patch` waves through exactly the payload `from_payload` mis-reads."""
+    out = _validate(
+        _typed_raw("schema_edit", _schema_edit_payload(proposed_yaml=123))
+    )
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_MALFORMED
+    assert "candidate.payload.proposed_yaml" in out.detail

@@ -13,6 +13,7 @@ place that flag is set. Nothing here may hand an interpreter exception string to
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any, get_args
 
 from data_agent.runtime.blueprint.template import TemplateBindError, validate_optional_pattern
@@ -1293,6 +1294,295 @@ def _blueprint_payload(raw: dict[str, Any]) -> BlueprintPayload:
     )
 
 
+# --- the NON-blueprint payloads (§3.3) ----------------------------------------------
+#
+# WHY THESE EXIST. Until this branch checked anything, `to_candidate` asked of a
+# non-blueprint payload only that it BE an object — so a `global_knowledge` candidate
+# whose payload read {definition, fact_type, intent, scope} passed intake, passed the S5
+# leakage gate (which scans a FIXED four-field list and therefore never looked at
+# `definition` or `intent` at all), reached a reviewer, was approved — and only THEN
+# died, inside `knowledge_seed_from_candidate`, on a `statement` that had never been
+# there. The scheduler could report that only as a landing failure, i.e. as INFRA, so the
+# approve answered 503 and retried forever without ever being able to succeed. Intake is
+# the one place where the same defect is still a CORRECTABLE decline the model can
+# re-emit against, instead of a hold no human action can clear.
+#
+# WHAT THEY CHECK IS DERIVED FROM WHAT LANDING READS — never from a hand-kept list of
+# plausible field names, which is the rule this plane keeps re-learning. Each reader
+# below mirrors, field for field, the one function that consumes its payload:
+#
+#   global_knowledge → `generalize/mapping.py::knowledge_seed_from_candidate`
+#   user_knowledge   → `user/models.py::UserKnowledgeRecord.from_candidate`
+#   schema_edit      → `schema_edit/models.py::SchemaEditPatch.from_payload`
+#
+# Two of those three DEFAULT every field they read, which is worse than raising: a
+# malformed `user_knowledge` payload commits a record with a BLANK statement, and a
+# malformed `schema_edit` opens a PR carrying an empty patch against no catalog. Neither
+# fails; both are silent. So REQUIRED here means "the consumer would otherwise default
+# this into nothing", not merely "the consumer raises".
+
+# The COMPLETE key set a `global_knowledge` payload may carry: the four content surfaces
+# the S5 gate scans (`leakage/gate.py::_ENTITY_FREE_SURFACES["global_knowledge"]`) plus
+# the `knowledge_type` label 05 §global_knowledge declares (no code reads it; the docs
+# name it, and a payload that carries it is not thereby malformed).
+#
+# Spelled here rather than imported, because importing the gate would drag the semantic
+# scanner + the user store into the validator for one tuple; `test_global_knowledge_keys_
+# match_the_leakage_gate_surfaces` pins the two together instead — the same arrangement
+# `schema.py::_SEARCH_KIND_ENUM` has with `prior_art.py::KNOWN_KINDS`.
+_GLOBAL_KNOWLEDGE_KEYS = frozenset(
+    {"statement", "knowledge_type", "related_terms", "structured", "scope"}
+)
+
+# How many off-contract keys one decline names. A payload with more than this has a
+# systemic problem, and the message is prompt text before it is a log line.
+_MAX_LISTED_KEYS = 6
+
+
+def _non_empty_text(value: Any, *, at: str, requirement: str) -> str:
+    """We are about to store this as the artifact's ONLY identifying text.
+
+    NOT `as_text`: that coerces a number, and `knowledge_seed_from_candidate` rejects a
+    non-`str` `statement` outright — a coercion here would merely move the same failure to
+    the far side of a human approve. Whitespace-only is rejected for the same reason it is
+    there: a blank statement recalls nothing and only pollutes the index.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ShapeError(at, requirement, value)
+    return value
+
+
+def _first_non_empty(candidates: tuple[tuple[str, Any], ...], *, requirement: str) -> str:
+    """The first usable value among several ALIAS keys, or a `ShapeError` naming them all.
+
+    `SchemaEditPatch.from_payload` reads three of its fields as `payload.get(a) or
+    payload.get(b) or ""` — the Locked names and the fixture names both work — so the intake
+    check has to accept the same disjunction on the same precedence. It also has to name
+    EVERY alias when none is usable: declining on `patch` alone would ask a model that
+    already sent `proposed_yaml` to add a field it had not omitted.
+
+    *candidates* is (dotted path, value) in the downstream `or`-chain's order. A wrong-TYPE
+    alias declines immediately rather than falling through, because `or` would skip it
+    silently and the model would never learn which of the two names it got wrong.
+    """
+    for path, value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value
+        if value is not None and not isinstance(value, str):
+            raise ShapeError(path, requirement, value)
+    raise ShapeError(" or ".join(path for path, _ in candidates), requirement, None, absent=True)
+
+
+def _global_knowledge_payload(raw: dict[str, Any]) -> Decline | None:
+    """Check a `global_knowledge` payload against what LANDING reads.
+
+    `statement` is the seed's whole first line and the ONLY field
+    `knowledge_seed_from_candidate` refuses to default — it raises on an absent or non-`str`
+    one, which is the exact defect this reader was written for.
+
+    The other four are optional, and their TYPE checks are the one thing here not forced by a
+    downstream raise: the mapper flattens `related_terms`/`structured` through `_collect_text`,
+    which walks a dict, a list or a bare string without complaint. It is not indifferent to
+    which, though — it just fails QUIETLY. `related_terms: "active, headcount"` lands as ONE
+    term rather than two, and a list-shaped `structured` lands leaves keyed by index. So the
+    types are checked against the DECLARED contract (the same one `schema.py` puts in front of
+    the model) rather than against the raise, on the rule that a landed artifact should be the
+    shape the reviewer approving it believes it is.
+
+    UNIQUELY AMONG THE THREE, the key set is CLOSED, and that is a leakage rule rather than a
+    tidiness one: this payload lands in the GLOBAL, scope-bypassed knowledge index, and the S5
+    gate scans exactly the surfaces named in `_GLOBAL_KNOWLEDGE_KEYS` and nothing else. A key
+    outside that set is therefore an UNSCANNED TEXT SURFACE — text that reaches a reviewer's
+    card and (if the mapper ever grows to read it) the global index, having been checked for
+    entities by nothing at all. The stuck candidate carried two of them, `definition` and
+    `intent`, and the gate reported `pass` on a payload it had never read.
+    """
+    at = "candidate.payload"
+    unknown = sorted(set(raw) - _GLOBAL_KNOWLEDGE_KEYS)
+    if unknown:
+        # NOT a `ShapeError`: nothing about the SHAPE of these keys is wrong — the objection
+        # is that they exist at all, which is not the sentence `ShapeError` writes. The exit
+        # is the same one (`_malformed`, correctable), so the corrective turn is unchanged.
+        # The key names are MODEL-AUTHORED text on their way into prompt text, so they go
+        # through `_quoted` exactly like a session literal does.
+        listed = ", ".join(_quoted(key) for key in unknown[:_MAX_LISTED_KEYS])
+        return _malformed(
+            "global_knowledge",
+            f"{at} carries {listed} — a global_knowledge payload may carry ONLY "
+            "statement, knowledge_type, related_terms, structured and scope. The leakage "
+            "gate scans exactly those five surfaces, so text "
+            "under any other key would reach the GLOBAL, scope-bypassed knowledge index "
+            "having been scanned for entities by nothing at all. State the fact in "
+            "`statement` (supporting terms in `related_terms` or `structured`) and drop "
+            "the remaining keys.",
+        )
+    require(
+        raw,
+        "statement",
+        _non_empty_text,
+        at=at,
+        requirement=(
+            "a non-empty, ENTITY-FREE sentence stating the fact being learned — it "
+            "becomes the whole text of the landed knowledge chunk"
+        ),
+    )
+    optional(
+        raw,
+        "knowledge_type",
+        as_text,
+        at=at,
+        requirement='a short label for the kind of fact (e.g. "business_rule")',
+        default=None,
+    )
+    for index, term in enumerate(
+        optional(
+            raw,
+            "related_terms",
+            as_array,
+            at=at,
+            requirement="an ARRAY of entity-free terms this fact should also be recalled by",
+            default=[],
+        )
+    ):
+        _non_empty_text(
+            term,
+            at=f"{at}.related_terms[{index}]",
+            requirement="a non-empty term, as a string",
+        )
+    optional(
+        raw,
+        "structured",
+        as_object,
+        at=at,
+        requirement="an OBJECT of supporting entity-free detail",
+        default={},
+    )
+    optional(
+        raw,
+        "scope",
+        as_text,
+        at=at,
+        requirement="a string naming what this fact is about (it titles the landed chunk)",
+        default=None,
+    )
+    return None
+
+
+def _user_knowledge_payload(raw: dict[str, Any]) -> Decline | None:
+    """Check a `user_knowledge` payload against `UserKnowledgeRecord.from_candidate`.
+
+    `statement` is required for the reason the reader's default hides: it is `payload.get(
+    "statement", "")`, so a payload without one COMMITS — a blank per-user fact that recalls
+    nothing, with no error anywhere to say so.
+
+    NO closed key set here, deliberately. This target is entity-BEARING by contract (the S5
+    gate's remit stops at the global types), it lands in a per-user store recalled only under
+    that user's scope, and the extra key the reader is most likely to meet is `user_id` — which
+    `from_candidate` reads and DISCARDS in favour of the session's authenticated user (R6/D17).
+    Rejecting unknown keys would decline candidates the consumer already handles safely.
+    """
+    at = "candidate.payload"
+    require(
+        raw,
+        "statement",
+        _non_empty_text,
+        at=at,
+        requirement="a non-empty sentence stating the per-user fact being remembered",
+    )
+    optional(
+        raw,
+        "fact_type",
+        as_text,
+        at=at,
+        requirement='a short label for the kind of fact (e.g. "preference")',
+        default=None,
+    )
+    optional(
+        raw,
+        "scope",
+        as_text,
+        at=at,
+        requirement='a string naming the fact\'s scope (defaults to "user")',
+        default=None,
+    )
+    optional(
+        raw,
+        "structured",
+        as_object,
+        at=at,
+        requirement="an OBJECT of supporting detail",
+        default={},
+    )
+    return None
+
+
+def _schema_edit_payload(raw: dict[str, Any]) -> Decline | None:
+    """Check a `schema_edit` payload against `SchemaEditPatch.from_payload`.
+
+    Every field that reader touches is defaulted, and the defaults are the danger: a payload
+    missing its patch opens a PR whose body is an empty string against a catalog path derived
+    from `""`. The bot never auto-commits (D18), so nothing is corrupted — but a reviewer is
+    sent an empty PR to judge, which is the most expensive possible way to say "malformed".
+
+    The three alias pairs are the reader's own `or`-chains, in its order, via `_first_non_empty`.
+    No closed key set: a schema_edit is human-gated and entity-bearing (it quotes catalog YAML),
+    so an extra key is a reviewer's problem rather than a leak.
+    """
+    at = "candidate.payload"
+    require(
+        raw,
+        "statement",
+        _non_empty_text,
+        at=at,
+        requirement="a non-empty sentence stating what the catalog edit changes and why",
+    )
+    _first_non_empty(
+        ((f"{at}.edit_kind", raw.get("edit_kind")), (f"{at}.edit_type", raw.get("edit_type"))),
+        requirement=(
+            'a non-empty string naming the kind of catalog edit (e.g. "add_rule") — under '
+            "either name; the writer reads edit_kind first, then edit_type"
+        ),
+    )
+    _first_non_empty(
+        ((f"{at}.proposed_yaml", raw.get("proposed_yaml")), (f"{at}.patch", raw.get("patch"))),
+        requirement=(
+            "a non-empty string carrying the proposed catalog YAML — under either name; "
+            "the writer reads proposed_yaml first, then patch, and an absent patch opens "
+            "an EMPTY pull request"
+        ),
+    )
+    target = optional(
+        raw,
+        "target",
+        as_object,
+        at=at,
+        requirement='an OBJECT naming what the edit targets, as {"database": ...}',
+        default={},
+    )
+    _first_non_empty(
+        (
+            (f"{at}.target_catalog", raw.get("target_catalog")),
+            (f"{at}.target.database", target.get("database")),
+        ),
+        requirement=(
+            "a non-empty string naming the catalog database the edit targets — under "
+            "either shape; the writer reads target_catalog first, then target.database"
+        ),
+    )
+    return None
+
+
+# Per non-blueprint type, the reader that checks its payload. `to_candidate` looks up
+# rather than branches, and `test_every_non_blueprint_type_has_a_payload_reader` pins the
+# table against `CANDIDATE_TYPES` — so adding a fifth target FAILS A TEST rather than
+# quietly re-opening the unchecked-payload hole this table exists to close.
+_PAYLOAD_READERS: dict[str, Callable[[dict[str, Any]], Decline | None]] = {
+    "global_knowledge": _global_knowledge_payload,
+    "user_knowledge": _user_knowledge_payload,
+    "schema_edit": _schema_edit_payload,
+}
+
+
 def to_candidate(
     raw: Any,
     summary: SessionSummary,
@@ -1354,8 +1644,22 @@ def to_candidate(
                 at="candidate",
                 requirement=f"an object carrying the {ctype} payload",
             )
+            # ...and its FIELDS, against what the type's landing actually reads
+            # (`_PAYLOAD_READERS`). `.get`, not `[...]`: a candidate type added without a
+            # reader must degrade to the old accept-any-object behaviour, never to a
+            # KeyError out of the one function documented never to raise. The parity test
+            # is what makes that gap loud at build time instead.
+            reader = _PAYLOAD_READERS.get(ctype)
+            payload_decline = reader(payload) if reader is not None else None
+            if payload_decline is not None:
+                return payload_decline
         except ShapeError as exc:
             return _malformed(ctype, str(exc))
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            # The same BELT the blueprint path has, for the same reason: a reader's own
+            # bug must become a traceable decline, not an un-acked queue message that
+            # dead-letters the whole session.
+            return _unreadable(ctype, f"{ctype} payload", exc)
         return ExtractedCandidate(header=header, payload=dict(payload))
 
     # --- blueprint depth path ---

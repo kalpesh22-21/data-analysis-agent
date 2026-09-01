@@ -32,6 +32,7 @@ from data_agent.learning.candidate.models import CandidateEnvelope, CandidateSta
 from data_agent.learning.inbox import ReviewInbox
 from data_agent.learning.inbox.service import _build_inbox_from_env, create_inbox_app
 from data_agent.learning.promotion import PromotionScheduler
+from data_agent.learning.promotion.landing import LandingInvalidError
 
 from ..promotion.helpers import (
     FakeHitCountReader,
@@ -527,6 +528,43 @@ def test_shipped_offline_construction_refuses_landing_approve_503(
     )
     assert resp.status_code == 503
     assert asyncio.run(inbox._store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
+
+
+def test_approve_of_a_malformed_payload_is_409_not_503(enabled: None) -> None:
+    """The other half of the mapping above, and the reason it was added: a landing that
+    fails DETERMINISTICALLY (the payload cannot be mapped onto a seed) is not a plane
+    outage. It answers 409 with an instruction the reviewer can act on — 503 "landing
+    plane unavailable" invited an approve-retry that could never have succeeded."""
+    store = InMemoryCandidateStore()
+    env = with_type(make_blueprint_candidate(status=CandidateStatus.IN_REVIEW), "global_knowledge")
+    _populate(store, [env])
+    scheduler = PromotionScheduler(
+        store,
+        probe=FakeWarehouseProbe(),
+        hit_counts=FakeHitCountReader(),
+        policy=promotion_policy(),
+        # The real writer's failure mode on a payload with no `statement`: its map
+        # step wraps the mapper's ValueError into the TYPED LandingInvalidError.
+        landing_writer=FakeLandingWriter(
+            fail=LandingInvalidError("empty knowledge statement"), fail_times=99
+        ),
+        require_landing=True,
+        clock=lambda: "2026-07-09T00:00:00+00:00",
+    )
+    client = _client(ReviewInbox(store, scheduler=scheduler), write_plane="full")
+
+    resp = client.post(
+        f"/inbox/{env.candidate_id}/approve",
+        json={"token": REVIEWER_TRIAL_TOKEN},
+        headers=AUTH,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == (
+        "candidate payload cannot be landed (malformed for its type); repair it "
+        "in the store or reject it — approving again will not help"
+    )
+    # The candidate was NOT faked into `validated`.
+    assert asyncio.run(store.get(env.candidate_id)).status == CandidateStatus.IN_REVIEW
 
 
 # --- happy paths mutate the store ---------------------------------------------

@@ -21,6 +21,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from data_agent.corpus.seeds import BlueprintSeed, KnowledgeSeed
+from data_agent.runtime.blueprint.models import BlueprintParseError
 from data_agent.runtime.retrieval.corpus_loader import load_corpus
 
 from ..candidate.models import CandidateEnvelope
@@ -41,7 +42,22 @@ class LandingEntityError(Exception):
     """A settled entity span leaked into the generalized landing seed — the last-gate D17 defense.
 
     RAISED so the writer NEVER lands an entity-bearing blueprint into the global, recallable
-    corpus; the scheduler then HOLDS `landing_failed`.
+    corpus; the scheduler then HOLDS `landing_entity_leak` — its OWN reason, because this is
+    deterministic (the same envelope leaks the same span every cycle) and is neither a
+    transient outage nor something a reviewer can edit the payload out of.
+    """
+
+
+class LandingInvalidError(Exception):
+    """The candidate payload cannot be MAPPED onto a corpus seed — deterministic, not infra.
+
+    Raised by `CorpusLandingWriter.land` from its MAP step ONLY, i.e. strictly BEFORE the
+    driver or the embedder is touched, wrapping whatever the seed mappers raised (`ValueError`,
+    `KeyError`, `TypeError`, `AttributeError`, `BlueprintParseError`). That PHASE boundary is
+    the classification: the scheduler holds `landing_invalid` on exactly this type, so an infra
+    client that happens to leak a `ValueError` mid-write can never be misfiled as a payload
+    defect (it stays `landing_failed`, transient, retried). A retry of THIS error re-reads the
+    same stored payload and fails identically, forever — only repairing the payload clears it.
     """
 
 
@@ -207,8 +223,11 @@ class CorpusLandingWriter:
         Order: map → entity-defense → embed + MERGE. *forbidden_spans* are the spans S5 identified,
         captured by the caller BEFORE the strip; the last-gate defense RAISES if any survives into
         the seed. *verified* is the Phase-3 approval flag stamped onto the seed — `source` stays
-        `"learning"` either way. Any failure RAISES, so the scheduler HOLDS `landing_failed` and
-        never writes `validated` (§3.1).
+        `"learning"` either way. Any failure RAISES, so the scheduler HOLDS and never writes
+        `validated` (§3.1) — under `landing_entity_leak`, `landing_invalid` or `landing_failed`
+        according to WHAT raised (`scheduler._land_and_promote` states the taxonomy). The map
+        step is deliberately first: a payload that cannot become a seed is caught before an
+        embedding call is spent on it.
         """
         seed_id = landing_id(env)
         if not (env.dedup is not None and env.dedup.canonical_key):
@@ -228,12 +247,28 @@ class CorpusLandingWriter:
         blueprint_seeds: list[BlueprintSeed] = []
         knowledge_seeds: list[KnowledgeSeed] = []
         seed: BlueprintSeed | KnowledgeSeed
-        if env.type == "global_knowledge":
-            seed = knowledge_seed_from_candidate(env, id=seed_id, verified=verified)
-            knowledge_seeds = [seed]
-        else:
-            seed = blueprint_seed_from_candidate(env, id=seed_id, verified=verified)
-            blueprint_seeds = [seed]
+        # The MAP step, wrapped so classification is by PHASE, not by exception type at a
+        # distance: anything the mappers raise here is a payload that cannot become a seed
+        # (deterministic, `landing_invalid`), because no driver/embedder has been touched
+        # yet. After this block, every raise is treated as infra (`landing_failed`).
+        try:
+            if env.type == "global_knowledge":
+                seed = knowledge_seed_from_candidate(env, id=seed_id, verified=verified)
+                knowledge_seeds = [seed]
+            else:
+                seed = blueprint_seed_from_candidate(env, id=seed_id, verified=verified)
+                blueprint_seeds = [seed]
+        except (
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            BlueprintParseError,
+        ) as exc:
+            raise LandingInvalidError(
+                f"candidate {env.candidate_id} cannot be mapped onto a "
+                f"{env.type} landing seed: {exc}"
+            ) from exc
         # Last gate BEFORE any embed/neo4j write: an entity in the seed → raise, no land.
         _assert_seed_entity_free(env.candidate_id, seed, forbidden_spans)
         await load_corpus(
@@ -325,4 +360,16 @@ class CorpusLandingWriter:
         return stamped
 
 
-__all__ = ["CorpusLandingWriter", "LandingEntityError", "landing_id"]
+# RE-EXPORTED, not merely imported. `BlueprintParseError` is what
+# `blueprint_seed_from_candidate` raises on a payload this writer cannot map, so it is part
+# of THIS module's failure contract — the caller that has to tell a deterministic mapping
+# defect from a transient neo4j outage (`scheduler._land_and_promote`) needs the whole set
+# in one import, from the plane it is catching, rather than reaching across into
+# `runtime.blueprint.models` for one name.
+__all__ = [
+    "BlueprintParseError",
+    "CorpusLandingWriter",
+    "LandingEntityError",
+    "LandingInvalidError",
+    "landing_id",
+]

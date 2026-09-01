@@ -183,6 +183,119 @@ _BLUEPRINT_PAYLOAD_SCHEMA = {
     "required": ["intent", "kind", "source_tool_call_refs", "accepted_signal", "parameterization"],
 }
 
+# --- the non-blueprint payloads -----------------------------------------------------
+#
+# These were an unspecified `{"type": "object"}` until a `global_knowledge` candidate
+# arrived carrying {definition, fact_type, intent, scope} — four plausible names, none of
+# them the contract's, and nothing on either side of the wire to say so until the approve
+# that should have landed it raised on a `statement` that was never sent. The model-side
+# schema is the cheapest of the three places to say it (here it costs a re-generation; at
+# intake it costs a corrective turn; at landing it costs a human).
+#
+# The required fields are the ones `validation.py::_PAYLOAD_READERS` enforces, which are
+# in turn the ones landing READS — three statements of one contract, kept in step by
+# `tests/learning/extractor/test_validation.py`. Every description here is written for a
+# model that has already got it wrong once, so it names the alternative it must not use.
+
+_GLOBAL_KNOWLEDGE_PAYLOAD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "statement": {
+            "type": "string",
+            "description": (
+                "The fact being learned, as one non-empty ENTITY-FREE sentence. This "
+                "field is REQUIRED and is the whole text of the landed knowledge chunk — "
+                "do NOT name it 'definition', 'fact' or 'intent'."
+            ),
+        },
+        "knowledge_type": {
+            "type": "string",
+            "description": (
+                "The kind of fact, e.g. 'business_rule' or 'definition'. NOT 'fact_type'."
+            ),
+        },
+        "related_terms": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Entity-free terms this fact should also be recalled by.",
+        },
+        "structured": {
+            "type": "object",
+            "description": "Optional supporting detail, as an object of entity-free strings.",
+        },
+        "scope": {
+            "type": "string",
+            "description": "What the fact is about; it titles the landed chunk.",
+        },
+    },
+    "required": ["statement"],
+    # CLOSED, and only for this type: a global_knowledge payload lands in the GLOBAL,
+    # scope-bypassed knowledge index, and the S5 leakage gate scans exactly statement,
+    # structured, related_terms and scope. Any other key is a text surface NOTHING scans,
+    # so the model must not be able to invent one (`validation.py::_global_knowledge_payload`
+    # rejects it too — this schema only makes the good emission likelier).
+    "additionalProperties": False,
+}
+
+_USER_KNOWLEDGE_PAYLOAD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "statement": {
+            "type": "string",
+            "description": (
+                "The per-user fact being remembered, as one non-empty sentence. REQUIRED."
+            ),
+        },
+        "fact_type": {"type": "string", "description": "e.g. 'preference' or 'alias'."},
+        "scope": {"type": "string", "description": "The fact's scope; defaults to 'user'."},
+        "structured": {"type": "object", "description": "Optional supporting detail."},
+    },
+    "required": ["statement"],
+    # OPEN, unlike global_knowledge: this target is entity-bearing by contract and lands
+    # in a per-user store, so an extra key is not a leak. `user_id` in particular is
+    # accepted and then IGNORED — the commit is scoped to the session's authenticated
+    # user, never to a model-supplied one (R6/D17).
+}
+
+_SCHEMA_EDIT_PAYLOAD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "statement": {
+            "type": "string",
+            "description": "What the catalog edit changes and why, in one sentence. REQUIRED.",
+        },
+        "edit_kind": {
+            "type": "string",
+            "description": "The kind of edit, e.g. 'add_rule'. REQUIRED (alias: edit_type).",
+        },
+        "target": {
+            "type": "object",
+            "properties": {"database": {"type": "string"}},
+            "description": (
+                "What the edit targets: {'database': '<catalog database>'}. REQUIRED "
+                "(alias: a top-level 'target_catalog' string)."
+            ),
+        },
+        "patch": {
+            "type": "string",
+            "description": (
+                "The proposed catalog YAML. REQUIRED (alias: proposed_yaml) — an absent "
+                "patch opens an EMPTY pull request."
+            ),
+        },
+        "risk": {
+            "type": "string",
+            "description": "Reviewer-facing risk note; defaults to 'medium'.",
+        },
+    },
+    # `edit_kind`/`target`/`patch` are each satisfiable under a SECOND name the writer
+    # also reads (edit_type / target_catalog / proposed_yaml), so JSON Schema `required`
+    # can only carry `statement` without wrongly rejecting the aliased shape. The
+    # disjunction is enforced at intake instead (`validation.py::_schema_edit_payload`),
+    # where a failure is a correctable decline rather than a refused generation.
+    "required": ["statement"],
+}
+
 _CANDIDATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -206,21 +319,43 @@ _CANDIDATE_SCHEMA = {
         "payload": {
             "type": "object",
             "description": (
-                "Type-specific payload. For type=='blueprint' it MUST be the blueprint "
-                "payload (required: intent, kind, source_tool_call_refs, accepted_signal, "
-                "parameterization) — see the conditional schema below."
+                "Type-specific payload; EVERY type has a required shape — see the "
+                "conditional schemas below. blueprint: intent, kind, "
+                "source_tool_call_refs, accepted_signal, parameterization. "
+                "global_knowledge and user_knowledge: 'statement' (never 'definition'). "
+                "schema_edit: statement, edit_kind, target, patch."
             ),
         },
     },
     "required": ["type", "confidence", "evidence", "rationale", "payload"],
-    # Polymorphic payload: only a blueprint candidate's payload is fully specified
-    # (required `kind` + FQ slot `binds_to` + slot-type enum). The if/then leaves the
-    # other three candidate types' payloads as a generic object (not wrongly rejected).
+    # Polymorphic payload: one if/then per candidate type, because the payload's SHAPE is
+    # a function of `type` and there is no other way to say so in JSON Schema. The
+    # blueprint branch was once the only one and the other three were left as a generic
+    # object — which is exactly how a global_knowledge payload with no `statement` was
+    # emitted, accepted, reviewed and approved before anything noticed (see
+    # `validation.py::_PAYLOAD_READERS` for the full story). A schema is not a guarantee
+    # — a model can still emit off-contract, and structured-output support varies by
+    # endpoint — so intake re-checks all of this; this is the cheap half of the belt.
     "allOf": [
         {
             "if": {"properties": {"type": {"const": "blueprint"}}, "required": ["type"]},
             "then": {"properties": {"payload": _BLUEPRINT_PAYLOAD_SCHEMA}},
-        }
+        },
+        {
+            "if": {
+                "properties": {"type": {"const": "global_knowledge"}},
+                "required": ["type"],
+            },
+            "then": {"properties": {"payload": _GLOBAL_KNOWLEDGE_PAYLOAD_SCHEMA}},
+        },
+        {
+            "if": {"properties": {"type": {"const": "user_knowledge"}}, "required": ["type"]},
+            "then": {"properties": {"payload": _USER_KNOWLEDGE_PAYLOAD_SCHEMA}},
+        },
+        {
+            "if": {"properties": {"type": {"const": "schema_edit"}}, "required": ["type"]},
+            "then": {"properties": {"payload": _SCHEMA_EDIT_PAYLOAD_SCHEMA}},
+        },
     ],
 }
 
