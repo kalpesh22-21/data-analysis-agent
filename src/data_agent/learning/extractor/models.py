@@ -306,14 +306,22 @@ class Decline:
     correctable: bool = False
     corrections_attempted: int = 0
     correction_history: tuple[str, ...] = ()
-    # The RAW candidate envelope this decline was judged on — the model's LAST attempt,
-    # verbatim, as `parse_candidates` read it out of the tool call.
+    # The RAW candidate envelope this decline was judged on, verbatim, as
+    # `parse_candidates` read it out of the tool call.
     #
-    # Present ONLY for a decline that survived correction (`extractor.py::_finish` pairs
-    # it by the emitted array's index); every other decline carries `None`, including a
-    # substantive one from the same batch, because a candidate that was never re-asked
-    # has no "last attempt" distinct from its first and nothing downstream may treat the
-    # two as interchangeable.
+    # Present ONLY for a decline a CORRECTION TOUCHED, which is two cases, and WHICH
+    # attempt it holds differs between them:
+    #   - it SURVIVED the correction — re-emitted and declined again, or never
+    #     re-answered — and the payload is the model's LAST attempt, taken by index from
+    #     the array it last emitted (`extractor.py::_finish`);
+    #   - the model WITHDREW it, taking the sanctioned "omit what you cannot fix" exit,
+    #     so there IS no last attempt: the payload is the attempt the correction NAMED,
+    #     taken from the array that correction pointed at
+    #     (`extractor.py::_withdrawn_declines`, resolved at withdrawal time because one
+    #     correction later that array is gone).
+    # Every other decline carries `None`, including a substantive one from the same
+    # batch, because a candidate that was never re-asked has no attempt distinct from
+    # its first and nothing downstream may treat the two as interchangeable.
     #
     # UNVALIDATED BY CONSTRUCTION: it is exactly the JSON that FAILED validation, so
     # every reader normalizes rather than trusts (`candidate/models.py::
@@ -327,6 +335,11 @@ class Decline:
 @dataclass(frozen=True)
 class ExtractionResult:
     candidates: tuple[ExtractedCandidate, ...]
+    # ORDER IS PART OF THE CONTRACT: `(*settled, *withdrawn, *corrected)`. It matters
+    # because `consumer.py::_persist_declined_for_review` takes `eligible[-1]` for the
+    # single review slot, so a decline that SURVIVED correction beats one the model
+    # withdrew — deliberately, since the survivor's `raw_payload` is the model's latest
+    # attempt while the withdrawn one's is the attempt it gave up on.
     declines: tuple[Decline, ...] = ()
     # Corrective turns SPENT on this extraction (0 for the overwhelming majority).
     # Surfaced on the extract span because it is a prompt-quality signal, not a model

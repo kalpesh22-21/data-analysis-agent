@@ -338,6 +338,14 @@ class LearningExtractor:
         kept: list[ExtractedCandidate] = []
         settled: list[Decline] = []  # substantive — judged on content, never re-asked
         pending: list[tuple[int, Decline]] = []  # correctable declines from the LAST batch
+        # Declines the model was asked to correct and then DROPPED from the re-emit,
+        # already FINISHED — payload paired and correction record stamped — at the
+        # moment of withdrawal, which is the only moment both are true. The payload
+        # pairing dies when `raw_candidates` is rebound one line below; the correction
+        # record has to be taken there too because `corrections_attempted` counts what
+        # THIS candidate was asked, and a candidate the model dropped after correction 1
+        # was never asked a second time, whatever later corrections its siblings earned.
+        withdrawn: list[Decline] = []
         history: list[str] = []  # the correction messages already sent, in order
         # The LAST batch the model emitted, in its emitted order — which is what makes
         # `pending`'s indices resolvable to the payload each decline was judged on. Bound
@@ -361,7 +369,7 @@ class LearningExtractor:
                 continue
 
             try:
-                raw_candidates = parse_candidates(result)
+                emitted = parse_candidates(result)
             except SchemaMismatchError as exc:
                 last_exc = exc
                 attempts_left -= 1
@@ -382,6 +390,26 @@ class LearningExtractor:
                 ]
                 continue
 
+            if history and pending:
+                # This array ANSWERS the correction that named `pending`, so the
+                # candidates it drops are withdrawn — banked BEFORE `pending` and
+                # `raw_candidates` are rebound, which is the last moment the pairing
+                # exists (see `_withdrawn_declines`). `and pending` is belt-and-braces:
+                # every path that reaches a re-parse with a non-empty `history` left
+                # `pending` non-empty too (the only exit with an empty one returns), so
+                # it guards nothing today and costs nothing if that stops being true.
+                withdrawn.extend(
+                    replace(
+                        decline,
+                        corrections_attempted=len(history),
+                        correction_history=tuple(history),
+                        raw_payload=payload,
+                    )
+                    for decline, payload in _withdrawn_declines(
+                        pending, raw_candidates, emitted
+                    )
+                )
+            raw_candidates = emitted
             batch_kept, batch_settled, pending = self._validate_batch(raw_candidates, summary)
             # PARTIAL SUCCESS: a candidate that passed every gate is KEPT and never
             # re-asked. Re-emitting the whole array to fix one sibling would put work
@@ -410,7 +438,9 @@ class LearningExtractor:
                 )
                 continue
 
-            return _finish(kept, settled, pending, history, summary, raw_candidates)
+            return _finish(
+                kept, settled, pending, withdrawn, history, summary, raw_candidates
+            )
 
         if history:
             # See ONE ASYMMETRY above: a correction was issued and the model then
@@ -421,7 +451,9 @@ class LearningExtractor:
                 "%d correction(s) — returning the %d candidate(s) already validated",
                 summary.session_id, len(history), len(kept),
             )
-            return _finish(kept, settled, pending, history, summary, raw_candidates)
+            return _finish(
+                kept, settled, pending, withdrawn, history, summary, raw_candidates
+            )
         assert last_exc is not None
         raise last_exc
 
@@ -521,23 +553,74 @@ class LearningExtractor:
         return messages
 
 
+def _withdrawn_declines(
+    pending: list[tuple[int, Decline]],
+    named_in: list[dict],
+    re_emitted: list[dict],
+) -> list[tuple[Decline, dict | None]]:
+    """The declines a corrective re-emit DROPPED, each with the payload it was named in.
+
+    THE PAIRING RULE. `build_correction_message` asks the model to call emit_candidates again
+    with "ONLY the corrected N candidates listed above", in that order, and to OMIT any it
+    cannot fix. So re-emitted position `i` answers `pending[i]`, and positions `>= len(
+    re_emitted)` were omitted: the withdrawn tail is exactly `pending[len(re_emitted):]`. A
+    longer re-emit withdraws nothing — the extra candidates are just validated normally.
+
+    THE HONEST LIMITATION: a model that omits from the MIDDLE rather than the tail has its
+    omission attributed to the wrong sibling by index. That is a LABELLING error — the withdrawn
+    decline names candidate B's fault while carrying candidate C's payload — not a loss: the
+    COUNT of declines is still right, and the alternative (matching re-emitted candidates back
+    to their originals by content) would have to guess at exactly the content the model was
+    told to change.
+
+    The payload comes from *named_in* — the array the correction POINTED AT — never from the
+    re-emit, which by construction does not contain these candidates at all. The `isinstance`
+    half of the bound is the live one: `parse_candidates` checks that `candidates` is a LIST and
+    validates no element, so a non-dict element reaches `_validate_batch`, declines, and arrives
+    here. The range half cannot fire — the indices come from an `enumerate` over this very array
+    — and is kept as the same assumption-free posture `_finish` takes, where the honest degrade
+    is a decline with no payload rather than an IndexError in a queue worker.
+    """
+    return [
+        (
+            decline,
+            (
+                dict(named_in[index])
+                if 0 <= index < len(named_in) and isinstance(named_in[index], dict)
+                else None
+            ),
+        )
+        for index, decline in pending[len(re_emitted):]
+    ]
+
+
 def _finish(
     kept: list[ExtractedCandidate],
     settled: list[Decline],
     pending: list[tuple[int, Decline]],
+    withdrawn: list[Decline],
     history: list[str],
     summary: SessionSummary,
     raw_candidates: list[dict],
 ) -> ExtractionResult:
     """Assemble the result, stamping the correction record onto the declines that SURVIVED it.
 
-    Only *pending* is stamped: a substantive decline was never re-asked and must not look as
+    Only *pending* is stamped HERE: a substantive decline was never re-asked and must not look as
     though it was, while a correctable one that outlived the budget must carry the count and the
     messages, so a reader can tell "could not produce a valid candidate" from "was never asked
     twice". THE PAYLOAD IS STAMPED HERE, at the one place holding both halves — `pending` carries
     each decline's index into the array the model LAST emitted, and that pairing exists nowhere
     else. Index-bounded rather than assumed: an out-of-range index would be a crash in a queue
     worker, and the honest degrade (a decline with no payload) costs a review item, not a session.
+
+    *withdrawn* arrives ALREADY STAMPED and is appended as-is. Those were named in a correction and
+    then dropped from the re-emit — the sanctioned "omit what you cannot fix" exit, which used to
+    leave NO trace at all: the candidate vanished, the span said `decline_count=0`, and an omission
+    was indistinguishable from a candidate that was never proposed. They are stamped upstream
+    because both halves of their record are perishable: the array they were named in is rebound on
+    the next parse, and `corrections_attempted` is PER CANDIDATE — a candidate dropped after the
+    first correction was asked once, however many corrections its surviving siblings went on to
+    earn.
     """
     corrected = [
         replace(
@@ -553,7 +636,7 @@ def _finish(
         )
         for index, decline in pending
     ]
-    if corrected and history:
+    if history and (corrected or withdrawn):
         # The FIRST LINE of each detail, not the whole thing. Every message is one line
         # except the totality checklist, whose remaining lines quote literals of the
         # analyst's accepted SQL — span-worthy under the D25 verbose gate
@@ -561,13 +644,18 @@ def _finish(
         # log. The first line names the candidate's problem in full and quotes nothing.
         _logger.warning(
             "extractor: %d candidate(s) for session %s still declined after %d "
-            "correction(s): %s",
-            len(corrected), summary.session_id, len(history),
-            "; ".join(d.detail.split("\n")[0] for d in corrected),
+            "correction(s) (%d of them WITHDRAWN — named in a correction and then "
+            "omitted from the re-emit): %s",
+            len(corrected) + len(withdrawn), summary.session_id, len(history),
+            len(withdrawn),
+            "; ".join(d.detail.split("\n")[0] for d in (*withdrawn, *corrected)),
         )
     return ExtractionResult(
         candidates=tuple(kept),
-        declines=(*settled, *corrected),
+        # Stable and documented: substantive first (never re-asked), then the withdrawn
+        # ones in the order they were named across corrections, then the ones that
+        # outlived the budget.
+        declines=(*settled, *withdrawn, *corrected),
         corrections=len(history),
     )
 

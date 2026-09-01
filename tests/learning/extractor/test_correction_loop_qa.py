@@ -38,6 +38,7 @@ from .helpers import (
     make_summary,
     malformed_turn,
     scripted_turn,
+    search_turn,
 )
 
 _RETRIES = 2
@@ -308,6 +309,334 @@ async def test_the_payload_survives_the_model_going_silent_after_a_correction() 
     assert len(result.declines) == 1
     assert result.declines[0].raw_payload["payload"]["intent"] == "the last attempt"
 
+
+# --- the withdrawn candidate: the sanctioned omit still leaves a trace -------------
+
+
+async def test_a_re_emit_that_omits_everything_still_declines_what_was_asked_for() -> None:
+    """The live loss (session s8e36f59b...), reduced to the two candidates the correction
+    named: there the re-emit was `{"candidates": []}` and every named candidate vanished.
+    No decline, no audit, `decline_count=0` on the span, and "could not produce a valid
+    candidate" became indistinguishable from "was never proposed", which is the ONE
+    distinction the whole correction record exists to keep. Omitting is a sanctioned exit
+    ("omit that candidate entirely"), not a licence to erase the ask."""
+    first = _bad_grain(intent="first candidate")
+    second = _bad_grain(intent="second candidate")
+    extractor = make_extractor([scripted_turn([first, second]), scripted_turn([])])
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    correction = _correction_text(extractor)
+    assert result.candidates == ()
+    assert result.corrections == 1
+    assert len(result.declines) == 2
+    assert all(d.corrections_attempted == 1 for d in result.declines)
+    assert all(d.correction_history == (correction,) for d in result.declines)
+    # Paired against the array the correction POINTED AT, not the (empty) re-emit.
+    assert [d.raw_payload["payload"]["intent"] for d in result.declines] == [
+        "first candidate",
+        "second candidate",
+    ]
+
+
+async def test_a_partial_re_emit_keeps_the_fix_and_declines_the_omission() -> None:
+    """The mixed answer, and the pairing rule that reads it: the correction asked for
+    "ONLY the corrected N listed above" in order, so re-emitted position i answers
+    pending[i] and positions past the end were omitted. One fix comes back, so the
+    withdrawn one is the SECOND — asserted by payload, because an implementation that
+    always blamed the first would pass a count-only test forever."""
+    first = _bad_grain(intent="first candidate")
+    second = _bad_grain(intent="second candidate")
+    extractor = make_extractor(
+        [scripted_turn([first, second]), scripted_turn([_good_grain()])]
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert len(result.candidates) == 1
+    assert len(result.declines) == 1
+    withdrawn = result.declines[0]
+    assert withdrawn.raw_payload["payload"]["intent"] == "second candidate"
+    assert withdrawn.corrections_attempted == 1
+    assert withdrawn.reason == "malformed_candidate"  # its ORIGINAL reason, unchanged
+
+
+async def test_the_withdrawn_payload_is_found_by_emitted_index_not_by_pending_position():
+    """The off-by-one this pairing can actually have. `pending` holds `(index, decline)`
+    where the index is the position in the EMITTED array, and those two coincide for
+    every batch whose bad candidates start at 0 — so a lookup by position in `pending`
+    passes all of those and fails the live shape, where a good candidate sits in front.
+    Here `pending == [(1, first), (2, second)]`: the withdrawn one is `second`, at index
+    2, and a position-based implementation would report `first` instead."""
+    first = _bad_grain(intent="first candidate")
+    second = _bad_grain(intent="second candidate")
+    extractor = make_extractor(
+        [
+            scripted_turn([_good_grain(intent="kept"), first, second]),
+            scripted_turn([_good_grain(intent="fixed first")]),
+        ]
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert len(result.candidates) == 2  # the one accepted up front plus the fix
+    assert len(result.declines) == 1
+    assert result.declines[0].raw_payload["payload"]["intent"] == "second candidate"
+
+
+async def test_a_withdrawal_survives_a_later_correction_and_the_model_going_silent():
+    """Both losing paths at once. The first correction is answered partially — one
+    candidate withdrawn — the survivor earns a SECOND correction, and then the model
+    stops returning parseable tool calls, which exits through the other `_finish` call
+    site. The withdrawal happened two turns and one rebind of `raw_candidates` ago, so
+    if it is not banked at the moment of withdrawal it is gone."""
+    first = _bad_grain(intent="first candidate")
+    second = _bad_grain(intent="second candidate")
+    extractor = make_extractor(
+        [
+            scripted_turn([first, second]),
+            scripted_turn([_bad_grain(intent="the last attempt")]),
+        ]
+        + [malformed_turn() for _ in range(_RETRIES + 1)]
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert result.corrections == _CORRECTIONS
+    assert result.candidates == ()
+    # Withdrawn first, then the one that outlived the budget (`_finish`'s documented order).
+    assert [d.raw_payload["payload"]["intent"] for d in result.declines] == [
+        "second candidate",
+        "the last attempt",
+    ]
+    # The withdrawn one was asked ONCE — it was gone before the second correction was
+    # written — while the survivor was asked both times. `result.corrections` is the run
+    # total; `corrections_attempted` is per candidate, and here they differ.
+    assert [d.corrections_attempted for d in result.declines] == [1, _CORRECTIONS]
+    assert [len(d.correction_history) for d in result.declines] == [1, _CORRECTIONS]
+
+
+async def test_a_re_emit_longer_than_the_correction_asked_for_withdraws_nothing() -> None:
+    """The other side of the pairing rule, and the one an off-by-one gets wrong. Two
+    candidates are named and THREE come back — two repairs and an uninvited extra. There
+    is no withdrawal to record (`pending[len(re_emitted):]` is empty when the re-emit is
+    longer), and the extra is not special: it is validated like any other candidate in
+    the batch, and when it fails it earns the NEXT correction rather than a withdrawal.
+    An implementation that indexed the re-emit by `pending` instead of the other way
+    round would either lose the extra or blame it for a sibling's fault."""
+    extractor = make_extractor(
+        [
+            scripted_turn(
+                [_bad_grain(intent="first candidate"), _bad_grain(intent="second candidate")]
+            ),
+            scripted_turn(
+                [
+                    _good_grain(intent="first, repaired"),
+                    _good_grain(intent="second, repaired"),
+                    _bad_grain(intent="an extra nobody asked for"),
+                ]
+            ),
+            scripted_turn([_bad_grain(intent="the extra, still wrong")]),
+        ]
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert result.corrections == _CORRECTIONS
+    assert sorted(c.payload.intent for c in result.candidates) == [
+        "first, repaired",
+        "second, repaired",
+    ]
+    # ONE decline — the extra, carried through the normal correction path. Two would
+    # mean a withdrawal was invented for a candidate the model actually re-emitted.
+    assert len(result.declines) == 1
+    assert result.declines[0].raw_payload["payload"]["intent"] == "the extra, still wrong"
+    assert result.declines[0].corrections_attempted == _CORRECTIONS
+
+
+async def test_a_full_re_emit_that_is_still_bad_withdraws_nothing_and_banks_nothing_twice():
+    """The stubborn model, which is the case the withdrawn bookkeeping most easily
+    double-counts: every candidate comes back every time, so nothing is ever withdrawn,
+    and the two declines at the end must be the two candidates — not four, and not the
+    first turn's payloads. `withdrawn` accumulates ACROSS corrections while `pending` is
+    rebound each round, so an implementation that banked the pending tail unconditionally
+    (or forgot to rebind) would show its arithmetic here and nowhere else."""
+    extractor = make_extractor(
+        [
+            scripted_turn(
+                [_bad_grain(intent=f"first, attempt {n}"), _bad_grain(intent=f"second, attempt {n}")]
+            )
+            for n in (1, 2, 3)
+        ]
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert result.corrections == _CORRECTIONS
+    assert result.candidates == ()
+    assert len(result.declines) == 2
+    # The LAST attempt, because none of these was withdrawn: they all survived.
+    assert [d.raw_payload["payload"]["intent"] for d in result.declines] == [
+        "first, attempt 3",
+        "second, attempt 3",
+    ]
+    assert all(d.corrections_attempted == _CORRECTIONS for d in result.declines)
+
+
+async def test_a_malformed_turn_between_the_correction_and_the_omit_keeps_one_trace() -> None:
+    """The correction and the answer to it need not be adjacent. A malformed turn in
+    between spends a PARSE attempt and appends its own nudge, leaving `pending` and the
+    array it indexes into untouched — so the re-emit two turns later is still the answer
+    to the correction, and the omission is still a withdrawal. Asserted as an exact list
+    because the failure mode of a banking step in the wrong place is a DUPLICATE, which
+    a `len(declines) >= 2` test would happily accept."""
+    extractor = make_extractor(
+        [
+            scripted_turn(
+                [_bad_grain(intent="first candidate"), _bad_grain(intent="second candidate")]
+            ),
+            malformed_turn(),
+            scripted_turn([]),
+        ]
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    correction = _correction_text(extractor)
+    assert extractor._model_client.calls_made == 3
+    assert result.corrections == 1
+    assert [d.raw_payload["payload"]["intent"] for d in result.declines] == [
+        "first candidate",
+        "second candidate",
+    ]
+    assert all(d.corrections_attempted == 1 for d in result.declines)
+    assert all(d.correction_history == (correction,) for d in result.declines)
+
+
+async def test_a_search_between_the_correction_and_the_omit_keeps_one_trace() -> None:
+    """The same interleaving through the OTHER `continue` in the loop. A search-only turn
+    after a correction is served and costs a search, not a correction — and it is the one
+    branch that rebuilds `messages` wholesale, so it is the likeliest place for the
+    correction's pending set to be dropped on the floor. The re-emit after it still
+    answers the correction, and the omission is still recorded exactly once.
+
+    Reachable, unlike a search AT the emit: `_is_search_only` only lets the emit win when
+    the SAME turn carries both, and nothing stops a corrected model from asking first."""
+    index = InMemoryPriorArtIndex([])
+    extractor = make_extractor(
+        [
+            scripted_turn(
+                [_bad_grain(intent="first candidate"), _bad_grain(intent="second candidate")]
+            ),
+            search_turn("how has this been modelled before"),
+            scripted_turn([]),
+        ],
+        prior_art=index,
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert len(index.search_calls) == 2  # the mandatory pre-fetch plus the served one
+    assert result.corrections == 1
+    assert [d.raw_payload["payload"]["intent"] for d in result.declines] == [
+        "first candidate",
+        "second candidate",
+    ]
+    assert all(d.corrections_attempted == 1 for d in result.declines)
+
+
+async def test_each_withdrawal_pairs_with_the_array_that_named_it_not_the_first_one():
+    """WHY the pairing is resolved at withdrawal time rather than at `_finish`. Two
+    corrections, one candidate dropped by each: the first withdrawal points into the
+    ORIGINAL emit, the second into the FIRST RE-EMIT — an array that no longer exists by
+    the time the result is assembled, and that a `_finish`-side implementation could only
+    reach for by keeping the wrong one. The second decline's payload is therefore the
+    model's own second attempt, which is the attempt a reviewer needs to see.
+
+    The correction RECORD is resolved at the same moment and for the same reason, and it
+    is PER CANDIDATE: the one dropped after the first correction was asked ONCE and says
+    so, while the one that survived to be dropped after the second says 2. A run-total
+    would claim the first candidate had been asked twice, which is the exact "was it
+    actually re-asked?" question the field exists to answer, and which inbox.html renders
+    to a reviewer as "after N corrective rounds"."""
+    extractor = make_extractor(
+        [
+            scripted_turn(
+                [_bad_grain(intent="first candidate"), _bad_grain(intent="second candidate")]
+            ),
+            scripted_turn([_bad_grain(intent="a lone second attempt")]),  # drops the second
+            scripted_turn([]),  # drops what is left
+        ]
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert result.corrections == _CORRECTIONS
+    assert result.candidates == ()
+    assert [d.raw_payload["payload"]["intent"] for d in result.declines] == [
+        "second candidate",  # named in the original emit
+        "a lone second attempt",  # named in the first RE-emit
+    ]
+    # What each was ASKED, not what the run spent: dropped after correction 1 vs 2.
+    assert [d.corrections_attempted for d in result.declines] == [1, 2]
+    assert [len(d.correction_history) for d in result.declines] == [1, 2]
+    # The earlier record is a PREFIX of the later one — same run, read at two moments.
+    assert result.declines[1].correction_history[:1] == result.declines[0].correction_history
+
+
+async def test_a_withdrawn_entry_that_was_never_a_dict_degrades_to_no_payload() -> None:
+    """The honest degrade, on the path that reaches it. `parse_candidates` checks that
+    `candidates` is a LIST and nothing about its elements, so a model can put a bare
+    string in the array; it declines `malformed_candidate`, which is CORRECTABLE, so it
+    is named in a correction like any other — and when the model then omits it, the
+    withdrawal has to pair a decline with an entry that was never a payload.
+
+    The cost of getting this wrong is not a bad review item, it is a `TypeError` inside a
+    queue worker taking the whole session with it, which is why the guard is a type check
+    and not just a bounds check. A decline with no payload costs one review item; a crash
+    costs the session, and every candidate beside it — asserted here by the sibling, which
+    keeps its own payload intact."""
+    extractor = make_extractor(
+        [
+            scripted_turn([_bad_grain(intent="a real candidate"), "not a dict at all"]),
+            scripted_turn([]),
+        ]
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    assert result.corrections == 1
+    assert [d.reason for d in result.declines] == ["malformed_candidate"] * 2
+    assert result.declines[0].raw_payload["payload"]["intent"] == "a real candidate"
+    assert result.declines[1].raw_payload is None
+    # Still STAMPED, though: the correction record is what says it was asked for, and
+    # that is true whether or not there was a payload to bring back.
+    assert all(d.corrections_attempted == 1 for d in result.declines)
+async def test_a_substantive_decline_beside_a_withdrawn_one_is_still_unstamped() -> None:
+    """The distinction the stamp exists to keep, at its narrowest: two declines out of one
+    batch, one of which was re-asked and one of which must never look as though it was. The
+    merit-failed candidate keeps a zero and a `None` payload — it is supposed to die, and a
+    reader that saw a correction record on it would route it to a human to complete a form
+    whose content the extractor already judged unfit."""
+    extractor = make_extractor(
+        [
+            scripted_turn(
+                [blueprint_raw(evidence=[]), _bad_grain(intent="the one that was re-asked")]
+            ),
+            scripted_turn([]),
+        ]
+    )
+
+    result = await extractor.extract(make_summary(), KEEP_VERDICT)
+
+    # `_finish`'s documented order: substantive first, then withdrawn.
+    assert [d.reason for d in result.declines] == ["no_evidence", "malformed_candidate"]
+    unasked, withdrawn = result.declines
+    assert unasked.corrections_attempted == 0
+    assert unasked.correction_history == ()
+    assert unasked.raw_payload is None
+    assert withdrawn.corrections_attempted == 1
+    assert withdrawn.raw_payload["payload"]["intent"] == "the one that was re-asked"
 
 async def test_a_disabled_budget_declines_with_a_zero_that_means_never_asked() -> None:
     """The other side of the same distinction, and the pre-slice behaviour: with

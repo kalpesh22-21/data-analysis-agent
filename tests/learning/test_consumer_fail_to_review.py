@@ -144,6 +144,43 @@ async def test_a_merit_passed_totality_decline_is_persisted_for_review() -> None
     assert env.entity_scan["scanner"] == "regex+ner"
 
 
+async def test_a_withdrawn_totality_decline_reaches_the_same_review_route() -> None:
+    """The route's second entrance, and the one that did not exist. A merit-passed
+    candidate can fail the form in two ways: it can be corrected and still be wrong, or
+    the model can take the sanctioned exit and OMIT it from the re-emit. The second used
+    to leave nothing at all — no decline, so no reason, so no `raw_payload`, so no review
+    item — and a session whose blueprint a human could have finished in seconds
+    evaporated while the span said zero declines.
+
+    The two conditions the route actually turns on are read here on a WITHDRAWN decline
+    rather than assumed to travel with it: the reason is `totality_violation` (the
+    decline the model was ASKED to fix, unchanged by the withdrawal) and `raw_payload` is
+    the array the correction named it in, which is what `build_declined_envelope` fills
+    the review form from."""
+    candidates = InMemoryCandidateStore()
+    consumer = _consumer(
+        candidates,
+        # One emit, one correction, and an empty re-emit: the model gave up on it.
+        turns=[scripted_turn([_UNCOVERED]), scripted_turn([])],
+        stages=(LeakageGateStage(candidate_store=candidates),),
+    )
+
+    await consumer._run_extractor(_summary(content_hash="hash-withdrawn"), KEEP_VERDICT,
+                                  _proceeded())
+
+    stored = candidates.all_candidates()
+    assert len(stored) == 1
+    env = stored[0]
+    assert env.status == CandidateStatus.NEEDS_PARAMETERIZATION
+    assert env.candidate_id == mint_review_candidate_id("hash-withdrawn", 0)
+    assert env.decline is not None
+    assert env.decline.reason == "totality_violation"
+    assert env.decline.corrections_attempted == 1  # asked once, then dropped
+    assert len(env.decline.correction_history) == 1
+    # The form is filled from the payload the correction POINTED AT — the re-emit was
+    # empty, so there is no other candidate this row could have been built from.
+    assert env.payload["intent"] == "ratio of deductions to earnings per employee"
+    assert env.revalidation is not None
 async def test_the_quote_is_snapshotted_to_audit_and_never_to_the_candidate_store() -> None:
     """THE SPLIT, unchanged for a review item: the entity-bearing quote goes to
     `learning_audit` and only the minted ref travels on the envelope (D51/D17).
