@@ -137,6 +137,10 @@ _INBOX_ACTIONS = frozenset(
     {
         "approve", "reject", "retract", "complete", "revise",
         "apply_revision", "attest_scan", "trial_run", "verify", "promote",
+        # The knowledge edit pair (knowledge-edit design §C.2): `revise_knowledge` asks the
+        # assistant for a five-surface proposal and WRITES NOTHING; `apply_knowledge` is the
+        # ONE write path into a `global_knowledge` payload, and re-adjudicates behind it.
+        "revise_knowledge", "apply_knowledge",
     }
 )
 # The actions that carry a request body: `complete` (the reviewer's missing
@@ -154,6 +158,10 @@ _INBOX_BODY_ACTIONS = frozenset(
         "apply_revision",
         "attest_scan",
         "trial_run",
+        # `revise_knowledge` carries the reviewer's sentence; `apply_knowledge` carries the
+        # whole edited payload. Neither has a meaning without its body.
+        "revise_knowledge",
+        "apply_knowledge",
     }
 )
 # The only `?status=` values the list surface accepts (ui-inbox-type-archive contract
@@ -624,7 +632,7 @@ _INBOX_CONNECT_TIMEOUT_SECONDS = 5.0
 # Must stay ABOVE `learning_revise_timeout_seconds` (120s) so the upstream's own
 # graceful 'timed out; try again' reaches the browser instead of a bare 502.
 _INBOX_MODEL_HOP_TIMEOUT_SECONDS = 180.0
-_INBOX_MODEL_ACTIONS = frozenset({"revise"})
+_INBOX_MODEL_ACTIONS = frozenset({"revise", "revise_knowledge"})
 # A WAREHOUSE hop, not a model one: `trial_run` binds the template and executes it through the
 # MCP. Its own budget because it is neither a fast store read nor a model call — a real query
 # against live ClickHouse, which can legitimately take tens of seconds on a wide scan.
@@ -782,6 +790,56 @@ async def inbox_mint(request: Request) -> JSONResponse:
 async def inbox_health() -> JSONResponse:
     _require_inbox_enabled()
     return await _proxy_inbox("GET", "/inbox/health")
+
+
+# --- the per-user knowledge surface (knowledge-edit design §D) ----------------
+#
+# ⚠ BOTH ROUTES MUST STAY ABOVE `POST /api/inbox/{candidate_id}/{action}`, and the POST one
+# is the reason: `/api/inbox/user_knowledge/promote` also reads as `candidate_id=
+# "user_knowledge", action="promote"`, and `promote` IS in the action allowlist — so a
+# route declared after the catch-all would never be reached, and the BFF would ask the
+# inbox service to promote a candidate by that name. FastAPI matches in declaration order,
+# which makes the ORDER of these two blocks load-bearing rather than cosmetic (design §D.4,
+# and `test_promote_reaches_the_user_knowledge_route_not_the_candidate_one` pins it).
+
+
+@app.get("/api/inbox/user_knowledge")
+async def inbox_user_knowledge(
+    user_id: str | None = None, limit: int | None = None
+) -> JSONResponse:
+    """Proxy one USER's private facts (design §D.1), for the reviewer's promotion tab.
+
+    `user_id` is REQUIRED and validated here: the store's only read is per-user, an empty id
+    is not "every user", and a request that means nothing must not become a hop the service
+    has to refuse. That is the whole schema this BFF holds — the records themselves are
+    forwarded verbatim like every other inbox body."""
+    _require_inbox_enabled()
+    if user_id is None or not user_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="user_id is required — this surface lists ONE user's facts, never all.",
+        )
+    params: dict[str, str] = {"user_id": user_id.strip()}
+    if limit is not None:
+        params["limit"] = str(limit)
+    query = urllib.parse.urlencode(params)
+    return await _proxy_inbox("GET", f"/inbox/user_knowledge?{query}")
+
+
+@app.post("/api/inbox/user_knowledge/promote")
+async def inbox_user_knowledge_promote(request: Request) -> JSONResponse:
+    """Proxy the one-button promotion of a user fact into a `global_knowledge` candidate.
+
+    The body (`{user_id, record_id}`) is size-capped and forwarded VERBATIM — the inbox
+    service owns the pairing rule (a record whose `user_id` disagrees with the body is a 404,
+    design §D.2) and a second reading of it here would be a second vocabulary for the same
+    mistake."""
+    _require_inbox_enabled()
+    return await _proxy_inbox(
+        "POST",
+        "/inbox/user_knowledge/promote",
+        await _inbox_json_body(request, "promote"),
+    )
 
 
 @app.post("/api/inbox/{candidate_id}/{action}")

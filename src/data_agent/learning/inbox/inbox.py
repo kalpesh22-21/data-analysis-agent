@@ -36,7 +36,13 @@ from data_agent.runtime.blueprint.template import (
 from data_agent.runtime.blueprint.verify import verify_result
 from data_agent.timeutil import now_iso
 
-from ..candidate.models import CandidateEnvelope, CandidateStatus
+from ..candidate.decline import ValidationSnapshot
+from ..candidate.models import (
+    CandidateEnvelope,
+    CandidateStatus,
+    mint_promoted_candidate_id,
+    promoted_record_digest,
+)
 from ..candidate.store import CandidateStore
 from ..candidate.verdicts import (
     LeakageAttestation,
@@ -46,8 +52,25 @@ from ..candidate.verdicts import (
 from ..promotion.mcp_export import PromotionEmit, build_promotion_emit
 from ..promotion.models import ProbeResult, PromotionPolicy
 from ..promotion.scheduler import PromotionScheduler
-from ..revise import BlueprintReviser, ReviseProposal, ReviserUnavailableError
+from ..revise import (
+    BlueprintReviser,
+    KnowledgeProposal,
+    KnowledgeReviser,
+    ReviseProposal,
+    ReviserUnavailableError,
+)
+from ..user.models import UserKnowledgeRecord
+from ..user.store import UserKnowledgeStore
 from .completion import CompletionResult, ParameterizationCompleter, sql_rewrite_of
+from .knowledge_edit import (
+    KNOWLEDGE_TYPE,
+    ROUTE_REASON_EDITED,
+    ROUTE_REASON_PROMOTED,
+    KnowledgeEditor,
+    KnowledgeEditorUnavailableError,
+    KnowledgeEditResult,
+    entity_scan_view,
+)
 from .models import InboxItem, _leakage_cleared
 from .ranking import rank_key
 
@@ -56,6 +79,17 @@ _logger = logging.getLogger(__name__)
 
 class InboxTransitionError(Exception):
     """Raised when a human transition is requested from an illegal current status."""
+
+
+class UserKnowledgeUnavailableError(RuntimeError):
+    """No per-user knowledge store is wired in this deployment.
+
+    A 503, and its own type for the reason every other absence on this surface has one: it is a
+    fact about the DEPLOYMENT, not about the request, so mapping it to a 404 ("no such user") or
+    a 200-with-an-empty-list would tell a reviewer that a user has no facts when the truth is
+    that nobody looked. `_build_inbox_from_env` always wires a store — the in-memory one in the
+    offline posture — so this is reachable only from a directly-constructed inbox.
+    """
 
 
 class _NoOpProbe:
@@ -78,6 +112,204 @@ class _NoOpProbe:
 class _ZeroHitCounts:
     async def hit_count(self, canonical_key: str) -> int:
         return 0
+
+
+@dataclass(frozen=True)
+class UserKnowledgeView:
+    """One per-user fact as the reviewer's User Knowledge tab shows it (§D.1).
+
+    `promoted` is the CANDIDATE this record has already been lifted into, or `None`. Carried as
+    the envelope rather than pre-flattened so `to_wire` owns exactly what crosses — the card
+    needs an id and a status, and every other field on a candidate is a different kind of thing
+    that happens to be in hand.
+    """
+
+    record: UserKnowledgeRecord
+    promoted: CandidateEnvelope | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        """The record verbatim + the promotion pointer.
+
+        ⚠ ENTITY-BEARING AND DELIBERATELY UNREDACTED. This is the one listing on this surface
+        that carries raw per-user facts, because a redacted per-user fact is not a fact — the
+        reviewer is deciding whether the sentence can be generalized, which they cannot do
+        without reading it. What bounds it is the guard in front (`list_user_knowledge`: one
+        named user, never all) rather than a projection here.
+
+        The provenance is the SESSION AND TRACE IDS ONLY — the evidence refs are KV keys into
+        `learning_audit` and have no reader on this page, and a pointer offered with nothing to
+        follow it with is an invitation to add one.
+        """
+        record = self.record
+        return {
+            "record_id": record.record_id,
+            "user_id": record.user_id,
+            "statement": record.statement,
+            "fact_type": record.fact_type,
+            "scope": record.scope,
+            "structured": record.structured,
+            "committed_at": record.committed_at,
+            "provenance": {
+                "source_session": record.source_session,
+                "source_trace": record.source_trace,
+            },
+            "promotion": (
+                {
+                    "candidate_id": self.promoted.candidate_id,
+                    "status": self.promoted.status,
+                }
+                if self.promoted is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class PromotedUserKnowledge:
+    """What one press of "promote to global knowledge" produced (§D.2).
+
+    `already` is the SECOND-PRESS answer and it is a success, not an error: the deterministic id
+    means the row is the same row, so the honest response is the one that already exists. The
+    caller renders it as "in review as <id>" either way, which is why the two cases share a
+    shape instead of one of them being a 409.
+    """
+
+    candidate_id: str
+    status: str
+    already: bool
+    entity_scan: dict[str, Any]
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "status": self.status,
+            "already": self.already,
+            # `{result, hits:[{field, kind}]}` — the span is dropped by `entity_scan_view`,
+            # which owns that rule for every non-`InboxItem` response on this surface.
+            "entity_scan": self.entity_scan,
+        }
+
+
+# What a promoted fact's `extractor_rationale` says. There was no extractor: a person read a
+# private fact and decided the organisation should hold it, and the field is what a later
+# reader consults to understand where the row came from.
+PROMOTED_RATIONALE = "promoted from user knowledge by a reviewer"
+# `proposed_action` for the same row. A value outside the extractor's vocabulary ON PURPOSE, so
+# a query for "candidates a human introduced" is one predicate rather than a join through the
+# route reason.
+PROMOTED_ACTION = "promote_user_knowledge"
+# ⚠ ITS OWN CONTENT-HASH NAMESPACE, and this is load-bearing rather than tidy. `content_hash`
+# is what `CandidateStore.supersede` sweeps on: a re-extraction of the session this fact came
+# from would delete every candidate carrying that session's hash, and a promoted row sharing it
+# would vanish under a reviewer mid-review, with no trace and no way to tell it had existed.
+PROMOTED_HASH_PREFIX = "userpromote::"
+
+
+def promoted_content_hash(record_id: str) -> str:
+    """The `content_hash` a promoted user fact carries: the namespace, then a DIGEST.
+
+    ⚠ HASHED FOR THE REASON `mint_promoted_candidate_id` IS HASHED. This field used to
+    interpolate the record id — `userpromote::userknow::<user_id>::<candidate_id>` — which put
+    the owner's user id in cleartext on the candidate doc, in a field that is stored, exported
+    to the MCP canon and read back by anything auditing the store. The candidate id beside it
+    hashes precisely so a user id never rides along in a candidate field; the content hash had
+    the same exposure and now uses the same digest.
+
+    THE NAMESPACE SURVIVES, which is the property the field exists for: the prefix keeps this
+    row outside every session's hash, so `supersede(content_hash)` on a re-extraction of the
+    source session cannot sweep a promotion out from under the reviewer holding it.
+    """
+    return f"{PROMOTED_HASH_PREFIX}{promoted_record_digest(record_id)}"
+# A HUMAN CHOSE IT. Confidence on this row is not a model's estimate of anything, and any other
+# value would be a fabricated measurement — the ranking reads it, so a made-up 0.7 would order
+# the queue by a number nobody produced.
+PROMOTED_CONFIDENCE = 1.0
+
+
+def _promoted_payload(record: UserKnowledgeRecord) -> dict[str, Any]:
+    """The `global_knowledge` payload a user fact becomes (§D.2).
+
+    ⚠ `scope` IS NOT CARRIED, and the reason is that the two fields with that name mean
+    different things. On a user record `scope` is the literal string `"user"` (it is what makes
+    the record per-user); on a knowledge chunk it becomes the node TITLE
+    (`knowledge_seed_from_candidate`). Copying it across would title a shared corpus entry
+    "user", which is both meaningless and the exact opposite of what the field now claims.
+
+    `structured` is carried ONLY when it is a non-empty OBJECT — the record's is typed
+    `dict | None` but is rehydrated JSON, and intake declines a non-object, so a list there
+    would turn a promotion into a 422 about a field the reviewer never saw.
+
+    ⚠ AN OBJECT, NOT AN OBJECT OF STRINGS, and the distinction is checked nowhere on purpose
+    (design §F.1.b). `validate_payload` checks that `structured` IS an object and does not type
+    its values, so a nested one survives this hop; the knowledge reviser's tool would have
+    refused it, but a promoted record never went through the reviser. What must hold is that
+    the text inside is still SCANNED, and it is: the gate's `_collect_text` walks dicts and
+    lists to any depth, so a buried entity is attributed to a dotted field and flagged, and
+    `knowledge_seed_from_candidate` lands exactly those scanned leaves. Flattening or refusing
+    a nested value here would lose supporting detail the loop already handles correctly.
+
+    `fact_type` becomes `knowledge_type`, defaulting to `user_fact`: the label says what KIND of
+    thing this is, and "a fact one user taught the agent" is the truest available answer for a
+    record whose own type was never set.
+    """
+    payload: dict[str, Any] = {
+        "statement": record.statement,
+        "knowledge_type": record.fact_type or "user_fact",
+    }
+    if isinstance(record.structured, dict) and record.structured:
+        payload["structured"] = dict(record.structured)
+    return payload
+
+
+def _promoted_envelope(
+    record: UserKnowledgeRecord, candidate_id: str
+) -> CandidateEnvelope:
+    """The candidate a promoted user fact enters as. NOT yet written — `admit` does that.
+
+    The PAYLOAD is deliberately empty here: `KnowledgeEditor.admit` writes it, and seeding it in
+    both places would mean the same content arrived by two routes with the losing one silent —
+    the argument `mint/engine.py` makes about its own empty `parameterization`.
+
+    The `revalidation` snapshot is MINIMAL and carries exactly three facts: the owner's
+    `user_id`, the source session and the content hash. It is there so
+    `StageContext.summary.user_id` names the OWNER on every later re-run — a stage that scopes
+    anything to a user must scope it to the person whose fact this was, not to the reviewer who
+    pressed the button and not to nobody. The field is entity-free at the wire by construction:
+    it is never projected (`_inbox_item_to_wire` does not carry it).
+    """
+    return CandidateEnvelope(
+        candidate_id=candidate_id,
+        type=KNOWLEDGE_TYPE,
+        # `extracted` is the status the row is BUILT at and never the one it is stored at:
+        # `admit` moves it to `in_review` and uses this value as its race guard (see the call
+        # site). It is also the honest description of the instant — a candidate nothing has
+        # adjudicated yet.
+        status=CandidateStatus.EXTRACTED,
+        payload={},
+        source_session=record.source_session,
+        source_trace=record.source_trace,
+        # THE EVIDENCE TRAIL SURVIVES THE HOP. These are the same KV keys into `learning_audit`
+        # the original candidate carried, so the quotes behind a promoted fact are still
+        # resolvable — which is the whole difference between a promotion and a retyping.
+        evidence_refs=record.evidence_refs,
+        extractor_rationale=PROMOTED_RATIONALE,
+        # The S3 sentinel. `admit` overwrites it with the settled verdict a moment later; what
+        # matters is that the value in between is the one every guard fails closed on.
+        entity_scan={"result": "pending", "hits": [], "self_check_contains_entities": False},
+        confidence=PROMOTED_CONFIDENCE,
+        proposed_action=PROMOTED_ACTION,
+        # NOTHING TO WAIT FOR. A `depends_on` would be a claim about an artifact this fact needs
+        # to land first, and a promoted sentence needs none.
+        depends_on=(),
+        content_hash=promoted_content_hash(record.record_id),
+        revalidation=ValidationSnapshot(
+            session_id=record.source_session,
+            user_id=record.user_id,
+            trace_id=record.source_trace,
+            content_hash=promoted_content_hash(record.record_id),
+            accepted_signal=None,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -476,6 +708,9 @@ class ReviewInbox:
         minter: Any = None,
         mcp_client: Any = None,
         probe_factory: Any = None,
+        knowledge_editor: KnowledgeEditor | None = None,
+        knowledge_reviser: KnowledgeReviser | None = None,
+        user_store: UserKnowledgeStore | None = None,
     ) -> None:
         self._store = store
         # The fail-to-review completion plane. OPTIONAL and default-absent, so an inbox
@@ -499,6 +734,23 @@ class ReviewInbox:
         # REQUEST around the reviewer's own token (`_probe_for`) — only the transport is shared,
         # because it holds no authority.
         self._mcp_client = mcp_client
+        # THE ONE WRITE PATH into a `global_knowledge` candidate's payload (K1/K2). OPTIONAL
+        # and default-absent like the completer, and refusing LOUDLY on use for the same
+        # reason: a reviewer who typed a correction and got a 200 that wrote nothing would
+        # believe the corpus had been fixed. It is NOT folded into the completer — the
+        # completer re-runs the BLUEPRINT validation and the write router, and this re-runs
+        # intake validation and the scan; the two have neither a check nor a status in common.
+        self._knowledge_editor = knowledge_editor
+        # The LLM typing aid for that same edit. OPTIONAL and, like the blueprint reviser,
+        # absent changes nothing about what a reviewer can ACCOMPLISH: the five fields are
+        # still editable directly. What it costs is the one case it exists for — a fact whose
+        # entity the reviewer would otherwise have to remove by hand while the card is
+        # withholding the text they need to see.
+        self._knowledge_reviser = knowledge_reviser
+        # The per-user knowledge store, READ-ONLY from here (D17's deliberate exception —
+        # design §D.1). The inbox never commits to it: `promote_user_knowledge` reads one
+        # record and writes a CANDIDATE, so a promotion cannot alter the user's own facts.
+        self._user_store = user_store
         # HOW A PROBE IS MADE FROM A TOKEN. Injectable because the real one needs a live MCP
         # transport, and the alternative — falling back to the scheduler's own probe when none
         # is wired — is exactly the silent substitution this plane refuses everywhere else: a
@@ -854,6 +1106,226 @@ class ReviewInbox:
             )
         return await self._completer.complete(
             env, entries=entries, replace_all=True, rewritten_sql=rewritten_sql
+        )
+
+    # --- K1: editing a `global_knowledge` candidate under review ---------------
+
+    async def _require_knowledge(self, candidate_id: str) -> CandidateEnvelope:
+        """The row, or an `InboxTransitionError`. `in_review` AND `global_knowledge`.
+
+        TWO GUARDS, and the second is not redundant with the first. `in_review` holds a
+        blueprint, a schema edit and a knowledge fact, and the knowledge editor writes a payload
+        checked ONLY by `validate_payload("global_knowledge", ...)` — pointed at a blueprint it
+        would replace a generalization, a template and a parameterization with five text fields
+        and call it valid, because it never read the blueprint reader. So the type guard is what
+        keeps this from being a second, unvalidated write path into every other target, which is
+        exactly what `complete_parameterization`'s own status guard exists to prevent in the
+        other direction.
+        """
+        env = await self._require(candidate_id, CandidateStatus.IN_REVIEW)
+        if env.type != KNOWLEDGE_TYPE:
+            raise InboxTransitionError(
+                f"candidate {candidate_id!r} is a {env.type!r}, expected {KNOWLEDGE_TYPE!r}; "
+                "the knowledge edit surface writes a five-field fact and cannot check any "
+                "other kind of payload"
+            )
+        return env
+
+    async def propose_knowledge_revision(
+        self, candidate_id: str, *, feedback: str
+    ) -> KnowledgeProposal:
+        """Ask the assistant for a corrected fact. WRITES NOTHING.
+
+        ⚠ NO LEAKAGE REFUSAL IN FRONT OF THIS, and the asymmetry with `propose_revision` is
+        deliberate rather than an omission. That method refuses when the scan did not clear,
+        because a parameterization proposal necessarily QUOTES the flagged literals and a
+        redacted literal matches no predicate. Here the flagged text is the thing being removed,
+        so refusing on a dirty scan would switch the assistant off in precisely the case it
+        exists for — a knowledge card whose statement names somebody, which today has exactly
+        one action (`reject`).
+
+        The withholding rule is kept; it just moves to the OUTPUT. `KnowledgeReviser` scans its
+        own draft and returns a reason instead of a payload when the draft still trips the
+        scanner, so nothing entity-bearing crosses to the browser either way — see
+        `revise/knowledge.py`.
+
+        The proposal is returned, not applied. `apply_knowledge_edit` remains the only write.
+        """
+        env = await self._require_knowledge(candidate_id)
+        if self._knowledge_reviser is None:
+            raise ReviserUnavailableError(
+                f"revise_unavailable: no knowledge assistant is wired for {candidate_id!r}; "
+                "the five fields can still be edited directly"
+            )
+        return await self._knowledge_reviser.propose(env, feedback=feedback)
+
+    async def apply_knowledge_edit(
+        self, candidate_id: str, *, payload: dict[str, Any]
+    ) -> KnowledgeEditResult:
+        """Write a corrected fact onto a `global_knowledge` candidate under review (§B/§C.2).
+
+        THE ONLY WRITE into this payload, whether the reviewer pasted the assistant's draft,
+        hand-edited it, or typed one from scratch — the two-step the rework doc's §C.3
+        establishes for blueprints, kept here for the same reason: a model's output must face
+        the identical checks a human's does, and the way to guarantee that is to give them one
+        door.
+
+        It is RE-ADJUDICATION, not admission: intake validation runs (so the closed key set
+        holds), the leakage scan re-settles over the NEW text (so the card's withholding and
+        the approve guard are reading a verdict about what is actually stored), and the row
+        stays `in_review`. Nothing here moves a candidate forward — `approve` remains the only
+        thing that does.
+        """
+        env = await self._require_knowledge(candidate_id)
+        if self._knowledge_editor is None:
+            raise KnowledgeEditorUnavailableError(
+                f"knowledge_edit_unavailable: no knowledge write plane is wired for "
+                f"{candidate_id!r}, so the edited fact cannot be re-validated or re-scanned"
+            )
+        # ⚠ `editor.can_scan` IS DELIBERATELY NOT CHECKED HERE, and the promote path below
+        # deliberately does check it (design §F.1.a). The difference is the INPUT. An edit that
+        # nobody scanned is DEGRADED BUT HONEST: the text is what the reviewer just typed into
+        # a form they were looking at, so the queue shows them their own sentence, and the
+        # `pending` sentinel keeps the row unapprovable until a deployment with a gate settles
+        # a verdict on it. Refusing the edit as well would take away the one action available
+        # on an offline dev inbox in exchange for nothing.
+        return await self._knowledge_editor.admit(
+            env, payload=payload, route_reason=ROUTE_REASON_EDITED
+        )
+
+    # --- K2: a user fact, promoted --------------------------------------------
+
+    async def list_user_knowledge(
+        self, user_id: str, *, limit: int = 100
+    ) -> tuple[UserKnowledgeView, ...]:
+        """ONE named user's private facts, plus whether each is already promoted (§D.1).
+
+        ⚠ THIS IS THE D17 AMENDMENT, recorded rather than hidden. `learning/user/store.py` says
+        a per-user fact is "surfaced only in that user's context", and the reviewer role now
+        sees a named user's — on the same privileged, token-guarded surface that already shows
+        audit quotes, trial-run rows and unredacted SQL. The narrowing that keeps it an
+        exception rather than a hole: the store's PER-USER read is the only one used, no
+        cross-user listing is added to the Protocol, and the reviewer must NAME the user. An
+        empty id is refused, never read as "all users" — that single default is the difference
+        between an exception and a bulk export.
+
+        The records come back AS THEY ARE: they are entity-bearing by contract, so there is
+        nothing to redact toward (a redacted per-user fact is not a fact). They are never
+        indexed, scored or written back by this path.
+        """
+        if not (user_id or "").strip():
+            raise ValueError(
+                "user_id is required to list per-user knowledge: these records are "
+                "entity-bearing and are readable one named user at a time, never in bulk"
+            )
+        if self._user_store is None:
+            raise UserKnowledgeUnavailableError(
+                "user_knowledge_unavailable: no per-user knowledge store is wired in this "
+                "deployment, so a user's facts cannot be read here"
+            )
+        records = await self._user_store.list_for_user(user_id, limit=limit)
+        return tuple([await self._with_promotion(record) for record in records])
+
+    async def _with_promotion(self, record: UserKnowledgeRecord) -> UserKnowledgeView:
+        """One record plus its promoted candidate, if it has one.
+
+        A `get` on the DETERMINISTIC id rather than a scan — which is the whole reason the id is
+        deterministic (`mint_promoted_candidate_id`). It costs one KV read per row and answers
+        the only question the card needs: is this button still live.
+        """
+        env = await self._store.get(mint_promoted_candidate_id(record.record_id))
+        return UserKnowledgeView(record=record, promoted=env)
+
+    async def promote_user_knowledge(
+        self, user_id: str, record_id: str
+    ) -> PromotedUserKnowledge:
+        """Lift one user's private fact into a `global_knowledge` candidate under review (§D.2).
+
+        ⚠ BOTH IDS MUST AGREE. A record id is guessable — `userknow::<user>::<candidate>` — and
+        the `user_id` in the request is the one the reviewer was LOOKING AT, so a record whose
+        owner differs is a 404 rather than a promotion. Without that check the surface would
+        promote any user's fact from a URL, which is a much wider read than the named-user
+        listing this is supposed to be a button on.
+
+        IDEMPOTENT BY CONSTRUCTION. The candidate id is derived from the record id, so a second
+        press finds the existing row and returns it with `already=True` — no duplicate, no
+        status move, whatever status it has reached. That matters more than it sounds: this is
+        a button on a list, and the alternatives (a random id, or a scan for a matching payload)
+        would either file a second review row per click or need a search this store cannot do.
+
+        The row lands `in_review` with its verdict stamped, and the verdict will usually NOT be
+        `pass` — the fact was rerouted into the user store in the first place BECAUSE it carried
+        an entity. That is the designed outcome, not a failure: the card withholds the flagged
+        text, and the knowledge assistant is the next click.
+
+        ⚠ AND IF NOTHING CAN SCAN IT, THERE IS NO PROMOTION (§F.1.a). "Usually not `pass`" is
+        the whole reason: a deployment with no S5 gate would stamp the `pending` sentinel, the
+        listing renders that as a green `pass`, and the fact this button moves is entity-bearing
+        by construction. So an editor that cannot scan is a 503 here, while the same editor
+        still serves K1 — see the comment in `apply_knowledge_edit`.
+        """
+        if not (user_id or "").strip() or not (record_id or "").strip():
+            raise ValueError("both user_id and record_id are required to promote a fact")
+        if self._user_store is None:
+            raise UserKnowledgeUnavailableError(
+                "user_knowledge_unavailable: no per-user knowledge store is wired in this "
+                "deployment, so there is nothing to promote from"
+            )
+        if self._knowledge_editor is None:
+            raise KnowledgeEditorUnavailableError(
+                "knowledge_edit_unavailable: no knowledge write plane is wired in this "
+                "deployment, so a promoted fact could not be validated or scanned"
+            )
+        if not self._knowledge_editor.can_scan:
+            # ⚠ REFUSED, NOT DEGRADED (design §F.1.a). This posture is reachable in a real
+            # deployment — real `USER_KNOWLEDGE_*` credentials give the inbox a live per-user
+            # store, while an unreadable catalog gives it no write-router pipeline, so the
+            # editor is built with no stages beside a store full of real facts. Admitting
+            # through it would stamp the `pending` sentinel, which `inbox/models.py::
+            # _leakage_view` renders to the card as a green `pass`, and a raw per-user fact
+            # would sit on the SHARED review queue under a verdict nobody reached.
+            raise KnowledgeEditorUnavailableError(
+                "knowledge_scan_unavailable: this fact is entity-bearing by construction — it "
+                "was written to a private per-user store BECAUSE it named someone — and no "
+                "leakage scanner is wired in this deployment, so it cannot be put on the "
+                "shared review queue. Promote it from a deployment whose write-router "
+                "pipeline includes the S5 gate; editing an existing knowledge candidate still "
+                "works here."
+            )
+        record = await self._user_store.get(record_id)
+        if record is None or record.user_id != user_id:
+            # ONE message for both, on purpose: distinguishing "no such record" from "not your
+            # user's record" would turn this endpoint into an oracle for which record ids exist
+            # in other users' stores, which is the read the owner check exists to prevent.
+            raise InboxTransitionError(
+                f"user knowledge record {record_id!r} for user {user_id!r} not found"
+            )
+
+        candidate_id = mint_promoted_candidate_id(record_id)
+        existing = await self._store.get(candidate_id)
+        if existing is not None:
+            return PromotedUserKnowledge(
+                candidate_id=existing.candidate_id,
+                status=existing.status,
+                already=True,
+                entity_scan=entity_scan_view(existing.entity_scan),
+            )
+        result = await self._knowledge_editor.admit(
+            _promoted_envelope(record, candidate_id),
+            payload=_promoted_payload(record),
+            route_reason=ROUTE_REASON_PROMOTED,
+            # ⚠ THE RACE GUARD FOR A ROW THAT DOES NOT EXIST YET. `guarded_put` re-reads the id
+            # and requires it to be STILL ABSENT, so "somebody else promoted this between the
+            # check above and now" is a 409 rather than a silent overwrite of their row — the
+            # collision the deterministic id makes possible the moment two reviewers are
+            # looking at the same user.
+            expect_absent=True,
+        )
+        return PromotedUserKnowledge(
+            candidate_id=result.envelope.candidate_id,
+            status=result.envelope.status,
+            already=False,
+            entity_scan=entity_scan_view(result.entity_scan),
         )
 
     def mint_schema(self) -> dict[str, Any]:

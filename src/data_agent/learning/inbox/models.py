@@ -24,6 +24,7 @@ from ..candidate.verdicts import (
     LeakageVerdict,
 )
 from ..writer.routing import derive_inbox_reason
+from .knowledge_edit import ROUTE_REASON_EDITED, ROUTE_REASON_PROMOTED
 from .ranking import RankedScore, review_score
 
 InboxReason = Literal[
@@ -56,20 +57,42 @@ UNSCANNED_NOTICE = (
 )
 
 
+# The `route_reason` values that mark a payload a HUMAN put here through `KnowledgeEditor`
+# (K1's edit, K2's promotion). Imported from the editor rather than restated, so a third
+# human surface added there is withheld here by construction rather than by memory.
+_HUMAN_KNOWLEDGE_REASONS = frozenset({ROUTE_REASON_EDITED, ROUTE_REASON_PROMOTED})
+
+
 def _withheld_for_unsettled_scan(env: CandidateEnvelope) -> bool:
     """Must this row's CONTENT be withheld from the wire entirely?
 
-    Only for a FAIL-TO-REVIEW row whose scan never settled, and both halves matter. The redaction
-    machinery is keyed off SETTLED spans, so on an unsettled row it removes nothing and
-    `payload_view` would ship the raw payload verbatim — a combination no other listable status
-    can reach, because the write router settles a verdict on the way. And a decline-bearing row
-    CAN arrive here unscanned by design, since the consumer persists it with the `pending`
-    sentinel when no leakage stage is wired; withholding the decline detail while shipping the
-    same session's literals inside `payload_view` would be an elaborate way of leaking exactly
-    what the other rule protects. The row itself still LISTS, with its shape, decline reason and
-    counts — only the unscanned CONTENT is held back.
+    An UNSETTLED scan is the precondition for both cases, and it is the same fact in both: the
+    redaction machinery is keyed off SETTLED spans, so on an unsettled row it removes nothing
+    and `payload_view` would ship the raw payload verbatim. Two kinds of row can reach the
+    listing that way.
+
+    A FAIL-TO-REVIEW row, which arrives unscanned BY DESIGN — the consumer persists it with the
+    `pending` sentinel when no leakage stage is wired. Withholding its decline detail while
+    shipping the same session's literals inside `payload_view` would be an elaborate way of
+    leaking exactly what the other rule protects.
+
+    A HUMAN-WRITTEN KNOWLEDGE ROW (§F.1.a), which is the belt beside `promote_user_knowledge`'s
+    braces. That path now refuses to create an unscanned promotion at all; this is what keeps
+    the LISTING closed anyway, for a row some other path stored that way — a store restored
+    from a backup, a candidate written by a future surface, a deployment whose gate was removed
+    after the row was made. `_leakage_view` renders an unsettled scan as a green `pass`
+    (rightly, for its own purpose: the inbox never asserts a finding S5 did not settle), so
+    without this the card would show a raw entity-bearing statement under a verdict nobody
+    reached. Keyed off `route_reason` rather than off the type, because an EXTRACTED
+    `global_knowledge` candidate cannot get here unscanned — the write router settles a verdict
+    on the way — and withholding those would blank the ordinary queue.
+
+    The row itself still LISTS, with its shape, reason and counts — only the unscanned CONTENT
+    is held back.
     """
-    return env.decline is not None and not LeakageVerdict.is_settled(env.entity_scan)
+    if LeakageVerdict.is_settled(env.entity_scan):
+        return False
+    return env.decline is not None or env.route_reason in _HUMAN_KNOWLEDGE_REASONS
 
 
 def _summary_of(env: CandidateEnvelope) -> str:

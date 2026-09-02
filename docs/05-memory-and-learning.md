@@ -23,6 +23,17 @@ that runs after every chat session and turns the transcript into durable knowled
 | **User knowledge** | per-user store | **Entity-bearing OK** (personal) | Auto-land (scoped to user) |
 | **Schema edit** | `getTableSchema` source | Depends | **Human review queue — never auto-commit** |
 
+> **The one crossing between the two knowledge rows (2026-09-01).** A reviewer can now list ONE
+> named user's private facts in the inbox and **promote** one into a `global_knowledge` candidate
+> by a button, and can edit a knowledge candidate's payload with an LLM assistant before approving
+> it. Both write through a single re-adjudicating path: the extractor's own intake reader (so the
+> closed, entity-free key set holds on the human path too), then the leakage gate's SCAN, stamped
+> on a row that stays `in_review`. A promoted fact therefore arrives with a non-passing scan by
+> construction — the card withholds the flagged text, and the entity has to be edited out before
+> it can land. This is a deliberate, recorded exception to D17's "surfaced only in that user's
+> context": the reviewer surface sees a named user's facts. Design + the corrected account of what
+> the approve guard actually enforces: `decisions/knowledge-edit-and-user-promotion-design.md`.
+
 > **Global learning kill-switch (D58c).** `LEARNING_ENABLED=false` disables the **entire** learning
 > loop — write router **and** promotion scheduler — instantly, **without a deploy** (operational
 > safety valve for a discovered leak / bad-blueprint pattern). **Reads are unaffected**:

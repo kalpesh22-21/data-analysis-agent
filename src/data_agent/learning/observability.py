@@ -521,6 +521,17 @@ def revise_span(
     conflicts: int = 0,
     model: str = "",
     allow_sql: bool = False,
+    # WHICH ARTIFACT this turn was about. One span name for two revisers, distinguished by an
+    # attribute rather than by a second span, because every question an operator asks here
+    # ("was the assistant asked", "how often does it produce nothing", "how often is it
+    # withheld") is the same question for both — and a second span name would make the answer
+    # "run two queries and add them up", which is how one of the two silently stops being
+    # watched. `blueprint` is the default, so every existing emitter is unchanged.
+    subject: str = "blueprint",
+    # The knowledge reviser's analogue of `entries`: how many of the five entity-free surfaces
+    # the proposal actually stated. A SEPARATE attribute because the two count different things,
+    # and a shared name would make a dashboard average two populations into one meaningless line.
+    fields: int = 0,
     verbose: bool = False,
     feedback: str | None = None,
     rationale: str | None = None,
@@ -569,6 +580,8 @@ def revise_span(
         "learning.revise.conflicts": conflicts,
         "learning.revise.model": model,
         "learning.revise.allow_sql": allow_sql,
+        "learning.revise.subject": subject,
+        "learning.revise.fields": fields,
     }
     attrs.update(
         _verbose_attrs(

@@ -615,3 +615,209 @@ def test_every_model_backed_action_is_in_the_body_allowlist() -> None:
     # routes that are not per-candidate actions (`mint`), which must get the long read budget
     # WITHOUT being admitted to the action allowlist above.
     assert server._INBOX_MODEL_ACTIONS <= server._INBOX_MODEL_PATH_SEGMENTS
+
+
+# --- the knowledge edit pair + the user-knowledge surface (knowledge-edit design) ------
+
+
+def test_the_knowledge_edit_actions_are_reachable_and_carry_their_bodies(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """Both halves of the knowledge edit are per-candidate actions, so they ride the SAME
+    allowlisted, token-attaching hop as every other verb — and both are meaningless without a
+    body: `revise_knowledge` carries the reviewer's sentence, `apply_knowledge` carries the
+    whole edited payload. A verb missing from `_INBOX_BODY_ACTIONS` would hop with `None` and
+    the reviewer's work would never leave the browser."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "REVIEWER_TOKEN", "bff-held-secret")
+    feedback = {"feedback": "state it for the class, not the person"}
+    payload = {
+        "payload": {
+            "statement": "a transit allowance is paid monthly",
+            "knowledge_type": "business_rule",
+            "related_terms": ["transit allowance"],
+            "structured": {"column": "payroll.payroll_fact.allowance"},
+            "scope": "payroll",
+        }
+    }
+
+    assert (
+        client.post("/api/inbox/candidate::kn::0/revise_knowledge", json=feedback).status_code
+        == 200
+    )
+    assert (
+        client.post("/api/inbox/candidate::kn::0/apply_knowledge", json=payload).status_code
+        == 200
+    )
+
+    assert [hop["url"].rsplit("/", 1)[-1] for hop in fake_httpx] == [
+        "revise_knowledge",
+        "apply_knowledge",
+    ]
+    assert fake_httpx[0]["json"] == feedback
+    # VERBATIM: the five surfaces are the inbox service's contract (and the extractor's reader
+    # behind it), and a second schema here would be a second vocabulary for the same mistake.
+    assert fake_httpx[1]["json"] == payload
+    for hop in fake_httpx:
+        assert hop["headers"]["X-Reviewer-Token"] == "bff-held-secret"
+        assert hop["url"].endswith(f"/inbox/candidate%3A%3Akn%3A%3A0/{hop['url'].rsplit('/', 1)[-1]}")
+
+
+def test_the_knowledge_reviser_gets_the_model_read_budget(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """`revise_knowledge` calls a model upstream, exactly like `revise`, and the upstream
+    converts its OWN expiry into a 200 the reviewer can act on. A BFF deadline shorter than
+    that preempts it and blames the wrong component — the failure this budget was split for.
+    The write half is a store operation and keeps the fast CRUD timeout."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    client.post("/api/inbox/candidate::kn::0/revise_knowledge", json={"feedback": "f"})
+    client.post("/api/inbox/candidate::kn::0/apply_knowledge", json={"payload": {}})
+    assert _FakeAsyncClient.timeouts[0].read == server._INBOX_MODEL_HOP_TIMEOUT_SECONDS
+    assert _FakeAsyncClient.timeouts[1].read == server._INBOX_HOP_TIMEOUT_SECONDS
+    # ...and the invariant the existing allowlist test enforces still holds with it in the set.
+    assert "revise_knowledge" in server._INBOX_MODEL_ACTIONS
+    assert server._INBOX_MODEL_ACTIONS <= server._INBOX_ACTIONS
+    assert server._INBOX_MODEL_ACTIONS <= server._INBOX_BODY_ACTIONS
+    assert server._INBOX_MODEL_ACTIONS <= server._INBOX_MODEL_PATH_SEGMENTS
+
+
+def test_the_knowledge_actions_are_in_both_allowlists() -> None:
+    """Pinned as a set membership rather than through a request, so removing either verb from
+    one list and not the other fails HERE — where the two lists are visible together — instead
+    of as a 404 on a card that renders fine."""
+    for action in ("revise_knowledge", "apply_knowledge"):
+        assert action in server._INBOX_ACTIONS, action
+        assert action in server._INBOX_BODY_ACTIONS, action
+
+
+def test_the_user_knowledge_list_requires_a_user_id(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """⚠ AN EMPTY user_id IS NOT "EVERY USER". The store's only read is per-user (design §D.1,
+    the deliberate D17 exception), and this surface exists to show ONE named user's private
+    facts to a reviewer. A request without one means nothing, so it is refused here and never
+    becomes a hop the service has to interpret."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "REVIEWER_TOKEN", "bff-held-secret")
+
+    assert client.get("/api/inbox/user_knowledge").status_code == 400
+    assert client.get("/api/inbox/user_knowledge", params={"user_id": "   "}).status_code == 400
+    assert fake_httpx == []
+
+    resp = client.get("/api/inbox/user_knowledge", params={"user_id": "u-1042", "limit": 50})
+
+    assert resp.status_code == 200
+    hop = fake_httpx[0]
+    assert hop["method"] == "GET"
+    # Forwarded as an URLENCODED query param, so a user id carrying `&`, `=` or a space cannot
+    # add structure to the upstream query string.
+    assert hop["url"].endswith("/inbox/user_knowledge?user_id=u-1042&limit=50")
+    assert hop["headers"]["X-Reviewer-Token"] == "bff-held-secret"
+
+
+def test_a_user_id_with_reserved_characters_is_encoded_not_interpolated(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    client.get("/api/inbox/user_knowledge", params={"user_id": "a&limit=9999"})
+    assert fake_httpx[0]["url"].endswith("/inbox/user_knowledge?user_id=a%26limit%3D9999")
+
+
+def test_promote_reaches_the_user_knowledge_route_not_the_candidate_one(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """⚠ THE SHADOWING TRAP, named in design §D.4 and pinned here.
+
+    `/api/inbox/user_knowledge/promote` ALSO reads as `candidate_id="user_knowledge",
+    action="promote"`, and `promote` is in the action allowlist — so a catch-all declared first
+    would answer this path, and the BFF would ask the inbox service to promote a candidate by
+    that name. Both routes even produce the same upstream URL, which is exactly why the URL
+    cannot be the assertion: what is checked is WHICH endpoint the router resolves."""
+    from starlette.routing import Match
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/inbox/user_knowledge/promote",
+        "path_params": {},
+        "root_path": "",
+        "headers": [],
+    }
+    matched = [
+        route
+        for route in server.app.router.routes
+        if route.matches(scope)[0] == Match.FULL
+    ]
+    assert matched, "nothing matches the promote path at all"
+    assert matched[0].endpoint.__name__ == "inbox_user_knowledge_promote", (
+        "the candidate catch-all answers first — the new route must be DECLARED before it"
+    )
+
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "REVIEWER_TOKEN", "bff-held-secret")
+    body = {"user_id": "u-1042", "record_id": "userknow::u-1042::c1"}
+
+    resp = client.post("/api/inbox/user_knowledge/promote", json=body)
+
+    assert resp.status_code == 200
+    hop = fake_httpx[0]
+    assert hop["method"] == "POST"
+    assert hop["url"].endswith("/inbox/user_knowledge/promote")
+    # ...and NOT the percent-encoded per-candidate spelling a catch-all would have produced for
+    # a candidate whose id contained anything reserved.
+    assert "%3A" not in hop["url"]
+    assert hop["json"] == body
+    assert hop["headers"]["X-Reviewer-Token"] == "bff-held-secret"
+
+
+def test_an_oversized_user_promote_body_is_413_before_any_hop(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """The cap is the BFF's own resource and nobody downstream can give it back, so the new
+    write surface cannot become the way around it."""
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    monkeypatch.setattr(server, "INBOX_BODY_MAX_BYTES", 128)
+
+    resp = client.post(
+        "/api/inbox/user_knowledge/promote",
+        json={"user_id": "u-1042", "record_id": "x" * 5000},
+    )
+
+    assert resp.status_code == 413
+    assert fake_httpx == []
+
+
+def test_a_non_json_promote_body_is_400_and_never_proxied(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    monkeypatch.setenv("REVIEW_INBOX_ENABLED", "1")
+    resp = client.post(
+        "/api/inbox/user_knowledge/promote",
+        content=b"not json at all",
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+    assert fake_httpx == []
+
+
+def test_the_user_knowledge_surface_is_gated_by_the_flag_like_every_other(
+    monkeypatch: pytest.MonkeyPatch, fake_httpx: list[dict], client: TestClient
+) -> None:
+    """A dormant deployment must not grow a surface onto one user's private facts: the flag is
+    checked BEFORE the user_id validation and before any body is read, so both routes answer
+    404 rather than 400 — the surface does not exist, and it must not leak that it might."""
+    monkeypatch.delenv("REVIEW_INBOX_ENABLED", raising=False)
+    assert client.get("/api/inbox/user_knowledge", params={"user_id": "u-1042"}).status_code == 404
+    assert client.get("/api/inbox/user_knowledge").status_code == 404
+    assert (
+        client.post(
+            "/api/inbox/user_knowledge/promote", json={"user_id": "u", "record_id": "r"}
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post("/api/inbox/candidate::kn::0/revise_knowledge", json={"feedback": "f"}).status_code
+        == 404
+    )
+    assert fake_httpx == []

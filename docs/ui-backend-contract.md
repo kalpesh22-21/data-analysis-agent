@@ -537,6 +537,15 @@ Row-count rejection happens at **analyze**, before you render a mapping UI. Uplo
 | `POST /inbox/{id}/retract` | `validated → retired` (pull from index) |
 | `POST /inbox/{id}/verify` | human vouches for an auto-landed node |
 | `POST /inbox/{id}/promote` | emit MCP-format YAML for a manual PR; **idempotent re-emit** when the candidate is already `promoted` (no status move) |
+| `POST /inbox/{id}/revise_knowledge` | ask the assistant for a `global_knowledge` payload (§8.3). **Writes nothing** |
+| `POST /inbox/{id}/apply_knowledge` | the ONE write path into a knowledge candidate's payload (§8.3) |
+| `GET /inbox/user_knowledge?user_id=` | one named user's private facts (§8.4). `user_id` is REQUIRED |
+| `POST /inbox/user_knowledge/promote` | promote one private fact into a `global_knowledge` candidate (§8.4) |
+
+⚠ This table is not exhaustive: `complete`, `revise`, `apply_revision`, `attest_scan`, `trial_run`
+and the `/inbox/mint/*` surface also exist and are documented in their own design docs
+(`learning-blueprint-review-rework-design.md`, `learning-loop-*`). Pre-existing drift, recorded
+rather than fixed here.
 
 Ordering: the terminal archives `rejected` and `promoted` list **newest-first** (they are unbounded, so the limit caps old history — and a just-promoted row is the one whose YAML you are most likely to want back); `in_review`, `validated` and `needs_parameterization` list **oldest-first** (FIFO drain). Limit is 100, not configurable, **no pagination**.
 
@@ -620,10 +629,82 @@ interface PromotionEmit {                // POST /inbox/{id}/promote
 | `401` | missing `X-Reviewer-Token` |
 | `403` | wrong token |
 | `409` | illegal transition, or an approve that **held** — `detail` carries the reason verbatim |
-| `422` | candidate cannot be serialized to MCP YAML (promote only) |
+| `400` | a required query field is blank (`user_knowledge` listing without a `user_id`) |
+| `422` | candidate cannot be serialized to MCP YAML (`promote`); a payload the intake reader declines, or a model field this system has no contract for (`apply_knowledge` / `revise_knowledge`) — `detail` names the fix verbatim |
 | `503` | reviewer token unconfigured, **or** landing plane unavailable |
 
 **Offline mode is real:** when `GET /inbox/health` returns `"offline"`, list/reject/retract work but any approve that would land returns `503`. Pre-disable approve and show a read-only banner rather than letting the reviewer click into a 503. The service never fakes a `validated`.
+
+### 8.3 Editing a knowledge candidate
+
+Design: `knowledge-edit-and-user-promotion-design.md` §C. Both routes require the candidate to be
+`in_review` **and** `type === "global_knowledge"` (409 otherwise).
+
+```ts
+// POST /inbox/{id}/revise_knowledge   body { feedback: string }   — WRITES NOTHING
+interface KnowledgeProposal {
+  payload: KnowledgePayload | {};       // {} + a reason ⇒ "the assistant had no suggestion"
+  rationale: string;
+  reason: string;                       // render inline, never as an error banner
+  diff: { field: string; kind: "unchanged"|"changed"|"added"|"removed";
+          before: string; after: string }[];   // always five rows; `before` may be "[withheld]"
+}
+
+// POST /inbox/{id}/apply_knowledge    body { payload: KnowledgePayload }
+interface KnowledgeEditResult {
+  candidate_id: string; type: string; status: "in_review"; reason: null;
+  outcome: "edited";
+  entity_scan: { result: string; hits: { field: string; kind: string }[] };  // NEVER a span
+}
+
+// The payload's key set is CLOSED — exactly these five, enforced by the same reader the
+// extractor uses at intake. Any other key is a 422 naming it.
+interface KnowledgePayload {
+  statement: string;                    // required, non-empty
+  knowledge_type?: string; scope?: string;
+  related_terms?: string[]; structured?: Record<string, string>;
+}
+```
+
+`apply_knowledge` REPLACES the payload, so an optional field is cleared by omitting it. A 422
+carries the intake reader's own sentence — show it verbatim, it names the fix. A draft the
+assistant produced that still scans dirty is **withheld**: `payload` comes back empty and `reason`
+names `field (kind)`, never the span.
+
+### 8.4 The per-user knowledge surface
+
+Design: `knowledge-edit-and-user-promotion-design.md` §D. This is a **deliberate D17 exception** —
+a reviewer token can read one named user's private, entity-bearing facts. `user_id` is required;
+blank is a 400, never "all users". There is no cross-user listing.
+
+```ts
+// GET /inbox/user_knowledge?user_id=<id>&limit=100
+interface UserKnowledgeListResponse {
+  records: {
+    record_id: string; user_id: string; statement: string;
+    fact_type: string | null; scope: string; structured: Record<string, unknown> | null;
+    committed_at: string;
+    provenance: { source_session: string; source_trace: string };
+    promotion: { candidate_id: string; status: string } | null;   // already promoted?
+  }[];
+  count: number; user_id: string;
+}
+
+// POST /inbox/user_knowledge/promote   body { user_id, record_id }
+interface PromotedUserKnowledge {
+  candidate_id: string; status: string;
+  already: boolean;                     // a second press finds the same row, moves nothing
+  entity_scan: { result: string; hits: { field: string; kind: string }[] };
+}
+```
+
+The promoted candidate is an ordinary `global_knowledge` row on the review queue, and it usually
+arrives with a **non-passing** scan — the fact was a per-user one because it named an entity. That
+is the expected state, not an error: the card withholds the flagged text and §8.3's assistant is
+the next step. A `404` covers both an unknown record and one owned by a different user.
+
+**Route order matters.** `/inbox/user_knowledge*` must be matched before `/inbox/{candidate_id}/…`
+in both the service and any proxy, or a promote is read as a candidate named `user_knowledge`.
 
 ---
 
@@ -640,7 +721,9 @@ If you build your own BFF, mirror these. Paths are what the shipped demo UI call
 | `POST /api/query/page` | runtime `POST /query/page` | body `{session_id, sql, limit?, offset?}`; JSON passthrough. Status + body propagate, so a `400`/`403` reaches the browser unchanged |
 | `GET /api/inbox?status=` | inbox `GET /inbox` | validates `status ∈ {in_review, rejected, validated, needs_parameterization, promoted}` → else 400 |
 | `GET /api/inbox/health` | inbox `GET /inbox/health` | |
-| `POST /api/inbox/{id}/{action}` | inbox | `action ∈ {approve, reject, retract, complete, verify, promote}`; id is URL-encoded on the hop; `complete` and `promote` forward a JSON body (capped by `INBOX_BODY_MAX_BYTES`, 413 over it), the rest send none |
+| `POST /api/inbox/{id}/{action}` | inbox | `action ∈ {approve, reject, retract, complete, verify, promote, revise, apply_revision, attest_scan, trial_run, revise_knowledge, apply_knowledge}`; id is URL-encoded on the hop; body-carrying actions forward a JSON body (capped by `INBOX_BODY_MAX_BYTES`, 413 over it) |
+| `GET /api/inbox/user_knowledge?user_id=` | inbox `GET /inbox/user_knowledge` | `user_id` required — blank/absent ⇒ **400, never proxied**. Declared BEFORE the `{id}/{action}` catch-all |
+| `POST /api/inbox/user_knowledge/promote` | inbox same path | bounded JSON body `{user_id, record_id}`; declared BEFORE the catch-all, so `user_knowledge` is never read as a candidate id |
 | `POST /api/upload/analyze?session_id=` | `/scratch/v1/analyze` | **raw multipart passthrough** — do not parse the form |
 | `POST /api/upload?session_id=` | `/scratch/v1/upload` | same |
 | `POST /api/session/scope` | re-mints a narrower JWT | **test-only**; 404 unless `UI_TEST_AFFORDANCES=1`; narrows only, never widens |

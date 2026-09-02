@@ -182,11 +182,17 @@ class TestTypeTabs:
         for type_ in _TYPES:
             expect(_tab(page, type_)).to_be_visible()
 
-        # Seeded set: one blueprint + one global_knowledge; the other two are empty.
+        # Seeded set: one blueprint + one global_knowledge; schema_edit is empty.
         expect(_tab_count(page, "blueprint")).to_have_text("1", timeout=_ASSERT_TIMEOUT_MS)
         expect(_tab_count(page, "global_knowledge")).to_have_text("1")
-        expect(_tab_count(page, "user_knowledge")).to_have_text("0")
         expect(_tab_count(page, "schema_edit")).to_have_text("0")
+        # ⚠ USER KNOWLEDGE READS "—", NOT "0" (knowledge-edit design §D.3). That tab stopped
+        # being a filter over the candidate list — `user_knowledge` candidates auto-commit to
+        # the per-user store and are dropped from the candidate store, so a count over
+        # candidates could only ever be zero. It is now a VIEW over one named user's facts, and
+        # nothing has been counted until a reviewer names a user: "0" would claim a store had
+        # been consulted and found empty, which is a different and false statement.
+        expect(_tab_count(page, "user_knowledge")).to_have_text("—")
 
     def test_clicking_a_tab_filters_the_visible_list_to_that_type(
         self, page: Page
@@ -213,14 +219,67 @@ class TestTypeTabs:
         page.goto(f"{_INBOX_BFF_URL}/inbox")
         expect(page.get_by_test_id("inbox-tabs")).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
 
-        # user_knowledge has no seeded items → its tab shows the per-tab empty state,
-        # and none of the (other-type) seeded items are visible under it.
-        _tab(page, "user_knowledge").click()
+        # schema_edit has no seeded items → its tab shows the per-tab empty state, and none of
+        # the (other-type) seeded items are visible under it. This used to be asserted on
+        # user_knowledge, which no longer HAS an empty state — see the test below.
+        _tab(page, "schema_edit").click()
         empty = page.get_by_test_id("inbox-empty")
         expect(empty).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
-        expect(empty).to_contain_text("user knowledge")
+        expect(empty).to_contain_text("schema edit")
         expect(empty).to_contain_text("review queue")
         expect(_visible_items(page)).to_have_count(0)
+
+    def test_the_user_knowledge_tab_is_its_own_panel_not_an_empty_queue(
+        self, page: Page
+    ) -> None:
+        """⚠ THE TAB THIS DESIGN REPLACED (knowledge-edit design §D.3).
+
+        It used to be a filter over the candidate list that could never match anything, so it
+        rendered the per-tab empty state forever. It is now a VIEW over the per-user store: a
+        user-id box, a Load button, and one card per record with a Promote button.
+
+        So the assertion inverts — the empty state must NOT be shown, because "no candidates of
+        this type" is not a true thing to say about a panel that does not list candidates.
+        """
+        page.goto(f"{_INBOX_BFF_URL}/inbox")
+        expect(page.get_by_test_id("inbox-tabs")).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+
+        _tab(page, "user_knowledge").click()
+
+        # The panel replaces the candidate list, with the two controls §D.3 names.
+        panel = page.get_by_test_id("inbox-uk-panel")
+        expect(panel).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+        expect(page.get_by_test_id("inbox-uk-user-id")).to_be_visible()
+        expect(page.get_by_test_id("inbox-uk-load")).to_be_visible()
+        expect(page.get_by_test_id("inbox-uk-list")).to_be_attached()
+
+        # NO empty state and NO candidate rows — the queue view is not what this tab shows.
+        expect(page.get_by_test_id("inbox-empty")).to_be_hidden()
+        expect(_visible_items(page)).to_have_count(0)
+        # Nothing has been read yet, and the count line says so rather than claiming zero.
+        expect(page.get_by_test_id("inbox-count-line")).to_contain_text("name a user")
+
+    def test_loading_user_knowledge_without_a_user_id_is_refused_on_the_page(
+        self, page: Page
+    ) -> None:
+        """§D.1: the reviewer must NAME the user. The blank id is refused in the page as well
+        as at the BFF, and the message says why — a blank id is not a request for everyone.
+
+        Asserted in the browser because this is the guard that keeps the D17 exception narrow,
+        and a guard that only exists server-side would still let the page ASK."""
+        page.goto(f"{_INBOX_BFF_URL}/inbox")
+        _tab(page, "user_knowledge").click()
+        expect(page.get_by_test_id("inbox-uk-panel")).to_be_visible(
+            timeout=_ASSERT_TIMEOUT_MS
+        )
+
+        page.get_by_test_id("inbox-uk-load").click()
+
+        status = page.get_by_test_id("inbox-uk-status")
+        expect(status).to_be_visible(timeout=_ASSERT_TIMEOUT_MS)
+        expect(status).to_contain_text("never all of them")
+        # Still nothing loaded, so the badge still reads "—" rather than "0".
+        expect(_tab_count(page, "user_knowledge")).to_have_text("—")
 
 
 class TestStatusToggleDefault:

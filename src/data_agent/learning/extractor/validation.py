@@ -1596,6 +1596,43 @@ _PAYLOAD_READERS: dict[str, Callable[[dict[str, Any]], Decline | None]] = {
 }
 
 
+def validate_payload(candidate_type: str, raw: Any) -> Decline | None:
+    """Check one NON-BLUEPRINT payload against what its landing reads. `None` ⇒ usable.
+
+    THE INTAKE READER, MADE REACHABLE FROM OUTSIDE `to_candidate`. It exists because a second
+    write path into a candidate payload now exists — a reviewer editing a `global_knowledge`
+    candidate under review, and a user fact promoted into one
+    (`docs/decisions/knowledge-edit-and-user-promotion-design.md` §B) — and the ONE thing that
+    must not fork is what a legal payload IS. The closed `global_knowledge` key set is a LEAKAGE
+    rule, not a tidiness one (see `_global_knowledge_payload`): a key outside the five surfaces
+    is text the S5 gate never scans, so a human path that skipped this reader would reopen
+    exactly the hole the reader was written to close, on the path where a person's approval is
+    about to carry the payload into the global index.
+
+    `to_candidate` DELEGATES here rather than keeping its own copy of the dispatch, so the two
+    cannot answer differently for the same payload. The exception handling is the same shape it
+    has always had, for the same reason: this function is documented never to raise, so a
+    reader's own bug becomes a traceable decline rather than an escape.
+
+    An UNKNOWN type reads as `None` (no opinion) — the `.get`-not-`[...]` posture
+    `to_candidate` already had, kept loud by `test_every_non_blueprint_type_has_a_payload_reader`.
+    """
+    reader = _PAYLOAD_READERS.get(candidate_type)
+    if reader is None:
+        return None
+    try:
+        payload = as_object(
+            raw,
+            at="candidate.payload",
+            requirement=f"an object carrying the {candidate_type} payload",
+        )
+        return reader(payload)
+    except ShapeError as exc:
+        return _malformed(candidate_type, str(exc))
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        return _unreadable(candidate_type, f"{candidate_type} payload", exc)
+
+
 def to_candidate(
     raw: Any,
     summary: SessionSummary,
@@ -1657,13 +1694,13 @@ def to_candidate(
                 at="candidate",
                 requirement=f"an object carrying the {ctype} payload",
             )
-            # ...and its FIELDS, against what the type's landing actually reads
-            # (`_PAYLOAD_READERS`). `.get`, not `[...]`: a candidate type added without a
-            # reader must degrade to the old accept-any-object behaviour, never to a
-            # KeyError out of the one function documented never to raise. The parity test
-            # is what makes that gap loud at build time instead.
-            reader = _PAYLOAD_READERS.get(ctype)
-            payload_decline = reader(payload) if reader is not None else None
+            # ...and its FIELDS, against what the type's landing actually reads, through
+            # the SHARED reader (`validate_payload`) rather than a private dispatch here.
+            # The human edit path calls the same function, so the two paths into a
+            # non-blueprint payload cannot disagree about what a legal one is; the
+            # exception handling below is retained because it is this function's contract
+            # (never raise), not because it is the only place the readers are guarded.
+            payload_decline = validate_payload(ctype, payload)
             if payload_decline is not None:
                 return payload_decline
         except ShapeError as exc:

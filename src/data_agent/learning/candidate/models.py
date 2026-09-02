@@ -9,6 +9,7 @@ carries only `evidence_refs` (KV keys into `learning_audit`) — never the entit
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -67,6 +68,98 @@ def mint_review_candidate_id(content_hash: str, ordinal: int) -> str:
     FIELD, not the key.
     """
     return f"candidate::{content_hash}::review-{ordinal}"
+
+
+# How much of the record-id digest the promoted candidate id carries. 128 bits: far past any
+# collision an operator could reach, short enough that the id stays readable in a log line and
+# in a URL a reviewer pastes.
+_PROMOTED_ID_DIGEST_CHARS = 32
+
+
+def promoted_record_digest(record_id: str) -> str:
+    """The sha256 prefix that stands in for a record id wherever one would otherwise be read.
+
+    ONE DIGEST, TWO CONSUMERS: the promoted candidate id below, and the promoted candidate's
+    `content_hash` (`inbox/inbox.py::promoted_content_hash`). Both are fields that get rendered,
+    logged and pasted into URLs, and a record id is `userknow::<user_id>::<candidate_id>` — so
+    interpolating one puts the OWNER'S IDENTITY, which is D17-protected text, into a field every
+    surface shows. Hashing keeps the property both fields actually need (a stable, unique,
+    per-record value) and drops the one neither of them wanted.
+    """
+    return hashlib.sha256(record_id.encode("utf-8")).hexdigest()[:_PROMOTED_ID_DIGEST_CHARS]
+
+
+def mint_promoted_candidate_id(record_id: str) -> str:
+    """The deterministic candidate id for a user fact a reviewer promoted (design §D.2).
+
+    DETERMINISTIC IS THE WHOLE MECHANISM, and it replaces a uniqueness check this surface has no
+    way to perform. "Promote" is one button on a list that a second click, a stale tab or a
+    redelivered proxy request can fire twice; with a random id each press would file another
+    review row for the same fact, and nothing downstream would ever notice they were the same.
+    Derived from the RECORD id, so the answer to "has this fact already been promoted" is a
+    single `store.get` rather than a scan.
+
+    HASHED rather than interpolated. A record id is `userknow::<user_id>::<candidate_id>` — it
+    carries a user id, which is entity-bearing, and a candidate id from another namespace. A
+    candidate id is rendered on cards, put in URLs and written to logs, so embedding the user's
+    identity in it would leak D17-protected text through the one field every surface shows.
+    """
+    return f"candidate::userpromote::{promoted_record_digest(record_id)}"
+
+
+@dataclass(frozen=True)
+class KnowledgeEdit:
+    """The durable badge on a `global_knowledge` candidate a HUMAN edited (design §C.2).
+
+    ⚠ RECORDED ON THE ENVELOPE, NOT IN THE PAYLOAD, and that is forced rather than chosen: a
+    `global_knowledge` payload is a CLOSED key set (`validation.py::_GLOBAL_KNOWLEDGE_KEYS`)
+    precisely because every key in it is a text surface the S5 gate scans, so writing an edit
+    record into the payload would be adding an UNSCANNED surface through the very path that
+    exists to keep those surfaces honest. It also could not survive intake — the reader would
+    decline the payload naming the key.
+
+    ⚠ THE PREVIOUS STATEMENT IS A DIGEST, NEVER TEXT, for the reason
+    `completion.py::_sql_rewrite_record` gives about the previous SQL: the old statement is the
+    text the scan may have flagged, and the card renders this record. A hash answers the
+    question the record exists for — "is this still the sentence the extractor produced, and
+    which one was it before" — and can be matched against a trace after the fact, which a copy
+    of the sentence in a second field could not do without carrying the entity a second time.
+
+    `edits` counts human edits over the row's whole life, so "a reviewer touched this once" and
+    "this has been rewritten five times" stay distinguishable on the card.
+    """
+
+    applied_at: str
+    previous_statement_sha256: str
+    edits: int = 1
+
+    def to_doc(self) -> dict[str, Any]:
+        return {
+            "applied_at": self.applied_at,
+            "previous_statement_sha256": self.previous_statement_sha256,
+            "edits": self.edits,
+        }
+
+    @classmethod
+    def from_doc(cls, doc: Any) -> KnowledgeEdit | None:
+        """Rehydrate, or `None` for anything that is not one of ours.
+
+        NORMALIZE, DO NOT TRUST, like every other stamp on this envelope: the doc is rehydrated
+        JSON from a store humans can write through cbq. A non-int `edits` reads as 1 rather than
+        raising inside a listing projection, and a missing digest reads as absent — a badge that
+        cannot say WHAT was edited is not a badge.
+        """
+        if not isinstance(doc, dict):
+            return None
+        digest = doc.get("previous_statement_sha256")
+        if not isinstance(digest, str) or not digest:
+            return None
+        edits = doc.get("edits")
+        return cls(
+            applied_at=doc["applied_at"] if isinstance(doc.get("applied_at"), str) else "",
+            previous_statement_sha256=digest,
+            edits=edits if isinstance(edits, int) and not isinstance(edits, bool) else 1,
+        )
 
 
 @dataclass(frozen=True)
@@ -192,6 +285,11 @@ class CandidateEnvelope:
     # been filled in.
     decline: DeclineBlock | None = None
     revalidation: ValidationSnapshot | None = None
+    # --- human knowledge edit (design §C.2) --------------------------------------
+    # ADDITIVE, and the payload's key set is why it lives here rather than beside the edit
+    # itself — see `KnowledgeEdit`. Absent on every candidate a human has not edited, which is
+    # every candidate written before this slice, so a pre-slice doc round-trips byte-identically.
+    knowledge_edit: KnowledgeEdit | None = None
 
     def to_doc(self) -> dict[str, Any]:
         doc: dict[str, Any] = {
@@ -262,6 +360,10 @@ class CandidateEnvelope:
             doc["decline"] = self.decline.to_doc()
         if self.revalidation is not None:
             doc["revalidation"] = self.revalidation.to_doc()
+        # Same additive+optional posture as everything above: absent means no human has edited
+        # this candidate's payload, which is what every row written before the edit path is.
+        if self.knowledge_edit is not None:
+            doc["knowledge_edit"] = self.knowledge_edit.to_doc()
         return doc
 
     @classmethod
@@ -368,6 +470,9 @@ class CandidateEnvelope:
             # snapshot in particular must read as missing rather than as empty.
             decline=DeclineBlock.from_doc(doc.get("decline")),
             revalidation=ValidationSnapshot.from_doc(doc.get("revalidation")),
+            # Owns its own normalize-do-not-trust rule (a bad shape reads as ABSENT, never
+            # raises) — an unreadable badge must not stop a review queue from listing.
+            knowledge_edit=KnowledgeEdit.from_doc(doc.get("knowledge_edit")),
         )
 
 

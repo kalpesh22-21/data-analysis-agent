@@ -676,6 +676,15 @@ def build_promotion_plane(
     # shared here is a connection, not a credential.
     mcp_client: Any = None,
     probe_factory: Any = None,
+    # The `global_knowledge` edit plane and its typing aid, plus the per-user store the
+    # promote button reads (knowledge-edit design §E). All three OPTIONAL and default-absent,
+    # so an inbox built without them behaves exactly as it did before the slice — except that
+    # using one of the surfaces they serve is refused LOUDLY (503) rather than silently doing
+    # less. Threaded rather than constructed here for the reason every other collaborator is:
+    # this builder wires ports, it does not create infra.
+    knowledge_editor: Any = None,
+    knowledge_reviser: Any = None,
+    user_store: UserKnowledgeStore | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the S9 promotion plane (scheduler + review inbox) over ONE `candidate_store`.
 
@@ -713,6 +722,17 @@ def build_promotion_plane(
             "store (the inbox reads it; the completer re-validates and writes back to "
             "it). Build both from one store."
         )
+    if knowledge_editor is not None and knowledge_editor.store is not candidate_store:
+        # THE SAME ASSERTION, for the same reason and with a sharper failure. The inbox reads
+        # a row, guards its status and type, and hands the envelope to the editor, whose
+        # `guarded_put` re-reads THAT id to decide whether anything moved. Against a different
+        # store that re-read finds nothing, so the guard reports a race on every single edit —
+        # a wiring mistake that presents as a 409 the reviewer can never clear.
+        raise LearningWiringError(
+            "review inbox and its knowledge editor must share ONE candidate store (the "
+            "inbox reads it; the editor re-validates, re-scans and writes back to it). "
+            "Build both from one store."
+        )
     inbox = ReviewInbox(
         candidate_store,
         scheduler=scheduler,
@@ -725,6 +745,9 @@ def build_promotion_plane(
         minter=minter,
         mcp_client=mcp_client,
         probe_factory=probe_factory,
+        knowledge_editor=knowledge_editor,
+        knowledge_reviser=knowledge_reviser,
+        user_store=user_store,
     )
     return scheduler, inbox
 
@@ -747,6 +770,9 @@ def build_promotion_write_plane(
     completer: ParameterizationCompleter | None = None,
     reviser: BlueprintReviser | None = None,
     minter: Any = None,
+    knowledge_editor: Any = None,
+    knowledge_reviser: Any = None,
+    user_store: UserKnowledgeStore | None = None,
 ) -> tuple[PromotionScheduler, ReviewInbox]:
     """Assemble the FULLY-ACTIVATED S9 promotion WRITE plane (S9-activation Slice 2, §4).
 
@@ -786,6 +812,9 @@ def build_promotion_write_plane(
         reviser=reviser,
         minter=minter,
         mcp_client=mcp_client,
+        knowledge_editor=knowledge_editor,
+        knowledge_reviser=knowledge_reviser,
+        user_store=user_store,
     )
 
 

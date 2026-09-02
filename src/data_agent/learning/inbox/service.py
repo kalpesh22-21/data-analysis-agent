@@ -42,7 +42,11 @@ from ..mint import (
 )
 from ..observability import get_learning_tracer
 from ..promotion.scheduler import PromotionScheduler
-from ..revise import ForbiddenTemplateEditError, ReviserUnavailableError
+from ..revise import (
+    ForbiddenKnowledgeEditError,
+    ForbiddenTemplateEditError,
+    ReviserUnavailableError,
+)
 from .completion import (
     CompletionInputError,
     CompletionRaceError,
@@ -50,7 +54,21 @@ from .completion import (
     CompletionUnavailableError,
     ParameterizationCompleter,
 )
-from .inbox import InboxTransitionError, ReviewInbox, _NoOpProbe, _ZeroHitCounts
+from .inbox import (
+    InboxTransitionError,
+    ReviewInbox,
+    UserKnowledgeUnavailableError,
+    _NoOpProbe,
+    _ZeroHitCounts,
+)
+from .knowledge_edit import (
+    KnowledgeEditInputError,
+    KnowledgeEditor,
+    KnowledgeEditorUnavailableError,
+    KnowledgeEditResult,
+    entity_scan_view,
+    stage_scanner,
+)
 from .models import InboxItem
 
 
@@ -143,6 +161,49 @@ class ReviseParameterizationRequest(BaseModel):
 
     feedback: str = ""
     allow_sql: bool = False
+
+
+class ReviseKnowledgeRequest(BaseModel):
+    """The knowledge-REVISE body: a reviewer's sentence about what is wrong with the fact.
+
+    One field and free text, like `ReviseParameterizationRequest` — and, unlike it, no second
+    one. There is no §C.5-style opt-in here because there is nothing to opt into: the tool's
+    five properties ARE the five surfaces the entity scanner reads, so the assistant has no
+    capability a licence could unlock. Nothing here reaches a store; the proposal comes back for
+    the reviewer to apply through `apply_knowledge`, which stays the only write path.
+    """
+
+    feedback: str = ""
+
+
+class ApplyKnowledgeRequest(BaseModel):
+    """The knowledge-APPLY body: the COMPLETE fact to store.
+
+    `payload` is typed as loosely as the payload it becomes, for the reason
+    `CompleteParameterizationRequest` gives about `entries`: it goes through the SAME intake
+    reader a model's payload does (`validation.py::validate_payload`), so validating its shape
+    twice would give the reviewer two error vocabularies for one mistake — and only one of the
+    two would name the closed key set, which is the whole point of the check.
+
+    COMPLETE, not a patch. Whatever is here replaces the payload; a field left out is stored
+    absent. A merge would make "clear this field" unexpressible, and the reviewer is editing a
+    five-field form they can see in full.
+    """
+
+    payload: dict[str, Any] = {}
+
+
+class PromoteUserKnowledgeRequest(BaseModel):
+    """The promote-button body: which user, and which of their facts.
+
+    BOTH ARE REQUIRED and both are checked at the inbox, not just here. `record_id` alone would
+    be enough to find the record — the id is `userknow::<user>::<candidate>` and therefore
+    guessable — so `user_id` is what the reviewer was LOOKING AT, and the two must agree or it
+    is a 404. See `ReviewInbox.promote_user_knowledge`.
+    """
+
+    user_id: str = ""
+    record_id: str = ""
 
 
 class MintBlueprintRequest(BaseModel):
@@ -314,6 +375,29 @@ def _completion_result(result: CompletionResult) -> dict[str, Any]:
     }
 
 
+def _knowledge_edit_result(result: KnowledgeEditResult) -> dict[str, Any]:
+    """The knowledge-APPLY response (design §C.2).
+
+    `_completion_result`-SHAPED — the same four `ActionResult` fields plus an `outcome` the
+    caller branches on — because the page treats the two the same way: it refreshes the row and
+    reads one word to decide what to say. The `outcome` is always `"edited"`, and it is present
+    rather than implied so a client can branch on the field it already branches on elsewhere.
+
+    The extra field is `entity_scan`, and it is the one the reviewer actually needs: the whole
+    point of the write is that the scan re-settles over the NEW text, and "still flagged" is the
+    difference between "you can approve this now" and "the assistant is your next click".
+    Projected through `entity_scan_view`, which drops the span.
+    """
+    return {
+        "candidate_id": result.envelope.candidate_id,
+        "type": result.envelope.type,
+        "status": result.envelope.status,
+        "reason": None,
+        "outcome": "edited",
+        "entity_scan": entity_scan_view(result.entity_scan),
+    }
+
+
 def _map_transition_error(exc: InboxTransitionError) -> HTTPException:
     """Map an `InboxTransitionError` to the contract §2/§6 status codes.
 
@@ -463,8 +547,40 @@ def _build_completion_param_judge(
     )
 
 
-def _build_reviser(learning_settings: Any, runtime_settings: Any) -> Any:
-    """Build the LLM typing aid for the fail-to-review form, or `None`.
+@dataclass(frozen=True)
+class Revisers:
+    """The two LLM typing aids, built together or not at all (design §E).
+
+    ONE SWITCH, ONE KEY, ONE MODEL, ONE TIMEOUT, ONE TRACER. They are not two features: they are
+    the same feature — "the assistant helps a reviewer fix an artifact" — pointed at the two
+    artifact kinds this queue holds. Splitting the switch would produce a deployment where the
+    blueprint card offers an assistant and the knowledge card silently does not, which reads to
+    a reviewer as the knowledge one being broken.
+
+    Either may still be `None` on its own: `knowledge` is `None` when no scanner could be built
+    for it, because a knowledge draft that cannot be checked must never be shown (see
+    `revise/knowledge.py`), and that precondition has nothing to do with the blueprint side.
+    """
+
+    blueprint: Any = None
+    knowledge: Any = None
+
+
+def _build_reviser(
+    learning_settings: Any,
+    runtime_settings: Any,
+    *,
+    knowledge_scanner: Any = None,
+) -> Revisers:
+    """Build the LLM typing aids for the review surfaces, or `Revisers()`.
+
+    *knowledge_scanner* is the OUTPUT GATE for the knowledge half — the hook that scans a
+    proposed fact before it is allowed onto a response body. Passed in rather than built here
+    because it must be the SAME write-router stage tuple the editor scans with (see
+    `stage_scanner`), and that tuple lives on the completer this process already hoisted. With
+    none, the knowledge reviser is not built AT ALL rather than built and permanently silent:
+    the page reads its absence as "no assistant here" and says so, where a wired-but-withholding
+    one would answer 200-with-a-reason for ever and look like a model that never has an idea.
 
     FAIL-SOFT at every precondition, and that is the difference between this and
     `_build_completer`: without a completer a reviewer CANNOT clear a form (so its absence 503s
@@ -480,16 +596,17 @@ def _build_reviser(learning_settings: Any, runtime_settings: Any) -> Any:
     if not getattr(learning_settings, "learning_revise_enabled", False):
         _logger.info(
             "inbox service: LLM-assisted revision is OFF (LEARNING_REVISE_ENABLED=false); "
-            "the parameterization form still accepts entries directly"
+            "the parameterization form still accepts entries directly, and so does the "
+            "knowledge edit form"
         )
-        return None
+        return Revisers()
     api_key = getattr(learning_settings, "learning_extractor_api_key", "")
     if not api_key:
         _logger.info(
             "inbox service: LLM-assisted revision is enabled but no extractor API key is "
-            "configured — no assistant; the form still works"
+            "configured — no assistant; the forms still work"
         )
-        return None
+        return Revisers()
 
     import json
 
@@ -497,20 +614,28 @@ def _build_reviser(learning_settings: Any, runtime_settings: Any) -> Any:
     from data_agent.runtime.model.openai_client import build_openai_model_client
 
     from ..extractor.grounding import known_rule_ids_from_catalog
-    from ..revise import BlueprintReviser
+    from ..revise import BlueprintReviser, KnowledgeReviser
 
     try:
         path = runtime_settings.catalog_fixture_file()
         with path.open(encoding="utf-8") as fh:
             catalog = json.load(fh)["catalog"]
     except (OSError, ValueError, KeyError, TypeError):
+        # ⚠ THE CATALOG GATES BOTH, and that is a real cost rather than a tidy simplification.
+        # The BLUEPRINT reviser genuinely needs it (an ungrounded one invents rule ids and
+        # column bindings the validator then rejects); the KNOWLEDGE reviser does not — a fact
+        # is five text fields and cites nothing. Refusing both keeps one switch, which is the
+        # property §E asks for, and the alternative is a deployment where the assistant appears
+        # on one card and not the other for a reason no reviewer could infer. Revisit if a
+        # catalog-less deployment ever becomes ordinary.
         _logger.info(
             "inbox service: the semantic catalog snapshot could not be read, so "
             "LLM-assisted revision is disabled (an ungrounded reviser would invent rule ids "
-            "and column bindings the validator then rejects)",
+            "and column bindings the validator then rejects); the knowledge assistant is off "
+            "with it, so the two cards behave the same way",
             exc_info=True,
         )
-        return None
+        return Revisers()
 
     model = (
         getattr(learning_settings, "learning_revise_model", "")
@@ -526,21 +651,49 @@ def _build_reviser(learning_settings: Any, runtime_settings: Any) -> Any:
     from opentelemetry import trace as _otel_trace
 
     tracer = get_learning_tracer(_otel_trace.get_tracer_provider())
-    return BlueprintReviser(
-        model_client=build_openai_model_client(
-            api_key=api_key,
-            model=model,
-            base_url=getattr(learning_settings, "learning_extractor_base_url", ""),
-        ),
-        known_rules=known_rule_ids_from_catalog(catalog),
-        catalog_schema=build_sqlglot_schema_from_catalog(catalog),
-        timeout_seconds=getattr(learning_settings, "learning_revise_timeout_seconds", 30.0),
+    timeout = getattr(learning_settings, "learning_revise_timeout_seconds", 30.0)
+    # ⚠ The verbose payload on `learning.revise` is a human's free text plus model prose about
+    # an UNREDACTED payload — the accepted SQL on one side, the knowledge fact on the other.
+    # Same switch, same posture, same D51 standard as every other entity-bearing span here.
+    verbose = getattr(learning_settings, "learning_trace_verbose", False)
+    # ONE CLIENT for both. Two would open two connection pools to the same endpoint with the
+    # same key and the same model, and would let a future timeout or retry setting apply to
+    # one assistant and not the other.
+    model_client = build_openai_model_client(
+        api_key=api_key,
         model=model,
-        tracer=tracer,
-        # ⚠ The verbose payload on `learning.revise` is a human's free text plus model prose
-        # about the UNREDACTED accepted SQL. Same switch, same posture, same D51 standard as
-        # every other entity-bearing span on this plane.
-        trace_verbose=getattr(learning_settings, "learning_trace_verbose", False),
+        base_url=getattr(learning_settings, "learning_extractor_base_url", ""),
+    )
+    if knowledge_scanner is None:
+        _logger.warning(
+            "inbox service: the KNOWLEDGE assistant is off — no entity scanner could be built "
+            "for it (no completion plane, hence no write-router stages). A proposed fact is "
+            "model prose about an unredacted payload, so an unscanned draft is never shown; "
+            "the five fields can still be edited directly. The blueprint assistant is "
+            "unaffected."
+        )
+    return Revisers(
+        blueprint=BlueprintReviser(
+            model_client=model_client,
+            known_rules=known_rule_ids_from_catalog(catalog),
+            catalog_schema=build_sqlglot_schema_from_catalog(catalog),
+            timeout_seconds=timeout,
+            model=model,
+            tracer=tracer,
+            trace_verbose=verbose,
+        ),
+        knowledge=(
+            KnowledgeReviser(
+                model_client=model_client,
+                scanner=knowledge_scanner,
+                timeout_seconds=timeout,
+                model=model,
+                tracer=tracer,
+                trace_verbose=verbose,
+            )
+            if knowledge_scanner is not None
+            else None
+        ),
     )
 
 
@@ -822,6 +975,65 @@ def _build_completion_coverage_judge(
     )
 
 
+
+def _offline_user_store() -> Any:
+    """The offline dev posture's per-user store: an EMPTY in-memory one.
+
+    Wired rather than left `None` so the User Knowledge tab answers an honest empty 200 instead
+    of a 503 the page has to explain away — the tab genuinely works offline, it simply has
+    nothing in it, and `promote` on a record that is not there is the 404 it should be. The
+    alternative (no store) makes a working tab indistinguishable from a broken deployment.
+    """
+    from ..user.memory_user_store import InMemoryUserKnowledgeStore
+
+    _logger.info(
+        "inbox service: the User Knowledge tab is backed by an EMPTY in-memory store "
+        "(offline dev mode) — listings return nothing and there is nothing to promote"
+    )
+    return InMemoryUserKnowledgeStore()
+
+
+def _user_knowledge_store() -> Any:
+    """The real per-user store when its OWN credentials are configured, else the empty one.
+
+    ⚠ ITS OWN CREDENTIALS, checked separately from `write_plane_ready`. The per-user store is a
+    SEPARATE RBAC boundary from the candidate/corpus stores (D17/D95 — it is the one keyspace
+    holding entity-bearing facts, and its role is granted to that keyspace alone), so a
+    deployment can perfectly well have a full write plane and no grant into this one. The
+    consumer wires it exactly this way (`scripts/run_learning_consumer.py`), and this mirrors
+    that rather than inferring the grant from a different store's.
+
+    FAIL-OPEN and LOGGED, like every other optional plane in this file: a store that cannot be
+    built leaves the tab empty and the promote button answering 404, which costs one feature
+    rather than refusing to start the review surface.
+    """
+    from ..user.config import UserKnowledgeStoreConfig
+
+    try:
+        config = UserKnowledgeStoreConfig()
+    except Exception:  # noqa: BLE001 — a misconfigured optional store may not stop the service
+        _logger.warning(
+            "inbox service: the per-user knowledge settings could not be read, so the User "
+            "Knowledge tab is EMPTY and nothing can be promoted from it",
+            exc_info=True,
+        )
+        return _offline_user_store()
+    if not (config.user_knowledge_username and config.user_knowledge_password):
+        _logger.info(
+            "inbox service: no USER_KNOWLEDGE_* credentials are configured, so the User "
+            "Knowledge tab is EMPTY (this is a SEPARATE RBAC grant from the candidate and "
+            "corpus stores — a full write plane does not imply one)"
+        )
+        return _offline_user_store()
+    from ..user.couchbase_user_store import CouchbaseUserKnowledgeStore
+
+    _logger.info(
+        "inbox service: the User Knowledge tab reads the REAL per-user store at %s",
+        config.user_knowledge_bucket,
+    )
+    return CouchbaseUserKnowledgeStore(config)
+
+
 def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
     """Build the `ReviewInbox` for a standalone run. Returns `(inbox, mode, driver)`.
 
@@ -894,7 +1106,28 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
             hit_counts=_ZeroHitCounts(),
             require_landing=True,
         )
-        return ReviewInbox(store, scheduler=scheduler), "offline", None
+        return (
+            ReviewInbox(
+                store,
+                scheduler=scheduler,
+                # A KNOWLEDGE EDITOR WITH NO STAGES, deliberately wired rather than omitted.
+                # `KnowledgeEditor` with an empty stage tuple still runs INTAKE VALIDATION —
+                # which is the check the closed key set depends on and needs no infra — and
+                # stamps the `pending` scan sentinel, which every approve guard refuses. So the
+                # offline posture is "you can edit a fact and never approve it", which is the
+                # honest shape for a deployment that scans nothing, rather than a 503 that makes
+                # the form untestable outside production. It logs the degrade itself.
+                knowledge_editor=KnowledgeEditor(store=store),
+                # NO ASSISTANT and NO PROMOTABLE FACTS: offline has no model and no per-user
+                # store, so `revise_knowledge` 503s and the User Knowledge tab lists nothing.
+                # The in-memory store is wired rather than left `None` so the tab answers an
+                # empty 200 ("this user has no facts here") instead of a 503 the page has to
+                # explain — the tab genuinely works, it is just empty.
+                user_store=_offline_user_store(),
+            ),
+            "offline",
+            None,
+        )
 
     from neo4j import AsyncGraphDatabase
 
@@ -954,6 +1187,29 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         judge=_build_completion_coverage_judge(learning_settings, prior_art, judge_deps),
         param_judge_deps=judge_deps,
     )
+    # THE KNOWLEDGE WRITE PLANE, built from the completer's OWN stage tuple. It has to be the
+    # same tuple: the editor stamps a verdict the approve guard then reads, and a privately
+    # built scanner would be a second definition of what a leak is (`settle_entity_scan` refuses
+    # that at the layer below). `stages=()` when there is no completer, which is the same
+    # degraded-but-honest posture the offline branch takes and which the editor logs itself.
+    #
+    # ⚠ THAT POSTURE IS REACHABLE WITH A LIVE PER-USER STORE — real `USER_KNOWLEDGE_*`
+    # credentials plus an unreadable catalog gives no completer, hence no stages, beside a
+    # store full of real facts. Degraded-but-honest is the right answer for K1 and the wrong
+    # one for K2, so `promote_user_knowledge` REFUSES in that posture rather than stamping the
+    # `pending` sentinel onto an entity-bearing fact (design §F.1.a, `KnowledgeEditor.can_scan`).
+    knowledge_stages = completer.stages if completer is not None else ()
+    knowledge_editor = KnowledgeEditor(store=candidate_store, stages=knowledge_stages)
+    # ⚠ BOTH REVISERS OR NEITHER (§E), and the knowledge half additionally needs the scanner —
+    # an unscanned draft is never shown, so a reviser without one would answer
+    # 200-with-a-reason for ever. `stage_scanner(())` is a scanner that always returns the
+    # `pending` sentinel, so passing it when there are no stages would produce exactly that
+    # permanently-silent assistant; `None` is what makes the page say "no assistant here".
+    revisers = _build_reviser(
+        learning_settings,
+        runtime_settings,
+        knowledge_scanner=stage_scanner(knowledge_stages) if knowledge_stages else None,
+    )
     # Same recipe as the scheduler entrypoint; we hold the returned INBOX (the
     # scheduler is wired into it and shares the one candidate store).
     _scheduler, inbox = build_promotion_write_plane(
@@ -984,7 +1240,15 @@ def _build_inbox_from_env() -> tuple[ReviewInbox, WritePlaneMode, Any]:
         # The LLM typing aid for that same form (design §C). Independent of the completer's
         # own switch: it is human-gated and human-committed, so it can be enabled much
         # earlier — and its absence costs a convenience, not a capability.
-        reviser=_build_reviser(learning_settings, runtime_settings),
+        reviser=revisers.blueprint,
+        # The `global_knowledge` half of the same idea. The editor is the write path
+        # (`apply_knowledge`); the reviser is the typing aid in front of it.
+        knowledge_editor=knowledge_editor,
+        knowledge_reviser=revisers.knowledge,
+        # The per-user store the User Knowledge tab READS and the promote button reads ONE
+        # record from. Nothing on this surface ever writes to it — a promotion produces a
+        # CANDIDATE, so it cannot alter the fact the user actually taught the agent.
+        user_store=_user_knowledge_store(),
         # The hand-authoring plane. Gated on the completer because it WRITES through it: a
         # minter without one would file review rows that can never be approved.
         minter=_build_minter(
@@ -1163,6 +1427,116 @@ def create_inbox_app(
     async def inbox_health() -> dict[str, str]:
         return {"write_plane": app.state.write_plane}
 
+    # ⚠ THE TWO USER-KNOWLEDGE ROUTES ARE DECLARED HERE, BEFORE EVERY `/inbox/{candidate_id}/…`
+    # ROUTE BELOW, AND THE ORDER IS LOAD-BEARING (design §D.4). FastAPI matches in declaration
+    # order, so `POST /inbox/user_knowledge/promote` declared AFTER
+    # `POST /inbox/{candidate_id}/promote` would be shadowed by it: every press would look up a
+    # candidate literally named `user_knowledge` and answer 404 "candidate not found" — a
+    # message about the wrong noun, from the wrong handler, with the real route unreachable and
+    # nothing logged to say so. `/inbox/mint/*` already sits above the parametrised block for
+    # exactly this reason, and `test_the_promote_route_is_not_shadowed_by_the_candidate_one`
+    # asserts it rather than trusting that the next person notices.
+
+    @app.get("/inbox/user_knowledge", dependencies=guard)
+    async def list_user_knowledge(
+        user_id: str | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        """ONE named user's private facts, with whether each is already promoted (§D.1).
+
+        ⚠ THE DELIBERATE D17 EXCEPTION, and the guard that keeps it one: `user_id` is REQUIRED.
+        An absent or blank one is a 400 and never "all users" — that single default is the
+        difference between a reviewer reading the facts of the person they are helping and a
+        bulk export of everyone's. The store's PER-USER read is the only one used; no cross-user
+        listing exists to call.
+
+        The records cross UNREDACTED, because they are entity-bearing by contract and a redacted
+        per-user fact is not a fact. This surface already carries audit quotes, trial-run rows
+        and unredacted SQL behind the same reviewer token.
+        """
+        if not (user_id or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "user_id is required: per-user facts are entity-bearing and are read one "
+                    "named user at a time, never in bulk"
+                ),
+            )
+        try:
+            views = await inbox.list_user_knowledge(user_id, limit=max(1, min(limit, 200)))
+        except ValueError as exc:
+            # The inbox re-checks the same precondition. Mapped rather than assumed unreachable:
+            # the two guards exist for different callers (this one for the browser, that one for
+            # any other caller of the method), and a 500 from the defensive copy of a check the
+            # route already made would be an absurd way to answer a blank box.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except UserKnowledgeUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail="per-user knowledge store unavailable"
+            ) from exc
+        wire = [view.to_wire() for view in views]
+        return {"records": wire, "count": len(wire), "user_id": user_id}
+
+    @app.post("/inbox/user_knowledge/promote", dependencies=guard)
+    async def promote_user_knowledge(
+        body: PromoteUserKnowledgeRequest | None = None,
+    ) -> dict[str, Any]:
+        """PROMOTE one user's fact into a `global_knowledge` candidate under review (§D.2).
+
+        Nothing is approved and nothing lands: the result is a review row a reviewer then works
+        on with the surfaces that already exist — the card, the knowledge assistant, approve.
+        The scan will usually NOT pass (the fact was routed into the user store because it
+        carried an entity), and that is the designed outcome rather than a failure; the response
+        carries the verdict so the page can say which click is next.
+
+        IDEMPOTENT: a second press answers 200 with `already: true` and the existing row, at
+        whatever status it has reached. 404 an unknown record OR one belonging to another user
+        — one message for both, so this cannot be used to probe which ids exist. 400 a missing
+        id, 409 a race, 422 a record whose fields cannot form a legal knowledge payload, 503 no
+        user store, no knowledge write plane, or NO LEAKAGE SCANNER in this deployment — the
+        last because the fact being promoted is entity-bearing by construction and an unscanned
+        one must not reach the shared queue (design §F.1.a).
+        """
+        req = body or PromoteUserKnowledgeRequest()
+        try:
+            result = await inbox.promote_user_knowledge(
+                (req.user_id or "").strip(), (req.record_id or "").strip()
+            )
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        except KnowledgeEditInputError as exc:
+            # ⚠ ABOVE `ValueError`, WHICH IT IS A SUBCLASS OF, and that ordering is the whole
+            # fix: `promote_user_knowledge` calls `admit`, so an intake decline propagates
+            # straight out into this frame, and with only the broad branch below it answered
+            # 400 while this route's own docstring and design §D.2 both promise 422. Reachable
+            # without any exotic input — `UserKnowledgeRecord.from_doc` defaults `statement` to
+            # `""`, so any record stored before that field was required promotes into a
+            # decline. 422 and the reader's SENTENCE, the same answer `apply_knowledge` gives
+            # the identical refusal; two write surfaces disagreeing about one refusal is two
+            # vocabularies for one mistake.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ValueError as exc:
+            # A MISSING id, and nothing else: the narrower `KnowledgeEditInputError` is caught
+            # above and `InboxTransitionError` before that.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except UserKnowledgeUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail="per-user knowledge store unavailable"
+            ) from exc
+        except KnowledgeEditorUnavailableError as exc:
+            # ⚠ THE SENTENCE, NOT A LABEL — the one place on this surface where a 503 says
+            # more than its name. Two very different absences reach this branch and the
+            # reviewer's next move differs: "no write plane at all" is an offline inbox, while
+            # "no leakage scanner" (§F.1.a) is a deployment that CAN edit knowledge and still
+            # must not accept this particular row, because the fact being promoted is
+            # entity-bearing by construction. "knowledge editing unavailable" would read as a
+            # transient outage on a button the reviewer would then keep pressing. The text is
+            # about the deployment's wiring and nothing else, on a surface already behind the
+            # reviewer token that returns intake sentences and unredacted SQL.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except CompletionRaceError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return result.to_wire()
+
     @app.post("/inbox/{candidate_id}/approve", dependencies=guard)
     async def approve(
         candidate_id: str, body: ApproveRequest | None = None
@@ -1317,6 +1691,82 @@ def create_inbox_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _completion_result(result)
 
+    @app.post("/inbox/{candidate_id}/revise_knowledge", dependencies=guard)
+    async def revise_knowledge(
+        candidate_id: str, body: ReviseKnowledgeRequest | None = None
+    ) -> dict[str, Any]:
+        """KNOWLEDGE REVISE: ask the assistant for a corrected fact. WRITES NOTHING.
+
+        Returns a PROPOSAL — the five fields, a rationale and a per-field diff — which the
+        reviewer then applies through `apply_knowledge`. That two-step is the design (§C.2), not
+        an oversight: `apply_knowledge` stays the ONLY write into a knowledge payload, so a
+        model's five fields face the identical intake validation and the identical leakage
+        re-scan a hand-typed set faces.
+
+        ⚠ A DRAFT THAT STILL TRIPS THE SCANNER IS NOT RETURNED. The 200 then carries an empty
+        `payload` and a `reason` naming the flagged `field (kind)` — never the span. That is the
+        card's own withholding rule applied to the one surface that could otherwise hand the
+        browser fresh entity-bearing text no stored verdict covers.
+
+        "The assistant had no suggestion" is likewise a 200 with an empty `payload` and a
+        `reason`, for the reason a still-incomplete completion is: the reviewer did nothing
+        wrong and the next step belongs on the page. 404 unknown id, 409 not `in_review` or not
+        a `global_knowledge` candidate, 422 the model wrote a field this contract does not have,
+        503 no knowledge assistant in this deployment.
+        """
+        req = body or ReviseKnowledgeRequest()
+        try:
+            proposal = await inbox.propose_knowledge_revision(
+                candidate_id, feedback=req.feedback
+            )
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        except ReviserUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail="LLM-assisted knowledge revision unavailable"
+            ) from exc
+        except ForbiddenKnowledgeEditError as exc:
+            # 422, surfaced VERBATIM — the same handling `revise` gives a forbidden template
+            # edit, for the same reason. The model worked against a contract this system does
+            # not have, and a reviewer reading that sentence learns something true (a fact has
+            # five fields, and they are the five the scanner reads) rather than "it failed".
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return proposal.to_wire()
+
+    @app.post("/inbox/{candidate_id}/apply_knowledge", dependencies=guard)
+    async def apply_knowledge(
+        candidate_id: str, body: ApplyKnowledgeRequest | None = None
+    ) -> dict[str, Any]:
+        """KNOWLEDGE APPLY: store a corrected fact. THE ONLY write into this payload (§B).
+
+        The reviewer may send the assistant's payload verbatim, a hand-edited one, or one typed
+        from scratch — the door is the same, which is what makes "a model's output faces the
+        checks a human's does" true rather than aspirational. The payload RE-VALIDATES through
+        the extractor's own intake reader and the leakage scan RE-SETTLES over the new text; the
+        row stays `in_review` either way, and a scan that comes back flagged is a 200 carrying
+        the verdict rather than an error — the reviewer's next move is another edit, not a retry.
+
+        404 unknown id, 409 not `in_review` / not `global_knowledge` / the row moved while this
+        ran, 422 a payload the intake reader declines (its own sentence, which names the
+        offending key), 503 no knowledge write plane in this deployment.
+        """
+        req = body or ApplyKnowledgeRequest()
+        try:
+            result = await inbox.apply_knowledge_edit(candidate_id, payload=req.payload or {})
+        except InboxTransitionError as exc:
+            raise _map_transition_error(exc) from exc
+        except KnowledgeEditorUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail="knowledge editing unavailable"
+            ) from exc
+        except CompletionRaceError as exc:
+            # 409 with the reason VERBATIM, like `complete`: the reviewer did nothing wrong and
+            # the only useful next step is to re-read the row.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeEditInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _knowledge_edit_result(result)
+
     @app.post("/inbox/{candidate_id}/trial_run", dependencies=guard)
     async def trial_run(
         candidate_id: str, body: TrialRunRequest | None = None
@@ -1334,8 +1784,10 @@ def create_inbox_app(
         into a data-browsing surface as a side effect of adding a button.
 
         A run that could not happen answers 200 with `ok=false` and a machine reason
-        (`no_template`, `missing_bindings`, `no_uses_scope`, `warehouse_error`): the reviewer
-        did nothing wrong, and the reason is the next step rather than an error banner.
+        (`no_template`, `missing_bindings`, `no_uses_scope`, `warehouse_error`, and for a
+        composite `table_intermediate_unsupported` / `scalar_shape` / `no_scalar_probe` /
+        `malformed_composite`): the reviewer did nothing wrong, and the reason is the next step
+        rather than an error banner.
         """
         req = body or TrialRunRequest()
         try:

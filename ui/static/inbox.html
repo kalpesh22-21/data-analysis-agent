@@ -1182,6 +1182,157 @@
     color: var(--color-text-dim);
   }
 
+  /* --- The knowledge edit form + its assistant (knowledge-edit design §C.3) ---
+     Deliberately the SAME visual family as `.revise-block`: it is the same two-step over a
+     different payload — the assistant proposes, the reviewer reads, one button writes — and
+     a second look for it would suggest a second set of rules. */
+  .knowledge-edit {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+  }
+
+  .kn-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .kn-field > label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-dim);
+  }
+
+  .knowledge-edit textarea,
+  .knowledge-edit input[type="text"] {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2);
+    font-family: inherit;
+    font-size: 0.85rem;
+  }
+
+  .knowledge-edit textarea {
+    min-height: 60px;
+  }
+
+  .kn-structured-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .kn-structured-row input[type="text"] {
+    flex: 1 1 8rem;
+  }
+
+  button.kn-row-btn {
+    background: var(--color-surface);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    font-size: 0.75rem;
+    padding: var(--space-1) var(--space-3);
+  }
+
+  .kn-note {
+    font-size: 0.75rem;
+    color: var(--color-text-dim);
+    margin: 0;
+  }
+
+  /* The one inline slot for anything either knowledge route SAYS — a 422 intake sentence, a
+     forbidden key, the settled scan after an apply. Never the page-level error banner: these
+     are sentences a reviewer acts on, beside the field they are about. */
+  .kn-reason {
+    font-size: 0.8rem;
+    margin: 0;
+    color: var(--color-text-dim);
+  }
+
+  .kn-reason.is-refusal {
+    color: var(--color-warn-text);
+    background: var(--color-warn-bg);
+    border: 1px solid var(--color-warn-border);
+    border-radius: var(--radius);
+    padding: var(--space-2);
+  }
+
+  /* --- The User Knowledge tab (knowledge-edit design §D.3) ------------------
+     Its own VIEW, not a filter over the candidate list: user_knowledge candidates are
+     committed to the per-user store and dropped, so this tab listed nothing for as long as
+     it existed. */
+  .uk-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .uk-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .uk-controls label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-dim);
+  }
+
+  .uk-controls input[type="text"] {
+    flex: 0 1 18rem;
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2);
+    font-family: inherit;
+    font-size: 0.85rem;
+  }
+
+  .uk-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .uk-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    background: var(--color-surface);
+    padding: var(--space-3);
+  }
+
+  .uk-promoted {
+    font-size: 0.8rem;
+    color: var(--color-text-dim);
+    margin: 0;
+  }
+
+  /* A closed promotion should not read as a moving one at a glance. The sentence says which
+     it is; this only keeps the eye from sliding past it. */
+  .uk-promoted--rejected {
+    color: var(--color-warn-text);
+  }
+
   /* --- Promotion hop (validated -> canon PR) --- */
   .item-promotion {
     border: 1px solid var(--color-border);
@@ -1391,6 +1542,28 @@
     </nav>
     <ul id="inbox-list" data-testid="inbox-list" aria-live="polite"></ul>
     <div id="inbox-empty" data-testid="inbox-empty" role="status" hidden></div>
+
+    <!-- The User Knowledge tab (knowledge-edit design §D.3). Its OWN view, shown INSTEAD of
+         the candidate list above: `user_knowledge` candidates auto-commit to the per-user
+         store and are dropped from the candidate store, so this tab was a filter that could
+         never match anything. Naming the user is required — the store's only read is
+         per-user, and this surface never lists everyone (design §D.1, the deliberate D17
+         exception). -->
+    <div id="uk-panel" class="uk-panel" data-testid="inbox-uk-panel" hidden>
+      <p class="kn-note">
+        One named user's private facts. Promoting one opens a global_knowledge candidate for
+        review on the Global Knowledge tab — nothing is landed from here, and the record
+        itself is never changed.
+      </p>
+      <div class="uk-controls">
+        <label for="uk-user-id">User id</label>
+        <input type="text" id="uk-user-id" data-testid="inbox-uk-user-id" autocomplete="off"
+               placeholder="the user whose facts to list">
+        <button type="button" id="uk-load" class="action-complete" data-testid="inbox-uk-load">Load</button>
+      </div>
+      <p id="uk-status" class="card-empty" data-testid="inbox-uk-status" role="status" hidden></p>
+      <ul id="uk-list" class="uk-list" data-testid="inbox-uk-list" aria-live="polite"></ul>
+    </div>
   </section>
 </main>
 
@@ -1408,7 +1581,13 @@
     // Index into the ACTIVE (type-filtered) list — the card the reviewer is on. Reset to
     // 0 whenever the filtered set changes identity (a tab or status switch, a reload),
     // because position 7 of the old queue means nothing in the new one.
-    cursor: 0
+    cursor: 0,
+    // The User Knowledge tab's own state (knowledge-edit design §D.3). It is a VIEW over one
+    // named user's private facts, not a slice of `items` — nothing in the candidate list has
+    // ever had type `user_knowledge`, because those candidates commit to the per-user store
+    // and are dropped. `loaded` is separate from an empty `records` so the tab can tell "no
+    // user named yet" apart from "this user has no facts".
+    uk: { userId: "", records: [], loaded: false }
   };
 
   // Fixed, always-shown candidate types (contract §Frontend): stable order,
@@ -1434,6 +1613,11 @@
     pagerPrev: document.getElementById("pager-prev"),
     pagerNext: document.getElementById("pager-next"),
     pagerPosition: document.getElementById("pager-position"),
+    ukPanel: document.getElementById("uk-panel"),
+    ukUserId: document.getElementById("uk-user-id"),
+    ukLoad: document.getElementById("uk-load"),
+    ukStatus: document.getElementById("uk-status"),
+    ukList: document.getElementById("uk-list"),
   };
 
   // Per-type tab controls, built once at init and keyed by candidate type.
@@ -3553,10 +3737,16 @@
   }
 
   function updateStatusToggle() {
+    // INERT on the User Knowledge tab, not hidden: that tab reads the per-user store, which
+    // has no candidate lifecycle at all, so every one of these buttons would refetch a
+    // candidate list the tab does not show. Disabled rather than removed so the reviewer can
+    // still see which queue they will return to.
+    var inert = state.activeType === "user_knowledge";
     els.statusToggle.querySelectorAll(".status-btn").forEach(function (btn) {
       var active = btn.dataset.status === state.status;
       btn.classList.toggle("is-active", active);
       btn.setAttribute("aria-pressed", active ? "true" : "false");
+      btn.disabled = inert;
     });
   }
 
@@ -3573,6 +3763,10 @@
   // reviewer's tab across status switches / action refreshes), else fall back to
   // the first non-empty type, else the default (blueprint).
   function pickDefaultType() {
+    // The User Knowledge tab is a VIEW, not a filter, so it has no candidate count to keep it
+    // selected. Without this line the refresh that follows any write would silently move a
+    // reviewer who is mid-promotion back to Blueprints.
+    if (state.activeType === "user_knowledge") return "user_knowledge";
     var counts = computeCounts();
     if (counts[state.activeType] > 0) return state.activeType;
     for (var i = 0; i < TYPES.length; i++) {
@@ -3587,7 +3781,14 @@
       var refs = tabEls[t.type];
       if (!refs) return;
       var active = t.type === state.activeType;
-      refs.count.textContent = String(counts[t.type]);
+      // The User Knowledge badge counts LOADED RECORDS, or nothing at all before a user is
+      // named. It used to read "0" forever, which was true of the candidate store and
+      // meaningless: that tab does not list candidates, and a zero there claimed a queue had
+      // been consulted and found empty.
+      refs.count.textContent =
+        t.type === "user_knowledge"
+          ? (state.uk.loaded ? String(state.uk.records.length) : "—")
+          : String(counts[t.type]);
       refs.btn.classList.toggle("is-active", active);
       refs.btn.setAttribute("aria-selected", active ? "true" : "false");
       refs.btn.tabIndex = active ? 0 : -1;
@@ -4594,6 +4795,387 @@
       });
   }
 
+  // --- Editing a knowledge candidate (knowledge-edit design §C.3) ----------
+  //
+  // A `global_knowledge` candidate with a wrong statement used to have exactly one action —
+  // reject — and no way back except hoping the same fact was mined again. This is the same
+  // two-step the blueprint form already runs, over a different payload: the assistant
+  // PROPOSES (`revise_knowledge`, which writes nothing), the reviewer edits what it said, and
+  // `apply_knowledge` is the ONE write, re-running intake validation and the entity scan
+  // behind it. Nothing here approves anything: a candidate whose scan is not clean stays
+  // refused for approve exactly as it was before the edit.
+  //
+  // The five fields ARE the payload's closed key set — the exact surfaces the S5 leakage gate
+  // scans — so the form cannot offer a sixth without the server refusing it by name.
+  var KNOWLEDGE_FIELDS = [
+    { name: "statement", label: "statement", multiline: true,
+      hint: "the entity-free sentence that becomes the landed chunk" },
+    { name: "knowledge_type", label: "knowledge type", multiline: false,
+      hint: "a short label, e.g. business_rule" },
+    { name: "related_terms", label: "related terms (one per line)", multiline: true,
+      hint: "terms this fact should also be recalled by" },
+    { name: "scope", label: "scope", multiline: false,
+      hint: "what the fact is about — it titles the landed chunk" }
+  ];
+
+  // The token the server leaves behind where it removed an entity span (D17): every
+  // `payload_view` value is already redacted, and the marker is the literal "[redacted]".
+  // A field carrying it is prefilled EMPTY, because writing the marker back into the payload
+  // is the one edit this form must never make easy — it would land a sentence with a hole in
+  // it and a clean scan.
+  var REDACTION_MARKER = "[redacted]";
+
+  function isWithheldValue(value) {
+    if (value === undefined || value === null) return false;
+    var text = typeof value === "string" ? value : stringifyPayload(value);
+    return text.indexOf(REDACTION_MARKER) !== -1;
+  }
+
+  // The last apply outcome per candidate, so the list refresh that FOLLOWS an apply does not
+  // destroy the answer the reviewer was meant to read. The settled scan is the whole point of
+  // the round trip — it says whether approve is now possible — and a refresh that wiped it
+  // would make the reviewer apply again to find out.
+  var knowledgeOutcomes = {};
+
+  function knowledgeApplyOutcome(result) {
+    var scan = isObject(result) && isObject(result.entity_scan) ? result.entity_scan : {};
+    var hits = Array.isArray(scan.hits) ? scan.hits.filter(isObject) : [];
+    var text = "edit applied — the entity scan settled " + String(scan.result || "unknown") + ".";
+    if (hits.length) {
+      text += " Flagged: " + hits.map(function (hit) {
+        return String(hit.field || "?") + " (" + String(hit.kind || "?") + ")";
+      }).join(", ") + " — approve stays refused until the text is clean or the finding is attested.";
+    }
+    return text;
+  }
+
+  // One key/value row of `structured`. Rows rather than a JSON textarea: the payload's
+  // structured block is a flat object of strings, and a reviewer editing raw JSON in a
+  // textarea can produce a shape the intake reader declines for a reason that is really a
+  // typo.
+  function addStructuredRow(rows, key, value) {
+    var row = el("div", "kn-structured-row");
+    row.setAttribute("data-testid", "inbox-kn-structured-row");
+    var keyInput = document.createElement("input");
+    keyInput.type = "text";
+    keyInput.className = "kn-structured-key";
+    keyInput.setAttribute("data-testid", "inbox-kn-structured-key");
+    keyInput.setAttribute("aria-label", "structured key");
+    keyInput.placeholder = "key";
+    keyInput.value = key || "";
+    row.appendChild(keyInput);
+    var valueInput = document.createElement("input");
+    valueInput.type = "text";
+    valueInput.className = "kn-structured-value";
+    valueInput.setAttribute("data-testid", "inbox-kn-structured-value");
+    valueInput.setAttribute("aria-label", "structured value");
+    valueInput.placeholder = "value";
+    valueInput.value = value || "";
+    row.appendChild(valueInput);
+    var remove = el("button", "kn-row-btn", "Remove");
+    remove.type = "button";
+    remove.setAttribute("data-testid", "inbox-kn-structured-remove");
+    remove.setAttribute("aria-label", "remove this structured row");
+    remove.addEventListener("click", function () {
+      if (row.parentNode) row.parentNode.removeChild(row);
+    });
+    row.appendChild(remove);
+    rows.appendChild(row);
+    return row;
+  }
+
+  function readStructuredRows(rows) {
+    var out = {};
+    rows.querySelectorAll('[data-testid="inbox-kn-structured-row"]').forEach(function (row) {
+      var key = row.querySelector(".kn-structured-key").value.trim();
+      var value = row.querySelector(".kn-structured-value").value.trim();
+      if (key) out[key] = value;
+    });
+    return out;
+  }
+
+  function fillStructuredRows(rows, obj) {
+    clearNode(rows);
+    if (isObject(obj)) {
+      Object.keys(obj).forEach(function (key) {
+        addStructuredRow(rows, key, typeof obj[key] === "string" ? obj[key] : stringifyPayload(obj[key]));
+      });
+    }
+  }
+
+  // The form's contents as the payload that will be POSTed.
+  //
+  // An EMPTY optional field is OMITTED, and that is what makes clearing one possible: the
+  // apply replaces the payload wholesale, so an absent key is the reviewer deleting it, and
+  // the intake reader defaults it exactly as it would for a mined candidate. `statement` is
+  // always sent, empty or not — an empty one is a 422 with the reader's own sentence, which
+  // is a better answer than a button that quietly does nothing.
+  function readKnowledgeForm(fields) {
+    var payload = { statement: fields.statement.value.trim() };
+    var type = fields.knowledge_type.value.trim();
+    if (type) payload.knowledge_type = type;
+    var scope = fields.scope.value.trim();
+    if (scope) payload.scope = scope;
+    var terms = fields.related_terms.value.split("\n").map(function (line) {
+      return line.trim();
+    }).filter(function (line) { return line.length > 0; });
+    if (terms.length) payload.related_terms = terms;
+    var structured = readStructuredRows(fields.structuredRows);
+    if (Object.keys(structured).length) payload.structured = structured;
+    return payload;
+  }
+
+  function fillKnowledgeForm(fields, payload) {
+    if (!isObject(payload)) return;
+    fields.statement.value = typeof payload.statement === "string" ? payload.statement : "";
+    fields.knowledge_type.value =
+      typeof payload.knowledge_type === "string" ? payload.knowledge_type : "";
+    fields.scope.value = typeof payload.scope === "string" ? payload.scope : "";
+    fields.related_terms.value = Array.isArray(payload.related_terms)
+      ? payload.related_terms.map(String).join("\n")
+      : "";
+    fillStructuredRows(fields.structuredRows, payload.structured);
+  }
+
+  // The assistant's proposal: rationale, the per-field diff, and a button that FILLS the form.
+  // "Use this draft" does not apply — the reviewer still presses Apply, so a wrong draft costs
+  // a glance rather than a bad write, and `apply_knowledge` stays the only write path.
+  function renderKnowledgeProposal(payload, out, fields) {
+    clearNode(out);
+    if (!isObject(payload)) return;
+    var proposed = isObject(payload.payload) ? payload.payload : {};
+    var draft = typeof proposed.statement === "string" && proposed.statement.trim().length > 0;
+    if (payload.rationale) {
+      out.appendChild(el("p", "revise-rationale", payload.rationale));
+    }
+    // A `reason` means something did NOT happen — no suggestion, or a draft that still scanned
+    // dirty and was withheld (it names field + kind, never the span). Either way it is words
+    // the reviewer reads and acts on, so it renders here rather than in the page banner.
+    if (payload.reason) {
+      var reason = el("p", "revise-warning", payload.reason);
+      reason.setAttribute("data-testid", "inbox-kn-proposal-reason");
+      out.appendChild(reason);
+    }
+    var diff = Array.isArray(payload.diff) ? payload.diff.filter(isObject) : [];
+    if (diff.length) {
+      var list = el("ul", "revise-diff");
+      list.setAttribute("data-testid", "inbox-kn-diff");
+      diff.forEach(function (row) {
+        var li = el("li", String(row.kind || ""));
+        li.appendChild(el("span", "kind", String(row.field || "") + " " + String(row.kind || "")));
+        if (row.before && row.kind !== "unchanged") {
+          li.appendChild(el("span", "before", String(row.before)));
+          li.appendChild(document.createTextNode("  →  "));
+        }
+        li.appendChild(document.createTextNode(String(row.after || row.before || "")));
+        list.appendChild(li);
+      });
+      out.appendChild(list);
+    }
+    if (!draft) {
+      if (!payload.reason) {
+        out.appendChild(el("p", "card-empty", "the assistant had no suggestion"));
+      }
+      return;
+    }
+    var use = el("button", "action-complete", "Use this draft");
+    use.type = "button";
+    use.setAttribute("data-testid", "inbox-kn-use-draft");
+    use.addEventListener("click", function () {
+      fillKnowledgeForm(fields, proposed);
+    });
+    out.appendChild(use);
+  }
+
+  function renderKnowledgeEdit(item) {
+    var view = isObject(item.payload_view) ? item.payload_view : {};
+    // The whole payload can be withheld (an unsettled scan ships the notice instead of the
+    // fields); treat that as every field being withheld rather than as an empty payload.
+    var allWithheld = typeof view.withheld === "string" && view.withheld.length > 0;
+
+    var block = el("div", "knowledge-edit");
+    block.setAttribute("data-testid", "inbox-kn-form");
+    block.appendChild(
+      el("p", "item-field-label", "edit this knowledge (these five fields ARE the payload)")
+    );
+
+    var fields = {};
+    var withheldNames = [];
+    KNOWLEDGE_FIELDS.forEach(function (spec) {
+      var wrap = el("div", "kn-field");
+      var inputId = "kn-" + spec.name + "-" +
+        String(item.candidate_id || "").replace(/[^A-Za-z0-9_-]/g, "-");
+      var label = el("label", null, spec.label);
+      label.setAttribute("for", inputId);
+      wrap.appendChild(label);
+      var input = document.createElement(spec.multiline ? "textarea" : "input");
+      if (!spec.multiline) input.type = "text";
+      input.id = inputId;
+      input.setAttribute("data-testid", "inbox-kn-field-" + spec.name);
+      input.placeholder = spec.hint;
+      var raw = view[spec.name];
+      var withheld = allWithheld || isWithheldValue(raw);
+      if (withheld) {
+        withheldNames.push(spec.name);
+        input.value = "";
+      } else if (spec.name === "related_terms") {
+        input.value = Array.isArray(raw) ? raw.map(String).join("\n") : "";
+      } else {
+        input.value = typeof raw === "string" ? raw : "";
+      }
+      wrap.appendChild(input);
+      fields[spec.name] = input;
+      block.appendChild(wrap);
+    });
+
+    var structuredWrap = el("div", "kn-field");
+    structuredWrap.appendChild(el("label", null, "structured (key / value)"));
+    var rows = el("div", "kn-structured-rows");
+    rows.setAttribute("data-testid", "inbox-kn-field-structured");
+    var structuredWithheld = allWithheld || isWithheldValue(view.structured);
+    if (structuredWithheld) withheldNames.push("structured");
+    else fillStructuredRows(rows, view.structured);
+    structuredWrap.appendChild(rows);
+    var addRow = el("button", "kn-row-btn", "Add a row");
+    addRow.type = "button";
+    addRow.setAttribute("data-testid", "inbox-kn-structured-add");
+    addRow.addEventListener("click", function () { addStructuredRow(rows, "", ""); });
+    structuredWrap.appendChild(addRow);
+    block.appendChild(structuredWrap);
+    fields.structuredRows = rows;
+
+    // SAID, not left as a blank box: a field prefilled empty because its text was withheld
+    // looks exactly like a field the candidate never had, and the difference decides whether
+    // retyping it is restoring a value or inventing one.
+    if (withheldNames.length) {
+      var note = el("p", "kn-note",
+        "prefilled EMPTY: " + withheldNames.join(", ") +
+        " — the entity scan flagged that text, so it is withheld from this page. Rewrite the " +
+        "fact without the entity; do not retype what you cannot see.");
+      note.setAttribute("data-testid", "inbox-kn-withheld");
+      block.appendChild(note);
+    }
+
+    var apply = el("button", "action-complete", "Apply");
+    apply.type = "button";
+    apply.setAttribute("data-testid", "inbox-kn-apply");
+    block.appendChild(apply);
+
+    var reasonNode = el("p", "kn-reason");
+    reasonNode.setAttribute("data-testid", "inbox-kn-reason");
+    reasonNode.setAttribute("role", "status");
+    reasonNode.hidden = true;
+    block.appendChild(reasonNode);
+
+    function setReason(text, refusal) {
+      reasonNode.textContent = text || "";
+      reasonNode.classList.toggle("is-refusal", refusal === true);
+      reasonNode.hidden = !text;
+    }
+
+    // Survives the refresh an apply triggers — see `knowledgeOutcomes`.
+    if (knowledgeOutcomes[item.candidate_id]) {
+      setReason(knowledgeOutcomes[item.candidate_id], false);
+    }
+
+    // --- the assistant, beside the form rather than instead of it ---
+    block.appendChild(
+      el("p", "item-field-label", "describe the fix (the assistant proposes a payload)")
+    );
+    var feedback = document.createElement("textarea");
+    feedback.setAttribute("data-testid", "inbox-kn-feedback");
+    feedback.setAttribute("aria-label", "describe what is wrong with this knowledge");
+    feedback.placeholder =
+      "e.g. state the rule without naming the employee — say it for any employee in the class.";
+    block.appendChild(feedback);
+
+    var ask = el("button", "action-complete", "Ask the assistant");
+    ask.type = "button";
+    ask.setAttribute("data-testid", "inbox-kn-revise");
+    block.appendChild(ask);
+
+    var proposal = el("div");
+    proposal.setAttribute("data-testid", "inbox-kn-proposal");
+    block.appendChild(proposal);
+
+    ask.addEventListener("click", function () {
+      clearError();
+      setReason("");
+      clearNode(proposal);
+      ask.disabled = true;
+      ask.textContent = "Asking…";
+      fetch("/api/inbox/" + encodeURIComponent(item.candidate_id) + "/revise_knowledge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ feedback: feedback.value })
+      })
+        .then(function (response) {
+          return response.text().then(function (text) {
+            var parsed = null;
+            try { parsed = JSON.parse(text); } catch (err) { parsed = null; }
+            if (response.status === 503) {
+              // No reviser wired is not an error state for this page: the form still works,
+              // so the block says so and gets out of the way.
+              proposal.appendChild(el("p", "card-empty",
+                "the assistant is unavailable in this deployment — edit the fields and apply"));
+              return;
+            }
+            if (!response.ok) {
+              // 422 names a key this system does not have. That sentence teaches something
+              // true, so it goes beside the form, not into the page banner.
+              setReason((parsed && parsed.detail) || text || response.statusText, true);
+              return;
+            }
+            renderKnowledgeProposal(parsed, proposal, fields);
+          });
+        })
+        .catch(function (err) { showError("NETWORK", String(err)); })
+        .then(function () {
+          ask.disabled = false;
+          ask.textContent = "Ask the assistant";
+        });
+    });
+
+    apply.addEventListener("click", function () {
+      clearError();
+      setReason("");
+      apply.disabled = true;
+      apply.textContent = "Applying…";
+      fetch("/api/inbox/" + encodeURIComponent(item.candidate_id) + "/apply_knowledge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ payload: readKnowledgeForm(fields) })
+      })
+        .then(function (response) {
+          return response.text().then(function (text) {
+            var parsed = null;
+            try { parsed = JSON.parse(text); } catch (err) { parsed = null; }
+            if (!response.ok) {
+              // 422 is the intake reader's own sentence (the same one a mined candidate would
+              // have been declined with) and 409 is a race or a status that moved. Both are
+              // about THIS form, so both render in it.
+              setReason((parsed && parsed.detail) || text || response.statusText, true);
+              return;
+            }
+            var outcome = knowledgeApplyOutcome(parsed);
+            knowledgeOutcomes[item.candidate_id] = outcome;
+            setReason(outcome, false);
+            // The row stays `in_review` (the edit re-adjudicates, it does not approve), so the
+            // refresh is what re-reads the stamped scan onto the card — the same reload every
+            // other write on this page ends with.
+            loadInbox();
+          });
+        })
+        .catch(function (err) { showError("NETWORK", String(err)); })
+        .then(function () {
+          apply.disabled = false;
+          apply.textContent = "Apply";
+        });
+    });
+
+    return block;
+  }
+
   function renderCompleteForm(item, node) {
     var form = document.createElement("div");
     form.className = "complete-form";
@@ -4874,6 +5456,13 @@
       li.appendChild(renderReviseBlock(item, null, null, li));
     }
 
+    // The knowledge edit form (knowledge-edit design §C.3). `in_review` ONLY: a `validated`
+    // knowledge candidate is already a neo4j node, so editing it means re-landing it — a
+    // different slice — and offering the form there would invite a write the server refuses.
+    if (item.status === "in_review" && item.type === "global_knowledge") {
+      li.appendChild(renderKnowledgeEdit(item));
+    }
+
     // Actions.
     var actions = document.createElement("div");
     actions.className = "item-actions";
@@ -4937,6 +5526,189 @@
     return li;
   }
 
+  // --- The User Knowledge tab (knowledge-edit design §D.3) -----------------
+  //
+  // A reviewer names a user; the panel lists that user's private facts and offers ONE button
+  // per record: promote it into a `global_knowledge` candidate for review. It is not a filter
+  // over the candidate list and never renders a candidate card — `render()` hands the whole
+  // section over to it, because the two views answer different questions from different
+  // stores.
+  //
+  // Nothing here writes to the per-user record itself: promoting COPIES the fact into a new
+  // candidate, which then faces the same intake validation, entity scan and human approval as
+  // anything the extractor mined.
+
+  function setUkStatus(text) {
+    els.ukStatus.textContent = text || "";
+    els.ukStatus.hidden = !text;
+  }
+
+  // The clause that names a TERMINAL promotion state, keyed by `promotion.status` exactly as
+  // the list route returns it. A status that is NOT a key here — a live one, or one added to
+  // the enum after this code was written — gets NO clause: the neutral "<status> as <id>" line
+  // states what is known without asserting an outcome, which is the only safe thing to render
+  // about a state this page has never heard of.
+  var UK_PROMOTION_NOTES = {
+    rejected:
+      "A reviewer rejected the promotion, and this fact cannot be promoted again from here.",
+    validated: "A reviewer accepted the promotion.",
+    promoted: "A reviewer accepted the promotion, and its YAML has been emitted."
+  };
+
+  // "in review as candidate::…" — the status the promotion is AT, in words, plus a sentence
+  // naming the terminal ones. The button is disabled for ALL of them, and a rejected promotion
+  // is a dead end on purpose (design §F.1.c: re-promoting would hand any reviewer a one-click
+  // way to re-open work another reviewer deliberately closed) — so this text is the only thing
+  // that can tell a reviewer whether the work is still moving or was already closed, and which
+  // way it closed. Read from the record on load (a fact promoted last week must not offer the
+  // button again) and from the response after a press; the two render identically on purpose,
+  // so a terminal status arriving in the 200 cannot say something different from the same
+  // status arriving in the list.
+  function ukPromotionText(status, candidateId, already) {
+    var key = String(status || "").toLowerCase();
+    var phrase = (key || "in_review").replace(/_/g, " ");
+    var text = phrase + " as " + String(candidateId || "(no id)");
+    if (already === true) text += " — it was already promoted";
+    // hasOwnProperty: `status` is server data, and a plain lookup would let "constructor"
+    // find something on the prototype and render it.
+    if (Object.prototype.hasOwnProperty.call(UK_PROMOTION_NOTES, key)) {
+      text += ". " + UK_PROMOTION_NOTES[key];
+    }
+    return text;
+  }
+
+  // A modifier CLASS, not a second testid: the sentence above already carries the state for a
+  // screen reader, and this only stops the closed case from looking like the moving one at a
+  // glance. Colour is supplementary here, never the sole carrier.
+  function ukPromotionClass(status) {
+    return String(status || "").toLowerCase() === "rejected"
+      ? "uk-promoted uk-promoted--rejected"
+      : "uk-promoted";
+  }
+
+  function renderUkCard(record) {
+    var li = el("li", "uk-card");
+    li.setAttribute("data-testid", "inbox-uk-card");
+    li.setAttribute("data-record-id", record.record_id || "");
+
+    li.appendChild(el("p", "item-summary", record.statement || "(no statement)"));
+
+    // Entity-BEARING by contract — this is the whole reason §D.1 is a deliberate exception to
+    // D17 — and shown as-is on this token-guarded surface. It is never indexed or written back
+    // from here.
+    var meta = renderKeyValues({
+      fact_type: record.fact_type,
+      scope: record.scope,
+      committed_at: record.committed_at,
+      session: isObject(record.provenance) ? record.provenance.source_session : "",
+      trace: isObject(record.provenance) ? record.provenance.source_trace : ""
+    }, "inbox-uk-meta");
+    if (meta) li.appendChild(meta);
+
+    if (isObject(record.structured) && Object.keys(record.structured).length) {
+      var pre = el("pre", "payload-view", stringifyPayload(record.structured));
+      pre.setAttribute("data-testid", "inbox-uk-structured");
+      li.appendChild(pre);
+    }
+
+    var promoted = el("p", "uk-promoted");
+    promoted.setAttribute("data-testid", "inbox-uk-promoted");
+    promoted.setAttribute("role", "status");
+    promoted.hidden = true;
+
+    var btn = el("button", "action-complete", "Promote to global knowledge");
+    btn.type = "button";
+    btn.setAttribute("data-testid", "inbox-uk-promote");
+
+    function markPromoted(status, candidateId, already) {
+      promoted.textContent = ukPromotionText(status, candidateId, already);
+      promoted.className = ukPromotionClass(status);
+      promoted.hidden = false;
+      btn.disabled = true;
+      btn.textContent = "Promoted";
+    }
+
+    // A record that ALREADY has a candidate loads promoted: the id is deterministic, so a
+    // second press is a no-op upstream, and a live button would still invite one.
+    if (isObject(record.promotion) && record.promotion.candidate_id) {
+      markPromoted(record.promotion.status, record.promotion.candidate_id, false);
+    }
+
+    btn.addEventListener("click", function () {
+      clearError();
+      btn.disabled = true;
+      btn.textContent = "Promoting…";
+      fetch("/api/inbox/user_knowledge/promote", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // The user id sent is the one the reviewer LOADED and is looking at, not one read back
+        // out of the record: the service refuses the pair when they disagree (design §D.2), and
+        // echoing the record's own field would make that check unable to fail.
+        body: JSON.stringify({
+          user_id: state.uk.userId || record.user_id || "",
+          record_id: record.record_id || ""
+        })
+      })
+        .then(function (response) {
+          return response.text().then(function (text) {
+            var parsed = null;
+            try { parsed = JSON.parse(text); } catch (err) { parsed = null; }
+            if (!response.ok) {
+              showError("HTTP_" + response.status,
+                (parsed && parsed.detail) || text || response.statusText);
+              btn.disabled = false;
+              btn.textContent = "Promote to global knowledge";
+              return;
+            }
+            markPromoted(parsed && parsed.status, parsed && parsed.candidate_id,
+                         parsed && parsed.already === true);
+            // The candidate lands on the GLOBAL KNOWLEDGE tab, and this panel is not showing
+            // it — so the list is left alone rather than refetched behind the reviewer.
+          });
+        })
+        .catch(function (err) {
+          showError("NETWORK", String(err));
+          btn.disabled = false;
+          btn.textContent = "Promote to global knowledge";
+        });
+    });
+
+    li.appendChild(promoted);
+    li.appendChild(btn);
+    return li;
+  }
+
+  function renderUkRecords() {
+    clearNode(els.ukList);
+    if (!state.uk.loaded) {
+      setUkStatus("Name a user to list their facts — this surface never lists everyone.");
+      return;
+    }
+    if (!state.uk.records.length) {
+      setUkStatus("No facts stored for " + state.uk.userId + ".");
+      return;
+    }
+    setUkStatus("");
+    state.uk.records.forEach(function (record) {
+      if (isObject(record)) els.ukList.appendChild(renderUkCard(record));
+    });
+  }
+
+  // Take over the section: the candidate list, its pager and its per-tab empty state all
+  // belong to a queue this tab is not reading.
+  function renderUserKnowledge() {
+    els.ukPanel.hidden = false;
+    els.pager.hidden = true;
+    els.empty.hidden = true;
+    clearNode(els.list);
+    var total = state.uk.records.length;
+    els.countLine.textContent = !state.uk.loaded
+      ? "user knowledge — name a user to list their facts"
+      : (total === 1 ? "1 fact for " + state.uk.userId
+                     : total + " facts for " + state.uk.userId);
+    renderUkRecords();
+  }
+
   function emptyMessage() {
     var where = "the review queue";
     if (state.status === "rejected") where = "the archive";
@@ -4955,6 +5727,15 @@
 
     updateStatusToggle();
     updateTabs(counts);
+
+    // The User Knowledge tab replaces this whole view (design §D.3). Returning here — rather
+    // than filtering `items` to a type that can never appear in them — is what makes the tab
+    // a view over the per-user store instead of a permanently empty queue.
+    if (state.activeType === "user_knowledge") {
+      renderUserKnowledge();
+      return;
+    }
+    els.ukPanel.hidden = true;
 
     if (state.status === "rejected") {
       els.countLine.textContent =
@@ -5081,6 +5862,44 @@
       });
   }
 
+  // One user's private facts (design §D.1). The user id is REQUIRED — refused here as well as
+  // at the BFF, because a blank one is a request that means nothing rather than a request for
+  // everyone. Nothing about the candidate queue is touched: this is a different store.
+  function loadUserKnowledge() {
+    var userId = (els.ukUserId.value || "").trim();
+    if (!userId) {
+      state.uk = { userId: "", records: [], loaded: false };
+      clearNode(els.ukList);
+      setUkStatus("Name a user — this surface lists one user's facts, never all of them.");
+      updateTabs(computeCounts());
+      return;
+    }
+    clearError();
+    els.ukLoad.disabled = true;
+    return fetch("/api/inbox/user_knowledge?user_id=" + encodeURIComponent(userId), {
+      headers: { Accept: "application/json" }
+    })
+      .then(function (response) {
+        return response.text().then(function (text) {
+          var parsed = null;
+          try { parsed = JSON.parse(text); } catch (err) { parsed = null; }
+          if (!response.ok) {
+            showError("HTTP_" + response.status,
+              (parsed && parsed.detail) || text || response.statusText);
+            return;
+          }
+          state.uk = {
+            userId: userId,
+            records: parsed && Array.isArray(parsed.records) ? parsed.records : [],
+            loaded: true
+          };
+          render();
+        });
+      })
+      .catch(function (err) { showError("NETWORK", String(err)); })
+      .then(function () { els.ukLoad.disabled = false; });
+  }
+
   // On load, learn the write-plane health so approve is pre-disabled and a
   // "read-only review" banner shows in offline mode (contract §5). Failure to
   // read health is treated as offline (fail safe — never arm a doomed approve).
@@ -5106,6 +5925,13 @@
         }
       });
   }
+
+  els.ukLoad.addEventListener("click", loadUserKnowledge);
+  // Enter in the user-id box loads, because a one-field form that only submits by mouse is a
+  // form people fill in and then wonder about.
+  els.ukUserId.addEventListener("keydown", function (event) {
+    if (event.key === "Enter") { event.preventDefault(); loadUserKnowledge(); }
+  });
 
   els.pagerPrev.addEventListener("click", function () { step(-1); });
   els.pagerNext.addEventListener("click", function () { step(1); });

@@ -455,3 +455,217 @@ def test_a_rewrite_with_no_entries_is_still_applicable() -> None:
     assert "becomes an empty array." in source
     # ...and the on-card note stops calling a real proposal "no suggestion".
     assert "the rewritten query has no literal predicates to classify" in _HTML
+
+
+# --- The composite plan is drawn, not listed ---------------------------------------
+#
+# The DAG is the first thing on this page built out of `createElementNS` rather than `el()`,
+# and an SVG has its own set of HTML sinks. What is pinned here is that the drawing exists,
+# that it is built with the namespace API rather than by assembling markup, and that the
+# layout rule stayed a plain function — the DOM tests drive the rest.
+
+
+def test_the_plan_graph_is_built_through_the_svg_namespace() -> None:
+    """An SVG cannot be created by `document.createElement` — a `<svg>` made that way is an
+    unknown HTML element and renders nothing, which is exactly the kind of failure that gets
+    "fixed" with an innerHTML string. The namespace call is the shape that keeps this page's
+    no-sink posture while drawing."""
+    assert 'createElementNS(SVG_NS' in _HTML
+    assert 'var SVG_NS = "http://www.w3.org/2000/svg";' in _HTML
+    # No external anything: the graph is drawn from the page's own primitives.
+    assert "<img" not in _HTML
+    assert "<use" not in _HTML
+
+
+def test_the_layout_is_a_function_a_test_can_call() -> None:
+    """The layering rule (longest path from a source) has no markup of its own. Kept as a
+    pure function and exposed deliberately, so a diamond can be asserted directly instead of
+    through rendered coordinates."""
+    assert "function dagLayout(steps)" in _HTML
+    assert "window.__inboxDag = { layout: dagLayout" in _HTML
+    # It touches no DOM: a layout that read the page could not be tested without one.
+    # (Sliced at the exposure line below it, which is the one `window` reference nearby.)
+    layout = _fn_source("dagLayout").split("window.__inboxDag")[0]
+    for sink in ("document.", "window.", "querySelector"):
+        assert sink not in layout, f"dagLayout reaches for {sink}"
+
+
+def test_a_composite_is_recognised_from_either_half_of_its_plan() -> None:
+    """The wiring (`composes`) and the SQL (`node_templates`) arrive separately and either can
+    be missing. Keying the card off one of them dropped whole steps of a hand-authored plan —
+    so the detector reads BOTH, plus the declared kind."""
+    detector = _fn_source("isCompositeItem")
+    assert 'view.kind === "composite"' in detector
+    assert "Array.isArray(view.composes) && view.composes.length" in detector
+    assert "Array.isArray(gen.node_templates)" in detector
+
+
+def test_the_bare_composes_chip_list_is_gone() -> None:
+    """`composes` IS the plan section now. Rendering it a second time as chips put the same
+    field on the card twice — and for the object form it actually takes, the chip list drew
+    nothing at all, which read as a composite with no plan."""
+    assert 'section("composes", renderChips(view.composes, null), null)' not in _HTML
+    # ...and it is still accounted for, so it cannot land in the "other fields" dump.
+    assert '"intent", "kind", "resolves", "notes", "composes", "parameterization",' in _HTML
+
+
+# --- editing a knowledge candidate (knowledge-edit design §C.3) ----------------
+
+
+def test_the_knowledge_form_carries_every_field_of_the_closed_key_set() -> None:
+    """The five fields ARE the payload — the exact surfaces the S5 leakage gate scans and the
+    exact key set the intake reader closes. A form missing one makes that field uneditable and
+    (because an apply replaces the payload) silently DELETABLE; a form with a sixth would
+    collect text the server refuses by name."""
+    # The per-field testid is COMPOSED from the field name at build time, so what is pinned
+    # statically is the composition plus the names it is composed from; the exact rendered
+    # testids are located in `tests/ui/test_inbox_card_render.py`.
+    assert '"inbox-kn-field-" + spec.name' in _HTML
+    for field in ("statement", "knowledge_type", "related_terms", "scope"):
+        assert f'name: "{field}"' in _HTML, field
+    # `structured` is not one of the text fields — it is key/value rows — so its container
+    # carries the testid literally.
+    assert '"inbox-kn-field-structured"' in _HTML
+    for testid in (
+        "inbox-kn-structured-row",
+        "inbox-kn-structured-key",
+        "inbox-kn-structured-value",
+        "inbox-kn-structured-add",
+        "inbox-kn-structured-remove",
+    ):
+        assert f'"{testid}"' in _HTML, testid
+    for testid in (
+        "inbox-kn-form",
+        "inbox-kn-apply",
+        "inbox-kn-revise",
+        "inbox-kn-feedback",
+        "inbox-kn-proposal",
+        "inbox-kn-use-draft",
+        "inbox-kn-reason",
+    ):
+        assert f'"{testid}"' in _HTML, testid
+    # The diff is rendered only when the proposal carries rows, so its testid lives in the
+    # renderer rather than in a static shell — pinned separately for that reason.
+    assert '"inbox-kn-diff"' in _HTML
+
+
+def test_the_knowledge_form_is_offered_on_in_review_knowledge_only() -> None:
+    """`validated` knowledge is already a neo4j node: editing it means re-landing, which this
+    slice does not do. A form rendered there would be a button whose only outcome is a refusal,
+    and the page never invites a reviewer into a transition that will be refused."""
+    assert (
+        'if (item.status === "in_review" && item.type === "global_knowledge") {\n'
+        "      li.appendChild(renderKnowledgeEdit(item));" in _HTML
+    )
+
+
+def test_the_two_knowledge_routes_are_posted_with_the_shapes_the_service_reads() -> None:
+    """`apply_knowledge` is the ONE write path into a knowledge payload, and it takes the whole
+    five-surface object under `payload` — not the fields spread at the top level, which the
+    service would read as a body with no payload in it at all."""
+    assert (
+        '"/api/inbox/" + encodeURIComponent(item.candidate_id) + "/revise_knowledge"' in _HTML
+    )
+    assert (
+        '"/api/inbox/" + encodeURIComponent(item.candidate_id) + "/apply_knowledge"' in _HTML
+    )
+    assert "JSON.stringify({ feedback: feedback.value })" in _HTML
+    assert "JSON.stringify({ payload: readKnowledgeForm(fields) })" in _HTML
+
+
+def test_a_redacted_field_is_never_prefilled_back_into_the_form() -> None:
+    """⚠ THE REDACTION MUST NOT ROUND-TRIP. `payload_view` leaves the literal `[redacted]`
+    where the scan removed a span; prefilling that string would let one Apply land a sentence
+    with a hole in it through a perfectly clean intake check. The marker is therefore a
+    DETECTOR here, never a default value."""
+    assert 'var REDACTION_MARKER = "[redacted]";' in _HTML
+    assert "isWithheldValue" in _HTML
+    # ...and the emptiness is EXPLAINED, because an empty box otherwise reads as a field the
+    # candidate never had.
+    assert '"inbox-kn-withheld"' in _HTML
+
+
+def test_the_knowledge_assistant_is_never_an_error_banner() -> None:
+    """A 503 means no reviser is wired, which is not an error state for this page — the form is
+    the capability and the assistant is the convenience. A 422 names a key the system does not
+    have, which is a sentence the reviewer fixes in the box under it. Neither belongs in the
+    page-level banner, which says "something went wrong" about the whole surface."""
+    block = _HTML[_HTML.index("function renderKnowledgeEdit(item) {") :]
+    block = block[: block.index("function renderCompleteForm")]
+    assert "if (response.status === 503) {" in block
+    assert "the assistant is unavailable in this deployment" in block
+    # The only banner use left inside the block is the NETWORK catch — a fetch that never
+    # reached the server is a page-level fact.
+    assert block.count("showError(") == block.count('showError("NETWORK"')
+
+
+# --- the User Knowledge tab (knowledge-edit design §D.3) ----------------------
+
+
+def test_the_user_knowledge_tab_has_its_own_view() -> None:
+    """It listed nothing for as long as it existed: a `user_knowledge` candidate commits to the
+    per-user store and is DROPPED from the candidate store, so the type filter could never
+    match. The tab now reads the store the facts are actually in."""
+    for testid in (
+        "inbox-uk-user-id",
+        "inbox-uk-load",
+        "inbox-uk-list",
+        "inbox-uk-card",
+        "inbox-uk-promote",
+        "inbox-uk-promoted",
+    ):
+        assert f'"{testid}"' in _HTML, testid
+    # The candidate list is HANDED OVER, not filtered: `render()` returns before it builds a
+    # single row, so no candidate card can appear under this tab.
+    assert 'if (state.activeType === "user_knowledge") {\n      renderUserKnowledge();' in _HTML
+
+
+def test_the_tab_fetches_one_named_user_and_never_all_of_them() -> None:
+    """The store's only read is per-user (design §D.1, the deliberate D17 exception). The page
+    refuses a blank id before fetching, and the BFF refuses it again — two guards, because
+    "list everyone's private facts" is the request neither layer may ever make."""
+    assert '"/api/inbox/user_knowledge?user_id=" + encodeURIComponent(userId)' in _HTML
+    assert 'setUkStatus("Name a user' in _HTML
+
+
+def test_only_known_terminal_statuses_get_an_outcome_sentence() -> None:
+    """The outcome clauses are a LOOKUP keyed by the statuses this page knows, guarded by
+    hasOwnProperty, and there is no `else` that invents one. A status added to the enum later
+    therefore renders the neutral "<status> as <id>" line — the page cannot grow a confident
+    wrong sentence about a state nobody taught it, and a plain lookup would let a status
+    called "constructor" find something on the prototype."""
+    block = _HTML[_HTML.index("var UK_PROMOTION_NOTES = {") :]
+    block = block[: block.index("function ukPromotionClass")]
+    assert "cannot be promoted again from here" in block
+    assert "its YAML has been emitted" in block
+    assert "Object.prototype.hasOwnProperty.call(UK_PROMOTION_NOTES, key)" in block
+    # Exactly three keys: the terminal states. Anything else falls through to neutral.
+    for status in ("rejected:", "validated:", "promoted:"):
+        assert status in block, status
+    # The state modifier is a CLASS with a stylesheet rule behind it, not a second testid: the
+    # sentence already carries the state, so colour is supplementary and never the sole carrier.
+    assert '"uk-promoted uk-promoted--rejected"' in _HTML
+    assert ".uk-promoted--rejected {" in _HTML
+
+
+def test_the_promote_button_posts_the_pair_the_service_checks() -> None:
+    """BOTH ids go in the body: a record id is guessable, and the service 404s when the
+    record's owner disagrees with the user the reviewer was looking at. Sending only the record
+    id would leave that check nothing to compare against."""
+    assert 'fetch("/api/inbox/user_knowledge/promote", {' in _HTML
+    assert "user_id: state.uk.userId || record.user_id" in _HTML
+    assert "record_id: record.record_id" in _HTML
+
+
+def test_the_status_toggle_and_pager_are_inert_on_the_user_knowledge_tab() -> None:
+    """Both belong to the candidate queue. A status button here would refetch a list this view
+    does not show, and a pager would page a queue with no rows in it — furniture that lies."""
+    assert 'var inert = state.activeType === "user_knowledge";' in _HTML
+    assert "btn.disabled = inert;" in _HTML
+    assert "els.pager.hidden = true;" in _HTML
+
+
+def test_the_tab_badge_does_not_claim_a_candidate_count() -> None:
+    """It read "0" forever — true of the candidate store and meaningless, because this tab does
+    not list candidates. A count is only shown once records have actually been loaded."""
+    assert 'state.uk.loaded ? String(state.uk.records.length) : "—"' in _HTML

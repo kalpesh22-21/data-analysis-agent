@@ -12,7 +12,19 @@ from .completion import (
     CompletionUnavailableError,
     ParameterizationCompleter,
 )
-from .inbox import InboxTransitionError, ReviewInbox
+from .inbox import (
+    InboxTransitionError,
+    PromotedUserKnowledge,
+    ReviewInbox,
+    UserKnowledgeUnavailableError,
+    UserKnowledgeView,
+)
+from .knowledge_edit import (
+    KnowledgeEditInputError,
+    KnowledgeEditor,
+    KnowledgeEditorUnavailableError,
+    KnowledgeEditResult,
+)
 from .models import InboxItem
 from .ranking import RankedScore, groundedness, novelty, rank_key, review_score, session_quality
 
@@ -23,9 +35,16 @@ __all__ = [
     "CompletionUnavailableError",
     "InboxItem",
     "InboxTransitionError",
+    "KnowledgeEditInputError",
+    "KnowledgeEditResult",
+    "KnowledgeEditor",
+    "KnowledgeEditorUnavailableError",
     "ParameterizationCompleter",
+    "PromotedUserKnowledge",
     "RankedScore",
     "ReviewInbox",
+    "UserKnowledgeUnavailableError",
+    "UserKnowledgeView",
     "groundedness",
     "novelty",
     "rank_key",

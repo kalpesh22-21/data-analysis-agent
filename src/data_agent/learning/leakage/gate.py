@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
+from typing import Any
 
 from ..candidate.models import CandidateEnvelope, CandidateStatus
 from ..candidate.store import CandidateStore
@@ -141,6 +142,12 @@ def _primary_statement(text_by_field: dict[str, str]) -> str:
     return ""
 
 
+# How the S5 gate is RECOGNISED inside a stage tuple. One spelling, because two callers now ask
+# the same question of a pipeline they did not build — "is the scanner in here" — and a literal
+# at each of them is a way for one to stop finding a gate the other still does.
+LEAKAGE_STAGE_ID = "leakage"
+
+
 @dataclass(frozen=True)
 class LeakageGateStage:
     """The injected S5 write-router stage.
@@ -154,7 +161,7 @@ class LeakageGateStage:
     semantic_scanner: SemanticEntityScanner = NullSemanticEntityScanner()
     user_store: UserKnowledgeStore | None = None
     tracer: object | None = None
-    stage_id: str = "leakage"
+    stage_id: str = LEAKAGE_STAGE_ID
 
     async def process(
         self, env: CandidateEnvelope, ctx: StageContext
@@ -318,6 +325,18 @@ PENDING_ENTITY_SCAN: dict = {
     "self_check_contains_entities": False,
 }
 
+def leakage_stage(stages: tuple) -> Any:
+    """The wired S5 gate inside *stages*, found by `stage_id`, or `None`.
+
+    ⚠ THE CAPABILITY QUESTION, ANSWERED IN ONE PLACE. `settle_entity_scan` uses it to decide
+    whether to scan or to stamp the sentinel, and `KnowledgeEditor.can_scan` uses it to decide
+    whether a caller whose input is entity-bearing BY CONSTRUCTION may proceed at all
+    (`knowledge-edit-and-user-promotion-design.md` §F.1.a). The two must never disagree: a
+    caller told "you can scan" that then received the sentinel would put an unscanned
+    entity-bearing fact onto a shared queue, which is exactly the posture §F.1.a closes.
+    """
+    return next((s for s in stages if getattr(s, "stage_id", "") == LEAKAGE_STAGE_ID), None)
+
 
 async def settle_entity_scan(
     stages: tuple,
@@ -339,7 +358,7 @@ async def settle_entity_scan(
 
     `extra_fields` is passed straight through — see `LeakageGateStage.scan`.
     """
-    stage = next((s for s in stages if getattr(s, "stage_id", "") == "leakage"), None)
+    stage = leakage_stage(stages)
     if stage is None:
         return dict(PENDING_ENTITY_SCAN)
     verdict, _text_by_field = await stage.scan(env, extra_fields=extra_fields)
