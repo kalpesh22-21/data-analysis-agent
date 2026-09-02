@@ -52,6 +52,25 @@ async def test_clean_blueprint_passes():
     assert verdict.scanned_fields == ("intent", "result_signature", "notes")
 
 
+async def test_title_cased_status_is_not_mistaken_for_a_person():
+    """Catalog business labels must not be destructively redacted as names."""
+    from dataclasses import replace
+
+    base = envelope("clean")
+    gen = dict(base.payload.get("generalization") or {})
+    gen["sql_template"] = (
+        "SELECT employee_code FROM dbpcm_warehouse.employee "
+        "WHERE employee_status != 'Not Hired'"
+    )
+    candidate = replace(base, payload={**base.payload, "generalization": gen})
+
+    result, _ = await _run(candidate)
+    verdict = LeakageVerdict.from_doc(result.envelope.entity_scan)
+
+    assert verdict.result == "pass"
+    assert all(hit.span != "Not Hired" for hit in verdict.hits)
+
+
 async def test_entity_in_intent_never_passes():
     """S5-leakage-blocks-entity: the leaking blueprint (intent carries E12345 +
     2025) must NOT pass; with no user_fact signal it quarantines. The gate stamps

@@ -56,6 +56,10 @@ _SYSTEM_PROMPT = (
     "Rules: (1) emit a PLAN, never SQL. (2) Every candidate MUST cite >=1 evidence "
     "quote (turn_ref + tool_call_ref) from the session; no evidence => do not emit it. "
     "(3) For a blueprint, the payload MUST include `kind` ('single'|'composite') and "
+    "`composes`. A statement containing WITH/CTEs is ONE query and therefore `single` "
+    "with an empty `composes`. Use `composite` only for multiple independently executed "
+    "SQL tool calls whose outputs feed later calls; it requires one non-empty DAG node per "
+    "call. "
     "`parameterization` with exactly one entry per literal predicate of the accepted "
     "SQL, each classified slot|rule|inline (there is NO drop role; a caller-specific "
     "predicate is an OPTIONAL slot with an optional_pattern; a metric-defining predicate "
@@ -86,7 +90,14 @@ _SYSTEM_PROMPT = (
     "(7) Emit NO `result_signature` (null) for a single scalar aggregate (sum(...) with "
     "only a WHERE filter and no GROUP BY); set it only when the SQL has a GROUP BY whose "
     "grouped columns appear in the SELECT output. (8) intent and result_signature must "
-    "be ENTITY-FREE (no literal values)."
+    "be ENTITY-FREE (no literal values). (9) Cite the SMALLEST accepted source set: normally "
+    "the final successful answerWithTable SQL designation alone. Do not cite denied explainQuery "
+    "attempts, diagnostic queries, or intermediate queries unless each is an actual node of a "
+    "multi-query composite. (10) A slot may vary only a literal predicate the deterministic "
+    "rewriter can replace. A horizon encoded by repeated UNION ALL branches or a sequence of "
+    "addMonths(..., 1), addMonths(..., 2), ... changes SQL structure; do NOT invent a column "
+    "locator for it and do NOT describe the resulting blueprint as next N months. Either keep "
+    "that horizon fixed in the entity-free intent or omit the blueprint candidate."
 )
 
 # Appended to the system prompt ONLY when a `PriorArtIndex` is wired.

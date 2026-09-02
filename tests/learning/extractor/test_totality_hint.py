@@ -73,6 +73,35 @@ _KNOWN = known_rule_ids_from_catalog(_CATALOG)
 _INDEX = rule_index_from_catalog(_CATALOG)
 
 
+def test_two_slots_cannot_claim_the_same_literal_predicate():
+    """The two meanings of `5` in the forecast incident must not collapse onto
+    the one hire_date predicate that the current locator grammar can address."""
+    sql = (
+        "SELECT number FROM numbers(5) WHERE "
+        "toYear(hire_date) >= toYear(today()) - 5"
+    )
+    raw = blueprint_raw(
+        kind="single",
+        source_refs=("tc1",),
+        parameterization=[
+            {
+                "locator": {"table": "dbpcm_warehouse.employee", "column": "hire_date", "value": "5"},
+                "role": "slot",
+                "slot": {"name": "historical_years", "type": "relative_window", "binds_to": None, "required": True},
+            },
+            {
+                "locator": {"table": "dbpcm_warehouse.employee", "column": "hire_date", "value": "5"},
+                "role": "slot",
+                "slot": {"name": "forecast_months", "type": "relative_window", "binds_to": None, "required": True},
+            },
+        ],
+    )
+    out = to_candidate(raw, _summary(sql), known_rules=_KNOWN, rule_index=_INDEX)
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_TOTALITY
+    assert "multiple parameterization entries" in out.detail
+
+
 def _summary(sql: str = _RATIO_SQL):
     return make_summary(tool_calls=(make_tool_call(ref="tc1", sql=sql),))
 

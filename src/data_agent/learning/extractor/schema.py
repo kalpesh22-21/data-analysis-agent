@@ -113,6 +113,22 @@ _PARAM_PLAN_SCHEMA = {
     "required": ["locator", "role"],
 }
 
+_COMPOSE_NODE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "order": {"type": "integer"},
+        "node_kind": {"type": "string", "enum": ["query"]},
+        "step_intent": {"type": "string"},
+        "feeds_from": {"type": "array", "items": {"type": "integer"}},
+        "consumes": {"type": "object", "additionalProperties": {"type": "string"}},
+        "output": {"type": "object", "additionalProperties": {"type": "string"}},
+        "source_tool_call_ref": {"type": ["string", "null"]},
+        "when": {"type": ["string", "null"]},
+        "requires_approval": {"type": ["object", "null"]},
+    },
+    "required": ["order", "source_tool_call_ref"],
+}
+
 _RESULT_SIGNATURE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -163,7 +179,15 @@ _BLUEPRINT_PAYLOAD_SCHEMA = {
                 "here, NOT in parameterization."
             ),
         },
-        "source_tool_call_refs": {"type": "array", "items": {"type": "string"}},
+        "source_tool_call_refs": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "The smallest set of successful calls that directly produced the accepted "
+                "artifact; normally only the final answerWithTable SQL designation. Exclude "
+                "denied explain attempts, diagnostics, and superseded/intermediate queries."
+            ),
+        },
         "accepted_signal": {"type": "string"},
         "parameterization": {
             "type": "array",
@@ -172,6 +196,15 @@ _BLUEPRINT_PAYLOAD_SCHEMA = {
                 "Exactly one entry per literal predicate in the WHERE / JOIN-ON clause, "
                 "each classified slot|rule|inline (no drop). Do NOT add an entry for the "
                 "aggregated metric column."
+            ),
+        },
+        "composes": {
+            "type": "array",
+            "items": _COMPOSE_NODE_SCHEMA,
+            "description": (
+                "DAG nodes for a true multi-query composite. A SQL statement with WITH/CTEs "
+                "is still kind='single'. Use kind='composite' only when multiple independently "
+                "executed SQL tool calls feed one another; then emit one node per call."
             ),
         },
         "result_signature": {

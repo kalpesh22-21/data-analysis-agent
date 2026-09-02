@@ -79,6 +79,25 @@ def test_wellformed_composite_still_extracts():
     assert len(out.payload.composes) == 2
 
 
+def test_composite_without_nodes_is_corrected_at_extraction():
+    out = _validate([])
+    assert isinstance(out, Decline)
+    assert out.correctable is True
+    assert "composes is empty" in out.detail
+
+
+def test_single_with_nodes_is_corrected_at_extraction():
+    raw = blueprint_raw(kind="single", source_refs=("tc1",), parameterization=[
+        param_slot("department", value="0420")
+    ])
+    raw["payload"]["composes"] = [_good_node()]
+    summary = make_summary(tool_calls=(make_tool_call(ref="tc1", sql=_NODE_SQL["tc1"]),))
+    out = to_candidate(raw, summary, known_rules=frozenset())
+    assert isinstance(out, Decline)
+    assert out.correctable is True
+    assert "kind is 'single'" in out.detail
+
+
 @pytest.mark.parametrize(
     ("composes", "needle"),
     [
@@ -119,7 +138,14 @@ def test_numeric_string_order_and_feeds_are_tolerated():
 
 def test_absent_composes_is_not_a_decline():
     # A single (non-composite) blueprint declares no DAG.
-    out = _validate(None)
+    raw = blueprint_raw(
+        kind="single",
+        parameterization=[param_slot("department", value="0420")],
+        source_refs=("tc1",),
+    )
+    raw["payload"].pop("composes", None)
+    summary = make_summary(tool_calls=(make_tool_call(ref="tc1", sql=_NODE_SQL["tc1"]),))
+    out = to_candidate(raw, summary, known_rules=frozenset())
     assert isinstance(out, ExtractedCandidate)
     assert out.payload.composes == ()
 

@@ -45,6 +45,24 @@ _DETECTORS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+# Title-cased business labels are common in catalog enums and metric names. The
+# deliberately broad two-word detector cannot distinguish them from names, so
+# suppress matches containing a domain word. Real names remain covered by this
+# regex, with the semantic scanner as the backstop for unusual spellings.
+_NON_PERSON_WORDS = frozenset(
+    {
+        "active", "annual", "earnings", "employee", "hired", "inactive",
+        "leave", "not", "on", "retired", "salary", "status", "terminated",
+        "total",
+    }
+)
+
+
+def _known_business_label(kind: str, span: str) -> bool:
+    return kind == "person" and any(
+        word.casefold() in _NON_PERSON_WORDS for word in span.split()
+    )
+
 
 def scan_text(field: str, text: str) -> tuple[EntityHit, ...]:
     """Every regex/NER entity hit in *text*, tagged with *field* (its payload location).
@@ -54,7 +72,10 @@ def scan_text(field: str, text: str) -> tuple[EntityHit, ...]:
     hits: list[EntityHit] = []
     for kind, pattern in _DETECTORS:
         for match in pattern.finditer(text):
-            hits.append(EntityHit(field=field, kind=kind, span=match.group(0)))
+            span = match.group(0)
+            if _known_business_label(kind, span):
+                continue
+            hits.append(EntityHit(field=field, kind=kind, span=span))
     return tuple(hits)
 
 

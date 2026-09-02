@@ -933,6 +933,21 @@ def _validate_compose_nodes(raw_nodes: Any) -> Decline | None:
     return None
 
 
+def _validate_kind_composes(kind: str, composes: tuple[ComposeNodePlan, ...]) -> Decline | None:
+    """Require the discriminator and DAG payload to describe the same shape."""
+    if kind == "composite" and not composes:
+        return _role_shape(
+            "candidate.payload.kind is 'composite' but composes is empty; WITH/CTEs are "
+            "one query, while a composite requires one DAG node per executed SQL call"
+        )
+    if kind == "single" and composes:
+        return _role_shape(
+            "candidate.payload.kind is 'single' but composes contains DAG nodes; use "
+            "'composite' for a multi-query DAG or remove the nodes"
+        )
+    return None
+
+
 def _compose_nodes(raw_nodes: list[dict[str, Any]]) -> tuple[ComposeNodePlan, ...]:
     """Build the typed `ComposeNodePlan`s.
 
@@ -1184,6 +1199,7 @@ def _validate_totality(
     saw_any_sql = False
     uncovered: list[LiteralPredicate] = []
     mismatch: Decline | None = None
+    duplicate_coverage: tuple[LiteralPredicate, list[int]] | None = None
     for ref in payload.source_tool_call_refs:
         for sql in resolved.get(ref, ()):
             saw_any_sql = True
@@ -1209,6 +1225,8 @@ def _validate_totality(
                     and plan.locator.value == pred.value
                     and _table_compatible(plan.locator.table, pred.table)
                 ]
+                if len(covering) > 1 and duplicate_coverage is None:
+                    duplicate_coverage = (pred, [index for index, _plan in covering])
                 # Deduplicated: the same predicate reached through two refs (a
                 # multi-table answer re-running one query) is ONE thing for the model to
                 # fix, and a correction listing it twice reads like two.
@@ -1242,6 +1260,14 @@ def _validate_totality(
     # different edits. Whichever is not reported this round is reported the next.
     if uncovered:
         return _predicate_hint(uncovered, rule_index)
+    if duplicate_coverage is not None:
+        pred, indexes = duplicate_coverage
+        return Decline(
+            "blueprint",
+            REASON_TOTALITY,
+            f"literal predicate {pred.column} {pred.operator} {pred.value!r} is covered by "
+            f"multiple parameterization entries {indexes}; exactly one entry may own a SQL site",
+        )
     return mismatch
 
 
@@ -1790,6 +1816,10 @@ def to_candidate(
         )
     if summary.accepted_signal is None:
         return Decline(ctype, REASON_NO_ACCEPTANCE, "session carried no acceptance signal")
+
+    kind_decline = _validate_kind_composes(payload.kind, payload.composes)
+    if kind_decline is not None:
+        return kind_decline
 
     role_decline = _validate_roles(list(payload.parameterization), known_rules, rule_index)
     if role_decline is not None:

@@ -650,14 +650,15 @@ class PromotionScheduler:
                 reason="approve_blocked_entity_scan_not_actionable",
             )
 
-        # Capture the entity spans S5 identified BEFORE the strip blanks them (D17 last
-        # gate) — the landing writer's tripwire needs the PRE-strip spans (§3.3). Now
-        # guaranteed to reflect a real verdict by Guard 2.
-        forbidden_spans = entity_spans(env)
-
-        # Guard 3 — entity strip on the promotion boundary (D17). Done up front so no
-        # entity-bearing payload or audit span can cross into a validated state.
-        env = strip_entity_bearing(env)
+        # A current human attestation says the localized scanner hit is a business
+        # label, not an entity. Preserve it byte-for-byte: recursively replacing an
+        # attested enum inside executable SQL changes query semantics. Without an
+        # attestation, retain the ordinary D17 strip + landing tripwire.
+        attestation = env.leakage_attestation
+        attested = attestation is not None and attestation.applies_to(env.entity_scan)
+        forbidden_spans = () if attested else entity_spans(env)
+        if not attested:
+            env = strip_entity_bearing(env)
 
         # Guard 4 — depends_on must resolve (§11.6) regardless of promotion path (Q2).
         if not await self._deps_resolved(env):
