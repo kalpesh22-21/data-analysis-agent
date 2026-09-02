@@ -33,6 +33,12 @@ _logger = logging.getLogger(__name__)
 # carries its `columns` header; the row itself is DISCARDED (never read, D98).
 _REPLAY_COLUMN_PROBE_LIMIT = 1
 
+# TWO rows, not one, for the scalar-cell read. A `limit: 1` would TRUNCATE a fanned-out
+# intermediate to its first row and hand it back as "the" scalar — the arbitrary-cell bind
+# `executor._extract_scalar_output` exists to refuse. Asking for one more than a scalar may
+# have is what makes the violation visible.
+_SCALAR_CELL_PROBE_LIMIT = 2
+
 
 class WarehouseProbeError(Exception):
     """A malformed/unreadable probe result. RAISED (never a value, never a silent
@@ -122,6 +128,30 @@ class MCPWarehouseProbe:
         # only the column signature is checked. row_count is unread — report 0.
         return ProbeResult(row_count=0, distinct_grain_count=None, columns=columns)
 
+    async def run_cell(self, sql: str, *, column_scope: tuple[str, ...]) -> Any:
+        """The `ScalarCellProbe` port: ONE cell, or `None` when the result is not one cell.
+
+        The one place this class returns a VALUE, and the exception is narrow by construction:
+        a composite blueprint passes an upstream node's single cell into its consumer's SQL, so
+        a reviewer's trial of a DAG either reads that cell or reports green for SQL nobody could
+        run. The caller (`ReviewInbox.trial_run`) binds it into the next node's template and
+        never puts it on a wire. `run` above is unchanged and still never returns a value.
+
+        FAIL-CLOSED ON SHAPE, mirroring `executor._extract_scalar_output`: exactly one row of
+        exactly one non-NULL cell, or `None`. A malformed/non-tabular result is `None` too — the
+        question this answers is "is there a single bindable cell here", and the honest answer
+        to a result we cannot read is no.
+        """
+        session_id = self._new_session_id()
+        jwt = await self._minter.mint(list(column_scope), session_id=session_id)
+        result = await self._mcp.call_tool(
+            "runQuery",
+            {"sql": sql, "limit": _SCALAR_CELL_PROBE_LIMIT},
+            jwt=jwt,
+            session_id=session_id,
+        )
+        return _single_cell(result)
+
 
 def _default_session_id() -> str:
     # A synthetic, non-user session id. It is LOAD-BEARING: the token is minted BOUND
@@ -143,6 +173,41 @@ def _columns_from_result(raw: Any) -> tuple[str, ...]:
     if not isinstance(columns, list):
         raise WarehouseProbeError("runQuery result carried no columns header")
     return tuple(str(c) for c in columns)
+
+
+def _single_cell(raw: Any) -> Any:
+    """The one cell of a one-row, one-column runQuery result, or `None` for any other SHAPE.
+
+    ⚠ TWO OUTCOMES THAT ARE NOT THE SAME FACT, and the first version conflated them:
+
+      * `None` means the result was READABLE and is not a scalar — 0 rows, a fan-out, a wide
+        row, or a NULL cell. That is a statement about the BLUEPRINT, and the caller reports it
+        as `scalar_shape`.
+      * RAISING means the result could not be read at all — a non-tabular payload, no `rows`
+        key, a row that is not a sequence. That is a statement about the TRANSPORT, and blaming
+        the blueprint for it sends a reviewer to rewrite SQL that is fine. It mirrors
+        `_columns_from_result` above, and the caller reports it as `warehouse_error`.
+
+    RAW ROWS ARE COUNTED BEFORE ANY FILTERING, which is the other half of the fix: dropping
+    non-list rows first meant `["garbage", [5]]` — two rows, one unreadable — collapsed to one
+    row and FAIL-OPENED to the scalar 5, binding an arbitrary cell downstream out of a payload
+    nobody could parse.
+    """
+    if not isinstance(raw, dict):
+        raise WarehouseProbeError(
+            "runQuery returned a non-tabular result; cannot read a scalar cell"
+        )
+    rows = raw.get("rows")
+    if not isinstance(rows, list):
+        raise WarehouseProbeError("runQuery result carried no rows")
+    if len(rows) != 1:
+        return None  # 0 rows or a fan-out — read fine, and not a scalar
+    row = rows[0]
+    if not isinstance(row, list | tuple):
+        raise WarehouseProbeError("runQuery returned a row that is not a sequence of cells")
+    if len(row) != 1:
+        return None  # a wide row — read fine, and not a scalar
+    return row[0]  # `None` here is a NULL cell, which is equally unbindable
 
 
 __all__ = ["MCPWarehouseProbe", "WarehouseProbeError"]

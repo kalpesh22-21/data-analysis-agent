@@ -118,6 +118,10 @@ def _template_parts(payload_view: dict[str, Any]) -> tuple[dict[str, str], ...]:
     also what keeps the page's `textContent`-only posture cheap to hold: alternating text and slot
     nodes are appended, never concatenated into markup.
 
+    A COMPOSITE has no top-level `sql_template` — it is `None` by construction, and its SQL
+    lives one per DAG node in `generalization.node_templates`. Its parts are the node templates'
+    parts, in node order, so the card shows every step it will run.
+
     EMPTY is the honest answer for everything without a template — a knowledge candidate, a
     withheld payload, and a `fail_to_review` blueprint (whose generalization carries no
     `sql_template` at all) are all legitimately here, and the card renders the section only when
@@ -127,8 +131,15 @@ def _template_parts(payload_view: dict[str, Any]) -> tuple[dict[str, str], ...]:
     if not isinstance(generalization, dict):
         return ()
     template = generalization.get("sql_template")
-    if not isinstance(template, str) or not template:
-        return ()
+    if isinstance(template, str) and template:
+        return _split_template(template)
+    return _composite_parts(
+        generalization.get("node_templates"), payload_view.get("composes")
+    )
+
+
+def _split_template(template: str) -> tuple[dict[str, str], ...]:
+    """One template → its alternating text / `{slot}` parts."""
     parts: list[dict[str, str]] = []
     cursor = 0
     # STRING-AWARE spans: a `{x}` inside a string constant is not a slot, and rendering a
@@ -141,6 +152,70 @@ def _template_parts(payload_view: dict[str, Any]) -> tuple[dict[str, str], ...]:
         cursor = end
     if cursor < len(template):
         parts.append({"text": template[cursor:]})
+    return tuple(parts)
+
+
+# What separates one node's SQL from the next on the card. A text part, so the browser appends
+# it like any other and still parses nothing.
+_NODE_SEPARATOR = "\n\n"
+
+
+def _composite_parts(raw_nodes: Any, raw_composes: Any) -> tuple[dict[str, str], ...]:
+    """The DAG's node templates split and concatenated in node order.
+
+    ⚠ A CHIP IS AN INPUT THE TRIAL WILL USE, and this projection has two ways to offer one the
+    trial would silently drop. Both render the token as TEXT instead, so the step's SQL is still
+    shown verbatim and no box is offered for a value nothing reads:
+
+      * A CONSUME PLACEHOLDER. `{total}` in the consumer is filled by the upstream step's
+        result, not by a human — `ReviewInbox.trial_run` derives its required set by SUBTRACTING
+        each node's referenced `consumes`, exactly as `executor._node_bindings` does. A chip for
+        it would ask a reviewer to hand-type an intermediate the DAG computes for itself.
+      * A REPEATED SLOT. The same slot legitimately appears in several nodes — a
+        `department_code` filtering both the sub-total step and the total step — and one typed
+        value binds every occurrence. A second box for one value could only disagree with the
+        first.
+
+    `composes` is where the wiring lives (`generalization.node_templates` carries only `order` +
+    `sql_template`), joined by `order`. Order is `order` order, which IS the DAG order
+    (`check_dag` forbids a forward edge). Read defensively throughout: this is a rehydrated store
+    doc, and a listing projection must not raise.
+    """
+    if not isinstance(raw_nodes, list):
+        return ()
+    ordered = [
+        node
+        for node in raw_nodes
+        if isinstance(node, dict)
+        and isinstance(node.get("order"), int)
+        and not isinstance(node.get("order"), bool)
+        and isinstance(node.get("sql_template"), str)
+        and node["sql_template"]
+    ]
+    consumed_by_order: dict[int, set[str]] = {}
+    for plan in raw_composes if isinstance(raw_composes, list) else []:
+        if not isinstance(plan, dict) or not isinstance(plan.get("consumes"), dict):
+            continue
+        order = plan.get("order")
+        if isinstance(order, int) and not isinstance(order, bool):
+            consumed_by_order[order] = {
+                key for key in plan["consumes"] if isinstance(key, str)
+            }
+    parts: list[dict[str, str]] = []
+    offered: set[str] = set()
+    for node in sorted(ordered, key=lambda n: n["order"]):
+        if parts:
+            parts.append({"text": _NODE_SEPARATOR})
+        filled = consumed_by_order.get(node["order"], set())
+        for part in _split_template(node["sql_template"]):
+            name = part.get("slot")
+            if name is None:
+                parts.append(part)
+            elif name in filled or name in offered:
+                parts.append({"text": "{" + name + "}"})
+            else:
+                offered.add(name)
+                parts.append(part)
     return tuple(parts)
 
 

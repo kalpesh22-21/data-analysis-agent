@@ -398,6 +398,235 @@
     white-space: nowrap;
   }
 
+  /* A COMPOSITE's template: one block per node, in execution order. A composite carries no
+     top-level query, so without this the card showed a `composes` chip list and no SQL at
+     all — the reviewer was asked to approve a blueprint they could not read. */
+  .card-nodes {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .card-node {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .card-node-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .card-node-step {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-dim);
+  }
+
+  /* --- The composite PLAN, drawn as the graph it is ---------------------------
+     A composite's steps are a DAG, not a list: `consumes` says whose output lands in which
+     name, and reading that off a vertical stack of SQL blocks means holding the wiring in
+     your head while you judge the SQL. The overview above the steps draws it, the ports on
+     each step card name it, and a STABLE HUE PER STEP is what ties the two together — a
+     producer and everything that consumes it carry the same colour.
+
+     The palette is scoped to `.card-plan` rather than `:root` on purpose: it is the only
+     thing on the page that colour-codes by identity rather than by severity, and severity is
+     what every other colour here means. */
+  .card-plan {
+    --dag-hue-0: #5b8cff;
+    --dag-hue-1: #4fc3a1;
+    --dag-hue-2: #c98bdb;
+    --dag-hue-3: #e0a458;
+    --dag-hue-4: #6fb1e0;
+    --dag-hue-5: #d1737f;
+    --dag-hue-6: #8bd17c;
+    --dag-hue-7: #b0a4f5;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  /* A big plan SCROLLS IN ITS OWN BOX, in BOTH directions. The card is 720px and a
+     five-layer plan is not — a graph that widened the page would push the verbs off the right
+     edge. Height is bounded for the same reason and it is not hypothetical: forty sources
+     fanning into one sink is nearly three thousand pixels tall, and an unbounded graph would
+     put the SQL it summarizes an entire screen-height below itself. */
+  .card-dag-wrap {
+    overflow: auto;
+    max-height: 480px;
+    max-width: 100%;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-2);
+  }
+
+  .card-dag {
+    display: block;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+
+  .card-dag .dag-node { cursor: pointer; }
+
+  .card-dag .dag-node-box {
+    fill: var(--color-surface);
+    stroke-width: 1.5;
+  }
+
+  .card-dag .dag-node:hover .dag-node-box,
+  .card-dag .dag-node:focus-visible .dag-node-box,
+  .card-dag .dag-node.is-linked .dag-node-box {
+    fill: var(--color-surface-2);
+    stroke-width: 2.5;
+  }
+
+  .card-dag .dag-node:focus { outline: none; }
+
+  .card-dag .dag-node:focus-visible .dag-node-box {
+    stroke: var(--color-accent);
+  }
+
+  .card-dag .dag-node-step {
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    fill: var(--color-text-dim);
+  }
+
+  .card-dag .dag-node-intent {
+    font-size: 10px;
+    fill: var(--color-text);
+  }
+
+  .card-dag .dag-tag-box {
+    fill: var(--color-surface-2);
+    stroke: var(--color-border);
+    stroke-width: 1;
+  }
+
+  .card-dag .dag-tag-text {
+    font-size: 8px;
+    fill: var(--color-text-dim);
+  }
+
+  .card-dag .dag-edge { opacity: 0.8; }
+
+  .card-dag .dag-edge.is-linked { opacity: 1; }
+
+  /* A skip edge (layer n to n+2 or beyond) passes behind the nodes between its ends. It is not
+     styled differently — the class is the hook that says its label was pulled back into the
+     first gap rather than left at 40% of a long curve, which is where a node was sitting. */
+
+  /* A back edge closes a CYCLE, which the plan contract refuses — only a damaged document
+     draws one. Warn-coloured and dashed in the renderer (the stroke is inline, so it wins over
+     this file), dropped below the row so it reads as a loop and not as an ordinary arrow. */
+  .card-dag .dag-edge.is-back { opacity: 1; }
+
+  .card-dag .dag-edge-label-box {
+    fill: var(--color-bg);
+    stroke: var(--color-border);
+    stroke-width: 1;
+  }
+
+  .card-dag .dag-edge-label-text {
+    font-size: 9px;
+    fill: var(--color-text-dim);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .card-dag .dag-edge.is-linked .dag-edge-label-text { fill: var(--color-text); }
+
+  /* The step card, coloured by the same hue as its node above. The left border is the join:
+     it is the one mark a reviewer can follow from the graph down to the SQL. */
+  .card-plan .card-node {
+    border-left: 3px solid var(--dag-step-hue, var(--color-border));
+    padding-left: var(--space-3);
+  }
+
+  /* A step the plan could not place — no usable `order`, so no node above and no hue to
+     join it to one. Marked rather than dressed as an ordinary step: the reviewer is looking
+     at SQL that the graph does not account for. */
+  .card-plan .card-node.is-unplaced {
+    border-left-style: dashed;
+    border-left-color: var(--color-warn-border);
+  }
+
+  .card-plan .card-node.is-linked {
+    background: var(--color-surface-2);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+
+  .card-ports {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: 0.75rem;
+  }
+
+  .card-ports-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-dim);
+  }
+
+  /* A port names the value, not the field: `detail_a ← step 0` is the wiring, and the type
+     mark beside it is why a trial run refuses a table intermediate. */
+  .card-port {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    border: 1px solid var(--color-border);
+    border-left: 3px solid var(--dag-port-hue, var(--color-border));
+    border-radius: 999px;
+    padding: var(--space-1) var(--space-3);
+    color: var(--color-text);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .card-port .port-type {
+    font-size: 0.7rem;
+    color: var(--color-text-dim);
+  }
+
+  /* A reference that parses but points at no step in this plan. Warned, not coloured like a
+     working input: the graph above has no edge for it, and the card must not imply one. */
+  .card-port.is-unresolved {
+    border-color: var(--color-warn-border);
+    border-left-color: var(--color-warn-border);
+    color: var(--color-warn-text);
+  }
+
+  .card-port.is-unresolved .port-type {
+    color: var(--color-warn-text);
+  }
+
+  /* The condition on a conditional step. Monospace because it is an expression the runtime
+     evaluates, not prose. */
+  .card-when {
+    display: inline-block;
+    /* ⚠ `inline-block` IS NOT ENOUGH HERE. This box is a direct child of a
+       `display: flex; flex-direction: column` section, and a flex item's `display` is
+       blockified — `align-items: stretch` then ran it the full 671px width of the card, so a
+       twelve-character expression arrived as a full-width strip that read like a code block.
+       `align-self` is the only thing that overrides the stretch. */
+    align-self: flex-start;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.8rem;
+    color: var(--color-text);
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-1) var(--space-2);
+    word-break: break-word;
+  }
+
   /* The slot table SCROLLS IN ITS OWN BOX rather than pushing the card wide. `binds_to` is a
      fully-qualified `database.table.column`, so three slots is enough to overflow 720px and
      clip the REQUIRED column off the right edge — which is exactly the column that says
@@ -1283,7 +1512,972 @@
   // never spells that grammar, and a template is never concatenated into markup.
   // The fallback renders the plain string when the field is absent (an older service,
   // or a candidate whose generalization carries no template).
+  // A COMPOSITE carries no top-level `sql_template`, and its steps arrive in TWO HALVES:
+  // the wiring in `payload_view.composes` (`order`, `node_kind`, `step_intent`, `feeds_from`,
+  // `consumes`, `output`, `when`) and the SQL in `generalization.node_templates`
+  // (`{order, sql_template}`). Either half can be missing — a hand-authored candidate can
+  // land with a plan and no generalization, and an S4-built one with node templates whose
+  // plan was withheld — so they are JOINED BY `order` and a step present in either is
+  // rendered. Keying off only `node_templates`, as this did, dropped whole steps of the plan
+  // off a card whose entire job is to show what will run.
+  //
+  // Defensive throughout, because a payload_view is untrusted input: a non-array half, a
+  // non-object entry, a non-numeric or duplicate `order`. First occurrence wins and nothing
+  // here throws.
+  //
+  // Sorted by `order` so the card reads in EXECUTION order rather than in whatever order the
+  // document happened to store; a node without a numeric order keeps its position.
+  //
+  // Returns `{steps, notes}`: the notes are what the merge had to DISCARD. A duplicate order
+  // within one half is a malformed plan, and silently keeping one of the two would show the
+  // reviewer a plan the payload does not describe — so the repeat is dropped and said.
+  function compositePlan(item) {
+    var view = isObject(item && item.payload_view) ? item.payload_view : {};
+    var gen = isObject(view.generalization) ? view.generalization : {};
+    var steps = [];
+    var notes = [];
+    var byKey = {};
+
+    // The key two halves are JOINED on. An order this page can place is joined on the number;
+    // one it cannot (`1.5`, `"later"`) is still joined on its own spelling, so a step written
+    // in both halves stays ONE step even when its number is unusable. Only a step with no
+    // order at all falls back to its position, which cannot collide with anything.
+    function joinKey(entry, index, tag) {
+      var order = dagOrderOf(entry);
+      if (order !== null) return "n:" + String(order);
+      var raw = entry.order;
+      var kind = typeof raw;
+      if (kind === "number" || kind === "string" || kind === "boolean") {
+        return "r:" + kind + ":" + String(raw);
+      }
+      return tag + ":" + String(index);
+    }
+
+    function absorbHalf(list, tag, half) {
+      var seenHere = {};
+      (Array.isArray(list) ? list : []).forEach(function (entry, index) {
+        if (!isObject(entry)) return;
+        var order = dagOrderOf(entry);
+        var key = joinKey(entry, index, tag);
+        if (hasKey(seenHere, key)) {
+          // FIRST OCCURRENCE WINS, and the loser is named rather than merged field-by-field
+          // into the winner — which is how a second step's SQL used to end up under the
+          // first step's intent.
+          notes.push("duplicate step " +
+            (order !== null ? String(order) : String(entry.order)) + " in " + half +
+            " — only the first was used");
+          return;
+        }
+        seenHere[key] = true;
+        var step = hasKey(byKey, key) ? byKey[key] : null;
+        if (!step) {
+          step = {};
+          byKey[key] = step;
+          steps.push(step);
+        }
+        Object.keys(entry).forEach(function (field) {
+          if (field === "__proto__") return;
+          // `hasKey`, not `=== undefined`: a step legitimately carrying a field named
+          // `constructor` or `toString` would otherwise read as already-present and the
+          // payload's own value would be dropped for a prototype's.
+          if (!hasKey(step, field)) step[field] = entry[field];
+        });
+        if (order !== null) step.order = order;
+      });
+    }
+
+    absorbHalf(view.composes, "c", "composes");
+    absorbHalf(gen.node_templates, "t", "node_templates");
+
+    steps.sort(function (a, b) {
+      var left = typeof a.order === "number" ? a.order : 0;
+      var right = typeof b.order === "number" ? b.order : 0;
+      return left - right;
+    });
+    return { steps: steps, notes: notes };
+  }
+
+  // The steps alone, for the callers that only read them.
+  function compositeNodes(item) {
+    return compositePlan(item).steps;
+  }
+
+  // Is this candidate a composite AT ALL? Wider than "does it have steps to draw": a payload
+  // that says `kind: "composite"` and carries neither half is still a composite, and the
+  // section label must not call its fallback template the whole blueprint.
+  function isCompositeItem(item) {
+    var view = isObject(item && item.payload_view) ? item.payload_view : {};
+    var gen = isObject(view.generalization) ? view.generalization : {};
+    if (view.kind === "composite") return true;
+    if (Array.isArray(view.composes) && view.composes.length) return true;
+    return Array.isArray(gen.node_templates) && gen.node_templates.length > 0;
+  }
+
+  // What this step is FOR, in the author's words. Several field names have carried it across
+  // the plan and hand-authored shapes, so the first one present wins rather than the card
+  // silently dropping the sentence because it arrived under a different key.
+  function nodeIntentText(node) {
+    var keys = ["step_intent", "intent", "step", "description", "notes"];
+    for (var i = 0; i < keys.length; i++) {
+      var value = node[keys[i]];
+      if (typeof value === "string" && value.trim()) return value;
+    }
+    return null;
+  }
+
+  // --- The composite plan, as a DAG ----------------------------------------
+  //
+  // A composite is a GRAPH and was being shown as a stack. `consumes` is the only place the
+  // page says which step's output becomes which name downstream, and as a list of `k → v`
+  // rows it asks the reviewer to re-derive the plan from strings — for a fan-in that is the
+  // whole judgement. Everything below draws that graph and labels its edges with the value
+  // that crosses them.
+  //
+  // NO LIBRARY and NO HTML SINK: the SVG is built with `createElementNS` + `setAttribute`,
+  // which is the same posture as the rest of the page (see the markup test). Layout is a
+  // PURE function of the steps — `dagLayout` touches no DOM, so it can be tested directly.
+
+  var DAG_NODE_W = 176;
+  var DAG_NODE_H = 58;
+  var DAG_LAYER_GAP = 286;
+  var DAG_ROW_GAP = 72;
+  var DAG_PAD = 12;
+  var DAG_HUES = 8;
+  // How far apart edges that would land on ONE line are pushed, perpendicular to themselves.
+  // Sized against the 14px label plate: any less and two names still touch.
+  var DAG_EDGE_SPREAD = 22;
+  // How far past the producer an edge label hangs, in the gap between the two boxes. It is
+  // where t=0.4 already put an ordinary edge's label on the 286px layer pitch — named so a
+  // SKIP edge can be bisected back to the same inset instead of drifting behind a node.
+  var DAG_LABEL_INSET = 46;
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  // `<marker>` and the rest live in a shared id space, so every graph on the page gets its
+  // own suffix. Several cards are in the DOM at once (the pager hides them, it does not
+  // unmount them), and a duplicated id makes the second graph point at the first one's defs.
+  var dagSeq = 0;
+
+  function hasKey(obj, key) {
+    return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
+  // The step's number, from whatever the payload spelled it as. `order` is the join key
+  // between the two halves of a composite and the identity of a node, so a string "2" has to
+  // read as 2 — and anything else has to read as ABSENT rather than as 0, which would silently
+  // merge every unnumbered step into one node.
+  //
+  // ⚠ INTEGERS ONLY, and that is not pedantry: this used to `Math.trunc`, so a step numbered
+  // `1.5` became step 1 — the join key — and was absorbed into it, taking its intent and its
+  // SQL off the card entirely. There is no reading of a plan under which step 1.5 IS step 1.
+  // A number this page cannot place reads as absent, and an unplaceable step is drawn as a
+  // step card with no node rather than merged into somebody else's.
+  function dagOrderOf(entry) {
+    var raw = isObject(entry) ? entry.order : entry;
+    if (typeof raw === "number") {
+      return isFinite(raw) && Math.floor(raw) === raw ? raw : null;
+    }
+    if (typeof raw === "string" && /^-?\d+$/.test(raw.trim())) return parseInt(raw.trim(), 10);
+    return null;
+  }
+
+  // A stable colour per step, cycled over a small palette. Stable is the whole point: the
+  // node, its card's left border and every pill that names it are the same hue, so a
+  // producer and its consumers are matched by eye rather than by re-reading `$0`.
+  function dagHue(order) {
+    var n = typeof order === "number" && isFinite(order) ? Math.trunc(order) : 0;
+    return "var(--dag-hue-" + String(((n % DAG_HUES) + DAG_HUES) % DAG_HUES) + ")";
+  }
+
+  // `$0` is the WHOLE TABLE output of step 0; `$0.company_avg` is one scalar column of it.
+  // Anything else is not a reference this page understands, and is left as the literal text
+  // it was rather than guessed at.
+  function dagParseRef(ref) {
+    if (typeof ref !== "string") return null;
+    var m = /^\$(\d+)(?:\.([A-Za-z_][A-Za-z0-9_]*))?$/.exec(ref.trim());
+    if (!m) return null;
+    return { order: parseInt(m[1], 10), column: m[2] || null };
+  }
+
+  // Is what crosses this edge a scalar or a table? The distinction is not cosmetic: a table
+  // intermediate is exactly what the trial run comes back `table_intermediate_unsupported`
+  // on, so the reviewer should be able to see which hop it was before they run anything.
+  function dagFlowOf(ref, producer, name) {
+    if (!ref) return "table";
+    if (ref.column) return "scalar";
+    var out = isObject(producer) && isObject(producer.output) ? producer.output : null;
+    var declared = out ? out[name] : null;
+    if (declared === "scalar") return "scalar";
+    if (declared === "table") return "table";
+    var values = out ? Object.keys(out).map(function (k) { return out[k]; }) : [];
+    if (values.length === 1 && values[0] === "scalar") return "scalar";
+    return "table";
+  }
+
+  // Steps keyed by order, first occurrence winning — a duplicate `order` is a malformed
+  // payload, and the alternative to picking one is throwing on the reviewer's card.
+  function dagStepsByOrder(steps) {
+    var byOrder = {};
+    (Array.isArray(steps) ? steps : []).forEach(function (step) {
+      if (!isObject(step)) return;
+      var order = dagOrderOf(step);
+      if (order === null || hasKey(byOrder, String(order))) return;
+      byOrder[String(order)] = step;
+    });
+    return byOrder;
+  }
+
+  // The graph, as coordinates. PURE: no DOM, no `item`, nothing but the steps in and a
+  // layout out — which is what lets a test assert the layering of a diamond directly.
+  //
+  // Layer is the LONGEST path from a source, not the shortest: a fan-in step drawn beside
+  // the earlier of its inputs would put an edge behind a node and read as if it ran early.
+  // Sorting by `order` is a topological order by contract (forward edges are refused
+  // upstream), but nothing here relies on that — a cycle in a hostile payload lays out as if
+  // the back edge were absent instead of recursing forever.
+  function dagLayout(steps) {
+    var byOrder = dagStepsByOrder(steps);
+    var orders = Object.keys(byOrder).map(function (k) { return byOrder[k]; }).map(dagOrderOf);
+    orders.sort(function (a, b) { return a - b; });
+
+    var nodes = orders.map(function (order) {
+      return { order: order, layer: 0, row: 0, x: 0, y: 0 };
+    });
+    var nodeByOrder = {};
+    nodes.forEach(function (n) { nodeByOrder[String(n.order)] = n; });
+
+    var edges = [];
+    var seenEdge = {};
+    function addEdge(from, to, name, flow) {
+      if (from === to) return;                                      // self-reference: ignored
+      if (!hasKey(nodeByOrder, String(from))) return;               // unknown upstream: ignored
+      if (!hasKey(nodeByOrder, String(to))) return;
+      var key = String(from) + ">" + String(to) + ">" + String(name || "") + ">" + flow;
+      if (hasKey(seenEdge, key)) return;
+      seenEdge[key] = true;
+      edges.push({
+        from: from,
+        to: to,
+        name: name || null,
+        flow: flow,
+        label: flow === "order" ? "" : String(name || "")
+      });
+    }
+
+    nodes.forEach(function (node) {
+      var step = byOrder[String(node.order)];
+      var consumes = isObject(step.consumes) ? step.consumes : {};
+      var covered = {};
+      Object.keys(consumes).forEach(function (name) {
+        var ref = dagParseRef(consumes[name]);
+        if (!ref || ref.order === node.order) return;
+        if (!hasKey(nodeByOrder, String(ref.order))) return;
+        covered[String(ref.order)] = true;
+        addEdge(ref.order, node.order, name, dagFlowOf(ref, byOrder[String(ref.order)], name));
+      });
+      // A `feeds_from` with no `consumes` behind it is an ORDERING constraint and nothing
+      // more — "runs after", not "takes a value from". Drawn dashed and unlabelled, and
+      // dropped entirely where a consumes edge already says the same thing more precisely.
+      var feeds = Array.isArray(step.feeds_from) ? step.feeds_from : [];
+      feeds.forEach(function (raw) {
+        var from = dagOrderOf(raw);
+        if (from === null || from === node.order || hasKey(covered, String(from))) return;
+        addEdge(from, node.order, null, "order");
+      });
+    });
+
+    // ⚠ BACK EDGES ARE DROPPED BEFORE THE WALK, NOT DURING IT. Sorting by `order` is a
+    // topological order by contract (forward edges are refused upstream), so an edge from a
+    // LATER step to an earlier one is by definition a cycle-closing edge. Cutting them here
+    // makes the layering a function of the payload alone; cutting them inside the recursion
+    // (the visit-stack guard below) made the answer depend on which node the walk started
+    // from, so the same cyclic payload could lay out two different ways.
+    var preds = {};
+    nodes.forEach(function (n) { preds[String(n.order)] = []; });
+    edges.forEach(function (e) {
+      if (e.from >= e.to) return;
+      preds[String(e.to)].push(e.from);
+    });
+
+    var memo = {};
+    function layerOf(order, stack) {
+      var key = String(order);
+      if (hasKey(memo, key)) return memo[key];
+      if (hasKey(stack, key)) return 0;   // unreachable given the cut above; kept as a net
+      stack[key] = true;
+      var best = 0;
+      preds[key].forEach(function (p) {
+        var candidate = layerOf(p, stack) + 1;
+        if (candidate > best) best = candidate;
+      });
+      delete stack[key];
+      memo[key] = best;
+      return best;
+    }
+    nodes.forEach(function (n) { n.layer = layerOf(n.order, {}); });
+
+    var rowCount = {};
+    nodes.slice().sort(function (a, b) {
+      return a.layer - b.layer || a.order - b.order;
+    }).forEach(function (n) {
+      var key = String(n.layer);
+      rowCount[key] = hasKey(rowCount, key) ? rowCount[key] + 1 : 0;
+      n.row = rowCount[key];
+    });
+
+    var maxLayer = 0;
+    var maxRow = 0;
+    nodes.forEach(function (n) {
+      n.x = DAG_PAD + n.layer * DAG_LAYER_GAP;
+      n.y = DAG_PAD + n.row * DAG_ROW_GAP;
+      if (n.layer > maxLayer) maxLayer = n.layer;
+      if (n.row > maxRow) maxRow = n.row;
+    });
+
+    return {
+      nodes: nodes,
+      edges: edges,
+      width: nodes.length ? DAG_PAD * 2 + maxLayer * DAG_LAYER_GAP + DAG_NODE_W : 0,
+      height: nodes.length ? DAG_PAD * 2 + maxRow * DAG_ROW_GAP + DAG_NODE_H : 0,
+      nodeWidth: DAG_NODE_W,
+      nodeHeight: DAG_NODE_H
+    };
+  }
+
+  // Reachable from a test, and from nothing else. The layout is the one piece of this card
+  // with interesting behaviour and no markup, and asserting a diamond's layering through
+  // rendered SVG coordinates would test the renderer instead of the rule.
+  window.__inboxDag = { layout: dagLayout, parseRef: dagParseRef, hue: dagHue };
+
+  function svgEl(name, className) {
+    var node = document.createElementNS(SVG_NS, name);
+    if (className) node.setAttribute("class", className);
+    return node;
+  }
+
+  function svgAttrs(node, attrs) {
+    Object.keys(attrs).forEach(function (k) { node.setAttribute(k, String(attrs[k])); });
+    return node;
+  }
+
+  function svgText(className, text, attrs) {
+    var node = svgEl("text", className);
+    svgAttrs(node, attrs);
+    node.appendChild(document.createTextNode(String(text)));
+    return node;
+  }
+
+  // A point on the edge's cubic. Used to hang a label ON the curve rather than at the
+  // straight-line midpoint — for a fan-in those are not the same place, and the difference is
+  // the label sliding off its own edge. Since edges that would overlap are spread apart by
+  // their control points, evaluating the SPREAD curve is also what keeps each of two parallel
+  // labels on the line it belongs to.
+  function dagBezier(t, p0, p1, p2, p3) {
+    var mt = 1 - t;
+    return mt * mt * mt * p0 + 3 * mt * mt * t * p1 + 3 * mt * t * t * p2 + t * t * t * p3;
+  }
+
+  // WHERE ON ITS OWN CURVE AN EDGE'S LABEL HANGS, as a `t`.
+  //
+  // 0.4 for an ordinary edge — short of the midpoint on purpose, because the arrowheads all
+  // crowd the target's left edge and a plate centred between the layers sat on top of them.
+  //
+  // ⚠ A SKIP EDGE CANNOT USE 0.4. An edge from layer n to layer n+2 is twice as long, so 40%
+  // along it is INSIDE the node it passes behind: `elementFromPoint` at the label's centre
+  // returned that node's box, which means the edge contributed an arrowhead and NOTHING the
+  // reviewer could read. It is bisected back to `DAG_LABEL_INSET` instead, putting the label
+  // in the FIRST inter-layer gap where the spread in `renderDagOverview` can separate it from
+  // the direct edge's label rather than let the two collide.
+  //
+  // Bisection rather than algebra: x is monotonic in t on a forward edge (both control points
+  // lie between the ends in x), six halvings put the label inside a pixel of the inset, and an
+  // exact cubic root here would be arithmetic nobody could check against the drawing.
+  function dagLabelT(x1, cx1, cx2, x2, skip) {
+    if (!skip) return 0.4;
+    var target = x1 + DAG_LABEL_INSET;
+    var lo = 0;
+    var hi = 1;
+    for (var i = 0; i < 6; i++) {
+      var mid = (lo + hi) / 2;
+      if (dagBezier(mid, x1, cx1, cx2, x2) < target) lo = mid; else hi = mid;
+    }
+    return (lo + hi) / 2;
+  }
+
+  // A value for a slot that has to stay ONE LINE — a port's type, a reference the page could
+  // not parse. `String(value)` on an object is `[object Object]`, which tells the reviewer
+  // nothing about a payload that told them something.
+  function compactValue(value) {
+    if (typeof value === "string") return value;
+    return stringifyPayload(value).replace(/\s+/g, " ");
+  }
+
+  function dagTruncate(text, max) {
+    var s = String(text).replace(/\s+/g, " ").trim();
+    return s.length > max ? s.slice(0, max - 1) + "…" : s;
+  }
+
+  function countWord(n, word) {
+    return String(n) + " " + word + (n === 1 ? "" : "s");
+  }
+
+  // A small tag on a node — "approval", "when", "table". Each one marks something that
+  // changes what a reviewer should DO: a gate, a conditional step, and the hop a trial run
+  // cannot materialize.
+  function dagTag(x, y, text) {
+    var g = svgEl("g", "dag-tag");
+    var width = 8 + String(text).length * 4.6;
+    var box = svgEl("rect", "dag-tag-box");
+    svgAttrs(box, { x: x, y: y, width: width.toFixed(1), height: 12, rx: 6, ry: 6 });
+    g.appendChild(box);
+    g.appendChild(svgText("dag-tag-text", text, { x: (x + 4).toFixed(1), y: y + 9 }));
+    g.setAttribute("data-width", width.toFixed(1));
+    return g;
+  }
+
+  // The overview graph. Read top-down with the step cards below it: this says HOW the steps
+  // are wired, the cards say what each one does.
+  function renderDagOverview(steps, layout) {
+    var wrap = el("div", "card-dag-wrap");
+    var byOrder = dagStepsByOrder(steps);
+    var nodeByOrder = {};
+    layout.nodes.forEach(function (n) { nodeByOrder[String(n.order)] = n; });
+
+    var id = "dag" + String(++dagSeq);
+    var width = Math.max(layout.width, 1);
+    var height = Math.max(layout.height, 1);
+    var svg = svgEl("svg", "card-dag");
+    svgAttrs(svg, {
+      viewBox: "0 0 " + String(width) + " " + String(height),
+      width: "100%",
+      height: String(height),
+      preserveAspectRatio: "xMinYMin meet",
+      // ⚠ GROUP, NOT IMG, and the per-node `tabindex` is why. The children of a `role="img"`
+      // are PRESENTATIONAL by definition, so every node's `aria-label` — the thing the focus
+      // stop exists to announce — was inside a subtree assistive technology is entitled to
+      // flatten to the one image name. `group` keeps the graph's own name AND leaves its
+      // labelled, focusable children exposed.
+      role: "group",
+      "aria-label": "plan graph: " + countWord(layout.nodes.length, "step") + ", " +
+        countWord(layout.edges.length, "edge"),
+      "data-testid": "inbox-dag"
+    });
+    svg.style.minWidth = String(width) + "px";
+
+    var defs = svgEl("defs");
+    svg.appendChild(defs);
+    var markers = {};
+    // One arrowhead per COLOUR, made on demand: the head has to match its edge, and a single
+    // shared marker would draw every arrow in one hue while the lines disagreed.
+    function markerFor(colorKey, color) {
+      if (hasKey(markers, colorKey)) return markers[colorKey];
+      var markerId = id + "-arrow-" + colorKey;
+      var marker = svgEl("marker");
+      svgAttrs(marker, {
+        id: markerId,
+        viewBox: "0 0 8 8",
+        refX: 7,
+        refY: 4,
+        markerWidth: 5,
+        markerHeight: 5,
+        orient: "auto-start-reverse"
+      });
+      var head = svgEl("path");
+      head.setAttribute("d", "M0 0 L8 4 L0 8 z");
+      head.style.fill = color;
+      marker.appendChild(head);
+      defs.appendChild(marker);
+      markers[colorKey] = "url(#" + markerId + ")";
+      return markers[colorKey];
+    }
+
+    // EDGES FIRST, so a node always paints over the line that ends on it.
+    var edgeLayer = svgEl("g", "dag-edges");
+    svg.appendChild(edgeLayer);
+    // ⚠ TWO EDGES ON ONE GEOMETRY ARE ONE ARROW. Two values taken from the same producer are
+    // two dependencies between the same pair of boxes, and off the same four control points
+    // they produced literally identical `d` attributes: the 3px table stroke painted over the
+    // 1.75px scalar one and the drawing said "one dependency" about two. Spreading only the
+    // LABELS was not enough — it left two names hanging off a single line.
+    //
+    // So the CURVE is what gets spread, and the bucket it is spread within is the place its
+    // LABEL would land: the producing step, plus the y the label hangs at. That bucket holds
+    // exactly the edges that would overlap — several values from one producer to one consumer,
+    // and a skip edge stacked on the direct edge beside it — and nothing else, so a fan-out to
+    // forty different rows is left alone instead of being fanned four hundred pixels apart.
+    //
+    // The count has to be known before the first edge is placed, hence the pre-pass.
+    function edgeBase(a, b) {
+      var x1 = a.x + DAG_NODE_W;
+      var y1 = a.y + DAG_NODE_H / 2;
+      var x2 = b.x;
+      var y2 = b.y + DAG_NODE_H / 2;
+      // A SKIP EDGE (layer n to layer n+2 or beyond) passes BEHIND the nodes in between —
+      // the accepted cost of a layered drawing, and the reason the consuming step's ports
+      // below name every input in text as well. Its LABEL is pulled back into the first gap
+      // (see `dagLabelT`), because a label behind a node is not a label.
+      var bend = Math.max(24, (x2 - x1) / 2);
+      var skip = b.layer - a.layer > 1;
+      var at = dagLabelT(x1, x1 + bend, x2 - bend, x2, skip);
+      return {
+        x1: x1, y1: y1, x2: x2, y2: y2, bend: bend, skip: skip,
+        back: x2 <= x1,
+        at: at,
+        // Rounded, because "the same spot" is a 14px plate and not a float.
+        bucket: String(a.order) + "@" + String(Math.round(dagBezier(at, y1, y1, y2, y2) / 6))
+      };
+    }
+    var anchorTotal = {};
+    var anchorSeen = {};
+    layout.edges.forEach(function (edge) {
+      var a = nodeByOrder[String(edge.from)];
+      var b = nodeByOrder[String(edge.to)];
+      if (!a || !b) return;
+      var key = edgeBase(a, b).bucket;
+      anchorTotal[key] = hasKey(anchorTotal, key) ? anchorTotal[key] + 1 : 1;
+    });
+    layout.edges.forEach(function (edge) {
+      var a = nodeByOrder[String(edge.from)];
+      var b = nodeByOrder[String(edge.to)];
+      if (!a || !b) return;
+      var base = edgeBase(a, b);
+      var x1 = base.x1;
+      var y1 = base.y1;
+      var x2 = base.x2;
+      var y2 = base.y2;
+      var bend = base.bend;
+      var seen = hasKey(anchorSeen, base.bucket) ? anchorSeen[base.bucket] : 0;
+      anchorSeen[base.bucket] = seen + 1;
+      var spread = (seen - (anchorTotal[base.bucket] - 1) / 2) * DAG_EDGE_SPREAD;
+
+      // PERPENDICULAR TO THE CHORD, not simply in y: a fan-in's edges are steep, and pushing
+      // those down would slide them ALONG themselves rather than apart.
+      var dx = x2 - x1;
+      var dy = y2 - y1;
+      var norm = Math.sqrt(dx * dx + dy * dy) || 1;
+      var nx = -dy / norm;
+      var ny = dx / norm;
+      // The ENDS move too, by less than the controls and never past the box, so each arrow
+      // arrives at its own point on the target's left edge instead of three heads stacked on
+      // one — while still landing on the node it names.
+      var reach = DAG_NODE_H / 2 - 8;
+      var shift = Math.max(-reach, Math.min(reach, spread * 0.6));
+      var sx = x1 + nx * shift;
+      var sy = y1 + ny * shift;
+      var ex = x2 + nx * shift;
+      var ey = y2 + ny * shift;
+      var cx1 = x1 + bend + nx * spread;
+      var cy1 = y1 + ny * spread;
+      var cx2 = x2 - bend + nx * spread;
+      var cy2 = y2 + ny * spread;
+      // ⚠ A BACK EDGE IS A HOSTILE PAYLOAD, and it drew as a STRAIGHT LINE ACROSS THE ROW with
+      // a control point off the left of the canvas — indistinguishable from a forward edge
+      // except for an arrowhead arriving out of the margin. Dropped below the row so the loop
+      // reads as a loop, and marked so it reads as wrong. Cheap on purpose: a cycle is refused
+      // upstream, so only a damaged document gets here and it only has to be legible.
+      if (base.back) {
+        cy1 += DAG_NODE_H;
+        cy2 += DAG_NODE_H;
+      }
+      var color = base.back
+        ? "var(--color-warn-border)"
+        : (edge.flow === "order" ? "var(--color-text-dim)" : dagHue(edge.from));
+      var colorKey = base.back
+        ? "back"
+        : (edge.flow === "order" ? "order" : "h" + String(edge.from));
+
+      var g = svgEl("g", "dag-edge is-" + edge.flow +
+        (base.skip ? " is-skip" : "") + (base.back ? " is-back" : ""));
+      svgAttrs(g, {
+        "data-testid": "inbox-dag-edge",
+        "data-from": edge.from,
+        "data-to": edge.to,
+        "data-flow": edge.flow
+      });
+      var path = svgEl("path", "dag-edge-path");
+      svgAttrs(path, {
+        d: "M" + sx.toFixed(1) + " " + sy.toFixed(1) + " C" + cx1.toFixed(1) + " " +
+          cy1.toFixed(1) + " " + cx2.toFixed(1) + " " + cy2.toFixed(1) + " " +
+          ex.toFixed(1) + " " + ey.toFixed(1),
+        fill: "none",
+        "marker-end": markerFor(colorKey, color)
+      });
+      path.style.stroke = color;
+      path.style.strokeWidth = edge.flow === "table" ? "3" : (edge.flow === "order" ? "1.25" : "1.75");
+      if (edge.flow === "order" || base.back) path.setAttribute("stroke-dasharray", "5 4");
+      g.appendChild(path);
+
+      // The label rides ITS OWN curve — the spread one — so a name always sits on the line it
+      // names. Plated so it stays readable where it crosses another edge.
+      if (edge.label) {
+        var at = base.at;
+        var mx = dagBezier(at, sx, cx1, cx2, ex);
+        var my = dagBezier(at, sy, cy1, cy2, ey);
+        // The label has to fit BETWEEN the layers — a name wider than the gap prints across
+        // the node it points at. Truncated to fit, with the full name on the pointer and,
+        // in full, on the consuming step's input port below.
+        var shown = dagTruncate(edge.label, 14);
+        var boxWidth = 10 + shown.length * 5.2;
+        var box = svgEl("rect", "dag-edge-label-box");
+        svgAttrs(box, {
+          x: (mx - boxWidth / 2).toFixed(1),
+          y: (my - 7).toFixed(1),
+          width: boxWidth.toFixed(1),
+          height: 14,
+          rx: 7,
+          ry: 7
+        });
+        g.appendChild(box);
+        var labelTitle = svgEl("title");
+        labelTitle.appendChild(document.createTextNode(edge.label));
+        g.appendChild(labelTitle);
+        var text = svgText("dag-edge-label-text", shown, {
+          x: mx.toFixed(1),
+          y: (my + 3).toFixed(1),
+          "text-anchor": "middle"
+        });
+        g.appendChild(text);
+      }
+      edgeLayer.appendChild(g);
+    });
+
+    layout.nodes.forEach(function (n) {
+      var step = byOrder[String(n.order)] || {};
+      // The kind is the PAYLOAD'S WORD, carried through rather than matched against a list of
+      // two. Only `approval` changes the shape — but a `guard`, or whatever the next gate is
+      // called, must still be legible in the drawing, which is the view a reviewer skims.
+      // Drawing it as an ordinary query said "there is no gate here" about a step that is one.
+      var kind = typeof step.node_kind === "string" && step.node_kind.trim()
+        ? step.node_kind.trim() : "";
+      var approval = kind === "approval";
+      var marked = kind && kind !== "query" ? kind : "";
+      var intent = nodeIntentText(step) || "";
+      var hue = dagHue(n.order);
+
+      var g = svgEl("g", "dag-node" + (approval ? " is-approval" : ""));
+      svgAttrs(g, {
+        "data-testid": "inbox-dag-node",
+        "data-order": n.order,
+        "data-layer": n.layer,
+        "data-row": n.row,
+        "data-kind": kind || "query",
+        tabindex: "0",
+        role: "img",
+        "aria-label": "step " + String(n.order) + (marked ? ", " + marked : "") +
+          (intent ? ": " + intent : "")
+      });
+      // The full sentence, for the pointer: the drawn one is truncated to fit the box, and a
+      // truncation with no way back to the original is a worse summary than none.
+      var title = svgEl("title");
+      title.appendChild(document.createTextNode(intent || ("step " + String(n.order))));
+      g.appendChild(title);
+
+      var box = svgEl("rect", "dag-node-box");
+      svgAttrs(box, {
+        x: n.x, y: n.y, width: DAG_NODE_W, height: DAG_NODE_H,
+        rx: approval ? 18 : 8, ry: approval ? 18 : 8
+      });
+      box.style.stroke = hue;
+      if (approval) box.setAttribute("stroke-dasharray", "5 3");
+      g.appendChild(box);
+
+      // The hue bar matches the card's left border below — but only on a rectangular node:
+      // the approval shape is a pill, and a straight bar down its curved edge sits outside it.
+      // There the dashed stroke carries the colour instead.
+      if (!approval) {
+        var bar = svgEl("rect", "dag-node-bar");
+        svgAttrs(bar, { x: n.x + 1.5, y: n.y + 1.5, width: 4, height: DAG_NODE_H - 3, rx: 2, ry: 2 });
+        bar.style.fill = hue;
+        g.appendChild(bar);
+      }
+
+      g.appendChild(svgText("dag-node-step", "step " + String(n.order), {
+        x: n.x + 12, y: n.y + 17
+      }));
+      if (intent) {
+        var shownIntent = dagTruncate(intent, 28);
+        // ⚠ CLIPPED BY A VIEWPORT, NOT BY AN ESTIMATE. A nested `<svg>` is its own viewport
+        // and clips what does not fit, so nothing can leave the box whatever the glyphs turn
+        // out to measure. The estimate below is a COMPACTION AID and was never a guarantee:
+        // it is tuned for lowercase, so a 27-character all-caps intent slipped under the
+        // threshold, rendered ~256px wide inside a 176px node, and printed across the edge
+        // labels beside it. Clipping is structural; the estimate only decides whether the
+        // text is squeezed to fit or simply cut off.
+        var clip = svgEl("svg", "dag-node-intent-clip");
+        svgAttrs(clip, {
+          x: n.x + 12,
+          y: n.y + 21,
+          width: DAG_NODE_W - 24,
+          height: 16,
+          overflow: "hidden"
+        });
+        var label = svgText("dag-node-intent", shownIntent, { x: 0, y: 12 });
+        // ⚠ ONLY WHEN IT WOULD OVERFLOW. `textLength` is a fit, not a font size: applied
+        // unconditionally it STRETCHED a one-word intent across the whole box, so "count"
+        // rendered as `c o u n t` and read as a rendering fault. The estimate is deliberately
+        // crude (≈5.6px per character at 10px) — it only has to catch the long tail, and the
+        // box is sized so an ordinary 28-character summary needs no help.
+        if (shownIntent.length * 5.6 > DAG_NODE_W - 24) {
+          label.setAttribute("textLength", String(DAG_NODE_W - 24));
+          label.setAttribute("lengthAdjust", "spacingAndGlyphs");
+        }
+        clip.appendChild(label);
+        g.appendChild(clip);
+      }
+
+      var tags = [];
+      if (marked) tags.push(dagTruncate(marked, 14));
+      // ⚠ THE SAME PREDICATE THE CARD USES, character for character. This tested
+      // `typeof step.when === "string"`, so a `when` that is an object or the number 0 gave a
+      // "when" section on the card below and NO tag up here: the overview said "unconditional"
+      // about a step the card said was conditional, and the overview is what a reviewer skims.
+      if (hasKey(step, "when") && !isEmptyValue(step.when)) tags.push("when");
+      var outputs = isObject(step.output) ? step.output : {};
+      if (Object.keys(outputs).some(function (k) { return outputs[k] === "table"; })) {
+        tags.push("table");
+      }
+      var tagX = n.x + 12;
+      tags.forEach(function (text) {
+        var tag = dagTag(tagX, n.y + DAG_NODE_H - 18, text);
+        tagX += parseFloat(tag.getAttribute("data-width")) + 4;
+        g.appendChild(tag);
+      });
+
+      svg.appendChild(g);
+    });
+
+    wrap.appendChild(svg);
+    return wrap;
+  }
+
+  // The step's inputs and outputs, as PORTS. `consumes` used to render as a `k → v` list of
+  // `$0.company_avg` strings — true, and unreadable: the reviewer had to resolve the
+  // reference themselves. A port names the value, the step it comes from, and its type, and
+  // carries the producer's hue so the match is visible without reading anything.
+  // `byOrder` is the SAME map the layout resolves producers through, so a port and an edge
+  // can never disagree about whether a reference points at a step that exists.
+  function renderNodePorts(step, byOrder) {
+    var rows = [];
+    var consumes = isObject(step.consumes) ? step.consumes : {};
+    var inputNames = Object.keys(consumes).filter(function (n) {
+      return !isEmptyValue(consumes[n]);
+    });
+    if (inputNames.length) {
+      var inputs = el("div", "card-ports");
+      inputs.setAttribute("data-testid", "inbox-node-inputs");
+      inputs.appendChild(el("span", "card-ports-label", "inputs"));
+      inputNames.forEach(function (name) {
+        var ref = dagParseRef(consumes[name]);
+        var from = ref ? String(ref.order) : "";
+        // ⚠ PARSEABLE IS NOT RESOLVABLE. `$99` reads as a reference to step 99 and the graph
+        // correctly refuses to draw an edge to a step that is not in the plan — so a port
+        // that dressed it as a working typed input made the two halves of this section
+        // contradict each other. A reference with no producer is UNRESOLVED: no type, no
+        // hue, no claim. Same for a step consuming itself, which is not a dependency.
+        var producer = ref && hasKey(byOrder, from) ? byOrder[from] : null;
+        var self = ref && dagOrderOf(step) === ref.order;
+        var resolved = !!producer && !self;
+        var pill = el("span", "card-port" + (ref && !resolved ? " is-unresolved" : ""));
+        pill.setAttribute("data-testid", "inbox-node-input");
+        pill.setAttribute("data-name", name);
+        if (resolved) {
+          pill.setAttribute("data-from", from);
+          pill.style.setProperty("--dag-port-hue", dagHue(ref.order));
+        }
+        // An unparseable reference is shown VERBATIM rather than dropped — it is the payload
+        // saying something this page does not understand, which the reviewer should see.
+        pill.appendChild(el("span", "", ref
+          ? name + " ← step " + from + (ref.column ? "." + ref.column : "") +
+            (resolved ? "" : (self ? " (itself)" : " (not in plan)"))
+          : name + " ← " + compactValue(consumes[name])));
+        var flow = resolved ? dagFlowOf(ref, producer, name) : (ref ? "unresolved" : null);
+        if (flow) {
+          pill.setAttribute("data-type", flow);
+          pill.appendChild(el("span", "port-type", flow));
+        }
+        inputs.appendChild(pill);
+      });
+      rows.push(inputs);
+    }
+
+    var output = isObject(step.output) ? step.output : {};
+    var outputNames = Object.keys(output).filter(function (n) {
+      return !isEmptyValue(output[n]);
+    });
+    if (outputNames.length) {
+      var produced = el("div", "card-ports");
+      produced.setAttribute("data-testid", "inbox-node-outputs");
+      produced.appendChild(el("span", "card-ports-label", "outputs"));
+      // ⚠ NO ORDER, NO HUE. `dagHue` maps anything that is not a number onto hue 0, so an
+      // UNPLACED step — one whose `order` this page cannot read — had its output pills painted
+      // in step 0's colour while its own card border correctly carried none. The hue is a JOIN:
+      // pills claiming a step they have nothing to do with is the one failure it cannot have.
+      // Left unset, the `var()` fallback in the stylesheet paints the neutral border.
+      var order = dagOrderOf(step);
+      outputNames.forEach(function (name) {
+        var pill = el("span", "card-port");
+        pill.setAttribute("data-testid", "inbox-node-output");
+        pill.setAttribute("data-name", name);
+        if (order !== null) pill.style.setProperty("--dag-port-hue", dagHue(order));
+        pill.appendChild(el("span", "", name));
+        var type = compactValue(output[name]);
+        pill.setAttribute("data-type", type);
+        pill.appendChild(el("span", "port-type", type));
+        produced.appendChild(pill);
+      });
+      rows.push(produced);
+    }
+    return rows;
+  }
+
+  // Graph and cards, joined. Hovering or focusing a node lights its edges and its card;
+  // clicking scrolls the card into view. Plain class toggling — the highlight is a reading
+  // aid, not state, and nothing outside this wrapper can see it.
+  function linkPlan(wrap) {
+    function each(list, fn) {
+      Array.prototype.forEach.call(list, fn);
+    }
+    function setLinked(order, on) {
+      var key = String(order);
+      each(wrap.querySelectorAll('[data-order="' + key + '"]'), function (node) {
+        if (node.classList.contains("card-node") || node.classList.contains("dag-node")) {
+          node.classList.toggle("is-linked", on);
+        }
+      });
+      each(wrap.querySelectorAll('[data-testid="inbox-dag-edge"]'), function (edge) {
+        if (edge.getAttribute("data-from") === key || edge.getAttribute("data-to") === key) {
+          edge.classList.toggle("is-linked", on);
+        }
+      });
+    }
+    function bind(node, order) {
+      node.addEventListener("mouseenter", function () { setLinked(order, true); });
+      node.addEventListener("mouseleave", function () { setLinked(order, false); });
+      node.addEventListener("focus", function () { setLinked(order, true); });
+      node.addEventListener("blur", function () { setLinked(order, false); });
+    }
+    each(wrap.querySelectorAll('[data-testid="inbox-dag-node"]'), function (node) {
+      var order = node.getAttribute("data-order");
+      bind(node, order);
+      node.addEventListener("click", function () {
+        var card = wrap.querySelector('.card-node[data-order="' + order + '"]');
+        if (card) card.scrollIntoView({ block: "nearest" });
+      });
+      // Keyboard parity: the node is focusable, so it has to be operable from the keyboard.
+      node.addEventListener("keydown", function (event) {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        var card = wrap.querySelector('.card-node[data-order="' + order + '"]');
+        if (card) card.scrollIntoView({ block: "nearest" });
+      });
+    });
+    each(wrap.querySelectorAll(".card-node[data-order]"), function (card) {
+      bind(card, card.getAttribute("data-order"));
+    });
+  }
+
+  // The whole composite section: the graph, what the merge had to drop, then the steps.
+  function renderCompositePlan(nodes, notes) {
+    var layout = dagLayout(nodes);
+    var wrap = el("div", "card-plan");
+    wrap.setAttribute("data-testid", "inbox-bp-plan");
+    if (layout.nodes.length) wrap.appendChild(renderDagOverview(nodes, layout));
+    (Array.isArray(notes) ? notes : []).forEach(function (text) {
+      var note = el("p", "card-empty", text);
+      note.setAttribute("data-testid", "inbox-plan-note");
+      wrap.appendChild(note);
+    });
+    wrap.appendChild(el("p", "item-field-label", "template — one query per step"));
+    wrap.appendChild(renderNodeTemplates(nodes, layout));
+    linkPlan(wrap);
+    return wrap;
+  }
+
+  // ⚠ NO SLOT CHIPS PER NODE, and that is the same rule the rest of this page keeps: the
+  // `{slot}` grammar belongs to the server and `template_parts` is the only pre-split it
+  // sends. For a composite those parts are the UNION across nodes, which cannot be re-attached
+  // to one node's text without this page re-tokenizing SQL. So node SQL is rendered VERBATIM
+  // as text, and the slots section below still lists what the blueprint as a whole takes.
+  function renderNodeTemplates(nodes, layout) {
+    var wrap = el("div", "card-nodes");
+    wrap.setAttribute("data-testid", "inbox-bp-node-templates");
+    var byOrder = dagStepsByOrder(nodes);
+    var placedOrders = {};
+    layout.nodes.forEach(function (n) { placedOrders[String(n.order)] = true; });
+    nodes.forEach(function (node, index) {
+      var order = dagOrderOf(node);
+      var placed = order !== null && hasKey(placedOrders, String(order));
+      var step = el("div", placed ? "card-node" : "card-node is-unplaced");
+      step.setAttribute("data-testid", "inbox-bp-node");
+
+      var head = el("div", "card-node-head");
+      // ⚠ A NUMBER IT DOES NOT HAVE IS WORSE THAN NO NUMBER. This used to fall back to
+      // `index + 1` for an unnumbered step, which collided with the real step 1: two cards
+      // titled "step 1", both answering to `data-order="1"`, so hovering the one node lit
+      // both of them. An unplaced step is addressed by a key no node can claim and says it
+      // has no place in the plan, which is the fact about it.
+      step.setAttribute("data-order", placed ? String(order) : "u" + String(index));
+      if (placed) step.style.setProperty("--dag-step-hue", dagHue(order));
+      head.appendChild(el("span", "card-node-step", placed ? "step " + String(order) : "step ?"));
+      if (typeof node.node_kind === "string" && node.node_kind) {
+        head.appendChild(el("span", "card-chip", node.node_kind));
+      }
+      step.appendChild(head);
+
+      var intent = nodeIntentText(node);
+      if (intent) step.appendChild(el("p", "item-summary", intent));
+
+      if (typeof node.sql_template === "string" && node.sql_template) {
+        var pre = el("pre", "card-template");
+        pre.setAttribute("data-testid", "inbox-bp-node-template");
+        pre.appendChild(document.createTextNode(node.sql_template));
+        step.appendChild(pre);
+      } else {
+        // Stated, not skipped: a step with no SQL is a fact about the candidate, and a
+        // silently-omitted block reads as a rendering fault.
+        step.appendChild(el("p", "card-empty", "no SQL on this step"));
+      }
+
+      // How this step is wired to the others, as typed PORTS. `consumes` is what makes a
+      // trial run refuse a table intermediate, so it is shown beside the SQL rather than
+      // left in the raw dump — and named by step and type rather than as a `$0.col` string.
+      renderNodePorts(node, byOrder).forEach(function (row) { step.appendChild(row); });
+
+      // ⚠ READ OFF THE EDGES THE GRAPH ACTUALLY DREW, not off `feeds_from` again. A second,
+      // looser walk of the same field printed "runs after step 1" on step 1 and "runs after
+      // step later" for an entry that is not a step number — dependencies the drawing above
+      // does not have and the runtime cannot honour. One resolution, two renderings.
+      var ordering = placed
+        ? layout.edges.filter(function (e) {
+            return e.to === order && e.flow === "order";
+          }).map(function (e) { return "step " + String(e.from); })
+        : [];
+      var feedsChips = renderChips(ordering, null);
+      if (feedsChips) step.appendChild(section("runs after", feedsChips, null));
+
+      // The CONDITION, in full. `when` decides whether this step runs at all, and the mark on
+      // the node above only says that there is one — a reviewer cannot judge a conditional
+      // step without reading the condition.
+      if (hasKey(node, "when") && !isEmptyValue(node.when)) {
+        step.appendChild(section(
+          "when",
+          typeof node.when === "string"
+            ? el("code", "card-when", node.when)
+            : el("pre", "payload-view", stringifyPayload(node.when)),
+          null
+        ));
+      }
+
+      wrap.appendChild(step);
+    });
+    return wrap;
+  }
+
   function renderTemplate(item) {
+    // COMPOSITE FIRST. `template_parts` for a composite is the union of the node slots, which
+    // would render here as a row of chips with no SQL around them — the nodes ARE the
+    // template, so they are what the section shows.
+    var plan = compositePlan(item);
+    if (plan.steps.length) return renderCompositePlan(plan.steps, plan.notes);
+
     var pre = el("pre", "card-template");
     pre.setAttribute("data-testid", "inbox-bp-template");
     var parts = item.template_parts;
@@ -1314,6 +2508,23 @@
     var gen = isObject(item && item.payload_view) ? item.payload_view.generalization : null;
     var raw = isObject(gen) ? gen.sql_template : null;
     if (typeof raw === "string" && raw) return raw;
+    // A composite has no single query. Joining the union of its `template_parts` would produce
+    // a string that is not any query this candidate runs, so the node templates are shown in
+    // order with a step marker instead — a READING of the candidate, never a posted one (the
+    // only SQL this page sends back is the server's own proposal, verbatim).
+    var nodes = compositeNodes(item);
+    if (nodes.length) {
+      // ⚠ AND NO INVENTED NUMBER HERE EITHER. This fell back to `index + 1`, which is the
+      // same defect the step cards were fixed for: an unnumbered step was marked `-- step 2`
+      // and collided with the real step 2 in the revise modal's read-only pane, where the two
+      // markers are the only thing telling the queries apart. `dagOrderOf` is the one reading
+      // of `order` this page has, and a step it cannot place says so.
+      return nodes.map(function (node) {
+        var order = dagOrderOf(node);
+        var sql = typeof node.sql_template === "string" ? node.sql_template : "";
+        return "-- step " + (order === null ? "?" : String(order)) + "\n" + sql;
+      }).join("\n\n");
+    }
     var parts = Array.isArray(item && item.template_parts) ? item.template_parts : [];
     return parts.map(function (part) {
       if (!isObject(part)) return "";
@@ -1675,7 +2886,27 @@
       out.push(section("withheld", el("p", "card-empty", view.withheld), "inbox-bp-withheld"));
     }
 
-    out.push(section("template", renderTemplate(item), null));
+    // The label says WHICH shape is below it, and for a composite it says HOW BIG: a plan
+    // with three steps and two edges is a different review from a single query, and a
+    // reviewer scrolling past "template" would read the first node as the whole thing.
+    var planSteps = compositeNodes(item);
+    var planLabel = "template";
+    if (planSteps.length) {
+      var planLayout = dagLayout(planSteps);
+      var unplaced = planSteps.length - planLayout.nodes.length;
+      // The count is of what is DRAWN, with the steps that could not be placed named
+      // separately: a header that counted them together would promise a graph node for a
+      // step the graph does not contain.
+      planLabel = "plan — " + countWord(planLayout.nodes.length, "step") +
+        (unplaced > 0 ? " (+" + String(unplaced) + " unplaced)" : "") + ", " +
+        countWord(planLayout.edges.length, "edge");
+    } else if (isCompositeItem(item)) {
+      // A DECLARED COMPOSITE WITH NOTHING READABLE IN IT. Whatever `renderTemplate` fell back
+      // to here is not the blueprint — a composite's stray `generalization.sql_template` is
+      // one query out of several — so it must not be labelled "template".
+      planLabel = "plan — no steps";
+    }
+    out.push(section(planLabel, renderTemplate(item), null));
     out.push(section("slots", renderSlots(entries), null));
     out.push(section("frozen filters", renderInline(entries), null));
     out.push(section("rule filters", renderRules(entries), null));
@@ -1704,7 +2935,17 @@
     );
     out.push(section("tables", renderChips(view.tables, null), null));
     out.push(section("rules used", renderChips(gen.uses_rules, null), null));
-    out.push(section("composes", renderChips(view.composes, null), null));
+    // ⚠ NOT a chip list any more. `composes` IS the plan section above — the graph and the
+    // step cards are built from it — and repeating it here as bare chips (which rendered
+    // nothing at all for the object form it actually takes) put the same field on the card
+    // twice, once unreadably. It survives here only when there is no plan to draw, so a
+    // malformed `composes` is still shown rather than silently swallowed by the section that
+    // could not use it.
+    out.push(section(
+      "composes",
+      planSteps.length || isEmptyValue(view.composes) ? null : renderValue(view.composes),
+      null
+    ));
     out.push(section("notes", renderText(view.notes), null));
     out.push(section("other fields", renderOtherFields(view, BLUEPRINT_KEYS), null));
     return out;
@@ -2012,7 +3253,15 @@
       }
     });
     var gen = isObject(item.payload_view) ? item.payload_view.generalization : null;
-    if (!isObject(gen) || !gen.sql_template) return null;
+    var nodes = compositeNodes(item);
+    var singleSql = isObject(gen) && typeof gen.sql_template === "string" && gen.sql_template;
+    // ⚠ GATED ON "IS THERE ANYTHING TO RUN", NOT ON `gen.sql_template`. A composite's template
+    // is null by construction, so keying off it alone deleted the whole trial block from every
+    // composite card — not a disabled button, not a sentence, nothing. A candidate with node
+    // templates or with server-split parts has something to bind and something to send; only a
+    // genuinely empty one gets no block, and the server's `no_template` still covers the case
+    // where what is here turns out not to be runnable.
+    if (!singleSql && !nodes.length && !parts.length) return null;
 
     var block = el("div", "trial-block");
     block.setAttribute("data-testid", "inbox-trial");
@@ -2026,13 +3275,22 @@
     // Held in a local only — never written to storage, never put in a URL, and never sent
     // anywhere but this one POST. It is cleared from the field after a run so a shared screen
     // or a browser restore cannot leak it.
+    // SANITIZED the same way the revise caution's id is: a candidate id is
+    // `candidate::<hash>::<n>`, and while `::` is a legal id it is not legal in the CSS
+    // selectors this page's own tests reach for. Computed ONCE and used for every id in this
+    // block, so the token field and the slot fields cannot drift into two spellings.
+    var idBase = String(item.candidate_id || "").replace(/[^A-Za-z0-9_-]/g, "-");
+
     var tokenInput = document.createElement("input");
     tokenInput.type = "password";
+    tokenInput.id = "trial-token-" + idBase;
     tokenInput.setAttribute("data-testid", "inbox-trial-token");
     tokenInput.setAttribute("autocomplete", "off");
     tokenInput.placeholder = "paste a warehouse token you already hold";
     var tokenRow = el("div", "trial-binding");
-    tokenRow.appendChild(el("label", "", "run as"));
+    var tokenLabel = el("label", "", "run as");
+    tokenLabel.setAttribute("for", tokenInput.id);
+    tokenRow.appendChild(tokenLabel);
     tokenRow.appendChild(tokenInput);
     block.appendChild(tokenRow);
     block.appendChild(
@@ -2042,15 +3300,29 @@
         "checked separately before anything is served)")
     );
 
+    // SAID BEFORE THE ROUND TRIP, for a composite. The bindings below are the union of the
+    // steps' slots, and a step that hands a TABLE to the next one cannot be materialized by
+    // the probe — the server answers `table_intermediate_unsupported`, and a reviewer who
+    // reads that expectation first will not read it as the blueprint being broken.
+    if (isCompositeItem(item)) {
+      var composite = el("p", "card-empty",
+        "this is a composite — the steps run in order and the fields below are the slots they " +
+        "share. A step that feeds the next one a TABLE cannot be trial-run yet; it comes back " +
+        "unsupported and the blueprint is reviewed on its SQL instead.");
+      composite.setAttribute("data-testid", "inbox-trial-composite-note");
+      block.appendChild(composite);
+    }
+
     var inputs = {};
     slots.forEach(function (name) {
       var row = el("div", "trial-binding");
+      var inputId = "trial-" + idBase + "-" + name;
       var label = el("label", "", name);
-      label.setAttribute("for", "trial-" + item.candidate_id + "-" + name);
+      label.setAttribute("for", inputId);
       row.appendChild(label);
       var input = document.createElement("input");
       input.type = "text";
-      input.id = "trial-" + item.candidate_id + "-" + name;
+      input.id = inputId;
       input.setAttribute("data-testid", "inbox-trial-binding");
       input.setAttribute("data-slot", name);
       input.placeholder = "a value to bind";
@@ -2060,7 +3332,10 @@
     });
     if (!slots.length) {
       block.appendChild(
-        el("p", "card-empty", "this template takes no arguments — run it as-is")
+        el("p", "card-empty",
+          nodes.length
+            ? "these steps take no arguments — run them as-is"
+            : "this template takes no arguments — run it as-is")
       );
     }
 
@@ -2130,6 +3405,30 @@
               "runs as you rather than as the service";
       } else if (why === "no_template") {
         why = "no SQL template on this candidate";
+      } else if (why === "table_intermediate_unsupported") {
+        // NOT a failed blueprint, and not a failed review either. The probe cannot materialize
+        // session scratch, so a step that hands a table to the next one has nowhere to put it —
+        // the candidate is still judged on its SQL, which the card now shows per step.
+        why = "this blueprint materializes a table intermediate — trial runs can't do that " +
+              "yet; it can still be reviewed on its SQL, step by step, above";
+      } else if (why === "no_scalar_probe") {
+        // The SERVER'S OWN SENTENCE, because this one is a fact about the DEPLOYMENT rather
+        // than about the candidate — an offline inbox whose probe cannot read an intermediate
+        // value. Re-wording it here would let this page assert a cause it cannot see. The
+        // fallback is for a server that sent the tag with no detail.
+        why = typeof r.detail === "string" && r.detail.trim()
+          ? String(r.detail)
+          : "this deployment cannot read an intermediate value, so a multi-step blueprint " +
+            "cannot be trialled here";
+      } else if (typeof r.detail === "string" && r.detail.trim()) {
+        // ⚠ THE FALLTHROUGH IS THE POINT. The composite walk answers with `scalar_shape`,
+        // `malformed_composite` and `bind_failed`, and each carries a step-level `detail`
+        // ("step 2 carries no SQL template") that is the entire actionable content — without
+        // this the reviewer read a bare tag and could not tell WHICH step. It catches reasons
+        // added later too, so a new server tag degrades to "tag: what happened" rather than to
+        // a token on its own. The `detail` is server data reaching the DOM through
+        // `textContent`, like every other value on this page.
+        why = why + ": " + String(r.detail);
       }
       var fail = el("p", "trial-result is-fail", why);
       fail.setAttribute("data-testid", "inbox-trial-result");

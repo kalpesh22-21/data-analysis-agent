@@ -23,7 +23,11 @@ import logging
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
-from data_agent.runtime.blueprint.models import ResultGrain
+from data_agent.runtime.blueprint.models import (
+    SCALAR_CONSUME_REF,
+    TABLE_CONSUME_REF,
+    ResultGrain,
+)
 from data_agent.runtime.blueprint.template import (
     TemplateBindError,
     bind_template,
@@ -142,6 +146,223 @@ def _expected_columns(payload: dict[str, Any]) -> list[str] | None:
         return None
     names = [c.get("column") for c in shape if isinstance(c, dict) and c.get("column")]
     return [str(n) for n in names] or None
+
+
+def _trial_verdict(
+    payload: dict[str, Any], grain: tuple[str, ...], result: ProbeResult
+) -> TrialRunResult:
+    """The D56 gate over a trial's FINAL result → the reviewer-facing `TrialRunResult`.
+
+    ONE implementation for both the single-template and the composite path — the composite runs
+    it over its TERMINAL node, exactly as `executor._finalize` does. Written once because the
+    two would otherwise be free to disagree about what "verified" means on the same card.
+    """
+    verdict = verify_result(
+        result_grain=ResultGrain(columns=grain, verifiable=bool(grain)),
+        row_count=result.row_count,
+        distinct_grain_count=result.distinct_grain_count,
+        columns=list(result.columns),
+        expected_columns=_expected_columns(payload),
+    )
+    return TrialRunResult(
+        ok=True,
+        columns=tuple(result.columns),
+        row_count=result.row_count,
+        distinct_grain_count=result.distinct_grain_count,
+        verify_passed=verdict.passed,
+        verify_reason=verdict.reason,
+    )
+
+
+# What replaces an upstream warehouse cell anywhere a message would otherwise render it.
+_CELL_REDACTED = "[upstream value redacted]"
+
+# Below this many characters a cell's rendering cannot be substituted out of a message without
+# corrupting unrelated text: `5` or `42` occurs inside error codes, byte offsets, dates and
+# column names, so replacing every run of it would produce a sentence that says something else.
+# Such a message is WITHHELD WHOLE instead (`_cell_safe` returns `None`) — fail-closed, and the
+# reviewer is told why rather than shown a mangled string.
+#
+# FOUR, not one and not ten, and the trade is deliberate. Withholding is always safe and always
+# costs the diagnostic, which on this path is the whole point of the reason string; substituting
+# is safe for values specific enough that an incidental match is not worth insuring against. A
+# 4+ character aggregate, date or id is in that class; a 1-3 character count is not. Nothing
+# leaks either way — the choice is only between "the message, redacted" and "no message".
+_MIN_REDACTABLE_CELL = 4
+
+
+def _cell_safe(text: str, cells: Any) -> str | None:
+    """*text* with every upstream cell's rendering replaced, or `None` if it cannot be made safe.
+
+    The cells are warehouse values this trial read to run the DAG. They are bound into SQL and
+    discarded; nothing may put them on a wire or in a log (`trial_run`'s "structure, never
+    values"). This is the read-back guard for the one path that can carry them out — a warehouse
+    error quoting the query it failed on.
+    """
+    for cell in cells:
+        rendered = str(cell)
+        if len(rendered) < _MIN_REDACTABLE_CELL:
+            return None
+        text = text.replace(rendered, _CELL_REDACTED)
+    return text
+
+
+def _declared_footprint(generalization: Any) -> tuple[tuple[str, ...], str]:
+    """The candidate's declared `uses` as a column-scope tuple, or `((), why)`.
+
+    ⚠ TYPE-GUARDED, and it is the ONE read on this path that decides what a query is allowed to
+    touch. `tuple(generalization.get("uses") or [])` accepted anything iterable, so a rehydrated
+    STRING footprint — `"payroll.payroll_fact.gross_pay"` — was exploded into one
+    single-character "column" per letter and handed to the probe as `column_scope`. The trial
+    then reported `ok=True`, having proved something about a scope nobody declared. Harmless
+    under the trial's own `SuppliedTokenMinter` (which ignores scope and returns the reviewer's
+    token verbatim) and NOT harmless on the offline fallback to the scheduler's probe, whose
+    minter posts that list to the IdP.
+
+    Every OTHER read in this walk is type-guarded (`_trial_nodes` refuses a non-list
+    `node_templates`, a non-dict `consumes`, a non-integer `order`); this one now is too. Damage
+    and emptiness share `no_uses_scope`, because the refusal and the reviewer's next step are the
+    same — there is no usable footprint to run inside — and the `detail` says which it was.
+    """
+    if not isinstance(generalization, dict):
+        return (), "this candidate carries no generalization to read a footprint from"
+    declared = generalization.get("uses")
+    if declared is None or declared == []:
+        return (), ""
+    if not isinstance(declared, list) or not all(isinstance(c, str) and c for c in declared):
+        return (), "the declared footprint ('uses') is not a list of column names"
+    return tuple(declared), ""
+
+
+@dataclass(frozen=True)
+class _TrialNode:
+    """One step of a composite, as the trial walks it.
+
+    Its two halves live in two places on the candidate and are joined by `order` here:
+    `generalization.node_templates` carries the AST-rewritten SQL, and the S3 plan's
+    `composes` carries the wiring (`consumes`, `output`). A composite's top-level
+    `sql_template` is `None` BY CONSTRUCTION (`generalize/builder.py`), so the node templates
+    are the only SQL such a candidate has.
+    """
+
+    order: int
+    sql_template: str
+    consumes: dict[str, str]  # {placeholder: "$N.name"} — SCALAR refs only (see `_trial_nodes`)
+
+
+# A composite whose shape this trial refuses to guess at. The payload is rehydrated JSON, so
+# every field below is read defensively rather than trusted: `check_dag` proved these shapes
+# at S4, but a store doc can carry anything and a projection must not raise.
+_MALFORMED_COMPOSITE = "malformed_composite"
+# EXACT STRING — the review card maps it to an explanation. A table intermediate needs the
+# scratch materialization the probe has no side-channel for, and it is the same shape that
+# cannot be promoted yet (`_provenance_uses` stamps `explain_ok=False` on it), so
+# honestly-unsupported is the truthful answer rather than a degraded run.
+_TABLE_INTERMEDIATE = "table_intermediate_unsupported"
+
+
+def _trial_nodes(payload: dict[str, Any]) -> tuple[tuple[_TrialNode, ...], str, str]:
+    """A composite's nodes IN DAG ORDER, or `((), reason, detail)` when it cannot be walked.
+
+    DAG order IS `order` order: `check_dag` refuses a `feeds_from` edge pointing at a HIGHER
+    order ("orders are a topological index"), which is the same invariant the executor's
+    `_topo_order` computes. Sorting is therefore the whole topological sort, not an
+    approximation of one.
+
+    A TABLE intermediate is refused here rather than half-run — see `_TABLE_INTERMEDIATE`. Both
+    spellings are caught: a bare `$N` consume, and a non-terminal node declaring a `table`
+    output (the shape the loader forbids but a poisoned record could carry).
+
+    ⚠ THE TWO HALVES MUST NAME THE SAME STEPS, and the check is derived from what the producer
+    can emit rather than from what looks tidy. `_generalize_composite` walks `sorted(composes)`
+    and appends EXACTLY ONE `NodeTemplate` per entry (and `check_dag` has already proved the
+    orders unique), so a candidate carrying node templates has a BIJECTION between the two
+    order sets — roots included, whose `composes` entry exists with an empty `consumes`. Nothing
+    downstream removes it either: `redact_payload` rewrites string leaves and drops no keys.
+
+    So every desync below is damage, and each has a wrong-answer to its name:
+
+      * a `composes` order with no template — the missing step may be the TERMINAL one, and the
+        walk would then gate an INTERMEDIATE's result and report `verify_passed` about the wrong
+        node;
+      * a template order with no `composes` entry — its `{total}` stops being an edge and
+        becomes an ordinary slot, so the card grows a box and a reviewer who types a number gets
+        a GREEN two-step run whose second step never saw the first one's output. That is the
+        "green for a query nobody ran" shape `no_scalar_probe` refuses;
+      * duplicate `composes` orders — the join key stops being a key, and a dict comprehension
+        would silently take the last one. Refused exactly as duplicate TEMPLATE orders are; the
+        two halves of one join cannot hold different standards.
+    """
+    generalization = payload.get("generalization")
+    raw_templates = (
+        generalization.get("node_templates") if isinstance(generalization, dict) else None
+    )
+    if not isinstance(raw_templates, list) or not raw_templates:
+        return (), "no_template", ""
+    templates: dict[int, str] = {}
+    for doc in raw_templates:
+        if not isinstance(doc, dict):
+            return (), _MALFORMED_COMPOSITE, "a node template is not an object"
+        order, sql = doc.get("order"), doc.get("sql_template")
+        if not isinstance(order, int) or isinstance(order, bool):
+            return (), _MALFORMED_COMPOSITE, "a node template has no integer 'order'"
+        if not isinstance(sql, str) or not sql.strip():
+            return (), _MALFORMED_COMPOSITE, f"step {order} carries no SQL template"
+        if order in templates:
+            return (), _MALFORMED_COMPOSITE, f"two node templates claim step {order}"
+        templates[order] = sql
+    raw_composes = payload.get("composes")
+    if not isinstance(raw_composes, list):
+        return (), _MALFORMED_COMPOSITE, "the composite carries no 'composes' wiring"
+    plans: dict[int, dict[str, Any]] = {}
+    for node in raw_composes:
+        if not isinstance(node, dict):
+            return (), _MALFORMED_COMPOSITE, "a 'composes' entry is not an object"
+        order = node.get("order")
+        if not isinstance(order, int) or isinstance(order, bool):
+            return (), _MALFORMED_COMPOSITE, "a 'composes' entry has no integer 'order'"
+        if order in plans:
+            return (), _MALFORMED_COMPOSITE, f"two 'composes' entries claim step {order}"
+        plans[order] = node
+    if set(plans) != set(templates):
+        missing_plan = sorted(set(templates) - set(plans))
+        missing_sql = sorted(set(plans) - set(templates))
+        return (
+            (),
+            _MALFORMED_COMPOSITE,
+            "the DAG's wiring and its SQL disagree about which steps exist: "
+            + (f"step(s) {missing_plan} have SQL but no wiring; " if missing_plan else "")
+            + (f"step(s) {missing_sql} have wiring but no SQL" if missing_sql else ""),
+        )
+    terminal = max(templates)
+    nodes: list[_TrialNode] = []
+    for order in sorted(templates):
+        plan = plans[order]
+        output = plan.get("output")
+        if output is not None and not isinstance(output, dict):
+            return (), _MALFORMED_COMPOSITE, f"step {order} has a malformed 'output'"
+        # `== "table"` per value rather than a set membership test: a rehydrated `output`
+        # value can be an unhashable list, and hashing it would raise out of a reader whose
+        # contract is a reason string.
+        if isinstance(output, dict) and order != terminal:
+            if any(kind == "table" for kind in output.values()):
+                return (), _TABLE_INTERMEDIATE, f"step {order} passes a whole table downstream"
+        raw_consumes = plan.get("consumes") or {}
+        if not isinstance(raw_consumes, dict):
+            return (), _MALFORMED_COMPOSITE, f"step {order} has a malformed 'consumes'"
+        consumes: dict[str, str] = {}
+        for placeholder, ref in raw_consumes.items():
+            if not isinstance(placeholder, str) or not isinstance(ref, str):
+                return (), _MALFORMED_COMPOSITE, f"step {order} has a malformed consume ref"
+            if TABLE_CONSUME_REF.match(ref) is not None:
+                return (), _TABLE_INTERMEDIATE, f"step {order} consumes step {ref[1:]} as a table"
+            if SCALAR_CONSUME_REF.match(ref) is None:
+                return (), _MALFORMED_COMPOSITE, f"step {order} consumes {ref!r}, which is neither consume grammar"
+            consumes[placeholder] = ref
+        nodes.append(
+            _TrialNode(order=order, sql_template=templates[order], consumes=consumes)
+        )
+    return tuple(nodes), "", ""
 
 
 # The statuses a parameterization revision may be proposed for and applied to.
@@ -755,6 +976,11 @@ class ReviewInbox:
         Allowed on `in_review` and `validated`: the two states where a human is deciding whether
         this artifact should go further. A `needs_parameterization` candidate has no template to
         bind, and says so rather than failing obscurely.
+
+        A COMPOSITE takes the second branch. Its top-level `sql_template` is `None` by
+        construction, so reading only that field answered `no_template` for every DAG the loop
+        or the minting page has ever produced — a review card with no inputs and a button that
+        could not work. See `_trial_run_composite`.
         """
         env = await self._require_one_of(
             candidate_id, (CandidateStatus.IN_REVIEW, CandidateStatus.VALIDATED)
@@ -764,7 +990,7 @@ class ReviewInbox:
             generalization.get("sql_template") if isinstance(generalization, dict) else None
         )
         if not isinstance(template, str) or not template.strip():
-            return TrialRunResult(ok=False, reason="no_template")
+            return await self._trial_run_composite(env, bindings=bindings, token=token)
 
         required = sorted(referenced_slots(template))
         missing = [name for name in required if not str(bindings.get(name, "")).strip()]
@@ -775,14 +1001,12 @@ class ReviewInbox:
         except TemplateBindError as exc:
             return TrialRunResult(ok=False, reason=f"bind_failed:{exc}")
 
-        uses = tuple(
-            (generalization.get("uses") or []) if isinstance(generalization, dict) else ()
-        )
+        uses, uses_detail = _declared_footprint(generalization)
         if not uses:
             # The same backstop `golden_replay` carries: an empty `uses` would mint an
             # UNRESTRICTED token, running reviewer-supplied input against live ClickHouse with
             # no column scope. Refuse with an honest reason rather than widen the scope.
-            return TrialRunResult(ok=False, reason="no_uses_scope")
+            return TrialRunResult(ok=False, reason="no_uses_scope", detail=uses_detail)
 
         grain = _result_grain_columns(env.payload)
         probe = self._probe_for(token)
@@ -801,21 +1025,170 @@ class ReviewInbox:
             _logger.info("trial run for %s failed: %s", candidate_id, safe[:400])
             return TrialRunResult(ok=False, reason="warehouse_error", detail=safe[:400])
 
-        verdict = verify_result(
-            result_grain=ResultGrain(columns=grain, verifiable=bool(grain)),
-            row_count=result.row_count,
-            distinct_grain_count=result.distinct_grain_count,
-            columns=list(result.columns),
-            expected_columns=_expected_columns(env.payload),
-        )
-        return TrialRunResult(
-            ok=True,
-            columns=tuple(result.columns),
-            row_count=result.row_count,
-            distinct_grain_count=result.distinct_grain_count,
-            verify_passed=verdict.passed,
-            verify_reason=verdict.reason,
-        )
+        return _trial_verdict(env.payload, grain, result)
+
+    async def _trial_run_composite(
+        self, env: CandidateEnvelope, *, bindings: dict[str, Any], token: str
+    ) -> TrialRunResult:
+        """Trial one SCALAR-PASSING composite: walk the DAG, node by node, in order.
+
+        The runtime `BlueprintExecutor` is the oracle this mirrors — bind slots plus upstream
+        scalar `consumes`, run each node, and gate the TERMINAL node's result on D56 — with two
+        deliberate narrowings, because a trial has a probe rather than the tool dispatcher:
+
+          * A TABLE intermediate is refused (`table_intermediate_unsupported`). Passing a whole
+            result downstream needs the D93 scratch side-channel the probe does not have, and
+            that same shape cannot be promoted today either, so an honest refusal is the whole
+            truth rather than a degraded run.
+          * Each upstream node is read as ONE CELL, through the `ScalarCellProbe` port. A node
+            that returns anything else fails `scalar_shape` — the same fail-closed rule as
+            `executor._extract_scalar_output`, and for the same reason: the D56 gate guards only
+            the terminal node, so an arbitrary cell bound from a fanned-out intermediate would
+            return a "verified" wrong answer.
+
+        NOT the promotion replay's `_pick_template`, which runs the terminal node ALONE. That is
+        right for a structure oracle over synthetic samples and wrong here: with no upstream run,
+        the terminal template's `{total}` is unbound, so the reviewer would either be asked to
+        type a value the blueprint computes for itself or get a bind failure.
+        """
+        nodes, reason, detail = _trial_nodes(env.payload)
+        if reason:
+            return TrialRunResult(ok=False, reason=reason, detail=detail)
+
+        # What each node needs FROM THE REVIEWER, and what it gets from upstream. A declared
+        # consume its template does not reference is IGNORED (`executor._node_bindings`' rule),
+        # so an unreferenced edge neither demands a value nor costs a warehouse read.
+        required: set[str] = set()
+        consumed: dict[int, set[str]] = {}
+        for node in nodes:
+            refs = referenced_slots(node.sql_template)
+            filled = {ph for ph in node.consumes if ph in refs}
+            required |= refs - filled
+            for placeholder in filled:
+                ref = node.consumes[placeholder]
+                match = SCALAR_CONSUME_REF.match(ref)
+                consumed.setdefault(int(match.group(1)), set()).add(ref)
+        for order in sorted(consumed):
+            if len(consumed[order]) > 1:
+                # The runtime binds several scalars off one wide row; this trial reads ONE
+                # cell per step, so it would have to bind that cell to both names. Refuse
+                # rather than pass the same value twice under different names.
+                return TrialRunResult(
+                    ok=False,
+                    reason="scalar_shape",
+                    detail=(
+                        f"step {order} is consumed as {len(consumed[order])} separate scalars; "
+                        "a trial reads one cell per step"
+                    ),
+                )
+
+        missing = sorted(name for name in required if not str(bindings.get(name, "")).strip())
+        if missing:
+            return TrialRunResult(ok=False, reason="missing_bindings", missing=tuple(missing))
+
+        uses, uses_detail = _declared_footprint(env.payload.get("generalization"))
+        if not uses:
+            # The same backstop the single path and `golden_replay` carry: an empty `uses`
+            # would mint an UNRESTRICTED token. Refuse rather than widen the scope.
+            return TrialRunResult(ok=False, reason="no_uses_scope", detail=uses_detail)
+        probe = self._probe_for(token)
+        if probe is None:
+            return TrialRunResult(ok=False, reason="no_token")
+        if consumed and not hasattr(probe, "run_cell"):
+            # An offline/dev inbox falls back to the scheduler's probe, which is a structure
+            # oracle only. Say so: the alternative is binding a synthetic value into the
+            # consumer and reporting green for a query nobody ran.
+            return TrialRunResult(
+                ok=False,
+                reason="no_scalar_probe",
+                detail=(
+                    "this deployment's warehouse probe cannot read an intermediate value, so a "
+                    "multi-step blueprint cannot be trialled here"
+                ),
+            )
+
+        grain = _result_grain_columns(env.payload)
+        terminal = nodes[-1].order
+        values: dict[str, Any] = {}  # "$N.name" → the cell that step returned
+        result: ProbeResult | None = None
+        for node in nodes:
+            refs = referenced_slots(node.sql_template)
+            node_bindings: dict[str, Any] = {}
+            for placeholder, ref in node.consumes.items():
+                if placeholder not in refs:
+                    continue
+                if ref not in values:
+                    return TrialRunResult(
+                        ok=False,
+                        reason=_MALFORMED_COMPOSITE,
+                        detail=f"step {node.order} consumes {ref}, which no earlier step produced",
+                    )
+                node_bindings[placeholder] = values[ref]
+            for name in refs - set(node_bindings):
+                node_bindings[name] = bindings[name]
+            try:
+                sql = bind_template(node.sql_template, node_bindings)
+            except TemplateBindError:
+                # ⚠ THE EXCEPTION TEXT IS WITHHELD HERE, where the single path quotes it. The
+                # difference is whose data is in it: on that path every binding is a value the
+                # reviewer typed, and on this one a binding can be a warehouse CELL this trial
+                # read from an upstream step (`bind_template` renders an offending value into
+                # its message). This surface returns structure, never values.
+                return TrialRunResult(
+                    ok=False,
+                    reason="bind_failed",
+                    detail=f"step {node.order} could not be bound",
+                )
+            try:
+                if node.order == terminal:
+                    result = await probe.run(sql, grain_columns=grain, column_scope=uses)
+                elif node.order in consumed:
+                    cell = await probe.run_cell(sql, column_scope=uses)
+                    if cell is None:
+                        return TrialRunResult(
+                            ok=False,
+                            reason="scalar_shape",
+                            detail=(
+                                f"step {node.order} is consumed as a single value but did not "
+                                "return exactly one non-empty cell"
+                            ),
+                        )
+                    values[next(iter(consumed[node.order]))] = cell
+                else:
+                    # Neither terminal nor consumed — nothing downstream needs its value, but
+                    # the executor still runs it, so a trial that skipped it would report green
+                    # on a DAG containing a step that does not execute.
+                    await probe.run(sql, grain_columns=(), column_scope=uses)
+            except Exception as exc:  # noqa: BLE001 — a trial is diagnostic; it may not 500 a review
+                # TWO scrubs, and the second is what a composite added. The first is the single
+                # path's: the reviewer's bearer token is on this request and a client's exception
+                # text quotes the request it failed on. The second is the same rule applied to
+                # the OTHER secret this walk handles — the SQL a consumer runs has an upstream
+                # warehouse cell rendered into it as a literal, and a warehouse routinely quotes
+                # the failing query back ("Cannot parse Date from String '2026-01-05'"), so the
+                # governed value the `bind_failed` branch above withholds would walk out through
+                # the error message instead. Applied to the LOG for the same reason: a value that
+                # reaches a log line has outlived the request it was read for.
+                safe = _cell_safe(_scrub(_explain(exc), token), values.values())
+                if safe is None:
+                    safe = (
+                        f"step {node.order} failed at the warehouse. The message is withheld: it "
+                        "may quote the query, which carries a value read from an earlier step, "
+                        "and that value is too short to remove without destroying the text."
+                    )
+                _logger.info(
+                    "trial run for %s failed at step %s: %s",
+                    env.candidate_id,
+                    node.order,
+                    safe[:400],
+                )
+                return TrialRunResult(ok=False, reason="warehouse_error", detail=safe[:400])
+
+        if result is None:  # unreachable: the terminal is the last node walked
+            return TrialRunResult(
+                ok=False, reason=_MALFORMED_COMPOSITE, detail="no terminal step ran"
+            )
+        return _trial_verdict(env.payload, grain, result)
 
     async def attest_scan(self, candidate_id: str, *, note: str) -> CandidateEnvelope:
         """Record a reviewer's statement that a leakage finding is a FALSE POSITIVE.

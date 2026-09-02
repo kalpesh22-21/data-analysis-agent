@@ -10,7 +10,7 @@ injected PORTS are Protocols, so Layer-1 fakes and the live stack use the identi
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from ..config import LearningSettings
 
@@ -222,6 +222,31 @@ class WarehouseProbe(Protocol):
     ) -> ProbeResult: ...
 
 
+class ScalarCellProbe(Protocol):
+    """Reads ONE cell out of a query — the composite trial's scalar-passing port.
+
+    Its OWN Protocol rather than a second method on `WarehouseProbe`, for the reason
+    `RecurrenceCountReader` is separate from `HitCountReader`: widening the existing port would
+    turn a Protocol change into an `AttributeError` in every fake and production double that
+    implements it structurally. A probe that does not implement this simply cannot walk a
+    composite, and `ReviewInbox.trial_run` says so (`no_scalar_probe`) instead of guessing.
+
+    ⚠ IT RETURNS A WAREHOUSE VALUE, which is exactly what `WarehouseProbe` refuses to do (D98).
+    The distinction is what the value is FOR: a composite DAG passes an upstream node's single
+    cell into its consumer's SQL, so a trial that cannot read that cell cannot run the DAG at
+    all — the alternative is binding a synthetic value, i.e. reporting green for a query nobody
+    ran. The cell is bound into SQL and DISCARDED; no caller may put it on a wire (the trial
+    result carries structure only, and `trial_run` withholds the bind exception for this
+    reason).
+
+    `None` means "not exactly one non-NULL cell" — a 0-row, fanned-out, wide or NULL result —
+    which the caller treats as a fail-closed shape violation, mirroring
+    `executor._extract_scalar_output`.
+    """
+
+    async def run_cell(self, sql: str, *, column_scope: tuple[str, ...]) -> Any: ...
+
+
 class HitCountReader(Protocol):
     """Reads the cross-session `hit_count` from the LANDED corpus artifact, not the envelope.
 
@@ -335,6 +360,7 @@ __all__ = [
     "PromotionPolicy",
     "PromotionSweep",
     "RecurrenceCountReader",
+    "ScalarCellProbe",
     "WarehouseProbe",
     "policy_from_settings",
 ]
