@@ -8,11 +8,12 @@ that keeps a user_knowledge candidate out of the review inbox.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from data_agent.learning.candidate.models import CandidateEnvelope
+from data_agent.learning.candidate.models import CandidateEnvelope, CandidateStatus
 from data_agent.learning.stage import StageContext
 from data_agent.learning.triage import TriageVerdict
 from data_agent.learning.user import (
@@ -78,8 +79,6 @@ async def test_default_keyspace_is_the_bucket_per_store_layout():
 async def test_list_for_user_is_scoped_no_cross_user_surface():
     store = InMemoryUserKnowledgeStore()
     a = UserKnowledgeRecord.from_candidate(_user_candidate(), user_id="user-1")
-    from dataclasses import replace
-
     b_env = replace(
         _user_candidate(),
         candidate_id="candidate::hash-userk-b::0",
@@ -124,11 +123,22 @@ async def test_commit_stage_auto_commits_and_drops():
     assert result.envelope.status == "validated"
 
 
+async def test_commit_stage_rejects_anonymous_candidate_without_poisoning_pipeline():
+    store = InMemoryUserKnowledgeStore()
+    stage = UserKnowledgeCommitStage(store=store)
+    ctx = StageContext(summary=replace(make_summary(), user_id=""), verdict=_KEEP)
+
+    result = await stage.process(_user_candidate(), ctx)
+
+    assert result.control == "route_inbox"
+    assert result.envelope.status == CandidateStatus.REJECTED
+    assert result.envelope.route_reason == "missing_authenticated_user"
+    assert store.commit_calls == 0
+
+
 async def test_commit_stage_passes_through_non_user_targets():
     store = InMemoryUserKnowledgeStore()
     stage = UserKnowledgeCommitStage(store=store)
-    from dataclasses import replace
-
     bp = replace(_user_candidate(), type="blueprint")
     result = await stage.process(bp, _ctx())
     assert result.control == "continue"

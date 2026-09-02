@@ -85,8 +85,9 @@ def _rule(column: str, value: str, rule_id: str) -> dict:
     return _entry(column, value, role="rule", rule_id=rule_id)
 
 
-def _inline(column: str, value: str, why: str = "the ratio is defined over these two "
-            "register types") -> dict:
+def _inline(
+    column: str, value: str, why: str = "the ratio is defined over these two register types"
+) -> dict:
     return _entry(column, value, role="inline", why=why)
 
 
@@ -135,16 +136,19 @@ def test_an_in_list_names_the_catalog_rule_for_each_member() -> None:
 
 
 def test_a_single_equality_names_the_one_rule_that_is_that_filter() -> None:
-    matches = rules_for_predicate(_predicate("SELECT x FROM t WHERE register_type = 'EARN'"), _INDEX)
+    matches = rules_for_predicate(
+        _predicate("SELECT x FROM t WHERE register_type = 'EARN'"), _INDEX
+    )
     assert [(m.value, m.rule.id) for m in matches] == [("EARN", "gross_earnings")]
 
 
 def test_a_predicate_no_rule_declares_returns_nothing() -> None:
     """The common case, and not a failure: the plan covers it with a slot or an inline
     instead, and the catalog may be owed a rule (§7)."""
-    assert rules_for_predicate(
-        _predicate("SELECT x FROM t WHERE department_code = '0420'"), _INDEX
-    ) == ()
+    assert (
+        rules_for_predicate(_predicate("SELECT x FROM t WHERE department_code = '0420'"), _INDEX)
+        == ()
+    )
 
 
 def test_one_query_of_mixed_predicates_is_matched_per_predicate() -> None:
@@ -328,9 +332,9 @@ async def test_the_correction_frames_the_accepted_sql_as_fixed_and_still_says_om
     )
     await extractor.extract(_summary(), KEEP_VERDICT)
 
-    correction = [
-        m for m in extractor._model_client.calls[1].messages if m.get("role") == "tool"
-    ][-1]["content"]
+    correction = [m for m in extractor._model_client.calls[1].messages if m.get("role") == "tool"][
+        -1
+    ]["content"]
     assert "the accepted SQL is fixed" in correction
     assert "gross_earnings" in correction and "employee_deductions" in correction
     assert "could not be READ" not in correction
@@ -338,27 +342,29 @@ async def test_the_correction_frames_the_accepted_sql_as_fixed_and_still_says_om
     assert "Do not change your analysis" in correction
 
 
-async def test_a_budget_already_spent_on_shape_leaves_the_hint_on_the_decline() -> None:
-    """THE LIVE TRACE, reproduced: two corrective turns go on shape fixes, and the
-    totality violation surfaces on the third emit with no budget left. The decline is
-    final — bounded rounds beat completeness — and it carries the predicates and the
-    rule ids, so the human who opens the inbox gets what the model did not."""
+async def test_shape_budget_does_not_starve_the_sql_budget() -> None:
     prose_grain = blueprint_raw(
         result_signature={"shape": [], "grain": "one row per employee", "invariants": []}
     )
     extractor = make_extractor(
-        [scripted_turn([prose_grain]), scripted_turn([prose_grain]), scripted_turn([_UNCOVERED])],
+        [
+            scripted_turn([prose_grain]),
+            scripted_turn([prose_grain]),
+            scripted_turn([_UNCOVERED]),
+            scripted_turn([_UNCOVERED]),
+            scripted_turn([_UNCOVERED]),
+        ],
         known_rules=_KNOWN,
         rule_index=_INDEX,
     )
 
     result = await extractor.extract(_summary(), KEEP_VERDICT)
 
-    assert extractor._model_client.calls_made == 3  # 1 + max_shape_corrections, not more
+    assert extractor._model_client.calls_made == 5
     assert result.candidates == ()
     assert [d.reason for d in result.declines] == [REASON_TOTALITY]
     decline = result.declines[0]
-    assert decline.corrections_attempted == 2  # it was asked — about something else
+    assert decline.corrections_attempted == 4
     assert "'EARN' as rule 'gross_earnings' on dbpcm_warehouse.payroll" in decline.detail
     # And it carries the payload it was judged on, which is what makes this decline
     # completable by a human instead of merely readable: the consumer builds the review
@@ -498,9 +504,9 @@ async def test_a_mis_cited_rule_is_re_asked_and_the_corrected_citation_lands() -
 
     result = await extractor.extract(_summary(sql), KEEP_VERDICT)
 
-    correction = [
-        m for m in extractor._model_client.calls[1].messages if m.get("role") == "tool"
-    ][-1]["content"]
+    correction = [m for m in extractor._model_client.calls[1].messages if m.get("role") == "tool"][
+        -1
+    ]["content"]
     assert "different filters" in correction
     assert "omit" in correction and "Do not change your analysis" in correction
     assert result.corrections == 1
@@ -515,9 +521,10 @@ async def test_the_corrected_plan_is_re_validated_in_full() -> None:
     predicates and breaks something else declines on that instead of being waved
     through."""
     extractor = make_extractor(
-        [scripted_turn([_UNCOVERED]), scripted_turn([_candidate(_COVERED["payload"]
-                                                                ["parameterization"],
-                                                                evidence=[])])],
+        [
+            scripted_turn([_UNCOVERED]),
+            scripted_turn([_candidate(_COVERED["payload"]["parameterization"], evidence=[])]),
+        ],
         known_rules=_KNOWN,
         rule_index=_INDEX,
     )

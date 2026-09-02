@@ -220,6 +220,8 @@ def promoted_content_hash(record_id: str) -> str:
     source session cannot sweep a promotion out from under the reviewer holding it.
     """
     return f"{PROMOTED_HASH_PREFIX}{promoted_record_digest(record_id)}"
+
+
 # A HUMAN CHOSE IT. Confidence on this row is not a model's estimate of anything, and any other
 # value would be a fabricated measurement — the ranking reads it, so a made-up 0.7 would order
 # the queue by a number nobody produced.
@@ -261,9 +263,7 @@ def _promoted_payload(record: UserKnowledgeRecord) -> dict[str, Any]:
     return payload
 
 
-def _promoted_envelope(
-    record: UserKnowledgeRecord, candidate_id: str
-) -> CandidateEnvelope:
+def _promoted_envelope(record: UserKnowledgeRecord, candidate_id: str) -> CandidateEnvelope:
     """The candidate a promoted user fact enters as. NOT yet written — `admit` does that.
 
     The PAYLOAD is deliberately empty here: `KnowledgeEditor.admit` writes it, and seeding it in
@@ -608,11 +608,13 @@ def _trial_nodes(payload: dict[str, Any]) -> tuple[tuple[_TrialNode, ...], str, 
             if TABLE_CONSUME_REF.match(ref) is not None:
                 return (), _TABLE_INTERMEDIATE, f"step {order} consumes step {ref[1:]} as a table"
             if SCALAR_CONSUME_REF.match(ref) is None:
-                return (), _MALFORMED_COMPOSITE, f"step {order} consumes {ref!r}, which is neither consume grammar"
+                return (
+                    (),
+                    _MALFORMED_COMPOSITE,
+                    f"step {order} consumes {ref!r}, which is neither consume grammar",
+                )
             consumes[placeholder] = ref
-        nodes.append(
-            _TrialNode(order=order, sql_template=templates[order], consumes=consumes)
-        )
+        nodes.append(_TrialNode(order=order, sql_template=templates[order], consumes=consumes))
     return tuple(nodes), "", ""
 
 
@@ -778,7 +780,9 @@ class ReviewInbox:
         # The SINGLE approve/reject implementation (R4). Defaulted for an unwired
         # inbox; production injects the wired scheduler.
         self._scheduler = scheduler or PromotionScheduler(
-            store, probe=_NoOpProbe(), hit_counts=_ZeroHitCounts(),
+            store,
+            probe=_NoOpProbe(),
+            hit_counts=_ZeroHitCounts(),
         )
         # Plan §4: the inbox needs exactly ONE knob off the promotion policy
         # (`review_score_cutoff`).
@@ -879,7 +883,13 @@ class ReviewInbox:
             )
         return env
 
-    async def approve(self, candidate_id: str, *, token: str = "") -> CandidateEnvelope:
+    async def approve(
+        self,
+        candidate_id: str,
+        *,
+        token: str = "",
+        acknowledge_date_warnings: bool = False,
+    ) -> CandidateEnvelope:
         """Human approve: `in_review → validated`, delegating to `apply_human_decision` (D17/R4).
 
         A guard that HOLDS — an unresolved `depends_on`, a missing generalization, a failed replay —
@@ -898,6 +908,13 @@ class ReviewInbox:
         proven against their access when it had been proven against somebody else's.
         """
         env = await self._require(candidate_id, CandidateStatus.IN_REVIEW)
+        static = (env.payload.get("generalization") or {}).get("static_validation") or {}
+        date_warnings = static.get("date_literal_warnings") or []
+        if date_warnings and not acknowledge_date_warnings:
+            raise InboxTransitionError(
+                "approve_needs_date_warning_ack: this blueprint contains ambiguous "
+                "date-like literals; inspect and acknowledge them before approval"
+            )
         probe = self._probe_for(token) if env.type == "blueprint" else None
         if env.type == "blueprint" and probe is None:
             raise InboxTransitionError(
@@ -907,9 +924,7 @@ class ReviewInbox:
             )
         decision = await self._scheduler.apply_human_decision(env, "approve", probe=probe)
         if decision.action != "approve":
-            raise InboxTransitionError(
-                f"approve held for {candidate_id}: {decision.reason}"
-            )
+            raise InboxTransitionError(f"approve held for {candidate_id}: {decision.reason}")
         return await self._store.get(candidate_id)
 
     async def reject(self, candidate_id: str) -> CandidateEnvelope:
@@ -1255,9 +1270,7 @@ class ReviewInbox:
         env = await self._store.get(mint_promoted_candidate_id(record.record_id))
         return UserKnowledgeView(record=record, promoted=env)
 
-    async def promote_user_knowledge(
-        self, user_id: str, record_id: str
-    ) -> PromotedUserKnowledge:
+    async def promote_user_knowledge(self, user_id: str, record_id: str) -> PromotedUserKnowledge:
         """Lift one user's private fact into a `global_knowledge` candidate under review (§D.2).
 
         ⚠ BOTH IDS MUST AGREE. A record id is guessable — `userknow::<user>::<candidate>` — and
@@ -1477,9 +1490,7 @@ class ReviewInbox:
             candidate_id, (CandidateStatus.IN_REVIEW, CandidateStatus.VALIDATED)
         )
         generalization = env.payload.get("generalization")
-        template = (
-            generalization.get("sql_template") if isinstance(generalization, dict) else None
-        )
+        template = generalization.get("sql_template") if isinstance(generalization, dict) else None
         if not isinstance(template, str) or not template.strip():
             return await self._trial_run_composite(env, bindings=bindings, token=token)
 
@@ -1793,8 +1804,7 @@ class ReviewInbox:
             return build_promotion_emit(env, doc_id=doc_id, title=title)
         if env.status != CandidateStatus.VALIDATED:
             raise InboxTransitionError(
-                f"candidate {candidate_id!r} is {env.status!r}, "
-                "expected 'validated' or 'promoted'"
+                f"candidate {candidate_id!r} is {env.status!r}, expected 'validated' or 'promoted'"
             )
         if not env.verified:
             raise InboxTransitionError(
@@ -1808,7 +1818,5 @@ class ReviewInbox:
             # A held promote (e.g. a racing status change) must NOT return 200 + YAML with
             # the candidate left validated — surface the hold reason fail-loud (mirrors
             # `approve`).
-            raise InboxTransitionError(
-                f"promote held for {candidate_id}: {decision.reason}"
-            )
+            raise InboxTransitionError(f"promote held for {candidate_id}: {decision.reason}")
         return emit

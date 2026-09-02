@@ -5,11 +5,9 @@ tool call (no free text). The model client is INJECTED, so Layer-1 tests drive a
 double; the extractor emits a PLAN only, never SQL (D35). Prior art comes from a MANDATORY
 pre-fetch block plus an OPTIONAL, per-call-capped `searchCorpus` tool.
 
-`_drive_turns` runs THREE INDEPENDENT BUDGETS — `max_search_calls`, `max_retries` (a
-malformed response; exhausting it RAISES, which dead-letters the session) and
-`max_shape_corrections` (shared across every correctable family; exhausting it DECLINES).
-Pooling any two would couple unrelated failures: a shape decline that ate the retry budget
-would turn a later genuinely-malformed response into a dead-lettered session.
+`_drive_turns` keeps search, malformed-response retries, and corrective turns independent.
+Corrective turns have structural, SQL, and semantic family budgets plus a total ceiling, so
+one kind of defect cannot consume every opportunity to repair a later, unrelated defect.
 
 With no `PriorArtIndex` wired the tool list, the turn count and the absence of every
 prior-art surface are exactly what they were pre-§3a. Fail-open throughout: an unreachable
@@ -28,7 +26,7 @@ from data_agent.runtime.model.client import ModelClient, ModelTurnResult, begin_
 from ..priorart import PriorArtIndex
 from ..summary.models import BOOKKEEPING_TOOLS, SessionSummary
 from ..triage import TriageVerdict
-from .correction import build_correction_message
+from .correction import build_correction_message, correction_family
 from .grounding import RuleIndex
 from .models import Decline, ExtractedCandidate, ExtractionResult
 from .prior_art import (
@@ -65,8 +63,10 @@ _SYSTEM_PROMPT = (
     "An optional_pattern MUST be a self-contained boolean SQL fragment that renders when "
     "the slot is ABSENT (typically 'TRUE' = no filter / all values) and contains NO slot "
     "placeholders. "
-    "(4) For each parameterization entry, `locator.table` is the 'database.table' and "
-    "`locator.column` is the BARE column. A slot's `binds_to` MUST be the "
+    "(4) For each parameterization entry, `locator.table` is the 'database.table', "
+    "`locator.column` is the BARE column, and `locator.value` is the BARE semantic "
+    "literal WITHOUT SQL quotes (`employee_status = 'A'` means value `A`, not `'A'`; "
+    "an empty SQL string means value ``). A slot's `binds_to` MUST be the "
     "FULLY-QUALIFIED 'database.table.column' (= locator.table + '.' + locator.column, "
     "e.g. 'dbpcm_warehouse.employee.Department'), NEVER a bare column, and must lie "
     "within the columns the SQL touches; each slot MUST include `name`, `type`, "
@@ -149,13 +149,16 @@ class ExtractorConfig:
     # shape decline is terminal and the model is never told). A NEGATIVE value behaves
     # exactly like 0 — see `__post_init__`.
     max_shape_corrections: int = 2
+    max_sql_corrections: int = 2
+    max_semantic_corrections: int = 1
+    max_total_corrections: int = 5
     # Cards per lookup. Enough to show a near-tie, few enough that the block stays a
     # glance rather than a page of the corpus (`prior_art.py::_MAX_BLOCK_CHARS`).
     prior_art_limit: int = 5
 
     def __post_init__(self) -> None:
-        # ONLY `max_retries` is validated, and the asymmetry with `max_search_calls`
-        # and `max_shape_corrections` is the whole point: validate what BREAKS,
+        # ONLY `max_retries` is validated, and the asymmetry with the search/correction
+        # budgets is the whole point: validate what BREAKS,
         # tolerate what degrades safely.
         #
         # `max_retries < 0` gives ZERO model calls — `_call_model_with_retry`'s loop
@@ -194,9 +197,7 @@ class LearningExtractor:
         # as it did before plan §3a — including offering `emit_candidates` alone.
         self._prior_art = prior_art
 
-    async def extract(
-        self, summary: SessionSummary, verdict: TriageVerdict
-    ) -> ExtractionResult:
+    async def extract(self, summary: SessionSummary, verdict: TriageVerdict) -> ExtractionResult:
         """Run the forced-structured-output call + validation → the candidates and the declines."""
         prior_art = await self._prefetch_prior_art(summary)
         return await self._drive_turns(summary, verdict, prior_art)
@@ -261,9 +262,7 @@ class LearningExtractor:
             else:
                 served += 1
                 content = await self._run_search(call.arguments)
-            messages.append(
-                {"role": "tool", "tool_call_id": call.id, "content": content}
-            )
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
         return messages, served
 
     async def _run_search(self, arguments: object) -> str:
@@ -277,7 +276,7 @@ class LearningExtractor:
         if parsed is None:
             return (
                 "error: searchCorpus needs a non-empty string `query` (and an optional "
-                "`kinds` array of \"blueprint\"/\"knowledge\"). Nothing was searched."
+                '`kinds` array of "blueprint"/"knowledge"). Nothing was searched.'
             )
         query, kinds = parsed
         # `self._prior_art` is non-None here by construction: the tool is only OFFERED
@@ -310,11 +309,11 @@ class LearningExtractor:
 
             searches_left     search turn      guarded `> 0`; -= served, and `served >= 1`
             attempts_left     malformed retry  guarded by the `while`; -= 1; raises at 0
-            corrections_left  shape correction guarded `> 0`; -= 1
+            family/total correction budgets guarded `> 0`; -= 1
             (return)          a validated result
 
-        so the loop runs at most `max_search_calls + (max_retries + 1) + max_shape_corrections`
-        times. A search or correction turn deliberately does NOT consume a parse attempt: the retry
+        so the loop is bounded by search calls, parse attempts, and the total correction ceiling.
+        A search or correction turn deliberately does NOT consume a parse attempt: the retry
         budget is for MALFORMED output, and spending it on a tool call the extractor itself offered
         would make the retry contract depend on how chatty the model is.
 
@@ -332,7 +331,13 @@ class LearningExtractor:
         # response — D31 retry-on-mismatch. A persistent malformed response raises
         # (→ the consumer leaves the message un-acked → reclaim → dead-letter).
         attempts_left = self._config.max_retries + 1
-        corrections_left = max(self._config.max_shape_corrections, 0)
+        corrections_left = {
+            "structural": max(self._config.max_shape_corrections, 0),
+            "sql": max(self._config.max_sql_corrections, 0),
+            "semantic": max(self._config.max_semantic_corrections, 0),
+        }
+        total_corrections_left = max(self._config.max_total_corrections, 0)
+        failure_counts: dict[tuple[str, str, str], int] = {}
         last_exc: SchemaMismatchError | None = None
 
         kept: list[ExtractedCandidate] = []
@@ -376,7 +381,8 @@ class LearningExtractor:
                 _logger.warning(
                     "extractor structured-output mismatch (attempt %d/%d): %s",
                     self._config.max_retries + 1 - attempts_left,
-                    self._config.max_retries + 1, exc,
+                    self._config.max_retries + 1,
+                    exc,
                 )
                 messages = [
                     *messages,
@@ -405,9 +411,7 @@ class LearningExtractor:
                         correction_history=tuple(history),
                         raw_payload=payload,
                     )
-                    for decline, payload in _withdrawn_declines(
-                        pending, raw_candidates, emitted
-                    )
+                    for decline, payload in _withdrawn_declines(pending, raw_candidates, emitted)
                 )
             raw_candidates = emitted
             batch_kept, batch_settled, pending = self._validate_batch(raw_candidates, summary)
@@ -421,8 +425,25 @@ class LearningExtractor:
             kept.extend(batch_kept)
             settled.extend(batch_settled)
 
-            if pending and corrections_left > 0:
-                corrections_left -= 1
+            pending_families = {correction_family(decline) for _index, decline in pending}
+            fingerprints = {
+                (
+                    correction_family(decline),
+                    decline.reason,
+                    " ".join(decline.detail.split()).lower(),
+                )
+                for _index, decline in pending
+            }
+            repeated = any(failure_counts.get(fingerprint, 0) >= 2 for fingerprint in fingerprints)
+            family_budget_available = all(
+                corrections_left.get(family, 0) > 0 for family in pending_families
+            )
+            if pending and total_corrections_left > 0 and family_budget_available and not repeated:
+                total_corrections_left -= 1
+                for family in pending_families:
+                    corrections_left[family] -= 1
+                for fingerprint in fingerprints:
+                    failure_counts[fingerprint] = failure_counts.get(fingerprint, 0) + 1
                 correction = build_correction_message(
                     pending, emitted=len(raw_candidates), accepted=len(batch_kept)
                 )
@@ -434,13 +455,18 @@ class LearningExtractor:
                     len(pending),
                     summary.session_id,
                     len(history),
-                    max(self._config.max_shape_corrections, 0),
+                    max(self._config.max_total_corrections, 0),
                 )
                 continue
 
-            return _finish(
-                kept, settled, pending, withdrawn, history, summary, raw_candidates
-            )
+            if pending and repeated:
+                _logger.info(
+                    "extractor: stopping corrections for session %s because the same "
+                    "normalized failure repeated",
+                    summary.session_id,
+                )
+
+            return _finish(kept, settled, pending, withdrawn, history, summary, raw_candidates)
 
         if history:
             # See ONE ASYMMETRY above: a correction was issued and the model then
@@ -449,11 +475,11 @@ class LearningExtractor:
             _logger.warning(
                 "extractor: session %s stopped returning a parseable tool call after "
                 "%d correction(s) — returning the %d candidate(s) already validated",
-                summary.session_id, len(history), len(kept),
+                summary.session_id,
+                len(history),
+                len(kept),
             )
-            return _finish(
-                kept, settled, pending, withdrawn, history, summary, raw_candidates
-            )
+            return _finish(kept, settled, pending, withdrawn, history, summary, raw_candidates)
         assert last_exc is not None
         raise last_exc
 
@@ -498,17 +524,28 @@ class LearningExtractor:
         payload = {
             "session_id": summary.session_id,
             "accepted_signal": summary.accepted_signal,
-            "triage": {"decision": verdict.decision, "reason": verdict.reason,
-                       "target_hints": list(verdict.target_hints)},
+            "triage": {
+                "decision": verdict.decision,
+                "reason": verdict.reason,
+                "target_hints": list(verdict.target_hints),
+            },
             "turns": [
-                {"turn_index": t.turn_index, "user_nl": t.user_nl,
-                 "assistant_text": t.assistant_text}
+                {
+                    "turn_index": t.turn_index,
+                    "user_nl": t.user_nl,
+                    "assistant_text": t.assistant_text,
+                }
                 for t in summary.turns
             ],
             "tool_calls": [
-                {"tool_call_ref": tc.tool_call_ref, "turn_index": tc.turn_index,
-                 "tool_name": tc.tool_name, "sql": tc.sql, "status": tc.status,
-                 "result_columns": list(tc.result_columns)}
+                {
+                    "tool_call_ref": tc.tool_call_ref,
+                    "turn_index": tc.turn_index,
+                    "tool_name": tc.tool_name,
+                    "sql": tc.sql,
+                    "status": tc.status,
+                    "result_columns": list(tc.result_columns),
+                }
                 for tc in summary.tool_calls
                 # Dropped from the PAYLOAD only — never from the `SessionSummary`,
                 # which stays a faithful projection other stages read. Derived from
@@ -527,13 +564,11 @@ class LearningExtractor:
             # stood on, and it may never have been dispatched as a `runQuery`, so
             # `tool_calls` can be missing it entirely.
             "answer_sql": [
-                {"tool_call_ref": a.tool_call_ref, "sql": a.sql,
-                 "blueprint_id": a.blueprint_id}
+                {"tool_call_ref": a.tool_call_ref, "sql": a.sql, "blueprint_id": a.blueprint_id}
                 for a in summary.answer_sqls
             ],
             "askuser_exchanges": [
-                {"question": ex.question, "answer": ex.answer}
-                for ex in summary.askuser_exchanges
+                {"question": ex.question, "answer": ex.answer} for ex in summary.askuser_exchanges
             ],
             "failed_fixed_sql": [
                 {"failed_sql": ff.failed_sql, "fixed_sql": ff.fixed_sql}
@@ -590,7 +625,7 @@ def _withdrawn_declines(
                 else None
             ),
         )
-        for index, decline in pending[len(re_emitted):]
+        for index, decline in pending[len(re_emitted) :]
     ]
 
 
@@ -629,8 +664,7 @@ def _finish(
             correction_history=tuple(history),
             raw_payload=(
                 dict(raw_candidates[index])
-                if 0 <= index < len(raw_candidates)
-                and isinstance(raw_candidates[index], dict)
+                if 0 <= index < len(raw_candidates) and isinstance(raw_candidates[index], dict)
                 else None
             ),
         )
@@ -646,7 +680,9 @@ def _finish(
             "extractor: %d candidate(s) for session %s still declined after %d "
             "correction(s) (%d of them WITHDRAWN — named in a correction and then "
             "omitted from the re-emit): %s",
-            len(corrected) + len(withdrawn), summary.session_id, len(history),
+            len(corrected) + len(withdrawn),
+            summary.session_id,
+            len(history),
             len(withdrawn),
             "; ".join(d.detail.split("\n")[0] for d in (*withdrawn, *corrected)),
         )

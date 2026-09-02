@@ -88,9 +88,7 @@ def parse_accepted_sql(accepted_sql: str) -> exp.Expression:
     return ast
 
 
-def _find_literal(
-    ast: exp.Expression, column: str, value: str
-) -> exp.Literal | None:
+def _find_literal(ast: exp.Expression, column: str, value: str) -> exp.Literal | None:
     """Find the (currently in-tree) literal for `column <op> value`.
 
     A comparison qualifies when it references `column` — directly or wrapped in a function such
@@ -165,9 +163,7 @@ def _check_rewritten(
             f"the rewritten template does not parse ({exc}) — the rewrite produced "
             f"invalid SQL: {rendered!r} (fail-to-review)."
         ) from exc
-    grown = [
-        shape for shape, count in _function_shapes(after).items() if count > before[shape]
-    ]
+    grown = [shape for shape, count in _function_shapes(after).items() if count > before[shape]]
     if grown:
         name, arity = sorted(grown)[0]
         raise RewriteError(
@@ -191,6 +187,17 @@ def _inline_literal_present(
     """
     if _located_inline_literal(ast, column, value):
         return True
+    # sqlglot represents `IS [NOT] NULL` with `exp.Null`, not `exp.Literal`, and the
+    # S3 literal-predicate enumerator intentionally omits NULL checks. Extractors still
+    # correctly classify these data-quality predicates as inline. Accept that truthful
+    # classification here; the rewrite never edits inline predicates.
+    if value.upper() == "NULL":
+        for null in ast.find_all(exp.Null):
+            predicate = null.parent
+            if isinstance(predicate, exp.Is) and column in {
+                col.name for col in predicate.find_all(exp.Column)
+            }:
+                return True
     predicates = literal_predicates(accepted_sql) or ()
     return any(
         predicate.column.lower() == column.lower() and predicate.value == value
@@ -213,9 +220,7 @@ def _located_inline_literal(ast: exp.Expression, column: str, value: str) -> boo
     )
 
 
-def _recheck_inline_literals(
-    ast: exp.Expression, entries: list[tuple[str, str]]
-) -> None:
+def _recheck_inline_literals(ast: exp.Expression, entries: list[tuple[str, str]]) -> None:
     """POST-CONDITION: every inline literal that was in the tree is STILL in the tree.
 
     The pre-pass proves the plan is honest about the accepted SQL; this proves the REWRITE was
@@ -286,9 +291,7 @@ def rewrite_sql_to_template(
     """
     ast = parse_accepted_sql(accepted_sql)
     before = _function_shapes(ast)
-    inline_recheck = (
-        _check_inline_literals(ast, accepted_sql, parameterization) if strict else []
-    )
+    inline_recheck = _check_inline_literals(ast, accepted_sql, parameterization) if strict else []
     slot_names: list[str] = []
 
     for param in parameterization:

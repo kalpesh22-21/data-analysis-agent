@@ -41,12 +41,51 @@ class CandidateStatus:
     # that measures how often the form is unfillable, which folding it into `in_review`
     # would destroy.
     NEEDS_PARAMETERIZATION = "needs_parameterization"
+    AWAITING_JUDGE = "awaiting_judge"
     # Phase-3 terminal state (governed-corpus inbox PROMOTE): a verified learning node
     # whose MCP-format YAML has been emitted for a manual PR into the MCP corpus repo.
     # Terminal — it drops out of the inbox validated listing. Caveat: if the human
     # never merges the PR, the neo4j node stays `source='learning'` (excluded from
     # recall) while the candidate stays `promoted`; the emit is optimistic.
     PROMOTED = "promoted"
+
+
+@dataclass(frozen=True)
+class JudgeRetryState:
+    first_attempt_at: str
+    next_attempt_at: str
+    deadline_at: str
+    attempts: int = 0
+    last_outcome: str = "not_judged"
+
+    def to_doc(self) -> dict[str, Any]:
+        return {
+            "first_attempt_at": self.first_attempt_at,
+            "next_attempt_at": self.next_attempt_at,
+            "deadline_at": self.deadline_at,
+            "attempts": self.attempts,
+            "last_outcome": self.last_outcome,
+        }
+
+    @classmethod
+    def from_doc(cls, doc: Any) -> JudgeRetryState | None:
+        if not isinstance(doc, dict):
+            return None
+        required = ("first_attempt_at", "next_attempt_at", "deadline_at")
+        if any(not isinstance(doc.get(key), str) or not doc[key] for key in required):
+            return None
+        attempts = doc.get("attempts", 0)
+        return cls(
+            first_attempt_at=doc["first_attempt_at"],
+            next_attempt_at=doc["next_attempt_at"],
+            deadline_at=doc["deadline_at"],
+            attempts=attempts
+            if isinstance(attempts, int) and not isinstance(attempts, bool)
+            else 0,
+            last_outcome=doc.get("last_outcome", "not_judged")
+            if isinstance(doc.get("last_outcome", "not_judged"), str)
+            else "not_judged",
+        )
 
 
 def mint_candidate_id(content_hash: str, ordinal: int) -> str:
@@ -172,7 +211,9 @@ class CandidateEnvelope:
     source_trace: str
     evidence_refs: tuple[str, ...]  # KV keys into learning_audit — never the quotes
     extractor_rationale: str
-    entity_scan: dict[str, Any]  # LeakageVerdict shape — "pending" pre-leakage-gate (S5 authoritative)
+    entity_scan: dict[
+        str, Any
+    ]  # LeakageVerdict shape — "pending" pre-leakage-gate (S5 authoritative)
     confidence: float
     proposed_action: str
     depends_on: tuple[str, ...]
@@ -182,7 +223,9 @@ class CandidateEnvelope:
     # downstream stage and defaults so a pre-stage envelope is a VALID doc. S3
     # never populates these; the S3 spine above is untouched. ---
     dedup: DedupVerdict | None = None  # S6 WRITES (Contract C); None pre-S6
-    drift: DriftStamp = field(default_factory=DriftStamp)  # S9 WRITES (Contract E); unchecked pre-S9
+    drift: DriftStamp = field(
+        default_factory=DriftStamp
+    )  # S9 WRITES (Contract E); unchecked pre-S9
     # W3C `traceparent` of the extracting consume span (the session's learning
     # trace). Stamped at extraction so the cron scheduler's promote/land spans
     # CONTINUE the SAME Phoenix trace as the enqueue → consume → extract that
@@ -285,6 +328,7 @@ class CandidateEnvelope:
     # been filled in.
     decline: DeclineBlock | None = None
     revalidation: ValidationSnapshot | None = None
+    judge_retry: JudgeRetryState | None = None
     # --- human knowledge edit (design §C.2) --------------------------------------
     # ADDITIVE, and the payload's key set is why it lives here rather than beside the edit
     # itself — see `KnowledgeEdit`. Absent on every candidate a human has not edited, which is
@@ -360,6 +404,8 @@ class CandidateEnvelope:
             doc["decline"] = self.decline.to_doc()
         if self.revalidation is not None:
             doc["revalidation"] = self.revalidation.to_doc()
+        if self.judge_retry is not None:
+            doc["judge_retry"] = self.judge_retry.to_doc()
         # Same additive+optional posture as everything above: absent means no human has edited
         # this candidate's payload, which is what every row written before the edit path is.
         if self.knowledge_edit is not None:
@@ -379,11 +425,7 @@ class CandidateEnvelope:
             evidence_refs=tuple(prov.get("evidence_ref", []) or []),
             extractor_rationale=prov.get("extractor_rationale", ""),
             entity_scan=dict(doc.get("entity_scan", {})),
-            dedup=(
-                DedupVerdict.from_doc(doc["dedup"])
-                if doc.get("dedup") is not None
-                else None
-            ),
+            dedup=(DedupVerdict.from_doc(doc["dedup"]) if doc.get("dedup") is not None else None),
             drift=DriftStamp.from_doc(doc.get("drift", {}) or {}),
             confidence=float(doc.get("confidence", 0.0)),
             proposed_action=doc.get("proposed_action", "new"),
@@ -419,9 +461,7 @@ class CandidateEnvelope:
             # trades this for a strictly worse failure, since a cutoff DROPS rows rather
             # than merely mis-ordering them (see `list_by_status`).
             last_scanned_at=(
-                doc["last_scanned_at"]
-                if isinstance(doc.get("last_scanned_at"), str)
-                else None
+                doc["last_scanned_at"] if isinstance(doc.get("last_scanned_at"), str) else None
             ),
             # A non-dict `judge` (a hand edit, a foreign writer) reads back as "the
             # judge did not run" rather than raising inside a queue worker — the same
@@ -441,9 +481,7 @@ class CandidateEnvelope:
             ),
             # `from_doc` returns None for anything without a usable fingerprint — an
             # attestation that binds to nothing would apply to everything.
-            leakage_attestation=LeakageAttestation.from_doc(
-                doc.get("leakage_attestation")
-            ),
+            leakage_attestation=LeakageAttestation.from_doc(doc.get("leakage_attestation")),
             # Same normalize-do-not-trust posture as `last_scanned_at`/`judge`: a
             # non-dict stamp (hand edit, foreign writer) reads back as "nobody looked"
             # rather than raising inside the cron scan or the inbox projection. The
@@ -465,6 +503,7 @@ class CandidateEnvelope:
             route_reason=(
                 doc["route_reason"] if isinstance(doc.get("route_reason"), str) else None
             ),
+            judge_retry=JudgeRetryState.from_doc(doc.get("judge_retry")),
             # Both own their own normalize-do-not-trust rules (a bad shape reads as
             # ABSENT, never raises) — see `candidate/decline.py`, which states why the
             # snapshot in particular must read as missing rather than as empty.
@@ -587,9 +626,7 @@ def _evidence_pointers(raw: dict[str, Any]) -> tuple[EvidencePointer, ...]:
             obj = as_object(item, at=at, requirement="an evidence object")
             out.append(
                 EvidencePointer(
-                    turn_ref=require(
-                        obj, "turn_ref", as_int, at=at, requirement="the turn index"
-                    ),
+                    turn_ref=require(obj, "turn_ref", as_int, at=at, requirement="the turn index"),
                     tool_call_ref=require(
                         obj, "tool_call_ref", as_text, at=at, requirement="the tool call id"
                     ),
@@ -626,6 +663,8 @@ def build_declined_envelope(
     evidence_refs: tuple[str, ...] = (),
     judge: CoverageAssessment | None = None,
     traceparent: str | None = None,
+    status: str = CandidateStatus.NEEDS_PARAMETERIZATION,
+    judge_retry: JudgeRetryState | None = None,
 ) -> CandidateEnvelope:
     """Assemble the FAIL-TO-REVIEW envelope for a candidate that died on the parameterization form.
 
@@ -646,7 +685,7 @@ def build_declined_envelope(
     return CandidateEnvelope(
         candidate_id=candidate_id,
         type=decline.type,
-        status=CandidateStatus.NEEDS_PARAMETERIZATION,
+        status=status,
         payload=_payload_of(raw),
         source_session=summary.session_id,
         source_trace=summary.trace_id,
@@ -670,7 +709,6 @@ def build_declined_envelope(
             corrections_attempted=decline.corrections_attempted,
             correction_history=decline.correction_history,
         ),
-        revalidation=ValidationSnapshot.from_summary(
-            summary, evidence=_evidence_pointers(raw)
-        ),
+        revalidation=ValidationSnapshot.from_summary(summary, evidence=_evidence_pointers(raw)),
+        judge_retry=judge_retry,
     )

@@ -53,7 +53,13 @@ _LOCATOR_SCHEMA = {
             "description": "The fully-qualified 'database.table' the column belongs to.",
         },
         "column": {"type": "string", "description": "The BARE column name (no table prefix)."},
-        "value": {"type": "string", "description": "The literal as it appeared in the SQL."},
+        "value": {
+            "type": "string",
+            "description": (
+                "The BARE semantic literal without surrounding SQL quotes. For "
+                "employee_status = 'A' emit A; for column != '' emit the empty string."
+            ),
+        },
     },
     "required": ["table", "column", "value"],
 }
@@ -70,7 +76,7 @@ _SLOT_SCHEMA = {
                 f"({', '.join(_SLOT_TYPE_ENUM)}). A named entity such as a department "
                 "is best modeled as 'entity'. 'period' is a warehouse pay-period key, "
                 "NOT a free calendar date. 'relative_window' is a trailing \"last N "
-                "<unit>\" window carried as a BARE WHOLE NUMBER (\"last 6 months\" -> 6; "
+                '<unit>" window carried as a BARE WHOLE NUMBER ("last 6 months" -> 6; '
                 "the unit lives in the SQL, e.g. INTERVAL {n} MONTH) — use it whenever "
                 "the SQL expresses a trailing window, rather than falling back to "
                 "'period' or 'string'."
@@ -151,8 +157,8 @@ _BLUEPRINT_PAYLOAD_SCHEMA = {
             "additionalProperties": {"type": "string"},
             "description": (
                 "A JSON OBJECT (map), NOT a list, of {ambiguous_term: "
-                "fully-qualified column} — e.g. {\"total salary\": "
-                "\"dbpcm_warehouse.employee.AnnualSalary\"}. The aggregated metric "
+                'fully-qualified column} — e.g. {"total salary": '
+                '"dbpcm_warehouse.employee.AnnualSalary"}. The aggregated metric '
                 "column (e.g. the argument of sum(...)) is NOT a predicate — record it "
                 "here, NOT in parameterization."
             ),

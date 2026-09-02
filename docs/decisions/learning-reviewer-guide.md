@@ -34,7 +34,7 @@ Every row carries a **reason** — why it is in front of you, not what is wrong 
 | `suppressed_duplicate` | it **is** something already in the corpus — a deterministic match against a live artifact | **revise it into a real delta, or reject it** — see below |
 | `leakage_near_miss` | the entity scan flagged something | inspect, then attest or reject |
 | `hand_authored` | an expert wrote it at `/mint` | ordinary review — this is not a defect |
-| `blueprint_sampled` | clean, and sampling picked it for a spot-check | ordinary review |
+| `blueprint_sampled` | clean mined blueprint (the production sample is 100%) | ordinary review |
 | `knowledge_pre_gate` | a fact with no SQL | there is no mechanical check — you *are* the gate |
 
 Content is **withheld until the entity scan settles**. A blank intent means "nobody has scanned

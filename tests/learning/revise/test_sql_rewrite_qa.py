@@ -112,23 +112,15 @@ async def test_a_rewrite_with_no_usable_entries_takes_the_rewrite_down_with_it(
     assert proposal.reason
 
 
-async def test_a_structurally_incomplete_entry_is_passed_through_to_the_validator() -> None:
-    """⚠ THE DELIBERATE NON-GUARD, asserted so nobody "fixes" it into a second vocabulary.
-
-    An entry with a `role` and no `locator` is nonsense, and this boundary lets it through ON
-    PURPOSE: `to_candidate` owns per-field validation, it is the same validator the extractor's
-    output faces, and re-implementing it here would give the reviewer two different error
-    messages for one mistake — only one of which names the fix.
-
-    What matters is that the entry is offered VERBATIM (the reviewer sees what the model actually
-    said) and that the rewrite rides with it, so the two are applied and adjudicated together.
-    """
+async def test_a_structurally_incomplete_rewrite_entry_is_withheld_before_apply() -> None:
+    """Proposal-time validation reuses the extractor's vocabulary and offers no broken draft."""
     reviser, _ = make_reviser([_turn(entries=[{"role": "inline"}])])
 
     proposal = await reviser.propose(declined_blueprint(), feedback="f", allow_sql=True)
 
-    assert proposal.entries == ({"role": "inline"},)
-    assert proposal.sql_changed is True  # not withheld — it is adjudicated downstream
+    assert proposal.entries == ()
+    assert proposal.sql_changed is False
+    assert "parameterization do not agree" in proposal.reason
 
 
 async def test_a_candidate_with_no_snapshot_is_refused_before_any_model_call() -> None:
@@ -183,10 +175,17 @@ async def test_only_a_byte_identical_echo_escapes_being_called_a_rewrite(
 
     proposal = await reviser.propose(declined_blueprint(), feedback="f", allow_sql=True)
 
-    assert proposal.sql_changed is expect_rewrite
-    assert bool(proposal.caution) is expect_rewrite
+    offered = expect_rewrite and mutation == NEW_SQL
+    # Semantically identical rewrites with an incomplete replacement entry list are now
+    # withheld; applying them would discard the old entries and fail totality.
+    if expect_rewrite:
+        assert proposal.sql_changed is False
+        assert "parameterization do not agree" in proposal.reason
+    else:
+        assert proposal.sql_changed is False
+    assert bool(proposal.caution) is offered
     # `replace` is forced exactly when a rewrite happened, and never otherwise.
-    assert proposal.replace is expect_rewrite
+    assert proposal.replace is offered
 
 
 # --- which rules are GUARDS here, and which are only prompt -------------------
@@ -253,7 +252,23 @@ async def test_a_date_literal_an_entry_adjudicates_is_not_treated_as_frozen() ->
         "SELECT department, sum(deductions) AS deductions FROM payroll.payroll_fact "
         "WHERE register_type = 'DDUCT' AND pay_date >= '2026-01-01' GROUP BY department"
     )
-    reviser, _ = make_reviser([_turn(sql=dated_but_adjudicated)])
+    date_entry = {
+        "locator": {
+            "table": "payroll.payroll_fact",
+            "column": "pay_date",
+            "value": "2026-01-01",
+        },
+        "role": "slot",
+        "slot": {
+            "name": "start_date",
+            "type": "as_of_date",
+            "binds_to": "payroll.payroll_fact.pay_date",
+            "required": True,
+        },
+    }
+    reviser, _ = make_reviser(
+        [_turn(sql=dated_but_adjudicated, entries=[_ENTRY, date_entry])]
+    )
 
     proposal = await reviser.propose(
         declined_blueprint(), feedback="from January", allow_sql=True

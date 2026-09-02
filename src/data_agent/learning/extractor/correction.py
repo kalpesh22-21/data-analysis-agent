@@ -42,6 +42,21 @@ _FAMILIES = {
     REASON_TOTALITY: _PREDICATE_FAMILY,
 }
 
+
+def correction_family(decline: Decline) -> str:
+    """Stable budget family for a correctable decline.
+
+    `role_inconsistent` is semantic once the payload is readable: the model chose an
+    impossible role/slot combination. Malformed fields remain structural; predicate
+    coverage and catalog-rule corrections share the SQL budget.
+    """
+    if decline.reason == "role_inconsistent":
+        return "semantic"
+    if _FAMILIES.get(decline.reason) in {_RULE_FAMILY, _PREDICATE_FAMILY}:
+        return "sql"
+    return "structural"
+
+
 # The closing instruction, per family. All four say "change only what was named" and all
 # four offer the exit; what differs is WHAT was named and what "cannot be fixed" means.
 _CLOSINGS = {
@@ -100,9 +115,7 @@ def build_correction_message(
     array the model just sent, so the model can find the one being talked about without the
     extractor quoting its content back at it.
     """
-    families = {
-        _FAMILIES.get(decline.reason, _SHAPE_FAMILY) for _index, decline in declines
-    }
+    families = {_FAMILIES.get(decline.reason, _SHAPE_FAMILY) for _index, decline in declines}
     family = families.pop() if len(families) == 1 else "mixed"
     lines = [
         f"CORRECTION. {_count(len(declines), 'candidate')} of the {emitted} you "

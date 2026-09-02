@@ -18,7 +18,7 @@ that runs after every chat session and turns the transcript into durable knowled
 
 | Target | Store | Entity policy | Commit gate |
 |---|---|---|---|
-| **Blueprint** | neo4j | **Entity-agnostic** (literals lifted to slots) | Auto-land as `candidate`; **sampled candidates + leakage near-misses → review inbox** for entity-leak detection + retraction (D58b) |
+| **Blueprint** | neo4j | **Entity-agnostic** (literals lifted to slots) | **All mined candidates → human review by default**; leakage and dedup findings remain visible on the card |
 | **Global knowledge** | vector index / RAG | **Entity-agnostic** | **Human review *before* retrievable (D58a)** — candidates land in the review inbox; `searchKnowledge` returns **only human-approved** statements. (Reverses the earlier "candidates retrievable" assumption for knowledge.) |
 | **User knowledge** | per-user store | **Entity-bearing OK** (personal) | Auto-land (scoped to user) |
 | **Schema edit** | `getTableSchema` source | Depends | **Human review queue — never auto-commit** |
@@ -100,20 +100,29 @@ Phoenix `learning-loop` project (see [10-observability.md](10-observability.md))
         │
         ▼
  (6) WRITERS (idempotent, keyed by content_hash)        each candidate carries provenance:
-       blueprint        → neo4j  status=candidate (+USES edges, +golden, hit_count seed)
-                          ↳ sampled candidates + leakage near-misses → REVIEW INBOX (D58b)
+       blueprint        → REVIEW INBOX by default (+USES edges, +golden, hit_count seed)
+                          ↳ leakage and dedup findings stay visible for reviewer repair
        global knowledge → REVIEW INBOX (human approval BEFORE retrievable — D58a)
        user knowledge   → per-user store (auto-commit, scoped)   {source_session, source_trace,
        schema edit      → REVIEW INBOX (human approval)            extractor_rationale, evidence}
         │
         ▼
  (7) REVIEW INBOX (human-in-loop): schema edits, ALL global-knowledge candidates (D58a),
-       knowledge conflicts, blueprint variants + sampled/near-miss blueprint candidates (D58b)
+       knowledge conflicts, all mined blueprints + leakage/dedup findings (D58b)
        approve → commit/version (knowledge becomes retrievable) ·  reject → archive as negative signal
        leaked artifact found → RETRACT (pull from index; D25 trace → who was exposed)
 ```
 
 ## Promotion scheduler (separate background process)
+
+Repairable extractor declines are durable even when the novelty judge is unavailable. They enter
+`awaiting_judge`, retry from the consumer with exponential backoff (five minutes initially, capped
+at six hours), and after 24 hours move to `needs_parameterization` with
+`route_reason=judge_unavailable`. This state is review-only and shares the six-month transient TTL.
+
+Extractor corrections use independent bounded budgets: two structural, two SQL/rule, and one
+semantic correction, with a hard total of five. A normalized failure repeated through two
+corrective attempts stops that family early.
 
 Candidates do not promote themselves. A store-wide scheduler advances state:
 

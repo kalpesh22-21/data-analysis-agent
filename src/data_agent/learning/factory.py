@@ -238,7 +238,8 @@ def build_learning_consumer(
     else:
         _logger.info(
             "cross-tier prior-art layer ENABLED via %s (S6 dedup + the S3 extractor's "
-            "PRIOR ART pre-fetch and searchCorpus tool)", type(prior_art).__name__
+            "PRIOR ART pre-fetch and searchCorpus tool)",
+            type(prior_art).__name__,
         )
     git_client = git_client if git_client is not None else _NullGitPullRequestClient()
     semantic_scanner = (
@@ -278,6 +279,11 @@ def build_learning_consumer(
         config=ExtractorConfig(
             max_retries=settings.learning_extractor_max_retries,
             max_shape_corrections=settings.learning_extractor_max_shape_corrections,
+            max_sql_corrections=getattr(settings, "learning_extractor_max_sql_corrections", 2),
+            max_semantic_corrections=getattr(
+                settings, "learning_extractor_max_semantic_corrections", 1
+            ),
+            max_total_corrections=getattr(settings, "learning_extractor_max_total_corrections", 5),
             known_rules=known_rules,
             rule_index=rule_index,
         ),
@@ -328,8 +334,7 @@ def build_learning_consumer(
     )
 
     _logger.info(
-        "learning consumer built WITH extraction + the %d-stage write-router "
-        "pipeline (%s)",
+        "learning consumer built WITH extraction + the %d-stage write-router pipeline (%s)",
         len(stages),
         " -> ".join(s.stage_id for s in stages),
     )
@@ -399,31 +404,33 @@ def build_write_router_stages(
                 trace_verbose=settings.learning_trace_verbose,
             )
         )
-    stages.extend([
-        LeakageGateStage(
-            candidate_store=candidate_store,
-            semantic_scanner=(
-                semantic_scanner
-                if semantic_scanner is not None
-                else NullSemanticEntityScanner()
+    stages.extend(
+        [
+            LeakageGateStage(
+                candidate_store=candidate_store,
+                semantic_scanner=(
+                    semantic_scanner
+                    if semantic_scanner is not None
+                    else NullSemanticEntityScanner()
+                ),
+                user_store=user_store,
+                tracer=tracer,
             ),
-            user_store=user_store,
-            tracer=tracer,
-        ),
-        DedupStage(
-            blueprint_corpus,
-            embedder,
-            prior_art=prior_art,
-            merge_threshold=settings.learning_dedup_merge_threshold,
-            conflict_threshold=settings.learning_dedup_conflict_threshold,
-            recurrence_threshold=settings.learning_recurrence_similarity_threshold,
-            # THE SAME judge instance the consumer screens sessions with — one object,
-            # two stages. A split would let the two halves of one candidate's lifetime
-            # run under different thresholds and write to different audit stores.
-            judge=judge,
-            tracer=tracer,
-        ),
-    ])
+            DedupStage(
+                blueprint_corpus,
+                embedder,
+                prior_art=prior_art,
+                merge_threshold=settings.learning_dedup_merge_threshold,
+                conflict_threshold=settings.learning_dedup_conflict_threshold,
+                recurrence_threshold=settings.learning_recurrence_similarity_threshold,
+                # THE SAME judge instance the consumer screens sessions with — one object,
+                # two stages. A split would let the two halves of one candidate's lifetime
+                # run under different thresholds and write to different audit stores.
+                judge=judge,
+                tracer=tracer,
+            ),
+        ]
+    )
     if include_target_specific:
         if user_store is None:
             raise LearningWiringError(
@@ -433,9 +440,7 @@ def build_write_router_stages(
             )
         stages.append(
             SchemaEditPRStage(
-                git_client=(
-                    git_client if git_client is not None else _NullGitPullRequestClient()
-                ),
+                git_client=(git_client if git_client is not None else _NullGitPullRequestClient()),
                 checks=checks if checks is not None else AllPassChecks(),
             )
         )

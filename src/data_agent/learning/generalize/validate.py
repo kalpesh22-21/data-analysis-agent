@@ -14,7 +14,7 @@ check — the value S7 routes on. Never raises; never auto-promotes.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
 
 import sqlglot
 import sqlglot.expressions as exp
@@ -53,6 +53,19 @@ REASON_DATE_LITERAL = "frozen_date_literal"
 _DATE_SHAPED = re.compile(
     r"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$"
 )
+_AMBIGUOUS_DATE_SHAPED = re.compile(
+    r"^(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}/\d{1,2}/\d{4}|\d{8})"
+    r"(?:[ T].*)?$"
+)
+_DATE_CONSTRUCTORS = {
+    "todate",
+    "todate32",
+    "todatetime",
+    "todatetime32",
+    "todatetime64",
+    "parsedatetimebesteffort",
+    "parsedatetimebesteffortornull",
+}
 
 # NOTE — there is deliberately NO local list of "comparison" node types here. Which
 # comparisons count is `sql_predicates.literal_predicate_of`'s decision and only its decision
@@ -259,6 +272,13 @@ def frozen_date_literals(template: str) -> tuple[str, ...]:
     Returns EVERY offender rather than the first: a model that froze one date usually froze two,
     and a reason naming one of them invites a second round trip for the other.
     """
+    return _date_literals_by_confidence(template, wanted="high")
+
+
+def _date_literals_by_confidence(
+    template: str, *, wanted: Literal["high", "ambiguous"]
+) -> tuple[str, ...]:
+    """Shared AST walk for definite and warning-only frozen date spellings."""
     # STRING-AWARE: a `{word}` inside a string constant is data, not a bind site.
     colon_form = sub_slot_tokens(template, lambda name: f":{name}")
     try:
@@ -271,9 +291,26 @@ def frozen_date_literals(template: str) -> tuple[str, ...]:
         return ()
     frozen: list[str] = []
     for literal in ast.find_all(exp.Literal):
-        if not literal.is_string:
+        text = str(literal.this)
+        date_like = _AMBIGUOUS_DATE_SHAPED.match(text)
+        if not date_like:
             continue
-        if not _DATE_SHAPED.match(str(literal.this)):
+        parent_func = None
+        ancestor = literal.parent
+        while ancestor is not None:
+            if isinstance(ancestor, exp.Func):
+                parent_func = ancestor
+                break
+            ancestor = ancestor.parent
+        function_name = ""
+        if parent_func is not None:
+            authored_name = parent_func.args.get("this")
+            function_name = (
+                authored_name if isinstance(authored_name, str) else parent_func.sql_name()
+            ).lower()
+        in_date_constructor = function_name in _DATE_CONSTRUCTORS
+        confidence = "high" if _DATE_SHAPED.match(text) or in_date_constructor else "ambiguous"
+        if confidence != wanted:
             continue
         node, child = literal.parent, literal
         while node is not None:
@@ -281,13 +318,24 @@ def frozen_date_literals(template: str) -> tuple[str, ...]:
                 # (b) `child` is the literal's whole SIDE of this predicate. A column in it
                 # means the constant S3 adjudicated came from the OTHER side, not from here.
                 if list(child.find_all(exp.Column)):
-                    frozen.append(str(literal.this))
+                    frozen.append(text)
                 break
             child, node = node, node.parent
         else:  # (a) no predicate the enumerator recognizes, anywhere above it
-            frozen.append(str(literal.this))
+            frozen.append(text)
     # ORDER-PRESERVING DE-DUP: the same run date pasted into two places is one fault to fix.
     return tuple(dict.fromkeys(frozen))
+
+
+def ambiguous_frozen_date_literals(template: str) -> tuple[str, ...]:
+    """Date-like, unadjudicated literals that require human acknowledgement.
+
+    ISO dates remain the high-confidence mechanical failure above. Unpadded, slash-form and
+    compact spellings are warnings unless a date constructor makes their meaning definite;
+    constructor-backed values are promoted to the high-confidence result by
+    `frozen_date_literals`.
+    """
+    return _date_literals_by_confidence(template, wanted="ambiguous")
 
 
 def decide_outcome(

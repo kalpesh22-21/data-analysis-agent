@@ -33,12 +33,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from typing import Any
 
 from data_agent.runtime.model.client import ModelClient, begin_turn_client
 
 from ..candidate.decline import last_sql as _last_sql
 from ..candidate.models import CandidateEnvelope
+from ..extractor.validation import validate_parameterization_totality
 from ..generalize.validate import check_read_only_select, frozen_date_literals
 from ..observability import revise_span
 from .diff import EntryDiff, diff_parameterization
@@ -318,6 +320,28 @@ class BlueprintReviser:
             # without `replace_all` for the same reason, so this is the surface agreeing with
             # the guard rather than substituting for it.
             replace = True
+
+            proposed_payload = dict(env.payload)
+            proposed_payload.setdefault("kind", "single")
+            proposed_payload.setdefault("accepted_signal", snapshot.accepted_signal)
+            proposed_payload.setdefault("source_tool_call_refs", list(snapshot.sql_by_ref))
+            proposed_payload["parameterization"] = list(entries)
+            rewritten_snapshot = dataclass_replace(
+                snapshot,
+                sql_by_ref={ref: (proposed_sql,) for ref in snapshot.sql_by_ref},
+            )
+            totality_decline = validate_parameterization_totality(
+                proposed_payload, rewritten_snapshot.to_summary()
+            )
+            if totality_decline is not None:
+                self._emit(env, "sql_rewrite_unusable", feedback=feedback, allow_sql=True)
+                return ReviseProposal(
+                    reason=(
+                        "the assistant's replacement SQL and parameterization do not agree: "
+                        f"{totality_decline.detail}. The proposal was discarded before apply; "
+                        "ask the assistant to classify every literal predicate in the new SQL"
+                    )
+                )
 
         current = env.payload.get("parameterization")
         rows = diff_parameterization(

@@ -3880,6 +3880,10 @@
       body.token = token;
       if (box) box.value = "";
     }
+    if (action === "approve") {
+      var dateAck = node.querySelector("[data-testid=inbox-date-warning-ack]");
+      if (dateAck) body.acknowledge_date_warnings = dateAck.checked === true;
+    }
     disableActions(actions);
     fetch("/api/inbox/" + encodeURIComponent(candidateId) + "/" + action, {
       method: "POST",
@@ -5493,6 +5497,21 @@
         makeActionButton(id, "promote", "Re-emit YAML", li, actions, false)
       );
     } else {
+      var staticValidation = (((item.payload_view || {}).generalization || {}).static_validation || {});
+      var dateWarnings = Array.isArray(staticValidation.date_literal_warnings)
+        ? staticValidation.date_literal_warnings : [];
+      if (dateWarnings.length) {
+        var dateAckLabel = el("label", "date-warning-ack");
+        var dateAck = document.createElement("input");
+        dateAck.type = "checkbox";
+        dateAck.setAttribute("data-testid", "inbox-date-warning-ack");
+        dateAckLabel.appendChild(dateAck);
+        dateAckLabel.appendChild(document.createTextNode(
+          " I inspected the ambiguous date-like literal" + (dateWarnings.length === 1 ? "" : "s") +
+          ": " + dateWarnings.join(", ")
+        ));
+        actions.appendChild(dateAckLabel);
+      }
       // Approve is pre-disabled offline (contract §5); retract is disabled here
       // because every listed item is in_review, not validated (contract §4).
       actions.appendChild(

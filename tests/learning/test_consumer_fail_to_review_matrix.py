@@ -225,12 +225,17 @@ async def test_the_gating_matrix(outcome: str, reason: str) -> None:
     await consumer._run_extractor(_summary(), KEEP_VERDICT, _judgement(outcome))
 
     stored = candidates.all_candidates()
-    should_persist = outcome == OUTCOME_PROCEEDED and reason in REVIEW_ROUTED_DECLINE_REASONS
+    should_persist = outcome != OUTCOME_DROPPED and reason in REVIEW_ROUTED_DECLINE_REASONS
     assert bool(stored) is should_persist, (
         f"judge={outcome!r} reason={reason!r} persisted={[e.status for e in stored]}"
     )
     if should_persist:
-        assert stored[0].status == CandidateStatus.NEEDS_PARAMETERIZATION
+        expected_status = (
+            CandidateStatus.NEEDS_PARAMETERIZATION
+            if outcome == OUTCOME_PROCEEDED
+            else CandidateStatus.AWAITING_JUDGE
+        )
+        assert stored[0].status == expected_status
         assert stored[0].decline is not None
         assert stored[0].decline.reason == reason
 
@@ -360,24 +365,22 @@ async def test_the_consume_path_actually_threads_its_own_judgement_through() -> 
     assert stored[0].judge.covered_by == "bp-total-earnings-by-department"
 
 
-async def test_a_judge_that_raises_on_the_real_path_writes_no_review_item() -> None:
-    """Fail-open must not manufacture merit. The session still extracts (that is the
-    documented degrade) and its decline still dies, because nobody screened it."""
+async def test_a_judge_that_raises_on_the_real_path_preserves_retry_work() -> None:
     candidates = InMemoryCandidateStore()
     consumer = _consumer(candidates, turns=_repeated(_UNCOVERED), judge=_StubJudge(boom=True))
 
     await _drive(consumer, _summary())
 
-    assert candidates.put_calls == 0
+    assert candidates.all_candidates()[0].status == CandidateStatus.AWAITING_JUDGE
 
 
-async def test_no_judge_wired_on_the_real_path_writes_no_review_item() -> None:
+async def test_no_judge_wired_on_the_real_path_preserves_retry_work() -> None:
     candidates = InMemoryCandidateStore()
     consumer = _consumer(candidates, turns=_repeated(_UNCOVERED), judge=None)
 
     await _drive(consumer, _summary())
 
-    assert candidates.put_calls == 0
+    assert candidates.all_candidates()[0].status == CandidateStatus.AWAITING_JUDGE
 
 
 async def test_a_judge_drop_never_reaches_the_review_route() -> None:
@@ -490,9 +493,7 @@ async def test_the_span_reports_the_parked_item_the_consumer_actually_wrote() ->
     assert attrs["learning.extract.decline_reasons"] == REASON_TOTALITY
 
 
-async def test_the_span_says_declined_when_the_judgement_was_absent() -> None:
-    """The control: the SAME decline, unscreened. Nothing is persisted, so the count is
-    an explicit zero and the outcome is the plain one."""
+async def test_the_span_says_declined_to_review_when_judgement_is_pending() -> None:
     tracer, exporter = _tracer_and_exporter()
     candidates = InMemoryCandidateStore()
     consumer = _consumer(candidates, turns=_repeated(_UNCOVERED), tracer=tracer)
@@ -500,8 +501,8 @@ async def test_the_span_says_declined_when_the_judgement_was_absent() -> None:
     await consumer._run_extractor(_summary(), KEEP_VERDICT, None)
 
     attrs = _extract_attrs(exporter)
-    assert attrs["learning.extract.outcome"] == "declined"
-    assert attrs["learning.extract.review_count"] == 0
+    assert attrs["learning.extract.outcome"] == "declined_to_review"
+    assert attrs["learning.extract.review_count"] == 1
 
 
 # --- supersede: the stale form must not outlive the session that produced it -------------------
@@ -590,9 +591,7 @@ async def test_the_gate_does_not_get_to_reroute_the_form_out_of_the_queue() -> N
     one is flowing toward a form. A quarantine must therefore leave the row exactly where
     a reviewer will find it — `needs_parameterization`, not `rejected`, not `in_review`."""
     candidates = InMemoryCandidateStore()
-    leaky = blueprint_raw(
-        intent="ratio for Jane Doe", source_refs=("tc1",), parameterization=[]
-    )
+    leaky = blueprint_raw(intent="ratio for Jane Doe", source_refs=("tc1",), parameterization=[])
     consumer = _consumer(
         candidates,
         turns=_repeated(leaky),

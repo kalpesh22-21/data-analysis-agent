@@ -12,6 +12,7 @@ from .memory_candidate_store import InMemoryCandidateStore
 from .models import (
     CandidateEnvelope,
     CandidateStatus,
+    JudgeRetryState,
     build_declined_envelope,
     build_envelope,
     mint_candidate_id,
@@ -26,6 +27,7 @@ __all__ = [
     "CandidateEnvelope",
     "CandidateStatus",
     "CandidateStore",
+    "JudgeRetryState",
     "DeclineBlock",
     "DedupVerdict",
     "DriftStamp",

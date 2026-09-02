@@ -154,7 +154,8 @@ class LearningSettings(BaseSettings):
         description="Couchbase connection string for the learning_audit bucket (may be the same cluster).",
     )
     learning_audit_bucket: str = Field(
-        "learning_audit", description="Dedicated audit bucket (D95) — separate retention/RBAC clock."
+        "learning_audit",
+        description="Dedicated audit bucket (D95) — separate retention/RBAC clock.",
     )
     # --- KEYSPACE, not just a bucket. Every learning store below carries a
     # `*_scope`/`*_collection` pair alongside its bucket, because the D95/D101/D48/D17
@@ -284,6 +285,7 @@ class LearningSettings(BaseSettings):
         """
         check_settings_keyspaces(self)
         return self
+
     learning_corpus_username: str = Field(
         "", description="RBAC user scoped to learning_corpus ONLY (learning_corpus_writer)."
     )
@@ -451,8 +453,24 @@ class LearningSettings(BaseSettings):
             "a rate that climbs is a PROMPT defect, not a model one."
         ),
     )
+    learning_extractor_max_sql_corrections: int = Field(
+        2,
+        ge=0,
+        description="Corrective turns for SQL totality and catalog-rule mismatches.",
+    )
+    learning_extractor_max_semantic_corrections: int = Field(
+        1,
+        ge=0,
+        description="Corrective turns for readable but semantically inconsistent role plans.",
+    )
+    learning_extractor_max_total_corrections: int = Field(
+        5,
+        ge=0,
+        description="Hard ceiling across all extractor correction families.",
+    )
     learning_extractor_api_key: str = Field(
-        "", description="API key for the extractor model client (secret). Empty ⇒ extractor dormant."
+        "",
+        description="API key for the extractor model client (secret). Empty ⇒ extractor dormant.",
     )
     learning_extractor_base_url: str = Field(
         "", description="Optional OpenAI-compatible base URL for the extractor model client."
@@ -587,9 +605,7 @@ class LearningSettings(BaseSettings):
     )
     learning_revise_model: str = Field(
         "",
-        description=(
-            "Model id for the revision proposal. EMPTY => reuse the extractor's model."
-        ),
+        description=("Model id for the revision proposal. EMPTY => reuse the extractor's model."),
     )
     # --- Hand-authored blueprints (the minting page). ---
     learning_mint_model: str = Field(
@@ -598,7 +614,7 @@ class LearningSettings(BaseSettings):
             "Model for the blueprint MINTING page. Empty (the default) falls back to the "
             "revise model, then the extractor's.\n\n"
             "DECLARED, not merely read: `_build_minter` reads this with `getattr`, and "
-            "settings use `extra=\"ignore\"` — so while the field did not exist, setting "
+            'settings use `extra="ignore"` — so while the field did not exist, setting '
             "LEARNING_MINT_MODEL in the environment did nothing at all, silently, and the "
             "minter always used the fallback. That is a trap this repo has already been "
             "bitten by; a field that is read must be declared."

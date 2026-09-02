@@ -66,7 +66,10 @@ If you do return a query, ALL of the following must hold or it will be refused:
   * literals are written PLAINLY (`department = '0420'`), never as placeholders. The template is
     generated from your entries, not from braces you type.
   * EVERY literal predicate in the NEW query has an entry. A validator walks the query YOU wrote
-    and refuses the blueprint if even one is unaccounted for.
+    and refuses the blueprint if even one is unaccounted for. Re-read the completed SQL after
+    writing it and enumerate its WHERE/HAVING predicates one by one; predicates you PRESERVE from
+    the old SQL still need entries in the COMPLETE replacement list. Never infer that preserving
+    a predicate preserves its old entry: `replace=true` removes every old entry.
   * `replace` is TRUE. Every existing entry describes the OLD query, and none of them survive.
 
 {DATE_RULE}

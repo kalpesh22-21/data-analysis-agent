@@ -28,6 +28,7 @@ from .validate import (
     REASON_DAG,
     REASON_UNREWRITABLE,
     REASON_WHEN_COMPOSITE,
+    ambiguous_frozen_date_literals,
     check_dag,
     check_no_frozen_date_literal,
     check_read_only_select,
@@ -69,11 +70,7 @@ def _uses_rules(parameterization: list[dict[str, Any]]) -> tuple[str, ...]:
 
     A plan-level fact, independent of any single node.
     """
-    rules = {
-        p["rule_id"]
-        for p in parameterization
-        if p.get("role") == "rule" and p.get("rule_id")
-    }
+    rules = {p["rule_id"] for p in parameterization if p.get("role") == "rule" and p.get("rule_id")}
     return tuple(sorted(rules))
 
 
@@ -174,9 +171,7 @@ def _provenance_uses(
     """
     uses: set[str] = set()
     for index, template in enumerate(templates):
-        declared, scratch_schema = (
-            per_node[index] if per_node else (frozenset(), {})
-        )
+        declared, scratch_schema = per_node[index] if per_node else (frozenset(), {})
         # ⚠ A PLACEHOLDER MAY NOT SHADOW A CATALOG TABLE NAME, and this is the FAIL-OPEN one.
         # `_build_alias_map` keys aliases by BARE table name, so `scratch.payroll` and
         # `dbpcm_warehouse.payroll` collide and the last source wins. When scratch wins, every
@@ -200,9 +195,7 @@ def _provenance_uses(
             declared = declared - shadowed
         schema = {**catalog_schema, **scratch_schema} if scratch_schema else catalog_schema
         try:
-            pairs = extract_column_provenance(
-                template, schema, declared_scratch=declared
-            )
+            pairs = extract_column_provenance(template, schema, declared_scratch=declared)
         except ProvenanceExtractionError:
             return False, ()
         for table, column in pairs:
@@ -346,9 +339,7 @@ def _accepted_sql_for_single(
     refs = payload.get("source_tool_call_refs") or []
     if not isinstance(refs, list):
         return None
-    resolved = [
-        sql_by_ref.get(ref) for ref in refs if isinstance(ref, str) and sql_by_ref.get(ref)
-    ]
+    resolved = [sql_by_ref.get(ref) for ref in refs if isinstance(ref, str) and sql_by_ref.get(ref)]
     return resolved[-1] if resolved else None
 
 
@@ -382,7 +373,9 @@ def generalize_blueprint(
     is_composite = kind == "composite" or bool(composes)
 
     if is_composite:
-        return _generalize_composite(payload, parameterization, composes, sql_by_ref, catalog_schema)
+        return _generalize_composite(
+            payload, parameterization, composes, sql_by_ref, catalog_schema
+        )
     return _generalize_single(payload, parameterization, sql_by_ref, catalog_schema)
 
 
@@ -406,6 +399,7 @@ def _generalize_single(
     binds_ok = provenance_ok and all(b in uses_set for b in binds)
     read_only = check_read_only_select(sql_template)
     date_literal_ok = check_no_frozen_date_literal(sql_template)
+    date_warnings = ambiguous_frozen_date_literals(sql_template)
     outcome, reason = decide_outcome(
         explain_ok=provenance_ok,
         binds_to_subset_uses=binds_ok,
@@ -427,6 +421,7 @@ def _generalize_single(
             date_literal_ok=date_literal_ok,
             outcome=outcome,
             reason=reason,
+            date_literal_warnings=date_warnings,
         ),
         canonical_ast_norm=_canonical_or_empty(sql_template),
     )
@@ -507,6 +502,13 @@ def _generalize_composite(
     # the node templates are the only SQL this candidate carries — one frozen date in one node
     # ages the whole blueprint.
     date_literal_ok = all(check_no_frozen_date_literal(t) for t in templates)
+    date_warnings = tuple(
+        dict.fromkeys(
+            warning
+            for template in templates
+            for warning in ambiguous_frozen_date_literals(template)
+        )
+    )
     dag_ok = True  # proven by the gate at the top; a False here returned already
     outcome, reason = decide_outcome(
         explain_ok=provenance_ok,
@@ -529,6 +531,7 @@ def _generalize_composite(
             date_literal_ok=date_literal_ok,
             outcome=outcome,
             reason=reason,
+            date_literal_warnings=date_warnings,
         ),
         canonical_ast_norm=_canonical_or_empty(None, tuple(node_templates)),
     )

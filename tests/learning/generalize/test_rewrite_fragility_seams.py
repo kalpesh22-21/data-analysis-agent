@@ -91,8 +91,12 @@ def _entry(column: str, value: str, **rest) -> dict:
 _COVERED = blueprint_raw(
     intent="ratio of deductions to earnings per employee",
     parameterization=[
-        _entry("register_type", "DDUCT,EARN", role="inline",
-               why="the ratio is defined over these two register types"),
+        _entry(
+            "register_type",
+            "DDUCT,EARN",
+            role="inline",
+            why="the ratio is defined over these two register types",
+        ),
         _entry("register_type", "DDUCT", role="rule", rule_id="employee_deductions"),
         _entry("register_type", "EARN", role="rule", rule_id="gross_earnings"),
     ],
@@ -137,8 +141,8 @@ async def test_the_deductions_ratio_candidate_now_generalizes_cleanly() -> None:
     template = generalization["sql_template"]
     # Both metrics survive, and they are DIFFERENT — the H6 failure was that the
     # deleting rewrite made them byte-identical one-argument calls.
-    assert "sumIf(p.amount, p.register_type = \'DDUCT\')" in template
-    assert "sumIf(p.amount, p.register_type = \'EARN\')" in template
+    assert "sumIf(p.amount, p.register_type = 'DDUCT')" in template
+    assert "sumIf(p.amount, p.register_type = 'EARN')" in template
     assert "WHERE" in template  # the IN filter is not silently dropped
     # And the rules are recorded next to the predicates they describe.
     assert set(generalization["uses_rules"]) == {"employee_deductions", "gross_earnings"}
@@ -232,23 +236,28 @@ _IN_LIST_SQL = (
     ("value", "outcome", "why"),
     [
         pytest.param(
-            "DDUCT,EARN", "ok",
+            "DDUCT,EARN",
+            "ok",
             "the IN-list value as the S3 totality enumerator writes it — members joined "
             "by a comma (`sql_predicates._in_predicate`). Splitting it and requiring "
             "each member is what keeps this legitimate entry from regressing",
             id="in-list-all-members-present",
         ),
         pytest.param(
-            "DDUCT", "ok", "one member of the list, named on its own", id="one-member",
+            "DDUCT",
+            "ok",
+            "one member of the list, named on its own",
+            id="one-member",
         ),
         pytest.param(
-            "DDUCT,BONUS", "fail_to_review",
-            "one member is not in the SQL — the plan claims a filter half of which does "
-            "not exist",
+            "DDUCT,BONUS",
+            "fail_to_review",
+            "one member is not in the SQL — the plan claims a filter half of which does not exist",
             id="one-member-absent",
         ),
         pytest.param(
-            "TAXES", "fail_to_review",
+            "TAXES",
+            "fail_to_review",
             "H3: the literal appears NOWHERE. S3 totality counts any entry as coverage "
             "and the rewrite leaves inline literals alone, so this used to ship "
             "`outcome: ok` with a plan that disagrees with its own template",
@@ -293,6 +302,35 @@ def test_an_inline_range_or_boolean_literal_is_still_accepted() -> None:
     assert "BETWEEN" in gen.sql_template and "TRUE" in gen.sql_template
 
 
+def test_an_inline_null_quality_predicate_is_not_falsely_called_hallucinated() -> None:
+    """`IS NOT NULL` is an exp.Null, not an exp.Literal, but is still present SQL."""
+    sql = "SELECT avg(annual_salary) FROM db.employee WHERE annual_salary IS NOT NULL"
+    plan = {
+        "kind": "single",
+        "intent": "average salary over present values",
+        "source_tool_call_refs": ["tc1"],
+        "parameterization": [
+            _entry(
+                "annual_salary",
+                "NULL",
+                role="inline",
+                why="keeps the aggregate defined over present salaries",
+            )
+        ],
+        "result_signature": {"grain": {"columns": [], "verifiable": False}},
+    }
+
+    gen = generalize_blueprint(
+        plan,
+        {"tc1": sql},
+        {"db.employee": {"annual_salary": "Nullable(Float64)"}},
+    )
+
+    assert gen.static_validation.reason != REASON_UNREWRITABLE
+    assert gen.sql_template is not None
+    assert "annual_salary IS NULL" in gen.sql_template
+
+
 def test_lenient_mode_is_unchanged_by_the_inline_check() -> None:
     """A composite node's SQL references only a SUBSET of the top-level params — an
     inline entry absent from THIS node is the normal case there, not a fault. The
@@ -325,10 +363,16 @@ _OR_ARM_SQL = (
 _OR_ARM_PLAN = blueprint_raw(
     intent="total pay for department 0420, plus 0910 earnings",
     parameterization=[
-        {"locator": {"table": _PAYROLL, "column": "department_code", "value": "0420"},
-         "role": "inline", "why": "the report pairs these two departments"},
-        {"locator": {"table": _PAYROLL, "column": "department_code", "value": "0910"},
-         "role": "inline", "why": "the report pairs these two departments"},
+        {
+            "locator": {"table": _PAYROLL, "column": "department_code", "value": "0420"},
+            "role": "inline",
+            "why": "the report pairs these two departments",
+        },
+        {
+            "locator": {"table": _PAYROLL, "column": "department_code", "value": "0910"},
+            "role": "inline",
+            "why": "the report pairs these two departments",
+        },
         _entry("register_type", "EARN", role="rule", rule_id="gross_earnings"),
     ],
     source_refs=("tc1",),
@@ -351,7 +395,7 @@ async def test_a_rule_conjunct_inside_an_or_arm_keeps_the_whole_condition() -> N
     assert control == "continue"
     assert generalization["static_validation"]["outcome"] == "ok"
     template = generalization["sql_template"]
-    assert "p.register_type = \'EARN\'" in template  # the conjunct that used to vanish
+    assert "p.register_type = 'EARN'" in template  # the conjunct that used to vanish
     assert "OR" in template
 
 
@@ -371,8 +415,12 @@ _IN_LIST_RULE_SQL = (
 _IN_LIST_RULE_PLAN = blueprint_raw(
     intent="total of deductions and earnings per employee",
     parameterization=[
-        _entry("register_type", "DDUCT,EARN", role="inline",
-               why="the total is defined over both register types"),
+        _entry(
+            "register_type",
+            "DDUCT,EARN",
+            role="inline",
+            why="the total is defined over both register types",
+        ),
         _entry("register_type", "EARN", role="rule", rule_id="gross_earnings"),
     ],
     source_refs=("tc1",),
@@ -398,15 +446,13 @@ async def test_a_rule_locator_naming_one_member_of_an_in_list_keeps_the_list() -
     into a rewrite that deletes nothing: the plan being honest about the SQL and the
     rewrite being honest about the plan are two different claims, and only the second
     one catches an edit."""
-    generalization, control = await _through_the_stage(
-        _IN_LIST_RULE_PLAN, sql=_IN_LIST_RULE_SQL
-    )
+    generalization, control = await _through_the_stage(_IN_LIST_RULE_PLAN, sql=_IN_LIST_RULE_SQL)
 
     assert control == "continue"
     assert generalization["static_validation"]["outcome"] == "ok"
     template = generalization["sql_template"]
     # BOTH members survive — the drop took the uncovered one with it.
-    assert "\'DDUCT\'" in template and "\'EARN\'" in template
+    assert "'DDUCT'" in template and "'EARN'" in template
 
 
 async def test_both_shapes_pass_s3_which_is_why_s4_had_to_get_them_right() -> None:

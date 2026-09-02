@@ -86,6 +86,7 @@ WINDOWED_SLOT_TYPES: frozenset[str] = frozenset({"relative_window", "period_rang
 # the plan doc; pinned by `test_period_range_withdrawn_qa.py`.
 UNSUPPORTED_SLOT_TYPES: frozenset[str] = frozenset({"period_range"})
 
+
 @dataclass(frozen=True)
 class EvidenceRef:
     turn_ref: int  # SessionSummary turn index
@@ -199,13 +200,17 @@ class ResultSignature:
     shape: tuple[ColumnShape, ...]
     grain: ResultGrainPlan
     invariants: tuple[str, ...]
+    normalizations: tuple[str, ...] = ()
 
     def to_doc(self) -> dict[str, Any]:
-        return {
+        doc = {
             "shape": [s.to_doc() for s in self.shape],
             "grain": self.grain.to_doc(),
             "invariants": list(self.invariants),
         }
+        if self.normalizations:
+            doc["normalizations"] = list(self.normalizations)
+        return doc
 
 
 @dataclass(frozen=True)

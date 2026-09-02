@@ -1,9 +1,9 @@
 """WriterStage — the terminal write-router `CandidateStage` (Slice 7).
 
 Runs LAST, converting the upstream verdicts into the consumer-owned `status` transition and
-the pipeline `control`: `continue` auto-lands at `status=candidate` (a clean, unsampled
-blueprint), `route_inbox` persists at `status=in_review`. The blueprint inbox SAMPLE (D58b)
-is an injected decider, so tests are deterministic and no global RNG is read here; leakage
+the pipeline `control`: `continue` parks an explicitly unsampled blueprint at `status=candidate`,
+while `route_inbox` persists at `status=in_review`. Production defaults to a 100% human-review
+sample; the injected decider remains so tests and deliberate deployments are deterministic. Leakage
 near-misses are NEVER sampled out, because `route_candidate` forces them to the inbox before
 the sample is consulted. This stage does not own `user_knowledge` and never mutates another
 stage's verdict field — it only advances `status`.
@@ -19,7 +19,9 @@ from ..candidate.models import CandidateEnvelope
 from ..stage import StageContext, StageResult
 from .routing import route_candidate
 
-_DEFAULT_BLUEPRINT_INBOX_SAMPLE_RATE = 0.10
+# Production is human-review-only: every mined blueprint is visible to a reviewer. The sampler
+# seam remains injectable for tests and deployments that deliberately ration review volume.
+_DEFAULT_BLUEPRINT_INBOX_SAMPLE_RATE = 1.0
 
 
 def _default_sampler(rate: float) -> Callable[[CandidateEnvelope], bool]:

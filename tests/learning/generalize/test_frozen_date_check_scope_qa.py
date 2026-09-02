@@ -101,17 +101,17 @@ def test_the_single_column_shape_is_the_one_s3_really_adjudicates():
 
 def test_every_iso_spelling_in_the_incident_position_is_now_date_shaped():
     """All of these are the INCIDENT's position — a bare, un-compared argument to date
-    arithmetic. Every ISO-8601 spelling is now caught; the three still uncaught are the
-    documented non-ISO scope line, pinned so a widening is a deliberate act."""
+    arithmetic. ISO spellings and date-like values inside an explicit date parser are
+    high-confidence frozen dates; ambiguous spellings without that context are warnings."""
     for literal, caught in (
         (f"{_RUN_DATE}T00:00:00Z", True),
         (f"{_RUN_DATE} 00:00:00+00:00", True),
         (f"{_RUN_DATE} 00:00", True),
         (f"{_RUN_DATE} 00:00:00.123456", True),
         (f"{_RUN_DATE} 00:00:00", True),  # what the incident actually emitted
-        ("2026-8-28", False),  # unpadded month/day — out of scope
-        ("20260828", False),  # compact — out of scope
-        ("28/08/2026", False),  # non-ISO — out of scope
+        ("2026-8-28", True),
+        ("20260828", True),
+        ("28/08/2026", True),
     ):
         sql = (
             f"SELECT DATE_DIFF(DAY, seniority_date, parseDateTimeBestEffort('{literal}')) "

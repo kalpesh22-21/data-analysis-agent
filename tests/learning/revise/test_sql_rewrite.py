@@ -192,6 +192,24 @@ async def test_a_rewrite_comes_back_with_the_sql_the_caution_and_forced_replace(
     assert "sql" in tools[0]["parameters"]["properties"]
 
 
+async def test_rewrite_proposal_is_withheld_when_new_sql_has_an_unclassified_predicate() -> None:
+    sql = (
+        "SELECT department, sum(deductions) AS deductions FROM payroll.payroll_fact "
+        "WHERE register_type = 'DDUCT' AND total_earnings != '0' GROUP BY department"
+    )
+    reviser, _ = make_reviser([rewrite_turn(sql=sql)])
+
+    proposal = await reviser.propose(
+        declined_blueprint(), feedback="keep the denominator guard", allow_sql=True
+    )
+
+    assert proposal.sql_changed is False
+    assert proposal.sql == ""
+    assert proposal.entries == ()
+    assert "parameterization do not agree" in proposal.reason
+    assert "total_earnings" in proposal.reason
+
+
 async def test_the_wire_projection_carries_the_new_fields() -> None:
     """ADDITIVE and ALWAYS PRESENT. A caution that appeared only sometimes would make its
     absence indistinguishable from an older server that could not produce one."""

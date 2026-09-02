@@ -21,8 +21,8 @@ Routing precedence, top wins:
       recognizes, becomes review noise rather than a silent auto-land.
   4.  blueprint with a settled `entity_scan.result != "pass"` → ALWAYS `in_review` (100% of
       leakage near-misses, D58b).
-  5.  clean blueprint, sampled → `in_review` (the D58b audit sample).
-  6.  clean blueprint, not sampled → `candidate` (auto-land, retrievable after S9).
+  5.  clean blueprint, sampled → `in_review` (production defaults to a 100% human-review sample).
+  6.  clean blueprint, explicitly not sampled → `candidate` (supported deployment override).
   7.  anything else → pass through unchanged.
 """
 
@@ -143,8 +143,7 @@ def derive_inbox_reason(env: CandidateEnvelope) -> str:
     if _dedup_forces_review(env):
         return (
             "suppressed_duplicate"
-            if env.dedup is not None
-            and env.dedup.action in {"increment", "redundant_with_canon"}
+            if env.dedup is not None and env.dedup.action in {"increment", "redundant_with_canon"}
             else "dedup_conflict"
         )
     if _is_leakage_near_miss(env):
@@ -185,9 +184,7 @@ def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> Routi
         # Both are human pre-gated → ALWAYS in_review, NEVER auto-landed. A
         # `schema_edit` without the PR-stage marker (R8) still fail-closes to review
         # (reason `fail_to_review` via `derive_inbox_reason`); it can never auto-land.
-        return RoutingDecision(
-            CandidateStatus.IN_REVIEW, "route_inbox", derive_inbox_reason(env)
-        )
+        return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", derive_inbox_reason(env))
 
     if env.type == "blueprint":
         if _static_outcome(env) == "fail_to_review":
@@ -201,15 +198,11 @@ def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> Routi
             )
             return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", reason)
         if _is_leakage_near_miss(env):
-            return RoutingDecision(
-                CandidateStatus.IN_REVIEW, "route_inbox", "leakage_near_miss"
-            )
+            return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", "leakage_near_miss")
         if _entity_scan_unsettled(env):
             # The leakage gate never settled a verdict (S5 skipped) → fail-closed to
             # human review; a blueprint must never auto-land on an unsettled scan (S4).
-            return RoutingDecision(
-                CandidateStatus.IN_REVIEW, "route_inbox", "fail_to_review"
-            )
+            return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", "fail_to_review")
         if _is_authored(env):
             # A HAND-AUTHORED blueprint is ALWAYS reviewed, never auto-landed, and the
             # asymmetry with a mined candidate is the whole argument: a mined one earned its
@@ -218,13 +211,9 @@ def route_candidate(env: CandidateEnvelope, *, sampled_for_inbox: bool) -> Routi
             # and in `pseudo`/`none` mode its SQL was written by a model from prose and has
             # never run at all. Auto-landing it would let a page that says "you review the
             # draft there" quietly promote something nobody looked at.
-            return RoutingDecision(
-                CandidateStatus.IN_REVIEW, "route_inbox", "hand_authored"
-            )
+            return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", "hand_authored")
         if sampled_for_inbox:
-            return RoutingDecision(
-                CandidateStatus.IN_REVIEW, "route_inbox", "blueprint_sampled"
-            )
+            return RoutingDecision(CandidateStatus.IN_REVIEW, "route_inbox", "blueprint_sampled")
         # Clean, unsampled blueprint → auto-land as a retrievable-after-S9 candidate.
         return RoutingDecision(CandidateStatus.CANDIDATE, "continue", None)
 

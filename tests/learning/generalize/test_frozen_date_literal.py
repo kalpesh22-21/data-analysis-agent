@@ -30,6 +30,7 @@ from data_agent.learning.generalize.builder import generalize_blueprint
 from data_agent.learning.generalize.validate import (
     REASON_DATE_LITERAL,
     REASON_READ_ONLY,
+    ambiguous_frozen_date_literals,
     check_no_frozen_date_literal,
     decide_outcome,
 )
@@ -90,22 +91,40 @@ def test_the_sentinel_floor_alone_passes():
     assert check_no_frozen_date_literal(_SENTINEL_ONLY_SQL) is True
 
 
+def test_unpadded_date_is_warning_only_without_date_context():
+    sql = "SELECT concat('as of ', '2026-9-2') FROM dbpcm_warehouse.employee"
+    assert check_no_frozen_date_literal(sql) is True
+    assert ambiguous_frozen_date_literals(sql) == ("2026-9-2",)
+
+
+def test_unpadded_date_in_date_constructor_is_high_confidence():
+    sql = "SELECT dateDiff('day', seniority_date, toDate('2026-9-2')) FROM dbpcm_warehouse.employee"
+    assert check_no_frozen_date_literal(sql) is False
+    assert ambiguous_frozen_date_literals(sql) == ()
+
+
 def test_a_threshold_inside_an_aggregate_passes():
     """`countIf(hire_date >= '2020-01-01')`: the comparison ancestor is INSIDE a function
     argument, which is why the walk goes up the whole chain rather than looking at the
     literal's immediate parent."""
-    assert check_no_frozen_date_literal(
-        "SELECT countIf(hire_date >= '2020-01-01') AS hired FROM dbpcm_warehouse.employee"
-    ) is True
+    assert (
+        check_no_frozen_date_literal(
+            "SELECT countIf(hire_date >= '2020-01-01') AS hired FROM dbpcm_warehouse.employee"
+        )
+        is True
+    )
 
 
 def test_a_between_range_passes():
     """`BETWEEN` is not in the rewrite's `_COMPARISONS` (it has no slot form) but the S3
     enumerator reads it as a range predicate — so it is adjudicated, and exempt."""
-    assert check_no_frozen_date_literal(
-        "SELECT count() AS c FROM dbpcm_warehouse.employee "
-        "WHERE seniority_date BETWEEN '2020-01-01' AND '2020-12-31'"
-    ) is True
+    assert (
+        check_no_frozen_date_literal(
+            "SELECT count() AS c FROM dbpcm_warehouse.employee "
+            "WHERE seniority_date BETWEEN '2020-01-01' AND '2020-12-31'"
+        )
+        is True
+    )
 
 
 def test_a_frozen_date_on_a_column_bearing_side_fails():
@@ -144,43 +163,58 @@ def test_a_date_in_its_own_nested_comparison_passes():
 def test_a_column_free_side_with_date_arithmetic_passes():
     """The column-free test is on the SIDE, not on the literal's immediate wrapper: a
     computed-but-constant bound is still the constant side S3 reads the literal out of."""
-    assert check_no_frozen_date_literal(
-        "SELECT count() AS c FROM dbpcm_warehouse.employee "
-        "WHERE seniority_date >= date_sub(toDate('2024-01-01'), INTERVAL 1 DAY)"
-    ) is True
+    assert (
+        check_no_frozen_date_literal(
+            "SELECT count() AS c FROM dbpcm_warehouse.employee "
+            "WHERE seniority_date >= date_sub(toDate('2024-01-01'), INTERVAL 1 DAY)"
+        )
+        is True
+    )
 
 
 def test_an_in_list_of_dates_passes():
-    assert check_no_frozen_date_literal(
-        "SELECT count() AS c FROM dbpcm_warehouse.employee "
-        "WHERE toDate(seniority_date) IN ('2024-01-01', '2024-02-01')"
-    ) is True
+    assert (
+        check_no_frozen_date_literal(
+            "SELECT count() AS c FROM dbpcm_warehouse.employee "
+            "WHERE toDate(seniority_date) IN ('2024-01-01', '2024-02-01')"
+        )
+        is True
+    )
 
 
 def test_a_slot_template_still_fails_on_the_frozen_date():
     """A `{slot}` is not SQL: the check re-parses in colon-form exactly as
     `rewrite._check_rewritten` does, so a template that has already been parameterized is
     still readable and the date is still caught."""
-    assert check_no_frozen_date_literal(
-        "SELECT DATE_DIFF(DAY, seniority_date, toDateTime64('2026-08-28 00:00:00', 6)) AS d "
-        "FROM dbpcm_warehouse.employee WHERE employee_status = {status}"
-    ) is False
+    assert (
+        check_no_frozen_date_literal(
+            "SELECT DATE_DIFF(DAY, seniority_date, toDateTime64('2026-08-28 00:00:00', 6)) AS d "
+            "FROM dbpcm_warehouse.employee WHERE employee_status = {status}"
+        )
+        is False
+    )
 
 
 def test_a_date_in_the_projection_fails():
     """No WHERE clause anywhere: a stamped report date ages exactly like the run date."""
-    assert check_no_frozen_date_literal(
-        "SELECT '2026-01-01' AS report_date, count() AS c FROM dbpcm_warehouse.employee"
-    ) is False
+    assert (
+        check_no_frozen_date_literal(
+            "SELECT '2026-01-01' AS report_date, count() AS c FROM dbpcm_warehouse.employee"
+        )
+        is False
+    )
 
 
 def test_a_bare_year_and_a_plain_string_pass():
     """The shape regex is a FULL ISO date on purpose. `2024` is a number (and lives under a
     comparison anyway); matching bare numbers would flag every threshold in the corpus."""
-    assert check_no_frozen_date_literal(
-        "SELECT count() AS c FROM dbpcm_warehouse.employee "
-        "WHERE toYear(seniority_date) = 2024 AND employee_status <> 'Not Hired'"
-    ) is True
+    assert (
+        check_no_frozen_date_literal(
+            "SELECT count() AS c FROM dbpcm_warehouse.employee "
+            "WHERE toYear(seniority_date) = 2024 AND employee_status <> 'Not Hired'"
+        )
+        is True
+    )
 
 
 def test_an_unparseable_template_passes_here():
@@ -227,15 +261,16 @@ def test_the_incident_candidate_is_routed_to_review():
     assert sv.reason == REASON_DATE_LITERAL
     # The OTHER four checks pass — this candidate was `ok` on every axis S4 had before.
     assert (sv.explain_ok, sv.binds_to_subset_uses, sv.dag_ok, sv.read_only_select) == (
-        True, True, True, True,
+        True,
+        True,
+        True,
+        True,
     )
     assert gen.to_doc()["static_validation"]["date_literal_ok"] is False
 
 
 def test_the_sentinel_only_candidate_still_stamps_ok():
-    gen = generalize_blueprint(
-        _single_payload(), {"tc1": _SENTINEL_ONLY_SQL}, _EMPLOYEE_CATALOG
-    )
+    gen = generalize_blueprint(_single_payload(), {"tc1": _SENTINEL_ONLY_SQL}, _EMPLOYEE_CATALOG)
     assert gen.static_validation.date_literal_ok is True
     assert gen.static_validation.outcome == "ok"
     assert gen.static_validation.reason is None

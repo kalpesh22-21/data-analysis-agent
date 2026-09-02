@@ -62,9 +62,10 @@ class StaticValidation:
     date_literal_ok: bool  # no frozen absolute date outside a comparison (a pasted run date)
     outcome: Literal["ok", "fail_to_review"]  # ANY false above ⇒ fail_to_review
     reason: str | None = None  # stable machine tag for the first failing check
+    date_literal_warnings: tuple[str, ...] = ()
 
     def to_doc(self) -> dict[str, Any]:
-        return {
+        doc = {
             "explain_ok": self.explain_ok,
             "binds_to_subset_uses": self.binds_to_subset_uses,
             "dag_ok": self.dag_ok,
@@ -73,6 +74,9 @@ class StaticValidation:
             "outcome": self.outcome,
             "reason": self.reason,
         }
+        if self.date_literal_warnings:
+            doc["date_literal_warnings"] = list(self.date_literal_warnings)
+        return doc
 
     @classmethod
     def from_doc(cls, doc: dict[str, Any]) -> StaticValidation:
@@ -86,6 +90,7 @@ class StaticValidation:
             date_literal_ok=bool(doc.get("date_literal_ok", True)),
             outcome=doc["outcome"],
             reason=doc.get("reason"),
+            date_literal_warnings=tuple(doc.get("date_literal_warnings", []) or []),
         )
 
 

@@ -136,25 +136,27 @@ async def test_archive_list_is_newest_first_review_queue_stays_oldest_first():
         ("candidate::arch::2", "2026-07-03T00:00:02+00:00"),
         ("candidate::arch::1", "2026-07-03T00:00:01+00:00"),
     ]:
-        await store.put(replace(base, candidate_id=cid,
-                                status=CandidateStatus.REJECTED, created_at=created_at))
+        await store.put(
+            replace(base, candidate_id=cid, status=CandidateStatus.REJECTED, created_at=created_at)
+        )
     # Two review-queue rows to prove ASC is untouched.
     for cid, created_at in [
         ("candidate::rev::1", "2026-07-03T01:00:01+00:00"),
         ("candidate::rev::0", "2026-07-03T01:00:00+00:00"),
     ]:
-        await store.put(replace(base, candidate_id=cid,
-                                status=CandidateStatus.IN_REVIEW, created_at=created_at))
+        await store.put(
+            replace(base, candidate_id=cid, status=CandidateStatus.IN_REVIEW, created_at=created_at)
+        )
 
     inbox = ReviewInbox(store)
     archive = await inbox.list(status=CandidateStatus.REJECTED, order="desc")
     assert [it.candidate_id for it in archive] == [
-        "candidate::arch::2", "candidate::arch::1", "candidate::arch::0"
+        "candidate::arch::2",
+        "candidate::arch::1",
+        "candidate::arch::0",
     ]
     review = await inbox.list()  # default in_review, order=asc
-    assert [it.candidate_id for it in review] == [
-        "candidate::rev::0", "candidate::rev::1"
-    ]
+    assert [it.candidate_id for it in review] == ["candidate::rev::0", "candidate::rev::1"]
 
 
 # --- S7-reject-is-negative-signal ---------------------------------------------
@@ -204,6 +206,26 @@ async def test_approve_promotes_to_validated_and_strips_entity_spans():
     assert hit.kind == "employee_code"
     # Persisted stripped.
     assert LeakageVerdict.from_doc((await store.get(cid)).entity_scan).hits[0].span == ""
+
+
+async def test_ambiguous_date_warning_requires_explicit_approval_acknowledgement():
+    store = await _store_with_all_reasons()
+    inbox = ReviewInbox(store)
+    cid = "candidate::reason-blueprint_sampled::0"
+    env = await store.get(cid)
+    payload = copy.deepcopy(env.payload)
+    payload["generalization"]["static_validation"]["date_literal_warnings"] = ["2026-9-2"]
+    await store.put(CandidateEnvelope.from_doc({**env.to_doc(), "payload": payload}))
+
+    with pytest.raises(InboxTransitionError, match="approve_needs_date_warning_ack"):
+        await inbox.approve(cid, token=REVIEWER_TRIAL_TOKEN)
+
+    approved = await inbox.approve(
+        cid,
+        token=REVIEWER_TRIAL_TOKEN,
+        acknowledge_date_warnings=True,
+    )
+    assert approved.status == CandidateStatus.VALIDATED
 
 
 async def test_retract_moves_validated_to_retired():

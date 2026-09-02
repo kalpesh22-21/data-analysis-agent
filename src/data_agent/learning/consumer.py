@@ -13,7 +13,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from data_agent.runtime.session.models import SessionDoc
@@ -26,6 +26,7 @@ from .candidate import (
     CandidateEnvelope,
     CandidateStore,
     InMemoryCandidateStore,
+    JudgeRetryState,
     build_declined_envelope,
     build_envelope,
     mint_candidate_id,
@@ -35,7 +36,7 @@ from .config import LearningSettings, learning_enabled
 from .extractor import ExtractedCandidate, LearningExtractor
 from .extractor.models import BlueprintPayload, Decline, EvidenceRef
 from .extractor.validation import REASON_RULE_MISMATCH, REASON_TOTALITY, read_evidence
-from .judge import OUTCOME_PROCEEDED, CoverageJudge, JudgeOutcomeResult
+from .judge import OUTCOME_DROPPED, OUTCOME_PROCEEDED, CoverageJudge, JudgeOutcomeResult
 from .leakage import settle_entity_scan
 from .models import LearningStatus, compute_content_hash
 from .observability import (
@@ -128,9 +129,7 @@ ENTITY_BEARING_DECLINE_REASONS: frozenset[str] = frozenset(
 #   * every merit-failed reason (`no_evidence`, `no_acceptance`, `unrewritable_sql`,
 #     `role_inconsistent`, `malformed_candidate`) — these are supposed to die, and a
 #     review queue that fills with them stops being read.
-REVIEW_ROUTED_DECLINE_REASONS: frozenset[str] = frozenset(
-    {REASON_TOTALITY, REASON_RULE_MISMATCH}
-)
+REVIEW_ROUTED_DECLINE_REASONS: frozenset[str] = frozenset({REASON_TOTALITY, REASON_RULE_MISMATCH})
 
 
 def _session_question(summary: SessionSummary) -> str | None:
@@ -321,6 +320,10 @@ class LearningConsumer:
 
         tally = _Tally()
 
+        # Correctable work whose novelty judge was unavailable is durable and retried
+        # independently of its already-ACKed session job.
+        await self._retry_awaiting_judges()
+
         # Reclaim + dead-letter first so a poison job never head-of-lines.
         reclaimed = await self._queue.reclaim_stale(
             min_idle_ms=self._settings.learning_reclaim_min_idle_seconds * 1000,
@@ -344,6 +347,84 @@ class LearningConsumer:
             skipped=tally.skipped,
         )
 
+    async def _retry_awaiting_judges(self) -> None:
+        """Retry durable judge work with exponential backoff, then expose it after 24h."""
+        now = datetime.now(UTC)
+        try:
+            rows = await self._candidates.list_by_status(
+                "awaiting_judge", limit=self._settings.learning_batch_size
+            )
+        except Exception:  # noqa: BLE001 - retry discovery must not stop queue consumption
+            _logger.exception("failed to load awaiting-judge candidates; continuing with queue")
+            return
+        for env in rows:
+            try:
+                await self._retry_awaiting_judge(env, now)
+            except Exception:  # noqa: BLE001 - isolate one durable candidate from the batch
+                _logger.exception("failed to retry awaiting-judge candidate %s", env.candidate_id)
+
+    async def _retry_awaiting_judge(self, env: CandidateEnvelope, now: datetime) -> None:
+        """Advance one durable judge retry without poisoning the consumer cycle."""
+        retry = env.judge_retry
+        snapshot = env.revalidation
+        if retry is None or snapshot is None:
+            _logger.warning(
+                "awaiting-judge candidate %s has no retry snapshot; routing unjudged",
+                env.candidate_id,
+            )
+            await self._candidates.put(
+                replace(env, status="needs_parameterization", route_reason="judge_unavailable")
+            )
+            return
+
+        def _instant(value: str) -> datetime:
+            parsed = datetime.fromisoformat(value)
+            return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+        try:
+            deadline = _instant(retry.deadline_at)
+            next_attempt = _instant(retry.next_attempt_at)
+        except (TypeError, ValueError):
+            deadline = now
+            next_attempt = now
+        if now >= deadline:
+            await self._candidates.put(
+                replace(env, status="needs_parameterization", route_reason="judge_unavailable")
+            )
+            return
+        if now < next_attempt or self._judge is None:
+            return
+        result = await self._judge_session(snapshot.to_summary())
+        if result.outcome == OUTCOME_PROCEEDED:
+            await self._candidates.put(
+                replace(
+                    env,
+                    status="needs_parameterization",
+                    judge=result.assessment,
+                    judge_retry=None,
+                )
+            )
+            return
+        if result.outcome == OUTCOME_DROPPED and result.drop:
+            await self._candidates.put(
+                replace(env, status="retired", judge=result.assessment, judge_retry=None)
+            )
+            return
+        attempts = retry.attempts + 1
+        delay_seconds = min(300 * (2 ** max(attempts - 1, 0)), 21600)
+        await self._candidates.put(
+            replace(
+                env,
+                judge_retry=JudgeRetryState(
+                    first_attempt_at=retry.first_attempt_at,
+                    next_attempt_at=(now + timedelta(seconds=delay_seconds)).isoformat(),
+                    deadline_at=retry.deadline_at,
+                    attempts=attempts,
+                    last_outcome=result.outcome,
+                ),
+            )
+        )
+
     async def _dispatch(self, delivered: DeliveredJob, tally: _Tally) -> None:
         """Route one delivery; a transient failure logs and stays in the PEL, sparing the batch."""
         try:
@@ -359,7 +440,9 @@ class LearningConsumer:
             _logger.info(
                 "learning consume lost a CAS race for message %s (session %s, "
                 "delivery %d); leaving it for reclaim",
-                delivered.message_id, delivered.job.session_id, delivered.delivery_count,
+                delivered.message_id,
+                delivered.job.session_id,
+                delivered.delivery_count,
             )
             tally.skipped += 1
             return
@@ -410,8 +493,12 @@ class LearningConsumer:
                 "(delivery %d, reclaimed=%s) names a session in learning_status %r "
                 "(reason=%s) — nothing can move it to `queued`, so the message is "
                 "discarded rather than redelivered until it dead-letters",
-                job.session_id, delivered.message_id, delivered.delivery_count,
-                delivered.reclaimed, status, reason,
+                job.session_id,
+                delivered.message_id,
+                delivered.delivery_count,
+                delivered.reclaimed,
+                status,
+                reason,
             )
             await self._queue.ack(delivered.message_id)
             self._emit_consume(
@@ -441,8 +528,11 @@ class LearningConsumer:
         try:
             if claim == "forward":
                 cas = await state_machine.transition(
-                    self._store, job.session_id, LearningStatus.QUEUED,
-                    LearningStatus.PROCESSING, cas,
+                    self._store,
+                    job.session_id,
+                    LearningStatus.QUEUED,
+                    LearningStatus.PROCESSING,
+                    cas,
                 )
             else:  # "recover" — `processing`/`done` re-entry (models.RECOVERY_TRANSITIONS)
                 cas = await state_machine.recover_to_processing(
@@ -487,8 +577,12 @@ class LearningConsumer:
             fresh_hash = compute_content_hash(doc)
             try:
                 await state_machine.transition(
-                    self._store, job.session_id, LearningStatus.PROCESSING,
-                    LearningStatus.DONE, cas, content_hash=fresh_hash,
+                    self._store,
+                    job.session_id,
+                    LearningStatus.PROCESSING,
+                    LearningStatus.DONE,
+                    cas,
+                    content_hash=fresh_hash,
                 )
             except CASMismatchError:
                 # Crash/lost race before XACK is safe: the message stays in the PEL,
@@ -503,9 +597,7 @@ class LearningConsumer:
             self._set_verbose_consume(consume, summary)
         return "done"
 
-    def _log_skip(
-        self, session_id: str, delivered: DeliveredJob, status: str, reason: str
-    ) -> None:
+    def _log_skip(self, session_id: str, delivered: DeliveredJob, status: str, reason: str) -> None:
         """EVERY non-processing outcome says what it saw, at INFO.
 
         A skip is ordinary and expected under concurrency, so it is not a warning. The three facts
@@ -516,8 +608,12 @@ class LearningConsumer:
             "learning consume SKIPPED session %s: message %s (delivery %d, "
             "reclaimed=%s) found learning_status=%r, reason=%s — not ACKed, left in "
             "the PEL for the owner or a later reclaim",
-            session_id, delivered.message_id, delivered.delivery_count,
-            delivered.reclaimed, status, reason,
+            session_id,
+            delivered.message_id,
+            delivered.delivery_count,
+            delivered.reclaimed,
+            status,
+            reason,
         )
 
     def _consume_scope(
@@ -589,8 +685,12 @@ class LearningConsumer:
 
         try:
             await state_machine.transition(
-                self._store, job.session_id, doc.learning_status,
-                LearningStatus.DEAD_LETTER, cas, assert_from=False,
+                self._store,
+                job.session_id,
+                doc.learning_status,
+                LearningStatus.DEAD_LETTER,
+                cas,
+                assert_from=False,
             )
         except CASMismatchError:
             # Peer advanced it — leave in the PEL for a later reclaim.
@@ -772,17 +872,15 @@ class LearningConsumer:
     ) -> int:
         """Persist a MERIT-PASSED, form-failed decline for a human to complete; returns 0 or 1.
 
-        TWO necessary conditions: the pre-extraction judge said `proceeded` (a POSITIVE statement
-        that a model looked at the corpus and found this work new — every other outcome, and
-        `judged is None`, means nobody screened it), and the reason is in
-        `REVIEW_ROUTED_DECLINE_REASONS`. ONE persist per extraction, taking the LAST qualifying
-        decline. The leakage scan runs FIRST over the built envelope using the SAME wired stage
+        A qualifying decline is always persisted. A positive `proceeded` judgement enters the
+        form immediately; an unavailable/unscreened judgement enters `awaiting_judge`, where the
+        consumer retries it with backoff for 24 hours before exposing it as explicitly unjudged.
+        ONE persist per extraction, taking the LAST qualifying decline. The leakage scan runs
+        FIRST over the built envelope using the SAME wired stage
         instance the pipeline uses, so the two gates cannot drift; with no stage wired the
         `pending` sentinel survives and every downstream surface fails closed on it. Evidence is
         snapshotted exactly as for a kept candidate (D31/D51/D17).
         """
-        if judged is None or judged.outcome != OUTCOME_PROCEEDED:
-            return 0
         eligible = [
             d
             for d in declines
@@ -790,14 +888,32 @@ class LearningConsumer:
         ]
         if not eligible:
             return 0
+        # Defensive parity with `_do_work`: a real drop returns before extraction. If a
+        # caller nevertheless supplies that outcome, do not manufacture retry work for
+        # something the judge positively classified as covered.
+        if judged is not None and judged.outcome == OUTCOME_DROPPED:
+            return 0
         if len(eligible) > 1:
             _logger.info(
                 "learning: session %s produced %d review-routable declines; persisting "
                 "the last one only (one review item per extraction — see the decision "
                 "doc §6). Reasons: %s",
-                summary.session_id, len(eligible), ", ".join(d.reason for d in eligible),
+                summary.session_id,
+                len(eligible),
+                ", ".join(d.reason for d in eligible),
             )
         decline = eligible[-1]
+        proceeded = judged is not None and judged.outcome == OUTCOME_PROCEEDED
+        now = datetime.now(UTC)
+        retry = None
+        if not proceeded:
+            retry = JudgeRetryState(
+                first_attempt_at=now.isoformat(),
+                next_attempt_at=(now + timedelta(minutes=5)).isoformat(),
+                deadline_at=(now + timedelta(hours=24)).isoformat(),
+                attempts=0,
+                last_outcome=judged.outcome if judged is not None else "not_judged",
+            )
         envelope = build_declined_envelope(
             decline,
             summary,
@@ -807,17 +923,22 @@ class LearningConsumer:
             evidence_refs=await self._snapshot_quotes(
                 read_evidence(decline.raw_payload or {}), summary
             ),
-            judge=judged.assessment,
+            judge=judged.assessment if judged is not None else None,
             traceparent=traceparent,
+            status="needs_parameterization" if proceeded else "awaiting_judge",
+            judge_retry=retry,
         )
         envelope = await self._scan_declined(envelope, summary, verdict)
         await self._candidates.put(envelope)
         _logger.info(
             "learning: session %s declined %s after %d correction(s) but the judge "
-            "passed it on merit — persisted %s at status=%s for a human to complete "
-            "the parameterization",
-            summary.session_id, decline.reason, decline.corrections_attempted,
-            envelope.candidate_id, envelope.status,
+            "produced reviewable work — persisted %s at status=%s; unavailable judges "
+            "retry for 24h before the form is exposed as unjudged",
+            summary.session_id,
+            decline.reason,
+            decline.corrections_attempted,
+            envelope.candidate_id,
+            envelope.status,
         )
         return 1
 
@@ -925,9 +1046,7 @@ class LearningConsumer:
 
     def _emit_extract_stub(self, session_id: str, target_hints: tuple[str, ...]) -> None:
         if self._tracer is not None:
-            with extract_stub_span(
-                self._tracer, session_id=session_id, target_hints=target_hints
-            ):
+            with extract_stub_span(self._tracer, session_id=session_id, target_hints=target_hints):
                 pass
 
     def _emit_extract(

@@ -10,12 +10,15 @@ passes straight through.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 
 from ..candidate.models import CandidateEnvelope, CandidateStatus
 from ..stage import StageContext, StageResult
 from .models import UserKnowledgeRecord
 from .store import UserKnowledgeStore
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,22 @@ class UserKnowledgeCommitStage:
         # Scope to the SESSION's authenticated user (ctx.summary.user_id), NEVER the
         # LLM-supplied payload.user_id (R6/D17) — a foreign payload user_id can never
         # write into another user's surface.
+        if not ctx.summary.user_id.strip():
+            # Anonymous/legacy sessions cannot safely own user knowledge. Treat that as
+            # a candidate-local rejection: raising here returns the whole session to the
+            # PEL forever and prevents valid sibling candidates from being published.
+            _logger.warning(
+                "rejecting user_knowledge candidate %s: source session has no authenticated user",
+                env.candidate_id,
+            )
+            return StageResult(
+                envelope=replace(
+                    env,
+                    status=CandidateStatus.REJECTED,
+                    route_reason="missing_authenticated_user",
+                ),
+                control="route_inbox",
+            )
         record = UserKnowledgeRecord.from_candidate(env, user_id=ctx.summary.user_id)
         # Auto-commit scoped to that user_id (D17). The commit is the authoritative
         # write; the enriched envelope is dropped, never persisted into the candidate

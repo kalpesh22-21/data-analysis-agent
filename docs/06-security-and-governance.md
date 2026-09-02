@@ -99,9 +99,9 @@ never re-scans for entities and `searchKnowledge` once returned candidates immed
 false-negative rate would equal the cross-user leak rate with no checkpoint. Therefore:
 - **`global_knowledge` requires human review *before* it is retrievable** (D58a) — `searchKnowledge`
   returns only human-approved statements (free-text prose is the hardest to guarantee entity-free).
-- **`blueprint` candidates auto-land but are sampled** (D58b) — a sampled fraction + all leakage
-  near-misses go to the review inbox; leaked artifacts are **retracted** (pull from index; the D25
-  `GUARDRAIL` trace identifies who was exposed).
+- **`blueprint` candidates require human review by default** (D58b) — all mined blueprints and all
+  leakage near-misses go to the review inbox; leaked artifacts are **retracted** (pull from index;
+  the D25 `GUARDRAIL` trace identifies who was exposed).
 - **`LEARNING_ENABLED=false`** (D58c) halts all write-back instantly without a deploy.
 
 ## PII and the scratch schema

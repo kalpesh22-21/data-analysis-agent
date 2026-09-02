@@ -132,8 +132,9 @@ def test_an_answer_designation_ref_resolves_like_a_runquery_ref():
         tool_calls=(make_tool_call(ref="ans", sql=None, tool_name="answerWithTable"),),
         answer_sqls=(make_answer_sql(PAYROLL_SQL, ref="ans"),),
     )
-    assert isinstance(_validate(blueprint_raw(source_refs=("ans",)), summary=summary),
-                      ExtractedCandidate)
+    assert isinstance(
+        _validate(blueprint_raw(source_refs=("ans",)), summary=summary), ExtractedCandidate
+    )
 
 
 def test_every_query_behind_a_multi_table_ref_is_checked_for_totality():
@@ -378,6 +379,79 @@ def test_or_two_values_with_a_plan_per_value_passes():
         blueprint_raw(parameterization=plan, source_refs=("tc1",)), summary, known_rules=frozenset()
     )
     assert isinstance(out, ExtractedCandidate)
+
+
+def test_sql_quoted_locator_values_normalize_to_the_bare_totality_value():
+    """Live extractors copy SQL tokens; quoting alone must not invent a missing predicate."""
+    summary = make_summary(tool_calls=(make_tool_call(ref="tc1", sql=_OR_SQL),))
+    plan = [
+        param_slot("region", name="region_na", value="'NA'", table="db.t", binds_to="db.t.region"),
+        param_slot("region", name="region_eu", value="'EU'", table="db.t", binds_to="db.t.region"),
+    ]
+    out = to_candidate(
+        blueprint_raw(parameterization=plan, source_refs=("tc1",)),
+        summary,
+        known_rules=frozenset(),
+    )
+    assert isinstance(out, ExtractedCandidate)
+    assert [p.locator.value for p in out.payload.parameterization] == ["NA", "EU"]
+
+
+def test_sql_quoted_empty_string_normalizes_to_empty():
+    sql = "SELECT count(*) FROM db.t WHERE region != ''"
+    summary = make_summary(tool_calls=(make_tool_call(ref="tc1", sql=sql),))
+    plan = [param_inline("region", value="''", table="db.t")]
+    out = to_candidate(
+        blueprint_raw(parameterization=plan, source_refs=("tc1",)),
+        summary,
+        known_rules=frozenset(),
+    )
+    assert isinstance(out, ExtractedCandidate)
+    assert out.payload.parameterization[0].locator.value == ""
+
+
+def test_result_columns_aliases_normalize_and_are_audited():
+    raw = blueprint_raw(
+        result_signature={
+            "columns": [
+                {"name": "region", "semantic_type": "dimension"},
+                {"name": "employee_count", "semantic_type": "measure"},
+            ],
+            "grain": {"columns": ["region"], "verifiable": True},
+            "invariants": [],
+        }
+    )
+
+    out = _validate(raw)
+
+    assert isinstance(out, ExtractedCandidate)
+    signature = out.payload.result_signature
+    assert signature is not None
+    assert [(column.column, column.type) for column in signature.shape] == [
+        ("region", "dimension"),
+        ("employee_count", "measure"),
+    ]
+    assert signature.normalizations == (
+        "columns_to_shape",
+        "name_to_column",
+        "semantic_type_to_type",
+    )
+
+
+def test_verifiable_grain_requires_a_nonempty_result_shape():
+    raw = blueprint_raw(
+        result_signature={
+            "shape": [],
+            "grain": {"columns": ["region"], "verifiable": True},
+            "invariants": [],
+        }
+    )
+
+    out = _validate(raw)
+
+    assert isinstance(out, Decline)
+    assert out.reason == REASON_MALFORMED
+    assert "non-empty array" in out.detail
 
 
 def test_bare_alias_happy_path_still_matches_no_false_decline():
@@ -662,9 +736,7 @@ def test_schema_edit_wrong_typed_proposed_yaml_beside_a_valid_patch_is_declined(
     A wrong-typed `proposed_yaml` next to a valid `patch` must decline: the writer
     would SELECT the wrong-typed value, so letting the pair pass on the strength of
     `patch` waves through exactly the payload `from_payload` mis-reads."""
-    out = _validate(
-        _typed_raw("schema_edit", _schema_edit_payload(proposed_yaml=123))
-    )
+    out = _validate(_typed_raw("schema_edit", _schema_edit_payload(proposed_yaml=123)))
     assert isinstance(out, Decline)
     assert out.reason == REASON_MALFORMED
     assert "candidate.payload.proposed_yaml" in out.detail

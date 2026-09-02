@@ -22,11 +22,13 @@ expensive:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from data_agent.learning.audit import InMemoryAuditStore
 from data_agent.learning.audit.judgement import CoverageAssessment
 from data_agent.learning.candidate import (
     InMemoryCandidateStore,
+    JudgeRetryState,
     mint_candidate_id,
     mint_review_candidate_id,
 )
@@ -165,8 +167,9 @@ async def test_a_withdrawn_totality_decline_reaches_the_same_review_route() -> N
         stages=(LeakageGateStage(candidate_store=candidates),),
     )
 
-    await consumer._run_extractor(_summary(content_hash="hash-withdrawn"), KEEP_VERDICT,
-                                  _proceeded())
+    await consumer._run_extractor(
+        _summary(content_hash="hash-withdrawn"), KEEP_VERDICT, _proceeded()
+    )
 
     stored = candidates.all_candidates()
     assert len(stored) == 1
@@ -181,6 +184,8 @@ async def test_a_withdrawn_totality_decline_reaches_the_same_review_route() -> N
     # empty, so there is no other candidate this row could have been built from.
     assert env.payload["intent"] == "ratio of deductions to earnings per employee"
     assert env.revalidation is not None
+
+
 async def test_the_quote_is_snapshotted_to_audit_and_never_to_the_candidate_store() -> None:
     """THE SPLIT, unchanged for a review item: the entity-bearing quote goes to
     `learning_audit` and only the minted ref travels on the envelope (D51/D17).
@@ -360,20 +365,39 @@ async def test_a_rule_predicate_mismatch_routes_the_same_way() -> None:
 # --- and everything else keeps today's behaviour ------------------------------------
 
 
-async def test_an_unscreened_session_writes_nothing() -> None:
-    """The judge never ran (no judge wired / it raised / it skipped below the floor).
-    `not_judged` is not a verdict, and the queue only takes work a model said was new."""
+async def test_an_unscreened_session_is_preserved_awaiting_judge() -> None:
     candidates = InMemoryCandidateStore()
     consumer = _consumer(candidates, turns=_uncovered_turns())
 
     await consumer._run_extractor(_summary(), KEEP_VERDICT, JudgeOutcomeResult())
 
-    assert candidates.put_calls == 0
+    assert candidates.all_candidates()[0].status == CandidateStatus.AWAITING_JUDGE
 
 
-async def test_a_skipped_judge_outcome_writes_nothing() -> None:
-    """`skipped_no_prior_art` and its siblings mean the judgement did not HAPPEN. They
-    look like a pass only if you read `drop=False` as merit."""
+async def test_awaiting_judge_exposes_the_form_after_the_24_hour_deadline() -> None:
+    candidates = InMemoryCandidateStore()
+    consumer = _consumer(candidates, turns=_uncovered_turns())
+    await consumer._run_extractor(_summary(), KEEP_VERDICT, JudgeOutcomeResult())
+    env = candidates.all_candidates()[0]
+    await candidates.put(
+        replace(
+            env,
+            judge_retry=JudgeRetryState(
+                first_attempt_at="2000-01-01T00:00:00+00:00",
+                next_attempt_at="2000-01-01T00:05:00+00:00",
+                deadline_at="2000-01-02T00:00:00+00:00",
+            ),
+        )
+    )
+
+    await consumer._retry_awaiting_judges()
+
+    exposed = candidates.all_candidates()[0]
+    assert exposed.status == CandidateStatus.NEEDS_PARAMETERIZATION
+    assert exposed.route_reason == "judge_unavailable"
+
+
+async def test_a_skipped_judge_outcome_is_preserved_awaiting_judge() -> None:
     candidates = InMemoryCandidateStore()
     consumer = _consumer(candidates, turns=_uncovered_turns())
 
@@ -381,7 +405,7 @@ async def test_a_skipped_judge_outcome_writes_nothing() -> None:
         _summary(), KEEP_VERDICT, JudgeOutcomeResult(outcome="skipped_no_prior_art")
     )
 
-    assert candidates.put_calls == 0
+    assert candidates.all_candidates()[0].status == CandidateStatus.AWAITING_JUDGE
 
 
 async def test_a_merit_failed_decline_writes_nothing_even_with_a_proceeded_judge() -> None:
@@ -395,15 +419,13 @@ async def test_a_merit_failed_decline_writes_nothing_even_with_a_proceeded_judge
     assert candidates.put_calls == 0
 
 
-async def test_no_judgement_at_all_is_the_pre_slice_path() -> None:
-    """The S3-era callers (and every test that drives `_run_extractor` directly) pass no
-    judgement. Absent is not `proceeded`."""
+async def test_no_judgement_at_all_is_preserved_for_retry() -> None:
     candidates = InMemoryCandidateStore()
     consumer = _consumer(candidates, turns=_uncovered_turns())
 
     await consumer._run_extractor(_summary(), KEEP_VERDICT)
 
-    assert candidates.put_calls == 0
+    assert candidates.all_candidates()[0].status == CandidateStatus.AWAITING_JUDGE
 
 
 # --- the guarantees around the persist ----------------------------------------------
@@ -418,9 +440,7 @@ async def test_only_one_review_item_is_written_per_extraction() -> None:
     first["payload"] = {**_UNCOVERED["payload"], "intent": "the first one"}
     second = dict(_UNCOVERED)
     second["payload"] = {**_UNCOVERED["payload"], "intent": "the last one"}
-    consumer = _consumer(
-        candidates, turns=[scripted_turn([first, second]) for _ in range(3)]
-    )
+    consumer = _consumer(candidates, turns=[scripted_turn([first, second]) for _ in range(3)])
 
     await consumer._run_extractor(_summary(), KEEP_VERDICT, _proceeded())
 

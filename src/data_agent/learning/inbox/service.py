@@ -132,6 +132,7 @@ class ApproveRequest(BaseModel):
     """
 
     token: str = ""
+    acknowledge_date_warnings: bool = False
 
 
 class AttestScanRequest(BaseModel):
@@ -330,9 +331,7 @@ def _inbox_item_to_wire(item: InboxItem) -> dict[str, Any]:
         # binds to the current finding, so the card can never show "attested" for a verdict
         # that has since changed.
         "leakage_attestation": (
-            item.leakage_attestation.to_doc()
-            if item.leakage_attestation is not None
-            else None
+            item.leakage_attestation.to_doc() if item.leakage_attestation is not None else None
         ),
     }
 
@@ -401,11 +400,11 @@ def _knowledge_edit_result(result: KnowledgeEditResult) -> dict[str, Any]:
 def _map_transition_error(exc: InboxTransitionError) -> HTTPException:
     """Map an `InboxTransitionError` to the contract §2/§6 status codes.
 
-      * message contains "not found"          → 404 (unknown id)
-      * a HELD approve for a malformed payload → 409 (repair in the store, or reject)
-      * a HELD approve for landing-unavailable → 503 ("landing plane unavailable")
-      * anything else                          → 409 (illegal transition / held
-                                                 approve — reason surfaced verbatim)
+    * message contains "not found"          → 404 (unknown id)
+    * a HELD approve for a malformed payload → 409 (repair in the store, or reject)
+    * a HELD approve for landing-unavailable → 503 ("landing plane unavailable")
+    * anything else                          → 409 (illegal transition / held
+                                               approve — reason surfaced verbatim)
     """
     message = str(exc)
     if "not found" in message:
@@ -443,9 +442,7 @@ def _map_transition_error(exc: InboxTransitionError) -> HTTPException:
     # reviewer mistake. 503 so the page says "unavailable here" rather than implying the
     # form was wrong.
     if "completion_unavailable" in message:
-        return HTTPException(
-            status_code=503, detail="parameterization completion unavailable"
-        )
+        return HTTPException(status_code=503, detail="parameterization completion unavailable")
     return HTTPException(status_code=409, detail=message)
 
 
@@ -511,9 +508,7 @@ def _judge_deps_if_needed(learning_settings: Any) -> _JudgeDeps | None:
     return _JudgeDeps.build(learning_settings) if wanted else None
 
 
-def _build_completion_param_judge(
-    learning_settings: Any, deps: _JudgeDeps | None = None
-) -> Any:
+def _build_completion_param_judge(learning_settings: Any, deps: _JudgeDeps | None = None) -> Any:
     """The S4 parameterization judge for the COMPLETION path, or `None`.
 
     ⚠ THE COMPLETION PATH NEEDS ITS OWN, and leaving it out is not a small omission. Design
@@ -637,9 +632,8 @@ def _build_reviser(
         )
         return Revisers()
 
-    model = (
-        getattr(learning_settings, "learning_revise_model", "")
-        or getattr(learning_settings, "learning_extractor_model", "")
+    model = getattr(learning_settings, "learning_revise_model", "") or getattr(
+        learning_settings, "learning_extractor_model", ""
     )
     _logger.info("inbox service: LLM-assisted revision is ON (model=%s)", model)
     # The tracer the daemon preamble already installed globally (`configure_daemon_process`
@@ -791,9 +785,7 @@ def _catalog_columns(catalog: Any) -> tuple[str, ...]:
         return ()
     return tuple(
         sorted(
-            f"{table}.{column}"
-            for table, columns in schema.items()
-            for column in (columns or {})
+            f"{table}.{column}" for table, columns in schema.items() for column in (columns or {})
         )
     )
 
@@ -973,7 +965,6 @@ def _build_completion_coverage_judge(
         # unchanged rather than special-cased.
         tracer=get_learning_tracer(_otel_trace.get_tracer_provider()),
     )
-
 
 
 def _offline_user_store() -> Any:
@@ -1314,9 +1305,7 @@ def create_inbox_app(
             raise HTTPException(status_code=404, detail="Not found.")
         expected = os.environ.get("REVIEWER_TOKEN", "")
         if not expected:
-            raise HTTPException(
-                status_code=503, detail="reviewer token not configured"
-            )
+            raise HTTPException(status_code=503, detail="reviewer token not configured")
         if x_reviewer_token is None:
             raise HTTPException(status_code=401, detail="Missing X-Reviewer-Token.")
         if not hmac.compare_digest(x_reviewer_token, expected):
@@ -1346,9 +1335,7 @@ def create_inbox_app(
         # The review queue + the validated (Phase-3 promotable) listing keep ASC (oldest
         # first — FIFO drain). Chosen explicitly by the caller, per the contract.
         order = (
-            "desc"
-            if selected in (CandidateStatus.REJECTED, CandidateStatus.PROMOTED)
-            else "asc"
+            "desc" if selected in (CandidateStatus.REJECTED, CandidateStatus.PROMOTED) else "asc"
         )
         items = await inbox.list(status=selected, limit=100, order=order)
         wire = [_inbox_item_to_wire(it) for it in items]
@@ -1438,9 +1425,7 @@ def create_inbox_app(
     # asserts it rather than trusting that the next person notices.
 
     @app.get("/inbox/user_knowledge", dependencies=guard)
-    async def list_user_knowledge(
-        user_id: str | None = None, limit: int = 100
-    ) -> dict[str, Any]:
+    async def list_user_knowledge(user_id: str | None = None, limit: int = 100) -> dict[str, Any]:
         """ONE named user's private facts, with whether each is already promoted (§D.1).
 
         ⚠ THE DELIBERATE D17 EXCEPTION, and the guard that keeps it one: `user_id` is REQUIRED.
@@ -1538,9 +1523,7 @@ def create_inbox_app(
         return result.to_wire()
 
     @app.post("/inbox/{candidate_id}/approve", dependencies=guard)
-    async def approve(
-        candidate_id: str, body: ApproveRequest | None = None
-    ) -> dict[str, Any]:
+    async def approve(candidate_id: str, body: ApproveRequest | None = None) -> dict[str, Any]:
         """Approve: `in_review -> validated`, replaying the blueprint against the warehouse.
 
         ⚠ CARRIES THE REVIEWER'S OWN TOKEN. That replay is a real query, and this service mints
@@ -1548,7 +1531,11 @@ def create_inbox_app(
         """
         req = body or ApproveRequest()
         try:
-            env = await inbox.approve(candidate_id, token=req.token or "")
+            env = await inbox.approve(
+                candidate_id,
+                token=req.token or "",
+                acknowledge_date_warnings=req.acknowledge_date_warnings,
+            )
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc
         return _action_result(env)
@@ -1716,9 +1703,7 @@ def create_inbox_app(
         """
         req = body or ReviseKnowledgeRequest()
         try:
-            proposal = await inbox.propose_knowledge_revision(
-                candidate_id, feedback=req.feedback
-            )
+            proposal = await inbox.propose_knowledge_revision(candidate_id, feedback=req.feedback)
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc
         except ReviserUnavailableError as exc:
@@ -1756,9 +1741,7 @@ def create_inbox_app(
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc
         except KnowledgeEditorUnavailableError as exc:
-            raise HTTPException(
-                status_code=503, detail="knowledge editing unavailable"
-            ) from exc
+            raise HTTPException(status_code=503, detail="knowledge editing unavailable") from exc
         except CompletionRaceError as exc:
             # 409 with the reason VERBATIM, like `complete`: the reviewer did nothing wrong and
             # the only useful next step is to re-read the row.
@@ -1768,9 +1751,7 @@ def create_inbox_app(
         return _knowledge_edit_result(result)
 
     @app.post("/inbox/{candidate_id}/trial_run", dependencies=guard)
-    async def trial_run(
-        candidate_id: str, body: TrialRunRequest | None = None
-    ) -> dict[str, Any]:
+    async def trial_run(candidate_id: str, body: TrialRunRequest | None = None) -> dict[str, Any]:
         """TRIAL RUN: execute this blueprint with reviewer-chosen slot values.
 
         The question a reviewer has before approving — "does it still run, and is the shape
@@ -1845,9 +1826,7 @@ def create_inbox_app(
         return result
 
     @app.post("/inbox/{candidate_id}/promote", dependencies=guard)
-    async def promote(
-        candidate_id: str, body: PromoteRequest | None = None
-    ) -> dict[str, Any]:
+    async def promote(candidate_id: str, body: PromoteRequest | None = None) -> dict[str, Any]:
         """Phase-3 PROMOTE: emit the MCP-format YAML for a MANUAL PR into the MCP corpus repo.
 
         The first promote (from `validated`, requiring `verified=true`) also moves the candidate to
@@ -1857,9 +1836,7 @@ def create_inbox_app(
         """
         req = body or PromoteRequest()
         try:
-            emit = await inbox.promote(
-                candidate_id, doc_id=req.doc_id, title=req.title
-            )
+            emit = await inbox.promote(candidate_id, doc_id=req.doc_id, title=req.title)
         except InboxTransitionError as exc:
             raise _map_transition_error(exc) from exc
         except (ValueError, BlueprintParseError) as exc:

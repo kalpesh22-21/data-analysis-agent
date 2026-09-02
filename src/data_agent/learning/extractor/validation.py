@@ -16,6 +16,9 @@ import re
 from collections.abc import Callable
 from typing import Any, get_args
 
+import sqlglot
+import sqlglot.expressions as exp
+
 from data_agent.runtime.blueprint.template import TemplateBindError, validate_optional_pattern
 
 from ..summary.models import AcceptedSignal, SessionSummary
@@ -210,10 +213,10 @@ def _predicate_hint(uncovered: list[LiteralPredicate], rule_index: RuleIndex | N
     Carries any catalog rule that IS that filter plus the three legal ways to cover it. KEEPS
     its `totality_violation` reason code, unlike the rule-id hint next door: the code still
     means "a predicate of the accepted SQL has no entry", so no existing count changes meaning
-    (`missing_rule` would have — hence `missing_rule_hinted`). Budget-exhausted is TERMINAL by
-    design: this shares `max_shape_corrections` with every other correctable family, and the
-    hint costs nothing when it cannot be re-asked while still being the most useful sentence in
-    the inbox.
+    (`missing_rule` would have — hence `missing_rule_hinted`). Budget-exhausted is TERMINAL;
+    the hint remains useful in the inbox even when it cannot be re-asked. Corrective turns
+    consume the SQL-family budget independently of shape and semantic repairs, until the
+    overall correction ceiling is reached.
     """
     listed = uncovered[:_MAX_LISTED_PREDICATES]
     unlisted = len(uncovered) - len(listed)
@@ -505,9 +508,7 @@ def _slot_plan(raw: Any, *, at: str) -> SlotPlan:
         requirement='an object with "name", "type", "binds_to" and "required"',
     )
     return SlotPlan(
-        name=require(
-            slot, "name", as_text, at=at, requirement="a short identifier for the slot"
-        ),
+        name=require(slot, "name", as_text, at=at, requirement="a short identifier for the slot"),
         # Presence only — `_validate_roles` owns the enum, because it is the one place
         # that also knows the type-dependent `binds_to` rule, and a decline naming the
         # wrong blocker is worse than a late one.
@@ -580,6 +581,26 @@ def _enum_values(slot: dict[str, Any], *, at: str) -> tuple[str, ...] | None:
     )
 
 
+def _bare_locator_value(value: str) -> str:
+    """Normalize a model-copied standalone SQL literal to the enumerator's bare value.
+
+    The extractor contract asks for a semantic value, but live models commonly copy the SQL
+    token including quotes. Only normalize when the whole value parses as one literal; names,
+    comma lists, and arbitrary text remain untouched rather than being guessed at.
+    """
+    try:
+        parsed = sqlglot.parse_one(
+            value, dialect="clickhouse", error_level=sqlglot.ErrorLevel.RAISE
+        )
+    except Exception:
+        return value
+    if isinstance(parsed, exp.Literal):
+        return parsed.name
+    if isinstance(parsed, exp.Boolean):
+        return "TRUE" if parsed.this else "FALSE"
+    return value
+
+
 def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
     plans: list[ParamPlan] = []
     for idx, rp in enumerate(raw_params):
@@ -620,12 +641,16 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
                         at=loc_at,
                         requirement="the BARE column name, with no table prefix",
                     ),
-                    value=require(
-                        loc,
-                        "value",
-                        as_text,
-                        at=loc_at,
-                        requirement="the literal exactly as it appeared in the SQL",
+                    value=_bare_locator_value(
+                        require(
+                            loc,
+                            "value",
+                            as_text,
+                            at=loc_at,
+                            requirement=(
+                                "the bare semantic literal without surrounding SQL quotes"
+                            ),
+                        )
                     ),
                 ),
                 # Presence and stringness only. An unknown role string still declines
@@ -639,9 +664,7 @@ def _param_plans(raw_params: list[Any], *, at: str) -> list[ParamPlan]:
                     requirement='exactly one of "slot", "rule" or "inline"',
                 ),  # type: ignore[arg-type]
                 slot=(
-                    _slot_plan(entry["slot"], at=f"{entry_at}.slot")
-                    if entry.get("slot")
-                    else None
+                    _slot_plan(entry["slot"], at=f"{entry_at}.slot") if entry.get("slot") else None
                 ),
                 rule_id=optional(
                     entry,
@@ -702,14 +725,26 @@ def _result_signature(raw: Any) -> ResultSignature | None:
         requirement="an array of the grouped column names (strings)",
         default=[],
     )
-    shape_items = optional(
-        sig,
-        "shape",
-        as_array,
-        at=at,
-        requirement='an array of {"column": <name>, "type": <type>} objects',
-        default=[],
-    )
+    normalizations: list[str] = []
+    if "shape" not in sig and "columns" in sig:
+        shape_items = as_array(
+            sig["columns"],
+            at=f"{at}.columns",
+            requirement=(
+                'an array of output column objects using either {"column", "type"} '
+                'or the recognized aliases {"name", "semantic_type"}'
+            ),
+        )
+        normalizations.append("columns_to_shape")
+    else:
+        shape_items = optional(
+            sig,
+            "shape",
+            as_array,
+            at=at,
+            requirement='an array of {"column": <name>, "type": <type>} objects',
+            default=[],
+        )
     invariants = optional(
         sig,
         "invariants",
@@ -721,26 +756,39 @@ def _result_signature(raw: Any) -> ResultSignature | None:
     shape: list[ColumnShape] = []
     for idx, item in enumerate(shape_items):
         item_at = f"{at}.shape[{idx}]"
-        column_shape = as_object(
-            item, at=item_at, requirement='an object with "column" and "type"'
-        )
+        column_shape = as_object(item, at=item_at, requirement='an object with "column" and "type"')
+        column_key = "column" if "column" in column_shape else "name"
+        type_key = "type" if "type" in column_shape else "semantic_type"
+        if column_key == "name":
+            normalizations.append("name_to_column")
+        if type_key == "semantic_type":
+            normalizations.append("semantic_type_to_type")
         shape.append(
             ColumnShape(
                 column=require(
                     column_shape,
-                    "column",
+                    column_key,
                     as_text,
                     at=item_at,
                     requirement="the output column name",
                 ),
                 type=require(
                     column_shape,
-                    "type",
+                    type_key,
                     as_text,
                     at=item_at,
                     requirement="the output column's type",
                 ),
             )
+        )
+    verifiable = optional(
+        grain, "verifiable", as_flag, at=grain_at, requirement="true or false", default=True
+    )
+    if verifiable and not shape:
+        raise ShapeError(
+            f"{at}.shape",
+            "a non-empty array of output columns when grain.verifiable is true",
+            shape_items,
         )
     return ResultSignature(
         shape=tuple(shape),
@@ -753,14 +801,13 @@ def _result_signature(raw: Any) -> ResultSignature | None:
                 )
                 for i, c in enumerate(columns)
             ),
-            verifiable=optional(
-                grain, "verifiable", as_flag, at=grain_at, requirement="true or false", default=True
-            ),
+            verifiable=verifiable,
         ),
         invariants=tuple(
             as_text(inv, at=f"{at}.invariants[{i}]", requirement="one invariant statement")
             for i, inv in enumerate(invariants)
         ),
+        normalizations=tuple(dict.fromkeys(normalizations)),
     )
 
 
@@ -815,8 +862,7 @@ def _validate_compose_nodes(raw_nodes: Any) -> Decline | None:
         if "order" not in rn:
             return _malformed(
                 "blueprint",
-                f"{where} has no 'order'; every node declares its integer position in "
-                "the DAG",
+                f"{where} has no 'order'; every node declares its integer position in the DAG",
             )
         order = _node_index(rn["order"])
         if order is None:
@@ -883,9 +929,7 @@ def _validate_compose_nodes(raw_nodes: Any) -> Decline | None:
         # where a non-object raises past the promotion path — reject it here instead.
         requires_approval = rn.get("requires_approval")
         if requires_approval is not None and not isinstance(requires_approval, dict):
-            return _malformed(
-                "blueprint", f"{where} 'requires_approval' is not an object"
-            )
+            return _malformed("blueprint", f"{where} 'requires_approval' is not an object")
     return None
 
 
@@ -964,7 +1008,8 @@ def _validate_roles(
             # this pipeline is also not a mistake the model made.
             if p.slot.type in UNSUPPORTED_SLOT_TYPES:
                 return Decline(
-                    "blueprint", REASON_BAD_ROLE,
+                    "blueprint",
+                    REASON_BAD_ROLE,
                     f"slot {p.slot.name} has type {p.slot.type!r}, which the runtime "
                     "executes but S4 cannot yet generalize (rewrite_sql_to_template "
                     "emits ONE token per predicate; this type binds two, "
@@ -1048,7 +1093,8 @@ def _validate_roles(
                     validate_optional_pattern(p.slot.name, p.slot.optional_pattern)
                 except TemplateBindError as exc:
                     return Decline(
-                        "blueprint", REASON_BAD_ROLE,
+                        "blueprint",
+                        REASON_BAD_ROLE,
                         f"optional slot {p.slot.name} has a malformed optional_pattern: {exc}",
                     )
         elif p.role == "rule":
@@ -1143,9 +1189,7 @@ def _validate_totality(
             saw_any_sql = True
             predicates = literal_predicates(sql)
             if predicates is None:
-                return Decline(
-                    "blueprint", REASON_UNREWRITABLE, f"un-parseable SQL at {ref}"
-                )
+                return Decline("blueprint", REASON_UNREWRITABLE, f"un-parseable SQL at {ref}")
             for pred in predicates:
                 # Per-locator coverage (LOW-1): match by (column, value) so
                 # `region='NA' OR region='EU'` needs a plan entry PER predicate, and
@@ -1240,9 +1284,7 @@ def _blueprint_payload(raw: dict[str, Any]) -> BlueprintPayload:
                 "does (no literal values)"
             ),
         ),
-        kind=require(
-            raw, "kind", as_text, at=at, requirement='either "single" or "composite"'
-        ),
+        kind=require(raw, "kind", as_text, at=at, requirement='either "single" or "composite"'),
         resolves=_resolves(raw.get("resolves")),
         source_tool_call_refs=tuple(
             as_text(
@@ -1257,8 +1299,7 @@ def _blueprint_payload(raw: dict[str, Any]) -> BlueprintPayload:
                     as_array,
                     at=at,
                     requirement=(
-                        "an array of the session tool_call_refs that produced the "
-                        "accepted answer"
+                        "an array of the session tool_call_refs that produced the accepted answer"
                     ),
                     default=[],
                 )
@@ -1743,9 +1784,9 @@ def to_candidate(
     # the session must actually have carried acceptance.
     if payload.accepted_signal not in _ACCEPTED_SIGNAL_DOMAIN:
         return Decline(
-            ctype, REASON_NO_ACCEPTANCE,
-            f"accepted_signal {payload.accepted_signal!r} not in "
-            f"{sorted(_ACCEPTED_SIGNAL_DOMAIN)}",
+            ctype,
+            REASON_NO_ACCEPTANCE,
+            f"accepted_signal {payload.accepted_signal!r} not in {sorted(_ACCEPTED_SIGNAL_DOMAIN)}",
         )
     if summary.accepted_signal is None:
         return Decline(ctype, REASON_NO_ACCEPTANCE, "session carried no acceptance signal")
@@ -1759,3 +1800,25 @@ def to_candidate(
         return totality_decline
 
     return ExtractedCandidate(header=header, payload=payload)
+
+
+def validate_parameterization_totality(
+    payload_doc: dict[str, Any],
+    summary: SessionSummary,
+    *,
+    rule_index: RuleIndex | None = None,
+) -> Decline | None:
+    """Validate that a proposed blueprint plan accounts for every SQL predicate.
+
+    This is the read-only proposal-time seam used by the review assistant. The eventual
+    apply still runs ``to_candidate`` in full; this narrower check prevents presenting a
+    proposal as applicable when its replacement SQL and entries are already known to be
+    inconsistent.
+    """
+    try:
+        payload = _blueprint_payload(payload_doc)
+    except ShapeError as exc:
+        return _malformed("blueprint", str(exc))
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        return _unreadable("blueprint", "blueprint payload", exc)
+    return _validate_totality(payload, summary, rule_index)

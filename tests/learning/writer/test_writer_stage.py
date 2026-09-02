@@ -87,6 +87,13 @@ async def test_clean_blueprint_sampled_routes_to_inbox_blueprint_sampled():
     assert route_candidate(env, sampled_for_inbox=True).reason == "blueprint_sampled"
 
 
+async def test_default_writer_routes_every_mined_blueprint_to_human_review():
+    env = _extracted(_reasons()["blueprint_sampled"])
+    result = await WriterStage().process(env, _ctx())
+    assert result.control == "route_inbox"
+    assert result.envelope.status == CandidateStatus.IN_REVIEW
+
+
 async def test_leakage_near_miss_always_inbox_even_when_unsampled():
     """100% of leakage near-misses go to the inbox, never sampled out (D58b)."""
     env = _extracted(_reasons()["leakage_near_miss"])
